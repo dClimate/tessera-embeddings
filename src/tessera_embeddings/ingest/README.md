@@ -189,22 +189,20 @@ export-zone-rois  (one task per zone, max_parallel_zones in flight, no barrier)
 ```
 
 `validate_zone_roi` is the reason to run this early. Its load-bearing check is **placement**:
-the count of stored chunk objects must equal `live_chunk_count`. That equality holds because
-the writer skips all-ocean blocks and Zarr elides all-fill chunks, so *the set of stored chunks
-is the set of live cells* — one listing asserts, for the whole zone, that the mask marks land
-where the coverage bitmap says land is and nowhere else. It also confirms the chunk grid is
-recoverable from the keys at all, which is the property the cropped ingest's fast path depends
-on (see `live_windows.live_chunk_grid_from_keys`). Alongside that: shape/CRS/affine equal the
-zone's `ZoneSpec` (a wrong origin otherwise surfaces hours later, as data on the wrong ground
-position), and `coverage_sha256` matches the coverage group's `registry_sha256` — stamped last
-by the writer, so it is the only evidence every pixel landed and that the mask is current for
-*this* land-mask delivery.
+the count of stored chunk objects must equal `live_chunk_count`. That holds because the writer
+skips all-ocean blocks and Zarr elides all-fill chunks, so the set of stored chunks *is* the set
+of live cells — one listing asserts for the whole zone that the mask marks land where the
+coverage bitmap says land is, and nowhere else. It also confirms the chunk grid is recoverable
+from the keys, which the cropped ingest's fast path depends on
+(`live_windows.live_chunk_grid_from_keys`). Alongside that: shape, CRS and affine equal the
+zone's `ZoneSpec`, since a wrong origin otherwise surfaces hours later as data on the wrong
+ground; and `coverage_sha256` matches the coverage group's `registry_sha256`, stamped last by
+the writer, so it is the only evidence every pixel landed for *this* land-mask delivery.
 
-Safe to run before, or alongside, campaign work. `export_zone_roi` is idempotent on that same
-sha, so a pre-generated mask is what the campaign would have written and the campaign skips it;
-a new delivery changes the sha and both paths rebuild. `validate_only=true` re-checks without
-writing. Any invalid zone **fails the run**, so a green run — not a log line — is the evidence
-that every mask is right.
+Safe to run before or alongside campaign work. `export_zone_roi` is idempotent on that sha, so
+a pre-generated mask is what the campaign would have written and the campaign skips it; a new
+delivery changes the sha and both paths rebuild. `validate_only=true` re-checks without writing,
+and any invalid zone **fails the run**, so a green run rather than a log line is the evidence.
 
 ```bash
 # all zones, then re-assert the gate without writing
@@ -559,12 +557,11 @@ These happen before `odc.stac.load` is called:
 - **GeoBox alignment** — when a `GeoBox` derived from `read_roi_metadata` is supplied, the
   output grid matches the ROI exactly (same CRS, transform, shape). This overrides bbox,
   CRS, and resolution.
-- **groupby** — `"solar_day"` merges items from adjacent MGRS tiles that were acquired on
-  the same local calendar day into a single mosaic. `odc.loader`'s default fuser writes only
-  where the destination is still empty, so the FIRST valid source of a group supplies a pixel
-  and later ones fill its gaps. Items are therefore sorted clearest-first: the clearest scene
-  wins the ground it covers, and its holes fall through to the next-clearest rather than to
-  nothing. Required for ROI queries that cross tile boundaries.
+- **groupby** — `"solar_day"` merges items from adjacent MGRS tiles acquired on the same local
+  calendar day into one mosaic. `odc.loader`'s default fuser writes only where the destination is
+  still empty, so the FIRST valid source of a group supplies a pixel and later ones fill its gaps.
+  Items are sorted clearest-first, so the clearest scene wins the ground it covers and its holes
+  fall through to the next-clearest. Required for ROI queries crossing tile boundaries.
 - **Dimension rename** — `normalize_odc_dims` maps `odc.stac.load`'s `y`/`x` output
   dimensions to the project-wide `northing`/`easting` convention and drops `spatial_ref`.
 
@@ -876,11 +873,10 @@ credentials, bypassing the env vars. The mechanism:
   env vars hold. It returns `icechunk.S3StaticCredentials`.
 - `storage.zarr_store` exposes a `credentials_provider(provider)` **context manager**.
   `_create_storage` uses the registered provider as the `get_credentials` callback for any S3
-  open lacking an explicit one, for the duration of the block — scoped rather than permanent
-  so a reused process (a Dask worker) is not left pinned to it for later, unrelated opens,
-  and the previous provider is restored even if the body raises. The storage layer ships this as `None` and never imports
-  botocore (it must stay cloud-agnostic, per the `no-botocore-outside-aws-provider`
-  architecture rule); only the AWS provider supplies the concrete callback.
+  open lacking an explicit one, for the duration of the block — scoped rather than permanent, so a
+  reused Dask worker is not left pinned to it, and the previous provider is restored even if the
+  body raises. The storage layer ships this as `None` and never imports botocore, per the
+  `no-botocore-outside-aws-provider` architecture rule; only the AWS provider supplies it.
 - The `process_roi_sar` Prefect task registers `iam_icechunk_credentials` via that hook when
   `use_s3_direct=True`. **This must happen in the task shell, not the flow body** — with the
   Dask task runner the domain function (and its store writes) execute in a *worker* process,
@@ -894,11 +890,11 @@ the **callable**, not its result — and `read_roi_mask` resolves it inside each
 than once when it builds the graph.
 
 That last part is load-bearing, because the mask array is LAZY: its block reads happen inside a
-later `write_day_windows` compute, which on the radar path spans a whole 30-day batch's writes. One
-credential resolved at graph-build time would be presented by every one of those reads, and once it
-expired the read would fail with `ExpiredToken` on a bucket the role can always read — a lifetime
-problem wearing a permissions problem's error message. Opening the store per block keeps the
-credential no older than the read that uses it.
+later `write_day_windows` compute, which on the radar path spans a whole 30-day batch. One
+credential resolved at graph-build time would be presented by every one of those reads and, once
+expired, would fail with `ExpiredToken` on a bucket the role can always read — a lifetime problem
+wearing a permissions problem's error message. Opening per block keeps the credential no older
+than the read using it.
 
 Two consequences. Each block read costs its own store open, so its own metadata round trip, where
 the old construction paid one for the whole array; and the returned array is cloudpickle-only,
@@ -913,22 +909,20 @@ Service (IMDS):
 - `iam_icechunk_credentials` sets `expires_after=15min` on the returned `S3StaticCredentials`.
   This is how often **icechunk** re-invokes our callback per repo client — it is *not* how
   often we should touch IMDS.
-- `_resolve_iam_credentials` is `@lru_cache(maxsize=1)`, so the botocore session — and the
-  live `RefreshableCredentials` it returns — is built **once per process**. For an IAM role
-  botocore hands back a `RefreshableCredentials` that serves its in-memory credential and
-  refreshes itself in the background; `get_frozen_credentials()` is a pure expiry-time check
-  that only re-hits IMDS inside botocore's refresh window (~advisory 15 min before the ~6h
-  token expiry), lock-guarded so concurrent callers don't stampede.
+- `_resolve_iam_credentials` is `@lru_cache(maxsize=1)`, so the botocore session and the live
+  `RefreshableCredentials` it returns are built **once per process**. Those refresh themselves in
+  the background, and `get_frozen_credentials()` is a pure expiry check that only re-hits IMDS
+  inside botocore's refresh window (advisory ~15 min before the ~6 h token expiry), lock-guarded
+  against stampedes.
 
-Without the cache, every callback built a *fresh* session and did a **cold IMDS resolve**.
-Under many concurrent workers/threads that bursts IMDS past its per-instance rate limit, and
-the SDK surfaces it as `failed to load IMDS session token / invalid token` or
-`no providers in chain provided credentials` — transient, but enough to fail a run of chunks
-before recovering. Caching the session decouples "how often icechunk asks" from "how often we
-hit IMDS": the former stays at 15 min, the latter drops to roughly once per token lifetime.
-`lru_cache` does not cache exceptions, so a failed cold resolve still retries next call. The
-same provider is injected into inference workers (see `inference/README.md`), where long-lived
-Ray actors made this the dominant failure mode.
+Without the cache every callback built a fresh session and did a **cold IMDS resolve**, which
+under many concurrent workers bursts IMDS past its per-instance rate limit and surfaces as
+`failed to load IMDS session token / invalid token` or `no providers in chain provided
+credentials` — transient, but enough to fail a run of chunks. Caching decouples how often
+icechunk asks from how often we hit IMDS: the former stays at 15 min, the latter drops to roughly
+once per token lifetime. `lru_cache` does not cache exceptions, so a failed cold resolve retries.
+The same provider is injected into inference workers, where long-lived Ray actors made this the
+dominant failure mode.
 
 ### URL Rewriting
 
@@ -1045,21 +1039,17 @@ the REMAINDER: waiting exactly what is left makes the next dispatch land on the 
 every time, which turns a race into a guarantee of the thing the deadline forbids. The rungs
 themselves are unchanged, and a leg with budget still escalates exactly as before.
 
-And a leg that is still COMMITTING DATES earns more deadline, by
-`IngestSettings.leg_progress_extension_s`. Counted from the first dispatch, the deadline
-charges a leg for the productive work of every prior attempt, so it cannot tell a cell
-behaving pathologically from one that has been working steadily all along. Progress is read
-from the leg's own child store — through the same `get_existing_dates` the ingest itself
-resumes from, so the parent and the leg cannot disagree about what the store holds — and a
-store that cannot be read earns nothing, which is the same answer as no progress. Two
-things bound it: a grant is a FIXED size, and each has to be PAID FOR by dates committed
-since the previous grant. Payment is also what limits the rate: the extension is asked for
-wherever the deadline is about to refuse an attempt, but only a RUNNING leg commits and every
-ask sits after an attempt has failed, so the asks within one attempt compete for the same
-growth and at most one of them is paid. So the ceiling is
-`max_leg_wall_clock_s + (max_leg_attempts - 1) * leg_progress_extension_s`, a leg that
-commits nothing never leaves `max_leg_wall_clock_s`, and setting the extension to 0 restores
-the plain deadline and its reads along with it.
+A leg that is still COMMITTING DATES earns more deadline, by
+`IngestSettings.leg_progress_extension_s`. Counted from the first dispatch, the plain deadline
+charges a leg for every prior attempt's productive work and so cannot tell a pathological cell
+from one working steadily. Progress is read from the leg's own child store through the same
+`get_existing_dates` the ingest resumes from, so parent and leg cannot disagree; a store that
+cannot be read earns nothing. Two bounds: a grant is a FIXED size, and each must be PAID FOR by
+dates committed since the previous grant. Payment also limits the rate, since every ask sits
+after a failed attempt and the asks within one attempt compete for the same growth, so at most
+one is paid. The ceiling is
+`max_leg_wall_clock_s + (max_leg_attempts - 1) * leg_progress_extension_s`; a leg that commits
+nothing never leaves `max_leg_wall_clock_s`, and an extension of 0 restores the plain deadline.
 
 `source_coverage.py`'s preflight probe deliberately does **not** use any of this. Every
 failure of that probe is already INCONCLUSIVE by design, which is the right answer for both
@@ -1357,22 +1347,21 @@ only the exception declines the outage the budget exists to outlast and spends t
 attempts on it.
 
 **The evidence window is the WRITE, not the attempt.** The policy asks once per failed attempt,
-but what it is asked is whether this WRITE is being refused, and an outage states its refusal
-while it is refusing rather than on the schedule the ladder happens to ask on. Re-armed per
-attempt, the question silently becomes "was anything refused in the last few seconds" — which a
-recovering provider answers correctly with NO, one attempt before the write would have succeeded,
-so patience is withdrawn at exactly the moment it was about to pay off. One window per write also
-makes the two readings of one failure agree: `read_failure_context` judges the same failure over
-the whole write when the retry finally gives up, so a narrower window here let the same words be a
-refusal to one reader and not to the other. Nothing is remembered — the window is derived, so the
-evidence is re-read and re-classified on every attempt, a write whose window holds no refusal never
-waits, and what bounds a write that keeps seeing one is `WAIT_OUT_BACKOFF_S`, unchanged. Each ask
-logs its verdict and how many refusal lines it read, because an attempt count alone cannot separate
-"no refusal was logged" from "a refusal was logged and not read", and those want opposite repairs. Optical does not pass `wait_out` at all — its answer to a
-refusal is a leg failure with the axis unmoved, because its per-date remedy is the copy ladder and
-a long wait per rung would multiply with it. The evidence still reaches optical through the same
-context manager, so a refusal there is declined by `is_unreadable_source` and fails the leg rather
-than stepping copies and recording data loss.
+but what it asks is whether this WRITE is being refused, and an outage states its refusal while it
+is refusing rather than on the ladder's schedule. Re-armed per attempt, the question becomes "was
+anything refused in the last few seconds" — which a recovering provider answers NO one attempt
+before the write would have succeeded, withdrawing patience exactly when it was about to pay off.
+One window per write also makes the two readings of one failure agree, since
+`read_failure_context` judges the same failure over the whole write when the retry gives up.
+Nothing is remembered: the window is derived, so evidence is re-read on every attempt, a write
+whose window holds no refusal never waits, and `WAIT_OUT_BACKOFF_S` bounds one that keeps seeing
+one. Each ask logs its verdict and how many refusal lines it read, because an attempt count cannot
+separate "no refusal was logged" from "a refusal was logged and not read".
+
+Optical does not pass `wait_out` at all: its answer to a refusal is a leg failure with the axis
+unmoved, because its per-date remedy is the copy ladder and a long wait per rung would multiply
+with it. The evidence still reaches optical through the same context manager, so a refusal there
+is declined by `is_unreadable_source` and fails the leg rather than stepping copies.
 
 **And only a refusal that arrives AFTER a successful read earns the expensive wait.** An
 authorization verdict on a valid credential is either the provider misbehaving or our permissions
@@ -2140,29 +2129,26 @@ per-date wall clock  ≈  max( W , P )  +  commit / k
     P = the preparation running alongside it, per date
 ```
 
-Batching divides the commit by `k` and does nothing else. It **cannot** make the write faster,
-because the fleet is already the constraint — so commit amortisation is its only gain, and it
-LOSES wherever the larger write graph crowds out the preparation overlapping it. On a mid-sized
-ROI, preparation at `k=1` already fitted exactly inside the write with zero stall, and batching
-disturbed an already-optimal overlap.
+Batching divides the commit by `k` and does nothing else. It cannot make the write faster,
+since the fleet is already the constraint, so commit amortisation is its only gain — and it LOSES
+wherever the larger write graph crowds out the preparation overlapping it. On a mid-sized ROI,
+preparation at `k=1` already fitted inside the write with zero stall.
 
-So batching pays only where the fleet has idle capacity for the extra work to fill. The threshold
-sits at the top of the range where that was *measured* to hold, not at an estimated crossover, so
-widening it means measuring an ROI in between. Being denominated in covered window area also couples
-it to the merge exchange rate above: a finer merge covers less area, so ROIs drift below the
-threshold and more of them batch. Recalibrate against runs, never an offline sweep at a different
-merge cost. Figures in `context_docs/ingest/ingest-performance.md` §3.16.
+So batching pays only where the fleet has idle capacity to fill. The threshold sits at the top of
+the range where that was measured to hold, so widening it means measuring an ROI in between.
+Denominating it in covered window area also couples it to the merge exchange rate above: a finer
+merge covers less area, so more ROIs drift below the threshold and batch. Recalibrate against
+runs, never an offline sweep at a different merge cost. Figures in
+`context_docs/ingest/ingest-performance.md` §3.16.
 
 When it is on, k consecutive PASSING dates compute as ONE graph: their work packs the fleet
 together, one date's straggling reads backfill with another's writes, and the drain tail and commit
 gap are paid once per batch.
 
-The commit unit becomes the batch, and that is forced rather than chosen: every date's
-append resizes the time axis, so per-date sessions forked from one snapshot would
-conflict on array metadata even though their chunk data is disjoint
-(`storage.zarr_store.write_days_windows`). A mid-batch failure therefore commits none
-of the batch's dates, and a retry — or a fresh run — re-ingests exactly the uncommitted
-dates; `get_existing_dates` sees only committed dates either way. Stores are
+The commit unit becomes the batch, forced rather than chosen: every date's append resizes the
+time axis, so per-date sessions forked from one snapshot would conflict on array metadata even
+with disjoint chunk data (`storage.zarr_store.write_days_windows`). A mid-batch failure commits
+none of the batch's dates, and a retry re-ingests exactly the uncommitted ones. Stores are
 byte-identical to the per-date path (pinned by a parity test whose gate-failing date
 sits mid-batch).
 
@@ -2258,12 +2244,11 @@ sometimes from more than one region. `duplicates.py` reduces each tile-date to o
 copies of one acquisition would be blended into one pixel stack at two different processing
 baselines, and the baseline recorded on the store would match neither.
 
-Preference is expressed as **one sort key** (`_preference_key`), and the property that makes it
-work is that it is **context-free**: no term means "best in my group", so the same tuple orders two
-copies of one acquisition and two copies from different ones. A term relative to the group's own
-best baseline makes a cross-acquisition comparison meaningless and forces a second key alongside
-this one, where a signal added to either is easily missed from the other. If you add a signal, add
-it here and nowhere else.
+Preference is **one sort key** (`_preference_key`), and what makes it work is that it is
+**context-free**: no term means "best in my group", so the same tuple orders two copies of one
+acquisition and two copies from different ones. A term relative to the group's own best baseline
+would make cross-acquisition comparison meaningless and force a second key alongside this one. Add
+a signal here and nowhere else.
 
 The key reads these signals, in this order:
 
@@ -2310,25 +2295,22 @@ Two properties of that ordering are easy to get wrong and are held by tests:
   ones is not locality, and an item exposing none of them is remote, because absence of
   evidence is not evidence of locality.
 - **An unreadable baseline sorts LAST, and makes locality inert for that copy.** A missing
-  baseline is an absence of evidence rather than a tie: treating it as a tie let a copy with no
-  baseline displace a raw copy at 05.00, selecting an older reprocessing *and* skipping the offset
-  correction. Such a copy also refuses its whole date downstream, and the read-failure ladder
-  recovers from a read error but not from a refusal, so a reprocessing that can be corrected beats
-  a newer one that cannot be processed at all. An already-harmonised copy is exempt: no offset
-  decision rests on its baseline, so penalising it there would hand the tile-date to an OLDER raw
-  reprocessing, which is the opposite of the usable-first rule the key starts with.
+  baseline is an absence of evidence rather than a tie: as a tie it let a copy with no baseline
+  displace a raw copy at 05.00, taking an older reprocessing *and* skipping the correction. Such a
+  copy also refuses its whole date downstream, and the ladder recovers from a read error but not a
+  refusal. An already-harmonised copy is exempt, since no offset decision rests on its baseline
+  and penalising it would hand the tile-date to an older raw reprocessing.
 
 **Which copies are the same acquisition is decided by identity, not by a timestamp.** Two
 reprocessings of one granule share a datatake — mission, sensing start and absolute orbit, in
-`s2:datatake_id` — and differ only in the processing-baseline suffix. They do **not** agree on the
-catalogue `datetime`, which is a per-copy field: on the committed 2017-12-19 cassette, the 02.06
-and 05.00 copies of one granule are timestamped more than three minutes apart. A tolerance around
-that timestamp therefore cannot separate "two reprocessings" from "two passes" without getting one
-of them wrong, and the pair was kept as two acquisitions and mosaicked together. Identity needs no
-tolerance: the timestamp window survives only as the fallback for a copy naming no datatake.
-Splitting on a real acquisition is what protects genuine same-day coverage — successive orbits
-revisit a high-latitude tile the same day, and keying on `(tile, solar day)` alone dropped 493 of
-2,733 items as duplicates when they were distinct acquisitions.
+`s2:datatake_id` — and differ only in the baseline suffix. They do **not** agree on the catalogue
+`datetime`, which is per-copy: on the 2017-12-19 cassette the 02.06 and 05.00 copies of one
+granule are timestamped more than three minutes apart, so a tolerance around that timestamp
+cannot separate "two reprocessings" from "two passes" without getting one wrong. The timestamp
+window survives only as the fallback for a copy naming no datatake. Splitting on a real
+acquisition protects genuine same-day coverage: successive orbits revisit a high-latitude tile
+the same day, and keying on `(tile, solar day)` alone dropped 493 of 2,733 distinct acquisitions
+as duplicates.
 
 A copy naming **no** datatake joins an identified acquisition its timestamp places it in, before it
 is allowed to start one, and it is matched against *any* member of that acquisition — members of
