@@ -424,19 +424,19 @@ What clears it is either a smaller response or a regrouping that produces one. `
 them in cost order.
 
 **A shorter window first.** Its halves between them walk about as many pages as the parent
-would have, where a smaller page re-walks the whole window at twice the requests. What matters
-is the window's **end** date; shortening only the start does not help, because the catalogue
-pages newest-first and the late bound fixes the whole cursor sequence. So `_query_stac_items` re-queries the window as shorter windows on any
-upstream-error refusal past the first page, recursing until a window completes or is down to
-a single day. Separately and proactively, it reads the match count the catalogue reports
-beside the first page and cuts a window matching more than `_MAX_QUERY_ITEMS` to size — that
-bounds *cost*, keeping a refusal from discarding a long walk, and is not what fixes the
-defect. **A smaller page as the fallback**, halved each time down to `_MIN_PAGE_SIZE`. Shortening
-cannot reach two refusals, and both failed a leg outright before this existed: a **first page**,
-which a shorter window asks identically, and a **single day**, which is the re-cut's own floor.
-Verified live — a 250-item page is over the cap and refused outright, and the recovery stepped
-250 → 125 → 62, interleaving with a window cut, and returned all 2,512 items with the post-sort
-order and the extracted baselines unchanged, for twice the requests.
+would have, where a smaller page re-walks the whole window at twice the requests. What matters is
+the window's **end** date: the catalogue pages newest-first, so the late bound fixes the whole
+cursor sequence and shortening only the start does not help. `_query_stac_items` re-queries as
+shorter windows on any upstream-error refusal past the first page, recursing until a window
+completes or reaches a single day. Separately, it reads the match count reported beside the first
+page and cuts a window matching more than `_MAX_QUERY_ITEMS` to size — that bounds *cost* rather
+than fixing the defect.
+
+**A smaller page as the fallback**, halved down to `_MIN_PAGE_SIZE`, because shortening cannot
+reach two refusals: a **first page**, which a shorter window asks identically, and a **single
+day**, the re-cut's floor. Verified live — a refused 250-item page stepped 250 → 125 → 62,
+interleaving with a window cut, and returned all 2,512 items with post-sort order and extracted
+baselines unchanged.
 
 A stated overload (429, 503) is never answered with a smaller page: that means the provider is
 busy, and more requests is the wrong direction. A refusal neither lever can route around still
@@ -452,12 +452,10 @@ rather than as pages arrive, so first-occurrence-wins means first in the **walk*
 off the wire.
 
 Six rather than eight, even though eight is faster: the campaign runs tens of cells against this
-one provider at once, so the setting is a multiplier on the concurrent search streams Element 84
-sees, and measured per-page latency degrades with width. A failure no longer stops the other
-windows either — every window is walked, all failures are collected, and the depth-first-earliest
-is raised, because which failure surfaces must be a function of the query rather than of which
-task finished first. The attempt-budget layer above decides a refusal is deterministic by seeing
-the identical signature again.
+one provider at once, so the setting multiplies the concurrent search streams Element 84 sees, and
+per-page latency degrades with width. A failure does not stop the other windows — every window is
+walked, all failures collected, and the depth-first-earliest raised, so which failure surfaces is
+a function of the query rather than of which task finished first.
 
 The re-partition is a pure re-cut of the window, never a narrowing, and it is exact in both
 directions: the outer bounds are the caller's own date strings handed straight back, and every
@@ -466,11 +464,10 @@ and the window that starts there. The catalogue's range is inclusive at both end
 is the input window with no gap and no overhang, and the only overlap is that one instant.
 
 The boundary is an instant rather than a date because the client expands a bare date end to
-`T23:59:59Z`: windows abutting on consecutive DATES would leave the last second of each seam's
-earlier day unasked for, a second the unsplit window covers. Sharing the whole boundary DAY
-also closes that gap, and was how this first shipped, but it makes every seam re-fetch a full
-day for the dedupe to discard — about 13 page requests each at Earth Search. Items are still
-deduped by `id` across every search a query runs, which absorbs the boundary instant and the
+`T23:59:59Z`, so windows abutting on consecutive DATES would leave the last second of each seam's
+earlier day unasked for. Sharing the whole boundary DAY closes that gap too, but makes every seam
+re-fetch a full day for the dedupe to discard — about 13 page requests each at Earth Search. Items
+are deduped by `id` across every search a query runs, which absorbs the boundary instant and the
 antimeridian overlap alike.
 
 **Item order.** The re-partition does change the order items are *walked* in — one walk returns
@@ -963,22 +960,19 @@ the pipeline does about it.
 `catalogue_refusal.py` is where a refused query stops being anonymous. Two things about the
 client stack make that necessary:
 
-- **The request is discarded on the way up.** `StacApiIO.request` catches every transport
-  failure and re-raises `APIError(str(err))`. What survives names the host and the endpoint
-  path; a STAC search is a request **body**, so the collection, the window, the bbox and the
-  page are all gone. Without them a refusal cannot be narrowed to a month or a page,
-  reproduced, or reported to whoever runs the archive.
-- **Our layer sits ABOVE a retry ladder, and only partly behind it.** For a status the
-  `urllib3.Retry` above force-lists, what escapes is the ladder reporting its own
-  exhaustion — a much stronger statement than one error response, and one that must not be
-  mistaken for a first attempt. For a status kept out of that list (502) the first refusal
-  arrives directly. `CatalogueRefusal.exhausted` records which, so no caller has to assume.
+- **The request is discarded on the way up.** `StacApiIO.request` catches every transport failure
+  and re-raises `APIError(str(err))`, which names only the host and endpoint path. A STAC search
+  is a request **body**, so the collection, window, bbox and page are gone — and without them a
+  refusal cannot be narrowed to a month or a page, reproduced, or reported upstream.
+- **Our layer sits ABOVE a retry ladder, and only partly behind it.** For a force-listed status
+  what escapes is the ladder reporting its own exhaustion, a much stronger statement than one
+  error response; for a status kept out of that list (502) the first refusal arrives directly.
+  `CatalogueRefusal.exhausted` records which.
 
-So `_query_stac_items` pages explicitly (`pages_as_dicts`, which is what `items_as_dicts`
-iterates internally) and wraps **only the page fetch** in a `CatalogueQueryError` carrying a
-`CatalogueRequest`. Wrapping the page body as well would classify our own validation
-failures as someone else's outage. Opening the catalogue is page 0, named separately so a
-root outage is not attributed to a window that was never asked for.
+So `_query_stac_items` pages explicitly (`pages_as_dicts`) and wraps **only the page fetch** in a
+`CatalogueQueryError` carrying a `CatalogueRequest` — wrapping the page body too would classify
+our own validation failures as someone else's outage. Opening the catalogue is page 0, named
+separately so a root outage is not attributed to a window never asked for.
 
 ```text
 CATALOGUE REFUSED collection=sentinel-2-l2a window=2021-09-01/2021-10-02
@@ -987,8 +981,8 @@ CATALOGUE REFUSED collection=sentinel-2-l2a window=2021-09-01/2021-10-02
                   — classified upstream-error:502
 ```
 
-The **classification** separates two refusals that arrive as one exception type from one
-endpoint and need opposite responses:
+The **classification** separates refusals that arrive as one exception type from one endpoint
+and need opposite responses:
 
 | refusal | statuses | what it claims | response |
 |---|---|---|---|
@@ -1153,18 +1147,6 @@ The last branch is the important one. **A date is only ever abandoned on positiv
 image itself is unusable.** Anything we cannot explain fails the job instead, which costs time and
 is recoverable, rather than costing a date, which is not.
 
-#### Why "we cannot tell" happens at all
-
-The image is read on one machine and the decision is made on another. Sending an error between
-machines loses the useful part: what arrives is the outer message ("read failed, see the previous
-error") without the previous error attached. The reason — say, "this file will not decompress" —
-stays behind on the machine that read it.
-
-We fix that at the source rather than guessing afterwards. Every machine that reads is given a
-small patch that lets the real reason travel with the error, and a job **refuses to start** unless
-every machine confirms it has that patch. A job that cannot explain its own failures is a job that
-can quietly ruin a dataset, so it is better not to start.
-
 #### Waiting: where it happens changes what it costs
 
 Two different budgets, for one reason:
@@ -1200,10 +1182,12 @@ the one outcome the recovery must never produce.
 its own log and raises something else entirely, and the section *When GDAL logs the reason instead
 of raising it* below is what closes that.
 
-**The chain only exists if something kept it.** The read fails on a Dask worker, and rasterio's
-GDAL error classes cannot be serialised out of it by default — Dask detects that and substitutes
-a plain `Exception` holding the wrapper's repr, so what arrives is one line with no cause and
-every predicate here has nothing to read. `loader_failures.keep_causes_picklable`, installed on
+**The chain only exists if something kept it**, and a leg **refuses to start** unless every
+worker confirms it can: a job that cannot explain its own failures can quietly ruin a dataset.
+The read fails on a Dask worker, and rasterio's GDAL error classes cannot be serialised out of it
+by default — Dask substitutes a plain `Exception` holding the wrapper's repr, so what arrives is
+one line with no cause and every predicate here has nothing to read.
+`loader_failures.keep_causes_picklable`, installed on
 every worker by the same plugin as the object capture, is what makes the cause arrive. It is best
 effort, so `cause_was_flattened` recognises a failure that arrived without one and
 `read_failure_context` logs `READ CAUSE LOST` — the signal that a verdict was reached from
@@ -1371,14 +1355,12 @@ a provider wobble arrives after the leg has already been served. `s1_roi` keeps 
 set on the first committed date, and withholds the long wait until it is set — so a leg whose
 access is genuinely wrong fails promptly and releases its fleet instead of idling on it.
 
-It fails closed three ways, and each closed door costs only the ordinary attempt limit. A
-credential fault on THIS side is excluded first, because it is repairable here and no waiting
-fixes it. A refusal nothing attributes to the source reader is excluded too: `AccessDenied`,
-`SlowDown` and `InternalError` are S3's words and every S3 client shares them, so those markers
-only count alongside GDAL's own vocabulary (`RasterioIOError`, `WarpOperationError`, `CPLE_`) —
-GDAL reads source imagery here and nothing else. And anything unrecognised is excluded, which is
-what a failure whose cause was stripped crossing the worker boundary looks like: it draws no long
-wait on suspicion, and it is not given up either.
+It fails closed three ways, each costing only the ordinary attempt limit. A credential fault on
+THIS side is excluded first, being repairable here. A refusal nothing attributes to the source
+reader is excluded too — `AccessDenied`, `SlowDown` and `InternalError` are S3's words, so they
+count only alongside GDAL's own vocabulary, by the same pairing rule as the not-found markers
+above. And anything unrecognised is excluded, which is what a failure whose cause was stripped
+crossing the worker boundary looks like: no long wait on suspicion, and not given up either.
 
 The two predicates were once overlapping, and a caller's ORDER of asking decided the verdict.
 They are now disjoint by construction, and by sharing one classification rather than keeping two
@@ -1432,13 +1414,13 @@ shifting every chunk after it, and a Zarr store's chunks sit at fixed positions 
 to shift them to. So **every day at or before the newest date a store already holds is closed to
 that store for good**, whatever the imagery for that day later turns out to be.
 
-Most runs are resumes. A leg is dispatched for a whole calendar year, fails or is stopped part way
-through, and is dispatched again for the same year. Everything below the line it reached last time
-is settled; only the days above it are still open.
+Most runs are resumes: a leg dispatched for a calendar year fails part way through and is
+dispatched again, so everything below the line it reached is settled and only the days above it
+are open.
 
-**So a run starts the day after the newest date its own store holds** (`resume_window_start` in
-`solar_days.py`). Three questions are asked in order, before the catalogue is queried and before
-any date is prepared:
+**A run therefore starts the day after the newest date its own store holds**
+(`resume_window_start` in `solar_days.py`). Three questions, asked before the catalogue is
+queried and before any date is prepared:
 
 1. **Does the window end before it begins?** That is a caller mistake and always was, so the run
    refuses it. Asked first, so a misconfigured leg can never be reported as a successful skip.
@@ -1448,37 +1430,29 @@ any date is prepared:
    its month first can precede the window's end while the date it came from does not.
 3. **Otherwise, begin the day after that newest date.**
 
-**The day after, rather than the first of its month.** Starting at the month boundary still offers
-the earlier days of that month, and that is exactly where an old gap sits — a day an earlier
-attempt could not write while later days landed above it. Offering such a day to the writer is
-fatal: the append is refused, the leg dies, and it dies again on every retry, because the imagery
-is the same every time. Starting the day after offers none of them. A drop-and-log guard sits in
-front of the writer as well; it should never fire, and it is there because the failure it prevents
-leaves a store with no remedy but deletion.
+**The day after, rather than the first of its month.** Starting at the month boundary still
+offers the earlier days of that month, which is exactly where an old gap sits — a day an earlier
+attempt could not write while later days landed above it. Offering one to the writer is fatal: the
+append is refused, the leg dies, and it dies again on every retry because the imagery is the same.
+A drop-and-log guard sits in front of the writer too; it should never fire, and exists because the
+failure it prevents leaves a store with no remedy but deletion.
 
 Nothing is lost by the tighter start. What a run may *write* is the span it **owns**, and every
-catalogue query is padded a day either side of that span, because a solar day's imagery can carry
-the adjacent UTC date (see *Solar days versus UTC queries*). The pad is what catches that edge
-day; the owned span still begins the day after the newest held date. One day of padding is
-provably enough, because a solar offset is a whole number of hours within ±12.
+catalogue query is padded a day either side, because a solar day's imagery can carry the adjacent
+UTC date (see *Solar days versus UTC queries*). One day is provably enough, since a solar offset
+is a whole number of hours within ±12.
 
-Each store works this out for itself. A cell has up to three of them — optical, ascending radar,
-descending radar — and they advance at different rates, so a start computed once and shared would
-skip days a lagging store never reached.
-
-The saving is the point as much as the safety. Searching the catalogue below the line cannot write
-anything, and searching is most of what a resumed run does, so a resume over a mostly-full store
-used to spend nearly all of its time on months it could not write to.
+Each store works this out for itself: a cell has up to three, and they advance at different rates,
+so a shared start would skip days a lagging store never reached. The saving matters as much as the
+safety — searching below the line cannot write anything, and searching is most of what a resumed
+run does.
 
 #### Why nothing records what was missed
 
-Once a day is closed, what happened on it stops mattering. Suppose an image that would not read
-this morning reads perfectly this afternoon: it still cannot be written, because a day below the
-line cannot be appended. Readability can change; the outcome cannot.
-
-That is why there is no ledger here of days that were missed. It could not change a decision —
-there is no action it would unlock — it would be one more thing that has to stay in step with the
-store, and it would be deleted along with the mosaic it was written on.
+Once a day is closed, what happened on it stops mattering: an image that would not read this
+morning and reads this afternoon still cannot be written. Readability can change; the outcome
+cannot. So there is no ledger of missed days — it would unlock no action, would have to stay in
+step with the store, and would be deleted along with the mosaic it was written on.
 
 **The published product already answers the question a reader actually has.** A mosaic is an
 intermediate: embeddings are computed from it and then it is deleted. What survives is the
