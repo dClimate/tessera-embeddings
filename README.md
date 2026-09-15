@@ -41,6 +41,9 @@ one value per year from 2017 to 2025. **No AWS account is needed** — the bucke
 anonymous reads. You do need the `icechunk` library, since xarray and Zarr alone cannot
 resolve an Icechunk snapshot.
 
+Embeddings are quantised: each pixel-year holds 128 int8 values plus one float32 `scales`
+value, and multiplying the two recovers the original numbers.
+
 ```python
 import icechunk, xarray as xr
 
@@ -53,6 +56,15 @@ session = repo.readonly_session(branch="main")
 ds = xr.open_zarr(session.store, group="33N", consolidated=False,
                   decode_coords="all", chunks=None)
 ```
+
+```python
+window = ds.isel(time=8, northing=slice(661604, 661620), easting=slice(49252, 49268))
+embeddings = window.embeddings * window.scales      # int8 x float32 -> float32
+```
+
+The band dimension broadcasts, so that needs no reshaping. A pixel that was never embedded
+carries a `NaN` scale and so comes out as `NaN` rather than a misleading zero, which makes
+`scales` the array to ask about coverage.
 
 `group=` is a UTM zone, `01N`–`60N` or `01S`–`60S`. Pass no configuration object: the store
 carries reader-tuned settings already, and supplying your own replaces them wholesale. Keep
