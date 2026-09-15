@@ -17,6 +17,7 @@ into Icechunk/Zarr stores. Used by the Tessera ingestion flows (`ingest_s1_roi_s
 - [Error handling](#error-handling)
 - [Performance Optimizations](#performance-optimizations)
 - [Accessing the Dask Dashboard](#accessing-the-dask-dashboard)
+- [Appendix A — the Earth Search response cap in detail](#appendix-a--the-earth-search-response-cap-in-detail)
 
 Read the overview below; the rest of this file is meant to be searched rather than read
 through. The rationale behind these choices — what was measured, and what was tried and
@@ -323,231 +324,12 @@ to reject it — so both query paths split the box at ±180° into two ordinary 
 queries and deduplicate the results by item id. A granule straddling the line is returned
 by both halves and must be loaded once.
 
-#### How one query runs, in plain terms
+### Timestamp handling (`solar_days.py`)
 
-Everything above is what a query asks for. The rest of this section is what happens when the
-catalogue will not answer it, which is most of the query code and all of its complexity, so it is
-worth one plain-language pass before the detail.
-
-Four terms. A **page** is one request and the hundred results it returns. A **cursor** is a
-bookmark the catalogue hands back, which the next request must carry — not a page number, so
-there is no way to ask for the twentieth page directly and a refused request leaves no bookmark
-for the one after it. A **date window** is a from-date and a to-date. A **worklist** holds one job
-per date window; an impossible job is crossed off and replaced by two shorter ones.
-
-The problem this shape exists for: Earth Search refuses **any request whose answer would exceed
-about 6 MB**, AWS Lambda's synchronous response limit. The refusal arrives in 1.3 seconds, as fast
-as a success, so nothing is overloaded and repeating cannot help — the remedy is always to ask for
-a smaller answer. The diagram is the whole mechanism; everything after it is detail.
-
-```text
-WHY A REQUEST GETS REFUSED -- the whole mechanism, in one line
-
-   Earth Search will not return more than about 6 MB in one answer.
-   That is AWS Lambda's limit on a single synchronous response, and the search API
-   sits behind one.
-
-   scenes are not all the same size, so a hundred of them is 4.6 MB on average
-   but anywhere from 4.2 to 5.3 MB in practice -- and sometimes over the line:
-
-      100 scenes from this bookmark  ->  would be ~6.2 MB  ->  REFUSED
-       90 scenes from this bookmark  ->            5.6 MB  ->  answered
-       75 scenes from this bookmark  ->            4.6 MB  ->  answered
-
-   Same bookmark, same dates, character for character. Only the number asked for
-   changed. So nothing is wrong with the bookmark, the depth, or the service --
-   the reply was simply too big to send.
-
-   Which hundred scenes you land on is decided by your bookmark and your date
-   window, which is why it looks like the service has taken against one specific
-   request. It hasn't. It is doing arithmetic on the size of the answer.
-
-   THE MARGIN IS THE RISK: 4.6 MB average against a 6 MB ceiling is ~30% of room.
-   Fatter scenes -- a newer processing baseline, a provider-side change -- push
-   FIRST pages over the line, and a first page is the one refusal that shortening
-   the dates cannot fix. `max_page_size` is the lever if that ever happens.
-
-
-HOW THE QUERY IS SHAPED AROUND IT
-
-   28 Feb ---------------------------------------------------------------- 1 Apr
-       |  the catalogue reports the total beside the first page, so a window too big to
-       |  walk is cut before the walk starts rather than hundreds of requests in
-       v
-    +--------+--------+--------+--------+--------+--------+
-    |  job 1 |  job 2 |  job 3 |  job 4 |  job 5 |  job 6 |   jobs meet on a shared
-    +--------+--------+--------+--------+--------+--------+   INSTANT, so nothing falls
-        ok       ok       ok    refused     ok       ok       between them and nothing
-                                  |                          is asked for twice
-                                  |  cross it off, write two shorter jobs. Shorter dates
-                                  |  regroup the scenes into different hundreds, so the
-                                  |  fat group is split and every answer fits. The other
-                                  v  five jobs are untouched and still running.
-                                     If the dates cannot be shortened -- a single day, or
-                                     a FIRST request, which a shorter window asks the same
-                                     way -- ask for fewer scenes at a time instead.
-                            16-22 March
-                              +-- 16-19 March   ok
-                              +-- 19-22 March   refused
-                                    +-- 19-21 March   ok
-                                    +-- 21-22 March   refused
-                                          +-- 21 March   ok   <- one day is as far
-                                          +-- 22 March   ok      as this can go
-
-   Up to six jobs run at once. Almost all of a request is spent waiting for the catalogue
-   to think -- 86% of it, before a single byte arrives -- so overlapping the waits is the
-   only thing that moves the clock. Same query, same scenes, same order: 39 minutes as
-   first written, 3.5 minutes now.
-```
-
-Two properties are tested. The jobs must add up to exactly the window
-asked for, no day missed and no day added. And the results must come back in the same **order**, not
-merely the same set — two scenes taken on the same day with the same cloud cover are separated only
-by which arrived first, and that decides which one supplies an overlapping pixel.
-
-The rest of this section is the mechanism behind that picture.
-
-#### The months where the catalogue entries are heavy
-
-**Earth Search refuses any request whose response would exceed roughly 6 MB** — AWS Lambda's
-limit on a synchronous response, and the search API sits behind one. Every 502 this campaign has
-seen from that provider is this and nothing else.
-
-What makes it bite unevenly is that items are not all the same size. Catalogue entries from
-roughly **November 2018 to March 2019** are about 100× larger than normal: an entry usually
-carries the tile's bounding rectangle, a couple of hundred bytes, while these carry the outline of
-where the imagery actually falls, and since Sentinel-2 builds an image from twelve detectors that
-edge is a fine sawtooth — 98 KB in one measured entry against 0.2 KB. The asset list is ~18 KB
-either way, so the outline is what makes them heavy. The band is a reprocessing gap: ESA
-reprocessed most of the archive to a version carrying the simple rectangle, and those months are
-the stretch where only the original 02.11 is on offer. It cannot spread, since no current
-processing version produces these outlines, and it could disappear if that stretch is ever
-reprocessed.
-
-Two consequences in this code: a hundred entries is ~2.2 MB outside the band and at or over the
-ceiling inside it, so page refusals are a 2019 phenomenon; and a month of these entries holds an
-order of magnitude more bytes than the same month in 2024, which is part of why the query streams
-month by month. Any per-item figure — page size, retained bytes, query timing — reads differently
-here than anywhere else in the archive.
-
-The page size is `STACProvider.max_page_size` (the `limit` per page request), defaulting to 250
-and set to 100 for Earth Search. It applies only to providers queried through `client.search()`,
-which in production means Earth Search; the OPERA `cmr-asf` path queries the native CMR Granule
-API instead — see [ADR 009](../../../context_docs/decisions/009-native-cmr-granule-query.md).
-
-**Why 100 for Earth Search, and what to watch.** Not throughput but the cap: 250 items of
-`sentinel-2-l2a` is always over it. A hundred averages 4.6 MB, yet the largest page ever served
-was 96% of the cap, so the margin between fine and refused is about a quarter of a megabyte and
-the average is the wrong number to reason from. Lowering it further is not the answer — six months
-of a ten-year archive is a concentrated problem, and the page-size fallback below handles it where
-it happens rather than taxing every query in every year. If first pages ever start returning 502
-this margin is the first thing to check, since a first-page refusal is the one case no date-window
-re-cut can route around.
-
-**The same cap also refuses pages deep in a walk**, which looks like a separate defect and is
-not. Because item sizes vary the refusal is deterministic in the *request* — cursor and date
-window together — rather than in how deep the walk has got, which is why the same refusal has
-appeared at page 289 of one window and page 14 of a shorter one sharing its late bound.
-
-What clears it is either a smaller response or a regrouping that produces one, and `stac.py`
-tries them in cost order.
-
-**A shorter window first.** Its halves between them walk about as many pages as the parent would
-have, where a smaller page re-walks the whole window at twice the requests. What matters is the
-window's **end** date: the catalogue pages newest-first, so the late bound fixes the whole cursor
-sequence and shortening only the start does not help. `_query_stac_items` re-queries as shorter
-windows on any upstream-error refusal past the first page, recursing until a window completes or
-reaches a single day. Separately, it reads the match count reported beside the first page and
-cuts a window matching more than `_MAX_QUERY_ITEMS` to size — that bounds *cost* rather than
-fixing the defect.
-
-**A smaller page as the fallback**, halved down to `_MIN_PAGE_SIZE`, because shortening cannot
-reach two refusals: a **first page**, which a shorter window asks identically, and a **single
-day**, the re-cut's floor. A stated overload (429, 503) is never answered with a smaller page:
-that means the provider is busy, and more requests is the wrong direction. A refusal neither
-lever can route around still raises the classified `CatalogueQueryError` with its token.
-
-**Concurrency.** The windows are independent searches, so `_fill_window_tree` walks up to
-`_QUERY_WINDOW_WORKERS` (6) of them at once. The worklist is driven from the calling thread and
-tasks only ever walk — they never submit and never wait — so deadlock is structurally impossible
-rather than merely unobserved. Each thread gets its own `Client`, because `StacApiIO` wraps a
-`requests.Session` that is not documented thread-safe. Output order comes from
-`_WindowWalk.preorder()` on the finished tree, and the `id` dedupe runs at that assembly step
-rather than as pages arrive, so first-occurrence-wins means first in the **walk** and not first
-off the wire. Six rather than eight, even though eight is faster: the campaign runs tens of cells
-against this one provider at once, so the setting multiplies the concurrent search streams
-Element 84 sees, and per-page latency degrades with width. A failure does not stop the other
-windows — every window is walked, all failures collected, and the depth-first-earliest raised, so
-which failure surfaces is a function of the query rather than of which task finished first.
-
-The re-partition is a pure re-cut, never a narrowing, and it is exact in both directions: the
-outer bounds are the caller's own date strings handed straight back, and every interior boundary
-is a single **instant** (`T00:00:00Z`) shared by the window that ends there and the window that
-starts there. The catalogue's range is inclusive at both ends, so the union is the input window
-with no gap and no overhang, and the only overlap is that one instant. An instant rather than a
-date because the client expands a bare date end to `T23:59:59Z`, so windows abutting on
-consecutive DATES would leave the last second of each seam's earlier day unasked for; sharing the
-whole boundary DAY closes that gap too, but makes every seam re-fetch a full day for the dedupe
-to discard. Items are deduped by `id` across every search a query runs, which absorbs the
-boundary instant and the antimeridian overlap alike.
-
-It does change the order items are *walked* in — one walk returns the window newest-first, the
-worklist returns window by window in date order — which is safe only because `query_stac_items`
-re-sorts with `solar_day_sort_key`, making the final sequence a function of the items rather than
-of the order the walk produced (see *Cloud cover decides which scene wins a pixel* above for
-what that sort decides).
-
-The cap, the measured margins, the sampling behind the heavy band and the levers that are closed
-are all derived in `context_docs/ingest/ingest-performance.md` §7c.
-
-### OPERA-Specific Query Quirks
-
-#### Native granule query (orbit filtering + item construction)
-
-`make_s1_item_provider` builds an `item_provider_fn` that returns ready-to-load OPERA items
-**without calling CMR-STAC `client.search()` at all**. CMR-STAC's cursor pagination
-intermittently 500s on CONUS-scale queries (nasa/cmr-stac#408) and pages internally at ~100
-items regardless of the requested `limit` (#411); it also **silently ignores** the `query`
-extension for CMR additional attributes such as `ASCENDING_DESCENDING`. The native CMR
-Granule Search API has none of these problems.
-
-The provider queries the granule API directly:
-
-```text
-GET https://cmr.earthdata.nasa.gov/search/granules.json
-    ?short_name=OPERA_L2_RTC-S1_V1
-    &attribute[]=string,ASCENDING_DESCENDING,ASCENDING
-    &bounding_box=...
-    &temporal=...
-    &page_size=2000
-```
-
-Orbit direction is filtered **server-side** via `attribute[]`, so the response holds only the
-desired orbit — no separate STAC search and no local granule-ID intersection. Each granule's data
-links (`rel` ending `/data#`, href ending `_VV.tif` / `_VH.tif`) map onto the `S1_OPERA_BANDS`
-asset keys (`0_VV`, `0_VH`) to build `pystac.Item`s shape-compatible with the rest of the
-pipeline, with `title`, `time_start` and `polygons` supplying id, datetime and geometry.
-Pagination uses the `CMR-Search-After` header, which pages cleanly at 2000. See
-[ADR 009](../../../context_docs/decisions/009-native-cmr-granule-query.md).
-
-#### Burst Timestamp Normalisation
-
-A single MGRS tile bbox query returns ~10 burst granules per date, each with a slightly
-different sub-second UTC timestamp (reflecting actual acquisition time). If passed to
-`odc.stac.load` as-is, each burst becomes a separate time step instead of being mosaicked
-together.
-
-`normalize_opera_timestamps` delegates to `solar_days.normalize_to_solar_day`, grouping bursts
-by **solar day** and setting every timestamp in a group to noon UTC of that day. `odc.stac.load`
-then treats them as concurrent acquisitions and mosaics them into a single time slice.
-
-#### UTM CRS Derivation
-
-CMR-STAC OPERA items lack the `proj:` extension, so `odc.stac.load` cannot infer the output
-CRS. `mgrs_tile_to_utm_epsg` derives the correct UTM EPSG from the tile's zone number and
-latitude band (C–M = southern hemisphere, N–X = northern hemisphere), e.g. `33UUP` → EPSG:32633.
-
-### Solar days versus UTC queries (`solar_days.py`)
+Three things about a date have to be decided before a query is sent, and they are one subject:
+which day an acquisition belongs to, which day a group of them is labelled with, and which day
+range a catalogue is asked for. Getting any of them from a different convention than the others
+loses imagery silently.
 
 **One rule, and everything else follows: the solar offset is applied exactly once, by
 `normalize_to_solar_day`, at the catalogue chokepoint. After that an item's `datetime` IS
@@ -644,7 +426,18 @@ prefers the geobox centroid over a bbox midpoint, why `group_items_by_date` take
 would silently let a cloudier pixel win. Central longitudes image far from UTC midnight and are
 unaffected, which kept it latent.
 
-### Which day a slice is called (and why it is not an item's timestamp)
+#### Fusing OPERA's per-burst timestamps
+
+A single MGRS tile bbox query returns ~10 burst granules per date, each with a slightly
+different sub-second UTC timestamp (reflecting actual acquisition time). If passed to
+`odc.stac.load` as-is, each burst becomes a separate time step instead of being mosaicked
+together.
+
+`normalize_opera_timestamps` delegates to `solar_days.normalize_to_solar_day`, grouping bursts
+by **solar day** and setting every timestamp in a group to noon UTC of that day. `odc.stac.load`
+then treats them as concurrent acquisitions and mosaics them into a single time slice.
+
+#### Which day a slice is called, and why it is not an item's timestamp
 
 A mosaic slice represents one **solar day**, and it is labelled with that day — taken from the
 grouping key, not from the loaded dataset's own time coordinate.
@@ -659,6 +452,129 @@ Taking the day from the grouping key instead makes three things true by construc
 unique per slice, monotonic across them (so the batched write needs no sorting), and stable
 against the catalogue revising its cloud estimates. This only decides WHICH day — pixels, ordering
 and which tile wins are untouched, and at mid longitudes the value is unchanged anyway.
+
+### Adjusting Request Sizes to Accommodate EarthSearch (S2) Lambda Response Limits
+
+Earth Search will not return more than about 6 MB in one answer, and a Sentinel-2 query over a
+zone-year asks for far more than that. Sizing requests around the refusal is most of the query
+code and all of its complexity, so this section is one plain-language pass over the mechanism;
+[Appendix A](#appendix-a--the-earth-search-response-cap-in-detail) holds the implementation.
+
+Four terms. A **page** is one request and the hundred results it returns. A **cursor** is a
+bookmark the catalogue hands back, which the next request must carry — not a page number, so
+there is no way to ask for the twentieth page directly and a refused request leaves no bookmark
+for the one after it. A **date window** is a from-date and a to-date. A **worklist** holds one job
+per date window; an impossible job is crossed off and replaced by two shorter ones.
+
+The problem this shape exists for: Earth Search refuses **any request whose answer would exceed
+about 6 MB**, AWS Lambda's synchronous response limit. The refusal arrives in 1.3 seconds, as fast
+as a success, so nothing is overloaded and repeating cannot help — the remedy is always to ask for
+a smaller answer. The diagram is the whole mechanism; everything after it is detail.
+
+```text
+WHY A REQUEST GETS REFUSED -- the whole mechanism, in one line
+
+   Earth Search will not return more than about 6 MB in one answer.
+   That is AWS Lambda's limit on a single synchronous response, and the search API
+   sits behind one.
+
+   scenes are not all the same size, so a hundred of them is 4.6 MB on average
+   but anywhere from 4.2 to 5.3 MB in practice -- and sometimes over the line:
+
+      100 scenes from this bookmark  ->  would be ~6.2 MB  ->  REFUSED
+       90 scenes from this bookmark  ->            5.6 MB  ->  answered
+       75 scenes from this bookmark  ->            4.6 MB  ->  answered
+
+   Same bookmark, same dates, character for character. Only the number asked for
+   changed. So nothing is wrong with the bookmark, the depth, or the service --
+   the reply was simply too big to send.
+
+   Which hundred scenes you land on is decided by your bookmark and your date
+   window, which is why it looks like the service has taken against one specific
+   request. It hasn't. It is doing arithmetic on the size of the answer.
+
+   THE MARGIN IS THE RISK: 4.6 MB average against a 6 MB ceiling is ~30% of room.
+   Fatter scenes -- a newer processing baseline, a provider-side change -- push
+   FIRST pages over the line, and a first page is the one refusal that shortening
+   the dates cannot fix. `max_page_size` is the lever if that ever happens.
+
+
+HOW THE QUERY IS SHAPED AROUND IT
+
+   28 Feb ---------------------------------------------------------------- 1 Apr
+       |  the catalogue reports the total beside the first page, so a window too big to
+       |  walk is cut before the walk starts rather than hundreds of requests in
+       v
+    +--------+--------+--------+--------+--------+--------+
+    |  job 1 |  job 2 |  job 3 |  job 4 |  job 5 |  job 6 |   jobs meet on a shared
+    +--------+--------+--------+--------+--------+--------+   INSTANT, so nothing falls
+        ok       ok       ok    refused     ok       ok       between them and nothing
+                                  |                          is asked for twice
+                                  |  cross it off, write two shorter jobs. Shorter dates
+                                  |  regroup the scenes into different hundreds, so the
+                                  |  fat group is split and every answer fits. The other
+                                  v  five jobs are untouched and still running.
+                                     If the dates cannot be shortened -- a single day, or
+                                     a FIRST request, which a shorter window asks the same
+                                     way -- ask for fewer scenes at a time instead.
+                            16-22 March
+                              +-- 16-19 March   ok
+                              +-- 19-22 March   refused
+                                    +-- 19-21 March   ok
+                                    +-- 21-22 March   refused
+                                          +-- 21 March   ok   <- one day is as far
+                                          +-- 22 March   ok      as this can go
+
+   Up to six jobs run at once. Almost all of a request is spent waiting for the catalogue
+   to think -- 86% of it, before a single byte arrives -- so overlapping the waits is the
+   only thing that moves the clock. Same query, same scenes, same order: 39 minutes as
+   first written, 3.5 minutes now.
+```
+
+Two properties are tested. The jobs must add up to exactly the window asked for, no day missed
+and no day added. And the results must come back in the same **order**, not merely the same set —
+two scenes taken on the same day with the same cloud cover are separated only by which arrived
+first, and that decides which one supplies an overlapping pixel.
+
+Everything behind that picture — which months carry the heavy entries, why the page size is 100,
+how a refused window is re-cut, and how the windows are walked concurrently — is in
+[Appendix A: the Earth Search response cap in detail](#appendix-a--the-earth-search-response-cap-in-detail).
+
+### OPERA-Specific Query Quirks
+
+#### Native granule query (orbit filtering + item construction)
+
+`make_s1_item_provider` builds an `item_provider_fn` that returns ready-to-load OPERA items
+**without calling CMR-STAC `client.search()` at all**. CMR-STAC's cursor pagination
+intermittently 500s on CONUS-scale queries (nasa/cmr-stac#408) and pages internally at ~100
+items regardless of the requested `limit` (#411); it also **silently ignores** the `query`
+extension for CMR additional attributes such as `ASCENDING_DESCENDING`. The native CMR
+Granule Search API has none of these problems.
+
+The provider queries the granule API directly:
+
+```text
+GET https://cmr.earthdata.nasa.gov/search/granules.json
+    ?short_name=OPERA_L2_RTC-S1_V1
+    &attribute[]=string,ASCENDING_DESCENDING,ASCENDING
+    &bounding_box=...
+    &temporal=...
+    &page_size=2000
+```
+
+Orbit direction is filtered **server-side** via `attribute[]`, so the response holds only the
+desired orbit — no separate STAC search and no local granule-ID intersection. Each granule's data
+links (`rel` ending `/data#`, href ending `_VV.tif` / `_VH.tif`) map onto the `S1_OPERA_BANDS`
+asset keys (`0_VV`, `0_VH`) to build `pystac.Item`s shape-compatible with the rest of the
+pipeline, with `title`, `time_start` and `polygons` supplying id, datetime and geometry.
+Pagination uses the `CMR-Search-After` header, which pages cleanly at 2000. See
+[ADR 009](../../../context_docs/decisions/009-native-cmr-granule-query.md).
+
+#### UTM CRS Derivation
+
+CMR-STAC OPERA items lack the `proj:` extension, so `odc.stac.load` cannot infer the output
+CRS. `mgrs_tile_to_utm_epsg` derives the correct UTM EPSG from the tile's zone number and
+latitude band (C–M = southern hemisphere, N–X = northern hemisphere), e.g. `33UUP` → EPSG:32633.
 
 ### Date deduplication before loading
 
@@ -1211,8 +1127,8 @@ query. `StacApiIO`'s own default `max_retries=5` passes a bare int to urllib3, w
 `status_forcelist` means 5xx is **not** retried, so the explicit `Retry` object is required.
 
 **Why 502 sits outside it.** An Earth Search page refusal then arrives unretried, and the
-date-window re-cut described under
-[§ The months where the catalogue entries are heavy](#the-months-where-the-catalogue-entries-are-heavy)
+date-window re-cut described in
+[Appendix A](#appendix-a--the-earth-search-response-cap-in-detail)
 starts immediately rather than after the ladder's backoff; a transient 502 is absorbed by the
 attempt budget owning the leg. The CMR Granule query keeps its own ladder
 (`opera_query._CMR_RETRY`), 502 included, because nothing has measured a response-size cap there.
@@ -1652,7 +1568,7 @@ failure it prevents leaves a store with no remedy but deletion.
 
 Nothing is lost by the tighter start. What a run may *write* is the span it **owns**, and every
 catalogue query is padded a day either side, because a solar day's imagery can carry the adjacent
-UTC date (see *Solar days versus UTC queries*). One day is provably enough, since a solar offset
+UTC date (see *Timestamp handling*). One day is provably enough, since a solar offset
 is a whole number of hours within ±12.
 
 Each store works this out for itself: a cell has up to three, and they advance at different rates,
@@ -2134,7 +2050,7 @@ Each single-date graph is small: `spatial_chunks × bands` tasks, with no date d
 multiply through, and the per-date overhead of one Python loop iteration and one Zarr append is
 negligible beside the Dask compute for a large spatial ROI.
 
-The grouping key must match the loader's, per *Solar days versus UTC queries* above. Grouping
+The grouping key must match the loader's, per *Timestamp handling* above. Grouping
 here by UTC calendar date lets the two disagree, and a group we believe is one day then loads as
 TWO time slices against a cloud mask reduced to one:
 
@@ -2246,3 +2162,100 @@ container (RDS, an internal ALB); current SSM agents refuse loopback destination
 fail with `Forwarding to IP address localhost is forbidden`.
 
 Requires the [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) (`brew install session-manager-plugin`).
+
+---
+
+## Appendix A — the Earth Search response cap in detail
+
+**Earth Search refuses any request whose response would exceed roughly 6 MB** — AWS Lambda's
+limit on a synchronous response, and the search API sits behind one. Every 502 this campaign has
+seen from that provider is this and nothing else.
+
+What makes it bite unevenly is that items are not all the same size. Catalogue entries from
+roughly **November 2018 to March 2019** are about 100× larger than normal: an entry usually
+carries the tile's bounding rectangle, a couple of hundred bytes, while these carry the outline of
+where the imagery actually falls, and since Sentinel-2 builds an image from twelve detectors that
+edge is a fine sawtooth — 98 KB in one measured entry against 0.2 KB. The asset list is ~18 KB
+either way, so the outline is what makes them heavy. The band is a reprocessing gap: ESA
+reprocessed most of the archive to a version carrying the simple rectangle, and those months are
+the stretch where only the original 02.11 is on offer. It cannot spread, since no current
+processing version produces these outlines, and it could disappear if that stretch is ever
+reprocessed.
+
+Two consequences in this code: a hundred entries is ~2.2 MB outside the band and at or over the
+ceiling inside it, so page refusals are a 2019 phenomenon; and a month of these entries holds an
+order of magnitude more bytes than the same month in 2024, which is part of why the query streams
+month by month. Any per-item figure — page size, retained bytes, query timing — reads differently
+here than anywhere else in the archive.
+
+The page size is `STACProvider.max_page_size` (the `limit` per page request), defaulting to 250
+and set to 100 for Earth Search. It applies only to providers queried through `client.search()`,
+which in production means Earth Search; the OPERA `cmr-asf` path queries the native CMR Granule
+API instead — see [ADR 009](../../../context_docs/decisions/009-native-cmr-granule-query.md).
+
+**Why 100 for Earth Search, and what to watch.** Not throughput but the cap: 250 items of
+`sentinel-2-l2a` is always over it. A hundred averages 4.6 MB, yet the largest page ever served
+was 96% of the cap, so the margin between fine and refused is about a quarter of a megabyte and
+the average is the wrong number to reason from. Lowering it further is not the answer — six months
+of a ten-year archive is a concentrated problem, and the page-size fallback below handles it where
+it happens rather than taxing every query in every year. If first pages ever start returning 502
+this margin is the first thing to check, since a first-page refusal is the one case no date-window
+re-cut can route around.
+
+**The same cap also refuses pages deep in a walk**, which looks like a separate defect and is
+not. Because item sizes vary the refusal is deterministic in the *request* — cursor and date
+window together — rather than in how deep the walk has got, which is why the same refusal has
+appeared at page 289 of one window and page 14 of a shorter one sharing its late bound.
+
+What clears it is either a smaller response or a regrouping that produces one, and `stac.py`
+tries them in cost order.
+
+**A shorter window first.** Its halves between them walk about as many pages as the parent would
+have, where a smaller page re-walks the whole window at twice the requests. What matters is the
+window's **end** date: the catalogue pages newest-first, so the late bound fixes the whole cursor
+sequence and shortening only the start does not help. `_query_stac_items` re-queries as shorter
+windows on any upstream-error refusal past the first page, recursing until a window completes or
+reaches a single day. Separately, it reads the match count reported beside the first page and
+cuts a window matching more than `_MAX_QUERY_ITEMS` to size — that bounds *cost* rather than
+fixing the defect.
+
+**A smaller page as the fallback**, halved down to `_MIN_PAGE_SIZE`, because shortening cannot
+reach two refusals: a **first page**, which a shorter window asks identically, and a **single
+day**, the re-cut's floor. A stated overload (429, 503) is never answered with a smaller page:
+that means the provider is busy, and more requests is the wrong direction. A refusal neither
+lever can route around still raises the classified `CatalogueQueryError` with its token.
+
+**Concurrency.** The windows are independent searches, so `_fill_window_tree` walks up to
+`_QUERY_WINDOW_WORKERS` (6) of them at once. The worklist is driven from the calling thread and
+tasks only ever walk — they never submit and never wait — so deadlock is structurally impossible
+rather than merely unobserved. Each thread gets its own `Client`, because `StacApiIO` wraps a
+`requests.Session` that is not documented thread-safe. Output order comes from
+`_WindowWalk.preorder()` on the finished tree, and the `id` dedupe runs at that assembly step
+rather than as pages arrive, so first-occurrence-wins means first in the **walk** and not first
+off the wire. Six rather than eight, even though eight is faster: the campaign runs tens of cells
+against this one provider at once, so the setting multiplies the concurrent search streams
+Element 84 sees, and per-page latency degrades with width. A failure does not stop the other
+windows — every window is walked, all failures collected, and the depth-first-earliest raised, so
+which failure surfaces is a function of the query rather than of which task finished first.
+
+The re-partition is a pure re-cut, never a narrowing, and it is exact in both directions: the
+outer bounds are the caller's own date strings handed straight back, and every interior boundary
+is a single **instant** (`T00:00:00Z`) shared by the window that ends there and the window that
+starts there. The catalogue's range is inclusive at both ends, so the union is the input window
+with no gap and no overhang, and the only overlap is that one instant. An instant rather than a
+date because the client expands a bare date end to `T23:59:59Z`, so windows abutting on
+consecutive DATES would leave the last second of each seam's earlier day unasked for; sharing the
+whole boundary DAY closes that gap too, but makes every seam re-fetch a full day for the dedupe
+to discard. Items are deduped by `id` across every search a query runs, which absorbs the
+boundary instant and the antimeridian overlap alike.
+
+It does change the order items are *walked* in — one walk returns the window newest-first, the
+worklist returns window by window in date order — which is safe only because `query_stac_items`
+re-sorts with `solar_day_sort_key`, making the final sequence a function of the items rather than
+of the order the walk produced (see
+[§ Cloud cover decides which scene wins a pixel](#cloud-cover-decides-which-scene-wins-a-pixel)
+for what that sort decides).
+
+The cap, the measured margins, the sampling behind the heavy band and the levers that are closed
+are all derived in `context_docs/ingest/ingest-performance.md` §7c.
+
