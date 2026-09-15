@@ -54,8 +54,8 @@ catalogues refuse it.
 
 **Filtering.** Whole items are dropped first — when their date is already in the store, when a
 reprocessed granule duplicates one already chosen, or when an optional caller hook rejects them.
-What survives is then sorted clearest-first, which is what decides in-scene which pixel wins where
-two scenes of a solar day overlap.
+What survives is then sorted clearest-first, and that sort decides which pixel wins where two
+scenes of a solar day overlap.
 
 **Mosaic writing.** What survives is loaded lazily through `odc.stac.load` into a
 Dask-backed array, corrected at load time where a producer's reflectance offset requires it,
@@ -211,7 +211,7 @@ and any invalid zone **fails the run**, so a green run rather than a log line is
 ```
 
 Cost is S3 request latency, roughly one PUT per live ingest chunk (~100 k campaign-wide across
-the 112 land zones), which is why it fans out per zone and why running it in-region matters:
+the 112 land zones), so it fans out per zone and running it in-region matters:
 the same export measured ~4 chunk-writes/second from a laptop.
 
 ---
@@ -337,7 +337,7 @@ HOW THE QUERY IS SHAPED AROUND IT
    first written, 3.5 minutes now.
 ```
 
-Two properties are load-bearing and both are tested. The jobs must add up to exactly the window
+Two properties are tested. The jobs must add up to exactly the window
 asked for, no day missed and no day added. And the results must come back in the same **order**, not
 merely the same set — two scenes taken on the same day with the same cloud cover are separated only
 by which arrived first, and that decides which one supplies an overlapping pixel.
@@ -370,7 +370,7 @@ It cannot spread, since no current processing version produces these outlines, a
 disappear if that stretch is ever reprocessed.
 
 Two consequences in this code. A hundred entries is ~2.2 MB outside the band and at or over
-the ~6 MB response ceiling inside it, which is why page refusals are a 2019 phenomenon. And a
+the ~6 MB response ceiling inside it, so page refusals are a 2019 phenomenon. And a
 month of these entries holds an order of magnitude more bytes than the same month in 2024,
 which is part of why the query streams month by month.
 
@@ -444,8 +444,8 @@ raises the classified `CatalogueQueryError` with its token.
 
 **Concurrency.** The windows are independent searches, so `_fill_window_tree` walks up to
 `_QUERY_WINDOW_WORKERS` (6) of them at once. The worklist is driven from the calling thread and
-tasks only ever walk — they never submit and never wait — which is what makes deadlock
-structurally impossible rather than merely unobserved. Each thread gets its own `Client`, because
+tasks only ever walk — they never submit and never wait — so deadlock is structurally impossible
+rather than merely unobserved. Each thread gets its own `Client`, because
 `StacApiIO` wraps a `requests.Session` that is not documented thread-safe. Output order comes
 from `_WindowWalk.preorder()` on the finished tree, and the `id` dedupe runs at that assembly step
 rather than as pages arrive, so first-occurrence-wins means first in the **walk** and not first
@@ -565,8 +565,8 @@ which is exactly why ownership, not the query bound, decides what gets written.
 - Every consumption point **re-normalises defensively** rather than trusting call order,
   because every supplier (`query_fn`, `item_provider_fn`) is injectable.
 
-Two more properties. `normalize_to_solar_day` is **idempotent**, which is what lets the
-consumption points call it defensively. And the canonical stamp is **noon, not midnight**, so it
+Two more properties. `normalize_to_solar_day` is **idempotent**, letting the consumption points
+call it defensively. And the canonical stamp is **noon, not midnight**, so it
 reads as the solar day both directly and after `odc.stac.load` groups on it — noon leaves half a
 day of margin, and no offset the grid produces (±11 h nearest the antimeridian) crosses midnight.
 
@@ -624,7 +624,7 @@ entirely. `solar_day_offset_seconds` is the single definition, and it is the rea
 That is why `group_items_by_date` takes a `mid_longitude`, and why the pre-sort uses the same key —
 the sort carries the fusion contract (clearest tile FIRST within a group), so sorting on
 a different notion of "day" than the grouping would silently let a cloudier pixel win. Central
-longitudes image far from UTC midnight and are unaffected, which is what kept this latent.
+longitudes image far from UTC midnight and are unaffected, which kept it latent.
 Each iteration builds a single-date Dask graph, calls `odc.stac.load` for that day, filters
 coverage, and writes before moving to the next date:
 
@@ -654,7 +654,7 @@ negligible compared to the Dask compute time for a large spatial ROI.
 A mosaic slice represents one **solar day**, and it is labelled with that day — taken from the
 grouping key, not from the loaded dataset's own time coordinate.
 
-That distinction is load-bearing. `odc.stac.load` stamps each group from `group[0]`, tying the
+That distinction matters. `odc.stac.load` stamps each group from `group[0]`, tying the
 label to whichever item the sort left first — which can disagree with the solar day wherever the
 offset crosses UTC midnight, so two consecutive solar days collide on the time axis: the batched
 write rejects them as not strictly increasing, the unbatched write rejects the second as a
@@ -875,7 +875,7 @@ asset lives (`boa_offset.source_decision`). Three properties of it are worth sta
 
 **Consulting the assets at all is scoped to the collections that need it**, via
 `CollectionConfig.harmonisation_varies_by_item`. That read looks assets up under the keys named in
-`bands`, which is how Earth Search keys its assets and is NOT how every provider does: Planetary
+`bands`, the way Earth Search keys its assets and NOT how every provider does: Planetary
 Computer serves the same imagery under native keys (`B02`, `SCL`) and relies on the loader
 resolving the common names, so the read finds nothing there. On Planetary Computer it therefore
 classified every modern item as undeterminable and refused every date at baseline 04.00 or above.
@@ -883,7 +883,7 @@ classified every modern item as undeterminable and refused every date at baselin
 So where the producer cannot vary between items, the **collection's own configuration supplies the
 answer**: a correction threshold on such a collection says every item is unharmonised, which is
 what the threshold is there to correct. `source_decision` takes that as `known_harmonisation` and
-does not consult the bucket at all — which is what lets a provider serving its bands under native
+does not consult the bucket at all, letting a provider that serves its bands under native
 asset keys be decided here, and is why every Planetary Computer source is corrected rather than
 refused. One decision then serves both providers, so they cannot disagree about a producer.
 
@@ -894,7 +894,7 @@ assets and correct nothing. `scl` is excluded structurally — it is simply not 
 keys — rather than by a list the corrector is told to skip.
 
 The correction VALUE is a **constant** — `S2_BASELINE_OFFSET`, `-1000`. The baseline decides only
-*whether* the offset is removed, never how much, which is what makes the move from a per-date to a
+*whether* the offset is removed, never how much — that is what makes the move from a per-date to a
 per-source decision produce bit-identical pixels on every day the pipeline already loaded.
 `extract_baselines` remains separate and untouched: it records what each item declared, is what
 reaches the store's `baselines_applied`, and is **not** a correction input — one integer per date is
@@ -911,7 +911,7 @@ neither of the others, and `ingest_tile`, which leaves it to the loader: the loa
 `baselines` in place and that is the same dict `ingest_tile` returns, so the map still describes
 the copy that was kept.
 
-Selecting over an already-selected set is a no-op, which is what makes more than one owner safe.
+Selecting over an already-selected set is a no-op, so more than one owner is safe.
 
 **One ambiguous shape survives, and it refuses** (`HeterogeneousProducerError`): a reflectance
 source at or above the threshold whose producer cannot be determined — served from a bucket nobody
@@ -979,7 +979,7 @@ from `cfg` and refusing anything else is owed.
 The arithmetic widens to `int32` and casts back to the INPUT dtype, so nothing wraps and the store's
 unsigned arrays are unaffected: the offset is negative and the floor is positive, so an unsigned
 input stays representable. Adding a negative Python int to a `uint16` array raises under numpy 2,
-which is what the widening is for.
+which the widening exists for.
 
 **The floor still acts on resampled values, and that is a recorded limit.** `odc.stac.load`
 reads and resamples in one step, so the wrapped reader sees already-warped pixels, and six of the
@@ -1178,7 +1178,7 @@ env-stripped chain, returned in the shape fsspec takes as `storage_options`. The
 the **callable**, not its result — and `read_roi_mask` resolves it inside each block read rather
 than once when it builds the graph.
 
-That last part is load-bearing, because the mask array is LAZY: its block reads happen inside a
+That last part matters, because the mask array is LAZY: its block reads happen inside a
 later `write_day_windows` compute, which on the radar path spans a whole 30-day batch. One
 credential resolved at graph-build time would be presented by every one of those reads and, once
 expired, would fail with `ExpiredToken` on a bucket the role can always read — a lifetime problem
@@ -1652,8 +1652,8 @@ It fails closed three ways, each costing only the ordinary attempt limit. A cred
 THIS side is excluded first, being repairable here. A refusal nothing attributes to the source
 reader is excluded too — `AccessDenied`, `SlowDown` and `InternalError` are S3's words, so they
 count only alongside GDAL's own vocabulary, by the same pairing rule as the not-found markers
-above. And anything unrecognised is excluded, which is what a failure whose cause was stripped
-crossing the worker boundary looks like: no long wait on suspicion, and not given up either.
+above. And anything unrecognised is excluded — the shape of a failure whose cause was stripped
+crossing the worker boundary: no long wait on suspicion, and not given up either.
 
 The two predicates were once overlapping, and a caller's ORDER of asking decided the verdict.
 They are now disjoint by construction, and by sharing one classification rather than keeping two
@@ -1896,7 +1896,7 @@ as the chunk area costing the same (`WINDOW_COST_IN_CHUNKS`). That price is larg
 pays whenever it is geometrically sane.
 
 The merge runs **twice** — once over the run's live grid, once over each date's narrowed grid —
-and both must use the same price, which is why `windows_for_date` takes it as a parameter. Priced
+and both must use the same price, so `windows_for_date` takes it as a parameter. Priced
 at the sequential default while the run used the overlapped rate, the per-date re-merge would buy
 dead area back to save boundaries the write path had already made cheap.
 
@@ -1931,8 +1931,7 @@ a single-threaded event loop — past its throughput, extra area stops being che
 Grouping is solved **exactly**, by a dynamic program over consecutive bands rather than a greedy
 rule: a heuristic bound on wasted area cannot express "extra area is nearly free", so it
 under-merges precisely on the sparse ROIs where the waste is trivial. Windows stay chunk-aligned
-and mutually chunk-disjoint either way, which is what lets one session write a whole date and
-commit once.
+and mutually chunk-disjoint either way, letting one session write a whole date and commit once.
 
 Effect on the campaign's zones, smallest to largest:
 
@@ -1969,7 +1968,7 @@ per passing date (one writable session ── one commit)
 ```
 
   The empty-axis seed matters: the time axis only ever contains dates whose pixels
-  committed, which is what keeps `get_existing_dates` (the STAC dedupe),
+  committed, keeping `get_existing_dates` (the STAC dedupe),
   `check_time_window_coverage`, and the empty-timestep prunes truthful.
 - **The retry must not retry a second writer** — the one exception to "a failed write commits
   nothing, so retrying is safe". One store has exactly one writer: these commits pass no
@@ -2004,7 +2003,7 @@ per passing date (one writable session ── one commit)
 
   **The ingest's per-orbit item count is the authority on which case it is.** It has just queried
   both orbits, so `items_seen=0` means the source offers nothing here, which is terrain rather
-  than a gap. A consumer reading a finished mosaic cannot distinguish the two, which is why its
+  than a gap. A consumer reading a finished mosaic cannot distinguish the two, so its
   warning names the mosaic and points at that count.
 
   Accepting a radar-free ROI necessarily means embedding S2-only pixels, since every pixel there
@@ -2014,7 +2013,7 @@ per passing date (one writable session ── one commit)
 - **Reads retry, per date.** `roi_processing.source_read_retrying` wraps the point where a
   date's graph is first *computed*. S1's read happens inside its write's `compute()` and is
   already covered by the write retry; S2's fires earlier, in its coverage gate. Scoped per
-  date deliberately — a task-level retry would re-run the whole multi-day loop, which is why
+  date deliberately: a task-level retry would re-run the whole multi-day loop, so
   `tasks/ingest.py` refuses `@task(retries=...)`. Unlike the write policy it is **not**
   narrowed by exception type: reads fail through rasterio, GDAL/CPL, botocore and bare socket
   timeouts, a read is idempotent, and enumerating those surfaces risks a new transient class
@@ -2080,9 +2079,8 @@ clock.
 **A date whose imagery reaches NO live window is skipped entirely**, on both paths and
 unconditionally. Writing it builds a full graph to store nothing. On S1 this is not a rare case:
 one zone skipped 13 of 58 dates, and some zones have an orbit that reaches land on *no* date of
-the year. Skipping those means no store is created, which is what lets `resolve_s1_orbit`
-correctly downgrade to single-orbit instead of publishing a store full of fill that inference
-would read as real signal.
+the year. Skipping those creates no store, letting `resolve_s1_orbit` downgrade to single-orbit
+rather than publishing a store of fill that inference would read as real signal.
 
 **The safety rule, and it is the whole design.** A footprint that is too LARGE only costs
 computed area that would have been discarded; one that is too SMALL drops imagery and nothing
@@ -2152,8 +2150,8 @@ capacity. The overlap pays in proportion to the spare capacity the write leaves,
 `pipeline_dates` prepares date N+1 on one background thread while date N is written
 (`ingest/_pipeline.py`). The write stays serial: icechunk commits are sequential on a branch and
 one commit per date is the contract, so the store has exactly one writer either way. Preparation
-must be **side-effect-free**, touching nothing but the dataset it hands back, which is what makes
-the two modes produce identical stores — pinned by a parity test including a date that fails the
+must be **side-effect-free**, touching nothing but the dataset it hands back, and that is what
+makes the two modes produce identical stores — pinned by a parity test including a date that fails the
 coverage gate mid-run.
 
 Depth is 1, intrinsically rather than by tuning: preparation is a small fraction of a write, so
@@ -2183,7 +2181,7 @@ untouched.
 
 **Sized per ROI, and NOT a straight win.** `batch_dates=None` (the default) derives the batch size
 from the ROI's covered window area via `config.ingest.auto_batch_dates`; an explicit integer forces
-one, which is how an A/B arm is pinned. Batching helps small ROIs, is roughly neutral on large
+one, which pins an A/B arm. Batching helps small ROIs, is roughly neutral on large
 ones, and **costs about 29% on mid-sized ones** — so one global value is wrong for part of the
 range.
 
@@ -2241,7 +2239,7 @@ figure that contention has inflated.
 `ingest_s2_roi_reflectance` queries STAC for the full date range upfront, groups items by
 **local solar day** via `group_items_by_date`, then processes one day at a time in a Python loop.
 
-The grouping key is load-bearing and must match the loader's. `odc.stac.load(groupby="solar_day")`
+The grouping key must match the loader's. `odc.stac.load(groupby="solar_day")`
 shifts every timestamp by ONE longitude — its geobox extent's centroid in WGS84, truncated to whole
 hours — and groups on the result. Grouping here by UTC calendar date instead lets the two disagree,
 and a group we believe is one day then loads as TWO time slices against a cloud mask reduced to one:
