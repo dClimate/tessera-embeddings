@@ -1073,166 +1073,31 @@ for out-of-region access where S3 direct is not available, but is significantly 
 
 ## Error handling
 
-Everything that goes wrong between a catalogue request and a written pixel, and what
-the pipeline does about it.
+Everything that goes wrong between a catalogue request and a written pixel, and what the pipeline
+does about it.
 
-### When the catalogue refuses: naming the request, and telling the two refusals apart
+**One fact governs every decision here.** A store's dates are append-only — a date can only be
+added after the newest one the store already holds — so a date the pipeline gives up on is given
+up permanently, and no later run can fill it in. That makes the two failure modes cost wildly
+different amounts. Giving up too early costs a hole in the dataset that nothing can repair.
+Giving up too late costs wall clock on a job that will be dispatched again anyway. So the whole
+section is built to spend time rather than dates, and the mechanism behind the constraint is in
+*Where a resumed run starts* at the end.
 
-`catalogue_refusal.py` is where a refused query stops being anonymous. Two things about the
-client stack make that necessary:
+Three things can fail, and they are answered differently:
 
-- **The request is discarded on the way up.** `StacApiIO.request` catches every transport failure
-  and re-raises `APIError(str(err))`, which names only the host and endpoint path. A STAC search
-  is a request **body**, so the collection, window, bbox and page are gone — and without them a
-  refusal cannot be narrowed to a month or a page, reproduced, or reported upstream.
-- **Our layer sits ABOVE a retry ladder, and only partly behind it.** For a force-listed status
-  what escapes is the ladder reporting its own exhaustion, a much stronger statement than one
-  error response; for a status kept out of that list (502) the first refusal arrives directly.
-  `CatalogueRefusal.exhausted` records which.
+- **The catalogue will not answer a query.** Nothing has been read yet, so nothing is at risk
+  beyond the time spent asking again.
+- **A read will not produce pixels.** Here the decision is expensive, because one answer gives a
+  date up and another waits for it.
+- **Whatever was lost has to be reckoned with by the next run**, which starts from what the
+  store already holds rather than from what the last run intended.
 
-So `_query_stac_items` pages explicitly (`pages_as_dicts`) and wraps **only the page fetch** in a
-`CatalogueQueryError` carrying a `CatalogueRequest` — wrapping the page body too would classify
-our own validation failures as someone else's outage. Opening the catalogue is page 0, named
-separately so a root outage is not attributed to a window never asked for.
-
-```text
-CATALOGUE REFUSED collection=sentinel-2-l2a window=2021-09-01/2021-10-02
-                  bbox=-3.0000,50.0000,-2.0000,51.0000 page 3
-                  with HTTP 502 without being retried after 500 item(s)
-                  — classified upstream-error:502
-```
-
-The **classification** separates refusals that arrive as one exception type from one endpoint
-and need opposite responses:
-
-| refusal | statuses | what it claims | response |
-|---|---|---|---|
-| `LOAD` | 429, 503 | the upstream names ITSELF as the constraint | wait — this is what the expansive retry exists for, however often it recurs |
-| `UPSTREAM_ERROR` | 500, 502, 504 | the upstream failed to PRODUCE an answer | retry once; a repeat settles it as deterministic |
-| `UNKNOWN` | anything else | no readable status | behave as the default does: retry |
-
-The two named sets must jointly cover the ladder's `status_forcelist`, or a status the ladder
-retries but the taxonomy does not name falls to `UNKNOWN` and keeps its expansive retry forever;
-a unit test asserts that containment. The converse is deliberate: the taxonomy names 502, which
-the ladder does **not** retry, and a second test pins that exclusion.
-
-**The ladder it must cover.** `_query_stac_items` configures retries at the HTTP layer via a
-custom `urllib3.Retry` built by `make_logging_retry()` (`_http.py`, shared with the CMR Granule
-query) and passed into `StacApiIO` (`total=8, backoff_factor=2, status_forcelist=(429, 500, 503,
-504)`). The subclass logs each attempt at WARNING — urllib3 otherwise retries silently inside the
-`HTTPAdapter`, making a slow query indistinguishable from a hang. Because `search.items()`
-paginates lazily each page fetch is a separate HTTP call, so retrying at the adapter recovers a
-transient 5xx on page N in place instead of throwing away prior pages and restarting the whole
-query. `StacApiIO`'s own default `max_retries=5` passes a bare int to urllib3, whose empty
-`status_forcelist` means 5xx is **not** retried, so the explicit `Retry` object is required.
-
-**Why 502 sits outside it.** An Earth Search page refusal then arrives unretried, and the
-date-window re-cut described in
-[Appendix A](#appendix-a--the-earth-search-response-cap-in-detail)
-starts immediately rather than after the ladder's backoff; a transient 502 is absorbed by the
-attempt budget owning the leg. The CMR Granule query keeps its own ladder
-(`opera_query._CMR_RETRY`), 502 included, because nothing has measured a response-size cap there.
-
-The status is read from the exception **chain**, not the message: `pystac_client` re-raises
-without `from`, so the evidence sits under `__context__` on urllib3's exception. The message is a
-documented fallback for a refusal that crossed a boundary carrying no chain.
-
-**A status is necessary and not sufficient.** A gateway can fail for minutes and recover, so one
-exhaustion is not proof of a defect. What settles it is a REPEAT — the identical request refused
-the identical way on a later attempt — and that belongs to whoever holds the attempt budget,
-`ingest_zone_year`'s leg loop: this module classifies, the budget holder supplies the repeat. The
-two live in separate deployment runs, so the only thing crossing between them is failure text —
-hence one whitespace-free token under a stable name (`CATALOGUE_REFUSAL=`), matched by name and
-never by position, covering exactly the fields that decide the answer (collection, window, area,
-page) and nothing that varies between attempts. A counter or timestamp inside it would make every
-refusal unique and the repeat check dead code.
-
-**Attempts are the only thing those budgets count; elapsed time has exactly one bound.** Each
-page fetch gets 9 HTTP attempts across 364 s of backoff before anything above sees a failure, and
-every budget above it — leg, cell, zone round — treats the layer below as one try. None reads a
-clock, and expansive backoff makes the clock the axis that grows without limit.
-`IngestSettings.max_leg_wall_clock_s` bounds it in the leg loop: once the deadline passes, the
-loop refuses to START another attempt. A running leg is never measured against it, so the worst
-case is the deadline plus one final attempt. Failing the cell this way costs latency, not work —
-the cell returns to the work list and a later dispatch resumes from the dates already committed.
-The derivation is in `context_docs/ingest/source-read-failures.md` (cause 3).
-
-**Two things stop that bound refusing an attempt a leg had the budget for.**
-
-The retry ladder DESCENDS rather than ending the retry. Backoff doubles per attempt, so the rung
-an attempt has escalated to can be longer than the deadline has left even while a shorter rung
-fits easily. The rungs beneath are the same policy applied one escalation earlier, so the loop
-takes the longest rung that FITS and only a leg with no room for even the base rung is refused.
-It does not cap the wait to the REMAINDER: waiting exactly what is left makes the next dispatch
-land on the deadline every time, turning a race into a guarantee of the thing the deadline
-forbids.
-
-A leg that is still COMMITTING DATES earns more deadline, by
-`IngestSettings.leg_progress_extension_s`, because a deadline counted from the first dispatch
-charges a leg for every prior attempt's productive work and cannot tell a pathological cell from
-one working steadily. Progress is read from the leg's own child store through the same
-`get_existing_dates` the ingest resumes from, so parent and leg cannot disagree, and a store that
-cannot be read earns nothing. A grant is a FIXED size and each must be PAID FOR by dates
-committed since the previous grant, which also limits the rate: every ask sits after a failed
-attempt and the asks within one attempt compete for the same growth, so at most one is paid. The
-ceiling is `max_leg_wall_clock_s + (max_leg_attempts - 1) * leg_progress_extension_s`; a leg that
-commits nothing never leaves `max_leg_wall_clock_s`, and an extension of 0 restores the plain
-deadline.
-
-`source_coverage.py`'s preflight probe deliberately does **not** use any of this. Every
-failure of that probe is already INCONCLUSIVE by design, which is the right answer for both
-refusals at once, and the module sits outside the mosaic-content fingerprint closure.
-
-### When the archive says "success" but sends something that is not JSON
-
-Asking the archive for a page of radar granules normally returns a success code and a JSON
-document. Occasionally it returns a success code and a body that is not JSON at all — an error
-page, or a document cut off partway through.
-
-**This slips past every defence we have.** Everything that decides whether to retry a request
-looks at the response's status code, and here the status code is fine: it says success, and by the
-only measure those checks apply it *was* a success. Only the body is wrong, and nothing inspects
-the body. So the request sails through the retry logic untouched and fails later, when something
-tries to read it as JSON, with a message that says only:
-
-```
-Expecting value: line 1 column 1 (char 0)
-```
-
-That line names no address, no status, nothing about what arrived, and not even which of the
-several services we query was the one that broke. In production it ended a radar run that had been
-working for half an hour.
-
-**So the page is simply asked for again**, a small fixed number of times. This is deliberately
-narrow: every other kind of failure is left exactly as it was, and a server error is not re-asked
-here, because the ordinary retry logic has already waited and tried for that one. The re-ask uses
-the position marker the archive itself gave us, so it asks for the same page rather than the next
-one and cannot step over granules.
-
-If the retries are used up, the failure now describes itself: which address answered, what status
-it gave, what kind of document it claimed to be sending, and how big it was. A document claiming
-to be JSON alongside a body that will not parse means it was cut off; one claiming to be a web
-page means an error page was substituted.
-
-**The body that arrived is written to the log, and deliberately kept out of the error message.**
-Whether to run a failed leg again is decided by searching the failure's text for certain words,
-and the body is text the provider chose rather than us — so an error page containing one of those
-words could flip a leg that should have been retried into one treated as permanently dead, costing
-a whole zone-year. In the log it is just as readable and steers nothing.
-
-**The credential requests never log their body at all.** They use the same helper, because they can
-fail the same way, but with the body capture switched off: a credential document cut off partway
-through is precisely the one that fails to parse, and its opening characters are the credential.
-
-### When a read fails
+### How a failure is decided
 
 Reading one satellite image can fail for very different reasons, and the right answer to each is
-different — sometimes opposite. Getting it wrong is expensive both ways. Give up too easily and we
-punch a permanent hole in a dataset, because the time axis only ever grows: once a later date is
-written, an earlier one can never be filled in. Give up too late and one bad file stops a whole
-year of work that was otherwise fine.
-
-So a failed read is asked one question, once, and gets exactly one answer.
+different — sometimes opposite. So a failed read is asked one question, once, and gets exactly one
+answer.
 
 ```
                             a read fails
@@ -1299,7 +1164,170 @@ One extra guard: the long wait is only granted after a job has already read some
 wrong — but wrong permissions fail the very first image, while a provider wobble arrives after the
 job has already been served. So the first successful read is what earns the patience.
 
-### Retrying a date's read
+### The catalogue would not answer
+
+Both of these happen before a single pixel is read, so the remedy is always to ask again, ask
+differently, or stop the leg — never to abandon a date.
+
+#### When the catalogue refuses: naming the request, and telling the two refusals apart
+
+`catalogue_refusal.py` is where a refused query stops being anonymous. Two things about the
+client stack make that necessary:
+
+- **The request is discarded on the way up.** `StacApiIO.request` catches every transport failure
+  and re-raises `APIError(str(err))`, which names only the host and endpoint path. A STAC search
+  is a request **body**, so the collection, window, bbox and page are gone — and without them a
+  refusal cannot be narrowed to a month or a page, reproduced, or reported upstream.
+- **Our layer sits ABOVE a retry ladder, and only partly behind it.** For a force-listed status
+  what escapes is the ladder reporting its own exhaustion, a much stronger statement than one
+  error response; for a status kept out of that list (502) the first refusal arrives directly.
+  `CatalogueRefusal.exhausted` records which.
+
+So `_query_stac_items` pages explicitly (`pages_as_dicts`) and wraps **only the page fetch** in a
+`CatalogueQueryError` carrying a `CatalogueRequest` — wrapping the page body too would classify
+our own validation failures as someone else's outage. Opening the catalogue is page 0, named
+separately so a root outage is not attributed to a window never asked for.
+
+```text
+CATALOGUE REFUSED collection=sentinel-2-l2a window=2021-09-01/2021-10-02
+                  bbox=-3.0000,50.0000,-2.0000,51.0000 page 3
+                  with HTTP 502 without being retried after 500 item(s)
+                  — classified upstream-error:502
+```
+
+The **classification** separates refusals that arrive as one exception type from one endpoint
+and need opposite responses:
+
+| refusal | statuses | what it claims | response |
+|---|---|---|---|
+| `LOAD` | 429, 503 | the upstream names ITSELF as the constraint | wait, however often it recurs — an upstream naming its own load is the one refusal patience actually fixes |
+| `UPSTREAM_ERROR` | 500, 502, 504 | the upstream failed to PRODUCE an answer | retry once; a repeat settles it as deterministic |
+| `UNKNOWN` | anything else | no readable status | behave as the default does: retry |
+
+A `LOAD` verdict draws the **expansive retry**: the leg-retry ladder's long, doubling delays,
+granted without counting against the attempt budget for as long as the upstream keeps naming
+itself. Everything else gets the ordinary attempt limit. So the two named sets must jointly cover
+the ladder's `status_forcelist`, or a status the ladder retries but the taxonomy does not name
+falls to `UNKNOWN` and keeps that expansive retry forever; a unit test asserts the containment.
+The converse is deliberate: the taxonomy names 502, which the ladder does **not** retry, and a
+second test pins that exclusion.
+
+**The ladder it must cover.** `_query_stac_items` configures retries at the HTTP layer via a
+custom `urllib3.Retry` built by `make_logging_retry()` (`_http.py`, shared with the CMR Granule
+query) and passed into `StacApiIO` (`total=8, backoff_factor=2, status_forcelist=(429, 500, 503,
+504)`). The subclass logs each attempt at WARNING — urllib3 otherwise retries silently inside the
+`HTTPAdapter`, making a slow query indistinguishable from a hang. Because `search.items()`
+paginates lazily each page fetch is a separate HTTP call, so retrying at the adapter recovers a
+transient 5xx on page N in place instead of throwing away prior pages and restarting the whole
+query. `StacApiIO`'s own default `max_retries=5` passes a bare int to urllib3, whose empty
+`status_forcelist` means 5xx is **not** retried, so the explicit `Retry` object is required.
+
+**Why 502 sits outside it.** An Earth Search page refusal then arrives unretried, and the
+date-window re-cut described in
+[Appendix A](#appendix-a--the-earth-search-response-cap-in-detail)
+starts immediately rather than after the ladder's backoff; a transient 502 is absorbed by the
+attempt budget owning the leg. The CMR Granule query keeps its own ladder
+(`opera_query._CMR_RETRY`), 502 included, because nothing has measured a response-size cap there.
+
+The status is read from the exception **chain**, not the message: `pystac_client` re-raises
+without `from`, so the evidence sits under `__context__` on urllib3's exception. The message is a
+documented fallback for a refusal that crossed a boundary carrying no chain.
+
+**A status is necessary and not sufficient.** A gateway can fail for minutes and recover, so one
+exhaustion is not proof of a defect. What settles it is a REPEAT — the identical request refused
+the identical way on a later attempt — and that belongs to whoever holds the attempt budget,
+`ingest_zone_year`'s leg loop: this module classifies, the budget holder supplies the repeat. The
+two live in separate deployment runs, so the only thing crossing between them is failure text —
+hence one whitespace-free token under a stable name (`CATALOGUE_REFUSAL=`), matched by name and
+never by position, covering exactly the fields that decide the answer (collection, window, area,
+page) and nothing that varies between attempts. A counter or timestamp inside it would make every
+refusal unique and the repeat check dead code.
+
+**Attempts are the only thing those budgets count; elapsed time has exactly one bound.** Each
+page fetch gets 9 HTTP attempts across 364 s of backoff before anything above sees a failure, and
+every budget above it — leg, cell, zone round — treats the layer below as one try. None reads a
+clock, and expansive backoff makes the clock the axis that grows without limit.
+`IngestSettings.max_leg_wall_clock_s` bounds it in the leg loop: once the deadline passes, the
+loop refuses to START another attempt. A running leg is never measured against it, so the worst
+case is the deadline plus one final attempt. Failing the cell this way costs latency, not work —
+the cell returns to the work list and a later dispatch resumes from the dates already committed.
+The derivation is in `context_docs/ingest/source-read-failures.md` (cause 3).
+
+**Two things stop that bound refusing an attempt a leg had the budget for.**
+
+The retry ladder DESCENDS rather than ending the retry. Backoff doubles per attempt, so the rung
+an attempt has escalated to can be longer than the deadline has left even while a shorter rung
+fits easily. The rungs beneath are the same policy applied one escalation earlier, so the loop
+takes the longest rung that FITS and only a leg with no room for even the base rung is refused.
+It does not cap the wait to the REMAINDER: waiting exactly what is left makes the next dispatch
+land on the deadline every time, turning a race into a guarantee of the thing the deadline
+forbids.
+
+A leg that is still COMMITTING DATES earns more deadline, by
+`IngestSettings.leg_progress_extension_s`, because a deadline counted from the first dispatch
+charges a leg for every prior attempt's productive work and cannot tell a pathological cell from
+one working steadily. Progress is read from the leg's own child store through the same
+`get_existing_dates` the ingest resumes from, so parent and leg cannot disagree, and a store that
+cannot be read earns nothing. A grant is a FIXED size and each must be PAID FOR by dates
+committed since the previous grant, which also limits the rate: every ask sits after a failed
+attempt and the asks within one attempt compete for the same growth, so at most one is paid. The
+ceiling is `max_leg_wall_clock_s + (max_leg_attempts - 1) * leg_progress_extension_s`; a leg that
+commits nothing never leaves `max_leg_wall_clock_s`, and an extension of 0 restores the plain
+deadline.
+
+`source_coverage.py`'s preflight probe deliberately does **not** use any of this. Every failure
+of that probe is already INCONCLUSIVE by design, which is the right answer for both refusals at
+once, so telling them apart would buy nothing.
+
+#### When the archive says "success" but sends something that is not JSON
+
+Asking the archive for a page of radar granules normally returns a success code and a JSON
+document. Occasionally it returns a success code and a body that is not JSON at all — an error
+page, or a document cut off partway through.
+
+**This slips past every defence we have.** Everything that decides whether to retry a request
+looks at the response's status code, and here the status code is fine: it says success, and by the
+only measure those checks apply it *was* a success. Only the body is wrong, and nothing inspects
+the body. So the request sails through the retry logic untouched and fails later, when something
+tries to read it as JSON, with a message that says only:
+
+```
+Expecting value: line 1 column 1 (char 0)
+```
+
+That line names no address, no status, nothing about what arrived, and not even which of the
+several services we query was the one that broke. In production it ended a radar run that had been
+working for half an hour.
+
+**So the page is simply asked for again**, a small fixed number of times. This is deliberately
+narrow: every other kind of failure is left exactly as it was, and a server error is not re-asked
+here, because the ordinary retry logic has already waited and tried for that one. The re-ask uses
+the position marker the archive itself gave us, so it asks for the same page rather than the next
+one and cannot step over granules.
+
+If the retries are used up, the failure now describes itself: which address answered, what status
+it gave, what kind of document it claimed to be sending, and how big it was. A document claiming
+to be JSON alongside a body that will not parse means it was cut off; one claiming to be a web
+page means an error page was substituted.
+
+**The body that arrived is written to the log, and deliberately kept out of the error message.**
+Whether to run a failed leg again is decided by searching the failure's text for certain words,
+and the body is text the provider chose rather than us — so an error page containing one of those
+words could flip a leg that should have been retried into one treated as permanently dead, costing
+a whole zone-year. In the log it is just as readable and steers nothing.
+
+**The credential requests never log their body at all.** They use the same helper, because they can
+fail the same way, but with the body capture switched off: a credential document cut off partway
+through is precisely the one that fails to parse, and its opening characters are the credential.
+
+### A read would not produce pixels
+
+This is where the cost asymmetry bites, and where most of the machinery is. The sections below
+follow one failure outwards: where the retry sits, how a corrupt object is told apart from a
+provider having a bad hour, what to do when GDAL declines to say which it was, and what the radar
+path does differently because it has no second copy to fall back on.
+
+#### Where the retry sits, and how a failed date is attributed
 
 `roi_processing.source_read_retrying` wraps the point where a date's graph is first *computed*.
 S1's read happens inside its write's `compute()` and is already covered by the write retry; S2's
@@ -1309,18 +1337,17 @@ policy it is **not** narrowed by exception type — reads fail through rasterio,
 and bare socket timeouts, a read is idempotent, and enumerating those surfaces risks a new
 transient class becoming fatal.
 
-### Attributing a failed date
+**A failed date must say which date, and on which ROI.** Per-date telemetry is emitted *after* a
+date commits, so the furthest date in a log is the last one that WORKED and a failure otherwise
+leaves no trace. `roi_processing.read_failure_context` emits `READ FAILED roi=… date=… items=…
+first=…` with the traceback on both sensors' per-date paths. `roi=` is what makes it attributable:
+the exception is raised on a Dask worker whose log stream is an ECS task id, so without it the
+same text appears for every zone and belongs to none. The traceback recovers rasterio's cause,
+which reports only `Read failed. See previous exception for details.` — GDAL's actual reason is
+discarded unless the chain is logged. It is also where the reason GDAL never raised is attached;
+see *When GDAL logs the reason instead of raising it*.
 
-Per-date telemetry is emitted *after* a date commits, so the furthest date in a log is the last
-one that WORKED and a failure otherwise leaves no trace. `roi_processing.read_failure_context`
-emits `READ FAILED roi=… date=… items=… first=…` with the traceback on both sensors' per-date
-paths. `roi=` is what makes it attributable: the exception is raised on a Dask worker whose log
-stream is an ECS task id, so without it the same text appears for every zone and belongs to none.
-The traceback recovers rasterio's cause, which reports only `Read failed. See previous exception
-for details.` — GDAL's actual reason is discarded unless the chain is logged. It is also where the
-reason GDAL never raised is attached; see *When GDAL logs the reason instead of raising it*.
-
-### When a source object will not read
+#### When a source object will not read
 
 Some published objects are corrupt: a tile of the COG will not inflate, and no retry of any
 length recovers it. That is a different condition from a throttle or an expired credential,
@@ -1387,23 +1414,23 @@ isolates first: an unreadable source anywhere in a batch re-runs the batch's dat
 time, each then getting the per-date recovery. That isolation is what stops one corrupt
 object from failing a zone-year identically on every retry.
 
-### When the provider refuses the read
+#### When the provider refuses the read
 
 An authorization refusal, a throttle and a server error are a different finding again. They say
 nothing about the imagery — the same object read minutes earlier and reads again once the service
 recovers — so no fallback copy helps and no date should be given up for one. That verdict is
-reached inside `is_unreadable_source` in `duplicates.py`, which declines them before any
-bad-data marker is consulted; there is no separate predicate to ask.
+reached by the same `is_unreadable_source` the section above describes: it answers one question
+for both cases, returning true for codec-level damage and **false** for a refusal, which it tests
+for first. There is no second predicate to ask.
 
-**What a positive verdict buys is TIME, and nothing else.** It is passed to the shared write
-retry as `wait_out`, and the policy re-attempts that one failure until it has spent
-`WAIT_OUT_BACKOFF_S` of backoff. It is never spent on giving up a date, for the append-only
-reason given under the radar skip below. If the wait is not enough the write fails, the leg fails
+**What a positive verdict buys is TIME, and nothing else.** It is passed to the shared write retry
+as `wait_out`, and the policy re-attempts that one failure until it has spent `WAIT_OUT_BACKOFF_S`
+of backoff. It is never spent on giving up a date, for the append-only reason above: a date
+abandoned now cannot be written later. If the wait is not enough the write fails, the leg fails
 with its time axis unmoved, and the leg's own retry re-offers the date in order.
 
-The two waiting budgets are the ones described under *Waiting: where it happens changes what it
-costs* — minutes in-leg, where the fleet sits idle, and tens of minutes between attempts, where
-it does not. The between-attempt budget is `leg_refusal_backoff_s`.
+The in-leg budget is `WAIT_OUT_BACKOFF_S` and the between-attempt one is
+`leg_refusal_backoff_s`, per the two budgets above.
 
 Carrying the verdict between the two takes a type: the leg-retry layer sees only a failure DETAIL
 string, and no marker on it can separate a refused read from a crash, since the wrapper discarded
@@ -1411,7 +1438,7 @@ the cause. So a radar write that exhausts its in-leg budget on a refusal raises
 `errors.ProviderRefusedReadsError`, whose name reaches the detail and is what `_leg_backoff_s`
 keys the long delay on. Nothing else about the failure changes.
 
-### When GDAL logs the reason instead of raising it
+#### When GDAL logs the reason instead of raising it
 
 Everything above reads the exception chain. Some of a read failure's reason never reaches it.
 
@@ -1487,18 +1514,15 @@ unmoved, because its per-date remedy is the copy ladder and a long wait per rung
 with it. The evidence still reaches optical through the same context manager, so a refusal there
 is declined by `is_unreadable_source` and fails the leg rather than stepping copies.
 
-The long wait is also withheld until a leg has read something successfully, per *Waiting: where it
-happens changes what it costs* above: `s1_roi` keeps one per-leg flag, set on the first committed
-date, so a leg whose access is genuinely wrong fails promptly and releases its fleet instead of
-idling on it.
+The prior-success guard lives here too: `s1_roi` keeps one per-leg flag, set on the first
+committed date, and the long wait is withheld until it is set.
 
-Otherwise it fails closed, each way costing only the ordinary attempt limit. A credential fault
-on THIS side is excluded first, being repairable here. A refusal nothing attributes to the source
-reader is excluded too — `AccessDenied`, `SlowDown` and `InternalError` are S3's words, so they
-count only alongside GDAL's own vocabulary, by the same pairing rule as the not-found markers
-above. And a refusal carrying neither a name nor a status — a transport failure with no code, or a
-cause destroyed crossing the worker boundary — is declined for want of evidence: no long wait on
-suspicion, and not given up either. `cause_was_flattened` says which of those two happened, so a
+Three shapes are excluded, each costing only the ordinary attempt limit. A credential fault on
+THIS side, being repairable here. A refusal nothing attributes to the source reader —
+`AccessDenied`, `SlowDown` and `InternalError` are S3's words, so they count only alongside
+GDAL's own vocabulary, by the same pairing rule as the not-found markers above. And a refusal
+carrying neither a name nor a status: a transport failure with no code, or a cause destroyed
+crossing the worker boundary. `cause_was_flattened` says which of those last two happened, so a
 leg reading without a decidable cause is visible rather than silent.
 
 The two predicates are disjoint by construction, and stay so by sharing one classification rather
@@ -1506,7 +1530,7 @@ than keeping two lists in step: both read the same markers and the same HTTP sta
 status nobody enumerated cannot be a refusal to one predicate and bad data to the other, and a
 caller that knows only one of them cannot misclassify.
 
-### The radar bounded skip (`s1_roi.py`)
+#### The radar bounded skip (`s1_roi.py`)
 
 Every OPERA read on the radar path happens inside a date's write, so a failed read raises out of
 the per-date loop. Until this skip, one refused read cost every LATER date in the window too: a
@@ -1538,7 +1562,13 @@ A date offered by two consecutive batches is given up ONCE. Batch queries are pa
 side, so a boundary solar day comes back from two queries and would otherwise be listed twice and
 cost twice.
 
-### Where a resumed run starts
+### What a resumed run does about it
+
+A leg that failed is dispatched again, and what it does next is decided by the store rather than
+by anything the failed run recorded. This is the constraint the rest of the section is written
+around.
+
+#### Where a resumed run starts
 
 A store's dates can only be added in order, newest last. Slotting one into the middle would mean
 shifting every chunk after it, and a Zarr store's chunks sit at fixed positions — there is nowhere
@@ -1608,6 +1638,7 @@ A lost day still produces a `DATA LOSS` line naming the date, the cause and the 
 summary at the end of the leg. What it does not produce is a record anything later reads.
 
 ---
+
 ## Performance Optimizations
 
 ### Background: how Dask task graphs consume scheduler RAM
@@ -1827,8 +1858,7 @@ per passing date (one writable session ── one commit)
   derives `allow_s2_only` for that case rather than asking the caller, because the alternative is
   a fill that writes nothing and reports success.
 - **Reads retry, per date**, and a failed date says which date and which ROI. See
-  *Retrying a date's read* and *Attributing a failed date* under
-  [Error handling](#error-handling).
+  [§ Where the retry sits, and how a failed date is attributed](#where-the-retry-sits-and-how-a-failed-date-is-attributed).
 - **Each date narrows further, to the land its own imagery reaches**, via `windows_for_date`.
   See *Narrowing a date's windows, and skipping dates that reach none*.
 
