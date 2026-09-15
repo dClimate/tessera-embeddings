@@ -237,21 +237,36 @@ not yet wired into any flow — [issue #47](https://github.com/dClimate/tessera-
 ### STAC Providers and Collections
 
 Provider configs live in
-[`config/providers.py`](../config/providers.py) (`PROVIDERS`, `CollectionConfig`). Supported:
+[`config/providers.py`](../config/providers.py) (`PROVIDERS`, `CollectionConfig`). Two
+catalogues are queried in production:
 
-| Provider | Collections |
-|---|---|
-| Earth Search (AWS) | Sentinel-2 L2A, Sentinel-1 GRD |
-| Planetary Computer | Sentinel-2 L2A, Landsat (**untested**) |
-| CMR-STAC (NASA) | OPERA RTC-S1 |
+| Catalogue | Collection in production | Whose pixels arrive |
+|---|---|---|
+| Earth Search (Element 84) | Sentinel-2 L2A | Element 84's harmonised COGs (`sentinel-cogs`, `e84-earth-search-sentinel-data`) **and** ESA's originals (`sentinel-s2-l2a`) |
+| CMR-STAC (NASA/ASF) | OPERA RTC-S1 | ASF (`asf-cumulus-prod-opera-products`) |
+
+Earth Search's `sentinel-1-grd`, `sentinel-2-l1c` and `landsat-c2-l2` entries are configured and
+**have no caller**: radar comes from OPERA, and `ingest_s1_roi_sar` names the `cmr-asf` provider
+directly rather than taking it as a parameter.
+
+**ESA's own products reach us through Earth Search, not through a separate catalogue.** The
+`sentinel-2-l2a` collection there indexes both Element 84's reprocessed COGs and items whose
+assets point straight at ESA's archive, and a query returns them mixed. The two producers differ
+on one thing that matters — Element 84 has already subtracted the post-baseline-04.00 reflectance
+offset and ESA has not — so which producer served an asset is decided per asset from where that
+asset lives, never from the collection. That decision is the subject of
+[§ Sentinel-2 Baseline Correction](#sentinel-2-baseline-correction-load-time), and choosing
+between an ESA copy and an Element 84 copy of the same tile-date is the subject of
+[§ Choosing between duplicate copies](#choosing-between-duplicate-copies-of-a-tile-date).
 
 Each `CollectionConfig` records: collection ID, band list, native resolution, tile ID property
 (for S2/Landsat property-based queries), and correction parameters. For OPERA RTC-S1 on
 CMR-STAC there is no tile ID property, so the query falls back to a WGS84 bbox.
 
-**NOTE** Planetary Computer is an untested provider. Feedback from Cambridge's TESSERA team
-indicates however that Microsoft throttles heavy outbound traffic from Planetary Computer and
-hence it's not an ideal provider. For this reason we jumped through all the OPERA RTC hoops.
+`PROVIDERS` also carries a `planetary-computer` entry. **Nothing has ever run against it** — it
+is a sketch of a future path rather than a supported one, and the Cambridge TESSERA team's report
+that Microsoft throttles heavy outbound traffic from Planetary Computer is why the OPERA RTC route
+was built instead. Treat it as unvalidated configuration.
 
 ---
 ## Detailed Ingestion Process
@@ -265,7 +280,54 @@ S2 and Landsat are queried by tile ID property (e.g., `grid:code = T33UUP`), whi
 only items for that specific MGRS tile. OPERA RTC-S1 on CMR-STAC lacks an equivalent
 property, so queries use a bbox derived from the MGRS tile via `mgrs_tile_to_bbox()`.
 
+#### Cloud cover decides which scene wins a pixel
+
+Cloud cover is intentionally **not** used as a filter at the STAC query stage — pixel-level
+cloud classification is handled later (SCL for S2, ML model for inference). For S2, items
+are sorted by `(date, eo:cloud_cover)` ASCENDING, so the clearest tile of a solar day comes FIRST.
+
+First, because that is the one the loader keeps. `odc.loader`'s default fuser is `nodata_fuser`
+— `np.copyto(dst, src, where=dst_is_nodata)` — so it writes only where the destination is still
+empty, and this package configures no fuser of its own. The first valid source of a group supplies
+a pixel and later ones fill its gaps, so the clearest scene covering a pixel wins it and a hole in
+it falls through to the next-clearest rather than to nothing.
+
+An item declaring no `eo:cloud_cover` sorts after every measured value, where it can only fill
+gaps. `solar_day_sort_key` gives it infinity rather than 100, since 100 is itself a real reading
+and the two would otherwise tie and be reordered by `id`, letting an unmeasured scene take ground
+from one known to be fully clouded.
+
+#### Streaming the query month by month (S2)
+
+`ingest_s2_roi_reflectance` queries **one month at a time** by default
+(`stream_stac_monthly`), prefetching the next while the current one is ingested. Querying the
+whole window up front retains every returned item for the run's duration, and a zone-year's worth
+does not fit alongside the ingest on one worker; streaming bounds retention to the month in hand
+plus the one being fetched.
+
+The prefetch runs on a daemon thread rather than a pooled worker: an in-flight catalogue walk
+cannot be interrupted from outside, so abandoning it is the only way to stop waiting, and a
+daemon thread does not hold the process open when a run is cancelled mid-query.
+
+Month ranges **partition** the window — each month owns a half-open slice and items are
+filtered to their owner — so a date cannot be ingested twice or skipped at a boundary.
+Set `stream_stac_monthly=False` to issue one query for the whole window; the per-date work
+is byte-identical either way.
+
+#### Antimeridian queries
+
+UTM zones 01 and 60 straddle ±180°, and the ROI's WGS84 bounding box is written in the
+GeoJSON crossing convention (`west > east`) so it stays narrow instead of spanning the
+globe. Neither catalog can be relied on to read that form — the native CMR path is known
+to reject it — so both query paths split the box at ±180° into two ordinary west-to-east
+queries and deduplicate the results by item id. A granule straddling the line is returned
+by both halves and must be loaded once.
+
 #### How one query runs, in plain terms
+
+Everything above is what a query asks for. The rest of this section is what happens when the
+catalogue will not answer it, which is most of the query code and all of its complexity, so it is
+worth one plain-language pass before the detail.
 
 Four terms. A **page** is one request and the hundred results it returns. A **cursor** is a
 bookmark the catalogue hands back, which the next request must carry — not a page number, so
@@ -368,25 +430,10 @@ order of magnitude more bytes than the same month in 2024, which is part of why 
 month by month. Any per-item figure — page size, retained bytes, query timing — reads differently
 here than anywhere else in the archive.
 
-`_query_stac_items` configures retries at the HTTP layer via a custom `urllib3.Retry` built by
-`make_logging_retry()` (`_http.py`, shared with the CMR Granule query) and passed into
-`StacApiIO` (`total=8, backoff_factor=2, status_forcelist=(429, 500, 503, 504)`). The subclass
-logs each attempt at WARNING — urllib3 otherwise retries silently inside the `HTTPAdapter`,
-making a slow query indistinguishable from a hang. Because `search.items()` paginates lazily each
-page fetch is a separate HTTP call, so retrying at the adapter recovers a transient 5xx on page N
-in place instead of throwing away prior pages and restarting the whole query.
-
-**502 is deliberately absent from that force-list**, so an Earth Search page refusal arrives
-unretried and the date-window re-cut below starts immediately rather than after the ladder's
-backoff; a transient 502 is absorbed by the attempt budget owning the leg. The CMR Granule query
-keeps its own ladder (`opera_query._CMR_RETRY`), 502 included. Note that `StacApiIO`'s default
-`max_retries=5` passes a bare int to urllib3, whose empty `status_forcelist` means 5xx is **not**
-retried — the explicit `Retry` object is required.
-
 The page size is `STACProvider.max_page_size` (the `limit` per page request), defaulting to 250
-and set to 100 for Earth Search. It applies only to providers queried through `client.search()`
-(Earth Search, Planetary Computer); the OPERA `cmr-asf` path queries the native CMR Granule API
-instead — see [ADR 009](../../../context_docs/decisions/009-native-cmr-granule-query.md).
+and set to 100 for Earth Search. It applies only to providers queried through `client.search()`,
+which in production means Earth Search; the OPERA `cmr-asf` path queries the native CMR Granule
+API instead — see [ADR 009](../../../context_docs/decisions/009-native-cmr-granule-query.md).
 
 **Why 100 for Earth Search, and what to watch.** Not throughput but the cap: 250 items of
 `sentinel-2-l2a` is always over it. A hundred averages 4.6 MB, yet the largest page ever served
@@ -447,54 +494,11 @@ boundary instant and the antimeridian overlap alike.
 It does change the order items are *walked* in — one walk returns the window newest-first, the
 worklist returns window by window in date order — which is safe only because `query_stac_items`
 re-sorts with `solar_day_sort_key`, making the final sequence a function of the items rather than
-of the order the walk produced (see *Cloud cover* below for what that sort decides).
+of the order the walk produced (see *Cloud cover decides which scene wins a pixel* above for
+what that sort decides).
 
 The cap, the measured margins, the sampling behind the heavy band and the levers that are closed
 are all derived in `context_docs/ingest/ingest-performance.md` §7c.
-
-#### Cloud cover decides which scene wins a pixel
-
-Cloud cover is intentionally **not** used as a filter at the STAC query stage — pixel-level
-cloud classification is handled later (SCL for S2, ML model for inference). For S2, items
-are sorted by `(date, eo:cloud_cover)` ASCENDING, so the clearest tile of a solar day comes FIRST.
-
-First, because that is the one the loader keeps. `odc.loader`'s default fuser is `nodata_fuser`
-— `np.copyto(dst, src, where=dst_is_nodata)` — so it writes only where the destination is still
-empty, and this package configures no fuser of its own. The first valid source of a group supplies
-a pixel and later ones fill its gaps, so the clearest scene covering a pixel wins it and a hole in
-it falls through to the next-clearest rather than to nothing.
-
-An item declaring no `eo:cloud_cover` sorts after every measured value, where it can only fill
-gaps. `solar_day_sort_key` gives it infinity rather than 100, since 100 is itself a real reading
-and the two would otherwise tie and be reordered by `id`, letting an unmeasured scene take ground
-from one known to be fully clouded.
-
-#### Streaming the query month by month (S2)
-
-`ingest_s2_roi_reflectance` queries **one month at a time** by default
-(`stream_stac_monthly`), prefetching the next while the current one is ingested. Querying the
-whole window up front retains every returned item for the run's duration, and a zone-year's worth
-does not fit alongside the ingest on one worker; streaming bounds retention to the month in hand
-plus the one being fetched.
-
-The prefetch runs on a daemon thread rather than a pooled worker: an in-flight catalogue walk
-cannot be interrupted from outside, so abandoning it is the only way to stop waiting, and a
-daemon thread does not hold the process open when a run is cancelled mid-query.
-
-Month ranges **partition** the window — each month owns a half-open slice and items are
-filtered to their owner — so a date cannot be ingested twice or skipped at a boundary.
-Set `stream_stac_monthly=False` to issue one query for the whole window; the per-date work
-is byte-identical either way.
-
-#### Antimeridian queries
-
-UTM zones 01 and 60 straddle ±180°, and the ROI's WGS84 bounding box is written in the
-GeoJSON crossing convention (`west > east`) so it stays narrow instead of spanning the
-globe. Neither catalog can be relied on to read that form — the native CMR path is known
-to reject it — so both query paths split the box at ±180° into two ordinary west-to-east
-queries and deduplicate the results by item id. A granule straddling the line is returned
-by both halves and must be loaded once.
-
 
 ### OPERA-Specific Query Quirks
 
@@ -542,7 +546,6 @@ then treats them as concurrent acquisitions and mosaics them into a single time 
 CMR-STAC OPERA items lack the `proj:` extension, so `odc.stac.load` cannot infer the output
 CRS. `mgrs_tile_to_utm_epsg` derives the correct UTM EPSG from the tile's zone number and
 latitude band (C–M = southern hemisphere, N–X = northern hemisphere), e.g. `33UUP` → EPSG:32633.
-
 
 ### Solar days versus UTC queries (`solar_days.py`)
 
@@ -758,9 +761,9 @@ both survived to be fused.
 
 **The tile key is read from whichever property the catalogue populates**, `grid:code` or
 `s2:mgrs_tile`, then the item id — all canonicalised to one form, so two catalogues naming one
-tile produce one grouping key. Planetary Computer needs its own property: its ids carry the tile
-in a field the Element 84 pattern does not match, so without it every item was unkeyable and
-duplicate selection was a no-op for the whole provider.
+tile produce one grouping key. Reading only Earth Search's property would leave every item from a
+catalogue naming the tile elsewhere unkeyable, which makes duplicate selection a silent no-op for
+that whole provider rather than an error.
 
 **Where the producer cannot be read from an item's assets, the collection supplies it**, through
 `known_harmonisation` on `select_preferred_duplicates` — the same value
@@ -856,9 +859,10 @@ that asset lives (`boa_offset.source_decision`). Three properties of it are wort
 **collection's configuration supplies the answer** instead: a correction threshold on such a
 collection says every item is unharmonised, which is what the threshold is there to correct, and
 `source_decision` takes that as `known_harmonisation` without consulting the bucket. That is what
-lets Planetary Computer — which serves the same imagery under native asset keys (`B02`, `SCL`) an
-item-level read would find nothing under — be decided here and corrected rather than refused. One
-decision serves both providers, so they cannot disagree about a producer.
+lets a catalogue serving its bands under native asset keys — `B02`, `SCL`, which an item-level
+read keyed on the configured band names finds nothing under — be decided here and corrected
+rather than refused on every modern item. One decision serves both shapes of collection, so they
+cannot disagree about a producer.
 
 Which assets carry the reflectance bands is resolved through **odc's own alias table**
 (`stac._reflectance_asset_keys`), not from the configured band names, for the same reason. `scl`
@@ -969,7 +973,6 @@ Constants (`S1_DB_SHIFT = 50`, `S1_DB_SCALE = 200`) are ported from
 `tessera_preprocessing/s1_fast_processor.py`. Zero/negative amplitudes are masked to `1e-10`
 before `log10` to avoid domain errors; they are written back as 0 (nodata) after conversion.
 This is a fully lazy Dask operation — no data is materialised until the Zarr write.
-
 
 ### Recording the window an ingest examined
 
@@ -1196,6 +1199,23 @@ The two named sets must jointly cover the ladder's `status_forcelist`, or a stat
 retries but the taxonomy does not name falls to `UNKNOWN` and keeps its expansive retry forever;
 a unit test asserts that containment. The converse is deliberate: the taxonomy names 502, which
 the ladder does **not** retry, and a second test pins that exclusion.
+
+**The ladder it must cover.** `_query_stac_items` configures retries at the HTTP layer via a
+custom `urllib3.Retry` built by `make_logging_retry()` (`_http.py`, shared with the CMR Granule
+query) and passed into `StacApiIO` (`total=8, backoff_factor=2, status_forcelist=(429, 500, 503,
+504)`). The subclass logs each attempt at WARNING — urllib3 otherwise retries silently inside the
+`HTTPAdapter`, making a slow query indistinguishable from a hang. Because `search.items()`
+paginates lazily each page fetch is a separate HTTP call, so retrying at the adapter recovers a
+transient 5xx on page N in place instead of throwing away prior pages and restarting the whole
+query. `StacApiIO`'s own default `max_retries=5` passes a bare int to urllib3, whose empty
+`status_forcelist` means 5xx is **not** retried, so the explicit `Retry` object is required.
+
+**Why 502 sits outside it.** An Earth Search page refusal then arrives unretried, and the
+date-window re-cut described under
+[§ The months where the catalogue entries are heavy](#the-months-where-the-catalogue-entries-are-heavy)
+starts immediately rather than after the ladder's backoff; a transient 502 is absorbed by the
+attempt budget owning the leg. The CMR Granule query keeps its own ladder
+(`opera_query._CMR_RETRY`), 502 included, because nothing has measured a response-size cap there.
 
 The status is read from the exception **chain**, not the message: `pystac_client` re-raises
 without `from`, so the evidence sits under `__context__` on urllib3's exception. The message is a
