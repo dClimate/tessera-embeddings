@@ -1696,28 +1696,24 @@ r3    b  b  .  .  .                         .  .  .  .  .    r3   .  .  .  .  .
   from the cell's live-chunk count (0.5 workers/chunk, clamped) instead of granting a
   4-tile zone the same fleet as a dense one.
 
-Unconditional at every layer — see "Cropping to live windows (unconditional)" above for
-why the flag was removed rather than defaulted. The full-extent write path it used to
-select is gone from both modules, along with every branch that tested for it. S1 and S2
-share the mechanism; the one difference is that S1's multi-date batches loop per date
-(non-contiguous dates cannot share a region write), each date keeping its own atomic
-commit and retry scope.
+Unconditional at every layer; the full-extent write path is gone from both modules along with
+every branch that tested for it. S1 and S2 share the mechanism, differing only in that S1's
+multi-date batches loop per date, since non-contiguous dates cannot share a region write, each
+keeping its own atomic commit and retry scope.
 
-The zone fill's grid validation checks the declared grid COMPLETELY, not just its
-corners: matching length, CRS and endpoints still admit a reordered or non-affine
-interior, and inference writes positionally, so such a mosaic would publish real pixels
-at wrong coordinates in silence. Uniform 10 m spacing is asserted on both axes. Nothing
-this ingest produces can fail that — odc builds every load against the zone geobox — but
-a fill run with `ingest=False` accepts a mosaic staged by hand, and that path is
-supported.
+The zone fill's grid validation checks the declared grid COMPLETELY rather than just its corners:
+matching length, CRS and endpoints still admit a reordered or non-affine interior, and inference
+writes positionally, so such a mosaic would publish real pixels at wrong coordinates silently.
+Uniform 10 m spacing is asserted on both axes. Nothing this ingest produces can fail that, since
+odc builds every load against the zone geobox, but a fill run with `ingest=False` accepts a
+mosaic staged by hand.
 
 ### Background: how Dask task graphs consume scheduler RAM
 
-"Dask is lazy" means workers don't read data until `.compute()` is called. It does *not*
-mean the scheduler avoids work. Before the first worker task executes, `dask.distributed`
-must expand the full `HighLevelGraph` (HLG) — the compact Python-side description of the
-computation — into a flat dictionary of `TaskState` objects in the scheduler process. Each
-`TaskState` holds the function, arguments, and dependency set for one task. The cost:
+"Dask is lazy" means workers do not read data until `.compute()`; it does not mean the
+scheduler avoids work. Before the first worker task executes, `dask.distributed` expands the full
+`HighLevelGraph` into a flat dictionary of `TaskState` objects in the scheduler process, each
+holding one task's function, arguments and dependency set. The cost:
 
 ```text
     scheduler RAM used ≈ n_tasks × 1.5 KB
@@ -1959,32 +1955,28 @@ Default **on** for both S2 and S1. `write_day_windows` itself still defaults to 
 sequential path: a storage-layer default should not decide write strategy for its callers,
 so each ingest path opts in explicitly.
 
-S1 was measured before it opted in. The gain is **2.4–3.9×** on per-date write time and does
-not vary with either quantity we can vary: not with window count (23, 9 and 7 windows gave
-2.79×, 2.86× and 2.40×) and not with fleet width (30 and 60 workers gave 3.67× and 3.85×,
-inside the noise floor). **Why it is that size is not explained** — three accounts have been
-proposed for the family of S1 write effects and all three were refuted by their own
-predictions. Rely on the measured range; do not model it, and do not extrapolate far outside
-the widths measured. The campaign record's §4.9 has each refutation.
+The gain is **2.4–3.9×** on per-date write time and varies with neither quantity we can vary —
+not window count (23, 9 and 7 windows gave 2.79×, 2.86× and 2.40×) nor fleet width (30 and 60
+workers gave 3.67× and 3.85×, inside the noise floor). **Why it is that size is not explained**:
+three accounts were proposed and all three refuted by their own predictions, each recorded in the
+campaign record's §4.9. Rely on the measured range, do not model it, and do not extrapolate far
+outside the widths measured.
 
 ### Which day a slice is called (and why it is not an item's timestamp)
 
 A mosaic slice represents one **solar day**, and it is labelled with that day — taken from the
 grouping key, not from the loaded dataset's own time coordinate.
 
-That distinction is load-bearing. `odc.stac.load` stamps each group from `group[0]`, which ties the
-label to whichever item the sort left first. A label taken that way can disagree with the solar day
-wherever the solar offset crosses UTC midnight, and two consecutive solar days then collide on the
-time axis — the batched write rejects the dates as not strictly increasing, the unbatched write
-rejects the second as a duplicate time slot. Taking the day from the grouping key removes the
-dependence on order entirely.
+That distinction is load-bearing. `odc.stac.load` stamps each group from `group[0]`, tying the
+label to whichever item the sort left first — which can disagree with the solar day wherever the
+offset crosses UTC midnight, so two consecutive solar days collide on the time axis: the batched
+write rejects them as not strictly increasing, the unbatched write rejects the second as a
+duplicate slot.
 
-Taking the day from the grouping makes three things true by construction rather than by care:
-labels are unique per slice, monotonic across them (consecutive solar days differ by exactly one
-day, so the batched write needs no sorting), and stable against the catalogue revising its cloud
-estimates. The store's axis is day-granular either way, so this only decides WHICH day — pixels,
-ordering and which tile wins are untouched, and at mid longitudes the value is unchanged because
-the solar day IS the UTC date there.
+Taking the day from the grouping key instead makes three things true by construction: labels are
+unique per slice, monotonic across them (so the batched write needs no sorting), and stable
+against the catalogue revising its cloud estimates. This only decides WHICH day — pixels, ordering
+and which tile wins are untouched, and at mid longitudes the value is unchanged anyway.
 
 ### Recording the window an ingest examined
 
@@ -1996,12 +1988,12 @@ indistinguishable, and the coverage gate has to fail on both.
 The attribute belongs on the repo the gate opens — `reflectance.zarr` or `sar_<orbit>.zarr` —
 not on the mosaic directory that contains them.
 
-**It is written whenever the store exists, not only when the run wrote a date.** The case that
-needs it most writes nothing. A run interrupted between its last date commit and this record
-leaves every date present and the attribute absent; the retry then dedupes all of those dates
-away, takes the zero-write path, and — keyed on what *this* invocation wrote — skipped the record
-again. Every retry after it did the same, so a legitimately empty month stayed permanently
-indistinguishable from a gap and the zone-year could never complete. Keyed on the store, the
+**It is written whenever the store exists, not only when the run wrote a date**, because the
+case needing it most writes nothing. A run interrupted between its last date commit and this
+record leaves every date present and the attribute absent; the retry dedupes those dates away,
+takes the zero-write path and, keyed on what *this* invocation wrote, skips the record again.
+Every later retry does the same, so a legitimately empty month stays indistinguishable from a gap
+and the zone-year can never complete. Keyed on the store, the
 resume repairs the attribute. The extra existence probe runs only when nothing was written, so a
 normal run pays nothing for it. A genuinely absent store is still left alone: there is no repo to
 annotate, and that case was never ambiguous — no store means the orbit is absent and callers
@@ -2041,37 +2033,34 @@ disagree with the loader wherever the offset crosses UTC midnight.
 
 ### Pipelining a date's preparation (`pipeline_dates`)
 
-A date's wall clock splits into **preparation** — building the load graph, running the
-coverage gate, narrowing the footprint, constructing the masks — and the **write**.
-Preparation is part client-side CPU (graph building, genuinely independent of fleet width)
-and part cluster compute (the coverage gate reads SCL on the workers, so it scales with
-width like any other fleet work). Only the client-side part is serial residual that a wider
-fleet cannot shrink.
+A date's wall clock splits into **preparation** — building the load graph, running the coverage
+gate, narrowing the footprint, constructing the masks — and the **write**. Preparation is part
+client-side CPU, independent of fleet width, and part cluster compute, since the coverage gate
+reads SCL on the workers. Only the client-side part is serial residual a wider fleet cannot
+shrink.
 
-**The overlap's payoff is therefore not symmetric between the two parts.** Hiding the
-client-side part behind the write is free. Hiding the gate is not: it is fleet work, so on a
-fleet the write already saturates it competes for the same slots and is additive regardless
-of scheduling order — and task priorities cannot change that, since they reorder a queue
-without creating capacity. The overlap pays off in proportion to the spare capacity the
-write leaves, which makes it **more** valuable on narrow fleets than on wide ones.
+**The overlap's payoff is therefore not symmetric.** Hiding the client-side part behind the write
+is free; hiding the gate is not, because it is fleet work and on a saturated fleet competes for
+the same slots regardless of scheduling order — task priorities reorder a queue without creating
+capacity. The overlap pays in proportion to the spare capacity the write leaves, making it
+**more** valuable on narrow fleets than wide ones.
 
-`pipeline_dates` prepares date N+1 on one background thread while date N is being written
-(`ingest/_pipeline.py`). What stays serial is the write: icechunk commits are sequential on
-a branch, one commit per date is the contract, and the store therefore has exactly one
-writer either way. Preparation is required to be **side-effect-free** — it may touch nothing
-but the dataset it hands back — which is what makes the two modes produce identical stores
-(pinned by a parity test that includes a date failing the coverage gate mid-run).
+`pipeline_dates` prepares date N+1 on one background thread while date N is written
+(`ingest/_pipeline.py`). The write stays serial: icechunk commits are sequential on a branch and
+one commit per date is the contract, so the store has exactly one writer either way. Preparation
+must be **side-effect-free**, touching nothing but the dataset it hands back, which is what makes
+the two modes produce identical stores — pinned by a parity test including a date that fails the
+coverage gate mid-run.
 
-Depth is 1 and that is intrinsic rather than tuned: preparation is a small fraction of a
-write, so buffering more dates would hold graphs in memory to hide nothing. The pipeline
-lives inside one `_drive` call, so it drains naturally at each streamed month boundary,
-leaving one unhidden preparation per month.
+Depth is 1, intrinsically rather than by tuning: preparation is a small fraction of a write, so
+buffering more would hold graphs in memory to hide nothing. The pipeline lives inside one `_drive`
+call and drains at each streamed month boundary, leaving one unhidden preparation per month.
 
-Each written date logs a `Pipeline date=…: prepare=… hidden=… stall=…` line in both modes.
-`stall` is the preparation the write could not cover and is the health metric: near zero
-when preparation hides fully, and rising toward the whole preparation when the gate is
-starved behind the write's own tasks. Serially every date stalls for its full preparation
-and hides none of it, so the two modes are comparable from one line.
+Each written date logs `Pipeline date=…: prepare=… hidden=… stall=…` in both modes. `stall` is
+the preparation the write could not cover, and is the health metric: near zero when preparation
+hides fully, rising toward the whole preparation when the gate is starved behind the write's own
+tasks. Serially every date stalls for its full preparation, so the two modes compare from one
+line.
 
 > **`hidden` is not a saving, and reading it as one overstates the benefit several-fold.**
 > When pipelined, `prepare` is wall time on a background thread that spans the whole
