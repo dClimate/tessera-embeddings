@@ -17,6 +17,7 @@ no release date to quote.
 
 ## Contents
 
+- [Quickstart — data access](#quickstart--data-access)
 - [What this is](#what-this-is)
 - [One area, or the whole world](#one-area-or-the-whole-world)
 - [What this isn't](#what-this-isnt)
@@ -31,6 +32,35 @@ no release date to quote.
 - [Contributing](#contributing)
 - [License](#license)
 - [Acknowledgments](#acknowledgments)
+
+---
+## Quickstart — data access
+
+The finished global store is public: a 128-dimensional embedding for every 10 m land pixel,
+one value per year from 2017 to 2025. **No AWS account is needed** — the bucket allows
+anonymous reads. You do need the `icechunk` library, since xarray and Zarr alone cannot
+resolve an Icechunk snapshot.
+
+```python
+import icechunk, xarray as xr
+
+storage = icechunk.s3_storage(
+    bucket="tessera-embeddings", prefix="v1.1/dclimate.icechunk",
+    region="us-west-2", anonymous=True,
+)
+repo = icechunk.Repository.open(storage)
+session = repo.readonly_session(branch="main")
+ds = xr.open_zarr(session.store, group="33N", consolidated=False,
+                  decode_coords="all", chunks=None)
+```
+
+`group=` is a UTM zone, `01N`–`60N` or `01S`–`60S`. Pass no configuration object: the store
+carries reader-tuned settings already, and supplying your own replaces them wholesale. Keep
+`chunks=None`, which skips building a Dask graph over the array's 8.67 million chunks, and
+slice with `.sel` or `.isel` before reading any values.
+
+[The global embeddings store](#the-global-embeddings-store) below covers the layout, the
+coverage caveats and what a read costs.
 
 ---
 ## What this is
