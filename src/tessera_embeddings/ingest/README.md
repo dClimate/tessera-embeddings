@@ -1937,9 +1937,9 @@ intersects the run's windows with that date's own STAC footprints — reprojecte
 grid and padded one cell, so a curved reprojection cannot under-cover — then re-bands and
 re-groups. Tasks over the removed windows would run, find nothing and write nothing, so this
 cannot change what a mosaic contains. When a footprint cannot be determined the full window list
-is returned unchanged, so the conservative path is the fallback. Both sensors do it (`narrow_windows_per_date` on S1, always
-on S2): six times fewer windows per date on the S1 zones measured, worth 7–20% of per-date wall
-clock.
+is returned unchanged, so the conservative path is the fallback. Both sensors do it
+(`narrow_windows_per_date` on S1, always on S2): six times fewer windows per date on the S1 zones
+measured, worth 7–20% of per-date wall clock.
 
 **A date whose imagery reaches NO live window is skipped entirely**, on both paths and
 unconditionally. Writing it builds a full graph to store nothing. On S1 this is not a rare case:
@@ -2013,8 +2013,8 @@ the write leaves, making it **more** valuable on narrow fleets than wide ones.
 (`ingest/_pipeline.py`). The write stays serial: icechunk commits are sequential on a branch and
 one commit per date is the contract, so the store has exactly one writer either way. Preparation
 must be **side-effect-free**, touching nothing but the dataset it hands back, and that is what
-makes the two modes produce identical stores — pinned by a parity test including a date that fails the
-coverage gate mid-run.
+makes the two modes produce identical stores — pinned by a parity test including a date that fails
+the coverage gate mid-run.
 
 Depth is 1, intrinsically rather than by tuning: preparation is a small fraction of a write, so
 buffering more would hold graphs in memory to hide nothing. The pipeline lives inside one `_drive`
