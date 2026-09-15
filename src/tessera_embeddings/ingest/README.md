@@ -485,17 +485,16 @@ Cloud cover is intentionally **not** used as a filter at the STAC query stage �
 cloud classification is handled later (SCL for S2, ML model for inference). For S2, items
 are sorted by `(date, eo:cloud_cover)` ASCENDING, so the clearest tile of a solar day comes FIRST.
 
-First, because that is the one the loader keeps. `odc.loader`'s default fuser is `nodata_fuser` —
-`np.copyto(dst, src, where=dst_is_nodata)` — so it writes only where the destination is still empty,
-and this package configures no fuser of its own. The first valid source of a group therefore
-supplies a pixel and later ones fill the gaps it left, which is the behaviour wanted: the clearest
-scene covering a pixel wins it, and a hole in the clearest scene falls through to the next-clearest
-rather than to nothing.
+First, because that is the one the loader keeps. `odc.loader`'s default fuser is `nodata_fuser`
+— `np.copyto(dst, src, where=dst_is_nodata)` — so it writes only where the destination is still
+empty, and this package configures no fuser of its own. The first valid source of a group supplies
+a pixel and later ones fill its gaps, so the clearest scene covering a pixel wins it and a hole in
+it falls through to the next-clearest rather than to nothing.
 
 An item declaring no `eo:cloud_cover` sorts after every measured value, where it can only fill
-gaps: unknown never displaces measured. `solar_day_sort_key` gives it infinity rather than 100 —
-100 is itself a real reading, and the two would otherwise tie and be reordered by `id`, letting an
-unmeasured scene take ground from one known to be fully clouded.
+gaps. `solar_day_sort_key` gives it infinity rather than 100, since 100 is itself a real reading
+and the two would otherwise tie and be reordered by `id`, letting an unmeasured scene take ground
+from one known to be fully clouded.
 
 #### Streaming the query month by month (S2)
 
@@ -555,10 +554,9 @@ These happen before `odc.stac.load` is called:
   output grid matches the ROI exactly (same CRS, transform, shape). This overrides bbox,
   CRS, and resolution.
 - **groupby** — `"solar_day"` merges items from adjacent MGRS tiles acquired on the same local
-  calendar day into one mosaic. `odc.loader`'s default fuser writes only where the destination is
-  still empty, so the FIRST valid source of a group supplies a pixel and later ones fill its gaps.
-  Items are sorted clearest-first, so the clearest scene wins the ground it covers and its holes
-  fall through to the next-clearest. Required for ROI queries crossing tile boundaries.
+  calendar day into one mosaic, which is required for ROI queries crossing tile boundaries. Which
+  scene wins a pixel is decided by the sort order; see *Cloud cover decides which scene wins a
+  pixel*.
 - **Dimension rename** — `normalize_odc_dims` maps `odc.stac.load`'s `y`/`x` output
   dimensions to the project-wide `northing`/`easting` convention and drops `spatial_ref`.
 
@@ -765,15 +763,13 @@ GET https://cmr.earthdata.nasa.gov/search/granules.json
     &page_size=2000
 ```
 
-Orbit direction is filtered **server-side** via `attribute[]`, so the response already
-contains only the desired orbit — no separate STAC search and no local granule-ID
-intersection. Each granule entry's data download links (`rel` ending `/data#`, href ending
-`_VV.tif` / `_VH.tif`) are mapped onto the `S1_OPERA_BANDS` asset keys (`0_VV`, `0_VH`) to
-construct `pystac.Item`s shape-compatible with the rest of the pipeline. The granule's
-`title`, `time_start`, and `polygons` supply the item id, datetime, and geometry. CMR
-pagination is handled via the `CMR-Search-After` response header, which pages cleanly at
-2000 against the same host. See
-[ADR 009](../../../context_docs/decisions/009-native-cmr-granule-query.md) for the full rationale.
+Orbit direction is filtered **server-side** via `attribute[]`, so the response holds only the
+desired orbit — no separate STAC search and no local granule-ID intersection. Each granule's data
+links (`rel` ending `/data#`, href ending `_VV.tif` / `_VH.tif`) map onto the `S1_OPERA_BANDS`
+asset keys (`0_VV`, `0_VH`) to build `pystac.Item`s shape-compatible with the rest of the
+pipeline, with `title`, `time_start` and `polygons` supplying id, datetime and geometry.
+Pagination uses the `CMR-Search-After` header, which pages cleanly at 2000. See
+[ADR 009](../../../context_docs/decisions/009-native-cmr-granule-query.md).
 
 #### Burst Timestamp Normalisation
 
@@ -782,13 +778,9 @@ different sub-second UTC timestamp (reflecting actual acquisition time). If pass
 `odc.stac.load` as-is, each burst becomes a separate time step instead of being mosaicked
 together.
 
-`normalize_opera_timestamps` delegates to `solar_days.normalize_to_solar_day`: it groups
-bursts by **solar day** and sets all timestamps in each group to noon UTC of that day.
-It grouped by UTC *date* until 2026-07-30, which made the whole solar-day apparatus on the
-S1 path inert — everything downstream derived its "solar day" from a timestamp already
-flattened to the UTC date, so radar was labelled in UTC while optical was labelled in solar
-days. `odc.stac.load` then treats them as concurrent acquisitions
-and spatially mosaics them into a single time slice.
+`normalize_opera_timestamps` delegates to `solar_days.normalize_to_solar_day`, grouping bursts
+by **solar day** and setting every timestamp in a group to noon UTC of that day. `odc.stac.load`
+then treats them as concurrent acquisitions and mosaics them into a single time slice.
 
 #### UTM CRS Derivation
 
@@ -930,10 +922,10 @@ CMR-STAC returns HTTPS asset URLs in two formats depending on satellite vintage:
 | **datapool** (older S1A) | `https://datapool.asf.alaska.edu/RTC/OPERA-S1/<filename>` |
 | **earthdatacloud** (newer S1C) | `https://cumulus.asf.earthdatacloud.nasa.gov/OPERA/OPERA_L2_RTC-S1/<dir>/<file>` |
 
-`auth.rewrite_assets_to_s3` converts both to `s3://asf-cumulus-prod-opera-products/...` via
-pure string manipulation (no HTTP calls). For the datapool format, the granule directory name
-is reconstructed by stripping the band suffix (`_VV.tif`, `_VH.tif`, `_mask.tif`) from the
-flat filename.
+`auth.rewrite_assets_to_s3` converts both to `s3://asf-cumulus-prod-opera-products/...` by pure
+string manipulation, no HTTP calls. For the datapool format the granule directory name is
+reconstructed by stripping the band suffix (`_VV.tif`, `_VH.tif`, `_mask.tif`) from the flat
+filename.
 
 ### Legacy CloudFront Signed URLs (fallback)
 
@@ -1382,12 +1374,11 @@ source refusing reads for thirteen minutes emptied 178 zone-years that had alrea
 months of sound data.
 
 The radar response is the tail of the optical one without the copy ladder, which radar has no use
-for — OPERA publishes one copy of a granule:
+for: OPERA publishes one copy of a granule, so there is nothing to step down to.
 
 1. **Retry**, through the shared `store_write_retrying` policy — and for a provider refusal that
    arrived after a successful read, retry past the attempt limit, because waiting is the only
-   response a refusal has. Radar is the one caller that asks for this, since OPERA publishes one
-   copy of a granule and there is nothing to step down to.
+   response a refusal has. Radar is the one caller that asks for this.
 1. **Fail the leg under a name the cell can act on** if that wait was not enough
    (`ProviderRefusedReadsError`), so the re-dispatch waits on the long schedule. No date is
    skipped and the time axis does not move.
@@ -2154,17 +2145,15 @@ credential's roughly one-hour life is unrelated to how long a batch takes, so a 
 it cannot renew at its own boundary. Renewal is owned by a timer — see "Renewal runs on a timer"
 below.
 
-`batch_days` is a parameter on `ingest_s1_roi_sar`. It is not present on the S2 flow. The
-formula in the background section above applies to estimating how many tasks a given
-window width will produce; the 30-day default keeps each batch well within the scheduler's
-RAM budget at cornbelt scale.
+`batch_days` is a parameter on `ingest_s1_roi_sar` and is absent from the S2 flow. The formula
+in the background section above estimates how many tasks a given window width produces; the
+30-day default keeps each batch inside the scheduler's RAM budget at cornbelt scale.
 
-Batch windows are inclusive on both ends and do not overlap: each batch spans `batch_days`
-calendar days, and the loop advances `batch_start` to the day *after* `batch_end`. Because
-CMR/STAC also treat their query end date as inclusive, each day is queried by exactly one
-batch — a batch boundary that landed on the same day as the next batch's start would page
-that day twice, wasteful at CONUS scale where each day is many pages of bursts. The overall
-`[start_date, end_date]` range is inclusive of `end_date`.
+Batch windows are inclusive at both ends and do not overlap: each spans `batch_days` calendar
+days and the loop advances `batch_start` to the day *after* `batch_end`. Since CMR and STAC also
+treat their end date as inclusive, each day is queried by exactly one batch — a boundary landing
+on the next batch's start day would page it twice, wasteful where each day is many pages of
+bursts.
 
 ### Lazy evaluation throughout
 
@@ -2175,29 +2164,26 @@ execution triggered by the Zarr write step.
 
 ### Coverage pre-filtering before compute
 
-`filter_low_coverage_dates` eagerly computes only the per-date valid pixel counts (one
-scalar per time step) from the quality band (SCL for S2, VV for S1) to decide which dates to
-keep. All spectral bands remain lazy. Dropping low-coverage dates before `.compute()` avoids
-reading band data for cloud-covered or off-ROI scenes.
+`filter_low_coverage_dates` eagerly computes only the per-date valid pixel counts — one scalar
+per time step, from SCL for S2 or VV for S1 — to decide which dates to keep. All spectral bands
+stay lazy, so cloud-covered and off-ROI scenes are dropped before any band data is read.
 
 ### Date deduplication before loading
 
-`_filter_existing_dates` removes items whose dates are already in the Zarr store before
-calling `odc.stac.load`. This avoids building Dask task graphs for data that will be
-discarded, and prevents unnecessary COG reads from S3.
+`_filter_existing_dates` removes items whose dates are already in the Zarr store before calling
+`odc.stac.load`, so no task graph is built and no COG read is issued for data that would be
+discarded.
 
-The filter must be keyed the same way the store was written. Both S1 and S2 load with
-`groupby="solar_day"`, so their time axes hold solar days — and an acquisition's UTC date
-is not its solar day wherever the offset crosses midnight (the far-eastern and far-western
-zones). Callers that group by solar day pass `mid_longitude` down through `ingest_tile` /
-`query_stac_items`; matching UTC dates against a solar-day set instead would filter only the
-half of a committed group that falls on the near side of midnight, and the surviving half
-would reload, regroup onto the day already present, and be written a second time.
+The filter must be keyed the way the store was written. Both sensors load with
+`groupby="solar_day"`, so their time axes hold solar days, and an acquisition's UTC date is not
+its solar day where the offset crosses midnight. Callers grouping by solar day pass
+`mid_longitude` down through `ingest_tile` / `query_stac_items`; matching UTC dates against a
+solar-day set would filter only the half of a committed group on the near side of midnight, and
+the surviving half would reload, regroup onto the day already present, and be written twice.
 
-The filter is an optimisation, not the guarantee. On S1 the queries are built one batch
-ahead of the writes, so the set they filter against is a snapshot frozen before the run
-began; the write loop tracks what it has actually written and is the authority, on the
-cropped and full-extent branches alike.
+The filter is an optimisation, not the guarantee. On S1 the queries are built one batch ahead of
+the writes, so the set they filter against is frozen before the run began; the write loop tracks
+what it actually wrote and is the authority.
 
 ### Choosing between duplicate copies of a tile-date
 
