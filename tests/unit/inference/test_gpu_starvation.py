@@ -77,7 +77,7 @@ PX_PER_TILE = 2048 * 2048
 
 # --- ingest duration ---------------------------------------------------------------------
 # Both fits are from the CANONICAL ingest record,
-# `context_docs/ingest/ingest-performance.md`.
+# `context_docs/ingest/campaign-ingest-measurements.md`.
 #
 # DENSITY — five regions, k=1 (one commit per date), each arm launched together so time-of-day
 # and catalogue conditions cancel:

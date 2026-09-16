@@ -20,6 +20,10 @@ what was tried and abandoned — you want [`context_docs/`](../context_docs/) in
 | know which names are stable to import | [`public-api.md`](public-api.md) |
 | read the published global dataset | [`global-store.md`](global-store.md) |
 | choose between one area and the whole globe | [`single-vs-global.md`](single-vs-global.md) |
+| work out why an ingest failed, or what it does about a refused query or a corrupt file | [`ingest-error-handling.md`](ingest-error-handling.md) |
+| work out what is limiting an ingest, and which levers to reach for | [`ingest-performance.md`](ingest-performance.md) |
+| work out why the GPU is idle during inference, and which levers to reach for | [`inference-performance.md`](inference-performance.md) |
+| read how a pipeline stage works internally | its package README, e.g. [`ingest/README.md`](../src/tessera_embeddings/ingest/README.md) |
 | understand *why* a design is the way it is | [`../context_docs/`](../context_docs/) |
 | understand what the code *is* | the [top-level README](../README.md) |
 
@@ -42,6 +46,11 @@ project before.
 
 Measurements do not belong in this directory. If you find a throughput figure, a cost, or a
 benchmark here, it is either a short summary with a link, or it has drifted from
-`context_docs/` and should be replaced by one. The reason is that a figure quoted in two places
+`context_docs/` and should be replaced by one.
+[`ingest-performance.md`](ingest-performance.md) is the exception that proves the rule: it
+carries a lot of figures, because a lever is useless without its price, and every one of them
+cites the derivation in
+[`campaign-ingest-measurements.md`](../context_docs/ingest/campaign-ingest-measurements.md)
+rather than restating the working. The reason is that a figure quoted in two places
 gets corrected in one of them — which has happened often enough in this repository to have its own
 index, [`context_docs/corrections-register.md`](../context_docs/corrections-register.md).

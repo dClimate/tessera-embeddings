@@ -29,7 +29,7 @@ Read it before publishing a figure, before quoting one, or when a review finding
 familiar.
 
 **Two records already do this for themselves**, and both now sit inside
-[`ingest/ingest-performance.md`](ingest/ingest-performance.md) — §5 "Claims made and withdrawn",
+[`ingest/campaign-ingest-measurements.md`](ingest/campaign-ingest-measurements.md) — §5 "Claims made and withdrawn",
 and the fleet-scale investigation's own self-corrections, condensed into §11. Both work, and both
 were blind past their own edges: the second noticed it had repeated one mistake three times, while
 the same mistake sat uncorrected in two neighbouring documents it never cited. **Merging those
@@ -47,7 +47,7 @@ that was entirely an artefact.
 
 - **The 1.8–2.1× "slowdown at fleet scale."** Compared May–September dates against a
   January baseline. Same zone, same width, different **season**. Matched on all three it is
-  **1.17×**. Withdrawn in [`ingest/ingest-performance.md`](ingest/ingest-performance.md) §11.3;
+  **1.17×**. Withdrawn in [`ingest/campaign-ingest-measurements.md`](ingest/campaign-ingest-measurements.md) §11.3;
   the correction propagated to [`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md)
   §4 and to that record's own header.
 - **"Width may not be usable."** The "six times the fleet for under twice the rate" reading
@@ -57,7 +57,7 @@ that was entirely an artefact.
 - **"The sweep's timing gap came from contention with concurrent automation testing."**
   Asserted from three paired dates with no mechanism. An identical catalogue query measured
   37.6 s at 21:45 and 33.1 s at 23:45 — external latency drifts ~12% over two hours on its
-  own. (`ingest/ingest-performance.md` §5)
+  own. (`ingest/campaign-ingest-measurements.md` §5)
 - Plus, by that investigation's own count, three more of its six corrections: zone in one,
   keep threshold in another, generalising a single zone in a third.
 - **The assembly crossover "near 158 actors at 16 workers, near 383 at 32."** Published as the
@@ -225,7 +225,7 @@ one stratification flipped the sign of the conclusion.
   points, which cannot constrain a two-parameter model. A third control at 45 workers put
   the serial constant anywhere from 11.4 to 39.3 s, and the three-point fit makes aggregate
   throughput **flat within ~6% from 20 to 120 workers**. There is no optimum.
-  (`ingest/ingest-performance.md`)
+  (`ingest/campaign-ingest-measurements.md`)
 - **"Batching wins 1.14×, adopt it globally."** One point on a curve that is **not
   monotonic** — the same setting *loses* on two of four further regions. Batching is now
   chosen per region by a size threshold.
@@ -233,7 +233,7 @@ one stratification flipped the sign of the conclusion.
   2.56× at 40 cells. None is measurable to 20 concurrent cells.
 - **A linear cost fit from two runs failed its first out-of-sample test** — predicted 122 s at
   three windows, measured 193.9 s. Superseded by a dispatch-floor model
-  ([`ingest/ingest-performance.md`](ingest/ingest-performance.md) §12.2). **The retired fit
+  ([`ingest/campaign-ingest-measurements.md`](ingest/campaign-ingest-measurements.md) §12.2). **The retired fit
   survived in two other documents for weeks after it was superseded**, which is mechanism 8 below
   and is the clearest single argument for merging them.
 
@@ -317,7 +317,7 @@ needs enough points to show it is monotonic before one of them becomes a recomme
 - **"Most of the dead area is not geometric — it is cloud."** Backwards: geometric dead is
   55–66% of live chunks and radiometric 10–21%. *"The claim was made to explain the null
   result and was not measured before being asserted."*
-  (`ingest/ingest-performance.md` §5)
+  (`ingest/campaign-ingest-measurements.md` §5)
 - **Two mechanism accounts for the overlap gain, both refuted.** Sum-over-max predicted the
   gain should scale with window count — flat across a 3.3× spread. Fleet occupancy predicted
   it should grow with fleet width — 3.67× at 30 workers against 3.85× at 60, at the noise
@@ -432,7 +432,7 @@ Distilled from the nine above. Each line exists because skipping it cost a withd
 
 Two rules, because the documents are read differently.
 
-**The measurement records keep theirs in place.** `ingest/ingest-performance.md`,
+**The measurement records keep theirs in place.** `ingest/campaign-ingest-measurements.md`,
 `inference/inference-on-gpus.md`, the assembly records and the decision records all carry their
 withdrawn claims beside the corrected ones. A reader reaching for one of those figures has to read
 past the retraction to reach it, which is the point, and the retractions are under a tenth of the
