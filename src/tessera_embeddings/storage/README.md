@@ -29,9 +29,9 @@ dataset's.
 
 `empty_store.py` creates a dataset with the right shape but no values in it, and
 `global_store.py` does that for all 120 groups at once, so filling never resizes anything.
-`shard_writer.py` then fills one group-year in parallel, `session_catch_up.py` stops those
-writers overwriting each other, and `region_writes.py` works out where a block of data
-belongs.
+`shard_writer.py` then fills one group-year in parallel and `region_writes.py` works out where a
+block of data belongs. What stops two writers overwriting each other is the conflict check at
+commit time; `session_catch_up.py` only shortens the work that check has to do.
 
 `campaign.py` tracks what is finished and clears out old versions, `published_store.py`
 checks a finished dataset from outside, and `object_store.py` deletes what we no longer need.

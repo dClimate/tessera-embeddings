@@ -393,9 +393,9 @@ the destination store as provider data loss. `NoSuchBucket` is deliberately excl
 bucket is systemic and must fail the leg on its first date.
 
 Nothing counts or caps these skips on the OPTICAL path: they are rare enough per granule that a
-ceiling would only fire on a fault of another kind, and every date given up is logged, restated
-in the end-of-run summary, and written to the store. The radar skip below does carry a ceiling,
-because it answers a provider refusal, which arrives fleet-wide and all at once.
+ceiling would only fire on a fault of another kind, and every date given up is logged and restated
+in the end-of-run summary. Nothing is written to the store. The radar skip below does carry a
+ceiling, because it answers a provider refusal, which arrives fleet-wide and all at once.
 
 Past that point the response is a ladder, in `s2_roi.py`'s consume path:
 

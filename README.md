@@ -41,7 +41,8 @@ value per year from 2017 to 2025. Coverage is near-complete rather than total �
 zone-years never landed, and a pixel below the quality bar is left empty — so check the year
 against the group's `years_complete` and treat a non-finite `scales` as absent data rather
 than a read failure. **No AWS account is needed** — the bucket allows anonymous reads. You do
-need the `icechunk` library, since xarray and Zarr alone cannot resolve an Icechunk snapshot.
+need the `icechunk` library, since xarray and Zarr alone cannot resolve an Icechunk snapshot,
+and `numcodecs[pcodec]`, which is what decodes `scales`.
 
 Embeddings are quantised: each pixel-year holds 128 int8 values plus one float32 `scales`
 value, and multiplying the two dequantises them, to within about half a scale step.

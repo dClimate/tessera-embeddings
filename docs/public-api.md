@@ -113,7 +113,7 @@ rather than re-exported from the top-level package:
   `stamp_root_identity` / `check_root_identity` / `check_destination_types`. From
   `published_store`, the reader-side audit helpers: `layout_departures`,
   `coordinate_departures`, `live_shards` / `live_shards_async`, `shard_pixel_window`,
-  `sample_live_pixels`, `calendar_years`, `missing_seeded_arrays`.
+  `sample_live_pixels`, `calendar_years`. `missing_seeded_arrays` is in `global_store`, not here.
 
 ## Privacy conventions
 

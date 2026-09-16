@@ -187,8 +187,10 @@ of them has to build.
 
 ### S2: per-date iteration
 
-`ingest_s2_roi_reflectance` queries STAC for the full date range upfront, groups items by **local
-solar day** via `group_items_by_date`, then processes one day at a time in a Python loop: each
+`ingest_s2_roi_reflectance` streams the catalogue month by month (`stream_stac_monthly=True`,
+the default), holding only the current and prefetched month, because a zone-year of items does
+not fit on a worker; querying the whole range up front is the rollback path. It groups items by
+**local solar day** via `group_items_by_date`, then processes one day at a time in a loop: each
 iteration builds a single-date Dask graph, calls `odc.stac.load` for that day, filters coverage,
 and writes before moving on.
 
@@ -242,18 +244,17 @@ Batched approach (batch_days=30, ingest_s1_roi_sar only):
 
 A batch boundary is **not** a credential checkpoint, and treating it as one is unsafe: the STS
 credential's roughly one-hour life is unrelated to how long a batch takes, so a batch that outruns
-it cannot renew at its own boundary. Renewal is owned by a timer — see "Renewal runs on a timer"
-above.
+it cannot renew at its own boundary. Renewal is owned by a timer — see
+[Authentication](../src/tessera_embeddings/ingest/README.md#authentication-edl--opera-data).
 
 `batch_days` is a parameter on `ingest_s1_roi_sar` and is absent from the S2 flow. The formula
 in the background section above estimates how many tasks a given window width produces; the
 30-day default keeps each batch inside the scheduler's RAM budget at cornbelt scale.
 
-Batch windows are inclusive at both ends and do not overlap: each spans `batch_days` calendar
-days and the loop advances `batch_start` to the day *after* `batch_end`. Since CMR and STAC also
-treat their end date as inclusive, each day is queried by exactly one batch — a boundary landing
-on the next batch's start day would page it twice, wasteful where each day is many pages of
-bursts.
+Batch *ownership* ranges are inclusive at both ends and do not overlap: each spans `batch_days`
+calendar days and the loop advances `batch_start` to the day *after* `batch_end`. The *queries*
+do overlap, because `fixed_day_ranges` pads each one a UTC day either side, so a boundary solar
+day comes back from two batches and `s1_roi.py` gives it up once rather than twice.
 
 ### Cropping to live windows (unconditional)
 
@@ -560,7 +561,8 @@ Three practical details:
 - Logging changes. Instead of one `Stage timings` line per date there is one `Batch timings` line
   per batch. Its build and gate figures are sums of the real per-date values; the write is a
   single shared computation and cannot be split per date.
-- The default is 1, which is the one-commit-per-date path, unchanged.
+- The default, `batch_dates=None`, is automatic rather than 1: `auto_batch_dates` fuses four
+  dates for a run covering at most 500 chunks and one above that.
 
 **Combining it with `pipeline_dates`.** The two fix different idleness. Batching fills gaps
 *inside* a date's write; pipelining removes the serial preparation *between* writes. Used

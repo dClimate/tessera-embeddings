@@ -515,9 +515,10 @@ writing a year rewrites only that year's manifest.
 2. **append** — extend the time axis of an existing store.
 3. **region overwrite** — rewrite a slice, in time or space, in place.
 4. **shard-assemble** — staged inference tiles written as whole, lean 2048-pixel shards into a
-   pre-allocated zone group, one fork-and-merge commit per (zone, year). These commits are
-   ungated: they contend on the repository's single branch tip, which costs seconds and never a
-   conflict. The mechanics are in
+   pre-allocated zone group. Two commits per (zone, year), not one: the shards land first, then
+   `commit_year_attrs` records `years_complete` and provenance, so a crash between them leaves a
+   year written but unmarked. These commits are ungated: they contend on the repository's single
+   branch tip, which costs seconds and never a conflict. The mechanics are in
    [`context_docs/storage/writing-to-the-global-store.md`](../context_docs/storage/writing-to-the-global-store.md).
 
 The full write-path reference, including what a fork worker does and how a resume tells a

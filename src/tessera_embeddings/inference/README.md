@@ -445,7 +445,8 @@ buckets.
    exists. If that distinction matters to you, read the two radar counts and decide per pixel.
 
 2. **Which bucket each pixel goes in.** `compute_bin_keys` maps a pixel's
-   `(optical count, radar count)` to the nearest entry in `num_obs_checkpoints`. Pixels
+   `(optical count, radar count)` UP to the smallest entry in `num_obs_checkpoints` that is at
+   least as large — 11 observations map to 16, not 8. Pixels
    sharing a `(s2_bin, s1_bin)` key form a bucket, and the model receives one rectangular
    `(B, seq_len, bands+1)` tensor per bucket — no padding, no attention masking, no
    variable-length overhead.
@@ -632,8 +633,8 @@ delegates to `quantize_rows`.
 
 - `embeddings` — int8, `(H, W, 128)`
 - `scales` — float32, `(H, W)`
-- `embedding_std` — float32, `(H, W, 128)`, unquantized, present only with
-  `compute_std=True`
+- `embedding_std` — float32, `(H, W, 128)`, unquantized. **Never written under v1.1**:
+  sampling is deterministic, so `InferenceConfig` forces `compute_std` to False.
 
 Assembly validates that staged tiles carry these dtypes and rejects a mismatch, so a
 change of dtype cannot silently corrupt a store.

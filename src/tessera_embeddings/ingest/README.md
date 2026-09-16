@@ -53,8 +53,9 @@ STAC cannot filter by orbit direction server-side. Queries are streamed month by
 per orbit, because a single whole-year request over a large zone is large enough that
 catalogues refuse it.
 
-**Filtering.** Whole items are dropped first — when their date is already in the store, when a
+**Filtering.** Whole items are set aside first — when their date is already in the store, when a
 reprocessed granule duplicates one already chosen, or when an optional caller hook rejects them.
+A duplicate is kept rather than discarded: it becomes the next rung the read falls back to.
 What survives is then sorted clearest-first, and that sort decides which pixel wins where two
 scenes of a solar day overlap.
 
