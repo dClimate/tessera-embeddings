@@ -586,28 +586,20 @@ every catalogue query is padded a day either side regardless
 ### Why nothing records what was missed
 
 Once a day is closed, what happened on it stops mattering: an image that would not read this
-morning and reads this afternoon still cannot be written. Readability can change; the outcome
-cannot. There is no ledger of missed days — it would unlock no action, would have to stay in
-step with the store, and would be deleted along with the mosaic it was written on.
+morning and reads this afternoon still cannot be written. A ledger of missed days would unlock no
+action, and would be deleted along with the mosaic it described.
 
-**The published product already answers the question a reader actually has.** A mosaic is an
-intermediate, deleted once embeddings are computed from it. What survives carries per-pixel
-coverage layers: `s2_obs_count`, `s1_asc_obs_count` and `s1_desc_obs_count` count usable
-observations, and `s2_month_covered`, `s1_asc_month_covered` and `s1_desc_month_covered` give one
-boolean per pixel per month (`config/store_layout.py`). "Does this pixel have data for August" is
-answered by the published data rather than by a note attached to something deleted. And downstream
-every absence is the same absence: a day the satellite did not pass over, a day too cloudy to
-keep, and a day whose files would not read all put no pixel in the mosaic, and nothing consuming a
-mosaic tells them apart.
+Coverage questions are answered by the published product instead, which carries per-pixel
+observation counts and month masks (`config/store_layout.py`). Downstream every absence is the
+same absence — no pass, too cloudy, unreadable file — so nothing consuming a mosaic tells them
+apart anyway.
 
-What the store does carry is `assessed_window`: the date range a leg examined in full, so a month
-inside it holding no dates reads as "we looked and there was nothing" rather than "no run got
-here". It works at month granularity and unblocks a cell rather than blocking one, with
-`assessed_empty_dates` beside it as a count for observability — see
-[Recording the window an ingest examined](../src/tessera_embeddings/ingest/README.md#recording-the-window-an-ingest-examined).
+What the store does carry is `assessed_window`, the date range a leg examined in full, so an
+empty month inside it reads as "we looked and there was nothing" rather than "no run got here".
+See [Recording the window an ingest examined](../src/tessera_embeddings/ingest/README.md#recording-the-window-an-ingest-examined).
 
-A lost day still produces a `DATA LOSS` line naming the date, the cause and the objects, plus a
-summary at the end of the leg. What it does not produce is a record anything later reads.
+A lost day still produces a `DATA LOSS` line and an end-of-leg summary. What it does not produce
+is a record anything later reads.
 
 ---
 
