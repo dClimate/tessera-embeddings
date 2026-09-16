@@ -5,31 +5,68 @@ each other. A corrupt file, an expired credential and a throttled provider all a
 same exception with the reason stripped out. This document covers how the pipeline recovers the
 reason, what it does with each answer, and why guessing costs more than waiting.
 
-## What actually went wrong
+## The five classes of failure
 
-Twelve distinct causes were diagnosed over the campaign, and several need opposite responses:
+Twelve distinct causes were diagnosed over the campaign. They fall into five classes, and the
+class is what decides the response:
 
-| what happened | how it arrived | what it needs |
+| class | what it means | the right answer |
 |---|---|---|
-| the read credential expired mid-run | `WarpOperationError`, with a 403 in GDAL's log | a fresh credential, then retry |
-| the published object is corrupt | the same `WarpOperationError`, no HTTP error at all | another copy of the scene, never a retry |
-| the object was never published | 404, `NoSuchKey` | another copy, then skip the date |
-| the provider refused reads for 13 minutes | `AccessDenied`, `SlowDown`, `InternalError` | wait it out |
-| the catalogue refused the request | HTTP 502, arriving as fast as a success | a smaller request, not a retry |
-| the catalogue refused the rate | HTTP 429, 503 | wait, however often it recurs |
-| the archive returned HTTP 200 and a body that was not JSON | `Expecting value: line 1 column 1` | ask for the same page again |
-| a refusal was reported in GDAL's log and raised as a decode error | `ZIPDecode: Decoding error at scanline 0` | read the log, not the exception |
-| the cause was destroyed crossing the Dask worker boundary | one line, no chain | keep causes serialisable, and refuse to start without them |
+| **provider system failure** | the service is unwell: throttling, gateway errors, a refusal lasting an excessive number of minutes | wait, and keep waiting |
+| **authentication failure** | our credential is expired or wrong | refresh it, or stop the job outright |
+| **data corruption** | the object is published but broken — will not decompress, truncated, missing a band | fetch a different copy; never retry the same one |
+| **missing data** | the object was never published at all | a different copy, then give the date up |
+| **bad response body** | the service answers "success" and sends something else: an error page, or a truncated document | ask for the same page again |
 
-The cost of getting one wrong is uneven, and that shapes everything below. A store's dates are
-append-only: a date can only be added after the newest one already there. Give up on a date and
-it is gone. Give up too late and the cost is wall clock on a job that gets dispatched again
-anyway. The pipeline spends time rather than dates, and abandons a date only on positive
-evidence that the imagery itself is unusable.
+Two pairs are dangerous. A provider system failure and data corruption need opposite responses:
+waiting fixes the first and wastes time on the second, switching copies fixes the second and does
+nothing for the first. And an expired token wants a refresh and a retry where wrong permissions
+want the job stopped, which the provider words identically.
 
-One classifier in `duplicates.py` decides, over one set of evidence, reached through a single
-context manager on both sensors' per-date paths. Everything else here is how evidence gets to it
-or what the callers do with its answer, organised by what failed:
+## Why telling them apart needs its own machinery
+
+The class is not in the exception. Three layers each destroy part of the evidence:
+
+- **rasterio** wraps whatever GDAL failed at in a `WarpOperationError` and discards the cause, so
+  a corrupt file and an expired credential arrive as the same sentence.
+- **GDAL** reports some refusals only to its own log, and raises something unrelated. A refused
+  range request comes back as an XML error document, which GDAL feeds to the TIFF decompressor;
+  what surfaces is `ZIPDecode: Decoding error at scanline 0` — a corruption message for a
+  provider refusal, and those two verdicts are opposites.
+- **Dask** cannot serialise rasterio's GDAL error classes out of a worker, so it substitutes a
+  plain exception holding one line of text and the chain is gone.
+
+Hence the machinery, which is most of this document. A second log handler captures what GDAL only
+logged, including from GDAL's own fetch threads, which write past the handler rasterio installs.
+Captured lines are attached to the failing exception as evidence rather than acted on. A worker
+plugin keeps causes serialisable, and a leg refuses to start unless every worker confirms it can.
+One classifier in `duplicates.py` reads all of it together, and both sensors reach it through a
+single context manager, so two callers cannot reach different verdicts about one failure.
+
+## Why a wrong answer is expensive
+
+A store's dates are append-only: a date can only be added after the newest one already there.
+Give up on a date and it is gone. Give up too late and the cost is wall clock on a job that gets
+dispatched again anyway. The pipeline therefore spends time rather than dates, and abandons a
+date only on positive evidence that the imagery itself is unusable.
+
+## One-area runs and global campaign runs
+
+Everything above is shared. Both paths use the same classifier, the same copy ladder, the same
+per-date retry, the same GDAL log capture, and the same rule about where a resumed run starts.
+
+The global campaign adds a layer *above* a run. `ingest_zone_year` dispatches a cell's ingest as
+a **leg** and retries the leg; a single-area run has no such loop, so it runs once and either
+finishes or fails. These are campaign-only:
+
+- the attempt budget, and the wall-clock deadline that bounds it
+  (`max_leg_wall_clock_s`, extended while a leg is still committing dates)
+- the long between-attempt wait for a provider refusal (`leg_refusal_backoff_s`)
+- the leg-retry classifier, which decides whether a named failure is worth another dispatch
+- the REPEAT test on a catalogue refusal, which needs two attempts to see and so cannot live
+  inside one
+
+The rest is organised by what failed:
 
 - **The catalogue would not answer.** Nothing has been read, so nothing is at risk but time.
 - **A read would not produce pixels.** The expensive decision, and most of the machinery.
@@ -186,7 +223,8 @@ never by position, covering exactly the fields that decide the answer (collectio
 page) and nothing that varies between attempts. A counter or timestamp inside it would make every
 refusal unique and the repeat check dead code.
 
-**Attempts are the only thing those budgets count; elapsed time has exactly one bound.** Each
+**Attempts are the only thing those budgets count; elapsed time has exactly one bound.**
+*(Campaign only — a single-area run has no leg loop.)* Each
 page fetch gets 9 HTTP attempts across 364 s of backoff before anything above sees a failure, and
 every budget above it — leg, cell, zone round — treats the layer below as one try. None reads a
 clock, and expansive backoff makes the clock the axis that grows without limit.
@@ -378,8 +416,9 @@ of backoff. It is never spent on giving up a date, for the append-only reason ab
 abandoned now cannot be written later. If the wait is not enough the write fails, the leg fails
 with its time axis unmoved, and the leg's own retry re-offers the date in order.
 
-The in-leg budget is `WAIT_OUT_BACKOFF_S` and the between-attempt one is
-`leg_refusal_backoff_s`, per the two budgets above.
+The in-leg budget is `WAIT_OUT_BACKOFF_S`, which applies to every run. The between-attempt one,
+`leg_refusal_backoff_s`, is campaign only: it is the delay before `ingest_zone_year` dispatches
+the leg again.
 
 Carrying the verdict between the two takes a type: the leg-retry layer sees only a failure DETAIL
 string, and no marker on it can separate a refused read from a crash, since the wrapper discarded
@@ -483,7 +522,7 @@ caller that knows only one of them cannot misclassify.
 
 Every OPERA read on the radar path happens inside a date's write, so a failed read raises out of
 the per-date loop. Until this skip, one refused read cost every LATER date in the window too: a
-source refusing reads for thirteen minutes emptied 178 zone-years that had already committed
+source that refused reads for thirteen minutes emptied 178 zone-years that had already committed
 months of sound data.
 
 The radar response is the tail of the optical one without the copy ladder, which radar has no use
@@ -502,7 +541,7 @@ for: OPERA publishes one copy of a granule, so there is nothing to step down to.
    the re-run meant to recover it is refused instead.
 4. **Name it in the log**, per date and again in an end-of-leg summary. Nothing durable: the day
    is below the store's newest date by the time the next date commits.
-5. **Stop past `MAX_GIVEN_UP_DATES`**, and stopping is TERMINAL.
+5. **Stop past `MAX_GIVEN_UP_DATES`**, and stopping is TERMINAL. On the campaign path
    `TooManyGivenUpDatesError` is in the leg-retry classifier's non-retryable set, because nothing
    counted toward the ceiling can clear: every date reaching that counter failed for a cause that
    recomputes, so a re-dispatch would re-read the same objects to reach the identical answer.
@@ -538,22 +577,11 @@ queried and before any date is prepared:
    its month first can precede the window's end while the date it came from does not.
 3. **Otherwise, begin the day after that newest date.**
 
-**The day after, rather than the first of its month.** Starting at the month boundary still
-offers the earlier days of that month, which is exactly where an old gap sits — a day an earlier
-attempt could not write while later days landed above it. Offering one to the writer is fatal: the
-append is refused, the leg dies, and it dies again on every retry because the imagery is the same.
-A drop-and-log guard sits in front of the writer too; it should never fire, and exists because the
-failure it prevents leaves a store with no remedy but deletion.
-
-Nothing is lost by the tighter start. What a run may *write* is the span it **owns**, and every
-catalogue query is padded a day either side, because a solar day's imagery can carry the adjacent
-UTC date (see [Timestamp handling](../src/tessera_embeddings/ingest/README.md#timestamp-handling-solar_dayspy)). One day is provably enough, since a solar offset
-is a whole number of hours within ±12.
-
-Each store works this out for itself: a cell has up to three, and they advance at different rates,
-so a shared start would skip days a lagging store never reached. The saving matters as much as the
-safety — searching below the line cannot write anything, and searching is most of what a resumed
-run does.
+**The day after, rather than the first of its month**: a month boundary re-offers days already
+below the line, and the append refuses them, killing the leg on every retry. Each store works
+its own start out, since a cell's stores advance at different rates, and nothing is lost because
+every catalogue query is padded a day either side regardless
+([Timestamp handling](../src/tessera_embeddings/ingest/README.md#timestamp-handling-solar_dayspy)).
 
 ### Why nothing records what was missed
 
@@ -572,18 +600,13 @@ every absence is the same absence: a day the satellite did not pass over, a day 
 keep, and a day whose files would not read all put no pixel in the mosaic, and nothing consuming a
 mosaic tells them apart.
 
-There used to be a ledger: `assessed_unreadable_dates` named every day a leg gave up on, and the
-coverage gate subtracted the months holding those days from the months an assessed window excuses.
-That subtraction refuses a month that can never be filled — nothing can be written below the line
-— so it deadlocked the cell rather than protecting anything, and the only way out was to delete
-the store, which is a judgement a person makes from an audit.
+What the store does carry is `assessed_window`: the date range a leg examined in full, so a month
+inside it holding no dates reads as "we looked and there was nothing" rather than "no run got
+here". It works at month granularity and unblocks a cell rather than blocking one, with
+`assessed_empty_dates` beside it as a count for observability — see
+[Recording the window an ingest examined](../src/tessera_embeddings/ingest/README.md#recording-the-window-an-ingest-examined).
 
-What remains on the store is `assessed_window`, which is not a loss record. It says which range a
-leg examined, so a month holding no dates reads as "we looked and there was nothing" rather than
-as "no run reached this month". It works at month granularity and unblocks a cell rather than
-blocking one. `assessed_empty_dates` sits beside it as a count, for observability only.
-
-A lost day still produces a `DATA LOSS` line naming the date, the cause and the objects, and a
+A lost day still produces a `DATA LOSS` line naming the date, the cause and the objects, plus a
 summary at the end of the leg. What it does not produce is a record anything later reads.
 
 ---
