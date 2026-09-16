@@ -21,6 +21,7 @@ what was tried and abandoned — you want [`context_docs/`](../context_docs/) in
 | choose between one area and the whole globe, or read the published global store | [`single-vs-global.md`](single-vs-global.md) |
 | work out why an ingest failed, or what it does about a refused query or a corrupt file | [`ingest-error-handling.md`](ingest-error-handling.md) |
 | work out what is limiting an ingest, and which levers to reach for | [`ingest-performance.md`](ingest-performance.md) |
+| work out why the GPU is idle during inference, and which levers to reach for | [`inference-performance.md`](inference-performance.md) |
 | read how a pipeline stage works internally | its package README, e.g. [`ingest/README.md`](../src/tessera_embeddings/ingest/README.md) |
 | understand *why* a design is the way it is | [`../context_docs/`](../context_docs/) |
 | understand what the code *is* | the [top-level README](../README.md) |
