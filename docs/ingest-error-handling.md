@@ -73,7 +73,13 @@ The rest is organised by what failed:
 - **The next run has to handle what was lost**, starting from what the store holds rather than
   what the last run intended.
 
+Every section below opens with a line saying which of the five classes it answers, whether it is
+part of the evidence machinery, and whether it exists only on the campaign path.
+
 ## How a failure is decided
+
+*Answers all five [classes](#the-five-classes-of-failure). This is the decision the rest of the
+document feeds.*
 
 Reading one satellite image can fail for very different reasons, and the right answer to each is
 different — sometimes opposite. A failed read is asked one question, once, and gets exactly one
@@ -126,6 +132,9 @@ is recoverable, rather than costing a date, which is not.
 
 ### Waiting: where it happens changes what it costs
 
+*[Provider system failure](#the-five-classes-of-failure), and the guard that keeps [authentication
+failure](#the-five-classes-of-failure) from buying the same patience.*
+
 Two different budgets, for one reason:
 
 ```
@@ -150,6 +159,9 @@ Both of these happen before a single pixel is read, so the remedy is always to a
 differently, or stop the leg, never to abandon a date.
 
 ### When the catalogue refuses: naming the request, and telling the two refusals apart
+
+*[Provider system failure](#the-five-classes-of-failure), split into rate and request. The REPEAT
+test is [campaign only](#one-area-runs-and-global-campaign-runs).*
 
 `catalogue_refusal.py` is where a refused query stops being anonymous. Two things about the
 client stack make that necessary:
@@ -262,6 +274,8 @@ once, so telling them apart would buy nothing.
 
 ### When the archive says "success" but sends something that is not JSON
 
+*[Bad response body](#the-five-classes-of-failure).*
+
 Asking the archive for a page of radar granules normally returns a success code and a JSON
 document. Occasionally it returns a success code and a body that is not JSON at all — an error
 page, or a document cut off partway through.
@@ -310,11 +324,17 @@ path does differently because it has no second copy to fall back on.
 
 ### GDAL network tuning
 
+*[Provider system failure](#the-five-classes-of-failure): absorbs the transient ones before they
+reach a classifier.*
+
 `configure_gdal_environment()` (in [`config/environment.py`](../src/tessera_embeddings/config/environment.py)) must be
 called before importing `rasterio` or `odc.stac`. It sets GDAL config options for network
 resilience (retry counts, timeouts, connection pooling) that affect all subsequent COG reads.
 
 ### Where the retry sits, and how a failed date is attributed
+
+*[Machinery](#why-telling-them-apart-needs-its-own-machinery): where evidence is gathered, and how
+a failure is tied to a date and an ROI.*
 
 `roi_processing.source_read_retrying` wraps the point where a date's graph is first *computed*.
 S1's read happens inside its write's `compute()` and is already covered by the write retry; S2's
@@ -335,6 +355,10 @@ discarded unless the chain is logged. It is also where the reason GDAL never rai
 see *When GDAL logs the reason instead of raising it*.
 
 ### When a source object will not read
+
+*[Data corruption](#the-five-classes-of-failure) and [missing data](#the-five-classes-of-failure),
+told apart from a refusal by [reading the
+chain](#why-telling-them-apart-needs-its-own-machinery).*
 
 Some published objects are corrupt: a tile of the COG will not inflate, and no retry of any
 length recovers it. That is a different condition from a throttle or an expired credential,
@@ -403,6 +427,9 @@ object from failing a zone-year identically on every retry.
 
 ### When the provider refuses the read
 
+*[Provider system failure](#the-five-classes-of-failure) and [authentication
+failure](#the-five-classes-of-failure), which share a message.*
+
 An authorization refusal, a throttle and a server error are a different finding again. They say
 nothing about the imagery — the same object read minutes earlier and reads again once the service
 recovers — so no fallback copy helps and no date should be given up for one. That verdict is
@@ -427,6 +454,10 @@ the cause. A radar write that exhausts its in-leg budget on a refusal raises
 keys the long delay on. Nothing else about the failure changes.
 
 ### When GDAL logs the reason instead of raising it
+
+*The core of the [machinery](#why-telling-them-apart-needs-its-own-machinery): recovers a
+[provider system failure](#the-five-classes-of-failure) that GDAL reported as [data
+corruption](#the-five-classes-of-failure).*
 
 Everything above reads the exception chain. Some of a read failure's reason never reaches it.
 
@@ -520,6 +551,10 @@ caller that knows only one of them cannot misclassify.
 
 ### The radar bounded skip (`s1_roi.py`)
 
+*[Provider system failure](#the-five-classes-of-failure) and [data
+corruption](#the-five-classes-of-failure) on a path with no second copy. The terminal ceiling is
+[campaign only](#one-area-runs-and-global-campaign-runs).*
+
 Every OPERA read on the radar path happens inside a date's write, so a failed read raises out of
 the per-date loop. Until this skip, one refused read cost every LATER date in the window too: a
 source that refused reads for thirteen minutes emptied 178 zone-years that had already committed
@@ -558,6 +593,8 @@ around.
 
 ### Where a resumed run starts
 
+*Not a class — the consequence every class is judged against.*
+
 A store's dates can only be added in order, newest last. Slotting one into the middle would mean
 shifting every chunk after it, and a Zarr store's chunks sit at fixed positions — there is nowhere
 to shift them to. So **every day at or before the newest date a store already holds is closed to
@@ -579,6 +616,8 @@ queried and before any date is prepared:
    which would re-offer days already below the line.
 
 ### Why nothing records what was missed
+
+*Not a class — why no class is recorded once its date is closed.*
 
 Once a day is closed, what happened on it stops mattering: an image that would not read this
 morning and reads this afternoon still cannot be written. A ledger of missed days would unlock no
