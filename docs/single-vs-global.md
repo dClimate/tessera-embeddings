@@ -33,7 +33,7 @@ Otherwise, the **model, ingest, and inference are identical**. Assembly shares i
 point of writing, and then the two write differently — the global path lays down whole 2048-pixel
 tiles into slots that were set aside in advance,in order to let many machines add to one
 dataset at once; the single-area path creates or extends a store of its own. That difference
-reaches the data in one place, and it is worth knowing before you compare the two: where a tile
+reaches the data in one place, and it matters when comparing the two: where a tile
 was looked at and refused — no pixel in it passed the quality rules — the global path still writes
 the observation counts it measured there, while the single-area path leaves them at fill. So a
 refused footprint reads as zero observations in a single-area output and as the real count in the
@@ -42,10 +42,11 @@ asymmetry is deliberate, and the reason is in a comment at the write site. What 
 is how much you run at once, how you say which ground you want, and what the output store looks
 like when it lands.
 
-If you are uncertain, you almost certainly should use the single-area path. If you need global coverage,
-first check if the published multi-year global dataset at s3://tessera-embeddings/v1.1/dclimate.icechunk
-works for you. The single path is simpler and more flexible about time periods, can be flexibly run
-on different cluster sizes or single machines, and is vastly more cost-effective for small area analysis.
+If you are uncertain, you almost certainly should use the single-area path. If you need global
+coverage, first check if the published multi-year global dataset at
+s3://tessera-embeddings/v1.1/dclimate.icechunk works for you. The single path is simpler and more
+flexible about time periods, can be flexibly run on different cluster sizes or single machines,
+and is vastly more cost-effective for small area analysis.
 
 ## What is genuinely the same
 
@@ -239,7 +240,7 @@ The global campaign does not rasterise a polygon. Its coverage comes from a prep
 one bitmap per UTM zone, marking which 2048-pixel tiles contain land. That store is built once
 from a global delivery of small per-cell files, and the campaign reads it to decide what exists.
 
-Two consequences worth knowing:
+Two consequences:
 
 - **It is tile-granular, not pixel-granular.** A coastal tile with any land in it is included
   whole, so the ocean pixels inside that tile come along — and they are **embedded, not dropped**.
@@ -330,10 +331,10 @@ Without it the dataset holds exactly the same numbers; `time_bnds` just lists lo
 start of the exact January-to-December window that slot holds**
 (`time_convention="calendar_year"`, and the fill runner rejects any other window, so the label
 always matches the data). The companion `time_bnds` variable, shape `(time, 2)` and linked from
-`time.attrs["bounds"]` as CF requires, states each slot's interval outright:
-`[YYYY-01-01, (YYYY+1)-01-01)` — half-open, so the upper bound is the following 1 January and
-the whole of 31 December is inside the interval. Rolling twelve-month windows are never written here; they belong in a
-single-area store, whose convention is one entry per window, labelled by the month it ended.
+`time.attrs["bounds"]` as CF requires, states each slot's interval outright: `[YYYY-01-01,
+(YYYY+1)-01-01)` — half-open, so the upper bound is the following 1 January and the whole of 31
+December is inside the interval. Rolling twelve-month windows are never written here; they belong
+in a single-area store, whose convention is one entry per window, labelled by the month it ended.
 
 **How many observations fed each pixel.** Three count layers record it —
 `s2_obs_count`, `s1_asc_obs_count`, `s1_desc_obs_count` — always written, with `0` meaning none.
@@ -526,8 +527,8 @@ finished tile from an interrupted one, is in the
 ## Which should I use?
 
 **Use the single-area path if** you have a study area, you want one or several time windows that are
-not a calendar year, you want to iterate quickly, or you are evaluating whether these embeddings help
-you at all.
+not a calendar year, you want to iterate quickly, or you are evaluating whether these embeddings
+help you at all.
 
 **Use the global dataset if** the area you want is already filled. Reading a published store is
 free and instant compared with computing anything.

@@ -126,9 +126,9 @@ answer.
                                          Never skip a date on a guess.
 ```
 
-The last branch is the important one. **A date is only ever abandoned on positive evidence that the
-image itself is unusable.** Anything we cannot explain fails the job instead, which costs time and
-is recoverable, rather than costing a date, which is not.
+**A date is only ever abandoned on positive evidence that the image itself is unusable.** Anything
+we cannot explain fails the job instead, which costs time and is recoverable, rather than costing
+a date, which is not.
 
 ### Waiting: where it happens changes what it costs
 

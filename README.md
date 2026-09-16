@@ -132,18 +132,20 @@ run this at production scale. They are examples, not requirements.
 This repository supports two pathways, referred to in the code base as SINGLE and GLOBAL.
 
 **One region of interest (ROI).** You supply an area of interest — a polygon, a set of Sentinel-2 tiles, or any mask
-you can draw — and get embeddings for it over any twelve-month window you choose. This runs on a cloud cluster
-or equally on one machine; the [quickstart](docs/quickstart.md) does it on a laptop in a few minutes.
+you can draw — and get embeddings for it over any twelve-month window you choose. This runs on a
+cloud cluster or equally on one machine; the [quickstart](docs/quickstart.md) does it on a laptop
+in a few minutes.
 
 Our assumption is that the vast majority of users of this repository will follow the single ROI 
 path for their custom workflows.
 
 **The whole world.** The same pipeline, run as a campaign over the world's land between
 **59.45°S and 83.65°N** (Antarctica is excluded), one UTM zone and one calendar year at a time.
-The result is published as **global TESSERA v1.1** at `s3://tessera-embeddings/v1.1/dclimate.icechunk/`,
-so in most cases you can read it rather than compute anything — checking each zone's `years_complete`
-first, because unfilled cells read back as fill values rather than as an error. Note that each UTM
-zone corresponds to one zarr group and the data within is projected to the corresponding UTM-specific EPSG.
+The result is published as **global TESSERA v1.1** at
+`s3://tessera-embeddings/v1.1/dclimate.icechunk/`, so in most cases you can read it rather than
+compute anything — checking each zone's `years_complete` first, because unfilled cells read back
+as fill values rather than as an error. Note that each UTM zone corresponds to one zarr group and
+the data within is projected to the corresponding UTM-specific EPSG.
 
 The global campaign is complex, long, and extremely expensive (see ['context_docs/campaign/campaign-cost-model.md'](context_docs/campaign/campaign-cost-model.md)). When done it creates a more complex Icechunk Zarr with
 Zarr Groups that require a very slightly more complex access pattern. We have primarily exposed
@@ -157,10 +159,10 @@ as it already does robustly for the single ROI use case. This was hard-coded pur
 of convenience.
 
 **The model and the ingest are the same code in both**, and assembly is shared up to the point of
-writing. What differs is scale, how you include/exclude oceans and other unwanted areas,
-the store's conventions — most importantly that the global store holds calendar years only, while
-a single area can use any twelve-month window — and the campaign's different pixel-selection settings
-— two of them looser than the library defaults and one stricter — which mean the same
+writing. What differs is scale, how you include/exclude oceans and other unwanted areas, the
+store's conventions — most importantly that the global store holds calendar years only, while a
+single area can use any twelve-month window — and the campaign's different pixel-selection
+settings — two of them looser than the library defaults and one stricter — which mean the same
 area and year can give different results on the two paths.
 
 **→ [`docs/single-vs-global.md`](docs/single-vs-global.md)** explains in greater detail the differences between
@@ -511,8 +513,8 @@ tests/                   unit, architecture, integration, parity and GPU tiers
 ## Using this for your own project
 
 The domain layer is a library, not a framework: there is nothing to inherit and nothing
-to register. You import the functions you want and call them. Four things are worth
-knowing before you build on it.
+to register. You import the functions you want and call them. Four things shape what you can
+build on it.
 
 **Depend only on the documented public API.** This library follows semver for the surface
 listed in [`docs/public-api.md`](docs/public-api.md). Anything outside it —

@@ -406,7 +406,7 @@ one zone skipped 13 of 58 dates, and some zones have an orbit that reaches land 
 the year. Skipping those creates no store, letting `resolve_s1_orbit` downgrade to single-orbit
 rather than publishing a store of fill that inference would read as real signal.
 
-**The safety rule, and it is the whole design.** A footprint that is too LARGE only costs
+**The safety rule is to widen, never narrow.** A footprint that is too LARGE only costs
 computed area that would have been discarded; one that is too SMALL drops imagery and nothing
 downstream notices. Every uncertain path widens rather than narrows: an unreadable footprint
 returns the full window set, and on S1 a time slice that cannot be matched to its items writes

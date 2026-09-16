@@ -369,7 +369,7 @@ chokepoint is that this table has no exceptions:
 
 The two timestamp forms differ (noon in flight, midnight in the store) and never meet as
 numbers: everything crossing that boundary compares `YYYY-MM-DD` strings. The one deliberately
-UTC row is the query bound, because a catalogue has no other vocabulary — which is exactly why
+UTC row is the query bound, because a catalogue has no other vocabulary — which is why
 ownership, not the query bound, decides what gets written. Noon rather than midnight is what
 makes the stamp read as the solar day both directly and after `odc.stac.load` groups on it: noon
 leaves half a day of margin, and no offset the grid produces (±11 h nearest the antimeridian)
@@ -397,8 +397,7 @@ missing acquisitions; padding the query but clamping the pad to the window loses
 last solar day of a zone-year, since the padding vanishes at the window's own edges. Both are
 silent — `assessed_window` still covers the days and the coverage gate still passes.
 
-The mechanism is one idea. A chunk **owns** a range of solar days and **queries** a wider range
-of UTC dates:
+A chunk **owns** a range of solar days and **queries** a wider range of UTC dates:
 
 ```text
                  own:            2024-01-31 .............. 2024-02-29
@@ -456,7 +455,7 @@ then treats them as concurrent acquisitions and mosaics them into a single time 
 A mosaic slice represents one **solar day**, and it is labelled with that day — taken from the
 grouping key, not from the loaded dataset's own time coordinate.
 
-That distinction matters. `odc.stac.load` stamps each group from `group[0]`, tying the
+`odc.stac.load` stamps each group from `group[0]`, tying the
 label to whichever item the sort left first — which can disagree with the solar day wherever the
 offset crosses UTC midnight, so two consecutive solar days collide on the time axis: the batched
 write rejects them as not strictly increasing, the unbatched write rejects the second as a
@@ -483,7 +482,7 @@ per date window; an impossible job is crossed off and replaced by two shorter on
 The problem this shape exists for: Earth Search refuses **any request whose answer would exceed
 about 6 MB**, AWS Lambda's synchronous response limit. The refusal arrives in 1.3 seconds, as fast
 as a success, so nothing is overloaded and repeating cannot help — the remedy is always to ask for
-a smaller answer. The diagram is the whole mechanism; everything after it is detail.
+a smaller answer.
 
 ```text
 WHY A REQUEST GETS REFUSED -- the whole mechanism, in one line
@@ -717,7 +716,7 @@ silent, a skipped correction leaving plausible pixels 1000 too high and a double
 every value by 1000.
 
 So `baseline_threshold` **is** set for Earth Search, and the decision is made per ASSET from where
-that asset lives (`boa_offset.source_decision`). Three properties of it are worth stating:
+that asset lives (`boa_offset.source_decision`). Three properties of that decision:
 
 - **Judged over the reflectance bands only.** A real Element 84 item carries the original JP2s
   as extra assets beside its COG bands, so judging every asset reports a straddle for an item
