@@ -28,7 +28,7 @@ as possible.**
 
 A GPU-equipped machine costs many times what a CPU one does, and the model itself is quick.
 On a naive pipeline the card sits idle roughly **half the time** — not waiting on
-arithmetic, but waiting for imagery to arrive from S3, for the next batch of pixels to be
+computation, but waiting for imagery to arrive from S3, for the next batch of pixels to be
 prepared, and for finished results to be written back. Most of what follows removes a reason
 for the card to wait rather than making the model faster.
 
@@ -515,7 +515,7 @@ runtime size**: every actor calls `batch_size_for_gpu` at start-up, which scales
 the card's VRAM, the actor's share of that card, and the deepest sequence its buckets can
 reach. On the A10G and L4 fallback paths, and for any fractional-GPU actor, the real batch is
 smaller — so read a throughput or memory figure against the batch that actor actually chose.
-The size is not arbitrary. The model's arithmetic is
+The size is not arbitrary. The model's work is
 dominated by large matrix multiplications, and GPUs run those on dedicated hardware
 (tensor cores) that is only efficient when the matrices are big — a larger batch makes each
 multiplication bigger, so less of that hardware sits unused. 7,168 was measured as the
@@ -545,7 +545,7 @@ bandwidth or host-side queueing is the constraint, this pipeline only answers th
 ```
 
 The operations are issued in the same order, on the same stream, as the plain serial loop,
-so the arithmetic is unchanged and the outputs are **identical bit for bit**. Set
+so the computation is unchanged and the outputs are **identical bit for bit**. Set
 `TESSERA_SERIAL_GPU_LOOP=1` to use the serial version; the pipelined one is CUDA-only.
 
 **Batch preparation had to be made faster than the GPU.** The resamplers in §6 are
@@ -976,9 +976,9 @@ dump is the only way to get one
 
 ## Performance
 
-The GPU is idle about half the time in a naive pipeline, and almost none of that is arithmetic —
-it is waiting for data to cross a memory hierarchy narrower than the compute it feeds. What closes
-each source of that idle time, and how much it buys, is in
+The GPU is idle about half the time in a naive pipeline, and almost none of that time is spent
+computing — it is waiting for data to cross a memory hierarchy narrower than the compute it feeds.
+What closes each source of that idle time, and how much it buys, is in
 **[inference-performance.md](../../../docs/inference-performance.md)**.
 
 ## Fault tolerance

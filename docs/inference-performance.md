@@ -1,9 +1,10 @@
 # Inference performance: keeping the GPU fed
 
 The GPU is fast enough. A naive pipeline leaves it idle about half the time, and almost none of
-that is arithmetic — it is waiting for data. Imagery travels from S3 to host memory, across PCIe
-into VRAM, and then into the tensor cores, each hop narrower than the compute it feeds. That idle
-falls into **three windows**, the fixes into **two families**, and the adaptive family turns on
+that time is spent computing — it is waiting for data. Imagery travels from S3 to host memory,
+across PCIe into VRAM, and then into the tensor cores, each hop narrower than the compute it
+feeds. That idle falls into **three windows**, the fixes into **two families**, and the adaptive
+family turns on
 **two kinds of sparsity**. Nothing here changes what the model computes.
 
 ## Why the card idles
@@ -33,12 +34,12 @@ optimization below is tagged with the window it reclaims.
 
 ## Why a faster card would not fix it
 
-Even with data resident, the card is not short of arithmetic. Fleet telemetry shows the L40S
+Even with data resident, the card is not short of compute. Fleet telemetry shows the L40S
 running its multiprocessors at 99% occupancy while the tensor pipes sit under half engaged, at 85
 effective TFLOPS against 362 quoted. An A10G-versus-L4 comparison settled why: the card with
 twice the bandwidth and barely half the tensor compute is the faster one. The forward pass is
 **memory-bandwidth bound** — the limit is moving operands in and out of VRAM, not multiplying
-them. That is what makes batch size a lever, since a larger batch does more arithmetic per byte
+them. That is what makes batch size a lever, since a larger batch does more computation per byte
 moved, and why pinned, double-buffered transfers buy more than raw FLOPS would.
 
 ## The two families of fix
@@ -76,7 +77,7 @@ to the model; the envelope and the harness are in
 
 *Reference for the sections that follow.*
 
-- **GEMM** — a general matrix–matrix multiply, the dominant arithmetic inside the
+- **GEMM** — a general matrix–matrix multiply, the dominant computation inside the
   transformer. GPUs run GEMMs on dedicated **tensor cores**, which are most efficient
   when the matrices are *large*; a bigger **batch** (more pixels multiplied in one go)
   makes each GEMM larger, so the tensor cores idle less.
