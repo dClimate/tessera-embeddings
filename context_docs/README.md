@@ -53,7 +53,7 @@ context_docs/
 │                                                  three quarters of that is a polarisation choice
 │
 ├── ingest/                        BUILDING THE MOSAICS
-│   ├── ingest-performance.md                   what ingest costs, what made it faster, and what
+│   ├── campaign-ingest-measurements.md         what ingest costs, what made it faster, and what
 │   │                                              limits it now — the graph budget, the catalogue
 │   │                                              budget, live-tile cropping, region writes
 │   ├── source-read-failures.md                 twelve ways a source read fails, the guard each

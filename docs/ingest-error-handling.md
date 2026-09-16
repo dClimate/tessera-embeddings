@@ -24,7 +24,7 @@ Twelve distinct causes were diagnosed over the campaign, and several need opposi
 The cost of getting one wrong is uneven, and that shapes everything below. A store's dates are
 append-only: a date can only be added after the newest one already there. Give up on a date and
 it is gone. Give up too late and the cost is wall clock on a job that gets dispatched again
-anyway. So the pipeline spends time rather than dates, and abandons a date only on positive
+anyway. The pipeline spends time rather than dates, and abandons a date only on positive
 evidence that the imagery itself is unusable.
 
 One classifier in `duplicates.py` decides, over one set of evidence, reached through a single
@@ -39,7 +39,7 @@ or what the callers do with its answer, organised by what failed:
 ## How a failure is decided
 
 Reading one satellite image can fail for very different reasons, and the right answer to each is
-different — sometimes opposite. So a failed read is asked one question, once, and gets exactly one
+different — sometimes opposite. A failed read is asked one question, once, and gets exactly one
 answer.
 
 ```
@@ -104,13 +104,13 @@ run starts*).
 
 One extra guard: the long wait is only granted after a job has already read something successfully.
 "Access denied" looks identical whether the provider is misbehaving or our permissions are simply
-wrong — but wrong permissions fail the very first image, while a provider wobble arrives after the
-job has already been served. So the first successful read is what earns the patience.
+wrong, but wrong permissions fail the very first image, while a provider wobble arrives after the
+job has already been served. The first successful read is what earns the patience.
 
 ## The catalogue would not answer
 
 Both of these happen before a single pixel is read, so the remedy is always to ask again, ask
-differently, or stop the leg — never to abandon a date.
+differently, or stop the leg, never to abandon a date.
 
 ### When the catalogue refuses: naming the request, and telling the two refusals apart
 
@@ -119,7 +119,7 @@ client stack make that necessary:
 
 - **The request is discarded on the way up.** `StacApiIO.request` catches every transport failure
   and re-raises `APIError(str(err))`, which names only the host and endpoint path. A STAC search
-  is a request **body**, so the collection, window, bbox and page are gone — and without them a
+  is a request **body**, so the collection, window, bbox and page are gone, and without them a
   refusal cannot be narrowed to a month or a page, reproduced, or reported upstream.
 - **Our layer sits ABOVE a retry ladder, and only partly behind it.** For a force-listed status
   what escapes is the ladder reporting its own exhaustion, a much stronger statement than one
@@ -149,7 +149,7 @@ and need opposite responses:
 
 A `LOAD` verdict draws the **expansive retry**: the leg-retry ladder's long, doubling delays,
 granted without counting against the attempt budget for as long as the upstream keeps naming
-itself. Everything else gets the ordinary attempt limit. So the two named sets must jointly cover
+itself. Everything else gets the ordinary attempt limit. The two named sets must jointly cover
 the ladder's `status_forcelist`, or a status the ladder retries but the taxonomy does not name
 falls to `UNKNOWN` and keeps that expansive retry forever; a unit test asserts the containment.
 The converse is deliberate: the taxonomy names 502, which the ladder does **not** retry, and a
@@ -178,7 +178,7 @@ documented fallback for a refusal that crossed a boundary carrying no chain.
 
 **A status is necessary and not sufficient.** A gateway can fail for minutes and recover, so one
 exhaustion is not proof of a defect. What settles it is a REPEAT — the identical request refused
-the identical way on a later attempt — and that belongs to whoever holds the attempt budget,
+the identical way on a later attempt, and that belongs to whoever holds the attempt budget,
 `ingest_zone_year`'s leg loop: this module classifies, the budget holder supplies the repeat. The
 two live in separate deployment runs, so the only thing crossing between them is failure text —
 hence one whitespace-free token under a stable name (`CATALOGUE_REFUSAL=`), matched by name and
@@ -231,7 +231,7 @@ page, or a document cut off partway through.
 **This slips past every defence we have.** Everything that decides whether to retry a request
 looks at the response's status code, and here the status code is fine: it says success, and by the
 only measure those checks apply it *was* a success. Only the body is wrong, and nothing inspects
-the body. So the request sails through the retry logic untouched and fails later, when something
+the body. The request sails through the retry logic untouched and fails later, when something
 tries to read it as JSON, with a message that says only:
 
 ```
@@ -272,7 +272,7 @@ path does differently because it has no second copy to fall back on.
 
 ### GDAL network tuning
 
-`configure_gdal_environment()` (in [`config/environment.py`](../config/environment.py)) must be
+`configure_gdal_environment()` (in [`config/environment.py`](../src/tessera_embeddings/config/environment.py)) must be
 called before importing `rasterio` or `odc.stac`. It sets GDAL config options for network
 resilience (retry counts, timeouts, connection pooling) that affect all subsequent COG reads.
 
@@ -353,7 +353,7 @@ immediately, where without attribution the ladder first walks every *other* tile
 a full re-read of the date per rung, to reach the same answer.
 
 Attribution can fail — a worker that died with the read, a cluster already gone, a loader that
-words its message differently — and the unattributed behaviour above is then the fallback. The
+words its message differently, and the unattributed behaviour above is then the fallback. The
 record says which happened: `scope=attributed` means the named objects are the ones that failed,
 `scope=whole-date` means the failing object was not identified and the tiles listed are every tile
 in the date.
@@ -383,7 +383,7 @@ The in-leg budget is `WAIT_OUT_BACKOFF_S` and the between-attempt one is
 
 Carrying the verdict between the two takes a type: the leg-retry layer sees only a failure DETAIL
 string, and no marker on it can separate a refused read from a crash, since the wrapper discarded
-the cause. So a radar write that exhausts its in-leg budget on a refusal raises
+the cause. A radar write that exhausts its in-leg budget on a refusal raises
 `errors.ProviderRefusedReadsError`, whose name reaches the detail and is what `_leg_backoff_s`
 keys the long delay on. Nothing else about the failure changes.
 
@@ -394,7 +394,7 @@ Everything above reads the exception chain. Some of a read failure's reason neve
 A refused object is not empty: S3 answers the range request with an XML error document, and GDAL
 hands it to the TIFF decompressor, which fails on it — `ZIPDecode: Decoding error at scanline 0`,
 sometimes `unknown compression method`. That is what gets raised. GDAL states the refusal as a
-warning in its own log and raises nothing about it. So the chain says the bytes are bad and the
+warning in its own log and raises nothing about it. The chain says the bytes are bad and the
 log says the service refused, and those verdicts are opposites: bad bytes gives the date up,
 refused waits and gives up nothing.
 
@@ -489,7 +489,7 @@ months of sound data.
 The radar response is the tail of the optical one without the copy ladder, which radar has no use
 for: OPERA publishes one copy of a granule, so there is nothing to step down to.
 
-1. **Retry**, through the shared `store_write_retrying` policy — and for a provider refusal that
+1. **Retry**, through the shared `store_write_retrying` policy, and for a provider refusal that
    arrived after a successful read, retry past the attempt limit, because waiting is the only
    response a refusal has. Radar is the one caller that asks for this.
 2. **Fail the leg under a name the cell can act on** if that wait was not enough
@@ -559,7 +559,7 @@ run does.
 
 Once a day is closed, what happened on it stops mattering: an image that would not read this
 morning and reads this afternoon still cannot be written. Readability can change; the outcome
-cannot. So there is no ledger of missed days — it would unlock no action, would have to stay in
+cannot. There is no ledger of missed days — it would unlock no action, would have to stay in
 step with the store, and would be deleted along with the mosaic it was written on.
 
 **The published product already answers the question a reader actually has.** A mosaic is an

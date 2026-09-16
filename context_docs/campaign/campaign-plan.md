@@ -1070,7 +1070,7 @@ pointer, never a derivation.
 | this file | what runs, with what settings, in what order, and what to do when it breaks | any figure's derivation |
 | [`campaign-cost-model.md`](campaign-cost-model.md) | every cost, rate, fleet size and GPU-hour figure; the per-pixel source-coverage census; and (§5b) how work balances across N clusters | operational order |
 | [`../inference/inference-on-gpus.md`](../inference/inference-on-gpus.md) | everything the GPU does: the saturation work, which cards may be rented, how the batch is sized to one, and the measured per-cell campaign behaviour behind the cost basis | anything from a run still in flight, which it now refuses to carry |
-| [`../ingest/ingest-performance.md`](../ingest/ingest-performance.md) | every ingest measurement — what each change bought, what failed, the graph and catalogue budgets, and the fleet-scale throughput work | any figure quoted without its season, since the duration basis is January-conditions |
+| [`../ingest/campaign-ingest-measurements.md`](../ingest/campaign-ingest-measurements.md) | every ingest measurement — what each change bought, what failed, the graph and catalogue budgets, and the fleet-scale throughput work | any figure quoted without its season, since the duration basis is January-conditions |
 | [`../storage/writing-to-the-global-store.md`](../storage/writing-to-the-global-store.md) | how a finished cell is written: the fork pool, the session catch-up, the credential incident, why commits are ungated, and the published registry | the store's user-facing layout, which is §2 here |
 | [`radar-coverage-by-zone.md`](radar-coverage-by-zone.md) | which zones publish **no** usable radar at all, and the polarisation reason Greenland and Arctic Canada are optical-only | how much LAND has radar — that is a per-pixel question and belongs to the cost model |
 | [`campaign-validation-and-monitoring.md`](campaign-validation-and-monitoring.md) | how each cell is checked, what blocks, and how a finding reaches a person | whether a given cell passed, which is its verdict on file |
@@ -1092,7 +1092,7 @@ do not cite each other. **Read it before publishing a figure or reusing one.**
 
 - [`campaign-cost-model.md`](campaign-cost-model.md) — costs, GPU fleet sizing, the idle-burn
   arithmetic, the observation-count model behind the throughput basis, and the cluster split.
-- [`../ingest/ingest-performance.md`](../ingest/ingest-performance.md) — every ingest
+- [`../ingest/campaign-ingest-measurements.md`](../ingest/campaign-ingest-measurements.md) — every ingest
   measurement: what each change bought and what failed.
 - [`../decisions/011-campaign-zone-ingestion.md`](../decisions/011-campaign-zone-ingestion.md)
   — why the campaign triggers ingestion per zone.

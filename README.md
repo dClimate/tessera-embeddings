@@ -310,7 +310,7 @@ chunk-aligned windows that intersect the ROI mask (measured
 campaign-wide: ~4.3× less compute; a sparse island zone drops from
 3,706 chunks per band-date to 4). This is unconditional and has no
 flag — it serves a single sparse ROI and a global campaign zone alike.
-See [the ingest README](src/tessera_embeddings/ingest/README.md#cropping-to-live-windows-unconditional).
+See [the ingest performance notes](docs/ingest-performance.md#cropping-to-live-windows-unconditional).
 
 ### Profiling a run
 

@@ -53,7 +53,7 @@ repo.save_config()   # REQUIRED to persist; workers re-opening read persisted co
 
 **The split config must be identical across create and every later open** (library precedent: the
 `manifest_split()` contextmanager docstring). Which axis to split on is a workload question, and the
-measurement is in [`../ingest/ingest-performance.md`](../ingest/ingest-performance.md) §12.7: **split
+measurement is in [`../ingest/campaign-ingest-measurements.md`](../ingest/campaign-ingest-measurements.md) §12.7: **split
 the axis along which a single commit is NARROW.**
 
 ## Fork and merge (cooperative writes)

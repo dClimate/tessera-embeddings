@@ -1113,7 +1113,7 @@ the cold first-chunk-per-worker prologue (~36 s, ~85 chunks on `a60550ae` as the
 cannot reach. **The next structural lever is source-store chunk geometry:** the 4000² storage
 chunking drives a ~13 s fixed read amplification, and an inference-aligned geometry chosen before a
 global ingestion would cut it for every future run. That is a config choice beforehand and a
-re-ingest afterwards — see [`../ingest/ingest-performance.md`](../ingest/ingest-performance.md) §4 for
+re-ingest afterwards — see [`../ingest/campaign-ingest-measurements.md`](../ingest/campaign-ingest-measurements.md) §4 for
 why the store chunk was not coarsened, which is the same trade seen from the ingest side.
 
 **There is no CI coverage of the CUDA path and that is accepted** — there is no GPU runner and none

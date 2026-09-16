@@ -402,7 +402,7 @@ billing assumptions. **What drives the figure is the area you keep, not the box 
 draw** — both ingest and inference skip whole chunks that fall outside your mask, so a
 compact area costs close to its own extent while a scattered one pays for every tile it
 lands on. The mechanism, and the measured saving, are in
-[the ingest README](../../src/tessera_embeddings/ingest/README.md#cropping-to-live-windows-unconditional).
+[the ingest performance notes](../ingest-performance.md#cropping-to-live-windows-unconditional).
 
 **Do not extrapolate them to a global run.** A campaign's bill is not a per-area figure
 multiplied up: storage, S3 requests and the container fleet together came to more than a

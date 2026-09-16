@@ -3,7 +3,7 @@
 **Dated 2026-07-29.** Extends the July-27 ingest cost estimate — which costed **ingest
 only** — to the whole campaign: ingest, inference, assembly, and the permanent output
 store. Nine years × **112 land zones**. The ingest measurements it rests on are recorded in
-[`../ingest/ingest-performance.md`](../ingest/ingest-performance.md); section references below of
+[`../ingest/campaign-ingest-measurements.md`](../ingest/campaign-ingest-measurements.md); section references below of
 the form "ingest estimate §N" point at that record.
 
 **This is the figures annex to [`campaign-plan.md`](campaign-plan.md).** That document owns
@@ -282,7 +282,7 @@ the cheap half of the campaign. It does not change the inference line, which §6
    sooner, so re-scaling `max_workers` is not where the money is.
 3. **The fit's own basis** is five regions at R² 0.954, on code that has since changed.
 
-**Investigation and plan: [`../ingest/ingest-performance.md`](../ingest/ingest-performance.md)
+**Investigation and plan: [`../ingest/campaign-ingest-measurements.md`](../ingest/campaign-ingest-measurements.md)
 §11, "Throughput at fleet scale".** Six candidate causes
 are ruled out, including the orchestrator, the Dask schedulers, capacity, and store growth. Two
 findings bear directly on this section. Per-date cost rises through a run because **windows per
@@ -374,7 +374,7 @@ chunks or one completed full-year cell before committing a schedule to it. **Sea
 predictable and schedulable, so peak months can be planned around rather than hunted as a
 defect.**
 
-Full derivation: [`../ingest/ingest-performance.md`](../ingest/ingest-performance.md) §11.
+Full derivation: [`../ingest/campaign-ingest-measurements.md`](../ingest/campaign-ingest-measurements.md) §11.
 
 Two properties of the fit matter for anything that reasons about *individual* zones rather
 than the aggregate, and the aggregate basis hides both:
@@ -1097,7 +1097,7 @@ of the comparison.
 
 ## 11. Where the underlying detail lives
 
-- [`../ingest/ingest-performance.md`](../ingest/ingest-performance.md) — the authoritative record of
+- [`../ingest/campaign-ingest-measurements.md`](../ingest/campaign-ingest-measurements.md) — the authoritative record of
   every ingest measurement this rests on: what each change bought, what failed, the fleet-scale
   throughput investigation behind §4, and the constraints future work must respect.
 - [`../inference/inference-on-gpus.md`](../inference/inference-on-gpus.md) — where the throughput
