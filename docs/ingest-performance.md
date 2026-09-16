@@ -1,30 +1,32 @@
 # Ingest performance: what bounds a run, and the levers against it
 
-An ingest is not bounded by the imagery. It is bounded by the Dask scheduler, a single process
-that holds the whole task graph in memory before a worker reads a byte and dispatches every task
-through one event loop. The job is to keep the graph inside that process while keeping a fleet of
-hundreds of machines busy, and those two goals pull in opposite directions.
+An ingest is not bounded by the imagery. It is bounded by the Dask scheduler: a single process
+that holds the entire task graph in memory before a worker reads a byte, and that hands out every
+task through one event loop. Overwhelm it and it does not simply run out of memory. It gets slow
+at distributing work, and a fleet of hundreds of machines sits idle waiting to be given
+something to do.
 
 ## The problem, and the shape of the answer
 
-A zone-year over a large region describes millions of tasks. At roughly 1.5 KB each, the graph
-alone exhausts the scheduler before any pixel is read. But a small graph is easy to make idle:
-write one window at a time and the fleet waits through each one. Too far either way and the run
-fails, out of memory or paying for idle machines.
+A zone-year over a large region describes millions of tasks. At roughly 1.5 KB each the graph can
+exhaust the scheduler's memory before a pixel is read, and well short of that it saturates the
+loop doing the dispatching: tasks go out more slowly than workers finish them, the queue drains,
+and the fleet waits. **A graph that is too large buys idleness, not throughput.**
+
+A graph that does fit can still leave the fleet idle, for an unrelated reason: write one window
+at a time and every machine waits through each write.
 
 Every lever here does one of two things:
 
-- **Keeps the graph small.** Per-date iteration on optical and windowed batching on radar bound
-  what one graph describes. Cropping to live windows then removes the ocean, which on a sparse
-  zone is most of the extent.
-- **Keeps the fleet busy.** Overlapping a date's window writes, preparing the next date behind
-  the current one, and fusing several dates into one compute.
+- **Keeps the graph small,** so the scheduler can dispatch fast enough to keep the fleet fed:
+  per-date iteration on optical, windowed batching on radar, and cropping to live windows, which
+  on a sparse zone removes most of the extent.
+- **Keeps the fleet busy** once the graph fits: overlapping a date's window writes, preparing the
+  next date behind the current one, and fusing several dates into one compute.
 
-Because the two pull against each other, several levers are priced rather than switched on. The
-window merge buys fewer blocking writes with dead compute, at a rate that holds only while writes
-are cheap. Date batching helps small regions, is neutral on large ones and costs about a third on
-mid-sized ones, so it is sized per region. Figures here are measured; the derivations are in
-`context_docs/ingest/campaign-ingest-measurements.md`.
+The two interact, which is why several levers are priced rather than switched on: filling idle
+slots by enlarging the graph can slow the scheduler enough to empty the fleet again. Figures are
+measured, with derivations in `context_docs/ingest/campaign-ingest-measurements.md`.
 
 ## What bounds the run
 
@@ -47,6 +49,13 @@ This is fully predictable and independent of data size. A graph with 1 million t
 ~1.5 GB of scheduler RAM before any worker reads a single byte. Nothing is read until the Zarr
 write triggers the compute, so a date's whole pipeline — load, correct, mask, write — is one
 graph execution and the scheduler holds all of it at once.
+
+**RAM is the limit that kills a run, but it is not the one that shows up first.** The same process
+that holds the graph also assigns every task, on one event loop, and it slows down as the graph
+grows. Past a certain size the fleet finishes work faster than the scheduler can hand more out,
+so workers idle while the scheduler is pinned — the run is not out of memory, it is just paying
+for machines that are waiting. `MAX_TASKS_PER_WINDOW` and the per-date iteration below are sized
+against dispatch throughput for that reason, not against the RAM figure above.
 
 The HLG itself is compact — it stores *layer dicts* rather than expanded objects. The
 expansion to TaskStates happens only when the graph is submitted to the scheduler:
