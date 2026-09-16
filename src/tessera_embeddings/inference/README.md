@@ -25,22 +25,29 @@ and abandoned, is in
 **Every design choice below exists to keep the GPU busy — fully busy, as much and as often
 as possible.**
 
-That is worth saying once, plainly, because it explains the rest of the document. A
-GPU-equipped machine costs many times what a CPU one does, and the model itself is quick.
+A GPU-equipped machine costs many times what a CPU one does, and the model itself is quick.
 On a naive pipeline the card sits idle roughly **half the time** — not waiting on
 arithmetic, but waiting for imagery to arrive from S3, for the next batch of pixels to be
-prepared, and for finished results to be written back. Nothing here makes the model
-faster. Everything here removes a reason for the card to wait.
+prepared, and for finished results to be written back. Most of what follows removes a reason
+for the card to wait rather than making the model faster.
 
-Two consequences run through the whole design. Work is shaped so that reading, preparing
+**Not all of it, though.** The forward pass itself was also changed: the recurrent layer is
+fused so cuDNN runs it in about one kernel launch instead of 480, positional encoding is kept
+from dragging the whole graph into FP32, and the training-only heads never reach the model at
+all. Those are changes to what runs on the card, and they are what gave the scheduling work a
+fast forward pass to schedule around. They have their own section in the performance document.
+
+Two consequences run through the rest of the design. Work is shaped so that reading, preparing
 and writing happen *while* the GPU computes rather than in front of it. And the pipeline
 deliberately leaves host memory unused, because the cost of running out of it — a killed
 worker, and its tile redone — is far higher than the cost of a read that was not
 overlapped.
 
 [**docs/inference-performance.md**](../../../docs/inference-performance.md) maps every source of
-that idle time onto the thing that closes it, with relative impact. If you read one thing, read
-that; the phase-by-phase description below is the reference for what each stage actually does.
+that idle time onto the thing that closes it, with relative impact, and carries
+[the model changes](../../../docs/inference-performance.md#the-model-itself-was-also-changed).
+If you read one thing, read that; the phase-by-phase description below is the reference for what
+each stage actually does.
 
 ## Words used here
 
@@ -63,7 +70,8 @@ without further explanation.
 ## Contents
 
 - [Architecture at a glance](#architecture-at-a-glance)
-- [How a tile becomes embeddings](#how-a-tile-becomes-embeddings)
+- [Inference: how a tile becomes embeddings](#inference-how-a-tile-becomes-embeddings)
+- [Assembly: how staged tiles become a store](#assembly-how-staged-tiles-become-a-store)
 - [Performance](../../../docs/inference-performance.md)
 - [Fault tolerance](#fault-tolerance)
 - [Key configuration (`config.py`)](#key-configuration-configpy)
@@ -125,7 +133,7 @@ Input mosaic stores (Icechunk/Zarr on S3):
 
 ---
 
-## How a tile becomes embeddings
+## Inference: how a tile becomes embeddings
 
 ### 1. Deciding which tiles to run
 
@@ -491,8 +499,7 @@ they are concatenated, so the model sees per-orbit statistics rather than blende
 
 ### 7. The forward pass on the GPU (`inference.py`)
 
-This is the part every other section exists to serve. The arrangement below is what keeps
-the card from ever waiting.
+The arrangement below is what keeps the card from ever waiting.
 
 **One bucket at a time, biggest sequence first.** `iter_buckets(largest_first=True)` sorts by
 `s2_target × s1_target` descending, so the first bucket has the largest sequence shape — which
@@ -522,8 +529,8 @@ separate copy stream**: every operation goes on the current stream, in the seria
 What the pipeline buys is host-side queueing — while the GPU works through batch *i*, the host
 has already enqueued batch *i+1*'s copy and forward and is draining batch *i−1*'s results, so
 the card never waits for the host to catch up. It does **not** overlap a transfer with a
-forward pass; same-stream work still runs in order. That distinction matters when you are
-deciding whether transfer bandwidth or host-side queueing is the constraint.
+forward pass; same-stream work still runs in order. So if the question is whether transfer
+bandwidth or host-side queueing is the constraint, this pipeline only answers the second.
 
 ```
  serial loop:     [H2D][═ fwd i ═][D2H][scatter][H2D][═ fwd i+1 ═][D2H][scatter]
@@ -631,7 +638,15 @@ delegates to `quantize_rows`.
 Assembly validates that staged tiles carry these dtypes and rejects a mismatch, so a
 change of dtype cannot silently corrupt a store.
 
-### 9. Staging a finished tile (`assembly.py`)
+---
+
+## Assembly: how staged tiles become a store
+
+Inference leaves each tile staged as its own set of objects. Assembly is the separate phase that
+merges them into the published store — a different problem, with a different failure mode: many
+writers converging on one array rather than one worker feeding one card.
+
+### 1. Staging a finished tile (`assembly.py`)
 
 Each actor writes its finished tile to a staging prefix on S3, at
 `{staging_base}/{run_id}/{chunk_label}.zarr`, as **raw, uncompressed** zarr — compression
@@ -735,7 +750,7 @@ second gate to maintain.
 All of this guards the *staging* layer only. The final store is Icechunk, whose
 transactional commit already rolls back cleanly on a crash during assembly.
 
-### 10. Assembling the staged tiles into the store
+### 2. Assembling the staged tiles into the store
 
 Once the live tiles are done, `writer.assemble` writes them into the final Icechunk store
 with plain zarr assignments: a pool of worker processes on the flow runner, each holding a
@@ -902,17 +917,17 @@ tests on partial shards).
 On a store at CONUS scale, open it with `chunks=None` for interactive or selective reads:
 
 ```python
-ds = open_store(store_path, chunks=None)   # or xr.open_zarr(session.store, consolidated=False, chunks=None)
-ds.isel(time=0).sel(northing=slice(...), easting=slice(...)).embeddings.values
+ds = open_store(store_path, chunks=None)   # or xr.open_zarr(session.store, consolidated=False,
+chunks=None) ds.isel(time=0).sel(northing=slice(...), easting=slice(...)).embeddings.values
 ```
 
-The default chunking builds one Dask task per on-disk chunk. Inner chunks are
-`(1, 256, 256, 128)` — full depth, so the band axis is a single chunk — which puts 64 of them
-in each 2048-pixel shard and makes the graph `n_time × n_y × n_x` tasks over the 256-pixel
-grid. At CONUS extent that is large enough that even a *lazy* `isel` or `sel` runs out of
-memory while manipulating the graph, before any data is read. `chunks=None` opens the store zarr-lazy with no graph at
-all: slicing is pure metadata, and chunks load only when `.values` is pulled. This is
-unrelated to manifest splitting, which bounds commit cost rather than graph size.
+The default chunking builds one Dask task per on-disk chunk. Inner chunks are `(1, 256, 256, 128)`
+— full depth, so the band axis is a single chunk — which puts 64 of them in each 2048-pixel shard
+and makes the graph `n_time × n_y × n_x` tasks over the 256-pixel grid. At CONUS extent that is
+large enough that even a *lazy* `isel` or `sel` runs out of memory while manipulating the graph,
+before any data is read. `chunks=None` opens the store zarr-lazy with no graph at all: slicing is
+pure metadata, and chunks load only when `.values` is pulled. This is unrelated to manifest
+splitting, which bounds commit cost rather than graph size.
 
 #### Assembly telemetry
 
@@ -934,17 +949,17 @@ change.
 
 A global fill also carries **`catch_ups`**, a tally of what
 `storage.session_catch_up.catch_up_best_effort` did while the forks were writing — that is the
-wrapper `shard_writer` actually calls, and the distinction matters when you are reading the
-tally: it returns whatever the inner `catch_up_to_branch` returned **or `failed`**, an outcome
-the inner function cannot produce on its own. Trace a `failed` tick to the wrapper, which is
-where a catch-up that broke is turned into a lost optimisation rather than a lost fill. It is reported because a healthy commit looks identical
-whether the session was kept up to date or simply got lucky, so the tally is the only
-evidence the mechanism ran. Read a run of `blocked` ticks as "one or more writers touched
-this zone, from the first blocked tick onward" rather than as a count of collisions: the
-range checked runs from the session's base to the branch tip, and the base stops moving once
-anything is blocking, so one rival commit early in a fill latches every later tick. A fill in
-that state is exposed to the stall
-`context_docs/storage/writing-to-the-global-store.md` describes.
+wrapper `shard_writer` actually calls, and the distinction matters when you are reading the tally:
+it returns whatever the inner `catch_up_to_branch` returned **or `failed`**, an outcome the inner
+function cannot produce on its own. Trace a `failed` tick to the wrapper, which is where a
+catch-up that broke is turned into a lost optimisation rather than a lost fill. It is reported
+because a healthy commit looks identical whether the session was kept up to date or simply got
+lucky, so the tally is the only evidence the mechanism ran. Read a run of `blocked` ticks as "one
+or more writers touched this zone, from the first blocked tick onward" rather than as a count of
+collisions: the range checked runs from the session's base to the branch tip, and the base stops
+moving once anything is blocking, so one rival commit early in a fill latches every later tick. A
+fill in that state is exposed to the stall `context_docs/storage/writing-to-the-global-store.md`
+describes.
 
 **The fork phase is watched, and that is the assembly's one backstop.** A daemon thread in
 `shard_writer.run_forked` watches the shard counters the workers update in shared memory; if

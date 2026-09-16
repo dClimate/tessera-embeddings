@@ -125,17 +125,19 @@ MID-FORWARD; the write hides the POST-FORWARD idle (see the three windows above)
 *[Adaptive family](#the-two-families-of-fix). Reclaims the cold-start [window](#why-the-card-idles) by reading less, and the route
 a tile takes is decided by its [sparsity](#the-two-kinds-of-sparsity) and its valid-pixel count.*
 
-Two tiles make the tree concrete before you read it. A **dense interior tile** has
-little sparsity of either kind to exploit — it crops nothing and prunes little; its win
-comes from the striping and prefetch pipeline ([§4.2](../src/tessera_embeddings/inference/README.md#42-loading-a-tile-in-strips) and [§4.3](../src/tessera_embeddings/inference/README.md#43-starting-the-next-tile-early-and-finishing-the-last-one-late)), because its high valid-pixel
-count keeps the GPU busy enough to hide the strip loads. A **cloudy coastal sliver** is
-the opposite: high *temporal* sparsity (prune empty dates) and high *spatial* sparsity
-(crop to the bbox, skip empty row bands), so its win comes almost entirely from *reading
-less* ([§4.1](../src/tessera_embeddings/inference/README.md#41-read-as-little-as-possible)) — and since its low valid-pixel count makes it a single serial strip,
-reading less is the only lever it has. Same code, opposite paths.
+A **dense interior tile** has little sparsity of either kind to exploit — it crops nothing and
+prunes little; its win comes from the striping and prefetch pipeline
+([§4.2](../src/tessera_embeddings/inference/README.md#42-loading-a-tile-in-strips) and
+[§4.3](../src/tessera_embeddings/inference/README.md#43-starting-the-next-tile-early-and-finishing-the-last-one-late)),
+because its high valid-pixel count keeps the GPU busy enough to hide the strip loads. A **cloudy
+coastal sliver** is the opposite: high *temporal* sparsity (prune empty dates) and high *spatial*
+sparsity (crop to the bbox, skip empty row bands), so its win comes almost entirely from *reading
+less* ([§4.1](../src/tessera_embeddings/inference/README.md#41-read-as-little-as-possible)) — and
+since its low valid-pixel count makes it a single serial strip, reading less is the only lever it
+has. Same code, opposite paths.
 
-Each tile takes **one path** through the tree below, chosen from its valid-pixel count
-and where the valid data sits. Read top to bottom:
+Each tile takes **one path** through the tree below, chosen from its valid-pixel count and
+where the valid data sits:
 
 ```
 A tile arrives → load its SCL mask → count valid pixels, find their bbox
@@ -212,6 +214,53 @@ safe; it also drops a ~13 s fixed read per dense tile.
 
 ³ Large on edge/coast slivers (a 1.5K-valid-pixel tile dropped from ~39 s of loading to
 roughly bbox-proportional), negligible on interior tiles (which skip it).
+
+## The model itself was also changed
+
+Everything above rearranges *when* work happens. Four changes alter *what runs on the card*, and
+they are the reason the scheduling work had a fast forward pass to schedule around. All four are
+applied at build time in `models/builder.py` and `models/modules.py`, after the checkpoint loads
+and before the model is frozen.
+
+**The recurrent layer is replaced with a fused one.** The pooling head's `CustomGRU` is
+checkpoint-faithful but steps the sequence in Python, one kernel launch per timestep — about 480
+of them. `_fuse_custom_gru` swaps in PyTorch's `nn.GRU`, which cuDNN runs as roughly one launch,
+so the recurrence stops being bound by launch overhead. The two are not drop-in compatible, and
+the swap folds the weights across two differences:
+
+- **The update gate convention is inverted.** Tessera computes `h' = (1-z)h + zn`, where `z`
+  selects the new candidate; `nn.GRU` computes `h' = (1-z)n + zh`, where `z` keeps the old state.
+  Since `1 - sigmoid(x) = sigmoid(-x)`, every `z` weight and bias is negated.
+- **The reset gate sits on the other side of the matmul.** Tessera applies it before,
+  `W_hh @ (r * h)`; `nn.GRU` applies it after, `r * (W_hh @ h + b_hh)`. These are **not**
+  equivalent for dense weights. It is a real approximation, and it is accepted because the reset
+  gate is close to 1 on most dimensions after training. This one predates the performance
+  campaign and runs identically on `main`, so it cancels out of any before-and-after comparison
+  here — but it is an approximation, not a rearrangement, and it should not be filed with them.
+
+**Positional encoding computes in FP32 and casts its output.** Without the explicit cast,
+PyTorch's dtype promotion (BF16 + FP32 → FP32) spreads FP32 through the entire transformer and
+the GRU behind it — measured at 7 TFLOPS against 20–30 on tensor cores. One cast on one tensor
+keeps the rest of the graph in BF16.
+
+**That encoding is written into uninitialised memory.** `pe` is allocated with `torch.empty`
+rather than `zeros`, because the `0::2` and `1::2` strided writes partition an even `d_model`
+and leave nothing unwritten. The zero-fill was multi-gigabyte dead work for identical values.
+The intermediate `angles` tensor is also freed before the cast rather than after: at the largest
+bucket (B=7168, T=256) it is about 2.6 GiB, and holding it through `pe.to()` co-resides it with
+both the FP32 encoding and the BF16 output, which is VRAM the two concurrent backbones cannot
+spare.
+
+**Training-only parameters never reach the graph.** The checkpoint carries a BarlowTwins
+`projector` and a `segmented_matryoshka_projector` that served the variable-width training
+objective. Both are stripped by prefix before the model is built, so neither occupies VRAM nor
+appears in a forward pass.
+
+Two further options were tried and are off, both measured worse rather than merely unhelpful.
+`torch.compile` captured the model as a CUDA graph, consumed 11.6 GB of VRAM and roughly doubled
+the forward pass, because the recurrent layer recompiled for every distinct sequence length it
+saw. cuDNN's autotuner searches for the fastest kernel per input shape, and bucketing changes the
+shape constantly, so it searched constantly and inflated host memory doing it.
 
 ## What we ruled out, and why
 
