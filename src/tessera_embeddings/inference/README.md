@@ -1009,7 +1009,7 @@ the main loop; `ActorPool` encapsulates actor state and lifecycle operations
 | `batch_size` | 7168 | GPU pixels per forward pass within a bucket |
 | `num_obs_checkpoints` | `range(8, 257, 8)` | Bucketed sequence-length schedule; pixels binned to nearest checkpoint |
 | `s1_orbit` | `"both"` | `"ascending"`, `"descending"`, or `"both"` |
-| `norm_source` | `"mpc"` | Band stats origin; `"aws"` for the AWS-normalised encoder checkpoint |
+| `norm_source` | `"aws"` | Which band stats and checkpoint. `"aws"` matches Earth Search pixels, which is the only ingest path there is; `"mpc"` exists for Planetary Computer and is unexercised |
 | `latent_dim` | 192 | Transformer hidden dim (must match checkpoint) |
 | `representation_dim` | 192 | Model output dim; first 128 dims are saved to the store |
 | `dim_feedforward` | 2048 | Transformer FFN width |
