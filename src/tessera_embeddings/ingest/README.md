@@ -1252,17 +1252,18 @@ that means the provider is busy, and more requests is the wrong direction. A ref
 lever can route around still raises the classified `CatalogueQueryError` with its token.
 
 **Concurrency.** The windows are independent searches, so `_fill_window_tree` walks up to
-`_QUERY_WINDOW_WORKERS` (6) of them at once. The worklist is driven from the calling thread and
+`_QUERY_WINDOW_WORKERS` (2) of them at once. The worklist is driven from the calling thread and
 tasks only ever walk — they never submit and never wait — so deadlock is structurally impossible
 rather than merely unobserved. Each thread gets its own `Client`, because `StacApiIO` wraps a
 `requests.Session` that is not documented thread-safe. Output order comes from
 `_WindowWalk.preorder()` on the finished tree, and the `id` dedupe runs at that assembly step
 rather than as pages arrive, so first-occurrence-wins means first in the **walk** and not first
-off the wire. Six rather than eight, even though eight is faster: the campaign runs tens of cells
-against this one provider at once, so the setting multiplies the concurrent search streams
-Element 84 sees, and per-page latency degrades with width. A failure does not stop the other
-windows — every window is walked, all failures collected, and the depth-first-earliest raised, so
-which failure surfaces is a function of the query rather than of which task finished first.
+off the wire. Two, not more, even though more is faster: the campaign runs tens of cells against
+this one provider at once, so the setting multiplies the concurrent search streams Element 84
+sees. At 6 they answered the fleet with 403; 2 ran clean for a whole campaign. A failure does not
+stop the other windows — every window is walked, all failures collected, and the
+depth-first-earliest raised, so which failure surfaces is a function of the query rather than of
+which task finished first.
 
 The re-partition is a pure re-cut, never a narrowing, and it is exact in both directions: the
 outer bounds are the caller's own date strings handed straight back, and every interior boundary

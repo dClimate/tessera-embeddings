@@ -11,8 +11,9 @@ Two entry points run the same domain code:
   is the production path. It starts a Ray cluster on EC2 GPU instances, runs inference in
   parallel across the area, and assembles the result into an Icechunk/Zarr store.
 - [`orchestration/runners/plain.py`](../orchestration/runners/plain.py) is the
-  orchestrator-free equivalent, calling the same functions on `ray_cluster(num_gpus=0)`
-  for laptop and CI runs.
+  orchestrator-free equivalent, calling the same functions for laptop and manual runs. It
+  resolves `num_gpus` from the config's `device`, which defaults to `auto` — 0 on a CPU-only
+  machine, 1 where CUDA is present — so it is not a CPU-only path by construction.
 
 This file is the reference for what the code does. What was measured, and what was tried
 and abandoned, is in
@@ -331,7 +332,7 @@ plan picks the strategy that fits — the same choice appears as Q2 and Q3 of th
 [decision tree](../../../docs/inference-performance.md#how-a-tiles-path-is-chosen):
 
 ```text
- per_set = T_kept·H·W·(20 bands + 1 mask)      budget = _S2_STRIP_BYTE_BUDGET (5.75 GiB)
+ per_set = T_kept·H·W·(10 bands × 2 B + 1 B mask)   budget = _S2_STRIP_BYTE_BUDGET (5.75 GiB)
 
  per_set ≤ budget ─────────────────────────────▶ ONE strip, no prefetch   (most tiles)
  else, and enough valid pixels to hide the ───▶ equal strips ≤ budget, prefetch ON
@@ -473,7 +474,7 @@ Each bucket needs a fixed-length sequence per pixel. For a bucket `(s2_bin, s1_b
 
 - **`resample_s2_bucket`** selects `s2_bin` dates from each pixel's valid optical
   observations — deterministically, with no random repetition — and returns
-  `(B, s2_bin, 12)`: the normalised bands plus a day-of-year feature.
+  `(B, s2_bin, 11)`: ten normalised bands plus one day-of-year feature.
 - **`resample_s1_bucket`** loads the ascending and descending observations and returns
   `(B, s1_bin, 3)`: the normalised VV/VH pair plus a day-of-year feature.
 
@@ -840,8 +841,8 @@ one output shard (ADR-008 D3), so whole tiles round-robin across workers through
 all-fill inner chunks are elided, so a fully masked tile costs nothing and an inner chunk
 with no valid observation disappears. (Water is a valid surface class as far as the cloud
 mask is concerned, so a coastal tile does embed its ocean pixels — the mask selects tiles,
-not pixels.) `years_complete` and the per-year run provenance advance in the same single
-commit. The zone-fill runner
+not pixels.) `years_complete` and the per-year run provenance advance in a **second** commit,
+after the shards: a crash between the two leaves a year written but unmarked. The zone-fill runner
 ([`orchestration/runners/zone_fill.py`](../orchestration/runners/zone_fill.py)) drives the
 sequence: coverage mask → inference → `assemble_global` → `campaign.tag_zone_year`.
 
