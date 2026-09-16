@@ -575,13 +575,8 @@ queried and before any date is prepared:
    window is open to it. The run reports a skip and stops without querying anything. The
    comparison is against the raw date, not against anything derived from it: a value floored to
    its month first can precede the window's end while the date it came from does not.
-3. **Otherwise, begin the day after that newest date.**
-
-**The day after, rather than the first of its month**: a month boundary re-offers days already
-below the line, and the append refuses them, killing the leg on every retry. Each store works
-its own start out, since a cell's stores advance at different rates, and nothing is lost because
-every catalogue query is padded a day either side regardless
-([Timestamp handling](../src/tessera_embeddings/ingest/README.md#timestamp-handling-solar_dayspy)).
+3. **Otherwise, begin the SOLAR day after that newest date** — not the first of its month,
+   which would re-offer days already below the line.
 
 ### Why nothing records what was missed
 
