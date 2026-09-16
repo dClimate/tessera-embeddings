@@ -57,6 +57,7 @@ from tessera_embeddings.config.inference import (
     EMBEDDING_DIM,
     OPTICAL_MIN_OBS,
     RADAR_THIN_MAX_OBS,
+    ModelVersion,
     TimeWindow,
 )
 from tessera_embeddings.config.store_layout import (
@@ -73,7 +74,7 @@ from tessera_embeddings.config.store_layout import (
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, chunk_label, filter_chunks_by_roi_mask, parse_chunk_label
 from tessera_embeddings.storage import zone_grid
-from tessera_embeddings.storage.conventions import build_convention_attrs
+from tessera_embeddings.storage.conventions import assert_encoder_matches, build_convention_attrs
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
 from tessera_embeddings.storage.global_store import create_layout_arrays, open_global_repo
 from tessera_embeddings.storage.icechunk_logging import traced_commit
@@ -1124,8 +1125,8 @@ class ZarrWriter:
     ) -> str:
         """Write one chunk's embeddings to a staged intermediate (non-Icechunk) Zarr store.
 
-        Creates an xarray Dataset with an 'embedding' variable (mean) and optionally
-        'embedding_std' and 'scale' variables.
+        Creates an xarray Dataset with an ``embeddings`` variable, a ``scales`` variable, and
+        any supplied observation counts.
 
         Records completion **after** the store is fully written — the ``staged_complete`` in-store
         attribute, then the ``<label>.done`` sibling marker (:meth:`_done_marker_path`) — so an
@@ -1691,13 +1692,14 @@ class ZarrWriter:
         output_path: str,
         *,
         roi_zarr_path: str,
-        compute_std: bool = False,
         run_started_at: datetime.datetime | None = None,
         mosaic_base: str | None = None,
         log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
         time_window: TimeWindow | None = None,
         tile_id: str | None = None,
+        compute_std: bool = False,
         model_version: str | None = None,
+        encoder_version: ModelVersion | None = None,
         manifest: EmbeddingManifest | None = None,
         n_workers: int,
         get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
@@ -1756,6 +1758,8 @@ class ZarrWriter:
                 carries no ``crs`` attr.
             model_version: Encoder checkpoint identifier, recorded as the ``checkpoint_id``
                 provenance attr (``geoemb:model`` is the public encoder URL, derived separately).
+            encoder_version: Model FAMILY (e.g. ``"v2-large"``) selecting the public
+                ``geoemb:model`` URL. Omitting it stamps the default model's URL.
             manifest: Typed manifest for append-safety validation. Written on create, validated
                 before extending an existing store.
             n_workers: Worker *process* count.
@@ -1890,6 +1894,17 @@ class ZarrWriter:
         else:
             if manifest:
                 manifest.validate_against(extract_manifest(root.attrs), output_path)
+            # A CROSS-FAMILY APPEND, refused here rather than discovered later. The manifest
+            # check above cannot catch it: it compares the checkpoint filename STEM, which two
+            # families can share, and is skipped ENTIRELY for a legacy store with no `_manifest`.
+            # Past both, the attrs write at the end of this method restamps `geoemb:model` for the
+            # WHOLE store. Shared with the pre-flight so the two doors cannot disagree.
+            assert_encoder_matches(
+                cast("str | None", root.attrs.get("geoemb:model")),
+                model_version=encoder_version,
+                where=output_path,
+            )
+
             # The store's own grid is authoritative: on a mismatched extent a raw region write
             # would silently land in a corner, or be clamp-truncated.
             emb = cast(zarr.Array, root["embeddings"])
@@ -2082,6 +2097,7 @@ class ZarrWriter:
             y_coords=spatial.northing if spatial else None,
             x_coords=spatial.easting if spatial else None,
             model_version=model_version,
+            encoder_version=encoder_version,
         )
         if conv_attrs:
             attrs.update(conv_attrs)

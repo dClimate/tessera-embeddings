@@ -35,6 +35,7 @@ from tessera_embeddings.config.inference import (
     InferenceConfig,
     S1Orbit,
     batch_size_for_gpu,
+    est_px_per_sec,
 )
 from tessera_embeddings.config.store_layout import MONTH_COVERED_VARS, MONTHS_IN_YEAR
 from tessera_embeddings.config.time_windows import TimeWindow
@@ -452,7 +453,9 @@ class InferenceActor:
         """Open stores, load the SCL bundle, and derive the chunk read plan."""
         store_opener = make_store_opener(region=self._s3_region)
         mask_bundle = load_s2_mask_bundle(mosaic_base, chunk, time_window, store_opener=store_opener)
-        x_sub, valid_px, plan = _chunk_read_plan(chunk, mask_bundle)
+        x_sub, valid_px, plan = _chunk_read_plan(
+            chunk, mask_bundle, px_per_sec=est_px_per_sec(self.config.model_version)
+        )
         return store_opener, mask_bundle, x_sub, valid_px, plan
 
     def _load_strip_dataset(
@@ -499,6 +502,8 @@ class InferenceActor:
             s1_orbit=s1_orbit,
             allow_s2_only=allow_s2_only,
             optical_min_obs=self.config.optical_min_obs,
+            model_version=self.config.model_version,
+            norm_source=self.config.norm_source,
         )
         return data, dataset
 
@@ -563,7 +568,14 @@ class InferenceActor:
         credential-window miss degrades to the unprefetched behaviour.
         """
         store_opener, mask_bundle, x_sub, valid_px, plan = self._open_and_plan(chunk, mosaic_base, time_window)
-        rung = _xchunk_rung(chunk, int(mask_bundle.mask.shape[0]), x_sub, valid_px, plan)
+        rung = _xchunk_rung(
+            chunk,
+            int(mask_bundle.mask.shape[0]),
+            x_sub,
+            valid_px,
+            plan,
+            px_per_sec=est_px_per_sec(self.config.model_version),
+        )
 
         first_strip = None
         if rung == "starter":
@@ -1219,7 +1231,6 @@ class InferenceActor:
                         chunk,
                         embeddings,
                         run_id,
-                        embeddings_std=None,
                         scales=scales,
                         obs_counts=obs_buffers,
                         month_covered=month_buffers,
