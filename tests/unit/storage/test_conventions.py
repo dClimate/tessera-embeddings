@@ -1,6 +1,7 @@
 """Tests for GeoZarr convention attribute builders."""
 
 from importlib.metadata import version as _dist_version
+from typing import ClassVar
 
 import numpy as np
 import pytest
@@ -75,8 +76,8 @@ class TestBuildConventionAttrs:
         # zarr_conventions should contain all three
         conventions = attrs["zarr_conventions"]
         names = [c["name"] for c in conventions]
-        assert "proj:" in names
-        assert "spatial:" in names
+        assert "proj" in names
+        assert "spatial" in names
         assert "geoemb:" in names
         # Each convention has a UUID
         for conv in conventions:
@@ -90,7 +91,10 @@ class TestBuildConventionAttrs:
         # spatial:
         assert attrs["spatial:dimensions"] == ["northing", "easting"]
         assert attrs["spatial:transform_type"] == "affine"
-        assert attrs["spatial:transform"] == [10.0, 0.0, 500000.0, 0.0, -10.0, 6200000.0]
+        # The origin is the OUTER CORNER of the first pixel, half a pixel back from the first
+        # centre on each axis — `c` the western edge, `f` the northern edge — as the convention
+        # requires and as GDAL/rasterio write it.
+        assert attrs["spatial:transform"] == [10.0, 0.0, 499995.0, 0.0, -10.0, 6200005.0]
         assert attrs["spatial:shape"] == [100, 100]
         assert attrs["spatial:registration"] == "pixel"
         # bbox should be [xmin, ymin, xmax, ymax], extends half-pixel beyond coord centres
@@ -129,8 +133,8 @@ class TestBuildConventionAttrs:
         assert attrs["geoemb:type"] == "pixel"
         assert attrs["geoemb:dimensions"] == 128
         names = [c["name"] for c in attrs["zarr_conventions"]]
-        assert "proj:" not in names
-        assert "spatial:" not in names
+        assert "proj" not in names
+        assert "spatial" not in names
         assert "geoemb:" in names
 
     def test_non_mgrs_tile_id_omits_proj(self) -> None:
@@ -147,9 +151,9 @@ class TestBuildConventionAttrs:
         )
         assert "proj:code" not in attrs
         names = [c["name"] for c in attrs["zarr_conventions"]]
-        assert "proj:" not in names
+        assert "proj" not in names
         # spatial: still present since coords are provided
-        assert "spatial:" in names
+        assert "spatial" in names
 
     def test_model_is_public_ref_build_is_package_checkpoint_is_provenance(self) -> None:
         """geoemb:model is the PUBLIC encoder reference (ENCODER_VERSION), NOT the
@@ -243,7 +247,7 @@ class TestBuildConventionAttrs:
         assert "proj:wkt2" in attrs
         assert "proj:projjson" in attrs
         names = [c["name"] for c in attrs["zarr_conventions"]]
-        assert "proj:" in names
+        assert "proj" in names
 
     def test_single_pixel_coords_skips_spatial(self) -> None:
         """spatial: requires at least 2 coordinate values to derive a transform."""
@@ -258,6 +262,116 @@ class TestBuildConventionAttrs:
         assert "spatial:dimensions" not in attrs
         # proj: should still work
         assert attrs["proj:code"] == "EPSG:32633"
+
+
+class TestTransformAndBboxAgree:
+    """The transform origin and the bbox describe the SAME grid edges, at every shape.
+
+    The published store shipped with an origin at the first pixel's CENTRE while its bbox was
+    already edge-based, so the two attrs disagreed by half a pixel on all 120 zone groups and
+    every consumer trusting the transform placed the imagery half a cell to the south-east.
+    Pinning the transform's expected value alone did not catch it — the wrong value was pinned.
+    What catches it is the RELATIONSHIP, which holds whatever the resolution or the sign of the
+    axis, so these assertions do not need updating when either changes.
+    """
+
+    #: Absolute, and far tighter than a half pixel at any resolution here. `approx`'s default is
+    #: RELATIVE (1e-6), which on a 6.2 M metre northing is ±6.2 m — so the half-pixel error this
+    #: class exists to catch would pass every assertion below unnoticed.
+    TOL: ClassVar[dict[str, float]] = {"abs": 1e-6, "rel": 0.0}
+
+    @staticmethod
+    def _attrs(y: np.ndarray, x: np.ndarray) -> dict:
+        return build_convention_attrs(
+            epsg_code="EPSG:32633",
+            total_y=len(y),
+            total_x=len(x),
+            embedding_dim=128,
+            y_coords=y,
+            x_coords=x,
+        )
+
+    @pytest.mark.parametrize(
+        "res, y0, x0, n",
+        [
+            (10.0, 6200000.0, 500000.0, 100),  # 10 m UTM, the campaign's grid
+            (30.0, 4000000.0, 300000.0, 7),  # coarser, and an odd count
+            (0.5, 100.25, 200.25, 4),  # sub-metre, where a half-pixel is 0.25
+        ],
+    )
+    def test_origin_is_the_bbox_corner_not_the_first_centre(self, res: float, y0: float, x0: float, n: int) -> None:
+        """``c`` is the western bbox edge and ``f`` the northern one, for a north-up grid."""
+        y = y0 - np.arange(n) * res  # descending: row 0 is the top
+        x = x0 + np.arange(n) * res
+        attrs = self._attrs(y, x)
+        transform, bbox = attrs["spatial:transform"], attrs["spatial:bbox"]
+
+        assert transform[2] == pytest.approx(bbox[0], **self.TOL), "transform c must be the bbox's western edge"
+        assert transform[5] == pytest.approx(bbox[3], **self.TOL), "transform f must be the bbox's northern edge"
+        # And each sits exactly half a pixel off the first CENTRE, which is what the store
+        # shipped. Asserted as the offset rather than as "not equal", so the test states where
+        # the origin IS and not merely one place it is not.
+        assert float(x[0]) - transform[2] == pytest.approx(res / 2, **self.TOL)
+        assert transform[5] - float(y[0]) == pytest.approx(res / 2, **self.TOL)
+
+    def test_bbox_spans_exactly_shape_times_resolution_from_the_origin(self) -> None:
+        """Walking ``shape`` pixels from the origin lands on the far bbox edge, to the float.
+
+        The check an outside consumer would make, and the one that fails on a half-pixel error
+        at either end: an off-by-half origin leaves the far edge half a pixel short.
+        """
+        y = 6200000.0 - np.arange(40) * 10.0
+        x = 500000.0 + np.arange(25) * 10.0
+        attrs = self._attrs(y, x)
+        a, _, c, _, e, f = attrs["spatial:transform"]
+        height, width = attrs["spatial:shape"]
+        xmin, ymin, xmax, ymax = attrs["spatial:bbox"]
+
+        assert (c, f) == pytest.approx((xmin, ymax), **self.TOL)
+        assert c + a * width == pytest.approx(xmax, **self.TOL)
+        assert f + e * height == pytest.approx(ymin, **self.TOL)
+
+    def test_a_south_up_grid_steps_back_along_its_own_sign(self) -> None:
+        """An ascending Y axis puts the origin BELOW the first centre, not above it.
+
+        The half-pixel is taken along each axis's own signed resolution rather than as an
+        absolute value, so a grid stored bottom-row-first lands on its own leading edge instead
+        of half a pixel inside the data.
+        """
+        y = 6199000.0 + np.arange(20) * 10.0  # ascending
+        x = 500000.0 + np.arange(20) * 10.0
+        attrs = self._attrs(y, x)
+        transform, bbox = attrs["spatial:transform"], attrs["spatial:bbox"]
+
+        assert transform[4] == pytest.approx(10.0, **self.TOL)  # positive e: not north-up
+        assert transform[5] == pytest.approx(6199000.0 - 5.0, **self.TOL)  # below the first centre
+        assert transform[5] == pytest.approx(bbox[1], **self.TOL)  # which for this grid is ymin
+
+
+class TestConventionRegistration:
+    """The registration block a consumer follows to find the spec."""
+
+    def test_registered_urls_are_pinned_to_an_existing_tag(self) -> None:
+        """No ``v1`` exists for either convention, so nothing may claim one.
+
+        Offline by design — this asserts the pin, not that GitHub is up. The URLs were verified
+        to resolve by hand when they were chosen; what this guards is a silent edit back to a
+        version tag that upstream has not cut, which 404s for every consumer who follows it.
+        """
+        attrs = build_convention_attrs(
+            epsg_code="EPSG:32633",
+            total_y=10,
+            total_x=10,
+            embedding_dim=128,
+            y_coords=np.arange(6200000.0, 6199900.0, -10.0),
+            x_coords=np.arange(500000.0, 500100.0, 10.0),
+        )
+        registered = {c["name"]: c for c in attrs["zarr_conventions"]}
+        for name in ("proj", "spatial"):
+            for url_field in ("schema_url", "spec_url"):
+                url = registered[name][url_field]
+                assert "/v0.1/" in url, f"{name} {url_field} must pin the tag upstream actually cut"
+                assert "zarr-conventions/" in url, f"{name} {url_field} must use the conventions org"
 
 
 class TestMultiGroupPlacement:
@@ -279,7 +393,7 @@ class TestMultiGroupPlacement:
         assert "geoemb:type" not in attrs
         names = [c["name"] for c in attrs["zarr_conventions"]]
         assert "geoemb:" not in names
-        assert {"proj:", "spatial:"} <= set(names)
+        assert {"proj", "spatial"} <= set(names)
         assert attrs["proj:code"] == "EPSG:32633"
 
     def test_root_attrs_are_geoemb_only(self) -> None:

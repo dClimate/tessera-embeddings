@@ -18,7 +18,8 @@ what was tried and abandoned — you want [`context_docs/`](../context_docs/) in
 | run it on something other than AWS | [`providers/adding-your-own.md`](providers/adding-your-own.md) |
 | use a different orchestrator than Prefect | [`orchestrator-swap.md`](orchestrator-swap.md) |
 | know which names are stable to import | [`public-api.md`](public-api.md) |
-| choose between one area and the whole globe, or read the published global store | [`single-vs-global.md`](single-vs-global.md) |
+| read the published global dataset | [`global-store.md`](global-store.md) |
+| choose between one area and the whole globe | [`single-vs-global.md`](single-vs-global.md) |
 | work out why an ingest failed, or what it does about a refused query or a corrupt file | [`ingest-error-handling.md`](ingest-error-handling.md) |
 | work out what is limiting an ingest, and which levers to reach for | [`ingest-performance.md`](ingest-performance.md) |
 | work out why the GPU is idle during inference, and which levers to reach for | [`inference-performance.md`](inference-performance.md) |

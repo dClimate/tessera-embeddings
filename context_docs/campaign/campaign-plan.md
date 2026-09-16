@@ -211,8 +211,9 @@ s3://tessera-embeddings/v1.1/dclimate.icechunk     ← one repository, branch `m
 
 **Grid.** Each zone group is its own UTM CRS on a fixed 10 m grid, snapped to the 2048-px shard
 pitch, so a zone is about **933,888 × 67,584 px** (~63 Gpx per year, pole to pole and
-across the 6° zone). `northing`/`easting` are coordinate arrays in projected metres and the
-affine transform is on the group as `spatial:transform`. Nothing is reprojected or mosaicked
+across the 6° zone). `northing`/`easting` are coordinate arrays in projected metres, holding pixel CENTRES, and the
+affine transform is on the group as `spatial:transform`, whose origin is the outer CORNER of the
+first pixel — half a pixel apart, per the convention. Nothing is reprojected or mosaicked
 across zones: **a study area crossing a zone boundary reads two groups** and is the consumer's
 join. Zones overlap slightly, which is what makes that join possible.
 

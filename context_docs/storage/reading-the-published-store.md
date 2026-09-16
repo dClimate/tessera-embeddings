@@ -113,6 +113,53 @@ complete and tagged individually, but those five years never got their roll-up t
 using year tags to find finished years would see four of nine. The per-zone attribute is right; the
 roll-up is incomplete.
 
+### 2a. Georeferencing: where a pixel actually is
+
+Each zone group carries its own CRS and grid as `proj:` and `spatial:` attributes — the root has
+none, because the 120 zones do not share a grid. For zone `33N`:
+
+| attribute | value | what it is |
+|---|---|---|
+| `proj:code` | `EPSG:32633` | the zone's CRS, also given in full as `proj:wkt2` and `proj:projjson` |
+| `spatial:dimensions` | `["northing", "easting"]` | Y axis first, then X, naming the array dimensions |
+| `spatial:shape` | `[933888, 67584]` | `[height, width]`, matching the coordinate arrays |
+| `spatial:transform` | `[10, 0, 163840, 0, -10, 9338880]` | `[a, b, c, d, e, f]` in rasterio `Affine` order |
+| `spatial:bbox` | `[163840, 0, 839680, 9338880]` | `[xmin, ymin, xmax, ymax]`, the grid's outer edges |
+| `spatial:registration` | `"pixel"` | cells lie between the grid lines; the ranges above are edges |
+
+**The transform origin is the pixel's outer CORNER; the `northing`/`easting` arrays are pixel
+CENTRES.** They differ by half a pixel — 5 m — and mixing them up displaces everything by that
+much, so which one a reader is holding matters:
+
+```
+    c = 163840          transform origin: the western EDGE of column 0
+      │
+      ▼
+      ┌──────────┬──────────┬──────────┐
+      │          │          │          │      each cell is 10 m across
+      │     ●    │     ●    │     ●    │      ● = easting[i], the pixel CENTRE
+      │          │          │          │
+      └──────────┴──────────┴──────────┘
+            ▲
+         163845 = easting[0] = c + 10/2
+```
+
+This is the GDAL and rasterio convention, so the usual tools are already right: feeding
+`spatial:transform` straight into `affine.Affine(*transform)` and asking `rasterio`'s
+`transformer.xy(0, 0)` returns 163845 — the centre — because rasterio adds the half pixel itself.
+Read a coordinate array instead and you have centres already; do not add anything.
+
+Two identities hold on every group, and are worth asserting if a reader is deriving a grid rather
+than reading one: `c` equals `bbox[0]` and `f` equals `bbox[3]`, and walking `shape` pixels from
+the origin lands exactly on the far edges (`c + a × width == bbox[2]`, `f + e × height == bbox[1]`).
+
+`zarr_conventions` registers `proj:`, `spatial:` and `geoemb:` with a dereferenceable schema and
+spec URL each, pinned to the tag the upstream convention repository actually carries.
+
+Stores published before 2026-09-14 place the transform origin at the pixel centre instead, so a
+consumer holding one is half a pixel south-east of where this describes; see
+[ADR 024](../decisions/024-spatial-transform-origin-is-the-pixel-corner.md).
+
 ## 3. Three ways to ask what is covered
 
 **Per zone-year, from the attribute.** `zone.attrs["years_complete"]` — one metadata read, already
