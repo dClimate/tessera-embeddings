@@ -2,19 +2,20 @@
 
 An ingest is not bounded by the imagery. It is bounded by the Dask scheduler: a single process
 that holds the entire task graph in memory before a worker reads a byte, and that hands out every
-task through one event loop. Overwhelm it and it does not simply run out of memory. It gets slow
-at distributing work, and a fleet of hundreds of machines sits idle waiting to be given
-something to do.
+task through one event loop, on one CPU. Overwhelm it and it does not simply run out of memory.
+That one CPU saturates, the scheduler slows at handing out work, and hundreds of machines sit
+idle waiting for something to do.
 
 ## The problem, and the shape of the answer
 
 A zone-year over a large region describes millions of tasks. At roughly 1.5 KB each the graph can
-exhaust the scheduler's memory before a pixel is read, and well short of that it saturates the
-loop doing the dispatching: tasks go out more slowly than workers finish them, the queue drains,
-and the fleet waits. **A graph that is too large buys idleness, not throughput.**
+exhaust the scheduler's memory before a pixel is read. Well short of that it pins the single CPU
+doing the dispatching: past some graph size, tasks go out more slowly than workers finish them,
+the queue drains, and the fleet waits on a CPU-bound scheduler. **A graph that is too large buys
+idleness, not throughput.**
 
-A graph that does fit can still leave the fleet idle, for an unrelated reason: write one window
-at a time and every machine waits through each write.
+A graph that fits can still leave the fleet idle, for an unrelated reason: write one window at a
+time and every machine waits through each write.
 
 Every lever here does one of two things:
 
@@ -26,7 +27,7 @@ Every lever here does one of two things:
 
 The two interact, which is why several levers are priced rather than switched on: filling idle
 slots by enlarging the graph can slow the scheduler enough to empty the fleet again. Figures are
-measured, with derivations in `context_docs/ingest/campaign-ingest-measurements.md`.
+measured, derivations in `context_docs/ingest/campaign-ingest-measurements.md`.
 
 ## What bounds the run
 
@@ -50,12 +51,17 @@ This is fully predictable and independent of data size. A graph with 1 million t
 write triggers the compute, so a date's whole pipeline — load, correct, mask, write — is one
 graph execution and the scheduler holds all of it at once.
 
-**RAM is the limit that kills a run, but it is not the one that shows up first.** The same process
-that holds the graph also assigns every task, on one event loop, and it slows down as the graph
-grows. Past a certain size the fleet finishes work faster than the scheduler can hand more out,
-so workers idle while the scheduler is pinned — the run is not out of memory, it is just paying
-for machines that are waiting. `MAX_TASKS_PER_WINDOW` and the per-date iteration below are sized
-against dispatch throughput for that reason, not against the RAM figure above.
+**RAM is the limit that kills a run, but it is not the one that shows up first.** The process
+holding the graph is also the one assigning every task, and it does that on a single CPU through
+one event loop. Every assignment costs CPU time, so scheduler CPU — not worker capacity — becomes
+the ceiling as the graph grows.
+
+Past that point the fleet finishes work faster than the scheduler can hand more out. Workers go
+idle while the scheduler's CPU sits at 100%, and nothing in the run is short of memory: it is
+simply paying for machines that are waiting on one saturated core.
+
+`MAX_TASKS_PER_WINDOW` and the per-date iteration below are sized against that dispatch
+throughput, not against the RAM figure above.
 
 The HLG itself is compact — it stores *layer dicts* rather than expanded objects. The
 expansion to TaskStates happens only when the graph is submitted to the scheduler:
@@ -115,13 +121,24 @@ ChunkSpec-vs-sub-chunk decoupling that makes assembly survive on the same budget
 
 ### Chunk alignment
 
-The ROI Zarr mask is generated with `chunk_size` matching `INGEST_CHUNKS` so that
-`da.from_zarr` reads are zero-copy — each Dask partition maps to exactly one Zarr chunk.
-The same chunk sizes are passed to `odc.stac.load` (after translating `northing`/`easting`
-to `y`/`x`) so band arrays and the mask share the same partition boundaries for aligned
-Dask operations. (Inference reads 2048×2048 sub-tiles out of these 4096×4096 chunks via
-`zarr.Array.oindex`, which needs no such alignment — see
-[`inference/README.md`](../src/tessera_embeddings/inference/README.md).)
+The ROI Zarr mask is generated with `chunk_size` matching `INGEST_CHUNKS`, so each Dask
+partition maps to exactly one Zarr chunk and `da.from_zarr` reads are **zero-copy**. The same
+chunk sizes go to `odc.stac.load` (after translating `northing`/`easting` to `y`/`x`), so the
+band arrays and the mask share partition boundaries.
+
+**Alignment is worth more than it sounds.** When partitions do not line up with stored chunks,
+Dask has to rechunk: it reads several stored chunks to assemble each partition, allocates a new
+buffer for the result, and copies the overlapping pieces in. That adds a task layer to every
+graph it touches, which is exactly the cost the section above is spent avoiding, and it holds
+two copies of the data — the chunks read and the partition built from them — at the moment
+memory is tightest. Aligned, a partition *is* a stored chunk: nothing is reassembled, nothing is
+copied, and the graph gains no layer. Misalignment costs graph size, worker memory and wall
+clock together, which is why the mask writer and the loader are given the same chunk size rather
+than each choosing a sensible one.
+
+Inference is the exception, and deliberately so: it reads 2048×2048 sub-tiles out of these
+4096×4096 chunks through `zarr.Array.oindex`, which needs no alignment — see
+[`inference/README.md`](../src/tessera_embeddings/inference/README.md).
 
 ### Writing a date: one session, one commit
 
@@ -139,17 +156,29 @@ per passing date (one writable session ── one commit)
    └─ commit                      (crash before here ⇒ nothing visible; retry is clean)
 ```
 
-The empty-axis seed matters: the time axis only ever contains dates whose pixels
-committed, keeping `get_existing_dates` (the STAC dedupe),
-`check_time_window_coverage`, and the empty-timestep prunes truthful.
-**The retry must not retry a second writer** — the one exception to "a failed write commits
-nothing, so retrying is safe". One store has exactly one writer: these commits pass no
-`rebase_with`, so a concurrent commit is *refused* rather than merged
-(`icechunk.ConflictError`), and a date the other writer reached first is refused by the append
-guard (`DuplicateDateError`). Retrying would re-open the session from the tip that writer
-moved, turning the refusal into a success and letting two writers interleave dates onto one
-axis. Both errors are excluded by type in `storage.zarr_store.store_write_retrying`, the
-single policy all three write sites use (S1 per-date, S2 per-date, S2 per-batch).
+Two properties follow from that shape.
+
+**The time axis only ever lists dates whose pixels committed.** That is what the empty-axis seed
+buys: a date appears in the axis only after its write succeeded. Three things read the axis and
+trust it — `get_existing_dates` (the STAC dedupe), `check_time_window_coverage`, and the
+empty-timestep prunes — and all three would be wrong if the axis could name a date whose pixels
+never landed.
+
+**A failed write must not be retried if a second writer caused it.** Retrying a failed write is
+normally free, because a write that did not commit changed nothing. Concurrent writers are the
+one exception.
+
+A store is meant to have exactly one writer, and the code enforces that rather than assuming it:
+
+- These commits pass no `rebase_with`, so a commit that races another is **refused** instead of
+  merged (`icechunk.ConflictError`).
+- A date the other writer got to first is refused by the append guard (`DuplicateDateError`).
+
+Retrying either refusal is what breaks it. The retry re-opens the session from the tip the other
+writer just moved, so the second attempt succeeds — and the two writers interleave their dates
+onto one axis. Both errors are therefore excluded by type in
+`storage.zarr_store.store_write_retrying`, which is the single retry policy all three write sites
+use: S1 per-date, S2 per-date, and S2 per-batch.
 
 ## Keeping the graph small
 
@@ -471,13 +500,19 @@ untouched.
 
 ### Batching dates into one compute (`batch_dates`)
 
-**Sized per ROI, and NOT a straight win.** `batch_dates=None` (the default) derives the batch size
-from the ROI's covered window area via `config.ingest.auto_batch_dates`; an explicit integer forces
-one, which pins an A/B arm. Batching helps small ROIs, is roughly neutral on large
-ones, and **costs about 29% on mid-sized ones** — so one global value is wrong for part of the
-range.
+Normally each date is computed and written on its own. This fuses several consecutive dates into
+one computation and one write. The number fused is `k`.
 
-The arithmetic behind that shape:
+**It is not a free win, which is why the default sizes it per region.** With `batch_dates=None`
+the size comes from how much live land the region covers (`config.ingest.auto_batch_dates`).
+Passing an integer forces a fixed size, which is what an A/B comparison needs. Batching helps
+small regions, makes little difference on large ones, and **costs about 29% on mid-sized ones**,
+so no single value is right across the range.
+
+**Where the uneven shape comes from.** Two things happen at once while a date is written: the
+write itself, spread across the fleet, and the preparation for that date, running alongside it.
+Whichever is slower sets the pace. On top of that, each date pays for one **commit** — the single
+operation that makes it visible to readers.
 
 ```
 per-date wall clock  ≈  max( W, P )  +  commit / k
@@ -486,42 +521,57 @@ per-date wall clock  ≈  max( W, P )  +  commit / k
     P = the preparation running alongside it, per date
 ```
 
-Batching divides the commit by `k` and does nothing else. It cannot make the write faster,
-since the fleet is already the constraint, so commit amortisation is its only gain, and it LOSES
-wherever the larger write graph crowds out the preparation overlapping it. On a mid-sized ROI,
-preparation at `k=1` already fitted inside the write with zero stall.
+Fusing `k` dates divides the commit cost by `k`, and that is the entire gain. It cannot make the
+write faster, because the machines are already fully occupied. And it can lose: a bigger write
+graph leaves less room for the preparation running beside it. On a mid-sized region the
+preparation already fitted inside the write with nothing left over, so there was no idle capacity
+to win back and only the crowding to pay for.
 
-Batching pays only where the fleet has idle capacity to fill, and the threshold sits at the
-top of the range where that was measured to hold — widening it means measuring an ROI in between.
-Denominating it in covered window area also couples it to the merge exchange rate above: a finer
-merge covers less area, so more ROIs drift below the threshold and batch. Recalibrate against
-runs, never an offline sweep at a different merge cost. Figures in
+So batching pays only where the fleet has spare capacity to absorb a larger graph. The threshold
+is set at the largest region where that was actually measured to hold; raising it means measuring
+a region in between first.
+
+One coupling to watch. Because the size is derived from covered area, the window merge above
+changes it: a finer merge covers less area, so more regions fall below the threshold and get
+batched. Recalibrate against real runs rather than an offline sweep, since a different merge cost
+gives a different answer. Figures in
 `context_docs/ingest/campaign-ingest-measurements.md` §3.16.
 
-When it is on, k consecutive PASSING dates compute as ONE graph: their work packs the fleet
-together, one date's straggling reads backfill with another's writes, and the drain tail and
-commit gap are paid once per batch.
+**What happens when it is on.** `k` consecutive dates that pass the quality gate are computed as
+one graph, and their work interleaves — while one date waits on slow reads, another's writes keep
+the machines busy. The tail at the end of a computation, where the last few tasks finish and the
+fleet drains, is paid once per batch instead of once per date.
 
-The commit unit becomes the batch, forced rather than chosen: every date's append resizes the
-time axis, so per-date sessions forked from one snapshot would conflict on array metadata even
-with disjoint chunk data (`storage.zarr_store.write_days_windows`). A mid-batch failure commits
-none of the batch's dates, and a retry re-ingests exactly the uncommitted ones. Stores are
-byte-identical to the per-date path (pinned by a parity test whose gate-failing date
-sits mid-batch).
+**The batch has to be the commit unit; this is not a choice.** Adding a date lengthens the
+store's time axis, and that axis is shared metadata. Two dates committed separately from the same
+starting point would collide on it even though their pixels go to different places
+(`storage.zarr_store.write_days_windows`).
 
-Skipped dates do not occupy batch slots, so batches stay full exactly where the gate
-filters most; the trailing partial batch flushes at each streamed month boundary. In
-batched mode the per-date `Stage timings` line is replaced by one `Batch timings` line
-per batch (build/gate are sums of real per-date values; the write is one shared compute
-and has no per-date decomposition). Default 1 — the one-commit-per-date path — is unchanged.
+The consequence is all-or-nothing: a failure part way through commits none of the batch's dates,
+and a retry re-ingests exactly the ones that never landed. The resulting store is byte-for-byte
+identical to the one-date-at-a-time path, held by a test that puts a gate-failing date in the
+middle of a batch.
 
-**Composing with `pipeline_dates`.** The two are complementary: batching removes fleet idleness
-*within* a date's write, pipelining removes serial preparation *between* writes. Composed, the
-look-ahead is sized to the batch rather than one date, since a batch's write is one long consume
-and a depth-1 buffer would hide one date's preparation out of k. Preparation stays
-single-threaded at any depth, so its side-effect-free contract is unchanged; the cost is up to k
-prepared dates buffered while k more are written. `Batch timings` reports
-`prepare`/`hidden`/`stall` per batch, with the same caveat as the per-date line.
+Three practical details:
+
+- A date that fails the gate does not take up a slot, so batches stay full even in cloudy
+  stretches where most dates are rejected. Whatever is left over is written at each month
+  boundary.
+- Logging changes. Instead of one `Stage timings` line per date there is one `Batch timings` line
+  per batch. Its build and gate figures are sums of the real per-date values; the write is a
+  single shared computation and cannot be split per date.
+- The default is 1, which is the one-commit-per-date path, unchanged.
+
+**Combining it with `pipeline_dates`.** The two fix different idleness. Batching fills gaps
+*inside* a date's write; pipelining removes the serial preparation *between* writes. Used
+together, the look-ahead is sized to the batch rather than to one date: a batch's write is one
+long operation, so a buffer holding a single prepared date would hide only one date's preparation
+out of `k`.
+
+Preparation still runs on one thread at any depth, so the rule that it must not touch anything
+beyond the dataset it returns is unchanged. The cost is memory — up to `k` prepared dates held
+while `k` more are written. `Batch timings` reports `prepare`, `hidden` and `stall` per batch,
+with the same caveat as the per-date line.
 
 ## has_new_stac_dates pre-check
 
