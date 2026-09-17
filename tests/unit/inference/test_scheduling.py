@@ -83,13 +83,17 @@ def _fake_chunk(label: str) -> MagicMock:
     return c
 
 
+_U15 = chunk_uid("15N-2019-a", "c_0")
+_U16 = chunk_uid("16N-2019-b", "c_0")
+
+
 def _poll(
     progress: dict,
     *,
     stall_threshold: float = 300.0,
     max_stalls: int = 3,
     recovery_threshold: float | None = None,
-    cells: set[str] | None = None,
+    cells: dict[str, str] | None = None,
 ) -> list[str]:
     tracker = MagicMock()
     tracker.get_all.remote.return_value = MagicMock()
@@ -286,17 +290,20 @@ class TestPollTracker:
     @pytest.mark.parametrize(
         ("cells", "expected"),
         [
-            ({"15N-2019"}, "Progress [15N-2019]:"),
+            ({_U15: "15N-2019"}, "Progress [15N-2019]:"),
             # A chained session overlaps one zone's tail with the next zone's head.
-            ({"16N-2019", "15N-2019"}, "Progress [15N-2019, 16N-2019]:"),
+            ({_U15: "15N-2019", _U16: "16N-2019"}, "Progress [15N-2019, 16N-2019]:"),
+            # Dispatched but not yet reporting: none of these counts are that zone's yet.
+            ({_U15: "15N-2019", chunk_uid("17N-2019-c", "c_0"): "17N-2019"}, "Progress [15N-2019]:"),
             # A single-area run's id is a content digest: it names nothing, so nothing is shown.
-            (set(), "Progress: 0/10 chunks done"),
+            ({}, "Progress: 0/10 chunks done"),
         ],
-        ids=["one-cell", "chained-boundary", "unnamed"],
+        ids=["one-cell", "chained-boundary", "not-yet-reporting", "unnamed"],
     )
-    def test_the_line_names_the_cells_with_work_in_flight(self, caplog, cells, expected) -> None:
+    def test_the_line_names_only_cells_this_snapshot_counted(self, caplog, cells, expected) -> None:
+        progress = {_U15: (3, 10, 10.0, "inference"), _U16: (1, 10, 5.0, "inference")}
         with caplog.at_level(logging.INFO, logger="test"):
-            _poll({"c_0": (3, 10, 10.0, "inference")}, stall_threshold=300.0, max_stalls=10, cells=cells)
+            _poll(progress, stall_threshold=300.0, max_stalls=10, cells=cells)
         assert expected in caplog.text
 
     def test_phase_summary_logged(self, caplog: pytest.LogCaptureFixture) -> None:

@@ -14,7 +14,7 @@ import logging
 import math
 import time
 from collections import deque
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -885,7 +885,7 @@ def _poll_tracker(
     elapsed_min: float | None = None,
     gpu_hours: float | None = None,
     recovery_threshold_sec: float | None = None,
-    cells: Collection[str] | None = None,
+    cells: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Poll ProgressTracker; log stalls; return the uids that need recovery.
 
@@ -908,8 +908,9 @@ def _poll_tracker(
         gpu_hours: Fleet GPU-hours consumed so far — the cluster's JOINED GPU count integrated
             over wall time (see :func:`_joined_gpu_count`, a FLOOR on what is billed) — folded
             into the same line.
-        cells: Names of the cells with work in flight, for the progress line. Empty on a
-            single-area run, whose ``run_id`` names nothing to a reader, so it shows no cell.
+        cells: Chunk uid → its cell's name. Only uids in THIS snapshot are named, so a line
+            never names a cell none of its counts came from. Empty on a single-area run, whose
+            ``run_id`` names nothing to a reader, so it shows no cell.
         recovery_threshold_sec: Seconds without an update before a chunk is declared
             unrecoverable in place and returned for kill-and-requeue. Deliberately well above
             ``stall_threshold_sec`` so a warning always fires long before anything is killed and
@@ -964,7 +965,8 @@ def _poll_tracker(
             # bare "elapsed" beside a chunk counter invites reading it as run wall-clock.
             elapsed = f" — {elapsed_min:.1f} min inferring" if elapsed_min is not None else ""
             gpu = f", {gpu_hours:.1f} GPU-hrs" if gpu_hours is not None else ""
-            where = f" [{', '.join(sorted(cells))}]" if cells else ""
+            named = sorted({cells[uid] for uid in progress if uid in cells}) if cells else []
+            where = f" [{', '.join(named)}]" if named else ""
             # "chunks done" labels the whole first clause: what follows counts chunks in flight,
             # not actor slots and not GPUs. GPU-hrs carries its own unit.
             log.info(
@@ -1571,9 +1573,10 @@ def _process_chunks_work_stealing(
                 elapsed_min=(time.monotonic() - inference_t0) / 60,
                 gpu_hours=gpu_seconds / 3600,
                 recovery_threshold_sec=stall_recovery_sec,
-                # From the POOL, so a chained session names both zones at a boundary and a
-                # finished one drops out. Some pool tests put bare labels in the item slot.
-                cells={i.ctx.cell for i, _ in pool.pending.values() if isinstance(i, WorkItem) and i.ctx.cell},
+                # By uid, not collapsed here: the pool holds an item from dispatch but its
+                # tracker report is fire-and-forget, so at a boundary the pool knows the next
+                # zone before any count does. Some pool tests put bare labels in the item slot.
+                cells={i.uid: i.ctx.cell for i, _ in pool.pending.values() if isinstance(i, WorkItem) and i.ctx.cell},
             )
             # Why a single wedged chunk is killed rather than merely logged: the poll only ever
             # acted on the SIMULTANEOUS-stall threshold, which one chunk never reaches, so on
