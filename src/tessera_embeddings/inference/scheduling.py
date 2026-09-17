@@ -14,7 +14,7 @@ import logging
 import math
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -59,6 +59,11 @@ class ZoneContext:
     #: staged. This exists only so the scheduler's retry budget can tell one attempt from the
     #: next; see :attr:`WorkItem.retry_key`.
     attempt: int = 1
+    #: What to call this cell in the progress line, e.g. ``"15N-2019"``. ``None`` for a
+    #: single-area run, whose ``run_id`` is a bare content digest that would name nothing to a
+    #: reader — the line then carries no cell at all rather than a hash. Set by the callers
+    #: that fill zone-years, which are the runs whose logs interleave cells.
+    cell: str | None = None
 
 
 @dataclass(frozen=True)
@@ -882,6 +887,7 @@ def _poll_tracker(
     elapsed_min: float | None = None,
     gpu_hours: float | None = None,
     recovery_threshold_sec: float | None = None,
+    cell_names: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Poll ProgressTracker; log stalls; return the uids that need recovery.
 
@@ -904,6 +910,9 @@ def _poll_tracker(
         gpu_hours: Fleet GPU-hours consumed so far — the cluster's JOINED GPU count integrated
             over wall time (see :func:`_joined_gpu_count`, a FLOOR on what is billed) — folded
             into the same line.
+        cell_names: ``run_id`` → what to call that cell in the progress line. Only cells named
+            here are shown, so a run whose ids name nothing a reader would recognise (the
+            single-area path's content digest) gets the bare line instead of a hash.
         recovery_threshold_sec: Seconds without an update before a chunk is declared
             unrecoverable in place and returned for kill-and-requeue. Deliberately well above
             ``stall_threshold_sec`` so a warning always fires long before anything is killed and
@@ -958,16 +967,19 @@ def _poll_tracker(
             # bare "elapsed" beside a chunk counter invites reading it as run wall-clock.
             elapsed = f" — {elapsed_min:.1f} min inferring" if elapsed_min is not None else ""
             gpu = f", {gpu_hours:.1f} GPU-hrs" if gpu_hours is not None else ""
-            # WHICH cells these chunks belong to, read off the tracker's own keys rather than
-            # passed in: the keys are ``run_id:label`` (:func:`chunk_uid`) and a chained session
-            # holds two zones at a boundary, so the caller's scalar ``run_id`` would name only
-            # the first. A campaign cell's run id leads with its zone and year.
-            cells = ", ".join(sorted({uid.split(":", 1)[0] for uid in progress}))
+            # WHICH cells these chunks are from, resolved per ENTRY rather than from a caller's
+            # scalar: the tracker's keys are ``run_id:label`` (:func:`chunk_uid`), and a chained
+            # session holds two zones at a boundary, so one scalar would report the second zone's
+            # chunks under the first zone's name. Unnamed run ids contribute nothing, which is
+            # what keeps a single-area run's digest out of the line.
+            names = {cell_names.get(uid.split(":", 1)[0]) for uid in progress} if cell_names else set()
+            cells = ", ".join(sorted(n for n in names if n))
+            where = f" [{cells}]" if cells else ""
             # "chunks done" labels the whole first clause: what follows counts chunks in flight,
             # not actor slots and not GPUs. GPU-hrs carries its own unit.
             log.info(
-                "Progress [%s]: %d/%d chunks done, %d active (%s), %d stalled%s%s",
-                cells,
+                "Progress%s: %d/%d chunks done, %d active (%s), %d stalled%s%s",
+                where,
                 n_done,
                 n_total,
                 n_active,
@@ -1131,6 +1143,7 @@ def _process_chunks_work_stealing(
     more_work: Callable[[], list[WorkItem] | None] | None = None,
     source_has_work: Callable[[], bool] | None = None,
     on_item_done: Callable[[WorkItem, dict], None] | None = None,
+    cell: str | None = None,
 ) -> list[dict]:
     """Process chunks with dynamic work-stealing across actors.
 
@@ -1200,12 +1213,27 @@ def _process_chunks_work_stealing(
             success (after any deferred write confirms) or permanent failure — with the item
             and its result dict. A chained session uses it for per-zone completion accounting;
             it runs on the scheduler thread, so it must not block.
+        cell: What to call the cell built from this call's scalars, e.g. ``"15N-2019"``. A
+            chained session leaves it unset and names each cell on the items' own
+            :class:`ZoneContext` instead. ``None`` throughout keeps the cell out of the
+            progress line, which is what a single-area run's digest ``run_id`` wants.
 
     Returns:
         List of result dicts (status, chunk label, timing, etc.).
     """
-    default_ctx = ZoneContext(mosaic_base, staging_base, run_id)
-    chunk_queue: deque[WorkItem | ChunkSpec] = deque(_as_item(c, default_ctx) for c in chunks)
+    default_ctx = ZoneContext(mosaic_base, staging_base, run_id, cell=cell)
+    # ``run_id`` → the cell's name, for the progress line. Built from the ITEMS rather than from
+    # this call's scalars so a chained session picks each zone up as it is admitted; a cell that
+    # names itself nothing never enters, and the line then shows no cell at all.
+    cell_names: dict[str, str] = {}
+
+    def _admit(items: list[WorkItem]) -> list[WorkItem]:
+        for item in items:
+            if item.ctx.cell:
+                cell_names[item.ctx.run_id] = item.ctx.cell
+        return items
+
+    chunk_queue: deque[WorkItem | ChunkSpec] = deque(_admit([_as_item(c, default_ctx) for c in chunks]))
     n_total = len(chunk_queue)
 
     pool = ActorPool(
@@ -1511,7 +1539,7 @@ def _process_chunks_work_stealing(
                 )
             elif fetched:
                 source_idle = False
-                chunk_queue.extend(fetched)
+                chunk_queue.extend(_admit(fetched))
                 n_total += len(fetched)
                 log.info(
                     "Work source added %d chunk(s) (queue now %d, total %d)", len(fetched), len(chunk_queue), n_total
@@ -1566,6 +1594,7 @@ def _process_chunks_work_stealing(
                 elapsed_min=(time.monotonic() - inference_t0) / 60,
                 gpu_hours=gpu_seconds / 3600,
                 recovery_threshold_sec=stall_recovery_sec,
+                cell_names=cell_names,
             )
             # Why a single wedged chunk is killed rather than merely logged: the poll only ever
             # acted on the SIMULTANEOUS-stall threshold, which one chunk never reaches, so on

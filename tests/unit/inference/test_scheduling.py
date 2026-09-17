@@ -89,6 +89,7 @@ def _poll(
     stall_threshold: float = 300.0,
     max_stalls: int = 3,
     recovery_threshold: float | None = None,
+    cell_names: dict[str, str] | None = None,
 ) -> list[str]:
     tracker = MagicMock()
     tracker.get_all.remote.return_value = MagicMock()
@@ -101,6 +102,7 @@ def _poll(
             max_stalls,
             logging.getLogger("test"),
             recovery_threshold_sec=recovery_threshold,
+            cell_names=cell_names,
         )
 
 
@@ -285,22 +287,59 @@ class TestPollTracker:
         """A campaign log interleaves cells, so a bare chunk count cannot be attributed to one."""
         progress = {chunk_uid("15N-2019-abcd1234", f"c_{i}"): (3, 10, 10.0, "inference") for i in range(2)}
         with caplog.at_level(logging.INFO, logger="test"):
+            _poll(
+                progress,
+                stall_threshold=300.0,
+                max_stalls=10,
+                cell_names={"15N-2019-abcd1234": "15N-2019"},
+            )
+        assert "Progress [15N-2019]:" in caplog.text
+
+    def test_a_single_area_run_gets_no_cell_at_all(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Its run id is a content digest, which names nothing to a reader.
+
+        Showing it would put a bare hash in every progress line of a run that has only one
+        subject anyway, so an unnamed cell contributes nothing and the line reads as it did
+        before cells were named.
+        """
+        progress = {chunk_uid("3f8a1c9b2e04", f"c_{i}"): (3, 10, 10.0, "inference") for i in range(2)}
+        with caplog.at_level(logging.INFO, logger="test"):
             _poll(progress, stall_threshold=300.0, max_stalls=10)
-        assert "Progress [15N-2019-abcd1234]:" in caplog.text
+        assert "Progress: 0/10 chunks done" in caplog.text
+        assert "3f8a1c9b2e04" not in caplog.text
 
     def test_both_zones_are_named_across_a_chained_boundary(self, caplog: pytest.LogCaptureFixture) -> None:
         """A chained session overlaps one zone's tail with the next zone's head.
 
-        The cells come off the tracker's own keys for exactly this case: the caller's scalar
-        ``run_id`` is the first zone's and would misreport the second zone's chunks as its own.
+        Each entry resolves through its OWN run id for exactly this case: one scalar label would
+        report the second zone's chunks under the first zone's name.
         """
         progress = {
             chunk_uid("15N-2019-abcd1234", "c_0"): (3, 10, 10.0, "inference"),
             chunk_uid("16N-2019-ef567890", "c_0"): (1, 10, 5.0, "loading"),
         }
         with caplog.at_level(logging.INFO, logger="test"):
-            _poll(progress, stall_threshold=300.0, max_stalls=10)
-        assert "Progress [15N-2019-abcd1234, 16N-2019-ef567890]:" in caplog.text
+            _poll(
+                progress,
+                stall_threshold=300.0,
+                max_stalls=10,
+                cell_names={"15N-2019-abcd1234": "15N-2019", "16N-2019-ef567890": "16N-2019"},
+            )
+        assert "Progress [15N-2019, 16N-2019]:" in caplog.text
+
+    def test_a_zone_that_has_finished_drops_out_of_the_line(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The names map keeps every zone the session ever admitted, so it cannot be the source
+        of truth for what is RUNNING. Only cells with live tracker entries are named.
+        """
+        progress = {chunk_uid("16N-2019-ef567890", "c_0"): (1, 10, 5.0, "inference")}
+        with caplog.at_level(logging.INFO, logger="test"):
+            _poll(
+                progress,
+                stall_threshold=300.0,
+                max_stalls=10,
+                cell_names={"15N-2019-abcd1234": "15N-2019", "16N-2019-ef567890": "16N-2019"},
+            )
+        assert "Progress [16N-2019]:" in caplog.text
 
     def test_phase_summary_logged(self, caplog: pytest.LogCaptureFixture) -> None:
         progress = {"c_A": (3, 10, 10.0, "inference"), "c_B": (1, 5, 5.0, "loading")}
@@ -1553,6 +1592,64 @@ class TestWorkStealingLoopCondition:
         # The chunk must have been processed despite the actor dying
         assert len(results) == 1
         assert results[0]["status"] == "ok"
+
+
+# ===========================================================================
+# _process_chunks_work_stealing — which cell the progress line names
+# ===========================================================================
+
+
+class TestWorkStealingNamesTheCell:
+    """The loop tells the poll what to call the cells its chunks came from.
+
+    Covers the wiring the unit tests of ``_poll_tracker`` cannot: that a name given to the
+    loop reaches the poll under the right ``run_id``, and that a run which names no cell
+    hands over nothing rather than a placeholder.
+    """
+
+    @staticmethod
+    def _run_loop(*, cell: str | None) -> list[dict]:
+        actor = MagicMock(name="actor_0")
+        work_ref = MagicMock(name="work_ref")
+        actor.process_chunk.remote.return_value = work_ref
+        config = MagicMock()
+        config.checkpoint_path = "s3://bucket/ckpt.pt"
+
+        def fake_wait(refs, num_returns=None, timeout=60):
+            if timeout == 0:
+                return ([], list(refs))
+            return ([work_ref], [r for r in refs if r is not work_ref])
+
+        polls: list[dict] = []
+
+        with (
+            patch.object(_sched_mod.ray, "wait", side_effect=fake_wait),
+            patch.object(_sched_mod.ray, "get", return_value={"chunk": "c0", "status": "ok"}),
+            patch.object(_sched_mod, "_poll_tracker", side_effect=lambda *a, **kw: polls.append(kw) or []),
+        ):
+            _process_chunks_work_stealing(
+                actors=[actor],  # type: ignore[arg-type]
+                actor_instance_ids=["i-0000"],
+                chunks=[_fake_chunk("c0")],
+                mosaic_base="m",
+                staging_base="s",
+                run_id="15N-2019-abcd1234",
+                config=config,
+                log=logging.getLogger("test"),
+                tracker=MagicMock(),
+                cell=cell,
+            )
+        assert polls, "the loop must have polled at least once for this to mean anything"
+        return polls
+
+    def test_a_named_cell_reaches_the_poll_under_its_run_id(self) -> None:
+        polls = self._run_loop(cell="15N-2019")
+        assert polls[0]["cell_names"] == {"15N-2019-abcd1234": "15N-2019"}
+
+    def test_an_unnamed_run_hands_over_no_names(self) -> None:
+        """The single-area path names no cell, and must not get its run id used as one."""
+        polls = self._run_loop(cell=None)
+        assert polls[0]["cell_names"] == {}
 
 
 # ===========================================================================
