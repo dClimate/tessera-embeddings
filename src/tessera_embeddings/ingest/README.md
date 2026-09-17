@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="../../../docs/images/sacramento-delta-tessera-2025.webp" width="100%"
+  <img src="../../../docs/images/sacramento-delta-tessera-2025-plain.webp" width="100%"
        alt="TESSERA embeddings of the Sacramento-San Joaquin Delta in false colour: the reclaimed islands in green and terracotta, the sloughs and channels threading between them in dark blue.">
 </p>
 
