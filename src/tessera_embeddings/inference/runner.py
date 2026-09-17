@@ -63,6 +63,7 @@ def run_inference(
     more_work: Callable[[], list[WorkItem] | None] | None = None,
     source_has_work: Callable[[], bool] | None = None,
     on_item_done: Callable[[WorkItem, dict], None] | None = None,
+    cell: str | None = None,
 ) -> list[dict]:
     """Create Ray actors, run work-stealing inference, return per-chunk results.
 
@@ -112,6 +113,8 @@ def run_inference(
             pause that is holding real work; see the scheduler's docstring.
         on_item_done: Optional per-item final-outcome callback (chained sessions use it for
             per-zone completion accounting). Runs on the scheduler thread — must not block.
+        cell: What to call this run's cell in the progress line (:attr:`ZoneContext.cell`).
+            ``None`` for a single-area run, whose ``run_id`` names nothing to a reader.
 
     Returns:
         Per-chunk result dicts (status, valid pixel count, timing, etc.), with
@@ -249,6 +252,7 @@ def run_inference(
             more_work=more_work,
             source_has_work=source_has_work,
             on_item_done=on_item_done,
+            cell=cell,
         )
     finally:
         fleet.clear()

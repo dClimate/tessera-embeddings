@@ -241,6 +241,7 @@ def _await_forks(
     progress_interval_s: float,
     *,
     unit: str = "partitions",
+    label: str | None = None,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     slots: ctypes.Array[ctypes.c_long] | None = None,
     abort: threading.Event | None = None,
@@ -261,11 +262,15 @@ def _await_forks(
     ``unit`` is the caller's name for one payload. What a payload holds is the
     caller's decision (northing bands for one, round-robin tile partitions for
     another), so a fixed noun would misdescribe the work for all callers but one.
+    ``label`` names WHAT is being assembled — the zone group for a global fill, the
+    tile for a single-area one. Campaign logs interleave cells, so a progress line
+    that names no cell cannot be attributed to one.
     ``log`` is where the lines go: the module logger reaches only the process's own
     log stream, so a caller inside a flow passes its run logger to make the wait
     visible to the orchestrator as well.
     """
     logger = log or _log
+    where = f" [{label}]" if label else ""
     started = time.monotonic()
     pending: set[Future] = set(futures)
     while pending:
@@ -305,7 +310,8 @@ def _await_forks(
                     want = sum(totals)
                     shards = f"{got}/{want} shards written ({100.0 * got / want:.0f}%), "
             logger.info(
-                "Assembly progress: %s%d/%d %s outstanding after %.0f min",
+                "Assembly progress%s: %s%d/%d %s outstanding after %.0f min",
+                where,
                 shards,
                 len(pending),
                 n,
@@ -417,6 +423,7 @@ def run_forked(
     progress_interval_s: float = PROGRESS_INTERVAL_S,
     fork_stall_timeout_s: float = FORK_STALL_TIMEOUT_S,
     unit: str = "partitions",
+    label: str | None = None,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     catch_up: Callable[[], str] | None = None,
 ) -> dict[str, Any]:
@@ -442,8 +449,8 @@ def run_forked(
     write is as long as its slowest band. Hence progress on a TIMER rather than
     per completion: waiting on completions alone says nothing until the first band
     lands, which on a dense zone is the bulk of the write. ``progress_interval_s``
-    is the reporting period, and ``unit`` and ``log`` are the coordinator lines'
-    payload noun and destination (see :func:`_await_forks`).
+    is the reporting period, and ``unit``, ``label`` and ``log`` are the coordinator
+    lines' payload noun, subject and destination (see :func:`_await_forks`).
 
     Returns the write's telemetry rather than nothing, because this is the only
     scope that sees all three of the fork, the workers, and the merge:
@@ -509,6 +516,7 @@ def run_forked(
                     futures,
                     progress_interval_s,
                     unit=unit,
+                    label=label,
                     log=log,
                     slots=slots,
                     abort=abort,
@@ -871,6 +879,7 @@ def write_year_shards(
         _write_shards_worker,
         payloads,
         unit="tile partitions",
+        label=group,
         log=log,
         # Keep the session current WHILE the workers write. Without this the commit below has
         # to walk every snapshot published during the write, and that walk is where seven of

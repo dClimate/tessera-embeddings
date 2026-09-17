@@ -1135,6 +1135,7 @@ def fill_zones_sequential(
                     # reuses its run_id and labels, so without it the new attempt inherits the
                     # exhausted counts of the one that failed.
                     attempt,
+                    cell=f"{cell.zone}-{cell.year}",
                 )
                 with lock:
                     tallies[prep.run_id] = tally
