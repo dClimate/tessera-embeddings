@@ -1,3 +1,13 @@
+<p align="center">
+  <img src="../../../docs/images/red-river-tessera-2025.webp" width="100%"
+       alt="TESSERA embeddings of the Red River of the North in false colour: the river meandering tightly through a grid of section-line fields, each field a different colour.">
+</p>
+
+<p align="center">
+  <em>The Red River of the North, 28&nbsp;km of it, as 2025 TESSERA embeddings. Each field
+  reads as its own colour because each one behaved differently across the year.</em>
+</p>
+
 # Tessera Inference Pipeline
 
 Distributed GPU inference that turns mosaicked Sentinel-2 reflectance and Sentinel-1 radar
