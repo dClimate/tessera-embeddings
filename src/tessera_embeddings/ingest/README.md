@@ -1,6 +1,12 @@
 <p align="center">
   <img src="../../../docs/images/sacramento-delta-tessera-2025.webp" width="100%"
-       alt="An annotated plate of the Sacramento-San Joaquin Delta rendered from TESSERA embeddings: reclaimed islands in green and terracotta, the channels between them in dark blue, with a title, scale bar and legend.">
+       alt="TESSERA embeddings of the Sacramento-San Joaquin Delta in false colour: the reclaimed islands in green and terracotta, the sloughs and channels threading between them in dark blue.">
+</p>
+
+<p align="center">
+  <em>The Sacramento&ndash;San Joaquin Delta, 28&nbsp;km of it, as 2025 TESSERA embeddings.
+  Every island reads as its own colour because each one was farmed, flooded or left alone
+  differently across the year.</em>
 </p>
 
 # Satellite Ingestion
