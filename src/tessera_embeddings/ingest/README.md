@@ -1,3 +1,8 @@
+<p align="center">
+  <img src="../../../docs/images/sacramento-delta-tessera-2025.webp" width="100%"
+       alt="An annotated plate of the Sacramento-San Joaquin Delta rendered from TESSERA embeddings: reclaimed islands in green and terracotta, the channels between them in dark blue, with a title, scale bar and legend.">
+</p>
+
 # Satellite Ingestion
 
 Modules for querying, authenticating, and loading satellite data from STAC catalogs and CMR

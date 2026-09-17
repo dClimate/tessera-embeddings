@@ -1,3 +1,13 @@
+<p align="center">
+  <img src="docs/images/mississippi-meanders-tessera-2025.webp" width="100%"
+       alt="TESSERA embeddings of the lower Mississippi meander belt near Greenville, rendered in false colour: the river and its oxbow lakes in deep blue, cropland and batture forest in pale green, built ground in terracotta.">
+</p>
+
+<p align="center">
+  <em>TESSERA 2025 embeddings of the lower Mississippi meander belt &mdash; 128 numbers per
+  10&nbsp;m pixel, reduced to three by principal component analysis and shown as colour.</em>
+</p>
+
 # TESSERA Inference
 
 [![Lint](https://github.com/dClimate/tessera-embeddings/actions/workflows/lint.yml/badge.svg)](https://github.com/dClimate/tessera-embeddings/actions/workflows/lint.yml)
