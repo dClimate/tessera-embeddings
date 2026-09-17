@@ -113,9 +113,8 @@ def run_inference(
             pause that is holding real work; see the scheduler's docstring.
         on_item_done: Optional per-item final-outcome callback (chained sessions use it for
             per-zone completion accounting). Runs on the scheduler thread — must not block.
-        cell: What to call this run's cell in the progress line, e.g. ``"15N-2019"``. ``None``
-            for a single-area run, whose ``run_id`` is a content digest that would name nothing
-            to a reader; the line then carries no cell rather than a hash.
+        cell: What to call this run's cell in the progress line (:attr:`ZoneContext.cell`).
+            ``None`` for a single-area run, whose ``run_id`` names nothing to a reader.
 
     Returns:
         Per-chunk result dicts (status, valid pixel count, timing, etc.), with
