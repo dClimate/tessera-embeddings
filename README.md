@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/images/mississippi-meanders-tessera-2025.webp" width="100%"
+  <img src="https://raw.githubusercontent.com/dClimate/tessera-embeddings/main/docs/images/mississippi-meanders-tessera-2025.webp" width="100%"
        alt="TESSERA embeddings of the lower Mississippi meander belt near Greenville, rendered in false colour: the river and its oxbow lakes in deep blue, cropland and batture forest in pale green, built ground in terracotta.">
 </p>
 
