@@ -958,10 +958,16 @@ def _poll_tracker(
             # bare "elapsed" beside a chunk counter invites reading it as run wall-clock.
             elapsed = f" — {elapsed_min:.1f} min inferring" if elapsed_min is not None else ""
             gpu = f", {gpu_hours:.1f} GPU-hrs" if gpu_hours is not None else ""
+            # WHICH cells these chunks belong to, read off the tracker's own keys rather than
+            # passed in: the keys are ``run_id:label`` (:func:`chunk_uid`) and a chained session
+            # holds two zones at a boundary, so the caller's scalar ``run_id`` would name only
+            # the first. A campaign cell's run id leads with its zone and year.
+            cells = ", ".join(sorted({uid.split(":", 1)[0] for uid in progress}))
             # "chunks done" labels the whole first clause: what follows counts chunks in flight,
             # not actor slots and not GPUs. GPU-hrs carries its own unit.
             log.info(
-                "Progress: %d/%d chunks done, %d active (%s), %d stalled%s%s",
+                "Progress [%s]: %d/%d chunks done, %d active (%s), %d stalled%s%s",
+                cells,
                 n_done,
                 n_total,
                 n_active,

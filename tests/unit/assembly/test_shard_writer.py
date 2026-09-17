@@ -307,6 +307,21 @@ class TestForkProgressReporting:
         assert len(lines) >= 2, f"a single long band reported {len(lines)} progress line(s)"
         assert "1/1 partitions outstanding" in lines[0]
 
+    def test_the_progress_line_names_what_is_being_assembled(self, caplog):
+        # Campaign logs interleave cells, so an unlabelled line cannot be attributed to one.
+        outstanding: Future = Future()
+        threading.Timer(0.15, lambda: outstanding.set_result("done")).start()
+        with caplog.at_level(logging.INFO, logger="tessera_embeddings.storage.shard_writer"):
+            assert _await_forks([outstanding], 0.01, label="15N") == ["done"]
+        assert "Assembly progress [15N]:" in self._progress_lines(caplog)[0]
+
+    def test_an_unlabelled_caller_gets_no_empty_brackets(self, caplog):
+        outstanding: Future = Future()
+        threading.Timer(0.15, lambda: outstanding.set_result("done")).start()
+        with caplog.at_level(logging.INFO, logger="tessera_embeddings.storage.shard_writer"):
+            assert _await_forks([outstanding], 0.01) == ["done"]
+        assert self._progress_lines(caplog)[0].startswith("Assembly progress: ")
+
     def test_nothing_outstanding_reports_nothing(self, caplog):
         with caplog.at_level(logging.INFO, logger="tessera_embeddings.storage.shard_writer"):
             assert _await_forks([self._resolved(1), self._resolved(2)], 0.01) == [1, 2]

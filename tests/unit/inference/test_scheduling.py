@@ -281,6 +281,27 @@ class TestPollTracker:
         with patch.object(_sched_mod.ray, "get", side_effect=ConnectionError("dead")):
             _poll_tracker(tracker, 0, 10, 300.0, 3, logging.getLogger("test"))
 
+    def test_the_progress_line_names_the_cell_the_chunks_belong_to(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A campaign log interleaves cells, so a bare chunk count cannot be attributed to one."""
+        progress = {chunk_uid("15N-2019-abcd1234", f"c_{i}"): (3, 10, 10.0, "inference") for i in range(2)}
+        with caplog.at_level(logging.INFO, logger="test"):
+            _poll(progress, stall_threshold=300.0, max_stalls=10)
+        assert "Progress [15N-2019-abcd1234]:" in caplog.text
+
+    def test_both_zones_are_named_across_a_chained_boundary(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A chained session overlaps one zone's tail with the next zone's head.
+
+        The cells come off the tracker's own keys for exactly this case: the caller's scalar
+        ``run_id`` is the first zone's and would misreport the second zone's chunks as its own.
+        """
+        progress = {
+            chunk_uid("15N-2019-abcd1234", "c_0"): (3, 10, 10.0, "inference"),
+            chunk_uid("16N-2019-ef567890", "c_0"): (1, 10, 5.0, "loading"),
+        }
+        with caplog.at_level(logging.INFO, logger="test"):
+            _poll(progress, stall_threshold=300.0, max_stalls=10)
+        assert "Progress [15N-2019-abcd1234, 16N-2019-ef567890]:" in caplog.text
+
     def test_phase_summary_logged(self, caplog: pytest.LogCaptureFixture) -> None:
         progress = {"c_A": (3, 10, 10.0, "inference"), "c_B": (1, 5, 5.0, "loading")}
         with caplog.at_level(logging.INFO, logger="test"):
