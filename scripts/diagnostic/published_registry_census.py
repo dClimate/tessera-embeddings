@@ -219,6 +219,54 @@ def _read_dataset(fs: pyarrow.fs.FileSystem, root: str, *, with_schema: bool) ->
     }
 
 
+def _completeness(fs: pyarrow.fs.FileSystem, root: str) -> dict[str, Any]:
+    """How much of the registry actually carries measurements, per cell and in total.
+
+    **A registry can be perfectly well-formed and still say nothing.** Every other check here asks
+    whether the rows are shaped right; this asks whether they hold numbers. The published campaign
+    finished green with 1,519,045 of 3,247,410 rows (47%) null across every measurement column,
+    and no check noticed — a consumer reading ``embedded`` alone sees full coverage while the
+    refusal counts that qualify it are absent.
+
+    ``chunk_px`` stands in for all of them: a row's measurement columns are null together, and
+    this is the one a rebuild can always populate.
+
+    A refused tile's record comes from its skip marker on object storage and survives a resume; an
+    embedded tile's comes from the actor's in-memory result and does not. So the split by
+    ``embedded`` is diagnostic rather than decorative — unmeasured rows concentrated entirely on
+    the embedded side is the signature of that asymmetry rather than of a broken writer.
+    """
+    import pyarrow.compute as pc
+    import pyarrow.dataset as ds
+
+    prefix = root.removeprefix("s3://").rstrip("/") + "/parts"
+    started = time.monotonic()
+    dataset = ds.dataset(prefix, filesystem=fs, partitioning="hive", schema=dataset_schema())
+    table = dataset.to_table(columns=["zone", "year", "embedded", "chunk_px"])
+    unmeasured = pc.is_null(table.column("chunk_px")).to_pylist()
+    embedded = table.column("embedded").to_pylist()
+    zones, years = table.column("zone").to_pylist(), table.column("year").to_pylist()
+
+    per_cell: dict[str, dict[str, int]] = {}
+    for zone, year, is_unmeasured in zip(zones, years, unmeasured, strict=True):
+        cell = per_cell.setdefault(f"{zone}/{year}", {"rows": 0, "unmeasured": 0})
+        cell["rows"] += 1
+        cell["unmeasured"] += int(is_unmeasured)
+    total_unmeasured = sum(unmeasured)
+    return {
+        "wall_s": round(time.monotonic() - started, 2),
+        "rows": table.num_rows,
+        "rows_without_measurements": total_unmeasured,
+        "fraction_without_measurements": round(total_unmeasured / table.num_rows, 6) if table.num_rows else 0.0,
+        "unmeasured_rows_that_are_embedded": sum(
+            1 for is_unmeasured, was_embedded in zip(unmeasured, embedded, strict=True) if is_unmeasured and was_embedded
+        ),
+        "cells_wholly_unmeasured": sorted(k for k, v in per_cell.items() if v["unmeasured"] == v["rows"]),
+        "cells_partly_unmeasured": sorted(k for k, v in per_cell.items() if 0 < v["unmeasured"] < v["rows"]),
+        "cells_fully_measured": sum(1 for v in per_cell.values() if v["unmeasured"] == 0),
+    }
+
+
 def _aoi_query(
     fs: pyarrow.fs.FileSystem, root: str, aoi: tuple[float, float, float, float], year: int
 ) -> dict[str, Any]:
@@ -482,6 +530,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--aoi-year", type=int, default=2025)
     parser.add_argument("--skip-schema-audit", action="store_true", help="skip the per-part footer read")
     parser.add_argument(
+        "--max-unmeasured",
+        type=float,
+        default=0.0,
+        help=(
+            "fraction of rows allowed to carry no measurements before this fails. Zero by default: "
+            "a null row is the registry saying nothing about that ground, and a campaign should not "
+            "be able to finish green having published half a coverage record"
+        ),
+    )
+    parser.add_argument(
         "--anonymous",
         action="store_true",
         help="read with no credentials (the published bucket grants public reads)",
@@ -551,6 +609,25 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  columns an inferring reader loses: {dropped or 'none'}")
     report["columns_lost_by_inference"] = dropped
 
+    report["completeness"] = _completeness(fs, args.registry)
+    complete = report["completeness"]
+    print(f"\nmeasurement completeness ({complete['wall_s']}s):")
+    print(
+        f"  rows with no measurements: {complete['rows_without_measurements']:,} of {complete['rows']:,} "
+        f"({complete['fraction_without_measurements']:.1%}), of which {complete['unmeasured_rows_that_are_embedded']:,} "
+        "are embedded tiles"
+    )
+    print(
+        f"  cells wholly unmeasured {len(complete['cells_wholly_unmeasured'])}, "
+        f"partly {len(complete['cells_partly_unmeasured'])}, fully measured {complete['cells_fully_measured']}"
+    )
+    incomplete = complete["fraction_without_measurements"] > args.max_unmeasured
+    if incomplete:
+        print(
+            f"  ABOVE THE THRESHOLD ({args.max_unmeasured:.1%}) — every column is derivable from the store, so "
+            "this is repairable: scripts/maintenance/rebuild_registry_measurements.py"
+        )
+
     if args.aoi:
         west, south, east, north = (float(v) for v in args.aoi.split(","))
         report["aoi_query"] = _aoi_query(fs, args.registry, (west, south, east, north), args.aoi_year)
@@ -619,7 +696,7 @@ def main(argv: list[str] | None = None) -> int:
     aoi_broken = any(aoi.get(key) for key in _AOI_FINDINGS)
     audit = report.get("schema_audit", {})
     broken = any(audit.get(key) for key in _SCHEMA_FINDINGS)
-    return 1 if (unparsed or broken or disagreements or aoi_broken) else 0
+    return 1 if (unparsed or broken or disagreements or aoi_broken or incomplete) else 0
 
 
 if __name__ == "__main__":
