@@ -196,6 +196,11 @@ def cmd_gate(args: argparse.Namespace) -> int:
         if not args.zones or cell[0] in args.zones
     ]
     measured = [(cell, rows) for cell, rows in measured if rows]
+    if not measured:
+        # Opening the store costs a session and a credential; a registry with nothing to check
+        # against does not need one, and a local rehearsal often has no store at all.
+        print("gate: no rows carry measurements, so there is nothing to re-derive against")
+        return 0
     rng = random.Random(args.seed)
     # Spread the sample over cells rather than over rows: the thing that could differ is a cell's
     # geometry or its rule, and a row-uniform sample would spend most of its budget in the largest
@@ -247,6 +252,14 @@ def cmd_rebuild(args: argparse.Namespace) -> int:
     cells = _cells(table)
     run_id = args.run_id or rebuild_run_id(suffix="optical" if args.skip_radar else "full")
     rebuild_root = args.registry.rstrip("/") + "/rebuild"
+    if not any(
+        row.get("chunk_px") is None
+        for (zone, _year), rows in cells.items()
+        if not args.zones or zone in args.zones
+        for row in rows
+    ):
+        print("rebuild: every row already carries measurements, so there is nothing to re-derive")
+        return 0
     root = _open_zone(args.store, args.region, anonymous=args.anonymous)
     rng = random.Random(args.seed)
 
