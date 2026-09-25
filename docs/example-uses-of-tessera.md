@@ -9,9 +9,9 @@ append a row with the application, the authors and year, and a link to the paper
 | Crop type mapping | Retkute & Gilligan, 2026 | [MDPI](https://www.mdpi.com/2076-3417/16/13/6370) |
 | Fruit tree mapping | Orlowski et al., 2026 | [arXiv](https://arxiv.org/abs/2607.08945) |
 | Local climate zone mapping | Kim & Song, 2026 | [IEEE Xplore](https://ieeexplore.ieee.org/abstract/document/11684796) |
-| Local climate zone mapping | Ko & Atzberger, 2026 | [arXiv](https://arxiv.org/abs/2606.20034) |
+| Local climate zone mapping | Ko Ko & Atzberger, 2026 | [arXiv](https://arxiv.org/abs/2606.20034) |
 | Urban morphology, demographic and economic indicator mapping | Liu et al., 2026 | [arXiv](https://arxiv.org/abs/2605.26036) |
-| Tree species mapping | Ball et al., 2026 | [PDF](https://openpub.fmach.it/retrieve/bdcc32f0-4d1d-4219-9dd3-5c55834c5559/2026%20SRS%20Dalponte.pdf) |
+| Tree species mapping | Ball et al., 2026 | [ScienceDirect](https://doi.org/10.1016/j.srs.2026.100466) |
 | Tree species mapping | Koukos et al., 2026 | [arXiv](https://arxiv.org/abs/2609.03480) |
 | Environmental monitoring | Feng et al., 2026 | [SSRN](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=6142416) |
 | Burned area identification | Silva & Gonçalves, 2026 | [Research Square](https://www.researchsquare.com/article/rs-10285823/v1) |
