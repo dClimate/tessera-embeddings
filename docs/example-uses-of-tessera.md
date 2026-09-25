@@ -1,4 +1,4 @@
-# Selected applications of TESSERA
+# Published applications of TESSERA
 
 A running log of published and preprint work that applies TESSERA embeddings. To add an entry,
 append a row with the application, the authors and year, and a link to the paper.
