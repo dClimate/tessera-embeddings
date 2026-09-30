@@ -37,7 +37,7 @@ bit-identical). Re-fetch instructions are in that file's header.
 | Band stats | MPC/AWS split (`norm_source`) | one fixed set; `norm_source` rejected |
 | Resampling rule | `build_resample_indices` | `build_resample_indices_v2` (upstream `_pad_pattern`) — the bucket SCHEDULE is shared, the index selection is not |
 | Fusion | `concat` or `sum` | `concat` only, refused at config time |
-| Checkpoint artifact | `tessera_v1_1_{aws,mpc}_encoder.pt` | `student_large.pt` from `geotessera/TESSERA-V-2.0-2B-L` (`ckpt/student_large.pt`, 175 MB) |
+| Checkpoint artifact | `tessera_v1_1_{aws,mpc}_encoder.pt` | `v2_student_large.pt`, staged from `geotessera/TESSERA-V-2.0-2B-L` (`ckpt/student_large.pt`, 175 MB) |
 
 Both versions share the same input *contract* (S2 = 10 bands in upstream order,
 S1 = VV/VH merged with per-orbit normalisation, raw integer DOY 1–365, the

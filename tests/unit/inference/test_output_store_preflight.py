@@ -145,7 +145,7 @@ def test_a_cross_family_append_is_refused_before_any_compute(tmp_path) -> None:
     v2_config = build_inference_config(
         s1_orbit="both",
         time_window=parse_time_window("June 2025"),
-        checkpoint_path=f"{tmp_path}/models/student_large.pt",
+        checkpoint_path=f"{tmp_path}/models/v2_student_large.pt",
         inputs_bucket=str(tmp_path / "inputs"),
         output_bucket=str(tmp_path / "outputs"),
         model_version="v2-large",
@@ -170,7 +170,7 @@ def test_a_legacy_store_with_no_encoder_attr_is_read_as_v11(tmp_path) -> None:
     v2_config = build_inference_config(
         s1_orbit="both",
         time_window=parse_time_window("June 2025"),
-        checkpoint_path=f"{tmp_path}/models/student_large.pt",
+        checkpoint_path=f"{tmp_path}/models/v2_student_large.pt",
         inputs_bucket=str(tmp_path / "inputs"),
         output_bucket=str(tmp_path / "outputs"),
         model_version="v2-large",

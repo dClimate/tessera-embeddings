@@ -1093,10 +1093,10 @@ FSDP and compile prefixes and the training-only heads. v2 Large is built from
 cross-checks the stored `args` against the config. If either format changes, its loader
 needs updating. Both run inside the same `MultimodalBTInferenceModel` wrapper.
 
-The v2 checkpoint is `student_large.pt`, published on Hugging Face as
-`geotessera/TESSERA-V-2.0-2B-L` (`ckpt/student_large.pt`). The Prefect flow reads it from
-the same model directory as the v1.1 checkpoints, `{inputs}/models/`, so it has to be staged
-there first; the plain runner can instead be given its URL as `checkpoint_url`, as the
+The v2 checkpoint is published on Hugging Face as `geotessera/TESSERA-V-2.0-2B-L`
+(`ckpt/student_large.pt`). The Prefect flow reads it as `v2_student_large.pt` from the same
+model directory as the v1.1 checkpoints, `{inputs}/models/`, so it has to be staged there
+under that name first; the plain runner can instead be given its URL as `checkpoint_url`, as the
 quickstart does for v1.1. The side-by-side comparison of the two architectures, and the porting rules, are
 in [`models/README.md`](models/README.md). v2 Large's measured throughput against v1.1 is §7
 of [`inference-on-gpus.md`](../../../context_docs/inference/inference-on-gpus.md).

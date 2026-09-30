@@ -42,7 +42,7 @@ def test_checkpoint_filename_invalid_raises() -> None:
 
 
 def test_checkpoint_filename_v2_large() -> None:
-    assert checkpoint_filename(model_version="v2-large") == "student_large.pt"
+    assert checkpoint_filename(model_version="v2-large") == "v2_student_large.pt"
 
 
 def test_checkpoint_filename_v2_ignores_norm_source() -> None:

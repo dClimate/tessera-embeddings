@@ -181,11 +181,11 @@ class TestBuildConventionAttrs:
         stem alone cannot select the URL — the family has to be threaded.
         """
         v2 = build_convention_attrs(
-            total_y=10, total_x=10, embedding_dim=128, model_version="student_large", encoder_version="v2-large"
+            total_y=10, total_x=10, embedding_dim=128, model_version="v2_student_large", encoder_version="v2-large"
         )
         assert v2["geoemb:model"] == encoder_url("v2-large")
         assert v2["geoemb:model"] != encoder_url("v1.1")
-        assert v2["checkpoint_id"] == "student_large"  # stem stays separate provenance
+        assert v2["checkpoint_id"] == "v2_student_large"  # stem stays separate provenance
         # An explicit URL still wins over the family lookup.
         explicit = build_convention_attrs(
             total_y=10, total_x=10, embedding_dim=128, encoder_version="v2-large", model_url="https://example/x"

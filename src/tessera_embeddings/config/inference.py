@@ -118,12 +118,12 @@ _CHECKPOINT_NAMES: dict[str, str] = {
 
 # v2 has a single checkpoint per student size (no norm_source split). The Large
 # student's artifact is published on Hugging Face as
-# ``geotessera/TESSERA-V-2.0-2B-L``, file ``ckpt/student_large.pt`` (175 MB); the
-# filename below is the name it is expected to carry in our own model directory
-# (``{inputs}/models/`` by default), mirroring how v1.1 checkpoints are staged.
+# ``geotessera/TESSERA-V-2.0-2B-L``, file ``ckpt/student_large.pt`` (175 MB). It is
+# staged in our own model directory (``{inputs}/models/`` by default) under the
+# version-prefixed name below, beside the v1.1 checkpoints.
 # Nothing in the inference path fetches from Hugging Face — a full URI can be
 # supplied instead via ``InferenceConfig.checkpoint_path``.
-V2_LARGE_CHECKPOINT_NAME = "student_large.pt"
+V2_LARGE_CHECKPOINT_NAME = "v2_student_large.pt"
 
 
 def checkpoint_filename(
