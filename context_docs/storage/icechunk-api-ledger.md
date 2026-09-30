@@ -53,7 +53,7 @@ repo.save_config()   # REQUIRED to persist; workers re-opening read persisted co
 
 **The split config must be identical across create and every later open** (library precedent: the
 `manifest_split()` contextmanager docstring). Which axis to split on is a workload question, and the
-measurement is in [`../ingest/ingest-performance.md`](../ingest/ingest-performance.md) §12.7: **split
+measurement is in [`../ingest/campaign-ingest-measurements.md`](../ingest/campaign-ingest-measurements.md) §12.7: **split
 the axis along which a single commit is NARROW.**
 
 ## Fork and merge (cooperative writes)
@@ -113,7 +113,8 @@ Repository.garbage_collect(delete_object_older_than: datetime, *, dry_run=False,
                            max_concurrent_manifest_fetches=500) -> GCSummary
 Repository.reset_branch(branch, snapshot_id, *, from_snapshot_id=None)
 Repository.rewrite_manifests(message, *, branch, …)   # repo-wide only
-Repository.total_chunks_storage(...) -> int
+Repository.chunk_storage_stats(...) -> ChunkStorageStats   # .native_bytes for native chunks only
+Repository.total_chunks_storage(...) -> int               # DEPRECATED in 2.1.1; use the above
 ```
 
 Tags (`repo.create_tag(name, snapshot_id=…)`) protect snapshots from expiry. **Tags are write-once

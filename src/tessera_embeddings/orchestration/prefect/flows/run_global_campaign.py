@@ -85,7 +85,7 @@ from tessera_embeddings.storage.campaign import (
     tag_year_complete,
     zone_year_tag,
 )
-from tessera_embeddings.storage.global_store import open_global_repo
+from tessera_embeddings.storage.global_store import open_global_repo, set_saved_manifest_preload
 from tessera_embeddings.storage.object_store import delete_prefix
 from tessera_embeddings.storage.time_axis import CAMPAIGN_YEARS
 from tessera_embeddings.storage.zarr_store import is_missing_repo, open_store_group_and_tip
@@ -2044,6 +2044,18 @@ async def run_global_campaign(
             detail,
         )
         log.warning("=== END OF UNFILLED LIST (%d cell(s)) ===", total)
+
+    # Final maintenance: leave the store tuned for the readers who now own it. The manifest preload
+    # earns its keep during a fill and costs every consumer seconds per open afterwards, so it goes
+    # off once the filling stops. NON-FATAL — a campaign that landed its cells has succeeded, and
+    # failing it over a tuning step would be the wrong trade; the operator can run
+    # `scripts/maintenance/set_published_store_reader_config.py` instead.
+    try:
+        set_saved_manifest_preload(store_path, enabled=False, get_credentials=store_credentials, region=s3_region)
+        log.info("Store left with manifest preloading off, for readers")
+    except Exception as exc:
+        log.warning("Could not switch manifest preloading off (%s); run the maintenance script", exc)
+
     return {
         "work_at_start": len(work),
         "dispatched": dispatched,

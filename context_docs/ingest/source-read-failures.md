@@ -31,7 +31,7 @@ nothing could ever fill. A lost date is still logged per date and again in an en
 what survives a fill is the embeddings store's per-pixel observation counts and per-month coverage
 masks. `assessed_window` and `assessed_empty_dates` are unaffected.
 
-Companion to [`ingest-performance.md`](ingest-performance.md), which is the authoritative record of
+Companion to [`campaign-ingest-measurements.md`](campaign-ingest-measurements.md), which is the authoritative record of
 what ingest *costs* and of the fleet-width contention work. This one is about what makes it *fail*.
 
 ## Headline
@@ -427,7 +427,7 @@ quantity it has to exceed.
 
 **Firing costs latency, not work.** Icechunk commits each date's time slot atomically with its
 pixels, so a leg that gives up returns the cell to the campaign work list and the next dispatch
-**resumes from the dates already committed** (`ingest-performance.md` §4.15). A shorter bound does
+**resumes from the dates already committed** (`campaign-ingest-measurements.md` §4.15). A shorter bound does
 not discard a long slow leg's output; it releases the campaign slot sooner and picks the work up
 where it stopped.
 

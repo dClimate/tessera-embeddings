@@ -747,7 +747,7 @@ about the run. **Before this, the two were indistinguishable and the gate treate
 The cropping shipped behind `crop_to_live_windows`, defaulting OFF, so the smallest land zone in the
 scheme still built a full-extent graph and died. **The flag is gone** — removed once no scenario
 wanted cropping disabled — and the validation that depended on it went with it, its precondition now
-holding by construction (`ingest-performance.md`).
+holding by construction (`campaign-ingest-measurements.md`).
 
 The lesson is about defaults rather than about this flag: a correctness-preserving optimisation
 shipped OFF is a change nobody is running, and the first real cell is where you discover that.

@@ -513,12 +513,11 @@ def encoder_url(model_version: ModelVersion = DEFAULT_MODEL_VERSION) -> str:
     another encoder's URL misidentifies itself to every downstream reader, and
     does so silently.
 
-    MERGE NOTE (global-tessera-scoping): that branch's
-    ``conventions.expected_model_url()`` re-derives this URL at fill time and
-    compares it to the seed's, from a single module constant. Route it through
-    here and pass the fill's ``model_version``, or the gate checks a v2 fill
-    against v1.1's URL — rejecting a correct run, or waving through a real
-    mismatch when the seed carried the same stale constant.
+    ``conventions.expected_model_url()`` re-derives this URL at fill time
+    through here, with the fill's ``model_version``. A single module constant
+    there would check a v2 fill against v1.1's URL — rejecting a correct run,
+    or waving through a real mismatch when the seed carried the same stale
+    constant.
     """
     try:
         return MODEL_ENCODER_URLS[model_version]
@@ -673,7 +672,7 @@ class InferenceConfig:
             num_workers: GPU workers.
             s1_orbit: Which S1 orbit(s) — "ascending", "descending", "both", or
                 "none" for radar-free land (which requires allow_s2_only).
-            compute_std: No-op under v1.1 (deterministic sampling); always False.
+            compute_std: No-op (both encoders sample deterministically); always False.
 
         I/O:
             checkpoint_path: Path to model checkpoint (.pt file).
@@ -916,7 +915,7 @@ class InferenceConfig:
             )
         self.num_obs_checkpoints = _normalize_obs_checkpoints(self.num_obs_checkpoints)
 
-        # v1.1 sampling is deterministic — no repeat variance to measure.
+        # Both encoders sample deterministically — no repeat variance to measure.
         self.compute_std = False
 
     def _apply_arch_defaults(self) -> None:

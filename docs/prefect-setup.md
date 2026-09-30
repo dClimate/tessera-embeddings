@@ -173,7 +173,8 @@ Symptom: flow logs hundreds of warnings about heartbeat timeouts
 while "Building Dask graph"; eventually fails.
 
 Cause: chunk size too small → graph too big. See
-[`README.md`](../README.md) §"Why chunk size dominates everything".
+[`single-vs-global.md`](single-vs-global.md#why-chunk-size-dominates-everything)
+on why chunk size dominates everything.
 Only *ingest* uses Dask (`INGEST_CHUNK_SIZE = 4096` storage chunks);
 assembly runs as local worker processes on the flow runner — size that
 container for the **full 64 GiB** (`AssemblyConfig` caps **16** workers, and a
@@ -182,14 +183,6 @@ commit. Anything smaller risks an OOM in the shard-write
 tail rather than a clean failure. Don't reach for
 `INFERENCE_CHUNK_SIZE` here: it drives GPU read-tiling, not Dask, and
 must stay equal to the 2048-px shard pitch for the global store (D3).
-
-### ECS task definition diff between dev branches
-
-Not relevant in this OSS package; the closed-source `yield_modeling`
-deployment system uses per-branch ECS task definition revisions to
-let dev branches use a different image without polluting the prod
-family. If you've forked from a downstream that does this, the
-machinery lives outside the OSS scope.
 
 ### Why two `@flow`s per flow file?
 
@@ -239,7 +232,10 @@ helpers; the flow wires them into Prefect's lifecycle.
 - **CDK / Terraform / Pulumi** for the Prefect server itself.
 - **The work pool job template** as a file — it's deployment-specific
   (your VPC, your IAM, your image registry).
-- **A CI/CD pipeline for deploying flows** — your call.
+- **A CI/CD pipeline for deploying flows** — your call. That includes anything that
+  gives a dev branch its own container image or its own task-definition revision:
+  deployment names are caller-supplied (see Deployments above), so the library never
+  needs to know which environment it is in.
 
 We document the env-var contract; you bring the infrastructure.
 That keeps the OSS surface narrow without forcing every adopter

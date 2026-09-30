@@ -834,6 +834,7 @@ def _infer_planned(
         get_credentials=get_credentials,
         s3_region=s3_region,
         retire_idle_actors=retire_idle_actors,
+        cell=f"{plan.zone}-{plan.year}",
     )
     return complete_zone_inference(plan, results=results)
 

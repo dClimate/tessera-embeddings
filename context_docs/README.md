@@ -53,7 +53,7 @@ context_docs/
 │                                                  three quarters of that is a polarisation choice
 │
 ├── ingest/                        BUILDING THE MOSAICS
-│   ├── ingest-performance.md                   what ingest costs, what made it faster, and what
+│   ├── campaign-ingest-measurements.md         what ingest costs, what made it faster, and what
 │   │                                              limits it now — the graph budget, the catalogue
 │   │                                              budget, live-tile cropping, region writes
 │   ├── source-read-failures.md                 twelve ways a source read fails, the guard each
@@ -92,6 +92,9 @@ context_docs/
     ├── writing-to-the-global-store.md          assembly's fork pool, the session catch-up, the
     │                                              credential incident, why commits are ungated,
     │                                              and the registry published beside the store
+    ├── reading-the-published-store.md          the reader's side: no credentials needed, what
+    │                                              conforms, measured speeds in two regions, and
+    │                                              what would surprise a consumer
     ├── staging-identity-and-resume.md          what a run id identifies, and what resumes
     └── icechunk-api-ledger.md                  signatures and gotchas the scale tests earned
 ```

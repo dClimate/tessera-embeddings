@@ -11,7 +11,11 @@ exclude = [
     ".pytest_cache",
     ".mypy_cache",
     ".ruff_cache",
-    "build",
+    # ANCHORED. A bare "build" matches any directory of that name at any depth, which silently
+    # excluded `scripts/build/` — two scripts, and anything later added beside them, were neither
+    # linted nor formatted, and nothing said so. Only the build artifact directory at the project
+    # root is meant here.
+    "/build",
     "dist",
     "*.egg-info",
     "open_sourcing_planning",

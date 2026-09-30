@@ -110,7 +110,7 @@ def _assert_seeded_model_matches(
     seeded = cast("str | None", root.attrs.get("geoemb:model"))
     # EXPLICIT, not defaulted. The campaign fills with v1.1 today — `fill_zone_year` exposes no
     # model selector — but an unversioned call here silently compares any future v2 fill
-    # against v1.1's URL, which is what `encoder_url`'s own docstring warns this merge about:
+    # against v1.1's URL, the failure `encoder_url`'s docstring describes:
     # it rejects a correct run, or waves through a real mismatch when the seed carried the
     # same stale default. Passing the version makes the seam visible and one-line to move.
     expected = expected_model_url(model_version=encoder_version)

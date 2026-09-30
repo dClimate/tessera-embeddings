@@ -16,7 +16,7 @@ config/
 │                           INFERENCE_CHUNK_SIZE = 2048
 │                           EMBEDDING_DIM = 128
 │                           DEFAULT_NUM_OBS_CHECKPOINTS = tuple(range(8, 257, 8))
-│                           checkpoint_filename(norm_source="mpc"|"aws") → str
+│                           checkpoint_filename(norm_source="aws"|"mpc") → str
 ├── time_windows.py         parse_time_window(s)  ── "Month YYYY" → TimeWindow
 ├── assembly.py             AssemblyConfig   ── frozen: worker-process pool sizing
 ├── dask.py                 compute_pipeline_cluster_sizing ── ingest cluster caps
@@ -92,7 +92,7 @@ config = InferenceConfig(
     num_gpus=1,                    # 0 for CPU runs
     # v1.1 sampling — bucketed deterministic resampling:
     num_obs_checkpoints=tuple(range(8, 257, 8)),  # default; multiples of 8 up to 256
-    norm_source="mpc",             # "aws" for the AWS-normalised encoder checkpoint
+    norm_source="aws",             # the default; "mpc" is unexercised
 )
 ```
 

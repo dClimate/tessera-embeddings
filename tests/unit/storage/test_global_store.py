@@ -76,7 +76,7 @@ def test_coords_and_attrs(tmp_path):
     assert "geoemb:type" not in attrs
     zone_conventions = [c["name"] for c in attrs["zarr_conventions"]]
     assert "geoemb:" not in zone_conventions
-    assert {"proj:", "spatial:"} <= set(zone_conventions)
+    assert {"proj", "spatial"} <= set(zone_conventions)
 
 
 def test_root_carries_geoemb_convention(tmp_path):

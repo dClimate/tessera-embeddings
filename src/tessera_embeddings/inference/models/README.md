@@ -5,14 +5,15 @@ architecture and forward-pass logic are **unchanged** from training — do not
 modify unless you are also retraining or have verified checkpoint compatibility.
 
 Two model versions live here, selected by `InferenceConfig.model_version`
-(`"v1.1"` — the default — or `"v2-large"`). `builder.py` dispatches; everything
-upstream of the model (loading, sampling, bucketing) is version-agnostic.
+(`"v1.1"` — the default — or `"v2-large"`). `builder.py` dispatches. Loading and
+bucketing upstream of the model are shared; the resampling rule and the band statistics
+are chosen per version (see below).
 
 ## Source mapping
 
 | File | Ported from | Changes from original |
 |---|---|---|
-| `modules.py` | `tessera_infer/src/models/modules.py` | Type hints, ruff formatting. Upstream's `TransformerEncoder` renamed `V11TransformerEncoder` (upstream v2 has a same-named class; see `student_v2.py`). `TemporalPositionalEncoder` caches `div_term` per device in FP32 and takes an explicit output dtype, and the encoder casts bands (not DOY) to the weights' dtype — see "Reduced precision" in `../README.md`. Layer shapes and forward-pass math are unchanged. |
+| `modules.py` | `tessera_infer/src/models/modules.py` | Type hints, ruff formatting. Upstream's `TransformerEncoder` renamed `V11TransformerEncoder` (upstream v2 has a same-named class; see `student_v2.py`). `TemporalPositionalEncoder` caches `div_term` per device in FP32 and takes an explicit output dtype, and the encoder casts bands (not DOY) to the weights' dtype — see "The input stays FP32" in `../README.md` §7. Layer shapes and forward-pass math are unchanged. |
 | `ssl_model.py` | `tessera_infer/src/models/ssl_model.py` | Type hints, ruff formatting. Backbone annotations widened to `nn.Module` so the wrapper hosts either version's backbones. |
 | `student_v2.py` | `geotessera/TESSERA-V-2.0-2B-L` (Hugging Face) `model.py`, = `ucam-eo/tessera` `tessera_infer_v2/student/model.py` | Type hints, ruff formatting; upstream's `TransformerEncoder` renamed `StudentTransformerEncoder`; upstream's inline positional encoder replaced by the shared `modules.TemporalPositionalEncoder` (bit-identical at fp32, plus an explicit output-dtype cast and a per-device FP32 `div_term` cache); the top-level `PixelStudent` assembly is not duplicated — see below. |
 | `builder.py` | `tessera_infer/src/models/builder.py` | Type hints, ruff formatting. Added FSDP prefix stripping in `load_v11_checkpoint()`, plus the v2 build/load path (`_build_v2_inference_model`, `load_v2_checkpoint`, `_verify_v2_args`). |
@@ -51,7 +52,7 @@ versions.
 The shared bucket schedule is a shared *contract*, not shared preprocessing: a
 pixel with `k` valid observations lands in the same bucket under either version,
 but the indices chosen to fill that bucket come from the version's own rule (see
-the table above and `../README.md` §4c). Anything comparing two models' outputs
+the table above and `../README.md` §6). Anything comparing two models' outputs
 has to treat the selection as model-specific — the boundary is drawn in
 `context_docs/inference/validating-a-model-change.md` §2.
 

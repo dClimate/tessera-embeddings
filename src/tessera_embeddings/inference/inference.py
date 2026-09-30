@@ -6,7 +6,7 @@ sliced to the canonical 128-D downstream width (a real slice for v1.1's 192-D ou
 v2 Large's native 128-D) and written into a flat per-pixel output array.
 
 Inputs reach the model as FP32; each backbone casts its own band channels to the weights' dtype so
-the raw integer DOY channel is never rounded. See "Reduced precision" in ``README.md``.
+the raw integer DOY channel is never rounded. See "The input stays FP32" in ``README.md`` §7.
 """
 
 from __future__ import annotations
