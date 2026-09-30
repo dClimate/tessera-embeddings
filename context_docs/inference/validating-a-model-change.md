@@ -181,7 +181,74 @@ carry the expected payload before the run: keys `args` and `model`, `latent_dim`
 `dim_feedforward` 2560, 4 layers, 4 heads, `repr_dim` 128, QK-norm off, and exactly 43,831,170
 parameters.
 
-## 7. Not covered here
+## 7. End-to-end checks on the dev stack, 2026-09-30
+
+Two sets of runs on `global-tessera-dev`, from tessera-embeddings `c550f2bb` (this PR after merging
+`main`), deployed through yield-embeddings `dev/global-tessera-v2-large` (`266a884`). The v2
+checkpoint was staged as `s3://global-tessera-inputs-dev/models/v2_student_large.pt`, SHA-256
+`b5f20239…c1e1`.
+
+### Wiring: v1.1 and v2 over the same mosaics
+
+The single-area flow on `m10_parity_15S_epsg32715` (1024 × 1025 px, `time_window_end="December
+2024"`, `num_actors=2`), once per model and from the same code, so the model was the only variable.
+
+| check | result |
+|---|---|
+| the six provenance arrays (three observation counts, three month masks) | identical |
+| pixels embedded | the same set, 99.90% of the area |
+| embeddings | differ: 0.55% of int8 values coincide, median v1.1-to-v2 cosine −0.05 |
+| v2 identity | `geoemb:model` is the Hugging Face URL, `checkpoint_id` is `v2_student_large`, run ID `v2-5f141cb56305`, 128-d |
+| v2 output after dequantization | per-pixel mean 0.0000, standard deviation 1.0000 |
+| a v2 run pointed at the v1.1 store | refused by the pre-flight before any Ray cluster started |
+
+Flow runs: v1.1 `cf5b18d3`, v2 `f4b57309`, refusal `69a06a5f`.
+
+### v1.1 against the published store
+
+Whether v1.1 from this branch reproduces the published product. The published inputs no longer
+exist (mosaics are deleted after assembly), so the tile was re-ingested, and this compares the whole
+chain rather than inference alone.
+
+- **Tile:** zone 14N, 2025, the 2048-px shard at easting 655,360–675,840 and northing
+  5,222,400–5,242,880 (zone-grid row 409,600, column 49,152), on the Red River of the North. In the
+  published store every pixel is embedded, with a median of 84 optical, 34 ascending and 31
+  descending observations, produced at commit `e7c43d55`.
+- **The campaign path, not the single-area one.** Only the campaign path runs the published
+  settings: the 0.1% date threshold, the 15-observation minimum, radar-free pixels allowed, and the
+  zone grid itself. It was narrowed to one tile with a coverage mask built from the two registry
+  cells lying entirely inside it (`build-land-mask`, name `parity-redriver`), then `seed-global-store`
+  (`parity-v11-redriver`, `optical_min_obs=15`), `ingest-zone-year`, and `fill-zone-year`
+  (`allow_s2_only=true`, `require_s1=false`, `num_actors=2`).
+- **One deliberate deviation:** `ingest_settings.min_valid_coverage=0.0001` in place of 0.1. The
+  threshold is a percentage of the mask's live pixels. The published run's denominator was all of
+  zone 14N's land; a one-tile mask shrinks it to one tile, where 0.1% would drop mostly-cloudy dates
+  the published run kept. The provenance result below is what confirms the substitute.
+- **Comparison:** the same tile-year read from both stores by index, since the grids are identical.
+  Provenance must match exactly, and embeddings are compared on the pixels whose provenance matches.
+
+Over all 4,194,304 pixels:
+
+| | result |
+|---|---|
+| the six provenance arrays | identical on 100% of pixels |
+| pixels embedded | 100% in both |
+| int8 values identical | 77.5% |
+| largest difference | 3 quantization levels; 9.0% of pixels differ by more than one level in some channel |
+| per-pixel cosine, dequantized | min 0.999867, 0.1st percentile 0.999912, 1st 0.999925, median 0.999955; 0.013% below 0.9999 |
+| per-pixel `scales` | median relative difference 0 |
+
+**Reading.** The re-ingest reproduced the published inputs exactly, so the difference lies in
+inference. It fails ADR-012's same-numerics gate (99.5% of int8 values identical, at most one level
+apart) and essentially meets its cosine bar. That is the shape expected from this PR's day-of-year
+precision fix, which changes v1.1's BF16 output on every pixel: on the v2 checkpoint the fix moved
+mean cosine against the FP32 graph from 0.99995 to 0.99999, and the median here is 0.999955. **Not
+separated:** the fix, GPU nondeterminism, and any other inference change since `e7c43d55`. The same
+fill run at `e7c43d55` would separate them.
+
+Flow runs: mask `4be8b6b8`, seed `13f21478`, ingest `b4831f2e`, fill `16ab4af4`.
+
+## 8. Not covered here
 
 Whether a new model is *better* than the old one is a downstream-task question, not a readback one.
 For v2 the intended measure is a crop-type probe against the USDA Cropland Data Layer, which is
