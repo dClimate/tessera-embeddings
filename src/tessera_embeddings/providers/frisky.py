@@ -234,7 +234,13 @@ def _frisky_cli(*args: str) -> str:
     people and agents, and its output is the same thing they will read.
     """
     command = [sys.executable, "-m", "frisky.cli", *args]
-    return subprocess.run(command, capture_output=True, text=True, timeout=300, check=True).stdout
+    done = subprocess.run(command, capture_output=True, text=True, timeout=300, check=False)
+    if done.returncode:
+        # The CLI says why on stderr, then prints usage hints; CalledProcessError's message drops both.
+        lines = done.stderr.strip().splitlines()
+        reason = next((line for line in reversed(lines) if "Error" in line), lines[-1] if lines else "no stderr")
+        raise RuntimeError(f"frisky {args[0]} {args[1] if len(args) > 1 else ''} exited {done.returncode}: {reason}")
+    return done.stdout
 
 
 def _write(uri: str, text: str) -> None:
