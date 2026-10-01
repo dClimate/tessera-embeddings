@@ -235,5 +235,8 @@ documentation: [`docs/frisky.md`](../../docs/frisky.md).
   about 10 s of its last batch, not 45.
 - Find why the gate's computes run one after another on Frisky.
 - Check the span drain's load on the scheduler at B4's scale; at Iowa its peak was 79% of a core.
+  On 35N with `pipeline_dates`, whole-minute drain requests hit the dashboard proxy's timeout
+  (HTTP 504) and each miss grew the retry; drains now request 15-second slices and keep the
+  slices read before a failure. Confirm on dev.
 - Decide whether Frisky stays a core dependency when this reaches `main`, on the experiment's
   results and the constraints under Packaging above.

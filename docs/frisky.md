@@ -63,7 +63,8 @@ capture covers the last half minute.
 
 **To keep the whole run,** also set `frisky_drain_spans=True`. Every minute the run then copies its
 task, transfer and spill spans (`SPAN_DRAIN_NAMES`, a fifth of all spans and every second of task
-time) to `<perf_report_uri>/spans/part-NNNNNN.json.gz`. That is about 9 GB a day gzipped per 60
+time) to `<perf_report_uri>/spans/part-NNNNNN.json.gz`, asking for 15 seconds at a time so each
+request stays inside the dashboard proxy's timeout. That is about 9 GB a day gzipped per 60
 workers. `spans.json` then keeps only the last 100,000 spans (`SPANS_CAPTURE_LIMIT_DRAINED`), about
 7 s at Iowa scale, because the parts already hold every task span. To read a run's parts as one
 file:
