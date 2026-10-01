@@ -207,6 +207,15 @@ findings:
   spans every minute. They are a fifth of the spans and hold all of the task time; spans under
   1 ms would be another five times smaller but lose a quarter of the transfer time. On Iowa the
   drain kept every span Frisky did, and Frisky's tracing itself misses about one in 2,000.
+- **The end-of-run capture took 45 s with the drain on, against Dask's 7 s, while the whole fleet
+  was billed.** The bundle's S3 timestamps on the `-fix` run split it: the final drain about 9 s,
+  the 500,000-span `spans.json` 18 s before its 167 MB upload began (five pages from the
+  dashboard), and that upload and the five CLI calls the last 18 s, one after another. Locally, on
+  a hijacked cluster holding 600,000 spans, three changes take the same exit from 8.4 s to 2.1 s.
+  The drain writes each part with one `json.dumps` at gzip level 6, where streaming `json.dump` ran
+  the pure-Python encoder into level 9: a 173,000-span part takes 0.53 s instead of 2.35 s and is
+  9% larger. With the drain on, `spans.json` keeps 100,000 spans, one page of the span API. And the
+  final captures run concurrently. Not yet measured on dev.
 
 The 2048-px chunk changes pixels slightly, through GDAL's approximate warp transformer rather than
 through either engine; the plan's B1 result has the measurement.
@@ -222,7 +231,8 @@ documentation: [`docs/frisky.md`](../../docs/frisky.md).
   the matching step of `_MatchDaskWorker` go.
 - Report the up-front graph pickling and the 4096 tail upstream, with these numbers, and ask
   icechunk to make `computing_meta` pickle by reference so `_picklable_merge_reduction` can go.
-- Shorten the end-of-run capture when the drain is on: on Iowa it took 45 s of a 60-worker fleet.
+- Confirm the shorter end-of-run capture on dev: a drained Iowa run's bundle should land within
+  about 10 s of its last batch, not 45.
 - Find why the gate's computes run one after another on Frisky.
 - Check the span drain's load on the scheduler at B4's scale; at Iowa its peak was 79% of a core.
 - Decide whether Frisky stays a core dependency when this reaches `main`, on the experiment's

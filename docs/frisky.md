@@ -63,8 +63,10 @@ capture covers the last half minute.
 
 **To keep the whole run,** also set `frisky_drain_spans=True`. Every minute the run then copies its
 task, transfer and spill spans (`SPAN_DRAIN_NAMES`, a fifth of all spans and every second of task
-time) to `<perf_report_uri>/spans/part-NNNNNN.json.gz`. That is about 8 GB a day gzipped per 60
-workers. To read a run's parts as one file:
+time) to `<perf_report_uri>/spans/part-NNNNNN.json.gz`. That is about 9 GB a day gzipped per 60
+workers. `spans.json` then keeps only the last 100,000 spans (`SPANS_CAPTURE_LIMIT_DRAINED`), about
+7 s at Iowa scale, because the parts already hold every task span. To read a run's parts as one
+file:
 
 ```bash
 python -c "import glob, gzip, json, sys; json.dump([s for p in sorted(glob.glob(sys.argv[1] + '/part-*.json.gz')) for s in json.load(gzip.open(p, 'rt'))], sys.stdout)" spans > run-spans.json
