@@ -112,7 +112,8 @@ def engine_client(request: pytest.FixtureRequest, spawned_cluster: Client) -> It
 def test_frisky_destroys_the_cause_until_the_worker_plugin_is_installed(spawned_cluster: Client) -> None:
     """Frisky's own A/B, and the test that says when its workaround can go.
 
-    Frisky returns a task's exception by plain pickle, which drops ``__cause__`` even with this
+    Frisky never registers a failing chain with tblib, as Dask does on every failure, so GDAL's
+    classes, imported after the worker's one registration, lose ``__cause__`` even with this
     module's rescue in place. If the first half stops reproducing, an upgrade fixed it, and
     the tblib step of ``_MatchDaskWorker`` in ``providers/frisky.py`` is a candidate for deletion.
     """

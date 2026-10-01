@@ -24,11 +24,12 @@ Three behaviours differ from Dask and are handled here or by the providers:
 - **No adaptive scaling.** Dask sizes an adaptive fleet from its own task load, which a hijacked
   cluster no longer has, so it would shrink to the minimum and retire workers holding Frisky's
   data. ``ecs_cluster(frisky=True)`` fixes the fleet at ``max_workers`` instead.
-- **Exception chains.** Frisky returns a task's exception with plain pickle, which drops
-  ``__cause__``: the GDAL reason every read-failure verdict is decided from. :func:`hijack`
-  installs tblib's chain-preserving reducers on every worker, the step Dask itself takes on each
-  failure; with ``loader_failures.keep_causes_picklable`` (installed by the ingest) the whole
-  chain arrives.
+- **Exception chains.** A task's exception keeps its ``__cause__`` only for classes tblib has
+  registered, which happens once, when the worker imports Dask. Dask registers the failing chain
+  on every failure and Frisky never does, so rasterio's GDAL errors, imported later, lose the cause
+  every read-failure verdict is decided from. :func:`hijack` registers them on every worker after
+  importing the ingest; with ``loader_failures.keep_causes_picklable`` (installed by the ingest)
+  the whole chain arrives.
 """
 
 from __future__ import annotations
