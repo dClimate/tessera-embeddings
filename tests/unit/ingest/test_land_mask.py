@@ -374,14 +374,15 @@ def test_live_chunk_count_equals_written_chunk_objects(tmp_path) -> None:
     """
     zone = "31N"
     tiles_per_chunk = land_mask.INGEST_CHUNK_SIZE // SHARD_PX
-    # Two tiles inside one chunk block, plus one in a different block: the count
-    # must coarsen (3 tiles -> 2 chunks), not simply track tiles.
-    cov = make_coverage(tmp_path, zone, [(0, 0), (0, 1), (4 * tiles_per_chunk, 3 * tiles_per_chunk)])
+    # Two neighbouring tiles plus one far away. Where a chunk spans several tiles the first two
+    # share one, so the count must coarsen (3 tiles -> 2 chunks) rather than track tiles.
+    tiles = [(0, 0), (0, 1), (4 * tiles_per_chunk, 3 * tiles_per_chunk)]
+    cov = make_coverage(tmp_path, zone, tiles)
     dest = str(tmp_path / "roi.zarr")
     land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest)
 
     expected = land_mask.live_chunk_count(zone, land_mask_path=cov)
-    assert expected == 2
+    assert expected == len({(r // tiles_per_chunk, c // tiles_per_chunk) for r, c in tiles})
     grid = live_chunk_grid_from_keys(dest, zarr.open(dest, mode="r"))
     assert grid is not None  # layout the ingest's cropping fast path requires
     assert int(grid.sum()) == expected

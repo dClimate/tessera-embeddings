@@ -367,7 +367,7 @@ def fill_zone_year_flow(
         checkpoint_path=f"{paths.inputs.rstrip('/')}/models/{checkpoint_filename()}",
         inputs_bucket=paths.inputs,
         output_bucket=paths.outputs,
-        # 1 inference tile == 1 output shard == 2x2 tiles per 4096-px ingest chunk (D3), so
+        # 1 inference tile == 1 output shard == 1 ingest chunk at 2048 px (D3), so
         # assembly writes whole, lean shards with no read-modify-write. Passed explicitly even
         # though INFERENCE_CHUNK_SIZE equals SHARD_PX: this path REQUIRES the identity, and
         # stating it keeps a retune of the default from silently unaligning the campaign.

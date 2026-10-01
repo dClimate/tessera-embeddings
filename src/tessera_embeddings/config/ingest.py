@@ -34,19 +34,20 @@ def ingest_code_identity() -> str:
     return source_identity(_MOSAIC_CONTENT_SOURCES, "ingcode")
 
 
-# Spatial chunk size for storage (written at ingest). 4096 aligns with the embedding store's
-# 2048-px shard grid: one ingest chunk is exactly 2x2 shards (and 16x16 of the 256-px inner
-# chunks). Both pipelines read the same 2048-px tile (config.inference.INFERENCE_CHUNK_SIZE), so
-# the chain divides evenly end to end — 4096 ingest chunk -> 2048 inference tile -> 2048 output
-# shard -> 256 inner chunk, no rechunk at any hop — while still exceeding the inference read-tile
-# size to keep the satellite-ingest Dask graph small. Inference reads sub-tiles via .oindex and
-# imposes no alignment requirement of its own; the alignment is what makes every read
-# whole-object rather than partial.
+# Spatial chunk size for storage (written at ingest). 2048 is the embedding store's shard pitch and
+# the inference read tile (config.inference.INFERENCE_CHUNK_SIZE), so one ingest chunk is exactly
+# one tile and one output shard (and 8x8 of the 256-px inner chunks): every read on the way to the
+# store is one whole object, with no rechunk at any hop.
 #
-# Older 4000-px stores stay readable, but appending to one under this config is rejected by the
-# RoiManifest chunk-size check (structural-param mismatch) — finish such a campaign on its own
-# config, or re-ingest.
-INGEST_CHUNK_SIZE = 4096
+# The cost is the task graph. Tasks scale with chunks, so the same area costs four times the tasks
+# it did at 4096, the previous value, which was chosen to keep Dask's single-threaded scheduler
+# ahead of the graph. This branch tests the smaller chunk on Frisky (docs/frisky.md). The
+# thresholds counted in chunks (the window merge costs, the batching threshold, zone fleet sizing)
+# are their 4096 measurements converted by area, and provisional until re-measured at 2048.
+#
+# Older stores stay readable, but appending to a store written at another chunk size is rejected
+# (the ingest code identity differs) — finish such a campaign on its own config, or re-ingest.
+INGEST_CHUNK_SIZE = 2048
 
 INGEST_CHUNKS = {"time": 1, "northing": INGEST_CHUNK_SIZE, "easting": INGEST_CHUNK_SIZE}
 
@@ -94,7 +95,9 @@ DEFAULT_MIN_VALID_COVERAGE = 0.1
 # nobody touching this constant (a finer merge covers less area, so ROIs drift DOWN and more of
 # them batch). Recalibrate against runs, not an offline sweep at a different cost, whenever that
 # exchange rate changes.
-AUTO_BATCH_DATES_MAX_COVERED_CHUNKS = 500
+#
+# Provisional at 2048-px chunks: the 500 measured at 4096, converted by area. Re-measure.
+AUTO_BATCH_DATES_MAX_COVERED_CHUNKS = 2000
 
 # Dates fused per graph when batching turns on. The only batch size measured.
 AUTO_BATCH_DATES = 4

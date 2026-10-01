@@ -501,7 +501,7 @@ def _create_storage(
 _manifest_split_sizes: dict[str, int] | None = None
 
 # Default for the region-write merge workload, case (a) above — NOT for campaign ingest,
-# which wants time-only. With INGEST_CHUNK_SIZE=4096 a 4x4 spatial split is ~16k px/shard, a
+# which wants time-only. With INGEST_CHUNK_SIZE=2048 a 4x4 spatial split is ~8k px/shard, a
 # touch larger than a typical ~3x3-chunk region write, so most commits hit only 1-4 tiles
 # while shard objects stay in the low hundreds on a ~50x50-chunk store. Region writes are
 # spatially scattered, so a per-write commit rewrites its tiles rather than the full-height

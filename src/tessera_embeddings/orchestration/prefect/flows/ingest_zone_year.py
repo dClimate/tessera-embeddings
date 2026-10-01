@@ -240,15 +240,16 @@ def _write_ingest_marker(store_path: str, fingerprint: dict, *, get_credentials:
 
 
 # Chunk-scaled worker sizing for cropped ingests: workers proportional to the cell's work
-# measure, clamped. One 4096-px ingest chunk is the unit of work once writes crop to live
-# windows, so a 4-tile zone does not get a dense zone's fleet. The floor keeps a tiny cell off
-# a single worker; the caller's max_workers stays the hard cap (quota).
-_WORKERS_PER_LIVE_CHUNK = 0.5
+# measure, clamped. One ingest chunk is the unit of work once writes crop to live windows, so a
+# 4-tile zone does not get a dense zone's fleet. The floor keeps a tiny cell off a single worker;
+# the caller's max_workers stays the hard cap (quota). Provisional at 2048-px chunks: the 0.5 per
+# chunk measured at 4096, converted by area. Re-measure.
+_WORKERS_PER_LIVE_CHUNK = 0.125
 _WORKERS_FLOOR = 10
 
 
 def _scaled_max_workers(live_chunks: int, settings: IngestSettings) -> int:
-    """Clamp(0.5 x live chunks) into [max(min_workers, floor), max_workers]."""
+    """Clamp(_WORKERS_PER_LIVE_CHUNK x live chunks) into [max(min_workers, floor), max_workers]."""
     # `or 1` reads the sentinel as 1, keeping this max() a no-op for an unset min_workers.
     # It floors the derived WIDTH — a different question from the fleet's adaptive minimum;
     # see IngestSettings.floor_for.

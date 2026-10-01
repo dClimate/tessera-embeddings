@@ -65,7 +65,8 @@ DEFAULT_TASKS_PER_CHUNK = 200
 #: parallel and cheap; a serial window boundary is not. Calibration in
 #: ``context_docs/ingest/campaign-ingest-measurements.md``. Still the right value for the
 #: sequential write path — S1 is on it (``overlap_window_writes`` defaults False there).
-WINDOW_COST_IN_CHUNKS = 200
+#: Provisional at 2048-px chunks: the 200 measured at 4096, converted by area. Re-measure.
+WINDOW_COST_IN_CHUNKS = 800
 
 #: The same exchange rate once a date's windows share ONE dask graph (``overlap_window_writes``),
 #: which makes a window boundary cheap rather than a serial stall: a window then costs a
@@ -77,7 +78,9 @@ WINDOW_COST_IN_CHUNKS = 200
 #: cuts covered area 6.0% for 14.4% more windows, and total submitted tasks FALL 6% because area
 #: dominates. The knee is 10-20: 200->50 buys 74 chunks per added window, 50->20 buys 28, 20->10
 #: buys 13.5. Per-zone spread in ``yield-embeddings/context_docs/measurements/`` (2026-07-27).
-WINDOW_COST_IN_CHUNKS_OVERLAPPED = 20
+#:
+#: Those figures are in 4096-px chunks. Provisional at 2048: the 20 converted by area. Re-measure.
+WINDOW_COST_IN_CHUNKS_OVERLAPPED = 80
 
 
 @dataclass(frozen=True)
@@ -189,7 +192,7 @@ def live_chunk_grid(
 ) -> np.ndarray:
     """Coarsen the ROI mask onto the ingest chunk grid: True where any pixel is live.
 
-    Reads one chunk-sized block at a time (~16 MB at the 4096 default), reducing each straight
+    Reads one chunk-sized block at a time (~4 MB at the 2048 default), reducing each straight
     into its ``live`` cell — never a whole row band (hundreds of MB on a wide zone, unbounded on
     an arbitrary single ROI) and never the whole mask (tens of GB decompressed). Zarr fetches
     per chunk either way, so this bounds memory without extra I/O. Plain zarr, no dask: a

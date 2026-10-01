@@ -35,7 +35,7 @@ from tessera_embeddings.storage.zone_grid import ZONES, canonicalize_zone
 
 #: Zone-level fan-out width. The work is S3 request latency rather than CPU, so the useful
 #: ceiling is well above the runner's core count; 12 keeps peak memory modest (each in-flight
-#: zone upsamples one 4096-px bool block at a time) while making the run bounded by the
+#: zone upsamples one ingest-chunk bool block at a time) while making the run bounded by the
 #: largest single zone rather than by their sum.
 DEFAULT_MAX_PARALLEL_ZONES = 12
 
