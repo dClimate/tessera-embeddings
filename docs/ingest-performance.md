@@ -33,7 +33,8 @@ measured, derivations in `context_docs/ingest/campaign-ingest-measurements.md`.
 
 Three facts a reader needs before any of the levers make sense: what the scheduler actually
 spends memory on, how the chunk grids line up, and what the write contract is that every lever
-has to preserve.
+has to preserve. The scheduler itself is also swappable: `use_frisky` (experimental) runs the same
+graphs on Frisky, a Rust reimplementation of Dask's (`context_docs/ingest/frisky-experiment.md`).
 
 ### Background: how Dask task graphs consume scheduler RAM
 

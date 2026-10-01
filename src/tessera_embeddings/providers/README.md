@@ -39,10 +39,25 @@ providers/
 │   ├── cluster.yaml.template Ray autoscaler template with INJECT comments
 │   ├── cloudwatch-agent.json.tpl
 │   └── gotchas.md            operational knowledge: AMI bake, teardown, etc.
-└── local/                    Single-machine fallbacks
-    ├── ray.py                ray.init / ray.shutdown ctx manager
-    └── dask.py               LocalCluster ctx manager
+├── local/                    Single-machine fallbacks
+│   ├── ray.py                ray.init / ray.shutdown ctx manager
+│   └── dask.py               LocalCluster ctx manager
+└── frisky.py                 Frisky (experimental) on top of either Dask provider
 ```
+
+## Frisky (experimental)
+
+Both Dask providers take `frisky=True`, which loads
+[Frisky](https://getfrisky.dev/), a Rust reimplementation of Dask's scheduler
+and workers, onto the cluster they built. The ingest's compute then runs on
+Frisky; provisioning, teardown and the Prefect task runner stay on Dask.
+`ecs_cluster(frisky=True)` fixes the fleet at `max_workers`, because adaptive
+scaling reads a task load that Frisky now holds.
+
+`frisky.py` is the only module that calls Frisky's API, so a library change
+lands in one place. It needs the optional `frisky` extra (a closed-source
+binary). Design, the four ways Frisky differs from Dask and the do's and
+don'ts: [`context_docs/ingest/frisky-experiment.md`](../../../context_docs/ingest/frisky-experiment.md).
 
 ## Scheduler health logging (Dask)
 

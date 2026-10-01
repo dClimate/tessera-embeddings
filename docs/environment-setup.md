@@ -12,6 +12,7 @@ execution that is the actual point of the library.
 | Inference (typical) | `pip install tessera_embeddings[inference]` | most users |
 | + Prefect orchestration | `pip install tessera_embeddings[inference,prefect]` | Prefect deployments |
 | + AWS | `pip install tessera_embeddings[inference,prefect,aws]` | AWS production |
+| + Frisky (experimental) | add `frisky` to any of the above | ingest runs with `use_frisky`; a closed-source binary, so never part of `all` |
 | Base only | `pip install tessera_embeddings` | contributors, CI, library integrations |
 
 uv is recommended for reproducible installs but not required — all `pip`
@@ -25,8 +26,11 @@ cd tessera-embeddings
 uv sync --all-extras   # resolves uv.lock; all extras + dev tools
 ```
 
+`--all-extras` includes `frisky`, a closed-source binary, which is how CI
+runs its tests; `uv sync --all-extras --no-extra frisky` leaves it out.
+
 `uv.lock` at repo root is the single lock file. It covers every extra
-(inference, prefect, aws) plus the dev group (pytest, ruff, mypy). Run
+(inference, prefect, aws, frisky) plus the dev group (pytest, ruff, mypy). Run
 `uv lock` after any change to `pyproject.toml` and commit the updated
 `uv.lock`. CI's `lock-check.yml` catches drift.
 
