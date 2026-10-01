@@ -53,12 +53,14 @@ engine appends on the other, which the parity tests justify.
 
 ## What differs from Dask, and what handles it
 
-Four things, each found by running the real ingest rather than by reading Frisky's docs.
+Four things. The first two are in none of Frisky's docs and showed only when the real ingest
+ran; the last two follow from reading Dask's adaptive scaling and Frisky's client.
 
 **1. Thread state is destroyed after every task.** This was the blocker. Frisky enters Python
 with `PyGILState_Ensure` and `PyGILState_Release` around each piece of work, and the release
 destroys the thread's Python state, so every `threading.local` is rebuilt per task. Measured on
-one OS thread, four tasks in a row read back the previous task's value:
+one OS thread, four tasks in a row each stored a value and read back what the one before had
+stored:
 
 | Engine | Values read back |
 |---|---|
@@ -78,8 +80,12 @@ after it joined, and the tasks placed on it but never completed were odc's image
 The smallest reproduction is a pyproj `CRS` passed as a task argument: 19 worker restarts before
 it was stopped. The fix is `_pin_thread_state`, one unmatched `PyGILState_Ensure` per thread. It is
 installed by wrapping `pickle.loads` on each worker, because unpickling is the first Python a
-Frisky thread runs for any task. With the pin, the reproduction shows 0 restarts and the real
-Denver ingest completes.
+Frisky thread runs for any task. With the pin, the reproduction shows 0 restarts, and the real
+Denver ingest completes with 10 of 13 dates passing the coverage gate, as on Dask, in 64 to 68 s.
+
+To see the failure again, remove the `pickle.loads` wrap from `_MatchDaskWorker.setup` and run
+`test_real_imagery_produces_an_equivalent_store_on_frisky`: it hangs while the workers crash-loop.
+`test_frisky_threads_keep_their_python_state_between_tasks` fails the same way in seconds.
 
 The pin relies on Frisky looking `pickle.loads` up after our plugin runs.
 `test_frisky_threads_keep_their_python_state_between_tasks` fails if an upgrade changes that.
@@ -112,10 +118,10 @@ table, which under a hijack holds one task: the driver. It would shrink the flee
 the ingest Frisky's client directly.
 
 **Measured and ruled out: thread stack size.** Frisky's task threads get Rust's default 2 MiB
-stack; Dask's get 16 MiB on macOS (and typically 8 MiB on Linux). Raising Frisky's with `RUST_MIN_STACK` did
-not stop the crash above, and once thread state is pinned the real ingest succeeds at 2 MiB, so
-nothing changes it. If a future crash really is a stack overflow, `RUST_MIN_STACK` set in the
-workers' environment (`worker_env_overrides`) is the lever.
+stack; Dask's get 16 MiB on macOS (and typically 8 MiB on Linux). Raising Frisky's with
+`RUST_MIN_STACK` did not stop the crash above, and once thread state is pinned the real ingest
+succeeds at 2 MiB, so nothing changes it. If a future crash really is a stack overflow,
+`RUST_MIN_STACK` set in the workers' environment (`worker_env_overrides`) is the lever.
 
 ## Do's and don'ts
 
@@ -152,8 +158,9 @@ workers' environment (`worker_env_overrides`) is the lever.
   but the nanny still kills a worker process at 95% of its memory limit. Frisky's own thresholds
   are `FRISKY_SPILL_FRACTION` and `FRISKY_SPILL_TARGET_FRACTION`, settable through
   `worker_env_overrides`.
-- **Read the heartbeat's task fields as the ingest's load.** Under Frisky, `SchedulerResourceLogger`'s
-  `tasks`, `processing` and `wmanaged` count only Dask's single driver task. Its `cpu`, `rss` and
+- **Read the heartbeat's task fields as the ingest's load.** Under Frisky,
+  `SchedulerResourceLogger`'s `tasks`, `processing` and `wmanaged` count only Dask's single driver
+  task. Its `cpu`, `rss` and
   `lag` still measure the scheduler process, which now also hosts Frisky's scheduler.
 - **Mistake the periodic stdout summary for an error.** Frisky prints one by default;
   `FRISKY_SUMMARY=off` silences it.
@@ -162,7 +169,8 @@ workers' environment (`worker_env_overrides`) is the lever.
 
 ### a) Does it work?
 
-Done locally (macOS, Python 3.13):
+Done locally (macOS, Python 3.13), and green again in CI on Linux (Python 3.12 and 3.13) on PR
+#205:
 
 | Suite | Covers | Result |
 |---|---|---|
@@ -191,6 +199,9 @@ Next, on the dev account:
 - **Pair the arms.** Run Dask with `min_workers == max_workers`, so the comparison measures the
   engine rather than autoscaling. Repeat each pair two or three times, alternating which engine
   goes first.
+- **Record each rung's configuration** with its result, so any number here can be rerun: commit,
+  image tag, Frisky version, ROI and date window, `max_workers`, worker CPU and memory, and every
+  ingest flag passed (`batch_dates`, `pipeline_dates`, `overlap_window_writes`).
 - **Measure:**
   - wall clock per leg;
   - the per-batch `Batch timings` lines (`build`, `gate`, `write`, `stall`);
@@ -200,7 +211,10 @@ Next, on the dev account:
   large `batch_dates`, the width at which `MAX_PIPELINE_DATES_WORKERS` stops pipelining) and not
   where image reads do.
 - **The only evidence so far** is the network-bound Denver toy, where the engines are
-  indistinguishable:
+  indistinguishable. Both ran on a laptop with 2 workers of 2 threads and 2 GB each, default
+  ingest flags, Denver July 2024 (13 dates, 10 written). Dask's figures are from
+  `test_s2_roi_parity`'s domain run; Frisky's from the same call on a hijacked cluster of the same
+  shape:
 
 | Engine | `gate` per batch (s) | `write` per batch (s) |
 |---|---|---|
