@@ -23,6 +23,7 @@ from tessera_embeddings.orchestration.prefect.flows._dask_lifecycle import (
     get_task_runner_for_cluster,
 )
 from tessera_embeddings.orchestration.prefect.tasks.ingest import process_roi_reflectance
+from tessera_embeddings.providers.frisky import maybe_capture_spans
 
 MAX_PIPELINE_DATES_WORKERS = 140
 """Widest fleet on which date pipelining is allowed to run.
@@ -81,6 +82,7 @@ def _ingest_s2_roi_impl(
     batch_dates: int | None = None,
     allow_ingest_code_mismatch: bool = False,
     s3_region: str | None = None,
+    use_frisky: bool = False,
 ) -> dict[str, Any]:
     """Inner flow: submits the S2 ingestion task to the configured Dask runner."""
     future = process_roi_reflectance.submit(
@@ -98,6 +100,7 @@ def _ingest_s2_roi_impl(
         batch_dates=batch_dates,
         allow_ingest_code_mismatch=allow_ingest_code_mismatch,
         s3_region=s3_region,
+        use_frisky=use_frisky,
     )
     return future.result()
 
@@ -123,6 +126,7 @@ def ingest_s2_roi_reflectance(
     collection: str = "sentinel-2-l2a",
     ec2_scheduler: bool = False,
     use_local: bool = False,
+    use_frisky: bool = False,
     storage_options: dict | None = None,
     perf_report_uri: str | None = None,
     stream_stac_monthly: bool = True,
@@ -152,10 +156,14 @@ def ingest_s2_roi_reflectance(
         ec2_scheduler: Run the Dask scheduler on EC2 instead of Fargate (better
             single-thread CPU for large graphs). Ignored when ``use_local=True``.
         use_local: Use the local-machine Dask provider instead of AWS, for tests and dev.
+        use_frisky: Run the ingest's compute on Frisky, an experimental Rust scheduler loaded
+            onto the same Dask cluster (:mod:`tessera_embeddings.providers.frisky`). On AWS it
+            fixes the fleet at ``max_workers`` and sends ``perf_report_uri`` Frisky's spans
+            instead of a Dask report. Off by default.
         storage_options: fsspec storage options forwarded to the domain function.
-        perf_report_uri: When set, a Dask performance-report HTML for this run is uploaded
-            there (probe-rung profiling; off by default). Ignored, with a warning, on the
-            ``use_local`` path.
+        perf_report_uri: When set, a Dask performance-report HTML (Frisky's spans as JSON with
+            ``use_frisky``) for this run is uploaded there (probe-rung profiling; off by
+            default). Ignored, with a warning, on the ``use_local`` path.
         stream_stac_monthly: Query STAC one calendar month at a time, prefetching the next
             while the current is processed. Bounds retained items so a year-long window
             fits the worker; ``False`` is the rollback path only.
@@ -207,7 +215,7 @@ def ingest_s2_roi_reflectance(
             # Say so rather than no-op: an operator finding nothing at the URI would
             # otherwise suspect the upload or their credentials.
             log.warning("perf_report_uri is ignored on the local-cluster path (use_local=True)")
-        with local_cluster() as cluster:
+        with local_cluster(frisky=use_frisky) as cluster:
             log.info("Local Dask cluster ready: scheduler=%s", cluster.scheduler_address)
             task_runner = get_task_runner_for_cluster(cluster.scheduler_address)
             return _ingest_s2_roi_impl.with_options(task_runner=task_runner)(  # type: ignore[arg-type]
@@ -225,6 +233,7 @@ def ingest_s2_roi_reflectance(
                 batch_dates=batch_dates,
                 allow_ingest_code_mismatch=allow_ingest_code_mismatch,
                 s3_region=s3_region,
+                use_frisky=use_frisky,
             )
 
     from tessera_embeddings.providers.aws.dask import ecs_cluster, maybe_performance_report
@@ -241,10 +250,16 @@ def ingest_s2_roi_reflectance(
         # Tag every cluster resource with this run's id so the cancellation/crash hook can
         # sweep the tasks from a fresh process (see _dask_lifecycle).
         resource_tags=dask_resource_tags(flow_run_ctx.id),
+        frisky=use_frisky,
     ) as cluster:
         task_runner = get_task_runner_for_cluster(cluster.scheduler_address)
         log.info("Task runner connected to scheduler at %s", cluster.scheduler_address)
-        with maybe_performance_report(cluster.scheduler_address, perf_report_uri, log):
+        report = (
+            maybe_capture_spans(cluster.dashboard_link, perf_report_uri, log)
+            if use_frisky
+            else maybe_performance_report(cluster.scheduler_address, perf_report_uri, log)
+        )
+        with report:
             return _ingest_s2_roi_impl.with_options(task_runner=task_runner)(  # type: ignore[arg-type]
                 roi_zarr_path=roi_zarr_path,
                 start_date=start_date,
@@ -260,4 +275,5 @@ def ingest_s2_roi_reflectance(
                 batch_dates=batch_dates,
                 allow_ingest_code_mismatch=allow_ingest_code_mismatch,
                 s3_region=s3_region,
+                use_frisky=use_frisky,
             )

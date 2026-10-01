@@ -1,7 +1,9 @@
 """Prefect task shells for ingest domain functions.
 
 Each shell pulls ``client`` and ``log`` from Prefect / Dask context, delegates to the domain
-function, and converts the dataclass result to a dict at the boundary.
+function, and converts the dataclass result to a dict at the boundary. With ``use_frisky`` the
+client sends its compute to Frisky on the same, already-hijacked cluster
+(:func:`tessera_embeddings.providers.frisky.connect`).
 
 This file is one of the few places in the package that imports from :mod:`prefect`. Domain
 modules under ``ingest/`` never do.
@@ -21,6 +23,7 @@ from tessera_embeddings.config.ingest import INGEST_MANIFEST_SPLIT
 from tessera_embeddings.ingest.roi_processing import DEFAULT_MIN_VALID_COVERAGE
 from tessera_embeddings.ingest.s1_roi import S1Orbit, ingest_s1_roi_sar
 from tessera_embeddings.ingest.s2_roi import ingest_s2_roi_reflectance
+from tessera_embeddings.providers.frisky import connect
 from tessera_embeddings.storage.zarr_store import StorageOptions, credentials_provider, manifest_split
 
 
@@ -44,6 +47,7 @@ def process_roi_reflectance(
     batch_dates: int | None = None,
     allow_ingest_code_mismatch: bool = False,
     s3_region: str | None = None,
+    use_frisky: bool = False,
 ) -> dict[str, Any]:
     """Prefect task: ingest S2 reflectance for one ROI.
 
@@ -74,13 +78,17 @@ def process_roi_reflectance(
 
     # Shard the mosaic's manifests: the store is created and appended to entirely
     # within this call, so create and every later append see the same config.
-    with cred_provider_cm, manifest_split(INGEST_MANIFEST_SPLIT):
+    with (
+        cred_provider_cm,
+        manifest_split(INGEST_MANIFEST_SPLIT),
+        connect(get_client(), enabled=use_frisky) as client,
+    ):
         result = ingest_s2_roi_reflectance(
             roi_zarr_path=roi_zarr_path,
             start_date=start_date,
             end_date=end_date,
             store_path=store_path,
-            client=get_client(),
+            client=client,
             min_valid_coverage=min_valid_coverage,
             provider=provider,
             collection=collection,
@@ -117,6 +125,7 @@ def process_roi_sar(
     narrow_windows_per_date: bool = True,
     allow_ingest_code_mismatch: bool = False,
     s3_region: str | None = None,
+    use_frisky: bool = False,
 ) -> dict[str, Any]:
     """Prefect task: ingest S1 OPERA SAR for one ROI.
 
@@ -160,13 +169,17 @@ def process_roi_sar(
 
     # manifest_split for the same reason as the S2 task: this mosaic is region-written once
     # per date batch, so an unsharded manifest makes each commit rewrite every ref so far.
-    with cred_provider_cm, manifest_split(INGEST_MANIFEST_SPLIT):
+    with (
+        cred_provider_cm,
+        manifest_split(INGEST_MANIFEST_SPLIT),
+        connect(get_client(), enabled=use_frisky) as client,
+    ):
         result = ingest_s1_roi_sar(
             roi_zarr_path=roi_zarr_path,
             start_date=start_date,
             end_date=end_date,
             store_path=store_path,
-            client=get_client(),
+            client=client,
             orbit=orbit,
             batch_days=batch_days,
             edl_credentials_fn=edl_credentials_fn,
