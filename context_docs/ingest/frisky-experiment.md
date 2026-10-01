@@ -215,8 +215,9 @@ findings:
   `cluster.close()` then timed out on it and failed the flow. On the year-long Iowa run, whose
   buffers filled at about minute 63, dispatch latency rose from milliseconds to 11–61 s a task
   while workers sat at 2–3% CPU, and an overview query took 87 s. `ecs_cluster(frisky=True)` now
-  sets 200,000, and a drained run's live snapshot analyses 50,000 spans and logs its own time,
-  to recalibrate against. Not yet confirmed on dev.
+  sets 200,000; a drained run's live snapshot analyses 50,000 spans and logs its own time, to
+  recalibrate against; and the end-of-run capture asks the scheduler for spans once, computing
+  both overviews from that file in the flow's process. Not yet confirmed on dev.
 - **The end-of-run capture took 45 s with the drain on, against Dask's 7 s, while the whole fleet
   was billed.** The bundle's S3 timestamps on the `-fix` run split it: the final drain about 9 s,
   the 500,000-span `spans.json` 18 s before its 167 MB upload began (five pages from the
