@@ -48,7 +48,6 @@ from tessera_embeddings.storage.zarr_store import (
     write_day_windows,
 )
 
-pytest.importorskip("frisky")
 pytestmark = pytest.mark.integration
 
 LOG = logging.getLogger(__name__)

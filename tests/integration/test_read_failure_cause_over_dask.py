@@ -101,7 +101,6 @@ def engine_client(request: pytest.FixtureRequest, spawned_cluster: Client) -> It
     if request.param == "dask":
         yield spawned_cluster
         return
-    pytest.importorskip("frisky")
     from tessera_embeddings.providers.frisky import connect, hijack
 
     hijack(spawned_cluster)
@@ -117,7 +116,8 @@ def test_frisky_destroys_the_cause_until_the_worker_plugin_is_installed(spawned_
     module's rescue in place. If the first half stops reproducing, an upgrade fixed it, and
     the tblib step of ``_MatchDaskWorker`` in ``providers/frisky.py`` is a candidate for deletion.
     """
-    frisky = pytest.importorskip("frisky")
+    import frisky
+
     from tessera_embeddings.ingest.loader_failures import install_capture_everywhere
     from tessera_embeddings.providers.frisky import _MatchDaskWorker, connect
 

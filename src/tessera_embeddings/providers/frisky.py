@@ -29,9 +29,6 @@ Three behaviours differ from Dask and are handled here or by the providers:
   installs tblib's chain-preserving reducers on every worker, the step Dask itself takes on each
   failure; with ``loader_failures.keep_causes_picklable`` (installed by the ingest) the whole
   chain arrives.
-
-``frisky`` is the optional ``frisky`` extra, so it is imported inside the functions that use it
-and this module loads without it.
 """
 
 from __future__ import annotations
@@ -46,6 +43,7 @@ import threading
 from collections.abc import Iterator
 from typing import Any, cast
 
+import frisky
 import fsspec
 import tblib.pickling_support
 from distributed import Client, WorkerPlugin
@@ -122,8 +120,6 @@ def hijack(dask_client: Client) -> None:
     order, late joiners included, and the pin must be in place before Frisky's worker
     deserialises its first task. Both plugins outlive ``dask_client``.
     """
-    import frisky
-
     dask_client.register_plugin(_MatchDaskWorker())
     frisky.hijack(dask_client, connect_client=False)
 
@@ -157,8 +153,6 @@ def connect(dask_client: Client, *, enabled: bool = True) -> Iterator[Client]:
         yield dask_client
         return
 
-    import frisky
-
     frisky_client = frisky.Client(dask_client.run_on_scheduler(_frisky_address))
     try:
         yield cast(Client, _HijackedClient(dask_client, frisky_client))
@@ -184,8 +178,6 @@ def maybe_capture_spans(
         yield
     finally:
         if uri:
-            import frisky
-
             try:
                 spans = frisky.query_spans(limit=SPANS_CAPTURE_LIMIT, dashboard_url=dashboard_url)
                 with fsspec.open(uri, "w") as out:

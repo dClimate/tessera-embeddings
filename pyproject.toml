@@ -77,6 +77,13 @@ dependencies = [
     # Imported directly by providers/frisky.py, which installs its chain-preserving exception
     # reducers on workers. It arrives via distributed, but the import is ours, so declare it.
     "tblib",
+    # Frisky, a Rust reimplementation of Dask's scheduler and workers, for the `use_frisky`
+    # ingest path (providers/frisky.py). Core on this branch because the branch exists to test
+    # it as the engine. It is closed-source (a free binary licence, not open source) and
+    # pre-1.0, so it is bounded to one minor: 0.x minors are where it breaks, and
+    # providers/frisky.py reaches past its documented API (`connect_client=False`, the
+    # `frisky_address` the hijack leaves on the Dask scheduler, when it looks up `pickle.loads`).
+    "frisky>=0.7.2,<0.8",
     "tqdm",
     "pyyaml",
     "python-dotenv",
@@ -112,14 +119,6 @@ aws = [
     # plugin). It arrives transitively via distributed, but the import is ours,
     # so declare it rather than rely on a dependency's dependency.
     "psutil",
-]
-# Frisky, an experimental Rust Dask scheduler, for the opt-in `use_frisky` ingest path (see
-# providers/frisky.py). Deliberately not in `all`: it is closed-source (a free binary licence,
-# not open source) and pre-1.0. Bounded to one minor because 0.x minors are where it breaks, and
-# providers/frisky.py reaches past its documented API (`connect_client=False`, the
-# `frisky_address` the hijack plugin leaves on the Dask scheduler).
-frisky = [
-    "frisky>=0.7.2,<0.8",
 ]
 all = [
     "tessera_embeddings[inference,prefect,aws]",

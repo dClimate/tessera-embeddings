@@ -767,9 +767,9 @@ def ecs_cluster(
             an emergency teardown can find this run's tasks from nothing but the flow run
             (see :func:`stop_ecs_tasks_by_tag`).
         frisky: Load Frisky onto the cluster before yielding it (see
-            :mod:`tessera_embeddings.providers.frisky`). The image must carry the ``frisky``
-            extra. Fixes the fleet at ``max_workers``, because adaptive scaling reads Dask's task
-            load, which a hijacked cluster no longer has, and would retire Frisky's workers.
+            :mod:`tessera_embeddings.providers.frisky`). Fixes the fleet at ``max_workers``,
+            because adaptive scaling reads Dask's task load, which a hijacked cluster no longer
+            has, and would retire Frisky's workers.
 
     Yields:
         The :class:`ECSCluster`/``FargateCluster``.

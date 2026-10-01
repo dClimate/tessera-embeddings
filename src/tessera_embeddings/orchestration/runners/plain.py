@@ -414,7 +414,7 @@ def run_plain(
             allow_s2_only: false   # embed S2-valid pixels with zero S1 observations
             n_workers: 2
             frisky: false           # run ingest compute on Frisky, an experimental Rust scheduler
-                                    # (needs the `frisky` extra; see providers/frisky.py)
+                                    # (see providers/frisky.py)
             checkpoint_dir: null    # override model directory; null → {inputs}/models/
             checkpoint_url: null    # full checkpoint URI (s3://, https://, …); overrides checkpoint_dir
             device: auto            # "auto" | "cpu" | "cuda"

@@ -30,8 +30,6 @@ from tests.parity.helpers import assert_zarr_equivalent, stage_quickstart_roi
 from tests.parity.test_ingest_s2_roi_parity import CASSETTE_NAME, DENVER_DATES
 from tests.parity.test_ingest_s2_roi_pipeline_parity import DATES, _ingest, _stage_roi
 
-pytest.importorskip("frisky")
-
 
 @pytest.fixture
 def default_cassette_name() -> str:

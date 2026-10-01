@@ -4469,6 +4469,7 @@ dependencies = [
     { name = "cloudpickle" },
     { name = "dask" },
     { name = "distributed" },
+    { name = "frisky" },
     { name = "fsspec" },
     { name = "icechunk" },
     { name = "mgrs" },
@@ -4523,9 +4524,6 @@ aws = [
     { name = "psutil" },
     { name = "s3fs" },
 ]
-frisky = [
-    { name = "frisky" },
-]
 inference = [
     { name = "aiohttp" },
     { name = "ray", extra = ["default"] },
@@ -4568,7 +4566,7 @@ requires-dist = [
     { name = "dask" },
     { name = "dask-cloudprovider", extras = ["aws"], marker = "extra == 'aws'" },
     { name = "distributed" },
-    { name = "frisky", marker = "extra == 'frisky'", specifier = ">=0.7.2,<0.8" },
+    { name = "frisky", specifier = ">=0.7.2,<0.8" },
     { name = "fsspec" },
     { name = "icechunk", specifier = ">=2.1.1" },
     { name = "mgrs" },
@@ -4605,7 +4603,7 @@ requires-dist = [
     { name = "xarray" },
     { name = "zarr" },
 ]
-provides-extras = ["inference", "prefect", "aws", "frisky", "all", "architecture-tests"]
+provides-extras = ["inference", "prefect", "aws", "all", "architecture-tests"]
 
 [package.metadata.requires-dev]
 dev = [
