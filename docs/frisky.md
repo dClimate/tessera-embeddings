@@ -57,8 +57,9 @@ After the run, read the spans `perf_report_uri` captured:
 frisky observe overview spans.json
 ```
 
-The capture keeps the most recent 500,000 spans (`SPANS_CAPTURE_LIMIT`), so a long run keeps its
-tail. Frisky also prints a periodic cluster summary to stdout; `FRISKY_SUMMARY=off` silences it.
+The capture keeps the most recent 500,000 spans (`SPANS_CAPTURE_LIMIT`), so a long run keeps only
+its tail: at Iowa scale (60 workers, 2048-px chunks) Frisky emits about 15,000 spans a second, so
+the capture covers the last half minute. To see a busy phase, query the live views during it. Frisky also prints a periodic cluster summary to stdout; `FRISKY_SUMMARY=off` silences it.
 
 ## Do's and don'ts
 

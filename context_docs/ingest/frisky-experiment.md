@@ -154,10 +154,26 @@ Done locally (macOS, Python 3.13), and green again in CI on Linux (Python 3.12 a
 | `tests/integration/test_read_failure_cause_over_dask.py` | Frisky's before-and-after for the cause chain; the read-failure classification on both engines | 16 passed |
 | `tests/parity/test_ingest_s2_roi_frisky_parity.py` | The S2 domain ingest on Dask versus Frisky: offline synthetic dates byte for byte (with `pipeline_dates` and a mid-run gate failure), and Denver July 2024 real imagery within 1e-6 | 2 passed, about 2 min |
 
-The dev-account test plan, and the record of its runs, is
-[`frisky-dev-test-plan.md`](frisky-dev-test-plan.md). How to use Frisky, and the do's and
-don'ts that follow from the findings above, are reference documentation:
-[`docs/frisky.md`](../../docs/frisky.md).
+## On the dev account
+
+The runs, their figures and how to rerun them are in
+[`frisky-dev-test-plan.md`](frisky-dev-test-plan.md). Up to Iowa at production width, three
+findings:
+
+- **Stable and exact.** No worker died in any run, and Frisky's stores are bit-identical to Dask's
+  at both chunk sizes.
+- **Slower at Iowa scale, in the store write.** Frisky took 25 to 40% longer than Dask per S2 date.
+  It reads and warps a chunk about 10% faster, but each icechunk write task takes 54% longer, and
+  the write has the most tasks. Dask's scheduler is not the bound at that scale, so Frisky's
+  scheduling advantage has nothing to recover yet.
+- **The bundle keeps only a run's tail.** At Iowa scale Frisky emits about 15,000 spans a second,
+  so the 500,000 captured at the end cover about half a minute.
+
+The 2048-px chunk changes pixels slightly, through GDAL's approximate warp transformer rather than
+through either engine; the plan's B1 result has the measurement.
+
+How to use Frisky, and the do's and don'ts that follow from these findings, are reference
+documentation: [`docs/frisky.md`](../../docs/frisky.md).
 
 ## Open items
 
@@ -165,5 +181,7 @@ don'ts that follow from the findings above, are reference documentation:
   [mrocklin/frisky-issues](https://github.com/mrocklin/frisky-issues). Drafts with standalone
   reproductions are written but not filed. Either fix upstream lets
   the matching step of `_MatchDaskWorker` go.
+- Find why an icechunk write task runs 54% longer on Frisky than on Dask.
+- Capture telemetry that covers a whole run, not its last half minute.
 - Decide whether Frisky stays a core dependency when this reaches `main`, on the experiment's
   results and the constraints under Packaging above.

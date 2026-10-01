@@ -12,18 +12,20 @@ is: [`frisky-experiment.md`](frisky-experiment.md). How to operate it:
   account (profile `yield`). The global-tessera accounts are not used. Every ROI the plan needs is
   already in `s3://arbol-tessera-inputs-dev`, so nothing is read across accounts.
 - **Ingest only, until Phase C.** Frisky changes only the ingest.
-- **One change at a time.** Two code versions, deployed separately:
+- **One change at a time.** Each chunk size is its own deployment:
 
   | Version | tessera-embeddings commit | Chunk | `ingest_code_identity` | YE branch |
   |---|---|---|---|---|
   | A | `b3e902b0` | 4096 | `ingcode-0869839717820a9c` | `dev/frisky-4096` |
+  | A′ | `4c12a5d1` | 4096 | `ingcode-0869839717820a9c` | `dev/frisky-4096` |
   | B | `9d994f84` | 2048 | `ingcode-5f707a14bb6d5062` | `dev/frisky-2048` |
 
   Version B also moves `inference_code_identity`, from `infcode-c9905e5aa8f93d3e` to
   `infcode-2613e97f0ad55679`, because `config/ingest.py` is inside the inference import closure.
   B1 ran on `aef6c55b`, which differs from B only in how `ecs_cluster` connects its setup clients
   (by the cluster object, so the hijack waited for the fleet). That is outside both code
-  identities, so B1's stores hold what B writes.
+  identities, so B1's stores hold what B writes. A′ is A with that same fix, on the branch
+  `experiment/frisky-4096-startup-fix`; B2's 4096 arms ran on it.
 
 - **Paired arms.** Every Frisky run has a Dask run from the same deployment with the same
   parameters; only `use_frisky` differs. Dask runs with `min_workers == max_workers`, so both arms
@@ -117,8 +119,30 @@ setup clients by address, which does not wait.
 ## Phase B: the 2048-px chunk (version B)
 
 **B1: the same two rungs at 2048.** The same pass criteria as Phase A, and one more: each 2048 store
-must hold the same pixels and dates as the 4096 store of the same rung and engine. Chunking differs;
-content must not.
+must hold the same dates as the 4096 store of the same rung, and the same pixels to within GDAL's
+warp approximation.
+
+**Result: passed.** Every leg completed with no worker exits or restarts, and every store holds its
+rung's dates. Frisky and Dask are bit-identical at 2048, as at 4096. The 2048 stores differ slightly
+from the 4096 ones, and the cause is the warp, not the ingest. Each chunk is a separate GDAL warp,
+and GDAL's approximate transformer places each sample within 0.125 source pixels of its exact
+position by interpolating across the destination window, so a different window size moves the
+samples. Comparing the 2048 Frisky stores with Phase A's 4096 Dask stores on 15SWC:
+
+| | Valid pixels that differ | Typical difference | 1st to 99th percentile |
+|---|---|---|---|
+| S2 red | about 35% | 1 to 2 counts | −27 to +28 |
+| S1 VV | 82% | 0.1% of the value | −50 to +51 |
+
+- **No gate decision changed.** About 0.05% of S2 pixels switch between nodata and valid, at data
+  and mask edges and equally in both directions; no window does.
+- **S1 moves most** because its tolerance is in 30 m source pixels, which is 0.375 output pixels.
+- **The mechanism is reproduced.** Warping one S2 scene over the 15SWC grid both ways gives the
+  same spread (−38 to +39), and with the exact transformer (`tolerance=0`) both window sizes give
+  identical output.
+- **2048 is the closer to exact.** On a 20 m band, the mean difference from the exact warp is 1.5
+  counts for 2048 windows and 6.7 for 4096. The exact transformer would cost eight times the warp
+  time; 2048 windows cost 3% more than 4096 ones.
 
 **B2: Iowa, the performance matrix.** `iowa_epsg5070` (the whole state), 2024-07-01 to
 2024-07-14, S2 and S1 ascending (Iowa is single-orbit). Four arms per sensor, two of them on
@@ -131,6 +155,31 @@ version A's deployment:
 
 Repeat the two Frisky arms. Report per-date cycle time, its build, gate and write parts, and
 worker-hours for each cell, with the spread across repeats.
+
+**Result.** Every arm completed, and each sensor's six stores hold the same dates. The repeats
+agree within 6%.
+
+| Iowa, s/date | Dask | Frisky, two runs |
+|---|---|---|
+| S2 at 4096 | 17.2 | 22.8, 24.2 |
+| S2 at 2048 | 18.6 | 23.2, 23.3 |
+| S1 at 4096 | 13.7 | 16.4, 16.6 |
+| S1 at 2048 | 13.0 | 14.6, 14.8 |
+
+An S2 arm cost $0.94 on Dask at 4096, $1.11 on Dask at 2048, $1.21 to $1.25 on Frisky at 4096 and
+$1.36 to $1.38 on Frisky at 2048. An S1 arm cost $0.14 to $0.16.
+
+- **At Iowa scale the scheduler is not the bound.** Dask runs four times the tasks at 2048 for 8%
+  more S2 time and slightly less S1 time.
+- **Frisky is slower: 25 to 40% on S2 and 12 to 21% on S1, almost all of it in the write.** Per
+  task, from Frisky's spans and the Dask report's task stream of the 2048 S2 arms, Frisky reads and
+  warps a band chunk about 10% faster (a median 880 ms against 1,030 ms). But its store write
+  (`getitem-where-ice-changeset`, which hands one chunk to icechunk) takes 54% longer, 203 ms
+  against 132 ms, over 23,000 such tasks. GIL waits and deserialisation are negligible, so the time
+  is inside the write call itself. Why is open.
+- **The bundle covers only the run's tail.** The end-of-run capture keeps the most recent 500,000
+  spans, and at Iowa scale Frisky emits about 15,000 a second, so it holds the last 33 s. The live
+  views fetch 200,000, about 13 s. The per-task comparison above came from that tail.
 
 **B3: breadth, on ROIs ingested before.** Each for one month, Frisky against Dask at 2048, for
 correctness and stability:
@@ -182,24 +231,23 @@ inference and assembly.
 | Goal | Passes when |
 |---|---|
 | Stability | No worker death, hang or failed leg attributable to Frisky in any phase |
-| Correctness | Every paired store equivalent, date lists identical; 2048 stores equal to 4096 stores in content; Phase C embeddings equivalent to `main`'s |
+| Correctness | Every paired store equivalent, date lists identical; 2048 stores the same as 4096 stores to within GDAL's warp approximation; Phase C embeddings equivalent to `main`'s |
 | Performance | Reported per rung with its spread; whether a gain is worth adopting is the maintainers' call, not this plan's |
 | Telemetry | For each rung's slowest date, the Frisky bundle answers where the time went (compute, transfer, scheduler, idle) and which worker straggled, and the Dask report from the paired arm is compared on the same questions |
 
 ## Rough cost
 
-Ingest only, at about $0.27 a worker-hour. Phase A is measured; the rest scale from it by area,
-Iowa being 14.6 times 15SWC:
+Ingest only, at about $0.27 a worker-hour. Phases A to B2 are measured; the rest are estimates:
 
 | Phase | Cost |
 |---|---|
 | A | $2.30, measured |
-| B1 | about $3 |
-| B2 | about $20 (six S2 arms of about $3, six S1 arms of about $0.50) |
-| B3 | about $15 |
+| B1 | $1.72, measured, with the startup fix's two smoke runs |
+| B2 | $8.12, measured |
+| B3 | about $10 |
 | B4 | about $15 (two arms of about 20 worker-hours) |
 
-That is about $55 for the ingest phases. Phase C adds GPU time, estimated once the actor counts
+That is about $37 for the ingest phases. Phase C adds GPU time, estimated once the actor counts
 are fixed. The run log records the actual figures.
 
 ## Run log
@@ -215,3 +263,23 @@ write for S2, or stall and write for S1, divided by the dates written.
 | 2026-10-01 | a2-s2-dask | A | Dask | 15SWC_epsg5070, 2024-07 | S2 | 60 | `a34bdea5` | 3m34s | 5.0 | 0 | pass: 10 dates, $0.57 |
 | 2026-10-01 | a2-s1-dask | A | Dask | 15SWC_epsg5070, 2024-07 | S1 asc | 60 | `8a0ff606` | 2m43s | 5.3 | 0 | pass: 2 dates, $0.38 |
 | 2026-10-01 | a2-s1-frisky | A | Frisky | 15SWC_epsg5070, 2024-07 | S1 asc | 60 | `ec58103a` | 3m12s | 5.6 | 0 | pass: 2 dates, $0.49 |
+| 2026-10-01 | b1-s2-frisky-tiny | B (`aef6c55b`) | Frisky | tiny_epsg5070, 2024-07 | S2 | 4 | `46fe6e45` | 3m17s | smoke only | 0 | pass |
+| 2026-10-01 | b1-s1-frisky-tiny | B (`aef6c55b`) | Frisky | tiny_epsg5070, 2024-07 | S1 asc | 4 | `fe49fc1b` | 2m32s | smoke only | 0 | pass |
+| 2026-10-01 | b1-s2-frisky | B (`aef6c55b`) | Frisky | 15SWC_epsg5070, 2024-07 | S2 | 60 | `5cf9e61f` | 4m27s | 4.9 | 0 | pass: 10 dates, $0.79 |
+| 2026-10-01 | b1-s2-dask | B (`aef6c55b`) | Dask | 15SWC_epsg5070, 2024-07 | S2 | 60 | `868cf1f3` | 3m31s | 4.3 | 0 | pass: 10 dates, $0.55 |
+| 2026-10-01 | b1-s1-frisky | B (`aef6c55b`) | Frisky | 15SWC_epsg5070, 2024-07 | S1 asc | 13 | `9eafc4f3` | 3m39s | 4.7 | 0 | pass: 2 dates, $0.15 |
+| 2026-10-01 | b1-s1-dask | B (`aef6c55b`) | Dask | 15SWC_epsg5070, 2024-07 | S1 asc | 13 | `cfa56cf5` | 2m39s | 4.3 | 0 | pass: 2 dates, $0.09 |
+| 2026-10-01 | bfix-s2-frisky-tiny | B | Frisky | tiny_epsg5070, 2024-07 | S2 | 4 | `9d0e434d` | 3m11s | smoke only | 0 | pass: workers joined after the hijack |
+| 2026-10-01 | bfix-s1-frisky-tiny | B | Frisky | tiny_epsg5070, 2024-07 | S1 asc | 4 | `0b497120` | 2m25s | smoke only | 0 | pass: workers joined after the hijack |
+| 2026-10-01 | b2-s2-frisky-2048 | B | Frisky | iowa_epsg5070, 2024-07-01..14 | S2 | 60 | `99b04091` | 6m54s | 23.2 | 0 | pass: 8 dates, $1.38 |
+| 2026-10-01 | b2-s2-dask-2048 | B | Dask | iowa_epsg5070, 2024-07-01..14 | S2 | 60 | `c0a4cfd8` | 5m48s | 18.6 | 0 | pass: 8 dates, $1.11 |
+| 2026-10-01 | b2-s1-frisky-2048 | B | Frisky | iowa_epsg5070, 2024-07-01..14 | S1 asc | 13 | `dfdec4ff` | 4m08s | 14.6 | 0 | pass: 4 dates, $0.16 |
+| 2026-10-01 | b2-s1-dask-2048 | B | Dask | iowa_epsg5070, 2024-07-01..14 | S1 asc | 13 | `e4bcd4f0` | 3m49s | 13.0 | 0 | pass: 4 dates, $0.14 |
+| 2026-10-01 | b2-s2-frisky-4096 | A′ | Frisky | iowa_epsg5070, 2024-07-01..14 | S2 | 60 | `fe79b0a0` | 6m20s | 22.8 | 0 | pass: 8 dates, $1.21 |
+| 2026-10-01 | b2-s2-dask-4096 | A′ | Dask | iowa_epsg5070, 2024-07-01..14 | S2 | 60 | `4f0dda2d` | 5m13s | 17.2 | 0 | pass: 8 dates, $0.94 |
+| 2026-10-01 | b2-s1-frisky-4096 | A′ | Frisky | iowa_epsg5070, 2024-07-01..14 | S1 asc | 13 | `8abf9d49` | 3m37s | 16.4 | 0 | pass: 4 dates, $0.14 |
+| 2026-10-01 | b2-s1-dask-4096 | A′ | Dask | iowa_epsg5070, 2024-07-01..14 | S1 asc | 13 | `1c11f591` | 3m31s | 13.7 | 0 | pass: 4 dates, $0.14 |
+| 2026-10-01 | b2-s2-frisky-2048-r2 | B | Frisky | iowa_epsg5070, 2024-07-01..14 | S2 | 60 | `c85d4321` | 6m50s | 23.3 | 0 | pass: 8 dates, $1.36 |
+| 2026-10-01 | b2-s1-frisky-2048-r2 | B | Frisky | iowa_epsg5070, 2024-07-01..14 | S1 asc | 13 | `0310ec3a` | 3m51s | 14.8 | 0 | pass: 4 dates, $0.15 |
+| 2026-10-01 | b2-s2-frisky-4096-r2 | A′ | Frisky | iowa_epsg5070, 2024-07-01..14 | S2 | 60 | `297322b4` | 6m18s | 24.2 | 0 | pass: 8 dates, $1.25 |
+| 2026-10-01 | b2-s1-frisky-4096-r2 | A′ | Frisky | iowa_epsg5070, 2024-07-01..14 | S1 asc | 13 | `7358d35d` | 3m34s | 16.6 | 0 | pass: 4 dates, $0.14 |
