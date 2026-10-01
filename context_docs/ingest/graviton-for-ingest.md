@@ -86,8 +86,8 @@ how long a worker runs. Probably not by much either way, but only the dev test c
   which it does not say, and it is a best case on AWS's benchmarks, not a forecast for ours. A
   Graviton vCPU is a whole core, where an x86 vCPU is one hyperthread, which helps multi-threaded
   work like the workers' reads and warps. Per thread, x86 still leads, which is what matters to the
-  single-threaded scheduler. Fargate offers no choice of generation: it launched on Graviton2 (Neoverse N1), and the
-  faster Graviton3 and 4 are EC2 instance choices.
+  single-threaded scheduler. Fargate offers no choice of generation: it launched on Graviton2
+  (Neoverse N1), and the faster Graviton3 and 4 are EC2 instance choices.
 - **Our workers are not CPU-bound at dev scale.** Across the Frisky dev runs on 2026-10-01 (a tiny
   ROI, 15SWC and Iowa, up to 60 S2 workers, both engines), Container Insights shows workers using
   **20–27% of reserved CPU** over the runs, and about 60% in the busiest minute. A worker spends
