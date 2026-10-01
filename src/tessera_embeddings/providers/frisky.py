@@ -15,7 +15,7 @@ the two calls the ingest makes that Frisky's client lacks, ``register_plugin`` a
 still reach Frisky's tasks because they run in the same processes. :func:`connect` hands the
 ingest a client that sends compute to Frisky and everything else to Dask.
 
-Three behaviours differ from Dask and are handled here or by the providers:
+Four behaviours differ from Dask and are handled here or by the providers:
 
 - **Thread state.** Frisky destroys a thread's Python state after each task, so every
   ``threading.local`` cache in the read stack is rebuilt per task, and pyproj segfaults the worker
@@ -31,6 +31,10 @@ Three behaviours differ from Dask and are handled here or by the providers:
   every read-failure verdict is decided from. :func:`hijack` registers them on every worker after
   importing the ingest; with ``loader_failures.keep_causes_picklable`` (installed by the ingest)
   the whole chain arrives.
+- **Graph pickling before the first task.** Dask's scheduler pickles each task as it dispatches
+  it, while the fleet works. Frisky's client pickles the whole graph before it submits, while the
+  fleet waits, so a task that pickles slowly costs idle fleet time. :func:`connect` makes the
+  store write's slowest ones cheap (:func:`_picklable_merge_reduction`).
 """
 
 from __future__ import annotations
@@ -50,6 +54,8 @@ from typing import Any, cast
 
 import frisky
 import fsspec
+import icechunk.dask
+import numpy as np
 import tblib.pickling_support
 from distributed import Client, WorkerPlugin
 
@@ -69,9 +75,10 @@ LIVE_SNAPSHOT_INTERVAL_S = 300.0
 EVENTS_LIMIT = 2_000
 
 #: Span names the drain keeps, as prefixes: task execution (the call, its GIL wait and its
-#: deserialisation), data transfer and spill. They are a fifth of Frisky's spans and hold every
-#: second of task time; the rest is the scheduler's and comms' own bookkeeping.
-SPAN_DRAIN_NAMES = ("worker.exec", "worker.transfer", "spill")
+#: deserialisation), data transfer, spill, and the client's own work turning each graph into
+#: Frisky's tasks and submitting them. They are a fifth of Frisky's spans and hold every second of
+#: task time; the rest is the scheduler's and comms' own bookkeeping.
+SPAN_DRAIN_NAMES = ("worker.exec", "worker.transfer", "spill", "client")
 
 #: Seconds between drains. Each process keeps its own span buffer (1,000,000 spans by default,
 #: ``FRISKY_TRACING_CAPACITY``), which a worker fills in about an hour at Iowa's rate, so a drain a
@@ -164,6 +171,35 @@ def _frisky_address(dask_scheduler: Any) -> str:  # noqa: ANN401 — runs on the
     return str(dask_scheduler.frisky_address)
 
 
+def _meta_or_call(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
+    """``icechunk.dask.computing_meta``'s wrapper, at module level so it pickles by reference."""
+    if kwargs.get("computing_meta", False):
+        return np.array([object()], dtype=object)
+    return func(*args, **kwargs)
+
+
+def _computing_meta(func: Callable[..., Any]) -> Callable[..., Any]:
+    return functools.partial(_meta_or_call, func)
+
+
+@contextlib.contextmanager
+def _picklable_merge_reduction() -> Iterator[None]:
+    """Make the store write's merge tasks pickle by reference while the block runs.
+
+    ``icechunk.dask.session_merge_reduction`` wraps its two functions in a ``functools.wraps``
+    closure. Plain pickle refuses it, so every task holding one, about 22,000 of an Iowa batch's
+    47,000, is pickled by value with cloudpickle instead. Frisky's client pickles every task
+    before it submits any, so that cost holds the whole fleet idle at the start of each write
+    batch. The partial computes the same thing.
+    """
+    original = icechunk.dask.computing_meta
+    icechunk.dask.computing_meta = _computing_meta
+    try:
+        yield
+    finally:
+        icechunk.dask.computing_meta = original
+
+
 @contextlib.contextmanager
 def connect(dask_client: Client, *, enabled: bool = True) -> Iterator[Client]:
     """Yield the ingest's client: Frisky's compute on a hijacked cluster, else ``dask_client`` itself.
@@ -179,7 +215,8 @@ def connect(dask_client: Client, *, enabled: bool = True) -> Iterator[Client]:
 
     frisky_client = frisky.Client(dask_client.run_on_scheduler(_frisky_address))
     try:
-        yield cast(Client, _HijackedClient(dask_client, frisky_client))
+        with _picklable_merge_reduction():
+            yield cast(Client, _HijackedClient(dask_client, frisky_client))
     finally:
         frisky_client.close()
 

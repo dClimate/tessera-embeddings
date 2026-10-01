@@ -34,11 +34,13 @@ from typing import Any
 import dask
 import dask.array as da
 import frisky
+import icechunk.dask
 import numpy as np
 import pytest
 import xarray as xr
 from affine import Affine
 from dask.distributed import Client, WorkerPlugin, get_client
+from icechunk.distributed import extract_session
 from odc.geo.geobox import GeoBox
 from pyproj import CRS
 
@@ -261,6 +263,16 @@ def test_overlapped_window_writes_match_dask_and_commit_nothing_on_failure(hijac
     assert get_existing_dates(store) == {"2024-06-01", "2024-06-11"}
     snapshots = [len(list(open_repo(s).ancestry(branch="main"))) for s in (store, reference)]
     assert snapshots[0] == snapshots[1], "the poisoned date committed something"
+
+
+def test_the_store_writes_merge_functions_pickle_by_reference(hijacked) -> None:
+    """Frisky's client pickles every task before it submits any, so a task that plain pickle
+    refuses is pickled by value while the fleet waits. icechunk's merge closures were refused on
+    about 22,000 tasks of an Iowa write batch; ``connect`` swaps in a partial that is not.
+    """
+    wrapped = icechunk.dask.computing_meta(extract_session)
+    restored = pickle.loads(pickle.dumps(wrapped))
+    assert restored(None, computing_meta=True).dtype == object
 
 
 def test_the_telemetry_bundle_is_written_live_and_at_the_end(hijacked, tmp_path, caplog) -> None:
