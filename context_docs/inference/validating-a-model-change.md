@@ -273,6 +273,24 @@ Flow runs: at `e7c43d55`, mask `d9b35abf` (built by that code from the same two-
 seed `f708a449` and fill `3d05d69c`; at `main`, seed `84f0c719` and fill `810648d5`, which reused
 the first mask.
 
+### How large the precision fix's change is
+
+Cosine distance (1 − cos) per pixel, on a random million of the tile's pixels:
+
+| | median | 99th percentile |
+|---|---|---|
+| **the fix: the same pixel before and after** | **4.5 × 10⁻⁵** | **7.5 × 10⁻⁵** |
+| int8 rounding already in the stored product (expected) | 1.9 × 10⁻⁵ | 3.1 × 10⁻⁵ |
+| a pixel and its east neighbour | 3.6 × 10⁻³ | 1.1 × 10⁻¹ |
+| the same pixel, 2024 against 2025 | 0.20 | 0.37 |
+| two random pixels in the tile | 0.19 | 0.54 |
+
+The fix moves each vector by about 1% of its length, roughly twice the int8 rounding every stored
+pixel already carries, 80 times less than the difference between adjacent pixels, and 4,500 times
+less than a year's change. Of each pixel's ten most similar pixels (2,000 queries against 200,000),
+95.5% are unchanged. Every replacement was ranked 11th to 18th before, and the 10th and 11th were
+typically only 1.2 × 10⁻⁴ apart in cosine, so the swaps are reorderings among near-ties.
+
 ## 8. Not covered here
 
 Whether a new model is *better* than the old one is a downstream-task question, not a readback one.
