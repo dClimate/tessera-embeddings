@@ -162,10 +162,12 @@ findings:
 
 - **Stable and exact.** No worker died in any run, and Frisky's stores are bit-identical to Dask's
   at both chunk sizes.
-- **Slower at Iowa scale, in the store write.** Frisky took 25 to 40% longer than Dask per S2 date.
-  It reads and warps a chunk about 10% faster, but each icechunk write task takes 54% longer, and
-  the write has the most tasks. Dask's scheduler is not the bound at that scale, so Frisky's
-  scheduling advantage has nothing to recover yet.
+- **Slower at Iowa scale, but not in its tasks.** Frisky took 25 to 40% longer than Dask per S2
+  date, mostly in the write phase. Yet over a whole run its store writes are as fast (0.97 of
+  Dask's median), its reads faster (0.89), and its total task time lower on the same graph. The
+  time is lost outside task execution; the first suspect is the driver converting each graph for
+  Frisky. Dask's scheduler is not the bound at that scale, so Frisky's scheduling advantage has
+  nothing to recover yet.
 - **The end-of-run capture keeps only a run's tail.** At Iowa scale Frisky emits about 15,000 spans
   a second, so the 500,000 captured at the end cover about half a minute. Each process keeps its
   own span buffer (1,000,000 by default), which a worker fills in about an hour, so the run's spans
@@ -186,7 +188,8 @@ documentation: [`docs/frisky.md`](../../docs/frisky.md).
   [mrocklin/frisky-issues](https://github.com/mrocklin/frisky-issues). Drafts with standalone
   reproductions are written but not filed. Either fix upstream lets
   the matching step of `_MatchDaskWorker` go.
-- Find why an icechunk write task runs 54% longer on Frisky than on Dask.
+- Find where Frisky's write phase loses its 25%. Its tasks are not slower, so the driver's graph
+  submission is the first suspect.
 - Check the span drain's load on the scheduler at B4's scale; at Iowa its peak was 79% of a core.
 - Decide whether Frisky stays a core dependency when this reaches `main`, on the experiment's
   results and the constraints under Packaging above.

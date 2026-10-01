@@ -171,15 +171,19 @@ $1.36 to $1.38 on Frisky at 2048. An S1 arm cost $0.14 to $0.16.
 
 - **At Iowa scale the scheduler is not the bound.** Dask runs four times the tasks at 2048 for 8%
   more S2 time and slightly less S1 time.
-- **Frisky is slower: 25 to 40% on S2 and 12 to 21% on S1, almost all of it in the write.** Per
-  task, from Frisky's spans and the Dask report's task stream of the 2048 S2 arms, Frisky reads and
-  warps a band chunk about 10% faster (a median 880 ms against 1,030 ms). But its store write
-  (`getitem-where-ice-changeset`, which hands one chunk to icechunk) takes 54% longer, 203 ms
-  against 132 ms, over 23,000 such tasks. GIL waits and deserialisation are negligible, so the time
-  is inside the write call itself. Why is open.
+- **Frisky is slower: 25 to 40% on S2 and 12 to 21% on S1, mostly in the write phase, but not in
+  its tasks.** Over the whole drained run below, against the Dask arm's task stream at 2048:
+  Frisky's median store write (`getitem-where-ice-changeset`, one chunk handed to icechunk) is
+  128 ms against 132 ms, over 23,187 and 23,188 writes, and it reads and warps a band chunk 11%
+  faster (907 ms against 1,017 ms). It spends less task time on the same graph, 25,712 s against
+  27,753 s. So the time is lost outside task execution, and the first suspect is the driver
+  converting each graph for Frisky before any task starts. Why is open.
+- **A tail sample misleads here.** Write times rise through each batch, from about 90 ms to
+  210 ms, so the end-of-run capture's last 33 s alone put Frisky's writes 54% above Dask's
+  whole-run median. Compare engines on whole runs.
 - **The bundle covers only the run's tail.** The end-of-run capture keeps the most recent 500,000
   spans, and at Iowa scale Frisky emits about 15,000 a second, so it holds the last 33 s. The live
-  views fetch 200,000, about 13 s. The per-task comparison above came from that tail.
+  views fetch 200,000, about 13 s.
 
 **The span drain, on the same S2 and S1 Frisky arms at 2048** (`frisky_drain_spans`, the
 `-drain` rows in the run log):
