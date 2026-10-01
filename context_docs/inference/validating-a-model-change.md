@@ -238,15 +238,40 @@ Over all 4,194,304 pixels:
 | per-pixel cosine, dequantized | min 0.999867, 0.1st percentile 0.999912, 1st 0.999925, median 0.999955; 0.013% below 0.9999 |
 | per-pixel `scales` | median relative difference 0 |
 
-**Reading.** The re-ingest reproduced the published inputs exactly, so the difference lies in
-inference. It fails ADR-012's same-numerics gate (99.5% of int8 values identical, at most one level
-apart) and essentially meets its cosine bar. That is the shape expected from this PR's day-of-year
-precision fix, which changes v1.1's BF16 output on every pixel: on the v2 checkpoint the fix moved
-mean cosine against the FP32 graph from 0.99995 to 0.99999, and the median here is 0.999955. **Not
-separated:** the fix, GPU nondeterminism, and any other inference change since `e7c43d55`. The same
-fill run at `e7c43d55` would separate them.
+The re-ingest reproduced the published inputs exactly, so the difference lies in inference. It
+fails ADR-012's same-numerics gate (99.5% of int8 values identical, at most one level apart) and
+essentially meets its cosine bar.
 
 Flow runs: mask `4be8b6b8`, seed `13f21478`, ingest `b4831f2e`, fill `16ab4af4`.
+
+### What causes the v1.1 difference
+
+Two more fills of the same tile, from the same mosaic, mask registry and settings, each deployed at
+one commit:
+- **the published commit**: tessera-embeddings `e7c43d55` through yield-embeddings
+  `dev/global-tessera-parity-e7c43d5`, at `738b27d`, the last yield-embeddings commit locked to it;
+- **`main`**: tessera-embeddings `63ace646` through `dev/global-tessera-parity-main`.
+
+All three fills ran on L40S cards at batch size 7,168 with the same strip plan. All provenance
+arrays are identical in every comparison, so each row isolates a code difference:
+
+| comparison | int8 identical | largest difference | cosine, min / median |
+|---|---|---|---|
+| published vs a re-run at `e7c43d55` | 99.95% | 3 levels, on 0.008% of pixels | 0.999907 / 1.000000 |
+| `e7c43d55` vs `main` | 100%, bit-identical | none | 1 / 1 |
+| `main` vs this PR | 77.5% | 3 levels, on 9.0% of pixels | 0.999867 / 0.999955 |
+
+**The whole difference is this PR**, and for v1.1 the PR's only change to the arithmetic is the
+day-of-year precision fix: the v1.1 resampler, band statistics and model are untouched. A month of
+`main` since publication changes no v1.1 output at all. Two separate GPU runs on the same inputs
+produced bit-identical results, so run-to-run variation is not a factor here. Re-running the
+published code today reproduces the published tile within ADR-012's 99.5% bar. That small residual
+comes from re-ingesting, or from the campaign's own run differing in card or batching; nothing here
+separates the two.
+
+Flow runs: at `e7c43d55`, mask `d9b35abf` (built by that code from the same two-cell registry),
+seed `f708a449` and fill `3d05d69c`; at `main`, seed `84f0c719` and fill `810648d5`, which reused
+the first mask.
 
 ## 8. Not covered here
 
