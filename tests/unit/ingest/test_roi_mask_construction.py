@@ -1,23 +1,23 @@
 """What the mask's new construction must not change, and what it costs.
 
-``read_roi_mask`` moved from ``da.from_zarr`` to ``da.map_blocks`` over a closure so the
-credential resolves when a block is read rather than when the graph is built
-(``test_roi_mask_credential_expiry.py`` covers the credential itself). The closure builds a
+``read_roi_mask`` moved from ``da.from_zarr`` to ``da.map_blocks`` over a block reader that opens
+the store itself, so the credential resolves when a block is read rather than when the graph is
+built (``test_roi_mask_credential_expiry.py`` covers the credential itself). The reader builds a
 DIFFERENT graph, so the risks this file guards have nothing to do with credentials:
 
-* **The pixels.** The closure derives each block's slice from ``block_info``. A one-pixel
+* **The pixels.** The reader derives each block's slice from ``block_info``. A one-pixel
   disagreement at a ragged edge would change what gets embedded, silently, so the mask is
   checked against the numpy array that was written.
-* **The laziness.** The old call read no pixels when it built the graph. A closure that
+* **The laziness.** The old call read no pixels when it built the graph. A reader that
   read eagerly would fetch every ROI whether the leg needed it or not.
 * **The serialization.** The old graph carried a zarr array; the new one carries a function
-  with captured variables. Only a process-based scheduler exercises that.
+  and the storage options. Only a process-based scheduler exercises that, and Frisky's client
+  pickles each task with plain pickle first.
 
-The per-block request cost of the change, and the fact that the graph is cloudpickle-only,
-live in ``context_docs/decisions/022-resolve-the-roi-mask-credential-at-read-time.md``
-rather than in assertions here. The cost is an exact count that a zarr or dask release can
-move without anything being wrong, and the pickle limitation could only be asserted AS a
-limitation — a test that fails the day someone lifts it.
+The per-block request cost of the change lives in
+``context_docs/decisions/022-resolve-the-roi-mask-credential-at-read-time.md`` rather than in an
+assertion here: it is an exact count that a zarr or dask release can move without anything being
+wrong.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ import ast
 import collections
 import contextlib
 import functools
+import pickle
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -212,7 +213,7 @@ def test_construction_reads_metadata_and_never_chunk_bytes(roi_on_s3, s3_chunks)
 
 
 # ---------------------------------------------------------------------------
-# 3. The closure must survive being sent to a Dask worker
+# 3. The reader must survive being sent to a Dask worker
 # ---------------------------------------------------------------------------
 
 
@@ -223,13 +224,13 @@ def test_construction_reads_metadata_and_never_chunk_bytes(roi_on_s3, s3_chunks)
         pytest.param(lambda opts: functools.partial(dict, **opts), id="provider-callable"),
     ],
 )
-def test_the_closure_survives_a_process_based_scheduler(roi_on_s3, s3_chunks, make_options) -> None:
+def test_the_reader_survives_a_process_based_scheduler(roi_on_s3, s3_chunks, make_options) -> None:
     """PROCESSES, not threads: the only scheduler that actually serializes the graph.
 
-    The old graph shipped a zarr array holding a filesystem object. The new one ships a
-    nested function plus its captured variables, which plain pickle cannot do at all — it
-    survives only because distributed falls back to cloudpickle. A threaded or synchronous
-    scheduler shares memory and would prove nothing about that.
+    The old graph shipped a zarr array holding a filesystem object. The new one ships the reader
+    and its storage options, which must plain-pickle: Frisky's client pickles every task on its
+    own, and a task plain pickle refuses goes through cloudpickle by value at about ten times the
+    cost. A threaded or synchronous scheduler shares memory and would prove nothing about either.
 
     Run with both storage-option forms: a dict, and a callable provider, since the provider
     has to arrive on the worker still callable for the credential to be resolved there
@@ -245,6 +246,7 @@ def test_the_closure_survives_a_process_based_scheduler(roi_on_s3, s3_chunks, ma
         distributed.Client(cluster) as client,
     ):
         mask = read_roi_mask(url, s3_chunks, make_options(dict(options)))
+        pickle.dumps(dict(mask.__dask_graph__()))  # plain pickle, as Frisky's client tries first
         computed = client.compute(mask, sync=True)
 
     assert np.array_equal(computed, truth), "the mask read on a worker process differs from what was written"

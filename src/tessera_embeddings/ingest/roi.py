@@ -17,6 +17,7 @@ index on S3 as a shortcut for tile-aligned ROIs.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 from dataclasses import dataclass
@@ -118,6 +119,21 @@ def read_roi_metadata(roi_path: str, *, storage_options: StorageOptions = None) 
     )
 
 
+def _open_mask(roi_path: str, storage_options: StorageOptions) -> zarr.Array:
+    opts = resolve_storage_options(storage_options)
+    return cast("zarr.Array", zarr.open_array(roi_path, mode="r", storage_options=opts))
+
+
+def _read_mask_block(roi_path: str, storage_options: StorageOptions, block_info: dict) -> np.ndarray:
+    """One block of the mask, from a store opened for this read.
+
+    Module level, so a graph holding it plain-pickles. A closure needs cloudpickle, which Frisky's
+    client runs once per task at about ten times plain pickle's cost.
+    """
+    (y0, y1), (x0, x1) = block_info[None]["array-location"]
+    return np.asarray(_open_mask(roi_path, storage_options)[y0:y1, x0:x1])
+
+
 def read_roi_mask(
     roi_path: str,
     chunks: dict[str, int],
@@ -137,21 +153,12 @@ def read_roi_mask(
     Returns:
         Chunked dask boolean array aligned to the target grid (True = inside ROI).
     """
-
-    def _open() -> zarr.Array:
-        opts = resolve_storage_options(storage_options)
-        return cast("zarr.Array", zarr.open_array(roi_path, mode="r", storage_options=opts))
-
-    def _read_block(block_info: dict) -> np.ndarray:
-        (y0, y1), (x0, x1) = block_info[None]["array-location"]
-        return np.asarray(_open()[y0:y1, x0:x1])
-
     # Each block opens the store itself, so the provider resolves when the read HAPPENS.
     # Handing a store to ``da.from_zarr`` bakes ONE resolution into the graph, and the
     # write that computes it can outlive that credential.
-    z = _open()
+    z = _open_mask(roi_path, storage_options)
     return da.map_blocks(
-        _read_block,
+        functools.partial(_read_mask_block, roi_path, storage_options),
         dtype=z.dtype,
         chunks=normalize_chunks((chunks["northing"], chunks["easting"]), shape=z.shape, dtype=z.dtype),
         meta=np.empty((0, 0), dtype=z.dtype),
