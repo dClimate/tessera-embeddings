@@ -92,7 +92,9 @@ Frisky also prints a periodic cluster summary to stdout; `FRISKY_SUMMARY=off` si
   terabytes.
 - Pass Frisky's own settings through `worker_env_overrides`. Examples are
   `FRISKY_SPILL_FRACTION` and `FRISKY_SPILL_TARGET_FRACTION` for its spill thresholds, and
-  `FRISKY_TRACING_CAPACITY` for spans kept per worker.
+  `FRISKY_TRACING_CAPACITY` for spans kept per process. `ecs_cluster(frisky=True)` sets the last to
+  200,000 (`TRACING_CAPACITY`) on the scheduler and every worker unless you do; Frisky's own
+  1,000,000 grew the scheduler past 5 GiB on a zone run and slowed every span query.
 - After upgrading Frisky, run `tests/integration/test_frisky.py`,
   `tests/integration/test_read_failure_cause_over_dask.py` and
   `tests/parity/test_ingest_s2_roi_frisky_parity.py`. They pin the library behaviour the ingest

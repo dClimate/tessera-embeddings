@@ -207,6 +207,16 @@ findings:
   spans every minute. They are a fifth of the spans and hold all of the task time; spans under
   1 ms would be another five times smaller but lose a quarter of the transfer time. On Iowa the
   drain kept every span Frisky did, and Frisky's tracing itself misses about one in 2,000.
+- **Frisky's default span buffer is too big for a long or zone-scale run.** Each process keeps
+  `FRISKY_TRACING_CAPACITY` spans, 1,000,000 by default, about 6 KB each in the scheduler. On the
+  pipelined 35N rerun the scheduler's memory doubled every two minutes to 5.7 GiB of its 8 GiB,
+  held there once the buffer was full, reached 6.8 GiB under the end-of-run capture's three large
+  span queries, and the process died without logging a close, after all seven dates had committed;
+  `cluster.close()` then timed out on it and failed the flow. On the year-long Iowa run, whose
+  buffers filled at about minute 63, dispatch latency rose from milliseconds to 11–61 s a task
+  while workers sat at 2–3% CPU, and an overview query took 87 s. `ecs_cluster(frisky=True)` now
+  sets 200,000, and a drained run's live snapshot analyses 50,000 spans and logs its own time,
+  to recalibrate against. Not yet confirmed on dev.
 - **The end-of-run capture took 45 s with the drain on, against Dask's 7 s, while the whole fleet
   was billed.** The bundle's S3 timestamps on the `-fix` run split it: the final drain about 9 s,
   the 500,000-span `spans.json` 18 s before its 167 MB upload began (five pages from the
