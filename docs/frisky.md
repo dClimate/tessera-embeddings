@@ -104,7 +104,8 @@ Frisky also prints a periodic cluster summary to stdout; `FRISKY_SUMMARY=off` si
 - **Put a closure, lambda or `functools.wraps` wrapper in a big graph.** Frisky's client pickles
   every task before it submits any, and the fleet waits meanwhile. Plain pickle refuses those, so
   each task holding one goes through cloudpickle by value. `connect` already fixes icechunk's
-  merge closures, which were half of a write batch's pickling.
+  merge closures, which were half of a write batch's pickling, and the ROI mask's block reader
+  is module-level for the same reason: as a closure it was most of each coverage gate's.
 - **Use a raw `frisky.hijack` for the ingest.** Without our worker plugin, the first real image
   read segfaults the worker and the run hangs.
 - **Reference the `frisky` module from a function pickled by value,** such as one defined in

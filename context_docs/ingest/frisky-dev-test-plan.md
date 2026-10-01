@@ -187,7 +187,8 @@ $1.36 to $1.38 on Frisky at 2048. An S1 arm cost $0.14 to $0.16.
   phases ran 5% shorter than Dask's. Both engines logged their last batch at the same second;
   Frisky's run then spent 45 s on its end-of-run telemetry against Dask's 7 s, which is the
   remaining cost gap ($1.21 against $1.07) and only arises on runs that set `perf_report_uri`.
-  The rest of Frisky's idle time is the gate's computes running one after another.
+  The rest of Frisky's idle time is its client pickling each coverage gate's graph, mostly the
+  ROI mask's reader (the record's item 5).
 - **At 4096, each batch also ends on a long tail.** The final batch held the same work on every
   arm, about 10,350 task-seconds, but took 66 s and 86 s on Frisky against 49 s on Dask: one
   worker was handed up to 1.8 times the mean work and kept it while the rest went idle.

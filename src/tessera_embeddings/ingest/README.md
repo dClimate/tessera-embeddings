@@ -1100,11 +1100,13 @@ That matters because the mask array is LAZY: its block reads happen inside a lat
 `write_day_windows` compute, which on the radar path spans a whole 30-day batch. One credential
 resolved at graph-build time would be presented by every one of those reads and, once expired,
 fail with `ExpiredToken` on a bucket the role can always read — a lifetime problem wearing a
-permissions problem's error message. Two consequences: each block read pays its own store open
-and metadata round trip where the old construction paid one for the whole array, and the returned
-array is cloudpickle-only because the closure is nested. Both are measured in
-`context_docs/decisions/022-resolve-the-roi-mask-credential-at-read-time.md`, and both argue
-against handing this array to a plain-pickle boundary or reading a zone grid you do not need.
+permissions problem's error message. The cost is that each block read pays its own store open and
+metadata round trip where the old construction paid one for the whole array, measured in
+`context_docs/decisions/022-resolve-the-roi-mask-credential-at-read-time.md`; do not read a zone
+grid you do not need. The block reader is a module-level function bound with `functools.partial`,
+so the array plain-pickles whenever its `storage_options` does (`iam_s3_storage_options` does).
+Keep it that way: Frisky's client pickles every task on its own, and each one plain pickle refuses
+goes through cloudpickle at about ten times the cost.
 
 **IMDS throttling — why `_resolve_iam_credentials` is `lru_cache`d (gotcha).** The credential
 machinery has two distinct TTLs, and conflating them overwhelms the EC2 Instance Metadata

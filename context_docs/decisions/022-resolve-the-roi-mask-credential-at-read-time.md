@@ -37,7 +37,7 @@ way.
 ## Decision
 
 **`read_roi_mask` opens the store inside each block read.** The array is assembled with
-`da.map_blocks` over a closure that calls `resolve_storage_options` and `zarr.open_array` itself, so
+`da.map_blocks` over a block reader that calls `resolve_storage_options` and `zarr.open_array` itself, so
 the credential is no older than the read that presents it. Nothing else changes: same provider,
 same call sites, same returned dask array.
 
@@ -57,11 +57,13 @@ It stays small in absolute terms: metadata GETs are a few hundred bytes, blocks 
 share one cached fsspec client, and every consumer slices the mask to live windows, so dask culls
 the opens with the blocks.
 
-The graph is also **no longer plain-picklable**: `pickle.dumps` raises `Can't get local object
-'read_roi_mask.<locals>._read_block'` where `da.from_zarr` pickled fine. Safe today, since
-distributed falls back to cloudpickle and nothing in `src` plain-pickles a graph, but it narrows
-where this array may be sent. Recorded here rather than asserted in a test, because a test
-demanding the graph *cannot* be plain-pickled would fail the day someone made it picklable.
+The block reader is `_read_mask_block`, a module-level function bound with `functools.partial`, so
+the graph plain-pickles as `da.from_zarr`'s did. The first version was a closure, which plain
+pickle refuses. Dask did not notice, pickling the graph once with a cloudpickle fallback, but
+Frisky's client pickles each task on its own and fell back to cloudpickle on every task holding the
+closure: on Iowa at 2048 px, 438 tasks in each coverage gate and most of its pickling
+(`context_docs/ingest/frisky-experiment.md`, item 5).
+`test_the_reader_survives_a_process_based_scheduler` asserts the graph plain-pickles.
 
 Left standing: `ingest.roi_processing.apply_roi_mask` reads the mask with no `storage_options`, which
 resolves the environment, if a caller passes no `roi_mask`. Every production caller passes one, and
