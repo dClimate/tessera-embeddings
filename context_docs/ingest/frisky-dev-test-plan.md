@@ -24,10 +24,11 @@ is: [`frisky-experiment.md`](frisky-experiment.md). How to operate it:
 
 - **Paired arms.** Every Frisky run has a Dask run from the same deployment with the same
   parameters; only `use_frisky` differs. Dask runs with `min_workers == max_workers`, so both arms
-  have a fixed fleet and the comparison measures the engine, not autoscaling.
-- **Arms run one after the other, never at the same time.** The log queries select by time window
-  on the shared `/ecs/yield-embeddings` log group, so concurrent arms would mix.
-- **Alternate which engine goes first** on any rung that is repeated.
+  have the same fleet size.
+- **A pair runs side by side, and no more than two arms run at once.** Both arms then see the same
+  catalog and S3 conditions. Their log lines share `/ecs/yield-embeddings`, so every timing row is
+  attributed by its `@logStream`: the stream name ends in the ECS task id, and each task carries
+  `tessera-flow-run-id=<flow run id>`.
 - **A fresh store for every run**, under `s3://arbol-tessera-inputs-dev/mosaics/_frisky/<run>/`.
   Never an existing mosaic: version B could not append to one anyway.
 - **Telemetry on every run.** Set `perf_report_uri` to `s3://arbol-tessera-inputs-dev/perf/_frisky/<run>`.
@@ -63,12 +64,12 @@ Version B repeats steps 1 to 3 on `dev/frisky-2048`, pinned at `@aef6c55b`.
 | Measure | Source |
 |---|---|
 | Wall clock per leg | the flow run's start and end (`watch_run.py`) |
-| Per-date build, gate and write | `te-ingest-log-queries --log-group /ecs/yield-embeddings --query date_stage_timings` (`batch_timings` for batched runs) |
+| Per-date build, gate and write | `te-ingest-log-queries --log-group /ecs/yield-embeddings --query date_stage_timings` (`batch_timings` for batched runs, `s1_batch_timings` for S1), keeping the rows from the run's own task ids |
 | Worker restarts and exits | `worker_lifecycle_counts` and `worker_exit_reasons` from the same tool. On Frisky also the bundle's `events.json`, where any `worker_removed` is a death mid-run |
 | Frisky's live state | the `frisky state:` lines (`--query frisky_state`), and `live/overview.json` in the bundle |
 | Scheduler process load | the `scheduler health` lines (`te-watch-scheduler`). On Frisky only `cpu`, `rss` and `lag` mean anything |
-| Correctness | the paired stores compared with `tests/parity/helpers.assert_zarr_equivalent` after `aws s3 sync` to local disk, plus identical date lists |
-| Cost | workers × fleet lifetime × the Fargate rate (about $0.27 a worker-hour at 4 vCPU and 24 GiB) |
+| Correctness | once per version: every chunk of every array read from both stores and compared exactly, NaN positions and time coordinates included. Every run: its date list |
+| Cost | each tagged ECS task's billed lifetime (image pull to stop) × its vCPU and memory × the Fargate rate (about $0.27 a worker-hour at 4 vCPU and 24 GiB) |
 | The dossier | `te-ingest-report`, with `--frisky <bundle>` on Frisky runs |
 
 ## Phase A: Frisky at 4096 (version A), a basic check
@@ -90,6 +91,23 @@ Does Frisky work on dev, with nothing else changed?
 
 **On a failure,** stop. Diagnose from the bundle (`events.json`, `logs.json`) and the workers'
 log streams before going further.
+
+**Result: passed.** Every leg completed; all 240 workers of the four A2 arms registered and left
+cleanly, with no exits, kills or restarts. The A2 stores are bit-identical between engines: S2's
+11 bands over 10 dates and S1's VV and VH over 2 dates, every chunk equal, NaN positions too.
+
+| A2 arm | Engine time | Cluster created to work done | Cost |
+|---|---|---|---|
+| S2 Dask | 50.2 s (gate 15.5, write 33.3, build 1.4) | 127 s | $0.57 |
+| S2 Frisky | 58.7 s (gate 21.9, write 35.6, build 1.2) | 170 s | $0.75 |
+| S1 Dask | 10.6 s (stall 0.7, write 9.9) | 78 s | $0.38 |
+| S1 Frisky | 11.3 s (stall 1.0, write 10.3) | 102 s | $0.49 |
+
+Engine time is close. Frisky's S2 gate is slower by 6 s over three batches, which Iowa should
+explain from its bundle. The cost gap is setup: on a Frisky arm the first `Client(cluster)` after
+`cluster.scale(60)` waits until all 60 Fargate tasks have started (about 75 s), because `distributed`'s
+`Client` awaits the cluster's pending workers. Dask's `adapt` has requested no workers at that
+point, so its client connects at once and its work overlaps worker boot.
 
 ## Phase B: the 2048-px chunk (version B)
 
@@ -165,20 +183,30 @@ inference and assembly.
 
 ## Rough cost
 
-At about $0.27 a worker-hour, ingest only:
+Ingest only, at about $0.27 a worker-hour. Phase A is measured; the rest scale from it by area,
+Iowa being 14.6 times 15SWC:
 
-| Phase | Estimate |
+| Phase | Cost |
 |---|---|
-| A | about $35 |
-| B1 | about $35 |
-| B2 | about $100 |
-| B3 | about $50 |
-| B4 | about $30 |
+| A | $2.30, measured |
+| B1 | about $3 |
+| B2 | about $30 (twelve arms of two to three dollars) |
+| B3 | about $15 |
+| B4 | about $15 (two arms of about 20 worker-hours) |
 
-That is about $250 for all of the ingest phases. Phase C adds GPU time, estimated once the actor counts are fixed. These are estimates; the run
-log records the actual figures.
+That is about $65 for the ingest phases. Phase C adds GPU time, estimated once the actor counts
+are fixed. The run log records the actual figures.
 
 ## Run log
 
-| Date | Run | Version | Engine | ROI and window | Sensor | Workers | Flow run | Wall | s/date (median) | Restarts | Result |
+Wall is the flow run, setup included. s/date is engine time per date: the batches' build, gate and
+write for S2, or stall and write for S1, divided by the dates written.
+
+| Date | Run | Version | Engine | ROI and window | Sensor | Workers | Flow run | Wall | s/date | Restarts | Result |
 |---|---|---|---|---|---|---|---|---|---|---|---|
+| 2026-10-01 | a1-s2-frisky | A | Frisky | tiny_epsg5070, 2024-07 | S2 | 4 | `ea817d60` | 3m05s | smoke only | 0 | pass: 11 dates |
+| 2026-10-01 | a1-s1-frisky | A | Frisky | tiny_epsg5070, 2024-07 | S1 asc | 4 | `3de4ae35` | 2m33s | smoke only | 0 | pass: 2 dates |
+| 2026-10-01 | a2-s2-frisky | A | Frisky | 15SWC_epsg5070, 2024-07 | S2 | 60 | `60a14518` | 4m25s | 5.9 | 0 | pass: 10 dates, $0.75 |
+| 2026-10-01 | a2-s2-dask | A | Dask | 15SWC_epsg5070, 2024-07 | S2 | 60 | `a34bdea5` | 3m34s | 5.0 | 0 | pass: 10 dates, $0.57 |
+| 2026-10-01 | a2-s1-dask | A | Dask | 15SWC_epsg5070, 2024-07 | S1 asc | 60 | `8a0ff606` | 2m43s | 5.3 | 0 | pass: 2 dates, $0.38 |
+| 2026-10-01 | a2-s1-frisky | A | Frisky | 15SWC_epsg5070, 2024-07 | S1 asc | 60 | `ec58103a` | 3m12s | 5.6 | 0 | pass: 2 dates, $0.49 |

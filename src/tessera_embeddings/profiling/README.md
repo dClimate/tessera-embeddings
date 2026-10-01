@@ -16,7 +16,7 @@ group).
 | Question | Reach for |
 | --- | --- |
 | Is the ingest scheduler falling behind at N workers? | `te-watch-scheduler` (live heartbeat → JSON + alerts), `te-ingest-log-queries` (429/503/retry/worker-exit aggregates), `te-ingest-report` (per-run dossier) |
-| Where does a date's time go, and what did a mode change buy? | `te-ingest-log-queries` — `date_stage_timings`, `batch_timings` (its `batch_dates > 1` counterpart: one shared write per batch, divide by `n_dates`), `pipeline_stalls` (emitted in both modes, so the A/B is one query) |
+| Where does a date's time go, and what did a mode change buy? | `te-ingest-log-queries` — `date_stage_timings`, `batch_timings` (its `batch_dates > 1` counterpart: one shared write per batch, divide by `n_dates`), `pipeline_stalls` (emitted in both modes, so the A/B is one query), `s1_batch_timings` for S1. Each timing row carries its `@logStream`, whose suffix is the ECS task id, so arms run at the same time stay separable |
 | Are the GPUs busy? Are workers OOMing? | `te-observe-cluster` (live GPU/RAM pollers + CloudWatch rollups), plus the `te-compare-*` equivalence gates |
 
 ## Invocation
