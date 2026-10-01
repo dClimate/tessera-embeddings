@@ -93,12 +93,14 @@ The pin relies on Frisky looking `pickle.loads` up after our plugin runs.
 `test_frisky_threads_keep_their_python_state_between_tasks` fails if an upgrade changes that.
 The bug belongs upstream: a long-lived worker thread should keep one thread state.
 
-**2. Exception chains lose their cause.** Frisky returns a task's exception with plain pickle,
-which keeps `__notes__` but drops `__cause__`. The cause is the GDAL reason every read-failure
-verdict is decided from (`context_docs/ingest/source-read-failures.md`). Dask avoids this by
-installing tblib's chain-preserving reducers on every failure. `_MatchDaskWorker` installs them
-once, after importing the ingest's import closure, because tblib covers only classes that exist
-when it runs. Combined with `loader_failures.keep_causes_picklable`, which the ingest already
+**2. Exception chains lose their cause.** A task's exception keeps its `__cause__` only if tblib
+has registered its classes. In a worker that happens once, when Dask is imported, and covers the
+classes that exist at that moment. Dask also registers the failing chain on every failure; Frisky
+never does. So rasterio's GDAL errors, imported later, come back with `__notes__` but without
+`__cause__`, which is the GDAL reason every read-failure verdict is decided from
+(`context_docs/ingest/source-read-failures.md`).
+`_MatchDaskWorker` registers the classes once, after importing the ingest's import closure,
+because tblib covers only classes that exist when it runs. Combined with `loader_failures.keep_causes_picklable`, which the ingest already
 installs, the whole chain arrives.
 
 Two caveats:
@@ -242,7 +244,8 @@ Next, on the dev account:
 ## Open items
 
 - Report the thread-state bug and the dropped exception cause upstream, at
-  [mrocklin/frisky-issues](https://github.com/mrocklin/frisky-issues). Either fix upstream lets
+  [mrocklin/frisky-issues](https://github.com/mrocklin/frisky-issues). Drafts with standalone
+  reproductions are written but not filed. Either fix upstream lets
   the matching step of `_MatchDaskWorker` go.
 - Decide whether Frisky stays a core dependency when this reaches `main`, on the experiment's
   results and the constraints under Packaging above.
