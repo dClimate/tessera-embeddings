@@ -180,7 +180,7 @@ $1.36 to $1.38 on Frisky at 2048. An S1 arm cost $0.14 to $0.16.
   208 s run, against 20 s on Dask, longest before the two write batches (32 s and 25 s, against
   8 s and 7 s) while Frisky's client pickled each graph before submitting it. The record's item 5
   has the mechanism and the fix.
-- **The pickling fix closes the S2 gap** (`9d994f84`'s successor `31ea6ac0`, the `-fix` rows in the
+- **The pickling fix closes the S2 gap** (`31ea6ac0`, the `-fix` rows in the
   run log, Frisky and Dask side by side). Per date, S2 took 17.9 s on both engines and S1 13.1 s
   on Frisky against 13.8 s on Dask. The idle stretches before the two write batches fell from
   31.7 s and 25.1 s to 10.3 s and 8.4 s, against Dask's 9.1 s and 8.0 s, and Frisky's write
