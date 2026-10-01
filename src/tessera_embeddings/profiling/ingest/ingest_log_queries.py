@@ -101,6 +101,20 @@ QUERIES: dict[str, tuple[str, str]] = {
         r" | display @timestamp, date, prepare_s, hidden_s, stall_s"
         r" | sort date asc",
     ),
+    "frisky_state": (
+        "Frisky's live cluster state, from the `frisky state:` lines a Frisky run "
+        "(`use_frisky`) logs every few minutes: workers, idle workers, and tasks by "
+        "state. Workers below the fleet size, or erred above zero, is the first sign "
+        "of trouble. The lines come from the flow runner, so pass its log group as "
+        "--log-group.",
+        r"fields @timestamp"
+        r" | filter @message like /frisky state:/"
+        r" | parse @message /frisky state: workers=(?<workers>\d+) idle=(?<idle>\d+)"
+        r" processing=(?<processing>\d+) waiting=(?<waiting>\d+) queued=(?<queued>\d+)"
+        r" memory=(?<memory>\d+) erred=(?<erred>\d+)/"
+        r" | display @timestamp, workers, idle, processing, waiting, queued, memory, erred"
+        r" | sort @timestamp asc",
+    ),
     "http_retries_by_service": (
         "Catalog HTTP retry count by service (CMR vs STAC/earth-search) — the "
         "primary external-throttling discriminator.",

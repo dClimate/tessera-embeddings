@@ -26,7 +26,7 @@ from tessera_embeddings.orchestration.prefect.flows._dask_lifecycle import (
     get_task_runner_for_cluster,
 )
 from tessera_embeddings.orchestration.prefect.tasks.ingest import process_roi_sar
-from tessera_embeddings.providers.frisky import maybe_capture_spans
+from tessera_embeddings.providers.frisky import maybe_capture_telemetry
 
 
 @flow(name="ingest_s1_roi_impl")
@@ -135,12 +135,12 @@ def ingest_s1_roi_sar(
         use_local: Use the local Dask provider for testing.
         use_frisky: Run the ingest's compute on Frisky, an experimental Rust scheduler loaded
             onto the same Dask cluster (:mod:`tessera_embeddings.providers.frisky`). On AWS it
-            fixes the fleet at ``max_workers`` and sends ``perf_report_uri`` Frisky's spans
-            instead of a Dask report. Off by default.
+            fixes the fleet at ``max_workers``, and ``perf_report_uri`` becomes a prefix for
+            Frisky's telemetry instead of a Dask report. Off by default.
         storage_options: fsspec storage options forwarded to the domain function.
-        perf_report_uri: Optional fsspec URI; when set, a Dask performance-report HTML (Frisky's
-            spans as JSON with ``use_frisky``) for this run is captured and uploaded there
-            (probe-rung profiling; default off).
+        perf_report_uri: Optional fsspec URI; when set, a Dask performance-report HTML for this
+            run is captured and uploaded there; with ``use_frisky``, Frisky's live and final
+            telemetry is written under it as a prefix (probe-rung profiling; default off).
             Ignored on the ``use_local`` path, which warns.
         overlap_window_writes: Submit a date's windows as ONE dask compute rather than one
             blocking compute per window, so they share the fleet instead of each waiting its
@@ -231,7 +231,7 @@ def ingest_s1_roi_sar(
         task_runner = get_task_runner_for_cluster(cluster.scheduler_address)
         log.info("Task runner connected to scheduler at %s", cluster.scheduler_address)
         report = (
-            maybe_capture_spans(cluster.dashboard_link, perf_report_uri, log)
+            maybe_capture_telemetry(cluster.dashboard_link, perf_report_uri, log)
             if use_frisky
             else maybe_performance_report(cluster.scheduler_address, perf_report_uri, log)
         )

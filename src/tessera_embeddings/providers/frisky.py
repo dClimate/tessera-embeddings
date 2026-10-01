@@ -3,8 +3,9 @@
 `Frisky <https://getfrisky.dev/>`_ reimplements Dask's scheduler and workers in Rust, with far
 more telemetry. It is pre-1.0 and closed-source, so this module is the only place the pipeline
 calls its API: a change in the library lands here. Opt-in per run (``use_frisky`` on the ingest
-flows, ``frisky:`` in the plain runner's config); with it off nothing here runs. Background,
-measurements and the do's and don'ts: ``context_docs/ingest/frisky-experiment.md``.
+flows, ``frisky:`` in the plain runner's config); with it off nothing here runs. How to use it,
+and its do's and don'ts: ``docs/frisky.md``. Why it is wired this way, and the evidence:
+``context_docs/ingest/frisky-experiment.md``.
 
 The providers build the same Dask cluster as always and :func:`hijack` loads Frisky onto it: a
 Frisky scheduler inside the Dask scheduler process and a Frisky worker inside every Dask worker
@@ -40,8 +41,10 @@ import functools
 import json
 import logging
 import pickle
+import subprocess
+import sys
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any, cast
 
 import frisky
@@ -53,10 +56,16 @@ from distributed import Client, WorkerPlugin
 #: :func:`connect` yields is Dask's; when Frisky's client grows one, adding it here is the change.
 FRISKY_METHODS = frozenset({"compute", "persist", "submit", "map", "gather", "scatter"})
 
-#: Most recent spans :func:`maybe_capture_spans` keeps. A span is a dict of about a kilobyte on the
-#: flow runner, so this bounds the capture near 500 MB; a longer run keeps its tail, like Dask's
+#: Most recent spans :func:`maybe_capture_telemetry` keeps. A span is a dict of about a kilobyte on
+#: the flow runner, so this bounds the capture near 500 MB; a longer run keeps its tail, like Dask's
 #: capped task stream.
 SPANS_CAPTURE_LIMIT = 500_000
+
+#: Seconds between the live snapshots :func:`maybe_capture_telemetry` takes while a run is going.
+LIVE_SNAPSHOT_INTERVAL_S = 300.0
+
+#: Scheduler events per query, the most ``frisky observe events`` returns.
+EVENTS_LIMIT = 2_000
 
 
 #: Native ids of the Frisky threads whose Python thread state is pinned (see :func:`_pin_thread_state`).
@@ -161,29 +170,115 @@ def connect(dask_client: Client, *, enabled: bool = True) -> Iterator[Client]:
         frisky_client.close()
 
 
+def _frisky_cli(*args: str) -> str:
+    """Run a ``frisky`` CLI command and return its stdout.
+
+    The CLI rather than the dashboard's REST API, because it is Frisky's documented interface for
+    people and agents, and its output is the same thing they will read.
+    """
+    command = [sys.executable, "-m", "frisky.cli", *args]
+    return subprocess.run(command, capture_output=True, text=True, timeout=300, check=True).stdout
+
+
+def _write(uri: str, text: str) -> None:
+    with fsspec.open(uri, "w") as out:
+        out.write(text)
+
+
+def _live_snapshot(dashboard_url: str, uri: str, log: logging.Logger | logging.LoggerAdapter[Any]) -> None:
+    """Overwrite ``live/overview.json`` and log the cluster's state as one ``frisky state:`` line."""
+    bundle = _frisky_cli("observe", "overview", dashboard_url, "--json")
+    _write(f"{uri}/live/overview.json", bundle)
+    state = json.loads(bundle)["state"]
+    log.info(
+        "frisky state: workers=%d idle=%d processing=%d waiting=%d queued=%d memory=%d erred=%d",
+        *(state[k] for k in ("workers_total", "workers_idle", "tasks_processing", "tasks_waiting")),
+        *(state[k] for k in ("tasks_queued", "tasks_memory", "tasks_erred")),
+    )
+
+
+def _final_artifacts(dashboard_url: str) -> dict[str, Callable[[], str]]:
+    """The end-of-run bundle, one file each, so a failure costs only its own file."""
+
+    def events() -> str:
+        lifecycle = ("--kind", "worker_added,worker_removed")
+        return json.dumps(
+            {
+                "lifecycle": json.loads(
+                    _frisky_cli("observe", "events", dashboard_url, "--json", *lifecycle, "-n", str(EVENTS_LIMIT))
+                ),
+                "recent": json.loads(
+                    _frisky_cli("observe", "events", dashboard_url, "--json", "-n", str(EVENTS_LIMIT))
+                ),
+            }
+        )
+
+    return {
+        "spans.json": lambda: json.dumps(frisky.query_spans(limit=SPANS_CAPTURE_LIMIT, dashboard_url=dashboard_url)),
+        "overview.txt": lambda: _frisky_cli("observe", "overview", dashboard_url),
+        "overview.json": lambda: _frisky_cli("observe", "overview", dashboard_url, "--json"),
+        "events.json": events,
+        "logs.json": lambda: _frisky_cli(
+            "logs", "--url", dashboard_url, "--json", "--level", "warn", "--limit", "50000"
+        ),
+    }
+
+
 @contextlib.contextmanager
-def maybe_capture_spans(
+def maybe_capture_telemetry(
     dashboard_url: str,
     uri: str | None,
     log: logging.Logger | logging.LoggerAdapter[Any],
+    *,
+    interval_s: float = LIVE_SNAPSHOT_INTERVAL_S,
 ) -> Iterator[None]:
-    """Upload Frisky's spans to ``uri`` (any fsspec target) after the body, for offline analysis.
+    """Write Frisky's telemetry for this run under the prefix ``uri`` (any fsspec target).
+
+    **While the body runs,** every ``interval_s``: ``live/overview.json`` is overwritten and one
+    ``frisky state:`` line is logged, so a running, hung or killed run can be read from storage or
+    the run log with no port-forward. **After it:** the bundle below, captured before the cluster
+    closes, so any ``worker_removed`` event in it is a worker that left mid-run.
+
+    =================  ==========================================================================
+    ``spans.json``     the most recent :data:`SPANS_CAPTURE_LIMIT` spans; ``frisky observe
+                       overview spans.json`` and the other offline views read it
+    ``overview.txt``   ``frisky observe overview``, rendered
+    ``overview.json``  the same as a structured bundle: state, perf, costliest spans, outliers
+    ``events.json``    ``lifecycle`` (every worker joining and leaving) and ``recent`` (the last
+                       :data:`EVENTS_LIMIT` scheduler events)
+    ``logs.json``      Frisky's own scheduler and worker warnings and errors. Task logs are not
+                       here; they stay in the workers' log streams.
+    =================  ==========================================================================
 
     Frisky's counterpart to ``providers.aws.dask.maybe_performance_report``, isolated the same way:
     it never raises, so diagnostics cannot fail a run or mask its exception. No-op without a
-    ``uri``. The file is what ``frisky observe spans`` writes, so ``frisky observe overview
-    spans.json`` reads it once the cluster is gone. ``dashboard_url`` is the Dask dashboard link,
-    which serves Frisky's dashboard and API once hijacked.
+    ``uri``. ``dashboard_url`` is the Dask dashboard link, which serves Frisky's once hijacked.
     """
+    if not uri:
+        yield
+        return
+
+    stop = threading.Event()
+
+    def snapshots() -> None:
+        while not stop.wait(interval_s):
+            try:
+                _live_snapshot(dashboard_url, uri, log)
+            except Exception as e:
+                log.warning("Frisky live snapshot failed: %s", e)
+
+    live = threading.Thread(target=snapshots, name="frisky-telemetry", daemon=True)
+    live.start()
     try:
         yield
     finally:
-        if uri:
+        stop.set()
+        live.join(timeout=30)  # a snapshot in flight must not hold up the end of the run
+        written = []
+        for name, produce in _final_artifacts(dashboard_url).items():
             try:
-                spans = frisky.query_spans(limit=SPANS_CAPTURE_LIMIT, dashboard_url=dashboard_url)
-                with fsspec.open(uri, "w") as out:
-                    json.dump(spans, out)
-                capped = " (capped: the run's tail only)" if len(spans) >= SPANS_CAPTURE_LIMIT else ""
-                log.info("wrote %d Frisky spans to %s%s", len(spans), uri, capped)
+                _write(f"{uri}/{name}", produce())
+                written.append(name)
             except Exception as e:
-                log.warning("failed to capture Frisky spans to %s: %s", uri, e)
+                log.warning("failed to capture Frisky %s to %s: %s", name, uri, e)
+        log.info("wrote Frisky telemetry to %s: %s", uri, ", ".join(written) or "nothing")

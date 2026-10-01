@@ -25,6 +25,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable, Iterator
 from typing import Any
 
@@ -38,7 +39,7 @@ from dask.distributed import Client, WorkerPlugin, get_client
 from odc.geo.geobox import GeoBox
 from pyproj import CRS
 
-from tessera_embeddings.providers.frisky import connect, maybe_capture_spans
+from tessera_embeddings.providers.frisky import connect, maybe_capture_telemetry
 from tessera_embeddings.providers.local.dask import local_cluster
 from tessera_embeddings.storage.manifest import IngestManifest
 from tessera_embeddings.storage.zarr_store import (
@@ -232,19 +233,30 @@ def test_overlapped_window_writes_match_dask_and_commit_nothing_on_failure(hijac
     assert snapshots[0] == snapshots[1], "the poisoned date committed something"
 
 
-def test_captured_spans_are_what_frisky_observe_reads(hijacked, tmp_path) -> None:
-    """The telemetry a Fargate run leaves behind: worker spans, via the Dask dashboard's proxy,
-    in the file format the ``frisky observe`` CLI analyses offline.
+def test_the_telemetry_bundle_is_written_live_and_at_the_end(hijacked, tmp_path, caplog) -> None:
+    """What a Fargate run leaves behind, through the Dask dashboard's proxy: live snapshots while
+    it runs, then a bundle the ``frisky observe`` CLI reads after the cluster is gone.
     """
     dask_client, _ = hijacked
-    spans_file = tmp_path / "spans.json"
-    with maybe_capture_spans(dask_client.dashboard_link, str(spans_file), LOG):
-        da.ones(10_000, chunks=100).sum().compute()
+    bundle = tmp_path / "bundle"
+    with (
+        caplog.at_level(logging.INFO),
+        maybe_capture_telemetry(dask_client.dashboard_link, str(bundle), LOG, interval_s=1),
+    ):
+        for _ in range(4):  # long enough for live snapshots to land
+            da.ones(10_000, chunks=100).sum().compute()
+            time.sleep(1)
 
-    names = {span["name"] for span in json.loads(spans_file.read_text())}
+    assert (bundle / "live" / "overview.json").exists()
+    assert "frisky state: workers=2 " in caplog.text
+    for name in ("spans.json", "overview.txt", "overview.json", "events.json", "logs.json"):
+        assert (bundle / name).exists(), name
+    lifecycle = json.loads((bundle / "events.json").read_text())["lifecycle"]["events"]
+    assert sorted(e["kind"] for e in lifecycle) == ["worker_added", "worker_added"], "a worker left mid-run"
+    names = {span["name"] for span in json.loads((bundle / "spans.json").read_text())}
     assert any(name.startswith("worker.exec") for name in names), sorted(names)
     overview = subprocess.run(
-        [sys.executable, "-m", "frisky.cli", "observe", "overview", str(spans_file)],
+        [sys.executable, "-m", "frisky.cli", "observe", "overview", str(bundle / "spans.json")],
         capture_output=True,
         text=True,
         timeout=60,
@@ -258,7 +270,7 @@ def test_span_capture_never_fails_or_masks_the_run(tmp_path, caplog) -> None:
     with (
         caplog.at_level(logging.WARNING),
         pytest.raises(ValueError, match="the run's own failure"),
-        maybe_capture_spans("http://127.0.0.1:9", str(tmp_path / "spans.json"), LOG),
+        maybe_capture_telemetry("http://127.0.0.1:9", str(tmp_path / "spans.json"), LOG),
     ):
         raise ValueError("the run's own failure")
     assert "failed to capture Frisky spans" in caplog.text
