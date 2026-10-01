@@ -887,9 +887,11 @@ def ecs_cluster(
     # Register the scheduler health heartbeat. A short-lived Client is the only way to push a
     # SchedulerPlugin onto a remote scheduler; the plugin persists after this Client closes,
     # independent of the task-runner Client the flow opens next. Best-effort — diagnostics
-    # must not take down the run.
+    # must not take down the run. Both short-lived Clients connect by address: given the cluster
+    # object, a Client first waits for every worker already requested to reach RUNNING, which
+    # after ``scale(max_workers)`` is the whole fleet's boot.
     try:
-        with Client(cluster, timeout="60s") as client:
+        with Client(cluster.scheduler_address, timeout="60s") as client:
             client.register_plugin(SchedulerResourceLogger(), name=SchedulerResourceLogger.name)
         log.info("Scheduler health logging enabled (every %.0fs)", DEFAULT_SCHEDULER_PROFILE_INTERVAL_S)
     except Exception as e:
@@ -899,7 +901,7 @@ def ecs_cluster(
         # Inside the try, unlike the best-effort plugin above: a failed hijack must fail the run
         # rather than leave it on Dask, and must not leak the cluster it failed on.
         if frisky:
-            with Client(cluster, timeout="60s") as client:
+            with Client(cluster.scheduler_address, timeout="60s") as client:
                 frisky_engine.hijack(client)
             log.info("Frisky loaded onto the cluster")
         yield cluster

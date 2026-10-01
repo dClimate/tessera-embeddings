@@ -22,6 +22,7 @@ import contextlib
 import json
 import logging
 import os
+import pickle
 import subprocess
 import sys
 import threading
@@ -124,6 +125,32 @@ def test_frisky_threads_keep_their_python_state_between_tasks(hijacked) -> None:
 
     crs = CRS.from_epsg(32613)
     assert {client.submit(_epsg, crs).result(timeout=30) for _ in range(20)} == {32613}
+
+
+def _nth_epsg(_: int, crs: CRS) -> int | None:
+    return crs.to_epsg()
+
+
+def _hijack_state() -> tuple[bool, bool]:
+    """Whether this worker pins thread state and has the ingest imported (runs on a worker)."""
+    return getattr(pickle.loads, "_tessera_pins", False), "tessera_embeddings.ingest.s1_roi" in sys.modules
+
+
+def test_workers_that_join_after_the_hijack_run_its_queued_work() -> None:
+    """A Fargate fleet boots after the hijack, and a restarted worker rejoins the same way: work
+    queued while no worker exists must run on the late joiners, each pinned and with the ingest
+    imported before its Frisky worker takes a task.
+    """
+    with (
+        local_cluster(n_workers=0, threads_per_worker=2, dashboard_address=":0", frisky=True) as cluster,
+        Client(cluster) as dask_client,
+        connect(dask_client) as client,
+        _ran_on(dask_client, frisky=True),
+    ):
+        futures = client.map(_nth_epsg, range(20), crs=CRS.from_epsg(32613))
+        cluster.scale(2)
+        assert {future.result(timeout=120) for future in futures} == {32613}
+        assert set(dask_client.run(_hijack_state).values()) == {(True, True)}
 
 
 class _MarkProcess(WorkerPlugin):
