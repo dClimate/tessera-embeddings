@@ -77,6 +77,19 @@ SPANS_CAPTURE_LIMIT_DRAINED = 100_000
 #: Seconds between the live snapshots :func:`maybe_capture_telemetry` takes while a run is going.
 LIVE_SNAPSHOT_INTERVAL_S = 300.0
 
+#: Spans a live snapshot analyses when the drain is on (``frisky observe overview --limit``).
+#: The drain already keeps them all, so the snapshot only needs a recent sample; Frisky's default
+#: of 200,000 cost 87 s a query on a full Iowa run. Each ``frisky state:`` line logs the
+#: snapshot's own time, to recalibrate this against.
+LIVE_SNAPSHOT_SPANS_DRAINED = 50_000
+
+#: Spans each Frisky process keeps (``FRISKY_TRACING_CAPACITY``, Frisky's default 1,000,000),
+#: set on the scheduler and every worker by ``ecs_cluster(frisky=True)``. At the default the
+#: scheduler's buffer grew to 5.7 GiB of its 8 GiB on zone 35N and its process died at the end of
+#: the run, and every span query slowed as buffers filled. 200,000 is still several minutes of a
+#: worker's spans, ample for a drain each minute.
+TRACING_CAPACITY = 200_000
+
 #: Scheduler events per query, the most ``frisky observe events`` returns.
 EVENTS_LIMIT = 2_000
 
@@ -252,15 +265,19 @@ def _write(uri: str, text: str) -> None:
         out.write(text)
 
 
-def _live_snapshot(dashboard_url: str, uri: str, log: logging.Logger | logging.LoggerAdapter[Any]) -> None:
+def _live_snapshot(
+    dashboard_url: str, uri: str, log: logging.Logger | logging.LoggerAdapter[Any], limit: int | None = None
+) -> None:
     """Overwrite ``live/overview.json`` and log the cluster's state as one ``frisky state:`` line."""
-    bundle = _frisky_cli("observe", "overview", dashboard_url, "--json")
+    started = time.monotonic()
+    bundle = _frisky_cli("observe", "overview", dashboard_url, "--json", *(["--limit", str(limit)] if limit else []))
     _write(f"{uri}/live/overview.json", bundle)
     state = json.loads(bundle)["state"]
     log.info(
-        "frisky state: workers=%d idle=%d processing=%d waiting=%d queued=%d memory=%d erred=%d",
+        "frisky state: workers=%d idle=%d processing=%d waiting=%d queued=%d memory=%d erred=%d snapshot=%.1fs",
         *(state[k] for k in ("workers_total", "workers_idle", "tasks_processing", "tasks_waiting")),
         *(state[k] for k in ("tasks_queued", "tasks_memory", "tasks_erred")),
+        time.monotonic() - started,
     )
 
 
@@ -402,7 +419,8 @@ def maybe_capture_telemetry(
 
     stop = threading.Event()
     drain = _SpanDrain(dashboard_url, uri) if drain_spans else None
-    loops = [(interval_s, lambda: _live_snapshot(dashboard_url, uri, log), "live snapshot")]
+    limit = LIVE_SNAPSHOT_SPANS_DRAINED if drain else None
+    loops = [(interval_s, lambda: _live_snapshot(dashboard_url, uri, log, limit), "live snapshot")]
     if drain:
         loops.append((SPAN_DRAIN_INTERVAL_S, drain.drain, "span drain"))
     threads = [

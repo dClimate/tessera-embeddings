@@ -978,3 +978,35 @@ class TestDaskContainerEnvironment:
         assert env["PREFECT_LOGGING_TO_API_ENABLED"] == "false"
         assert env["EXTRA"] == "1"
         assert env["AWS_NO_SIGN_REQUEST"] == "YES"  # defaults survive alongside
+
+
+class _CapturedError(Exception):
+    """Raised by the fake cluster to stop ``ecs_cluster`` once it has the kwargs."""
+
+
+@pytest.mark.parametrize(
+    ("frisky", "extra", "expected"),
+    [(True, None, "200000"), (True, {"FRISKY_TRACING_CAPACITY": "50000"}, "50000"), (False, None, None)],
+)
+def test_frisky_clusters_cap_span_buffers_on_scheduler_and_workers(monkeypatch, frisky, extra, expected) -> None:
+    """``FRISKY_TRACING_CAPACITY`` rides the environment every task gets, so an explicit value wins."""
+    from tessera_embeddings.providers.aws import dask as aws_dask
+
+    captured: dict = {}
+
+    def fake_cluster(**kwargs):
+        captured.update(kwargs)
+        raise _CapturedError
+
+    class _Config:
+        def to_cluster_kwargs(self) -> dict:
+            return {"environment": {}, "scheduler_task_kwargs": {}}
+
+    monkeypatch.setattr(aws_dask, "get_fargate_config", lambda: _Config())
+    monkeypatch.setattr(aws_dask, "FargateCluster", fake_cluster)
+    with (
+        pytest.raises(_CapturedError),
+        aws_dask.ecs_cluster(logging.getLogger("t"), extra_worker_env=extra, frisky=frisky),
+    ):
+        pass
+    assert captured["environment"].get("FRISKY_TRACING_CAPACITY") == expected

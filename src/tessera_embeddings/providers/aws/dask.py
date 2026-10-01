@@ -796,6 +796,9 @@ def ecs_cluster(
 
     if extra_worker_env:
         cluster_kwargs["environment"].update(extra_worker_env)
+    if frisky:
+        # The environment reaches the scheduler too, whose span buffer is the largest.
+        cluster_kwargs["environment"].setdefault("FRISKY_TRACING_CAPACITY", str(frisky_engine.TRACING_CAPACITY))
 
     if diagnostic_task_stream:
         cluster_kwargs["environment"]["DASK_DISTRIBUTED__SCHEDULER__DASHBOARD__TASKS__TASK_STREAM_LENGTH"] = str(

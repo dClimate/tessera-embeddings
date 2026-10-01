@@ -98,4 +98,6 @@ def test_frisky_state_parses_the_line_the_live_snapshot_logs(monkeypatch, tmp_pa
 
     pattern = re.search(r"parse @message /(.*?)/ \|", QUERIES["frisky_state"][1]).group(1)
     fields = re.search(re.sub(r"\(\?<(\w+)>", r"(?P<\1>", pattern), caplog.text).groupdict()
+    snapshot_s = fields.pop("snapshot_s")
     assert fields == dict(workers="60", idle="2", processing="118", waiting="4021", queued="0", memory="355", erred="1")
+    assert float(snapshot_s) >= 0
