@@ -71,7 +71,9 @@ python -c "import glob, gzip, json, sys; json.dump([s for p in sorted(glob.glob(
 frisky observe overview run-spans.json
 ```
 
-The parts are raw material, not a record: once a run is analysed, delete them with
+Frisky's tracing misses about one span in 2,000, so a task count taken from spans runs that much
+short; the drain itself loses none. The parts are raw material, not a record: once a run is
+analysed, delete them with
 `aws s3 rm --recursive <perf_report_uri>/spans/`. The rest of the bundle is small and stays.
 
 Frisky also prints a periodic cluster summary to stdout; `FRISKY_SUMMARY=off` silences it.

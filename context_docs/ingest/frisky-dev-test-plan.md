@@ -181,6 +181,20 @@ $1.36 to $1.38 on Frisky at 2048. An S1 arm cost $0.14 to $0.16.
   spans, and at Iowa scale Frisky emits about 15,000 a second, so it holds the last 33 s. The live
   views fetch 200,000, about 13 s. The per-task comparison above came from that tail.
 
+**The span drain, on the same S2 and S1 Frisky arms at 2048** (`frisky_drain_spans`, the
+`-drain` rows in the run log):
+
+- **It keeps the run.** The S2 run's 4 parts hold 419,652 spans in 12.1 MB gzipped, from all 60
+  workers over 208 s. They count 23,187 store writes and 2,113 reads of each band, against the
+  23,188 and 2,113 in the Dask arm's task stream.
+- **It loses nothing Frisky keeps.** Over the last 33 s, every drained-name span in the
+  end-of-run capture is in the parts. The few tasks short of a span in the parts (two band reads,
+  and about 0.05% of call, GIL and deserialise spans) are short in Frisky's own buffers too: its
+  tracing misses about one span in 2,000.
+- **It costs little at this scale.** 24.1 s a date on S2 against 23.2 and 23.3 without it, and
+  15.1 on S1 against 14.6 and 14.8: within the repeats' spread, though higher on both. The
+  scheduler's CPU peaked at 79% of a core against 54% and 59%, its median unchanged at about 10%.
+
 **B3: breadth, on ROIs ingested before.** Each for one month, Frisky against Dask at 2048, for
 correctness and stability:
 
@@ -244,11 +258,11 @@ Ingest only, at about $0.27 a worker-hour. Phases A to B2 are measured; the rest
 |---|---|
 | A | $2.30, measured |
 | B1 | $1.72, measured, with the startup fix's two smoke runs |
-| B2 | $8.12, measured |
+| B2 | $9.70, measured, with the drain's two runs |
 | B3 | about $10 |
 | B4 | about $15 (two arms of about 20 worker-hours) |
 
-That is about $37 for the ingest phases. Phase C adds GPU time, estimated once the actor counts
+That is about $39 for the ingest phases. Phase C adds GPU time, estimated once the actor counts
 are fixed. The run log records the actual figures.
 
 ## Run log
@@ -284,3 +298,5 @@ write for S2, or stall and write for S1, divided by the dates written.
 | 2026-10-01 | b2-s1-frisky-2048-r2 | B | Frisky | iowa_epsg5070, 2024-07-01..14 | S1 asc | 13 | `0310ec3a` | 3m51s | 14.8 | 0 | pass: 4 dates, $0.15 |
 | 2026-10-01 | b2-s2-frisky-4096-r2 | A′ | Frisky | iowa_epsg5070, 2024-07-01..14 | S2 | 60 | `297322b4` | 6m18s | 24.2 | 0 | pass: 8 dates, $1.25 |
 | 2026-10-01 | b2-s1-frisky-4096-r2 | A′ | Frisky | iowa_epsg5070, 2024-07-01..14 | S1 asc | 13 | `7358d35d` | 3m34s | 16.6 | 0 | pass: 4 dates, $0.14 |
+| 2026-10-01 | b2-s2-frisky-2048-drain | B (`8d461c61`) | Frisky | iowa_epsg5070, 2024-07-01..14 | S2 | 60 | `6f7f663a` | 7m05s | 24.1 | 0 | pass: 8 dates, $1.42, 419,652 spans drained |
+| 2026-10-01 | b2-s1-frisky-2048-drain | B (`8d461c61`) | Frisky | iowa_epsg5070, 2024-07-01..14 | S1 asc | 13 | `e99aebd7` | 3m58s | 15.1 | 0 | pass: 4 dates, $0.16, 26,767 spans drained |

@@ -171,7 +171,8 @@ findings:
   own span buffer (1,000,000 by default), which a worker fills in about an hour, so the run's spans
   are still there to drain as it goes: `frisky_drain_spans` copies the task, transfer and spill
   spans every minute. They are a fifth of the spans and hold all of the task time; spans under
-  1 ms would be another five times smaller but lose a quarter of the transfer time.
+  1 ms would be another five times smaller but lose a quarter of the transfer time. On Iowa the
+  drain kept every span Frisky did, and Frisky's tracing itself misses about one in 2,000.
 
 The 2048-px chunk changes pixels slightly, through GDAL's approximate warp transformer rather than
 through either engine; the plan's B1 result has the measurement.
@@ -186,6 +187,6 @@ documentation: [`docs/frisky.md`](../../docs/frisky.md).
   reproductions are written but not filed. Either fix upstream lets
   the matching step of `_MatchDaskWorker` go.
 - Find why an icechunk write task runs 54% longer on Frisky than on Dask.
-- Run `frisky_drain_spans` on dev, and check its load on the scheduler at B4's scale.
+- Check the span drain's load on the scheduler at B4's scale; at Iowa its peak was 79% of a core.
 - Decide whether Frisky stays a core dependency when this reaches `main`, on the experiment's
   results and the constraints under Packaging above.
