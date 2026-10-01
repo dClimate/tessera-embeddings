@@ -57,9 +57,17 @@ After the run, read the spans `perf_report_uri` captured:
 frisky observe overview spans.json
 ```
 
-That capture keeps the most recent 500,000 spans (`SPANS_CAPTURE_LIMIT`), so it holds only a run's
+That capture keeps the most recent 200,000 spans (`SPANS_CAPTURE_LIMIT`), so it holds only a run's
 tail: at Iowa scale (60 workers, 2048-px chunks) Frisky emits about 15,000 spans a second, and the
-capture covers the last half minute.
+capture covers the last 13 seconds or so.
+
+**Span telemetry must never take the scheduler's memory.** Each process keeps its spans in memory
+(`FRISKY_TRACING_CAPACITY`), and the scheduler assembles every span query's answer in its own:
+on zone 35N, Frisky's default buffer of 1,000,000 plus three end-of-run queries took the
+scheduler past 6.7 of its 8 GiB, and it died. So the wiring bounds every term: 200,000 spans a
+process, a 15-second slice per drain request, at most 50,000 spans per live snapshot with the
+drain on, and ONE span query at a time at the end of the run, the overviews being computed from
+`spans.json` in the flow's own process. Keep it that way when adding a capture.
 
 **To keep the whole run,** also set `frisky_drain_spans=True`. Every minute the run then copies its
 task, transfer and spill spans (`SPAN_DRAIN_NAMES`, a fifth of all spans and every second of task
@@ -87,7 +95,7 @@ Frisky also prints a periodic cluster summary to stdout; `FRISKY_SUMMARY=off` si
 
 - Size the fleet with `max_workers`.
 - Set `perf_report_uri` on any run you want to analyse after its cluster is gone, and
-  `frisky_drain_spans` as well if the analysis needs more than the run's last half minute.
+  `frisky_drain_spans` as well if the analysis needs more than the run's last few seconds.
 - Delete `<perf_report_uri>/spans/` when the analysis is done. A global run's parts reach
   terabytes.
 - Pass Frisky's own settings through `worker_env_overrides`. Examples are
