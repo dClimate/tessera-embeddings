@@ -453,8 +453,8 @@ buckets.
    radar slice *in normalised space*, in the smallest bucket, bit-identical to what
    `ucam-eo/tessera`'s `_sample_s1_merged` returns for the same case. Nothing in the
    encoder requires a radar observation to exist. v2 Large is fed the same slice; no test
-   compares that against upstream v2's own handling of a radar-free pixel. Radar-informed pixels are unaffected by
-   the flag. Downstream, an optical-only pixel is exactly one with a finite `scales` value
+   compares that against upstream v2's own handling of a radar-free pixel. Radar-informed
+   pixels are unaffected by the flag. Downstream, an optical-only pixel is exactly one with a finite `scales` value
    and `s1_asc_obs_count + s1_desc_obs_count == 0`. **The production gate on this is recorded
    as cleared** — [ADR-013](../../../context_docs/decisions/013-optional-s1-s2-only-pixels.md)
    §Quality caveat, and the global campaign runs with the flag on, because about a fifth of
@@ -873,8 +873,9 @@ icechunk sessions read their own writes, so the merged result is exact.
    `geoemb:model` as v1.1; the pre-flight runs the same check before any GPU is
    provisioned). Then either resize every time-dimensioned array by one step (an append
    *is* a resize plus a write at the new index) or, when the time value already exists,
-   target that index for an in-place overwrite. That makes a resume **idempotent**: a crashed assembly re-run lands on the
-   same index instead of appending a duplicate timestep. On an overwrite, any
+   target that index for an in-place overwrite. That makes a resume **idempotent**: a
+   crashed assembly re-run lands on the same index instead of appending a duplicate
+   timestep. On an overwrite, any
    time-dimensioned array this run does *not* write — `embedding_std` when standard
    deviations are off, say, or the other radar orbit's count — is reset to fill at that
    index, so no stale slice describes the overwritten data.
@@ -1086,20 +1087,16 @@ explicit one. See `models/README.md` before touching them.
 **not** change layer dimensions, activations, or the forward pass unless you are also
 retraining.
 
-`models/builder.py` dispatches on `model_version`. v1.1 is built from `modules.py` and
-`ssl_model.py`, and its checkpoint loads non-strictly after `load_v11_checkpoint` strips the
-FSDP and compile prefixes and the training-only heads. v2 Large is built from
-`student_v2.py`, and `load_v2_checkpoint` loads its `{"model", "args"}` payload strictly and
-cross-checks the stored `args` against the config. If either format changes, its loader
-needs updating. Both run inside the same `MultimodalBTInferenceModel` wrapper.
+`models/builder.py` dispatches on `model_version`. The two architectures side by side, their
+checkpoint loaders, and the porting rules are in [`models/README.md`](models/README.md); v2
+Large's throughput against v1.1 is §7 of
+[`inference-on-gpus.md`](../../../context_docs/inference/inference-on-gpus.md).
 
-The v2 checkpoint is published on Hugging Face as `geotessera/TESSERA-V-2.0-2B-L`
-(`ckpt/student_large.pt`). The Prefect flow reads it as `v2_student_large.pt` from the same
-model directory as the v1.1 checkpoints, `{inputs}/models/`, so it has to be staged there
-under that name first; the plain runner can instead be given its URL as `checkpoint_url`, as the
-quickstart does for v1.1. The side-by-side comparison of the two architectures, and the porting rules, are
-in [`models/README.md`](models/README.md). v2 Large's measured throughput against v1.1 is §7
-of [`inference-on-gpus.md`](../../../context_docs/inference/inference-on-gpus.md).
+**Staging the v2 checkpoint.** It is published on Hugging Face as `geotessera/TESSERA-V-2.0-2B-L`
+(`ckpt/student_large.pt`). The Prefect flow reads it as `v2_student_large.pt` from the model
+directory the v1.1 checkpoints use, `{inputs}/models/`, so it must be staged there under that
+name. The plain runner can instead take its URL as `checkpoint_url`, as the quickstart does for
+v1.1.
 
 ---
 

@@ -1129,11 +1129,9 @@ spread is a T artifact. The same caution §2 states applies: quote tokens/s, not
 by-product: it makes the null result below a real absence rather than an undetectable effect. A 5%
 change would have been plainly visible.
 
-**Correction: the tensor-pipe prediction was wrong.** Before measuring, the expectation recorded was
-that v2 would *raise* tensor-pipe utilisation by dropping v1.1's launch-bound CustomGRU, which §2
-named as a bottleneck. It did not: TENSO is a dead heat with v1.1. The reason is that shipped v1.1
-had already reached 0.42–0.47 via the batch 3584 → 7168 change, so there was no headroom on that
-axis left for the GRU removal to recover.
+**Dropping the GRU frees no tensor-pipe headroom.** TENSO is a dead heat with v1.1, although v2
+removes the launch-bound CustomGRU §2 named as a bottleneck: shipped v1.1 had already reached
+0.42–0.47 through the batch 3584 → 7168 change, leaving nothing on that axis to recover.
 
 ### The per-model planning rate estimate is a NULL RESULT
 
@@ -1157,15 +1155,13 @@ At larger samples the distributions converge further (78.6% vs 77.9% `starter`).
 dense multi-strip plans that dominate Iowa, the `t_infer >= t_load` comparison clears its threshold
 by a wide margin at both 16,000 and 22,000, so no decision changes.
 
-**Correction to an earlier claim.** It was asserted that fixing the estimate would convert run A's
-123/402 prefetch misses into hits. That was wrong. Those misses come from chunk geometry —
+Nor does it explain run A's 123/402 prefetch misses. Those come from chunk geometry —
 budget-sized first strips and pair-budget plans, excluded by construction — not from a mis-estimated
-rate. The lesson: check which decisions sit *near* a threshold before predicting that moving the
-threshold helps.
+rate. Check which decisions sit *near* a threshold before predicting that moving the threshold helps.
 
 The change is still correct (a stale per-model constant is the same class of defect as the
-provenance defect below) and may matter on an ROI dominated by sparse single-strip tiles. It is not
-a speedup for Iowa.
+provenance one in [`validating-a-model-change.md`](validating-a-model-change.md) §5) and may matter
+on an ROI dominated by sparse single-strip tiles. It is not a speedup for Iowa.
 
 ### Where the remaining time goes
 
@@ -1179,74 +1175,14 @@ Reading: v2's forward pass is fast enough that fixed I/O cost is no longer hidde
 moves the bottleneck off the GPU and onto the read/write path** — which also explains the
 utilization gap against v1.1 despite higher throughput.
 
-#### Staging write anatomy
+#### Staging writes, on the staging layout of the time
 
-- 418 writes measured: **19.9 s mean, 21.2 s median, 26.4 s p90, 30.0 s max**.
-- `BAND_CHUNK_DIVISOR = 32` ⇒ 4 bands per object. A 2000×2000 chunk writes 16 spatial tiles × 32
-  band groups = **512 objects for embeddings**, ~1 MB each, plus ~64 for scales and obs counts. So
-  **~576 objects, ~540 MB, uncompressed** (`"compressors": None`), i.e. ~26 MB/s —
-  request-count-bound, not bytes or CPU.
-
-#### Zarr's concurrency cap is not binding, and the evidence says so
-
-`zarr.config`'s `async.concurrency` defaults to **10** and is never overridden anywhere in the
-source. Correlating 1 s outbound-:443 socket samples against reconstructed write windows
-(`observe_cluster --start-pollers`, added for this), over **117 write windows / 465 in-write samples
-across 10 workers**:
-
-| | established :443 | median | max |
-|---|---|---|---|
-| during a write | 41.6 mean | 40 | 72 |
-| baseline | 14.4 mean | 3 | 64 |
-
-**No plateau at 10, and no plateau anywhere.** The in-write distribution spans 24–72, with broad
-clusters near 32–36 and 49–52 and no single value the samples pile onto. A binding cap would show as
-a spike at that value; concurrency here is demand-driven, not limit-driven. So the write is **not
-concurrency-limited** — its ~20 s cost is per-request latency or host CPU contention with inference
-batch prep.
-
-The window overlaps the next chunk's background strip read, so some of those sockets are reads
-rather than uploads. That does not rescue the cap hypothesis: even attributing half to reads leaves
-the writer far above 10.
-
-Implication: raising the cap will not help. The remaining levers are fewer, larger staged objects
-(which couples to the assembly read path, pinning `500×500×(embedding_dim/BAND_CHUNK_DIVISOR)`) or
-accepting the cost. Deepening the write pipeline past its current depth of 1 is **not** advised: the
-pending write holds the ~512 MB embeddings buffer, and peak RAM is already 54% against the 55–60%
-guard §5 set after an OOM kill.
-
-### A provenance defect this rollout found, and fixed
-
-A v2 run stamped `geoemb:model = https://geotessera.org/model/1.1` while `checkpoint_id` and the
-manifest correctly read `student_large` — the store advertised itself as v1.1. Cause:
-`ENCODER_VERSION` was a module constant pinned to 1.1, so nothing could vary the public URL per
-model. It is now `MODEL_ENCODER_URLS` + `encoder_url()`, with
-`build_convention_attrs(encoder_version=…)` kept distinct from `model_version`, the checkpoint stem.
-
-`encoder_url` **raises** on an unregistered model rather than defaulting: wrong provenance is worse
-than missing provenance because it is silent. That is the opposite choice from `est_px_per_sec`,
-which falls back, because one is a correctness value and the other a speed hint.
-
-v2's public reference is its Hugging Face repo; it is not published under the
-`geotessera.org/model/<version>` scheme, and inventing a path there would be a fabricated
-identifier. Replace it if a canonical one is minted.
-
-Neither run A nor run B exercised the fix — both predate it.
-
-### Operational notes from these two runs
-
-- **Prefect logs are not a reliable progress signal at fleet width.** In run A the flow logged
-  nothing for the last ~75% of the run while work proceeded normally — the progress line fires
-  several times a second and appears to hit an ingestion limit. CloudWatch `CHUNK_SUMMARY` telemetry
-  stayed accurate throughout; use it. (§6 says the same thing from the campaign path.)
-- **`--start-pollers` truncates.** The GPU poller redirects with `>`, so re-running it to catch
-  late-joining workers destroys samples already collected on the others. On a staggered fleet,
-  instrument incrementally — new instances only.
-- **One SSM tunnel per machine.** `arbol_prefect_client` binds a fixed local port
-  (`DEFAULT_PORT = 8443`) and its readiness check only tests that *something* accepts there. A
-  second process usually piggybacks on the first's tunnel and then dies with `httpx.ConnectError`
-  when that one exits — or silently queries the wrong server if the two target different
-  environments.
+Measured on the layout these runs used — 2000-px chunks staged as 4-band objects, about 576
+uncompressed objects (~540 MB) per chunk — since replaced by 256 × 256 inner chunks holding the full
+band axis. A staged write averaged 19.9 s (p90 26.4 s), about 26 MB/s, request-count-bound rather
+than bytes- or CPU-bound. Zarr's `async.concurrency` cap of 10 was **not** binding: 1 s socket samples
+across 117 write windows showed 24–72 established connections during writes, with no plateau at 10 or
+anywhere else, so raising the cap would not help.
 
 ---
 

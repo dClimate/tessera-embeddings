@@ -34,6 +34,8 @@ te-observe-cluster \
    wildcard entry; a catch-all glob would drop samples and displace other
    logs. Clusters launched before the template gained the entry keep the data
    worker-local — `--report` still summarizes it live.)
+   Re-running it truncates the GPU poller's output (it redirects with `>`), so
+   on a fleet that is still growing, start pollers on new instances only.
 2. `--report` while live: per-worker RAM summary (peak, seconds ≥55%/≥60%,
    top spike samples), OOM forensics (kernel OOM-killer + Ray memory-monitor
    events), GPU summaries, and the per-chunk phase table.

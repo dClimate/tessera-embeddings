@@ -5,14 +5,14 @@ better.** The method, the thresholds, and the measurements the thresholds were c
 Written for the Tessera v2 Large rollout, but the argument is about model swaps in general and
 applies to the next one.
 
-Run-level figures for the rollout this was built for are in §7 of
-[`inference-on-gpus.md`](inference-on-gpus.md): that section records the verdict, this file explains
-why the checks are the ones they are.
+The rollout's verdict is §5 here; its throughput is §7 of
+[`inference-on-gpus.md`](inference-on-gpus.md); what its precision fix did to v1.1 is in
+[`v1.1-against-the-published-store.md`](v1.1-against-the-published-store.md).
 
 **Where the gate lives:** `scripts/validate_embedding_model_change.py` in the **yield-embeddings**
-repo. It landed there because that is where the runs were driven from, not by design — its siblings
-(`profiling/inference/compare_outputs.py`, `compare_coarsened_stores.py`) are in this repo, and it
-arguably belongs beside them.
+repo, beside the runs it was built for.
+[ADR-019](../decisions/019-validation-modules-belong-in-the-library.md) moves it here, next to its siblings
+(`profiling/inference/compare_outputs.py`, `compare_coarsened_stores.py`), after the campaign.
 
 ---
 
@@ -34,9 +34,8 @@ The invariant that survives a model swap is that **only the model changed**. So 
 model-independent must match the reference exactly, while the values must not match at all. The gate
 asserts both halves, then judges the values on structure rather than on agreement.
 
-**Where that boundary actually falls, and it is earlier than "the encoder".** Two stages before it
-are model-specific, not one, and an earlier draft of this document got that wrong — it called
-sampling shared, which would send a reader chasing a preprocessing difference through the encoder or
+**That boundary falls earlier than "the encoder".** Two stages before it are model-specific, and
+treating sampling as shared sends a reader chasing a preprocessing difference through the encoder or
 the normalisation, where it is not.
 
 *Shared, and so exact-match testable:* the mosaic reads, the SCL validity mask and per-pixel
@@ -53,14 +52,8 @@ model, because `MODEL_ARCHS["v2-large"]` overrides only the architecture fields 
   the reachable population (`compute_bin_keys` clips a count to the smallest checkpoint at or
   above it, so the pairs a bucket can actually receive are counts 1..B for each of the 32
   buckets: 4,224 pairs) the two rules select **different indices for 4,128 of them — 97.7%**,
-  agreeing on only 96. So two runs over byte-identical pixels hand their encoders different
-  observation sequences, at the same shape and dtype.
-
-  > *Withdrawn:* `build_resample_indices_v2`'s docstring claimed "1,163 of the 1,188 (count,
-  > bucket) pairs". That figure reproduces under no enumeration of this pipeline's buckets —
-  > counts 1..B give 4,224 pairs, the parity test's wider 1..2B sweep gives 8,448 — so it was
-  > removed from the docstring rather than carried forward. The 4,128/4,224 above was measured
-  > by enumerating both resamplers directly.
+  agreeing on only 96, measured by enumerating both resamplers. So two runs over byte-identical
+  pixels hand their encoders different observation sequences, at the same shape and dtype.
 * **Band standardisation.** `band_stats(model_version, norm_source)` returns v2's single
   hard-coded set for v2 and the AWS/MPC pair for v1.1, so the normalised tensors differ too.
 
@@ -139,7 +132,9 @@ These are loose on purpose. They are set to catch a broken run, not to grade a w
 landing far below the v1.1 ceiling on neighbour agreement while still clearing 5× is not a pass in
 any meaningful sense — **read the numbers, not just the verdict.**
 
-## 5. What the v2 rollout scored against them
+## 5. What the v2 rollout scored
+
+### Readback gate, Iowa run A
 
 921,600 pixels sampled, run A output, against the v1.1 reference store.
 
@@ -165,6 +160,32 @@ tighter scales. This follows from unit-variance output: per-pixel absmax is near
 so resolution is spent covering the tail. Not a defect, but v2 gets slightly lower quantization SNR
 for the same storage budget.
 
+### End to end on the dev stack, 2026-09-30
+
+The single-area flow on `m10_parity_15S_epsg32715` (1024 × 1025 px, `time_window_end="December
+2024"`, `num_actors=2`), once per model from the same code — tessera-embeddings `c550f2bb` through
+yield-embeddings `dev/global-tessera-v2-large` — so the model was the only variable.
+
+| check | result |
+|---|---|
+| the six provenance arrays (three observation counts, three month masks) | identical |
+| pixels embedded | the same set, 99.90% of the area |
+| embeddings | differ: 0.55% of int8 values coincide, median v1.1-to-v2 cosine −0.05 |
+| v2 identity | `geoemb:model` is the Hugging Face URL, `checkpoint_id` is `v2_student_large`, run ID `v2-5f141cb56305`, 128-d |
+| v2 output after dequantization | per-pixel mean 0.0000, standard deviation 1.0000 |
+| a v2 run pointed at the v1.1 store | refused by the pre-flight before any Ray cluster started |
+
+Flow runs: v1.1 `cf5b18d3`, v2 `f4b57309`, refusal `69a06a5f`.
+
+### The provenance defect the rollout found
+
+The Iowa runs stamped `geoemb:model = https://geotessera.org/model/1.1` while `checkpoint_id` and the
+manifest read `student_large`: `ENCODER_VERSION` was a module constant pinned to 1.1. The URL now
+comes from `MODEL_ENCODER_URLS` through `encoder_url()`, which raises on an unregistered model rather
+than defaulting, because wrong provenance is silent and missing provenance is not. v2's public
+reference is its Hugging Face repo, since it has none under `geotessera.org/model/<version>`; replace
+it if one is minted. The dev-stack run above is the first to carry the fix.
+
 ## 6. Independent evidence, obtained more strongly elsewhere
 
 The port itself is verified separately and far more strongly than any readback check can manage.
@@ -181,117 +202,7 @@ carry the expected payload before the run: keys `args` and `model`, `latent_dim`
 `dim_feedforward` 2560, 4 layers, 4 heads, `repr_dim` 128, QK-norm off, and exactly 43,831,170
 parameters.
 
-## 7. End-to-end checks on the dev stack, 2026-09-30
-
-Two sets of runs on `global-tessera-dev`, from tessera-embeddings `c550f2bb` (this PR after merging
-`main`), deployed through yield-embeddings `dev/global-tessera-v2-large` (`266a884`). The v2
-checkpoint was staged as `s3://global-tessera-inputs-dev/models/v2_student_large.pt`, SHA-256
-`b5f20239…c1e1`.
-
-### Wiring: v1.1 and v2 over the same mosaics
-
-The single-area flow on `m10_parity_15S_epsg32715` (1024 × 1025 px, `time_window_end="December
-2024"`, `num_actors=2`), once per model and from the same code, so the model was the only variable.
-
-| check | result |
-|---|---|
-| the six provenance arrays (three observation counts, three month masks) | identical |
-| pixels embedded | the same set, 99.90% of the area |
-| embeddings | differ: 0.55% of int8 values coincide, median v1.1-to-v2 cosine −0.05 |
-| v2 identity | `geoemb:model` is the Hugging Face URL, `checkpoint_id` is `v2_student_large`, run ID `v2-5f141cb56305`, 128-d |
-| v2 output after dequantization | per-pixel mean 0.0000, standard deviation 1.0000 |
-| a v2 run pointed at the v1.1 store | refused by the pre-flight before any Ray cluster started |
-
-Flow runs: v1.1 `cf5b18d3`, v2 `f4b57309`, refusal `69a06a5f`.
-
-### v1.1 against the published store
-
-Whether v1.1 from this branch reproduces the published product. The published inputs no longer
-exist (mosaics are deleted after assembly), so the tile was re-ingested, and this compares the whole
-chain rather than inference alone.
-
-- **Tile:** zone 14N, 2025, the 2048-px shard at easting 655,360–675,840 and northing
-  5,222,400–5,242,880 (zone-grid row 409,600, column 49,152), on the Red River of the North. In the
-  published store every pixel is embedded, with a median of 84 optical, 34 ascending and 31
-  descending observations, produced at commit `e7c43d55`.
-- **The campaign path, not the single-area one.** Only the campaign path runs the published
-  settings: the 0.1% date threshold, the 15-observation minimum, radar-free pixels allowed, and the
-  zone grid itself. It was narrowed to one tile with a coverage mask built from the two registry
-  cells lying entirely inside it (`build-land-mask`, name `parity-redriver`), then `seed-global-store`
-  (`parity-v11-redriver`, `optical_min_obs=15`), `ingest-zone-year`, and `fill-zone-year`
-  (`allow_s2_only=true`, `require_s1=false`, `num_actors=2`).
-- **One deliberate deviation:** `ingest_settings.min_valid_coverage=0.0001` in place of 0.1. The
-  threshold is a percentage of the mask's live pixels. The published run's denominator was all of
-  zone 14N's land; a one-tile mask shrinks it to one tile, where 0.1% would drop mostly-cloudy dates
-  the published run kept. The provenance result below is what confirms the substitute.
-- **Comparison:** the same tile-year read from both stores by index, since the grids are identical.
-  Provenance must match exactly, and embeddings are compared on the pixels whose provenance matches.
-
-Over all 4,194,304 pixels:
-
-| | result |
-|---|---|
-| the six provenance arrays | identical on 100% of pixels |
-| pixels embedded | 100% in both |
-| int8 values identical | 77.5% |
-| largest difference | 3 quantization levels; 9.0% of pixels differ by more than one level in some channel |
-| per-pixel cosine, dequantized | min 0.999867, 0.1st percentile 0.999912, 1st 0.999925, median 0.999955; 0.013% below 0.9999 |
-| per-pixel `scales` | median relative difference 0 |
-
-The re-ingest reproduced the published inputs exactly, so the difference lies in inference. It
-fails ADR-012's same-numerics gate (99.5% of int8 values identical, at most one level apart) and
-essentially meets its cosine bar.
-
-Flow runs: mask `4be8b6b8`, seed `13f21478`, ingest `b4831f2e`, fill `16ab4af4`.
-
-### What causes the v1.1 difference
-
-Two more fills of the same tile, from the same mosaic, mask registry and settings, each deployed at
-one commit:
-- **the published commit**: tessera-embeddings `e7c43d55` through yield-embeddings
-  `dev/global-tessera-parity-e7c43d5`, at `738b27d`, the last yield-embeddings commit locked to it;
-- **`main`**: tessera-embeddings `63ace646` through `dev/global-tessera-parity-main`.
-
-All three fills ran on L40S cards at batch size 7,168 with the same strip plan. All provenance
-arrays are identical in every comparison, so each row isolates a code difference:
-
-| comparison | int8 identical | largest difference | cosine, min / median |
-|---|---|---|---|
-| published vs a re-run at `e7c43d55` | 99.95% | 3 levels, on 0.008% of pixels | 0.999907 / 1.000000 |
-| `e7c43d55` vs `main` | 100%, bit-identical | none | 1 / 1 |
-| `main` vs this PR | 77.5% | 3 levels, on 9.0% of pixels | 0.999867 / 0.999955 |
-
-**The whole difference is this PR**, and for v1.1 the PR's only change to the arithmetic is the
-day-of-year precision fix: the v1.1 resampler, band statistics and model are untouched. A month of
-`main` since publication changes no v1.1 output at all. Two separate GPU runs on the same inputs
-produced bit-identical results, so run-to-run variation is not a factor here. Re-running the
-published code today reproduces the published tile within ADR-012's 99.5% bar. That small residual
-comes from re-ingesting, or from the campaign's own run differing in card or batching; nothing here
-separates the two.
-
-Flow runs: at `e7c43d55`, mask `d9b35abf` (built by that code from the same two-cell registry),
-seed `f708a449` and fill `3d05d69c`; at `main`, seed `84f0c719` and fill `810648d5`, which reused
-the first mask.
-
-### How large the precision fix's change is
-
-Cosine distance (1 − cos) per pixel, on a random million of the tile's pixels:
-
-| | median | 99th percentile |
-|---|---|---|
-| **the fix: the same pixel before and after** | **4.5 × 10⁻⁵** | **7.5 × 10⁻⁵** |
-| int8 rounding already in the stored product (expected) | 1.9 × 10⁻⁵ | 3.1 × 10⁻⁵ |
-| a pixel and its east neighbour | 3.6 × 10⁻³ | 1.1 × 10⁻¹ |
-| the same pixel, 2024 against 2025 | 0.20 | 0.37 |
-| two random pixels in the tile | 0.19 | 0.54 |
-
-The fix moves each vector by about 1% of its length, roughly twice the int8 rounding every stored
-pixel already carries, 80 times less than the difference between adjacent pixels, and 4,500 times
-less than a year's change. Of each pixel's ten most similar pixels (2,000 queries against 200,000),
-95.5% are unchanged. Every replacement was ranked 11th to 18th before, and the 10th and 11th were
-typically only 1.2 × 10⁻⁴ apart in cosine, so the swaps are reorderings among near-ties.
-
-## 8. Not covered here
+## 7. Not covered here
 
 Whether a new model is *better* than the old one is a downstream-task question, not a readback one.
 For v2 the intended measure is a crop-type probe against the USDA Cropland Data Layer, which is

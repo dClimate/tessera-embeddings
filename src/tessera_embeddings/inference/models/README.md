@@ -7,7 +7,9 @@ modify unless you are also retraining or have verified checkpoint compatibility.
 Two model versions live here, selected by `InferenceConfig.model_version`
 (`"v1.1"` — the default — or `"v2-large"`). `builder.py` dispatches. Loading and
 bucketing upstream of the model are shared; the resampling rule and the band statistics
-are chosen per version (see below).
+are chosen per version (`../README.md` §6), which is why comparing two models' outputs
+has to treat sampling as model-specific
+(`context_docs/inference/validating-a-model-change.md` §2).
 
 ## Source mapping
 
@@ -49,13 +51,6 @@ upstream v2's `PixelStudent.encode`, so a v2 checkpoint loads into it
 the dual-CUDA-stream backbone execution and the profiling hooks for both
 versions.
 
-The shared bucket schedule is a shared *contract*, not shared preprocessing: a
-pixel with `k` valid observations lands in the same bucket under either version,
-but the indices chosen to fill that bucket come from the version's own rule (see
-the table above and `../README.md` §6). Anything comparing two models' outputs
-has to treat the selection as model-specific — the boundary is drawn in
-`context_docs/inference/validating-a-model-change.md` §2.
-
 `builder._fuse_custom_gru` is a v1.1-only optimisation and is skipped for v2:
 there is no GRU in the v2 graph (so also none of the reset-gate approximation
 documented in its docstring).
@@ -66,8 +61,7 @@ documented in its docstring).
   `TemporalEncoding`, `TemporalAwarePooling`, and the `CustomGRU` / `CustomGRUCell`
   pair — these define the exact architecture the v1.1 checkpoint was trained with.
   Changing layer dimensions, activation functions, or the forward pass will break
-  checkpoint loading. (`TransformerEncoder` was renamed `V11TransformerEncoder` when
-  v2 arrived, so the two versions' encoders can sit side by side.)
+  checkpoint loading.
 
 - **`ssl_model.py`**: `MultimodalBTInferenceModel` (the shared inference wrapper)
   and `build_dim_reducer` (v1.1 reducer). The fusion method (`concat` vs `sum`) and

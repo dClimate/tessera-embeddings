@@ -69,6 +69,8 @@ context_docs/
 │   ├── validating-a-model-change.md            how a store is proved correct when the ENCODER
 │   │                                              changed — the checks, their thresholds, and the
 │   │                                              same-model ceiling they were calibrated from
+│   ├── v1.1-against-the-published-store.md     what PR #98's precision fix did to v1.1: one
+│   │                                              published tile re-made at three commits
 │   ├── minimum-optical-depth.md                the one data-quality rule: refuse a pixel below
 │   │                                              15 observations. Four measurement campaigns
 │   ├── gpu-fleet-launch-throttling.md          why several clusters asking EC2 for GPUs at once
