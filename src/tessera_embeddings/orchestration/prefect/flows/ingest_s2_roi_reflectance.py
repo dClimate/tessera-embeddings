@@ -168,7 +168,7 @@ def ingest_s2_roi_reflectance(
             ``use_local`` path.
         frisky_drain_spans: With ``use_frisky`` and ``perf_report_uri``, also copy the run's
             task, transfer and spill spans to ``<perf_report_uri>/spans/`` every minute, so the
-            whole run is kept rather than the tail the final capture holds. About 8 GB a day
+            whole run is kept rather than the tail the final capture holds. About 9 GB a day
             gzipped per 60 workers; delete the prefix once the run is analysed. Off by default.
         stream_stac_monthly: Query STAC one calendar month at a time, prefetching the next
             while the current is processed. Bounds retained items so a year-long window

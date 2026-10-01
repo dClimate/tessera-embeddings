@@ -145,7 +145,7 @@ def ingest_s1_roi_sar(
             Ignored on the ``use_local`` path, which warns.
         frisky_drain_spans: With ``use_frisky`` and ``perf_report_uri``, also copy the run's
             task, transfer and spill spans to ``<perf_report_uri>/spans/`` every minute, so the
-            whole run is kept rather than the tail the final capture holds. About 8 GB a day
+            whole run is kept rather than the tail the final capture holds. About 9 GB a day
             gzipped per 60 workers; delete the prefix once the run is analysed. Off by default.
         overlap_window_writes: Submit a date's windows as ONE dask compute rather than one
             blocking compute per window, so they share the fleet instead of each waiting its
