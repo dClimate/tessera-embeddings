@@ -324,6 +324,7 @@ def test_the_span_drain_keeps_every_task_once(hijacked, tmp_path, monkeypatch) -
     dask_client, client = hijacked
     monkeypatch.setattr(frisky_engine, "SPAN_DRAIN_INTERVAL_S", 0.3)
     monkeypatch.setattr(frisky_engine, "_SPAN_DRAIN_LAG_NS", 100_000_000)
+    monkeypatch.setattr(frisky_engine, "_SPAN_DRAIN_SLICE_NS", 50_000_000)  # several slices per drain
     with maybe_capture_telemetry(dask_client.dashboard_link, str(tmp_path), LOG, interval_s=3600, drain_spans=True):
         assert client.submit(_held, 1.5).result(timeout=30) == 1.5
         for batch in range(3):

@@ -94,6 +94,10 @@ SPAN_DRAIN_INTERVAL_S = 60.0
 #: How far behind the present a drain stops, so a span still being recorded lands in the next one.
 _SPAN_DRAIN_LAG_NS = 10_000_000_000
 
+#: Time slice one span request covers. A whole minute of a busy zone run timed out in the Dask
+#: dashboard's proxy (HTTP 504), and each miss made the retry bigger.
+_SPAN_DRAIN_SLICE_NS = 15_000_000_000
+
 
 #: Native ids of the Frisky threads whose Python thread state is pinned (see :func:`_pin_thread_state`).
 _PINNED_THREADS: set[int] = set()
@@ -281,22 +285,32 @@ class _SpanDrain:
 
     def _drain(self, final: bool) -> None:
         until_ns = time.time_ns() - (0 if final else _SPAN_DRAIN_LAG_NS)
-        spans = [
-            span
-            for name in SPAN_DRAIN_NAMES
-            for span in frisky.query_spans(
-                name=name, start_ns=self.since_ns, limit=sys.maxsize, dashboard_url=self.dashboard_url
-            )
-            if span["end_ns"] < until_ns and (self.since_ns is None or span["end_ns"] >= self.since_ns)
-        ]
-        if spans:
-            # One-shot dumps at gzip's level 6: json.dump runs the pure-Python encoder, and level 9
-            # compresses 9% smaller in three times the time. Together four times faster.
-            with fsspec.open(f"{self.uri}/spans/part-{self.parts:06d}.json.gz", "wb") as out:
-                out.write(gzip.compress(json.dumps(spans).encode(), compresslevel=6))
-            self.parts += 1
-            self.spans += len(spans)
-        self.since_ns = until_ns
+        # One request per name and time slice. The first drain has no start, and covers only the
+        # run's first minute.
+        starts = [None] if self.since_ns is None else list(range(self.since_ns, until_ns, _SPAN_DRAIN_SLICE_NS))
+        spans: list[dict[str, Any]] = []
+        reached = self.since_ns
+        try:
+            for start, end in zip(starts, [*starts[1:], until_ns], strict=True):
+                spans += [
+                    span
+                    for name in SPAN_DRAIN_NAMES
+                    for span in frisky.query_spans(
+                        name=name, start_ns=start, end_ns=end, limit=sys.maxsize, dashboard_url=self.dashboard_url
+                    )
+                    if (start is None or span["end_ns"] >= start) and span["end_ns"] < end
+                ]
+                reached = end
+        finally:
+            # Keep what was read even when a later slice failed, so a retry starts where this stopped.
+            if spans:
+                # One-shot dumps at gzip's level 6: json.dump runs the pure-Python encoder, and level
+                # 9 compresses 9% smaller in three times the time. Together four times faster.
+                with fsspec.open(f"{self.uri}/spans/part-{self.parts:06d}.json.gz", "wb") as out:
+                    out.write(gzip.compress(json.dumps(spans).encode(), compresslevel=6))
+                self.parts += 1
+                self.spans += len(spans)
+            self.since_ns = reached
 
 
 def _repeat(
