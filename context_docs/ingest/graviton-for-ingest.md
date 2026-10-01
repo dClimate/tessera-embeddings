@@ -8,8 +8,8 @@ yield-embeddings; this repo needs no code change.
 - **Move the Dask workers to ARM64 Fargate before the next campaign or annual update.** Leave the
   scheduler and the flow runners on x86.
 - **It saves about 19% of ingest's Fargate cost.** That is ARM's 20% lower price, not extra speed,
-  so it holds provided ARM workers keep pace. On a campaign the size of the last one (a $187,441 Fargate line) that is about **$32,000–35,000**, or about
-  **$3,600–3,900 per global year**. The yield account's own Fargate use is dev-scale, so the saving
+  so it holds provided ARM workers keep pace. On a campaign the size of the last one (a $187,441
+  Fargate line) that is about **$32,000–35,000**, or about **$3,600–3,900 per global year**. The yield account's own Fargate use is dev-scale, so the saving
   there is negligible.
 - **The change is small:** two Dockerfile lines, a `platforms` input on the image build, and one
   property on one task definition. Then one paired dev test costing about $15–25.
