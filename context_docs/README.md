@@ -58,10 +58,8 @@ context_docs/
 │   │                                              budget, live-tile cropping, region writes
 │   ├── source-read-failures.md                 twelve ways a source read fails, the guard each
 │   │                                              earned, and the retry budget they share
-│   ├── solar-day-fusion-order.md               which scene wins a contested pixel, and why the
-│   │                                              answer was inverted for the life of the code
-│   └── graviton-for-ingest.md                  PROPOSED: Dask workers on ARM64 Fargate — what
-│                                                  it saves, what is verified, and the dev test
+│   └── solar-day-fusion-order.md               which scene wins a contested pixel, and why the
+│                                                  answer was inverted for the life of the code
 │
 ├── inference/                     RUNNING THE ENCODER
 │   ├── inference-on-gpus.md                    throughput, which cards may be rented, why the

@@ -8,6 +8,7 @@ Four measurement campaigns are folded together here. The July 2026 optimization 
 (§1–§10); the fleet-scale throughput investigation that corrected its duration basis is §11; the
 graph and catalogue budgets that limit it now are §12; the live-tile cropping derivation that §3.1
 and §3.2 summarise is §13; and the region-write primitive the whole windowed design rests on is §14.
+§15 is a proposal rather than a measurement: running the workers on Graviton (ARM64).
 
 > **The duration basis was re-measured, and the correction matters more than it looks.** A 2026-08
 > reading found every zone running 1.8–2.1× slower than the figures here. **That claim is
@@ -2447,3 +2448,140 @@ path is current.
 12. **Storage hang protection.** Icechunk defaults to unbounded timeouts and a single try, so a wedged
     socket blocks a write forever. `_default_repo_config` applies finite per-attempt timeouts and
     backed-off retries at every repo open — region writes inherit it for free.
+
+---
+
+## 15. Graviton (ARM64) workers — proposed, not implemented (2026-10-01)
+
+**The proposal: run the Dask workers on ARM64 Fargate from the next campaign or annual update, and
+keep the schedulers and flow runners on x86.** The change is in yield-embeddings. Nothing in this
+repo changes.
+
+### 15.1 What it saves, and what moves it
+
+**The saving is the price, not speed.** ARM Fargate costs $0.03238 per vCPU-hour against $0.04048
+(−20.0%) and $0.00356 per GB-hour against $0.004445 (−19.9%), per the AWS Pricing API for
+us-west-2. A 4 vCPU / 24 GB worker drops from $0.2686 to $0.2150 an hour.
+
+**Workers are 94% of a cell's hourly cost** at 60 S2 workers, and 95% at 80, by the per-cell
+formula in [the cost model §4](../campaign/campaign-cost-model.md). The last campaign's container
+line was $187,441 ([§12 there](../campaign/campaign-cost-model.md)). That line also carries
+assembly (about $1,300) and the inference flow runners, which billing does not separate. At equal
+worker-hours, ARM workers would have saved **about $32,000–35,000, or $3,600–3,900 per global
+year**. The yield account's own Fargate use is dev-scale, so the saving there is negligible.
+
+**Speed moves the saving only where it changes how long a worker runs.** Workers are billed for
+their lifetime, not their CPU use. With `r` = ARM worker-hours ÷ x86 worker-hours for the same work:
+
+| r | 0.85 | 1.00 | 1.10 | 1.25 |
+|---|---|---|---|---|
+| saving on worker cost | 32% | 20% | 12% | 0, break-even |
+
+One cost bounds `r` more tightly than break-even does. Ingest feeds the GPU fleet, and a slower
+ingest can leave cards idle. The campaign's Fargate peak used 73% of its 25,000 vCPU quota (one
+quota covers both architectures), so a slowdown of about 10% can be absorbed by running wider. Much
+more than that cannot.
+
+### 15.2 Faster or slower
+
+- **AWS's headline includes the price cut.** It claims "up to 40% improved price/performance at
+  20% lower cost". How much extra speed that implies depends on how AWS defines price/performance,
+  which it does not say, and it is a best case on AWS's benchmarks, not a forecast for ours. A
+  Graviton vCPU is a whole core, where an x86 vCPU is one hyperthread, which helps multi-threaded
+  work like the workers' reads and warps. Per thread, x86 still leads. Fargate offers no choice of
+  generation: it launched on Graviton2.
+- **Dev-scale workers are not CPU-bound.** Container Insights over the 2026-10-01 Frisky dev runs
+  (a tiny ROI, 15SWC and Iowa, both engines) shows workers using 20–27% of reserved CPU, and about
+  60% in the busiest minute. That cuts both ways: a slower core costs little, and a faster one saves
+  little. The last campaign's figure is in the global-tessera account and was not read.
+- **The fleet-full regime is the open question.** On a dense zone one date oversubscribes the fleet
+  (§1), and there worker speed sets the pace. The serial graph build (§12.5) also lands on a worker,
+  but [`_pipeline.py`](../../src/tessera_embeddings/ingest/_pipeline.py) overlaps it with the
+  previous date's write.
+- **The scheduler stays on x86.** It is single-threaded and the known scaling wall (§6, §12.3).
+  Moving it would save about 0.5% of a cell.
+
+### 15.3 Will the mosaics change?
+
+**Measured: no, on a real scene.** rasterio 1.5.0's x86_64 and aarch64 wheels bundle the same GDAL
+3.12.1, PROJ 9.7.1 and GEOS 3.14.1. Both architectures' builds of the ingestion image did the
+following, and **zero pixels differed**:
+
+- warped windows of `S2B_15SWC_20240724_0_L2A` (B04 at 10 m, B11 at 20 m, about 9.4 M valid pixels
+  each) to EPSG:5070 at 10 m, bilinear and nearest, through `rasterio.warp.reproject` with its
+  default approximate transformer;
+- ran `amplitude_to_db`'s formula on 20 M seeded float32 amplitudes, with identical uint16 values
+  and identical raw `log10` bits.
+
+**One gap: the x86 side ran without AVX-512.** It ran under Docker's emulation on Apple Silicon,
+which offers AVX2 only. numpy's x86 wheel ships Intel SVML AVX-512 `log10` kernels (the ARM wheel
+has none), and uses them only on AVX-512 CPUs. AWS does not say which x86 CPUs run Fargate. If they
+have AVX-512, production S1 values may differ from ARM by a rounding step.
+
+**The append check cannot see an architecture change.** `ingest_code_identity` hashes source, so an
+ARM run would append to a mosaic an x86 run began. If the dev test finds the stores identical, that
+is harmless, and switching between campaigns is only a precaution. If it does not, then before
+adopting, record the worker architecture on the mosaic and refuse a mismatched append. That has to
+be its own check: adding the architecture to `ingest_code_identity` would change the identity of
+every existing mosaic.
+
+### 15.4 Feasibility
+
+| Item | Status |
+|---|---|
+| Dependencies | of 167 locked packages, 137 are pure Python and all 29 compiled ones ship manylinux aarch64 wheels (`pywin32` is Windows-only) |
+| Base images | `osgeo/gdal:ubuntu-small-3.12.1` and `prefect-aws:0.7.7-python3.12` publish `linux/arm64` |
+| Image build | builds for `linux/arm64` with only the two `--platform=linux/amd64` pins removed; every ingest module imports; all 1,387 of `main`'s ingest unit tests pass on Linux ARM64 |
+| Fargate | ARM64 supports every task size we use, and Fargate Spot since 2024-09 |
+| CI | `ubuntu-24.04-arm` runners in private repositories since 2026-01-29, or QEMU |
+| ECR | the 7-day untagged-image expiry is safe: ECR never expires an image a manifest list references |
+| Task definitions | branch clones copy `runtimePlatform`; with pinned definitions dask-cloudprovider registers nothing, so the CDK definition alone sets the architecture |
+| Frisky, if adopted | 0.7.2 ships a manylinux aarch64 wheel, and its 10 integration tests pass on Linux ARM64 |
+
+### 15.5 The change
+
+All in yield-embeddings: delete `--platform=linux/amd64` from both `FROM` lines of
+`infra/docker/ingestion.Dockerfile`. Add a `platforms` input to `.github/workflows/_build-image.yml`,
+passing `linux/amd64,linux/arm64` for the ingestion image only. Give `_dask_task_def` in
+`infra/aws/stacks/consumer_stack.py` an ARM64 `runtime_platform` when `kind == "worker"`. A
+multi-arch image lets every other family keep pulling amd64, and rolling back is a one-property
+revert. This is about half a day of work, plus a day for the dev test.
+
+### 15.6 The dev test
+
+Run it on yield dev, after the Frisky runs finish, on two `dev/<slug>` branches that differ only in
+the worker architecture. Run each rung's two arms at the same time, with a fresh store each.
+
+| Rung | ROI and window | Width | What it measures |
+|---|---|---|---|
+| 1. production | `iowa_epsg5070`, July 2024 | S2 60, S1 13 | cost and time per date as the campaign runs |
+| 2. fleet-bound | the same | S2 15 | worker throughput: Iowa's ~1,180-task read width oversubscribes 60 slots about 20× |
+| 3. optional | the same as rung 1 | S2 60 | the scheduler on ARM too |
+
+**Gate on paired per-date ratios, not on two means.** Both arms ingest the same dates, so take each
+date's ARM ÷ x86 ratio of cost and of write time, and gate on the ratio's 95% confidence interval.
+At 19% per-date variance (§12.6), the gap between two unpaired 14-date means is only known to
+about ±14%, which is wider than the margins below. Add dates until the interval is narrower than the
+margin being tested.
+
+**Adopt when:**
+
+- the stores are bit-identical (every chunk compared, NaN positions and time coordinates included),
+  or embeddings from both arms pass ADR 012's equivalence gates
+  ([`012`](../decisions/012-validated-equivalence-for-inference-outputs.md), `te-compare-outputs`)
+  on an end-to-end run. A one-count mosaic difference feeds the encoder, so unchanged nodata alone
+  proves nothing;
+- the upper bound of the cost ratio is at most 0.9 on both rungs;
+- the upper bound of the write-time ratio on rung 2 is at most 1.10.
+
+The ingest arms cost about $15–25. An end-to-end comparison adds GPU time.
+
+### 15.7 Out of scope
+
+- **Fargate Spot** saves up to 70% and stacks with ARM. dask-cloudprovider's `fargate_spot=True`
+  puts workers on Spot and keeps the scheduler on demand. The hazard is particular to us: the
+  ingest body runs on one Dask worker, so reclaiming that worker restarts the run's driver.
+- **The other ingestion-image families** (runner, coarsen, Fargate `merge_kind`) become a
+  one-property change each once the image is multi-arch. `merge_kind_ec2` would need a Graviton
+  instance type instead.
+- **Inference** runs on x86 CUDA instances, and its image follows them.
