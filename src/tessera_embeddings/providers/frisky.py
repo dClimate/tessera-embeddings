@@ -48,10 +48,12 @@ import logging
 import pickle
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any, cast
 
 import frisky
@@ -65,10 +67,10 @@ from distributed import Client, WorkerPlugin
 #: :func:`connect` yields is Dask's; when Frisky's client grows one, adding it here is the change.
 FRISKY_METHODS = frozenset({"compute", "persist", "submit", "map", "gather", "scatter"})
 
-#: Most recent spans :func:`maybe_capture_telemetry` keeps. A span is a dict of about a kilobyte on
-#: the flow runner, so this bounds the capture near 500 MB; a longer run keeps its tail, like Dask's
-#: capped task stream.
-SPANS_CAPTURE_LIMIT = 500_000
+#: Most recent spans :func:`maybe_capture_telemetry` keeps in ``spans.json``, Frisky's own default
+#: for its views. The scheduler assembles a query's whole answer in its own memory, so this bounds
+#: what one query can add there; a longer run keeps its tail, like Dask's capped task stream.
+SPANS_CAPTURE_LIMIT = 200_000
 
 #: The same, with the span drain on. The drain already holds every task span, so the tail only has
 #: to keep the bundle readable as it is: one page of Frisky's span API, about 7 s of an Iowa run.
@@ -345,12 +347,22 @@ def _repeat(
             log.warning("Frisky %s failed: %s", what, e)
 
 
-def _capture(uri: str, produce: Callable[[], str]) -> None:
-    _write(uri, produce())
+def _end_of_run(dashboard_url: str, uri: str, drain: _SpanDrain | None, log: Any) -> list[str]:  # noqa: ANN401
+    """Write the end-of-run bundle, one file each, so a failure costs only its own file.
 
+    The scheduler serves ONE span query at a time: the final drain, then ``spans.json``. Both
+    overviews are computed from that file in this process rather than asked of the scheduler again,
+    since every span query is assembled in the scheduler's memory, and three at once helped kill
+    one. The event and log captures are cheap and run alongside. Returns what was written.
+    """
+    written: list[str] = []
 
-def _final_artifacts(dashboard_url: str, spans_limit: int) -> dict[str, Callable[[], str]]:
-    """The end-of-run bundle, one file each, so a failure costs only its own file."""
+    def attempt(name: str, produce: Callable[[], str]) -> None:
+        try:
+            _write(f"{uri}/{name}", produce())
+            written.append(name)
+        except Exception as e:
+            log.warning("failed to capture Frisky %s to %s: %s", name, uri, e)
 
     def events() -> str:
         lifecycle = ("--kind", "worker_added,worker_removed")
@@ -365,15 +377,35 @@ def _final_artifacts(dashboard_url: str, spans_limit: int) -> dict[str, Callable
             }
         )
 
-    return {
-        "spans.json": lambda: json.dumps(frisky.query_spans(limit=spans_limit, dashboard_url=dashboard_url)),
-        "overview.txt": lambda: _frisky_cli("observe", "overview", dashboard_url),
-        "overview.json": lambda: _frisky_cli("observe", "overview", dashboard_url, "--json"),
-        "events.json": events,
-        "logs.json": lambda: _frisky_cli(
-            "logs", "--url", dashboard_url, "--json", "--level", "warn", "--limit", "50000"
-        ),
-    }
+    def logs() -> str:
+        return _frisky_cli("logs", "--url", dashboard_url, "--json", "--level", "warn", "--limit", "50000")
+
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="frisky-telemetry") as pool:
+        pool.submit(attempt, "events.json", events)
+        pool.submit(attempt, "logs.json", logs)
+        if drain:
+            try:
+                drain.drain(final=True)
+            except Exception as e:
+                log.warning("Frisky span drain failed: %s", e)
+            written.append(f"spans/ ({drain.spans} spans in {drain.parts} parts)")
+        with tempfile.TemporaryDirectory() as tmp:
+            local = f"{tmp}/spans.json"
+            limit = SPANS_CAPTURE_LIMIT_DRAINED if drain else SPANS_CAPTURE_LIMIT
+            attempt(
+                "spans.json",
+                lambda: _keep(local, json.dumps(frisky.query_spans(limit=limit, dashboard_url=dashboard_url))),
+            )
+            if "spans.json" in written:
+                attempt("overview.txt", lambda: _frisky_cli("observe", "overview", local))
+                attempt("overview.json", lambda: _frisky_cli("observe", "overview", local, "--json"))
+    return written
+
+
+def _keep(path: str, text: str) -> str:
+    """Write ``text`` to a local ``path`` too, and pass it on."""
+    Path(path).write_text(text)
+    return text
 
 
 @contextlib.contextmanager
@@ -399,8 +431,8 @@ def maybe_capture_telemetry(
     ``spans.json``     the most recent :data:`SPANS_CAPTURE_LIMIT` spans of every kind
                        (:data:`SPANS_CAPTURE_LIMIT_DRAINED` with ``drain_spans``); ``frisky
                        observe overview spans.json`` and the other offline views read it
-    ``overview.txt``   ``frisky observe overview``, rendered
-    ``overview.json``  the same as a structured bundle: state, perf, costliest spans, outliers
+    ``overview.txt``   ``frisky observe overview`` of ``spans.json``, computed here, not by the scheduler
+    ``overview.json``  the same as a structured bundle: perf, costliest spans, outliers
     ``events.json``    ``lifecycle`` (every worker joining and leaving) and ``recent`` (the last
                        :data:`EVENTS_LIMIT` scheduler events)
     ``logs.json``      Frisky's own scheduler and worker warnings and errors. Task logs are not
@@ -435,20 +467,5 @@ def maybe_capture_telemetry(
         stop.set()
         for thread in threads:
             thread.join(timeout=30)  # a capture in flight must not hold up the end of the run
-        # All at once: each waits on the dashboard or a CLI subprocess, so together they take the
-        # slowest one's time rather than the sum, while the whole fleet is still billed.
-        artifacts = _final_artifacts(dashboard_url, SPANS_CAPTURE_LIMIT_DRAINED if drain else SPANS_CAPTURE_LIMIT)
-        with ThreadPoolExecutor(max_workers=len(artifacts) + 1, thread_name_prefix="frisky-telemetry") as pool:
-            final_drain = pool.submit(drain.drain, final=True) if drain else None
-            captures = {name: pool.submit(_capture, f"{uri}/{name}", produce) for name, produce in artifacts.items()}
-        written = []
-        if drain and final_drain:
-            if e := final_drain.exception():
-                log.warning("Frisky span drain failed: %s", e)
-            written.append(f"spans/ ({drain.spans} spans in {drain.parts} parts)")
-        for name, capture in captures.items():
-            if e := capture.exception():
-                log.warning("failed to capture Frisky %s to %s: %s", name, uri, e)
-            else:
-                written.append(name)
+        written = _end_of_run(dashboard_url, uri, drain, log)
         log.info("wrote Frisky telemetry to %s: %s", uri, ", ".join(written) or "nothing")
