@@ -150,7 +150,7 @@ Done locally (macOS, Python 3.13), and green again in CI on Linux (Python 3.12 a
 
 | Suite | Covers | Result |
 |---|---|---|
-| `tests/integration/test_frisky.py` | Every compute path the ingest uses; Dask plugins and `run` reaching Frisky's processes; a driver running as a Dask task (the Prefect shape), including a second thread; overlapped icechunk writes identical to Dask's and committing nothing when a window fails; thread state and the CRS reproduction; work queued before any worker exists, run on workers that join after the hijack; spans readable by `frisky observe`; span capture never failing a run | 8 passed, about 15 s |
+| `tests/integration/test_frisky.py` | Every compute path the ingest uses; Dask plugins and `run` reaching Frisky's processes; a driver running as a Dask task (the Prefect shape), including a second thread; overlapped icechunk writes identical to Dask's and committing nothing when a window fails; thread state and the CRS reproduction; work queued before any worker exists, run on workers that join after the hijack; spans readable by `frisky observe`; the span drain keeping every span exactly once; span capture never failing a run | 9 passed, about 20 s |
 | `tests/integration/test_read_failure_cause_over_dask.py` | Frisky's before-and-after for the cause chain; the read-failure classification on both engines | 16 passed |
 | `tests/parity/test_ingest_s2_roi_frisky_parity.py` | The S2 domain ingest on Dask versus Frisky: offline synthetic dates byte for byte (with `pipeline_dates` and a mid-run gate failure), and Denver July 2024 real imagery within 1e-6 | 2 passed, about 2 min |
 
@@ -166,8 +166,12 @@ findings:
   It reads and warps a chunk about 10% faster, but each icechunk write task takes 54% longer, and
   the write has the most tasks. Dask's scheduler is not the bound at that scale, so Frisky's
   scheduling advantage has nothing to recover yet.
-- **The bundle keeps only a run's tail.** At Iowa scale Frisky emits about 15,000 spans a second,
-  so the 500,000 captured at the end cover about half a minute.
+- **The end-of-run capture keeps only a run's tail.** At Iowa scale Frisky emits about 15,000 spans
+  a second, so the 500,000 captured at the end cover about half a minute. Each process keeps its
+  own span buffer (1,000,000 by default), which a worker fills in about an hour, so the run's spans
+  are still there to drain as it goes: `frisky_drain_spans` copies the task, transfer and spill
+  spans every minute. They are a fifth of the spans and hold all of the task time; spans under
+  1 ms would be another five times smaller but lose a quarter of the transfer time.
 
 The 2048-px chunk changes pixels slightly, through GDAL's approximate warp transformer rather than
 through either engine; the plan's B1 result has the measurement.
@@ -182,6 +186,6 @@ documentation: [`docs/frisky.md`](../../docs/frisky.md).
   reproductions are written but not filed. Either fix upstream lets
   the matching step of `_MatchDaskWorker` go.
 - Find why an icechunk write task runs 54% longer on Frisky than on Dask.
-- Capture telemetry that covers a whole run, not its last half minute.
+- Run `frisky_drain_spans` on dev, and check its load on the scheduler at B4's scale.
 - Decide whether Frisky stays a core dependency when this reaches `main`, on the experiment's
   results and the constraints under Packaging above.

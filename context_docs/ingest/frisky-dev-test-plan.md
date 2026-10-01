@@ -194,10 +194,11 @@ correctness and stability:
 2024-01-07 only, S2, at 60 workers. That is the record's reference rung; yield-embeddings'
 `conc_ref` measured 118 to 179 s a date on Dask at 4096. It is not a zone-year.
 
-- **Arms:** Frisky at 2048, then Dask at 2048.
+- **Arms:** Frisky at 2048 with `frisky_drain_spans`, then Dask at 2048.
 - **Watch it live:** use the SSM port-forward and `frisky observe overview`, `stragglers` and
   `transfers`.
-- **Check the capture:** its size and how long it takes.
+- **Check the capture:** the drained parts' size, whether they hold every date, and the
+  scheduler's CPU while they are taken.
 - **Stop rule:** cancel an arm that exceeds twice the other's per-date time, or 45 minutes.
 
 **B5: re-measure the provisional constants.** Version B's chunk-counted thresholds are the 4096

@@ -57,16 +57,34 @@ After the run, read the spans `perf_report_uri` captured:
 frisky observe overview spans.json
 ```
 
-The capture keeps the most recent 500,000 spans (`SPANS_CAPTURE_LIMIT`), so a long run keeps only
-its tail: at Iowa scale (60 workers, 2048-px chunks) Frisky emits about 15,000 spans a second, so
-the capture covers the last half minute. To see a busy phase, query the live views during it. Frisky also prints a periodic cluster summary to stdout; `FRISKY_SUMMARY=off` silences it.
+That capture keeps the most recent 500,000 spans (`SPANS_CAPTURE_LIMIT`), so it holds only a run's
+tail: at Iowa scale (60 workers, 2048-px chunks) Frisky emits about 15,000 spans a second, and the
+capture covers the last half minute.
+
+**To keep the whole run,** also set `frisky_drain_spans=True`. Every minute the run then copies its
+task, transfer and spill spans (`SPAN_DRAIN_NAMES`, a fifth of all spans and every second of task
+time) to `<perf_report_uri>/spans/part-NNNNNN.json.gz`. That is about 8 GB a day gzipped per 60
+workers. To read a run's parts as one file:
+
+```bash
+python -c "import glob, gzip, json, sys; json.dump([s for p in sorted(glob.glob(sys.argv[1] + '/part-*.json.gz')) for s in json.load(gzip.open(p, 'rt'))], sys.stdout)" spans > run-spans.json
+frisky observe overview run-spans.json
+```
+
+The parts are raw material, not a record: once a run is analysed, delete them with
+`aws s3 rm --recursive <perf_report_uri>/spans/`. The rest of the bundle is small and stays.
+
+Frisky also prints a periodic cluster summary to stdout; `FRISKY_SUMMARY=off` silences it.
 
 ## Do's and don'ts
 
 **Do:**
 
 - Size the fleet with `max_workers`.
-- Set `perf_report_uri` on any run you want to analyse after its cluster is gone.
+- Set `perf_report_uri` on any run you want to analyse after its cluster is gone, and
+  `frisky_drain_spans` as well if the analysis needs more than the run's last half minute.
+- Delete `<perf_report_uri>/spans/` when the analysis is done. A global run's parts reach
+  terabytes.
 - Pass Frisky's own settings through `worker_env_overrides`. Examples are
   `FRISKY_SPILL_FRACTION` and `FRISKY_SPILL_TARGET_FRACTION` for its spill thresholds, and
   `FRISKY_TRACING_CAPACITY` for spans kept per worker.
