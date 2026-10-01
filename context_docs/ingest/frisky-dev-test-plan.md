@@ -176,8 +176,13 @@ $1.36 to $1.38 on Frisky at 2048. An S1 arm cost $0.14 to $0.16.
   Frisky's median store write (`getitem-where-ice-changeset`, one chunk handed to icechunk) is
   128 ms against 132 ms, over 23,187 and 23,188 writes, and it reads and warps a band chunk 11%
   faster (907 ms against 1,017 ms). It spends less task time on the same graph, 25,712 s against
-  27,753 s. So the time is lost outside task execution, and the first suspect is the driver
-  converting each graph for Frisky before any task starts. Why is open.
+  27,753 s. The time is lost between computes: the whole fleet sat idle 80 s of the drained
+  208 s run, against 20 s on Dask, longest before the two write batches (32 s and 25 s, against
+  8 s and 7 s) while Frisky's client pickled each graph before submitting it. The record's item 5
+  has the mechanism and the fix.
+- **At 4096, each batch also ends on a long tail.** The final batch held the same work on every
+  arm, about 10,350 task-seconds, but took 66 s and 86 s on Frisky against 49 s on Dask: one
+  worker was handed up to 1.8 times the mean work and kept it while the rest went idle.
 - **A tail sample misleads here.** Write times rise through each batch, from about 90 ms to
   210 ms, so the end-of-run capture's last 33 s alone put Frisky's writes 54% above Dask's
   whole-run median. Compare engines on whole runs.
