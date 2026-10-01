@@ -19,6 +19,7 @@ Covered elsewhere: the read-failure cause chain beside its Dask counterpart, in
 from __future__ import annotations
 
 import contextlib
+import gzip
 import json
 import logging
 import os
@@ -32,6 +33,7 @@ from typing import Any
 
 import dask
 import dask.array as da
+import frisky
 import numpy as np
 import pytest
 import xarray as xr
@@ -40,6 +42,7 @@ from dask.distributed import Client, WorkerPlugin, get_client
 from odc.geo.geobox import GeoBox
 from pyproj import CRS
 
+from tessera_embeddings.providers import frisky as frisky_engine
 from tessera_embeddings.providers.frisky import connect, maybe_capture_telemetry
 from tessera_embeddings.providers.local.dask import local_cluster
 from tessera_embeddings.storage.manifest import IngestManifest
@@ -292,12 +295,49 @@ def test_the_telemetry_bundle_is_written_live_and_at_the_end(hijacked, tmp_path,
     assert overview.returncode == 0, overview.stderr
 
 
+def _held(seconds: float) -> float:
+    time.sleep(seconds)
+    return seconds
+
+
+def _span_id(span: dict[str, Any]) -> tuple[str, int]:
+    """A span id is numbered per process, so a span is its process and its id."""
+    return span["worker"], span["span_id"]
+
+
+def test_the_span_drain_keeps_every_task_once(hijacked, tmp_path, monkeypatch) -> None:
+    """``drain_spans`` keeps the whole run in parts written while it runs: every task exactly once,
+    including one running across several drains, and nothing outside the drained names.
+    """
+    dask_client, client = hijacked
+    monkeypatch.setattr(frisky_engine, "SPAN_DRAIN_INTERVAL_S", 0.3)
+    monkeypatch.setattr(frisky_engine, "_SPAN_DRAIN_LAG_NS", 100_000_000)
+    with maybe_capture_telemetry(dask_client.dashboard_link, str(tmp_path), LOG, interval_s=3600, drain_spans=True):
+        assert client.submit(_held, 1.5).result(timeout=30) == 1.5
+        for batch in range(3):
+            client.gather(client.map(_held, [(batch * 100 + i) * 1e-9 for i in range(100)]))
+            time.sleep(0.5)
+    buffered = {
+        _span_id(span)
+        for name in frisky_engine.SPAN_DRAIN_NAMES
+        for span in frisky.query_spans(name=name, limit=sys.maxsize, dashboard_url=dask_client.dashboard_link)
+    }
+
+    parts = sorted((tmp_path / "spans").glob("part-*.json.gz"))
+    spans = [span for part in parts for span in json.loads(gzip.decompress(part.read_bytes()))]
+    assert len(parts) > 1
+    assert len({_span_id(span) for span in spans}) == len(spans), "a span was written twice"
+    assert {_span_id(span) for span in spans} == buffered, "the parts are not everything Frisky kept"
+    assert any(span["name"] == "worker.exec.call" and span["duration_ns"] >= 1.5e9 for span in spans)
+
+
 def test_span_capture_never_fails_or_masks_the_run(tmp_path, caplog) -> None:
     """Diagnostics must not change a run's outcome: an unreachable dashboard only warns."""
     with (
         caplog.at_level(logging.WARNING),
         pytest.raises(ValueError, match="the run's own failure"),
-        maybe_capture_telemetry("http://127.0.0.1:9", str(tmp_path / "spans.json"), LOG),
+        maybe_capture_telemetry("http://127.0.0.1:9", str(tmp_path / "spans.json"), LOG, drain_spans=True),
     ):
         raise ValueError("the run's own failure")
     assert "failed to capture Frisky spans" in caplog.text
+    assert "Frisky span drain failed" in caplog.text

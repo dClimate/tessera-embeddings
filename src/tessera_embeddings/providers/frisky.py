@@ -44,6 +44,7 @@ import pickle
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable, Iterator
 from typing import Any, cast
 
@@ -66,6 +67,19 @@ LIVE_SNAPSHOT_INTERVAL_S = 300.0
 
 #: Scheduler events per query, the most ``frisky observe events`` returns.
 EVENTS_LIMIT = 2_000
+
+#: Span names the drain keeps, as prefixes: task execution (the call, its GIL wait and its
+#: deserialisation), data transfer and spill. They are a fifth of Frisky's spans and hold every
+#: second of task time; the rest is the scheduler's and comms' own bookkeeping.
+SPAN_DRAIN_NAMES = ("worker.exec", "worker.transfer", "spill")
+
+#: Seconds between drains. Each process keeps its own span buffer (1,000,000 spans by default,
+#: ``FRISKY_TRACING_CAPACITY``), which a worker fills in about an hour at Iowa's rate, so a drain a
+#: minute leaves wide slack for one that fails.
+SPAN_DRAIN_INTERVAL_S = 60.0
+
+#: How far behind the present a drain stops, so a span still being recorded lands in the next one.
+_SPAN_DRAIN_LAG_NS = 10_000_000_000
 
 
 #: Native ids of the Frisky threads whose Python thread state is pinned (see :func:`_pin_thread_state`).
@@ -197,6 +211,58 @@ def _live_snapshot(dashboard_url: str, uri: str, log: logging.Logger | logging.L
     )
 
 
+class _SpanDrain:
+    """Copies the :data:`SPAN_DRAIN_NAMES` spans out of Frisky as the run goes.
+
+    Each drain writes the spans that ended since the previous one to
+    ``{uri}/spans/part-NNNNNN.json.gz``, a gzipped JSON list in the format of ``spans.json``, so
+    the parts together are the whole run. A span belongs to the drain whose window its end falls
+    in, so no span is written twice.
+    """
+
+    def __init__(self, dashboard_url: str, uri: str) -> None:
+        self.dashboard_url, self.uri = dashboard_url, uri
+        self.since_ns: int | None = None  # the first drain takes everything since the hijack
+        self.parts = self.spans = 0
+        self._lock = threading.Lock()  # the final drain waits for one still in flight
+
+    def drain(self, *, final: bool = False) -> None:
+        with self._lock:
+            self._drain(final)
+
+    def _drain(self, final: bool) -> None:
+        until_ns = time.time_ns() - (0 if final else _SPAN_DRAIN_LAG_NS)
+        spans = [
+            span
+            for name in SPAN_DRAIN_NAMES
+            for span in frisky.query_spans(
+                name=name, start_ns=self.since_ns, limit=sys.maxsize, dashboard_url=self.dashboard_url
+            )
+            if span["end_ns"] < until_ns and (self.since_ns is None or span["end_ns"] >= self.since_ns)
+        ]
+        if spans:
+            with fsspec.open(f"{self.uri}/spans/part-{self.parts:06d}.json.gz", "wt", compression="gzip") as out:
+                json.dump(spans, out)
+            self.parts += 1
+            self.spans += len(spans)
+        self.since_ns = until_ns
+
+
+def _repeat(
+    stop: threading.Event,
+    interval_s: float,
+    action: Callable[[], None],
+    what: str,
+    log: logging.Logger | logging.LoggerAdapter[Any],
+) -> None:
+    """Run ``action`` every ``interval_s`` until ``stop`` is set, logging rather than raising."""
+    while not stop.wait(interval_s):
+        try:
+            action()
+        except Exception as e:
+            log.warning("Frisky %s failed: %s", what, e)
+
+
 def _final_artifacts(dashboard_url: str) -> dict[str, Callable[[], str]]:
     """The end-of-run bundle, one file each, so a failure costs only its own file."""
 
@@ -231,13 +297,17 @@ def maybe_capture_telemetry(
     log: logging.Logger | logging.LoggerAdapter[Any],
     *,
     interval_s: float = LIVE_SNAPSHOT_INTERVAL_S,
+    drain_spans: bool = False,
 ) -> Iterator[None]:
     """Write Frisky's telemetry for this run under the prefix ``uri`` (any fsspec target).
 
     **While the body runs,** every ``interval_s``: ``live/overview.json`` is overwritten and one
     ``frisky state:`` line is logged, so a running, hung or killed run can be read from storage or
-    the run log with no port-forward. **After it:** the bundle below, captured before the cluster
-    closes, so any ``worker_removed`` event in it is a worker that left mid-run.
+    the run log with no port-forward. With ``drain_spans``, every :data:`SPAN_DRAIN_INTERVAL_S`
+    the task, transfer and spill spans of the run so far are appended under ``spans/`` as well
+    (:class:`_SpanDrain`), so the whole run is kept rather than its tail. **After it:** the bundle
+    below, captured before the cluster closes, so any ``worker_removed`` event in it is a worker
+    that left mid-run.
 
     =================  ==========================================================================
     ``spans.json``     the most recent :data:`SPANS_CAPTURE_LIMIT` spans; ``frisky observe
@@ -248,6 +318,8 @@ def maybe_capture_telemetry(
                        :data:`EVENTS_LIMIT` scheduler events)
     ``logs.json``      Frisky's own scheduler and worker warnings and errors. Task logs are not
                        here; they stay in the workers' log streams.
+    ``spans/``         with ``drain_spans`` only: the whole run's task, transfer and spill spans,
+                       as gzipped parts written while it ran
     =================  ==========================================================================
 
     Frisky's counterpart to ``providers.aws.dask.maybe_performance_report``, isolated the same way:
@@ -259,22 +331,29 @@ def maybe_capture_telemetry(
         return
 
     stop = threading.Event()
-
-    def snapshots() -> None:
-        while not stop.wait(interval_s):
-            try:
-                _live_snapshot(dashboard_url, uri, log)
-            except Exception as e:
-                log.warning("Frisky live snapshot failed: %s", e)
-
-    live = threading.Thread(target=snapshots, name="frisky-telemetry", daemon=True)
-    live.start()
+    drain = _SpanDrain(dashboard_url, uri) if drain_spans else None
+    loops = [(interval_s, lambda: _live_snapshot(dashboard_url, uri, log), "live snapshot")]
+    if drain:
+        loops.append((SPAN_DRAIN_INTERVAL_S, drain.drain, "span drain"))
+    threads = [
+        threading.Thread(target=_repeat, args=(stop, *loop, log), name="frisky-telemetry", daemon=True)
+        for loop in loops
+    ]
+    for thread in threads:
+        thread.start()
     try:
         yield
     finally:
         stop.set()
-        live.join(timeout=30)  # a snapshot in flight must not hold up the end of the run
+        for thread in threads:
+            thread.join(timeout=30)  # a capture in flight must not hold up the end of the run
         written = []
+        if drain:
+            try:
+                drain.drain(final=True)
+            except Exception as e:
+                log.warning("Frisky span drain failed: %s", e)
+            written.append(f"spans/ ({drain.spans} spans in {drain.parts} parts)")
         for name, produce in _final_artifacts(dashboard_url).items():
             try:
                 _write(f"{uri}/{name}", produce())

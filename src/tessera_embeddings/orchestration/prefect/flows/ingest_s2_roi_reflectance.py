@@ -129,6 +129,7 @@ def ingest_s2_roi_reflectance(
     use_frisky: bool = False,
     storage_options: dict | None = None,
     perf_report_uri: str | None = None,
+    frisky_drain_spans: bool = False,
     stream_stac_monthly: bool = True,
     overlap_window_writes: bool = True,
     pipeline_dates: bool = False,
@@ -165,6 +166,10 @@ def ingest_s2_roi_reflectance(
             there; with ``use_frisky``, Frisky's live and final telemetry is written under it
             as a prefix (probe-rung profiling; off by default). Ignored, with a warning, on the
             ``use_local`` path.
+        frisky_drain_spans: With ``use_frisky`` and ``perf_report_uri``, also copy the run's
+            task, transfer and spill spans to ``<perf_report_uri>/spans/`` every minute, so the
+            whole run is kept rather than the tail the final capture holds. About 8 GB a day
+            gzipped per 60 workers; delete the prefix once the run is analysed. Off by default.
         stream_stac_monthly: Query STAC one calendar month at a time, prefetching the next
             while the current is processed. Bounds retained items so a year-long window
             fits the worker; ``False`` is the rollback path only.
@@ -256,7 +261,7 @@ def ingest_s2_roi_reflectance(
         task_runner = get_task_runner_for_cluster(cluster.scheduler_address)
         log.info("Task runner connected to scheduler at %s", cluster.scheduler_address)
         report = (
-            maybe_capture_telemetry(cluster.dashboard_link, perf_report_uri, log)
+            maybe_capture_telemetry(cluster.dashboard_link, perf_report_uri, log, drain_spans=frisky_drain_spans)
             if use_frisky
             else maybe_performance_report(cluster.scheduler_address, perf_report_uri, log)
         )

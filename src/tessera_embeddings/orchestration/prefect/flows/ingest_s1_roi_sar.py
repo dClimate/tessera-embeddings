@@ -109,6 +109,7 @@ def ingest_s1_roi_sar(
     use_frisky: bool = False,
     storage_options: dict | None = None,
     perf_report_uri: str | None = None,
+    frisky_drain_spans: bool = False,
     overlap_window_writes: bool = True,
     pipeline_batches: bool = True,
     narrow_windows_per_date: bool = True,
@@ -142,6 +143,10 @@ def ingest_s1_roi_sar(
             run is captured and uploaded there; with ``use_frisky``, Frisky's live and final
             telemetry is written under it as a prefix (probe-rung profiling; default off).
             Ignored on the ``use_local`` path, which warns.
+        frisky_drain_spans: With ``use_frisky`` and ``perf_report_uri``, also copy the run's
+            task, transfer and spill spans to ``<perf_report_uri>/spans/`` every minute, so the
+            whole run is kept rather than the tail the final capture holds. About 8 GB a day
+            gzipped per 60 workers; delete the prefix once the run is analysed. Off by default.
         overlap_window_writes: Submit a date's windows as ONE dask compute rather than one
             blocking compute per window, so they share the fleet instead of each waiting its
             turn. Identical store either way. **Defaults ON.** Also selects the window merge
@@ -231,7 +236,7 @@ def ingest_s1_roi_sar(
         task_runner = get_task_runner_for_cluster(cluster.scheduler_address)
         log.info("Task runner connected to scheduler at %s", cluster.scheduler_address)
         report = (
-            maybe_capture_telemetry(cluster.dashboard_link, perf_report_uri, log)
+            maybe_capture_telemetry(cluster.dashboard_link, perf_report_uri, log, drain_spans=frisky_drain_spans)
             if use_frisky
             else maybe_performance_report(cluster.scheduler_address, perf_report_uri, log)
         )
