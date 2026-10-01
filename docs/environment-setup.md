@@ -16,7 +16,7 @@ execution that is the actual point of the library.
 
 Every tier includes Frisky, the Rust Dask scheduler behind the ingest's `use_frisky` option. It
 is a closed-source binary under a free licence, and it installs only on Python below 3.15
-(`context_docs/ingest/frisky-experiment.md`).
+([`frisky.md`](frisky.md)).
 
 uv is recommended for reproducible installs but not required — all `pip`
 commands above work identically with `uv pip`.

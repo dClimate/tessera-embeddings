@@ -2,6 +2,8 @@
 
 **Status: experimental, opt-in, off by default.** Frisky 0.7.2, wired in
 `src/tessera_embeddings/providers/frisky.py`. Nothing changes for a run that does not ask for it.
+This is the record: why Frisky is wired this way and what was found. How to use it is
+[`docs/frisky.md`](../../docs/frisky.md).
 
 [Frisky](https://getfrisky.dev/) is Matthew Rocklin's reimplementation of Dask's scheduler and
 workers in Rust: about 100x cheaper scheduling (around 3 µs a task) and far more telemetry,
@@ -127,51 +129,7 @@ stack; Dask's get 16 MiB on macOS (and typically 8 MiB on Linux). Raising Frisky
 succeeds at 2 MiB, so nothing changes it. If a future crash really is a stack overflow,
 `RUST_MIN_STACK` set in the workers' environment (`worker_env_overrides`) is the lever.
 
-## Do's and don'ts
-
-**Do:**
-
-- **Turn it on per run.** Pass `use_frisky=True` to `ingest_s2_roi_reflectance` or
-  `ingest_s1_roi_sar`, or set `frisky: true` in the plain runner's config. The campaign and fill
-  flows deliberately do not pass it through.
-- **Build both images from this branch:** the flow runner's, which calls `frisky.hijack`, and
-  the one the Fargate scheduler and workers run (`DASK_ECR_IMAGE_URI`), where the hijack's
-  plugins import Frisky. As a core dependency, Frisky arrives with a normal install.
-- **Size the fleet with `max_workers`.** The fleet is fixed at that size.
-- **Capture telemetry with `perf_report_uri`.** On a Frisky run it receives Frisky's spans as
-  JSON, readable after the cluster is gone with `frisky observe overview spans.json`.
-- **Watch a live run through the existing SSM port-forward to 8787**, which now serves Frisky's
-  dashboard. Start with `frisky observe overview http://localhost:8787`.
-- **To upgrade Frisky,** move the bound in `pyproject.toml`, then run `test_frisky.py`,
-  `test_read_failure_cause_over_dask.py` and `test_ingest_s2_roi_frisky_parity.py`. The Frisky
-  before-and-after test fails when an upgrade makes the tblib step unnecessary.
-
-**Don't:**
-
-- **Call Frisky's API outside `providers/frisky.py`.**
-- **Use a raw `frisky.hijack` for the ingest.** Without `_MatchDaskWorker`, the first real image
-  read segfaults the worker.
-- **Reference the `frisky` module from a function pickled by value** (one defined in `__main__`,
-  a notebook or a test's lambda). Frisky replaces its module's class, and cloudpickle cannot
-  pickle the module object.
-- **Pass `pure=` to Frisky's `submit`.** It is forwarded to your function as an argument. Frisky
-  keys every call uniquely anyway.
-- **Keep a Frisky client open longer than its work in a shared process,** such as a test session.
-  It reroutes every bare `.compute()` in that process.
-- **Count on Dask's memory management for Frisky's data.** Dask's pause and spill cannot see it,
-  but the nanny still kills a worker process at 95% of its memory limit. Frisky's own thresholds
-  are `FRISKY_SPILL_FRACTION` and `FRISKY_SPILL_TARGET_FRACTION`, settable through
-  `worker_env_overrides`.
-- **Read the heartbeat's task fields as the ingest's load.** Under Frisky,
-  `SchedulerResourceLogger`'s `tasks`, `processing` and `wmanaged` count only Dask's single driver
-  task. Its `cpu`, `rss` and
-  `lag` still measure the scheduler process, which now also hosts Frisky's scheduler.
-- **Mistake the periodic stdout summary for an error.** Frisky prints one by default;
-  `FRISKY_SUMMARY=off` silences it.
-
-## Test plan
-
-### a) Does it work?
+## Verified so far
 
 Done locally (macOS, Python 3.13), and green again in CI on Linux (Python 3.12 and 3.13) on PR
 #205:
@@ -182,64 +140,10 @@ Done locally (macOS, Python 3.13), and green again in CI on Linux (Python 3.12 a
 | `tests/integration/test_read_failure_cause_over_dask.py` | Frisky's before-and-after for the cause chain; the read-failure classification on both engines | 16 passed |
 | `tests/parity/test_ingest_s2_roi_frisky_parity.py` | The S2 domain ingest on Dask versus Frisky: offline synthetic dates byte for byte (with `pipeline_dates` and a mid-run gate failure), and Denver July 2024 real imagery within 1e-6 | 2 passed, about 2 min |
 
-Next, on the dev account:
-
-1. **Smoke.** One small S2 probe rung with `use_frisky=True` and about 10 workers. Check:
-   - The log line "Frisky loaded onto the cluster" appears.
-   - Every worker appears in `frisky observe workers`. This also proves the security group lets
-     workers reach the Frisky scheduler's random port.
-   - CloudWatch shows no "Restarting worker".
-   - The store passes the checks a Dask run does.
-2. **Equivalence at scale.** The same zone tile and window ingested by both engines into
-   sibling stores, compared with `assert_zarr_equivalent`. Do this once for S2 and once for one S1
-   orbit; S1 has no Frisky parity test yet.
-3. **A full fleet.** Confirm the worker count reaches `max_workers`, and that workers which join
-   late run tasks. Most of a Fargate fleet joins after the hijack.
-
-### b) Is it faster?
-
-- **Same rungs.** Use the probe rungs already used for Dask
-  (`context_docs/ingest/campaign-ingest-measurements.md`), at two or three ROI sizes.
-- **Pair the arms.** Run Dask with `min_workers == max_workers`, so the comparison measures the
-  engine rather than autoscaling. Repeat each pair two or three times, alternating which engine
-  goes first.
-- **Record each rung's configuration** with its result, so any number here can be rerun: commit,
-  image tag, Frisky version, ROI and date window, `max_workers`, worker CPU and memory, and every
-  ingest flag passed (`batch_dates`, `pipeline_dates`, `overlap_window_writes`).
-- **Measure:**
-  - wall clock per leg;
-  - the per-batch `Batch timings` lines (`build`, `gate`, `write`, `stall`);
-  - the scheduler heartbeat's `cpu`, `rss` and `lag`;
-  - worker-hours.
-- **The hypothesis to test** is that Frisky helps where the scheduler bounds the run (wide fleets,
-  large `batch_dates`, the width at which `MAX_PIPELINE_DATES_WORKERS` stops pipelining) and not
-  where image reads do.
-- **The only evidence so far** is the network-bound Denver toy, where the engines are
-  indistinguishable. Both ran on a laptop with 2 workers of 2 threads and 2 GB each, default
-  ingest flags, Denver July 2024 (13 dates, 10 written). Dask's figures are from
-  `test_s2_roi_parity`'s domain run; Frisky's from the same call on a hijacked cluster of the same
-  shape:
-
-| Engine | `gate` per batch (s) | `write` per batch (s) |
-|---|---|---|
-| Dask | 3.7, 6.4, 1.9 | 13.6, 13.7, 11.2 |
-| Frisky | 5.0, 3.5, 6.1 | 15.3, 14.8, 11.4 |
-
-### c) Is the telemetry better?
-
-- **Capture on every rung.** Set `perf_report_uri` on each Frisky rung. Read the spans offline
-  with `frisky observe overview`, `prefixes`, `stragglers` and `transfers`.
-- **Compare like with like.** Set the Dask performance report from the equivalent Dask rung
-  alongside them.
-- **The test is concrete:** for the slowest date of a rung, can each engine's telemetry say why
-  (critical path, GIL time, transfer time, a straggling worker), and at what cost (capture size,
-  capture time, scheduler overhead)?
-- **First evidence is this branch's own debugging.** Dask's logs said only "Restarting worker".
-  Frisky's event log named the dying workers' lifetimes and the read tasks that killed them.
-- **Limits to know:**
-  - The capture keeps the most recent `SPANS_CAPTURE_LIMIT` (500,000) spans.
-  - Workers record up to `FRISKY_TRACING_CAPACITY` spans (default 1,000,000).
-  - The scheduler's event log keeps `FRISKY_EVENT_LOG_CAPACITY` events.
+The dev-account test plan, and the record of its runs, is
+[`frisky-dev-test-plan.md`](frisky-dev-test-plan.md). How to use Frisky, and the do's and
+don'ts that follow from the findings above, are reference documentation:
+[`docs/frisky.md`](../../docs/frisky.md).
 
 ## Open items
 

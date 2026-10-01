@@ -56,8 +56,9 @@ scaling reads a task load that Frisky now holds.
 
 `frisky.py` is the only module that calls Frisky's API, so a library change
 lands in one place. Frisky is a core dependency on this branch (a
-closed-source binary under a free licence). Design, the four ways Frisky differs from Dask and the do's and
-don'ts: [`context_docs/ingest/frisky-experiment.md`](../../../context_docs/ingest/frisky-experiment.md).
+closed-source binary under a free licence). How to use it, and its do's and
+don'ts: [`docs/frisky.md`](../../../docs/frisky.md). Why it is wired this way:
+[`context_docs/ingest/frisky-experiment.md`](../../../context_docs/ingest/frisky-experiment.md).
 
 ## Scheduler health logging (Dask)
 

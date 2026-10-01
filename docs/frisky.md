@@ -1,0 +1,93 @@
+# Running the ingest on Frisky
+
+[Frisky](https://getfrisky.dev/) is a Rust reimplementation of Dask's scheduler and workers, with
+much cheaper scheduling and far more telemetry. The S2 and S1 ingest can run their compute on it
+instead of Dask. It is experimental and off by default; a run that does not ask for it is
+unchanged.
+
+Frisky is a core dependency on this branch. It is closed-source (a free binary licence) and installs
+only on Python below 3.15. Why it is wired the way it is, and the evidence behind every rule
+below: [`context_docs/ingest/frisky-experiment.md`](../context_docs/ingest/frisky-experiment.md).
+
+## Turning it on
+
+| Entry point | How |
+|---|---|
+| `ingest_s2_roi_reflectance` flow | `use_frisky=True` |
+| `ingest_s1_roi_sar` flow | `use_frisky=True` |
+| Plain runner | `frisky: true` in the YAML config |
+
+The campaign flows (`ingest_zone_year`, the fills) do not pass it through. To ingest a zone on
+Frisky, dispatch the S2 or S1 ingest flow directly against the zone's ROI.
+
+What changes when it is on:
+
+- The same Dask cluster is built, and Frisky is loaded onto it: a Frisky scheduler inside the
+  Dask scheduler process, a Frisky worker inside every Dask worker process.
+- **The fleet is fixed at `max_workers`.** Dask's adaptive scaling cannot see Frisky's tasks, so
+  `min_workers` is ignored.
+- `perf_report_uri` receives Frisky's spans as JSON instead of a Dask performance report.
+- The dashboard on port 8787 is Frisky's. Dask's own pages (`/workers`, `/health`) keep their
+  paths.
+
+## What a deployment needs
+
+- **Both images built from this branch:** the flow runner's, which loads Frisky onto the cluster,
+  and the Dask image (`DASK_ECR_IMAGE_URI`), where the scheduler and workers import it. An image
+  without Frisky fails the run at cluster start.
+- **A security group that admits Frisky's scheduler port.** It is a random port beside Dask's
+  8786, dialled on the scheduler's private IP. A group that admits only 8786 and 8787 leaves every
+  Frisky worker unregistered.
+
+## Watching a run
+
+Use the SSM port-forward the flow logs for the Dask dashboard; it now opens Frisky's. Then, from
+your machine:
+
+```bash
+frisky observe overview http://localhost:8787     # start here: state, costliest spans, stragglers
+frisky observe workers  --url http://localhost:8787
+frisky observe events   http://localhost:8787 --kind worker_removed   # workers that died, and when
+frisky observe --help                             # the rest: prefixes, blocked, transfers, ...
+```
+
+After the run, read the spans `perf_report_uri` captured:
+
+```bash
+frisky observe overview spans.json
+```
+
+The capture keeps the most recent 500,000 spans (`SPANS_CAPTURE_LIMIT`), so a long run keeps its
+tail. Frisky also prints a periodic cluster summary to stdout; `FRISKY_SUMMARY=off` silences it.
+
+## Do's and don'ts
+
+**Do:**
+
+- Size the fleet with `max_workers`.
+- Set `perf_report_uri` on any run you want to analyse after its cluster is gone.
+- Pass Frisky's own settings through `worker_env_overrides`. Examples are
+  `FRISKY_SPILL_FRACTION` and `FRISKY_SPILL_TARGET_FRACTION` for its spill thresholds, and
+  `FRISKY_TRACING_CAPACITY` for spans kept per worker.
+- After upgrading Frisky, run `tests/integration/test_frisky.py`,
+  `tests/integration/test_read_failure_cause_over_dask.py` and
+  `tests/parity/test_ingest_s2_roi_frisky_parity.py`. They pin the library behaviour the ingest
+  relies on.
+
+**Don't:**
+
+- **Call Frisky's API outside `providers/frisky.py`.** That module works around three Frisky
+  behaviours (see the context doc), and code that bypasses it loses the workarounds.
+- **Use a raw `frisky.hijack` for the ingest.** Without our worker plugin, the first real image
+  read segfaults the worker and the run hangs.
+- **Reference the `frisky` module from a function pickled by value,** such as one defined in
+  `__main__`, a notebook or a test's lambda. cloudpickle cannot pickle the module object.
+- **Pass `pure=` to Frisky's `submit`.** It is forwarded to your function as an argument. Frisky
+  keys every call uniquely anyway.
+- **Keep a Frisky client open longer than its work in a shared process,** such as a test session.
+  It reroutes every bare `.compute()` in that process to Frisky.
+- **Count on Dask's memory management for Frisky's data.** Dask's pause and spill cannot see it,
+  but Dask's nanny still kills a worker process at 95% of its memory limit.
+- **Read the scheduler heartbeat's task counts as the ingest's load.** Under Frisky, the
+  `tasks`, `processing` and `wmanaged` fields count only Dask's one driver task. Its `cpu`, `rss`
+  and `lag` still measure the scheduler process, which now also hosts Frisky's scheduler.
