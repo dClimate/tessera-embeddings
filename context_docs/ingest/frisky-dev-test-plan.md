@@ -180,6 +180,14 @@ $1.36 to $1.38 on Frisky at 2048. An S1 arm cost $0.14 to $0.16.
   208 s run, against 20 s on Dask, longest before the two write batches (32 s and 25 s, against
   8 s and 7 s) while Frisky's client pickled each graph before submitting it. The record's item 5
   has the mechanism and the fix.
+- **The pickling fix closes the S2 gap** (`9d994f84`'s successor `31ea6ac0`, the `-fix` rows in the
+  run log, Frisky and Dask side by side). Per date, S2 took 17.9 s on both engines and S1 13.1 s
+  on Frisky against 13.8 s on Dask. The idle stretches before the two write batches fell from
+  31.7 s and 25.1 s to 10.3 s and 8.4 s, against Dask's 9.1 s and 8.0 s, and Frisky's write
+  phases ran 5% shorter than Dask's. Both engines logged their last batch at the same second;
+  Frisky's run then spent 45 s on its end-of-run telemetry against Dask's 7 s, which is the
+  remaining cost gap ($1.21 against $1.07) and only arises on runs that set `perf_report_uri`.
+  The rest of Frisky's idle time is the gate's computes running one after another.
 - **At 4096, each batch also ends on a long tail.** The final batch held the same work on every
   arm, about 10,350 task-seconds, but took 66 s and 86 s on Frisky against 49 s on Dask: one
   worker was handed up to 1.8 times the mean work and kept it while the rest went idle.
@@ -267,11 +275,11 @@ Ingest only, at about $0.27 a worker-hour. Phases A to B2 are measured; the rest
 |---|---|
 | A | $2.30, measured |
 | B1 | $1.72, measured, with the startup fix's two smoke runs |
-| B2 | $9.70, measured, with the drain's two runs |
+| B2 | $12.27, measured, with the drain's and the fix's runs |
 | B3 | about $10 |
 | B4 | about $15 (two arms of about 20 worker-hours) |
 
-That is about $39 for the ingest phases. Phase C adds GPU time, estimated once the actor counts
+That is about $41 for the ingest phases. Phase C adds GPU time, estimated once the actor counts
 are fixed. The run log records the actual figures.
 
 ## Run log
@@ -309,3 +317,7 @@ write for S2, or stall and write for S1, divided by the dates written.
 | 2026-10-01 | b2-s1-frisky-4096-r2 | A′ | Frisky | iowa_epsg5070, 2024-07-01..14 | S1 asc | 13 | `7358d35d` | 3m34s | 16.6 | 0 | pass: 4 dates, $0.14 |
 | 2026-10-01 | b2-s2-frisky-2048-drain | B (`8d461c61`) | Frisky | iowa_epsg5070, 2024-07-01..14 | S2 | 60 | `6f7f663a` | 7m05s | 24.1 | 0 | pass: 8 dates, $1.42, 419,652 spans drained |
 | 2026-10-01 | b2-s1-frisky-2048-drain | B (`8d461c61`) | Frisky | iowa_epsg5070, 2024-07-01..14 | S1 asc | 13 | `e99aebd7` | 3m58s | 15.1 | 0 | pass: 4 dates, $0.16, 26,767 spans drained |
+| 2026-10-01 | b2-s2-frisky-2048-fix | B (`31ea6ac0`) | Frisky | iowa_epsg5070, 2024-07-01..14 | S2 | 60 | `3f2efe64` | 6m20s | 17.9 | 0 | pass: 8 dates, $1.21, drained |
+| 2026-10-01 | b2-s2-dask-2048-fix | B (`31ea6ac0`) | Dask | iowa_epsg5070, 2024-07-01..14 | S2 | 60 | `2289dd5c` | 5m43s | 17.9 | 0 | pass: 8 dates, $1.07 |
+| 2026-10-01 | b2-s1-frisky-2048-fix | B (`31ea6ac0`) | Frisky | iowa_epsg5070, 2024-07-01..14 | S1 asc | 13 | `b60a9706` | 3m34s | 13.1 | 0 | pass: 4 dates, $0.14, drained |
+| 2026-10-01 | b2-s1-dask-2048-fix | B (`31ea6ac0`) | Dask | iowa_epsg5070, 2024-07-01..14 | S1 asc | 13 | `4600ef05` | 3m54s | 13.8 | 0 | pass: 4 dates, $0.15 |

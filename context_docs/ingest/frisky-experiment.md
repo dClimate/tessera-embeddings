@@ -164,7 +164,9 @@ writes, the time from the write call to the first task falls from 9.9 s to 5.5 s
 
 Locally the Dask scheduler shares the driver's process; on Fargate it runs on its own task. Most
 of what remains on Frisky, lowering the graph and pickling the other tasks, is how its client
-works.
+works. On dev, side by side with Dask on Iowa, the fix cut the idle stretch before each write
+batch from 32 s and 25 s to 10 s and 8 s (Dask's are 9 s and 8 s), and S2 took 17.9 s a date on
+both engines.
 
 **Measured and ruled out: thread stack size.** Frisky's task threads get Rust's default 2 MiB
 stack; Dask's get 16 MiB on macOS (and typically 8 MiB on Linux). Raising Frisky's with
@@ -191,12 +193,13 @@ findings:
 
 - **Stable and exact.** No worker died in any run, and Frisky's stores are bit-identical to Dask's
   at both chunk sizes.
-- **Slower at Iowa scale, between computes.** Frisky took 25 to 40% longer than Dask per S2 date,
-  yet over a whole drained run its store write's median task was 0.97 of Dask's and its band
-  read's 0.89. The gap is the fleet idling while the driver pickles each graph (item 5 above).
-  Dask's scheduler is not the bound at that scale, so Frisky's scheduling advantage has nothing to
-  recover yet. At 4096 a second cost shows: each batch ends on a long tail, because one worker is
-  handed up to 1.8 times the mean work and keeps it while the others go idle.
+- **As fast as Dask at Iowa scale, once its graphs pickle cheaply.** Frisky's tasks are as fast or
+  faster (store writes 0.97 of Dask's median, band reads 0.89), but it first took 25 to 40% longer
+  per S2 date, idling while the driver pickled each graph (item 5 above). With the fix it matches
+  Dask on S2 (17.9 s a date each) and edges it on S1 (13.1 s against 13.8 s). Dask's scheduler is
+  not the bound at that scale, so Frisky's scheduling advantage has nothing to recover yet. At
+  4096 a second cost shows: each batch ends on a long tail, because one worker is handed up to 1.8
+  times the mean work and keeps it while the others go idle.
 - **The end-of-run capture keeps only a run's tail.** At Iowa scale Frisky emits about 15,000 spans
   a second, so the 500,000 captured at the end cover about half a minute. Each process keeps its
   own span buffer (1,000,000 by default), which a worker fills in about an hour, so the run's spans
@@ -217,8 +220,9 @@ documentation: [`docs/frisky.md`](../../docs/frisky.md).
   [mrocklin/frisky-issues](https://github.com/mrocklin/frisky-issues). Drafts with standalone
   reproductions are written but not filed. Either fix upstream lets
   the matching step of `_MatchDaskWorker` go.
-- Measure `_picklable_merge_reduction` on dev: the idle gap before each write batch should about
-  halve. Then report the up-front pickling and the 4096 tail upstream, with these numbers.
+- Report the up-front graph pickling and the 4096 tail upstream, with these numbers, and ask
+  icechunk to make `computing_meta` pickle by reference so `_picklable_merge_reduction` can go.
+- Shorten the end-of-run capture when the drain is on: on Iowa it took 45 s of a 60-worker fleet.
 - Find why the gate's computes run one after another on Frisky.
 - Check the span drain's load on the scheduler at B4's scale; at Iowa its peak was 79% of a core.
 - Decide whether Frisky stays a core dependency when this reaches `main`, on the experiment's
