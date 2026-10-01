@@ -17,25 +17,29 @@ is: [`frisky-experiment.md`](frisky-experiment.md). How to operate it:
   | Version | tessera-embeddings commit | Chunk | `ingest_code_identity` | YE branch |
   |---|---|---|---|---|
   | A | `b3e902b0` | 4096 | `ingcode-0869839717820a9c` | `dev/frisky-4096` |
-  | B | `aef6c55b` | 2048 | `ingcode-5f707a14bb6d5062` | `dev/frisky-2048` |
+  | B | `9d994f84` | 2048 | `ingcode-5f707a14bb6d5062` | `dev/frisky-2048` |
 
   Version B also moves `inference_code_identity`, from `infcode-c9905e5aa8f93d3e` to
   `infcode-2613e97f0ad55679`, because `config/ingest.py` is inside the inference import closure.
+  B1 ran on `aef6c55b`, which differs from B only in how `ecs_cluster` connects its setup clients
+  (by the cluster object, so the hijack waited for the fleet). That is outside both code
+  identities, so B1's stores hold what B writes.
 
 - **Paired arms.** Every Frisky run has a Dask run from the same deployment with the same
   parameters; only `use_frisky` differs. Dask runs with `min_workers == max_workers`, so both arms
   have the same fleet size.
-- **A pair runs side by side, and no more than two arms run at once.** Both arms then see the same
-  catalog and S3 conditions. Their log lines share `/ecs/yield-embeddings`, so every timing row is
-  attributed by its `@logStream`: the stream name ends in the ECS task id, and each task carries
-  `tessera-flow-run-id=<flow run id>`.
+- **A rung's arms run at the same time:** S2 and S1 together, as in production, each on both
+  engines. Paired arms then see the same catalog and S3 conditions. Their log lines share
+  `/ecs/yield-embeddings`, so every timing row is attributed by its `@logStream`: the stream name
+  ends in the ECS task id, and each task carries `tessera-flow-run-id=<flow run id>`.
 - **A fresh store for every run**, under `s3://arbol-tessera-inputs-dev/mosaics/_frisky/<run>/`.
   Never an existing mosaic: version B could not append to one anyway.
 - **Telemetry on every run.** Set `perf_report_uri` to `s3://arbol-tessera-inputs-dev/perf/_frisky/<run>`.
   A Dask arm writes a performance report there; a Frisky arm writes its live and final bundle
   under it.
-- **Width:** 60 workers, the production width, for every performance rung. The tiny ROI uses 4,
-  because its single chunk cannot occupy more.
+- **Width:** the production widths. S2 uses 60 workers; S1 uses 13, which is 0.22 of S2's width
+  (`ingest_settings.s1_worker_fraction`). The tiny ROI uses 4, because its single chunk cannot
+  occupy more. Phase A's S1 arms ran at 60.
 
 ## Phase 0: deploy (no runs)
 
@@ -57,7 +61,7 @@ Already checked, read-only: the yield Dask security group (`sg-03b679cab3d7d672b
 traffic from itself, so Frisky's random scheduler port is reachable. Dask and the flow runner both
 log to `/ecs/yield-embeddings`.
 
-Version B repeats steps 1 to 3 on `dev/frisky-2048`, pinned at `@aef6c55b`.
+Version B repeats steps 1 to 3 on `dev/frisky-2048`, pinned at `@9d994f84`.
 
 ## What every run records
 
@@ -107,7 +111,8 @@ Engine time is close. Frisky's S2 gate is slower by 6 s over three batches, whic
 explain from its bundle. The cost gap is setup: on a Frisky arm the first `Client(cluster)` after
 `cluster.scale(60)` waits until all 60 Fargate tasks have started (about 75 s), because `distributed`'s
 `Client` awaits the cluster's pending workers. Dask's `adapt` has requested no workers at that
-point, so its client connects at once and its work overlaps worker boot.
+point, so its client connects at once and its work overlaps worker boot. Version B connects its
+setup clients by address, which does not wait.
 
 ## Phase B: the 2048-px chunk (version B)
 
@@ -116,7 +121,7 @@ must hold the same pixels and dates as the 4096 store of the same rung and engin
 content must not.
 
 **B2: Iowa, the performance matrix.** `iowa_epsg5070` (the whole state), 2024-07-01 to
-2024-07-14, S2, then S1 ascending (Iowa is single-orbit), 60 workers. Four arms, two of them on
+2024-07-14, S2 and S1 ascending (Iowa is single-orbit). Four arms per sensor, two of them on
 version A's deployment:
 
 | | Dask | Frisky |
@@ -190,11 +195,11 @@ Iowa being 14.6 times 15SWC:
 |---|---|
 | A | $2.30, measured |
 | B1 | about $3 |
-| B2 | about $30 (twelve arms of two to three dollars) |
+| B2 | about $20 (six S2 arms of about $3, six S1 arms of about $0.50) |
 | B3 | about $15 |
 | B4 | about $15 (two arms of about 20 worker-hours) |
 
-That is about $65 for the ingest phases. Phase C adds GPU time, estimated once the actor counts
+That is about $55 for the ingest phases. Phase C adds GPU time, estimated once the actor counts
 are fixed. The run log records the actual figures.
 
 ## Run log

@@ -119,6 +119,20 @@ table, which under a hijack holds one task: the driver. It would shrink the flee
 `min_workers` and retire workers holding Frisky's data. `ecs_cluster(frisky=True)` calls
 `cluster.scale(max_workers)` instead, and `min_workers` is ignored.
 
+The hijack does not wait for that fleet. A Dask `Client` given the cluster object first waits for
+every requested worker's ECS task to reach RUNNING, which after the scale-up held the hijack back
+73 to 77 s at 60 workers on dev, so `ecs_cluster` connects its short-lived clients by address.
+Every worker therefore joins after the hijack. Dask hands a joining worker its plugins in
+registration order, `_MatchDaskWorker` before Frisky's, and Frisky spreads the work it queued
+while no worker existed onto the workers as they arrive
+(`test_workers_that_join_after_the_hijack_run_its_queued_work`). One ordering is weaker than
+Dask's. Dask holds a joining worker's tasks until all its plugins are set up, but Frisky's worker
+starts inside its own plugin, so the plugins the ingest registers after the hijack (the
+credential broadcast and the read-failure capture) finish setting up just after it. Theirs take
+microseconds, and none of 2,000 tasks probed locally on 20 late joiners ran before them; a plugin
+whose setup sleeps 0.5 s lost the race on every task. A read that did lose it would fail closed,
+not drop data: `is_unreadable_source` excludes credential failures, so they propagate.
+
 **4. The client lacks part of Dask's API.** Frisky's client has no `run`, `register_plugin`,
 `run_on_scheduler`, `scheduler_info` or `cancel`. Hence the routing client, rather than handing
 the ingest Frisky's client directly.
@@ -136,7 +150,7 @@ Done locally (macOS, Python 3.13), and green again in CI on Linux (Python 3.12 a
 
 | Suite | Covers | Result |
 |---|---|---|
-| `tests/integration/test_frisky.py` | Every compute path the ingest uses; Dask plugins and `run` reaching Frisky's processes; a driver running as a Dask task (the Prefect shape), including a second thread; overlapped icechunk writes identical to Dask's and committing nothing when a window fails; thread state and the CRS reproduction; spans readable by `frisky observe`; span capture never failing a run | 7 passed, about 5 s |
+| `tests/integration/test_frisky.py` | Every compute path the ingest uses; Dask plugins and `run` reaching Frisky's processes; a driver running as a Dask task (the Prefect shape), including a second thread; overlapped icechunk writes identical to Dask's and committing nothing when a window fails; thread state and the CRS reproduction; work queued before any worker exists, run on workers that join after the hijack; spans readable by `frisky observe`; span capture never failing a run | 8 passed, about 15 s |
 | `tests/integration/test_read_failure_cause_over_dask.py` | Frisky's before-and-after for the cause chain; the read-failure classification on both engines | 16 passed |
 | `tests/parity/test_ingest_s2_roi_frisky_parity.py` | The S2 domain ingest on Dask versus Frisky: offline synthetic dates byte for byte (with `pipeline_dates` and a mid-run gate failure), and Denver July 2024 real imagery within 1e-6 | 2 passed, about 2 min |
 

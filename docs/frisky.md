@@ -86,6 +86,9 @@ tail. Frisky also prints a periodic cluster summary to stdout; `FRISKY_SUMMARY=o
   keys every call uniquely anyway.
 - **Keep a Frisky client open longer than its work in a shared process,** such as a test session.
   It reroutes every bare `.compute()` in that process to Frisky.
+- **Give a worker plugin a slow `setup`.** On a worker that joins after the hijack, which on
+  Fargate is every worker, Frisky's tasks can start before a plugin registered after the hijack
+  has finished setting up.
 - **Count on Dask's memory management for Frisky's data.** Dask's pause and spill cannot see it,
   but Dask's nanny still kills a worker process at 95% of its memory limit.
 - **Read the scheduler heartbeat's task counts as the ingest's load.** Under Frisky, the
