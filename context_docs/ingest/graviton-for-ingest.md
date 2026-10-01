@@ -81,9 +81,10 @@ about 10% can be absorbed by running wider. Much more than that cannot.
 The saving above comes from the price alone. Speed moves it up or down, and only where it changes
 how long a worker runs. Probably not by much either way, but only the dev test can say.
 
-- **AWS's headline is mostly the price cut.** "Up to 40% improved price/performance at 20% lower
-  cost" means at best about 12% more work per vCPU (1.4 × 0.8 = 1.12). A Graviton vCPU is a whole
-  core, where an x86 vCPU is one hyperthread, which helps multi-threaded work like the workers'
+- **AWS's headline includes the price cut.** It claims "up to 40% improved price/performance at
+  20% lower cost". How much extra speed that implies depends on how AWS defines price/performance,
+  which it does not say, and it is a best case on AWS's benchmarks, not a forecast for ours. A
+  Graviton vCPU is a whole core, where an x86 vCPU is one hyperthread, which helps multi-threaded work like the workers'
   reads and warps. Per thread, x86 still leads, which is what matters to the single-threaded
   scheduler. Fargate offers no choice of generation: it launched on Graviton2 (Neoverse N1), and the
   faster Graviton3 and 4 are EC2 instance choices.
