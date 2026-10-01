@@ -7,8 +7,8 @@ yield-embeddings; this repo needs no code change.
 
 - **Move the Dask workers to ARM64 Fargate before the next campaign or annual update.** Leave the
   scheduler and the flow runners on x86.
-- **It saves about 19% of ingest's Fargate cost, provided ARM workers keep pace.** On a campaign the
-  size of the last one (a $187,441 Fargate line) that is about **$32,000–35,000**, or about
+- **It saves about 19% of ingest's Fargate cost.** That is ARM's 20% lower price, not extra speed,
+  so it holds provided ARM workers keep pace. On a campaign the size of the last one (a $187,441 Fargate line) that is about **$32,000–35,000**, or about
   **$3,600–3,900 per global year**. The yield account's own Fargate use is dev-scale, so the saving
   there is negligible.
 - **The change is small:** two Dockerfile lines, a `platforms` input on the image build, and one
@@ -76,19 +76,23 @@ which was $537,000 of the campaign, and a slower ingest can leave cards idle. Th
 peak used 73% of the 25,000 vCPU quota (one quota covers both architectures), so a slowdown of
 about 10% can be absorbed by running wider. Much more than that cannot.
 
-## Will ARM workers be slower?
+## Will ARM workers be faster or slower?
 
-Probably not by much, but only the dev test can say.
+The saving above comes from the price alone. Speed moves it up or down, and only where it changes
+how long a worker runs. Probably not by much either way, but only the dev test can say.
 
-- **A Graviton vCPU is a whole core; an x86 vCPU is one hyperthread.** AWS does not say which
-  Graviton generation Fargate uses; it launched on Graviton2 (Neoverse N1). AWS claims "up to 40%
-  improved price/performance at 20% lower cost" over x86 Fargate. Per thread, x86 still leads.
+- **AWS's headline is mostly the price cut.** "Up to 40% improved price/performance at 20% lower
+  cost" means at best about 12% more work per vCPU (1.4 × 0.8 = 1.12). A Graviton vCPU is a whole
+  core, where an x86 vCPU is one hyperthread, which helps multi-threaded work like the workers'
+  reads and warps. Per thread, x86 still leads, which is what matters to the single-threaded
+  scheduler. Fargate offers no choice of generation: it launched on Graviton2 (Neoverse N1), and the
+  faster Graviton3 and 4 are EC2 instance choices.
 - **Our workers are not CPU-bound at dev scale.** Across the Frisky dev runs on 2026-10-01 (a tiny
   ROI, 15SWC and Iowa, up to 60 S2 workers, both engines), Container Insights shows workers using
-  **20–27% of
-  reserved CPU** over the runs, and about 60% in the busiest minute. A worker spends most of its
-  time waiting on S3 reads and dispatch, and a slower core does not lengthen a wait. No figure from
-  the last campaign was read: those metrics are in the global-tessera account.
+  **20–27% of reserved CPU** over the runs, and about 60% in the busiest minute. A worker spends
+  most of its time waiting on S3 reads and dispatch. That cuts both ways: a slower core costs little,
+  and a faster one saves little. No figure from the last campaign was read: those metrics are in
+  the global-tessera account.
 - **The fleet-saturated regime is the real question.** Of a dense zone's task work, 72% is reading
   and resampling source imagery, and one date's work oversubscribes the fleet
   ([§1](campaign-ingest-measurements.md)). In that regime, worker speed sets the pace. The dev test
