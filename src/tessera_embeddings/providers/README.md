@@ -55,8 +55,8 @@ Frisky; provisioning, teardown and the Prefect task runner stay on Dask.
 scaling reads a task load that Frisky now holds.
 
 `frisky.py` is the only module that calls Frisky's API, so a library change
-lands in one place. It needs the optional `frisky` extra (a closed-source
-binary). Design, the four ways Frisky differs from Dask and the do's and
+lands in one place. Frisky is a core dependency on this branch (a
+closed-source binary under a free licence). Design, the four ways Frisky differs from Dask and the do's and
 don'ts: [`context_docs/ingest/frisky-experiment.md`](../../../context_docs/ingest/frisky-experiment.md).
 
 ## Scheduler health logging (Dask)

@@ -19,7 +19,7 @@ Marked `@pytest.mark.integration`. Skipped by default; opt in via
 * **Library-contract tests for Frisky** (`test_frisky.py`). Frisky is
   pre-1.0 and closed-source, so these pin the library's own behaviour
   that the ingest relies on, and each one checks that its work really
-  ran on Frisky. They skip without the `frisky` extra. Run them, with
+  ran on Frisky. Run them, with
   `test_read_failure_cause_over_dask.py`, after any Frisky upgrade.
 
 ## What does NOT go here

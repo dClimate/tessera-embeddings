@@ -71,7 +71,6 @@ runs the S2 domain ingest on Dask and on Frisky (`use_frisky`, see
 `context_docs/ingest/frisky-experiment.md`) over the pipeline test's toy dates, which
 must match byte for byte, and over the Denver cassette's real imagery. Each Frisky run
 also asserts that Frisky scheduled the work, so a silent fall-back to Dask cannot pass.
-It skips without the `frisky` extra.
 
 ## Adding a parity test
 

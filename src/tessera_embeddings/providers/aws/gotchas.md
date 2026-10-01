@@ -425,10 +425,11 @@ An ingest flow run with `use_frisky=True` builds the usual Fargate
 cluster and loads Frisky onto it (`ecs_cluster(frisky=True)`). What that
 needs from the deployment:
 
-* **Both images carry the `frisky` extra:** the flow runner's, which
-  calls `frisky.hijack`, and `DASK_ECR_IMAGE_URI`, because the scheduler
-  and every worker import Frisky when the hijack's plugins reach them. A
-  missing extra fails the run at cluster start, not mid-ingest.
+* **Both images are built from this branch,** where Frisky is a core
+  dependency: the flow runner's, which calls `frisky.hijack`, and
+  `DASK_ECR_IMAGE_URI`, because the scheduler and every worker import
+  Frisky when the hijack's plugins reach them. An image without it fails
+  the run at cluster start, not mid-ingest.
 * **The security group admits the Frisky scheduler's port.** It binds a
   random port beside Dask's 8786, and workers dial it on the scheduler's
   private IP. A rule that admits only 8786 and 8787 within the group

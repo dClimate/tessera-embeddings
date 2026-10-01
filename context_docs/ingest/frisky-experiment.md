@@ -10,10 +10,12 @@ experiment here. The ingest's scheduler is a known bound: graph size and schedul
 of the levers in `docs/ingest-performance.md`. And the profiling we have is hand-built: a scheduler
 heartbeat plugin and a capped Dask performance report.
 
-**Licence.** Frisky is not open source. It ships as a free binary under its author's own licence,
-which permits commercial use and redistribution but not modification. That is why it is the
-optional `frisky` extra and is kept out of `all`. It is also why it never becomes a base
-dependency of this public repository.
+**Packaging.** On this branch Frisky is a core dependency, because the branch exists to test it as
+the engine. Whether it stays core when the work reaches `main` depends on the experiment's results
+and on two constraints. Frisky is not open source: it ships as a free binary under its author's
+own licence, which permits commercial use and redistribution but not modification, and this
+repository is public and Apache-2.0. And Frisky installs only on Python below 3.15, so a core
+dependency caps where the package installs.
 
 ## How it is wired
 
@@ -130,9 +132,9 @@ succeeds at 2 MiB, so nothing changes it. If a future crash really is a stack ov
 - **Turn it on per run.** Pass `use_frisky=True` to `ingest_s2_roi_reflectance` or
   `ingest_s1_roi_sar`, or set `frisky: true` in the plain runner's config. The campaign and fill
   flows deliberately do not pass it through.
-- **Install the `frisky` extra in both images:** the flow runner's, which calls
-  `frisky.hijack`, and the one the Fargate scheduler and workers run (`DASK_ECR_IMAGE_URI`),
-  where the hijack's plugins import Frisky.
+- **Build both images from this branch:** the flow runner's, which calls `frisky.hijack`, and
+  the one the Fargate scheduler and workers run (`DASK_ECR_IMAGE_URI`), where the hijack's
+  plugins import Frisky. As a core dependency, Frisky arrives with a normal install.
 - **Size the fleet with `max_workers`.** The fleet is fixed at that size.
 - **Capture telemetry with `perf_report_uri`.** On a Frisky run it receives Frisky's spans as
   JSON, readable after the cluster is gone with `frisky observe overview spans.json`.
@@ -174,7 +176,7 @@ Done locally (macOS, Python 3.13), and green again in CI on Linux (Python 3.12 a
 
 | Suite | Covers | Result |
 |---|---|---|
-| `tests/integration/test_frisky.py` | Every compute path the ingest uses; Dask plugins and `run` reaching Frisky's processes; a driver running as a Dask task (the Prefect shape), including a second thread; overlapped icechunk writes identical to Dask's and committing nothing when a window fails; thread state and the CRS reproduction; spans readable by `frisky observe`; span capture never failing a run | 8 passed, about 8 s |
+| `tests/integration/test_frisky.py` | Every compute path the ingest uses; Dask plugins and `run` reaching Frisky's processes; a driver running as a Dask task (the Prefect shape), including a second thread; overlapped icechunk writes identical to Dask's and committing nothing when a window fails; thread state and the CRS reproduction; spans readable by `frisky observe`; span capture never failing a run | 7 passed, about 5 s |
 | `tests/integration/test_read_failure_cause_over_dask.py` | Frisky's before-and-after for the cause chain; the read-failure classification on both engines | 16 passed |
 | `tests/parity/test_ingest_s2_roi_frisky_parity.py` | The S2 domain ingest on Dask versus Frisky: offline synthetic dates byte for byte (with `pipeline_dates` and a mid-run gate failure), and Denver July 2024 real imagery within 1e-6 | 2 passed, about 2 min |
 
@@ -242,6 +244,5 @@ Next, on the dev account:
 - Report the thread-state bug and the dropped exception cause upstream, at
   [mrocklin/frisky-issues](https://github.com/mrocklin/frisky-issues). Either fix upstream lets
   the matching step of `_MatchDaskWorker` go.
-- `uv sync --all-extras`, which CI and the contributor instructions use, now installs Frisky. That
-  is what runs these tests in CI, at the price of a closed-source binary in every contributor's
-  environment (`--no-extra frisky` opts out).
+- Decide whether Frisky stays a core dependency when this reaches `main`, on the experiment's
+  results and the constraints under Packaging above.
