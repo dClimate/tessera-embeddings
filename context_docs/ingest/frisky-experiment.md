@@ -239,17 +239,20 @@ The runs, their figures and how to rerun them are in
   not the bound at that scale, so Frisky's scheduling advantage has nothing to recover yet. At
   4096 a second cost shows: each batch ends on a long tail, because one worker is handed up to 1.8
   times the mean work and keeps it while the others go idle.
-- **Frisky's scheduler does more work per heartbeat the longer a run goes.** Its own summary line
-  in the scheduler's log (`sched: busy=… heartbeat=…`) shows the time spent on worker heartbeats
-  rising steadily with the work submitted: on Iowa from about 20 ms a window at the start to
-  850 ms an hour in, and the loop's busy share from 2% to 17–18%, where it levelled off. Both Iowa
-  runs follow the same curve, with span buffers of 1,000,000 and of 200,000; and locally 4,000
-  small graphs take it from 1 to 10 ms whatever `FRISKY_EVENT_LOG_CAPACITY` or
-  `FRISKY_TRACING_CAPACITY` is, so it is neither the spans nor the event log. On the first
-  year-long Iowa run the slowdown began as the busy share levelled, about an hour in: gates rose
-  from 10 to 93 s and writes from 52 to 228 s, with gaps of 11 to 61 s between small tasks while
-  the workers idled, and an overview query took 87 s. It is inside Frisky, so it goes upstream; a
-  zone-year runs for hours, so it decides whether Frisky can take one.
+- **Frisky's scheduler does more work the longer a run goes, until it saturates.** On Iowa at 60
+  workers, the scheduler process's CPU climbs in a straight line, about 3 points a minute, and
+  Frisky's own summary line in the scheduler's log (`sched: busy=… heartbeat=…`) shows the time it
+  spends on worker heartbeats rising with it, from about 15 ms a window to 800 ms. About an hour in
+  the CPU levels at 165%, the loop's busy share at 17–19%, and the ingest slows: on the first
+  year-long run gates rose from 10 to 93 s and writes from 52 to 228 s, with gaps of 11 to 61 s
+  between small tasks while the workers idled, and an overview query took 87 s; on version C gates
+  rose from 10–40 s to 88 s within minutes of the CPU levelling. Neither Dask's event loop (no lag)
+  nor Frisky's sender thread (1%) is the limit. Both runs follow the same curve with span buffers
+  of 1,000,000 and of 200,000, and locally 4,000 small graphs take the heartbeat time from 1 to
+  10 ms whatever `FRISKY_EVENT_LOG_CAPACITY` or `FRISKY_TRACING_CAPACITY` is, so it is neither the
+  spans nor the event log: it grows with the work the cluster has run. It is inside Frisky, so it
+  goes upstream. A zone-year runs for hours, so until it is fixed Frisky suits runs of under an
+  hour at this width.
 - **The end-of-run capture keeps only a run's tail.** At Iowa scale Frisky emits about 15,000 spans
   a second, so the 500,000 captured at the end cover about half a minute. Each process keeps its
   own span buffer (1,000,000 by default), which a worker fills in about an hour, so the run's spans

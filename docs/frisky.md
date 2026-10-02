@@ -52,9 +52,9 @@ frisky observe --help                             # the rest: prefixes, blocked,
 ```
 
 On a long run, also watch Frisky's own summary in the scheduler's log stream, a `sched: busy=…`
-line every few seconds. Its `heartbeat=` time grows with all the work the cluster has run, and
-past about an hour of Iowa (17–18% busy) the ingest slowed sharply; the record has the
-measurements.
+line every few seconds. Its `heartbeat=` time grows with all the work the cluster has run: past
+about an hour of Iowa at 60 workers the scheduler saturates and the ingest slows sharply, so keep
+Frisky to shorter runs for now. The record has the measurements.
 
 After the run, read the spans `perf_report_uri` captured:
 
