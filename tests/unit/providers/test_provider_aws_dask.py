@@ -299,6 +299,15 @@ class TestSchedulerResourceLogger:
     sleeping for a PeriodicCallback tick.
     """
 
+    @pytest.fixture(autouse=True)
+    def _propagate(self, monkeypatch) -> None:
+        """Let ``caplog`` see ``distributed``'s records.
+
+        Dask's own logging setup stops them propagating when ``distributed`` is imported before
+        pytest's handler is in place, as by a conftest's import.
+        """
+        monkeypatch.setattr(logging.getLogger("distributed"), "propagate", True)
+
     def _emit(self, plugin: SchedulerResourceLogger, sched: _FakeScheduler, caplog) -> str:
         """Run one probe with the plugin bound to ``sched`` and return the line."""
         plugin._scheduler = sched

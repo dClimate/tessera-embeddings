@@ -34,7 +34,9 @@ Four behaviours differ from Dask and are handled here or by the providers:
 - **Graph pickling before the first task.** Dask's scheduler pickles each task as it dispatches
   it, while the fleet works. Frisky's client pickles the whole graph before it submits, while the
   fleet waits, so a task that pickles slowly costs idle fleet time. :func:`connect` makes the
-  store write's slowest ones cheap (:func:`_picklable_merge_reduction`).
+  store write's slowest ones cheap (:func:`_picklable_merge_reduction`), and the S2 store write
+  submits each date as a few graphs so the fleet starts while the rest convert
+  (``storage.zarr_store.WRITE_SUBMISSION_GROUPS``).
 """
 
 from __future__ import annotations

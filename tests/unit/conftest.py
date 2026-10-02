@@ -26,6 +26,7 @@ import icechunk  # noqa: E402
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 import xarray as xr  # noqa: E402
+from dask.distributed import Client  # noqa: E402
 from moto.server import ThreadedMotoServer  # noqa: E402
 
 # Belt and braces: if anything imported icechunk before this file was loaded, it has already
@@ -69,6 +70,13 @@ def test_bucket(s3_client):
     bucket_name = "test-tessera-embeddings"
     s3_client.create_bucket(Bucket=bucket_name)
     return bucket_name
+
+
+@pytest.fixture(scope="module")
+def dask_client():
+    """An in-process Dask client for code that takes one, kept out of every bare ``.compute()``."""
+    with Client(processes=False, n_workers=1, threads_per_worker=2, dashboard_address=":0", set_as_default=False) as c:
+        yield c
 
 
 # -----------------------------------------------------------------------------

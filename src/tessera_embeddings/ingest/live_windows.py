@@ -68,7 +68,7 @@ DEFAULT_TASKS_PER_CHUNK = 200
 #: Provisional at 2048-px chunks: the 200 measured at 4096, converted by area. Re-measure.
 WINDOW_COST_IN_CHUNKS = 800
 
-#: The same exchange rate once a date's windows share ONE dask graph (``overlap_window_writes``),
+#: The same exchange rate once a date's windows are computed together (``overlap_window_writes``),
 #: which makes a window boundary cheap rather than a serial stall: a window then costs a
 #: client-side subgraph, one leaf in the merge reduction and one changeset — order 15 chunks
 #: against the 200 a serial write costs.
@@ -494,7 +494,7 @@ def live_windows_for_mask(
 
     ``window_cost_in_chunks`` is what one window is assumed to cost, in chunk area, and the
     caller owns it because it depends on how that caller WRITES: pass
-    :data:`WINDOW_COST_IN_CHUNKS_OVERLAPPED` when a date's windows share one dask graph, and
+    :data:`WINDOW_COST_IN_CHUNKS_OVERLAPPED` when a date's windows are computed together, and
     leave the default when each window is its own blocking write. Backwards is a regression, not
     a mis-tuning — a sequential writer on the overlapped rate pays extra serial boundaries for
     area it does not care about.

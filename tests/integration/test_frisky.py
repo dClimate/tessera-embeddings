@@ -209,12 +209,22 @@ class _Roi:
     height = width = 8
 
 
-def _poison(block: np.ndarray) -> np.ndarray:
-    raise RuntimeError("poisoned window")
+def _poison(block: np.ndarray, block_info: dict) -> np.ndarray:
+    """Fail the bottom row of chunks only: the second window, which grouped is its own graph."""
+    if block_info[0]["chunk-location"][1] == 1:
+        raise RuntimeError("poisoned window")
+    return block
 
 
-def _write(store: str, date: str, value: int, blocks: Callable[[np.ndarray], np.ndarray] | None = None) -> None:
-    """One date through the ingest's overlapped window write: icechunk's fork and merge reduction.
+def _write(
+    store: str,
+    date: str,
+    value: int,
+    blocks: Callable[..., np.ndarray] | None = None,
+    client: Client | None = None,
+) -> None:
+    """One date through the ingest's overlapped window write: icechunk's fork and merge reduction,
+    as one graph, or as one graph per window when given the ingest's client.
 
     Two variables, as every real mosaic has: the overlapped write fails on a one-variable dataset
     under any scheduler.
@@ -238,14 +248,18 @@ def _write(store: str, date: str, value: int, blocks: Callable[[np.ndarray], np.
         crs="EPSG:32601",
         chunks={"time": 1, "northing": 4, "easting": 4},
         parallel_windows=True,
+        client=client,
     )
 
 
-def test_overlapped_window_writes_match_dask_and_commit_nothing_on_failure(hijacked, tmp_path) -> None:
+@pytest.mark.parametrize("grouped", [False, True], ids=["one-graph", "grouped"])
+def test_overlapped_window_writes_match_dask_and_commit_nothing_on_failure(hijacked, tmp_path, grouped) -> None:
     """The store write is where an engine could differ silently: forked icechunk sessions are
-    pickled to workers and merged back. A failing window must still commit nothing.
+    pickled to workers and merged back. A failing window must still commit nothing, grouped too,
+    where the other window's graph succeeds.
     """
-    dask_client, _ = hijacked
+    dask_client, client = hijacked
+    submit_to = client if grouped else None
     dates = (("2024-06-01", 7), ("2024-06-11", 9))
     reference, store = str(tmp_path / "reference"), str(tmp_path / "frisky")
     with _ran_on(dask_client, frisky=False), dask.config.set(scheduler="sync"):
@@ -253,9 +267,9 @@ def test_overlapped_window_writes_match_dask_and_commit_nothing_on_failure(hijac
             _write(reference, date, value)
     with _ran_on(dask_client, frisky=True):
         for date, value in dates:
-            _write(store, date, value)
+            _write(store, date, value, client=submit_to)
         with pytest.raises(RuntimeError, match="poisoned window"):
-            _write(store, "2024-06-21", 3, _poison)
+            _write(store, "2024-06-21", 3, _poison, client=submit_to)
 
     np.testing.assert_array_equal(
         np.asarray(open_store_as_zarr_group(store)["band"]), np.asarray(open_store_as_zarr_group(reference)["band"])

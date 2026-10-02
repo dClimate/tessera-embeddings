@@ -24,7 +24,7 @@ supply a connected :class:`dask.distributed.Client` and a logger.
 
 Step 4 is split into a prepare half and a write half so ``pipeline_dates`` can overlap one
 date's preparation with the previous date's write, and so ``batch_dates`` can compute several
-dates' writes as one graph (one commit per BATCH — see ``storage.zarr_store.write_days_windows``
+dates' writes together (one commit per BATCH — see ``storage.zarr_store.write_days_windows``
 for why that unit is forced). Writes stay in date order under every mode.
 """
 
@@ -319,17 +319,19 @@ def ingest_s2_roi_reflectance(
             whole year's items do not fit in the worker this runs on. ``False`` restores the
             single up-front query and is a rollback path only — a year-long window cannot
             complete under it.
-        overlap_window_writes: Submit every window of a date as one dask compute instead of one
-            blocking compute per window, so the windows' critical paths overlap across the fleet
-            rather than summing. Identical stores either way; falls back to the sequential write
-            when the overlapped machinery is unavailable.
+        overlap_window_writes: Compute every window of a date together instead of one blocking
+            compute per window, so the windows' critical paths overlap across the fleet rather
+            than summing. The windows go to ``client`` as a few graphs submitted one after
+            another, so the fleet starts on the first while the driver converts the rest
+            (``zarr_store.WRITE_SUBMISSION_GROUPS``). Identical stores either way; falls back to
+            the sequential write when the overlapped machinery is unavailable.
         pipeline_dates: Prepare the next date — load graph, coverage gate, footprint narrowing,
             masking — on a background thread while the current date is written, so preparation
             costs wall clock only when the write cannot cover it. The WRITE stays serial and in
             date order: one commit per date, one writer either way. Identical stores either way,
             which rests on preparation being side-effect-free.
-        batch_dates: Write up to this many consecutive PASSING dates as one dask compute and one
-            commit, so the dates' graphs pack the fleet together — one date's straggling reads
+        batch_dates: Write up to this many consecutive PASSING dates together in one commit,
+            so the dates' graphs pack the fleet together — one date's straggling reads
             backfill with another's work — and the per-date drain tail and commit gap are paid
             once per batch. The commit unit becomes the batch: a mid-batch failure commits none
             of its dates and the retry re-ingests exactly those (per-date sessions are impossible
@@ -386,7 +388,7 @@ def ingest_s2_roi_reflectance(
     # its own imagery reaches (``windows_for_date`` below), because a satellite covers only a
     # fraction of a wide ROI per pass.
     #
-    # The merge exchange rate follows how this run WRITES: overlapped windows share one graph, so
+    # The merge exchange rate follows how this run WRITES: overlapped windows compute together, so
     # a boundary is cheap and the DP should stop trading ocean area for fewer windows; sequential
     # writes still pay the serial cost. Bound once because per-date narrowing re-merges on the
     # same terms, and a second differing rate there would undo this for every narrowed date.
@@ -733,6 +735,7 @@ def ingest_s2_roi_reflectance(
                         chunks=INGEST_CHUNKS,
                         parallel_windows=overlap_window_writes,
                         s3_region=s3_region,
+                        client=client,
                     )
         # One line per kept date, partitioning its wall clock into the client-side graph build,
         # the coverage-gate compute and the write (windows + commit). Stable format: CloudWatch
@@ -763,7 +766,7 @@ def ingest_s2_roi_reflectance(
         )
 
     def _write_batch(batch: list[_PreparedDate], stall_s: float = 0.0) -> None:
-        """Write a batch of prepared dates: one dask compute, ONE commit.
+        """Write a batch of prepared dates, computed together: ONE commit.
 
         The same retry contract as ``_write_date``, at batch granularity: the
         batched write commits nothing on failure, so a retry re-runs the whole
@@ -803,8 +806,9 @@ def ingest_s2_roi_reflectance(
                         chunks=INGEST_CHUNKS,
                         parallel_windows=overlap_window_writes,
                         s3_region=s3_region,
+                        client=client,
                     )
-        # The batch's write is ONE compute, so a per-date write time does not exist as a
+        # The batch's dates are written together, so a per-date write time does not exist as a
         # measurement: this line is the batched counterpart of `Stage timings` and analysis
         # divides by n. build/gate are sums of the real per-date values.
         write_s = time.monotonic() - write_started

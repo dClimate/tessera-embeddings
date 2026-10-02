@@ -3,8 +3,8 @@
 Pins what makes the batch form safe to trust:
 
 * byte-identity — a batch of k dates produces exactly the store k single-date calls
-  produce, arrays and merged attrs alike, under both the sequential and the
-  overlapped compute;
+  produce, arrays and merged attrs alike, under the sequential compute and the
+  overlapped one, in one graph or submitted in groups;
 * atomicity at batch granularity — one snapshot per batch, and a failure mid-batch
   commits none of its dates (the no-date-before-its-pixels invariant, batch-sized);
 * the guards — dates out of order or duplicated refuse before anything is written,
@@ -56,7 +56,7 @@ def _day_ds(date: str, band_val: int) -> xr.Dataset:
     )
 
 
-def _batch(store: str, dates: list[tuple[str, int]], *, parallel: bool = False) -> None:
+def _batch(store: str, dates: list[tuple[str, int]], *, parallel: bool = False, client=None) -> None:
     write_days_windows(
         store,
         [(_day_ds(d, v), list(WINDOWS)) for d, v in dates],
@@ -67,6 +67,7 @@ def _batch(store: str, dates: list[tuple[str, int]], *, parallel: bool = False) 
         crs="EPSG:32601",
         chunks=CHUNKS,
         parallel_windows=parallel,
+        client=client,
     )
 
 
@@ -91,14 +92,21 @@ def _snapshots(store: str) -> int:
 DATES = [("2024-06-01", 7), ("2024-06-02", 9), ("2024-06-03", 11)]
 
 
-@pytest.mark.parametrize("parallel", [False, True], ids=["sequential", "overlapped"])
-def test_batch_matches_singles_byte_for_byte(tmp_path, parallel):
-    """The batch's arrays AND merged attrs equal k single-date writes'."""
+@pytest.mark.parametrize(("mode", "graphs"), [("sequential", None), ("overlapped", 1), ("grouped", 4)])
+def test_batch_matches_singles_byte_for_byte(tmp_path, mode, graphs, request, caplog):
+    """The batch's arrays AND merged attrs equal k single-date writes'.
+
+    Grouped, the six windows of three dates go out as four graphs, so groups straddle dates.
+    """
     ref = str(tmp_path / "ref.zarr")
     got = str(tmp_path / "got.zarr")
     for d, v in DATES:
         _single(ref, d, v)
-    _batch(got, DATES, parallel=parallel)
+    client = request.getfixturevalue("dask_client") if mode == "grouped" else None
+    with caplog.at_level("DEBUG", logger="tessera_embeddings.storage.zarr_store"):
+        _batch(got, DATES, parallel=graphs is not None, client=client)
+    if graphs:  # proof the overlapped write ran, since its sequential fallback writes the same store
+        assert f"in {graphs} graph(s)" in caplog.text
 
     a, b = open_store(ref), open_store(got)
     assert list(a.time.values) == list(b.time.values)

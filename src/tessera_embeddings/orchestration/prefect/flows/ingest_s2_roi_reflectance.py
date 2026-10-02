@@ -173,10 +173,10 @@ def ingest_s2_roi_reflectance(
         stream_stac_monthly: Query STAC one calendar month at a time, prefetching the next
             while the current is processed. Bounds retained items so a year-long window
             fits the worker; ``False`` is the rollback path only.
-        overlap_window_writes: Submit a date's windows as ONE dask compute rather than a
-            blocking compute per window, so their critical paths overlap across the fleet
-            instead of summing. Identical stores either way; falls back to the sequential
-            write when the overlapped machinery is unavailable.
+        overlap_window_writes: Compute a date's windows together, submitted as a few graphs
+            one after another, rather than a blocking compute per window, so their critical
+            paths overlap across the fleet instead of summing. Identical stores either way;
+            falls back to the sequential write when the overlapped machinery is unavailable.
         pipeline_dates: Prepare the next date (load graph, coverage gate, footprint
             narrowing, masking) on a background thread while the current date is written,
             so preparation costs wall clock only where the write cannot cover it. The write

@@ -9,6 +9,7 @@ snapshot per date, and windows landing while everything outside stays fill.
 from __future__ import annotations
 
 import dask.array as da
+import icechunk.dask
 import numpy as np
 import pytest
 import xarray as xr
@@ -16,6 +17,7 @@ from affine import Affine
 from odc.geo.geobox import GeoBox
 
 from tessera_embeddings.errors import ConfigMismatchError
+from tessera_embeddings.storage import zarr_store
 from tessera_embeddings.storage.empty_store import create_empty_store
 from tessera_embeddings.storage.manifest import MIXED_CODE_IDENTITIES_ATTR, IngestManifest, extract_manifest
 from tessera_embeddings.storage.zarr_store import (
@@ -181,16 +183,17 @@ def test_crash_between_seed_and_first_windows_is_retryable(tmp_path):
 
 # --- the overlapped window write -------------------------------------------------
 #
-# One dask compute for all of a date's windows instead of one blocking compute per
-# window. Equivalence with the sequential path is the shipping gate: the parallel
-# path lifts icechunk's own fork/merge machinery, and these tests pin that the lift
-# changes nothing about what lands in the store or when a commit happens.
+# All of a date's windows computed together instead of one blocking compute per window: one
+# graph without a client, a few graphs submitted back to back with one. Equivalence with the
+# sequential path is the shipping gate: the parallel path lifts icechunk's own fork/merge
+# machinery, and these tests pin that the lift changes nothing about what lands in the store or
+# when a commit happens.
 
 
-def _write_mode(store: str, date: str, band_val: int, windows, parallel: bool) -> None:
+def _write_mode(store: str, date: str, band_val: int, windows, parallel: bool, client=None, day=None) -> None:
     write_day_windows(
         store,
-        _day_ds(date, band_val),
+        _day_ds(date, band_val) if day is None else day,
         list(windows),
         roi=_Roi(),
         manifest=MANIFEST,
@@ -199,6 +202,7 @@ def _write_mode(store: str, date: str, band_val: int, windows, parallel: bool) -
         crs="EPSG:32601",
         chunks=CHUNKS,
         parallel_windows=parallel,
+        client=client,
     )
 
 
@@ -206,13 +210,34 @@ def _snapshots(store: str) -> int:
     return len(list(open_repo(store).ancestry(branch="main")))
 
 
-def test_parallel_windows_matches_sequential(tmp_path):
-    """Byte-identical stores, identical merged attrs, one snapshot per date each."""
+@pytest.fixture(params=["one-graph", "grouped"])
+def client(request, monkeypatch):
+    """No client, so one blocking graph; or a client, with up to three windows split over two groups."""
+    if request.param == "one-graph":
+        return None
+    monkeypatch.setattr(zarr_store, "WRITE_SUBMISSION_GROUPS", 2)
+    return request.getfixturevalue("dask_client")
+
+
+def test_parallel_windows_matches_sequential(tmp_path, client, monkeypatch, caplog):
+    """Byte-identical stores, identical merged attrs, one snapshot per date each.
+
+    Grouped, the three windows split one and two, so a group holds several windows. The merge
+    must look ``computing_meta`` up as it builds: under Frisky, ``connect()`` swaps it for a
+    picklable equivalent, and missing the swap pickles every merge task by value.
+    """
+    looked_up: list = []
+    real = icechunk.dask.computing_meta
+    monkeypatch.setattr(icechunk.dask, "computing_meta", lambda f: looked_up.append(f) or real(f))
     seq, par = str(tmp_path / "seq"), str(tmp_path / "par")
-    windows = [(0, 4, 0, 8), (4, 8, 0, 4)]  # two disjoint windows, one partial row
-    for store, flag in ((seq, False), (par, True)):
-        _write_mode(store, "2024-01-01", 7, windows, flag)
-        _write_mode(store, "2024-01-02", 9, windows, flag)
+    windows = [(0, 4, 0, 8), (4, 8, 0, 4), (4, 8, 4, 8)]  # three disjoint windows, two in a partial row
+    with caplog.at_level("DEBUG", logger=zarr_store.__name__):
+        for store, flag in ((seq, False), (par, True)):
+            looked_up.clear()  # keep only the overlapped write's lookups
+            _write_mode(store, "2024-01-01", 7, windows, flag, client)
+            _write_mode(store, "2024-01-02", 9, windows, flag, client)
+    # A fallback to the sequential write would pass every check below, so first prove it did not.
+    assert f"in {1 if client is None else 2} graph(s)" in caplog.text
 
     gs = open_store_as_zarr_group(seq)
     gp = open_store_as_zarr_group(par)
@@ -221,38 +246,33 @@ def test_parallel_windows_matches_sequential(tmp_path):
     for key in ("baselines_applied", "doy"):
         assert gs.attrs[key] == gp.attrs[key]
     assert _snapshots(seq) == _snapshots(par)
+    assert looked_up, "the merge bound computing_meta before Frisky could swap it"
 
 
-def test_parallel_failure_commits_nothing_and_retry_succeeds(tmp_path):
-    """A poisoned window fails the single compute; the date never lands; a clean
-    retry writes it — the abandoned-session contract, unchanged by overlap.
+def _poison_bottom_row(block: np.ndarray, block_info: dict) -> np.ndarray:
+    """Fail only the bottom row of chunks, which is the second window, and grouped its own group."""
+    if block_info[0]["chunk-location"][1] == 1:
+        raise RuntimeError("poisoned window")
+    return block
+
+
+def test_parallel_failure_commits_nothing_and_retry_succeeds(tmp_path, client):
+    """A poisoned window fails the write while the other window succeeds, in another group when
+    grouped; the date never lands; a clean retry writes it — the abandoned-session contract,
+    unchanged by overlap.
     """
     store = str(tmp_path / "s")
-    _write_mode(store, "2024-01-01", 7, [(0, 4, 0, 8)], True)
+    _write_mode(store, "2024-01-01", 7, [(0, 4, 0, 8)], True, client)
     before = _snapshots(store)
 
-    def _poison(block):
-        raise RuntimeError("poisoned window")
-
     bad = _day_ds("2024-01-02", 3)
-    bad["band"] = (("time", "northing", "easting"), bad["band"].data.map_blocks(_poison, dtype=np.uint16))
+    bad["band"] = (("time", "northing", "easting"), bad["band"].data.map_blocks(_poison_bottom_row, dtype=np.uint16))
     with pytest.raises(RuntimeError, match="poisoned window"):
-        write_day_windows(
-            store,
-            bad,
-            [(0, 4, 0, 8), (4, 8, 0, 4)],
-            roi=_Roi(),
-            manifest=MANIFEST,
-            baselines={"2024-01-02": 5},
-            tile_id="roi.zarr",
-            crs="EPSG:32601",
-            chunks=CHUNKS,
-            parallel_windows=True,
-        )
+        _write_mode(store, "2024-01-02", 3, [(0, 4, 0, 8), (4, 8, 0, 4)], True, client, day=bad)
     assert _snapshots(store) == before, "a failed parallel write must commit nothing"
     assert get_existing_dates(store) == {"2024-01-01"}
 
-    _write_mode(store, "2024-01-02", 9, [(0, 4, 0, 8)], True)  # clean retry
+    _write_mode(store, "2024-01-02", 9, [(0, 4, 0, 8)], True, client)  # clean retry
     assert get_existing_dates(store) == {"2024-01-01", "2024-01-02"}
     g = open_store_as_zarr_group(store)
     assert (g["band"][1, :4, :] == 9).all()
