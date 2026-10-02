@@ -8,7 +8,7 @@ Four measurement campaigns are folded together here. The July 2026 optimization 
 (§1–§10); the fleet-scale throughput investigation that corrected its duration basis is §11; the
 graph and catalogue budgets that limit it now are §12; the live-tile cropping derivation that §3.1
 and §3.2 summarise is §13; and the region-write primitive the whole windowed design rests on is §14.
-§15 is a proposal rather than a measurement: running the workers on Graviton (ARM64).
+§15 measures Dask workers on Graviton (ARM64) against x86, and records the switch built for them.
 
 > **The duration basis was re-measured, and the correction matters more than it looks.** A 2026-08
 > reading found every zone running 1.8–2.1× slower than the figures here. **That claim is
@@ -2451,135 +2451,147 @@ path is current.
 
 ---
 
-## 15. Graviton (ARM64) workers — proposed, not implemented (2026-10-01)
+## 15. Graviton (ARM64) Dask workers — measured on yield dev (2026-10-02)
 
-**The proposal: run the Dask workers on ARM64 Fargate from the next campaign or annual update, and
-keep the schedulers and flow runners on x86.** The change is in yield-embeddings. Nothing in this
-repo changes.
+**On Fargate, ARM workers write 1.6–2× faster than x86 on every leg at production width; runs finish
+18–41% sooner, and each rung costs 45–53% less.** Fargate's ARM tasks run on Graviton3; its x86
+tasks run on 2017–2019 Xeons. The mosaics are not bit-identical: a small share of pixels round one
+count differently, which is physically meaningless (§15.4). That reaches the embeddings as a mean
+cosine similarity of 0.999983, slightly beyond ADR 012's gates on the worst pixels, so switching is
+a maintainers' decision (§15.6). The switch is built in yield-embeddings, off by default (§15.5).
 
-### 15.1 What it saves, and what moves it
+### 15.1 How it was measured
 
-**The saving is the price, not speed.** ARM Fargate costs $0.03238 per vCPU-hour against $0.04048
-(−20.0%) and $0.00356 per GB-hour against $0.004445 (−19.9%), per the AWS Pricing API for
-us-west-2. A 4 vCPU / 24 GB worker drops from $0.2686 to $0.2150 an hour.
+Two yield dev branches, `dev/graviton-workers` (x86) and `dev/graviton-workers-arm` (ARM), identical
+except that the second sets `BRANCH_DASK_WORKERS_ON_ARM64`. Both ran tessera `bbb9d836`, with x86
+schedulers and runners. Each rung's arms were dispatched within seconds of each other with the same
+parameters, into fresh stores. Cost is each task's billed lifetime at its own architecture's list
+rate, using the `ecs.cpu-architecture` ECS reports per task. Timings come from the ingest's own
+`Stage timings`, `Batch timings` and `S1 stage timings` lines, attributed to a run by log stream.
 
-**Workers are 94% of a cell's hourly cost** at 60 S2 workers, and 95% at 80, by the per-cell
-formula in [the cost model §4](../campaign/campaign-cost-model.md). The last campaign's container
-line was $187,441 ([§12 there](../campaign/campaign-cost-model.md)). That line also carries
-assembly (about $1,300) and the inference flow runners, which billing does not separate. At equal
-worker-hours, ARM workers would have saved **about $32,000–35,000, or $3,600–3,900 per global
-year**. The yield account's own Fargate use is dev-scale, so the saving there is negligible.
-
-**Speed moves the saving only where it changes how long a worker runs.** Workers are billed for
-their lifetime, not their CPU use. With `r` = ARM worker-hours ÷ x86 worker-hours for the same work:
-
-| r | 0.85 | 1.00 | 1.10 | 1.25 |
+| Rung | Leg (workers) | Wall clock, x86 → ARM | Cost, x86 → ARM | Write per date, x86 → ARM |
 |---|---|---|---|---|
-| saving on worker cost | 32% | 20% | 12% | 0, break-even |
+| tiny ROI, July 2024 | S2 (4) / S1 asc (4) | 4:10 → 4:10 / 4:10 → 3:39 | $0.04 → $0.03 / $0.03 → $0.03 | equal (17.6 s vs 17.7 s for 11 dates) |
+| Iowa, July 2024 | S2 (60), 18 dates | 9:44 → 7:44 | $1.68 → $0.91 | 14.9 → 8.0 s |
+| | S1 asc (13), 8 dates | 5:41 → 4:40 | $0.17 → $0.11 | 11.2 → 6.5 s |
+| Iowa, Nov 2024 – Oct 2025 | S2 (60), 221 dates | 1:20:21 → 47:25 | $18.65 → $8.71 | 16.8 → 8.5 s |
+| | S1 asc (13), 169 dates | 35:15 → 23:03 | $1.75 → $0.88 | 10.3 → 6.1 s |
+| 35N, 2024-01-01 – 01-07 | S2 (60), 6 dates | 20:23 → 14:48 | $4.20 → $2.35 | 134.2 → 78.2 s (cycle 152.7 → 97.5 s) |
+| | S1 asc (13), 7 dates | 11:16 → 8:16 | $0.47 → $0.24 | 55.9 → 30.1 s |
+| | S1 desc (13), 7 dates | 13:17 → 9:18 | $0.59 → $0.31 | 77.1 → 40.2 s |
 
-One cost bounds `r` more tightly than break-even does. Ingest feeds the GPU fleet, and a slower
-ingest can leave cards idle. The campaign's Fargate peak used 73% of its 25,000 vCPU quota (one
-quota covers both architectures), so a slowdown of about 10% can be absorbed by running wider. Much
-more than that cannot.
+Costs are scheduler plus workers. Per-date figures are medians, except Iowa S2, which batches dates
+and is total write time divided by dates.
 
-### 15.2 Faster or slower
+- **The gain is stable.** Over the Iowa year, the x86 ÷ ARM S2 write ratio is between 1.73 and 2.15
+  in every month, November to October.
+- **The x86 arm behaves as on record.** Its Iowa S1 year (35 minutes) matches the 33–35 minutes
+  recorded for this window, and its 35N cycle (152.7 s a date at 60 workers) sits just under the
+  167.9 s of the July 60-worker cell on older code (yield-embeddings
+  `context_docs/measurements/fleet_scaling_report.md`). At 60 workers, ARM's 97.5 s beats that
+  record's 120-worker cell (102.1 s).
+- **One stage is slower on ARM.** The single-threaded S2 graph build on 35N, about 1,000 scenes a
+  day, takes 9.4 s a date against 5.0 s. On Iowa it is faster on ARM (50 s against 84 s over the
+  year). It is under 5% of a 35N date.
+- **Concurrency did not flatter ARM.** The other experiment ran in the same account throughout,
+  and the last 13 batches of the x86 Iowa-year S2 overlapped the 35N rung. Their median ratio,
+  2.01, is 3% above the 1.94 before.
 
-- **AWS's headline includes the price cut.** It claims "up to 40% improved price/performance at
-  20% lower cost". How much extra speed that implies depends on how AWS defines price/performance,
-  which it does not say, and it is a best case on AWS's benchmarks, not a forecast for ours. A
-  Graviton vCPU is a whole core, where an x86 vCPU is one hyperthread, which helps multi-threaded
-  work like the workers' reads and warps. Per thread, x86 still leads. Fargate offers no choice of
-  generation: it launched on Graviton2.
-- **Dev-scale workers are not CPU-bound.** Container Insights over the 2026-10-01 Frisky dev runs
-  (a tiny ROI, 15SWC and Iowa, both engines) shows workers using 20–27% of reserved CPU, and about
-  60% in the busiest minute. That cuts both ways: a slower core costs little, and a faster one saves
-  little. The last campaign's figure is in the global-tessera account and was not read.
-- **The fleet-full regime is the open question.** On a dense zone one date oversubscribes the fleet
-  (§1), and there worker speed sets the pace. The serial graph build (§12.5) also lands on a worker,
-  but [`_pipeline.py`](../../src/tessera_embeddings/ingest/_pipeline.py) overlaps it with the
-  previous date's write.
-- **The scheduler stays on x86.** It is single-threaded and the known scaling wall (§6, §12.3).
-  Moving it would save about 0.5% of a cell.
+### 15.2 Why ARM is faster
 
-### 15.3 Will the mosaics change?
+Five probe tasks per architecture printed `lscpu`. Every ARM task ran on **Neoverse-V1
+(Graviton3)**. The x86 tasks ran on Xeon Platinum 8259CL (Cascade Lake, four tasks) and 8175M
+(Skylake, one), all with AVX-512. A Graviton vCPU is a whole core, and an x86 vCPU is one
+hyperthread of a 2017–2019 core. In the Iowa July rung, Container Insights put x86 workers at about
+60% CPU in their busy minutes, and ARM workers at about 30% while finishing sooner.
 
-**Measured: no, on a real scene.** rasterio 1.5.0's x86_64 and aarch64 wheels bundle the same GDAL
-3.12.1, PROJ 9.7.1 and GEOS 3.14.1. Both architectures' builds of the ingestion image did the
-following, and **zero pixels differed**:
+### 15.3 What it saves
 
-- warped windows of `S2B_15SWC_20240724_0_L2A` (B04 at 10 m, B11 at 20 m, about 9.4 M valid pixels
-  each) to EPSG:5070 at 10 m, bilinear and nearest, through `rasterio.warp.reproject` with its
-  default approximate transformer;
-- ran `amplitude_to_db`'s formula on 20 M seeded float32 amplitudes, with identical uint16 values
-  and identical raw `log10` bits.
+**Most of the saving is speed.** ARM's list price is 20% lower ($0.03238 against $0.04048 per
+vCPU-hour, $0.00356 against $0.004445 per GB-hour). Each measured rung cost 45–53% less, and each
+leg 35–53% less, because ARM workers also finish sooner. Workers are 94–95% of a cell's hourly cost,
+and schedulers and runners stay x86.
 
-**One gap: the x86 side ran without AVX-512.** It ran under Docker's emulation on Apple Silicon,
-which offers AVX2 only. numpy's x86 wheel ships Intel SVML AVX-512 `log10` kernels (the ARM wheel
-has none), and uses them only on AVX-512 CPUs. AWS does not say which x86 CPUs run Fargate. If they
-have AVX-512, production S1 values may differ from ARM by a rounding step.
+Applied to the last campaign's container line, $187,441
+([cost model §12](../campaign/campaign-cost-model.md)), most of which is ingest, ARM workers would
+have saved **about $75,000–95,000, or $8,000–11,000 per global year**. This assumes the campaign
+account's Fargate hosts match the ones measured here (same service, same region). That account was
+not examined. Year-long runs also finish 35–41% sooner (the Iowa year), so the same quota feeds the
+GPU fleet sooner.
 
-**The append check cannot see an architecture change.** `ingest_code_identity` hashes source, so an
-ARM run would append to a mosaic an x86 run began. If the dev test finds the stores identical, that
-is harmless, and switching between campaigns is only a precaution. If it does not, then before
-adopting, record the worker architecture on the mosaic and refuse a mismatched append. That has to
-be its own check: adding the architecture to `ingest_code_identity` would change the identity of
-every existing mosaic.
+### 15.4 The mosaics differ by one count, and it does not matter
 
-### 15.4 Feasibility
+| | Iowa, July and year (EPSG:5070 grid) | 35N (UTM zone grid) |
+|---|---|---|
+| S2 10 m bands | 0–4 pixels per band in about 1 billion sampled | identical |
+| S2 20 m bands | 0–5 pixels per band in about 1 billion sampled | 2.85% of valid pixels, all −1 on ARM |
+| SCL (cloud classes) | identical | identical |
+| S1 (VH / VV) | 0.029–0.036% / 0.012–0.015%, nearly all +1 on ARM | 0.036–0.041% / 0.018–0.020% |
+| Valid and nodata swapped | S1 only: 10 in 6.7 billion (July), 22 in 1.4 billion (year) | S1 only: 18 in about 730 million |
 
-| Item | Status |
-|---|---|
-| Dependencies | of 167 locked packages, 137 are pure Python and all 29 compiled ones ship manylinux aarch64 wheels (`pywin32` is Windows-only) |
-| Base images | `osgeo/gdal:ubuntu-small-3.12.1` and `prefect-aws:0.7.7-python3.12` publish `linux/arm64` |
-| Image build | builds for `linux/arm64` with only the two `--platform=linux/amd64` pins removed; every ingest module imports; all 1,387 of `main`'s ingest unit tests pass on Linux ARM64 |
-| Fargate | ARM64 supports every task size we use, and Fargate Spot since 2024-09 |
-| CI | `ubuntu-24.04-arm` runners in private repositories since 2026-01-29, or QEMU |
-| ECR | the 7-day untagged-image expiry is safe: ECR never expires an image a manifest list references |
-| Task definitions | branch clones copy `runtimePlatform`; with pinned definitions dask-cloudprovider registers nothing, so the CDK definition alone sets the architecture |
-| Frisky, if adopted | 0.7.2 ships a manylinux aarch64 wheel, and its 10 integration tests pass on Linux ARM64 |
+The 35N and Iowa-year figures come from seeded random samples of chunks. Iowa July's S2 figures come
+from a sample, and its S1 figures from every chunk.
+
+**Why it is not worth worrying about.** One count is 0.0001 reflectance for S2 and 0.005 dB for S1.
+At every differing S2 pixel, the exact interpolated value is precisely halfway between two integers.
+Both architectures are therefore off by the same half count that every stored integer already
+carries, in opposite directions, and neither is more correct. On campaign grids, the S2 bias averages
+−0.03 counts over a 20 m band, and nothing differs by more than one count anywhere.
+
+**Where it comes from.**
+
+- **S2: GDAL's bilinear warp.** It rounds some exact half-count ties differently on each
+  architecture, with ARM always one lower. This was reproduced locally without AVX-512. In a 20 m →
+  10 m warp onto an aligned grid in the scene's own UTM zone, 3.14% of pixels differed, and all of
+  20,000 sampled differing pixels were exact ties. Campaign zone grids align with Sentinel-2's 20 m
+  grid, so ties are common there. Iowa's grid does not align, so they are rare.
+- **S1: `log10`.** The Fargate x86 hosts, all with AVX-512, round differently from every other
+  machine tried. The S1 formula on 20 M seeded amplitudes hashes identically on Graviton3, on
+  Apple-silicon ARM and on x86 without AVX-512, but not on the Fargate x86 hosts. Disabling numpy's
+  AVX-512 kernels through `NPY_DISABLE_CPU_FEATURES` did not change the result.
+
+**What it does downstream.** It nudges the embeddings by a mean cosine similarity of 0.999983
+(§15.6).
+
+**The one practical consequence.** The ingest code identity hashes source only, so it cannot see
+which architecture built a mosaic. Do not let one mosaic hold dates from both. Mosaics are deleted
+after publication, so switching at a campaign boundary is enough.
 
 ### 15.5 The change
 
-All in yield-embeddings, and built (its PR #90). The ingestion image is built for amd64 and arm64,
-so every other family keeps pulling amd64 from the same tags. Two switches move the workers, both
-off by default:
+All in yield-embeddings (PR #90). The ingestion image is built for amd64 and arm64, so every other
+family keeps pulling amd64 from the same tags. Two switches move the workers, both off by default:
 
 - **`Deployment.dask_workers_on_arm64`** puts a deployment's `yield-dask-worker-{dev,prod}`
   definitions on ARM64. Off, it changes no synthesized template at all.
 - **`BRANCH_DASK_WORKERS_ON_ARM64`** in `register_branch_task_defs.py`, set in one branch's own
-  commit, moves only that branch's worker clone. The dev test below runs on it.
+  commit, moves only that branch's worker clone. The paired arms above ran on it.
 
-**Coarsen moves with ingest.** Every Dask fleet in a deployment pins the same worker definition,
-so a deployment that coarsens needs coarsen covered by the dev test before it switches.
+**Coarsen moves with ingest.** Every Dask fleet in a deployment pins the same worker definition.
+Coarsen was not part of these rungs, so a deployment that coarsens should run one coarsen pair
+before it switches.
 
-### 15.6 The dev test
+### 15.6 Before switching a deployment
 
-Run it on yield dev, while no other ingest experiment is running there, on two `dev/<slug>`
-branches that differ only in `BRANCH_DASK_WORKERS_ON_ARM64`. Run each rung's two arms at the same
-time, with a fresh store each.
+1. **Decide whether the embedding difference is acceptable.** It is tiny, but it exceeds ADR 012's
+   gates on the worst pixels. A one-chunk crop of 35N's grid (41 km of Moldovan farmland, November
+   2024 to October 2025) was ingested on each architecture, and both were embedded on the same GPU
+   type (L40S):
 
-| Rung | ROI and window | Width | What it measures |
-|---|---|---|---|
-| 1. production | `iowa_epsg5070`, July 2024 | S2 60, S1 13 | cost and time per date as the campaign runs |
-| 2. fleet-bound | the same | S2 15 | worker throughput: Iowa's ~1,180-task read width oversubscribes 60 slots about 20× |
+   - 92.2–92.9% of int8 values are identical, and 99.995% are within one level, with a maximum of
+     three.
+   - Mean cosine similarity is 0.999983, and the worst pixel is 0.99981.
+   - Per-pixel scale drifts by up to 1.8%.
 
-**Gate on paired per-date ratios, not on two means.** Both arms ingest the same dates, so take each
-date's ARM ÷ x86 ratio of cost and of write time, and gate on the ratio's 95% confidence interval.
-At 19% per-date variance (§12.6), the gap between two unpaired 14-date means is only known to
-about ±14%, which is wider than the margins below. Add dates until the interval is narrower than the
-margin being tested.
-
-**Adopt when:**
-
-- the stores are bit-identical (every chunk compared, NaN positions and time coordinates included),
-  or embeddings from both arms pass ADR 012's equivalence gates
-  ([`012`](../decisions/012-validated-equivalence-for-inference-outputs.md), `te-compare-outputs`)
-  on an end-to-end run. A one-count mosaic difference feeds the encoder, so unchanged nodata alone
-  proves nothing;
-- the upper bound of the cost ratio is at most 0.9 on both rungs;
-- the upper bound of the write-time ratio on rung 2 is at most 1.10.
-
-The ingest arms cost about $15–25. An end-to-end comparison adds GPU time.
+   Inference itself is bit-reproducible: rerunning it on the same x86 mosaics matched to the bit.
+   All of the difference is therefore the mosaics' one-count rounding passing through the encoder.
+   Nearly every pixel has about a hundred observations a year, so nearly every pixel has at least
+   one nudged input. ADR 012's gates were set for inference code changes, and this fails them on
+   the worst pixels: cosine below 0.9999 in every chunk, and scale drift above the 1.6%
+   cross-configuration bound in one of four.
+2. **Switch at a campaign boundary,** with no mosaic half-built (§15.4).
+3. **Expect `cost_accrual.py` to overstate.** It prices Fargate vCPU at x86 rates, and the usage
+   series it reads does not distinguish architectures.
 
 ### 15.7 Out of scope
 
@@ -2587,6 +2599,5 @@ The ingest arms cost about $15–25. An end-to-end comparison adds GPU time.
   puts workers on Spot and keeps the scheduler on demand. The hazard is particular to us: the
   ingest body runs on one Dask worker, so reclaiming that worker restarts the run's driver.
 - **The other ingestion-image families** (runner, coarsen, Fargate `merge_kind`) become a
-  one-property change each once the image is multi-arch. `merge_kind_ec2` would need a Graviton
-  instance type instead.
+  one-property change each. `merge_kind_ec2` would need a Graviton instance type instead.
 - **Inference** runs on x86 CUDA instances, and its image follows them.
