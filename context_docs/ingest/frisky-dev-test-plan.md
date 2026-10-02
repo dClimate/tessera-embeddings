@@ -290,7 +290,10 @@ first:
 - **Grouped writes help Frisky and hurt Dask.** Frisky's writes ran 3% to 16% shorter from the
   second date; Dask's ran 31% to 35% longer on every date (194 to 296 s, against 147 to 223 s on
   both earlier runs). The record's item 5 has the numbers.
-- **Both completed.** Frisky's span drain kept 4,822,258 spans in 19 parts with no failed request.
+- **Both completed, and the stores agree.** The same 7 dates, and a random 400 chunks of each of
+  the 11 arrays identical, NaN positions included (45 to 53 of them held data; the rest of the
+  zone is sea), read with `temp/frisky-dev/compare_stores.py --sample 400`. Frisky's span drain
+  kept 4,822,258 spans in 19 parts with no failed request.
 - **Scheduler memory.** Frisky's levelled at 3.4 to 3.5 GiB after stepping up at the first two
   live snapshots, then reached 6.6 GiB under the end-of-run `spans.json` query, which timed out
   at the proxy; both are now kept off the scheduler for drained runs. Dask's reached 6.8 GiB
