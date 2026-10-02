@@ -20,6 +20,7 @@ is: [`frisky-experiment.md`](frisky-experiment.md). How to operate it:
   | A′ | `4c12a5d1` | 4096 | `ingcode-0869839717820a9c` | `dev/frisky-4096` |
   | B | `9d994f84` | 2048 | `ingcode-5f707a14bb6d5062` | `dev/frisky-2048` |
 | C | `cb2307d6` | 2048 | `ingcode-dfef8f7ea6482ad6` | `dev/frisky-2048c` |
+| D | `427abb7a` | 2048 | `ingcode-81529682d8f0ada2` | `dev/frisky-2048d` |
 
   Version B also moves `inference_code_identity`, from `infcode-c9905e5aa8f93d3e` to
   `infcode-2613e97f0ad55679`, because `config/ingest.py` is inside the inference import closure.
@@ -34,6 +35,11 @@ is: [`frisky-experiment.md`](frisky-experiment.md). How to operate it:
   reader made module-level, and a date's write submitted in groups (the record's item 5). It also
   carries the span-telemetry bounds, which sit outside both identities. It moves
   `inference_code_identity` to `infcode-678da02d8d87d6aa`.
+
+  Version D groups writes on Frisky only, keeps every unfiltered span query off a drained run's
+  scheduler, and lets an S2 run set its workers' thread count (`worker_nthreads`). The task cuts
+  after it (`bad60450`: `ingcode-475495ea11e45b47`, `infcode-14f5b3af5cc1683b`) are not yet
+  deployed.
 
 - **Paired arms.** Every Frisky run has a Dask run from the same deployment with the same
   parameters; only `use_frisky` differs. Dask runs with `min_workers == max_workers`, so both arms
@@ -301,6 +307,27 @@ first:
   at the proxy; both are now kept off the scheduler for drained runs. Dask's reached 6.8 GiB
   writing its performance report, which took 4 min 14 s after the last date.
 
+**On version D, worker threads.** Three Frisky arms at once, identical but for the threads:
+
+| 35N, 1 to 7 January 2024 | 4 threads | 6 threads | 6 threads, `GDAL_NUM_THREADS=1` |
+|---|---|---|---|
+| Wall between date commits, median (mean) | 150 s (146) | 127 s (123) | 134 s (130) |
+| Run wall | 22m46s | 18m50s | 20m05s |
+| Cost | $4.93 | $4.22 | $4.51 |
+| Worker CPU with the fleet's threads at least 90% busy | 73% | 83% | 88% |
+| 20 m band read, median task | 719 ms | 1,017 ms | 991 ms |
+
+- **Six threads per 4-vCPU worker are 15% faster a date and 14% cheaper.** With four, the workers
+  used 73% of their CPU even with every thread busy, so the reads spent part of each task waiting.
+  Each read takes longer with six, sharing the cores, but more are in flight. The remaining CPU
+  headroom (83%) bounds what eight could add to a few percent.
+- **One GDAL thread per read does not help.** It lifted the busy CPU to 88% but ran 6% slower a
+  date than six threads with GDAL's default, `ALL_CPUS`.
+- **The schedulers peaked at 1.7 GiB,** against 6.6 GiB on version C, now that no unfiltered span
+  query reaches them.
+- Read with `temp/frisky-dev/thread_arms.py`: commit gaps from the stage-timing lines, read times
+  and busy share from the drained spans, CPU from Container Insights.
+
 **B5: re-measure the provisional constants.** Version B's chunk-counted thresholds are the 4096
 measurements converted by area:
 
@@ -389,9 +416,11 @@ Ingest only, at about $0.27 a worker-hour:
 | B3 | $6.15, measured |
 | B4 | $36.92, measured, over three attempts |
 | C on version B | $24.27, measured, ingest only, cancelled |
+| B4 on version C | $14.44, measured |
+| Thread test on version D | $13.66, measured |
 | C on version C | $19.58 of ingest and $47 to $62 of GPU time, measured |
 
-That is $59.36 for the ingest phases. The run log records each run's figures.
+That is $87.46 for the ingest rungs, besides Phase C. The run log records each run's figures.
 
 ## Run log
 
@@ -464,3 +493,6 @@ stages overlap, so those runs give the wall clock between one date's commit and 
 | 2026-10-02 | vc-iowa-s2-frisky-r2 | C | Frisky | iowa_epsg5070, resumed from 2025-09-20, pipelined | S2 | 60 | `be279b05` | 11m06s | 20.6 | 0 | pass: 29 dates, $2.38, drained |
 | 2026-10-02 | vc-iowa-embed | C | Ray | iowa_epsg5070, to October 2025 | inference | 30 actors | `b65429de` | 13m01s | – | – | fail: no checkpoint under the experiment prefix, no actor started |
 | 2026-10-02 | vc-iowa-embed-r2 | C | Ray | iowa_epsg5070, to October 2025 | inference | 30 actors, 28 at peak | `d7e25533` | 1h37m32s | 230 s/chunk median | – | pass: 394 chunks, 25.2 GPU-hours busy, $47 to $62 |
+| 2026-10-02 | vd-35n-s2-t4 | D | Frisky | zone_35N (2048 mask), 2024-01-01..07, pipelined | S2 | 60 × 4 threads | `4e69c335` | 22m46s | 150 (wall, median) | 0 | pass: 7 dates, $4.93, drained |
+| 2026-10-02 | vd-35n-s2-t6 | D | Frisky | zone_35N (2048 mask), 2024-01-01..07, pipelined | S2 | 60 × 6 threads | `3e3a212d` | 18m50s | 127 (wall, median) | 0 | pass: 7 dates, $4.22, drained |
+| 2026-10-02 | vd-35n-s2-t6-gdal1 | D | Frisky | zone_35N (2048 mask), 2024-01-01..07, pipelined, `GDAL_NUM_THREADS=1` | S2 | 60 × 6 threads | `4443e65a` | 20m05s | 134 (wall, median) | 0 | pass: 7 dates, $4.51, drained |

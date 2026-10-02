@@ -143,7 +143,9 @@ once, and its scheduler pickles each task as it dispatches it, while the fleet w
 client lowers the graph to a task dict and pickles every task before it submits any, so the fleet
 waits for all of it. On the drained Iowa S2 run at 2048 the whole fleet stood idle 32 s and 25 s
 before the two write batches, against 8 s and 7 s on Dask, and about 2 s before each of the 11
-gate computes, which ran one after another where Dask overlaps them. The same tasks took 9% less
+gate computes. Both engines run those one after another; Frisky's extra second or so a gate was
+its client pickling the ROI mask's block reader, a closure, by value, which version C makes
+module-level (`ingest/roi.py`). The same tasks took 9% less
 time on Frisky, so this idle time is its whole per-date gap: 80 s of the 208 s run, against 20 s
 on Dask.
 
@@ -204,6 +206,30 @@ Dask's writes ran 31% to 35% longer on every date, and its time between dates ro
 269 s: its scheduler, already at 100% of its core, now takes four graphs a date instead of one. So
 only Frisky groups: `group_window_writes`, which the Frisky task sets from `use_frisky`.
 
+**Where the hand-over goes, and the tasks that do nothing.** Frisky's client spans on version C's
+35N week split the driver's side. Pickling every task took 697 s, lowering the graph to a task
+dict 256 s, and ordering, conversion and submission 23 s together; the driver was inside one of
+these steps for 524 s of the 1,216 s run, and no task ran anywhere for 20% of it. The steps sum
+past the run's share because 41 of the 53 pickling steps ran beside another conversion, the
+pipelining thread's gate against the write's groups: Python's GIL serialises them, so a task cost
+36 µs to pickle alone and a median 302 µs contended. All of it scales with the task count, and 45%
+of the week's 1.32 million tasks did no work: icechunk's merge partials (100,000) and the aliases
+dask leaves for a fused chain (`ice-changeset`, 254,000), and the gate's and masks' reductions.
+Three changes in our code (`bad60450`, not yet deployed) cut a 35N-shaped probe's tasks by 23%
+with byte-identical stores: the merge fan-in set per spatial axis (dask spreads an integer `8`
+over three axes as 2 each, so merge partials fall from 616 to 66), the gate's validity mask as one
+block-wise `np.isin`, and the gate counting over each date's own windows rather than the run's.
+Locally the write fell from 33.0 s to 22.4 s on Dask and from 15.0 s to 13.2 s on Frisky. The
+aliases remain; removing them means graph surgery with dask internals.
+
+**Tried and set aside: dask-array.** `mrocklin/dask-array` (0.7.1) builds Frisky-native task
+records instead of pickled Python tasks. Under its xarray `register()` our first icechunk write
+fails, since icechunk's merge stays on `dask.array`; odc-stac's loads stay legacy whatever is
+registered; and Frisky takes the native path only through `dask.compute`, not the
+`client.compute` the gate and grouped writes use. On a gate-shaped graph it owns end to end it
+saved about 0.7 s of driver CPU per 3,600 chunks and ran 8% slower, splitting the gate into 43%
+more tasks.
+
 **Measured and ruled out: thread stack size.** Frisky's task threads get Rust's default 2 MiB
 stack; Dask's get 16 MiB on macOS (and typically 8 MiB on Linux). Raising Frisky's with
 `RUST_MIN_STACK` did not stop the crash above, and once thread state is pinned the real ingest
@@ -233,6 +259,10 @@ The runs, their figures and how to rerun them are in
   a date against Dask's 275 s, and 152 s against 269 s with `pipeline_dates` and grouped writes
   (above). Dask's scheduler sat at 95% to 101% of its core and ran the coverage gate with the
   fleet under a third busy; Frisky's kept the fleet 97% busy through every write.
+- **Six task threads per 4-vCPU worker are 15% faster a date on 35N**, and 14% cheaper: with
+  four the workers used 73% of their CPU even with every thread busy, so the reads wait for part
+  of each task. One GDAL thread per read does not help. Measured on Frisky; the plan's B4 result
+  has the table.
 - **As fast as Dask at Iowa scale, once its graphs pickle cheaply.** Frisky's tasks are as fast or
   faster (store writes 0.97 of Dask's median, band reads 0.89), but it first took 25 to 40% longer
   per S2 date, idling while the driver pickled each graph (item 5 above). With the fix it matches
@@ -280,7 +310,7 @@ The runs, their figures and how to rerun them are in
   drain's parts hold the spans. The end-of-run `spans.json`, the one unfiltered query left, then
   took the same scheduler from 3.4 to 6.6 GiB and timed out at the dashboard proxy (HTTP 504);
   with the drain it is now the drain's own tail, so a drained run asks the scheduler only for
-  filtered slices.
+  filtered slices. On version D the three 35N arms' schedulers peaked at 1.7 GiB.
 - **The end-of-run capture took 45 s with the drain on, against Dask's 7 s, while the whole fleet
   was billed.** The bundle's S3 timestamps on the `-fix` run split it: the final drain about 9 s,
   the 500,000-span `spans.json` 18 s before its 167 MB upload began (five pages from the
@@ -308,9 +338,9 @@ documentation: [`docs/frisky.md`](../../docs/frisky.md).
   the matching step of `_MatchDaskWorker` go.
 - Report the up-front graph pickling and the 4096 tail upstream, with these numbers, and ask
   icechunk to make `computing_meta` pickle by reference so `_picklable_merge_reduction` can go.
-- Confirm the shorter end-of-run capture on dev: a drained Iowa run's bundle should land within
-  about 10 s of its last batch, not 45.
+- Deploy the task cuts (`bad60450`) and confirm them on 35N, on both engines.
+- Set the worker thread count: six per 4-vCPU worker measured 15% faster; the default belongs in
+  `FargateConfig` once Dask is measured too.
 - Report the heartbeat growth upstream, with the local reproduction.
-- Find why the gate's computes run one after another on Frisky.
 - Decide whether Frisky stays a core dependency when this reaches `main`, on the experiment's
   results and the constraints under Packaging above.
