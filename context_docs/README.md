@@ -67,6 +67,8 @@ context_docs/
 │                                                  the record of each run
 │
 ├── inference/                     RUNNING THE ENCODER
+│   ├── inference-at-2048.md                    what 2048-px mosaics let inference change, ranked
+│   │                                              by impact against complexity, and the test plan
 │   ├── inference-on-gpus.md                    throughput, which cards may be rented, why the
 │   │                                              batch is sized to the card, and what the
 │   │                                              campaign path itself measured
