@@ -81,12 +81,6 @@ SPANS_CAPTURE_LIMIT_DRAINED = 100_000
 #: Seconds between the live snapshots :func:`maybe_capture_telemetry` takes while a run is going.
 LIVE_SNAPSHOT_INTERVAL_S = 300.0
 
-#: Spans a live snapshot analyses when the drain is on (``frisky observe overview --limit``).
-#: The drain already keeps them all, so the snapshot only needs a recent sample; Frisky's default
-#: of 200,000 cost 87 s a query on a full Iowa run. Each ``frisky state:`` line logs the
-#: snapshot's own time, to recalibrate this against.
-LIVE_SNAPSHOT_SPANS_DRAINED = 50_000
-
 #: Spans each Frisky process keeps (``FRISKY_TRACING_CAPACITY``, Frisky's default 1,000,000),
 #: set on the scheduler and every worker by ``ecs_cluster(frisky=True)``. At the default the
 #: scheduler's buffer grew to 5.7 GiB of its 8 GiB on zone 35N and its process died at the end of
@@ -270,13 +264,20 @@ def _write(uri: str, text: str) -> None:
 
 
 def _live_snapshot(
-    dashboard_url: str, uri: str, log: logging.Logger | logging.LoggerAdapter[Any], limit: int | None = None
+    dashboard_url: str, uri: str, log: logging.Logger | logging.LoggerAdapter[Any], *, spans: bool = True
 ) -> None:
-    """Overwrite ``live/overview.json`` and log the cluster's state as one ``frisky state:`` line."""
+    """Overwrite ``live/overview.json`` and log the cluster's state as one ``frisky state:`` line.
+
+    Without ``spans``, ``live/cluster.json`` holds the cluster's counts alone. An overview's span
+    query has the scheduler assemble every process's buffer before ``--limit`` trims it: on zone
+    35N each snapshot stepped the scheduler up by 0.5 to 1.8 GiB. The span drain's queries, filtered
+    by name and time, do not.
+    """
     started = time.monotonic()
-    bundle = _frisky_cli("observe", "overview", dashboard_url, "--json", *(["--limit", str(limit)] if limit else []))
-    _write(f"{uri}/live/overview.json", bundle)
-    state = json.loads(bundle)["state"]
+    view = "overview" if spans else "cluster"
+    bundle = _frisky_cli("observe", view, dashboard_url, "--json")
+    _write(f"{uri}/live/{view}.json", bundle)
+    state = json.loads(bundle)["state"] if spans else json.loads(bundle)
     log.info(
         "frisky state: workers=%d idle=%d processing=%d waiting=%d queued=%d memory=%d erred=%d snapshot=%.1fs",
         *(state[k] for k in ("workers_total", "workers_idle", "tasks_processing", "tasks_waiting")),
@@ -421,11 +422,12 @@ def maybe_capture_telemetry(
 ) -> Iterator[None]:
     """Write Frisky's telemetry for this run under the prefix ``uri`` (any fsspec target).
 
-    **While the body runs,** every ``interval_s``: ``live/overview.json`` is overwritten and one
-    ``frisky state:`` line is logged, so a running, hung or killed run can be read from storage or
-    the run log with no port-forward. With ``drain_spans``, every :data:`SPAN_DRAIN_INTERVAL_S`
-    the task, transfer and spill spans of the run so far are appended under ``spans/`` as well
-    (:class:`_SpanDrain`), so the whole run is kept rather than its tail. **After it:** the bundle
+    **While the body runs,** every ``interval_s``: ``live/overview.json`` (``live/cluster.json``,
+    the counts alone, with ``drain_spans``) is overwritten and one ``frisky state:`` line is
+    logged, so a running, hung or killed run can be read from storage or the run log with no
+    port-forward. With ``drain_spans``, every :data:`SPAN_DRAIN_INTERVAL_S` the task, transfer and
+    spill spans of the run so far are appended under ``spans/`` as well (:class:`_SpanDrain`), so
+    the whole run is kept rather than its tail. **After it:** the bundle
     below, captured all at once before the cluster closes, so any ``worker_removed`` event in it
     is a worker that left mid-run.
 
@@ -453,8 +455,8 @@ def maybe_capture_telemetry(
 
     stop = threading.Event()
     drain = _SpanDrain(dashboard_url, uri) if drain_spans else None
-    limit = LIVE_SNAPSHOT_SPANS_DRAINED if drain else None
-    loops = [(interval_s, lambda: _live_snapshot(dashboard_url, uri, log, limit), "live snapshot")]
+    # The drain keeps every span, so its live snapshots take none from the scheduler.
+    loops = [(interval_s, lambda: _live_snapshot(dashboard_url, uri, log, spans=not drain), "live snapshot")]
     if drain:
         loops.append((SPAN_DRAIN_INTERVAL_S, drain.drain, "span drain"))
     threads = [

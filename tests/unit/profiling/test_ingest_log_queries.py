@@ -79,8 +79,12 @@ def test_every_query_has_a_description() -> None:
         assert description.strip(), f"{name}: empty description"
 
 
-def test_frisky_state_parses_the_line_the_live_snapshot_logs(monkeypatch, tmp_path, caplog) -> None:
-    """Producer and consumer of the `frisky state:` line live in different modules; pin them together."""
+@pytest.mark.parametrize("spans", [True, False], ids=["overview", "cluster"])
+def test_frisky_state_parses_the_line_the_live_snapshot_logs(monkeypatch, tmp_path, caplog, spans) -> None:
+    """Producer and consumer of the `frisky state:` line live in different modules; pin them together.
+
+    Both views a snapshot reads: the overview nests the counts under ``state``, the cluster view does not.
+    """
     from tessera_embeddings.providers import frisky as frisky_engine
 
     state = dict(
@@ -92,9 +96,9 @@ def test_frisky_state_parses_the_line_the_live_snapshot_logs(monkeypatch, tmp_pa
         tasks_memory=355,
         tasks_erred=1,
     )
-    monkeypatch.setattr(frisky_engine, "_frisky_cli", lambda *args: json.dumps({"state": state}))
+    monkeypatch.setattr(frisky_engine, "_frisky_cli", lambda *args: json.dumps({"state": state} if spans else state))
     with caplog.at_level(logging.INFO):
-        frisky_engine._live_snapshot("http://unused", str(tmp_path), logging.getLogger("frisky-state"))
+        frisky_engine._live_snapshot("http://unused", str(tmp_path), logging.getLogger("frisky-state"), spans=spans)
 
     pattern = re.search(r"parse @message /(.*?)/ \|", QUERIES["frisky_state"][1]).group(1)
     fields = re.search(re.sub(r"\(\?<(\w+)>", r"(?P<\1>", pattern), caplog.text).groupdict()

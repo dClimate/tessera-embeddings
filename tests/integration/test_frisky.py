@@ -289,21 +289,23 @@ def test_the_store_writes_merge_functions_pickle_by_reference(hijacked) -> None:
     assert restored(None, computing_meta=True).dtype == object
 
 
-def test_the_telemetry_bundle_is_written_live_and_at_the_end(hijacked, tmp_path, caplog) -> None:
+@pytest.mark.parametrize("drain", [False, True], ids=["undrained", "drained"])
+def test_the_telemetry_bundle_is_written_live_and_at_the_end(hijacked, tmp_path, caplog, drain) -> None:
     """What a Fargate run leaves behind, through the Dask dashboard's proxy: live snapshots while
-    it runs, then a bundle the ``frisky observe`` CLI reads after the cluster is gone.
+    it runs, then a bundle the ``frisky observe`` CLI reads after the cluster is gone. Drained, the
+    snapshots read the cluster's counts alone, since the drain keeps every span.
     """
     dask_client, _ = hijacked
     bundle = tmp_path / "bundle"
     with (
         caplog.at_level(logging.INFO),
-        maybe_capture_telemetry(dask_client.dashboard_link, str(bundle), LOG, interval_s=1),
+        maybe_capture_telemetry(dask_client.dashboard_link, str(bundle), LOG, interval_s=1, drain_spans=drain),
     ):
         for _ in range(4):  # long enough for live snapshots to land
             da.ones(10_000, chunks=100).sum().compute()
             time.sleep(1)
 
-    assert (bundle / "live" / "overview.json").exists()
+    assert [p.name for p in (bundle / "live").iterdir()] == ["cluster.json" if drain else "overview.json"]
     assert "frisky state: workers=2 " in caplog.text
     for name in ("spans.json", "overview.txt", "overview.json", "events.json", "logs.json"):
         assert (bundle / name).exists(), name
