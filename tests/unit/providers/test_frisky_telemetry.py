@@ -61,21 +61,26 @@ def test_a_failed_slice_keeps_earlier_slices_and_the_next_drain_fills_the_gap(tm
     assert len(got) == len(set(got)), "a span was written twice"
 
 
-def test_the_end_of_run_capture_asks_the_scheduler_for_spans_one_query_at_a_time(tmp_path, monkeypatch) -> None:
-    """Every span query is assembled in the scheduler's memory: never two at once, and the overviews
-    are computed from the captured file rather than asked of the scheduler again.
+def test_the_end_of_run_capture_asks_the_scheduler_for_filtered_spans_one_query_at_a_time(
+    tmp_path, monkeypatch
+) -> None:
+    """Every span query is assembled in the scheduler's memory: never two at once, never one filtered
+    by limit alone, which assembles every buffer. With a drain, ``spans.json`` is the drain's own
+    tail, and the overviews are computed from that file rather than asked of the scheduler again.
     """
     in_flight, peak, lock = [0], [0], threading.Lock()
+    queries: list[dict[str, Any]] = []
     cli_calls: list[tuple[str, ...]] = []
 
-    def query_spans(**_: Any) -> list[dict[str, Any]]:
+    def query_spans(**kwargs: Any) -> list[dict[str, Any]]:
         with lock:
             in_flight[0] += 1
             peak[0] = max(peak[0], in_flight[0])
+            queries.append(kwargs)
         time.sleep(0.05)
         with lock:
             in_flight[0] -= 1
-        return []
+        return _spans(3) if kwargs["name"] == "worker.exec" else []
 
     def frisky_cli(*args: str) -> str:
         cli_calls.append(args)
@@ -87,6 +92,8 @@ def test_the_end_of_run_capture_asks_the_scheduler_for_spans_one_query_at_a_time
     written = frisky_engine._end_of_run("http://live", str(tmp_path), drain, logging.getLogger("t"))
 
     assert peak[0] == 1
+    assert all(q.get("name") for q in queries), "a span query filtered by limit alone"
     assert {"spans.json", "overview.txt", "overview.json", "events.json", "logs.json"} <= set(written)
+    assert json.loads((tmp_path / "spans.json").read_text()) == _spans(3)
     overviews = [c for c in cli_calls if c[:2] == ("observe", "overview")]
     assert overviews and all(c[2].endswith("spans.json") for c in overviews), "an overview went to the live scheduler"

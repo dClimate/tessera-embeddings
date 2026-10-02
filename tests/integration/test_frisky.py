@@ -368,5 +368,5 @@ def test_span_capture_never_fails_or_masks_the_run(tmp_path, caplog) -> None:
         maybe_capture_telemetry("http://127.0.0.1:9", str(tmp_path / "spans.json"), LOG, drain_spans=True),
     ):
         raise ValueError("the run's own failure")
-    assert "failed to capture Frisky spans" in caplog.text
+    assert "failed to capture Frisky events.json" in caplog.text
     assert "Frisky span drain failed" in caplog.text

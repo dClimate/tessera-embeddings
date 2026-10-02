@@ -41,6 +41,7 @@ Four behaviours differ from Dask and are handled here or by the providers:
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import ctypes
 import functools
@@ -70,12 +71,15 @@ from distributed import Client, WorkerPlugin
 FRISKY_METHODS = frozenset({"compute", "persist", "submit", "map", "gather", "scatter"})
 
 #: Most recent spans :func:`maybe_capture_telemetry` keeps in ``spans.json``, Frisky's own default
-#: for its views. The scheduler assembles a query's whole answer in its own memory, so this bounds
-#: what one query can add there; a longer run keeps its tail, like Dask's capped task stream.
+#: for its views; a longer run keeps its tail, like Dask's capped task stream. The limit does not
+#: bound the scheduler's memory: to answer a query filtered by nothing else, it assembles every
+#: process's buffer first.
 SPANS_CAPTURE_LIMIT = 200_000
 
-#: The same, with the span drain on. The drain already holds every task span, so the tail only has
-#: to keep the bundle readable as it is: one page of Frisky's span API, about 7 s of an Iowa run.
+#: The same, with the span drain on, taken from the drain's own latest spans rather than asked of
+#: the scheduler: on zone 35N that one query took the scheduler from 3.4 to 6.6 GiB of its 8 and
+#: timed out at the dashboard proxy. The drain holds every task span, so this tail only keeps the
+#: bundle readable as it is, about 7 s of an Iowa run.
 SPANS_CAPTURE_LIMIT_DRAINED = 100_000
 
 #: Seconds between the live snapshots :func:`maybe_capture_telemetry` takes while a run is going.
@@ -299,6 +303,7 @@ class _SpanDrain:
         self.dashboard_url, self.uri = dashboard_url, uri
         self.since_ns: int | None = None  # the first drain takes everything since the hijack
         self.parts = self.spans = 0
+        self.tail: collections.deque[dict[str, Any]] = collections.deque(maxlen=SPANS_CAPTURE_LIMIT_DRAINED)
         self._lock = threading.Lock()  # the final drain waits for one still in flight
 
     def drain(self, *, final: bool = False) -> None:
@@ -332,6 +337,7 @@ class _SpanDrain:
                     out.write(gzip.compress(json.dumps(spans).encode(), compresslevel=6))
                 self.parts += 1
                 self.spans += len(spans)
+                self.tail.extend(spans)
             self.since_ns = reached
 
 
@@ -353,10 +359,11 @@ def _repeat(
 def _end_of_run(dashboard_url: str, uri: str, drain: _SpanDrain | None, log: Any) -> list[str]:  # noqa: ANN401
     """Write the end-of-run bundle, one file each, so a failure costs only its own file.
 
-    The scheduler serves ONE span query at a time: the final drain, then ``spans.json``. Both
-    overviews are computed from that file in this process rather than asked of the scheduler again,
-    since every span query is assembled in the scheduler's memory, and three at once helped kill
-    one. The event and log captures are cheap and run alongside. Returns what was written.
+    Every span query is assembled in the scheduler's memory, and three at once helped kill one, so
+    it serves ONE at a time: the final drain's filtered slices, then ``spans.json``, which with a
+    drain is the drain's own tail and asks the scheduler for nothing. Both overviews are computed
+    from that file in this process. The event and log captures are cheap and run alongside.
+    Returns what was written.
     """
     written: list[str] = []
 
@@ -394,10 +401,16 @@ def _end_of_run(dashboard_url: str, uri: str, drain: _SpanDrain | None, log: Any
             written.append(f"spans/ ({drain.spans} spans in {drain.parts} parts)")
         with tempfile.TemporaryDirectory() as tmp:
             local = f"{tmp}/spans.json"
-            limit = SPANS_CAPTURE_LIMIT_DRAINED if drain else SPANS_CAPTURE_LIMIT
             attempt(
                 "spans.json",
-                lambda: _keep(local, json.dumps(frisky.query_spans(limit=limit, dashboard_url=dashboard_url))),
+                lambda: _keep(
+                    local,
+                    json.dumps(
+                        list(drain.tail)
+                        if drain
+                        else frisky.query_spans(limit=SPANS_CAPTURE_LIMIT, dashboard_url=dashboard_url)
+                    ),
+                ),
             )
             if "spans.json" in written:
                 attempt("overview.txt", lambda: _frisky_cli("observe", "overview", local))
@@ -432,9 +445,10 @@ def maybe_capture_telemetry(
     is a worker that left mid-run.
 
     =================  ==========================================================================
-    ``spans.json``     the most recent :data:`SPANS_CAPTURE_LIMIT` spans of every kind
-                       (:data:`SPANS_CAPTURE_LIMIT_DRAINED` with ``drain_spans``); ``frisky
-                       observe overview spans.json`` and the other offline views read it
+    ``spans.json``     the most recent :data:`SPANS_CAPTURE_LIMIT` spans of every kind (with
+                       ``drain_spans``, the drain's latest :data:`SPANS_CAPTURE_LIMIT_DRAINED`, of
+                       the drained kinds); ``frisky observe overview spans.json`` and the other
+                       offline views read it
     ``overview.txt``   ``frisky observe overview`` of ``spans.json``, computed here, not by the scheduler
     ``overview.json``  the same as a structured bundle: perf, costliest spans, outliers
     ``events.json``    ``lifecycle`` (every worker joining and leaving) and ``recent`` (the last
