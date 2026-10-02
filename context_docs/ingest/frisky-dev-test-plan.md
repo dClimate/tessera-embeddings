@@ -335,6 +335,12 @@ gates rose from 10 to 93 s and writes from 52 to 228 s, with gaps of 11 to 61 s 
 tasks while the workers idled. The run was cancelled at 1 h 36 min, with S1's year complete, and
 the year rerun on version C.
 
+**On version C, ingest.** S1's year took 33 min at 10.8 s a date. S2 ran at about 18 s a date
+between commits through August, then slowed at the same hour mark, gates reaching 88 s; it was
+cancelled at 1 h 05 min with 192 dates written and resumed on a fresh cluster, which starts the
+day after the newest held date and wrote the last 29 dates in 11 min at 20.6 s a date. Ingest cost
+$19.58 in all. Inference runs on the result as `b65429de`.
+
 ## Acceptance
 
 | Goal | Passes when |
@@ -427,3 +433,5 @@ stages overlap, so those runs give the wall clock between one date's commit and 
 | 2026-10-02 | vc-35n-s2-frisky | C | Frisky | zone_35N (2048 mask), 2024-01-01..07, pipelined | S2 | 60 | `11a8f199` | 23m03s | 152 (wall, dates 2 to 7) | 0 | pass: 7 dates, $5.18, 4,822,258 spans drained |
 | 2026-10-02 | vc-35n-s2-dask | C | Dask | zone_35N (2048 mask), 2024-01-01..07, pipelined | S2 | 60 | `2f72bf4b` | 40m39s | 269 (wall, dates 2 to 7) | 0 | pass: 7 dates, $9.26 |
 | 2026-10-02 | vc-iowa-s1-frisky | C | Frisky | iowa_epsg5070, 2024-11-01..2025-10-31 | S1 asc | 13 | `26a5b4ac` | 33m19s | 10.8 | 0 | pass: 169 dates, $1.74, drained |
+| 2026-10-02 | vc-iowa-s2-frisky | C | Frisky | iowa_epsg5070, 2024-11-01..2025-10-31, pipelined | S2 | 60 | `edb1c173` | 1h05m27s | 23.6 to August, 48.2 from September | 0 | cancelled at the slowdown: 192 dates written, $15.46, drained |
+| 2026-10-02 | vc-iowa-s2-frisky-r2 | C | Frisky | iowa_epsg5070, resumed from 2025-09-20, pipelined | S2 | 60 | `be279b05` | 11m06s | 20.6 | 0 | pass: 29 dates, $2.38, drained |
