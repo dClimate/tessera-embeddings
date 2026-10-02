@@ -398,7 +398,10 @@ intersects the run's windows with that date's own STAC footprints — reprojecte
 grid and padded one cell, so a curved reprojection cannot under-cover — then re-bands and
 re-groups. Tasks over the removed windows would run, find nothing and write nothing, so this
 cannot change what a mosaic contains. When a footprint cannot be determined the full window list
-is returned unchanged, so the conservative path is the fallback. Both sensors do it
+is returned unchanged, so the conservative path is the fallback. The S2 coverage gate counts its
+numerator over the same narrowed windows, since a valid pixel needs imagery; its denominator stays
+the ROI's whole live area, because its ratio asks how much of the ROI's land the date saw. On a
+zone that is most of the gate: a date's imagery reaches about a third of 35N's live chunks. Both sensors do it
 (`narrow_windows_per_date` on S1, always on S2): six times fewer windows per date on the S1 zones
 measured, worth 7–20% of per-date wall clock.
 
@@ -458,6 +461,11 @@ The resulting store is identical either way, because the windows are chunk-disjo
 makes the merged changesets conflict-free, and the same property that lets a date commit exactly
 once. Should icechunk's internals move, the write falls back to the sequential loop with a
 warning.
+
+The changesets merge in a tree whose fan-in is set per spatial axis (`_MERGE_SPLIT_EVERY`, 8 by
+8 store blocks). dask spreads an integer fan-in across every reduced axis as its root, so 8 over
+time, northing and easting gave 2 per axis: a merge task for every third store block, about one
+task in thirteen of a zone date, doing nothing.
 
 Default **on** for both S2 and S1. `write_day_windows` itself still defaults to the
 sequential path: a storage-layer default should not decide write strategy for its callers,
