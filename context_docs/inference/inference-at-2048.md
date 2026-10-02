@@ -47,8 +47,8 @@ a strip: a smaller budget now costs a few seconds of read per extra strip rather
 
 **Outside this list, for scale.** The largest lever on the card line does not depend on the chunk:
 running the encoder's matrix multiplies in FP8 on the L40S, whose dense FP8 ceiling is twice its
-BF16 one. It changes the outputs, so it would need the equivalence gate of ADR 012 and an explicit
-decision on accuracy before any test. Running L40S only, where capacity allows, is a scheduling
+BF16 one. It changes the outputs, so it is deferred to a later round, after an explicit decision on
+accuracy and the equivalence gate of ADR 012. Running L40S only, where capacity allows, is a scheduling
 decision rather than a code one.
 
 ## Testing plan
@@ -102,8 +102,9 @@ about $12, round 3 about $14, so about $55 in all.
 
 ## Open questions
 
-- Whether `g5.xlarge` capacity is as available as `g5.2xlarge` in us-west-2. Round 2 shows it for
-  one run, not for a campaign's fleet.
+`g5.xlarge` capacity is taken as equivalent to `g5.2xlarge`'s, so option 1 turns on throughput and
+memory alone.
+
 - Whether the fleet-mix rung list (`providers/aws/fleet_mix.py`) needs a per-card memory budget
   passed to the actor, the way the batch size already is, or one budget small enough for every
   card.

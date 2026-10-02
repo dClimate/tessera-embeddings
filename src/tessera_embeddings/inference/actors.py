@@ -13,7 +13,6 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
-import os
 import time
 from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -42,7 +41,7 @@ from tessera_embeddings.inference.assembly import OBS_COUNT_VARS, ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.inference.data_loading import load_chunk, load_s2_mask_bundle, make_store_opener
 from tessera_embeddings.inference.progress import chunk_uid
-from tessera_embeddings.inference.read_plan import _STARTER_STRIP_H, _chunk_read_plan, _StripPlan, _xchunk_rung
+from tessera_embeddings.inference.read_plan import _chunk_read_plan
 from tessera_embeddings.inference.resource_monitor import ResourceMonitor
 from tessera_embeddings.storage.zarr_store import credentials_provider
 
@@ -63,20 +62,19 @@ class _ChunkPrologue:
     """Everything ``_process_chunk`` needs before its first forward pass.
 
     Built serially (GPU idle) by :meth:`InferenceActor._load_chunk_prologue`, or ahead of time
-    by the bounded cross-chunk prefetch (the ``_XCHUNK_*`` constants) — in which case
-    ``first_strip`` may still be None (mask-only rung) and the consumer loads it serially.
+    by the cross-chunk prefetch during the previous chunk's last strip (``prefetched``).
     """
 
     store_opener: StoreOpener
     mask_bundle: S2MaskBundle
-    plan: _StripPlan
+    # Northing strips the chunk is tiled into (read_plan._strip_plan).
+    strips: list[slice]
     # Chunk-relative easting window of the S2 valid-pixel bounding box, or None for full width. Sparse/edge chunks
     # read (and infer) only these columns; outputs are placed at this offset in the whole-chunk buffers.
     x_sub: slice | None
-    # (ChunkData, dataset) for plan.strips[0]; None until loaded.
-    first_strip: tuple[ChunkData, MosaicChunkInferenceDataset] | None
-    # Prefetch rung ("starter" | "mask-only") for the hit log; None = serial.
-    rung: str | None = None
+    # (ChunkData, dataset) for strips[0].
+    first_strip: tuple[ChunkData, MosaicChunkInferenceDataset]
+    prefetched: bool = False
 
 
 logger = logging.getLogger(__name__)
@@ -98,7 +96,7 @@ def _chunk_summary_line(**fields: Any) -> str:  # noqa: ANN401 — heterogeneous
 # — the GPU is idle and wants the fastest load.
 _BACKGROUND_LOAD_RESERVED_CPUS = PREFETCH_DEPTH
 
-# Hard ceiling on any in-actor wait for a background I/O future — a strip / starter prefetch load, or the prior
+# Hard ceiling on any in-actor wait for a background I/O future — a strip or cross-chunk prefetch load, or the prior
 # chunk's deferred staging write. Normal case is seconds of S3/zarr I/O (a full strip is ~6.5 s at measured BW), so a
 # wait this long means the client is wedged with no socket timeout. Bounding it lets process_chunk fail out (or fall
 # back to a serial load) so Ray surfaces the error and the scheduler kills + replaces the actor and requeues —
@@ -109,24 +107,16 @@ _BACKGROUND_IO_TIMEOUT_S = 600.0
 
 
 # ---------------------------------------------------------------------------
-# Bounded cross-chunk starter prefetch ("interleaving lite")
+# Cross-chunk prefetch
 # ---------------------------------------------------------------------------
-# The scheduler reserves each actor's next chunk and passes it as ``prefetch_hint``; during the
-# CURRENT chunk's last strip (its final load is complete by then — the RAM trough, temporally
-# separated from the mid-chunk two-strip peak), the actor prefetches a hard-capped payload for
-# the next chunk: its SCL mask bundle and, when the cap and a net-gain check allow, its 256-row
-# starter strip. This is NOT the removed full interleaving, which co-resided an entire next
-# working set (5-7+ GiB) and OOM-killed a worker at 92-95% RAM; this co-resides <= ~2 GiB by
-# construction, and every failure (cap exceeded, label mismatch after a steal, credential-window
-# expiry, load error) degrades to the serial prologue — slower, never bigger. Escape hatch:
-# TESSERA_DISABLE_XCHUNK_PREFETCH=1.
-_XCHUNK_DISABLE_ENV = "TESSERA_DISABLE_XCHUNK_PREFETCH"
-# The full-SCL read transiently holds t_all x H x W bytes before pruning; skip prefetching entirely for chunks where
-# even that transient is outsized.
-_XCHUNK_MASK_TRANSIENT_CAP_BYTES = int(1.5 * 1024**3)
-# Upper-bound estimate of pre-prune S2 timesteps in a 12-month window (~5-day revisit x tile overlap); used only for
-# the transient precheck above.
-_XCHUNK_T_ALL_EST = 230
+# The scheduler reserves each actor's next chunk and passes it as ``prefetch_hint``. The strip
+# pipeline is one strip deep, and during the CURRENT chunk's last strip the next strip to load is
+# the hinted chunk's first: its SCL mask bundle and first strip load on the prefetch thread behind
+# this strip's inference. That keeps at most two band sets resident — the last strip and the next
+# chunk's first, each charged its own mask — which is the pair read_plan._S2_STRIP_BYTE_BUDGET is
+# sized for, plus the next mask read's brief pre-prune transient (~1 GB at 2048^2). Every failure
+# (label mismatch after a steal, credential-window expiry, load error) degrades to the serial
+# prologue — slower, never bigger.
 
 
 def _fetch_ec2_instance_id() -> str:
@@ -446,15 +436,6 @@ class InferenceActor:
         self._resource_monitor.start()
         logger.info("InferenceActor ready on instance %s", self.instance_id)
 
-    def _open_and_plan(
-        self, chunk: ChunkSpec, mosaic_base: str, time_window: TimeWindow
-    ) -> tuple[StoreOpener, S2MaskBundle, slice | None, int, _StripPlan]:
-        """Open stores, load the SCL bundle, and derive the chunk read plan."""
-        store_opener = make_store_opener(region=self._s3_region)
-        mask_bundle = load_s2_mask_bundle(mosaic_base, chunk, time_window, store_opener=store_opener)
-        x_sub, valid_px, plan = _chunk_read_plan(chunk, mask_bundle)
-        return store_opener, mask_bundle, x_sub, valid_px, plan
-
     def _load_strip_dataset(
         self,
         chunk: ChunkSpec,
@@ -502,44 +483,60 @@ class InferenceActor:
         )
         return data, dataset
 
+    def _load_prologue(
+        self,
+        chunk: ChunkSpec,
+        mosaic_base: str,
+        time_window: TimeWindow,
+        s1_orbit: S1Orbit,
+        *,
+        reserve_cpus: int = 0,
+        prefetched: bool = False,
+    ) -> _ChunkPrologue:
+        """Open stores, load the SCL bundle, plan the strips and load the first one.
+
+        The one loader behind both the serial prologue and the cross-chunk prefetch, so a
+        prefetched chunk is opened, cropped and tiled exactly as it would have been serially.
+        """
+        store_opener = make_store_opener(region=self._s3_region)
+        mask_bundle = load_s2_mask_bundle(mosaic_base, chunk, time_window, store_opener=store_opener)
+        x_sub, strips = _chunk_read_plan(chunk, mask_bundle)
+        first_strip = self._load_strip_dataset(
+            chunk,
+            mosaic_base,
+            time_window,
+            s1_orbit,
+            y_sub=strips[0],
+            store_opener=store_opener,
+            mask_bundle=mask_bundle,
+            x_sub=x_sub,
+            reserve_cpus=reserve_cpus,
+        )
+        return _ChunkPrologue(store_opener, mask_bundle, strips, x_sub, first_strip, prefetched=prefetched)
+
     def _load_chunk_prologue(
         self, chunk: ChunkSpec, mosaic_base: str, time_window: TimeWindow, s1_orbit: S1Orbit
     ) -> _ChunkPrologue:
         """Load everything _process_chunk needs before its first forward pass.
 
-        Runs inline (serially, GPU idle) at the top of every chunk, UNLESS the bounded cross-chunk
-        prefetch staged some of it during the previous chunk's tail (the ``_XCHUNK_*`` constants):
-        a label-matching stash supplies the mask bundle + read plan and possibly the first strip,
-        and whatever is missing loads serially here.
+        Takes the cross-chunk prefetch's stash when it holds this chunk; otherwise loads inline
+        (serially, GPU idle).
         """
         prologue = self._take_prefetched(chunk.label)
-        if prologue is not None:
-            logger.info("xchunk prefetch: hit (%s) for %s", prologue.rung, chunk.label)
-            # The stash's opener was created on the prefetch thread; if that thread's store opens outlived the PRIOR
-            # chunk's credential scope (the icechunk provider is a process-wide global, not thread-local) its repo
-            # handles are bound to the default AWS chain, which can fail to refresh on long-lived workers. The
-            # prefetched mask/strip are already-materialised numpy and safe to keep, but the LIVE opener is rebuilt
-            # inside THIS call's credential scope so body-strip reads never inherit stale credentials. Worst case: one
-            # repo re-open, matching the serial path.
-            prologue.store_opener = make_store_opener(region=self._s3_region)
-        else:
-            store_opener, mask_bundle, x_sub, _valid_px, plan = self._open_and_plan(chunk, mosaic_base, time_window)
-            prologue = _ChunkPrologue(store_opener, mask_bundle, plan, x_sub, first_strip=None)
-        if prologue.first_strip is None:
-            prologue.first_strip = self._load_strip_dataset(
-                chunk,
-                mosaic_base,
-                time_window,
-                s1_orbit,
-                y_sub=prologue.plan.strips[0],
-                store_opener=prologue.store_opener,
-                mask_bundle=prologue.mask_bundle,
-                x_sub=prologue.x_sub,
-            )
+        if prologue is None:
+            return self._load_prologue(chunk, mosaic_base, time_window, s1_orbit)
+        logger.info("xchunk prefetch: hit for %s", chunk.label)
+        # The stash's opener was created on the prefetch thread; if that thread's store opens outlived the PRIOR
+        # chunk's credential scope (the icechunk provider is a process-wide global, not thread-local) its repo
+        # handles are bound to the default AWS chain, which can fail to refresh on long-lived workers. The prefetched
+        # mask and strip are already-materialised numpy and safe to keep, but the LIVE opener is rebuilt inside THIS
+        # call's credential scope so body-strip reads never inherit stale credentials. Worst case: one repo re-open,
+        # matching the serial path.
+        prologue.store_opener = make_store_opener(region=self._s3_region)
         return prologue
 
     # ------------------------------------------------------------------
-    # Bounded cross-chunk starter prefetch
+    # Cross-chunk prefetch
     # ------------------------------------------------------------------
     # Stash keyed by chunk label; lazily initialised so test harnesses building bare actors via
     # object.__new__ keep working without __init__.
@@ -552,66 +549,31 @@ class InferenceActor:
             self._xchunk_prefetched: dict[str, Future[_ChunkPrologue]] = {}
         return self._xchunk_prefetch_pool, self._xchunk_prefetched
 
-    def _load_prefetched_starter(
-        self, chunk: ChunkSpec, mosaic_base: str, time_window: TimeWindow, s1_orbit: S1Orbit
-    ) -> _ChunkPrologue:
-        """Load the capped prefetch payload for ``chunk`` (prefetch thread).
-
-        Store opens normally land inside the calling process_chunk's scoped credential provider;
-        a prefetch that outlives its originating call may open through icechunk's default chain
-        instead. If that fails the consumer falls back to an inline, in-scope reload, so a
-        credential-window miss degrades to the unprefetched behaviour.
-        """
-        store_opener, mask_bundle, x_sub, valid_px, plan = self._open_and_plan(chunk, mosaic_base, time_window)
-        rung = _xchunk_rung(chunk, int(mask_bundle.mask.shape[0]), x_sub, valid_px, plan)
-
-        first_strip = None
-        if rung == "starter":
-            if not plan.starter_first:
-                # One-budget single-strip plan: convert to starter+body (both <= one budget) so the prefetched piece
-                # is small; the body loads behind the starter's inference via the normal strip pipeline. The rung's
-                # net-gain check priced the extra read.
-                plan = _StripPlan(
-                    strips=[slice(0, _STARTER_STRIP_H), slice(_STARTER_STRIP_H, chunk.height)],
-                    prefetch=True,
-                    strategy="single+xstarter",
-                    strip_h=chunk.height - _STARTER_STRIP_H,
-                    starter_first=True,
-                )
-            first_strip = self._load_strip_dataset(
-                chunk,
-                mosaic_base,
-                time_window,
-                s1_orbit,
-                y_sub=plan.strips[0],
-                store_opener=store_opener,
-                mask_bundle=mask_bundle,
-                x_sub=x_sub,
-                reserve_cpus=_BACKGROUND_LOAD_RESERVED_CPUS,
-            )
-        return _ChunkPrologue(store_opener, mask_bundle, plan, x_sub, first_strip, rung=rung)
-
     def _start_chunk_prefetch(
         self, chunk: ChunkSpec, mosaic_base: str, time_window: TimeWindow, s1_orbit: S1Orbit
     ) -> None:
-        """Kick off the next chunk's capped prefetch on the prefetch thread.
+        """Kick off the next chunk's prologue load on the prefetch thread.
 
         Called from the strip loop at the top of the CURRENT chunk's last strip — its load is
-        complete by then and no body loads remain, so the stash's bytes land on the RAM trough,
-        temporally separated from the mid-chunk two-strip peak.
+        complete by then and no body loads remain, so the next chunk's first set takes the slot
+        the strip pipeline would otherwise use. Store opens normally land inside the calling
+        process_chunk's scoped credential provider; a prefetch that outlives its originating call
+        may open through icechunk's default chain instead. If that fails the consumer falls back
+        to an inline, in-scope reload, so a credential-window miss degrades to the serial path.
         """
-        if os.environ.get(_XCHUNK_DISABLE_ENV):
-            logger.info("xchunk prefetch: disabled by env — skipping %s", chunk.label)
-            return
-        # Transient precheck: the full-SCL read briefly holds t_all x H x W bytes before pruning.
-        if _XCHUNK_T_ALL_EST * chunk.height * chunk.width > _XCHUNK_MASK_TRANSIENT_CAP_BYTES:
-            logger.info("xchunk prefetch: skipped (cap) — %s mask transient too large", chunk.label)
-            return
         pool, stash = self._prefetch_state()
         if chunk.label in stash:
             return
         logger.info("xchunk prefetch: starting for %s", chunk.label)
-        stash[chunk.label] = pool.submit(self._load_prefetched_starter, chunk, mosaic_base, time_window, s1_orbit)
+        stash[chunk.label] = pool.submit(
+            self._load_prologue,
+            chunk,
+            mosaic_base,
+            time_window,
+            s1_orbit,
+            reserve_cpus=_BACKGROUND_LOAD_RESERVED_CPUS,
+            prefetched=True,
+        )
 
     def _take_prefetched(self, label: str) -> _ChunkPrologue | None:
         """Consume the stash for ``label``; evict stale entries.
@@ -766,8 +728,8 @@ class InferenceActor:
             run_id: Unique run identifier.
             tracker: Optional ProgressTracker actor handle for batch-level progress.
             prefetch_hint: The chunk the scheduler has reserved as this actor's next assignment;
-                its capped starter payload is prefetched during this chunk's last strip (see the
-                ``_XCHUNK_*`` constants).
+                its mask and first strip are prefetched during this chunk's last strip (see
+                "Cross-chunk prefetch" above).
             s1_orbit: This CELL's resolved orbit, overriding the actor's own config: a chained
                 session's cells may resolve different orbits because parts of the globe are
                 radar-free in principle, and an actor built for ``"both"`` could not otherwise
@@ -834,13 +796,13 @@ class InferenceActor:
 
         try:
             # The prologue — repo handles, full-chunk SCL mask (which sizes the density-based strips), and the first
-            # strip's bands + dataset — loads serially here (GPU idle) unless the bounded cross-chunk prefetch staged
-            # part of it during the PREVIOUS chunk's tail; see _load_chunk_prologue and the _XCHUNK_* constants.
+            # strip's bands + dataset — loads serially here (GPU idle) unless the cross-chunk prefetch loaded it during
+            # the PREVIOUS chunk's last strip; see _load_chunk_prologue.
             prologue = self._load_chunk_prologue(chunk, mosaic_base, window, orbit)
             store_opener = prologue.store_opener
             mask_bundle = prologue.mask_bundle
-            plan = prologue.plan
-            strips = plan.strips
+            strips = prologue.strips
+            strip_h = strips[0].stop - strips[0].start
             x_sub = prologue.x_sub
             # Column window the cropped grids map to in the whole-chunk output buffers (full width when uncropped).
             cols = x_sub if x_sub is not None else slice(0, chunk.width)
@@ -860,17 +822,9 @@ class InferenceActor:
             # the comparison possible.
             t_s1_asc = 0
             t_s1_desc = 0
-            rung = prologue.rung or "serial"
+            rung = "prefetched" if prologue.prefetched else "serial"
             prologue_s = time.monotonic() - t0
-            logger.info(
-                "Chunk %s: T_kept=%d -> strip_h=%d -> %d strip(s) [%s, prefetch=%s]",
-                chunk.label,
-                t_kept,
-                plan.strip_h,
-                len(strips),
-                plan.strategy,
-                plan.prefetch,
-            )
+            logger.info("Chunk %s: T_kept=%d -> strip_h=%d -> %d strip(s)", chunk.label, t_kept, strip_h, len(strips))
             del prologue
 
             # Whole-chunk output buffers, allocated once and held for the chunk: only INPUTS are sub-tiled. save_dim
@@ -934,11 +888,9 @@ class InferenceActor:
             # includes the per-cell orbit downgrade and only the dataset knows it.
             radar_rule_enforced: bool | None = None
             infer_s = 0.0  # summed wall-clock of the per-strip inference calls
-            # Strip pipeline. With prefetch on (dense/hideable), strip i+1 loads and buckets on the background thread
-            # while strip i runs inference, so at most two S2 sets are co-resident. With it off (sparse/non-hideable),
-            # each strip loads serially in the loop body with the prior set dropped first, so only ONE is ever
-            # resident and a strip may safely use the larger pair budget. Strip 0 arrives loaded with the prologue in
-            # both modes. Managed explicitly, NOT with `with`: a timed-out strip load raises below, and
+            # Strip pipeline: strip i+1 loads and buckets on the background thread while strip i runs inference, so
+            # at most two S2 sets are co-resident. Strip 0 arrives loaded with the prologue. Managed explicitly, NOT
+            # with `with`: a timed-out strip load raises below, and
             # `ThreadPoolExecutor.__exit__` calls shutdown(wait=True), which re-joins the SAME hung worker and
             # swallows the escape. The finally shuts down non-blocking so the raise reaches the scheduler; the wedged
             # worker leaks but dies with the actor the scheduler then replaces. On the normal path nothing is
@@ -970,7 +922,7 @@ class InferenceActor:
                         assert first_strip is not None
                         chunk_data, dataset = first_strip
                         first_strip = None
-                    elif plan.prefetch:
+                    else:
                         assert next_future is not None
                         # Bounded: a wedged background strip read would hang the actor inside process_chunk with no
                         # scheduler recourse. Raising on timeout (with strip context) fails the chunk out so the actor
@@ -982,24 +934,14 @@ class InferenceActor:
                                 f"Background strip {i} load for {chunk.label} exceeded {_BACKGROUND_IO_TIMEOUT_S:.0f}s"
                             )
                             raise RuntimeError(msg) from exc
-                    else:
-                        # Serial: GPU idle, take all cores, one set resident.
-                        chunk_data, dataset = _load_strip(strip, mask_bundle, 0)
 
-                    # With prefetch on, kick off the next strip's BACKGROUND load (reserving prep cores) before
-                    # inferring this one.
-                    if plan.prefetch:
-                        next_future = (
-                            pool.submit(_load_strip, strips[i + 1], mask_bundle, _BACKGROUND_LOAD_RESERVED_CPUS)
-                            if i + 1 < len(strips)
-                            else None
+                    # Kick off the next strip's BACKGROUND load (reserving prep cores) before inferring this one. On
+                    # the last strip the next strip is the NEXT chunk's first, loaded by the cross-chunk prefetch.
+                    if i + 1 < len(strips):
+                        next_future = pool.submit(
+                            _load_strip, strips[i + 1], mask_bundle, _BACKGROUND_LOAD_RESERVED_CPUS
                         )
-
-                    # Last strip: its load is complete (bound above) and no body loads remain. For <=1x-budget plans
-                    # this is the RAM trough, so prefetch the NEXT chunk's capped starter behind this strip's
-                    # inference. Pair-budget plans hold a near-2x set here — no room for the stash — so they take a
-                    # serial prologue.
-                    if i + 1 == len(strips) and prefetch_hint is not None and not plan.pair_budget:
+                    elif prefetch_hint is not None:
                         self._start_chunk_prefetch(prefetch_hint, mosaic_base, window, orbit)
 
                     # The chunk's radar sequence lengths. Every strip sees the same ones — SAR is read full-width
@@ -1148,8 +1090,7 @@ class InferenceActor:
                         infer_s=0.0,
                         overhead_s=round(elapsed, 1),
                         strips=len(strips),
-                        strip_h=plan.strip_h,
-                        strategy=plan.strategy,
+                        strip_h=strip_h,
                         t_kept=t_kept,
                         rung=rung,
                         x_crop_w=(x_sub.stop - x_sub.start) if x_sub is not None else None,
@@ -1266,8 +1207,7 @@ class InferenceActor:
                     # everything that is not inference.
                     overhead_s=round(elapsed - infer_s, 1),
                     strips=len(strips),
-                    strip_h=plan.strip_h,
-                    strategy=plan.strategy,
+                    strip_h=strip_h,
                     t_kept=t_kept,
                     # Optical depth alone does not say how much the forward pass did — see the capture site. Additive
                     # keys, and every consumer reads by name.

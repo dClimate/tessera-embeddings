@@ -411,7 +411,7 @@ class TestSubmit:
 
 
 class TestReservations:
-    """1-deep next-chunk reservations feeding the cross-chunk starter prefetch."""
+    """1-deep next-chunk reservations feeding the cross-chunk prefetch."""
 
     def test_deep_queue_reserves_head_and_passes_hint(self) -> None:
         pool = _make_pool(2)

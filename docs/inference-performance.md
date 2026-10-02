@@ -20,7 +20,7 @@ optimization below is tagged with the window it reclaims.
    COLD START (idle) ──▶ FORWARD PASS (busy) ──▶ WRITE (idle) ──▶ next tile
 
   1. COLD START — GPU idle: load SCL mask, read the 1st strip, build the dataset.
-       reclaimed by:  crop · prune · empty-strip skip · starter strip ·
+       reclaimed by:  crop · prune · empty-strip skip ·
                       cross-chunk prefetch (next tile's cold start already done)
 
   2. FORWARD PASS — GPU busy (the real work): sub-batch → sub-batch, across strips.
@@ -153,30 +153,18 @@ A tile arrives → load its SCL mask → count valid pixels, find their bbox
 │           — cloudy dates the resampler would never read
 │
 ├─ Q2. Does bands + full mask fit ONE RAM budget?
-│        ├─ yes → single strip — no split, no prefetch (common interior)
+│        ├─ yes → single strip — no split (common on sparse and edge tiles)
 │        │
-│        └─ no  → SPLIT into northing strips  ● bounds peak host RAM    [§4.2]
-│                 │
-│                 └─ Q3. Enough valid data for the GPU to hide the strip
-│                        loads behind inference?
-│                          ├─ yes (dense) →
-│                          │     ◐ intra-chunk strip prefetch: strip     [§4.2]
-│                          │       i+1 loads while strip i runs the GPU
-│                          │     ○ starter strip: small first slice, GPU [§4.3]
-│                          │       starts one read sooner
-│                          └─ no (wide but few valid px) →
-│                                prefetch OFF, strips at the PAIR budget [§4.2]
-│                                (one set resident → bigger budget safe;
-│                                fewer, larger reads)
+│        └─ no  → SPLIT into budget-sized northing strips               [§4.2]
+│                 ● bounds peak host RAM
+│                 ◐ strip prefetch: strip i+1 loads while strip i
+│                   runs the GPU
 │
-├─ Q4. On the LAST strip, is this a RAM trough (≤ 1× budget)?
-│        ├─ yes, and a next tile is reserved →
-│        │     ● cross-chunk starter prefetch: preload the next tile's [§4.3]
-│        │       mask + 256-row starter NOW (mask-only when the rung says
-│        │       the starter wouldn't pay for its extra read), so its GPU
-│        │       work starts ~6 s later instead of ~24–36 s
-│        └─ no (pair budget) → skip it; the next tile takes the serial
-│              prologue (slower, but never over the RAM ceiling)
+├─ On the LAST strip, is a next tile reserved?
+│        ├─ yes → ● cross-chunk prefetch: the pipeline's next strip is  [§4.3]
+│        │        the next tile's first, loaded with its mask, so its
+│        │        GPU work starts without a serial prologue
+│        └─ no  → the next tile takes the serial prologue
 │
 └─ SPATIAL sparsity (per strip): ◐ empty-strip skip — a strip whose    [§4.1]
                            mask slice has zero valid pixels skips the S2 band read
@@ -198,9 +186,8 @@ which GPU-idle window each reclaims (see the three-windows diagram above).
 | Batch size 3584 → 7168 ([§7](../src/tessera_embeddings/inference/README.md#7-the-forward-pass-on-the-gpu-inferencepy)) | core loop | mid-forward | always | ◐ medium¹ |
 | Background staging write ([§4.3](../src/tessera_embeddings/inference/README.md#43-starting-the-next-tile-early-and-finishing-the-last-one-late)) | core loop | write (post) | always | ○ small |
 | Valid-pixel-aware northing striping ([§4.2](../src/tessera_embeddings/inference/README.md#42-loading-a-tile-in-strips)) | adaptive | *enabling* | tile exceeds one RAM budget | ● large² |
-| Intra-chunk strip prefetch ([§4.2](../src/tessera_embeddings/inference/README.md#42-loading-a-tile-in-strips)) | adaptive | mid-forward | dense/hideable split | ◐ medium |
-| Starter strip ([§4.3](../src/tessera_embeddings/inference/README.md#43-starting-the-next-tile-early-and-finishing-the-last-one-late)) | adaptive | cold-start | dense split with a real body | ○ small |
-| Cross-chunk starter prefetch ([§4.3](../src/tessera_embeddings/inference/README.md#43-starting-the-next-tile-early-and-finishing-the-last-one-late)) | adaptive | cold-start (next tile) | last strip is a RAM trough + next tile reserved | ● large |
+| Strip prefetch ([§4.2](../src/tessera_embeddings/inference/README.md#42-loading-a-tile-in-strips)) | adaptive | mid-forward | any split tile | ◐ medium |
+| Cross-chunk prefetch ([§4.3](../src/tessera_embeddings/inference/README.md#43-starting-the-next-tile-early-and-finishing-the-last-one-late)) | adaptive | cold-start (next tile) | next tile reserved | ● large |
 | Timestep pruning ([§4.1](../src/tessera_embeddings/inference/README.md#41-read-as-little-as-possible)) | adaptive | cold-start | **temporal** sparsity (cloudy/empty dates) | ○ small–◐ |
 | Empty-strip skip ([§4.1](../src/tessera_embeddings/inference/README.md#41-read-as-little-as-possible)) | adaptive | cold-start (per strip) | **spatial** sparsity (a row band with no valid px) | ◐ medium |
 | Easting bbox crop ([§4.1](../src/tessera_embeddings/inference/README.md#41-read-as-little-as-possible)) | adaptive | cold-start | **spatial** sparsity (valid px in a narrow column window) | ◐ medium³ |

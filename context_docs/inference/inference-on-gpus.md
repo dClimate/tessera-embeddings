@@ -1079,16 +1079,12 @@ evidence yet that the inference line is sound.
 ## 7. Gotchas, and remaining headroom
 
 **RAM budget is load-bearing.** Do NOT raise `_S2_STRIP_BYTE_BUDGET` or reintroduce whole-chunk
-cross-chunk prefetch without re-deriving the arithmetic at the constant. The pair ceiling (2× budget)
-plus the ~2 GiB prefetch stash is what keeps peak host RAM under 60%. The prefetch MUST skip
-pair-budget plans — their last strip is not a RAM trough. (The guard is no longer a named list of
-unsafe strategies: **every** strategy now respects the same resident-pair ceiling in `_strip_plan`,
-and the `_XCHUNK_*` caps live in `inference/read_plan.py`, except the three the actor's
-execution path owns — `_XCHUNK_DISABLE_ENV`, `_XCHUNK_MASK_TRANSIENT_CAP_BYTES` and
-`_XCHUNK_T_ALL_EST` — which stay in `inference/actors.py`.)
-
-**The strip-plan estimator is strategy-only.** `_EST_*` constants pick which safe strategy is
-fastest; they are NEVER a RAM bound. Every branch is RAM-safe regardless of estimate accuracy.
+cross-chunk prefetch without re-deriving the arithmetic at the constant. The load pipeline is one
+strip deep and runs across chunk boundaries, so at most two band sets are resident — mid-chunk, the
+strip being inferred and the next one loading; across a boundary, the last strip and the next chunk's
+first — and the pair ceiling (2× budget) is what keeps peak host RAM under 60%. On 2048² mosaics the
+budget is 3.5 GiB and the measured peak 41%
+([`inference-at-2048.md`](inference-at-2048.md)).
 
 **Shared CloudWatch log group across runs.** `--ram-report` and log greps must be scoped tightly with
 `--since` / `--until`; a broad window mixes concurrent runs. On-worker 1 s GPU poll files
@@ -1111,7 +1107,7 @@ full extent.
 the cold first-chunk-per-worker prologue (~36 s, ~85 chunks on `a60550ae` as the fleet autoscaled
 22→30) — a chunk with no predecessor to prefetch from, which the cross-chunk prefetch structurally
 cannot reach. **Source-store chunk geometry is not a lever at this scale.** The 4000² storage
-chunking drives a ~13 s fixed read amplification per chunk, but the starter prefetch hides it: on
+chunking drives a ~13 s fixed read amplification per chunk, but the cross-chunk prefetch hid it: on
 Iowa, mosaics stored in 2048² chunks gave the same median per-chunk GPU overhead (5.7 s) and the
 same fleet GPU time (33.5 GPU-hours by peak actors × span, against ~34) as 4000² ones
 ([`../ingest/frisky-dev-test-plan.md`](../ingest/frisky-dev-test-plan.md), Phase C).
@@ -1135,7 +1131,7 @@ gap exists. See [`../../tests/README.md`](../../tests/README.md).
 | the allocator flag | `inference/actors.py`, the `@ray.remote(runtime_env=...)` decorator |
 | the checkpoint ladder and its clipping | `inference/sampling.py`, `compute_bin_keys` |
 | deepest bucket first | `inference/dataset.py`, `iter_buckets(largest_first=True)` |
-| the strip plan and its RAM budget | `inference/read_plan.py`, `_strip_plan`, `_S2_STRIP_BYTE_BUDGET`, `_XCHUNK_PREFETCH_CAP_BYTES` |
+| the strip plan and its RAM budget | `inference/read_plan.py`, `_strip_plan`, `_S2_STRIP_BYTE_BUDGET` |
 | the pipelined forward loop | `inference/inference.py`, `_pipelined_gpu_loop` |
 | how many actors Ray packs on a card | `inference/scheduling.py`, `FleetDemand.machines` |
 | which instance rungs may be opened | `providers/aws/fleet_mix.py`, `GPU_RUNGS` |
