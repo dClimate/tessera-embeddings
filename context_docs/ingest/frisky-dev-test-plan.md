@@ -322,8 +322,9 @@ baseline in [`inference-on-gpus.md`](../inference/inference-on-gpus.md). The bas
 `a60550ae` inferred 404 chunks in about 73 minutes and 34 GPU-hours on 30 actors. Ingest S2 at 60
 workers and S1 ascending at 13 on Frisky with the drain, then run `tessera-embeddings` with the
 baseline's parameters (30 actors, `s1_orbit` both, `time_window_end` October 2025). Everything
-writes under its own prefix in each bucket, `_frisky_e2e_c/` for version C, with the Iowa ROI
-copied there unchanged, so no baseline store is touched; the mosaics are kept for reruns.
+writes under its own prefix in each bucket, `_frisky_e2e_c/` for version C, with the Iowa ROI and
+the model checkpoint (`models/tessera_v1_1_aws_encoder.pt`, which inference reads from under the
+inputs prefix) copied there unchanged, so no baseline store is touched; the mosaics are kept for reruns.
 
 **Compare** against the baseline: the embeddings with `te-compare-outputs`, and the wall clock
 and cost, split into ingest, inference and assembly. Inference code has changed since the
@@ -339,7 +340,31 @@ the year rerun on version C.
 between commits through August, then slowed at the same hour mark, gates reaching 88 s; it was
 cancelled at 1 h 05 min with 192 dates written and resumed on a fresh cluster, which starts the
 day after the newest held date and wrote the last 29 dates in 11 min at 20.6 s a date. Ingest cost
-$19.58 in all. Inference runs on the result as `b65429de`.
+$19.58 in all.
+
+**On version C, inference** (`d7e25533`; the first attempt, `b65429de`, found no checkpoint under
+the prefix and started no actor). The 2048 store did not change inference at Iowa scale, because
+the starter prefetch already hides the chunk reads it was meant to shorten:
+
+| Iowa inference | Baseline `a60550ae` (4000² mosaics) | 2048² mosaics |
+|---|---|---|
+| Chunks | 404 | 394, all written |
+| Inference span | about 73 min, 30 actors | 72 min, 28 at peak (GPU capacity) |
+| GPU-hours, peak actors × span | about 34 | 33.5 ($62) |
+| GPU-hours busy | not recorded | 25.2 ($47) |
+| Per-chunk GPU overhead, median | about 6 s | 5.7 s |
+
+The flow took 1 h 37 min: 9 min to start the Ray cluster and actors, 72 min inferring, 15 min
+assembling. The baseline's own logs are past CloudWatch's retention, so its column is the
+inference record's figures.
+
+The embeddings agree broadly but are not equivalent. Over 40 random 64-px windows (163,840 pixels,
+`temp/frisky-dev/compare_embeddings.py`), the median cosine similarity is 0.993 and the 5th
+percentile 0.947. The difference is in the mosaics, not the inference: the two S2 stores hold the
+same dates (all 217 of the baseline's, plus 4), but the per-pixel S2 observation counts agree on
+only 28% of pixels, far beyond the warp's 0.05% (S1 ascending: 95%). The baseline's mosaics predate
+later ingest changes, the clearest-scene fix of PR #121 among them, so isolating the chunk size
+needs a 4096 ingest of the same year on current code.
 
 ## Acceptance
 
@@ -362,9 +387,9 @@ Ingest only, at about $0.27 a worker-hour:
 | B3 | $6.15, measured |
 | B4 | $36.92, measured, over three attempts |
 | C on version B | $24.27, measured, ingest only, cancelled |
+| C on version C | $19.58 of ingest and $47 to $62 of GPU time, measured |
 
-That is $59.36 for the ingest phases. Phase C on version C adds about $25 of ingest and, if
-inference matches the baseline, $60 to $70 of GPU time. The run log records the actual figures.
+That is $59.36 for the ingest phases. The run log records each run's figures.
 
 ## Run log
 
@@ -435,3 +460,5 @@ stages overlap, so those runs give the wall clock between one date's commit and 
 | 2026-10-02 | vc-iowa-s1-frisky | C | Frisky | iowa_epsg5070, 2024-11-01..2025-10-31 | S1 asc | 13 | `26a5b4ac` | 33m19s | 10.8 | 0 | pass: 169 dates, $1.74, drained |
 | 2026-10-02 | vc-iowa-s2-frisky | C | Frisky | iowa_epsg5070, 2024-11-01..2025-10-31, pipelined | S2 | 60 | `edb1c173` | 1h05m27s | 23.6 to August, 48.2 from September | 0 | cancelled at the slowdown: 192 dates written, $15.46, drained |
 | 2026-10-02 | vc-iowa-s2-frisky-r2 | C | Frisky | iowa_epsg5070, resumed from 2025-09-20, pipelined | S2 | 60 | `be279b05` | 11m06s | 20.6 | 0 | pass: 29 dates, $2.38, drained |
+| 2026-10-02 | vc-iowa-embed | C | Ray | iowa_epsg5070, to October 2025 | inference | 30 actors | `b65429de` | 13m01s | – | – | fail: no checkpoint under the experiment prefix, no actor started |
+| 2026-10-02 | vc-iowa-embed-r2 | C | Ray | iowa_epsg5070, to October 2025 | inference | 30 actors, 28 at peak | `d7e25533` | 1h37m32s | 230 s/chunk median | – | pass: 394 chunks, 25.2 GPU-hours busy, $47 to $62 |

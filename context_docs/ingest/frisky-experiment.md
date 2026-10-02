@@ -292,7 +292,9 @@ The runs, their figures and how to rerun them are in
   most of it the failed `spans.json` query above.
 
 The 2048-px chunk changes pixels slightly, through GDAL's approximate warp transformer rather than
-through either engine; the plan's B1 result has the measurement.
+through either engine; the plan's B1 result has the measurement. It does not change inference at
+Iowa scale: a year of Iowa took the same GPU time on 2048² mosaics as the 4000² baseline, because
+the starter prefetch already hides the chunk reads (the plan's Phase C result).
 
 How to use Frisky, and the do's and don'ts that follow from these findings, are reference
 documentation: [`docs/frisky.md`](../../docs/frisky.md).
@@ -311,6 +313,8 @@ documentation: [`docs/frisky.md`](../../docs/frisky.md).
   Dask's by 27%. Grouping only on Frisky, or not at all, changes the ingest code identity either
   way.
 - Report the heartbeat growth upstream, with the local reproduction.
+- Ingest the Iowa year at 4096 on current code, to separate the chunk size from the ingest changes
+  since the inference baseline in the embedding comparison.
 - Find why the gate's computes run one after another on Frisky.
 - Decide whether Frisky stays a core dependency when this reaches `main`, on the experiment's
   results and the constraints under Packaging above.
