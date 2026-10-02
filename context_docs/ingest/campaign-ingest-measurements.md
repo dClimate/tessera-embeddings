@@ -1623,6 +1623,7 @@ defect fix.
 | window-strategy bound | best any rectangle strategy achieves is **0.50×** current area; shipped achieves 0.75× | local, real footprints (§4.7) |
 | external catalog latency drift | identical query **37.6 s vs 33.1 s** two hours apart (~12%) | §5 |
 | worker-count scaling, dense zone | median s/date **194.8 at 120w, 232.4 at 60w, 396.7 at 30w**; doubling buys 1.71× at 30→60 and 1.19× at 60→120 | 7 dates per rung |
+| task threads per worker, 4 → 6 | **~3% per date** (134 → 130 s median), busy-thread CPU 85% → 92%, peak worker memory 3.7 → 5.7 GiB of 24, no spill | paired 60w arms, §11.7 |
 
 ---
 
@@ -1841,6 +1842,31 @@ been interpretable. What made it interpretable at all was reading achieved width
 health lines: median 57, max 60 workers with `no-worker=0` on all 48 samples, against 28
 loaded-account fleets of which 14 sat at max 60. **Nominal width is a request, not a fact** — fleets
 hold only 85–90% of nominal.
+
+### 11.7 Task threads per worker: 6 instead of 4 buys about 3% (2026-10-02)
+
+**Conditions:** zone `35N`, 2024-01-01 to 2024-01-07, 60 workers of 4 vCPU and 24576 MiB, 4096-px
+chunks, `pipeline_dates` on, `min_valid_coverage` 0.1, the 4096 zone mask, main at `63ace646` plus
+the S2 flow's `worker_nthreads` parameter (`de57cba8`, no code-identity change). Two Dask arms ran
+at the same time, identical but for the threads, so the comparison is immune to the hours-scale
+latency drift (§11.6).
+
+| | 4 threads (default) | 6 threads |
+|---|---|---|
+| Wall between date commits, median (mean) | 134 s (132) | 130 s (128) |
+| Run wall, cost | 20m32s, $4.45 | 19m53s, $4.34 |
+| Worker CPU in minutes with the fleet's threads ≥ 90% busy | 85% | 92% |
+| Peak worker memory (Container Insights; health-line `wmax`) | 3.7 GiB (3.3) | 5.7 GiB (5.3) |
+| Median band read, 10 m and 20 m | 469 ms, 2,226 ms | 715 ms, 3,405 ms |
+
+No worker spilled, paused, failed or exited in either arm. **At 4096 the workers are already close
+to CPU-bound with four threads**, so the extra two mostly share the same cores: each read takes
+about 1.5× as long and the date only 3% less. Memory grows 1.5× and stays at a quarter of the
+worker. The same change gave 15% on 2048-px chunks under Frisky, where four threads left the CPU at
+73% busy (`context_docs/ingest/frisky-dev-test-plan.md` on the `experiment/frisky-ingest` branch),
+so the gain is a property of how much each read waits, not of the threads alone. **Verdict: not
+worth changing main's default for**; `worker_nthreads` stays a per-run knob. Both arms beat F-23's
+pipelined 156.4 s on the same zone, dates and width, under July's code.
 
 ---
 
