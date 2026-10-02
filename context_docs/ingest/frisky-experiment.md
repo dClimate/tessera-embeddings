@@ -198,6 +198,11 @@ about 4.4 s, against about 7 s of `client.convert_legacy`). On Dask the first ta
 sooner, but the tasks then take longer, and the write's wall clock is unchanged within the runs'
 spread; locally Dask's scheduler shares the driver's process, which Fargate's does not.
 
+On 35N on dev (version C, with `pipeline_dates`) the grouping pays only on Frisky. Frisky's writes
+ran 3% to 16% shorter from the second date on, and its time between dates fell from 165 s to 152 s.
+Dask's writes ran 31% to 35% longer on every date, and its time between dates rose from 211 s to
+269 s: its scheduler, already at 100% of its core, now takes four graphs a date instead of one.
+
 **Measured and ruled out: thread stack size.** Frisky's task threads get Rust's default 2 MiB
 stack; Dask's get 16 MiB on macOS (and typically 8 MiB on Linux). Raising Frisky's with
 `RUST_MIN_STACK` did not stop the crash above, and once thread state is pinned the real ingest
@@ -218,11 +223,15 @@ Done locally (macOS, Python 3.13), and green again in CI on Linux (Python 3.12 a
 ## On the dev account
 
 The runs, their figures and how to rerun them are in
-[`frisky-dev-test-plan.md`](frisky-dev-test-plan.md). Up to Iowa at production width, three
-findings:
+[`frisky-dev-test-plan.md`](frisky-dev-test-plan.md). Up to zone scale at production width:
 
 - **Stable and exact.** No worker died in any run, and Frisky's stores are bit-identical to Dask's
-  at both chunk sizes.
+  at both chunk sizes. One Frisky scheduler died, at the end of a zone run, from its span buffers
+  (below).
+- **Faster at zone scale, because Dask's scheduler saturates.** On 35N for a week Frisky took 193 s
+  a date against Dask's 275 s, and 152 s against 269 s with `pipeline_dates` and grouped writes
+  (above). Dask's scheduler sat at 95% to 101% of its core and ran the coverage gate with the
+  fleet under a third busy; Frisky's kept the fleet 97% busy through every write.
 - **As fast as Dask at Iowa scale, once its graphs pickle cheaply.** Frisky's tasks are as fast or
   faster (store writes 0.97 of Dask's median, band reads 0.89), but it first took 25 to 40% longer
   per S2 date, idling while the driver pickled each graph (item 5 above). With the fix it matches
@@ -230,21 +239,32 @@ findings:
   not the bound at that scale, so Frisky's scheduling advantage has nothing to recover yet. At
   4096 a second cost shows: each batch ends on a long tail, because one worker is handed up to 1.8
   times the mean work and keeps it while the others go idle.
+- **Frisky's scheduler does more work per heartbeat the longer a run goes.** Its own summary line
+  in the scheduler's log (`sched: busy=… heartbeat=…`) shows the time spent on worker heartbeats
+  rising steadily with the work submitted: on Iowa from about 20 ms a window at the start to
+  850 ms an hour in, and the loop's busy share from 2% to 17–18%, where it levelled off. Both Iowa
+  runs follow the same curve, with span buffers of 1,000,000 and of 200,000; and locally 4,000
+  small graphs take it from 1 to 10 ms whatever `FRISKY_EVENT_LOG_CAPACITY` or
+  `FRISKY_TRACING_CAPACITY` is, so it is neither the spans nor the event log. On the first
+  year-long Iowa run the slowdown began as the busy share levelled, about an hour in: gates rose
+  from 10 to 93 s and writes from 52 to 228 s, with gaps of 11 to 61 s between small tasks while
+  the workers idled, and an overview query took 87 s. It is inside Frisky, so it goes upstream; a
+  zone-year runs for hours, so it decides whether Frisky can take one.
 - **The end-of-run capture keeps only a run's tail.** At Iowa scale Frisky emits about 15,000 spans
   a second, so the 500,000 captured at the end cover about half a minute. Each process keeps its
   own span buffer (1,000,000 by default), which a worker fills in about an hour, so the run's spans
   are still there to drain as it goes: `frisky_drain_spans` copies the task, transfer and spill
   spans every minute. They are a fifth of the spans and hold all of the task time; spans under
   1 ms would be another five times smaller but lose a quarter of the transfer time. On Iowa the
-  drain kept every span Frisky did, and Frisky's tracing itself misses about one in 2,000.
+  drain kept every span Frisky did, and Frisky's tracing itself misses about one in 2,000. It asks
+  for 15 seconds at a time: on 35N whole-minute requests timed out at the dashboard proxy (HTTP
+  504), and in slices none of version C's requests failed, 4.8 million spans over the 35N week.
 - **Frisky's default span buffer is too big for a long or zone-scale run.** Each process keeps
   `FRISKY_TRACING_CAPACITY` spans, 1,000,000 by default. On the
   pipelined 35N rerun the scheduler's memory doubled every two minutes to 5.7 GiB of its 8 GiB,
   held there once the buffer was full, reached 6.8 GiB under the end-of-run capture's three large
   span queries, and the process died without logging a close, after all seven dates had committed;
-  `cluster.close()` then timed out on it and failed the flow. On the year-long Iowa run, whose
-  buffers filled at about minute 63, dispatch latency rose from milliseconds to 11–61 s a task
-  while workers sat at 2–3% CPU, and an overview query took 87 s. `ecs_cluster(frisky=True)` now
+  `cluster.close()` then timed out on it and failed the flow. `ecs_cluster(frisky=True)` now
   sets 200,000, and the end-of-run capture asks the scheduler for spans once, computing both
   overviews from that file in the flow's process. At 200,000 on version C the scheduler still
   stepped up at each live snapshot while the buffers filled, and only then: 0.6 to 2.7 GiB at the
@@ -284,12 +304,10 @@ documentation: [`docs/frisky.md`](../../docs/frisky.md).
   icechunk to make `computing_meta` pickle by reference so `_picklable_merge_reduction` can go.
 - Confirm the shorter end-of-run capture on dev: a drained Iowa run's bundle should land within
   about 10 s of its last batch, not 45.
-- Confirm the grouped write submission on 35N on dev: the idle stretch before each date's write
-  (15 to 29 s) should shrink on Frisky, and Dask's per-date time should not rise.
+- Decide the grouped write submission: on 35N it cut Frisky's time a date by 8% and raised
+  Dask's by 27%. Grouping only on Frisky, or not at all, changes the ingest code identity either
+  way.
+- Report the heartbeat growth upstream, with the local reproduction.
 - Find why the gate's computes run one after another on Frisky.
-- Check the span drain's load on the scheduler at B4's scale; at Iowa its peak was 79% of a core.
-  On 35N with `pipeline_dates`, whole-minute drain requests hit the dashboard proxy's timeout
-  (HTTP 504) and each miss grew the retry; drains now request 15-second slices and keep the
-  slices read before a failure. Confirm on dev.
 - Decide whether Frisky stays a core dependency when this reaches `main`, on the experiment's
   results and the constraints under Packaging above.

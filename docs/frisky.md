@@ -51,6 +51,11 @@ frisky observe events   http://localhost:8787 --kind worker_removed   # workers 
 frisky observe --help                             # the rest: prefixes, blocked, transfers, ...
 ```
 
+On a long run, also watch Frisky's own summary in the scheduler's log stream, a `sched: busy=…`
+line every few seconds. Its `heartbeat=` time grows with all the work the cluster has run, and
+past about an hour of Iowa (17–18% busy) the ingest slowed sharply; the record has the
+measurements.
+
 After the run, read the spans `perf_report_uri` captured:
 
 ```bash

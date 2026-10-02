@@ -278,6 +278,24 @@ first:
   queries took it to 6.8 GiB before it died; `cluster.close()` then timed out reaching it. The
   record's span-buffer finding has the fix, which version C carries.
 
+**On version C** (the 2048 mask, `pipeline_dates`, both arms at once, wall between date commits):
+
+| 35N, 2 to 7 January | Dask | Frisky |
+|---|---|---|
+| Version B, s/date | 211 (to 6 January) | 165 |
+| Version C, s/date | 269 | 152 |
+| Version C, run wall | 41 min | 23 min |
+| Version C, cost | $9.26 | $5.18 |
+
+- **Grouped writes help Frisky and hurt Dask.** Frisky's writes ran 3% to 16% shorter from the
+  second date; Dask's ran 31% to 35% longer on every date (194 to 296 s, against 147 to 223 s on
+  both earlier runs). The record's item 5 has the numbers.
+- **Both completed.** Frisky's span drain kept 4,822,258 spans in 19 parts with no failed request.
+- **Scheduler memory.** Frisky's levelled at 3.4 to 3.5 GiB after stepping up at the first two
+  live snapshots, then reached 6.6 GiB under the end-of-run `spans.json` query, which timed out
+  at the proxy; both are now kept off the scheduler for drained runs. Dask's reached 6.8 GiB
+  writing its performance report, which took 4 min 14 s after the last date.
+
 **B5: re-measure the provisional constants.** Version B's chunk-counted thresholds are the 4096
 measurements converted by area:
 
@@ -308,10 +326,11 @@ copied there unchanged, so no baseline store is touched; the mosaics are kept fo
 and cost, split into ingest, inference and assembly. Inference code has changed since the
 baseline, so a difference is only attributed to the chunk size once that is ruled out.
 
-**On version B, cancelled.** The S2 ingest slowed about 63 minutes in, when the span buffers
-filled: gates rose from 10 to 93 s and writes from 52 to 228 s, with gaps of 11 to 61 s between small
-tasks while the workers idled. The run was cancelled at 1 h 36 min, with S1's year complete, and the year
-rerun on version C.
+**On version B, cancelled.** The S2 ingest slowed about 63 minutes in, as the growing cost of
+Frisky's scheduler heartbeats levelled its loop at 17–18% busy (the record's heartbeat finding):
+gates rose from 10 to 93 s and writes from 52 to 228 s, with gaps of 11 to 61 s between small
+tasks while the workers idled. The run was cancelled at 1 h 36 min, with S1's year complete, and
+the year rerun on version C.
 
 ## Acceptance
 
@@ -401,4 +420,7 @@ stages overlap, so those runs give the wall clock between one date's commit and 
 | 2026-10-01 | b4c-s2-frisky | B (`31ea6ac0`) | Frisky | zone_35N (2048 mask), 2024-01-01..07, pipelined | S2 | 60 | `e4581666` | 26m51s | 165 (wall, dates 2 to 7) | 0 | fail at close: 7 dates written, scheduler died after the capture, $5.55, drained |
 | 2026-10-01 | b4c-s2-dask | B (`31ea6ac0`) | Dask | zone_35N (2048 mask), 2024-01-01..07, pipelined | S2 | 60 | `fec46c8d` | 30m58s | 211 (wall, dates 2 to 6) | 0 | pass: 7 dates, $7.00 |
 | 2026-10-01 | c-iowa-s1-frisky | B (`31ea6ac0`) | Frisky | iowa_epsg5070, 2024-11-01..2025-10-31 | S1 asc | 13 | `88928e92` | 35m10s | 11.2 | 0 | pass: 169 dates, $1.84, drained |
-| 2026-10-01 | c-iowa-s2-frisky | B (`31ea6ac0`) | Frisky | iowa_epsg5070, 2024-11-01..2025-10-31 | S2 | 60 | `eeff91a8` | 1h35m33s | 23.0 | 0 | cancelled: span buffers full, 180 dates written, $22.43, drained |
+| 2026-10-01 | c-iowa-s2-frisky | B (`31ea6ac0`) | Frisky | iowa_epsg5070, 2024-11-01..2025-10-31 | S2 | 60 | `eeff91a8` | 1h35m33s | 23.0 | 0 | cancelled: slowed after an hour, 180 dates written, $22.43, drained |
+| 2026-10-02 | vc-35n-s2-frisky | C | Frisky | zone_35N (2048 mask), 2024-01-01..07, pipelined | S2 | 60 | `11a8f199` | 23m03s | 152 (wall, dates 2 to 7) | 0 | pass: 7 dates, $5.18, 4,822,258 spans drained |
+| 2026-10-02 | vc-35n-s2-dask | C | Dask | zone_35N (2048 mask), 2024-01-01..07, pipelined | S2 | 60 | `2f72bf4b` | 40m39s | 269 (wall, dates 2 to 7) | 0 | pass: 7 dates, $9.26 |
+| 2026-10-02 | vc-iowa-s1-frisky | C | Frisky | iowa_epsg5070, 2024-11-01..2025-10-31 | S1 asc | 13 | `26a5b4ac` | 33m19s | 10.8 | 0 | pass: 169 dates, $1.74, drained |
