@@ -67,16 +67,17 @@ on zone 35N, Frisky's default buffer of 1,000,000 plus three end-of-run queries 
 scheduler past 6.7 of its 8 GiB, and it died. A query filtered only by `--limit` assembles every
 process's buffer before trimming; one filtered by span name and time window does not. So the wiring
 bounds every term: 200,000 spans a process, a name and a 15-second slice per drain request, no span
-query in a drained run's live snapshot (it reads `frisky observe cluster` instead), and ONE span
-query at a time at the end of the run, the overviews being computed from `spans.json` in the
-flow's own process. Keep it that way when adding a capture.
+query in a drained run's live snapshot (it reads `frisky observe cluster` instead) or in its
+end-of-run `spans.json` (the drain's own tail), and ONE span query at a time at the end of the run,
+the overviews being computed from `spans.json` in the flow's own process. Keep it that way when adding a capture.
 
 **To keep the whole run,** also set `frisky_drain_spans=True`. Every minute the run then copies its
 task, transfer and spill spans (`SPAN_DRAIN_NAMES`, a fifth of all spans and every second of task
 time) to `<perf_report_uri>/spans/part-NNNNNN.json.gz`, asking for 15 seconds at a time so each
 request stays inside the dashboard proxy's timeout. That is about 9 GB a day gzipped per 60
-workers. `spans.json` then keeps only the last 100,000 spans (`SPANS_CAPTURE_LIMIT_DRAINED`), about
-7 s at Iowa scale, because the parts already hold every task span. To read a run's parts as one
+workers. `spans.json` is then the drain's own last 100,000 spans (`SPANS_CAPTURE_LIMIT_DRAINED`),
+about 7 s at Iowa scale and of the drained kinds only, because the parts already hold every task
+span. To read a run's parts as one
 file:
 
 ```bash

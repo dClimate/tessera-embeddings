@@ -253,7 +253,10 @@ findings:
   snapshot's overview asks for the latest 50,000 spans, which the scheduler finds by assembling
   every process's buffer, while the drain asks for one span name over a 15-second slice. So a
   drained run's live snapshot now reads `frisky observe cluster`, the counts alone, and the
-  drain's parts hold the spans.
+  drain's parts hold the spans. The end-of-run `spans.json`, the one unfiltered query left, then
+  took the same scheduler from 3.4 to 6.6 GiB and timed out at the dashboard proxy (HTTP 504);
+  with the drain it is now the drain's own tail, so a drained run asks the scheduler only for
+  filtered slices.
 - **The end-of-run capture took 45 s with the drain on, against Dask's 7 s, while the whole fleet
   was billed.** The bundle's S3 timestamps on the `-fix` run split it: the final drain about 9 s,
   the 500,000-span `spans.json` 18 s before its 167 MB upload began (five pages from the
@@ -261,8 +264,9 @@ findings:
   a hijacked cluster holding 600,000 spans, three changes take the same exit from 8.4 s to 2.1 s.
   The drain writes each part with one `json.dumps` at gzip level 6, where streaming `json.dump` ran
   the pure-Python encoder into level 9: a 173,000-span part takes 0.53 s instead of 2.35 s and is
-  9% larger. With the drain on, `spans.json` keeps 100,000 spans, one page of the span API. And the
-  final captures run concurrently. Not yet measured on dev.
+  9% larger. With the drain on, `spans.json` is the drain's last 100,000 spans. And the final
+  captures run concurrently. On version C's 35N run the capture took 16 s after the last date,
+  most of it the failed `spans.json` query above.
 
 The 2048-px chunk changes pixels slightly, through GDAL's approximate warp transformer rather than
 through either engine; the plan's B1 result has the measurement.
