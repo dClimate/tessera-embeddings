@@ -238,19 +238,6 @@ def test_v2_output_is_layer_normalised_per_row(v2_model) -> None:
     torch.testing.assert_close(out.std(dim=-1, unbiased=False), torch.ones(8), atol=1e-4, rtol=0)
 
 
-def test_a_radar_free_pixel_embeds_as_upstream_v2_does(v2_model) -> None:
-    """Upstream v2 feeds a radar-free pixel ONE all-zero S1 step; the shared bucket schedule
-    feeds eight. Identical tokens make the two equal up to float rounding, which is why the
-    schedule needs no v2-specific branch — and a change that made sequence length matter
-    (an index-based position, a mask) would break it here first.
-    """
-    s2 = torch.randn(16, 16, 11)
-    s2[:, :, 10] = torch.sort(torch.randint(1, 366, (16, 16)), dim=1).values.float()
-    with torch.no_grad():
-        one, eight = v2_model(s2, torch.zeros(16, 1, 3)), v2_model(s2, torch.zeros(16, 8, 3))
-    torch.testing.assert_close(eight, one, atol=1e-5, rtol=0)
-
-
 def test_quantization_is_version_agnostic(v2_model) -> None:
     """Per-pixel abs-max int8 + fp32 scale needs no v2 changes.
 
@@ -276,17 +263,19 @@ def test_quantization_is_version_agnostic(v2_model) -> None:
     torch.testing.assert_close(s_torch, torch.from_numpy(scales), atol=0, rtol=0)
 
 
-def test_v2_runs_the_unmodified_inference_loop(v2_model, sample_chunk_data) -> None:
+@pytest.mark.parametrize("t_s1", [5, 0], ids=["with-radar", "radar-free"])
+def test_v2_runs_the_unmodified_inference_loop(v2_model, sample_chunk_data, t_s1: int) -> None:
     """The bucketing/sampling/quantize path needs no v2 changes: (H, W, 128) int8 out.
 
     ``save_dim = min(EMBEDDING_DIM, representation_dim)`` is 128 for v2, so the
-    v1.1 slice is the identity and the store layout is unchanged.
+    v1.1 slice is the identity and the store layout is unchanged. The radar-free chunk
+    puts every pixel in v2's one-step S1 bucket, a length no other bucket has.
     """
     from tessera_embeddings.inference.dataset import MosaicChunkInferenceDataset
     from tessera_embeddings.inference.inference import run_inference
 
     config = v2_config(batch_size=8)
-    chunk = sample_chunk_data(height=4, width=4, t_s2=10, t_s1a=5, t_s1d=5)
+    chunk = sample_chunk_data(height=4, width=4, t_s2=10, t_s1a=t_s1, t_s1d=t_s1)
     dataset = MosaicChunkInferenceDataset(
         chunk,
         num_obs_checkpoints=config.num_obs_checkpoints,
@@ -296,6 +285,7 @@ def test_v2_runs_the_unmodified_inference_loop(v2_model, sample_chunk_data) -> N
         # demonstrating the bug it should have caught.
         model_version=config.model_version,
         norm_source=config.norm_source,
+        allow_s2_only=True,
     )
 
     result = run_inference(v2_model, dataset, config, torch.device("cpu"))

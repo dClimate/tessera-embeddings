@@ -449,13 +449,12 @@ buckets.
    and — by default — at least one non-zero radar observation. The radar requirement is
    optional: with `InferenceConfig.allow_s2_only=True` (the flow parameter
    `allow_s2_only`, off by default), optical-valid pixels inside radar coverage gaps are
-   embedded too. They are fed the upstream v1.1 missing-radar convention: an all-zeros
-   radar slice *in normalised space*, in the smallest bucket, bit-identical to what
-   `ucam-eo/tessera`'s `_sample_s1_merged` returns for the same case. Nothing in the
-   encoder requires a radar observation to exist. v2 Large is fed the same slice, where
-   upstream v2 uses a single zero step; the steps are identical tokens, so the two give the
-   same embedding up to float rounding (`test_student_v2.py`). Radar-informed pixels are
-   unaffected by the flag. Downstream, an optical-only pixel is exactly one with a finite `scales` value
+   embedded too. Each model gets its own upstream missing-radar input, an all-zeros radar
+   slice *in normalised space*: v1.1 in the smallest bucket, bit-identical to what
+   `ucam-eo/tessera`'s `_sample_s1_merged` returns for the same case, and v2 as a single step,
+   as upstream v2 does, which costs seven fewer tokens per pixel. Nothing in the encoder
+   requires a radar observation to exist. Radar-informed pixels are unaffected by the flag.
+   Downstream, an optical-only pixel is exactly one with a finite `scales` value
    and `s1_asc_obs_count + s1_desc_obs_count == 0`. **The production gate on this is recorded
    as cleared** — [ADR-013](../../../context_docs/decisions/013-optional-s1-s2-only-pixels.md)
    §Quality caveat, and the global campaign runs with the flag on, because about a fifth of

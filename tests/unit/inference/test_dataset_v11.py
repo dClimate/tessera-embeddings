@@ -143,19 +143,21 @@ def test_s2_only_pixels_dropped_by_default() -> None:
     assert list(ds.iter_buckets()) == []
 
 
-def test_allow_s2_only_embeds_s1_empty_pixels_with_upstream_convention() -> None:
-    """With allow_s2_only, S2-valid/S1-empty pixels are kept and receive the
-    upstream v1.1 missing-S1 input: the SMALLEST S1 bucket and an all-zeros
-    (normalized-space) S1 slice — exactly ucam-eo/tessera's
-    ``_sample_s1_merged`` zero return.
+@pytest.mark.parametrize(("model_version", "s1_steps"), [("v1.1", CKPS[0]), ("v2-large", 1)])
+def test_allow_s2_only_embeds_s1_empty_pixels_with_upstream_convention(model_version: str, s1_steps: int) -> None:
+    """With allow_s2_only, S2-valid/S1-empty pixels are kept and receive their model's upstream
+    missing-S1 input, an all-zeros (normalized-space) S1 slice: the SMALLEST S1 bucket for v1.1
+    (ucam-eo/tessera's ``_sample_s1_merged`` zero return), ONE step for v2 (``max(s1_bin, 1)``).
     """
     chunk_data = _make_chunk_data(H=4, W=4, n_s2=12, n_s1a=0, n_s1d=0)
-    ds = MosaicChunkInferenceDataset(chunk_data, num_obs_checkpoints=CKPS, allow_s2_only=True)
+    ds = MosaicChunkInferenceDataset(
+        chunk_data, num_obs_checkpoints=CKPS, allow_s2_only=True, model_version=model_version
+    )
     assert len(ds) > 0  # every S2-valid pixel is now embedded
     for (s2_bin, s1_bin), idxs in ds.iter_buckets():
-        assert s1_bin == CKPS[0]  # zero S1 count clips into the smallest bucket
+        assert s1_bin == s1_steps
         batch = ds.get_bucket_batch((s2_bin, s1_bin), 0, len(idxs))
-        assert batch["s1"].shape[1:] == (CKPS[0], 3)
+        assert batch["s1"].shape[1:] == (s1_steps, 3)
         np.testing.assert_array_equal(batch["s1"], 0.0)  # neutral all-zeros slice
         assert np.all(np.isfinite(batch["s2"]))
 

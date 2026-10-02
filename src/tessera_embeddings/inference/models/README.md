@@ -38,6 +38,7 @@ bit-identical). Re-fetch instructions are in that file's header.
 | Checkpoint payload | `{"model_state"/"model_state_dict": …}` + FSDP/compile prefixes + training heads → `strict=False` | `{"model": state_dict, "args": {...}}`, clean → `strict=True` |
 | Band stats | MPC/AWS split (`norm_source`) | one fixed set; `norm_source` rejected |
 | Resampling rule | `build_resample_indices` | `build_resample_indices_v2` (upstream `_pad_pattern`) — the bucket SCHEDULE is shared, the index selection is not |
+| Radar-free pixel (`allow_s2_only`) | all-zeros S1 slice in the smallest bucket | all-zeros S1 slice, one step |
 | Fusion | `concat` or `sum` | `concat` only, refused at config time |
 | Checkpoint artifact | `tessera_v1_1_{aws,mpc}_encoder.pt` | `v2_student_large.pt`, staged from `geotessera/TESSERA-V-2.0-2B-L` (`ckpt/student_large.pt`, 175 MB) |
 

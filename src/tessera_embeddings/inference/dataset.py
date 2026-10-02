@@ -44,10 +44,10 @@ class MosaicChunkInferenceDataset:
         s1_orbit: Which S1 orbit direction(s) are active. Only affects logging. ``"none"`` means
             radar-free land, where every pixel takes the ``allow_s2_only`` branch.
         allow_s2_only: Keep S2-valid pixels with ZERO S1 observations (sub-zone SAR coverage gaps,
-            or an ROI with no radar at all). They land in the smallest S1 bucket and receive the
-            upstream v1.1 missing-S1 input: an all-zeros normalized-space S1 slice
-            (``resample_s1_bucket`` zero-count rows == ucam-eo/tessera's ``_sample_s1_merged``
-            zero return). Default False skips such pixels entirely — this pipeline's default gate.
+            or an ROI with no radar at all). They receive their model's upstream missing-S1 input,
+            an all-zeros normalized-space S1 slice: in the smallest S1 bucket for v1.1 (ucam-eo/tessera's
+            ``_sample_s1_merged`` zero return), one step long for v2 (``tessera_infer_v2``'s
+            ``max(s1_bin, 1)``). Default False skips such pixels entirely — this pipeline's default gate.
         optical_min_obs: Minimum valid optical observations for a pixel to be embedded at all.
             ``None`` embeds every pixel with any optical input, which is what every non-campaign
             caller wants. A positive value refuses thinner pixels, which is **not** a filter a
@@ -139,8 +139,8 @@ class MosaicChunkInferenceDataset:
         s1_total_valid = s1_asc_valid + s1_desc_valid
 
         # A pixel needs real S2 to embed at all; the S1 term is the optional part. By default a pixel with zero S1
-        # observations is skipped; with allow_s2_only it is kept and flows through as the upstream v1.1 missing-S1
-        # convention (all-zeros normalized S1 slice, smallest bucket via compute_bin_keys' clip). Per-pixel provenance
+        # observations is skipped; with allow_s2_only it is kept and given its model's upstream missing-S1 input
+        # (an all-zeros normalized S1 slice: the smallest bucket for v1.1, one step for v2). Per-pixel provenance
         # stays exact either way — s1_asc/desc_obs_count are written as 0 for these pixels.
         #
         # THREE refusal reasons, kept apart rather than folded into one boolean: no optical input at all, too little
@@ -187,6 +187,10 @@ class MosaicChunkInferenceDataset:
         pixel_s2_counts = s2_valid_count[rows, cols]
         pixel_s1_counts = s1_total_valid[rows, cols]
         keys = compute_bin_keys(pixel_s2_counts, pixel_s1_counts, self.num_obs_checkpoints)
+        if self.model_version != "v1.1":
+            # Each family's own missing-S1 input: v2 gives a radar-free pixel ONE zero step (upstream
+            # `s1_B = max(s1_bin, 1)`), where v1.1 keeps the smallest bucket. Seven fewer tokens per pixel.
+            keys["s1"][pixel_s1_counts == 0] = 1
 
         # Group pixel indices by (s2, s1) bucket, packing structured (int32, int32) into one int64 for a stable
         # argsort.

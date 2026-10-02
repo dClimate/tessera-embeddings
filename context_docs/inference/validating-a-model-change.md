@@ -56,6 +56,8 @@ model, because `MODEL_ARCHS["v2-large"]` overrides only the architecture fields 
   pixels hand their encoders different observation sequences, at the same shape and dtype.
 * **Band standardisation.** `band_stats(model_version, norm_source)` returns v2's single
   hard-coded set for v2 and the AWS/MPC pair for v1.1, so the normalised tensors differ too.
+* **A radar-free pixel's S1 length**, under `allow_s2_only`: one zero step for v2, the smallest
+  bucket for v1.1, each model's upstream input.
 
 Requiring either of those to match would assert something false. Hence the exact-match half of the
 gate is scoped to the shared list above and stops at the bucket schedule — which is precisely why
