@@ -1096,7 +1096,9 @@ Large's throughput against v1.1 is §7 of
 (`ckpt/student_large.pt`). The Prefect flow reads it as `v2_student_large.pt` from the model
 directory the v1.1 checkpoints use, `{inputs}/models/`, so it must be staged there under that
 name. The plain runner can instead take its URL as `checkpoint_url`, as the quickstart does for
-v1.1.
+v1.1. A store records the checkpoint's file name as its model identity (`checkpoint_id`), so append
+to a store from the same source that built it: the staged copy and the Hugging Face file have
+different names, and the append check refuses the mix.
 
 ---
 
