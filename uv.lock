@@ -1143,6 +1143,21 @@ wheels = [
 ]
 
 [[package]]
+name = "frisky"
+version = "0.7.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cloudpickle" },
+    { name = "rich" },
+    { name = "typer" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/6e/37/73b296033208e7e1feb553b13359305ce7501a24231abb8706fe19d2ffe3/frisky-0.7.2-cp311-abi3-macosx_11_0_arm64.whl", hash = "sha256:3069b1d5a0762919a30d8268f271e4b086eecc2963ea8e5589a7f531bdbd14ab", size = 5731430, upload-time = "2026-07-23T23:27:18.374Z" },
+    { url = "https://files.pythonhosted.org/packages/04/a6/8e4e20b2682077a7f1f30eb8e4998c7997ae725d0c443b3ebf780e093e84/frisky-0.7.2-cp311-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:c9d1ffa5dc09cc851b2da763afe91c4ff85415c3ba917e69ed0aa122403aaee4", size = 6208749, upload-time = "2026-07-23T23:27:20.256Z" },
+    { url = "https://files.pythonhosted.org/packages/ef/44/beee609070b80e7811a2f661fa80d9409a2cca7a63fa90cf4fa196facda9/frisky-0.7.2-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:178b8faa6c966d67ffcef26d33fafcf05c4fefd3837f5af5faea308514577fa4", size = 6445446, upload-time = "2026-07-23T23:27:21.719Z" },
+]
+
+[[package]]
 name = "frozenlist"
 version = "1.8.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2694,8 +2709,8 @@ name = "pendulum"
 version = "3.2.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "python-dateutil", marker = "python_full_version < '3.13'" },
-    { name = "tzdata", marker = "python_full_version < '3.13'" },
+    { name = "python-dateutil" },
+    { name = "tzdata" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/cb/72/9a51afa0a822b09e286c4cb827ed7b00bc818dac7bd11a5f161e493a217d/pendulum-3.2.0.tar.gz", hash = "sha256:e80feda2d10fa3ff8b1526715f7d33dcb7e08494b3088f2c8a3ac92d4a4331ce", size = 86912, upload-time = "2026-01-30T11:22:24.093Z" }
 wheels = [
@@ -4454,6 +4469,7 @@ dependencies = [
     { name = "cloudpickle" },
     { name = "dask" },
     { name = "distributed" },
+    { name = "frisky" },
     { name = "fsspec" },
     { name = "icechunk" },
     { name = "mgrs" },
@@ -4475,6 +4491,7 @@ dependencies = [
     { name = "rioxarray" },
     { name = "shapely" },
     { name = "stackstac" },
+    { name = "tblib" },
     { name = "tenacity" },
     { name = "tqdm" },
     { name = "xarray" },
@@ -4549,6 +4566,7 @@ requires-dist = [
     { name = "dask" },
     { name = "dask-cloudprovider", extras = ["aws"], marker = "extra == 'aws'" },
     { name = "distributed" },
+    { name = "frisky", specifier = ">=0.7.2,<0.8" },
     { name = "fsspec" },
     { name = "icechunk", specifier = ">=2.1.1" },
     { name = "mgrs" },
@@ -4577,6 +4595,7 @@ requires-dist = [
     { name = "scikit-learn", marker = "extra == 'inference'" },
     { name = "shapely" },
     { name = "stackstac" },
+    { name = "tblib" },
     { name = "tenacity" },
     { name = "tessera-embeddings", extras = ["inference", "prefect", "aws"], marker = "extra == 'all'" },
     { name = "torch", marker = "extra == 'inference'", index = "https://download.pytorch.org/whl/cpu" },
@@ -4652,13 +4671,13 @@ resolution-markers = [
     "python_full_version < '3.13' and sys_platform == 'darwin'",
 ]
 dependencies = [
-    { name = "filelock", marker = "python_full_version < '3.15' and sys_platform == 'darwin'" },
-    { name = "fsspec", marker = "python_full_version < '3.15' and sys_platform == 'darwin'" },
-    { name = "jinja2", marker = "python_full_version < '3.15' and sys_platform == 'darwin'" },
-    { name = "networkx", marker = "python_full_version < '3.15' and sys_platform == 'darwin'" },
-    { name = "setuptools", marker = "python_full_version < '3.15' and sys_platform == 'darwin'" },
-    { name = "sympy", marker = "python_full_version < '3.15' and sys_platform == 'darwin'" },
-    { name = "typing-extensions", marker = "python_full_version < '3.15' and sys_platform == 'darwin'" },
+    { name = "filelock" },
+    { name = "fsspec" },
+    { name = "jinja2" },
+    { name = "networkx" },
+    { name = "setuptools" },
+    { name = "sympy" },
+    { name = "typing-extensions" },
 ]
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.12.0-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:b41339df93d491435e790ff8bcbae1c0ce777175889bfd1281d119862793e6a2", upload-time = "2026-05-12T16:20:12Z" },
@@ -4687,13 +4706,13 @@ resolution-markers = [
     "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 dependencies = [
-    { name = "filelock", marker = "python_full_version >= '3.15' or sys_platform != 'darwin'" },
-    { name = "fsspec", marker = "python_full_version >= '3.15' or sys_platform != 'darwin'" },
-    { name = "jinja2", marker = "python_full_version >= '3.15' or sys_platform != 'darwin'" },
-    { name = "networkx", marker = "python_full_version >= '3.15' or sys_platform != 'darwin'" },
-    { name = "setuptools", marker = "python_full_version >= '3.15' or sys_platform != 'darwin'" },
-    { name = "sympy", marker = "python_full_version >= '3.15' or sys_platform != 'darwin'" },
-    { name = "typing-extensions", marker = "python_full_version >= '3.15' or sys_platform != 'darwin'" },
+    { name = "filelock" },
+    { name = "fsspec" },
+    { name = "jinja2" },
+    { name = "networkx" },
+    { name = "setuptools" },
+    { name = "sympy" },
+    { name = "typing-extensions" },
 ]
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.12.0%2Bcpu-cp312-cp312-linux_s390x.whl", hash = "sha256:b9d0e8eed0af9321ffb12b75f4aca371b071254f12cf75875d5a8e7cc8f52b51", upload-time = "2026-05-12T23:16:33Z" },
@@ -4927,8 +4946,8 @@ name = "whenever"
 version = "0.10.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "tzdata", marker = "python_full_version >= '3.13' and sys_platform == 'win32'" },
-    { name = "tzlocal", marker = "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux'" },
+    { name = "tzdata", marker = "sys_platform == 'win32'" },
+    { name = "tzlocal", marker = "sys_platform != 'darwin' and sys_platform != 'linux'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/fd/13/281bc0bc19f0e2e9559a22137607271d6e684b0f9bcbaf0a95b95a5e9258/whenever-0.10.0.tar.gz", hash = "sha256:a5ef2b5493531de95294080495d4d9bce9691b4b3d681c6952c7a8b3d52d7a04", size = 429588, upload-time = "2026-04-05T18:43:50.199Z" }
 wheels = [

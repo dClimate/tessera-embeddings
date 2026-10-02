@@ -16,6 +16,11 @@ Marked `@pytest.mark.integration`. Skipped by default; opt in via
   workflow is documented in `tests/fixtures/stac_cassettes/README.md`.
 * **Plain-runner partials** like `--skip-inference` end-to-end against
   cassettes.
+* **Library-contract tests for Frisky** (`test_frisky.py`). Frisky is
+  pre-1.0 and closed-source, so these pin the library's own behaviour
+  that the ingest relies on, and each one checks that its work really
+  ran on Frisky. Run them, with
+  `test_read_failure_cause_over_dask.py`, after any Frisky upgrade.
 
 ## What does NOT go here
 

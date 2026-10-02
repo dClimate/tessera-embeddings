@@ -23,13 +23,14 @@ granule query ([ADR 009](../../context_docs/decisions/009-native-cmr-granule-que
 and no longer matches on replay. **Neither reason is the other's fix**, so what you see depends on
 your environment — a skip with no credentials, an xfail with any of them.
 
-So `-m parity` collects eight — seven comparisons plus `adapter_template/`, which is
+So `-m parity` collects ten — nine comparisons plus `adapter_template/`, which is
 `@pytest.mark.skip`ped on purpose as a template to copy. **With no Earthdata credentials in the
-environment** a clean run reports **`6 passed, 2 skipped` in about 100 seconds** (measured, cassette
-replay) — the template and S1 being the two skips. **With credentials set** the same run reports
-`6 passed, 1 skipped, 1 xfailed` in 101.8 s — the same six comparisons, the same wall clock, and a
-different label on S1, because it fails on the cassette mismatch before doing real work.
-Either way, read it as six of seven comparisons made, not as a full verification.
+environment** a clean serial run reports **`8 passed, 2 skipped` in about 215 seconds** (measured,
+cassette replay; the real-imagery tests also read live COGs, so the network sets most of it) — the
+template and S1 being the two skips. **With credentials set** the same run reports
+`8 passed, 1 skipped, 1 xfailed` — the same eight comparisons and a different label on S1, because
+it fails on the cassette mismatch before doing real work. Either way, read it as eight of nine
+comparisons made, not as a full verification.
 
 If a parity test fails, one of two things happened:
 
@@ -64,6 +65,12 @@ Those tests take the same shape (two temp stores, one `assert_zarr_equivalent`)
 and carry the same weight, but a failure means a third thing beyond the two
 above: the optimisation is not semantics-preserving. That is a STOP rather than a
 fix-forward — the flag stays off until the stores match.
+
+The scheduling *engine* is the same kind of flag. `test_ingest_s2_roi_frisky_parity.py`
+runs the S2 domain ingest on Dask and on Frisky (`use_frisky`, see
+`context_docs/ingest/frisky-experiment.md`) over the pipeline test's toy dates, which
+must match byte for byte, and over the Denver cassette's real imagery. Each Frisky run
+also asserts that Frisky scheduled the work, so a silent fall-back to Dask cannot pass.
 
 ## Adding a parity test
 

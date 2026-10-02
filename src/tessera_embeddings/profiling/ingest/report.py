@@ -2,8 +2,10 @@
 
 The dossier is the deliverable of every at-scale ingest rung: it merges the scheduler
 profile (``watch_scheduler.py --report``), the external-service aggregates
-(``ingest_log_queries.py``) and — when captured — the deep-profile
-``performance_report`` artifact link into one markdown skeleton, leaving a
+(``ingest_log_queries.py``), a Frisky run's telemetry bundle (``--frisky``, the directory
+``providers.frisky.maybe_capture_telemetry`` writes under ``perf_report_uri``) and — when
+captured — the deep-profile ``performance_report`` artifact link into one markdown skeleton,
+leaving a
 clearly-marked **Interpretation** section for the operator to fill in with the
 bottleneck verdict and the recommended next rung.
 
@@ -18,6 +20,10 @@ Usage::
         --scheduler sched.json --logs logs.json \
         --run-id abc123 --zone 32633 --year 2025 --max-workers 500 \
         --perf-report s3://.../perf.html --out dossier.md
+
+    # A Frisky run: download its bundle first, then add it.
+    aws s3 cp --recursive s3://.../perf/<run>/ bundle/
+    te-ingest-report --scheduler sched.json --logs logs.json --frisky bundle/ --out dossier.md
 """
 
 from __future__ import annotations
@@ -162,6 +168,52 @@ def _logs_section(logs: dict | None) -> str:
     return "\n".join(out)
 
 
+def _frisky_section(bundle: str | None) -> str:
+    """Summarise a Frisky telemetry bundle: what ran, which workers left, what cost the most.
+
+    The bundle is captured before the cluster closes, so every ``worker_removed`` event in it is
+    a worker that died or was retired mid-run: on Frisky's fixed fleet, a death.
+    """
+    if not bundle:
+        return ""
+    root = Path(bundle)
+    # A file the capture failed to write reads as empty: a partial bundle still gets a dossier.
+    overview, events, logs = (
+        (_load_json(str(root / name)) if (root / name).exists() else None) or {}
+        for name in ("overview.json", "events.json", "logs.json")
+    )
+    perf, state = overview.get("perf", {}), overview.get("state", {})
+    lifecycle = events.get("lifecycle", {}).get("events", [])
+    joined = sum(e.get("kind") == "worker_added" for e in lifecycle)
+    left = [e for e in lifecycle if e.get("kind") == "worker_removed"]
+    out = [
+        "### Frisky",
+        "",
+        f"{perf.get('tasks', '?')} tasks on {perf.get('workers', '?')} workers over {perf.get('wall_s', 0):.0f} s "
+        f"of spans; {state.get('tasks_erred', '?')} erred at capture.",
+        "",
+        f"**Workers joined {joined}, left {len(left)} before the capture.** Any departure is a worker that "
+        "died mid-run" + (f": {', '.join(e.get('worker', '?') for e in left[:10])}" if left else "") + ".",
+        "",
+        "**Costliest span types**",
+        "",
+        _md_table(overview.get("costliest", [])),
+        "**Workers unlike their peers**",
+        "",
+        _md_table(overview.get("outliers", [])),
+    ]
+    by_level: dict[str, int] = {}
+    for entry in logs.get("logs", []):
+        key = f"{entry.get('level', '?')} {entry.get('target', '?')}"
+        by_level[key] = by_level.get(key, 0) + 1
+    out += [
+        "**Frisky's own warnings and errors**",
+        "",
+        _md_table([{"level target": k, "count": v} for k, v in sorted(by_level.items())]),
+    ]
+    return "\n".join(out)
+
+
 def build_dossier(args: argparse.Namespace, sched: dict | None, logs: dict | None) -> str:
     """Merge the scheduler + log-query JSON into the dossier markdown skeleton."""
     title = args.title or f"Ingest run {args.run_id or '(unlabeled)'}"
@@ -204,6 +256,7 @@ def build_dossier(args: argparse.Namespace, sched: dict | None, logs: dict | Non
             _scheduler_section(sched),
             "",
             _logs_section(logs),
+            *([_frisky_section(args.frisky)] if getattr(args, "frisky", None) else []),
             "---",
             "",
             "_Raw JSON is the system of record: "
@@ -222,6 +275,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--scheduler", help="watch_scheduler.py --report JSON file")
     parser.add_argument("--logs", help="ingest_log_queries.py JSON file")
     parser.add_argument("--perf-report", help="S3 URI of the distributed performance_report HTML (if captured)")
+    parser.add_argument("--frisky", help="local copy of a Frisky run's telemetry bundle directory")
     parser.add_argument("--run-id")
     parser.add_argument("--zone")
     parser.add_argument("--year")
@@ -231,8 +285,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", help="write the dossier here (default: stdout)")
     args = parser.parse_args(argv)
 
-    if not args.scheduler and not args.logs:
-        parser.error("supply at least one of --scheduler / --logs")
+    if not args.scheduler and not args.logs and not args.frisky:
+        parser.error("supply at least one of --scheduler / --logs / --frisky")
 
     try:
         sched, logs = _load_json(args.scheduler), _load_json(args.logs)

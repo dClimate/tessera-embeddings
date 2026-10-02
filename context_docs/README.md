@@ -58,8 +58,13 @@ context_docs/
 │   │                                              budget, live-tile cropping, region writes
 │   ├── source-read-failures.md                 twelve ways a source read fails, the guard each
 │   │                                              earned, and the retry budget they share
-│   └── solar-day-fusion-order.md               which scene wins a contested pixel, and why the
-│                                                  answer was inverted for the life of the code
+│   ├── solar-day-fusion-order.md               which scene wins a contested pixel, and why the
+│   │                                              answer was inverted for the life of the code
+│   ├── frisky-experiment.md                    Frisky, a Rust Dask scheduler, as an opt-in ingest
+│   │                                              engine: how it is wired and the four ways it
+│   │                                              differs from Dask
+│   └── frisky-dev-test-plan.md                 the dev runs that test it and the 2048-px chunk, and
+│                                                  the record of each run
 │
 ├── inference/                     RUNNING THE ENCODER
 │   ├── inference-on-gpus.md                    throughput, which cards may be rented, why the

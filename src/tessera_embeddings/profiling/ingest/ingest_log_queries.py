@@ -70,7 +70,7 @@ QUERIES: dict[str, tuple[str, str]] = {
         r" | parse @message /date=(?<date>\S+): build=(?<build_s>[\d.]+)s"
         r" gate=(?<gate_s>[\d.]+)s write=(?<write_s>[\d.]+)s"
         r" total=(?<total_s>[\d.]+)s windows=(?<n_windows>\d+) mode=(?<mode>\S+)/"
-        r" | display @timestamp, date, build_s, gate_s, write_s, total_s, n_windows, mode"
+        r" | display @timestamp, @logStream, date, build_s, gate_s, write_s, total_s, n_windows, mode"
         r" | sort date asc",
     ),
     "batch_timings": (
@@ -84,7 +84,20 @@ QUERIES: dict[str, tuple[str, str]] = {
         r" | parse @message /dates=(?<first_date>\S+)\.\.(?<last_date>\S+)"
         r" n=(?<n_dates>\d+): build=(?<build_s>[\d.]+)s gate=(?<gate_s>[\d.]+)s"
         r" write=(?<write_s>[\d.]+)s windows=(?<n_windows>\d+)/"
-        r" | display @timestamp, first_date, last_date, n_dates, build_s, gate_s, write_s, n_windows"
+        r" | display @timestamp, @logStream, first_date, last_date, n_dates, build_s, gate_s, write_s, n_windows"
+        r" | sort first_date asc",
+    ),
+    "s1_batch_timings": (
+        "S1's per-batch decomposition from `S1 batch timings` lines: catalog query, "
+        "preparation hidden behind the previous write, the stall it did not hide, the "
+        "write, and the per-date cost.",
+        r"fields @timestamp"
+        r" | filter @message like /S1 batch timings/"
+        r" | parse @message /\[(?<orbit>\w+)\] S1 batch timings (?<first_date>\S+)\.\.(?<last_date>\S+)"
+        r" roi=\S+ n=(?<n_dates>\d+): query=(?<query_s>[\d.]+)s hidden=(?<hidden_s>[\d.]+)s"
+        r" stall=(?<stall_s>[\d.]+)s write=(?<write_s>[\d.]+)s per_date=(?<per_date_s>[\d.]+)s/"
+        r" | display @timestamp, @logStream, orbit, first_date, last_date, n_dates, query_s, hidden_s,"
+        r" stall_s, write_s, per_date_s"
         r" | sort first_date asc",
     ),
     "pipeline_stalls": (
@@ -100,6 +113,20 @@ QUERIES: dict[str, tuple[str, str]] = {
         r" hidden=(?<hidden_s>[\d.]+)s stall=(?<stall_s>[\d.]+)s/"
         r" | display @timestamp, date, prepare_s, hidden_s, stall_s"
         r" | sort date asc",
+    ),
+    "frisky_state": (
+        "Frisky's live cluster state, from the `frisky state:` lines a Frisky run "
+        "(`use_frisky`) logs every few minutes: workers, idle workers, and tasks by "
+        "state, and how long the snapshot itself took. Workers below the fleet size, or "
+        "erred above zero, is the first sign of trouble. The lines come from the flow runner, so pass its log group as "
+        "--log-group.",
+        r"fields @timestamp"
+        r" | filter @message like /frisky state:/"
+        r" | parse @message /frisky state: workers=(?<workers>\d+) idle=(?<idle>\d+)"
+        r" processing=(?<processing>\d+) waiting=(?<waiting>\d+) queued=(?<queued>\d+)"
+        r" memory=(?<memory>\d+) erred=(?<erred>\d+)(?: snapshot=(?<snapshot_s>[\d.]+)s)?/"
+        r" | display @timestamp, workers, idle, processing, waiting, queued, memory, erred, snapshot_s"
+        r" | sort @timestamp asc",
     ),
     "http_retries_by_service": (
         "Catalog HTTP retry count by service (CMR vs STAC/earth-search) — the "

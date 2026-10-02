@@ -19,10 +19,11 @@ Sentinel-2 reflectance and cloud masks. Five write paths, all committing atomica
   atomically WITH that date's chunk-disjoint live-window region writes, all under ONE
   commit. Same bookkeeping contract as create/append (attr set, baselines/doy merge,
   per-write manifest validation); write volume scales with live area instead of extent.
-  ``parallel_windows`` submits the date's windows as a SINGLE dask compute rather than one
-  blocking compute per window, so their critical paths overlap across the fleet instead of
-  summing — the same store either way, and the windows' chunk-disjointness is what makes
-  the merged changesets conflict-free.
+  ``parallel_windows`` computes the date's windows together rather than one blocking compute
+  per window, so their critical paths overlap across the fleet instead of summing — the same
+  store either way, and the windows' chunk-disjointness is what makes the merged changesets
+  conflict-free. Given a ``client``, it submits them as a few graphs one after another, so the
+  fleet starts on the first while the driver converts the rest.
 - **shard-assemble** (embeddings only; in :mod:`tessera_embeddings.inference.assembly` +
   :mod:`tessera_embeddings.storage.shard_writer`) — staged inference tiles written
   straight into the output arrays as raw-zarr fork/merge region writes:
@@ -39,8 +40,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
+import dask.array as da
 import fsspec
 import icechunk
 import numpy as np
@@ -64,6 +66,9 @@ from tessera_embeddings.storage.region_writes import (
 )
 from tessera_embeddings.storage.time_axis import TIME_ENCODING, compute_doy, read_time_values
 from tessera_embeddings.utils import utcnow_iso
+
+if TYPE_CHECKING:
+    from dask.distributed import Client
 
 logger = logging.getLogger(__name__)
 
@@ -501,7 +506,7 @@ def _create_storage(
 _manifest_split_sizes: dict[str, int] | None = None
 
 # Default for the region-write merge workload, case (a) above — NOT for campaign ingest,
-# which wants time-only. With INGEST_CHUNK_SIZE=4096 a 4x4 spatial split is ~16k px/shard, a
+# which wants time-only. With INGEST_CHUNK_SIZE=2048 a 4x4 spatial split is ~8k px/shard, a
 # touch larger than a typical ~3x3-chunk region write, so most commits hit only 1-4 tiles
 # while shard objects stay in the low hundreds on a ~50x50-chunk store. Region writes are
 # spatially scattered, so a per-write commit rewrites its tiles rather than the full-height
@@ -1476,11 +1481,22 @@ def batched_region_writes(
     logger.debug("Committed '%s' in %.1fs", message, time.monotonic() - commit_started)
 
 
-#: Fan-in of the tree reduction that merges window changesets back into the session. Shared by
-#: both write paths so they reduce identically — the overlapped path merges every window's
-#: changesets in one reduction, the sequential path one window's at a time, and a difference
-#: here would show up as a behaviour difference between them.
-_MERGE_SPLIT_EVERY = 8
+#: Fan-in of the tree reduction that merges window changesets back into the session, per spatial
+#: axis, so one merge takes up to 8 x 8 store blocks. Per axis because dask spreads an integer
+#: across every reduced axis as its root (8 over time, northing and easting is 2 each), which
+#: merged four blocks a task and made a merge task for every third store block. Shared by both
+#: write paths so they reduce identically — the overlapped path merges every window's changesets
+#: in one reduction, the sequential path one window's at a time, and a difference here would show
+#: up as a behaviour difference between them.
+_MERGE_SPLIT_EVERY = {1: 8, 2: 8}
+
+#: How many graphs an overlapped window write is split into when the caller passes a client. Each
+#: is submitted without waiting for the one before, because Frisky's client converts and pickles a
+#: WHOLE graph before submitting any of it: one graph per date holds the fleet idle for the date's
+#: whole conversion (15 to 29 s at zone scale), while in groups the fleet runs one group as the
+#: driver converts the next. Groups are contiguous runs of windows, capped at the window count, so
+#: a single window is still a single graph.
+WRITE_SUBMISSION_GROUPS = 4
 
 
 def _window_slice(day_ds: xr.Dataset, window: "tuple[int, int, int, int]", drop: "list[str]") -> xr.Dataset:
@@ -1499,24 +1515,77 @@ def _window_region(window: "tuple[int, int, int, int]", time_index: int) -> dict
     }
 
 
+def _changeset_reduction(stored: da.Array) -> da.Array:
+    """One stored array's write changesets, tree-reduced lazily to one fork session.
+
+    ``icechunk.dask.session_merge_reduction``'s own reduction, without its blocking compute, so a
+    caller can submit several groups of these without waiting on each. Every name is looked up on
+    ``icechunk.dask`` at CALL time, ``computing_meta`` above all: under Frisky, ``connect()`` swaps
+    it for a picklable equivalent, and a name bound at import would keep icechunk's closure, which
+    Frisky's client then pickles by value on every merge task. A drifted name raises
+    ``AttributeError``, which the caller treats as the overlapped write being unavailable.
+    """
+    computing_meta = icechunk.dask.computing_meta
+    return da.reduction(
+        stored,
+        name="ice-changeset",
+        chunk=computing_meta(icechunk.dask.extract_session),
+        aggregate=computing_meta(icechunk.dask.merge_sessions_array_kwargs),
+        split_every=_MERGE_SPLIT_EVERY,
+        concatenate=False,
+        keepdims=False,
+        dtype=object,
+        meta=np.array([object()], dtype=object),
+    )
+
+
+def _merge_submitted_groups(session: "icechunk.Session", client: "Client", groups: "list[list[da.Array]]") -> None:
+    """Submit each group's changeset reductions in turn, then merge every result into ``session``.
+
+    ``client.compute`` returns as soon as a group's graph is converted and submitted, on Dask's
+    client and on Frisky's alike, so the fleet works on one group while the driver converts the
+    next. Nothing reaches ``session`` until every group has succeeded. The futures are released on
+    the way out, as Dask's own blocking compute does, so after a failure the other groups' work
+    stops rather than running on into the retry.
+    """
+    futures: list = []
+    try:
+        for group in groups:
+            futures.extend(client.compute(group))
+        forks = client.gather(futures)
+    finally:
+        for future in futures:
+            future.release()
+    session.merge(*forks)
+
+
 def _write_windows_overlapped(
     session: "icechunk.Session",
     writes: "list[tuple[xr.Dataset, list[tuple[int, int, int, int]], int, list[str]]]",
+    client: "Client | None" = None,
 ) -> bool:
-    """Write every window of one or more dates as ONE dask compute on one forked session.
+    """Write every window of one or more dates on one forked session, overlapped across the fleet.
 
     The sequential path issues one ``to_icechunk`` per window and runs each graph to
     completion before the next starts, so a date costs the SUM of its windows' critical paths
     while the fleet works on one window at a time. This lifts icechunk's own dask sequence
-    (fork → lazy stored arrays → merge reduction) one level so all windows share a single
-    compute and overlap across the fleet. The windows' chunk-disjointness, enforced by the
+    (fork → lazy stored arrays → merge reduction) one level so all windows are computed together
+    and overlap across the fleet. The windows' chunk-disjointness, enforced by the
     caller's alignment guard, is what makes the merged changesets conflict-free — the same
     property the sequential path relies on for one-commit-per-date.
+
+    Without a ``client`` the windows are ONE blocking compute, through icechunk's
+    ``session_merge_reduction``. With one they are split into :data:`WRITE_SUBMISSION_GROUPS`
+    groups of contiguous windows, submitted one after another without blocking
+    (:func:`_merge_submitted_groups`), so the fleet starts on the first group while the driver
+    converts the rest; that conversion is what Frisky's client does for a whole graph before any of
+    it runs. Every group's changesets merge into the session together, so the date is still one
+    commit, and a failure in any group commits nothing.
 
     ``writes`` carries ``(day_ds, windows, time_index, drop)`` per date. Several dates in one
     call is the same induction applied once more: distinct time indices make the dates' chunk
     writes mutually disjoint exactly as windows within a date are, so they share the single
-    fork, compute and merge. What dates cannot share is a session each — every date's append
+    fork and merge. What dates cannot share is a session each — every date's append
     resizes the time axis, so sibling sessions forked from one snapshot conflict on array
     METADATA even though their chunk data never overlaps. A multi-date batch is therefore one
     session and one commit by construction, not by preference.
@@ -1555,36 +1624,52 @@ def _write_windows_overlapped(
                 writers.append(writer)
 
         # ONE fork for all windows of all dates: every lazy region write lands its
-        # changeset in the same fork, and one merge returns them to the session together.
+        # changeset in the same fork, and the merge returns them to the session together.
         fork = session.fork()
-        stored: list = []
+        stored: list[list[da.Array]] = []  # per window with lazy writes, its target arrays together
         for writer in writers:
             if not writer.writer.sources:
                 continue  # nothing lazy in this window; write_eager covered it
             writer.writer.targets = [
                 zarr.open_array(fork.store, path=target.path, mode="a") for target in writer.writer.targets
             ]
-            stored.extend(
+            stored.append(
                 writer.writer.sync(
                     compute=False,
                     chunkmanager_store_kwargs={"load_stored": False, "return_stored": True},
                 )
             )
+        # With a client, contiguous runs of windows as even as integer division makes them, the
+        # first never larger than the rest so the fleet starts soonest; without one, no groups.
+        n_groups = min(WRITE_SUBMISSION_GROUPS, len(stored)) if client is not None else 0
+        bounds = [i * len(stored) // n_groups for i in range(n_groups + 1)] if n_groups else []
+        groups = [
+            [_changeset_reduction(arr) for window in stored[lo:hi] for arr in window]
+            for lo, hi in itertools.pairwise(bounds)
+        ]
     except (AttributeError, TypeError) as exc:
         logger.warning("Overlapped window write failed to assemble (%s); writing sequentially", exc)
         return False
 
-    if stored:
+    if client is not None:
+        _merge_submitted_groups(session, client, groups)
+    elif stored:
         # The single compute: every window's loads, masks and chunk writes in one graph,
         # reduced to one mergeable changeset.
-        session.merge(session_merge_reduction(stored, split_every=_MERGE_SPLIT_EVERY))
+        session.merge(
+            session_merge_reduction(
+                [arr for window in stored for arr in window],
+                split_every=_MERGE_SPLIT_EVERY,  # type: ignore[arg-type]  # hinted int; dask takes per-axis
+            )
+        )
     # DEBUG, not INFO: the chattiest line this path produces, once per write, and Prefect
     # ships task logs to the orchestrator API from whichever Dask worker ran the task, so it
     # scales with total worker count. The timing is already in the caller's per-batch line.
     logger.debug(
-        "Parallel window compute: %d window(s) across %d date(s) in one graph: %.1fs",
+        "Parallel window compute: %d window(s) across %d date(s) in %d graph(s): %.1fs",
         n_windows,
         len(writes),
+        n_groups if client is not None else 1,
         time.monotonic() - started,
     )
     return True
@@ -1607,6 +1692,7 @@ def write_day_windows(
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     s3_region: str | None = None,
     parallel_windows: bool = False,
+    client: "Client | None" = None,
 ) -> None:
     """Write ONE date's live windows into a mosaic store, one commit for the date.
 
@@ -1631,6 +1717,7 @@ def write_day_windows(
         get_credentials=get_credentials,
         s3_region=s3_region,
         parallel_windows=parallel_windows,
+        client=client,
     )
 
 
@@ -1647,15 +1734,19 @@ def write_days_windows(
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     s3_region: str | None = None,
     parallel_windows: bool = False,
+    client: "Client | None" = None,
 ) -> None:
     """Write one or more dates' live windows into a mosaic store, ONE commit for the batch.
 
-    ``parallel_windows`` submits every window of every date as a single dask compute
+    ``parallel_windows`` computes every window of every date together
     (:func:`_write_windows_overlapped`) instead of one blocking compute per window, so the
     critical paths overlap across the fleet rather than summing — and with several dates, one
-    date's straggling reads backfill with another date's work. Both paths produce identical
-    stores (pinned by test), and when the overlapped machinery is unavailable the sequential
-    path runs regardless, so the flag can never fail a write that would otherwise succeed.
+    date's straggling reads backfill with another date's work. ``client`` (used only with
+    ``parallel_windows``) submits those windows in :data:`WRITE_SUBMISSION_GROUPS` graphs, one after
+    another without blocking, so the fleet starts work while the driver is still converting the
+    rest; without it they are one blocking compute. Every path produces the same store (pinned by
+    test), and when the overlapped machinery is unavailable the sequential path runs regardless,
+    so the flag can never fail a write that would otherwise succeed.
 
     The batch is one commit BY CONSTRUCTION: each date's append resizes the time axis, so
     per-date sessions forked from one snapshot would conflict on array metadata even though
@@ -1792,7 +1883,7 @@ def write_days_windows(
             # Same commit as the dates it describes; a union, since one resume writes many.
             prior = cast("list", attrs.get(MIXED_CODE_IDENTITIES_ATTR, []))
             attrs[MIXED_CODE_IDENTITIES_ATTR] = sorted(set(prior) | set(mixed))
-        if parallel_windows and _write_windows_overlapped(batch.session, writes):
+        if parallel_windows and _write_windows_overlapped(batch.session, writes, client):
             return  # normal context exit: the batched commit below still runs
         for one_ds, one_windows, t, drop in writes:
             for i, window in enumerate(one_windows, 1):
@@ -1808,7 +1899,7 @@ def write_days_windows(
                     # threshold: peak spill 3.19 GiB across ~30% of scheduler samples, against
                     # zero with it on. Spill scales badly here, so the ~4% is not worth it.
                     align_chunks=True,
-                    split_every=_MERGE_SPLIT_EVERY,
+                    split_every=_MERGE_SPLIT_EVERY,  # type: ignore[arg-type]  # hinted int; dask takes per-axis
                 )
                 # Each window is a blocking compute, so these lines ARE the write pipeline's
                 # decomposition: their sum against the date's write phase says whether

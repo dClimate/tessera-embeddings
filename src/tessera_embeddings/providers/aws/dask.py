@@ -63,6 +63,8 @@ from tenacity import (
 )
 from tornado.ioloop import PeriodicCallback
 
+from tessera_embeddings.providers import frisky as frisky_engine
+
 # Default Fargate task sizes for ingest workloads; ``ecs_cluster``'s ``worker_cpu`` /
 # ``worker_mem`` override per call.
 #
@@ -730,11 +732,12 @@ def ecs_cluster(
     diagnostic_task_stream: bool = False,
     image: str | None = None,
     resource_tags: dict[str, str] | None = None,
+    frisky: bool = False,
 ) -> Iterator[ECSCluster]:
     """Provision a Dask cluster backed by AWS Fargate (or hybrid EC2 scheduler).
 
     Reads the environment-variable contract in this module's docstring. The cluster adapts
-    between ``min_workers`` and ``max_workers``.
+    between ``min_workers`` and ``max_workers``, or is fixed at ``max_workers`` with ``frisky``.
 
     Args:
         log: Logger.
@@ -763,6 +766,10 @@ def ecs_cluster(
             scheduler and worker ECS tasks included. The flows tag with their flow-run id so
             an emergency teardown can find this run's tasks from nothing but the flow run
             (see :func:`stop_ecs_tasks_by_tag`).
+        frisky: Load Frisky onto the cluster before yielding it (see
+            :mod:`tessera_embeddings.providers.frisky`). Fixes the fleet at ``max_workers``,
+            because adaptive scaling reads Dask's task load, which a hijacked cluster no longer
+            has, and would retire Frisky's workers.
 
     Yields:
         The :class:`ECSCluster`/``FargateCluster``.
@@ -789,6 +796,9 @@ def ecs_cluster(
 
     if extra_worker_env:
         cluster_kwargs["environment"].update(extra_worker_env)
+    if frisky:
+        # The environment reaches the scheduler too, whose span buffer is the largest.
+        cluster_kwargs["environment"].setdefault("FRISKY_TRACING_CAPACITY", str(frisky_engine.TRACING_CAPACITY))
 
     if diagnostic_task_stream:
         cluster_kwargs["environment"]["DASK_DISTRIBUTED__SCHEDULER__DASHBOARD__TASKS__TASK_STREAM_LENGTH"] = str(
@@ -870,21 +880,33 @@ def ecs_cluster(
     log.info("Dashboard: %s", cluster.dashboard_link)
     log_dashboard_ssm_command(log, cluster)
 
-    cluster.adapt(minimum=min_workers, maximum=max_workers)
-    log.info("Adaptive scaling configured: min=%d, max=%d", min_workers, max_workers)
+    if frisky:
+        cluster.scale(max_workers)
+        log.info("Fixed fleet of %d workers for Frisky (adaptive scaling cannot see its load)", max_workers)
+    else:
+        cluster.adapt(minimum=min_workers, maximum=max_workers)
+        log.info("Adaptive scaling configured: min=%d, max=%d", min_workers, max_workers)
 
     # Register the scheduler health heartbeat. A short-lived Client is the only way to push a
     # SchedulerPlugin onto a remote scheduler; the plugin persists after this Client closes,
     # independent of the task-runner Client the flow opens next. Best-effort — diagnostics
-    # must not take down the run.
+    # must not take down the run. Both short-lived Clients connect by address: given the cluster
+    # object, a Client first waits for every worker already requested to reach RUNNING, which
+    # after ``scale(max_workers)`` is the whole fleet's boot.
     try:
-        with Client(cluster, timeout="60s") as client:
+        with Client(cluster.scheduler_address, timeout="60s") as client:
             client.register_plugin(SchedulerResourceLogger(), name=SchedulerResourceLogger.name)
         log.info("Scheduler health logging enabled (every %.0fs)", DEFAULT_SCHEDULER_PROFILE_INTERVAL_S)
     except Exception as e:
         log.warning("Could not enable scheduler health logging: %s", e)
 
     try:
+        # Inside the try, unlike the best-effort plugin above: a failed hijack must fail the run
+        # rather than leave it on Dask, and must not leak the cluster it failed on.
+        if frisky:
+            with Client(cluster.scheduler_address, timeout="60s") as client:
+                frisky_engine.hijack(client)
+            log.info("Frisky loaded onto the cluster")
         yield cluster
     finally:
         log.info("Closing cluster...")

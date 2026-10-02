@@ -23,6 +23,7 @@ from tessera_embeddings.orchestration.prefect.flows._dask_lifecycle import (
     get_task_runner_for_cluster,
 )
 from tessera_embeddings.orchestration.prefect.tasks.ingest import process_roi_reflectance
+from tessera_embeddings.providers.frisky import maybe_capture_telemetry
 
 MAX_PIPELINE_DATES_WORKERS = 140
 """Widest fleet on which date pipelining is allowed to run.
@@ -81,6 +82,7 @@ def _ingest_s2_roi_impl(
     batch_dates: int | None = None,
     allow_ingest_code_mismatch: bool = False,
     s3_region: str | None = None,
+    use_frisky: bool = False,
 ) -> dict[str, Any]:
     """Inner flow: submits the S2 ingestion task to the configured Dask runner."""
     future = process_roi_reflectance.submit(
@@ -98,6 +100,7 @@ def _ingest_s2_roi_impl(
         batch_dates=batch_dates,
         allow_ingest_code_mismatch=allow_ingest_code_mismatch,
         s3_region=s3_region,
+        use_frisky=use_frisky,
     )
     return future.result()
 
@@ -123,13 +126,16 @@ def ingest_s2_roi_reflectance(
     collection: str = "sentinel-2-l2a",
     ec2_scheduler: bool = False,
     use_local: bool = False,
+    use_frisky: bool = False,
     storage_options: dict | None = None,
     perf_report_uri: str | None = None,
+    frisky_drain_spans: bool = False,
     stream_stac_monthly: bool = True,
     overlap_window_writes: bool = True,
     pipeline_dates: bool = False,
     batch_dates: int | None = None,
     worker_env_overrides: dict[str, str] | None = None,
+    worker_nthreads: int | None = None,
     allow_ingest_code_mismatch: bool = False,
     s3_region: str | None = None,
 ) -> dict[str, Any]:
@@ -137,7 +143,7 @@ def ingest_s2_roi_reflectance(
 
     Reads the Zarr ROI store for a WGS84 bounding box, queries STAC for intersecting tiles,
     and writes a mosaicked ``reflectance.zarr`` under ``store_path`` at the ingestion
-    pipeline's INGEST_CHUNKS (4000x4000).
+    pipeline's INGEST_CHUNKS.
 
     Args:
         roi_zarr_path: Any fsspec-compatible URI to the Zarr ROI store.
@@ -152,17 +158,27 @@ def ingest_s2_roi_reflectance(
         ec2_scheduler: Run the Dask scheduler on EC2 instead of Fargate (better
             single-thread CPU for large graphs). Ignored when ``use_local=True``.
         use_local: Use the local-machine Dask provider instead of AWS, for tests and dev.
+        use_frisky: Run the ingest's compute on Frisky, an experimental Rust scheduler loaded
+            onto the same Dask cluster (:mod:`tessera_embeddings.providers.frisky`). On AWS it
+            fixes the fleet at ``max_workers``, and ``perf_report_uri`` becomes a prefix for
+            Frisky's telemetry instead of a Dask report. Off by default.
         storage_options: fsspec storage options forwarded to the domain function.
         perf_report_uri: When set, a Dask performance-report HTML for this run is uploaded
-            there (probe-rung profiling; off by default). Ignored, with a warning, on the
+            there; with ``use_frisky``, Frisky's live and final telemetry is written under it
+            as a prefix (probe-rung profiling; off by default). Ignored, with a warning, on the
             ``use_local`` path.
+        frisky_drain_spans: With ``use_frisky`` and ``perf_report_uri``, also copy the run's
+            task, transfer and spill spans to ``<perf_report_uri>/spans/`` every minute, so the
+            whole run is kept rather than the tail the final capture holds. About 9 GB a day
+            gzipped per 60 workers; delete the prefix once the run is analysed. Off by default.
         stream_stac_monthly: Query STAC one calendar month at a time, prefetching the next
             while the current is processed. Bounds retained items so a year-long window
             fits the worker; ``False`` is the rollback path only.
-        overlap_window_writes: Submit a date's windows as ONE dask compute rather than a
-            blocking compute per window, so their critical paths overlap across the fleet
-            instead of summing. Identical stores either way; falls back to the sequential
-            write when the overlapped machinery is unavailable.
+        overlap_window_writes: Compute a date's windows together rather than a blocking compute
+            per window, so their critical paths overlap across the fleet instead of summing. With
+            ``use_frisky`` they are submitted as a few graphs one after another, so the fleet
+            starts while Frisky's client converts the rest. Identical stores either way; falls
+            back to the sequential write when the overlapped machinery is unavailable.
         pipeline_dates: Prepare the next date (load graph, coverage gate, footprint
             narrowing, masking) on a background thread while the current date is written,
             so preparation costs wall clock only where the write cannot cover it. The write
@@ -182,6 +198,10 @@ def ingest_s2_roi_reflectance(
             run only, to A/B worker-side tuning (allocator, cache behaviour) one arm at a
             time. Not a configuration channel — anything meant to hold for every run belongs
             in ``FargateConfig``. Ignored on the ``use_local`` path.
+        worker_nthreads: Task threads per Dask worker, and so per Frisky worker. ``None`` keeps
+            one per vCPU. For one arm of a comparison: on zone 35N workers used 68% of their
+            CPU with every thread busy, so the reads spend part of their time waiting. Ignored
+            on the ``use_local`` path.
         allow_ingest_code_mismatch: Resume a store built by different ingest code (off by default).
 
         s3_region: S3 region for the mosaic Icechunk store. ``None`` uses the storage
@@ -207,7 +227,7 @@ def ingest_s2_roi_reflectance(
             # Say so rather than no-op: an operator finding nothing at the URI would
             # otherwise suspect the upload or their credentials.
             log.warning("perf_report_uri is ignored on the local-cluster path (use_local=True)")
-        with local_cluster() as cluster:
+        with local_cluster(frisky=use_frisky) as cluster:
             log.info("Local Dask cluster ready: scheduler=%s", cluster.scheduler_address)
             task_runner = get_task_runner_for_cluster(cluster.scheduler_address)
             return _ingest_s2_roi_impl.with_options(task_runner=task_runner)(  # type: ignore[arg-type]
@@ -225,6 +245,7 @@ def ingest_s2_roi_reflectance(
                 batch_dates=batch_dates,
                 allow_ingest_code_mismatch=allow_ingest_code_mismatch,
                 s3_region=s3_region,
+                use_frisky=use_frisky,
             )
 
     from tessera_embeddings.providers.aws.dask import ecs_cluster, maybe_performance_report
@@ -238,13 +259,20 @@ def ingest_s2_roi_reflectance(
         # raise it only when a report is actually being captured.
         diagnostic_task_stream=bool(perf_report_uri),
         extra_worker_env=worker_env_overrides,
+        worker_nthreads=worker_nthreads,
         # Tag every cluster resource with this run's id so the cancellation/crash hook can
         # sweep the tasks from a fresh process (see _dask_lifecycle).
         resource_tags=dask_resource_tags(flow_run_ctx.id),
+        frisky=use_frisky,
     ) as cluster:
         task_runner = get_task_runner_for_cluster(cluster.scheduler_address)
         log.info("Task runner connected to scheduler at %s", cluster.scheduler_address)
-        with maybe_performance_report(cluster.scheduler_address, perf_report_uri, log):
+        report = (
+            maybe_capture_telemetry(cluster.dashboard_link, perf_report_uri, log, drain_spans=frisky_drain_spans)
+            if use_frisky
+            else maybe_performance_report(cluster.scheduler_address, perf_report_uri, log)
+        )
+        with report:
             return _ingest_s2_roi_impl.with_options(task_runner=task_runner)(  # type: ignore[arg-type]
                 roi_zarr_path=roi_zarr_path,
                 start_date=start_date,
@@ -260,4 +288,5 @@ def ingest_s2_roi_reflectance(
                 batch_dates=batch_dates,
                 allow_ingest_code_mismatch=allow_ingest_code_mismatch,
                 s3_region=s3_region,
+                use_frisky=use_frisky,
             )

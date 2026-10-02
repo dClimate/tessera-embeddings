@@ -37,9 +37,11 @@ def test_tiny_rois_batch(covered: int) -> None:
     assert auto_batch_dates(covered) == AUTO_BATCH_DATES
 
 
-@pytest.mark.parametrize("covered", [930, 2631, 100_000])
+@pytest.mark.parametrize("covered", [3720, 10_524, 100_000])
 def test_large_rois_do_not_batch(covered: int) -> None:
-    """Mid and large ROIs get 1: this is where batching was measured to cost."""
+    """Mid and large ROIs get 1: this is where batching was measured to cost. The two measured
+    ROIs covered 930 and 2,631 chunks at 4096 px, so four times that at 2048.
+    """
     assert auto_batch_dates(covered) == 1
 
 

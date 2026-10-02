@@ -8,6 +8,9 @@ Interpretation prompts — no AWS involved.
 from __future__ import annotations
 
 import argparse
+import json
+
+import pytest
 
 from tessera_embeddings.profiling.ingest import report as rep
 
@@ -181,3 +184,42 @@ class TestFleetMemoryReachesTheDossier:
         """
         md = rep.build_dossier(_args(logs=None), _SCHED, None)  # fixture has no fleet keys
         assert "Peak FLEET memory: **not recorded**" in md
+
+
+def _frisky_bundle(root, *, removed: tuple[str, ...] = (), with_logs: bool = True):
+    """A Frisky telemetry bundle as ``maybe_capture_telemetry`` writes it, two workers strong."""
+    overview = {
+        "perf": {"tasks": 1200, "workers": 2, "wall_s": 61.0},
+        "state": {"tasks_erred": 0},
+        "costliest": [{"name": "worker.exec.call", "total_s": 12.5}],
+        "outliers": [],
+    }
+    lifecycle = [{"kind": "worker_added", "worker": w} for w in ("w1", "w2")]
+    lifecycle += [{"kind": "worker_removed", "worker": w} for w in removed]
+    (root / "overview.json").write_text(json.dumps(overview))
+    (root / "events.json").write_text(json.dumps({"lifecycle": {"events": lifecycle}, "recent": {"events": []}}))
+    if with_logs:
+        (root / "logs.json").write_text(json.dumps({"logs": [{"level": "warn", "target": "spill", "message": "m"}]}))
+    return str(root)
+
+
+@pytest.mark.parametrize(
+    ("removed", "with_logs", "expected"),
+    [
+        (
+            ("w2",),
+            True,
+            "Workers joined 2, left 1 before the capture.** Any departure is a worker that died mid-run: w2",
+        ),
+        ((), False, "Workers joined 2, left 0 before the capture."),
+    ],
+)
+def test_a_frisky_bundle_reports_workers_that_died_mid_run(tmp_path, removed, with_logs, expected):
+    """The bundle is captured before teardown, so a departure in it is a death; and a bundle
+    missing a file it failed to capture still renders.
+    """
+    md = rep.build_dossier(
+        _args(logs=None, frisky=_frisky_bundle(tmp_path, removed=removed, with_logs=with_logs)), None, None
+    )
+    assert expected in md
+    assert "worker.exec.call" in md

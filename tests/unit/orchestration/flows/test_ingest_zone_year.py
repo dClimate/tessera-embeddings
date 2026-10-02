@@ -354,10 +354,9 @@ class TestChunkScaledWorkers:
         assert s2 == 50
         assert s1 == 11  # round(50 * 0.22)
 
-    def test_mid_zone_scales_half_worker_per_chunk(self, wired, monkeypatch):
-
-        tiles = np.zeros((20, 20), dtype=bool)
-        tiles[::2, ::2] = True  # every 2x2 tile block live -> all 100 chunks live
+    def test_mid_zone_scales_with_live_area(self, wired, monkeypatch):
+        """400 live tiles of 2048 px get 50 workers, the 0.5 per 4096-px chunk this was measured at."""
+        tiles = np.ones((20, 20), dtype=bool)
         s1, s2 = self._dispatch(wired, monkeypatch, tile_live=tiles, max_workers=200)
         assert s2 == 50
         assert s1 == 11

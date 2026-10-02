@@ -145,6 +145,7 @@ class _Run:
         self.result = None
         self.loaded: list[str] = []
         self.written: list[str] = []
+        self.write_clients: list = []  # the client each store write was handed
         self.load_started: dict[str, float] = {}
         self.write_ended: dict[str, float] = {}
         self.attempts: list[str] = []
@@ -223,10 +224,12 @@ def run_ingest(monkeypatch):
             run.written.append(date)
             run.write_ended[date] = time.monotonic()
 
-        def write_day_windows(_store, day_ds, _windows, **_kwargs):
+        def write_day_windows(_store, day_ds, _windows, **kwargs):
+            run.write_clients.append(kwargs.get("client"))
             _record_write(day_ds)
 
-        def write_days_windows(_store, days, **_kwargs):
+        def write_days_windows(_store, days, **kwargs):
+            run.write_clients.append(kwargs.get("client"))
             # The batched writer takes (day_ds, windows) pairs; each still counts as its
             # own write, which is what the one-commit-per-date accounting assumes.
             for day_ds, _windows in days:
@@ -276,6 +279,19 @@ SKIP_CHAIN = {
     "2024-01-04": False,
     "2024-01-05": True,
 }
+
+
+@pytest.mark.parametrize("batch_dates", [1, 2], ids=["per-date", "batched"])
+@pytest.mark.parametrize("group", [False, True], ids=["one-graph", "grouped"])
+def test_the_store_write_gets_the_client_only_when_grouping(run_ingest, batch_dates, group):
+    """Grouped submission pays on Frisky and slows Dask, so only a grouping run hands the write its client."""
+    run = run_ingest(
+        {"2024-01-01": True, "2024-01-02": True},
+        pipeline_dates=False,
+        batch_dates=batch_dates,
+        group_window_writes=group,
+    )
+    assert run.write_clients and all((c is not None) == group for c in run.write_clients)
 
 
 @BOTH_MODES
@@ -440,6 +456,33 @@ def test_per_date_narrowing_is_priced_like_the_run(run_ingest, monkeypatch, over
     )
     expected = s2_roi.WINDOW_COST_IN_CHUNKS_OVERLAPPED if overlapped else s2_roi.WINDOW_COST_IN_CHUNKS
     assert seen == {"run": expected, "date": expected}
+
+
+def test_the_gate_counts_over_the_dates_own_windows(run_ingest, monkeypatch):
+    """Not the run's: outside its footprint a date has no imagery, so counting there reads SCL for nothing.
+
+    The denominator stays the ROI's whole live area.
+    """
+    gated = []
+    real_gate = s2_roi._coverage_from_scl
+
+    def recording_gate(*args, windows=None, **kwargs):
+        gated.append((args[2], windows))
+        return real_gate(*args, windows=windows, **kwargs)
+
+    monkeypatch.setattr(s2_roi, "windows_for_date", lambda *_a, **_k: [SimpleNamespace(y0=0, y1=4, x0=0, x1=SIZE)])
+    monkeypatch.setattr(s2_roi, "_coverage_from_scl", recording_gate)
+    run = run_ingest({"2024-01-01": True}, pipeline_dates=False)
+    assert gated == [(SIZE * SIZE, [(0, 4, 0, SIZE)])]
+    assert run.written == ["2024-01-01"]
+
+
+def test_a_date_reaching_no_window_is_skipped_without_a_gate(run_ingest, monkeypatch):
+    """The gate would count nothing for it, so it is not run; the date is filtered as before."""
+    monkeypatch.setattr(s2_roi, "windows_for_date", lambda *_a, **_k: [])
+    monkeypatch.setattr(s2_roi, "_coverage_from_scl", lambda *_a, **_k: pytest.fail("gated a date with no window"))
+    run = run_ingest({"2024-01-01": True}, pipeline_dates=False)
+    assert (run.result.dates_filtered_coverage, run.written) == (1, [])
 
 
 def test_the_assessed_window_lands_on_the_reflectance_repo(run_ingest, monkeypatch):

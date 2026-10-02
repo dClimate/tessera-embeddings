@@ -1110,11 +1110,13 @@ full extent.
 **Remaining headroom.** Fleet GPU utilisation sits at ~89–93%; the residual gap is almost entirely
 the cold first-chunk-per-worker prologue (~36 s, ~85 chunks on `a60550ae` as the fleet autoscaled
 22→30) — a chunk with no predecessor to prefetch from, which the cross-chunk prefetch structurally
-cannot reach. **The next structural lever is source-store chunk geometry:** the 4000² storage
-chunking drives a ~13 s fixed read amplification, and an inference-aligned geometry chosen before a
-global ingestion would cut it for every future run. That is a config choice beforehand and a
-re-ingest afterwards — see [`../ingest/campaign-ingest-measurements.md`](../ingest/campaign-ingest-measurements.md) §4 for
-why the store chunk was not coarsened, which is the same trade seen from the ingest side.
+cannot reach. **Source-store chunk geometry is not a lever at this scale.** The 4000² storage
+chunking drives a ~13 s fixed read amplification per chunk, but the starter prefetch hides it: on
+Iowa, mosaics stored in 2048² chunks gave the same median per-chunk GPU overhead (5.7 s) and the
+same fleet GPU time (33.5 GPU-hours by peak actors × span, against ~34) as 4000² ones
+([`../ingest/frisky-dev-test-plan.md`](../ingest/frisky-dev-test-plan.md), Phase C).
+[`../ingest/campaign-ingest-measurements.md`](../ingest/campaign-ingest-measurements.md) §4 has
+the same trade seen from the ingest side.
 
 **There is no CI coverage of the CUDA path and that is accepted** — there is no GPU runner and none
 is coming. `TestPipelinedGpuLoop` keeps its `skipif`, and that skip is the only standing signal the

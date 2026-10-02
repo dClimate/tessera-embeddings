@@ -15,6 +15,8 @@ against the service (see the README's per-run workflow).
 
 from __future__ import annotations
 
+import json
+import logging
 import re
 
 import pytest
@@ -75,3 +77,31 @@ def test_every_query_has_a_description() -> None:
     """--list is the discovery surface; an undescribed query is unusable."""
     for name, (description, _) in QUERIES.items():
         assert description.strip(), f"{name}: empty description"
+
+
+@pytest.mark.parametrize("spans", [True, False], ids=["overview", "cluster"])
+def test_frisky_state_parses_the_line_the_live_snapshot_logs(monkeypatch, tmp_path, caplog, spans) -> None:
+    """Producer and consumer of the `frisky state:` line live in different modules; pin them together.
+
+    Both views a snapshot reads: the overview nests the counts under ``state``, the cluster view does not.
+    """
+    from tessera_embeddings.providers import frisky as frisky_engine
+
+    state = dict(
+        workers_total=60,
+        workers_idle=2,
+        tasks_processing=118,
+        tasks_waiting=4021,
+        tasks_queued=0,
+        tasks_memory=355,
+        tasks_erred=1,
+    )
+    monkeypatch.setattr(frisky_engine, "_frisky_cli", lambda *args: json.dumps({"state": state} if spans else state))
+    with caplog.at_level(logging.INFO):
+        frisky_engine._live_snapshot("http://unused", str(tmp_path), logging.getLogger("frisky-state"), spans=spans)
+
+    pattern = re.search(r"parse @message /(.*?)/ \|", QUERIES["frisky_state"][1]).group(1)
+    fields = re.search(re.sub(r"\(\?<(\w+)>", r"(?P<\1>", pattern), caplog.text).groupdict()
+    snapshot_s = fields.pop("snapshot_s")
+    assert fields == dict(workers="60", idle="2", processing="118", waiting="4021", queued="0", memory="355", erred="1")
+    assert float(snapshot_s) >= 0

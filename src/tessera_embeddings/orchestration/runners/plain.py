@@ -48,6 +48,7 @@ from tessera_embeddings.ingest.roi import rasterize_roi_zarr
 from tessera_embeddings.ingest.roi_processing import DEFAULT_MIN_VALID_COVERAGE
 from tessera_embeddings.ingest.s1_roi import ingest_s1_roi_sar
 from tessera_embeddings.ingest.s2_roi import ingest_s2_roi_reflectance
+from tessera_embeddings.providers.frisky import connect
 from tessera_embeddings.providers.local.dask import local_cluster
 from tessera_embeddings.providers.local.ray import ray_cluster
 from tessera_embeddings.storage.manifest import EmbeddingManifest
@@ -80,9 +81,13 @@ def _resolve_num_gpus(device: str) -> int:
 
 
 @contextmanager
-def _dask_client(n_workers: int) -> Iterator[Client]:
-    """Create a local Dask cluster + connected client."""
-    with local_cluster(n_workers=n_workers) as cluster, Client(cluster) as client:
+def _dask_client(n_workers: int, *, frisky: bool = False) -> Iterator[Client]:
+    """Create a local Dask cluster + connected client, its compute on Frisky when ``frisky``."""
+    with (
+        local_cluster(n_workers=n_workers, frisky=frisky) as cluster,
+        Client(cluster) as dask_client,
+        connect(dask_client, enabled=frisky) as client,
+    ):
         yield client
 
 
@@ -181,6 +186,7 @@ def _run_ingest(
     storage_options: dict | None,
     s1_use_s3_direct: bool,
     min_valid_coverage: float = DEFAULT_MIN_VALID_COVERAGE,
+    frisky: bool = False,
 ) -> None:
     """Run S2 + S1 ingestion sequentially against a local Dask cluster.
 
@@ -189,7 +195,7 @@ def _run_ingest(
     """
     mosaic_base = paths.store_for(roi_name, "reflectance").rsplit("/", 1)[0]
 
-    with _dask_client(n_workers) as client:
+    with _dask_client(n_workers, frisky=frisky) as client:
         log.info("Local Dask cluster ready: scheduler=%s", client.scheduler_info()["address"])
 
         log.info("Ingesting S2 reflectance into %s", mosaic_base)
@@ -407,6 +413,8 @@ def run_plain(
                                     # --min-valid-coverage overrides it
             allow_s2_only: false   # embed S2-valid pixels with zero S1 observations
             n_workers: 2
+            frisky: false           # run ingest compute on Frisky, an experimental Rust scheduler
+                                    # (see providers/frisky.py)
             checkpoint_dir: null    # override model directory; null → {inputs}/models/
             checkpoint_url: null    # full checkpoint URI (s3://, https://, …); overrides checkpoint_dir
             device: auto            # "auto" | "cpu" | "cuda"
@@ -460,6 +468,7 @@ def run_plain(
         end_date=time_range["end"],
         s1_orbit=cfg.get("s1_orbit", "both"),
         n_workers=cfg.get("n_workers", 2),
+        frisky=cfg.get("frisky", False),
         log=log,
         storage_options=cfg.get("storage_options"),
         # The domain-layer default is True (S3 direct from us-west-2). On a laptop outside

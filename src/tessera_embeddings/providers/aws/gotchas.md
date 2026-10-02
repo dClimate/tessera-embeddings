@@ -22,6 +22,7 @@ are no hardcoded AWS account IDs in source control.
 - [Teardown — three layers of defence](#teardown--three-layers-of-defence)
 - [Launch throttling — the account quota nobody owns](#launch-throttling--the-account-quota-nobody-owns)
 - [Connection modes](#connection-modes)
+- [Frisky on the ingest cluster (`use_frisky`)](#frisky-on-the-ingest-cluster-use_frisky)
 - [Adding a new cloud provider](#adding-a-new-cloud-provider)
 - [Kubernetes](#kubernetes)
 
@@ -415,6 +416,37 @@ separate context manager because the AWS argument surface (SSM
 prefix, AMI, tags, …) is irrelevant locally. Code that wants to be
 substrate-agnostic should accept a `ray_cluster` callable as a
 parameter and let the caller pick the provider.
+
+---
+
+## Frisky on the ingest cluster (`use_frisky`)
+
+An ingest flow run with `use_frisky=True` builds the usual Fargate
+cluster and loads Frisky onto it (`ecs_cluster(frisky=True)`). What that
+needs from the deployment:
+
+* **Both images are built from this branch,** where Frisky is a core
+  dependency: the flow runner's, which calls `frisky.hijack`, and
+  `DASK_ECR_IMAGE_URI`, because the scheduler and every worker import
+  Frisky when the hijack's plugins reach them. An image without it fails
+  the run at cluster start, not mid-ingest.
+* **The security group admits the Frisky scheduler's port.** It binds a
+  random port beside Dask's 8786, and workers dial it on the scheduler's
+  private IP. A rule that admits only 8786 and 8787 within the group
+  leaves every Frisky worker unregistered; `frisky observe workers`
+  shows it.
+* **The fleet is fixed at `max_workers`** (`cluster.scale`, not
+  `adapt`), because Dask's adaptive scaling cannot see Frisky's tasks.
+  `min_workers` is ignored.
+* **The dashboard command does not change.** The logged SSM
+  port-forward to 8787 now opens Frisky's dashboard, and
+  `frisky observe overview http://localhost:8787` queries it. Dask's own
+  pages (`/workers`, `/health`) stay at their paths.
+* **`perf_report_uri` receives Frisky's spans** (JSON) instead of a Dask
+  performance report.
+
+Why each of these, and what else differs:
+[`context_docs/ingest/frisky-experiment.md`](../../../../context_docs/ingest/frisky-experiment.md).
 
 ---
 

@@ -33,7 +33,8 @@ measured, derivations in `context_docs/ingest/campaign-ingest-measurements.md`.
 
 Three facts a reader needs before any of the levers make sense: what the scheduler actually
 spends memory on, how the chunk grids line up, and what the write contract is that every lever
-has to preserve.
+has to preserve. The scheduler itself is also swappable: `use_frisky` (experimental) runs the same
+graphs on Frisky, a Rust reimplementation of Dask's ([`frisky.md`](frisky.md)).
 
 ### Background: how Dask task graphs consume scheduler RAM
 
@@ -397,7 +398,10 @@ intersects the run's windows with that date's own STAC footprints — reprojecte
 grid and padded one cell, so a curved reprojection cannot under-cover — then re-bands and
 re-groups. Tasks over the removed windows would run, find nothing and write nothing, so this
 cannot change what a mosaic contains. When a footprint cannot be determined the full window list
-is returned unchanged, so the conservative path is the fallback. Both sensors do it
+is returned unchanged, so the conservative path is the fallback. The S2 coverage gate counts its
+numerator over the same narrowed windows, since a valid pixel needs imagery; its denominator stays
+the ROI's whole live area, because its ratio asks how much of the ROI's land the date saw. On a
+zone that is most of the gate: a date's imagery reaches about a third of 35N's live chunks. Both sensors do it
 (`narrow_windows_per_date` on S1, always on S2): six times fewer windows per date on the S1 zones
 measured, worth 7–20% of per-date wall clock.
 
@@ -434,7 +438,7 @@ Sequential windows — the fleet sees one window at a time:
  │◄─ window 1 ─►│◄─ window 2 ─►│◄─ window 3 ─►│◄ w4 ►│◄─ window 5 ─►│
  └─ the date costs the SUM of these, and most slots idle within each ─┘
 
-Overlapped (overlap_window_writes, the default) — one graph, one commit:
+Overlapped (overlap_window_writes, the default) — one commit:
  │◄─ window 1 ─►│
  │◄─ window 2 ──►│     all submitted together, so the fleet packs them and
  │◄─ window 3 ─►│      the date costs roughly the LONGEST window plus
@@ -445,13 +449,23 @@ Overlapped (overlap_window_writes, the default) — one graph, one commit:
 
 Mechanism: icechunk's dask path already forks a session, stores lazily and merges changesets,
 and writing per window runs that sequence once per window. Overlapping lifts it one level — fork
-once, collect every window's lazy stored arrays, run one merge reduction — so every window's
-loads, masks and chunk writes occupy a single graph.
+once, collect every window's lazy stored arrays, merge all their changesets back together — so
+every window's loads, masks and chunk writes run at once, as one blocking graph a date. On Frisky
+(`group_window_writes`, set from `use_frisky`) S2 hands the write its client instead, and the
+windows go out as `WRITE_SUBMISSION_GROUPS` (4) graphs of contiguous windows, each submitted
+without waiting for the one before: Frisky's client converts a whole graph before running any of
+it, so the fleet starts on the first group while the rest convert. Dask keeps one graph, because
+its scheduler, saturated at zone scale, ran 27% slower a date taking four.
 
 The resulting store is identical either way, because the windows are chunk-disjoint: that is what
 makes the merged changesets conflict-free, and the same property that lets a date commit exactly
 once. Should icechunk's internals move, the write falls back to the sequential loop with a
 warning.
+
+The changesets merge in a tree whose fan-in is set per spatial axis (`_MERGE_SPLIT_EVERY`, 8 by
+8 store blocks). dask spreads an integer fan-in across every reduced axis as its root, so 8 over
+time, northing and easting gave 2 per axis: a merge task for every third store block, about one
+task in thirteen of a zone date, doing nothing.
 
 Default **on** for both S2 and S1. `write_day_windows` itself still defaults to the
 sequential path: a storage-layer default should not decide write strategy for its callers,
@@ -518,7 +532,7 @@ operation that makes it visible to readers.
 ```
 per-date wall clock  ≈  max( W, P )  +  commit / k
 
-    W = the batch's write, per date          k = dates fused into one graph
+    W = the batch's write, per date          k = dates fused into one write
     P = the preparation running alongside it, per date
 ```
 
@@ -538,8 +552,8 @@ batched. Recalibrate against real runs rather than an offline sweep, since a dif
 gives a different answer. Figures in
 `context_docs/ingest/campaign-ingest-measurements.md` §3.16.
 
-**What happens when it is on.** `k` consecutive dates that pass the quality gate are computed as
-one graph, and their work interleaves — while one date waits on slow reads, another's writes keep
+**What happens when it is on.** `k` consecutive dates that pass the quality gate are computed
+together, and their work interleaves — while one date waits on slow reads, another's writes keep
 the machines busy. The tail at the end of a computation, where the last few tasks finish and the
 fleet drains, is paid once per batch instead of once per date.
 

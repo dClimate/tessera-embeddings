@@ -14,6 +14,10 @@ execution that is the actual point of the library.
 | + AWS | `pip install tessera_embeddings[inference,prefect,aws]` | AWS production |
 | Base only | `pip install tessera_embeddings` | contributors, CI, library integrations |
 
+Every tier includes Frisky, the Rust Dask scheduler behind the ingest's `use_frisky` option. It
+is a closed-source binary under a free licence, and it installs only on Python below 3.15
+([`frisky.md`](frisky.md)).
+
 uv is recommended for reproducible installs but not required — all `pip`
 commands above work identically with `uv pip`.
 

@@ -26,6 +26,7 @@ from tessera_embeddings.orchestration.prefect.flows._dask_lifecycle import (
     get_task_runner_for_cluster,
 )
 from tessera_embeddings.orchestration.prefect.tasks.ingest import process_roi_sar
+from tessera_embeddings.providers.frisky import maybe_capture_telemetry
 
 
 @flow(name="ingest_s1_roi_impl")
@@ -46,6 +47,7 @@ def _ingest_s1_roi_impl(
     narrow_windows_per_date: bool,
     allow_ingest_code_mismatch: bool,
     s3_region: str | None = None,
+    use_frisky: bool = False,
 ) -> dict[str, Any]:
     """Inner flow: submits the S1 ingestion task to the configured Dask runner."""
     future = process_roi_sar.submit(
@@ -64,6 +66,7 @@ def _ingest_s1_roi_impl(
         narrow_windows_per_date=narrow_windows_per_date,
         allow_ingest_code_mismatch=allow_ingest_code_mismatch,
         s3_region=s3_region,
+        use_frisky=use_frisky,
     )
     return future.result()
 
@@ -103,8 +106,10 @@ def ingest_s1_roi_sar(
     orbit: S1Orbit,
     use_s3_direct: bool = True,
     use_local: bool = False,
+    use_frisky: bool = False,
     storage_options: dict | None = None,
     perf_report_uri: str | None = None,
+    frisky_drain_spans: bool = False,
     overlap_window_writes: bool = True,
     pipeline_batches: bool = True,
     narrow_windows_per_date: bool = True,
@@ -129,10 +134,19 @@ def ingest_s1_roi_sar(
             ``set_s3_credentials`` as the STS refresh and broadcast callbacks: workers get
             EDL env vars via ``extra_worker_env`` but need STS tokens for the OPERA bucket.
         use_local: Use the local Dask provider for testing.
+        use_frisky: Run the ingest's compute on Frisky, an experimental Rust scheduler loaded
+            onto the same Dask cluster (:mod:`tessera_embeddings.providers.frisky`). On AWS it
+            fixes the fleet at ``max_workers``, and ``perf_report_uri`` becomes a prefix for
+            Frisky's telemetry instead of a Dask report. Off by default.
         storage_options: fsspec storage options forwarded to the domain function.
-        perf_report_uri: Optional fsspec URI; when set, a Dask performance-report HTML for
-            this run is captured and uploaded there (probe-rung profiling; default off).
+        perf_report_uri: Optional fsspec URI; when set, a Dask performance-report HTML for this
+            run is captured and uploaded there; with ``use_frisky``, Frisky's live and final
+            telemetry is written under it as a prefix (probe-rung profiling; default off).
             Ignored on the ``use_local`` path, which warns.
+        frisky_drain_spans: With ``use_frisky`` and ``perf_report_uri``, also copy the run's
+            task, transfer and spill spans to ``<perf_report_uri>/spans/`` every minute, so the
+            whole run is kept rather than the tail the final capture holds. About 9 GB a day
+            gzipped per 60 workers; delete the prefix once the run is analysed. Off by default.
         overlap_window_writes: Submit a date's windows as ONE dask compute rather than one
             blocking compute per window, so they share the fleet instead of each waiting its
             turn. Identical store either way. **Defaults ON.** Also selects the window merge
@@ -180,7 +194,7 @@ def ingest_s1_roi_sar(
             # Say so rather than no-op: an operator who set this and finds nothing at the
             # URI would otherwise suspect the upload or their credentials.
             log.warning("perf_report_uri is ignored on the local-cluster path (use_local=True)")
-        with local_cluster() as cluster:
+        with local_cluster(frisky=use_frisky) as cluster:
             log.info("Local Dask cluster ready: scheduler=%s", cluster.scheduler_address)
             task_runner = get_task_runner_for_cluster(cluster.scheduler_address)
             return _ingest_s1_roi_impl.with_options(task_runner=task_runner)(  # type: ignore[arg-type]
@@ -199,6 +213,7 @@ def ingest_s1_roi_sar(
                 narrow_windows_per_date=narrow_windows_per_date,
                 allow_ingest_code_mismatch=allow_ingest_code_mismatch,
                 s3_region=s3_region,
+                use_frisky=use_frisky,
             )
 
     from tessera_embeddings.providers.aws.dask import ecs_cluster, maybe_performance_report
@@ -216,10 +231,16 @@ def ingest_s1_roi_sar(
         # Tag every cluster resource with this run's id so the cancellation/crash hook can
         # sweep the tasks from a fresh process (see _dask_lifecycle).
         resource_tags=dask_resource_tags(flow_run_ctx.id),
+        frisky=use_frisky,
     ) as cluster:
         task_runner = get_task_runner_for_cluster(cluster.scheduler_address)
         log.info("Task runner connected to scheduler at %s", cluster.scheduler_address)
-        with maybe_performance_report(cluster.scheduler_address, perf_report_uri, log):
+        report = (
+            maybe_capture_telemetry(cluster.dashboard_link, perf_report_uri, log, drain_spans=frisky_drain_spans)
+            if use_frisky
+            else maybe_performance_report(cluster.scheduler_address, perf_report_uri, log)
+        )
+        with report:
             return _ingest_s1_roi_impl.with_options(task_runner=task_runner)(  # type: ignore[arg-type]
                 roi_zarr_path=roi_zarr_path,
                 start_date=start_date,
@@ -236,4 +257,5 @@ def ingest_s1_roi_sar(
                 narrow_windows_per_date=narrow_windows_per_date,
                 allow_ingest_code_mismatch=allow_ingest_code_mismatch,
                 s3_region=s3_region,
+                use_frisky=use_frisky,
             )

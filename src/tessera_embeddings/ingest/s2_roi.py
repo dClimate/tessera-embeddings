@@ -24,7 +24,7 @@ supply a connected :class:`dask.distributed.Client` and a logger.
 
 Step 4 is split into a prepare half and a write half so ``pipeline_dates`` can overlap one
 date's preparation with the previous date's write, and so ``batch_dates`` can compute several
-dates' writes as one graph (one commit per BATCH — see ``storage.zarr_store.write_days_windows``
+dates' writes together (one commit per BATCH — see ``storage.zarr_store.write_days_windows``
 for why that unit is forced). Writes stay in date order under every mode.
 """
 
@@ -193,11 +193,12 @@ def _coverage_from_scl(
     ``odc.stac.load`` graph: SCL is one of the written bands, so loading it separately costs a
     second client-side graph build and a second read of the same data for no information.
 
-    Both sides of the coverage ratio must be cropped together or every percentage is skewed:
-    under ``windows`` the numerator reduces over the windows only, which equals the full-extent
-    count because the mask is False outside them and row bands are chunk-disjoint. ``any_valid``
-    stays LAZY there — materialising it would defeat the cropping, and the write pulls only
-    window slices of it.
+    Under ``windows`` the numerator reduces over those windows only: the date's own windows, which
+    count everything the full extent would, since a valid pixel needs imagery, the windows hold all
+    of the date's (``windows_for_date``), the mask is False outside the ROI's live area, and row
+    bands are chunk-disjoint. The denominator, ``roi_pixel_count``, stays the ROI's whole live area.
+    ``any_valid`` stays LAZY there — materialising it would defeat the cropping, and the write pulls
+    only window slices of it.
 
     Returns:
         ``(passes, any_valid)``; ``any_valid`` is ``None`` when the date fails.
@@ -210,7 +211,15 @@ def _coverage_from_scl(
         return (False, None)
 
     invalid_classes = np.array(sorted(S2_SCL_INVALID_CLASSES), dtype=scl_2d.dtype)
-    any_valid = ~scl_2d.isin(invalid_classes)
+    # One task per chunk. `DataArray.isin` reaches dask's isin, which reduces over the test values
+    # with `any` and so adds two tasks per chunk, here and again where the write masks by it.
+    any_valid = xr.apply_ufunc(
+        np.isin,
+        scl_2d,
+        kwargs={"test_elements": invalid_classes, "invert": True},
+        dask="parallelized",
+        output_dtypes=[bool],
+    )
 
     if windows is not None:
         masked = any_valid & roi_mask
@@ -293,6 +302,7 @@ def ingest_s2_roi_reflectance(
     storage_options: StorageOptions = None,
     stream_stac_monthly: bool = True,
     overlap_window_writes: bool = True,
+    group_window_writes: bool = False,
     pipeline_dates: bool = False,
     batch_dates: int | None = None,
     allow_ingest_code_mismatch: bool = False,
@@ -319,17 +329,24 @@ def ingest_s2_roi_reflectance(
             whole year's items do not fit in the worker this runs on. ``False`` restores the
             single up-front query and is a rollback path only — a year-long window cannot
             complete under it.
-        overlap_window_writes: Submit every window of a date as one dask compute instead of one
-            blocking compute per window, so the windows' critical paths overlap across the fleet
-            rather than summing. Identical stores either way; falls back to the sequential write
-            when the overlapped machinery is unavailable.
+        overlap_window_writes: Compute every window of a date together instead of one blocking
+            compute per window, so the windows' critical paths overlap across the fleet rather
+            than summing. Identical stores either way; falls back to the sequential write when
+            the overlapped machinery is unavailable.
+        group_window_writes: With ``overlap_window_writes``, submit a date's windows to
+            ``client`` as ``zarr_store.WRITE_SUBMISSION_GROUPS`` graphs one after another rather
+            than as one, so the fleet starts on the first while the driver converts the rest.
+            That pays only on an engine whose client converts a whole graph before running any
+            of it, as Frisky's does: on zone 35N it cut Frisky's time a date by 8% and raised
+            Dask's by 27%, whose saturated scheduler then takes four graphs a date. The Frisky
+            flows turn it on.
         pipeline_dates: Prepare the next date — load graph, coverage gate, footprint narrowing,
             masking — on a background thread while the current date is written, so preparation
             costs wall clock only when the write cannot cover it. The WRITE stays serial and in
             date order: one commit per date, one writer either way. Identical stores either way,
             which rests on preparation being side-effect-free.
-        batch_dates: Write up to this many consecutive PASSING dates as one dask compute and one
-            commit, so the dates' graphs pack the fleet together — one date's straggling reads
+        batch_dates: Write up to this many consecutive PASSING dates together in one commit,
+            so the dates' graphs pack the fleet together — one date's straggling reads
             backfill with another's work — and the per-date drain tail and commit gap are paid
             once per batch. The commit unit becomes the batch: a mid-batch failure commits none
             of its dates and the retry re-ingests exactly those (per-date sessions are impossible
@@ -386,7 +403,7 @@ def ingest_s2_roi_reflectance(
     # its own imagery reaches (``windows_for_date`` below), because a satellite covers only a
     # fraction of a wide ROI per pass.
     #
-    # The merge exchange rate follows how this run WRITES: overlapped windows share one graph, so
+    # The merge exchange rate follows how this run WRITES: overlapped windows compute together, so
     # a boundary is cheap and the DP should stop trading ocean area for fewer windows; sequential
     # writes still pay the serial cost. Bound once because per-date narrowing re-merges on the
     # same terms, and a second differing rate there would undo this for every narrowed date.
@@ -433,8 +450,7 @@ def ingest_s2_roi_reflectance(
     #
     # The window total equals the full-extent total because the mask is False outside every
     # window, and row bands are chunk-disjoint so nothing is counted twice. _coverage_from_scl
-    # relies on that same property for the numerator: both sides of the coverage ratio must stay
-    # cropped together, or every percentage is silently skewed.
+    # relies on that same property for the numerator, which it counts over each date's own windows.
     roi_pixel_count = int(_sum_over_windows(roi_mask, live_windows).compute())
 
     if roi_pixel_count == 0:
@@ -605,6 +621,40 @@ def ingest_s2_roi_reflectance(
                 read_error=exc,
             )
 
+        # Narrow this date to the land its own imagery reaches, before the gate counts it. The run's
+        # windows cover the whole ROI's land on every date, but one pass images a fraction of a wide
+        # ROI, so most hold nothing today: their tasks run, find no data, count no valid pixel and
+        # write nothing, since an all-fill chunk is never stored. Dropping them changes neither the
+        # gate's count nor the mosaic, only what is computed. The gate's DENOMINATOR stays the
+        # ROI's whole live area (`roi_pixel_count`): its ratio is "how much of the ROI's land did
+        # this date see", and cropping that would rescale every percentage.
+        date_windows: list[tuple[int, int, int, int]] = live_windows
+        if run_windows:
+            narrowed = windows_for_date(
+                run_windows,
+                [getattr(item, "bbox", None) for item in day_items],  # type: ignore[misc]
+                roi.geobox,
+                chunk_px=INGEST_CHUNK_SIZE,
+                window_cost_in_chunks=window_cost,
+            )
+            if not narrowed:
+                # No live cell is reachable today: the gate would count nothing, and there is
+                # nothing to write. DEBUG: per skipped date; counted in the coverage-filter summary.
+                log.debug("Skipping date: its imagery reaches no live window")
+                return _PreparedDate(date, None, [], time.monotonic() - stage_started, 0.0, "no-live-window")
+            date_windows = [(w.y0, w.y1, w.x0, w.x1) for w in narrowed]
+            if len(narrowed) != len(run_windows):
+                # DEBUG, not INFO: this fires once per date, and Prefect ships every task log
+                # line to the orchestrator API from whichever DASK WORKER ran the task
+                # (logging.to_api is on by default), so a per-date INFO line scales with total
+                # worker count rather than cell count. The per-date TIMING line stays at INFO as
+                # the progress signal; this one is detail, and its numbers appear there too.
+                log.debug(
+                    "Date footprint: writing %d of %d live window(s)",
+                    len(narrowed),
+                    len(run_windows),
+                )
+
         # The gate is where the graph is first COMPUTED, so it is where a source read actually
         # fails — `load_stac_items` above only builds. Retried per date, and named with zone and
         # date on failure so the message identifies the cell.
@@ -625,7 +675,7 @@ def ingest_s2_roi_reflectance(
                             roi_pixel_count,
                             min_valid_coverage,
                             client,
-                            windows=live_windows,
+                            windows=date_windows,
                         )
         except Exception as exc:
             # The gate is the FIRST compute of the date, so an SCL object that will never read
@@ -648,43 +698,6 @@ def ingest_s2_roi_reflectance(
         # it describes, unique per slice and monotonic across them.
         day_ds["time"] = [np.datetime64(date, "ns")]
 
-        # Narrow this date's writes to the land its own imagery reaches. The run's windows cover
-        # the whole ROI's land on every date, but one pass images a fraction of a wide ROI, so most
-        # hold nothing today: those tasks run, find no data and write nothing, since an all-fill
-        # chunk is never stored. Dropping them cannot change the mosaic, only what is computed.
-        #
-        # The COVERAGE GATE above deliberately keeps the run's FULL window set: its ratio is "how
-        # much of the ROI's land did this date see", so cropping its denominator would rescale
-        # every percentage. The numerator is unaffected, there being no valid pixels outside the
-        # footprint to count.
-        date_windows: list[tuple[int, int, int, int]] = live_windows
-        if run_windows:
-            narrowed = windows_for_date(
-                run_windows,
-                [getattr(item, "bbox", None) for item in day_items],  # type: ignore[misc]
-                roi.geobox,
-                chunk_px=INGEST_CHUNK_SIZE,
-                window_cost_in_chunks=window_cost,
-            )
-            if not narrowed:
-                # No live cell is reachable today. Nothing to write, and writing an
-                # empty window set would commit a date holding nothing.
-                # DEBUG: per skipped date; counted in the coverage-filter summary.
-                log.debug("Skipping date: its imagery reaches no live window")
-                return _PreparedDate(date, None, [], build_s, gate_s, "no-live-window")
-            date_windows = [(w.y0, w.y1, w.x0, w.x1) for w in narrowed]
-            if len(narrowed) != len(run_windows):
-                # DEBUG, not INFO: this fires once per date, and Prefect ships every task log
-                # line to the orchestrator API from whichever DASK WORKER ran the task
-                # (logging.to_api is on by default), so a per-date INFO line scales with total
-                # worker count rather than cell count. The per-date TIMING line stays at INFO as
-                # the progress signal; this one is detail, and its numbers appear there too.
-                log.debug(
-                    "Date footprint: writing %d of %d live window(s)",
-                    len(narrowed),
-                    len(run_windows),
-                )
-
         # ONE masking pass, not two. Zeroing invalid pixels and zeroing outside the
         # ROI both fill with 0, so `x.where(A, 0).where(B, 0)` is `x.where(A & B, 0)`
         # — and each `where` is a graph task per (chunk, band), which is the budget
@@ -697,6 +710,8 @@ def ingest_s2_roi_reflectance(
             day_ds[str(var)] = day_ds[str(var)].where(mask_for_var, other=0)
 
         return _PreparedDate(date, day_ds, date_windows, build_s, gate_s, items=day_items, baselines=baselines)
+
+    write_client = client if group_window_writes else None  # the store write groups only given one
 
     def _write_date(prepared: _PreparedDate, stall_s: float) -> None:
         """Write one prepared date's pixels: the store's only writer.
@@ -733,6 +748,7 @@ def ingest_s2_roi_reflectance(
                         chunks=INGEST_CHUNKS,
                         parallel_windows=overlap_window_writes,
                         s3_region=s3_region,
+                        client=write_client,
                     )
         # One line per kept date, partitioning its wall clock into the client-side graph build,
         # the coverage-gate compute and the write (windows + commit). Stable format: CloudWatch
@@ -763,7 +779,7 @@ def ingest_s2_roi_reflectance(
         )
 
     def _write_batch(batch: list[_PreparedDate], stall_s: float = 0.0) -> None:
-        """Write a batch of prepared dates: one dask compute, ONE commit.
+        """Write a batch of prepared dates, computed together: ONE commit.
 
         The same retry contract as ``_write_date``, at batch granularity: the
         batched write commits nothing on failure, so a retry re-runs the whole
@@ -803,8 +819,9 @@ def ingest_s2_roi_reflectance(
                         chunks=INGEST_CHUNKS,
                         parallel_windows=overlap_window_writes,
                         s3_region=s3_region,
+                        client=write_client,
                     )
-        # The batch's write is ONE compute, so a per-date write time does not exist as a
+        # The batch's dates are written together, so a per-date write time does not exist as a
         # measurement: this line is the batched counterpart of `Stage timings` and analysis
         # divides by n. build/gate are sums of the real per-date values.
         write_s = time.monotonic() - write_started
