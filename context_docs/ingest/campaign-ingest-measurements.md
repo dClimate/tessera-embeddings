@@ -2540,23 +2540,28 @@ every existing mosaic.
 
 ### 15.5 The change
 
-All in yield-embeddings: delete `--platform=linux/amd64` from both `FROM` lines of
-`infra/docker/ingestion.Dockerfile`. Add a `platforms` input to `.github/workflows/_build-image.yml`,
-passing `linux/amd64,linux/arm64` for the ingestion image only. Give `_dask_task_def` in
-`infra/aws/stacks/consumer_stack.py` an ARM64 `runtime_platform` when `kind == "worker"`. A
-multi-arch image lets every other family keep pulling amd64, and rolling back is a one-property
-revert. This is about half a day of work, plus a day for the dev test.
+All in yield-embeddings, and built (its PR #90). The ingestion image is built for amd64 and arm64,
+so every other family keeps pulling amd64 from the same tags. Two switches move the workers, both
+off by default:
+
+- **`Deployment.dask_workers_on_arm64`** puts a deployment's `yield-dask-worker-{dev,prod}`
+  definitions on ARM64. Off, it changes no synthesized template at all.
+- **`BRANCH_DASK_WORKERS_ON_ARM64`** in `register_branch_task_defs.py`, set in one branch's own
+  commit, moves only that branch's worker clone. The dev test below runs on it.
+
+**Coarsen moves with ingest.** Every Dask fleet in a deployment pins the same worker definition,
+so a deployment that coarsens needs coarsen covered by the dev test before it switches.
 
 ### 15.6 The dev test
 
-Run it on yield dev, after the Frisky runs finish, on two `dev/<slug>` branches that differ only in
-the worker architecture. Run each rung's two arms at the same time, with a fresh store each.
+Run it on yield dev, while no other ingest experiment is running there, on two `dev/<slug>`
+branches that differ only in `BRANCH_DASK_WORKERS_ON_ARM64`. Run each rung's two arms at the same
+time, with a fresh store each.
 
 | Rung | ROI and window | Width | What it measures |
 |---|---|---|---|
 | 1. production | `iowa_epsg5070`, July 2024 | S2 60, S1 13 | cost and time per date as the campaign runs |
 | 2. fleet-bound | the same | S2 15 | worker throughput: Iowa's ~1,180-task read width oversubscribes 60 slots about 20× |
-| 3. optional | the same as rung 1 | S2 60 | the scheduler on ARM too |
 
 **Gate on paired per-date ratios, not on two means.** Both arms ingest the same dates, so take each
 date's ARM ÷ x86 ratio of cost and of write time, and gate on the ratio's 95% confidence interval.
