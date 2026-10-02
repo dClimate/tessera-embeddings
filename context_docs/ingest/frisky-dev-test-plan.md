@@ -289,7 +289,9 @@ first:
 
 - **Grouped writes help Frisky and hurt Dask.** Frisky's writes ran 3% to 16% shorter from the
   second date; Dask's ran 31% to 35% longer on every date (194 to 296 s, against 147 to 223 s on
-  both earlier runs). The record's item 5 has the numbers.
+  both earlier runs). The record's item 5 has the numbers. Since then only Frisky groups
+  (`group_window_writes`), which moves `ingest_code_identity` to `ingcode-81529682d8f0ada2`, not
+  yet deployed.
 - **Both completed, and the stores agree.** The same 7 dates, and a random 400 chunks of each of
   the 11 arrays identical, NaN positions included (45 to 53 of them held data; the rest of the
   zone is sea), read with `temp/frisky-dev/compare_stores.py --sample 400`. Frisky's span drain
@@ -363,8 +365,8 @@ The embeddings agree broadly but are not equivalent. Over 40 random 64-px window
 percentile 0.947. The difference is in the mosaics, not the inference: the two S2 stores hold the
 same dates (all 217 of the baseline's, plus 4), but the per-pixel S2 observation counts agree on
 only 28% of pixels, far beyond the warp's 0.05% (S1 ascending: 95%). The baseline's mosaics predate
-later ingest changes, the clearest-scene fix of PR #121 among them, so isolating the chunk size
-needs a 4096 ingest of the same year on current code.
+later ingest changes, the clearest-scene fix of PR #121 among them. The chunk size's own effect is
+the warp difference B1 measured, so no 4096 rerun is planned.
 
 ## Acceptance
 

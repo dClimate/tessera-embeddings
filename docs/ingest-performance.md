@@ -447,11 +447,12 @@ Overlapped (overlap_window_writes, the default) — one commit:
 Mechanism: icechunk's dask path already forks a session, stores lazily and merges changesets,
 and writing per window runs that sequence once per window. Overlapping lifts it one level — fork
 once, collect every window's lazy stored arrays, merge all their changesets back together — so
-every window's loads, masks and chunk writes run at once. S2 hands the write its client, and the
+every window's loads, masks and chunk writes run at once, as one blocking graph a date. On Frisky
+(`group_window_writes`, set from `use_frisky`) S2 hands the write its client instead, and the
 windows go out as `WRITE_SUBMISSION_GROUPS` (4) graphs of contiguous windows, each submitted
-without waiting for the one before. An engine that converts a whole graph on the client before
-running any of it, as Frisky does, then starts on the first group while the rest convert. S1
-passes no client, so each of its dates is one blocking graph.
+without waiting for the one before: Frisky's client converts a whole graph before running any of
+it, so the fleet starts on the first group while the rest convert. Dask keeps one graph, because
+its scheduler, saturated at zone scale, ran 27% slower a date taking four.
 
 The resulting store is identical either way, because the windows are chunk-disjoint: that is what
 makes the merged changesets conflict-free, and the same property that lets a date commit exactly

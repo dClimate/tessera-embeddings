@@ -128,8 +128,10 @@ Frisky also prints a periodic cluster summary to stdout; `FRISKY_SUMMARY=off` si
 - **Hand Frisky a big graph as one blocking compute when the work splits.** Its client converts
   the whole graph before any task runs, so the fleet waits for all of it. Submit the parts one
   after another with `client.compute`, which returns once each is submitted, and gather at the
-  end: the fleet runs the first part while the client converts the next. The S2 store write does
-  this for each date (`WRITE_SUBMISSION_GROUPS` in `storage/zarr_store.py`).
+  end: the fleet runs the first part while the client converts the next. With `use_frisky` the S2
+  store write does this for each date (`group_window_writes`, `WRITE_SUBMISSION_GROUPS` in
+  `storage/zarr_store.py`). Not on Dask: its scheduler, saturated at zone scale, ran 27% slower a
+  date taking four graphs instead of one.
 - **Use a raw `frisky.hijack` for the ingest.** Without our worker plugin, the first real image
   read segfaults the worker and the run hangs.
 - **Reference the `frisky` module from a function pickled by value,** such as one defined in

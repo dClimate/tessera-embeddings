@@ -171,7 +171,7 @@ both engines.
 At zone scale that remainder dominates. On 35N at 60 workers a date's write graph holds 108,000 to
 168,000 tasks, and the fleet sat idle 15 to 29 s before each one while the driver converted it.
 `pipeline_dates` does not hide it: it prepares the next date in the background, but a write's
-conversion happens inside the write. So the S2 ingest passes its client to the store write, which
+conversion happens inside the write. So on Frisky the S2 ingest passes its client to the store write, which
 splits a date's windows into `WRITE_SUBMISSION_GROUPS` (4) contiguous groups and submits them one
 after another with `client.compute`. That call returns as soon as a group's graph is converted and
 submitted, so the fleet runs the first group while the driver converts the next. The groups'
@@ -201,7 +201,8 @@ spread; locally Dask's scheduler shares the driver's process, which Fargate's do
 On 35N on dev (version C, with `pipeline_dates`) the grouping pays only on Frisky. Frisky's writes
 ran 3% to 16% shorter from the second date on, and its time between dates fell from 165 s to 152 s.
 Dask's writes ran 31% to 35% longer on every date, and its time between dates rose from 211 s to
-269 s: its scheduler, already at 100% of its core, now takes four graphs a date instead of one.
+269 s: its scheduler, already at 100% of its core, now takes four graphs a date instead of one. So
+only Frisky groups: `group_window_writes`, which the Frisky task sets from `use_frisky`.
 
 **Measured and ruled out: thread stack size.** Frisky's task threads get Rust's default 2 MiB
 stack; Dask's get 16 MiB on macOS (and typically 8 MiB on Linux). Raising Frisky's with
@@ -309,12 +310,7 @@ documentation: [`docs/frisky.md`](../../docs/frisky.md).
   icechunk to make `computing_meta` pickle by reference so `_picklable_merge_reduction` can go.
 - Confirm the shorter end-of-run capture on dev: a drained Iowa run's bundle should land within
   about 10 s of its last batch, not 45.
-- Decide the grouped write submission: on 35N it cut Frisky's time a date by 8% and raised
-  Dask's by 27%. Grouping only on Frisky, or not at all, changes the ingest code identity either
-  way.
 - Report the heartbeat growth upstream, with the local reproduction.
-- Ingest the Iowa year at 4096 on current code, to separate the chunk size from the ingest changes
-  since the inference baseline in the embedding comparison.
 - Find why the gate's computes run one after another on Frisky.
 - Decide whether Frisky stays a core dependency when this reaches `main`, on the experiment's
   results and the constraints under Packaging above.
