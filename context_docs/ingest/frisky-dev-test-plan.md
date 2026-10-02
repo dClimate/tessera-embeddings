@@ -19,13 +19,21 @@ is: [`frisky-experiment.md`](frisky-experiment.md). How to operate it:
   | A | `b3e902b0` | 4096 | `ingcode-0869839717820a9c` | `dev/frisky-4096` |
   | A′ | `4c12a5d1` | 4096 | `ingcode-0869839717820a9c` | `dev/frisky-4096` |
   | B | `9d994f84` | 2048 | `ingcode-5f707a14bb6d5062` | `dev/frisky-2048` |
+| C | `cb2307d6` | 2048 | `ingcode-dfef8f7ea6482ad6` | `dev/frisky-2048c` |
 
   Version B also moves `inference_code_identity`, from `infcode-c9905e5aa8f93d3e` to
   `infcode-2613e97f0ad55679`, because `config/ingest.py` is inside the inference import closure.
   B1 ran on `aef6c55b`, which differs from B only in how `ecs_cluster` connects its setup clients
   (by the cluster object, so the hijack waited for the fleet). That is outside both code
   identities, so B1's stores hold what B writes. A′ is A with that same fix, on the branch
-  `experiment/frisky-4096-startup-fix`; B2's 4096 arms ran on it.
+  `experiment/frisky-4096-startup-fix`; B2's 4096 arms ran on it. B's later runs ran on later
+  commits of its branch that change neither identity (`8d461c61`, the span drain; `31ea6ac0`, the
+  pickling fix); the run log names each.
+
+  Version C adds the two fixes B's runs found inside the ingest identity: the ROI mask's block
+  reader made module-level, and a date's write submitted in groups (the record's item 5). It also
+  carries the span-telemetry bounds, which sit outside both identities. It moves
+  `inference_code_identity` to `infcode-678da02d8d87d6aa`.
 
 - **Paired arms.** Every Frisky run has a Dask run from the same deployment with the same
   parameters; only `use_frisky` differs. Dask runs with `min_workers == max_workers`, so both arms
@@ -63,7 +71,8 @@ Already checked, read-only: the yield Dask security group (`sg-03b679cab3d7d672b
 traffic from itself, so Frisky's random scheduler port is reachable. Dask and the flow runner both
 log to `/ecs/yield-embeddings`.
 
-Version B repeats steps 1 to 3 on `dev/frisky-2048`, pinned at `@9d994f84`.
+Version B repeats steps 1 to 3 on `dev/frisky-2048`, pinned at `@9d994f84`, and version C on
+`dev/frisky-2048c` at `@cb2307d6`, registering `tessera-embeddings` too for Phase C.
 
 ## What every run records
 
@@ -222,6 +231,11 @@ correctness and stability:
 | `rondonia_humidtropical_epsg32720` | humid tropics | descending |
 | `alps_highrelief_epsg32632` | high relief | both |
 
+**Result: passed** (version B at `31ea6ac0`, 2024-07, all 16 arms at once). Every arm completed,
+each pair of stores holds the same dates, and none of the 490 workers died or restarted. S2 took
+2% to 19% longer a date on Frisky; S1 went both ways, from 47% faster to 49% slower, on two to
+eight dates an arm with 16 arms competing for the catalog. It cost $6.15.
+
 **B4: one bounded dense-zone run, for telemetry at scale.** `zone_35N` for 2024-01-01 to
 2024-01-07 only, S2, at 60 workers. That is the record's reference rung; yield-embeddings'
 `conc_ref` measured 118 to 179 s a date on Dask at 4096. It is not a zone-year.
@@ -232,6 +246,37 @@ correctness and stability:
 - **Check the capture:** the drained parts' size, whether they hold every date, and the
   scheduler's CPU while they are taken.
 - **Stop rule:** cancel an arm that exceeds twice the other's per-date time, or 45 minutes.
+
+**Result: Frisky is 18% to 30% faster a date, because Dask's scheduler saturates.** Three
+attempts, all version B at `31ea6ac0` with the campaign's 0.1% coverage threshold after the
+first:
+
+| 35N, 1 to 7 January 2024 | Dask | Frisky |
+|---|---|---|
+| 4096 mask, no pipelining, s/date | 275 | 193 |
+| 2048 mask, `pipeline_dates`, wall between dates, 2 to 6 January | 170 to 246, mean 211 | 136 to 204, mean 173 |
+| 2048 mask, `pipeline_dates`, run wall | 31 min | 27 min, failed at close |
+
+- **The first attempt sat in the mask scan.** The zone masks were exported at 4096. At 2048 the
+  live-window code cannot list the mask's chunk keys, and reads it block by block on one
+  thread, about 10 minutes for 35N, before any task exists. It was cancelled at 9 minutes for
+  that. The second attempt paid the scan on both arms; the third ran on masks exported at 2048
+  (`s3://arbol-tessera-inputs-dev/_frisky_2048/rois/zarrs/`, all 112 zones with land), which
+  take the listing.
+- **Dask's scheduler is the bound at zone scale.** It sat at 95% to 101% of its core through every
+  date, and froze its event loop for up to 10 s taking a write graph of 108,000 to 168,000 tasks.
+  It ran the gate's 42,000 small tasks with the fleet 24% to 32% busy and the write at about
+  80%. Frisky's scheduler ran at a median 8% of a core and kept the fleet 97% busy through every
+  write. Median task times are the same on both engines.
+- **Frisky's remaining loss is between computes.** Over the second attempt no task ran anywhere
+  for 31% of the run, against Dask's 35%: 18 to 35 s before each write and 24 to 26 s before each
+  gate, while its client converted each graph. `pipeline_dates` hid the gate's share on every
+  date of the third attempt, where Dask still stalled 23 to 26 s a date; version C's grouped
+  writes target the write's share.
+- **The pipelined Frisky arm wrote every date and then failed.** Its scheduler's span buffer, at
+  Frisky's default of 1,000,000, grew it to 5.7 GiB of 8, and the end-of-run capture's three span
+  queries took it to 6.8 GiB before it died; `cluster.close()` then timed out reaching it. The
+  record's span-buffer finding has the fix, which version C carries.
 
 **B5: re-measure the provisional constants.** Version B's chunk-counted thresholds are the 4096
 measurements converted by area:
@@ -251,13 +296,22 @@ measurements converted by area:
 
 ## Phase C: end to end, up to Iowa
 
-Only after Phase B passes. Run the single-ROI pipeline on version B's deployment on
-`tiny_epsg5070`, then `15SWC_epsg5070`, then `iowa_epsg5070`, and no larger. Pass explicit
-worker and actor counts rather than the auto-sizing, which is still calibrated in 4096-px chunks.
+One run: `iowa_epsg5070` for a year, 2024-11-01 to 2025-10-31, the window of the Iowa inference
+baseline in [`inference-on-gpus.md`](../inference/inference-on-gpus.md). The baseline's
+`a60550ae` inferred 404 chunks in about 73 minutes and 34 GPU-hours on 30 actors. Ingest S2 at 60
+workers and S1 ascending at 13 on Frisky with the drain, then run `tessera-embeddings` with the
+baseline's parameters (30 actors, `s1_orbit` both, `time_window_end` October 2025). Everything
+writes under its own prefix in each bucket, `_frisky_e2e_c/` for version C, with the Iowa ROI
+copied there unchanged, so no baseline store is touched; the mosaics are kept for reruns.
 
-**Compare** each against the same ROI and window on `main`'s pipeline. Check two things: the
-embeddings with `te-compare-outputs`, and the total wall clock and cost, split into ingest,
-inference and assembly.
+**Compare** against the baseline: the embeddings with `te-compare-outputs`, and the wall clock
+and cost, split into ingest, inference and assembly. Inference code has changed since the
+baseline, so a difference is only attributed to the chunk size once that is ruled out.
+
+**On version B, cancelled.** The S2 ingest slowed about 63 minutes in, when the span buffers
+filled: gates rose from 10 to 93 s and writes from 52 to 228 s, with gaps of 11 to 61 s between small
+tasks while the workers idled. The run was cancelled at 1 h 36 min, with S1's year complete, and the year
+rerun on version C.
 
 ## Acceptance
 
@@ -270,23 +324,25 @@ inference and assembly.
 
 ## Rough cost
 
-Ingest only, at about $0.27 a worker-hour. Phases A to B2 are measured; the rest are estimates:
+Ingest only, at about $0.27 a worker-hour:
 
 | Phase | Cost |
 |---|---|
 | A | $2.30, measured |
 | B1 | $1.72, measured, with the startup fix's two smoke runs |
 | B2 | $12.27, measured, with the drain's and the fix's runs |
-| B3 | about $10 |
-| B4 | about $15 (two arms of about 20 worker-hours) |
+| B3 | $6.15, measured |
+| B4 | $36.92, measured, over three attempts |
+| C on version B | $24.27, measured, ingest only, cancelled |
 
-That is about $41 for the ingest phases. Phase C adds GPU time, estimated once the actor counts
-are fixed. The run log records the actual figures.
+That is $59.36 for the ingest phases. Phase C on version C adds about $25 of ingest and, if
+inference matches the baseline, $60 to $70 of GPU time. The run log records the actual figures.
 
 ## Run log
 
 Wall is the flow run, setup included. s/date is engine time per date: the batches' build, gate and
-write for S2, or stall and write for S1, divided by the dates written.
+write for S2, or stall and write for S1, divided by the dates written. With `pipeline_dates` the
+stages overlap, so those runs give the wall clock between one date's commit and the next.
 
 | Date | Run | Version | Engine | ROI and window | Sensor | Workers | Flow run | Wall | s/date | Restarts | Result |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -322,3 +378,27 @@ write for S2, or stall and write for S1, divided by the dates written.
 | 2026-10-01 | b2-s2-dask-2048-fix | B (`31ea6ac0`) | Dask | iowa_epsg5070, 2024-07-01..14 | S2 | 60 | `2289dd5c` | 5m43s | 17.9 | 0 | pass: 8 dates, $1.07 |
 | 2026-10-01 | b2-s1-frisky-2048-fix | B (`31ea6ac0`) | Frisky | iowa_epsg5070, 2024-07-01..14 | S1 asc | 13 | `b60a9706` | 3m34s | 13.1 | 0 | pass: 4 dates, $0.14, drained |
 | 2026-10-01 | b2-s1-dask-2048-fix | B (`31ea6ac0`) | Dask | iowa_epsg5070, 2024-07-01..14 | S1 asc | 13 | `4600ef05` | 3m54s | 13.8 | 0 | pass: 4 dates, $0.15 |
+| 2026-10-01 | b3-choco-s2-frisky | B (`31ea6ac0`) | Frisky | choco_sparse_epsg32618, 2024-07 | S2 | 60 | `0d7815a1` | 6m04s | 8.1 | 0 | pass: 4 dates, $0.95, drained |
+| 2026-10-01 | b3-choco-s2-dask | B (`31ea6ac0`) | Dask | choco_sparse_epsg32618, 2024-07 | S2 | 60 | `2fa77a40` | 6m07s | 7.2 | 0 | pass: 4 dates, $0.59 |
+| 2026-10-01 | b3-choco-s1-asc-frisky | B (`31ea6ac0`) | Frisky | choco_sparse_epsg32618, 2024-07 | S1 asc | 13 | `6af69cbf` | 5m04s | 7.0 | 0 | pass: 2 dates, $0.14, drained |
+| 2026-10-01 | b3-choco-s1-asc-dask | B (`31ea6ac0`) | Dask | choco_sparse_epsg32618, 2024-07 | S1 asc | 13 | `63d7efa9` | 5m38s | 6.4 | 0 | pass: 2 dates, $0.18 |
+| 2026-10-01 | b3-choco-s1-des-frisky | B (`31ea6ac0`) | Frisky | choco_sparse_epsg32618, 2024-07 | S1 des | 13 | `6d6513f2` | 5m22s | 10.8 | 0 | pass: 3 dates, $0.12, drained |
+| 2026-10-01 | b3-choco-s1-des-dask | B (`31ea6ac0`) | Dask | choco_sparse_epsg32618, 2024-07 | S1 des | 13 | `2353f446` | 5m08s | 9.1 | 0 | pass: 3 dates, $0.14 |
+| 2026-10-01 | b3-rondonia-s2-frisky | B (`31ea6ac0`) | Frisky | rondonia_humidtropical_epsg32720, 2024-07 | S2 | 60 | `67f94ad3` | 5m39s | 6.4 | 0 | pass: 12 dates, $0.77, drained |
+| 2026-10-01 | b3-rondonia-s2-dask | B (`31ea6ac0`) | Dask | rondonia_humidtropical_epsg32720, 2024-07 | S2 | 60 | `667de6e8` | 5m50s | 6.3 | 0 | pass: 12 dates, $0.83 |
+| 2026-10-01 | b3-rondonia-s1-des-frisky | B (`31ea6ac0`) | Frisky | rondonia_humidtropical_epsg32720, 2024-07 | S1 des | 13 | `85a843d5` | 5m47s | 10.3 | 0 | pass: 4 dates, $0.20, drained |
+| 2026-10-01 | b3-rondonia-s1-des-dask | B (`31ea6ac0`) | Dask | rondonia_humidtropical_epsg32720, 2024-07 | S1 des | 13 | `4441e872` | 3m40s | 6.9 | 0 | pass: 4 dates, $0.12 |
+| 2026-10-01 | b3-alps-s2-frisky | B (`31ea6ac0`) | Frisky | alps_highrelief_epsg32632, 2024-07 | S2 | 60 | `b3094666` | 5m37s | 6.9 | 0 | pass: 12 dates, $0.79, drained |
+| 2026-10-01 | b3-alps-s2-dask | B (`31ea6ac0`) | Dask | alps_highrelief_epsg32632, 2024-07 | S2 | 60 | `6d1e2ec8` | 5m38s | 5.8 | 0 | pass: 12 dates, $0.69 |
+| 2026-10-01 | b3-alps-s1-asc-frisky | B (`31ea6ac0`) | Frisky | alps_highrelief_epsg32632, 2024-07 | S1 asc | 13 | `639ebe69` | 5m27s | 5.2 | 0 | pass: 8 dates, $0.13, drained |
+| 2026-10-01 | b3-alps-s1-asc-dask | B (`31ea6ac0`) | Dask | alps_highrelief_epsg32632, 2024-07 | S1 asc | 13 | `ceb41466` | 5m05s | 9.8 | 0 | pass: 8 dates, $0.16 |
+| 2026-10-01 | b3-alps-s1-des-frisky | B (`31ea6ac0`) | Frisky | alps_highrelief_epsg32632, 2024-07 | S1 des | 13 | `0eb80dbb` | 5m51s | 6.2 | 0 | pass: 8 dates, $0.19, drained |
+| 2026-10-01 | b3-alps-s1-des-dask | B (`31ea6ac0`) | Dask | alps_highrelief_epsg32632, 2024-07 | S1 des | 13 | `f1ef3f31` | 5m47s | 9.2 | 0 | pass: 8 dates, $0.15 |
+| 2026-10-01 | b4-s2-frisky | B (`31ea6ac0`) | Frisky | zone_35N (4096 mask), 2024-01-01..07, 5% coverage | S2 | 60 | `6c4b5125` | 9m40s | – | 0 | cancelled in the mask scan, $2.10 |
+| 2026-10-01 | b4-s2-dask | B (`31ea6ac0`) | Dask | zone_35N (4096 mask), 2024-01-01..07, 5% coverage | S2 | 60 | `43caa8f3` | 9m30s | – | 0 | cancelled in the mask scan, $2.07 |
+| 2026-10-01 | b4b-s2-frisky | B (`31ea6ac0`) | Frisky | zone_35N (4096 mask), 2024-01-01..07 | S2 | 60 | `844c18eb` | 37m00s | 193.2 | 0 | pass: 7 dates, $8.50, drained |
+| 2026-10-01 | b4b-s2-dask | B (`31ea6ac0`) | Dask | zone_35N (4096 mask), 2024-01-01..07 | S2 | 60 | `9e1718dc` | 51m02s | 275.4 | 0 | pass: 7 dates, $11.70 |
+| 2026-10-01 | b4c-s2-frisky | B (`31ea6ac0`) | Frisky | zone_35N (2048 mask), 2024-01-01..07, pipelined | S2 | 60 | `e4581666` | 26m51s | 165 (wall, dates 2 to 7) | 0 | fail at close: 7 dates written, scheduler died after the capture, $5.55, drained |
+| 2026-10-01 | b4c-s2-dask | B (`31ea6ac0`) | Dask | zone_35N (2048 mask), 2024-01-01..07, pipelined | S2 | 60 | `fec46c8d` | 30m58s | 211 (wall, dates 2 to 6) | 0 | pass: 7 dates, $7.00 |
+| 2026-10-01 | c-iowa-s1-frisky | B (`31ea6ac0`) | Frisky | iowa_epsg5070, 2024-11-01..2025-10-31 | S1 asc | 13 | `88928e92` | 35m10s | 11.2 | 0 | pass: 169 dates, $1.84, drained |
+| 2026-10-01 | c-iowa-s2-frisky | B (`31ea6ac0`) | Frisky | iowa_epsg5070, 2024-11-01..2025-10-31 | S2 | 60 | `eeff91a8` | 1h35m33s | 23.0 | 0 | cancelled: span buffers full, 180 dates written, $22.43, drained |
