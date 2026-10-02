@@ -193,11 +193,12 @@ def _coverage_from_scl(
     ``odc.stac.load`` graph: SCL is one of the written bands, so loading it separately costs a
     second client-side graph build and a second read of the same data for no information.
 
-    Both sides of the coverage ratio must be cropped together or every percentage is skewed:
-    under ``windows`` the numerator reduces over the windows only, which equals the full-extent
-    count because the mask is False outside them and row bands are chunk-disjoint. ``any_valid``
-    stays LAZY there — materialising it would defeat the cropping, and the write pulls only
-    window slices of it.
+    Under ``windows`` the numerator reduces over those windows only: the date's own windows, which
+    count everything the full extent would, since a valid pixel needs imagery, the windows hold all
+    of the date's (``windows_for_date``), the mask is False outside the ROI's live area, and row
+    bands are chunk-disjoint. The denominator, ``roi_pixel_count``, stays the ROI's whole live area.
+    ``any_valid`` stays LAZY there — materialising it would defeat the cropping, and the write pulls
+    only window slices of it.
 
     Returns:
         ``(passes, any_valid)``; ``any_valid`` is ``None`` when the date fails.
@@ -210,7 +211,15 @@ def _coverage_from_scl(
         return (False, None)
 
     invalid_classes = np.array(sorted(S2_SCL_INVALID_CLASSES), dtype=scl_2d.dtype)
-    any_valid = ~scl_2d.isin(invalid_classes)
+    # One task per chunk. `DataArray.isin` reaches dask's isin, which reduces over the test values
+    # with `any` and so adds two tasks per chunk, here and again where the write masks by it.
+    any_valid = xr.apply_ufunc(
+        np.isin,
+        scl_2d,
+        kwargs={"test_elements": invalid_classes, "invert": True},
+        dask="parallelized",
+        output_dtypes=[bool],
+    )
 
     if windows is not None:
         masked = any_valid & roi_mask
@@ -441,8 +450,7 @@ def ingest_s2_roi_reflectance(
     #
     # The window total equals the full-extent total because the mask is False outside every
     # window, and row bands are chunk-disjoint so nothing is counted twice. _coverage_from_scl
-    # relies on that same property for the numerator: both sides of the coverage ratio must stay
-    # cropped together, or every percentage is silently skewed.
+    # relies on that same property for the numerator, which it counts over each date's own windows.
     roi_pixel_count = int(_sum_over_windows(roi_mask, live_windows).compute())
 
     if roi_pixel_count == 0:
@@ -613,6 +621,40 @@ def ingest_s2_roi_reflectance(
                 read_error=exc,
             )
 
+        # Narrow this date to the land its own imagery reaches, before the gate counts it. The run's
+        # windows cover the whole ROI's land on every date, but one pass images a fraction of a wide
+        # ROI, so most hold nothing today: their tasks run, find no data, count no valid pixel and
+        # write nothing, since an all-fill chunk is never stored. Dropping them changes neither the
+        # gate's count nor the mosaic, only what is computed. The gate's DENOMINATOR stays the
+        # ROI's whole live area (`roi_pixel_count`): its ratio is "how much of the ROI's land did
+        # this date see", and cropping that would rescale every percentage.
+        date_windows: list[tuple[int, int, int, int]] = live_windows
+        if run_windows:
+            narrowed = windows_for_date(
+                run_windows,
+                [getattr(item, "bbox", None) for item in day_items],  # type: ignore[misc]
+                roi.geobox,
+                chunk_px=INGEST_CHUNK_SIZE,
+                window_cost_in_chunks=window_cost,
+            )
+            if not narrowed:
+                # No live cell is reachable today: the gate would count nothing, and there is
+                # nothing to write. DEBUG: per skipped date; counted in the coverage-filter summary.
+                log.debug("Skipping date: its imagery reaches no live window")
+                return _PreparedDate(date, None, [], time.monotonic() - stage_started, 0.0, "no-live-window")
+            date_windows = [(w.y0, w.y1, w.x0, w.x1) for w in narrowed]
+            if len(narrowed) != len(run_windows):
+                # DEBUG, not INFO: this fires once per date, and Prefect ships every task log
+                # line to the orchestrator API from whichever DASK WORKER ran the task
+                # (logging.to_api is on by default), so a per-date INFO line scales with total
+                # worker count rather than cell count. The per-date TIMING line stays at INFO as
+                # the progress signal; this one is detail, and its numbers appear there too.
+                log.debug(
+                    "Date footprint: writing %d of %d live window(s)",
+                    len(narrowed),
+                    len(run_windows),
+                )
+
         # The gate is where the graph is first COMPUTED, so it is where a source read actually
         # fails — `load_stac_items` above only builds. Retried per date, and named with zone and
         # date on failure so the message identifies the cell.
@@ -633,7 +675,7 @@ def ingest_s2_roi_reflectance(
                             roi_pixel_count,
                             min_valid_coverage,
                             client,
-                            windows=live_windows,
+                            windows=date_windows,
                         )
         except Exception as exc:
             # The gate is the FIRST compute of the date, so an SCL object that will never read
@@ -655,43 +697,6 @@ def ingest_s2_roi_reflectance(
         # value from the grouping rather than from odc's label is what makes it identify the day
         # it describes, unique per slice and monotonic across them.
         day_ds["time"] = [np.datetime64(date, "ns")]
-
-        # Narrow this date's writes to the land its own imagery reaches. The run's windows cover
-        # the whole ROI's land on every date, but one pass images a fraction of a wide ROI, so most
-        # hold nothing today: those tasks run, find no data and write nothing, since an all-fill
-        # chunk is never stored. Dropping them cannot change the mosaic, only what is computed.
-        #
-        # The COVERAGE GATE above deliberately keeps the run's FULL window set: its ratio is "how
-        # much of the ROI's land did this date see", so cropping its denominator would rescale
-        # every percentage. The numerator is unaffected, there being no valid pixels outside the
-        # footprint to count.
-        date_windows: list[tuple[int, int, int, int]] = live_windows
-        if run_windows:
-            narrowed = windows_for_date(
-                run_windows,
-                [getattr(item, "bbox", None) for item in day_items],  # type: ignore[misc]
-                roi.geobox,
-                chunk_px=INGEST_CHUNK_SIZE,
-                window_cost_in_chunks=window_cost,
-            )
-            if not narrowed:
-                # No live cell is reachable today. Nothing to write, and writing an
-                # empty window set would commit a date holding nothing.
-                # DEBUG: per skipped date; counted in the coverage-filter summary.
-                log.debug("Skipping date: its imagery reaches no live window")
-                return _PreparedDate(date, None, [], build_s, gate_s, "no-live-window")
-            date_windows = [(w.y0, w.y1, w.x0, w.x1) for w in narrowed]
-            if len(narrowed) != len(run_windows):
-                # DEBUG, not INFO: this fires once per date, and Prefect ships every task log
-                # line to the orchestrator API from whichever DASK WORKER ran the task
-                # (logging.to_api is on by default), so a per-date INFO line scales with total
-                # worker count rather than cell count. The per-date TIMING line stays at INFO as
-                # the progress signal; this one is detail, and its numbers appear there too.
-                log.debug(
-                    "Date footprint: writing %d of %d live window(s)",
-                    len(narrowed),
-                    len(run_windows),
-                )
 
         # ONE masking pass, not two. Zeroing invalid pixels and zeroing outside the
         # ROI both fill with 0, so `x.where(A, 0).where(B, 0)` is `x.where(A & B, 0)`

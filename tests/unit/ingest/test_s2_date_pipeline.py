@@ -458,6 +458,33 @@ def test_per_date_narrowing_is_priced_like_the_run(run_ingest, monkeypatch, over
     assert seen == {"run": expected, "date": expected}
 
 
+def test_the_gate_counts_over_the_dates_own_windows(run_ingest, monkeypatch):
+    """Not the run's: outside its footprint a date has no imagery, so counting there reads SCL for nothing.
+
+    The denominator stays the ROI's whole live area.
+    """
+    gated = []
+    real_gate = s2_roi._coverage_from_scl
+
+    def recording_gate(*args, windows=None, **kwargs):
+        gated.append((args[2], windows))
+        return real_gate(*args, windows=windows, **kwargs)
+
+    monkeypatch.setattr(s2_roi, "windows_for_date", lambda *_a, **_k: [SimpleNamespace(y0=0, y1=4, x0=0, x1=SIZE)])
+    monkeypatch.setattr(s2_roi, "_coverage_from_scl", recording_gate)
+    run = run_ingest({"2024-01-01": True}, pipeline_dates=False)
+    assert gated == [(SIZE * SIZE, [(0, 4, 0, SIZE)])]
+    assert run.written == ["2024-01-01"]
+
+
+def test_a_date_reaching_no_window_is_skipped_without_a_gate(run_ingest, monkeypatch):
+    """The gate would count nothing for it, so it is not run; the date is filtered as before."""
+    monkeypatch.setattr(s2_roi, "windows_for_date", lambda *_a, **_k: [])
+    monkeypatch.setattr(s2_roi, "_coverage_from_scl", lambda *_a, **_k: pytest.fail("gated a date with no window"))
+    run = run_ingest({"2024-01-01": True}, pipeline_dates=False)
+    assert (run.result.dates_filtered_coverage, run.written) == (1, [])
+
+
 def test_the_assessed_window_lands_on_the_reflectance_repo(run_ingest, monkeypatch):
     """It must be written to the repo the coverage gate opens, not the parent directory.
 

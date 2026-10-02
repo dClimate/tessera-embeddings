@@ -1481,11 +1481,14 @@ def batched_region_writes(
     logger.debug("Committed '%s' in %.1fs", message, time.monotonic() - commit_started)
 
 
-#: Fan-in of the tree reduction that merges window changesets back into the session. Shared by
-#: both write paths so they reduce identically — the overlapped path merges every window's
-#: changesets in one reduction, the sequential path one window's at a time, and a difference
-#: here would show up as a behaviour difference between them.
-_MERGE_SPLIT_EVERY = 8
+#: Fan-in of the tree reduction that merges window changesets back into the session, per spatial
+#: axis, so one merge takes up to 8 x 8 store blocks. Per axis because dask spreads an integer
+#: across every reduced axis as its root (8 over time, northing and easting is 2 each), which
+#: merged four blocks a task and made a merge task for every third store block. Shared by both
+#: write paths so they reduce identically — the overlapped path merges every window's changesets
+#: in one reduction, the sequential path one window's at a time, and a difference here would show
+#: up as a behaviour difference between them.
+_MERGE_SPLIT_EVERY = {1: 8, 2: 8}
 
 #: How many graphs an overlapped window write is split into when the caller passes a client. Each
 #: is submitted without waiting for the one before, because Frisky's client converts and pickles a
@@ -1654,7 +1657,10 @@ def _write_windows_overlapped(
         # The single compute: every window's loads, masks and chunk writes in one graph,
         # reduced to one mergeable changeset.
         session.merge(
-            session_merge_reduction([arr for window in stored for arr in window], split_every=_MERGE_SPLIT_EVERY)
+            session_merge_reduction(
+                [arr for window in stored for arr in window],
+                split_every=_MERGE_SPLIT_EVERY,  # type: ignore[arg-type]  # hinted int; dask takes per-axis
+            )
         )
     # DEBUG, not INFO: the chattiest line this path produces, once per write, and Prefect
     # ships task logs to the orchestrator API from whichever Dask worker ran the task, so it
@@ -1893,7 +1899,7 @@ def write_days_windows(
                     # threshold: peak spill 3.19 GiB across ~30% of scheduler samples, against
                     # zero with it on. Spill scales badly here, so the ~4% is not worth it.
                     align_chunks=True,
-                    split_every=_MERGE_SPLIT_EVERY,
+                    split_every=_MERGE_SPLIT_EVERY,  # type: ignore[arg-type]  # hinted int; dask takes per-axis
                 )
                 # Each window is a blocking compute, so these lines ARE the write pipeline's
                 # decomposition: their sum against the date's write phase says whether
