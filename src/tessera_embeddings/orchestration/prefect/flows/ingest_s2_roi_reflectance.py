@@ -130,6 +130,7 @@ def ingest_s2_roi_reflectance(
     pipeline_dates: bool = False,
     batch_dates: int | None = None,
     worker_env_overrides: dict[str, str] | None = None,
+    worker_nthreads: int | None = None,
     allow_ingest_code_mismatch: bool = False,
     s3_region: str | None = None,
 ) -> dict[str, Any]:
@@ -182,6 +183,9 @@ def ingest_s2_roi_reflectance(
             run only, to A/B worker-side tuning (allocator, cache behaviour) one arm at a
             time. Not a configuration channel — anything meant to hold for every run belongs
             in ``FargateConfig``. Ignored on the ``use_local`` path.
+        worker_nthreads: Task threads per Dask worker. ``None`` keeps one per vCPU. For one arm
+            of a comparison: the band reads wait on S3 for part of each task, so a worker can
+            have CPU to spare with every thread busy. Ignored on the ``use_local`` path.
         allow_ingest_code_mismatch: Resume a store built by different ingest code (off by default).
 
         s3_region: S3 region for the mosaic Icechunk store. ``None`` uses the storage
@@ -238,6 +242,7 @@ def ingest_s2_roi_reflectance(
         # raise it only when a report is actually being captured.
         diagnostic_task_stream=bool(perf_report_uri),
         extra_worker_env=worker_env_overrides,
+        worker_nthreads=worker_nthreads,
         # Tag every cluster resource with this run's id so the cancellation/crash hook can
         # sweep the tasks from a fresh process (see _dask_lifecycle).
         resource_tags=dask_resource_tags(flow_run_ctx.id),
