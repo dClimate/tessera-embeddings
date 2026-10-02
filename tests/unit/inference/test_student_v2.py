@@ -238,6 +238,19 @@ def test_v2_output_is_layer_normalised_per_row(v2_model) -> None:
     torch.testing.assert_close(out.std(dim=-1, unbiased=False), torch.ones(8), atol=1e-4, rtol=0)
 
 
+def test_a_radar_free_pixel_embeds_as_upstream_v2_does(v2_model) -> None:
+    """Upstream v2 feeds a radar-free pixel ONE all-zero S1 step; the shared bucket schedule
+    feeds eight. Identical tokens make the two equal up to float rounding, which is why the
+    schedule needs no v2-specific branch — and a change that made sequence length matter
+    (an index-based position, a mask) would break it here first.
+    """
+    s2 = torch.randn(16, 16, 11)
+    s2[:, :, 10] = torch.sort(torch.randint(1, 366, (16, 16)), dim=1).values.float()
+    with torch.no_grad():
+        one, eight = v2_model(s2, torch.zeros(16, 1, 3)), v2_model(s2, torch.zeros(16, 8, 3))
+    torch.testing.assert_close(eight, one, atol=1e-5, rtol=0)
+
+
 def test_quantization_is_version_agnostic(v2_model) -> None:
     """Per-pixel abs-max int8 + fp32 scale needs no v2 changes.
 

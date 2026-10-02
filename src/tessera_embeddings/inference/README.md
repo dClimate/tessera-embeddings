@@ -452,9 +452,10 @@ buckets.
    embedded too. They are fed the upstream v1.1 missing-radar convention: an all-zeros
    radar slice *in normalised space*, in the smallest bucket, bit-identical to what
    `ucam-eo/tessera`'s `_sample_s1_merged` returns for the same case. Nothing in the
-   encoder requires a radar observation to exist. v2 Large is fed the same slice; no test
-   compares that against upstream v2's own handling of a radar-free pixel. Radar-informed
-   pixels are unaffected by the flag. Downstream, an optical-only pixel is exactly one with a finite `scales` value
+   encoder requires a radar observation to exist. v2 Large is fed the same slice, where
+   upstream v2 uses a single zero step; the steps are identical tokens, so the two give the
+   same embedding up to float rounding (`test_student_v2.py`). Radar-informed pixels are
+   unaffected by the flag. Downstream, an optical-only pixel is exactly one with a finite `scales` value
    and `s1_asc_obs_count + s1_desc_obs_count == 0`. **The production gate on this is recorded
    as cleared** — [ADR-013](../../../context_docs/decisions/013-optional-s1-s2-only-pixels.md)
    §Quality caveat, and the global campaign runs with the flag on, because about a fifth of
