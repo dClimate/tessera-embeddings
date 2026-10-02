@@ -117,6 +117,11 @@ Frisky also prints a periodic cluster summary to stdout; `FRISKY_SUMMARY=off` si
   each task holding one goes through cloudpickle by value. `connect` already fixes icechunk's
   merge closures, which were half of a write batch's pickling, and the ROI mask's block reader
   is module-level for the same reason: as a closure it was most of each coverage gate's.
+- **Hand Frisky a big graph as one blocking compute when the work splits.** Its client converts
+  the whole graph before any task runs, so the fleet waits for all of it. Submit the parts one
+  after another with `client.compute`, which returns once each is submitted, and gather at the
+  end: the fleet runs the first part while the client converts the next. The S2 store write does
+  this for each date (`WRITE_SUBMISSION_GROUPS` in `storage/zarr_store.py`).
 - **Use a raw `frisky.hijack` for the ingest.** Without our worker plugin, the first real image
   read segfaults the worker and the run hangs.
 - **Reference the `frisky` module from a function pickled by value,** such as one defined in

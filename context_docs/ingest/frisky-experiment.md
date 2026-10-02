@@ -168,6 +168,36 @@ works. On dev, side by side with Dask on Iowa, the fix cut the idle stretch befo
 batch from 32 s and 25 s to 10 s and 8 s (Dask's are 9 s and 8 s), and S2 took 17.9 s a date on
 both engines.
 
+At zone scale that remainder dominates. On 35N at 60 workers a date's write graph holds 108,000 to
+168,000 tasks, and the fleet sat idle 15 to 29 s before each one while the driver converted it.
+`pipeline_dates` does not hide it: it prepares the next date in the background, but a write's
+conversion happens inside the write. So the S2 ingest passes its client to the store write, which
+splits a date's windows into `WRITE_SUBMISSION_GROUPS` (4) contiguous groups and submits them one
+after another with `client.compute`. That call returns as soon as a group's graph is converted and
+submitted, so the fleet runs the first group while the driver converts the next. The groups'
+results merge into the session together, so a date is still one commit, and a failing group
+commits nothing. Locally, one synthetic date (11 variables, row-band windows, instant reads, 4
+workers of 2 threads), two runs each:
+
+| One date, local | Tasks | Write call to first task | Write, wall |
+|---|---|---|---|
+| Frisky, one graph | 47,000 | 4.3 to 4.5 s | 28 to 31 s |
+| Frisky, four groups | 47,000 | 1.6 s | 26 s |
+| Frisky, one graph | 106,000 | 11.1 to 11.4 s | 67 to 69 s |
+| Frisky, four groups | 106,000 | 2.9 s | 60 to 68 s |
+| Dask, one graph | 47,000 | 5.3 to 5.7 s | 44 to 45 s |
+| Dask, four groups | 47,000 | 2.6 s | 45 s |
+| Dask, one graph | 106,000 | 11.9 to 14.0 s | 114 to 120 s |
+| Dask, four groups | 106,000 | 4.5 to 5.1 s | 114 to 129 s |
+
+At 106,000 tasks on Frisky the four groups were submitted 2.8, 4.6 to 4.8, 6.6 to 7.0 and 8.5 to
+9.0 s after the write call, so the first group's tasks ran while the other three were still being
+converted. The conversion itself also fell, from about 9.4 s to 7.5 s, because `client.compute`
+lowers the graph more cheaply than the blocking compute's route does (`client.lower_graph` totals
+about 4.4 s, against about 7 s of `client.convert_legacy`). On Dask the first task also starts
+sooner, but the tasks then take longer, and the write's wall clock is unchanged within the runs'
+spread; locally Dask's scheduler shares the driver's process, which Fargate's does not.
+
 **Measured and ruled out: thread stack size.** Frisky's task threads get Rust's default 2 MiB
 stack; Dask's get 16 MiB on macOS (and typically 8 MiB on Linux). Raising Frisky's with
 `RUST_MIN_STACK` did not stop the crash above, and once thread state is pinned the real ingest
@@ -181,7 +211,7 @@ Done locally (macOS, Python 3.13), and green again in CI on Linux (Python 3.12 a
 
 | Suite | Covers | Result |
 |---|---|---|
-| `tests/integration/test_frisky.py` | Every compute path the ingest uses; Dask plugins and `run` reaching Frisky's processes; a driver running as a Dask task (the Prefect shape), including a second thread; overlapped icechunk writes identical to Dask's and committing nothing when a window fails; thread state and the CRS reproduction; work queued before any worker exists, run on workers that join after the hijack; spans readable by `frisky observe`; their merge functions pickling by reference; the span drain keeping every span exactly once; span capture never failing a run | 10 passed, about 20 s |
+| `tests/integration/test_frisky.py` | Every compute path the ingest uses; Dask plugins and `run` reaching Frisky's processes; a driver running as a Dask task (the Prefect shape), including a second thread; overlapped icechunk writes identical to Dask's and committing nothing when a window fails, as one graph and submitted in groups; thread state and the CRS reproduction; work queued before any worker exists, run on workers that join after the hijack; spans readable by `frisky observe`; their merge functions pickling by reference; the span drain keeping every span exactly once; span capture never failing a run | 11 passed, about 11 s |
 | `tests/integration/test_read_failure_cause_over_dask.py` | Frisky's before-and-after for the cause chain; the read-failure classification on both engines | 16 passed |
 | `tests/parity/test_ingest_s2_roi_frisky_parity.py` | The S2 domain ingest on Dask versus Frisky: offline synthetic dates byte for byte (with `pipeline_dates` and a mid-run gate failure), and Denver July 2024 real imagery within 1e-6 | 2 passed, about 2 min |
 
@@ -244,6 +274,8 @@ documentation: [`docs/frisky.md`](../../docs/frisky.md).
   icechunk to make `computing_meta` pickle by reference so `_picklable_merge_reduction` can go.
 - Confirm the shorter end-of-run capture on dev: a drained Iowa run's bundle should land within
   about 10 s of its last batch, not 45.
+- Confirm the grouped write submission on 35N on dev: the idle stretch before each date's write
+  (15 to 29 s) should shrink on Frisky, and Dask's per-date time should not rise.
 - Find why the gate's computes run one after another on Frisky.
 - Check the span drain's load on the scheduler at B4's scale; at Iowa its peak was 79% of a core.
   On 35N with `pipeline_dates`, whole-minute drain requests hit the dashboard proxy's timeout

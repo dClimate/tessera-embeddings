@@ -435,7 +435,7 @@ Sequential windows — the fleet sees one window at a time:
  │◄─ window 1 ─►│◄─ window 2 ─►│◄─ window 3 ─►│◄ w4 ►│◄─ window 5 ─►│
  └─ the date costs the SUM of these, and most slots idle within each ─┘
 
-Overlapped (overlap_window_writes, the default) — one graph, one commit:
+Overlapped (overlap_window_writes, the default) — one commit:
  │◄─ window 1 ─►│
  │◄─ window 2 ──►│     all submitted together, so the fleet packs them and
  │◄─ window 3 ─►│      the date costs roughly the LONGEST window plus
@@ -446,8 +446,12 @@ Overlapped (overlap_window_writes, the default) — one graph, one commit:
 
 Mechanism: icechunk's dask path already forks a session, stores lazily and merges changesets,
 and writing per window runs that sequence once per window. Overlapping lifts it one level — fork
-once, collect every window's lazy stored arrays, run one merge reduction — so every window's
-loads, masks and chunk writes occupy a single graph.
+once, collect every window's lazy stored arrays, merge all their changesets back together — so
+every window's loads, masks and chunk writes run at once. S2 hands the write its client, and the
+windows go out as `WRITE_SUBMISSION_GROUPS` (4) graphs of contiguous windows, each submitted
+without waiting for the one before. An engine that converts a whole graph on the client before
+running any of it, as Frisky does, then starts on the first group while the rest convert. S1
+passes no client, so each of its dates is one blocking graph.
 
 The resulting store is identical either way, because the windows are chunk-disjoint: that is what
 makes the merged changesets conflict-free, and the same property that lets a date commit exactly
@@ -519,7 +523,7 @@ operation that makes it visible to readers.
 ```
 per-date wall clock  ≈  max( W, P )  +  commit / k
 
-    W = the batch's write, per date          k = dates fused into one graph
+    W = the batch's write, per date          k = dates fused into one write
     P = the preparation running alongside it, per date
 ```
 
@@ -539,8 +543,8 @@ batched. Recalibrate against real runs rather than an offline sweep, since a dif
 gives a different answer. Figures in
 `context_docs/ingest/campaign-ingest-measurements.md` §3.16.
 
-**What happens when it is on.** `k` consecutive dates that pass the quality gate are computed as
-one graph, and their work interleaves — while one date waits on slow reads, another's writes keep
+**What happens when it is on.** `k` consecutive dates that pass the quality gate are computed
+together, and their work interleaves — while one date waits on slow reads, another's writes keep
 the machines busy. The tail at the end of a computation, where the last few tasks finish and the
 fleet drains, is paid once per batch instead of once per date.
 
