@@ -2457,8 +2457,8 @@ path is current.
 18–41% sooner, and each rung costs 45–53% less.** Fargate's ARM tasks run on Graviton3; its x86
 tasks run on 2017–2019 Xeons. The mosaics are not bit-identical: a small share of pixels round one
 count differently, which is physically meaningless (§15.4). That reaches the embeddings as a mean
-cosine similarity of 0.999983, slightly beyond ADR 012's gates on the worst pixels, so switching is
-a maintainers' decision (§15.6). The switch is built in yield-embeddings, off by default (§15.5).
+cosine similarity of 0.999983, slightly beyond ADR 012's gates on the worst pixels, and the
+maintainers accepted it (§15.6). The switch is built in yield-embeddings, off by default (§15.5).
 
 ### 15.1 How it was measured
 
@@ -2571,12 +2571,12 @@ family keeps pulling amd64 from the same tags. Two switches move the workers, bo
 Coarsen was not part of these rungs, so a deployment that coarsens should run one coarsen pair
 before it switches.
 
-### 15.6 Before switching a deployment
+### 15.6 Switching a deployment
 
-1. **Decide whether the embedding difference is acceptable.** It is tiny, but it exceeds ADR 012's
-   gates on the worst pixels. A one-chunk crop of 35N's grid (41 km of Moldovan farmland, November
-   2024 to October 2025) was ingested on each architecture, and both were embedded on the same GPU
-   type (L40S):
+1. **The embedding difference is accepted** (maintainers, 2026-10-02). It is tiny, but it exceeds
+   ADR 012's gates on the worst pixels. A one-chunk crop of 35N's grid (41 km of Moldovan farmland,
+   November 2024 to October 2025) was ingested on each architecture, and both were embedded on the
+   same GPU type (L40S):
 
    - 92.2–92.9% of int8 values are identical, and 99.995% are within one level, with a maximum of
      three.
