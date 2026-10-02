@@ -22,6 +22,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import dask.array as da
 import numpy as np
@@ -108,6 +109,7 @@ def _ingest(
     client: Client,
     monkeypatch: pytest.MonkeyPatch,
     pipeline_dates: bool,
+    **ingest_kwargs: Any,
 ):
     """Run the real domain ingest over the toy dates, with only the band load stubbed."""
     monkeypatch.setattr(s2_roi, "query_stac_items", lambda **_kwargs: ([_item(d) for d in DATES], {}))
@@ -128,6 +130,7 @@ def _ingest(
         log=log,
         stream_stac_monthly=False,
         pipeline_dates=pipeline_dates,
+        **ingest_kwargs,
     )
 
 

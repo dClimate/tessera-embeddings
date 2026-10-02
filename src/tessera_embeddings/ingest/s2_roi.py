@@ -293,6 +293,7 @@ def ingest_s2_roi_reflectance(
     storage_options: StorageOptions = None,
     stream_stac_monthly: bool = True,
     overlap_window_writes: bool = True,
+    group_window_writes: bool = False,
     pipeline_dates: bool = False,
     batch_dates: int | None = None,
     allow_ingest_code_mismatch: bool = False,
@@ -321,10 +322,15 @@ def ingest_s2_roi_reflectance(
             complete under it.
         overlap_window_writes: Compute every window of a date together instead of one blocking
             compute per window, so the windows' critical paths overlap across the fleet rather
-            than summing. The windows go to ``client`` as a few graphs submitted one after
-            another, so the fleet starts on the first while the driver converts the rest
-            (``zarr_store.WRITE_SUBMISSION_GROUPS``). Identical stores either way; falls back to
-            the sequential write when the overlapped machinery is unavailable.
+            than summing. Identical stores either way; falls back to the sequential write when
+            the overlapped machinery is unavailable.
+        group_window_writes: With ``overlap_window_writes``, submit a date's windows to
+            ``client`` as ``zarr_store.WRITE_SUBMISSION_GROUPS`` graphs one after another rather
+            than as one, so the fleet starts on the first while the driver converts the rest.
+            That pays only on an engine whose client converts a whole graph before running any
+            of it, as Frisky's does: on zone 35N it cut Frisky's time a date by 8% and raised
+            Dask's by 27%, whose saturated scheduler then takes four graphs a date. The Frisky
+            flows turn it on.
         pipeline_dates: Prepare the next date — load graph, coverage gate, footprint narrowing,
             masking — on a background thread while the current date is written, so preparation
             costs wall clock only when the write cannot cover it. The WRITE stays serial and in
@@ -700,6 +706,8 @@ def ingest_s2_roi_reflectance(
 
         return _PreparedDate(date, day_ds, date_windows, build_s, gate_s, items=day_items, baselines=baselines)
 
+    write_client = client if group_window_writes else None  # the store write groups only given one
+
     def _write_date(prepared: _PreparedDate, stall_s: float) -> None:
         """Write one prepared date's pixels: the store's only writer.
 
@@ -735,7 +743,7 @@ def ingest_s2_roi_reflectance(
                         chunks=INGEST_CHUNKS,
                         parallel_windows=overlap_window_writes,
                         s3_region=s3_region,
-                        client=client,
+                        client=write_client,
                     )
         # One line per kept date, partitioning its wall clock into the client-side graph build,
         # the coverage-gate compute and the write (windows + commit). Stable format: CloudWatch
@@ -806,7 +814,7 @@ def ingest_s2_roi_reflectance(
                         chunks=INGEST_CHUNKS,
                         parallel_windows=overlap_window_writes,
                         s3_region=s3_region,
-                        client=client,
+                        client=write_client,
                     )
         # The batch's dates are written together, so a per-date write time does not exist as a
         # measurement: this line is the batched counterpart of `Stage timings` and analysis

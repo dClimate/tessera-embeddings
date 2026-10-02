@@ -96,6 +96,7 @@ def process_roi_reflectance(
             storage_options=storage_options,
             stream_stac_monthly=stream_stac_monthly,
             overlap_window_writes=overlap_window_writes,
+            group_window_writes=use_frisky,
             pipeline_dates=pipeline_dates,
             s3_region=s3_region,
             batch_dates=batch_dates,

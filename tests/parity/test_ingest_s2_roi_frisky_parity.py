@@ -54,16 +54,19 @@ def _frisky_client() -> Iterator[Client]:
 
 
 def _on_both(
-    run: Callable[[Client, Path], IngestResult],
+    run: Callable[[Client, Path, bool], IngestResult],
     dask: Client,
     tmp_path: Path,
     between: Callable[[], None] = lambda: None,
 ) -> tuple[IngestResult, ...]:
-    """``run`` under Dask, then under Frisky, into sibling stores; returns both results."""
-    dask_result = run(dask, tmp_path / "dask")
+    """``run`` under Dask, then under Frisky, into sibling stores; returns both results.
+
+    The third argument is ``group_window_writes``, on for Frisky only, as the flows set it.
+    """
+    dask_result = run(dask, tmp_path / "dask", False)
     between()
     with _frisky_client() as client:
-        frisky_result = run(client, tmp_path / "frisky")
+        frisky_result = run(client, tmp_path / "frisky", True)
     return dask_result, frisky_result
 
 
@@ -74,8 +77,13 @@ def test_toy_dates_produce_an_identical_store_on_frisky(
     """Byte for byte, with the date counters agreeing first so empty stores cannot pass."""
     roi_zarr = _stage_roi(tmp_path)
     results = _on_both(
-        lambda client, store: _ingest(
-            roi_zarr=roi_zarr, store_path=store, client=client, monkeypatch=monkeypatch, pipeline_dates=True
+        lambda client, store, grouped: _ingest(
+            roi_zarr=roi_zarr,
+            store_path=store,
+            client=client,
+            monkeypatch=monkeypatch,
+            pipeline_dates=True,
+            group_window_writes=grouped,
         ),
         parity_cluster,
         tmp_path,
@@ -99,13 +107,14 @@ def test_real_imagery_produces_an_equivalent_store_on_frisky(
     """
     roi_zarr = stage_quickstart_roi(tmp_path, fixture_quickstart_roi)
     results = _on_both(
-        lambda client, store: ingest_s2_roi_reflectance(
+        lambda client, store, grouped: ingest_s2_roi_reflectance(
             roi_zarr_path=str(roi_zarr),
             start_date=DENVER_DATES[0],
             end_date=DENVER_DATES[1],
             store_path=str(store),
             client=client,
             log=logging.getLogger("parity-s2-frisky"),
+            group_window_writes=grouped,
         ),
         parity_cluster,
         tmp_path,
