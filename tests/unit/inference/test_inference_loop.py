@@ -35,7 +35,6 @@ class TestRunInference:
         assert result.embeddings.dtype == np.int8
         assert result.scales.shape == (h, w)
         assert result.scales.dtype == np.float32
-        assert result.embeddings_std is None
 
     def test_invalid_pixels_are_zero(self, inference_config, test_model):
         """Pixels that can't be generated get 0 in every band and a NaN scale.
@@ -124,7 +123,7 @@ class TestRunInference:
                     end = min(start + inference_config.batch_size, n)
                     batch, _ = _prepare_batch(dataset_ref, bucket_key, start, end)
                     q_host, scales_host, global_idxs, _, _ = _transfer_and_forward(
-                        test_model, batch, bucket_key, device, None, save_dim
+                        test_model, batch, bucket_key, device, save_dim
                     )
                     _write_quantized_rows(q_host, scales_host, global_idxs, ref_q, ref_scales)
         ref_emb = ref_q.reshape(h, w, save_dim)
@@ -144,26 +143,14 @@ class TestRunInference:
         finite = ~np.isnan(ref_scales_2d)
         np.testing.assert_array_equal(result.scales[finite], ref_scales_2d[finite])
 
-    def test_compute_std_is_coerced_off(self, sample_chunk_data, inference_config, test_model):
-        """compute_std is silently forced off under v1.1; embeddings_std is None."""
-        h, w = 8, 8
-        # Try to turn it on; the dataclass __post_init__ forces it back to False.
-        inference_config.compute_std = True
-        chunk = sample_chunk_data(height=h, width=w, t_s2=10, t_s1a=5, t_s1d=5)
-        dataset = MosaicChunkInferenceDataset(chunk, num_obs_checkpoints=inference_config.num_obs_checkpoints)
-
-        result = run_inference(test_model, dataset, inference_config, torch.device("cpu"))
-        assert result.embeddings_std is None
-
 
 class TestPrepareGpu:
     """Tests for _prepare_gpu helper."""
 
-    def test_cpu_returns_none(self, test_model):
-        """On CPU, returns None (inputs stay float32) and leaves the model float32."""
-        reduced_dtype = _prepare_gpu(test_model, torch.device("cpu"))
+    def test_cpu_leaves_the_model_in_float32(self, test_model):
+        """On CPU there is no reduced-precision cast at all."""
+        _prepare_gpu(test_model, torch.device("cpu"))
 
-        assert reduced_dtype is None
         param = next(test_model.parameters())
         assert param.dtype == torch.float32
 
@@ -199,11 +186,10 @@ class TestPrepareGpu:
 
         monkeypatch.setattr(test_model, "bfloat16", counting_bfloat16)
 
-        first = _prepare_gpu(test_model, device)
-        second = _prepare_gpu(test_model, device)
+        _prepare_gpu(test_model, device)
+        _prepare_gpu(test_model, device)
 
-        assert first == torch.bfloat16
-        assert second == torch.bfloat16
+        assert next(test_model.parameters()).dtype == torch.bfloat16
         assert casts["count"] == 1  # converted once, skipped on the second call
 
 
@@ -223,7 +209,7 @@ class TestProcessSubBatch:
 
         with torch.no_grad():
             q_host, scales_host, global_idxs, transfer_secs, forward_secs = _transfer_and_forward(
-                test_model, batch, bucket_key, device, None, save_dim, config=inference_config
+                test_model, batch, bucket_key, device, save_dim, config=inference_config
             )
 
         assert q_host.shape == (end, save_dim)
@@ -250,7 +236,7 @@ class TestProcessSubBatch:
 
         with torch.no_grad():
             q_host, scales_host, global_idxs, _, _ = _transfer_and_forward(
-                test_model, batch, bucket_key, device, None, save_dim, config=inference_config
+                test_model, batch, bucket_key, device, save_dim, config=inference_config
             )
         _write_quantized_rows(q_host, scales_host, global_idxs, flat_q, flat_scales)
 

@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from tessera_embeddings.config.inference import S2_BAND_ORDER
+from tessera_embeddings.config.inference import DEFAULT_MODEL_VERSION, S2_BAND_ORDER, est_px_per_sec
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 
 if TYPE_CHECKING:
@@ -74,10 +74,12 @@ _MIN_STRIP_H = 256
 
 # Strategy-only estimator constants, calibrated from real run logs (a two-strip chunk: 4.85 GB in 19.4 s and 0.19 GB
 # in 14.5 s => BW ~950 MB/s, fixed ~14 s/read from re-decompressing the shared 4000^2 storage chunks + zarr open +
-# bucketing; inference ~16K px/s, GPU-bound). These pick a strip STRATEGY only — never a correctness value and never a
-# RAM bound. A wrong estimate's worst case is the old always-prefetch behaviour, since every strategy respects the
-# same resident-pair ceiling (see _strip_plan).
-_EST_PX_PER_SEC = 16_000.0
+# bucketing). These pick a strip STRATEGY only — never a correctness value and never a RAM bound. A wrong estimate's
+# worst case is the old always-prefetch behaviour, since every strategy respects the same resident-pair ceiling (see
+# _strip_plan).
+# Inference throughput is per-model (config.inference.MODEL_EST_PX_PER_SEC). This is only the signature fallback for
+# the planning helpers below; callers that know their model pass est_px_per_sec(config.model_version).
+_EST_PX_PER_SEC = est_px_per_sec(DEFAULT_MODEL_VERSION)
 
 
 _EST_READ_BYTES_PER_SEC = 900e6
@@ -180,7 +182,15 @@ class _StripPlan:
     starter_first: bool = False
 
 
-def _strip_plan(t_kept: int, height: int, width: int, valid_px: int, mask_width: int | None = None) -> _StripPlan:
+def _strip_plan(
+    t_kept: int,
+    height: int,
+    width: int,
+    valid_px: int,
+    mask_width: int | None = None,
+    *,
+    px_per_sec: float = _EST_PX_PER_SEC,
+) -> _StripPlan:
     """Choose a strip tiling + prefetch strategy for a chunk.
 
     Bytes scale with ``t_kept x height x width``; inference time scales with valid pixels — they
@@ -190,6 +200,8 @@ def _strip_plan(t_kept: int, height: int, width: int, valid_px: int, mask_width:
     (only one set ever resident). RAM safety does NOT depend on the estimates: every branch
     respects the pair ceiling (arithmetic at :data:`_S2_STRIP_BYTE_BUDGET`), so a mis-estimate
     costs only speed. ``mask_width`` is the full-chunk mask width when bands are easting-cropped.
+    ``px_per_sec`` is the model's inference rate (:func:`~tessera_embeddings.config.inference.est_px_per_sec`);
+    it defaults to the v1.1 rate so a caller that does not know its model still plans.
     """
     budget = _S2_STRIP_BYTE_BUDGET
     mw = mask_width if mask_width is not None else width
@@ -204,7 +216,7 @@ def _strip_plan(t_kept: int, height: int, width: int, valid_px: int, mask_width:
     # Split needed. Will inference hide the loads? Compare estimated total inference time against estimated total load
     # time (fixed per-read cost x number of 1x-budget strips, plus bytes / bandwidth).
     n_dense = (per_set_1x + budget - 1) // budget
-    t_infer = valid_px / _EST_PX_PER_SEC
+    t_infer = valid_px / px_per_sec
     t_load = n_dense * _EST_FIXED_READ_S + bytes_total / _EST_READ_BYTES_PER_SEC
 
     if t_infer >= t_load:
@@ -241,7 +253,9 @@ def _strip_plan(t_kept: int, height: int, width: int, valid_px: int, mask_width:
     )
 
 
-def _chunk_read_plan(chunk: ChunkSpec, mask_bundle: S2MaskBundle) -> tuple[slice | None, int, _StripPlan]:
+def _chunk_read_plan(
+    chunk: ChunkSpec, mask_bundle: S2MaskBundle, *, px_per_sec: float = _EST_PX_PER_SEC
+) -> tuple[slice | None, int, _StripPlan]:
     """Crop bbox, valid-pixel count, and strip plan derived from the SCL mask.
 
     Shared by the serial prologue and the cross-chunk starter prefetch so both make identical
@@ -278,11 +292,19 @@ def _chunk_read_plan(chunk: ChunkSpec, mask_bundle: S2MaskBundle) -> tuple[slice
     valid_px = int(valid_any[:, x_sub].sum()) if x_sub is not None else int(valid_any.sum())
     # Bands read at effective_width (possibly cropped); the SCL mask stays full chunk width, so charge it at
     # chunk.width in the budget.
-    plan = _strip_plan(t_kept, chunk.height, effective_width, valid_px, mask_width=chunk.width)
+    plan = _strip_plan(t_kept, chunk.height, effective_width, valid_px, mask_width=chunk.width, px_per_sec=px_per_sec)
     return x_sub, valid_px, plan
 
 
-def _xchunk_rung(chunk: ChunkSpec, t_kept: int, x_sub: slice | None, valid_px: int, plan: _StripPlan) -> str:
+def _xchunk_rung(
+    chunk: ChunkSpec,
+    t_kept: int,
+    x_sub: slice | None,
+    valid_px: int,
+    plan: _StripPlan,
+    *,
+    px_per_sec: float = _EST_PX_PER_SEC,
+) -> str:
     """Choose the prefetch rung for a hinted next chunk: "starter" or "mask-only".
 
     The starter rung requires ``plan.strips[0]`` to be the SMALL 256-row starter: either the plan
@@ -296,7 +318,7 @@ def _xchunk_rung(chunk: ChunkSpec, t_kept: int, x_sub: slice | None, valid_px: i
     if plan.starter_first:
         candidate = True
     elif len(plan.strips) == 1 and not plan.pair_budget and chunk.height > _STARTER_STRIP_H:
-        starter_infer_s = (_STARTER_STRIP_H / chunk.height) * (valid_px / _EST_PX_PER_SEC)
+        starter_infer_s = (_STARTER_STRIP_H / chunk.height) * (valid_px / px_per_sec)
         candidate = starter_infer_s >= _EST_FIXED_READ_S
     else:
         candidate = False

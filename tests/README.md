@@ -105,6 +105,21 @@ Profiles are configured in `tests/conftest.py`:
   See its `README.md` for the recording workflow.
 - `checkpoints/` — small fake model checkpoints for tests that need to
   load a model. Real production checkpoints are too large for git.
+- `upstream/` — verbatim copies of upstream model code, used as golden
+  references for our ports. Excluded from ruff (lint *and* format) so they stay
+  byte-comparable to the source; each file's header has the re-fetch command.
+
+Real checkpoints stay out of git, so tests that need one are gated on an
+environment variable and skip without it:
+
+```bash
+# v2 Large port vs. upstream reference on the real 175 MB checkpoint
+# (geotessera/TESSERA-V-2.0-2B-L, file ckpt/student_large.pt)
+TESSERA_V2_CKPT=/path/to/student_large.pt uv run pytest tests/unit/inference/test_student_v2_golden.py
+```
+
+The test checks the file's size and SHA-256 against the published digest before
+loading it, since the vendored upstream loader unpickles arbitrary objects.
 
 ## Running subsets
 

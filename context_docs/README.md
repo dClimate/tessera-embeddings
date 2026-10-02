@@ -63,8 +63,14 @@ context_docs/
 │
 ├── inference/                     RUNNING THE ENCODER
 │   ├── inference-on-gpus.md                    throughput, which cards may be rented, why the
-│   │                                              batch is sized to the card, and what the
-│   │                                              campaign path itself measured
+│   │                                              batch is sized to the card, what the campaign
+│   │                                              path itself measured, and what the v2 Large
+│   │                                              student measured against that baseline (§7)
+│   ├── validating-a-model-change.md            how a store is proved correct when the ENCODER
+│   │                                              changed — the checks, their thresholds, and the
+│   │                                              same-model ceiling they were calibrated from
+│   ├── v1.1-against-the-published-store.md     what PR #98's precision fix did to v1.1: one
+│   │                                              published tile re-made at three commits
 │   ├── minimum-optical-depth.md                the one data-quality rule: refuse a pixel below
 │   │                                              15 observations. Four measurement campaigns
 │   ├── gpu-fleet-launch-throttling.md          why several clusters asking EC2 for GPUs at once

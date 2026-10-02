@@ -19,11 +19,11 @@ Generate per-pixel (10m^2) TESSERA satellite embeddings at any scale. Ports the 
 cloud-native, distributed architecture that runs on any major cloud —
 or on a laptop (slowly).
 
-**This repository is currently set up for TESSERA v1.1.** The model architecture, the
-band statistics, the temporal sampling and the published global store are all v1.1, and a
-run you start today is a v1.1 run. Support for a **v2 Large student model is in flight**
-([PR #98](https://github.com/dClimate/tessera-embeddings/pull/98)) — not merged, and with
-no release date to quote.
+**TESSERA v1.1 is the default model, and the published global store is v1.1.** The
+distilled **v2 Large student** can be selected on the single-area paths with
+`model_version="v2-large"`; the global campaign's zone fill runs v1.1 only. What differs
+between the two is in the
+[inference README](src/tessera_embeddings/inference/README.md#model-architecture-constraint).
 
 ## Contents
 

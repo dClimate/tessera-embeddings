@@ -53,8 +53,8 @@ and is vastly more cost-effective for small area analysis.
 **The same inference code runs in both.** The single-area flow and the global campaign both call
 the same `run_inference` function, producing the same 128-dimensional embedding per pixel. There is
 no "global model" and no "small model" — by default they run the same checkpoint too, though the
-single-area path lets you point at another one with `checkpoint_url`, in which case the outputs are
-of course no longer comparable.
+single-area path can select the v2 Large encoder with `model_version` or point at another checkpoint
+with `checkpoint_url`, in which case the outputs are of course no longer comparable.
 
 **The same ingest code runs in both, and it sees the same kind of input.** This is the part that
 surprises people. The global campaign holds its coverage information in one format and the

@@ -18,14 +18,11 @@ from typing import Literal
 import numpy as np
 
 from tessera_embeddings.config.inference import (
+    DEFAULT_MODEL_VERSION,
     DEFAULT_NUM_OBS_CHECKPOINTS,
-    S1_ASC_BAND_MEAN,
-    S1_ASC_BAND_STD,
-    S1_DESC_BAND_MEAN,
-    S1_DESC_BAND_STD,
-    S2_BAND_MEAN,
-    S2_BAND_STD,
+    ModelVersion,
     _normalize_obs_checkpoints,
+    band_stats,
 )
 from tessera_embeddings.inference.data_loading import ChunkData
 from tessera_embeddings.inference.sampling import compute_bin_keys, resample_s1_bucket, resample_s2_bucket
@@ -47,15 +44,24 @@ class MosaicChunkInferenceDataset:
         s1_orbit: Which S1 orbit direction(s) are active. Only affects logging. ``"none"`` means
             radar-free land, where every pixel takes the ``allow_s2_only`` branch.
         allow_s2_only: Keep S2-valid pixels with ZERO S1 observations (sub-zone SAR coverage gaps,
-            or an ROI with no radar at all). They land in the smallest S1 bucket and receive the
-            upstream v1.1 missing-S1 input: an all-zeros normalized-space S1 slice
-            (``resample_s1_bucket`` zero-count rows == ucam-eo/tessera's ``_sample_s1_merged``
-            zero return). Default False skips such pixels entirely — this pipeline's default gate.
+            or an ROI with no radar at all). They receive their model's upstream missing-S1 input,
+            an all-zeros normalized-space S1 slice: in the smallest S1 bucket for v1.1 (ucam-eo/tessera's
+            ``_sample_s1_merged`` zero return), one step long for v2 (``tessera_infer_v2``'s
+            ``max(s1_bin, 1)``). Default False skips such pixels entirely — this pipeline's default gate.
         optical_min_obs: Minimum valid optical observations for a pixel to be embedded at all.
             ``None`` embeds every pixel with any optical input, which is what every non-campaign
             caller wants. A positive value refuses thinner pixels, which is **not** a filter a
             consumer can undo: the refused pixel has no embedding, so recovering it means
             re-running its shard. Zero is rejected rather than treated as "off" — see ``__init__``.
+        model_version: Which student's PADDING RULE to resample with. Versioned for the same reason
+            ``stats`` is, and just as invisibly if wrong: v1.1 and v2 disagree on the index pattern
+            for almost every inexact observation count, and the resulting tensor is the correct
+            shape and dtype either way, so a mismatch reaches the model as a plausible but
+            untrained observation sequence rather than as an error.
+        norm_source: v1.1 statistic set — ``"aws"`` (the default when ``None``) or ``"mpc"``.
+            Ignored by v2, which hard-codes one set. The band statistics are DERIVED from this and
+            ``model_version`` rather than passed in, so normalisation and resampling cannot
+            describe different students.
     """
 
     def __init__(
@@ -65,6 +71,8 @@ class MosaicChunkInferenceDataset:
         s1_orbit: Literal["ascending", "descending", "both", "none"] = "both",
         allow_s2_only: bool = False,
         optical_min_obs: int | None = None,
+        model_version: ModelVersion = DEFAULT_MODEL_VERSION,
+        norm_source: str | None = None,
     ) -> None:
         if optical_min_obs is not None and optical_min_obs <= 0:
             # Zero refuses nothing while reading as a configured rule, making a caller that meant "no minimum"
@@ -74,6 +82,7 @@ class MosaicChunkInferenceDataset:
                 f"optical_min_obs={optical_min_obs} refuses nothing — pass None for no minimum, "
                 "or a positive number of observations."
             )
+        self.model_version = model_version
         self.num_obs_checkpoints = _normalize_obs_checkpoints(num_obs_checkpoints)
         self.s1_orbit = s1_orbit
         self.allow_s2_only = allow_s2_only
@@ -81,12 +90,17 @@ class MosaicChunkInferenceDataset:
         self.H = chunk_data.height
         self.W = chunk_data.width
 
-        self.s2_band_mean = np.array(S2_BAND_MEAN, dtype=np.float32)
-        self.s2_band_std = np.array(S2_BAND_STD, dtype=np.float32)
-        self.s1a_band_mean = np.array(S1_ASC_BAND_MEAN, dtype=np.float32)
-        self.s1a_band_std = np.array(S1_ASC_BAND_STD, dtype=np.float32)
-        self.s1d_band_mean = np.array(S1_DESC_BAND_MEAN, dtype=np.float32)
-        self.s1d_band_std = np.array(S1_DESC_BAND_STD, dtype=np.float32)
+        # DERIVED, not accepted. `stats` used to be a separate argument, so a caller could pass
+        # v2's model_version with v1.1's statistics — or the reverse — and get an embedding
+        # normalised by one student and resampled by the other. Both halves describe the same
+        # thing, so only one of them is an input now and the contradiction cannot be expressed.
+        stats = band_stats(model_version, norm_source)
+        self.s2_band_mean = np.array(stats["s2_mean"], dtype=np.float32)
+        self.s2_band_std = np.array(stats["s2_std"], dtype=np.float32)
+        self.s1a_band_mean = np.array(stats["s1_asc_mean"], dtype=np.float32)
+        self.s1a_band_std = np.array(stats["s1_asc_std"], dtype=np.float32)
+        self.s1d_band_mean = np.array(stats["s1_desc_mean"], dtype=np.float32)
+        self.s1d_band_std = np.array(stats["s1_desc_std"], dtype=np.float32)
 
         self._bucket_pixels: dict[tuple[int, int], np.ndarray] = {}
         self._rows = np.empty((0,), dtype=np.int64)
@@ -125,8 +139,8 @@ class MosaicChunkInferenceDataset:
         s1_total_valid = s1_asc_valid + s1_desc_valid
 
         # A pixel needs real S2 to embed at all; the S1 term is the optional part. By default a pixel with zero S1
-        # observations is skipped; with allow_s2_only it is kept and flows through as the upstream v1.1 missing-S1
-        # convention (all-zeros normalized S1 slice, smallest bucket via compute_bin_keys' clip). Per-pixel provenance
+        # observations is skipped; with allow_s2_only it is kept and given its model's upstream missing-S1 input
+        # (an all-zeros normalized S1 slice: the smallest bucket for v1.1, one step for v2). Per-pixel provenance
         # stays exact either way — s1_asc/desc_obs_count are written as 0 for these pixels.
         #
         # THREE refusal reasons, kept apart rather than folded into one boolean: no optical input at all, too little
@@ -173,6 +187,10 @@ class MosaicChunkInferenceDataset:
         pixel_s2_counts = s2_valid_count[rows, cols]
         pixel_s1_counts = s1_total_valid[rows, cols]
         keys = compute_bin_keys(pixel_s2_counts, pixel_s1_counts, self.num_obs_checkpoints)
+        if self.model_version != "v1.1":
+            # Each family's own missing-S1 input: v2 gives a radar-free pixel ONE zero step (upstream
+            # `s1_B = max(s1_bin, 1)`), where v1.1 keeps the smallest bucket. Seven fewer tokens per pixel.
+            keys["s1"][pixel_s1_counts == 0] = 1
 
         # Group pixel indices by (s2, s1) bucket, packing structured (int32, int32) into one int64 for a stable
         # argsort.
@@ -262,6 +280,7 @@ class MosaicChunkInferenceDataset:
             target=s2_target,
             s2_mean=self.s2_band_mean,
             s2_std=self.s2_band_std,
+            model_version=self.model_version,
         )
 
         s1 = resample_s1_bucket(
@@ -274,6 +293,7 @@ class MosaicChunkInferenceDataset:
             s1a_std=self.s1a_band_std,
             s1d_mean=self.s1d_band_mean,
             s1d_std=self.s1d_band_std,
+            model_version=self.model_version,
         )
 
         return {

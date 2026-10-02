@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 
@@ -11,26 +13,27 @@ from tessera_embeddings.inference.models.modules import (
     CustomGRUCell,
     TemporalAwarePooling,
     TemporalPositionalEncoder,
-    TransformerEncoder,
+    V11TransformerEncoder,
 )
 from tessera_embeddings.inference.models.ssl_model import (
     MultimodalBTInferenceModel,
     build_dim_reducer,
 )
+from tessera_embeddings.inference.models.student_v2 import StudentTransformerEncoder
 
 
 class TestTransformerEncoder:
-    """Tests for TransformerEncoder forward pass shapes."""
+    """Tests for V11TransformerEncoder forward pass shapes."""
 
     def test_s2_output_shape(self):
         """S2 backbone pools to (B, latent_dim * 4)."""
-        enc = TransformerEncoder(band_num=10, latent_dim=32, nhead=4, num_encoder_layers=2)
+        enc = V11TransformerEncoder(band_num=10, latent_dim=32, nhead=4, num_encoder_layers=2)
         x = torch.randn(4, 15, 11)
         assert enc(x).shape == (4, 128)
 
     def test_s1_output_shape(self):
         """S1 backbone pools to (B, latent_dim * 4)."""
-        enc = TransformerEncoder(band_num=2, latent_dim=32, nhead=4, num_encoder_layers=2)
+        enc = V11TransformerEncoder(band_num=2, latent_dim=32, nhead=4, num_encoder_layers=2)
         x = torch.randn(4, 15, 3)
         assert enc(x).shape == (4, 128)
 
@@ -118,8 +121,8 @@ class TestMultimodalBTInferenceModel:
     def test_forward_shape_concat(self):
         """Concat fusion forward pass returns (B, representation_dim)."""
         latent_dim, repr_dim = 32, 16
-        s2_enc = TransformerEncoder(band_num=10, latent_dim=latent_dim, nhead=4, num_encoder_layers=2)
-        s1_enc = TransformerEncoder(band_num=2, latent_dim=latent_dim, nhead=4, num_encoder_layers=2)
+        s2_enc = V11TransformerEncoder(band_num=10, latent_dim=latent_dim, nhead=4, num_encoder_layers=2)
+        s1_enc = V11TransformerEncoder(band_num=2, latent_dim=latent_dim, nhead=4, num_encoder_layers=2)
         reducer = build_dim_reducer(latent_dim=latent_dim, active_backbones=2, repr_dim=repr_dim)
         model = MultimodalBTInferenceModel(s2_enc, s1_enc, reducer, fusion_method="concat")
         model.eval()
@@ -132,8 +135,8 @@ class TestMultimodalBTInferenceModel:
 
     def test_invalid_fusion_raises(self):
         """An unknown fusion method raises ValueError on forward."""
-        s2_enc = TransformerEncoder(band_num=10, latent_dim=32, nhead=4, num_encoder_layers=2)
-        s1_enc = TransformerEncoder(band_num=2, latent_dim=32, nhead=4, num_encoder_layers=2)
+        s2_enc = V11TransformerEncoder(band_num=10, latent_dim=32, nhead=4, num_encoder_layers=2)
+        s1_enc = V11TransformerEncoder(band_num=2, latent_dim=32, nhead=4, num_encoder_layers=2)
         reducer = build_dim_reducer(latent_dim=32, active_backbones=2, repr_dim=16)
         model = MultimodalBTInferenceModel(s2_enc, s1_enc, reducer, fusion_method="invalid")
         with pytest.raises(ValueError, match="Unknown fusion method"):
@@ -161,7 +164,7 @@ class TestBuildInferenceModel:
 
 
 class TestLoadCheckpoint:
-    """Tests for load_checkpoint: state-key fallback, prefix stripping, head dropping."""
+    """Tests for load_v11_checkpoint: state-key fallback, prefix stripping, head dropping."""
 
     def _save(self, tmp_path, payload):
         """Write *payload* to a .pt file and return its path."""
@@ -171,7 +174,7 @@ class TestLoadCheckpoint:
 
     def test_strips_orig_mod_prefix(self, tmp_path):
         """`_orig_mod.` (torch.compile) prefixes are removed from param keys."""
-        from tessera_embeddings.inference.models.builder import load_checkpoint
+        from tessera_embeddings.inference.models.builder import load_v11_checkpoint
 
         path = self._save(
             tmp_path,
@@ -182,14 +185,14 @@ class TestLoadCheckpoint:
                 }
             },
         )
-        cleaned = load_checkpoint(path, torch.device("cpu"))
+        cleaned = load_v11_checkpoint(path, torch.device("cpu"))
         assert "s2_backbone.weight" in cleaned
         assert "_orig_mod.s2_backbone.weight" not in cleaned
         assert "s1_backbone.bias" in cleaned
 
     def test_drops_training_only_heads(self, tmp_path):
         """projector.* and segmented_matryoshka_projector.* params are dropped."""
-        from tessera_embeddings.inference.models.builder import load_checkpoint
+        from tessera_embeddings.inference.models.builder import load_v11_checkpoint
 
         path = self._save(
             tmp_path,
@@ -201,12 +204,12 @@ class TestLoadCheckpoint:
                 }
             },
         )
-        cleaned = load_checkpoint(path, torch.device("cpu"))
+        cleaned = load_v11_checkpoint(path, torch.device("cpu"))
         assert set(cleaned) == {"s2_backbone.weight"}
 
     def test_falls_back_to_model_state_dict_key(self, tmp_path):
         """When 'model_state' is absent, 'model_state_dict' is used."""
-        from tessera_embeddings.inference.models.builder import load_checkpoint
+        from tessera_embeddings.inference.models.builder import load_v11_checkpoint
 
         path = self._save(
             tmp_path,
@@ -214,12 +217,12 @@ class TestLoadCheckpoint:
                 "model_state_dict": {"s2_backbone.weight": torch.ones(2)},
             },
         )
-        cleaned = load_checkpoint(path, torch.device("cpu"))
+        cleaned = load_v11_checkpoint(path, torch.device("cpu"))
         assert "s2_backbone.weight" in cleaned
 
     def test_prefers_model_state_over_model_state_dict(self, tmp_path):
         """When both keys exist, 'model_state' wins."""
-        from tessera_embeddings.inference.models.builder import load_checkpoint
+        from tessera_embeddings.inference.models.builder import load_v11_checkpoint
 
         path = self._save(
             tmp_path,
@@ -228,25 +231,25 @@ class TestLoadCheckpoint:
                 "model_state_dict": {"from_model_state_dict": torch.ones(1)},
             },
         )
-        cleaned = load_checkpoint(path, torch.device("cpu"))
+        cleaned = load_v11_checkpoint(path, torch.device("cpu"))
         assert "from_model_state" in cleaned
         assert "from_model_state_dict" not in cleaned
 
     def test_raises_when_no_state_key(self, tmp_path):
         """A checkpoint with neither state key raises KeyError listing available keys."""
-        from tessera_embeddings.inference.models.builder import load_checkpoint
+        from tessera_embeddings.inference.models.builder import load_v11_checkpoint
 
         path = self._save(tmp_path, {"optimizer": {}, "epoch": 5})
         with pytest.raises(KeyError, match="model_state_dict"):
-            load_checkpoint(path, torch.device("cpu"))
+            load_v11_checkpoint(path, torch.device("cpu"))
 
     def test_preserves_tensor_values(self, tmp_path):
         """Param tensors survive cleaning unmodified."""
-        from tessera_embeddings.inference.models.builder import load_checkpoint
+        from tessera_embeddings.inference.models.builder import load_v11_checkpoint
 
         weight = torch.arange(6, dtype=torch.float32).reshape(2, 3)
         path = self._save(tmp_path, {"model_state": {"_orig_mod.layer.weight": weight}})
-        cleaned = load_checkpoint(path, torch.device("cpu"))
+        cleaned = load_v11_checkpoint(path, torch.device("cpu"))
         torch.testing.assert_close(cleaned["layer.weight"], weight)
 
 
@@ -254,19 +257,86 @@ class TestPositionalEncoderBitIdentity:
     """empty + strided sin/cos fill is bit-identical to the historical zeros fill."""
 
     @staticmethod
-    def _reference_forward(enc: TemporalPositionalEncoder, doy: torch.Tensor) -> torch.Tensor:
-        position = doy.unsqueeze(-1).float()
-        pe = torch.zeros(doy.shape[0], doy.shape[1], enc.d_model, device=doy.device)
-        pe[:, :, 0::2] = torch.sin(position * enc.div_term.float())
-        pe[:, :, 1::2] = torch.cos(position * enc.div_term.float())
-        return pe.to(doy.dtype)
+    def _reference_forward(d_model: int, doy: torch.Tensor, out_dtype: torch.dtype | None = None) -> torch.Tensor:
+        """The textbook FP32 encoding, written independently of the module."""
+        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * -(math.log(10000.0) / d_model))
+        position = doy.float().unsqueeze(-1)
+        pe = torch.zeros(doy.shape[0], doy.shape[1], d_model)
+        pe[:, :, 0::2] = torch.sin(position * div_term)
+        pe[:, :, 1::2] = torch.cos(position * div_term)
+        return pe.to(out_dtype or doy.dtype)
 
     def test_bit_identical_float32(self):
         enc = TemporalPositionalEncoder(d_model=32)
         doy = torch.randint(1, 366, (4, 20)).float()
-        torch.testing.assert_close(enc(doy), self._reference_forward(enc, doy), atol=0.0, rtol=0.0)
+        torch.testing.assert_close(enc(doy), self._reference_forward(32, doy), atol=0.0, rtol=0.0)
 
-    def test_bit_identical_bfloat16_cast_path(self):
+    def test_bf16_module_still_computes_the_fp32_encoding(self):
+        """``.bfloat16()`` must not reach the frequencies or the DOY arithmetic.
+
+        The production path calls ``model.bfloat16()``. If ``div_term`` were a
+        registered buffer it would be swept into BF16 and sin/cos arguments would
+        shift by up to ~0.70 rad at DOY 365 — a silent divergence from the FP32
+        graph the checkpoints were trained and golden-tested against. The only
+        permitted loss is the final cast of the result.
+        """
         enc = TemporalPositionalEncoder(d_model=64).bfloat16()
-        doy = torch.randint(1, 366, (2, 9)).bfloat16()
-        torch.testing.assert_close(enc(doy), self._reference_forward(enc, doy), atol=0.0, rtol=0.0)
+        doy = torch.randint(1, 366, (2, 9)).float()
+        expected = self._reference_forward(64, doy, out_dtype=torch.bfloat16)
+        actual = enc(doy, out_dtype=torch.bfloat16)
+        assert actual.dtype == torch.bfloat16
+        torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
+
+    def test_doy_above_256_keeps_one_day_resolution(self):
+        """DOY 257 and 258 must not collapse onto the same encoding.
+
+        BF16 carries 8 mantissa bits, so it steps by 2 above 256 — days 257
+        through 365 (mid-September onward) would otherwise round onto their even
+        neighbour before the encoder ever sees them.
+        """
+        enc = TemporalPositionalEncoder(d_model=32)
+        doy = torch.tensor([[257.0, 258.0]])
+        out = enc(doy, out_dtype=torch.bfloat16)
+        assert not torch.equal(out[0, 0], out[0, 1])
+        torch.testing.assert_close(out, self._reference_forward(32, doy, out_dtype=torch.bfloat16), atol=0.0, rtol=0.0)
+
+
+class TestEncoderComputeDtype:
+    """Backbones cast bands to the weight dtype and leave DOY alone.
+
+    The output dtype alone is NOT sufficient evidence: an encoder that cast the
+    whole input to BF16 before splitting off DOY would also return BF16, having
+    silently collapsed day 257 onto 256. So each test intercepts the tensor the
+    temporal encoder actually receives and checks it is still exact FP32.
+    """
+
+    @staticmethod
+    def _captured_doy(enc: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+        """Run *enc* on *x*, returning the DOY tensor its temporal encoder saw."""
+        seen: list[torch.Tensor] = []
+        handle = enc.temporal_encoder.register_forward_pre_hook(
+            lambda _module, args: seen.append(args[0].detach().clone()) and None
+        )
+        try:
+            with torch.no_grad():
+                out = enc(x)
+        finally:
+            handle.remove()
+        assert len(seen) == 1
+        assert out.dtype == torch.bfloat16, "reduced-precision compute dtype must survive to the output"
+        return seen[0]
+
+    def _assert_doy_survives(self, enc: torch.nn.Module, band_num: int) -> None:
+        # 257 and 258 straddle the BF16 integer-exactness boundary: BF16 steps by
+        # 2 above 256, so a whole-tensor cast would deliver 256 and 258.
+        x = torch.randn(1, 2, band_num + 1)
+        x[0, :, -1] = torch.tensor([257.0, 258.0])
+        doy = self._captured_doy(enc.bfloat16().eval(), x)
+        assert doy.dtype == torch.float32
+        torch.testing.assert_close(doy, torch.tensor([[257.0, 258.0]]), atol=0.0, rtol=0.0)
+
+    def test_v11_backbone_hands_the_encoder_exact_fp32_doy(self):
+        self._assert_doy_survives(V11TransformerEncoder(band_num=10, latent_dim=8, nhead=2, num_encoder_layers=1), 10)
+
+    def test_v2_backbone_hands_the_encoder_exact_fp32_doy(self):
+        self._assert_doy_survives(StudentTransformerEncoder(band_num=2, latent_dim=8, nhead=2, num_encoder_layers=1), 2)

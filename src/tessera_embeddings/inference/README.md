@@ -15,6 +15,13 @@ into **128-dimensional embeddings, one per pixel** — at 10 m for the global st
 default, though a single-area run sets its own `resolution` and gets one embedding per pixel
 at whatever it chose.
 
+Two encoders are selectable through `InferenceConfig.model_version`: Tessera v1.1, the
+default, and the distilled v2 Large student (`"v2-large"`). They share every stage below
+except the model itself, its band statistics and the rule that fills each observation
+sequence; what differs, and why, is in [Model architecture constraint](#model-architecture-constraint).
+Both single-area entry points below take `model_version`; the global campaign's zone fill
+does not, and runs v1.1.
+
 Two entry points run the same domain code:
 
 - [`orchestration/prefect/flows/tessera_embeddings.py`](../orchestration/prefect/flows/tessera_embeddings.py)
@@ -42,7 +49,7 @@ computation, but waiting for imagery to arrive from S3, for the next batch of pi
 prepared, and for finished results to be written back. Most of what follows removes a reason
 for the card to wait rather than making the model faster.
 
-**Not all of it, though.** The forward pass itself was also changed: the recurrent layer is
+**Not all of it, though.** The forward pass itself was also changed: v1.1's recurrent layer is
 fused so cuDNN runs it in about one kernel launch instead of 480, positional encoding is kept
 from dragging the whole graph into FP32, and the training-only heads never reach the model at
 all. Those are changes to what runs on the card, and they are what gave the scheduling work a
@@ -272,7 +279,7 @@ T ≈ 126 dates  (a full year of Sentinel-2 acquisitions over this area)
 T_kept ≈ 63 dates
       │
       │  Phase 2: read the full reflectance bands, for those dates only.
-      │  v1.1 uses every valid observation; nothing is pre-sampled.
+      │  Both encoders use every valid observation; nothing is pre-sampled.
       ▼
 Peak memory: ~2 GB, against ~15 GB reading the bands without the SCL pass first
 ```
@@ -301,7 +308,7 @@ the date count — and on a dense area `T_kept` can reach 120, which makes a sin
 bands alone about **10 GB in one allocation**. That has to share a 32 GB machine with the
 radar stack, the output buffers and the model.
 
-The date count is not something the pipeline can choose (v1.1 uses every valid
+The date count is not something the pipeline can choose (both encoders use every valid
 observation), so the only lever is how much ground is resident at once. `process_chunk`
 therefore loads a tile as a sequence of **strips**: full easting width, a slice of the
 northing rows. Each strip is a self-contained `ChunkData` that is grouped into buckets, run
@@ -442,11 +449,12 @@ buckets.
    and — by default — at least one non-zero radar observation. The radar requirement is
    optional: with `InferenceConfig.allow_s2_only=True` (the flow parameter
    `allow_s2_only`, off by default), optical-valid pixels inside radar coverage gaps are
-   embedded too. They are fed the upstream v1.1 missing-radar convention: an all-zeros
-   radar slice *in normalised space*, in the smallest bucket, bit-identical to what
-   `ucam-eo/tessera`'s `_sample_s1_merged` returns for the same case. Nothing in the
-   encoder requires a radar observation to exist. Radar-informed pixels are unaffected by
-   the flag. Downstream, an optical-only pixel is exactly one with a finite `scales` value
+   embedded too. Each model gets its own upstream missing-radar input, an all-zeros radar
+   slice *in normalised space*: v1.1 in the smallest bucket, bit-identical to what
+   `ucam-eo/tessera`'s `_sample_s1_merged` returns for the same case, and v2 as a single step,
+   as upstream v2 does, which costs seven fewer tokens per pixel. Nothing in the encoder
+   requires a radar observation to exist. Radar-informed pixels are unaffected by the flag.
+   Downstream, an optical-only pixel is exactly one with a finite `scales` value
    and `s1_asc_obs_count + s1_desc_obs_count == 0`. **The production gate on this is recorded
    as cleared** — [ADR-013](../../../context_docs/decisions/013-optional-s1-s2-only-pixels.md)
    §Quality caveat, and the global campaign runs with the flag on, because about a fifth of
@@ -488,18 +496,36 @@ Each bucket needs a fixed-length sequence per pixel. For a bucket `(s2_bin, s1_b
 - **`resample_s1_bucket`** loads the ascending and descending observations and returns
   `(B, s1_bin, 3)`: the normalised VV/VH pair plus a day-of-year feature.
 
-`build_resample_indices` is deterministic in both directions. Too **few** observations for the
-bucket target: every original index is kept, and the shortfall is filled with duplicate indices
-placed at evenly spaced positions across the whole observation range — `linspace` over
-`[0, valid_len - 1]`, rounded — so the duplicates are spread through the year rather than piled on
-the last date. Too **many**: each of `target` evenly split chunks contributes its median index.
-A reimplementation that repeated the final date instead would feed the model a different sequence
-and get different embeddings.
+**Which observations fill the sequence is decided per encoder.** Each was trained under its
+own padding and subsampling rule, and `resampler_for(model_version)` selects it. Both are
+deterministic in both directions:
+
+- **v1.1 — `build_resample_indices`.** Too **few** observations for the bucket target: every
+  original index is kept, and the shortfall is filled with duplicate indices placed at evenly
+  spaced positions across the whole observation range — `linspace` over `[0, valid_len - 1]`,
+  rounded — so the duplicates are spread through the year rather than piled on the last date.
+  Too **many**: each of `target` evenly split chunks contributes its median index.
+- **v2 Large — `build_resample_indices_v2`**, a port of upstream v2's `_pad_pattern`. Too
+  few: every original index is kept, and the shortfall is filled with the median of each of
+  `shortfall` split groups, or, when the shortfall exceeds the observation count, by cycling
+  through the series in order. Too many: `linspace` cast to integer, which truncates rather
+  than rounds.
+
+The two rules pick different indices for 97.7% of the (count, bucket) pairs a pixel can
+reach, so they are different algorithms, not variants. A reimplementation that repeated the
+final date, or used one encoder's rule for the other, would feed the model a sequence of the
+right shape that it was never trained on, and nothing downstream could object.
+`MosaicChunkInferenceDataset` therefore takes `model_version` and derives both the resampler
+and the band statistics from it, so the two cannot describe different encoders. What this
+means for validating a store across a model change is in
+[`validating-a-model-change.md`](../../../context_docs/inference/validating-a-model-change.md) §2.
 
 **Each radar orbit is normalised on its own statistics.** Ascending and descending
-observations are standardised with their own mean and standard deviation —
-`S1_ASC_BAND_MEAN/STD` and `S1_DESC_BAND_MEAN/STD` in `config/inference.py` — *before*
-they are concatenated, so the model sees per-orbit statistics rather than blended ones.
+observations are standardised with their own mean and standard deviation *before* they are
+concatenated, so the model sees per-orbit statistics rather than blended ones. The
+statistics come from `band_stats(model_version, norm_source)` in `config/inference.py`:
+v1.1's AWS or MPC set, or the single set hard-coded into v2, which keeps separate
+ascending and descending values too.
 
 > **Why `s1_orbit="both"` is safe for v1.1.** The v1.1 model uses a single merged radar
 > backbone (`split_s1_modalities=False`), which might suggest the two orbits have to share
@@ -580,11 +606,21 @@ out overflow on the grounds that the arithmetic is BF16. On cards older than Amp
 have no BF16, FP16 is a best-effort fallback, and there overflow is a routine hazard rather
 than a remote one — anything above 65,504.
 
+**The input stays FP32; each backbone casts only its bands.** The last channel of a bucket's
+tensor is the raw integer day of year, and BF16's eight mantissa bits step by 2 above 256, so
+casting the whole tensor would round day 257 to 256 and cost the last third of the year its
+one-day resolution. `V11TransformerEncoder.forward` and `StudentTransformerEncoder.forward`
+cast the band slice to the weights' dtype and hand the day-of-year column to
+`TemporalPositionalEncoder` in FP32. Its sinusoidal frequencies are an FP32 per-device cache
+rather than a registered buffer, so `model.bfloat16()` cannot round them either. Measured on
+the v2 Large checkpoint, the mean per-channel deviation from the FP32 graph fell from 0.0075
+to 0.0027. The copy to the GPU was already FP32, so this costs no bandwidth.
+
 **Four things are deliberately off or replaced**, each because it was measured and made
 things worse:
 
 - **`torch.compile` is disabled.** Capturing the model as a CUDA graph consumed 11.6 GB of
-  VRAM and roughly doubled the forward pass, because the recurrent layer recompiled for
+  VRAM and roughly doubled the forward pass, because v1.1's recurrent layer recompiled for
   every distinct sequence length it saw.
 - **cuDNN's autotuner (`benchmark` mode) is disabled.** It searches for the fastest kernel
   per input shape, and bucketing means the shapes change constantly, so it searches
@@ -594,6 +630,7 @@ things worse:
   `CustomGRU` with PyTorch's fused `nn.GRU` before inference, turning roughly 480 GPU
   kernel launches into one, so the recurrence is no longer bound by launch overhead. This
   is a small, deliberate approximation in the reset gate — see the builder's docstring.
+  v1.1 only: v2's pooling head is a single attention layer with no recurrence to fuse.
 - **Positional encoding writes into an uninitialised buffer.** The sine and cosine values
   are written straight into it, instead of being scattered into a multi-gigabyte block of
   FP32 zeros allocated on every forward pass. Same values, lower peak memory.
@@ -607,8 +644,9 @@ transformer's own layer count by `profiling.transformer_flops`. Both compare hon
 across tiles and across runs.
 
 **Output per tile:** an `embeddings` array of `(H, W, 128)` int8, zero where a pixel was
-not run, plus a per-pixel float32 `scale` factor for turning it back into real numbers. The
-model produces 192 dimensions; the first 128 are saved (`save_dim = min(128, repr_dim)`).
+not run, plus a per-pixel float32 `scale` factor for turning it back into real numbers.
+v1.1 produces 192 dimensions and the first 128 are saved (`save_dim = min(128, repr_dim)`);
+v2 Large produces 128 natively, so the same slice keeps everything.
 
 ### 8. Compressing embeddings to int8 (`quantization.py`)
 
@@ -644,8 +682,9 @@ delegates to `quantize_rows`.
 
 - `embeddings` — int8, `(H, W, 128)`
 - `scales` — float32, `(H, W)`
-- `embedding_std` — float32, `(H, W, 128)`, unquantized. **Never written under v1.1**:
-  sampling is deterministic, so `InferenceConfig` forces `compute_std` to False.
+- `embedding_std` — float32, `(H, W, 128)`, unquantized. **Never written by either
+  encoder**: both sample deterministically, so `InferenceConfig` forces `compute_std` to
+  False.
 
 Assembly validates that staged tiles carry these dtypes and rejects a mismatch, so a
 change of dtype cannot silently corrupt a store.
@@ -666,6 +705,12 @@ costs CPU, and CPU on a GPU-priced machine is the scarcest thing there is. The s
 sub-chunks are `256 × 256 × the full band axis` (`INNER_PX`, int8), which is exactly the
 final store's inner-chunk geometry: a staged 2048-pixel tile *is* the 8 × 8 grid of inner
 chunks it will become, and the band axis is never split (ADR-008 D2).
+
+**The `run_id` is the only record of which encoder staged a tile.** A staged tile is
+`(H, W, 128)` int8 under either encoder, so v2 runs carry a `v2-` prefix
+(`config.inference.run_id_prefix`) and `run_inference` refuses a `run_id` whose prefix
+contradicts `config.model_version`. An unprefixed id is read as v1.1. That is what stops a
+resume from finishing one encoder's staging with the other.
 
 **What travels with the embeddings.** Alongside `scales`, each staged tile carries the
 per-pixel provenance layers, which come in **pairs — a count and a month mask per
@@ -823,11 +868,14 @@ icechunk sessions read their own writes, so the merged result is exact.
 2. **Phase 1, schema and time-axis placement.** Every phase runs on a private
    `_assemble-wip` branch, never on `main` directly. On a fresh store: create the layout's
    array schemas and coordinate arrays, with no chunk data, at a cost independent of
-   extent. On an existing store: validate the `_manifest`, then either resize every
-   time-dimensioned array by one step (an append *is* a resize plus a write at the new
-   index) or, when the time value already exists, target that index for an in-place
-   overwrite. That makes a resume **idempotent**: a crashed assembly re-run lands on the
-   same index instead of appending a duplicate timestep. On an overwrite, any
+   extent. On an existing store: validate the `_manifest` and refuse a store published by the
+   other encoder (`conventions.assert_encoder_matches`, which reads a store with no
+   `geoemb:model` as v1.1; the pre-flight runs the same check before any GPU is
+   provisioned). Then either resize every time-dimensioned array by one step (an append
+   *is* a resize plus a write at the new index) or, when the time value already exists,
+   target that index for an in-place overwrite. That makes a resume **idempotent**: a
+   crashed assembly re-run lands on the same index instead of appending a duplicate
+   timestep. On an overwrite, any
    time-dimensioned array this run does *not* write — `embedding_std` when standard
    deviations are off, say, or the other radar orbit's count — is reset to fill at that
    index, so no stale slice describes the overwritten data.
@@ -1019,23 +1067,38 @@ the main loop; `ActorPool` encapsulates actor state and lifecycle operations
 | `batch_size` | 7168 | GPU pixels per forward pass within a bucket |
 | `num_obs_checkpoints` | `range(8, 257, 8)` | Bucketed sequence-length schedule; pixels binned to nearest checkpoint |
 | `s1_orbit` | `"both"` | `"ascending"`, `"descending"`, or `"both"` |
-| `norm_source` | `"aws"` | Which band stats and checkpoint. `"aws"` matches Earth Search pixels, which is the only ingest path there is; `"mpc"` exists for Planetary Computer and is unexercised |
-| `latent_dim` | 192 | Transformer hidden dim (must match checkpoint) |
-| `representation_dim` | 192 | Model output dim; first 128 dims are saved to the store |
-| `dim_feedforward` | 2048 | Transformer FFN width |
+| `model_version` | `"v1.1"` | `"v1.1"` or `"v2-large"`. Selects the architecture, checkpoint, band stats, resampling rule and output width |
+| `norm_source` | `"aws"` (v1.1) | Which v1.1 band stats and checkpoint. `"aws"` matches Earth Search pixels, which is the only ingest path there is; `"mpc"` exists for Planetary Computer and is unexercised. Rejected under v2, which has one fixed set |
+| `latent_dim` | 192 (v1.1) / 160 (v2) | Encoder base dim; the transformer width is `latent_dim * 4` (must match checkpoint) |
+| `representation_dim` | 192 (v1.1) / 128 (v2) | Model output dim; the first 128 are saved to the store |
+| `dim_feedforward` | 2048 (v1.1) / 2560 (v2) | Transformer FFN width |
 | `max_gpu_workers` | 500 | Ray autoscaler ceiling |
 
 **Architecture params** (`nhead`, `num_encoder_layers`, `dim_feedforward`, etc.) **must match
-the checkpoint**. See `models/README.md` before touching them.
+the checkpoint**. They are per-version defaults (`MODEL_ARCHS`): selecting `"v2-large"`
+replaces every field still at its v1.1 default with v2's value, and rejects a conflicting
+explicit one. See `models/README.md` before touching them.
 
 ---
 
 ## Model architecture constraint
 
-`models/` is ported from `tessera_infer` and must stay in sync with the checkpoint. Do **not**
-change layer dimensions, activations, or the forward pass unless you are also retraining.
-`builder.py` strips FSDP state-dict prefixes on load — if the checkpoint format changes,
-that function needs updating.
+`models/` is ported from upstream Tessera and must stay in sync with the checkpoints. Do
+**not** change layer dimensions, activations, or the forward pass unless you are also
+retraining.
+
+`models/builder.py` dispatches on `model_version`. The two architectures side by side, their
+checkpoint loaders, and the porting rules are in [`models/README.md`](models/README.md); v2
+Large's throughput against v1.1 is §7 of
+[`inference-on-gpus.md`](../../../context_docs/inference/inference-on-gpus.md).
+
+**Staging the v2 checkpoint.** It is published on Hugging Face as `geotessera/TESSERA-V-2.0-2B-L`
+(`ckpt/student_large.pt`). The Prefect flow reads it as `v2_student_large.pt` from the model
+directory the v1.1 checkpoints use, `{inputs}/models/`, so it must be staged there under that
+name. The plain runner can instead take its URL as `checkpoint_url`, as the quickstart does for
+v1.1. A store records the checkpoint's file name as its model identity (`checkpoint_id`), so append
+to a store from the same source that built it: the staged copy and the Hugging Face file have
+different names, and the append check refuses the mix.
 
 ---
 
@@ -1045,9 +1108,9 @@ Several modules are ported from the original `tessera_infer` repository:
 
 | File | Ported from | Changes |
 |---|---|---|
-| `sampling.py` | `tessera_infer/src/multi_tile_infer.py` | v1.1 bucketed deterministic sampling (replaces random repeat-averaging). |
-| `inference.py` | `tessera_infer` process_tile logic | v1.1 bucket loop with prefetch thread; removes repeat/averaging path. |
-| `models/` | `tessera_infer/src/models/` | See `models/README.md`. MLP `dim_reducer`, encoder-only checkpoint loading. |
+| `sampling.py` | `tessera_infer/src/multi_tile_infer.py`; v2's `tessera_infer_v2/student/infer.py` | v1.1 bucketed deterministic sampling (replaces random repeat-averaging). `build_resample_indices_v2` ports v2's `_pad_pattern`. |
+| `inference.py` | `tessera_infer` process_tile logic | v1.1 bucket loop with prefetch thread; removes repeat/averaging path. Serves both encoders unchanged. |
+| `models/` | `tessera_infer/src/models/` (v1.1); `geotessera/TESSERA-V-2.0-2B-L` `model.py` (v2 Large) | See `models/README.md`. MLP `dim_reducer`, encoder-only checkpoint loading; `student_v2.py` holds the v2 student blocks. |
 
 New code (not ported):
 

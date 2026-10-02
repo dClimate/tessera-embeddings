@@ -221,7 +221,9 @@ roughly bbox-proportional), negligible on interior tiles (which skip it).
 Everything above rearranges *when* work happens. Four changes alter *what runs on the card*, and
 they are the reason the scheduling work had a fast forward pass to schedule around. All four are
 applied at build time in `models/builder.py` and `models/modules.py`, after the checkpoint loads
-and before the model is frozen.
+and before the model is frozen. They were made on v1.1. The v2 Large student shares the positional
+encoder, so the two changes to it apply there too; it has no recurrent layer and its checkpoint
+carries no training-only heads, so the other two do not.
 
 **The recurrent layer is replaced with a fused one.** The pooling head's `CustomGRU` is
 checkpoint-faithful but steps the sequence in Python, one kernel launch per timestep — about 480

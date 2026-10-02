@@ -41,13 +41,13 @@ def test_fresh_run_id_is_bare_uuid_by_default() -> None:
     """Flag off → the historical bare 12-hex run_id; the single-ROI staging
     layout is unchanged when allow_s2_only is False.
     """
-    run_id = _resolve_run_id(None, allow_s2_only=False, assembly_only=False)
+    run_id = _resolve_run_id(None, model_version="v1.1", allow_s2_only=False, assembly_only=False)
     assert not run_id.startswith(S2_ONLY_RUN_PREFIX)
     assert len(run_id) == 12
 
 
 def test_fresh_run_id_encodes_s2_only_mode() -> None:
-    run_id = _resolve_run_id(None, allow_s2_only=True, assembly_only=False)
+    run_id = _resolve_run_id(None, model_version="v1.1", allow_s2_only=True, assembly_only=False)
     assert run_id.startswith(S2_ONLY_RUN_PREFIX)
 
 
@@ -56,7 +56,7 @@ def test_fresh_run_id_encodes_s2_only_mode() -> None:
     [("abc123def456", False), (f"{S2_ONLY_RUN_PREFIX}abc123", True)],
 )
 def test_resume_with_matching_mode_returns_run_id(previous: str, flag: bool) -> None:
-    assert _resolve_run_id(previous, allow_s2_only=flag, assembly_only=False) == previous
+    assert _resolve_run_id(previous, model_version="v1.1", allow_s2_only=flag, assembly_only=False) == previous
 
 
 @pytest.mark.parametrize(
@@ -68,7 +68,7 @@ def test_resume_with_flipped_mode_is_refused(previous: str, flag: bool) -> None:
     publish a mix of S1-gated and S2-only tiles. Reject it loudly.
     """
     with pytest.raises(ValueError, match="mix of S1-gated and S2-only"):
-        _resolve_run_id(previous, allow_s2_only=flag, assembly_only=False)
+        _resolve_run_id(previous, model_version="v1.1", allow_s2_only=flag, assembly_only=False)
 
 
 @pytest.mark.parametrize("flag", [False, True])
@@ -77,7 +77,7 @@ def test_assembly_only_resume_is_exempt_from_the_guard(flag: bool) -> None:
     gate, so a mode mismatch can't change its output — the guard must not block it.
     """
     previous = f"{S2_ONLY_RUN_PREFIX}abc123"
-    assert _resolve_run_id(previous, allow_s2_only=flag, assembly_only=True) == previous
+    assert _resolve_run_id(previous, model_version="v1.1", allow_s2_only=flag, assembly_only=True) == previous
 
 
 def test_flow_refuses_resume_mode_flip_before_any_io(monkeypatch) -> None:
@@ -153,7 +153,7 @@ def test_the_run_id_is_minted_from_the_effective_mode_not_the_requested_one(monk
     # asserting how many times the helper was called pinned the old implementation.
     calls: list[bool] = []
 
-    def record(previous, *, allow_s2_only, assembly_only):
+    def record(previous, *, allow_s2_only, assembly_only, **_):
         calls.append(allow_s2_only)
         raise _StopError
 
@@ -182,7 +182,7 @@ def test_a_forced_s2_only_resume_is_not_refused_by_the_early_guard(monkeypatch) 
     monkeypatch.setattr(emb_mod, "resolve_s1_orbit", lambda *a, **k: S1_ORBIT_NONE)
     seen: list[bool] = []
 
-    def record(previous, *, allow_s2_only, assembly_only):
+    def record(previous, *, allow_s2_only, assembly_only, **_):
         seen.append(allow_s2_only)
         raise _StopError
 
@@ -211,3 +211,21 @@ def test_an_assembly_only_resume_publishes_under_the_staged_mode() -> None:
     assert staged_s2_only_mode(f"{S2_ONLY_RUN_PREFIX}abc123") is True
     assert staged_s2_only_mode("plain-run-000") is False
     assert staged_s2_only_mode(None) is False
+
+
+# ── the master pipeline can actually select the second model ──
+
+
+def test_full_pipeline_forwards_model_version(monkeypatch) -> None:
+    """The child flow HAS a default, so an unforwarded selector fails silently: the run
+    produces v1.1 embeddings while the operator believes they chose v2.
+    """
+    calls = _run_master_pipeline(monkeypatch, model_version="v2-large")
+    emb_params = calls[fp_mod.PipelineDeployments().tessera_embeddings]
+    assert emb_params["model_version"] == "v2-large"
+
+
+def test_full_pipeline_model_version_defaults_to_v11(monkeypatch) -> None:
+    calls = _run_master_pipeline(monkeypatch)
+    emb_params = calls[fp_mod.PipelineDeployments().tessera_embeddings]
+    assert emb_params["model_version"] == "v1.1"
