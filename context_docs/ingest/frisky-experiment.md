@@ -219,8 +219,10 @@ Three changes in our code (`bad60450`, not yet deployed) cut a 35N-shaped probe'
 with byte-identical stores: the merge fan-in set per spatial axis (dask spreads an integer `8`
 over three axes as 2 each, so merge partials fall from 616 to 66), the gate's validity mask as one
 block-wise `np.isin`, and the gate counting over each date's own windows rather than the run's.
-Locally the write fell from 33.0 s to 22.4 s on Dask and from 15.0 s to 13.2 s on Frisky. The
-aliases remain; removing them means graph surgery with dask internals.
+Locally the write fell from 33.0 s to 22.4 s on Dask and from 15.0 s to 13.2 s on Frisky. On dev
+(version E, six threads) they cut a 35N week's tasks by 27% and Frisky's hand-over by 16%, but no
+date got shorter on either engine: the workers' reads set Frisky's pace by then, and the scheduler
+still sets Dask's. The aliases remain; removing them means graph surgery with dask internals.
 
 **Tried and set aside: dask-array.** `mrocklin/dask-array` (0.7.1) builds Frisky-native task
 records instead of pickled Python tasks. Under its xarray `register()` our first icechunk write
@@ -250,19 +252,26 @@ Done locally (macOS, Python 3.13), and green again in CI on Linux (Python 3.12 a
 ## On the dev account
 
 The runs, their figures and how to rerun them are in
-[`frisky-dev-test-plan.md`](frisky-dev-test-plan.md). Up to zone scale at production width:
+[`frisky-dev-test-plan.md`](frisky-dev-test-plan.md). Up to zone scale at production width.
+**The bottom line: at zone scale Frisky at 2048, with every change here, is level with main's
+production configuration, Dask at 4096**: 130 s a date on 35N for a week against main's 134 s (130
+s with six threads), for the same cost. Frisky removes the scheduler cost the 2048 chunk adds to
+Dask, and no more, and its scheduler saturates about an hour into a run (below), which a zone-year
+outlasts.
+
 
 - **Stable and exact.** No worker died in any run, and Frisky's stores are bit-identical to Dask's
   at both chunk sizes. One Frisky scheduler died, at the end of a zone run, from its span buffers
   (below).
-- **Faster at zone scale, because Dask's scheduler saturates.** On 35N for a week Frisky took 193 s
-  a date against Dask's 275 s, and 152 s against 269 s with `pipeline_dates` and grouped writes
+- **Faster than Dask at the same 2048 chunk, because Dask's scheduler saturates.** On 35N for a
+  week Frisky took 193 s a date against Dask's 275 s, and 152 s against 269 s with `pipeline_dates` and grouped writes
   (above). Dask's scheduler sat at 95% to 101% of its core and ran the coverage gate with the
   fleet under a third busy; Frisky's kept the fleet 97% busy through every write.
 - **Six task threads per 4-vCPU worker are 15% faster a date on 35N**, and 14% cheaper: with
   four the workers used 73% of their CPU even with every thread busy, so the reads wait for part
-  of each task. One GDAL thread per read does not help. Measured on Frisky; the plan's B4 result
-  has the table.
+  of each task. One GDAL thread per read does not help. On main at 4096 six threads gain 3%: its
+  larger reads wait less, and its workers already run at 85% CPU with four. The plan's B4 result
+  has both.
 - **As fast as Dask at Iowa scale, once its graphs pickle cheaply.** Frisky's tasks are as fast or
   faster (store writes 0.97 of Dask's median, band reads 0.89), but it first took 25 to 40% longer
   per S2 date, idling while the driver pickled each graph (item 5 above). With the fix it matches
@@ -338,9 +347,8 @@ documentation: [`docs/frisky.md`](../../docs/frisky.md).
   the matching step of `_MatchDaskWorker` go.
 - Report the up-front graph pickling and the 4096 tail upstream, with these numbers, and ask
   icechunk to make `computing_meta` pickle by reference so `_picklable_merge_reduction` can go.
-- Deploy the task cuts (`bad60450`) and confirm them on 35N, on both engines.
-- Set the worker thread count: six per 4-vCPU worker measured 15% faster; the default belongs in
-  `FargateConfig` once Dask is measured too.
+- Decide the experiment's outcome: level with main at zone scale, and the hour-long saturation
+  unsolved upstream.
 - Report the heartbeat growth upstream, with the local reproduction.
 - Decide whether Frisky stays a core dependency when this reaches `main`, on the experiment's
   results and the constraints under Packaging above.

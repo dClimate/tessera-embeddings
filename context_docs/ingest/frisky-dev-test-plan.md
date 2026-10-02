@@ -21,6 +21,7 @@ is: [`frisky-experiment.md`](frisky-experiment.md). How to operate it:
   | B | `9d994f84` | 2048 | `ingcode-5f707a14bb6d5062` | `dev/frisky-2048` |
 | C | `cb2307d6` | 2048 | `ingcode-dfef8f7ea6482ad6` | `dev/frisky-2048c` |
 | D | `427abb7a` | 2048 | `ingcode-81529682d8f0ada2` | `dev/frisky-2048d` |
+| E | `1fa17d82` | 2048 | `ingcode-475495ea11e45b47` | `dev/frisky-2048e` |
 
   Version B also moves `inference_code_identity`, from `infcode-c9905e5aa8f93d3e` to
   `infcode-2613e97f0ad55679`, because `config/ingest.py` is inside the inference import closure.
@@ -37,9 +38,9 @@ is: [`frisky-experiment.md`](frisky-experiment.md). How to operate it:
   `inference_code_identity` to `infcode-678da02d8d87d6aa`.
 
   Version D groups writes on Frisky only, keeps every unfiltered span query off a drained run's
-  scheduler, and lets an S2 run set its workers' thread count (`worker_nthreads`). The task cuts
-  after it (`bad60450`: `ingcode-475495ea11e45b47`, `infcode-14f5b3af5cc1683b`) are not yet
-  deployed.
+  scheduler, and lets an S2 run set its workers' thread count (`worker_nthreads`). Version E adds
+  the task cuts (`bad60450`), which also move `inference_code_identity`, to
+  `infcode-14f5b3af5cc1683b`.
 
 - **Paired arms.** Every Frisky run has a Dask run from the same deployment with the same
   parameters; only `use_frisky` differs. Dask runs with `min_workers == max_workers`, so both arms
@@ -328,6 +329,29 @@ first:
 - Read with `temp/frisky-dev/thread_arms.py`: commit gaps from the stage-timing lines, read times
   and busy share from the drained spans, CPU from Container Insights.
 
+**On version E, the task cuts.** Four arms at once at six threads, E and D on each engine:
+
+| 35N, 1 to 7 January 2024, 6 threads | E, Frisky | D, Frisky | E, Dask | D, Dask |
+|---|---|---|---|---|
+| Wall between date commits, median (mean) | 130 s (129) | 134 s (128) | 192 s (189) | 193 s (191) |
+| Cost | $4.37 | $4.38 | $6.49 | $6.88 |
+| Tasks in the week (Frisky's spans) | 964,718 | 1,320,813 | | |
+
+- **The cuts reached the graphs and changed no pixel:** 27% fewer tasks on Frisky (the gate's and
+  masks' from 438,000 to 174,000, merge partials from 103,000 to 9,500), and a random 400 chunks of
+  every array identical between E and D.
+- **They did not shorten a date on either engine.** On Frisky they cut the driver's hand-over from
+  485 s to 406 s of the run and its pickling from 581 s to 493 s, but the fleet idled 17% of the
+  run against 19%: at six threads the workers' reads, at 86% CPU, set the pace, and pipelining
+  already hid the gate. On Dask the scheduler still sets it. Dask's performance report finished two
+  minutes sooner and peaked its scheduler at 5.3 GiB against 7.3, which is the cost difference.
+
+**Against main's production configuration.** Measured the same afternoon on main's code at 4096
+(Dask, the 4096 zone mask, pipelined, 60 workers; branch `perf/s2-worker-threads`, recorded in
+`campaign-ingest-measurements.md` §11.7 there): **134 s a date (mean 132) at 4 threads, 130 s
+(128) at 6**, for $4.45 and $4.34. Main's workers already run at 85% CPU with four threads, so six
+gain 3%. Frisky at 2048 with every change here, six threads included, is level with it.
+
 **B5: re-measure the provisional constants.** Version B's chunk-counted thresholds are the 4096
 measurements converted by area:
 
@@ -418,9 +442,11 @@ Ingest only, at about $0.27 a worker-hour:
 | C on version B | $24.27, measured, ingest only, cancelled |
 | B4 on version C | $14.44, measured |
 | Thread test on version D | $13.66, measured |
+| Task cuts on version E, with D controls | $22.12, measured |
+| Main at 4096, 4 and 6 threads | $8.79, measured |
 | C on version C | $19.58 of ingest and $47 to $62 of GPU time, measured |
 
-That is $87.46 for the ingest rungs, besides Phase C. The run log records each run's figures.
+That is $118.37 for the ingest rungs, besides Phase C. The run log records each run's figures.
 
 ## Run log
 
@@ -496,3 +522,9 @@ stages overlap, so those runs give the wall clock between one date's commit and 
 | 2026-10-02 | vd-35n-s2-t4 | D | Frisky | zone_35N (2048 mask), 2024-01-01..07, pipelined | S2 | 60 × 4 threads | `4e69c335` | 22m46s | 150 (wall, median) | 0 | pass: 7 dates, $4.93, drained |
 | 2026-10-02 | vd-35n-s2-t6 | D | Frisky | zone_35N (2048 mask), 2024-01-01..07, pipelined | S2 | 60 × 6 threads | `3e3a212d` | 18m50s | 127 (wall, median) | 0 | pass: 7 dates, $4.22, drained |
 | 2026-10-02 | vd-35n-s2-t6-gdal1 | D | Frisky | zone_35N (2048 mask), 2024-01-01..07, pipelined, `GDAL_NUM_THREADS=1` | S2 | 60 × 6 threads | `4443e65a` | 20m05s | 134 (wall, median) | 0 | pass: 7 dates, $4.51, drained |
+| 2026-10-02 | ve-35n-s2-frisky | E | Frisky | zone_35N (2048 mask), 2024-01-01..07, pipelined | S2 | 60 × 6 threads | `9cf3cc7c` | 19m50s | 130 (wall, median) | 0 | pass: 7 dates, $4.37, drained; stores = D's |
+| 2026-10-02 | vd2-35n-s2-frisky | D | Frisky | zone_35N (2048 mask), 2024-01-01..07, pipelined | S2 | 60 × 6 threads | `cca1c7bc` | 19m55s | 134 (wall, median) | 0 | pass: 7 dates, $4.38, drained |
+| 2026-10-02 | ve-35n-s2-dask | E | Dask | zone_35N (2048 mask), 2024-01-01..07, pipelined | S2 | 60 × 6 threads | `ba601c9e` | 29m25s | 192 (wall, median) | 0 | pass: 7 dates, $6.49 |
+| 2026-10-02 | vd2-35n-s2-dask | D | Dask | zone_35N (2048 mask), 2024-01-01..07, pipelined | S2 | 60 × 6 threads | `8b98cd00` | 31m27s | 193 (wall, median) | 0 | pass: 7 dates, $6.88 |
+| 2026-10-02 | vm-35n-s2-dask-t4 | main (`de57cba8`) | Dask | zone_35N (4096 mask), 2024-01-01..07, pipelined | S2 | 60 × 4 threads | `4700188c` | 20m32s | 134 (wall, median) | 0 | pass: 7 dates, $4.45 |
+| 2026-10-02 | vm-35n-s2-dask-t6 | main (`de57cba8`) | Dask | zone_35N (4096 mask), 2024-01-01..07, pipelined | S2 | 60 × 6 threads | `921dc645` | 19m53s | 130 (wall, median) | 0 | pass: 7 dates, $4.34 |
