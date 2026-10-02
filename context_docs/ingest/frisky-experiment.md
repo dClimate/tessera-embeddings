@@ -211,7 +211,7 @@ Done locally (macOS, Python 3.13), and green again in CI on Linux (Python 3.12 a
 
 | Suite | Covers | Result |
 |---|---|---|
-| `tests/integration/test_frisky.py` | Every compute path the ingest uses; Dask plugins and `run` reaching Frisky's processes; a driver running as a Dask task (the Prefect shape), including a second thread; overlapped icechunk writes identical to Dask's and committing nothing when a window fails, as one graph and submitted in groups; thread state and the CRS reproduction; work queued before any worker exists, run on workers that join after the hijack; spans readable by `frisky observe`; their merge functions pickling by reference; the span drain keeping every span exactly once; span capture never failing a run | 11 passed, about 11 s |
+| `tests/integration/test_frisky.py` | Every compute path the ingest uses; Dask plugins and `run` reaching Frisky's processes; a driver running as a Dask task (the Prefect shape), including a second thread; overlapped icechunk writes identical to Dask's and committing nothing when a window fails, as one graph and submitted in groups; thread state and the CRS reproduction; work queued before any worker exists, run on workers that join after the hijack; spans readable by `frisky observe`; their merge functions pickling by reference; the span drain keeping every span exactly once; span capture never failing a run; a drained run's live snapshot reading no spans | 12 passed, about 27 s |
 | `tests/integration/test_read_failure_cause_over_dask.py` | Frisky's before-and-after for the cause chain; the read-failure classification on both engines | 16 passed |
 | `tests/parity/test_ingest_s2_roi_frisky_parity.py` | The S2 domain ingest on Dask versus Frisky: offline synthetic dates byte for byte (with `pipeline_dates` and a mid-run gate failure), and Denver July 2024 real imagery within 1e-6 | 2 passed, about 2 min |
 
@@ -238,16 +238,22 @@ findings:
   1 ms would be another five times smaller but lose a quarter of the transfer time. On Iowa the
   drain kept every span Frisky did, and Frisky's tracing itself misses about one in 2,000.
 - **Frisky's default span buffer is too big for a long or zone-scale run.** Each process keeps
-  `FRISKY_TRACING_CAPACITY` spans, 1,000,000 by default, about 6 KB each in the scheduler. On the
+  `FRISKY_TRACING_CAPACITY` spans, 1,000,000 by default. On the
   pipelined 35N rerun the scheduler's memory doubled every two minutes to 5.7 GiB of its 8 GiB,
   held there once the buffer was full, reached 6.8 GiB under the end-of-run capture's three large
   span queries, and the process died without logging a close, after all seven dates had committed;
   `cluster.close()` then timed out on it and failed the flow. On the year-long Iowa run, whose
   buffers filled at about minute 63, dispatch latency rose from milliseconds to 11–61 s a task
   while workers sat at 2–3% CPU, and an overview query took 87 s. `ecs_cluster(frisky=True)` now
-  sets 200,000; a drained run's live snapshot analyses 50,000 spans and logs its own time, to
-  recalibrate against; and the end-of-run capture asks the scheduler for spans once, computing
-  both overviews from that file in the flow's process. Not yet confirmed on dev.
+  sets 200,000, and the end-of-run capture asks the scheduler for spans once, computing both
+  overviews from that file in the flow's process. At 200,000 on version C the scheduler still
+  stepped up at each live snapshot while the buffers filled, and only then: 0.6 to 2.7 GiB at the
+  first (5 minutes in), 3.5 GiB at the second, then flat, on 35N; 0.7 to 2.5 and 3.0 GiB on Iowa.
+  The drain's queries, every minute, moved it not at all. The difference is the filter: the
+  snapshot's overview asks for the latest 50,000 spans, which the scheduler finds by assembling
+  every process's buffer, while the drain asks for one span name over a 15-second slice. So a
+  drained run's live snapshot now reads `frisky observe cluster`, the counts alone, and the
+  drain's parts hold the spans.
 - **The end-of-run capture took 45 s with the drain on, against Dask's 7 s, while the whole fleet
   was billed.** The bundle's S3 timestamps on the `-fix` run split it: the final drain about 9 s,
   the 500,000-span `spans.json` 18 s before its 167 MB upload began (five pages from the
