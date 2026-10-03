@@ -67,8 +67,9 @@ class _ChunkPrologue:
 
     store_opener: StoreOpener
     mask_bundle: S2MaskBundle
-    # Northing strips the chunk is tiled into (read_plan._strip_plan).
+    # Northing strips in run order, densest first (read_plan._chunk_read_plan); the first live_strips hold pixels.
     strips: list[slice]
+    live_strips: int
     # Chunk-relative easting window of the S2 valid-pixel bounding box, or None for full width. Sparse/edge chunks
     # read (and infer) only these columns; outputs are placed at this offset in the whole-chunk buffers.
     x_sub: slice | None
@@ -500,7 +501,7 @@ class InferenceActor:
         """
         store_opener = make_store_opener(region=self._s3_region)
         mask_bundle = load_s2_mask_bundle(mosaic_base, chunk, time_window, store_opener=store_opener)
-        x_sub, strips = _chunk_read_plan(chunk, mask_bundle)
+        x_sub, strips, live_strips = _chunk_read_plan(chunk, mask_bundle)
         first_strip = self._load_strip_dataset(
             chunk,
             mosaic_base,
@@ -512,7 +513,7 @@ class InferenceActor:
             x_sub=x_sub,
             reserve_cpus=reserve_cpus,
         )
-        return _ChunkPrologue(store_opener, mask_bundle, strips, x_sub, first_strip, prefetched=prefetched)
+        return _ChunkPrologue(store_opener, mask_bundle, strips, live_strips, x_sub, first_strip, prefetched=prefetched)
 
     def _load_chunk_prologue(
         self, chunk: ChunkSpec, mosaic_base: str, time_window: TimeWindow, s1_orbit: S1Orbit
@@ -802,7 +803,8 @@ class InferenceActor:
             store_opener = prologue.store_opener
             mask_bundle = prologue.mask_bundle
             strips = prologue.strips
-            strip_h = strips[0].stop - strips[0].start
+            live_strips = prologue.live_strips
+            strip_h = max(s.stop - s.start for s in strips)
             x_sub = prologue.x_sub
             # Column window the cropped grids map to in the whole-chunk output buffers (full width when uncropped).
             cols = x_sub if x_sub is not None else slice(0, chunk.width)
@@ -935,13 +937,14 @@ class InferenceActor:
                             )
                             raise RuntimeError(msg) from exc
 
-                    # Kick off the next strip's BACKGROUND load (reserving prep cores) before inferring this one. On
-                    # the last strip the next strip is the NEXT chunk's first, loaded by the cross-chunk prefetch.
+                    # Kick off the next strip's BACKGROUND load (reserving prep cores) before inferring this one.
                     if i + 1 < len(strips):
                         next_future = pool.submit(
                             _load_strip, strips[i + 1], mask_bundle, _BACKGROUND_LOAD_RESERVED_CPUS
                         )
-                    elif prefetch_hint is not None:
+                    # The NEXT chunk's mask and first strip load from the last strip with pixels, so they hide behind
+                    # real inference: any strips after it are empty and load little more than their radar counts.
+                    if i + 1 == max(live_strips, 1) and prefetch_hint is not None:
                         self._start_chunk_prefetch(prefetch_hint, mosaic_base, window, orbit)
 
                     # The chunk's radar sequence lengths. Every strip sees the same ones — SAR is read full-width
@@ -1090,6 +1093,7 @@ class InferenceActor:
                         infer_s=0.0,
                         overhead_s=round(elapsed, 1),
                         strips=len(strips),
+                        live_strips=live_strips,
                         strip_h=strip_h,
                         t_kept=t_kept,
                         rung=rung,
@@ -1207,6 +1211,7 @@ class InferenceActor:
                     # everything that is not inference.
                     overhead_s=round(elapsed - infer_s, 1),
                     strips=len(strips),
+                    live_strips=live_strips,
                     strip_h=strip_h,
                     t_kept=t_kept,
                     # Optical depth alone does not say how much the forward pass did — see the capture site. Additive

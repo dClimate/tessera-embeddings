@@ -159,8 +159,10 @@ A tile arrives → load its SCL mask → count valid pixels, find their bbox
 │                 ● bounds peak host RAM
 │                 ◐ strip prefetch: strip i+1 loads while strip i
 │                   runs the GPU
+│                 ○ densest strip first, empty strips last, so no load
+│                   waits behind a strip with nothing to infer
 │
-├─ On the LAST strip, is a next tile reserved?
+├─ On the last strip WITH PIXELS, is a next tile reserved?
 │        ├─ yes → ● cross-chunk prefetch: the pipeline's next strip is  [§4.3]
 │        │        the next tile's first, loaded with its mask, so its
 │        │        GPU work starts without a serial prologue

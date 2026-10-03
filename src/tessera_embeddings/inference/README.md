@@ -347,6 +347,11 @@ tile that fits one budget is a single strip.
                                  in the background (floor: 256 rows)
 ```
 
+**Strips run densest first, empty strips last.** Each strip's load hides behind the previous
+strip's inference, so an empty or sparse strip early in the order — the top rows of a tile on a
+footprint's edge — would leave the next load exposed with the card idle. The order does not change
+which pixels share a sub-batch, so the outputs are the same in any order.
+
 **Peak host memory has one ceiling.** The load pipeline is one strip deep, so at most two
 band sets co-reside — the strip being inferred and the strip being read — and the pair is
 bounded at twice the budget. That holds peak memory near 42% of a 32 GB worker, well under
@@ -373,8 +378,9 @@ an expensive card does nothing.
 
 The fix is to run it during the *previous* tile's last strip. The scheduler reserves each
 actor's next tile one ahead (`ActorPool.reserved`, passed to the actor as `prefetch_hint`),
-and the strip pipeline simply runs across the tile boundary: on tile N's last strip, the
-"next strip" to load is tile N+1's first, together with its SCL mask.
+and the strip pipeline simply runs across the tile boundary: on tile N's last strip with
+pixels, the "next strip" to load is tile N+1's first, together with its SCL mask. Any empty
+strips after it load alongside, for their observation counts.
 
 ```text
  actor timeline, tile N → N+1 (prefetch hit)

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import threading
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -123,6 +124,17 @@ class TestStripPlan:
         assert strips[-1].stop == 2000
         tallest = max(s.stop - s.start for s in strips)
         assert 120 * tallest * 2000 * len(S2_BAND_ORDER) * 2 + 120 * 2000 * 2000 <= _S2_STRIP_BYTE_BUDGET
+
+    def test_strips_run_densest_first_with_empty_strips_last(self):
+        # Rows 0-3 have no valid pixel, rows 4-7 half the columns, rows 8-11 all of them.
+        obs = np.zeros((12, 10), dtype=np.uint16)
+        obs[4:8, :5] = 1
+        obs[8:12, :] = 1
+        bundle = SimpleNamespace(mask=np.zeros((3, 12, 10), dtype=bool), obs_count=obs)
+        with patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(4)):
+            _x_sub, strips, live = _read_plan_mod._chunk_read_plan(_CHUNK, bundle)
+        assert strips == [slice(8, 12), slice(4, 8), slice(0, 4)]
+        assert live == 2
 
     def test_a_cropped_read_still_charges_the_full_width_mask(self):
         # Bands are read at the cropped width, but the SCL mask stays full chunk width.
@@ -734,6 +746,24 @@ class TestXChunkPrefetch:
         _assert_writes_identical(chained[1], serial[0])
         assert actor._xchunk_prefetched == {}  # stash consumed
 
+    def test_prefetch_starts_on_the_last_strip_with_pixels(self, inference_config, test_model, caplog):
+        # The half-empty tile runs its valid strip first and its empty strip last, so the next
+        # tile's prefetch must start before the valid strip's inference, not on the empty strip
+        # that has no inference to hide it behind.
+        patches = (
+            patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(6)),
+            patch.object(
+                _dl_mod,
+                "open_store_as_zarr_group",
+                side_effect=TestEmptyStripBandReadSkip()._make_half_empty_stores(),
+            ),
+        )
+        with caplog.at_level("INFO"):
+            _run_chunk_chain(inference_config, test_model, [(_CHUNK, _CHUNK_B), (_CHUNK_B, None)], patches)
+        text = caplog.text
+        assert text.index(f"xchunk prefetch: starting for {_CHUNK_B.label}") < text.index("Starting v1.1 inference")
+        assert f"xchunk prefetch: hit for {_CHUNK_B.label}" in text
+
     def test_stale_stash_evicted_on_reassignment(self, inference_config, test_model):
         # Prefetched B but got C (steal/requeue): C runs serially and the
         # stale B stash is discarded — never consumed for the wrong chunk.
@@ -963,8 +993,8 @@ class TestTheRecordTheConsumerWillRead:
             real_plan = _actors_mod._chunk_read_plan
 
             def _cropped(chunk, mask_bundle):
-                _x_sub, strips = real_plan(chunk, mask_bundle)
-                return crop, strips
+                _x_sub, strips, live = real_plan(chunk, mask_bundle)
+                return crop, strips, live
 
             monkeypatch.setattr(_actors_mod, "_chunk_read_plan", _cropped)
 

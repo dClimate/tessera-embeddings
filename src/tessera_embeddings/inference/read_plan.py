@@ -121,11 +121,18 @@ def _strip_plan(t_kept: int, height: int, width: int, mask_width: int | None = N
     return _strip_slices(height, _strip_height_for_density(t_kept, width, height, mask_width=mask_width))
 
 
-def _chunk_read_plan(chunk: ChunkSpec, mask_bundle: S2MaskBundle) -> tuple[slice | None, list[slice]]:
-    """Easting crop and northing strips derived from the SCL mask.
+def _chunk_read_plan(chunk: ChunkSpec, mask_bundle: S2MaskBundle) -> tuple[slice | None, list[slice], int]:
+    """Easting crop, northing strips in run order, and how many of them hold valid pixels.
 
     Shared by the serial prologue and the cross-chunk prefetch so both make identical decisions
     from the same inputs — a prefetched chunk must tile and crop exactly as it would have serially.
+
+    Strips run densest first. Each strip's load hides behind the previous strip's inference, so an
+    empty or sparse strip early in the order leaves the next load exposed with the GPU idle —
+    the case on tiles at the edge of a footprint. Order does not change which pixels share a
+    sub-batch, so the outputs are bit-identical. Empty strips, which still record their
+    observation counts, run last; the returned count of live strips tells the actor where they
+    begin.
     """
     t_kept = int(mask_bundle.mask.shape[0])
     # (H, W): pixels with >=1 valid S2 observation. Equivalent to mask.any(axis=0) — obs_count sums the pre-prune mask
@@ -155,4 +162,8 @@ def _chunk_read_plan(chunk: ChunkSpec, mask_bundle: S2MaskBundle) -> tuple[slice
     effective_width = chunk.width if x_sub is None else (x_sub.stop - x_sub.start)
     # Bands read at effective_width (possibly cropped); the SCL mask stays full chunk width, so charge it at
     # chunk.width in the budget.
-    return x_sub, _strip_plan(t_kept, chunk.height, effective_width, mask_width=chunk.width)
+    strips = _strip_plan(t_kept, chunk.height, effective_width, mask_width=chunk.width)
+    valid_rows = valid_any[:, x_sub].sum(axis=1) if x_sub is not None else valid_any.sum(axis=1)
+    counts = [int(valid_rows[s].sum()) for s in strips]
+    order = sorted(range(len(strips)), key=lambda k: -counts[k])  # stable: equal strips keep their order
+    return x_sub, [strips[k] for k in order], sum(c > 0 for c in counts)
