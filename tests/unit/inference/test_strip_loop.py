@@ -136,32 +136,6 @@ class TestStripPlan:
         assert strips == [slice(8, 12), slice(4, 8), slice(0, 4)]
         assert live == 2
 
-    def _plan_with_starter(self, obs, strip_h=6, starter_rows=2, min_px=4):
-        bundle = SimpleNamespace(mask=np.zeros((3, *obs.shape), dtype=bool), obs_count=obs)
-        with (
-            patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(strip_h)),
-            patch.object(_read_plan_mod, "_STARTER_ROWS", starter_rows),
-            patch.object(_read_plan_mod, "_STARTER_MIN_PX", min_px),
-        ):
-            return _read_plan_mod._chunk_read_plan(_CHUNK, bundle)
-
-    def test_the_densest_strips_denser_end_runs_first_as_a_starter(self):
-        # Rows 6-11 are the densest strip, and its bottom end (rows 10-11) is fuller than its top.
-        obs = np.zeros((12, 10), dtype=np.uint16)
-        obs[0:6, :3] = 1
-        obs[6:10, :6] = 1
-        obs[10:12, :] = 1
-        _x_sub, strips, live = self._plan_with_starter(obs)
-        assert strips == [slice(10, 12), slice(6, 10), slice(0, 6)]
-        assert live == 3
-
-    def test_no_starter_when_its_rows_hold_too_few_pixels(self):
-        obs = np.zeros((12, 10), dtype=np.uint16)
-        obs[6:12, :1] = 1
-        _x_sub, strips, live = self._plan_with_starter(obs, min_px=3)
-        assert strips == [slice(6, 12), slice(0, 6)]
-        assert live == 1
-
     def test_a_cropped_read_still_charges_the_full_width_mask(self):
         # Bands are read at the cropped width, but the SCL mask stays full chunk width.
         assert _strip_plan(120, 2000, 1000, mask_width=2000)[0].stop < _strip_plan(120, 2000, 1000)[0].stop

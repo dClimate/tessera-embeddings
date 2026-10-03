@@ -63,15 +63,6 @@ _X_CROP_MIN_SAVING = 0.10
 _MIN_STRIP_H = 256
 
 
-# A tile's first strip is what the cross-chunk prefetch loads behind the previous tile's last strip, and that load is
-# exposed, with the GPU idle, whenever that strip finishes first. Part of a load grows with its rows — the dataset
-# build, the radar read and some of the band decode; on the Iowa mosaics, 256 rows took ~9 s against ~15 s for 1,024 —
-# so the densest strip lends its denser end as a small starter that runs first. Only when the starter holds enough
-# pixels for its own inference (~20 s) to hide the load of the rest of that strip; otherwise the plan is unchanged.
-_STARTER_ROWS = 256
-_STARTER_MIN_PX = 400_000
-
-
 def _strip_height_for_density(
     t_kept: int,
     width: int,
@@ -130,15 +121,6 @@ def _strip_plan(t_kept: int, height: int, width: int, mask_width: int | None = N
     return _strip_slices(height, _strip_height_for_density(t_kept, width, height, mask_width=mask_width))
 
 
-def _starter(strip: slice, valid_rows: np.ndarray) -> slice | None:
-    """The denser ``_STARTER_ROWS`` end of *strip*, if it holds at least ``_STARTER_MIN_PX`` pixels."""
-    if strip.stop - strip.start <= 2 * _STARTER_ROWS:
-        return None
-    ends = (slice(strip.start, strip.start + _STARTER_ROWS), slice(strip.stop - _STARTER_ROWS, strip.stop))
-    best = max(ends, key=lambda s: int(valid_rows[s].sum()))
-    return best if int(valid_rows[best].sum()) >= _STARTER_MIN_PX else None
-
-
 def _chunk_read_plan(chunk: ChunkSpec, mask_bundle: S2MaskBundle) -> tuple[slice | None, list[slice], int]:
     """Easting crop, northing strips in run order, and how many of them hold valid pixels.
 
@@ -150,8 +132,7 @@ def _chunk_read_plan(chunk: ChunkSpec, mask_bundle: S2MaskBundle) -> tuple[slice
     the case on tiles at the edge of a footprint. Order does not change which pixels share a
     sub-batch, so the outputs are bit-identical. Empty strips, which still record their
     observation counts, run last; the returned count of live strips tells the actor where they
-    begin. When the densest strip has a dense enough end, that end runs first as a starter (see
-    ``_STARTER_ROWS``).
+    begin.
     """
     t_kept = int(mask_bundle.mask.shape[0])
     # (H, W): pixels with >=1 valid S2 observation. Equivalent to mask.any(axis=0) — obs_count sums the pre-prune mask
@@ -181,15 +162,8 @@ def _chunk_read_plan(chunk: ChunkSpec, mask_bundle: S2MaskBundle) -> tuple[slice
     effective_width = chunk.width if x_sub is None else (x_sub.stop - x_sub.start)
     # Bands read at effective_width (possibly cropped); the SCL mask stays full chunk width, so charge it at
     # chunk.width in the budget.
+    strips = _strip_plan(t_kept, chunk.height, effective_width, mask_width=chunk.width)
     valid_rows = valid_any[:, x_sub].sum(axis=1) if x_sub is not None else valid_any.sum(axis=1)
-
-    def densest_first(strips: list[slice]) -> list[slice]:
-        return sorted(strips, key=lambda s: -int(valid_rows[s].sum()))  # stable: equal strips keep their order
-
-    strips = densest_first(_strip_plan(t_kept, chunk.height, effective_width, mask_width=chunk.width))
-    starter = _starter(strips[0], valid_rows) if strips else None
-    if starter is not None:
-        first = strips[0]
-        rest = slice(starter.stop, first.stop) if starter.start == first.start else slice(first.start, starter.start)
-        strips = [starter, *densest_first([rest, *strips[1:]])]
-    return x_sub, strips, sum(int(valid_rows[s].sum()) > 0 for s in strips)
+    counts = [int(valid_rows[s].sum()) for s in strips]
+    order = sorted(range(len(strips)), key=lambda k: -counts[k])  # stable: equal strips keep their order
+    return x_sub, [strips[k] for k in order], sum(c > 0 for c in counts)
