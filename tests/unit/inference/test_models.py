@@ -253,8 +253,15 @@ class TestLoadCheckpoint:
         torch.testing.assert_close(cleaned["layer.weight"], weight)
 
 
+#: One FP32 unit in the last place for values in [-1, 1]. Multi-threaded CPU sin/cos rounds a few elements
+#: (~0.005%) one ulp differently depending on how the tensor is split across threads, so the per-pixel
+#: reference and the 367-row table can differ by this much on CPU. Single-threaded, after the cast to
+#: BF16, and on the GPU (elementwise, no split) they are identical.
+_ONE_FP32_ULP = 2.0**-24
+
+
 class TestPositionalEncoderBitIdentity:
-    """empty + strided sin/cos fill is bit-identical to the historical zeros fill."""
+    """The day-of-year table reproduces the textbook per-pixel FP32 encoding."""
 
     @staticmethod
     def _reference_forward(d_model: int, doy: torch.Tensor, out_dtype: torch.dtype | None = None) -> torch.Tensor:
@@ -266,10 +273,10 @@ class TestPositionalEncoderBitIdentity:
         pe[:, :, 1::2] = torch.cos(position * div_term)
         return pe.to(out_dtype or doy.dtype)
 
-    def test_bit_identical_float32(self):
+    def test_float32_matches_within_one_ulp(self):
         enc = TemporalPositionalEncoder(d_model=32)
         doy = torch.randint(1, 366, (4, 20)).float()
-        torch.testing.assert_close(enc(doy), self._reference_forward(32, doy), atol=0.0, rtol=0.0)
+        torch.testing.assert_close(enc(doy), self._reference_forward(32, doy), atol=_ONE_FP32_ULP, rtol=0.0)
 
     def test_bf16_module_still_computes_the_fp32_encoding(self):
         """``.bfloat16()`` must not reach the frequencies or the DOY arithmetic.
@@ -286,6 +293,14 @@ class TestPositionalEncoderBitIdentity:
         actual = enc(doy, out_dtype=torch.bfloat16)
         assert actual.dtype == torch.bfloat16
         torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
+
+    @pytest.mark.parametrize(("out_dtype", "atol"), [(torch.bfloat16, 0.0), (torch.float32, _ONE_FP32_ULP)])
+    def test_every_day_of_year_matches_the_per_pixel_encoding(self, out_dtype, atol):
+        """Every day the pipeline can produce, 0 through 366: exact in BF16, the production dtype."""
+        enc = TemporalPositionalEncoder(d_model=768)
+        doy = torch.arange(367, dtype=torch.float32).flip(0).repeat(3, 1)
+        expected = self._reference_forward(768, doy, out_dtype=out_dtype)
+        torch.testing.assert_close(enc(doy, out_dtype=out_dtype), expected, atol=atol, rtol=0.0)
 
     def test_doy_above_256_keeps_one_day_resolution(self):
         """DOY 257 and 258 must not collapse onto the same encoding.
