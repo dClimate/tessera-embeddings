@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import datetime
 import logging
-import os
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -43,24 +42,11 @@ logger = logging.getLogger(__name__)
 # and only to cores — hence the cap at the allocated CPU count, never above the band count.
 # ``sched_getaffinity`` where available (Linux actors) so a cgroup-pinned worker sees its real
 # allocation, not the host's.
-def _band_read_workers(reserve_cpus: int = 0) -> int:
-    """Decompression pool size for the concurrent S2 band read.
-
-    ``reserve_cpus`` leaves that many cores free for concurrent CPU work. Callers loading in
-    the background while the GPU runs (the intra-chunk strip prefetch) reserve cores for the
-    batch-prep workers that feed it — on the 4-vCPU g6e.xlarge, four decompression threads
-    competing with batch prep produced ~500 ms get_batch spikes that starved the GPU.
-    Foreground loads (the serial chunk prologue, GPU idle) reserve nothing.
-    """
-    try:
-        allocated = len(os.sched_getaffinity(0))  # type: ignore[attr-defined]
-    except AttributeError:  # macOS/Windows: no affinity API
-        allocated = os.cpu_count() or 4
-    # Reserve cores from the ALLOCATION first, then cap at the band count, so a
-    # host with more CPUs than bands still runs the full reader set (reserving
-    # after the cap would needlessly drop readers, e.g. 12 CPUs, 2 reserved ->
-    # min(10,12)-2=8 instead of min(10,10)=10). On the 4-vCPU worker both give 2.
-    return max(1, min(len(S2_BAND_ORDER), allocated - reserve_cpus))
+# How many of the ten bands are read at once. zarr decompresses chunks on its own thread pool, across every core,
+# whatever this is (measured on a 4-vCPU worker: two band readers already keep ~3.5 cores busy), so this sets memory,
+# not CPU: each reader holds one band's (T, rows, W) array while it is copied into the stack, so two readers add a
+# fifth of a strip's band bytes.
+_BAND_READERS = 2
 
 
 # Maps a store path to an open zarr group. Default ``open_store_as_zarr_group`` (a fresh repo open
@@ -210,7 +196,6 @@ def _load_s2_bands(
     time_indices: np.ndarray,
     y_slice: slice,
     x_slice: slice,
-    reserve_cpus: int = 0,
 ) -> np.ndarray:
     """Stack S2 bands in canonical order, reading directly from zarr.
 
@@ -226,13 +211,13 @@ def _load_s2_bands(
     # The 10 bands are independent zarr arrays and each thread writes a distinct
     # ``result[..., i]`` column, so the reads share no mutable state. Fanning them out collapses
     # 10 serial decompression waves into one bounded by the allocated cores
-    # (``_band_read_workers``). Concurrent reads on one readonly icechunk session store (an
+    # (``_BAND_READERS``). Concurrent reads on one readonly icechunk session store (an
     # immutable snapshot view) are safe — only concurrent *commits* are not; verified on a real
     # store.
     def _read_band(i: int, band: str) -> None:
         result[:, :, :, i] = root[band].oindex[time_indices, y_slice, x_slice]
 
-    with ThreadPoolExecutor(max_workers=_band_read_workers(reserve_cpus)) as pool:
+    with ThreadPoolExecutor(max_workers=_BAND_READERS) as pool:
         # Drain the map so any read exception propagates instead of being
         # swallowed with a partially-filled ``result``.
         list(pool.map(lambda ib: _read_band(*ib), enumerate(S2_BAND_ORDER)))
@@ -680,7 +665,6 @@ def _load_s2(
     y_sub: slice | None = None,
     store_opener: StoreOpener | None = None,
     mask_bundle: S2MaskBundle | None = None,
-    reserve_cpus: int = 0,
     x_sub: slice | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Load all S2 timesteps in the window that have any valid pixel in the (sub-)chunk.
@@ -735,9 +719,7 @@ def _load_s2(
             empty = np.empty((0, h, w, len(S2_BAND_ORDER)), dtype=root[S2_BAND_ORDER[0]].dtype)
             return empty, s2_masks[:0], s2_doys[:0], s2_obs_count
 
-        s2_bands = _load_s2_bands(
-            root, time_indices=abs_kept, y_slice=y_slice, x_slice=x_slice, reserve_cpus=reserve_cpus
-        )
+        s2_bands = _load_s2_bands(root, time_indices=abs_kept, y_slice=y_slice, x_slice=x_slice)
         logger.info("Loaded S2 bands shape %s (sliced shared mask)", s2_bands.shape)
         return s2_bands, s2_masks, s2_doys, s2_obs_count
 
@@ -766,7 +748,7 @@ def _load_s2(
 
     s2_doys = s2_doys_full[kept]
 
-    s2_bands = _load_s2_bands(root, time_indices=abs_kept, y_slice=y_slice, x_slice=x_slice, reserve_cpus=reserve_cpus)
+    s2_bands = _load_s2_bands(root, time_indices=abs_kept, y_slice=y_slice, x_slice=x_slice)
     logger.info("Loaded S2 bands shape %s", s2_bands.shape)
 
     # Mask stays bool (1 byte/elem) rather than widening to int32: it is resident in ChunkData for
@@ -853,7 +835,6 @@ def load_chunk(
     y_sub: slice | None = None,
     store_opener: StoreOpener | None = None,
     mask_bundle: S2MaskBundle | None = None,
-    reserve_cpus: int = 0,
     x_sub: slice | None = None,
 ) -> ChunkData:
     """Load all data for one spatial chunk (or a northing strip of it) for v1.1 inference.
@@ -877,9 +858,6 @@ def load_chunk(
             :func:`load_s2_mask_bundle`). When supplied, S2 SCL is sliced from it per strip
             instead of re-read and timestep pruning uses the bundle's chunk-level decision.
             ``None`` loads SCL inline.
-        reserve_cpus: Cores to leave free during the S2 band decompression — background loads
-            running alongside GPU inference reserve cores for the batch-prep workers (see
-            :func:`_band_read_workers`); foreground loads use the default 0.
         x_sub: Optional chunk-relative EASTING window (the S2 valid-pixel bounding box on
             sparse/edge chunks). S2 bands — the 20 B/px cost — are read only for these columns
             and the returned grid is cropped to them, mirroring how ``y_sub`` crops rows. SAR
@@ -912,7 +890,6 @@ def load_chunk(
         y_sub=y_sub,
         store_opener=store_opener,
         mask_bundle=mask_bundle,
-        reserve_cpus=reserve_cpus,
         x_sub=x_sub,
     )
 

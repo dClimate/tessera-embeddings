@@ -401,9 +401,10 @@ mean the next tile loads the way it would have anyway.
 **Two smaller overlaps ride on the same idea.** Bucketing rides the strip-prefetch thread:
 `_load_strip` returns the built dataset alongside the data, so choosing pixels and grouping
 them (about ten seconds) happens during the previous strip's GPU work rather than between
-load and inference. And background strip loads **reserve two cores** for the batch-prep
-workers feeding the GPU (`reserve_cpus`), so decompressing bands cannot starve inference on
-a four-vCPU machine.
+load and inference. Background loads do compete with the batch-prep workers for the four
+cores — zarr decompresses on its own pool across all of them — but preparing a batch takes
+about a quarter of the GPU's time per batch and the loop prepares two ahead, so the GPU still
+runs at its standalone rate.
 
 **The staging write is deferred too.** It goes to a single-slot writer thread and overlaps
 the next tile's prologue — both are I/O, and the GPU is idle for either. The tile's result

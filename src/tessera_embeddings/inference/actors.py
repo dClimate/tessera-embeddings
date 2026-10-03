@@ -26,7 +26,6 @@ import requests
 from tessera_embeddings.config.inference import (
     EMBEDDING_DIM,
     OPTICAL_MIN_OBS,
-    PREFETCH_DEPTH,
     RADAR_THIN_MAX_OBS,
     S1_ORBIT_NONE,
     TUNED_GPU_GIB,
@@ -90,12 +89,6 @@ def _chunk_summary_line(**fields: Any) -> str:  # noqa: ANN401 — heterogeneous
     """
     return "CHUNK_SUMMARY: " + json.dumps(fields, sort_keys=True)
 
-
-# Cores left free for the inference loop's batch-prep workers while a BACKGROUND strip load decompresses bands: one
-# per prep worker, tied BY DEFINITION to the prep pool size so a PREFETCH_DEPTH change cannot silently re-introduce
-# the ~500 ms get_batch starvation this prevents on the 4-vCPU g6e.xlarge. Foreground (prologue) loads reserve nothing
-# — the GPU is idle and wants the fastest load.
-_BACKGROUND_LOAD_RESERVED_CPUS = PREFETCH_DEPTH
 
 # Hard ceiling on any in-actor wait for a background I/O future — a strip or cross-chunk prefetch load, or the prior
 # chunk's deferred staging write. Normal case is seconds of S3/zarr I/O (a full strip is ~6.5 s at measured BW), so a
@@ -448,7 +441,6 @@ class InferenceActor:
         store_opener: StoreOpener,
         mask_bundle: S2MaskBundle,
         x_sub: slice | None,
-        reserve_cpus: int = 0,
     ) -> tuple[ChunkData, MosaicChunkInferenceDataset]:
         """Load one strip's bands and build its bucketed dataset.
 
@@ -472,7 +464,6 @@ class InferenceActor:
             y_sub=y_sub,
             store_opener=store_opener,
             mask_bundle=mask_bundle,
-            reserve_cpus=reserve_cpus,
             x_sub=x_sub,
         )
         dataset = MosaicChunkInferenceDataset(
@@ -491,7 +482,6 @@ class InferenceActor:
         time_window: TimeWindow,
         s1_orbit: S1Orbit,
         *,
-        reserve_cpus: int = 0,
         prefetched: bool = False,
     ) -> _ChunkPrologue:
         """Open stores, load the SCL bundle, plan the strips and load the first one.
@@ -511,7 +501,6 @@ class InferenceActor:
             store_opener=store_opener,
             mask_bundle=mask_bundle,
             x_sub=x_sub,
-            reserve_cpus=reserve_cpus,
         )
         return _ChunkPrologue(store_opener, mask_bundle, strips, live_strips, x_sub, first_strip, prefetched=prefetched)
 
@@ -572,7 +561,6 @@ class InferenceActor:
             mosaic_base,
             time_window,
             s1_orbit,
-            reserve_cpus=_BACKGROUND_LOAD_RESERVED_CPUS,
             prefetched=True,
         )
 
@@ -839,12 +827,8 @@ class InferenceActor:
             writer = ZarrWriter(staging_base, embedding_dim=save_dim)
 
             # mask_bundle is an explicit submit() arg rather than a capture, so the loop can `del` the only strong
-            # reference once the last strip has loaded (a closure capture cannot be deleted). BACKGROUND loads
-            # (prefetch on) reserve cores for the batch-prep workers feeding the GPU; SERIAL loads reserve nothing —
-            # the GPU is idle.
-            def _load_strip(
-                y_sub: slice, bundle: S2MaskBundle, reserve_cpus: int
-            ) -> tuple[ChunkData, MosaicChunkInferenceDataset]:
+            # reference once the last strip has loaded (a closure capture cannot be deleted).
+            def _load_strip(y_sub: slice, bundle: S2MaskBundle) -> tuple[ChunkData, MosaicChunkInferenceDataset]:
                 return self._load_strip_dataset(
                     chunk,
                     mosaic_base,
@@ -854,7 +838,6 @@ class InferenceActor:
                     store_opener=store_opener,
                     mask_bundle=bundle,
                     x_sub=x_sub,
-                    reserve_cpus=reserve_cpus,
                 )
 
             on_batch = (
@@ -939,9 +922,7 @@ class InferenceActor:
 
                     # Kick off the next strip's BACKGROUND load (reserving prep cores) before inferring this one.
                     if i + 1 < len(strips):
-                        next_future = pool.submit(
-                            _load_strip, strips[i + 1], mask_bundle, _BACKGROUND_LOAD_RESERVED_CPUS
-                        )
+                        next_future = pool.submit(_load_strip, strips[i + 1], mask_bundle)
                     # The NEXT chunk's mask and first strip load from the last strip with pixels, so they hide behind
                     # real inference: any strips after it are empty and load little more than their radar counts.
                     if i + 1 == max(live_strips, 1) and prefetch_hint is not None:
