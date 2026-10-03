@@ -146,11 +146,12 @@ Iowa year — 394 tiles each — on up to 8 workers each, every tile paired acro
 | edge | 89 | 13% | −2.7% | 6.2 → 0.3 s |
 | all | 394 | | −1.0% | |
 
-Interior tiles run the identical code path, so their −0.7% is run-to-run noise, and the edge
-figure has to be read against it. The effect that is attributable to the change is idle time:
-on the 24 edge tiles that had an empty strip, it fell 43% (284 → 162 s). Across all of Iowa that
-is about 0.1% of card time. Outputs are **bit-identical**: 229 of the 394 tiles were compared, every one exactly equal, including all 24 whose strip order changed. **Kept**: it is bit-identical, small,
-and removes the worst stall on footprint edges; its gain is small because that stall is rare.
+Interior tiles run the identical code path, so their −0.7% is run-to-run noise, and the edge figure
+has to be read against it. The effect that is attributable to the change is idle time: on the 24
+edge tiles that had an empty strip, it fell 43% (284 → 162 s). Across all of Iowa that is about 0.1%
+of card time. Outputs are **bit-identical**: 229 of the 394 tiles were compared, every one exactly
+equal, including all 24 whose strip order changed. **Kept**: it is bit-identical, small, and removes
+the worst stall on footprint edges; its gain is small because that stall is rare.
 
 **What the remaining idle time is.** About 2.3% of card time, over roughly a third of the tiles,
 is a tile starting before its first strip has finished loading: the previous tile's last stretch
