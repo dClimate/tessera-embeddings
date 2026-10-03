@@ -586,6 +586,30 @@ noted again in §4.9's open items for S1.
 was adopted globally on one favourable point and had to be withdrawn when four more regions were
 tried. Sweep before generalising, or scope the setting to where it was measured.
 
+### 3.18 Blosc-LZ4 for the mosaics — read for inference, not for ingest (October 2026)
+
+The mosaics are written once by ingest and read many times by inference: every strip of a tile
+decompresses the whole storage chunk of every band and date it touches, so a tile split into three
+strips decodes its data three times. That decode is CPU-bound and already uses every core of a
+4-vCPU GPU worker, and it is what a tile's first, exposed load mostly waits on. So the codec was
+chosen for decompression speed, measured on 60 real Iowa uint16 chunks (one band, one date, 2048²)
+on an `m6a` core, and end to end through icechunk on S3:
+
+| codec | size vs zstd | compress | decompress | strip read, 256 / 1,024 rows × 40 dates |
+|---|---|---|---|---|
+| zstd, zarr's default (before) | — | 30.6 ms | 9.5 ms | 2.4 / 3.2 s |
+| plain LZ4 | +25% | 5.0 ms | 4.2 ms | — |
+| **Blosc-LZ4, byte shuffle (now)** | **−6%** | **6.4 ms** | **3.7 ms** | **1.7 / 2.5 s** |
+| Blosc-zstd level 1, byte shuffle | −15% | 17.8 ms | 6.0 ms | — |
+
+A strip read is 20–30% faster rather than 2.6×, because the rest of it is fetching, TLS and zarr's
+own overhead. For inference that shortens the exposed first load by about 4–5 s of ~25 s, worth
+about 0.7% of card time on the edge-heavy Iowa year (the inference experiments in PR #207). For ingest, compressing a
+chunk is 4.8× cheaper, but compression was only about 1.5% of a date's worker CPU, so ingest gains
+about 1%. The values read back are identical: the codec is lossless. It is set in one place,
+`config.ingest.INGEST_COMPRESSORS`, used by both store-creation paths, and a store keeps the codec
+it was created with.
+
 ## 4. What did not work, and why
 
 ### 4.1-4.8 What was tried and rejected — the table, so none of it is retried

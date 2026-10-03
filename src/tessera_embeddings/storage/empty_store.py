@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import zarr
 
-from tessera_embeddings.config.ingest import INGEST_CHUNKS
+from tessera_embeddings.config.ingest import INGEST_CHUNKS, INGEST_COMPRESSORS
 from tessera_embeddings.config.store_layout import clamp_chunks_and_shards
 from tessera_embeddings.storage.time_axis import TIME_ENCODING, compute_doy
 from tessera_embeddings.storage.zarr_store import _create_repo, _delete_store
@@ -304,6 +304,7 @@ def create_empty_store(
                 dims=("time", "northing", "easting"),
                 dtype=dtype,
                 chunks=(chunk_t, chunk_y, chunk_x),
+                compressors=INGEST_COMPRESSORS,
             )
             for name, dtype in var_dtypes.items()
         },
