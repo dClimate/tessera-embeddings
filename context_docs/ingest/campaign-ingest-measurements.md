@@ -8,7 +8,7 @@ Four measurement campaigns are folded together here. The July 2026 optimization 
 (§1–§10); the fleet-scale throughput investigation that corrected its duration basis is §11; the
 graph and catalogue budgets that limit it now are §12; the live-tile cropping derivation that §3.1
 and §3.2 summarise is §13; and the region-write primitive the whole windowed design rests on is §14.
-§15 measures Dask workers on Graviton (ARM64) against x86, which is where they now run.
+§15 measures Dask workers on Graviton (ARM64) against x86, the result that moves them to ARM.
 
 > **The duration basis was re-measured, and the correction matters more than it looks.** A 2026-08
 > reading found every zone running 1.8–2.1× slower than the figures here. **That claim is
