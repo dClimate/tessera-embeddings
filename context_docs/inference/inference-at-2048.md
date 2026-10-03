@@ -1,166 +1,226 @@
-# Inference on 2048-px mosaics: what changed, what was measured, what shipped
+# Inference on 2048-px mosaics: what we tried, what we measured, what shipped
 
-The mosaics are now stored in 2048-px chunks, the same size as the inference tile. This record
-covers what that let inference change, how each change was tested on the finished Iowa mosaic, and
-what shipped. The experiment branch is `experiment/frisky-inference`, cut from the frozen ingest
-work (`experiment/frisky-ingest`, PR #205). How inference works today:
+This is the record of the inference experiments run on the `experiment/frisky-inference` branch in
+October 2026, after the mosaics moved to 2048-px storage chunks. It is written for someone arriving
+fresh: it explains the few terms it needs, then takes each experiment in turn — the question, the
+test, the result and the decision. How inference works in general is in
 [`../../src/tessera_embeddings/inference/README.md`](../../src/tessera_embeddings/inference/README.md);
-the GPU record it rests on: [`inference-on-gpus.md`](inference-on-gpus.md).
+the longer GPU record this builds on is [`inference-on-gpus.md`](inference-on-gpus.md).
 
-## What 2048 changes
+## In short
 
-**Where the money is.** Graphics cards were $537K of the last campaign's $828K, 65%
-([`../campaign/campaign-cost-model.md`](../campaign/campaign-cost-model.md) §12). The forward pass
-is about 90% of a tile's wall clock, so a saving comes from keeping the card busier or from a
-cheaper forward pass.
+Graphics cards are where the money goes: $537K of the last campaign's $828K
+([`../campaign/campaign-cost-model.md`](../campaign/campaign-cost-model.md) §12). So the question
+was what the new 2048-px mosaics let us change to spend less on them.
 
-**The read is now exact.** Each tile reads one storage chunk per band and date. At 4000² it
-decompressed four times the pixels it used and paid about 13 s of fixed cost per strip read, so
-the old strip planner worked hard to avoid strips. At 2048² an extra strip costs a background
-decompression and nothing more.
+- **Shipped on this branch:** a much simpler way of loading each tile (395 fewer lines). It cuts
+  the time the card sits idle on edge tiles and lowers peak memory by 2–5 points, and its outputs
+  differ from today's only by the rounding-level shimmer the published store already contains.
+  A second change runs each tile's row bands densest first; it is bit-identical and removes one
+  kind of stall, but nets only about 0.1% of card time.
+- **Shipped separately:** looking the positional encoding up in a 367-row day-of-year table makes
+  the model's forward pass 5–8% faster with identical outputs. It lives in its own PR off `main`
+  (#208), because the model code is shared with `main` and the v2 model.
+- **Ruled out:** a cheaper 16 GiB card, larger memory budgets, compiling the model with
+  `torch.compile`, and FP8 arithmetic. A PyTorch upgrade is handled in its own PR; on its own it
+  is no faster.
+- **What is left:** about 2.3% of card time goes to tiles waiting for their first rows to finish
+  loading. Fixing that needs either a faster load or more memory than the 60% ceiling allows.
 
-**On its own, 2048 moved neither the GPU bill nor the memory peak.** The year of Iowa on 2048
-mosaics (flow run `d7e25533`, against `a60550ae` on 4000²): 33.5 GPU-hours against about 34,
-GPU-idle overhead 5.7 s per tile against about 6, utilisation 92%, host RAM peak 16.1 GB of 30.9
-either way. The card was already fed, and the peak is set by the strip budget rather than by the
-storage chunk. What 2048 changed is the price of a strip, and that is what the work below uses.
+## The few terms this needs
 
-**Which card the savings apply to.** Production already runs the smallest L40S box,
-`g6e.xlarge` (32 GiB host RAM). No 16 GiB box costs less per unit of work than it (`g5.xlarge`
-1.18×, `g6.xlarge` 1.36×, on the throughput measured in `inference-on-gpus.md` §4), and the
-measured RAM floor (below) rules them out anyway. The ceiling is peak host RAM under **60%** of
-usable; the margin under it is what absorbs the memory spikes a global run does hit.
+A **tile** is a 2048 × 2048-pixel square of one UTM zone, the unit of work one GPU worker takes at
+a time. A tile's satellite data is too big to hold in memory at once, so it is loaded in
+**strips**: horizontal bands of rows, each sized to a fixed memory **budget**. The GPU embeds pixels
+in **sub-batches** of 7,168. While the GPU works on one strip, the next one loads in the
+background (**prefetching**), and on a tile's last strip the next tile's first strip loads, so the
+card can move straight on. Whatever time the card spends waiting rather than computing is
+**GPU-idle overhead**.
 
-## Options and outcomes
+```
+ one worker, tile N then tile N+1
 
-| Change | Outcome | Evidence |
-|---|---|---|
-| Collapse the strip planner to budget-sized strips and one uniform prefetch | **shipped** (`6d9d5db3`): −395 lines, ~4 s less GPU-idle overhead per tile (~2.5% of tile time), peak RAM 2–5 points lower | round 2 |
-| Fit an actor in 16 GiB for a cheaper A10G fallback (`g5.xlarge`) | **dropped**: even 1 GiB strips leave a ~12 GB peak, ~80% of a 16 GiB box | round 1 |
-| Larger strip budgets on 32 GiB boxes, for fewer strips | **moot**: throughput is flat from 1 to 5.75 GiB, so the smaller budget wins on headroom | round 1 |
-| Drop the S2 easting crop (`x_sub`) | **held**: it saves only resident memory, and removing it changes `eligible_px`, a published registry field | — |
-| Precompute the positional encoding as a day-of-year table | **candidate**: bit-identical, forward 5–7% faster; its peak VRAM is under investigation | benchmark |
-| `torch.compile` pieces of the forward pass | **not pursued**: the transformer layers run as one fused op the compiler cannot open (3–5% slower); compiling the encoding instead gains 6–8% but changes outputs, which the table avoids | benchmark |
-| PyTorch 2.5.1 → 2.14.1 on the workers | **separate PR off `main`**: eager is no faster (3–5% slower on the deepest bucket) and peaks 15% higher in VRAM there, so the per-card batch fit needs re-measuring | benchmark |
-| FP8 matrix multiplies | **denied**: changes the outputs beyond ADR 012, splits the fleet by card, and could not be mixed into the BF16 store | — |
+ GPU     [== strip 1 of N ==][== strip 2 of N ==][== strip 1 of N+1 ==][== strip 2 ...
+ loading     [strip 2 of N ]     [strip 1 of N+1]      [strip 2 of N+1]
+              loads while the GPU works on the previous strip, so the GPU never waits
+```
 
-## What shipped: one strip budget, one prefetch
+**Output equivalence** is judged by ADR 012
+([`../decisions/012-validated-equivalence-for-inference-outputs.md`](../decisions/012-validated-equivalence-for-inference-outputs.md)).
+Its strict gate says a change must leave stored values within one int8 level; its looser
+"cross-config" envelope covers changes that only alter how pixels are grouped on the GPU.
 
-`read_plan._strip_plan` tiles a chunk into the tallest strips whose bands and mask fit
-`_S2_STRIP_BYTE_BUDGET`, now **3.5 GiB** (was 5.75). The actor's load pipeline is always one strip
-deep, and it runs across tile boundaries: on a tile's last strip, the "next strip" is the next
-tile's mask and first strip. Removed: the three-regime plan, the starter strip, the estimator
-constants, the cross-tile prefetch tiers and caps, and the `TESSERA_DISABLE_XCHUNK_PREFETCH`
-switch. The scheduler's next-chunk reservation (`prefetch_hint`) is unchanged.
+## What 2048-px storage changed on its own
 
-**Why it is not bit-identical.** The model's arithmetic is unchanged and two runs of the same code
-match bit for bit. What moves is which pixels share a 7,168-pixel sub-batch: new strip boundaries
-regroup them and change the size of each strip's last partial sub-batch, cuBLAS picks a different
-kernel for a different shape, and its different reduction order shifts the last BF16 bit. ADR 012
-names this mechanism (fact 2: "bucket occupancy varying with strip boundaries") and holds it to
-its cross-config envelope.
+Nothing in the bill. A full year of Iowa on the 2048 mosaics used the same GPU time as on the old
+4000-px ones (33.5 against about 34 GPU-hours) with the same memory peak (16.1 of 30.9 GB). The card
+was already kept busy, and the memory peak is set by the strip budget, not by the storage chunk.
 
-**Why it does not matter for using the embeddings.** Against today's code, 99.84–99.99% of stored
-int8 values are identical and ≥ 99.9995% are within one level; the worst value moves 3 levels; the
-lowest per-pixel cosine is 0.9999 (an angle under 1°) and the mean 1.000000. Storing in int8
-already rounds every value by up to half a level, which by itself puts each stored vector about
-cosine 0.99998 from the model's output, and the published store already mixes A10G and L40S tiles,
-which differ by the same kind of shimmer. Nearest neighbours, classes and clusters come out the
-same except for pixels sitting on a decision boundary, which a different card would flip too. The
-inference code identity changes, so old and new tiles cannot mix inside one existing store.
-Accepted on these grounds (2026-10-02); two envelope metrics sit near their edges (scale drift
-1.56% against 1.6%, cosine 0.999901 against 0.9999).
+What changed is the price of a strip. With 4000-px storage, every strip read re-decompressed a
+chunk four times its size, about 13 s each, so the old loader went to great lengths to use few,
+large strips. With 2048-px storage, a strip costs one background decompression and nothing more.
+That is what made the simplification below possible.
 
-## Round 1 — yield dev, four arms at once
+## The experiments
 
-Four concurrent arms of 6 `g6e.xlarge` workers on the Iowa year, observed for 25 minutes, on code
-bundles that changed only worker-side constants. On the 26 tiles every arm finished:
+### 1. Could a cheaper card do the work?
 
-| Arm | Seconds per tile | GPU-idle overhead | Peak RAM |
+Production already uses the smallest L40S machine, `g6e.xlarge` (32 GiB of memory). The only
+cheaper machines have 16 GiB, and none of them is cheaper per unit of work: the A10G box costs
+1.18× as much and the L4 box 1.36× (from the throughput in `inference-on-gpus.md` §4). The test
+in round 1 settled it anyway: even with very small strips, a worker peaks at about 12 GB, about 80%
+of a 16 GiB machine against a 60% ceiling. **Dropped.**
+
+### 2. Could the strip loader be simplified now that strips are cheap?
+
+The old loader chose between three strategies per tile, added a small "starter" strip, and ran a
+separate, capped prefetch of the next tile with its own tiers and an off switch. Round 1 asked
+whether smaller strips cost speed; round 2 tested the simplified loader against today's.
+
+**Round 1** (yield account, four runs side by side, 6 workers each, the first 26 tiles):
+
+| Strip budget | Seconds per tile | GPU-idle overhead | Peak memory |
 |---|---|---|---|
-| today's code (5.75 GiB strips) | 169 | 23.0 s | 16.4 GB (53%) |
-| same code again | 166 | 23.1 s | 16.6 GB (54%) |
-| 3.5 GiB strips, 1 GiB cross-tile cap | 160 | 20.4 s | 12.7 GB (41%) |
-| 1 GiB strips (8 per tile) | 165 | 16.6 s | 12.4 GB (40%) |
+| 5.75 GiB (today) | 169 | 23.0 s | 53% |
+| 5.75 GiB (today, second run) | 166 | 23.1 s | 54% |
+| 3.5 GiB | 160 | 20.4 s | 41% |
+| 1 GiB | 165 | 16.6 s | 40% |
 
-Throughput is flat across budgets, and below ~3.5 GiB the strip budget no longer sets the peak.
-The second arm was meant to switch the cross-tile prefetch off, but the switch is read from the
-actor's runtime environment, which the driver sets, and a code bundle changes only the workers.
-It ran as a second control instead, which gives the noise floor: about 2% between identical arms.
-A tile loaded without any prefetch waits about 5 s before its first forward pass, so the
-cross-tile prefetch is worth keeping, but not its tiers.
+Speed is flat across budgets, so the smaller budget is free memory headroom; and the two identical
+runs show the noise between runs is about 2%.
 
-## Round 2 — global-tessera-dev, today's code against the simplified code
+**The simplified loader:** one budget (3.5 GiB), strips always loaded one ahead, and the same
+mechanism carrying on into the next tile — no strategies, no starter strip, no separate
+prefetch machinery.
 
-Two arms on today's code and two on `6d9d5db3`, 3 `g6e.xlarge` workers each, run side by side on
-one worker image while L40S capacity was scarce, observed for 35 minutes. On the 18 tiles all four
-finished:
+**Round 2** (global-tessera-dev, today's code and the simplified code twice each, 3 workers each,
+the 18 tiles all four finished):
 
-| Arm | Seconds per tile | Inference | GPU-idle overhead | Peak RAM |
+| Run | Seconds per tile | GPU-idle overhead | Peak memory |
+|---|---|---|---|
+| today's code, a | 161 | 23.8 s | 45% |
+| today's code, b | 163 | 23.2 s | 45% |
+| simplified, a | 164 | 19.2 s | 40% |
+| simplified, b | 154 | 19.2 s | 43% |
+
+About 4 s less idle time per tile, roughly 2.5% of tile time on these tiles, and lower memory.
+**Shipped** (`6d9d5db3`).
+
+**Its outputs are not bit-identical, and that was accepted.** The model's arithmetic is unchanged —
+two runs of the same code match exactly. What moves is which pixels share a 7,168-pixel
+sub-batch: new strip boundaries regroup them, the GPU's matrix library picks a different kernel
+for a different batch shape, and that kernel adds numbers in a different order, shifting the last
+bit of some results. ADR 012 names exactly this mechanism. Against today's code, 99.84–99.99% of
+stored values are identical and at least 99.9995% are within one level; the worst value moves 3
+levels; the lowest per-pixel cosine similarity is 0.9999 (an angle under 1°) and the mean is
+1.000000. That fails the strict gate and passes the cross-config envelope on all 39 tiles checked,
+with two measures near its edges (scale drift 1.56% against 1.6%, cosine 0.999901 against 0.9999).
+
+For using the embeddings it makes no difference. Storing them as int8 already moves every vector
+about this much (cosine about 0.99998 from the model's own output), and the published store already
+mixes tiles made on A10G and L40S cards, which differ by the same kind of shimmer. Searches,
+classifications and clusters come out the same, except for pixels sitting exactly on a decision
+boundary, which a different card would flip too. And the inference code identity changes, so old
+and new tiles cannot mix inside one store.
+
+### 3. Where did the remaining idle time go?
+
+Round 2's simplified runs still idled about 19 s per tile. Rebuilding each tile's timeline from the
+worker logs showed this was not spread across tiles: interior tiles idled about 0.2 s, while tiles
+on the edge of the Iowa footprint stalled once each. On such a tile the first strip can be entirely
+outside the footprint. The loader skips it immediately and then waits, with the GPU idle, for the
+next strip — whose load had only just started, because the empty strip gave it no work to hide
+behind.
+
+The fix: run each tile's strips **densest first, empty strips last**, and start the next tile's
+prefetch from the last strip that has pixels. Order does not change which pixels share a
+sub-batch, so the outputs should be identical. Each tile's summary now records how many of its
+strips hold pixels (`live_strips`), which is also what let round 3 sort tiles into classes.
+
+**Round 3** (global-tessera-dev, the simplified code with and without the new order, the whole
+Iowa year — 394 tiles each — on up to 8 workers each, every tile paired across the two runs):
+
+| Tile class | Tiles | Share of card time | Change in tile time | Median idle, before → after |
 |---|---|---|---|---|
-| today's code, a | 161 | 140 | 23.8 s | 14.0 GB (45%) |
-| today's code, b | 163 | 139 | 23.2 s | 13.9 GB (45%) |
-| simplified, a | 164 | 145 | 19.2 s | 12.3 GB (40%) |
-| simplified, b | 154 | 134 | 19.2 s | 13.2 GB (43%) |
+| interior (≥ 99% valid, every strip has pixels) | 305 | 87% | −0.7% | 0.3 → 0.3 s |
+| edge | 89 | 13% | −2.7% | 6.2 → 0.3 s |
+| all | 394 | | −1.0% | |
 
-The inference spread is card-to-card; the overhead drop is the change. The equivalence check
-(`te-compare-outputs`, run on a head node in the account) gave 21/21 tiles bit-identical between the
-two controls and 0/39 passing the same-config gate between control and simplified, all 39 inside
-the cross-config envelope, with the figures quoted above.
+Interior tiles run the identical code path, so their −0.7% is run-to-run noise, and the edge
+figure has to be read against it. The effect that is attributable to the change is idle time:
+on the 24 edge tiles that had an empty strip, it fell 43% (284 → 162 s). Across all of Iowa that
+is about 0.1% of card time. Outputs are **bit-identical**: 229 of the 394 tiles were compared, every one exactly equal, including all 24 whose strip order changed. **Kept**: it is bit-identical, small,
+and removes the worst stall on footprint edges; its gain is small because that stall is rare.
 
-## The forward-pass benchmark
+**What the remaining idle time is.** About 2.3% of card time, over roughly a third of the tiles,
+is a tile starting before its first strip has finished loading: the previous tile's last stretch
+of work was shorter than the 20–25 s that load takes. (Running densest first makes the last strip
+the sparsest, which occasionally shortens that window.) Starting the load one strip earlier would
+fix it but hold one more strip in memory, and the full-year runs already peak at 51–53%: another
+strip adds about 12 points, past the 60% ceiling. The other remaining cost is each worker's very
+first tile, which has nothing before it to prefetch behind: about 0.3%.
 
-One `g6e.xlarge`, the production model and checkpoint, B = 7,168, five (S2, S1) depths from 48/16
-to 256/104, median of 8 timed forwards after warm-up (`temp/frisky-dev/bench_fusion.py`):
+### 4. Could the model's forward pass itself be cheaper?
 
-| Variant (PyTorch 2.5.1) | Forward time vs eager | Outputs vs eager | Peak VRAM, deepest bucket |
+The forward pass is about 90% of a tile's time, so it is the biggest target. Its parts were timed
+on one L40S with the production model and checkpoint, batch 7,168, at five observation depths:
+
+| Change | Forward time | Outputs | Decision |
 |---|---|---|---|
-| eager (today) | — (1.98M tokens/s) | — | 18.6 GiB |
-| compile the transformer layers | 3–5% slower | identical | 19.3 GiB |
-| compile embedding + positional encoding | 6–8% faster | int8 93–96% exact, cosine ≥ 0.99999 | 18.6 GiB |
-| positional encoding as a 367-row table | 5–7% faster | bit-identical | 24.0 GiB |
+| positional encoding as a 367-row day-of-year table | **5–8% faster** | identical | **PR #208, off `main`** |
+| `torch.compile` of the embedding and encoding | 6–8% faster | int8 93–96% exact | not pursued: the table gets the same gain exactly |
+| `torch.compile` of the transformer layers | 3–5% slower | identical | not pursued: the layers run as one fused operation the compiler cannot open |
+| PyTorch 2.14.1 instead of 2.5.1 | equal, 3–5% slower at the deepest | not compared | separate PR off `main`; it also uses 15% more GPU memory at the deepest depth |
+| FP8 arithmetic | not measured | would change outputs | denied |
 
-The eager rate matches the 2.06M tokens/s per L40S measured on the fleet. On PyTorch 2.14.1 the
-variants rank the same, except that the table took 2.2 s at the deepest bucket, at a 26.7 GiB peak;
-eager there is level on shallow buckets and 3–5% slower on the deepest, at 21.3 GiB. The benchmark
-script is a local tool, not part of the package.
+The positional encoding turns each observation's day of year into a vector. Day of year is a whole
+number from 0 to 366, but the encoding used to be recomputed with sine and cosine for every pixel
+and observation on every forward pass. Computing all 367 days once and looking them up gives the
+same values and skips two large temporary tensors per pass. Because the model code is shared with
+`main` and the v2 model, that change went into its own PR rather than this branch.
 
-**Why the table is exact.** The encoding depends only on day of year, an integer 0–366 at the model
-input (`storage.time_axis.compute_doy`; 0 for the zero-filled radar rows of `allow_s2_only`
-pixels). The table is built once per device by the same code path and indexed by those integers,
-so every value is the one today's per-pixel sin/cos produces, without the two full-size FP32
-tensors it allocates on every forward.
+### 5. Smaller decisions
 
-## Method
+- **The easting crop stays.** Edge tiles read only the columns that hold pixels. Removing the crop
+  would save code but would change `eligible_px`, a published registry field, so it was held.
+- **Larger strip budgets are moot.** Round 1 showed speed does not depend on the budget, so the
+  smaller one wins on memory.
 
-**Inputs.** The Iowa year ingested at 2048² on Frisky version C: mosaics, ROI and checkpoint under
-`_frisky_e2e_c/`, in `s3://arbol-tessera-inputs-dev/` (round 1) and copied object for object to
-`s3://global-tessera-inputs-dev/` (round 2 onward).
+## How the tests were run
 
-**A change that keeps every name can ship as a code bundle; one that removes names needs a
-deployment.** Ray workers pull `s3://{code_bucket}/code/src{code_suffix}.tar.gz` at start-up, so a
-worker-side change of values runs from a bundle and the `code_suffix` run parameter. But Ray
-pickles the actor class on the driver, which runs the deployed code: a bundle that deletes a name
-the driver's copy imports fails at actor creation. Round 2 therefore ran each side from its own
-yield-embeddings branch (`dev/global-tessera-frisky-inf` pinned to today's code,
-`dev/global-tessera-frisky-inf-simple` to `6d9d5db3`). Switches belong in worker-side code, not in
-the runtime environment the driver sets.
+**Inputs.** The Iowa year ingested at 2048 px under `_frisky_e2e_c/` (mosaics, ROI and checkpoint),
+first in `s3://arbol-tessera-inputs-dev/` (round 1, yield account) and then copied object for
+object to `s3://global-tessera-inputs-dev/` (rounds 2 and 3, global-tessera-dev).
 
-**Arm shape and reading.** Arms run concurrently with at least one control, each on its own Ray
-cluster, and are cancelled once profiled; staging is kept until the equivalence check has run and
-deleted after. Per tile, `CHUNK_SUMMARY` gives total, inference, overhead and prologue seconds and
-the strip count; per actor, the `RESOURCES:` lines give host RAM and GPU use; tiles are compared by
-label (`temp/frisky-dev/inf_arms.py`). In global-tessera-dev the per-cluster GPU cap in SSM
-(`/global-tessera-dev/ray/gpu-worker-ladder`) was removed for this work.
+**Side by side, with a control.** Every round ran its variants at the same time, each on its own Ray
+cluster of `g6e.xlarge` workers, so S3 and capacity conditions were shared. Rounds 1 and 2 were
+stopped after 25–35 minutes of inference; round 3 ran to completion so that every tile of Iowa
+could be paired. Each tile's `CHUNK_SUMMARY` log line gives its total, inference, idle and prologue
+seconds and its strip counts; the workers' `RESOURCES` lines give memory. Tiles are compared by
+label, and costs as sums of per-tile seconds, which do not depend on how many workers each run got.
+Outputs are compared with `te-compare-outputs` on a machine in the same account.
 
-**Cost.** About 16 L40S-hours across both rounds plus head nodes, about 1.5 h of the benchmark
-box, and about $2 of requests for the 1.6 TB copy (about $36 a month to keep it).
+**A code bundle is not always enough.** Ray workers can load a different version of the code from
+a bundle in S3, which suits changes to values. But Ray builds the worker class on the driver, which
+runs the deployed code, so a change that removes or renames anything the driver's copy refers to
+fails at start-up. Rounds 2 and 3 therefore ran each side from its own yield-embeddings branch
+(`dev/global-tessera-frisky-inf`, `-simple` and `-order`). For the same reason, round 1's attempt
+to switch the old prefetch off through an environment variable did nothing: the driver sets that
+environment.
 
-## Open
+**Capacity.** L40S machines were scarce in us-west-2 for much of the work and arrived one at a time.
+In global-tessera-dev a per-cluster cap on GPU workers (`/global-tessera-dev/ray/gpu-worker-ladder`
+in SSM) was removed for these tests.
 
-- **The remaining ~19 s of GPU-idle overhead per tile**, about 12% of tile time and now the largest
-  cost outside the forward pass. The prologue is already hidden (0 s median), so it sits inside the
-  strip loop or the tile's wind-down.
-- **The table's peak VRAM** (+5.4 GiB at the deepest bucket) before it can ship: it removes two
-  full-size FP32 tensors, so the rise is likely how the gather allocates, or how the two backbones'
-  streams now overlap.
+**Cost.** About 70 L40S-hours across the three rounds and the benchmark (round 3 alone, two full
+runs, about 52), plus head nodes and a small comparison machine; about $2 to copy the 1.6 TB of
+inputs and about $36 a month to keep them.
+
+## What is left
+
+- **The first-strip wait** (about 2.3% of card time): making the next tile's first load faster —
+  for example a smaller first strip, which is what the old loader's starter strip did — rather
+  than holding more in memory.
+- **Merging.** Any change to the model or loader code changes the inference code identity, which
+  stops staged tiles being reused and puts later appends under a new identity. This branch, the
+  table (#208) and the PyTorch upgrade are best merged together so that happens once.

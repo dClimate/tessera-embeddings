@@ -1081,9 +1081,9 @@ evidence yet that the inference line is sound.
 **RAM budget is load-bearing.** Do NOT raise `_S2_STRIP_BYTE_BUDGET` or reintroduce whole-chunk
 cross-chunk prefetch without re-deriving the arithmetic at the constant. The load pipeline is one
 strip deep and runs across chunk boundaries, so at most two band sets are resident — mid-chunk, the
-strip being inferred and the next one loading; across a boundary, the last strip and the next chunk's
-first — and the pair ceiling (2× budget) is what keeps peak host RAM under 60%. On 2048² mosaics the
-budget is 3.5 GiB and the measured peak 41%
+strip being inferred and the next one loading; across a boundary, the last strip with pixels and the
+next chunk's first — and the pair ceiling (2× budget) is what keeps peak host RAM under 60%. On 2048²
+mosaics the budget is 3.5 GiB, and full-year runs peak at 51–53%
 ([`inference-at-2048.md`](inference-at-2048.md)).
 
 **Shared CloudWatch log group across runs.** `--ram-report` and log greps must be scoped tightly with
