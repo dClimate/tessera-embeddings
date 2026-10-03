@@ -2597,4 +2597,6 @@ Deploying the consumer stack is what moves an account's workers to ARM.
   ingest body runs on one Dask worker, so reclaiming that worker restarts the run's driver.
 - **The other ingestion-image families** (runner, coarsen, Fargate `merge_kind`) become a
   one-property change each. `merge_kind_ec2` would need a Graviton instance type instead.
-- **Inference** runs on x86 CUDA instances, and its image follows them.
+- **Inference** runs on x86 CUDA instances. Its Fargate runners, the Ray driver and assembly,
+  moved to Graviton too (yield-embeddings PR #92); the assembly measurement is in
+  [`../assembly/what-bounds-assembly-2026-09-09.md`](../assembly/what-bounds-assembly-2026-09-09.md).

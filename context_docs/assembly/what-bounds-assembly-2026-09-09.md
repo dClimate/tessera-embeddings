@@ -113,6 +113,30 @@ saturation is intermittent, and Fargate publishes no per-task network allowance,
 rates of 650-960 MB/s the headroom on the other candidate is unmeasurable from outside. Settling
 it needs a controlled run, not more of this data.
 
+## On Graviton, measured 2026-10-03
+
+The inference runner, which hosts assembly, was run on ARM64 Fargate (Graviton) against x86
+(yield-embeddings PR #92). Test: single-ROI assembly of 15SWC (36 chunks, 22.3 GB) from the same
+staged tiles on a 16 vCPU / 64 GiB runner of each architecture. Two pairs were dispatched
+together, and an earlier full ARM run did the same work.
+
+| | x86 | ARM |
+|---|---|---|
+| total wall time | 117 s, 122 s | 113 s, 102 s (114 s in the full run) |
+| worker CPU | 313 s, 313 s | 226 s, 226 s |
+| compression and upload CPU (`write_cpu_s`) | 180 s, 180 s | 100 s, 101 s |
+| read CPU | 133 s, 134 s | 125 s, 125 s |
+
+- **The assembled stores are bit-identical** across architectures: all 13 arrays, chunk for chunk.
+- **ARM does the same work on 28% less CPU, and 44% less for compression.** That repeats to the
+  second across runs.
+- **Wall time moved 3–17%, because this run was not CPU-bound.** It forked only 4 workers on a
+  16 vCPU box, so time went to waiting on S3 reads. Read wall time varies run to run, and it
+  explains most of the spread.
+- **The campaign pool remains unmeasured.** 16–32 workers saturate the box (above), and there the
+  CPU saving should become throughput, unless the network binds first, which is this record's
+  open question.
+
 ## What this supersedes
 
 Three rounds, each understated or misattributed, all reaching the same decision:
