@@ -8,7 +8,7 @@ Four measurement campaigns are folded together here. The July 2026 optimization 
 (§1–§10); the fleet-scale throughput investigation that corrected its duration basis is §11; the
 graph and catalogue budgets that limit it now are §12; the live-tile cropping derivation that §3.1
 and §3.2 summarise is §13; and the region-write primitive the whole windowed design rests on is §14.
-§15 measures Dask workers on Graviton (ARM64) against x86, and records the switch built for them.
+§15 measures Dask workers on Graviton (ARM64) against x86, which is where they now run.
 
 > **The duration basis was re-measured, and the correction matters more than it looks.** A 2026-08
 > reading found every zone running 1.8–2.1× slower than the figures here. **That claim is
@@ -2458,12 +2458,12 @@ path is current.
 tasks run on 2017–2019 Xeons. The mosaics are not bit-identical: a small share of pixels round one
 count differently, which is physically meaningless (§15.4). That reaches the embeddings as a mean
 cosine similarity of 0.999983, slightly beyond ADR 012's gates on the worst pixels, and the
-maintainers accepted it (§15.6). The switch is built in yield-embeddings, off by default (§15.5).
+maintainers accepted it (§15.6). yield-embeddings now runs every Dask worker on ARM (§15.5).
 
 ### 15.1 How it was measured
 
 Two yield dev branches, `dev/graviton-workers` (x86) and `dev/graviton-workers-arm` (ARM), identical
-except that the second sets `BRANCH_DASK_WORKERS_ON_ARM64`. Both ran tessera `bbb9d836`, with x86
+except that the second registered its Dask workers as ARM64. Both ran tessera `bbb9d836`, with x86
 schedulers and runners. Each rung's arms were dispatched within seconds of each other with the same
 parameters, into fresh stores. Cost is each task's billed lifetime at its own architecture's list
 rate, using the `ecs.cpu-architecture` ECS reports per task. Timings come from the ingest's own
@@ -2555,23 +2555,20 @@ carries, in opposite directions, and neither is more correct. On campaign grids,
 
 **The one practical consequence.** The ingest code identity hashes source only, so it cannot see
 which architecture built a mosaic. Do not let one mosaic hold dates from both. Mosaics are deleted
-after publication, so switching at a campaign boundary is enough.
+after publication, so deploying the change between campaigns is enough.
 
 ### 15.5 The change
 
-All in yield-embeddings (PR #90). The ingestion image is built for amd64 and arm64, so every other
-family keeps pulling amd64 from the same tags. Two switches move the workers, both off by default:
-
-- **`Deployment.dask_workers_on_arm64`** puts a deployment's `yield-dask-worker-{dev,prod}`
-  definitions on ARM64. Off, it changes no synthesized template at all.
-- **`BRANCH_DASK_WORKERS_ON_ARM64`** in `register_branch_task_defs.py`, set in one branch's own
-  commit, moves only that branch's worker clone. The paired arms above ran on it.
+yield-embeddings PR #90 makes every deployment's Dask worker task definitions ARM64, with no switch.
+Schedulers, flow runners and the EC2 merge family stay x86, so the ingestion image is built for
+both architectures. Branch clones copy the shared worker definition, architecture included.
 
 **Coarsen moves with ingest.** Every Dask fleet in a deployment pins the same worker definition.
-Coarsen was not part of these rungs, so a deployment that coarsens should run one coarsen pair
-before it switches.
+Coarsen was not part of these rungs.
 
-### 15.6 Switching a deployment
+### 15.6 Deploying it
+
+Deploying the consumer stack is what moves an account's workers to ARM.
 
 1. **The embedding difference is accepted** (maintainers, 2026-10-02). It is tiny, but it exceeds
    ADR 012's gates on the worst pixels. A one-chunk crop of 35N's grid (41 km of Moldovan farmland,
@@ -2589,9 +2586,9 @@ before it switches.
    one nudged input. ADR 012's gates were set for inference code changes, and this fails them on
    the worst pixels: cosine below 0.9999 in every chunk, and scale drift above the 1.6%
    cross-configuration bound in one of four.
-2. **Switch at a campaign boundary,** with no mosaic half-built (§15.4).
-3. **Expect `cost_accrual.py` to overstate.** It prices Fargate vCPU at x86 rates, and the usage
-   series it reads does not distinguish architectures.
+2. **Deploy between campaigns,** with no mosaic half-built (§15.4).
+3. **`cost_accrual.py` prices Fargate at ARM rates.** The usage series it reads does not split by
+   architecture, so the x86 schedulers and runners read about 20% low.
 
 ### 15.7 Out of scope
 
