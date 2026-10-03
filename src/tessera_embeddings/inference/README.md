@@ -631,9 +631,11 @@ things worse:
   kernel launches into one, so the recurrence is no longer bound by launch overhead. This
   is a small, deliberate approximation in the reset gate — see the builder's docstring.
   v1.1 only: v2's pooling head is a single attention layer with no recurrence to fuse.
-- **Positional encoding writes into an uninitialised buffer.** The sine and cosine values
-  are written straight into it, instead of being scattered into a multi-gigabyte block of
-  FP32 zeros allocated on every forward pass. Same values, lower peak memory.
+- **Positional encoding is a per-day lookup table.** Day of year is an integer, so the
+  sine/cosine encoding of all 367 days is computed once per device and dtype, by the same
+  FP32 arithmetic, and each forward pass indexes into it — instead of computing sin and cos
+  over every pixel and timestep into two full-size FP32 tensors. Same values on the GPU, a
+  forward pass 5–8% faster.
 
 **What the logs report, and why it is not pixels per second.** A pixel with few
 observations costs about a tenth of a densely observed one, so a pixels-per-second figure
