@@ -15,6 +15,7 @@ import xarray as xr
 from affine import Affine
 from odc.geo.geobox import GeoBox
 
+from tessera_embeddings.config.ingest import INGEST_INNER_CHUNKS
 from tessera_embeddings.errors import ConfigMismatchError
 from tessera_embeddings.storage.empty_store import create_empty_store
 from tessera_embeddings.storage.manifest import MIXED_CODE_IDENTITIES_ATTR, IngestManifest, extract_manifest
@@ -277,3 +278,18 @@ def test_parallel_falls_back_when_private_api_missing(tmp_path, monkeypatch, cap
     g = open_store_as_zarr_group(store)
     assert (g["band"][0, :4, :] == 7).all()
     assert (g["band"][0, 4:, :4] == 7).all()
+
+
+def test_a_sharded_store_takes_whole_shard_windows_and_reads_back(tmp_path, monkeypatch):
+    """With 2-px inner chunks the 4-px blocks become shards; windows land intact, date after date."""
+    monkeypatch.setitem(INGEST_INNER_CHUNKS, "northing", 2)
+    monkeypatch.setitem(INGEST_INNER_CHUNKS, "easting", 2)
+    store = str(tmp_path / "reflectance.zarr")
+    _write(store, "2024-06-01", 7, windows=[(0, 4, 0, 8), (4, 8, 4, 8)])
+    _write(store, "2024-06-11", 9, windows=[(4, 8, 0, 4)])
+
+    g = open_store_as_zarr_group(store)
+    assert g["band"].chunks == (1, 2, 2) and g["band"].shards == (1, 4, 4)
+    band = np.asarray(g["band"])
+    assert (band[0, 0:4, :] == 7).all() and (band[0, 4:8, 4:8] == 7).all() and (band[0, 4:8, 0:4] == 0).all()
+    assert (band[1, 4:8, 0:4] == 9).all() and (band[1, 0:4, :] == 0).all()

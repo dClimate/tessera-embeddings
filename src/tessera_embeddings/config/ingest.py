@@ -58,6 +58,27 @@ INGEST_CHUNKS = {"time": 1, "northing": INGEST_CHUNK_SIZE, "easting": INGEST_CHU
 # the one it was created with; mosaics are deleted after each fill, so nothing needs migrating.
 INGEST_COMPRESSORS = (BloscCodec(cname="lz4", clevel=5, shuffle="shuffle"),)
 
+# The mosaics are sharded: each INGEST_CHUNKS block stays one stored object and the unit ingest writes (the shard),
+# split inside into inner chunks of 256 rows by one 2048-px inference tile (config.inference.INFERENCE_CHUNK_SIZE).
+# A reader decodes only the inner chunks it touches, so an inference strip of one tile no longer decompresses the whole
+# 4096-px block of every band and date. Writes stay whole-shard because ingest writes block-aligned windows, which is
+# what keeps sharding cheap to write: ADR 008 measured unaligned shard writes as read-modify-write, 2.8x slower.
+INGEST_INNER_CHUNKS = {"time": 1, "northing": 256, "easting": 2048}
+
+
+def mosaic_chunk_layout(write_unit: tuple[int, ...]) -> tuple[tuple[int, ...], tuple[int, ...] | None]:
+    """``(chunks, shards)`` for a ``(time, northing, easting)`` mosaic array written in *write_unit* blocks.
+
+    The write unit becomes the shard, holding ``INGEST_INNER_CHUNKS``, when the inner chunk tiles it exactly.
+    Otherwise — a grid smaller than one block, or a small test grid — the array is unsharded, chunked by the write
+    unit, as before.
+    """
+    inner = (INGEST_INNER_CHUNKS["time"], INGEST_INNER_CHUNKS["northing"], INGEST_INNER_CHUNKS["easting"])
+    if tuple(write_unit) != inner and all(w % i == 0 for w, i in zip(write_unit, inner, strict=True)):
+        return inner, tuple(write_unit)
+    return tuple(write_unit), None
+
+
 # The load side deliberately uses the SAME block size as the store: fewer, larger read tasks cap
 # a date's parallel width at blocks x bands, starving any fleet wider than that, and that width
 # cost is paid on every compact ROI while the graph-size saving only binds on the densest zones
