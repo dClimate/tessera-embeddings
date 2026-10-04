@@ -588,9 +588,9 @@ tried. Sweep before generalising, or scope the setting to where it was measured.
 
 ### 3.18 Blosc-LZ4 for the mosaics — read for inference, not for ingest (October 2026)
 
-The mosaics are written once by ingest and read many times by inference: every strip of a tile
-decompresses the whole storage chunk of every band and date it touches, so a tile split into three
-strips decodes its data three times. That decode is CPU-bound and already uses every core of a
+The mosaics are written once by ingest and read many times by inference. On an unsharded mosaic
+every strip of a tile decompresses the whole storage chunk of every band and date it touches, so a
+tile split into three strips decodes its data three times (§3.19 shards the mosaics to avoid it). That decode is CPU-bound and already uses every core of a
 4-vCPU GPU worker, and it is what a tile's first, exposed load mostly waits on. So the codec was
 chosen for decompression speed, measured on 60 real Iowa uint16 chunks (one band, one date, 2048²)
 on an `m6a` core, and end to end through icechunk on S3:
@@ -610,6 +610,106 @@ about 1%. The values read back are identical: the codec is lossless. It is set i
 `config.ingest.INGEST_COMPRESSORS`, used by both store-creation paths, and a store keeps the codec
 it was created with.
 
+### 3.19 Sharding the mosaics — a strip decompresses only its own rows (October 2026)
+
+Each band, date and 4096-px block of a mosaic used to be one chunk, and reading any part of it
+decompressed all of it. An inference tile is a quarter of a block, read in strips of rows, so a
+256-row strip decompressed 32 times the pixels it used. The block is now a **shard**: still one
+stored object and still the unit ingest writes, but holding 32 separately compressed inner chunks
+of 256 rows × 2048 px (`INGEST_INNER_CHUNKS`) and an index of where each one sits. A read fetches
+and decompresses only the inner chunks it touches. The global embedding store already uses the
+same codec (ADR 008, D3); the cost ADR 008 warns about, a read-modify-write when a write covers
+part of a shard (2.8× slower), does not arise because ingest writes whole blocks.
+
+```
+ one band-date block, 4096 × 4096 px
+
+ before   [               one chunk               ]   any read decompresses all of it
+
+ after    +-------------------+-------------------+
+          |  256 x 2048 (A)   |  256 x 2048 (B)   |   x 16 rows of inner chunks, plus an index;
+          +-------------------+-------------------+   a strip of tile A decompresses only the
+          |        ...        |        ...        |   column-A chunks in its rows
+          +-------------------+-------------------+
+```
+
+**Reads.** One real Iowa block (30 dates × 10 bands, Blosc-LZ4), read the way inference reads a
+tile, on an `m6a` machine in the same region:
+
+| read | unsharded | sharded |
+|---|---|---|
+| a 256-row strip of one tile | 4.1 s | 0.95 s |
+| a 1,024-row strip | 4.3–4.7 s | 2.2 s |
+| the whole 2048-px tile | 5.2–5.4 s | 4.0 s |
+| CPU cores busy while reading | about 3.3 | 1.2–2.0 |
+
+Every inner chunk is its own ranged request, so at zarr's default of 10 requests in flight a
+sharded read waits on S3 latency. Inference actors raise it to 64 (`MOSAIC_READ_CONCURRENCY`),
+which made sharded reads 2–4× faster and left unsharded ones unchanged. Every read returned
+identical values.
+
+**Ingest.** The Iowa year (November 2024 to October 2025) was ingested twice side by side in
+`global-tessera-dev`, with identical code apart from the layout, on 60 workers for Sentinel-2 and 13
+for Sentinel-1:
+
+| | unsharded | sharded |
+|---|---|---|
+| Sentinel-2: wall time, measured cost | 67 min, $17.95 | 70 min, $18.65 (+3.9%) |
+| Sentinel-1 ascending: wall time, measured cost | 31 min, $1.85 | 32 min, $1.92 (+3.8%) |
+
+The whole difference is in the write stage, and it is consistent: sharded writes were slower in 54
+of 60 Sentinel-2 batches and 12 of 13 Sentinel-1 batches, by a median 4%. The cloud gate stage
+matched within 1%. Writing one block in isolation was not slower (15.9 s against 17.8 s), and the
+cause in ingest was not investigated. At campaign scale it is at most about $7K, against the
+$187K containers line of the last campaign.
+
+**Values.** Every block of every array in the two stores compared equal: 21,294 blocks for each
+radar polarization and 27,846 for each of the eleven reflectance variables, with the same dates and
+coordinates. The stores differ only in run attributes (timestamps, ROI path) and the ingest code
+identity.
+
+**Inference.** The Iowa year was then embedded from both stores side by side, with `main`'s loader,
+8 L40S workers each and the whole pipeline including assembly, and every tile paired across the two
+runs:
+
+| | unsharded | sharded |
+|---|---|---|
+| total tile time, 394 tiles | 91,643 s | 88,900 s (−3.0%) |
+| GPU computing | 86,780 s | 86,429 s (−0.4%) |
+| GPU idle, share of tile time | 5.3% | 2.7% |
+| of which, waiting for a tile's first strip | 3.5% | 1.4% |
+| peak host memory per worker | 18.8 GB (61%) | 17.1 GB (55%) |
+| GPU instance-hours | 26.1 | 25.4 |
+
+Computing time is unchanged, as it should be. What fell is the time the card waits for data, on
+interior tiles (−3.0%) as much as on edge tiles (−2.8%): about 2.6% of GPU time, or roughly $14K of
+the last campaign's $537K GPU line. Peak memory fell because a strip no longer decompresses whole
+blocks, which brings `main`'s loader back under the 60% ceiling it crosses on this run.
+
+The embeddings are **bit-identical** on all 390 tiles that both runs cut into the same strips. The
+other 4 were cut differently because `main`'s loader gives a tile a starter strip depending on
+which tile its worker handled before (found while measuring the PyTorch upgrade, #209). One of
+them still came out identical, and the other three are within ADR 012's cross-config envelope (at
+most 3 levels, cosine ≥ 0.99993), as two runs of `main` on the same store would be.
+
+**Compatibility.** Inference reads either layout. The ingest code identity changes, so sharded
+code refuses to append to a mosaic written unsharded, which is the right refusal: one array cannot
+mix layouts. Three things had to change for sharded writes to stay correct, each with a test that
+fails without it:
+
+- Region writes widen an unaligned window to whole shards, not inner chunks
+  (`storage/region_writes.py`).
+- xarray must be 2026.2.0 or later. Earlier releases align parallel writes to the inner chunk, so
+  several tasks rewrite one shard and lose each other's data (pydata/xarray#10831).
+  `pyproject.toml` requires it, and zarr 3.1.2 as ADR 008 records.
+- yield-embeddings' ROI merge sized its copy units from the master's `.chunks`, which on a sharded
+  master is the inner chunk; it now uses the shard. That fix lives in yield-embeddings and has to
+  ship with the pin bump that brings this layout in.
+
+**What this reopens.** §4.1 rejected a coarser store chunk because inference read whole chunks.
+With sharding the unit ingest writes and the unit inference reads are independent, so a larger
+block no longer costs readers anything. Not measured.
+
 ## 4. What did not work, and why
 
 ### 4.1-4.8 What was tried and rejected — the table, so none of it is retried
@@ -621,7 +721,7 @@ are cited by number elsewhere in this document.
 
 | approach | verdict | why |
 |---|---|---|
-| **4.1** coarsen the STORE chunk to 8192 | rejected | the GPU side vetoes it: inference reads whole chunks, so a coarser store chunk multiplies read volume for every consumer. Measured, not argued |
+| **4.1** coarsen the STORE chunk to 8192 | rejected | the GPU side vetoes it: inference reads whole chunks, so a coarser store chunk multiplies read volume for every consumer. Measured, not argued. Sharding (§3.19) removes the reason; untested since |
 | **4.2** cost-model window grouping | rejected | over-merged into the scheduler; the optimiser traded real area for a boundary cost that had already stopped existing (§3.17) |
 | **4.3** spatial manifest sharding | rejected | a **30–50% regression** — the axis matters more than the size, and time is the right axis |
 | **4.4** double load blocks again, 8192 → 16384 | not worth it | measured **1.35×**, against a prediction of 2–3×, at 537 MB per band-block |
