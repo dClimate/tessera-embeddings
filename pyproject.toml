@@ -27,7 +27,9 @@ classifiers = [
 # generation — that is what this library is for. The split is practical:
 # torch is large and CUDA variants are platform-specific.
 dependencies = [
-    "xarray",
+    # The mosaics are sharded: older xarray aligns region writes to inner chunks, so parallel dask tasks
+    # rewrite parts of one shard and lose each other's data (pydata/xarray#10831, fixed in 2026.2.0).
+    "xarray>=2026.2.0",
     "dask",
     "distributed",
     "zarr",
