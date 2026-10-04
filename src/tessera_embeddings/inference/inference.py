@@ -262,8 +262,7 @@ class _LoopProgress:
     tokens: int = 0
     flops: int = 0
     sub_batch_idx: int = 0
-    # Worst single-batch CPU prep this call: averages hide the spikes that actually starve the GPU (see actors'
-    # reserve_cpus).
+    # Worst single-batch CPU prep this call: averages hide the spikes that would starve the GPU.
     get_batch_max: float = 0.0
     # Per-bucket (pixels, sub-batches) — the workload-side input to any token-budget batching decision, since the
     # expected gain is bucket occupancy weighted by the per-shape speedup curve and occupancy varies by region. Counts

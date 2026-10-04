@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import threading
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -28,21 +29,15 @@ from tessera_embeddings.config.store_layout import (
     MONTHS_IN_YEAR,
 )
 from tessera_embeddings.config.time_windows import parse_time_window
-from tessera_embeddings.inference.actors import (
-    _XCHUNK_DISABLE_ENV,
-    InferenceActor,
-)
+from tessera_embeddings.inference.actors import InferenceActor
 from tessera_embeddings.inference.assembly import summarise_optical_skips
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.inference.read_plan import (
     _MIN_STRIP_H,
-    _S2_FOREGROUND_DECODE_READERS,
     _S2_STRIP_BYTE_BUDGET,
     _strip_height_for_density,
     _strip_plan,
     _strip_slices,
-    _StripPlan,
-    _xchunk_rung,
 )
 from tessera_embeddings.inference.resource_monitor import ResourceMonitor
 from tests.unit.mosaic_stores import S2_SEED, make_s2_group, make_sar_group, store_opener
@@ -88,11 +83,11 @@ class TestStripHeightForDensity:
 
     def test_single_strip_when_full_height_fits_one_budget(self):
         # A chunk whose full-height bands + mask fit ONE budget runs as a single
-        # strip; anything larger splits so the intra-chunk strip-prefetch pair
-        # stays bounded by 2 x budget.
-        h = _strip_height_for_density(60, 2000, 2000)
+        # strip; anything larger splits so the strip-prefetch pair stays bounded
+        # by 2 x budget.
+        h = _strip_height_for_density(30, 2000, 2000)
         assert h == 2000
-        full = 60 * 2000 * 2000 * len(S2_BAND_ORDER) * 2 + 60 * 2000 * 2000
+        full = 30 * 2000 * 2000 * len(S2_BAND_ORDER) * 2 + 30 * 2000 * 2000
         assert full <= _S2_STRIP_BYTE_BUDGET
 
     def test_dense_single_chunk_splits_to_respect_budget(self):
@@ -116,99 +111,34 @@ class TestStripHeightForDensity:
         # byte budget, logged) rather than degenerating into tiny reads.
         assert _strip_height_for_density(10**9, 4000, 4000) == _MIN_STRIP_H
 
-    def test_pair_budget_strip_charges_decode_transient(self):
-        # A pair-budget strip is read in the FOREGROUND, so its momentary peak is
-        # the resident stacked result PLUS the concurrent per-band decode
-        # temporaries. Sized with decode_readers, that momentary peak — not just
-        # the resident set — must fit the pair budget (else a high-T foreground
-        # read overshoots the RAM ceiling mid-decode).
-        pair = 2 * _S2_STRIP_BYTE_BUDGET
-        readers = _S2_FOREGROUND_DECODE_READERS
-        for t_kept, width, height in [(120, 2000, 2000), (200, 2000, 2000), (90, 4000, 4000)]:
-            h = _strip_height_for_density(t_kept, width, height, pair, decode_readers=readers)
-            if h <= _MIN_STRIP_H:
-                continue  # floored case may breach the budget by design
-            mask_bytes = t_kept * height * width
-            resident = t_kept * h * width * len(S2_BAND_ORDER) * 2
-            transient = readers * t_kept * h * width * 2
-            assert resident + transient + mask_bytes <= pair
-        # Sanity: charging the transient yields a strictly shorter strip than
-        # sizing the resident set alone (the pre-fix behaviour).
-        naive = _strip_height_for_density(200, 2000, 2000, pair)
-        charged = _strip_height_for_density(200, 2000, 2000, pair, decode_readers=readers)
-        assert charged < naive
-
 
 class TestStripPlan:
-    """The strip-plan chooses a tiling + prefetch mode; RAM stays bounded."""
+    """The strip plan tiles a chunk into budget-sized strips."""
 
-    def _peak_resident_bytes(self, plan: _StripPlan, t_kept: int, width: int, height: int) -> int:
-        # Largest single resident S2 set (a strip's bands + the full mask). With
-        # prefetch two sets co-reside; without, only one does. We check the
-        # per-set bound and let the caller compare against 1x or 2x budget.
-        mask_bytes = t_kept * height * width
-        tallest = max(s.stop - s.start for s in plan.strips)
-        return t_kept * tallest * width * len(S2_BAND_ORDER) * 2 + mask_bytes
+    def test_fits_one_budget_is_single_strip(self):
+        assert _strip_plan(t_kept=30, height=2000, width=2000) == [slice(0, 2000)]
 
-    def test_fits_one_budget_is_single_strip_no_prefetch(self):
-        # T=60 @ 2000^2: bands+mask fit one budget -> one strip, nothing to prefetch.
-        plan = _strip_plan(t_kept=60, height=2000, width=2000, valid_px=3_800_000)
-        assert plan.strips == [slice(0, 2000)]
-        assert plan.prefetch is False
-        assert plan.strategy == "single"
+    def test_dense_chunk_splits_with_every_set_under_one_budget(self):
+        strips = _strip_plan(t_kept=120, height=2000, width=2000)
+        assert len(strips) >= 2
+        assert strips[-1].stop == 2000
+        tallest = max(s.stop - s.start for s in strips)
+        assert 120 * tallest * 2000 * len(S2_BAND_ORDER) * 2 + 120 * 2000 * 2000 <= _S2_STRIP_BYTE_BUDGET
 
-    def test_dense_hideable_prefetches_and_stays_under_one_budget(self):
-        # T=120 @ 2000^2, nearly full -> must split; long inference hides the
-        # loads -> prefetch on, each resident set within ONE budget (pair <= 2x).
-        plan = _strip_plan(t_kept=120, height=2000, width=2000, valid_px=3_800_000)
-        assert plan.prefetch is True
-        assert len(plan.strips) >= 2
-        assert "dense/prefetch" in plan.strategy
-        assert self._peak_resident_bytes(plan, 120, 2000, 2000) <= _S2_STRIP_BYTE_BUDGET
+    def test_strips_run_densest_first_with_empty_strips_last(self):
+        # Rows 0-3 have no valid pixel, rows 4-7 half the columns, rows 8-11 all of them.
+        obs = np.zeros((12, 10), dtype=np.uint16)
+        obs[4:8, :5] = 1
+        obs[8:12, :] = 1
+        bundle = SimpleNamespace(mask=np.zeros((3, 12, 10), dtype=bool), obs_count=obs)
+        with patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(4)):
+            _x_sub, strips, live = _read_plan_mod._chunk_read_plan(_CHUNK, bundle)
+        assert strips == [slice(8, 12), slice(4, 8), slice(0, 4)]
+        assert live == 2
 
-    def test_dense_hideable_applies_starter_strip(self):
-        # A tall-body dense chunk gets a small starter first strip so the GPU
-        # starts early; the body hides behind it.
-        plan = _strip_plan(t_kept=120, height=2000, width=2000, valid_px=5_000_000)
-        assert plan.strips[0] == slice(0, 256)
-        assert plan.prefetch is True
-        assert "starter" in plan.strategy
-
-    def test_wide_but_few_valid_px_disables_prefetch(self):
-        # T=200 @ 2000^2 but almost no valid pixels: inference too short to hide
-        # loads -> prefetch OFF, strips sized to the pair budget so only ONE set
-        # is resident (peak still bounded by the dense pair = 2x budget).
-        plan = _strip_plan(t_kept=200, height=2000, width=2000, valid_px=50_000)
-        assert plan.prefetch is False
-        assert plan.strategy in ("no-prefetch", "single/wide-budget")
-        assert self._peak_resident_bytes(plan, 200, 2000, 2000) <= 2 * _S2_STRIP_BYTE_BUDGET
-
-    def test_wide_few_valid_px_fitting_pair_is_single_strip(self):
-        # T=100 needs >1 budget but <= the pair EVEN once its foreground decode
-        # temporaries are counted; non-hideable -> single strip at the wider
-        # budget, prefetch off.
-        plan = _strip_plan(t_kept=100, height=2000, width=2000, valid_px=30_000)
-        assert plan.strips == [slice(0, 2000)]
-        assert plan.prefetch is False
-        assert plan.strategy == "single/wide-budget"
-
-    def test_pair_budget_plan_fits_foreground_decode_transient(self):
-        # A wider/higher-T non-hideable chunk that would fit the pair budget as
-        # one RESIDENT set but NOT once its foreground per-band decode temporaries
-        # are counted must SPLIT — so no strip's momentary read peak overshoots
-        # the pair ceiling (pre-fix this single-stripped and could OOM mid-read).
-        plan = _strip_plan(t_kept=120, height=2000, width=2000, valid_px=1000)
-        assert plan.pair_budget is True
-        assert plan.prefetch is False
-        assert len(plan.strips) >= 2  # would have been a single strip pre-fix
-        pair = 2 * _S2_STRIP_BYTE_BUDGET
-        readers = _S2_FOREGROUND_DECODE_READERS
-        mask_bytes = 120 * 2000 * 2000
-        for s in plan.strips:
-            sh = s.stop - s.start
-            resident = 120 * sh * 2000 * len(S2_BAND_ORDER) * 2
-            transient = readers * 120 * sh * 2000 * 2
-            assert resident + transient + mask_bytes <= pair
+    def test_a_cropped_read_still_charges_the_full_width_mask(self):
+        # Bands are read at the cropped width, but the SCL mask stays full chunk width.
+        assert _strip_plan(120, 2000, 1000, mask_width=2000)[0].stop < _strip_plan(120, 2000, 1000)[0].stop
 
 
 # ---------------------------------------------------------------------------
@@ -298,22 +228,11 @@ def _run_process_chunk(inference_config, test_model, n_t_sar: int = 5):
     return result, _CapturingWriter.last_write
 
 
-def _force_strip_plan(strip_h: int, prefetch: bool, pair_budget: bool = False):
-    """Patch target for ``_strip_plan`` that forces a fixed tiling + prefetch mode.
+def _force_strip_plan(strip_h: int):
+    """Patch target for ``_strip_plan`` that forces a fixed strip height, whatever the density."""
 
-    Lets a test control the strip count, the prefetch-on/off branch, and the
-    ``pair_budget`` flag (which gates the cross-chunk prefetch) regardless of
-    the synthetic chunk's density estimates.
-    """
-
-    def _plan(_t_kept, height, _width, _valid_px, mask_width=None):
-        return _StripPlan(
-            strips=_strip_slices(height, strip_h),
-            prefetch=prefetch,
-            strategy="test",
-            strip_h=strip_h,
-            pair_budget=pair_budget,
-        )
+    def _plan(_t_kept, height, _width, mask_width=None):
+        return _strip_slices(height, strip_h)
 
     return _plan
 
@@ -322,25 +241,20 @@ class TestProcessChunkStriping:
     """1-strip vs N-strip equality and skip-marker behavior."""
 
     def test_single_vs_multi_strip_identical(self, inference_config, test_model):
-        # Force the tiling via _strip_plan so the test controls both the strip
-        # count and the prefetch branch, regardless of the synthetic chunk's
-        # density. strip_h > height -> one strip (== unstriped path).
-        with patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(10**6, prefetch=False)):
+        # Force the tiling via _strip_plan so the test controls the strip count
+        # regardless of the synthetic chunk's density. strip_h > height -> one
+        # strip (== unstriped path); a small strip height forces a multi-strip
+        # split of this tiny chunk. Both tilings must yield bit-identical output.
+        with patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(10**6)):
             res_one, write_one = _run_process_chunk(inference_config, test_model)
-        # A small strip height forces a multi-strip split of this tiny chunk,
-        # exercised on BOTH the prefetch-on (dense) and prefetch-off (sparse)
-        # paths — all three tilings must yield bit-identical output.
-        with patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(4, prefetch=True)):
-            res_pf, write_pf = _run_process_chunk(inference_config, test_model)
-        with patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(4, prefetch=False)):
-            res_nopf, write_nopf = _run_process_chunk(inference_config, test_model)
+        with patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(4)):
+            res_multi, write_multi = _run_process_chunk(inference_config, test_model)
 
-        assert res_one["status"] == res_pf["status"] == res_nopf["status"] == "success"
-        assert res_one["valid_pixels"] == res_pf["valid_pixels"] == res_nopf["valid_pixels"]
+        assert res_one["status"] == res_multi["status"] == "success"
+        assert res_one["valid_pixels"] == res_multi["valid_pixels"]
 
-        for other in (write_pf, write_nopf):
-            # int8 embeddings must be bit-identical regardless of input tiling
-            # or prefetch mode.
+        for other in (write_multi,):
+            # int8 embeddings must be bit-identical regardless of input tiling.
             np.testing.assert_array_equal(write_one["embeddings"], other["embeddings"])
             # Per-pixel scales are float32 and identical to ~1e-7 rel: the same
             # pixels go through the model, but float accumulation order differs
@@ -367,7 +281,7 @@ class TestProcessChunkStriping:
         Nothing downstream can tell those apart, so the check has to be that the flags are
         both PRESENT and consistent with the count they partition.
         """
-        with patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(4, prefetch=False)):
+        with patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(4)):
             result, write = _run_process_chunk(inference_config, test_model, n_t_sar=_N_T_SAR_SPANNING_MARCH)
 
         assert result["status"] == "success"
@@ -448,7 +362,7 @@ class TestProcessChunkStriping:
             with (
                 patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_open_store_side_effect()),
                 patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
-                patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(4, prefetch=True)),
+                patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(4)),
                 patch.object(_actors_mod, "load_chunk", side_effect=_blocking_load),
             ):
                 result = actor.process_chunk(_CHUNK, "s3://b/m", "/tmp/staging", "run-1")
@@ -652,7 +566,7 @@ class TestEmptyStripBandReadSkip:
         with (
             patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._make_half_empty_stores()),
             patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
-            patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(strip_h, prefetch=True)),
+            patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(strip_h)),
             patch.object(_dl_mod, "_load_s2_bands", wraps=_dl_mod._load_s2_bands) as band_spy,
         ):
             result = actor.process_chunk(_CHUNK, "s3://b/m", "/tmp/staging", "run-1")
@@ -774,7 +688,7 @@ class TestEastingBboxCrop:
 
 
 # ---------------------------------------------------------------------------
-# Bounded cross-chunk starter prefetch
+# Cross-chunk prefetch
 # ---------------------------------------------------------------------------
 
 _CHUNK_B = ChunkSpec(row=1, col=0, y_start=0, y_stop=12, x_start=0, x_stop=10)
@@ -815,56 +729,40 @@ def _assert_writes_identical(a, b):
 
 
 class TestXChunkPrefetch:
-    """Rung rules + end-to-end bit-identity for the cross-chunk prefetch."""
+    """End-to-end bit-identity and failure handling for the cross-chunk prefetch."""
 
-    def _plan(self, prefetch=True, pair_budget=False, starter_first=False):
-        return _StripPlan(
-            strips=[slice(0, 256), slice(256, 2000)],
-            prefetch=prefetch,
-            strategy="test",
-            strip_h=1744,
-            pair_budget=pair_budget,
-            starter_first=starter_first,
-        )
-
-    def test_rung_rules(self):
-        big = ChunkSpec(row=0, col=0, y_start=0, y_stop=2000, x_start=0, x_stop=2000)
-        dense_starter = self._plan(starter_first=True)
-        # Starter-first plans prefetch their (already small) starter.
-        assert _xchunk_rung(big, 60, None, 4_000_000, dense_starter) == "starter"
-        # Plain dense split: strips[0] is a budget-sized set — never prefetched.
-        assert _xchunk_rung(big, 60, None, 4_000_000, self._plan()) == "mask-only"
-        # Pair-budget (non-hideable) plans get the mask.
-        assert _xchunk_rung(big, 60, None, 50_000, self._plan(prefetch=False, pair_budget=True)) == "mask-only"
-        single = _StripPlan([slice(0, 2000)], prefetch=False, strategy="single", strip_h=2000)
-        # Dense single-strip: converting to starter+body nets positive.
-        assert _xchunk_rung(big, 60, None, 4_000_000, single) == "starter"
-        # Sparse single-strip: the extra fixed read could never hide.
-        assert _xchunk_rung(big, 60, None, 100_000, single) == "mask-only"
-        # Byte cap: very dense chunks fall back to the mask rung.
-        assert _xchunk_rung(big, 400, None, 4_000_000, dense_starter) == "mask-only"
-
-    def test_chain_bit_identical_mask_only_rung(self, inference_config, test_model):
-        # The tiny test chunk plans single-strip below the starter height, so
-        # the natural rung is mask-only: the stash supplies mask + plan and the
-        # first strip loads inline. Output must match a serial run exactly.
-        chained, actor = _run_chunk_chain(inference_config, test_model, [(_CHUNK, _CHUNK_B), (_CHUNK_B, None)])
-        serial, _ = _run_chunk_chain(inference_config, test_model, [(_CHUNK_B, None)])
+    @pytest.mark.parametrize("strip_h", [10**6, 4], ids=["one-strip", "multi-strip"])
+    def test_prefetched_chunk_is_bit_identical_to_serial(self, inference_config, test_model, caplog, strip_h):
+        # The stash carries the next chunk's mask, plan and loaded first strip;
+        # consuming it must produce output identical to a serial run under the
+        # same tiling.
+        patches = (patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(strip_h)),)
+        with caplog.at_level("INFO", logger=_actors_mod.logger.name):
+            chained, actor = _run_chunk_chain(
+                inference_config, test_model, [(_CHUNK, _CHUNK_B), (_CHUNK_B, None)], patches
+            )
+        assert f"xchunk prefetch: hit for {_CHUNK_B.label}" in caplog.text
+        serial, _ = _run_chunk_chain(inference_config, test_model, [(_CHUNK_B, None)], patches)
         _assert_writes_identical(chained[1], serial[0])
         assert actor._xchunk_prefetched == {}  # stash consumed
 
-    def test_chain_bit_identical_starter_rung(self, inference_config, test_model):
-        # Force a multi-strip plan and the starter rung so the stash carries a
-        # loaded first strip; the consuming prologue must produce identical
-        # output to a serial run under the same tiling.
+    def test_prefetch_starts_on_the_last_strip_with_pixels(self, inference_config, test_model, caplog):
+        # The half-empty tile runs its valid strip first and its empty strip last, so the next
+        # tile's prefetch must start before the valid strip's inference, not on the empty strip
+        # that has no inference to hide it behind.
         patches = (
-            patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(4, prefetch=True)),
-            patch.object(_actors_mod, "_xchunk_rung", lambda *a, **k: "starter"),
+            patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(6)),
+            patch.object(
+                _dl_mod,
+                "open_store_as_zarr_group",
+                side_effect=TestEmptyStripBandReadSkip()._make_half_empty_stores(),
+            ),
         )
-        chained, actor = _run_chunk_chain(inference_config, test_model, [(_CHUNK, _CHUNK_B), (_CHUNK_B, None)], patches)
-        serial, _ = _run_chunk_chain(inference_config, test_model, [(_CHUNK_B, None)], patches)
-        _assert_writes_identical(chained[1], serial[0])
-        assert actor._xchunk_prefetched == {}
+        with caplog.at_level("INFO"):
+            _run_chunk_chain(inference_config, test_model, [(_CHUNK, _CHUNK_B), (_CHUNK_B, None)], patches)
+        text = caplog.text
+        assert text.index(f"xchunk prefetch: starting for {_CHUNK_B.label}") < text.index("Starting v1.1 inference")
+        assert f"xchunk prefetch: hit for {_CHUNK_B.label}" in text
 
     def test_stale_stash_evicted_on_reassignment(self, inference_config, test_model):
         # Prefetched B but got C (steal/requeue): C runs serially and the
@@ -873,22 +771,6 @@ class TestXChunkPrefetch:
         serial, _ = _run_chunk_chain(inference_config, test_model, [(_CHUNK_C, None)])
         _assert_writes_identical(chained[1], serial[0])
         assert actor._xchunk_prefetched == {}
-
-    def test_env_hatch_disables_prefetch(self, inference_config, test_model, monkeypatch):
-        monkeypatch.setenv(_XCHUNK_DISABLE_ENV, "1")
-        _, actor = _run_chunk_chain(inference_config, test_model, [(_CHUNK, _CHUNK_B)])
-        # Never started: the lazily-created stash is empty (or never created).
-        assert getattr(actor, "_xchunk_prefetched", {}) == {}
-
-    def test_pair_budget_plan_skips_prefetch(self, inference_config, test_model):
-        # A pair-budget plan holds a near-2x-budget set on its last strip —
-        # NOT a RAM trough — so the cross-chunk prefetch must be skipped or it
-        # could breach the ceiling.
-        patches = (
-            patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(10**6, prefetch=False, pair_budget=True)),
-        )
-        _, actor = _run_chunk_chain(inference_config, test_model, [(_CHUNK, _CHUNK_B)], patches)
-        assert getattr(actor, "_xchunk_prefetched", {}) == {}
 
     def test_wedged_prefetch_pool_raises(self, inference_config, test_model, monkeypatch):
         # The prefetch pool is a single PERSISTENT worker: a hung task never
@@ -1021,8 +903,8 @@ class TestPerCellTimeWindow:
     def test_passing_the_config_window_explicitly_is_bit_identical(self, inference_config, test_model):
         """The safety property: threading the window must not have changed the numbers.
 
-        The window reaches three loader call sites — the serial prologue, the cross-chunk
-        prefetch starter, and the strip loop — which are documented as needing identical
+        The window reaches the loader call sites — the serial prologue, the cross-chunk
+        prefetch, and the strip loop — which are documented as needing identical
         kwargs for bit-identity. `_process_chunk` resolves the fallback ONCE into a local and
         passes that value to all three, so they cannot drift; this asserts the outcome.
         """
@@ -1111,8 +993,8 @@ class TestTheRecordTheConsumerWillRead:
             real_plan = _actors_mod._chunk_read_plan
 
             def _cropped(chunk, mask_bundle):
-                _x_sub, valid_px, plan = real_plan(chunk, mask_bundle)
-                return crop, valid_px, plan
+                _x_sub, strips, live = real_plan(chunk, mask_bundle)
+                return crop, strips, live
 
             monkeypatch.setattr(_actors_mod, "_chunk_read_plan", _cropped)
 

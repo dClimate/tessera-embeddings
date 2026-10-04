@@ -67,6 +67,10 @@ context_docs/
 │                                                  the record of each run
 │
 ├── inference/                     RUNNING THE ENCODER
+│   ├── inference-at-2048.md                    the October 2026 inference experiments: what was
+│   │                                              tried, measured and shipped — the simpler strip
+│   │                                              loader, densest-first strips, the forward-pass
+│   │                                              benchmark — written for a reader new to it
 │   ├── inference-on-gpus.md                    throughput, which cards may be rented, why the
 │   │                                              batch is sized to the card, and what the
 │   │                                              campaign path itself measured

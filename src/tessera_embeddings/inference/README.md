@@ -334,37 +334,34 @@ through the model, and written into the whole-tile output buffers by row range.
          └ each strip's read happens DURING the previous strip's forward passes
 ```
 
-**How the strips are chosen.** `_strip_plan` decides per tile, from the full-tile SCL mask
-it already loaded. Two quantities pull in different directions: the bytes to read scale with
-`T_kept × H × W` regardless of how many pixels are valid, while the GPU time scales with the
-**valid-pixel count**. A tile can be cheap to read and slow to infer, or the reverse, so the
-plan picks the strategy that fits — the same choice appears as Q2 and Q3 of the
-[decision tree](../../../docs/inference-performance.md#how-a-tiles-path-is-chosen):
+**How the strips are chosen.** `_strip_plan` sizes strips from the full-tile SCL mask it
+already loaded: the tallest strip whose bands plus the tile's mask fit one byte budget. A
+tile that fits one budget is a single strip.
 
 ```text
- per_set = T_kept·H·W·(10 bands × 2 B + 1 B mask)   budget = _S2_STRIP_BYTE_BUDGET (5.75 GiB)
+ per_set = T_kept·strip_h·W·(10 bands × 2 B) + T_kept·H·W·(1 B mask)
+ budget  = _S2_STRIP_BYTE_BUDGET (3.5 GiB)
 
- per_set ≤ budget ─────────────────────────────▶ ONE strip, no prefetch   (most tiles)
- else, and enough valid pixels to hide the ───▶ equal strips ≤ budget, prefetch ON
- reads behind inference (a dense tile)
-        └─ tall enough to be worth it? ───────▶   + a small "starter" strip, so the
-                                                   GPU begins one read sooner
- else (many bytes, few valid pixels, so ──────▶ strips ≤ the PAIR budget, prefetch OFF
- nothing to hide the reads behind)                (only one strip resident, so it may
-                                                   safely use twice the budget)
+ whole tile fits the budget ──▶ ONE strip
+ else                        ──▶ equal strips, each ≤ budget, the next one always loading
+                                 in the background (floor: 256 rows)
 ```
 
-**Peak host memory has the same ceiling in every branch.** With prefetching on, two band
-sets co-reside — the strip being inferred and the strip being read — each within the budget,
-so the pair is bounded at roughly twice it. With prefetching off the previous set is
-released before the next is read, so only one is resident and it may use the whole pair
-budget. Either way the ceiling is the same, and it holds peak memory under 60% of a 32 GB
-worker across the density variation of a whole UTM zone. The arithmetic behind the budget
-constant is in its own comment.
+**Strips run densest first, empty strips last.** Each strip's load hides behind the previous
+strip's inference, so an empty or sparse strip early in the order — the top rows of a tile on a
+footprint's edge — would leave the next load exposed with the card idle. The order does not change
+which pixels share a sub-batch, so the outputs are the same in any order.
 
-**Turning prefetching off is deliberate, not a fallback.** A background read only helps if
-there is inference to hide it behind. On a tile with many bytes and few valid pixels the
-read would sit exposed on the critical path *and* force a second resident set for nothing.
+**Peak host memory has one ceiling.** The load pipeline is one strip deep, so at most two
+band sets co-reside — the strip being inferred and the strip being read — and the pair is
+bounded at twice the budget. That holds peak memory near 42% of a 32 GB worker, well under
+the 60% ceiling, and the margin is what absorbs the memory spikes a global run does hit. The
+arithmetic behind the budget is in its own comment.
+
+**Strips are cheap on 2048-px mosaics.** The mosaics are stored in 2048-px chunks, the same
+size as the tile, so a strip reads row slices of whole storage chunks: each extra strip costs
+a background decompression rather than the ~13 s fixed read the 4000-px storage chunks once
+charged. That is why the budget could drop from 5.75 GiB without costing throughput.
 
 **Two reads are decoupled.** The SCL mask — one byte per pixel — is read **once** for the
 whole tile (`load_s2_mask_bundle`) and sliced per strip, never re-decompressed; it doubles
@@ -375,44 +372,39 @@ as if striping did not exist.
 
 #### 4.3 Starting the next tile early, and finishing the last one late
 
-Every tile pays a serial, GPU-idle **prologue** before its first forward pass: read the SCL
-mask, read the first band set, build the dataset. That is 24–36 seconds per tile in which
+Every tile pays a **prologue** before its first forward pass: read the SCL mask, read the
+first band set, build the dataset. Run serially, that is several seconds per tile in which
 an expensive card does nothing.
 
-The fix is to do it during the *previous* tile's work. The scheduler reserves each actor's
-next tile one ahead (`ActorPool.reserved`, passed to the actor as `prefetch_hint`), and
-during the current tile's **last strip** — by which point the co-residency has decayed to
-its low point — the actor preloads a **capped** payload for the tile it is about to get:
-its SCL mask and read plan, and where the budget allows, its first 256 rows.
+The fix is to run it during the *previous* tile's last strip. The scheduler reserves each
+actor's next tile one ahead (`ActorPool.reserved`, passed to the actor as `prefetch_hint`),
+and the strip pipeline simply runs across the tile boundary: on tile N's last strip with
+pixels, the "next strip" to load is tile N+1's first, together with its SCL mask. Any empty
+strips after it load alongside, for their observation counts.
 
 ```text
  actor timeline, tile N → N+1 (prefetch hit)
 
- [═════════ inference N ═══════════][═ N+1 starter ═][═══ N+1 body ═══]
-              [mask N+1][starter N+1]      [body N+1 loads]
-  GPU:  busy ─────────────────────── busy ── busy ─────── busy
-        └ prefetch runs during N's LAST strip (the memory trough) ┘
+ [═══ N strip k-1 ═══][═══ N last strip ═══][═══ N+1 strip 0 ═══][═══ N+1 strip 1 ═══]
+     [N last strip loads] [mask + strip 0 of N+1]  [N+1 strip 1 loads]
+  GPU:  busy ──────────── busy ──────────────── busy ──────────── busy
 ```
 
-**It deliberately does not prefetch the whole next tile.** That co-resides two full working
-sets, and at UTM-zone density variation it exhausts the machine's memory — measured at
-92–95% peak, which killed a worker. The cap is about 2 GiB
-(`_XCHUNK_PREFETCH_CAP_BYTES`), and the tiers that decide how much of it to use
-(`_xchunk_rung`) are conservative: a dense, already-striped tile gets its small starter
-free; a single-budget tile is converted into starter-plus-body only when a net-gain check
-says the extra fixed read will actually be hidden; everything else gets the mask alone.
+**It never holds more than the pair.** Tile N's last strip and tile N+1's first, each charged
+its own mask, are the same two sets the budget is sized for. Prefetching a whole next tile
+would co-reside two full working sets, which once exhausted a worker's memory at 92–95%.
 
-**Every way this can miss degrades to the serial prologue** — slower, never bigger. Hitting
-the cap, another actor stealing the reserved tile, a credential window expiring, a failed
-read, or the `TESSERA_DISABLE_XCHUNK_PREFETCH=1` escape hatch all simply mean the next tile
-loads the way it would have anyway.
+**Every way this can miss degrades to the serial prologue** — slower, never bigger. Another
+actor stealing the reserved tile, a credential window expiring, or a failed read all simply
+mean the next tile loads the way it would have anyway.
 
 **Two smaller overlaps ride on the same idea.** Bucketing rides the strip-prefetch thread:
 `_load_strip` returns the built dataset alongside the data, so choosing pixels and grouping
 them (about ten seconds) happens during the previous strip's GPU work rather than between
-load and inference. And background strip loads **reserve two cores** for the batch-prep
-workers feeding the GPU (`reserve_cpus`), so decompressing bands cannot starve inference on
-a four-vCPU machine.
+load and inference. Background loads do compete with the batch-prep workers for the four
+cores — zarr decompresses on its own pool across all of them — but preparing a batch takes
+about a quarter of the GPU's time per batch and the loop prepares two ahead, so the GPU still
+runs at its standalone rate.
 
 **The staging write is deferred too.** It goes to a single-slot writer thread and overlaps
 the next tile's prologue — both are I/O, and the GPU is idle for either. The tile's result
