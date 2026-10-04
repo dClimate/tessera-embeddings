@@ -1252,12 +1252,18 @@ strip and a body, while the rerun processed it first as one strip. That tiling d
 
 | | v1.1 | v2 |
 |---|---|---|
-| L40S, paired flow runs (25 tiles) | median tile 181 → 168 s; GPU-hours per tile 0.065 → 0.061 (−6%) | not run |
-| L40S, single box (same tiles, serial) | −3.5% wall per tile | ±1% |
+| L40S, single box (same tiles, serial) | **−3.5% wall per tile** | ±1% |
+| L40S, paired flow runs (25 tiles) | median tile 181 → 168 s; GPU-hours per tile 0.065 → 0.061 (−6%), on cards running 10% faster clocks (below) | not run |
 | A10G, deepest bucket (256 + 256) | 2,947 → 3,253 ms, **10% slower** | +1% |
 | A10G, shallower buckets | 1% faster | ±1% |
 | card memory, peak allocated | L40S 8.3 → 9.3 GiB; A10G deepest 12.0 → 13.4 GiB (fits; no OOM at the fitted batch) | unchanged |
 | host RAM, peak per actor (paired runs) | 16.1 → 15.0 GB | — |
+
+**The single box is the speed figure to use.** The paired runs give each stack its own cards, and
+cards differ: under the shared 350 W cap a card's clock falls about 11 MHz per degree it runs hotter.
+The 2.14.1 run's three cards averaged 1,842 MHz against the control's 1,680, and across 56 cards a 10%
+higher clock makes a forward pass about 2% faster, so part of the paired −6% is the cards. The single
+box ran both stacks on one card.
 
 Unit suites passed on 2.14.1 in both repositories (3,894 and 1,290 tests), as did v2's golden tests
 on the real checkpoint and a complete `m10_parity_15S` flow run, assembly included, in 8m24s.

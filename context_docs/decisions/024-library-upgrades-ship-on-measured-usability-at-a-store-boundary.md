@@ -61,5 +61,5 @@ against itself across two runs.**
   running would put two stacks into one store.
 - Every future upgrade repeats the measurement in `inference-on-gpus.md` §8, on both models and on
   every card the fleet may use. Speed and card memory are part of it, because they can move in
-  either direction: 2.14.1 is about 6% faster per tile on the L40S but 10% slower on the A10G's
+  either direction: 2.14.1 is about 3.5% faster per tile on the L40S but 10% slower on the A10G's
   deepest bucket.
