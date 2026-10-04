@@ -25,8 +25,8 @@ was what the new 2048-px mosaics let us change to spend less on them.
   `torch.compile`, and FP8 arithmetic. A PyTorch upgrade is handled in its own PR; on its own it
   is no faster.
 - **What is left:** about 2.3% of card time goes to tiles waiting for their first rows to finish
-  loading. A smaller first strip was tried and made tiles slower, so what remains is making the read
-  itself faster, which is a question for how the mosaics are stored (PR #210 and its follow-on).
+  loading. A smaller first strip was tried and saved nothing overall, so what remains is making the
+  read itself faster, which is a question for how the mosaics are stored (PR #210 and its follow-on).
 
 ## The few terms this needs
 
@@ -176,13 +176,16 @@ starter):
 
 | | Without starter | With starter |
 |---|---|---|
-| GPU idle, share of card time | 2.74% | 2.06% |
-| Total tile time | 88,527 s | 89,959 s (+1.6%) |
+| GPU idle, share of card time | 2.80% | 1.98% |
+| Total tile time, 361 tiles | 80,545 s | 80,363 s (−0.2%) |
 
-The idle time fell, but tiles took longer in total: the extra strip each tile carried (one more read,
-one more partly filled sub-batch) cost more than the idle it saved. The 32 tiles without a starter
-also moved, by +0.9%, so part of the difference is noise; either way there is no gain.
-**Reverted** (`21bcc8dd`).
+The idle time fell, but total tile time did not move: the extra strip each tile carried (one more
+read, one more partly filled sub-batch) cost about what the idle it removed saved. No gain worth the
+added loading logic. **Reverted** (`21bcc8dd`).
+
+One of the starter arm's eight cards overheated for much of the run: its thermal throttle was active
+in 43% of its samples, its clock fell as low as 525 MHz, and its tiles ran about 15% slower. Its 33
+tiles are left out of the figures above. With them in, the starter arm looks 1.6% slower.
 
 **One setting removed.** The loader limited its own band-reading threads to leave CPU cores for
 the GPU feed (`reserve_cpus`). But zarr decompresses on its own thread pool, across every core,
@@ -232,6 +235,13 @@ Iowa could be paired. Each tile's `CHUNK_SUMMARY` log line gives its total, infe
 seconds and its strip counts; the workers' `RESOURCES` lines give memory. Tiles are compared by
 label, and costs as sums of per-tile seconds, which do not depend on how many workers each run got.
 Outputs are compared with `te-compare-outputs` on a machine in the same account.
+
+**Cards differ, and one card can sink an arm.** Each run gets its own cards. Under the same 350 W
+power cap, a card's clock falls about 11 MHz for every degree it runs hotter, and the occasional card
+overheats and throttles itself. Every comparison here was checked for that from the workers'
+`RESOURCES` lines (clock, temperature and throttle reasons, every 30 s). Round 4 is the one affected.
+Round 3's densest-first arm happened to run 2% faster clocks on average, which matches its −0.7% on
+interior tiles whose code did not change.
 
 **A code bundle is not always enough.** Ray workers can load a different version of the code from
 a bundle in S3, which suits changes to values. But Ray builds the worker class on the driver, which
