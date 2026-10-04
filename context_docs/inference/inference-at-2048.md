@@ -25,7 +25,8 @@ was what the new 2048-px mosaics let us change to spend less on them.
   `torch.compile`, and FP8 arithmetic. A PyTorch upgrade is handled in its own PR; on its own it
   is no faster.
 - **What is left:** about 2.3% of card time goes to tiles waiting for their first rows to finish
-  loading. Fixing that needs either a faster load or more memory than the 60% ceiling allows.
+  loading. A smaller first strip was tried and made tiles slower, so what remains is making the read
+  itself faster, which is a question for how the mosaics are stored (PR #210 and its follow-on).
 
 ## The few terms this needs
 
@@ -161,7 +162,38 @@ fix it but hold one more strip in memory, and the full-year runs already peak at
 strip adds about 12 points, past the 60% ceiling. The other remaining cost is each worker's very
 first tile, which has nothing before it to prefetch behind: about 0.3%.
 
-### 4. Could the model's forward pass itself be cheaper?
+### 4. Could a tile's first strip load faster?
+
+On a dense tile the first load takes 20–25 s: about 3 s for the tile's cloud masks, 13 s to read and
+decompress the ten bands, 3 s to build the dataset and 4 s for the rest. The band read dominates,
+and most of its cost does not depend on how many rows the strip asks for: every read decompresses
+each whole storage chunk it touches. On a dense tile, reading a quarter of the rows took 2.4 s
+against 3.1 s for the whole height.
+
+**Round 4** (global-tessera-dev, the round 3 code with and without a small first "starter" strip on
+tiles dense enough to want one, the whole Iowa year, every tile paired; 362 of the 394 tiles got a
+starter):
+
+| | Without starter | With starter |
+|---|---|---|
+| GPU idle, share of card time | 2.74% | 2.06% |
+| Total tile time | 88,527 s | 89,959 s (+1.6%) |
+
+The idle time fell, but tiles took longer in total: the extra strip each tile carried (one more read,
+one more partly filled sub-batch) cost more than the idle it saved. The 32 tiles without a starter
+also moved, by +0.9%, so part of the difference is noise; either way there is no gain.
+**Reverted** (`21bcc8dd`).
+
+**One setting removed.** The loader limited its own band-reading threads to leave CPU cores for
+the GPU feed (`reserve_cpus`). But zarr decompresses on its own thread pool, across every core,
+whatever the loader's thread count, so the setting reserved nothing, and the GPU was not short of
+CPU anyway. It was removed (`d0336590`); the loader uses two band-reading threads.
+
+**The read can only get faster in storage.** Two changes off `main` target it: Blosc-LZ4 compression,
+which decompresses 2.6× faster than today's zstd (PR #210), and sharding the mosaics so that a strip
+decompresses only its own rows rather than whole 4096-px chunks (stacked on #210).
+
+### 5. Could the model's forward pass itself be cheaper?
 
 The forward pass is about 90% of a tile's time, so it is the biggest target. Its parts were timed
 on one L40S with the production model and checkpoint, batch 7,168, at five observation depths:
@@ -180,7 +212,7 @@ and observation on every forward pass. Computing all 367 days once and looking t
 same values and skips two large temporary tensors per pass. Because the model code is shared with
 `main` and the v2 model, that change went into its own PR rather than this branch.
 
-### 5. Smaller decisions
+### 6. Smaller decisions
 
 - **The easting crop stays.** Edge tiles read only the columns that hold pixels. Removing the crop
   would save code but would change `eligible_px`, a published registry field, so it was held.
@@ -191,12 +223,12 @@ same values and skips two large temporary tensors per pass. Because the model co
 
 **Inputs.** The Iowa year ingested at 2048 px under `_frisky_e2e_c/` (mosaics, ROI and checkpoint),
 first in `s3://arbol-tessera-inputs-dev/` (round 1, yield account) and then copied object for
-object to `s3://global-tessera-inputs-dev/` (rounds 2 and 3, global-tessera-dev).
+object to `s3://global-tessera-inputs-dev/` (rounds 2 to 4, global-tessera-dev).
 
 **Side by side, with a control.** Every round ran its variants at the same time, each on its own Ray
 cluster of `g6e.xlarge` workers, so S3 and capacity conditions were shared. Rounds 1 and 2 were
-stopped after 25–35 minutes of inference; round 3 ran to completion so that every tile of Iowa
-could be paired. Each tile's `CHUNK_SUMMARY` log line gives its total, inference, idle and prologue
+stopped after 25–35 minutes of inference; rounds 3 and 4 ran to completion so that every tile of
+Iowa could be paired. Each tile's `CHUNK_SUMMARY` log line gives its total, inference, idle and prologue
 seconds and its strip counts; the workers' `RESOURCES` lines give memory. Tiles are compared by
 label, and costs as sums of per-tile seconds, which do not depend on how many workers each run got.
 Outputs are compared with `te-compare-outputs` on a machine in the same account.
@@ -204,24 +236,24 @@ Outputs are compared with `te-compare-outputs` on a machine in the same account.
 **A code bundle is not always enough.** Ray workers can load a different version of the code from
 a bundle in S3, which suits changes to values. But Ray builds the worker class on the driver, which
 runs the deployed code, so a change that removes or renames anything the driver's copy refers to
-fails at start-up. Rounds 2 and 3 therefore ran each side from its own yield-embeddings branch
-(`dev/global-tessera-frisky-inf`, `-simple` and `-order`). For the same reason, round 1's attempt
-to switch the old prefetch off through an environment variable did nothing: the driver sets that
-environment.
+fails at start-up. Rounds 2 to 4 therefore ran each side from its own yield-embeddings branch
+(`dev/global-tessera-frisky-inf`, `-simple`, `-order` and `-starter`). For the same reason, round
+1's attempt to switch the old prefetch off through an environment variable did nothing: the driver
+sets that environment.
 
 **Capacity.** L40S machines were scarce in us-west-2 for much of the work and arrived one at a time.
 In global-tessera-dev a per-cluster cap on GPU workers (`/global-tessera-dev/ray/gpu-worker-ladder`
 in SSM) was removed for these tests.
 
-**Cost.** About 70 L40S-hours across the three rounds and the benchmark (round 3 alone, two full
-runs, about 52), plus head nodes and a small comparison machine; about $2 to copy the 1.6 TB of
+**Cost.** About 120 L40S-hours across the four rounds and the benchmarks (rounds 3 and 4, two full
+runs each, about 50 apiece), plus head nodes and small comparison machines; about $2 to copy the 1.6 TB of
 inputs and about $36 a month to keep them.
 
 ## What is left
 
-- **The first-strip wait** (about 2.3% of card time): making the next tile's first load faster —
-  for example a smaller first strip, which is what the old loader's starter strip did — rather
-  than holding more in memory.
+- **The first-strip wait** (about 2.3% of card time): a faster read, from the mosaic storage
+  changes above, rather than more memory or a smaller first strip.
 - **Merging.** Any change to the model or loader code changes the inference code identity, which
   stops staged tiles being reused and puts later appends under a new identity. This branch, the
-  table (#208) and the PyTorch upgrade are best merged together so that happens once.
+  table (#208), the PyTorch upgrade and the mosaic storage PRs are best merged together so that
+  happens once.
