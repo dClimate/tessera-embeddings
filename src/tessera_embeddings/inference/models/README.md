@@ -52,9 +52,12 @@ upstream v2's `PixelStudent.encode`, so a v2 checkpoint loads into it
 the dual-CUDA-stream backbone execution and the profiling hooks for both
 versions.
 
-`builder._fuse_custom_gru` is a v1.1-only optimisation and is skipped for v2:
-there is no GRU in the v2 graph (so also none of the reset-gate approximation
-documented in its docstring).
+v1.1's pooling head runs each timestep of its GRU, LayerNorm and attention score
+as one compiled step (`modules._gru_pool_step`), in the arithmetic the checkpoint
+was trained with: the reset gate is applied to the hidden state before its matrix
+multiply. PyTorch's `nn.GRU` applies it after and cannot stand in for it
+([ADR 026](../../../../context_docs/decisions/026-v1-1-runs-the-gru-it-was-trained-with.md)).
+v2 has no GRU.
 
 ## What not to touch
 
@@ -62,7 +65,9 @@ documented in its docstring).
   `TemporalEncoding`, `TemporalAwarePooling`, and the `CustomGRU` / `CustomGRUCell`
   pair — these define the exact architecture the v1.1 checkpoint was trained with.
   Changing layer dimensions, activation functions, or the forward pass will break
-  checkpoint loading.
+  checkpoint loading. `_gru_pool_step` must compute exactly what `CustomGRUCell`,
+  the LayerNorm and the attention score compute; `tests/unit/inference/test_models.py`
+  holds it to them.
 
 - **`ssl_model.py`**: `MultimodalBTInferenceModel` (the shared inference wrapper)
   and `build_dim_reducer` (v1.1 reducer). The fusion method (`concat` vs `sum`) and

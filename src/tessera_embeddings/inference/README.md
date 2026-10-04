@@ -49,9 +49,9 @@ computation, but waiting for imagery to arrive from S3, for the next batch of pi
 prepared, and for finished results to be written back. Most of what follows removes a reason
 for the card to wait rather than making the model faster.
 
-**Not all of it, though.** The forward pass itself was also changed: v1.1's recurrent layer is
-fused so cuDNN runs it in about one kernel launch instead of 480, positional encoding is kept
-from dragging the whole graph into FP32, and the training-only heads never reach the model at
+**Not all of it, though.** The forward pass itself was also changed: each step of v1.1's
+recurrent pooling head runs as one compiled kernel, positional encoding is kept from dragging
+the whole graph into FP32, and the training-only heads never reach the model at
 all. Those are changes to what runs on the card, and they are what gave the scheduling work a
 fast forward pass to schedule around. They have their own section in the performance document.
 
@@ -619,18 +619,23 @@ to 0.0027. The copy to the GPU was already FP32, so this costs no bandwidth.
 **Four things are deliberately off or replaced**, each because it was measured and made
 things worse:
 
-- **`torch.compile` is disabled.** Capturing the model as a CUDA graph consumed 11.6 GB of
-  VRAM and roughly doubled the forward pass, because v1.1's recurrent layer recompiled for
-  every distinct sequence length it saw.
+- **`torch.compile` is off for the model.** Capturing the model as a CUDA graph consumed
+  11.6 GB of VRAM and roughly doubled the forward pass, because v1.1's recurrent layer
+  recompiled for every distinct sequence length it saw. Only the pooling head's single
+  timestep is compiled (below): its shapes do not depend on the sequence length, so it compiles
+  once per process.
 - **cuDNN's autotuner (`benchmark` mode) is disabled.** It searches for the fastest kernel
   per input shape, and bucketing means the shapes change constantly, so it searches
   constantly — and inflates host memory doing it.
-- **The reference GRU is swapped for a fused one.** A GRU is the recurrent layer in the
-  model's pooling head. `builder._fuse_custom_gru` replaces the checkpoint-faithful
-  `CustomGRU` with PyTorch's fused `nn.GRU` before inference, turning roughly 480 GPU
-  kernel launches into one, so the recurrence is no longer bound by launch overhead. This
-  is a small, deliberate approximation in the reset gate — see the builder's docstring.
-  v1.1 only: v2's pooling head is a single attention layer with no recurrence to fuse.
+- **The pooling head runs one fused step per timestep.** v1.1 pools each pixel's sequence
+  with a GRU, a LayerNorm and an attention score. Run as written, the GRU is several small
+  GPU operations per timestep. Instead `modules._gru_pool_step` does one timestep of all
+  three, in the GRU's trained arithmetic, and is compiled into a single kernel; the
+  per-timestep GRU output is never stored, only one score per step. PyTorch's built-in
+  `nn.GRU` is not used: it applies the reset gate after the hidden-state matrix multiply,
+  where the model was trained with it before, and on real pixels that changes every stored
+  value ([ADR 026](../../../context_docs/decisions/026-v1-1-runs-the-gru-it-was-trained-with.md)).
+  v1.1 only: v2's pooling head is a single attention layer with no recurrence.
 - **Positional encoding writes into an uninitialised buffer.** The sine and cosine values
   are written straight into it, instead of being scattered into a multi-gigabyte block of
   FP32 zeros allocated on every forward pass. Same values, lower peak memory.

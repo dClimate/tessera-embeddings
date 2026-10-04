@@ -4,13 +4,16 @@ Ported from ``tessera_infer/src/models/modules.py``; logic is unchanged, so the 
 fixed by the checkpoints rather than chosen.
 """
 
+import functools
 import logging
 import math
 import time
+from collections.abc import Callable
 from typing import cast
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F  # noqa: N812 — the conventional spelling
 
 logger = logging.getLogger(__name__)
 
@@ -66,10 +69,9 @@ class CustomGRUCell(nn.Module):
 class CustomGRU(nn.Module):
     """GRU built from ``CustomGRUCell``, matching ``nn.GRU(batch_first=True)`` contract.
 
-    Exists because the tessera beta QAT checkpoint stores per-gate linear weights rather than
-    ``nn.GRU``'s fused matrices. A *reference* implementation only: ``builder._fuse_custom_gru``
-    swaps every instance for a cuDNN ``nn.GRU`` before the model runs, so keep this simple and
-    checkpoint-faithful and leave the speed to the fused path.
+    Holds the checkpoint's per-gate weights, which ``TemporalAwarePooling`` reads for its fused
+    step. Its own ``forward`` is the plain, step-at-a-time reference that the fused step is tested
+    against; inference never calls it.
     """
 
     def __init__(self, input_size: int, hidden_size: int) -> None:
@@ -103,10 +105,55 @@ class CustomGRU(nn.Module):
         return outputs, h_t.unsqueeze(0)
 
 
+# Timesteps whose input projections are computed in one matmul: a (steps, B, 3D) block rather than the
+# whole sequence, which at T=256 and B=7,168 would be 8 GiB of BF16.
+_INPUT_PROJECTION_STEPS = 32
+
+
+def _gru_pool_step(
+    gi: torch.Tensor,
+    h: torch.Tensor,
+    w_h_rz: torch.Tensor,
+    w_hh: torch.Tensor,
+    bias: torch.Tensor,
+    ln_weight: torch.Tensor,
+    ln_bias: torch.Tensor,
+    q_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One timestep of the pooling head: the checkpoint's GRU cell, its LayerNorm and its attention score.
+
+    The arithmetic of ``CustomGRUCell``, with the reset gate applied to ``h`` BEFORE ``W_hh`` as the
+    model was trained. ``gi`` is this step's input projection for the reset, update and candidate
+    gates, ``(B, 3D)``. Gates run in FP32 and the hidden state is kept at ``h``'s dtype.
+
+    Returns the new hidden state and the step's attention score, ``(B,)`` in FP32. The query's bias is
+    left out: it is the same at every timestep, so the softmax over time cancels it.
+    """
+    d = h.shape[-1]
+    g = gi.float() + bias
+    hf = h.float()
+    rz = torch.mm(h, w_h_rz.t()).float()
+    r = torch.sigmoid(g[:, :d] + rz[:, :d])
+    z = torch.sigmoid(g[:, d : 2 * d] + rz[:, d:])
+    n = torch.tanh(g[:, 2 * d :] + torch.mm((r * hf).to(h.dtype), w_hh.t()).float())
+    h_new = ((1 - z) * hf + z * n).to(h.dtype)
+    score = (F.layer_norm(h_new, (d,), ln_weight, ln_bias).float() * q_weight).sum(-1)
+    return h_new, score
+
+
+@functools.cache
+def _compiled_gru_pool_step() -> Callable[..., tuple[torch.Tensor, torch.Tensor]]:
+    """``_gru_pool_step`` compiled into one GPU kernel per step, once per process."""
+    return cast(Callable[..., tuple[torch.Tensor, torch.Tensor]], torch.compile(_gru_pool_step))
+
+
 class TemporalAwarePooling(nn.Module):
     """Temporal-aware pooling: custom GRU for temporal context, LayerNorm, then attention pooling.
 
-    Uses ``CustomGRU`` (explicit per-gate weights) to match the tessera beta QAT checkpoint.
+    Each timestep's GRU update, LayerNorm and attention score run as one fused step
+    (``_gru_pool_step``, compiled on CUDA), so the ``(B, T, D)`` GRU output is never materialised:
+    only the hidden state and one score per step are kept. The weights stay in ``CustomGRU``'s
+    checkpoint layout, and the result matches running ``CustomGRU``, LayerNorm and attention in turn.
     """
 
     def __init__(self, input_dim: int) -> None:
@@ -130,26 +177,37 @@ class TemporalAwarePooling(nn.Module):
             torch.cuda.synchronize()
             tg0 = time.monotonic()
 
-        x_context, _ = self.temporal_context(x)
-        x_context = self.layer_norm(x_context)
+        cell = self.temporal_context.gru_cell
+        w_in = torch.cat([cell.W_ir.weight, cell.W_iz.weight, cell.W_ih.weight])
+        w_h_rz = torch.cat([cell.W_hr.weight, cell.W_hz.weight])
+        bias = torch.cat([cell.b_r, cell.b_z, cell.b_h]).float()
+        q_weight = self.query.weight[0].float()
+        step = _compiled_gru_pool_step() if x.is_cuda else _gru_pool_step
+
+        h = x.new_zeros(x.shape[0], cell.hidden_size)
+        scores = []
+        for t0 in range(0, x.shape[1], _INPUT_PROJECTION_STEPS):
+            # Time-major, so each step reads one contiguous (B, 3D) slice.
+            for gi in torch.matmul(x[:, t0 : t0 + _INPUT_PROJECTION_STEPS].transpose(0, 1), w_in.t()):
+                h, score = step(
+                    gi, h, w_h_rz, cell.W_hh.weight, bias, self.layer_norm.weight, self.layer_norm.bias, q_weight
+                )
+                scores.append(score)
 
         if profile and x.is_cuda:
             torch.cuda.synchronize()
             tg1 = time.monotonic()
 
-        w = torch.softmax(self.query(x_context), dim=1)
+        w = torch.softmax(torch.stack(scores, dim=1), dim=1).to(x.dtype).unsqueeze(-1)
         result = (w * x).sum(dim=1)
 
         if profile and x.is_cuda:
             torch.cuda.synchronize()
             tg2 = time.monotonic()
             logger.debug(
-                "    PROFILE TemporalAwarePooling: "
-                "GRU+LN=%.1fms (input dtype=%s, output dtype=%s)  "
-                "attn=%.1fms  TOTAL=%.1fms",
+                "    PROFILE TemporalAwarePooling: GRU+LN=%.1fms (input dtype=%s)  attn=%.1fms  TOTAL=%.1fms",
                 (tg1 - tg0) * 1000,
                 x.dtype,
-                x_context.dtype,
                 (tg2 - tg1) * 1000,
                 (tg2 - tg0) * 1000,
             )
