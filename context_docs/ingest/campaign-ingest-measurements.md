@@ -648,20 +648,23 @@ sharded read waits on S3 latency. Inference actors raise it to 64 (`MOSAIC_READ_
 which made sharded reads 2–4× faster and left unsharded ones unchanged. Every read returned
 identical values.
 
-**Ingest.** The Iowa year (November 2024 to October 2025) was ingested twice side by side in
+**Ingest.** The Iowa year (November 2024 to October 2025) was ingested side by side in
 `global-tessera-dev`, with identical code apart from the layout, on 60 workers for Sentinel-2 and 13
-for Sentinel-1:
+for Sentinel-1. Sentinel-1 was then repeated twice per layout, to separate the layout from the
+variation between runs:
 
 | | unsharded | sharded |
 |---|---|---|
-| Sentinel-2: wall time, measured cost | 67 min, $17.95 | 70 min, $18.65 (+3.9%) |
-| Sentinel-1 ascending: wall time, measured cost | 31 min, $1.85 | 32 min, $1.92 (+3.8%) |
+| Sentinel-2 (one run each): wall time, measured cost | 67 min, $17.95 | 70 min, $18.65 |
+| Sentinel-1 ascending (three runs each): measured cost | $1.85, $1.91, $1.93 | $1.92, $1.92, $1.88 |
+| Sentinel-1 write stage, summed over batches | 1,713, 1,765, 1,780 s | 1,768, 1,777, 1,744 s |
 
-The whole difference is in the write stage, and it is consistent: sharded writes were slower in 54
-of 60 Sentinel-2 batches and 12 of 13 Sentinel-1 batches, by a median 4%. The cloud gate stage
-matched within 1%. Writing one block in isolation was not slower (15.9 s against 17.8 s), and the
-cause in ingest was not investigated. At campaign scale it is at most about $7K, against the
-$187K containers line of the last campaign.
+The layout costs nothing measurable. The Sentinel-1 runs of the two layouts overlap completely, and
+the 4% between the single Sentinel-2 pair is the size of the spread between identical runs. Writing
+one block costs about the same CPU either way: on one thread, 104 ms sharded against 110 ms
+unsharded per 4096-px block-date; with zarr's thread pool compressing a shard's 32 inner chunks in
+parallel, 111 against 94 ms. Encoding is about a fifth of a write task, so even that difference is
+under 1% of ingest.
 
 **Values.** Every block of every array in the two stores compared equal: 21,294 blocks for each
 radar polarization and 27,846 for each of the eleven reflectance variables, with the same dates and
