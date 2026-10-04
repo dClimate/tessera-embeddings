@@ -240,11 +240,10 @@ class ActorPool:
         self.chunk_attempts: dict[str, int] = {}
 
         # actor_idx → the item reserved as that actor's next assignment. Created at submit time
-        # and passed to the actor as ``prefetch_hint`` so it can prefetch a BOUNDED starter
-        # payload (mask + 256-row starter strip, hard-capped ~2 GiB — actors.py
-        # ``_XCHUNK_PREFETCH_CAP_BYTES``) during the current chunk's tail inference. Reservations
-        # stop when the queue is shallower than the live pool; a failed actor's reservation is
-        # requeued to the front. Only SAME-ZONE successors are reserved — the actor prefetches
+        # and passed to the actor as ``prefetch_hint`` so it can prefetch that chunk's mask and
+        # first strip during the current chunk's last strip (actors.py, "Cross-chunk prefetch").
+        # Reservations stop when the queue is shallower than the live pool; a failed actor's
+        # reservation is requeued to the front. Only SAME-ZONE successors are reserved — the actor prefetches
         # the hint from the CURRENT call's mosaic (see submit()).
         self.reserved: dict[int, WorkItem] = {}
 
@@ -420,8 +419,8 @@ class ActorPool:
         ``work`` is a :class:`WorkItem`, or (legacy callers/tests) a bare ``ChunkSpec`` wrapped
         with the scalar path args into a single-zone item. When ``chunk_queue`` is supplied and
         still deep, the queue head is also popped and RESERVED as this actor's next assignment,
-        riding along as ``prefetch_hint`` so the actor can prefetch that chunk's capped starter
-        payload during this chunk's tail inference (see actors.py). Reservations stop once
+        riding along as ``prefetch_hint`` so the actor can prefetch that chunk's mask and first
+        strip during this chunk's last strip (see actors.py). Reservations stop once
         ``len(queue) <= live_count``: at the tail of a run a reserved chunk pins work to a busy
         actor while others sit idle, costing more than the prologue overlap saves. A queue head
         from a DIFFERENT zone is never reserved — the actor prefetches the hint from the current
@@ -1335,7 +1334,7 @@ def _process_chunks_work_stealing(
         if orphaned is not None:
             _requeue_unconfirmed(orphaned, f"actor {actor_idx} failed with the write in flight")
 
-        # Its reserved next chunk (whose starter payload only this actor may have prefetched)
+        # Its reserved next chunk (whose first strip only this actor may have prefetched)
         # goes back to the queue FRONT for a healthy actor.
         reserved = pool.take_reserved(actor_idx)
         if reserved is not None:
