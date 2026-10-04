@@ -4582,7 +4582,7 @@ requires-dist = [
     { name = "torch", marker = "extra == 'inference'", index = "https://download.pytorch.org/whl/cpu" },
     { name = "tqdm" },
     { name = "xarray", specifier = ">=2026.2.0" },
-    { name = "zarr" },
+    { name = "zarr", specifier = ">=3.1.2" },
 ]
 provides-extras = ["inference", "prefect", "aws", "all", "architecture-tests"]
 

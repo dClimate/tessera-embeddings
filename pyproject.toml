@@ -32,7 +32,8 @@ dependencies = [
     "xarray>=2026.2.0",
     "dask",
     "distributed",
-    "zarr",
+    # Sharded arrays in icechunk need zarr-python 3.1.2 (ADR 008, D3); icechunk itself asks only for 3.1.0.
+    "zarr>=3.1.2",
     "icechunk>=2.1.1",
     "fsspec",
     # Bounded because `ingest/stac.py` subclasses `odc.stac._mdtools.StacMDParser` and
