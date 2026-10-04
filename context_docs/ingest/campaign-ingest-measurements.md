@@ -703,8 +703,8 @@ fails without it:
   several tasks rewrite one shard and lose each other's data (pydata/xarray#10831).
   `pyproject.toml` requires it, and zarr 3.1.2 as ADR 008 records.
 - yield-embeddings' ROI merge sized its copy units from the master's `.chunks`, which on a sharded
-  master is the inner chunk; it now uses the shard. That fix lives in yield-embeddings and has to
-  ship with the pin bump that brings this layout in.
+  master is the inner chunk; it now uses the shard (yield-embeddings#94). yield-embeddings tracks
+  this repository's `main`, so that fix has to merge before this layout does.
 
 **What this reopens.** §4.1 rejected a coarser store chunk because inference read whole chunks.
 With sharding the unit ingest writes and the unit inference reads are independent, so a larger
