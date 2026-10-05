@@ -101,9 +101,10 @@ DEFAULT_INGEST_WORKER_MEM = 24576
 
 # Task threads per ingest worker: six on 4 vCPU, not dask-cloudprovider's one per vCPU. Each
 # band read waits on S3 for part of its run, so with four threads a worker leaves CPU idle even
-# when every thread is busy. Six fill it, for a faster and cheaper date at about 1.5x the
-# worker's peak memory, still a quarter of the size above. Measured in
-# context_docs/ingest/campaign-ingest-measurements.md.
+# when every thread is busy. Where a date's work fills the fleet (dense zones) six take up that
+# slack, about 3% faster and cheaper a date; where it does not, they change nothing. Peak worker
+# memory grows about 1.5x and stays near a quarter of the size above. Measured in
+# context_docs/ingest/campaign-ingest-measurements.md §3.18.
 DEFAULT_INGEST_WORKER_NTHREADS = 6
 
 # Schedulers don't need much memory but benefit from a few cores so
