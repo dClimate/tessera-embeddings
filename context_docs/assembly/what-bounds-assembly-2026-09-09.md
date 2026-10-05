@@ -116,7 +116,7 @@ it needs a controlled run, not more of this data.
 ## On Graviton, measured 2026-10-03
 
 The inference runner, which hosts assembly, was run on ARM64 Fargate (Graviton) against x86
-(yield-embeddings PR #92). Test: single-ROI assembly of 15SWC (36 chunks, 22.3 GB) from the same
+(yield-embeddings PR #90). Test: single-ROI assembly of 15SWC (36 chunks, 22.3 GB) from the same
 staged tiles on a 16 vCPU / 64 GiB runner of each architecture. Two pairs were dispatched
 together, and an earlier full ARM run did the same work.
 

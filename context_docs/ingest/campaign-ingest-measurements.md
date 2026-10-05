@@ -2453,12 +2453,13 @@ path is current.
 
 ## 15. Graviton (ARM64) Dask workers — measured on yield dev (2026-10-02)
 
-**On Fargate, ARM workers write 1.6–2× faster than x86 on every leg at production width; runs finish
+**On Fargate at production width, ARM workers write 1.6–2× faster than x86 on every leg, runs finish
 18–41% sooner, and each rung costs 45–53% less.** Fargate's ARM tasks run on Graviton3; its x86
 tasks run on 2017–2019 Xeons. The mosaics are not bit-identical: a small share of pixels round one
 count differently, which is physically meaningless (§15.4). That reaches the embeddings as a mean
 cosine similarity of 0.999983, slightly beyond ADR 012's gates on the worst pixels, and the
-maintainers accepted it (§15.6). yield-embeddings now runs every Dask worker on ARM (§15.5).
+maintainers accepted it (§15.6). yield-embeddings now runs every Dask worker, and the inference and
+assembly runners, on ARM (§15.5).
 
 ### 15.1 How it was measured
 
@@ -2508,16 +2509,18 @@ hyperthread of a 2017–2019 core. In the Iowa July rung, Container Insights put
 ### 15.3 What it saves
 
 **Most of the saving is speed.** ARM's list price is 20% lower ($0.03238 against $0.04048 per
-vCPU-hour, $0.00356 against $0.004445 per GB-hour). Each measured rung cost 45–53% less, and each
-leg 35–53% less, because ARM workers also finish sooner. Workers are 94–95% of a cell's hourly cost,
-and schedulers and runners stay x86.
+vCPU-hour, $0.00356 against $0.004445 per GB-hour). Each production-width rung cost 45–53% less, and
+each leg 35–53% less, because ARM workers also finish sooner. The tiny ROI, a three-minute run on
+four workers, cost $0.07 against $0.06. Workers are 94–95% of a cell's hourly cost, and schedulers
+and ingest runners stay x86.
 
-Applied to the last campaign's container line, $187,441
-([cost model §12](../campaign/campaign-cost-model.md)), most of which is ingest, ARM workers would
-have saved **about $75,000–95,000, or $8,000–11,000 per global year**. This assumes the campaign
-account's Fargate hosts match the ones measured here (same service, same region). That account was
-not examined. Year-long runs also finish 35–41% sooner (the Iowa year), so the same quota feeds the
-GPU fleet sooner.
+Applied to the last campaign's container line, $187,441 ([cost model
+§12](../campaign/campaign-cost-model.md)), most of which is ingest, ARM workers would have saved
+**about $75,000–95,000, or $8,000–11,000 per global year**. This assumes the campaign account's
+Fargate hosts match the ones measured here (same service, same region). That account was not
+examined. The campaign is GPU-bound ([campaign plan §1](../campaign/campaign-plan.md)), so the speed
+buys cost, not schedule: narrowing fleets to the old pace keeps the saving and leaves the mosaic
+backlog where it was.
 
 ### 15.4 The mosaics differ by one count, and it does not matter
 
@@ -2536,7 +2539,7 @@ from a sample, and its S1 figures from every chunk.
 At every differing S2 pixel, the exact interpolated value is precisely halfway between two integers.
 Both architectures are therefore off by the same half count that every stored integer already
 carries, in opposite directions, and neither is more correct. On campaign grids, the S2 bias averages
-−0.03 counts over a 20 m band, and nothing differs by more than one count anywhere.
+−0.03 counts over a 20 m band, and no sampled pixel differs by more than one count.
 
 **Where it comes from.**
 
@@ -2560,20 +2563,24 @@ after publication, so deploying the change between campaigns is enough.
 ### 15.5 The change
 
 yield-embeddings PR #90 makes every deployment's Dask worker task definitions ARM64, with no switch.
-Schedulers, flow runners and the EC2 merge family stay x86, so the ingestion image is built for
-both architectures. Branch clones copy the shared worker definition, architecture included.
+It does the same for the inference and large-assembly runners: the ARM Ray driver steers the x86 GPU
+cluster, and assembly output is bit-identical on 28% less CPU ([assembly
+record](../assembly/what-bounds-assembly-2026-09-09.md)). Schedulers, the other flow runners and the
+EC2 merge family stay x86, so the ingestion and inference images are built for both architectures.
+Branch clones copy each definition's architecture.
 
 **Coarsen moves with ingest.** Every Dask fleet in a deployment pins the same worker definition.
 Coarsen was not part of these rungs.
 
 ### 15.6 Deploying it
 
-Deploying the consumer stack is what moves an account's workers to ARM.
+Deploying the consumer stack is what moves an account's workers and runners to ARM.
 
-1. **The embedding difference is accepted** (maintainers, 2026-10-02). It is tiny, but it exceeds
-   ADR 012's gates on the worst pixels. A one-chunk crop of 35N's grid (41 km of Moldovan farmland,
-   November 2024 to October 2025) was ingested on each architecture, and both were embedded on the
-   same GPU type (L40S):
+1. **The embedding difference is accepted** (maintainers, 2026-10-02). ADR 012's gates decide
+   forward-pass changes; a change to the ingest hosts is outside them, so the harness measured this
+   one and the maintainers decided it (ADR 012, "Scope"). A one-chunk crop of 35N's grid (41 km of
+   Moldovan farmland, November 2024 to October 2025) was ingested on each architecture, and both
+   were embedded on the same GPU type (L40S):
 
    - 92.2–92.9% of int8 values are identical, and 99.995% are within one level, with a maximum of
      three.
@@ -2583,12 +2590,12 @@ Deploying the consumer stack is what moves an account's workers to ARM.
    Inference itself is bit-reproducible: rerunning it on the same x86 mosaics matched to the bit.
    All of the difference is therefore the mosaics' one-count rounding passing through the encoder.
    Nearly every pixel has about a hundred observations a year, so nearly every pixel has at least
-   one nudged input. ADR 012's gates were set for inference code changes, and this fails them on
-   the worst pixels: cosine below 0.9999 in every chunk, and scale drift above the 1.6%
-   cross-configuration bound in one of four.
+   one nudged input. Held to ADR 012's gates anyway, it fails them on the worst pixels: cosine below
+   0.9999 in every chunk, and scale drift above the 1.6% cross-configuration bound in one of four.
 2. **Deploy between campaigns,** with no mosaic half-built (§15.4).
 3. **`cost_accrual.py` prices Fargate at ARM rates.** The usage series it reads does not split by
-   architecture, so the x86 schedulers and runners read about 20% low.
+   architecture, so the x86 schedulers and runners read about 20% low. They are about 6% of a cell's
+   Fargate cost once workers are on ARM, so the total reads about 1% low.
 
 ### 15.7 Out of scope
 
@@ -2597,6 +2604,4 @@ Deploying the consumer stack is what moves an account's workers to ARM.
   ingest body runs on one Dask worker, so reclaiming that worker restarts the run's driver.
 - **The other ingestion-image families** (runner, coarsen, Fargate `merge_kind`) become a
   one-property change each. `merge_kind_ec2` would need a Graviton instance type instead.
-- **Inference** runs on x86 CUDA instances. Its Fargate runners, the Ray driver and assembly,
-  moved to Graviton too (yield-embeddings PR #92); the assembly measurement is in
-  [`../assembly/what-bounds-assembly-2026-09-09.md`](../assembly/what-bounds-assembly-2026-09-09.md).
+- **GPU inference** stays on x86 CUDA instances.
