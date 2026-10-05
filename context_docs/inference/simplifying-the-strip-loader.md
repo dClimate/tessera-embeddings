@@ -19,9 +19,9 @@ was what cheaper reads let us change in how a tile reaches the card.
   loads while the card works, that pipeline carries straight on into the next tile, strips run
   densest first, and nothing reserves CPU cores. On sharded mosaics it peaks at 50% of the
   worker's memory against 56% for the loader it replaces, at the same speed. Its outputs differ
-  from today's only at the rounding level (section 2), and they no longer depend on which tile a
-  worker handled before, so two runs of the same code on the same kind of card give identical
-  outputs.
+  from today's only at the rounding level, which was accepted (section 2), and they no longer
+  depend on which tile a worker handled before, so two runs of the same code on the same kind of
+  card give identical outputs.
 - **Shipped separately:** looking the positional encoding up in a day-of-year table makes the
   forward pass 5–8% faster with identical outputs (#208, merged). A PyTorch upgrade has its own PR
   (#209); on its own it is no faster.
@@ -141,7 +141,8 @@ vector about this much (cosine about 0.99998 from the model's own output), and t
 already mixes tiles made on A10G and L40S cards, which differ by the same kind of shimmer. The
 PyTorch upgrade, whose differences are of the same kind and at least as large, was measured: 99.5%
 of each pixel's 20 nearest neighbours and 99.97% of cluster assignments stayed the same (#209). And
-the inference code identity changes, so old and new tiles cannot mix inside one store.
+the inference code identity changes, so old and new tiles cannot mix inside one store. On that
+evidence the maintainers accepted the change on 2026-10-05.
 
 ### 3. Where did the remaining idle time go?
 
