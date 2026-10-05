@@ -120,9 +120,8 @@ class TestPhaseParser:
             overhead_s=5.0,
             strips=2,
             strip_h=1024,
-            strategy="dense/prefetch",
             t_kept=50,
-            rung="starter",
+            rung="prefetched",
             x_crop_w=None,
         )
         skip = _chunk_summary_line(
@@ -135,7 +134,6 @@ class TestPhaseParser:
             overhead_s=2.0,
             strips=1,
             strip_h=2000,
-            strategy="single",
             t_kept=8,
             rung="serial",
             x_crop_w=120,
@@ -153,7 +151,7 @@ class TestPhaseParser:
             "chunk_0_0",
             "50",
             "2",
-            "starter",
+            "prefetched",
             "1000",
             "3.0",
             "15.0",
