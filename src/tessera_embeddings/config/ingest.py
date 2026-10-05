@@ -59,11 +59,13 @@ INGEST_CHUNKS = {"time": 1, "northing": INGEST_CHUNK_SIZE, "easting": INGEST_CHU
 INGEST_COMPRESSORS = (BloscCodec(cname="lz4", clevel=5, shuffle="shuffle"),)
 
 # The mosaics are sharded: each INGEST_CHUNKS block stays one stored object and the unit ingest writes (the shard),
-# split inside into inner chunks of 256 rows by one 2048-px inference tile (config.inference.INFERENCE_CHUNK_SIZE).
+# split inside into inner chunks of 512 rows by one 2048-px inference tile (config.inference.INFERENCE_CHUNK_SIZE).
 # A reader decodes only the inner chunks it touches, so an inference strip of one tile no longer decompresses the whole
-# 4096-px block of every band and date. Writes stay whole-shard because ingest writes block-aligned windows, which is
-# what keeps sharding cheap to write: ADR 008 measured unaligned shard writes as read-modify-write, 2.8x slower.
-INGEST_INNER_CHUNKS = {"time": 1, "northing": 256, "easting": 2048}
+# 4096-px block of every band and date. 512 rows rather than 256: strips read as fast and with as little memory, at
+# 1.1-1.6x the unsharded S3 read requests rather than 1.6-2.4x (each inner chunk is its own ranged request). Writes
+# stay whole-shard because ingest writes block-aligned windows, which is what keeps sharding cheap to write: ADR 008
+# measured unaligned shard writes as read-modify-write, 2.8x slower.
+INGEST_INNER_CHUNKS = {"time": 1, "northing": 512, "easting": 2048}
 
 
 def mosaic_chunk_layout(write_unit: tuple[int, ...]) -> tuple[tuple[int, ...], tuple[int, ...] | None]:

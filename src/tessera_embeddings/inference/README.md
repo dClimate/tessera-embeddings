@@ -380,8 +380,8 @@ read per strip on the tiles that split, and that per-strip read is exactly the w
 the byte budget bounds. A tile that fits one budget is loaded whole, byte for byte the same
 as if striping did not exist.
 
-**A strip reads only its own rows.** The mosaics are sharded (see the ingest README): each
-4096-px block is one stored object holding inner chunks of 256 rows × one 2048-px tile, and a
+**A strip reads little more than its own rows.** The mosaics are sharded (see the ingest README): each
+4096-px block is one stored object holding inner chunks of 512 rows × one 2048-px tile, and a
 read decompresses only the inner chunks it touches. Each is its own ranged request, so reads
 wait on S3 latency at zarr's default of 10 requests in flight; every actor raises that to 64
 (`MOSAIC_READ_CONCURRENCY`) when it starts. Mosaics written before sharding read as before,

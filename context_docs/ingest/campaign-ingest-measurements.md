@@ -610,13 +610,13 @@ about 1%. The values read back are identical: the codec is lossless. It is set i
 `config.ingest.INGEST_COMPRESSORS`, used by both store-creation paths, and a store keeps the codec
 it was created with.
 
-### 3.19 Sharding the mosaics — a strip decompresses only its own rows (October 2026)
+### 3.19 Sharding the mosaics — a strip decompresses little more than its own rows (October 2026)
 
 Each band, date and 4096-px block of a mosaic used to be one chunk, and reading any part of it
 decompressed all of it. An inference tile is a quarter of a block, read in strips of rows, so a
 256-row strip decompressed 32 times the pixels it used. The block is now a **shard**: still one
-stored object and still the unit ingest writes, but holding 32 separately compressed inner chunks
-of 256 rows × 2048 px (`INGEST_INNER_CHUNKS`) and an index of where each one sits. A read fetches
+stored object and still the unit ingest writes, but holding 16 separately compressed inner chunks
+of 512 rows × 2048 px (`INGEST_INNER_CHUNKS`) and an index of where each one sits. A read fetches
 and decompresses only the inner chunks it touches. The global embedding store already uses the
 same codec (ADR 008, D3); the cost ADR 008 warns about, a read-modify-write when a write covers
 part of a shard (2.8× slower), does not arise because ingest writes whole blocks.
@@ -627,26 +627,44 @@ part of a shard (2.8× slower), does not arise because ingest writes whole block
  before   [               one chunk               ]   any read decompresses all of it
 
  after    +-------------------+-------------------+
-          |  256 x 2048 (A)   |  256 x 2048 (B)   |   x 16 rows of inner chunks, plus an index;
+          |  512 x 2048 (A)   |  512 x 2048 (B)   |   x 8 rows of inner chunks, plus an index;
           +-------------------+-------------------+   a strip of tile A decompresses only the
-          |        ...        |        ...        |   column-A chunks in its rows
+          |        ...        |        ...        |   column-A chunks its rows touch
           +-------------------+-------------------+
 ```
 
-**Reads.** One real Iowa block (30 dates × 10 bands, Blosc-LZ4), read the way inference reads a
-tile, on an `m6a` machine in the same region:
+**Reads, and why 512 rows.** One real Iowa block (30 dates × 10 bands, Blosc-LZ4), one tile's
+strip read the way inference reads it (two band threads, 64 requests in flight, four cores), each
+read in a fresh process, two rounds, on an `m6a` machine in the same region:
 
-| read | unsharded | sharded |
-|---|---|---|
-| a 256-row strip of one tile | 4.1 s | 0.95 s |
-| a 1,024-row strip | 4.3–4.7 s | 2.2 s |
-| the whole 2048-px tile | 5.2–5.4 s | 4.0 s |
-| CPU cores busy while reading | about 3.3 | 1.2–2.0 |
+| strip | | unsharded | 256-row inner | **512-row inner** |
+|---|---|---|---|---|
+| 256 rows | time / CPU | 5.4 s / 20 s | 0.9–2.1 s / 1.3 s | 1.0–2.0 s / 1.8 s |
+| rows 256–768, straddling 512-row chunks | time / CPU | 5.3–5.6 s / 20 s | 1.2–2.0 s / 2.2 s | 1.6–1.9 s / 3.1 s |
+| 1,024 rows | time / CPU | 5.4–5.5 s / 20 s | 1.9–2.6 s / 3.9 s | 1.9 s / 3.6 s |
+| the whole 2048-px tile | time / CPU | 5.7 s / 20.5 s | 3.1–3.5 s / 7.1 s | 2.5–2.9 s / 6.2 s |
+| the whole tile | memory held briefly while reading | 2.25 GB | 0.93–0.98 GB | 1.01–1.07 GB |
 
-Every inner chunk is its own ranged request, so at zarr's default of 10 requests in flight a
-sharded read waits on S3 latency. Inference actors raise it to 64 (`MOSAIC_READ_CONCURRENCY`),
-which made sharded reads 2–4× faster and left unsharded ones unchanged. Every read returned
+Every inner chunk is its own ranged S3 request, and the index is fetched once more per strip, so the
+inner-chunk height trades decode waste against requests. Counted on a local S3 emulator with real
+data, one tile's strips cost these GET requests per band and date:
+
+| strips | unsharded | 256-row inner | 512-row inner |
+|---|---|---|---|
+| 3 (768, 768, 512 rows) | 5.5 | 11 | 8 |
+| 4 of 512 rows | 7.3 | 12 | 8 |
+
+Unsharded costs more than one request per strip because icechunk splits each ~14 MB block fetch
+into two ranges. 512-row inner chunks read as fast as 256-row ones and keep the memory saving, at
+1.1–1.6× today's requests against 1.6–2.4× (strip heights follow the memory budget and rarely land
+on a chunk boundary, which adds a request at each). The planner does not round strip heights to
+512 rows: a misaligned strip decompresses up to one extra inner chunk, which costs CPU (3.1 against
+2.2 s above) but not read time. Inference actors raise zarr's requests in flight from 10 to 64
+(`MOSAIC_READ_CONCURRENCY`): at 10, a sharded read waits on S3 latency. Every read returned
 identical values.
+
+The ingest and inference runs below used 256-row inner chunks. Values are identical whatever the
+inner chunk, and the benchmark above reads 512-row chunks at least as fast.
 
 **Ingest.** The Iowa year (November 2024 to October 2025) was ingested side by side in
 `global-tessera-dev`, with identical code apart from the layout, on 60 workers for Sentinel-2 and 13
@@ -662,7 +680,7 @@ variation between runs:
 The layout costs nothing measurable. The Sentinel-1 runs of the two layouts overlap completely, and
 the 4% between the single Sentinel-2 pair is the size of the spread between identical runs. Writing
 one block costs about the same CPU either way: on one thread, 104 ms sharded against 110 ms
-unsharded per 4096-px block-date; with zarr's thread pool compressing a shard's 32 inner chunks in
+unsharded per 4096-px block-date; with zarr's thread pool compressing a shard's 32 (256-row) inner chunks in
 parallel, 111 against 94 ms. Encoding is about a fifth of a write task, so even that difference is
 under 1% of ingest.
 

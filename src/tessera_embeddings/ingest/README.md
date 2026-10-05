@@ -76,7 +76,7 @@ converted where radar amplitude needs decibels, and written one date at a time i
 ROI's live windows. Writing per date rather than per year keeps the Dask graph small enough
 for a scheduler to hold. Each date is stored as `INGEST_CHUNKS` blocks, one object each, which is
 also the unit ingest writes. Each block is a shard of smaller inner chunks
-(`INGEST_INNER_CHUNKS`: 256 rows of one 2048-px inference tile), so a reader decompresses only the
+(`INGEST_INNER_CHUNKS`: 512 rows of one 2048-px inference tile), so a reader decompresses only the
 rows and tile it asks for rather than the whole block, and every inner chunk is compressed with
 Blosc-LZ4 (`INGEST_COMPRESSORS`), which decompresses 2.6× faster than zarr's default zstd while
 storing 6% less.
