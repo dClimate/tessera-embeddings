@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import importlib.util
 import math
+from pathlib import Path
 
 import pytest
 import torch
@@ -20,6 +22,7 @@ from tessera_embeddings.inference.models.ssl_model import (
     build_dim_reducer,
 )
 from tessera_embeddings.inference.models.student_v2 import StudentTransformerEncoder
+from tests._paths import FIXTURES
 
 
 class TestTransformerEncoder:
@@ -38,6 +41,15 @@ class TestTransformerEncoder:
         assert enc(x).shape == (4, 128)
 
 
+def _upstream_encoder(file: str) -> type[torch.nn.Module]:
+    """An upstream model file's own ``TemporalPositionalEncoder``, imported by path."""
+    spec = importlib.util.spec_from_file_location(f"upstream_{Path(file).stem}", FIXTURES / "upstream" / file)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.TemporalPositionalEncoder
+
+
 class TestTemporalPositionalEncoder:
     """Tests for positional encoding output shape."""
 
@@ -46,6 +58,18 @@ class TestTemporalPositionalEncoder:
         pe = TemporalPositionalEncoder(d_model=64)
         doy = torch.randint(1, 366, (4, 20))
         assert pe(doy).shape == (4, 20, 64)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="exp() rounds the same either way on a CPU-only host")
+    @pytest.mark.parametrize(
+        ("upstream_file", "d_model", "on_cpu"),
+        [("v1_1_reference/modules.py", 768, True), ("v2_student_reference.py", 640, False)],
+    )
+    def test_matches_its_upstream_on_gpu(self, upstream_file, d_model, on_cpu):
+        """Each model's encoding is bit-identical to its own upstream's on the GPU."""
+        doy = torch.arange(1, 366, device="cuda", dtype=torch.float32).repeat(3, 1)
+        ours = TemporalPositionalEncoder(d_model, frequencies_on_cpu=on_cpu)(doy, out_dtype=torch.float32)
+        theirs = _upstream_encoder(upstream_file)(d_model)(doy)
+        torch.testing.assert_close(ours, theirs, atol=0.0, rtol=0.0)
 
 
 def _reference_pool(pool: TemporalAwarePooling, x: torch.Tensor) -> torch.Tensor:

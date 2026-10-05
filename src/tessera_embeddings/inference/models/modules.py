@@ -258,9 +258,13 @@ class TemporalPositionalEncoder(nn.Module):
     driven by DOY values instead of integer positions.
     """
 
-    def __init__(self, d_model: int) -> None:
+    def __init__(self, d_model: int, *, frequencies_on_cpu: bool = False) -> None:
         super().__init__()
         self.d_model = d_model
+        # Where the frequencies' exp() runs, as each model's upstream runs it: v1.1 computes them on the
+        # CPU and moves them to the device, v2 computes them on the device. The two round differently in
+        # the last place on 116 of v1.1's 384 frequencies, so each model follows its own upstream.
+        self._frequencies_on_cpu = frequencies_on_cpu
         # div_term depends only on d_model, so it is not a per-forward compute (~18 ms per
         # backbone). It is cached per device rather than held as a registered buffer *on purpose*:
         # a buffer is swept by ``nn.Module.bfloat16()``, which would round these frequencies to 8
@@ -281,10 +285,11 @@ class TemporalPositionalEncoder(nn.Module):
         """
         cached = self._div_term_cache.get(device)
         if cached is None:
+            where = torch.device("cpu") if self._frequencies_on_cpu else device
             cached = torch.exp(
-                torch.arange(0, self.d_model, 2, dtype=torch.float32, device=device)
+                torch.arange(0, self.d_model, 2, dtype=torch.float32, device=where)
                 * -(math.log(10000.0) / self.d_model)
-            )
+            ).to(device)
             self._div_term_cache[device] = cached
         return cached
 
@@ -352,7 +357,7 @@ class V11TransformerEncoder(nn.Module):
             nn.Linear(latent_dim * 4, latent_dim * 4),
         )
 
-        self.temporal_encoder = TemporalPositionalEncoder(d_model=latent_dim * 4)
+        self.temporal_encoder = TemporalPositionalEncoder(d_model=latent_dim * 4, frequencies_on_cpu=True)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=latent_dim * 4,
