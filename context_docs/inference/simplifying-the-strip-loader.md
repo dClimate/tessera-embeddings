@@ -19,9 +19,9 @@ was what cheaper reads let us change in how a tile reaches the card.
   loads while the card works, that pipeline carries straight on into the next tile, strips run
   densest first, and nothing reserves CPU cores. On sharded mosaics it peaks at 50% of the
   worker's memory against 56% for the loader it replaces, at the same speed. Its outputs differ
-  from today's only at the rounding level, which was accepted (section 2), and they no longer
-  depend on which tile a worker handled before, so two runs of the same code on the same kind of
-  card give identical outputs.
+  from today's only at the rounding level and keep 99.98% of each pixel's nearest neighbours,
+  which was accepted (section 2). They no longer depend on which tile a worker handled before,
+  so two runs of the same code on the same kind of card give identical outputs.
 - **Shipped separately:** looking the positional encoding up in a day-of-year table makes the
   forward pass 5–8% faster with identical outputs (#208, merged). A PyTorch upgrade has its own PR
   (#209); on its own it is no faster.
@@ -136,13 +136,21 @@ two runs of the same code, and those tiles differed by up to 3 levels (4 of 394 
 sharding test, §3.19). The simpler loader plans a tile from its own mask alone, whether it was
 prefetched or loaded serially, so the same code always cuts it the same way.
 
-For using the embeddings this was not measured directly. Storing them as int8 already moves every
-vector about this much (cosine about 0.99998 from the model's own output), and the published store
-already mixes tiles made on A10G and L40S cards, which differ by the same kind of shimmer. The
-PyTorch upgrade, whose differences are of the same kind and at least as large, was measured: 99.5%
-of each pixel's 20 nearest neighbours and 99.97% of cluster assignments stayed the same (#209). And
-the inference code identity changes, so old and new tiles cannot mix inside one store. On that
-evidence the maintainers accepted the change on 2026-10-05.
+**What a user consumes barely moves.** Measured on all 394 round-5 tile pairs, by the method of
+[`validating-a-model-change.md`](validating-a-model-change.md): per tile, 2,000 query pixels among
+20,000 candidates by cosine, and k-means with k = 12.
+
+| measure | old loader against the simpler one | for scale |
+|---|---|---|
+| pixels whose stored embedding is identical | 99.0% (94.5% on the worst tile) | — |
+| mean per-pixel cosine distance | 1.4 × 10⁻⁷ | adjacent pixels: 5.8 × 10⁻³ (median), about 34,000 times larger |
+| top-20 neighbours kept | 99.98% (99.90% on the worst tile) | two same-model stores agree on 0.9940; the PyTorch upgrade kept 99.48% (#209) |
+| same k-means cluster | 99.999% | — |
+
+The 47 tiles beyond the envelope's extremes look like the rest: 99.97% of top-20 neighbours kept,
+99.999% in the same cluster. The inference code identity changes too, so old and new tiles cannot
+mix inside one store. On that evidence the maintainers accepted the change on 2026-10-05, under
+the rule ADR 012 sets for changes that only regroup sub-batches.
 
 ### 3. Where did the remaining idle time go?
 
@@ -282,7 +290,8 @@ stopped after 25–35 minutes of inference; rounds 3 to 5 ran to completion so t
 Iowa could be paired. Each tile's `CHUNK_SUMMARY` log line gives its total, inference, idle and
 prologue seconds and its strip counts; the workers' `RESOURCES` lines give memory. Tiles are
 compared by label, and costs as sums of per-tile seconds, which do not depend on how many workers
-each run got. Outputs are compared with `te-compare-outputs` on a machine in the same account.
+each run got. Outputs are compared with `te-compare-outputs` on a machine in the same account, and
+usability with the neighbour and cluster method of [`validating-a-model-change.md`](validating-a-model-change.md).
 
 **Cards differ, and one card can sink an arm.** Each run gets its own cards. Under the same 350 W
 power cap, a card's clock falls about 11 MHz for every degree it runs hotter, and the occasional

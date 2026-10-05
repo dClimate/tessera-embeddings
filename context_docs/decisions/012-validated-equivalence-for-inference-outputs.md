@@ -103,6 +103,24 @@ classes. This envelope is for diffing across configs; it is **not** a
 relaxation of the same-config gate, which every shippable forward-pass
 reorder must still meet.
 
+**Over a whole zone-year, regrouping alone can exceed the envelope's
+extremes.** Its maximum deviation, scale drift and worst cosine are extremes
+set on a few chunks, and extremes grow with the number of pixels compared:
+`main`'s own loader moves a tile by up to 3 levels between two runs of
+identical code ([ingest measurements
+§3.19](../ingest/campaign-ingest-measurements.md)). So a change that only
+regroups pixels into different sub-batches (strip boundaries, batch size,
+tile order), with no change to the arithmetic, ships if every tile holds the
+within-±1 bound and exact footprint and counts, and if measured usability
+holds: top-20 neighbour agreement at or above the same-model ceiling of
+0.9940 ([`validating-a-model-change.md`](../inference/validating-a-model-change.md)),
+on the same tiles. The extremes are recorded with the decision. The sharded
+strip loader was accepted this way on 2026-10-05, over the full Iowa year:
+every tile within ±1 on at least 99.9989% of values, 47 of 394 beyond the
+extremes (scale drift up to 1.97%, one value moving 4 levels, worst cosine
+0.999877), and 99.98% of top-20 neighbours kept
+([`simplifying-the-strip-loader.md`](../inference/simplifying-the-strip-loader.md) §2).
+
 **Precision stays BF16.** FP16 with reduced-precision accumulation would
 roughly double the matmul ceiling on GA10x-class GPUs (FP32-accumulate
 runs at half rate there), but FP16's range tops out at 65504 and
