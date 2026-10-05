@@ -587,6 +587,38 @@ noted again in §4.9's open items for S1.
 was adopted globally on one favourable point and had to be withdrawn when four more regions were
 tried. Sweep before generalising, or scope the setting to where it was measured.
 
+### 3.18 Six task threads per worker — a few percent on dense zones, nothing elsewhere
+
+Ingest workers are 4 vCPU and ran dask-cloudprovider's default of one task thread per vCPU. A band
+read waits on S3 for part of each task, so a worker can have CPU to spare with every thread busy.
+`DEFAULT_INGEST_WORKER_NTHREADS = 6` (`providers/aws/dask.py`) now gives every ingest worker, S2
+and S1, six. It is outside the ingest code identity, so stores built at four threads resume
+unchanged.
+
+Each row is a pair of arms run at the same time, identical but for the threads, so the comparison
+is immune to the hours-scale latency drift (§11.6). Same-time pairs on main's Dask stack at
+4096-px chunks:
+
+| Arms | 4 threads | 6 threads | Worker CPU | Peak worker memory |
+|---|---|---|---|---|
+| 35N, 1–7 Jan 2024, S2, 60 workers, pipelined (yield dev, 2026-10-02) | 134 s/date median, $4.45 | **130 s, $4.34** | 85% → 92% while the threads are ≥ 90% busy | 3.7 → 5.7 GiB |
+| Iowa, 2 June – 5 July 2024, S2, 60 workers, 25 dates in auto-sized batches of 4 (global-tessera-dev, 2026-10-05) | 344.0 s of writes | 344.3 s | 53% → 59% | 3.3 → 3.7 GiB |
+| Iowa, June – August 2024, S1 ascending, 13 workers, all 21 dates | 6m44s, $0.36 | 6m56s, $0.36 | 42% → 52% | 2.3 → 2.8 GiB |
+
+**The gain tracks how fully the fleet's threads are used, not the thread count.** On 35N one
+date's work oversubscribes the fleet (§1), so the two extra threads per worker take up idle CPU:
+3% faster and 2.5% cheaper a date, with each band read about 1.5× slower (469 → 715 ms at 10 m)
+because six threads share four cores. Iowa's fleets are wider than their work, run at half their
+CPU, and never fill the four threads they have, so six change nothing in either direction. The
+Frisky engine at 2048-px chunks (draft PR #205) left its workers at 73% CPU with four threads and
+gained 15% from six; main's workers do not have that headroom. Six threads with
+`GDAL_NUM_THREADS=1` was also tried there and ran 6% slower than six with GDAL's default.
+
+**Adopted** because it costs nothing where it does not help: memory stays under a quarter of the
+24 GiB worker, and no arm spilled, paused or lost a worker. Dense zones carry most of the campaign's
+worker hours, so the saving there is real money at campaign scale, at most about $4,700 of the
+nine-year campaign's $187,441 container bill (`context_docs/campaign/campaign-cost-model.md`).
+
 ## 4. What did not work, and why
 
 ### 4.1-4.8 What was tried and rejected — the table, so none of it is retried
@@ -1595,6 +1627,7 @@ defect fix.
 | hottest worker | 10.16 GiB of 16 at 8192 blocks; spill 0 throughout | run telemetry |
 | inference baseline (do not regress) | GPU util 99% in-phase, VRAM 97% peak, host RAM 46% of a 60% ceiling, GPU-idle ~6 s/chunk | 2,352 RESOURCES samples |
 | **ingest worker size (CURRENT)** | 4 vCPU / **24576 MiB** | Superseding, in order: 16384 → 30720 → 20480 → 24576 → 16384 → **24576**. **16384 is WITHDRAWN**, and with it §4.8's claim that pruning made the original size affordable: its 7.91 GiB peak over 91 dates was measured on 2017–18 optical at ~8 windows per date, and 2019 carries 14–16. The overlapped write (§3.11) holds a date's windows concurrently, so demand scales with that count — six workers on 2019 optical paused at **11.92 GiB**, 80% of the 14.90 GiB limit this size gives Dask, and never resumed, stalling four zone-years. 20480 was not chosen instead because §3.13 already records it as short: it was itself sized against a ~12.4 GiB short-run peak against a true ceiling of ~15. Whether 24576 holds at 60 concurrent cells on 2019-density data is **UNMEASURED**. With Dask task definitions PINNED the constant sets only Dask's `--memory-limit`, so the consumer's registered definition must be raised to match or the pause threshold lands above the container's hard limit. vCPU stays at 4 — the quota counts vCPU. |
+| **ingest worker task threads (CURRENT)** | **6** per 4 vCPU | 35N S2 paired: 134 → 130 s/date, $4.45 → $4.34, peak memory 3.7 → 5.7 GiB; Iowa S2 and S1 level (§3.18). Travels in the per-run worker command, so pinned task definitions need no change |
 | streaming retention cost | +1 month of items on the ingest worker; 1.25 GiB spill at 16 GiB | run telemetry |
 | items deferred across a month boundary | 1,084 of 31,507 (one day's worth) | live cluster |
 | write floor | graph ≈ store_chunks × bands; 2,992 covered vs 2,415 live (19% dead) | measured, all 7 windows |

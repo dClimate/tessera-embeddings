@@ -99,6 +99,14 @@ from tornado.ioloop import PeriodicCallback
 DEFAULT_INGEST_WORKER_CPU = 4096
 DEFAULT_INGEST_WORKER_MEM = 24576
 
+# Task threads per ingest worker: six on 4 vCPU, not dask-cloudprovider's one per vCPU. Each
+# band read waits on S3 for part of its run, so with four threads a worker leaves CPU idle even
+# when every thread is busy. Where a date's work fills the fleet (dense zones) six take up that
+# slack, about 3% faster and cheaper a date; where it does not, they change nothing. Peak worker
+# memory grows about 1.5x and stays near a quarter of the size above. Measured in
+# context_docs/ingest/campaign-ingest-measurements.md §3.18.
+DEFAULT_INGEST_WORKER_NTHREADS = 6
+
 # Schedulers don't need much memory but benefit from a few cores so
 # graph construction and dashboard responsiveness stay smooth.
 DEFAULT_INGEST_SCHEDULER_CPU = 4096
@@ -722,7 +730,7 @@ def ecs_cluster(
     worker_mem: int | None = None,
     scheduler_cpu: int | None = None,
     scheduler_mem: int | None = None,
-    worker_nthreads: int | None = None,
+    worker_nthreads: int = DEFAULT_INGEST_WORKER_NTHREADS,
     worker_nprocs: int | None = None,
     extra_worker_env: dict[str, str] | None = None,
     extra_scheduler_env: dict[str, str] | None = None,
@@ -744,7 +752,8 @@ def ecs_cluster(
         worker_mem: Override worker memory in MiB.
         scheduler_cpu: Override scheduler CPU units.
         scheduler_mem: Override scheduler memory in MiB.
-        worker_nthreads: Threads per worker process.
+        worker_nthreads: Threads per worker process (see :data:`DEFAULT_INGEST_WORKER_NTHREADS`).
+            The default is measured for the default 4 vCPU; pass both when resizing a worker.
         worker_nprocs: Worker processes per Fargate task. Set ``> 1`` with
             ``worker_nthreads=1`` for GIL-bound workloads to use all vCPUs.
         extra_worker_env: Env vars set on every worker, merged after the defaults.
@@ -822,12 +831,11 @@ def ecs_cluster(
         cluster_kwargs["image"] = image
     if resource_tags:
         cluster_kwargs["tags"] = dict(resource_tags)
+    cluster_kwargs["worker_nthreads"] = worker_nthreads
 
     worker_extra_args = ["--death-timeout", "300"]
     if worker_nprocs is not None:
         worker_extra_args.extend(["--nworkers", str(worker_nprocs)])
-    if worker_nthreads is not None:
-        worker_extra_args.extend(["--nthreads", str(worker_nthreads)])
     cluster_kwargs["worker_extra_args"] = worker_extra_args
     log.info("Worker args: %s", worker_extra_args)
 
