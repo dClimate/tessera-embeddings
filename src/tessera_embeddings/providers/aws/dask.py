@@ -753,6 +753,7 @@ def ecs_cluster(
         scheduler_cpu: Override scheduler CPU units.
         scheduler_mem: Override scheduler memory in MiB.
         worker_nthreads: Threads per worker process (see :data:`DEFAULT_INGEST_WORKER_NTHREADS`).
+            The default is measured for the default 4 vCPU; pass both when resizing a worker.
         worker_nprocs: Worker processes per Fargate task. Set ``> 1`` with
             ``worker_nthreads=1`` for GIL-bound workloads to use all vCPUs.
         extra_worker_env: Env vars set on every worker, merged after the defaults.
