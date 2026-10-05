@@ -26,7 +26,7 @@ was what the new 2048-px mosaics let us change to spend less on them.
   is no faster.
 - **What is left:** about 2.3% of card time goes to tiles waiting for their first rows to finish
   loading. A smaller first strip was tried and saved nothing overall, so what remains is making the
-  read itself faster, which is a question for how the mosaics are stored (PR #210 and its follow-on).
+  read itself faster, which is a question for how the mosaics are stored (PR #211).
 
 ## The few terms this needs
 
@@ -197,8 +197,8 @@ whatever the loader's thread count, so the setting reserved nothing, and the GPU
 CPU anyway. It was removed (`d0336590`); the loader uses two band-reading threads.
 
 **The read can only get faster in storage.** Two changes off `main` target it: Blosc-LZ4 compression,
-which decompresses 2.6× faster than today's zstd (PR #210), and sharding the mosaics so that a strip
-decompresses only its own rows rather than whole 4096-px chunks (stacked on #210).
+which decompresses 2.6× faster than today's zstd, and sharding the mosaics so that a strip
+decompresses little more than its own rows rather than whole 4096-px chunks (both in PR #211).
 
 ### 5. The simpler loader on sharded mosaics
 
