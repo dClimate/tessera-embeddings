@@ -114,15 +114,19 @@ for a different batch shape, and that kernel adds numbers in a different order, 
 bit of some results. ADR 012 names exactly this mechanism. Against today's code, 99.84–99.99% of
 stored values are identical and at least 99.9995% are within one level; the worst value moves 3
 levels; the lowest per-pixel cosine similarity is 0.9999 (an angle under 1°) and the mean is
-1.000000. That fails the strict gate and passes the cross-config envelope on all 39 tiles checked,
+1.000000. That fails the strict gate. On round 2's 39 tiles it passed the cross-config envelope,
 with two measures near its edges (scale drift 1.56% against 1.6%, cosine 0.999901 against 0.9999).
+On the whole Iowa year (round 5, section 5) 347 of 394 tiles pass and 47 exceed its tails: a few
+pixels per tile whose int8 scale moves by up to 1.97%, a worst-pixel cosine of 0.999877, and 4 tiles
+where one value moves 4 levels. The typical tile is closer: a median 99.95% of values identical,
+against 95–98% for the batch-size change the envelope was calibrated on.
 
-For using the embeddings it makes no difference. Storing them as int8 already moves every vector
-about this much (cosine about 0.99998 from the model's own output), and the published store already
-mixes tiles made on A10G and L40S cards, which differ by the same kind of shimmer. Searches,
-classifications and clusters come out the same, except for pixels sitting exactly on a decision
-boundary, which a different card would flip too. And the inference code identity changes, so old
-and new tiles cannot mix inside one store.
+For using the embeddings this was not measured directly. Storing them as int8 already moves every
+vector about this much (cosine about 0.99998 from the model's own output), and the published store
+already mixes tiles made on A10G and L40S cards, which differ by the same kind of shimmer. The
+PyTorch upgrade, whose differences are of the same kind and at least as large, was measured: 99.5%
+of each pixel's 20 nearest neighbours and 99.97% of cluster assignments stayed the same (ADR 024 on
+#209). And the inference code identity changes, so old and new tiles cannot mix inside one store.
 
 ### 3. Where did the remaining idle time go?
 
@@ -196,7 +200,24 @@ CPU anyway. It was removed (`d0336590`); the loader uses two band-reading thread
 which decompresses 2.6× faster than today's zstd (PR #210), and sharding the mosaics so that a strip
 decompresses only its own rows rather than whole 4096-px chunks (stacked on #210).
 
-### 5. Could the model's forward pass itself be cheaper?
+### 5. The simpler loader on sharded mosaics
+
+Sharding the mosaics (#211) lets a strip of a 4096-px mosaic decompress only its own rows, which is
+what the simpler loader relies on. **Round 5** ran it against `main`'s loader, both on sharded
+mosaics: the whole Iowa year, 8 L40S each, every tile paired. One of `main`'s cards overheated, so
+its 42 tiles are left out:
+
+| | `main`'s loader | simpler loader |
+|---|---|---|
+| Total tile time, 352 tiles | 80,215 s | 78,898 s (−1.6%) |
+| GPU idle, share of tile time | 2.5% | 2.6% |
+| Peak host memory per worker | 17.2 GB (56%) | 15.4 GB (50%) |
+
+On sharded mosaics both loaders hide the reads equally well. The 1.6% is all in inference time, and
+about a third of it is the simpler arm's cards running 2.5% faster clocks. What the simpler loader
+brings there is memory headroom and 395 fewer lines. Its outputs against `main`'s are in section 2.
+
+### 6. Could the model's forward pass itself be cheaper?
 
 The forward pass is about 90% of a tile's time, so it is the biggest target. Its parts were timed
 on one L40S with the production model and checkpoint, batch 7,168, at five observation depths:
@@ -215,7 +236,7 @@ and observation on every forward pass. Computing all 367 days once and looking t
 same values and skips two large temporary tensors per pass. Because the model code is shared with
 `main` and the v2 model, that change went into its own PR rather than this branch.
 
-### 6. Smaller decisions
+### 7. Smaller decisions
 
 - **The easting crop stays.** Edge tiles read only the columns that hold pixels. Removing the crop
   would save code but would change `eligible_px`, a published registry field, so it was held.
@@ -255,7 +276,7 @@ sets that environment.
 In global-tessera-dev a per-cluster cap on GPU workers (`/global-tessera-dev/ray/gpu-worker-ladder`
 in SSM) was removed for these tests.
 
-**Cost.** About 120 L40S-hours across the four rounds and the benchmarks (rounds 3 and 4, two full
+**Cost.** About 170 L40S-hours across the five rounds and the benchmarks (rounds 3 to 5, two full
 runs each, about 50 apiece), plus head nodes and small comparison machines; about $2 to copy the 1.6 TB of
 inputs and about $36 a month to keep them.
 
