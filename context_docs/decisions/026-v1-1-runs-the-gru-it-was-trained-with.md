@@ -73,8 +73,17 @@ attention score, compiled into a single GPU kernel. `nn.GRU` and `_fuse_custom_g
 
 The per-timestep GRU output is never stored: the step returns the new hidden state and one attention
 score, and the softmax over the scores weights the inputs at the end. The step's shapes do not depend
-on the sequence length, so it compiles once per process, with one recompile when a partial batch
-first arrives. CPU runs the same step uncompiled.
+on the sequence length, so a process compiles three graphs at most (a full batch, the first partial
+batch, a batch of one), never one per length. CPU runs the same step uncompiled.
+
+**It matches upstream.** On CPU in FP32, with the real checkpoint and real Iowa inputs, the model
+without the swap is bit-identical to upstream's own v1.1 model (`tessera_infer_QAT` in
+ucam-eo/tessera) at every module output, and the fused step differs only by FP32 rounding (relative
+4.4 × 10⁻⁷ in the pooled vector). `tests/unit/inference/test_v11_golden.py` holds it there against a
+verbatim copy of upstream's model; the old swap misses that test by 0.34 against a tolerance of 10⁻⁵.
+In BF16 on GPU the fused step stays within ADR 012's cross-config envelope of running `CustomGRU` as
+written: 94.7% of int8 values identical, 99.999% within one level, at most 2 levels, worst per-pixel
+cosine 0.99992, the same at odd batch sizes and on the L40S and A10G under PyTorch 2.5.1 and 2.14.1.
 
 ## 4. Consequences
 
@@ -84,11 +93,26 @@ first arrives. CPU runs the same step uncompiled.
   remembered.
 - **Stores written before this are not touched.** They hold the `nn.GRU` arithmetic. Whether any is
   recomputed or relabelled is a separate decision; v1.1 is expected to give way to v2.
-- **Faster, not slower.** The fused faithful step ran the forward pass 4.8–6.6% faster than the
-  `nn.GRU` path on one L40S (PyTorch 2.5.1, both backbones on their two streams, four batch shapes).
-  Running `CustomGRU` as written would have been correct but about 2.7 times slower in the GRU stage.
-- **`torch.compile` is now in the inference path,** for this one function. The first compile on a
-  fresh machine took up to about a minute; later ones take seconds.
+- **Faster, not slower.** Against the `nn.GRU` path, both backbones on their two streams:
+
+  | | PyTorch 2.5.1 | PyTorch 2.14.1 |
+  |---|---|---|
+  | L40S, forward pass, typical depths (48–128 optical steps) | 5.0–6.1% faster | 2.4–3.7% faster |
+  | L40S, forward pass, deep (208–256 steps) | 5.6% faster | 43–44% faster |
+  | L40S, end to end in the production loop | 4.2% faster | 1.7% faster (moderate depths only) |
+  | A10G, forward pass at 88/56 steps | 2.8% faster | 1.7% faster |
+
+  PyTorch 2.14.1 sends a BF16 `nn.GRU` to cuDNN, which is much slower at depth (1,930 against
+  1,113 ms per deep batch on the L40S) and runs out of memory on the A10G at 208/104 steps. The fused
+  step does not use `nn.GRU`, so v1.1 should not move to 2.14.1 without this change. Expect about 2–4%
+  end to end on the L40S. Running `CustomGRU` as written would have been correct but about 2.7 times
+  slower in the GRU stage.
+- **The step loop runs in Python,** so it needs the interpreter lock once per timestep, and CPU work
+  running alongside (batch preparation, strip prefetch) delays it more than it delayed `nn.GRU`'s
+  native loop. The pooling head's own `PROFILE` timings read high for that reason; end-to-end
+  throughput above is the measure to use.
+- **`torch.compile` is now in the inference path,** for this one function. A cold compile takes
+  2–3 s, and about 40 s on a freshly booted machine.
 
 ## 5. Not done, and why
 
