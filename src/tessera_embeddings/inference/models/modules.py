@@ -171,6 +171,9 @@ class TemporalAwarePooling(nn.Module):
         Returns:
             Pooled tensor of shape (B, dim).
         """
+        if x.shape[1] == 0:  # an empty sequence pools to zeros, as upstream's does
+            return x.new_zeros(x.shape[0], x.shape[2])
+
         profile = getattr(self, "_profile", False)
 
         if profile and x.is_cuda:

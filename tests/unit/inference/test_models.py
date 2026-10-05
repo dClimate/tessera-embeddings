@@ -100,6 +100,10 @@ class TestTemporalAwarePooling:
         with torch.no_grad():
             torch.testing.assert_close(pool(x), _reference_pool(pool, x), atol=1e-5, rtol=1e-5)
 
+    def test_empty_sequence_pools_to_zeros(self):
+        """A zero-length sequence returns zeros, as upstream's pooling head does."""
+        assert torch.equal(_trained_like_pool(64)(torch.randn(3, 0, 64)), torch.zeros(3, 64))
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="the compiled step runs on CUDA only")
     @pytest.mark.parametrize("batch", [1, 7, 7167])
     def test_compiled_step_matches_the_trained_formula_on_gpu(self, batch):
