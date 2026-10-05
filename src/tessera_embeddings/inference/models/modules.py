@@ -254,11 +254,20 @@ class TemporalEncoding(nn.Module):
         return self.proj(encoding)  # (B, T, d_model)
 
 
+#: Days the encoder can be asked for: DOY runs 1-366 (``storage.time_axis.compute_doy``), and 0 is the
+#: zero-filled radar slice of a pixel that has no S1 observation.
+_DOY_TABLE_SIZE = 367
+
+
 class TemporalPositionalEncoder(nn.Module):
     """Sinusoidal positional encoding from day-of-year values.
 
     Uses fixed sinusoidal frequencies (standard transformer positional encoding)
-    driven by DOY values instead of integer positions.
+    driven by DOY values instead of integer positions. DOY is always an integer day, so the
+    encoding is looked up in a 367-row table built once per device and dtype by the same FP32
+    arithmetic, rather than recomputed per pixel and timestep: bit-identical, and it spares
+    every forward the two full-size FP32 tensors (~2.6 + 5.3 GiB at the deepest bucket) that
+    sin/cos over ``(B, T, d_model)`` allocated.
     """
 
     def __init__(self, d_model: int, *, frequencies_on_cpu: bool = False) -> None:
@@ -276,6 +285,8 @@ class TemporalPositionalEncoder(nn.Module):
         # were trained and golden-tested on. A plain fp32 cache cannot be downcast by a
         # module-level dtype conversion.
         self._div_term_cache: dict[torch.device, torch.Tensor] = {}
+        # Every day's encoding, per (device, output dtype). Filled and read like the div_term cache.
+        self._table_cache: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
 
     def _div_term(self, device: torch.device) -> torch.Tensor:
         """FP32 sinusoidal frequencies for *device*, computed once per device.
@@ -296,40 +307,48 @@ class TemporalPositionalEncoder(nn.Module):
             self._div_term_cache[device] = cached
         return cached
 
-    def forward(self, doy: torch.Tensor, out_dtype: torch.dtype | None = None) -> torch.Tensor:
-        """Compute positional encoding from day-of-year.
-
-        Args:
-            doy: DOY values of shape (B, T). Must be FP32 — see the dtype note
-                below; BF16 cannot represent DOY above 256 to one-day resolution.
-            out_dtype: dtype of the returned encoding. Defaults to ``doy.dtype``.
-
-        Returns:
-            Positional encoding of shape (B, T, d_model).
-        """
+    def _encode(self, doy: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+        """The sinusoidal encoding of FP32 *doy* ``(B, T)``, as ``(B, T, d_model)`` in *out_dtype*."""
         # FP32 for precision, then cast the OUTPUT to the compute dtype (BF16 under
         # model.bfloat16()). Without that cast PyTorch's dtype promotion (BF16 + FP32 = FP32)
         # spreads FP32 through the whole transformer and GRU: 7 TFLOPS instead of 20-30 on T4
         # tensor cores.
         #
-        # *doy itself must arrive in FP32.* BF16 carries 8 mantissa bits, so it represents integers
-        # exactly only up to 256: DOY 257 would land on 256, and .float() here cannot recover what
-        # the cast already discarded. The callers therefore keep the DOY channel FP32 and cast only
-        # the bands — see V11TransformerEncoder.forward / StudentTransformerEncoder.forward.
-        #
         # torch.empty, not zeros: every element is written because 0::2 and 1::2 partition the
-        # even d_model, so the multi-GB zero-fill is dead work and the values are identical. The
-        # strided writes also avoid holding sin and cos live beside an interleaved output.
+        # even d_model, so a zero-fill is dead work and the values are identical.
         position = doy.float().unsqueeze(-1)
         angles = position * self._div_term(doy.device)  # (B, T, d_model/2)
         pe = torch.empty(doy.shape[0], doy.shape[1], self.d_model, device=doy.device)
         pe[:, :, 0::2] = torch.sin(angles)
         pe[:, :, 1::2] = torch.cos(angles)
-        # Drop angles before the cast: ~2.6 GiB at the largest (B=7168, T=256) bucket and unused
-        # from here, so holding it through pe.to() co-resides it with the fp32 pe and the bf16
-        # output — peak VRAM the concurrent s2/s1 backbones cannot spare.
-        del angles
-        return pe.to(out_dtype or doy.dtype)
+        return pe.to(out_dtype)
+
+    def _table(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """``(367, d_model)`` encodings of days 0-366 in *dtype*, computed once per (device, dtype)."""
+        key = (device, dtype)
+        cached = self._table_cache.get(key)
+        if cached is None:
+            days = torch.arange(_DOY_TABLE_SIZE, dtype=torch.float32, device=device)[None, :]
+            cached = self._encode(days, dtype)[0]
+            self._table_cache[key] = cached
+        return cached
+
+    def forward(self, doy: torch.Tensor, out_dtype: torch.dtype | None = None) -> torch.Tensor:
+        """Positional encoding of day-of-year.
+
+        Args:
+            doy: Integer DOY values in [0, 366], shape (B, T). Must be FP32 — BF16 cannot
+                represent DOY above 256 to one-day resolution (DOY 257 would land on 256), so
+                the callers keep the DOY channel FP32 and cast only the bands; see
+                V11TransformerEncoder.forward / StudentTransformerEncoder.forward. The pipeline
+                only produces integer days (``compute_doy``); a fractional one would be
+                truncated by the lookup.
+            out_dtype: dtype of the returned encoding. Defaults to ``doy.dtype``.
+
+        Returns:
+            Positional encoding of shape (B, T, d_model).
+        """
+        return self._table(doy.device, out_dtype or doy.dtype)[doy.long()]
 
 
 class V11TransformerEncoder(nn.Module):

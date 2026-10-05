@@ -636,9 +636,11 @@ things worse:
   where the model was trained with it before, and on real pixels that changes every stored
   value ([ADR 026](../../../context_docs/decisions/026-v1-1-runs-the-gru-it-was-trained-with.md)).
   v1.1 only: v2's pooling head is a single attention layer with no recurrence.
-- **Positional encoding writes into an uninitialised buffer.** The sine and cosine values
-  are written straight into it, instead of being scattered into a multi-gigabyte block of
-  FP32 zeros allocated on every forward pass. Same values, lower peak memory.
+- **Positional encoding is a per-day lookup table.** Day of year is an integer, so the
+  sine/cosine encoding of all 367 days is computed once per device and dtype, by the same
+  FP32 arithmetic, and each forward pass indexes into it — instead of computing sin and cos
+  over every pixel and timestep into two full-size FP32 tensors. Same values on the GPU, a
+  forward pass 5–8% faster.
 
 **What the logs report, and why it is not pixels per second.** A pixel with few
 observations costs about a tenth of a densely observed one, so a pixels-per-second figure
