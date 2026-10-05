@@ -81,6 +81,10 @@ without the swap is bit-identical to upstream's own v1.1 model (`tessera_infer_Q
 ucam-eo/tessera) at every module output, and the fused step differs only by FP32 rounding (relative
 4.4 × 10⁻⁷ in the pooled vector). `tests/unit/inference/test_v11_golden.py` holds it there against a
 verbatim copy of upstream's model; the old swap misses that test by 0.34 against a tolerance of 10⁻⁵.
+On GPU one more difference turned up and is fixed here: upstream v1.1 computes the positional
+encoding's frequencies on the CPU and moves them to the GPU, where ours computed them on the GPU, and
+`exp` rounds 116 of the 384 differently (final embeddings moved by at most 6.4 × 10⁻⁶). v1.1 now
+computes them on the CPU; v2's upstream computes them on the GPU, which ours already matched.
 In BF16 on GPU the fused step stays within ADR 012's cross-config envelope of running `CustomGRU` as
 written: 94.7% of int8 values identical, 99.999% within one level, at most 2 levels, worst per-pixel
 cosine 0.99992, the same at odd batch sizes and on the L40S and A10G under PyTorch 2.5.1 and 2.14.1.
