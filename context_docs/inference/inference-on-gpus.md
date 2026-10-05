@@ -1161,7 +1161,9 @@ rate. Check which decisions sit *near* a threshold before predicting that moving
 
 The change is still correct (a stale per-model constant is the same class of defect as the
 provenance one in [`validating-a-model-change.md`](validating-a-model-change.md) §5) and may matter
-on an ROI dominated by sparse single-strip tiles. It is not a speedup for Iowa.
+on an ROI dominated by sparse single-strip tiles. It is not a speedup for Iowa. The estimate has
+since been removed: the strip loader no longer makes any decision that depends on throughput
+([`simplifying-the-strip-loader.md`](simplifying-the-strip-loader.md)).
 
 ### Where the remaining time goes
 
@@ -1189,20 +1191,12 @@ anywhere else, so raising the cap would not help.
 ## 8. Gotchas, and remaining headroom
 
 **RAM budget is load-bearing.** Do NOT raise `_S2_STRIP_BYTE_BUDGET` or reintroduce whole-chunk
-cross-chunk prefetch without re-deriving the arithmetic at the constant. The pair ceiling (2× budget)
-plus the ~2 GiB prefetch stash is what keeps peak host RAM under 60%. The prefetch MUST skip
-pair-budget plans — their last strip is not a RAM trough. (The guard is no longer a named list of
-unsafe strategies: **every** strategy now respects the same resident-pair ceiling in `_strip_plan`,
-and the `_XCHUNK_*` caps live in `inference/read_plan.py`, except the three the actor's
-execution path owns — `_XCHUNK_DISABLE_ENV`, `_XCHUNK_MASK_TRANSIENT_CAP_BYTES` and
-`_XCHUNK_T_ALL_EST` — which stay in `inference/actors.py`.)
-
-**The strip-plan estimator is strategy-only.** `_EST_*` constants pick which safe strategy is
-fastest; they are NEVER a RAM bound. Every branch is RAM-safe regardless of estimate accuracy. The
-inference rate among them is per-model (`config.inference.MODEL_EST_PX_PER_SEC`, threaded in as
-`px_per_sec`); `_EST_PX_PER_SEC` in `inference/read_plan.py` is only the signature fallback for a
-caller that does not know its model. §7 measures what varying it actually changed, which was nothing
-on Iowa.
+cross-chunk prefetch without re-deriving the arithmetic at the constant. The load pipeline is one
+strip deep and runs across chunk boundaries, so at most two band sets are resident — mid-chunk, the
+strip being inferred and the next one loading; across a boundary, the last strip with pixels and the
+next chunk's first — and the pair ceiling (2× budget) is what keeps peak host RAM under 60%. The
+budget is 3.5 GiB, and a full Iowa year on sharded mosaics peaks at 50%
+([`simplifying-the-strip-loader.md`](simplifying-the-strip-loader.md)).
 
 **Shared CloudWatch log group across runs.** `--ram-report` and log greps must be scoped tightly with
 `--since` / `--until`; a broad window mixes concurrent runs. On-worker 1 s GPU poll files
@@ -1224,11 +1218,13 @@ full extent.
 **Remaining headroom.** Fleet GPU utilisation sits at ~89–93%; the residual gap is almost entirely
 the cold first-chunk-per-worker prologue (~36 s, ~85 chunks on `a60550ae` as the fleet autoscaled
 22→30) — a chunk with no predecessor to prefetch from, which the cross-chunk prefetch structurally
-cannot reach. **The next structural lever is source-store chunk geometry:** the 4000² storage
-chunking drives a ~13 s fixed read amplification, and an inference-aligned geometry chosen before a
-global ingestion would cut it for every future run. That is a config choice beforehand and a
-re-ingest afterwards — see [`../ingest/campaign-ingest-measurements.md`](../ingest/campaign-ingest-measurements.md) §4 for
-why the store chunk was not coarsened, which is the same trade seen from the ingest side.
+cannot reach. **Source-store chunk geometry was the structural lever, and sharding took it.** With
+whole 4000² or 4096² storage chunks every strip read decompressed its whole chunk, a ~13 s fixed
+amplification. The mosaics are now sharded into 512-row inner chunks, so a strip decompresses little
+more than its own rows: on Iowa, GPU idle fell from 5.3% to 2.7% of tile time and tile time by 3.0%
+([`../ingest/campaign-ingest-measurements.md`](../ingest/campaign-ingest-measurements.md) §3.19),
+and the strip loader could drop its read-cost planning
+([`simplifying-the-strip-loader.md`](simplifying-the-strip-loader.md)).
 
 **There is no CI coverage of the CUDA path and that is accepted** — there is no GPU runner and none
 is coming. `TestPipelinedGpuLoop` keeps its `skipif`, and that skip is the only standing signal the
@@ -1247,7 +1243,7 @@ gap exists. See [`../../tests/README.md`](../../tests/README.md).
 | the allocator flag | `inference/actors.py`, the `@ray.remote(runtime_env=...)` decorator |
 | the checkpoint ladder and its clipping | `inference/sampling.py`, `compute_bin_keys` |
 | deepest bucket first | `inference/dataset.py`, `iter_buckets(largest_first=True)` |
-| the strip plan and its RAM budget | `inference/read_plan.py`, `_strip_plan`, `_S2_STRIP_BYTE_BUDGET`, `_XCHUNK_PREFETCH_CAP_BYTES` |
+| the strip plan and its RAM budget | `inference/read_plan.py`, `_strip_plan`, `_S2_STRIP_BYTE_BUDGET` |
 | the pipelined forward loop | `inference/inference.py`, `_pipelined_gpu_loop` |
 | how many actors Ray packs on a card | `inference/scheduling.py`, `FleetDemand.machines` |
 | which instance rungs may be opened | `providers/aws/fleet_mix.py`, `GPU_RUNGS` |

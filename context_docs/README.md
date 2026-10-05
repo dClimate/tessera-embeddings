@@ -62,6 +62,10 @@ context_docs/
 │                                                  answer was inverted for the life of the code
 │
 ├── inference/                     RUNNING THE ENCODER
+│   ├── simplifying-the-strip-loader.md         the October 2026 loading experiments: what was
+│   │                                              tried, measured and shipped — the simpler strip
+│   │                                              loader on sharded mosaics, densest-first strips,
+│   │                                              the forward-pass benchmark
 │   ├── inference-on-gpus.md                    throughput, which cards may be rented, why the
 │   │                                              batch is sized to the card, what the campaign
 │   │                                              path itself measured, and what the v2 Large
