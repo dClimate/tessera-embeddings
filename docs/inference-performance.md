@@ -246,13 +246,13 @@ PyTorch's dtype promotion (BF16 + FP32 → FP32) spreads FP32 through the entire
 the GRU behind it — measured at 7 TFLOPS against 20–30 on tensor cores. One cast on one tensor
 keeps the rest of the graph in BF16.
 
-**That encoding is written into uninitialised memory.** `pe` is allocated with `torch.empty`
-rather than `zeros`, because the `0::2` and `1::2` strided writes partition an even `d_model`
-and leave nothing unwritten. The zero-fill was multi-gigabyte dead work for identical values.
-The intermediate `angles` tensor is also freed before the cast rather than after: at the largest
-bucket (B=7168, T=256) it is about 2.6 GiB, and holding it through `pe.to()` co-resides it with
-both the FP32 encoding and the BF16 output, which is VRAM the two concurrent backbones cannot
-spare.
+**That encoding is a 367-row table.** Day of year is always an integer from 0 to 366, so
+`TemporalPositionalEncoder` computes the encoding of every day once per device and output dtype,
+with the same FP32 arithmetic, and each forward pass looks it up. Computing sin and cos per pixel
+and timestep allocated an FP32 angle tensor (about 2.6 GiB at B=7168, T=256) and an FP32 encoding
+(about 5.3 GiB) on every forward of each backbone; the table is under a megabyte. On the GPU the
+values are bit-identical and the forward pass is 5–8% faster
+([`../context_docs/inference/inference-on-gpus.md`](../context_docs/inference/inference-on-gpus.md) §2).
 
 **Training-only parameters never reach the graph.** The checkpoint carries a BarlowTwins
 `projector` and a `segmented_matryoshka_projector` that served the variable-width training
