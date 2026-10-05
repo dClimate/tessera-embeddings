@@ -289,7 +289,7 @@ class TestPipelinedGpuLoop:
     the lockfile by default, so a bare invocation SKIPS rather than verifying anything::
 
         uv sync --all-extras --frozen
-        uv pip install "torch==2.6.0+cu124" --index-url https://download.pytorch.org/whl/cu124
+        uv pip install "torch==2.14.1+cu130" --index-url https://download.pytorch.org/whl/cu130
         uv run --no-sync python -c "import torch; assert torch.cuda.is_available()"
         uv run --no-sync pytest tests/unit/inference/test_inference_loop.py -k pipelined -v
 

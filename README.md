@@ -223,13 +223,13 @@ pip install tessera_embeddings[inference]
 # Full production stack — inference + Prefect orchestration + AWS:
 pip install tessera_embeddings[inference,prefect,aws]
 
-# GPU (CUDA 12.4, Python 3.12-3.13) — install torch first so pip keeps the CUDA wheel:
-pip install "torch==2.6.0+cu124" --index-url https://download.pytorch.org/whl/cu124
+# GPU (CUDA 13.0, NVIDIA driver 580+, Python 3.12-3.13) — install torch first so pip keeps
+# the CUDA wheel. On an older driver, use the cu126 build of the same version instead.
+pip install "torch==2.14.1+cu130" --index-url https://download.pytorch.org/whl/cu130
 pip install "tessera_embeddings[inference]"
 
-# 3.12-3.13 is the supported range: it is what CI tests, and cu124 tops out at torch 2.6.0,
-# which publishes cp39-cp313 and no cp314. Python 3.14 is untested rather than blocked --
-# see docs/environment-setup.md if you intend to run it anyway.
+# 3.12-3.13 is the supported range: it is what CI tests. torch 2.14.1 publishes wheels up to
+# Python 3.15, so 3.14 is untested rather than blocked -- see docs/environment-setup.md.
 ```
 
 For contributors:
