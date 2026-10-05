@@ -35,6 +35,18 @@ from tessera_embeddings.storage.zarr_store import ASSESSED_WINDOW_ATTR, is_missi
 logger = logging.getLogger(__name__)
 
 
+# Requests zarr keeps in flight per read call; its default is 10. A sharded mosaic
+# (``config.ingest.INGEST_INNER_CHUNKS``) is read as one small ranged request per inner chunk plus each shard's index,
+# so at 10 a strip read waits on S3 latency rather than on decompression: measured on a real Iowa block, 64 made strip
+# reads 2-4x faster than 10, and changed nothing for unsharded stores.
+MOSAIC_READ_CONCURRENCY = 64
+
+
+def configure_mosaic_reads() -> None:
+    """Raise zarr's per-read request concurrency for this process (see ``MOSAIC_READ_CONCURRENCY``)."""
+    zarr.config.set({"async.concurrency": MOSAIC_READ_CONCURRENCY})
+
+
 # Worker cap for the concurrent S2 band read (see ``_load_s2_bands``). Unlike the latency-bound
 # ROI probe (``chunk_spec._ROI_PROBE_WORKERS``, oversubscribed x4), this read is
 # DECOMPRESSION-bound: with time chunked at 1, each band's ``oindex`` already issues its
@@ -97,9 +109,8 @@ def make_store_opener(region: str | None = None) -> StoreOpener:
 class S2MaskBundle:
     """Full-chunk S2 SCL validity, loaded once and shared across northing strips.
 
-    The strip loop reads SCL for the whole chunk once, then slices this bundle per strip. SCL
-    chunks on disk are ``(time=1, 4000, 4000)``, so any sub-region read decompresses the whole
-    chunk anyway; loading once turns per-strip SCL re-reads into in-memory views. The mask also
+    The strip loop reads SCL for the whole chunk once, then slices this bundle per strip, turning
+    per-strip SCL re-reads into in-memory views. The mask also
     sizes the strip height (``read_plan._strip_height_for_density``): its ``T_kept`` is the true
     post-pruning timestep count for *this* chunk, so sparse chunks get tall strips and only
     genuinely dense chunks split.
