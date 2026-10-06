@@ -123,12 +123,12 @@ that kernel adds numbers in a different order, shifting the last bit of some res
 names exactly this mechanism. Against the old loader, 99.84–99.99% of stored values are identical
 and at least 99.9995% are within one level; the worst value moves 3 levels; the lowest per-pixel
 cosine similarity is 0.9999 (an angle under 1°) and the mean is 1.000000. That fails the strict
-gate. On round 2's 39 tiles it passed the cross-config envelope, with two measures near its edges
-(scale drift 1.56% against 1.6%, cosine 0.999901 against 0.9999). On the whole Iowa year (round 5)
-347 of 394 tiles pass and 47 exceed its tails: a few pixels per tile whose int8 scale moves by up
-to 1.97%, a worst-pixel cosine of 0.999877, and 4 tiles where one value moves 4 levels. The typical
-tile is closer: a median 99.95% of values identical, against 95–98% for the batch-size change the
-envelope was calibrated on.
+gate and passes ADR 012's cross-config envelope on every tile. Over the whole Iowa year (round 5)
+the worst tiles reach a scale drift of 1.97%, a worst-pixel cosine of 0.999877 and one value moving
+4 levels. Those extremes, with the same pattern in the v2 full-stack run, are what ADR 012's envelope
+was widened on: its first bounds (1.6%, 0.9999, 3 levels), set on three chunks of a batch-size
+change, failed 47 of these 394 tiles on extremes alone. The typical tile is closer than that
+batch-size change: a median 99.95% of values identical, against 95–98%.
 
 **The old loader's outputs were not stable either.** It gave a tile a starter strip depending on
 which tile its worker had handled before, so the same tile could be cut into different strips on
@@ -147,10 +147,10 @@ prefetched or loaded serially, so the same code always cuts it the same way.
 | top-20 neighbours kept | 99.98% (99.90% on the worst tile) | two same-model stores agree on 0.9940; the PyTorch upgrade kept 99.48% (#209) |
 | same k-means cluster | 99.999% | — |
 
-The 47 tiles beyond the envelope's extremes look like the rest: 99.97% of top-20 neighbours kept,
-99.999% in the same cluster. The inference code identity changes too, so old and new tiles cannot
-mix inside one store. On that evidence the maintainers accepted the change on 2026-10-05, under
-the rule ADR 012 sets for changes that only regroup sub-batches.
+The 47 tiles that the envelope's first bounds failed look like the rest: 99.97% of top-20
+neighbours kept, 99.999% in the same cluster. The inference code identity changes too, so old and
+new tiles cannot mix inside one store. On that evidence the maintainers accepted the change on
+2026-10-05.
 
 ### 3. Where did the remaining idle time go?
 

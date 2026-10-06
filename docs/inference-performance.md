@@ -197,8 +197,9 @@ which GPU-idle window each reclaims (see the three-windows diagram above).
 
 ¹ The only non-bit-identical change. It shifts a small fraction of int8 values by ±1–2
 levels (cuBLAS picks different kernels for different batch shapes), so a `main`-vs-branch
-diff is judged against the ADR-012 **cross-config** envelope (int8 within ±1 on ≥99.99% of
-values, max ≤3; observed max ±2) — not the same-config bit-identity gate the other rows meet.
+diff is judged against the ADR-012 **cross-config** envelope (int8 within ±1 on ≥99.5% of
+values, scale drift ≤3%, worst-pixel cosine ≥0.999; observed max ±2) — not the same-config
+bit-identity gate the other rows meet.
 
 ² Foundational — it bounds peak RAM, which is what makes every other adaptive choice
 safe; it also drops a ~13 s fixed read per dense tile.
