@@ -185,13 +185,15 @@ def compare_chunk(ref_path: str, test_path: str, label: str, *, cross_config: bo
             deq_ref = er.astype(np.float32) * sr[:, None]
             deq_test = et.astype(np.float32) * st[:, None]
             num = (deq_ref * deq_test).sum(axis=1)
-            den = np.linalg.norm(deq_ref, axis=1) * np.linalg.norm(deq_test, axis=1)
-            nz = den > 0
-            if nz.any():
-                cos = num[nz] / den[nz]
-                cosine_min = min(cosine_min, float(cos.min()))
-                cosine_sum += float(cos.sum())
-                cosine_count += int(nz.sum())
+            n_ref, n_test = np.linalg.norm(deq_ref, axis=1), np.linalg.norm(deq_test, axis=1)
+            # A zero vector against a real one scores 0 rather than dropping out, or an all-zero artifact
+            # with valid scales would pass; two zero vectors agree (the quantizer writes zeros only for a
+            # zero row).
+            den = n_ref * n_test
+            cos = np.divide(num, den, out=(n_ref == n_test).astype(num.dtype), where=den > 0)
+            cosine_min = min(cosine_min, float(cos.min()))
+            cosine_sum += float(cos.sum())
+            cosine_count += len(cos)
 
     # Obs-count layers: deterministic counts, EXACT and PRESENT in both stores. (H, W) uint16
     # — small enough to compare whole. A required layer missing from one store, or from BOTH,

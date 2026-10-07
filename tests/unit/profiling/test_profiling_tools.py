@@ -18,7 +18,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
+import xarray as xr
 
 from tessera_embeddings.inference.actors import _chunk_summary_line
 from tessera_embeddings.inference.resource_monitor import ResourceMonitor
@@ -292,6 +294,17 @@ class TestCoarsenedCompare:
         assert cmp.n_finite_pairs == 2  # the two finite pairs only
 
 
+def _staged(path: Path, emb: np.ndarray) -> str:
+    """A minimal staged tile: embeddings, positive scales and the three observation-count layers."""
+    yx = ("northing", "easting")
+    counts = {
+        v: (yx, np.ones(emb.shape[:2], "uint16")) for v in ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count")
+    }
+    scales = np.full(emb.shape[:2], 0.01, "float32")
+    xr.Dataset({"embeddings": ((*yx, "band"), emb), "scales": (yx, scales), **counts}).to_zarr(path)
+    return str(path)
+
+
 # The worst full-Iowa-year tile measured across configs: 4 levels, 1.97% scale drift, cosine 0.999865.
 _WORST_SHIMMER = compare_outputs.ChunkComparison(
     label="t",
@@ -324,3 +337,12 @@ class TestCrossConfigEnvelope:
     )
     def test_verdict(self, overrides: dict, passed: bool) -> None:
         assert dataclasses.replace(_WORST_SHIMMER, **overrides).passed is passed
+
+    @pytest.mark.parametrize("cross_config", [True, False])
+    def test_a_zeroed_artifact_fails(self, tmp_path: Path, cross_config: bool) -> None:
+        """All-zero embeddings with valid scales fail, even on a tile too small for the within-one share."""
+        emb = np.random.default_rng(0).integers(-127, 128, (8, 8, 16), dtype=np.int8)
+        ref, test = _staged(tmp_path / "ref.zarr", emb), _staged(tmp_path / "test.zarr", np.zeros_like(emb))
+        result = compare_outputs.compare_chunk(ref, test, "t", cross_config=cross_config)
+        assert result.cosine_min == 0.0
+        assert not result.passed
