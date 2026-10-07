@@ -187,8 +187,7 @@ A tile arrives → load its SCL mask → count valid pixels, find their bbox
 *Both [families](#the-two-families-of-fix), each tagged with the [window](#why-the-card-idles) it reclaims.*
 
 Every optimization here leaves outputs **bit-identical to `main`'s** except the batch-size
-change (¹) — the rest alter scheduling and I/O, not the math. (The builder's cuDNN-GRU
-reset-gate approximation ([§7](../src/tessera_embeddings/inference/README.md#7-the-forward-pass-on-the-gpu-inferencepy)) predates this work and is identical on `main`.) *Window* is
+change (¹) — the rest alter scheduling and I/O, not the math. *Window* is
 which GPU-idle window each reclaims (see the three-windows diagram above).
 
 | Optimization | Family | Window | Triggers on… | Impact |
@@ -219,27 +218,24 @@ roughly bbox-proportional), negligible on interior tiles (which skip it).
 ## The model itself was also changed
 
 Everything above rearranges *when* work happens. Four changes alter *what runs on the card*, and
-they are the reason the scheduling work had a fast forward pass to schedule around. All four are
-applied at build time in `models/builder.py` and `models/modules.py`, after the checkpoint loads
-and before the model is frozen. They were made on v1.1. The v2 Large student shares the positional
+they are the reason the scheduling work had a fast forward pass to schedule around. All four live
+in `models/builder.py` and `models/modules.py`. They were made on v1.1. The v2 Large student shares the positional
 encoder, so the two changes to it apply there too; it has no recurrent layer and its checkpoint
 carries no training-only heads, so the other two do not.
 
-**The recurrent layer is replaced with a fused one.** The pooling head's `CustomGRU` is
-checkpoint-faithful but steps the sequence in Python, one kernel launch per timestep — about 480
-of them. `_fuse_custom_gru` swaps in PyTorch's `nn.GRU`, which cuDNN runs as roughly one launch,
-so the recurrence stops being bound by launch overhead. The two are not drop-in compatible, and
-the swap folds the weights across two differences:
+**The pooling head runs one compiled step per timestep.** v1.1 pools each pixel's sequence with a
+GRU, a LayerNorm and an attention score. Written as `CustomGRU`, the GRU is several small GPU
+operations per timestep. `modules._gru_pool_step` does one timestep of all three in the GRU's
+trained arithmetic and is compiled into a single kernel, so the recurrence is no longer bound by
+launch overhead and the per-timestep GRU output is never stored. The step's shapes do not depend on
+the sequence length, so it compiles once per process.
 
-- **The update gate convention is inverted.** Tessera computes `h' = (1-z)h + zn`, where `z`
-  selects the new candidate; `nn.GRU` computes `h' = (1-z)n + zh`, where `z` keeps the old state.
-  Since `1 - sigmoid(x) = sigmoid(-x)`, every `z` weight and bias is negated.
-- **The reset gate sits on the other side of the matmul.** Tessera applies it before,
-  `W_hh @ (r * h)`; `nn.GRU` applies it after, `r * (W_hh @ h + b_hh)`. These are **not**
-  equivalent for dense weights. It is a real approximation, and it is accepted because the reset
-  gate is close to 1 on most dimensions after training. This one predates the performance
-  campaign and runs identically on `main`, so it cancels out of any before-and-after comparison
-  here — but it is an approximation, not a rearrangement, and it should not be filed with them.
+PyTorch's `nn.GRU` cannot stand in for it, although it would be one call: it applies the reset gate
+after the hidden-state matrix multiply, `r * (W_hh @ h)`, where the model was trained with it
+before, `W_hh @ (r * h)`. The two agree only when the reset gate is close to 1, and on real pixels it
+averages 0.37 (optical) and 0.45 (radar), so the swap changed every stored value. It also never
+reached cuDNN, whose RNN kernels do not take BF16. The measurements are in
+[ADR 026](../context_docs/decisions/026-v1-1-runs-the-gru-it-was-trained-with.md).
 
 **Positional encoding computes in FP32 and casts its output.** Without the explicit cast,
 PyTorch's dtype promotion (BF16 + FP32 → FP32) spreads FP32 through the entire transformer and
@@ -260,9 +256,9 @@ objective. Both are stripped by prefix before the model is built, so neither occ
 appears in a forward pass.
 
 Two further options were tried and are off, both measured worse rather than merely unhelpful.
-`torch.compile` captured the model as a CUDA graph, consumed 11.6 GB of VRAM and roughly doubled
-the forward pass, because the recurrent layer recompiled for every distinct sequence length it
-saw. cuDNN's autotuner searches for the fastest kernel per input shape, and bucketing changes the
+`torch.compile` of the whole model captured it as a CUDA graph, consumed 11.6 GB of VRAM and
+roughly doubled the forward pass, because the recurrent layer recompiled for every distinct sequence
+length it saw; only the pooling head's single timestep is compiled now. cuDNN's autotuner searches for the fastest kernel per input shape, and bucketing changes the
 shape constantly, so it searched constantly and inflated host memory doing it.
 
 ## What we ruled out, and why
@@ -277,8 +273,6 @@ Profiling ruled these out, so they're absent by design, not oversight:
   the bounded (~2 GiB) cross-chunk prefetch instead hold peak at ~52%, well under the
   60% ceiling, so tile-density spikes at UTM-zone scale can't OOM the node. The unused
   headroom is intentional insurance, not waste.
-- **GRU restructuring** — the model builder already fuses the recurrent stack to cuDNN;
-  a hand-restructure was written, measured as no faster, and reverted as dead code.
 - **FP16 fast-accumulate** — an L40S GEMM microbench showed BF16 already runs at the
   full dense tensor-core ceiling, so FP16 buys nothing here. BF16 stays.
 - **Adaptive token-budget batching** — measured; B=7168 is already throughput-optimal
