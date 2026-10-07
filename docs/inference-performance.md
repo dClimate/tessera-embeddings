@@ -64,15 +64,19 @@ read or where the strips are cut.
 
 ## What none of it changes
 
-**Outputs are bit-identical to `main`'s** except the batch-size change, and that exception is
-measured rather than assumed. Comparing `main` at batch 3584 against the shipped branch at 7168
+**Outputs are bit-identical to `main`'s** except for the two changes that regroup pixels into
+different GPU sub-batches, the batch size and the strip budget, and both exceptions are measured
+rather than assumed. Comparing `main` at batch 3584 against the shipped branch at 7168
 over ~512M values per tile: int8 values land within one level on **≥99.99%** of them, the largest
 observed deviation is **2 levels**, per-pixel scale drift stays **≤0.78%**, and the dequantized
 embeddings have **cosine similarity ≥0.9999** — which is the number that matters, since these
 vectors are used as features rather than read individually. Footprint and observation-count layers
 stay exact. The cause is cuBLAS picking different kernels for different batch shapes, not a change
 to the model; the envelope and the harness are in
-[ADR 012](../context_docs/decisions/012-validated-equivalence-for-inference-outputs.md).
+[ADR 012](../context_docs/decisions/012-validated-equivalence-for-inference-outputs.md). The
+strip budget, over a full Iowa year, leaves a median 99.95% of values identical, at most one value
+4 levels off, and 99.98% of each pixel's nearest neighbours unchanged
+([`simplifying-the-strip-loader.md`](../context_docs/inference/simplifying-the-strip-loader.md) §2).
 
 ## Terms and impact ratings
 
@@ -177,8 +181,9 @@ A tile arrives → load its SCL mask → count valid pixels, find their bbox
 
 *Both [families](#the-two-families-of-fix), each tagged with the [window](#why-the-card-idles) it reclaims.*
 
-Every optimization here leaves outputs **bit-identical to `main`'s** except the batch-size
-change (¹) — the rest alter scheduling and I/O, not the math. (The builder's cuDNN-GRU
+Every optimization here leaves outputs **bit-identical to `main`'s** except the two that change
+which pixels share a GPU sub-batch, the batch size and the strip budget (¹) — the rest alter
+scheduling and I/O, not the math. (The builder's cuDNN-GRU
 reset-gate approximation ([§7](../src/tessera_embeddings/inference/README.md#7-the-forward-pass-on-the-gpu-inferencepy)) predates this work and is identical on `main`.) *Window* is
 which GPU-idle window each reclaims (see the three-windows diagram above).
 
@@ -188,18 +193,19 @@ which GPU-idle window each reclaims (see the three-windows diagram above).
 | Async two-deep GPU pipeline ([§7](../src/tessera_embeddings/inference/README.md#7-the-forward-pass-on-the-gpu-inferencepy)) | core loop | mid-forward | always (CUDA) | ◐ medium |
 | Batch size 3584 → 7168 ([§7](../src/tessera_embeddings/inference/README.md#7-the-forward-pass-on-the-gpu-inferencepy)) | core loop | mid-forward | always | ◐ medium¹ |
 | Background staging write ([§4.3](../src/tessera_embeddings/inference/README.md#43-starting-the-next-tile-early-and-finishing-the-last-one-late)) | core loop | write (post) | always | ○ small |
-| Budget-sized northing strips ([§4.2](../src/tessera_embeddings/inference/README.md#42-loading-a-tile-in-strips)) | adaptive | *enabling* | tile exceeds one RAM budget | ● large² |
+| Budget-sized northing strips ([§4.2](../src/tessera_embeddings/inference/README.md#42-loading-a-tile-in-strips)) | adaptive | *enabling* | tile exceeds one RAM budget | ● large¹ ² |
 | Strip prefetch ([§4.2](../src/tessera_embeddings/inference/README.md#42-loading-a-tile-in-strips)) | adaptive | mid-forward | any split tile | ◐ medium |
 | Cross-chunk prefetch ([§4.3](../src/tessera_embeddings/inference/README.md#43-starting-the-next-tile-early-and-finishing-the-last-one-late)) | adaptive | cold-start (next tile) | next tile reserved | ● large |
 | Timestep pruning ([§4.1](../src/tessera_embeddings/inference/README.md#41-read-as-little-as-possible)) | adaptive | cold-start | **temporal** sparsity (cloudy/empty dates) | ○ small–◐ |
 | Empty-strip skip ([§4.1](../src/tessera_embeddings/inference/README.md#41-read-as-little-as-possible)) | adaptive | cold-start (per strip) | **spatial** sparsity (a row band with no valid px) | ◐ medium |
 | Easting bbox crop ([§4.1](../src/tessera_embeddings/inference/README.md#41-read-as-little-as-possible)) | adaptive | cold-start | **spatial** sparsity (valid px in a narrow column window) | ◐ medium³ |
 
-¹ The only non-bit-identical change. It shifts a small fraction of int8 values by ±1–2
-levels (cuBLAS picks different kernels for different batch shapes), so a `main`-vs-branch
-diff is judged against the ADR-012 **cross-config** envelope (int8 within ±1 on ≥99.5% of
-values, scale drift ≤3%, worst-pixel cosine ≥0.999; observed max ±2) — not the same-config
-bit-identity gate the other rows meet.
+¹ Not bit-identical. Both regroup pixels into different GPU sub-batches, cuBLAS picks
+different kernels for different batch shapes, and a small fraction of int8 values shift by a
+level or two. A before-and-after diff is judged against the ADR-012 **cross-config** envelope
+(int8 within ±1 on ≥99.5% of values, scale drift ≤3%, worst-pixel cosine ≥0.999) — not the
+same-config bit-identity gate the other rows meet. Observed: ±2 for the batch size, ±4 on one
+value for the strip budget over a full Iowa year.
 
 ² Foundational — it bounds peak RAM, which is what makes every other adaptive choice
 safe; it also drops a ~13 s fixed read per dense tile.
