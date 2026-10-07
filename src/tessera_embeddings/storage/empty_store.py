@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import zarr
 
-from tessera_embeddings.config.ingest import INGEST_CHUNKS
+from tessera_embeddings.config.ingest import INGEST_CHUNKS, INGEST_COMPRESSORS, mosaic_chunk_layout
 from tessera_embeddings.config.store_layout import clamp_chunks_and_shards
 from tessera_embeddings.storage.time_axis import TIME_ENCODING, compute_doy
 from tessera_embeddings.storage.zarr_store import _create_repo, _delete_store
@@ -88,6 +88,8 @@ class VarSpec:
     fill_value: Any = _DEFAULT_FILL
     serializer: Any = "auto"
     compressors: Any = "auto"
+    # Shard shape, in the same order as ``dims``; ``None`` leaves the array unsharded.
+    shards: tuple[int, ...] | None = None
 
     def resolved_fill(self) -> float | int:
         """The fill value to write: the explicit ``fill_value`` or the per-dtype default."""
@@ -134,11 +136,12 @@ def _write_group_schema(
         shape = tuple(len(coords[d]) for d in spec.dims)
         # One clamp implementation for on-disk geometry, shared with ArrayLayout.create_kwargs
         # (config.store_layout).
-        chunks, _ = clamp_chunks_and_shards(shape, spec.chunks, None)
+        chunks, shards = clamp_chunks_and_shards(shape, spec.chunks, spec.shards)
         node.create_array(
             name,
             shape=shape,
             chunks=chunks,
+            shards=shards,
             dtype=spec.dtype,
             fill_value=spec.resolved_fill(),
             dimension_names=spec.dims,
@@ -270,6 +273,7 @@ def create_empty_store(
     chunk_t = chunks["time"]
     chunk_y = min(chunks["northing"], ny)
     chunk_x = min(chunks["easting"], nx)
+    inner, shards = mosaic_chunk_layout((chunk_t, chunk_y, chunk_x))
 
     logger.info(
         "Creating empty store %s: %d dates x %d x %d, vars=%s",
@@ -303,7 +307,9 @@ def create_empty_store(
             name: VarSpec(
                 dims=("time", "northing", "easting"),
                 dtype=dtype,
-                chunks=(chunk_t, chunk_y, chunk_x),
+                chunks=inner,
+                compressors=INGEST_COMPRESSORS,
+                shards=shards,
             )
             for name, dtype in var_dtypes.items()
         },

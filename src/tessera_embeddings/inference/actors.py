@@ -41,7 +41,12 @@ from tessera_embeddings.config.store_layout import MONTH_COVERED_VARS, MONTHS_IN
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import OBS_COUNT_VARS, ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
-from tessera_embeddings.inference.data_loading import load_chunk, load_s2_mask_bundle, make_store_opener
+from tessera_embeddings.inference.data_loading import (
+    configure_mosaic_reads,
+    load_chunk,
+    load_s2_mask_bundle,
+    make_store_opener,
+)
 from tessera_embeddings.inference.progress import chunk_uid
 from tessera_embeddings.inference.read_plan import _STARTER_STRIP_H, _chunk_read_plan, _StripPlan, _xchunk_rung
 from tessera_embeddings.inference.resource_monitor import ResourceMonitor
@@ -397,6 +402,7 @@ class InferenceActor:
         )
 
         _configure_actor_logging()
+        configure_mosaic_reads()
 
         self.config = config
         self._get_credentials = get_credentials
