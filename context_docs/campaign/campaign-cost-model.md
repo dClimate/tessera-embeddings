@@ -63,7 +63,7 @@ actors per cluster; the widest measured is 160. Ingest velocity was also measure
 with the basis by 2.7–4.0× (§4) — resolved as season, not width and not contention (§4).
 
 **The model was v1.1.** The next campaign is planned on v2 Large with the October 2026
-optimisations, and §13 costs it from a measured Iowa year.
+optimisations, once zone fill can run v2, and §13 costs it from a measured Iowa year.
 
 The permanent embeddings store (0.9–1.8 PB) is **not costed here**: it goes to AWS Open
 Data, which sponsors the storage. Sizing it still matters for bucket planning — see §7 —
@@ -1672,9 +1672,14 @@ a quantity in an unclosed month can still move. `campaign_cost_actuals.py` print
 ## 13. The next campaign: v2 with the optimisation stack, about $560,000
 
 **On v2 Large with October 2026's optimisations, the nine-year campaign would cost about $560,000,
-a third less than §12's $828,364, and take about 11 days on the same peak fleet instead of 16.**
+a third less than §12's $828,364, and take about 10.5 days on §12's average fleet instead of 15.6.**
 Measured 2026-10-05 on the Iowa year on g6e.xlarge (L40S) cards; the factors are applied to the
 whole card line, A10G hours included.
+
+**One prerequisite: the global campaign cannot run v2 yet.** Zone fill (`fill_zone_year`) builds
+v1.1 only; v2 Large is selectable on the single-area paths. Wiring v2 through zone fill, its seed
+and its provenance checks comes first, and this section costs the campaign that wiring makes
+possible.
 
 ### GPU time, measured on the Iowa year
 
@@ -1682,14 +1687,15 @@ The same 394 tiles (1.46 billion valid pixels); tile time is card-seconds summed
 
 | | tile time | GPU instance-hours | relative GPU time |
 |---|---|---|---|
-| v1.1 on `main` | 91,643 s | 26.1 | 1.00 |
-| v2 on `main` | 76,606 s | 22.1 | 0.84 |
+| v1.1 without the stack | 91,643 s | 26.1 | 1.00 |
+| v2 without the stack | 76,606 s | 22.1 | 0.84 |
 | **v2 with the optimisation stack** | **61,262 s** | **17.9** | **0.67** |
 | v1.1 with every optimisation that applies to it | not run as one | — | 0.86 (0.83–0.88) |
 
 - **The stack** is sharded mosaics with LZ4 compression (#211), the simpler strip loader (#213),
   the day-of-year positional-encoding table (#208), PyTorch 2.14.1 (#209) and, for v1.1, the GRU
-  it was trained with (#212).
+  it was trained with (#212). #208, #211 and #212 have since merged, so "without the stack" means
+  `main` before them: `0e0bf2e2` for the v2 row.
 - **The two v2 rows ran side by side,** 8 L40S each, every tile paired. The stack cut tile time by
   20.0%: the model's own time fell 10.1%, and the card's wait for data fell from 15.0% of tile time
   to 4.4%. Its cards averaged 3% lower clocks, so the gain is if anything understated. Peak worker
@@ -1705,7 +1711,7 @@ The same 394 tiles (1.46 billion valid pixels); tile time is card-seconds summed
 
 ### What the campaign would cost
 
-| line | §12, v1.1 (actual) | v1.1, optimised | v2 on `main` | **v2 with the stack** |
+| line | §12, v1.1 (actual) | v1.1 with the stack | v2 without the stack | **v2 with the stack** |
 |---|---|---|---|---|
 | graphics cards | $536,706 | ~$459,000 | ~$452,000 | **~$363,000** |
 | Fargate containers | $187,441 | ~$95,000 | ~$95,000 | **~$95,000** |
@@ -1714,20 +1720,22 @@ The same 394 tiles (1.46 billion valid pixels); tile time is card-seconds summed
 | EBS and Ray head nodes | $4,726 | $5,000 | $5,000 | **$5,000** |
 | **campaign total** | **$828,364** | **~$660,000** | **~$650,000** | **~$560,000** |
 | per global year | $92,000 | ~$73,000 | ~$72,000 | **~$62,000** |
-| days at a 1,307-card peak | 16 | ~14 | ~13.5 | **~11** |
-| or cards for 16 days | 1,307 | ~1,120 | ~1,100 | **~890** |
+| graphics-card hours | 360,282 | ~308,000 | ~303,000 | **~244,000** |
+| days at §12's average fleet (964 cards) | 15.6 | ~13.3 | ~13.1 | **~10.5** |
+| or average fleet to finish in 15.6 days | 964 | ~824 | ~812 | **~653** |
 
 - **Graphics cards:** §12's $536,706 times the relative GPU time above.
 - **Fargate:** Graviton ingest workers, 45–53% cheaper per rung (ingest measurements §15), in every
   forward column because they are on `main`.
 - **S3 storage:** LZ4 mosaics are about 6% smaller (ingest measurements §3.18, #211).
 - **S3 requests:** sharded reads add $1,000–3,500 a campaign at 512-row inner chunks (§3.19, #211).
-- **Duration:** §12's campaign was bound by the cards AWS supplied, so days scale with GPU time.
-  Ingest stays ahead: Graviton workers also write 1.6–2× faster.
+- **Duration** is graphics-card hours over the average fleet. §12's fleet averaged 964 cards and
+  peaked at a 1,307-card daily average; these rows assume AWS supplies cards the same way. Ingest
+  stays ahead: Graviton workers also write 1.6–2× faster.
 
 ### Outputs
 
-The stack moves v2's outputs at the rounding level only. Against v2 on `main`, a median 99.991% of
+The stack moves v2's outputs at the rounding level only. Against v2 without it, a median 99.991% of
 int8 values are identical, every tile is inside ADR 012's cross-config envelope (#213), and
 99.99% of each pixel's 20 nearest neighbours are kept, against the 0.9940 two same-model stores
 agree on.
