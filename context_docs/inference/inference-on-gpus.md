@@ -238,8 +238,10 @@ carries its own provenance line, which is what the corrections register requires
   *every* sequence length, down to 8 timesteps, and larger B is neutral-to-worse. Shelved — and see
   §5, alternative A, where this is what closes the case for a per-bucket memory budget.
 - **Eager bucketing (P4).** Opens `dataset.py`; post-striping payoff is a sliver. Rejected.
-- **GRU restructure.** The builder already fuses `CustomGRU` into cuDNN's `nn.GRU`; the restructure
-  never reached production and was reverted as dead code.
+- **GRU restructure.** A hand-restructured GRU was measured no faster than the `nn.GRU` swap, never
+  reached production and was reverted as dead code. The swap itself turned out to change the
+  model's arithmetic; the pooling head now runs one compiled step per timestep in the trained
+  arithmetic ([ADR 026](../decisions/026-v1-1-runs-the-gru-it-was-trained-with.md)).
 - **`g6e.2xlarge` (8 vCPU).** A ~30% premium for ~7–15% of feed-recoverable time. The software route
   was preferred.
 

@@ -15,15 +15,21 @@ has to treat sampling as model-specific
 
 | File | Ported from | Changes from original |
 |---|---|---|
-| `modules.py` | `tessera_infer/src/models/modules.py` | Type hints, ruff formatting. Upstream's `TransformerEncoder` renamed `V11TransformerEncoder` (upstream v2 has a same-named class; see `student_v2.py`). `TemporalPositionalEncoder` caches `div_term` per device in FP32 and takes an explicit output dtype, and the encoder casts bands (not DOY) to the weights' dtype — see "The input stays FP32" in `../README.md` §7. Layer shapes and forward-pass math are unchanged. |
+| `modules.py` | `tessera_infer/src/models/modules.py` | Type hints, ruff formatting. Upstream's `TransformerEncoder` renamed `V11TransformerEncoder` (upstream v2 has a same-named class; see `student_v2.py`). `TemporalPositionalEncoder` caches `div_term` per device in FP32 (computed on the CPU for v1.1 and on the device for v2, as each upstream does) and takes an explicit output dtype, and the encoder casts bands (not DOY) to the weights' dtype — see "The input stays FP32" in `../README.md` §7. `TemporalAwarePooling` runs its GRU, LayerNorm and attention score as one compiled step per timestep. Layer shapes and forward-pass math are unchanged. |
 | `ssl_model.py` | `tessera_infer/src/models/ssl_model.py` | Type hints, ruff formatting. Backbone annotations widened to `nn.Module` so the wrapper hosts either version's backbones. |
 | `student_v2.py` | `geotessera/TESSERA-V-2.0-2B-L` (Hugging Face) `model.py`, = `ucam-eo/tessera` `tessera_infer_v2/student/model.py` | Type hints, ruff formatting; upstream's `TransformerEncoder` renamed `StudentTransformerEncoder`; upstream's inline positional encoder replaced by the shared `modules.TemporalPositionalEncoder` (bit-identical at fp32, plus an explicit output-dtype cast and a per-device FP32 `div_term` cache); the top-level `PixelStudent` assembly is not duplicated — see below. |
 | `builder.py` | `tessera_infer/src/models/builder.py` | Type hints, ruff formatting. Added FSDP prefix stripping in `load_v11_checkpoint()`, plus the v2 build/load path (`_build_v2_inference_model`, `load_v2_checkpoint`, `_verify_v2_args`). |
 
-`tests/fixtures/upstream/v2_student_reference.py` is a **verbatim** copy of
-upstream's v2 `model.py`; `tests/unit/inference/test_student_v2_golden.py` runs it beside
-our port on the real checkpoint and asserts identical outputs (observed:
-bit-identical). Re-fetch instructions are in that file's header.
+Both models are pinned to upstream by golden tests that run a **verbatim** copy of
+upstream's code beside our port on the real checkpoint, in FP32 on CPU:
+
+| Model | Vendored upstream | Test | Observed |
+|---|---|---|---|
+| v2 Large | `tests/fixtures/upstream/v2_student_reference.py` | `test_student_v2_golden.py` (`TESSERA_V2_CKPT`) | bit-identical |
+| v1.1 | `tests/fixtures/upstream/v1_1_reference/` | `test_v11_golden.py` (`TESSERA_V11_CKPT`) | FP32 rounding, from the fused pooling step |
+
+Each skips unless its environment variable points at the checkpoint, and refuses a file whose digest
+differs. Re-fetch instructions are in the vendored files' headers.
 
 ## v1.1 vs v2 Large
 
@@ -52,9 +58,12 @@ upstream v2's `PixelStudent.encode`, so a v2 checkpoint loads into it
 the dual-CUDA-stream backbone execution and the profiling hooks for both
 versions.
 
-`builder._fuse_custom_gru` is a v1.1-only optimisation and is skipped for v2:
-there is no GRU in the v2 graph (so also none of the reset-gate approximation
-documented in its docstring).
+v1.1's pooling head runs each timestep of its GRU, LayerNorm and attention score
+as one compiled step (`modules._gru_pool_step`), in the arithmetic the checkpoint
+was trained with: the reset gate is applied to the hidden state before its matrix
+multiply. PyTorch's `nn.GRU` applies it after and cannot stand in for it
+([ADR 026](../../../../context_docs/decisions/026-v1-1-runs-the-gru-it-was-trained-with.md)).
+v2 has no GRU.
 
 ## What not to touch
 
@@ -62,7 +71,9 @@ documented in its docstring).
   `TemporalEncoding`, `TemporalAwarePooling`, and the `CustomGRU` / `CustomGRUCell`
   pair — these define the exact architecture the v1.1 checkpoint was trained with.
   Changing layer dimensions, activation functions, or the forward pass will break
-  checkpoint loading.
+  checkpoint loading. `_gru_pool_step` must compute exactly what `CustomGRUCell`,
+  the LayerNorm and the attention score compute; `tests/unit/inference/test_models.py`
+  holds it to them.
 
 - **`ssl_model.py`**: `MultimodalBTInferenceModel` (the shared inference wrapper)
   and `build_dim_reducer` (v1.1 reducer). The fusion method (`concat` vs `sum`) and

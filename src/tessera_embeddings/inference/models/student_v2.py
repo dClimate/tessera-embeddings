@@ -12,7 +12,7 @@ Differences from the v1.1 blocks in ``modules.py`` / ``ssl_model.py``:
 * **Pooling head.** v1.1 pools with ``TemporalAwarePooling`` (CustomGRU +
   LayerNorm + attention); v2 pools with a plain single-head softmax attention
   (:class:`AttentionPooling` — one ``Linear(D, 1)``, no recurrence). There is no
-  GRU anywhere in v2, so ``builder._fuse_custom_gru`` has nothing to fuse.
+  GRU anywhere in v2.
 * **Final LayerNorm.** The v2 ``dim_reducer`` ends in a non-affine
   ``LayerNorm(repr_dim)``, so every output vector has per-pixel mean 0 / std 1
   across its 128 dimensions. It carries no parameters, so the state dict and

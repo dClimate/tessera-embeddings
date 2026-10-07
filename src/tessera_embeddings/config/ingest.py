@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pydantic import BaseModel, Field, model_validator
+from zarr.codecs import BloscCodec
 
 from tessera_embeddings.config.code_identity import source_identity
 
@@ -49,6 +50,36 @@ def ingest_code_identity() -> str:
 INGEST_CHUNK_SIZE = 4096
 
 INGEST_CHUNKS = {"time": 1, "northing": INGEST_CHUNK_SIZE, "easting": INGEST_CHUNK_SIZE}
+
+# How the imagery mosaics are compressed: Blosc-LZ4 with byte shuffle, in place of zarr's default zstd. Inference reads
+# each mosaic chunk whole for every strip of a tile, so decode speed is what costs; on real Iowa uint16 chunks this is
+# 6% smaller than zstd, decompresses 2.6x and compresses 4.8x faster, and makes a strip read through icechunk 20-30%
+# faster. Lossless, so every value reads back identical. The codec is fixed per array at creation, so a store keeps
+# the one it was created with; mosaics are deleted after each fill, so nothing needs migrating.
+INGEST_COMPRESSORS = (BloscCodec(cname="lz4", clevel=5, shuffle="shuffle"),)
+
+# The mosaics are sharded: each INGEST_CHUNKS block stays one stored object and the unit ingest writes (the shard),
+# split inside into inner chunks of 512 rows by one 2048-px inference tile (config.inference.INFERENCE_CHUNK_SIZE).
+# A reader decodes only the inner chunks it touches, so an inference strip of one tile no longer decompresses the whole
+# 4096-px block of every band and date. 512 rows rather than 256: strips read as fast and with as little memory, at
+# 1.1-1.6x the unsharded S3 read requests rather than 1.6-2.4x (each inner chunk is its own ranged request). Writes
+# stay whole-shard because ingest writes block-aligned windows, which is what keeps sharding cheap to write: ADR 008
+# measured unaligned shard writes as read-modify-write, 2.8x slower.
+INGEST_INNER_CHUNKS = {"time": 1, "northing": 512, "easting": 2048}
+
+
+def mosaic_chunk_layout(write_unit: tuple[int, ...]) -> tuple[tuple[int, ...], tuple[int, ...] | None]:
+    """``(chunks, shards)`` for a ``(time, northing, easting)`` mosaic array written in *write_unit* blocks.
+
+    The write unit becomes the shard, holding ``INGEST_INNER_CHUNKS``, when the inner chunk tiles it exactly.
+    Otherwise — a grid smaller than one block, or a small test grid — the array is unsharded, chunked by the write
+    unit, as before.
+    """
+    inner = (INGEST_INNER_CHUNKS["time"], INGEST_INNER_CHUNKS["northing"], INGEST_INNER_CHUNKS["easting"])
+    if tuple(write_unit) != inner and all(w % i == 0 for w, i in zip(write_unit, inner, strict=True)):
+        return inner, tuple(write_unit)
+    return tuple(write_unit), None
+
 
 # The load side deliberately uses the SAME block size as the store: fewer, larger read tasks cap
 # a date's parallel width at blocks x bands, starving any fleet wider than that, and that width

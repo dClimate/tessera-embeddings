@@ -53,12 +53,10 @@ def log_cuda_diagnostics(device: torch.device) -> None:
 def log_autocast_dtype_probe(device: torch.device, dtype: torch.dtype | None = None) -> None:
     """Probe which dtypes autocast actually uses for key operations.
 
-    Runs small test tensors through matmul, Linear, GRU, LayerNorm, and
+    Runs small test tensors through matmul, Linear, LayerNorm, and
     TransformerEncoderLayer under autocast and logs each output dtype, which
     reveals whether tensor cores can engage or autocast is silently keeping ops
-    in FP32. The GRU is the one to watch: PyTorch autocast may force RNNs to FP32
-    for numerical stability, which would explain FP32-like throughput despite
-    reduced-precision model weights.
+    in FP32.
 
     Args:
         device: Target device. No-op on CPU.
@@ -71,7 +69,7 @@ def log_autocast_dtype_probe(device: torch.device, dtype: torch.dtype | None = N
     # 2D tensor for matmul/linear/layernorm probes
     a2d = torch.randn(32, 512, device=device, dtype=dtype)
     w2d = torch.randn(512, 512, device=device, dtype=dtype)
-    # 3D tensor for GRU and transformer probes: (batch, seq_len, d_model)
+    # 3D tensor for the transformer probe: (batch, seq_len, d_model)
     a3d = torch.randn(4, 20, 512, device=device, dtype=dtype)
 
     with torch.no_grad(), torch.autocast("cuda", dtype=dtype):
@@ -79,9 +77,6 @@ def log_autocast_dtype_probe(device: torch.device, dtype: torch.dtype | None = N
 
         lin = torch.nn.Linear(512, 512, device=device).to(dtype)
         lin_out = lin(a2d)
-
-        gru = torch.nn.GRU(512, 512, batch_first=True, device=device).to(dtype)
-        gru_out, _ = gru(a3d)
 
         ln = torch.nn.LayerNorm(512, device=device).to(dtype)
         ln_out = ln(a2d)
@@ -97,11 +92,10 @@ def log_autocast_dtype_probe(device: torch.device, dtype: torch.dtype | None = N
         tel_out = tel(a3d)
 
     logger.debug(
-        "AUTOCAST DTYPE PROBE (%s): matmul=%s | linear=%s | GRU=%s | layernorm=%s | transformer_layer=%s",
+        "AUTOCAST DTYPE PROBE (%s): matmul=%s | linear=%s | layernorm=%s | transformer_layer=%s",
         dtype,
         mm_out.dtype,
         lin_out.dtype,
-        gru_out.dtype,
         ln_out.dtype,
         tel_out.dtype,
     )
