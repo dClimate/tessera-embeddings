@@ -4,13 +4,16 @@ Ported from ``tessera_infer/src/models/modules.py``; logic is unchanged, so the 
 fixed by the checkpoints rather than chosen.
 """
 
+import functools
 import logging
 import math
 import time
+from collections.abc import Callable
 from typing import cast
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F  # noqa: N812 — the conventional spelling
 
 logger = logging.getLogger(__name__)
 
@@ -66,10 +69,9 @@ class CustomGRUCell(nn.Module):
 class CustomGRU(nn.Module):
     """GRU built from ``CustomGRUCell``, matching ``nn.GRU(batch_first=True)`` contract.
 
-    Exists because the tessera beta QAT checkpoint stores per-gate linear weights rather than
-    ``nn.GRU``'s fused matrices. A *reference* implementation only: ``builder._fuse_custom_gru``
-    swaps every instance for a cuDNN ``nn.GRU`` before the model runs, so keep this simple and
-    checkpoint-faithful and leave the speed to the fused path.
+    Holds the checkpoint's per-gate weights, which ``TemporalAwarePooling`` reads for its fused
+    step. Its own ``forward`` is the plain, step-at-a-time reference that the fused step is tested
+    against; inference never calls it.
     """
 
     def __init__(self, input_size: int, hidden_size: int) -> None:
@@ -103,10 +105,55 @@ class CustomGRU(nn.Module):
         return outputs, h_t.unsqueeze(0)
 
 
+# Timesteps whose input projections are computed in one matmul: a (steps, B, 3D) block rather than the
+# whole sequence, which at T=256 and B=7,168 would be 8 GiB of BF16.
+_INPUT_PROJECTION_STEPS = 32
+
+
+def _gru_pool_step(
+    gi: torch.Tensor,
+    h: torch.Tensor,
+    w_h_rz: torch.Tensor,
+    w_hh: torch.Tensor,
+    bias: torch.Tensor,
+    ln_weight: torch.Tensor,
+    ln_bias: torch.Tensor,
+    q_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One timestep of the pooling head: the checkpoint's GRU cell, its LayerNorm and its attention score.
+
+    The arithmetic of ``CustomGRUCell``, with the reset gate applied to ``h`` BEFORE ``W_hh`` as the
+    model was trained. ``gi`` is this step's input projection for the reset, update and candidate
+    gates, ``(B, 3D)``. Gates run in FP32 and the hidden state is kept at ``h``'s dtype.
+
+    Returns the new hidden state and the step's attention score, ``(B,)`` in FP32. The query's bias is
+    left out: it is the same at every timestep, so the softmax over time cancels it.
+    """
+    d = h.shape[-1]
+    g = gi.float() + bias
+    hf = h.float()
+    rz = torch.mm(h, w_h_rz.t()).float()
+    r = torch.sigmoid(g[:, :d] + rz[:, :d])
+    z = torch.sigmoid(g[:, d : 2 * d] + rz[:, d:])
+    n = torch.tanh(g[:, 2 * d :] + torch.mm((r * hf).to(h.dtype), w_hh.t()).float())
+    h_new = ((1 - z) * hf + z * n).to(h.dtype)
+    score = (F.layer_norm(h_new, (d,), ln_weight, ln_bias).float() * q_weight).sum(-1)
+    return h_new, score
+
+
+@functools.cache
+def _compiled_gru_pool_step() -> Callable[..., tuple[torch.Tensor, torch.Tensor]]:
+    """``_gru_pool_step`` compiled into one GPU kernel per step, once per process."""
+    return cast(Callable[..., tuple[torch.Tensor, torch.Tensor]], torch.compile(_gru_pool_step))
+
+
 class TemporalAwarePooling(nn.Module):
     """Temporal-aware pooling: custom GRU for temporal context, LayerNorm, then attention pooling.
 
-    Uses ``CustomGRU`` (explicit per-gate weights) to match the tessera beta QAT checkpoint.
+    Each timestep's GRU update, LayerNorm and attention score run as one fused step
+    (``_gru_pool_step``, compiled on CUDA), so the ``(B, T, D)`` GRU output is never materialised:
+    only the hidden state and one score per step are kept. The weights stay in ``CustomGRU``'s
+    checkpoint layout, and the result matches running ``CustomGRU``, LayerNorm and attention in turn.
     """
 
     def __init__(self, input_dim: int) -> None:
@@ -124,32 +171,46 @@ class TemporalAwarePooling(nn.Module):
         Returns:
             Pooled tensor of shape (B, dim).
         """
+        if x.shape[1] == 0:  # an empty sequence pools to zeros, as upstream's does
+            return x.new_zeros(x.shape[0], x.shape[2])
+
         profile = getattr(self, "_profile", False)
 
         if profile and x.is_cuda:
             torch.cuda.synchronize()
             tg0 = time.monotonic()
 
-        x_context, _ = self.temporal_context(x)
-        x_context = self.layer_norm(x_context)
+        cell = self.temporal_context.gru_cell
+        w_in = torch.cat([cell.W_ir.weight, cell.W_iz.weight, cell.W_ih.weight])
+        w_h_rz = torch.cat([cell.W_hr.weight, cell.W_hz.weight])
+        bias = torch.cat([cell.b_r, cell.b_z, cell.b_h]).float()
+        q_weight = self.query.weight[0].float()
+        step = _compiled_gru_pool_step() if x.is_cuda else _gru_pool_step
+
+        h = x.new_zeros(x.shape[0], cell.hidden_size)
+        scores = []
+        for t0 in range(0, x.shape[1], _INPUT_PROJECTION_STEPS):
+            # Time-major, so each step reads one contiguous (B, 3D) slice.
+            for gi in torch.matmul(x[:, t0 : t0 + _INPUT_PROJECTION_STEPS].transpose(0, 1), w_in.t()):
+                h, score = step(
+                    gi, h, w_h_rz, cell.W_hh.weight, bias, self.layer_norm.weight, self.layer_norm.bias, q_weight
+                )
+                scores.append(score)
 
         if profile and x.is_cuda:
             torch.cuda.synchronize()
             tg1 = time.monotonic()
 
-        w = torch.softmax(self.query(x_context), dim=1)
+        w = torch.softmax(torch.stack(scores, dim=1), dim=1).to(x.dtype).unsqueeze(-1)
         result = (w * x).sum(dim=1)
 
         if profile and x.is_cuda:
             torch.cuda.synchronize()
             tg2 = time.monotonic()
             logger.debug(
-                "    PROFILE TemporalAwarePooling: "
-                "GRU+LN=%.1fms (input dtype=%s, output dtype=%s)  "
-                "attn=%.1fms  TOTAL=%.1fms",
+                "    PROFILE TemporalAwarePooling: GRU+LN=%.1fms (input dtype=%s)  attn=%.1fms  TOTAL=%.1fms",
                 (tg1 - tg0) * 1000,
                 x.dtype,
-                x_context.dtype,
                 (tg2 - tg1) * 1000,
                 (tg2 - tg0) * 1000,
             )
@@ -193,16 +254,29 @@ class TemporalEncoding(nn.Module):
         return self.proj(encoding)  # (B, T, d_model)
 
 
+#: Days the encoder can be asked for: DOY runs 1-366 (``storage.time_axis.compute_doy``), and 0 is the
+#: zero-filled radar slice of a pixel that has no S1 observation.
+_DOY_TABLE_SIZE = 367
+
+
 class TemporalPositionalEncoder(nn.Module):
     """Sinusoidal positional encoding from day-of-year values.
 
     Uses fixed sinusoidal frequencies (standard transformer positional encoding)
-    driven by DOY values instead of integer positions.
+    driven by DOY values instead of integer positions. DOY is always an integer day, so the
+    encoding is looked up in a 367-row table built once per device and dtype by the same FP32
+    arithmetic, rather than recomputed per pixel and timestep: bit-identical, and it spares
+    every forward the two full-size FP32 tensors (~2.6 + 5.3 GiB at the deepest bucket) that
+    sin/cos over ``(B, T, d_model)`` allocated.
     """
 
-    def __init__(self, d_model: int) -> None:
+    def __init__(self, d_model: int, *, frequencies_on_cpu: bool = False) -> None:
         super().__init__()
         self.d_model = d_model
+        # Where the frequencies' exp() runs, as each model's upstream runs it: v1.1 computes them on the
+        # CPU and moves them to the device, v2 computes them on the device. The two round differently in
+        # the last place on 116 of v1.1's 384 frequencies, so each model follows its own upstream.
+        self._frequencies_on_cpu = frequencies_on_cpu
         # div_term depends only on d_model, so it is not a per-forward compute (~18 ms per
         # backbone). It is cached per device rather than held as a registered buffer *on purpose*:
         # a buffer is swept by ``nn.Module.bfloat16()``, which would round these frequencies to 8
@@ -211,6 +285,8 @@ class TemporalPositionalEncoder(nn.Module):
         # were trained and golden-tested on. A plain fp32 cache cannot be downcast by a
         # module-level dtype conversion.
         self._div_term_cache: dict[torch.device, torch.Tensor] = {}
+        # Every day's encoding, per (device, output dtype). Filled and read like the div_term cache.
+        self._table_cache: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
 
     def _div_term(self, device: torch.device) -> torch.Tensor:
         """FP32 sinusoidal frequencies for *device*, computed once per device.
@@ -223,47 +299,56 @@ class TemporalPositionalEncoder(nn.Module):
         """
         cached = self._div_term_cache.get(device)
         if cached is None:
+            where = torch.device("cpu") if self._frequencies_on_cpu else device
             cached = torch.exp(
-                torch.arange(0, self.d_model, 2, dtype=torch.float32, device=device)
+                torch.arange(0, self.d_model, 2, dtype=torch.float32, device=where)
                 * -(math.log(10000.0) / self.d_model)
-            )
+            ).to(device)
             self._div_term_cache[device] = cached
         return cached
 
-    def forward(self, doy: torch.Tensor, out_dtype: torch.dtype | None = None) -> torch.Tensor:
-        """Compute positional encoding from day-of-year.
-
-        Args:
-            doy: DOY values of shape (B, T). Must be FP32 — see the dtype note
-                below; BF16 cannot represent DOY above 256 to one-day resolution.
-            out_dtype: dtype of the returned encoding. Defaults to ``doy.dtype``.
-
-        Returns:
-            Positional encoding of shape (B, T, d_model).
-        """
+    def _encode(self, doy: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+        """The sinusoidal encoding of FP32 *doy* ``(B, T)``, as ``(B, T, d_model)`` in *out_dtype*."""
         # FP32 for precision, then cast the OUTPUT to the compute dtype (BF16 under
         # model.bfloat16()). Without that cast PyTorch's dtype promotion (BF16 + FP32 = FP32)
         # spreads FP32 through the whole transformer and GRU: 7 TFLOPS instead of 20-30 on T4
         # tensor cores.
         #
-        # *doy itself must arrive in FP32.* BF16 carries 8 mantissa bits, so it represents integers
-        # exactly only up to 256: DOY 257 would land on 256, and .float() here cannot recover what
-        # the cast already discarded. The callers therefore keep the DOY channel FP32 and cast only
-        # the bands — see V11TransformerEncoder.forward / StudentTransformerEncoder.forward.
-        #
         # torch.empty, not zeros: every element is written because 0::2 and 1::2 partition the
-        # even d_model, so the multi-GB zero-fill is dead work and the values are identical. The
-        # strided writes also avoid holding sin and cos live beside an interleaved output.
+        # even d_model, so a zero-fill is dead work and the values are identical.
         position = doy.float().unsqueeze(-1)
         angles = position * self._div_term(doy.device)  # (B, T, d_model/2)
         pe = torch.empty(doy.shape[0], doy.shape[1], self.d_model, device=doy.device)
         pe[:, :, 0::2] = torch.sin(angles)
         pe[:, :, 1::2] = torch.cos(angles)
-        # Drop angles before the cast: ~2.6 GiB at the largest (B=7168, T=256) bucket and unused
-        # from here, so holding it through pe.to() co-resides it with the fp32 pe and the bf16
-        # output — peak VRAM the concurrent s2/s1 backbones cannot spare.
-        del angles
-        return pe.to(out_dtype or doy.dtype)
+        return pe.to(out_dtype)
+
+    def _table(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """``(367, d_model)`` encodings of days 0-366 in *dtype*, computed once per (device, dtype)."""
+        key = (device, dtype)
+        cached = self._table_cache.get(key)
+        if cached is None:
+            days = torch.arange(_DOY_TABLE_SIZE, dtype=torch.float32, device=device)[None, :]
+            cached = self._encode(days, dtype)[0]
+            self._table_cache[key] = cached
+        return cached
+
+    def forward(self, doy: torch.Tensor, out_dtype: torch.dtype | None = None) -> torch.Tensor:
+        """Positional encoding of day-of-year.
+
+        Args:
+            doy: Integer DOY values in [0, 366], shape (B, T). Must be FP32 — BF16 cannot
+                represent DOY above 256 to one-day resolution (DOY 257 would land on 256), so
+                the callers keep the DOY channel FP32 and cast only the bands; see
+                V11TransformerEncoder.forward / StudentTransformerEncoder.forward. The pipeline
+                only produces integer days (``compute_doy``); a fractional one would be
+                truncated by the lookup.
+            out_dtype: dtype of the returned encoding. Defaults to ``doy.dtype``.
+
+        Returns:
+            Positional encoding of shape (B, T, d_model).
+        """
+        return self._table(doy.device, out_dtype or doy.dtype)[doy.long()]
 
 
 class V11TransformerEncoder(nn.Module):
@@ -294,7 +379,7 @@ class V11TransformerEncoder(nn.Module):
             nn.Linear(latent_dim * 4, latent_dim * 4),
         )
 
-        self.temporal_encoder = TemporalPositionalEncoder(d_model=latent_dim * 4)
+        self.temporal_encoder = TemporalPositionalEncoder(d_model=latent_dim * 4, frequencies_on_cpu=True)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=latent_dim * 4,

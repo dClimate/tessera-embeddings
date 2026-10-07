@@ -72,6 +72,14 @@ A change that cannot pass does not ship. Changes that can be kept
 bit-identical (pipelining, memory movement, resampler vectorization) are
 kept bit-identical and tested as such.
 
+**Scope.** These gates decide changes to the forward pass and its config. A
+change upstream that alters the mosaics it reads, such as the ingest hosts'
+CPU architecture, is outside them: the harness measures it, and the
+maintainers accept or refuse it with that measurement on record. The
+Graviton ingest workers were accepted this way on 2026-10-02, at a
+worst-pixel cosine of 0.99981 ([ingest measurements
+§15.6](../ingest/campaign-ingest-measurements.md)).
+
 ### Cross-config comparison envelope
 
 The table above gates a **same-config** change — optimized code vs the

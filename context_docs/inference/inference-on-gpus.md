@@ -147,6 +147,27 @@ correctness was pinned by comparing outputs rather than by reasoning about the c
 is not — the prologue-idle hiding — is bounded by host RAM, and that bound is why it has a ceiling
 rather than a knob.
 
+### Later: the positional encoding as a day-of-year table (October 2026)
+
+The forward pass was benchmarked on one `g6e.xlarge` with the production v1.1 model and checkpoint,
+B = 7,168, at five (S2, S1) depths from 48/16 to 256/104, timing the median of 8 forwards after
+warm-up. Eager PyTorch 2.5.1 ran at 1.98M tokens/s, matching the 2.06M per L40S measured on the
+fleet. Computing sin and cos per pixel and timestep was the cheapest thing left to remove: day of
+year is an integer, so a 367-row table built by the same arithmetic gives the same values.
+
+| change | forward time | outputs vs today |
+|---|---|---|
+| day-of-year table | **5–8% faster** at every depth (1,177 against 1,273 ms at the deepest) | int8 100% identical at every depth, on PyTorch 2.5.1 and 2.14.1 |
+| `torch.compile` of the embedding and encoding | 6–8% faster | int8 93–96% exact: compiled sin/cos round differently |
+| `torch.compile` of the transformer layers | 3–5% slower | identical: the layers run as one fused op the compiler cannot open |
+
+On an L40S, the shipped encoder's table and its per-element path agree bit for bit at both model
+widths (768 for v1.1, 640 for v2), in BF16 and in FP32: zero mismatches over 2,048 × 256 days.
+Peak VRAM at the deepest bucket is 23.8 GiB either way. On a multi-threaded CPU, sin/cos itself
+rounds about 0.005% of elements one FP32 ulp differently depending on how the tensor is split
+across threads, so the CPU path can differ from the old one by that much in FP32 and not at all
+after the BF16 cast; the GPU computes each element alike, hence the exact match there.
+
 ### The phase-0 baseline the campaign started from
 
 2026-07-16, Iowa region, `main` at `batch_size=3584`, 4 × `g6e.xlarge`. Fleet GPU polls over ~10.5
@@ -217,8 +238,10 @@ carries its own provenance line, which is what the corrections register requires
   *every* sequence length, down to 8 timesteps, and larger B is neutral-to-worse. Shelved — and see
   §5, alternative A, where this is what closes the case for a per-bucket memory budget.
 - **Eager bucketing (P4).** Opens `dataset.py`; post-striping payoff is a sliver. Rejected.
-- **GRU restructure.** The builder already fuses `CustomGRU` into cuDNN's `nn.GRU`; the restructure
-  never reached production and was reverted as dead code.
+- **GRU restructure.** A hand-restructured GRU was measured no faster than the `nn.GRU` swap, never
+  reached production and was reverted as dead code. The swap itself turned out to change the
+  model's arithmetic; the pooling head now runs one compiled step per timestep in the trained
+  arithmetic ([ADR 026](../decisions/026-v1-1-runs-the-gru-it-was-trained-with.md)).
 - **`g6e.2xlarge` (8 vCPU).** A ~30% premium for ~7–15% of feed-recoverable time. The software route
   was preferred.
 
