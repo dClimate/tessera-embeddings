@@ -9,7 +9,7 @@ reference region.
 pipeline.** Every term is defined where it first appears, and the code locations are collected in an
 appendix so the explanation does not depend on them.
 
-Five measurement campaigns are folded together here, in the order a reader needs them:
+Six measurement campaigns are folded together here, in the order a reader needs them:
 
 | § | what it answers | when |
 |---|---|---|
@@ -19,6 +19,7 @@ Five measurement campaigns are folded together here, in the order a reader needs
 | 5 | why the batch is computed from the card rather than fixed | 2026-08-29 |
 | 6 | what the campaign path itself measured, which is what the cost model divides by | 2026-08 |
 | 7 | what the v2 Large student measured against that baseline | 2026-07 |
+| 8 | what moving the workers from PyTorch 2.5.1 to 2.14.1 changed, in outputs, speed and memory | 2026-10-03 |
 
 Cost figures are results here, with pointers. [`../campaign/campaign-cost-model.md`](../campaign/campaign-cost-model.md)
 is the source of truth for every rate, fleet size and dollar figure; where the two disagree, the
@@ -1209,7 +1210,98 @@ anywhere else, so raising the cap would not help.
 
 ---
 
-## 8. Gotchas, and remaining headroom
+## 8. The PyTorch 2.14.1 upgrade, measured
+
+The GPU workers ran PyTorch 2.5.1 (CUDA 12.1, cuDNN 9.1) because the Ray AMI installed "the newest
+CUDA 12.1 build" and that index stopped at 2.5.1. Tests and the driver image ran the lockfile's 2.12.
+This section measured moving the workers to 2.14.1 (CUDA 13.0, cuDNN 9.24) on the worker image's own
+driver (595.91.07, CUDA 13.2-capable). The rule it led to is
+[ADR 024](../decisions/024-library-upgrades-ship-on-measured-usability-at-a-store-boundary.md).
+Everything ran in `global-tessera-dev` on 2026-10-02 and 03.
+
+### Method: hold everything but the library stack
+
+**One L40S, both stacks.** `InferenceActor` was driven without Ray on one `g6e.xlarge`, first on the
+image's 2.5.1 and then on a copy of the same environment with only torch replaced. Each stack
+processed the same tiles in the same order, with the same prefetch hints, so tiling and batch were
+identical. The tiles were six Iowa tiles (deep and shallow optical, light and heavy radar, two
+easting-cropped edges) and the two-orbit `m10_parity_15S` tile, for v1.1 and for v2 (three Iowa
+tiles plus `m10`). A second 2.5.1 pass is the determinism control.
+
+**The production path, paired.** Two `tessera-embeddings` flow runs on Iowa, 3 L40S workers each,
+started together and cancelled after 35 minutes of inference. One ran the 2.14.1 AMI and the other
+an AMI baked from `main` that differs from it only in torch. Each worker's start-up line confirms its
+version. The 25 tiles both runs wrote completely, all cut into identical strips, are the comparison
+set: 70.3M valid pixels.
+
+**The A10G.** One `g5.2xlarge` ran the forward pass at the batch `batch_size_for_gpu` fits to its
+22.06 GiB card (3,593), with the workers' allocator settings, on both stacks. This is how the
+deepest bucket (256 optical plus 256 radar steps) was checked.
+
+### Outputs
+
+ADR 012's harness on the 25 production-path pairs (v1.1):
+
+| | result |
+|---|---|
+| same-config gate | **0 of 25 pass** — exact 98.5–99.4%, max ±3, scale drift ≤ 1.53%, worst-pixel cosine ≥ 0.99990 |
+| cross-config envelope | **25 of 25 pass** |
+| footprint and observation counts | exact on every tile |
+
+On the single box, v2 sat about ten times closer than v1.1. It had 99.986–99.99998% of int8 values
+exact, but still a maximum of ±3 and up to 1.36% scale drift, so it fails the same-config gate on
+those two metrics and passes the cross-config envelope (3 of 3 Iowa tiles). The likely reason is that
+v1.1 pools through a cuDNN GRU, and cuDNN changed between the stacks. v2 has no recurrence.
+
+What a user consumes, on the same 25 pairs. The neighbour method follows
+[`validating-a-model-change.md`](validating-a-model-change.md): 2,000 queries among 20,000 candidates
+per tile, by cosine.
+
+| measure | 2.5.1 against 2.14.1 | for scale |
+|---|---|---|
+| pixels whose embedding is bit-identical | 36% | — |
+| mean per-pixel cosine distance | 2.3e-6 | adjacent pixels: 4.7e-3 (median), about 2,000× larger |
+| largest per-pixel cosine distance | 9.3e-5 | — |
+| top-10 neighbours kept | 99.42% | the 2026-09 day-of-year fix kept 95.5% |
+| top-20 neighbours kept | 99.48% | two same-model stores agree on 0.9940 |
+| same k-means cluster (k = 12) | 99.97% | — |
+
+**The current stack does not meet the same-config gate against itself.** In the 2.5.1 rerun, a
+single-strip tile that had been prefetched behind its predecessor was split into a 256-row starter
+strip and a body, while the rerun processed it first as one strip. That tiling difference alone gave
+99.95% exact, ±3, and 1.52% scale drift. Same stack and same tiling were bit-identical every time.
+
+### Speed and memory
+
+| | v1.1 | v2 |
+|---|---|---|
+| L40S, single box (same tiles, serial) | **−3.5% wall per tile** | ±1% |
+| L40S, paired flow runs (25 tiles) | median tile 181 → 168 s; GPU-hours per tile 0.065 → 0.061 (−6%), on cards running 10% faster clocks (below) | not run |
+| A10G, deepest bucket (256 + 256) | 2,947 → 3,253 ms, **10% slower** | +1% |
+| A10G, shallower buckets | 1% faster | ±1% |
+| card memory, peak allocated | L40S 8.3 → 9.3 GiB; A10G deepest 12.0 → 13.4 GiB (fits; no OOM at the fitted batch) | unchanged |
+| host RAM, peak per actor (paired runs) | 16.1 → 15.0 GB | — |
+
+**The single box is the speed figure to use.** The paired runs give each stack its own cards, and
+cards differ: under the shared 350 W cap a card's clock falls about 11 MHz per degree it runs hotter.
+The 2.14.1 run's three cards averaged 1,842 MHz against the control's 1,680, and across 56 cards a 10%
+higher clock makes a forward pass about 2% faster, so part of the paired −6% is the cards. The single
+box ran both stacks on one card.
+
+Unit suites passed on 2.14.1 in both repositories (3,894 and 1,290 tests), as did v2's golden tests
+on the real checkpoint and a complete `m10_parity_15S` flow run, assembly included, in 8m24s.
+
+### Repeating this for the next upgrade
+
+Hold the tiles, the order and the batch fixed, and change only the library. That means a copied
+environment on one box, plus two flow runs whose only difference is `ami_ssm_name`. Confirm each
+stack's version from its own output; a pass that silently ran the old torch was caught here only that
+way. Run `te-compare-outputs` both ways, then the neighbour and cluster measures, on both models and on
+every card the fleet may rent.
+
+---
+
+## 9. Gotchas, and remaining headroom
 
 **RAM budget is load-bearing.** Do NOT raise `_S2_STRIP_BYTE_BUDGET` or reintroduce whole-chunk
 cross-chunk prefetch without re-deriving the arithmetic at the constant. The pair ceiling (2× budget)
@@ -1268,6 +1360,7 @@ gap exists. See [`../../tests/README.md`](../../tests/README.md).
 | where an actor applies it | `inference/actors.py`, `InferenceActor.__init__` |
 | reading the card's size | `inference/actors.py`, `_gpu_total_gib` |
 | the allocator flag | `inference/actors.py`, the `@ray.remote(runtime_env=...)` decorator |
+| the workers' PyTorch version | yield-embeddings `infra/packer/scripts/provision.sh`: the lockfile's version, as its CUDA 13.0 build |
 | the checkpoint ladder and its clipping | `inference/sampling.py`, `compute_bin_keys` |
 | deepest bucket first | `inference/dataset.py`, `iter_buckets(largest_first=True)` |
 | the strip plan and its RAM budget | `inference/read_plan.py`, `_strip_plan`, `_S2_STRIP_BYTE_BUDGET`, `_XCHUNK_PREFETCH_CAP_BYTES` |
