@@ -166,11 +166,17 @@ objects; the whole registry as dicts is ~6.7 GB, so each process holds only its 
 pass with the same `--run-id` overwrites the same parts, so a failed process is re-run for its zones
 alone. `compact` peaks at 8.7 GB and `verify` at 12.1 GB of memory, measured over the full registry.
 
-**Failures fail.** A missing or empty `parts/` — a mistyped `--registry` — stops every subcommand
-rather than reading as a registry with nothing to check; only `rebuild/` may be absent. A cell with
-no time slot in the store fails `gate` and blocks `rebuild`. `compact` rewrites `master/` in place,
-because S3 has no rename and a pointer to a staged prefix is a protocol every reader would have to
-learn: a reader during those seconds can see a partial master, `verify` fails on one, and
+**Failures fail.** A missing or empty `parts/` (a mistyped `--registry`) stops every subcommand
+rather than reading as a registry with nothing to check; only `rebuild/` may be absent. So does a
+`--zones` entry the registry does not hold, which in a zone-split run would otherwise leave that
+share unmeasured while every later step passed. A cell fails `gate` and is blocked in `rebuild`
+unless the store holds a time slot for it and the zone group's `runs` attribute names the same run
+as the registry: a refill that committed to the store but never published its part would otherwise
+be re-derived from pixels its rows do not describe. Every one of the 994 published cells matches.
+Fill runs are ordered by parsed, timezone-aware `assembled_at`, and a stamp that will not parse
+stops the compaction rather than letting text order pick a run. `compact` rewrites `master/` in
+place, because S3 has no rename and a pointer to a staged prefix is a protocol every reader would
+have to learn: a reader during those seconds can see a partial master, `verify` fails on one, and
 re-running `compact` repairs it.
 
 ## Verified against the published store
@@ -253,7 +259,7 @@ backfill depends on it.
 
 **The gap is now visible.** `scripts/diagnostic/published_registry_census.py` counts rows with no
 measurements, per cell and in total, and fails above `--max-unmeasured` — zero by default. It counts
-over `master/` once one exists — and fails a master short of the newest runs' tile-years — and over
-`parts/` before that, so it fails on the published registry until the backfill is compacted. The
-campaign finished green with half its coverage record absent because every other check asks whether
-the rows are shaped right and none asked whether they hold numbers.
+over `master/` once one exists — and fails a master that does not hold exactly the newest runs'
+tile-years — and over `parts/` before that, so it fails on the published registry until the backfill
+is compacted. The campaign finished green with half its coverage record absent because every other
+check asks whether the rows are shaped right and none asked whether they hold numbers.

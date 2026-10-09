@@ -7,6 +7,7 @@ so most of these tests are about what it refuses to do.
 from __future__ import annotations
 
 import pyarrow as pa
+import pytest
 
 from tessera_embeddings.storage.registry import dataset_schema
 from tessera_embeddings.storage.registry_master import (
@@ -57,6 +58,7 @@ def _parts(rows: list[dict]) -> pa.Table:
 
 
 FILLED = "2026-08-01T00:00:00+00:00"
+LATER = "2026-08-09T00:00:00+00:00"
 
 
 def _rebuilt(rows: list[dict], *, filled_at: str = FILLED) -> pa.Table:
@@ -141,6 +143,18 @@ class TestPrecedence:
         assert master.column("run_id").to_pylist() == ["run-b"]
         assert master.column("measured_by").to_pylist() == [None]
 
+    @pytest.mark.parametrize("stamp", ["not-a-time", "2026-08-09T00:00:00"], ids=["malformed", "naive"])
+    def test_a_run_whose_stamp_cannot_be_ordered_is_refused(self, stamp: str) -> None:
+        """Text order would let an arbitrary string decide which run the store holds."""
+        parts = _parts(
+            [
+                _row("chunk_0_0", measured=True, stamp=FILLED, run_id="run-a"),
+                _row("chunk_0_0", measured=True, stamp=stamp, run_id="run-b"),
+            ]
+        )
+        with pytest.raises(ValueError, match="cannot be ordered"):
+            merge(parts)
+
     def test_a_tile_nothing_has_measured_stays_in_the_master_as_a_null_row(self) -> None:
         """Dropping it would turn "nobody measured this" into "this ground does not exist"."""
         master = merge(_parts([_row("chunk_0_0", measured=False, stamp="2026-08-01T00:00:00+00:00")]))
@@ -206,22 +220,22 @@ class TestInvariants:
         """One tile-year twice reads as coverage counted twice, and nothing else would notice."""
         duplicated = self._master(
             [
-                _row("chunk_0_0", measured=True, stamp="a", measured_by=MEASURED_BY_FILL),
-                _row("chunk_0_0", measured=True, stamp="b", measured_by=MEASURED_BY_FILL),
+                _row("chunk_0_0", measured=True, stamp=FILLED, measured_by=MEASURED_BY_FILL),
+                _row("chunk_0_0", measured=True, stamp=LATER, measured_by=MEASURED_BY_FILL),
             ]
         )
         assert any("duplicate" in failure for failure in invariant_failures(duplicated))
 
     def test_a_lost_row_is_caught(self) -> None:
-        master = merge(_parts([_row("chunk_0_0", measured=True, stamp="a")]))
+        master = merge(_parts([_row("chunk_0_0", measured=True, stamp=FILLED)]))
         assert any("expected 2" in failure for failure in invariant_failures(master, expected_rows=2))
 
     def test_a_label_that_disagrees_with_the_measurements_is_caught(self) -> None:
-        mislabelled = self._master([_row("chunk_0_0", measured=False, stamp="a", measured_by=MEASURED_BY_FILL)])
+        mislabelled = self._master([_row("chunk_0_0", measured=False, stamp=FILLED, measured_by=MEASURED_BY_FILL)])
         assert any("disagree" in failure for failure in invariant_failures(mislabelled))
 
     def test_a_measured_by_value_naming_no_pass_is_caught(self) -> None:
-        odd = self._master([_row("chunk_0_0", measured=True, stamp="a", measured_by="guessed")])
+        odd = self._master([_row("chunk_0_0", measured=True, stamp=FILLED, measured_by="guessed")])
         assert any("name no pass" in failure for failure in invariant_failures(odd))
 
 
@@ -231,14 +245,14 @@ class TestFillRowsUnchanged:
     COLUMNS = ("refused_thin_px", "refused_px")
 
     def test_an_untouched_fill_row_reports_nothing(self) -> None:
-        parts = _parts([_row("chunk_0_0", measured=True, stamp="a", refused_thin_px=6)])
+        parts = _parts([_row("chunk_0_0", measured=True, stamp=FILLED, refused_thin_px=6)])
         assert fill_rows_unchanged(merge(parts), parts, self.COLUMNS) == []
 
     def test_an_altered_fill_row_is_reported(self) -> None:
         """The compaction must never change a published measurement, and "never" is worth testing."""
-        parts = _parts([_row("chunk_0_0", measured=True, stamp="a", refused_thin_px=6)])
+        parts = _parts([_row("chunk_0_0", measured=True, stamp=FILLED, refused_thin_px=6)])
         tampered = _table(
-            [_row("chunk_0_0", measured=True, stamp="a", refused_thin_px=999, measured_by=MEASURED_BY_FILL)],
+            [_row("chunk_0_0", measured=True, stamp=FILLED, refused_thin_px=999, measured_by=MEASURED_BY_FILL)],
             master_schema(),
         )
         differences = fill_rows_unchanged(tampered, parts, self.COLUMNS)
@@ -248,14 +262,14 @@ class TestFillRowsUnchanged:
         """Part order in a dataset scan is not run order; the source must be the run the merge kept."""
         parts = _parts(
             [
-                _row("chunk_0_0", measured=True, stamp="b", refused_thin_px=8, run_id="run-b"),
-                _row("chunk_0_0", measured=True, stamp="a", refused_thin_px=6, run_id="run-a"),
+                _row("chunk_0_0", measured=True, stamp=LATER, refused_thin_px=8, run_id="run-b"),
+                _row("chunk_0_0", measured=True, stamp=FILLED, refused_thin_px=6, run_id="run-a"),
             ]
         )
         assert fill_rows_unchanged(merge(parts), parts, self.COLUMNS) == []
 
     def test_a_rebuilt_row_is_not_compared_against_the_fill(self) -> None:
         """It is a re-derivation of a row the fill left null; there is nothing to differ from."""
-        parts = _parts([_row("chunk_0_0", measured=False, stamp="a")])
-        rebuilt = _rebuilt([_row("chunk_0_0", measured=True, stamp="b", refused_thin_px=7)], filled_at="a")
+        parts = _parts([_row("chunk_0_0", measured=False, stamp=FILLED)])
+        rebuilt = _rebuilt([_row("chunk_0_0", measured=True, stamp=LATER, refused_thin_px=7)], filled_at=FILLED)
         assert fill_rows_unchanged(merge(parts, rebuilt), parts, self.COLUMNS) == []

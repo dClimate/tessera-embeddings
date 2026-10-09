@@ -230,6 +230,18 @@ def _consumer_view(fs: pyarrow.fs.FileSystem, root: str) -> tuple[str, Any, bool
     return f"{base}/parts", dataset_schema(), False
 
 
+def _tile_years(table: pyarrow.Table, stamp: str) -> pyarrow.Array:
+    """Sorted ``zone/year/tile/<stamp>`` keys: which tile-years a table holds, and from which fill."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    year = pc.cast(table.column("year"), pa.string())
+    keys = pc.binary_join_element_wise(
+        table.column("zone"), year, table.column("tile"), table.column(stamp), "/"
+    ).combine_chunks()
+    return keys.take(pc.array_sort_indices(keys))
+
+
 def _completeness(fs: pyarrow.fs.FileSystem, root: str) -> dict[str, Any]:
     """How much of the registry actually carries measurements, per cell and in total.
 
@@ -249,23 +261,26 @@ def _completeness(fs: pyarrow.fs.FileSystem, root: str) -> dict[str, Any]:
 
     Counted over the compacted ``master/`` once one exists, since that is what consumers read and
     ``parts/`` keeps its null rows forever by design; over ``parts/`` before then. A master is only
-    trusted if it holds a row for every tile-year of the newest fill runs: ``compact`` rewrites it in
-    place, so an interrupted one can leave it short, and a short master has no null rows to count.
+    trusted if it holds exactly the newest fill runs' tile-years, each stamped with that run's fill
+    time: an interrupted ``compact`` leaves it short, a refill after it leaves it stale, and neither
+    has null rows to count.
     """
     import pyarrow.compute as pc
     import pyarrow.dataset as ds
 
     prefix, schema, compacted = _consumer_view(fs, root)
-    expected = None
+    started = time.monotonic()
+    dataset = ds.dataset(prefix, filesystem=fs, partitioning="hive", schema=schema)
+    table = dataset.to_table(
+        columns=["zone", "year", "tile", "embedded", "chunk_px", *(["filled_at"] if compacted else [])]
+    )
+    current = None
     if compacted:
         parts_prefix = prefix.rsplit("/", 1)[0] + "/parts"
         parts = ds.dataset(parts_prefix, filesystem=fs, partitioning="hive", schema=dataset_schema()).to_table(
             columns=["zone", "year", "tile", "run_id", "assembled_at"]
         )
-        expected = newest_fill_runs(parts).group_by(["zone", "year", "tile"]).aggregate([]).num_rows
-    started = time.monotonic()
-    dataset = ds.dataset(prefix, filesystem=fs, partitioning="hive", schema=schema)
-    table = dataset.to_table(columns=["zone", "year", "embedded", "chunk_px"])
+        current = _tile_years(newest_fill_runs(parts), "assembled_at").equals(_tile_years(table, "filled_at"))
     unmeasured = pc.is_null(table.column("chunk_px")).to_pylist()
     embedded = table.column("embedded").to_pylist()
     zones, years = table.column("zone").to_pylist(), table.column("year").to_pylist()
@@ -280,7 +295,7 @@ def _completeness(fs: pyarrow.fs.FileSystem, root: str) -> dict[str, Any]:
         "wall_s": round(time.monotonic() - started, 2),
         "prefix": prefix.rsplit("/", 1)[1],
         "rows": table.num_rows,
-        "rows_expected": expected,
+        "master_matches_newest_runs": current,
         "rows_without_measurements": total_unmeasured,
         "fraction_without_measurements": round(total_unmeasured / table.num_rows, 6) if table.num_rows else 0.0,
         "unmeasured_rows_that_are_embedded": sum(
@@ -650,12 +665,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     # Counts, not the rounded fraction: one null row in 3.2 M rounds to 0.0 and would pass a zero threshold.
     above = complete["rows_without_measurements"] > args.max_unmeasured * complete["rows"]
-    short = complete["rows_expected"] is not None and complete["rows"] != complete["rows_expected"]
-    incomplete = above or short
-    if short:
+    stale = complete["master_matches_newest_runs"] is False
+    incomplete = above or stale
+    if stale:
         print(
-            f"  master/ holds {complete['rows']:,} rows against {complete['rows_expected']:,} tile-years in the "
-            "newest fill runs — a partial or stale compaction; re-run compact"
+            "  master/ does not hold exactly the newest fill runs' tile-years — a partial or stale "
+            "compaction; re-run compact"
         )
     if above:
         print(

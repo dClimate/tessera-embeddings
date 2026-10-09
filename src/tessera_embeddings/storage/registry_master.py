@@ -48,6 +48,7 @@ meaning "not measured" and does not quietly come to mean "measured by something 
 
 from __future__ import annotations
 
+import datetime
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -137,13 +138,26 @@ def newest_fill_runs(parts: pa.Table) -> pa.Table:
     """
     if not parts.num_rows:
         return parts
-    runs = parts.group_by(["zone", "year", "run_id"]).aggregate([("assembled_at", "max")]).to_pylist()
-    newest: dict[tuple[str, int], tuple[str, str]] = {}
-    for run in runs:
-        cell, candidate = (run["zone"], run["year"]), (run["assembled_at_max"] or "", run["run_id"] or "")
+    runs = parts.group_by(["zone", "year", "run_id"]).aggregate([("assembled_at", "min"), ("assembled_at", "max")])
+    newest: dict[tuple[str, int], tuple[datetime.datetime, str]] = {}
+    for run in runs.to_pylist():
+        # min and max both parse, so every stamp in the run does: ISO-8601 sorts as text only within a format.
+        _aware(run["assembled_at_min"])
+        cell, candidate = (run["zone"], run["year"]), (_aware(run["assembled_at_max"]), run["run_id"] or "")
         newest[cell] = max(newest.get(cell, candidate), candidate)
     winners = pa.array([f"{zone}/{year}/{run_id}" for (zone, year), (_, run_id) in newest.items()])
     return parts.filter(pc.is_in(_cell_key(parts, "run_id"), value_set=winners))
+
+
+def _aware(stamp: str | None) -> datetime.datetime:
+    """``stamp`` as an aware datetime; raises rather than letting an unorderable run be chosen."""
+    try:
+        parsed = datetime.datetime.fromisoformat(stamp or "")
+    except ValueError:
+        parsed = None
+    if parsed is None or parsed.tzinfo is None:
+        raise ValueError(f"assembled_at {stamp!r} is not an aware ISO-8601 timestamp, so its run cannot be ordered")
+    return parsed
 
 
 def _cell_key(table: pa.Table, column: str) -> pa.Array:

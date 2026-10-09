@@ -148,6 +148,11 @@ def _cells(table: pa.Table, zones: list[str]) -> dict[tuple[str, int], list[dict
     """
     if zones:
         table = table.filter(pc.is_in(table.column("zone"), value_set=pa.array(zones)))
+        # A mistyped zone would otherwise select nothing and take a no-work success path, leaving
+        # that share of a zone-split run unmeasured while every later step passes.
+        absent = sorted(set(zones) - set(table.column("zone").unique().to_pylist()))
+        if absent:
+            raise SystemExit(f"--zones names zones the registry does not hold: {', '.join(absent)}")
     table = newest_fill_runs(table)
     grouped: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
     for row in table.to_pylist():
@@ -155,10 +160,20 @@ def _cells(table: pa.Table, zones: list[str]) -> dict[tuple[str, int], list[dict
     return dict(grouped)
 
 
-def _time_index(group: zarr.Group, year: int) -> int | None:
-    """The store's time index for a calendar year, or None if the zone has no slot for it."""
+def _store_slot(group: zarr.Group, year: int, run_id: str) -> int | str:
+    """The cell's time index in the store, or why the store cannot stand behind this registry run.
+
+    The zone group records which run it holds for each year. A refill that committed to the store
+    but never published its registry part leaves ``parts/`` naming the older run, and re-deriving
+    that run's rows from the newer pixels would publish a mixture neither run produced.
+    """
     years = published_store.calendar_years(group)
-    return years.index(year) if year in years else None
+    if year not in years:
+        return "no time slot in the store"
+    stored = ((dict(group.attrs).get("runs") or {}).get(str(year)) or {}).get("run_id")
+    if stored != run_id:
+        return f"the store holds run {stored!r}, the registry {run_id!r}"
+    return years.index(year)
 
 
 def _rebuild_many(
@@ -247,13 +262,13 @@ def cmd_gate(args: argparse.Namespace) -> int:
     totals: dict[str, int] = defaultdict(int)
     mismatches: list[dict[str, Any]] = []
     checked = 0
-    missing: list[str] = []
+    unusable: list[str] = []
     for (zone, year), rows in measured:
         group = root[zone]
-        time_index = _time_index(group, year)
-        if time_index is None:
-            print(f"  {zone}/{year}: no time slot in the store — a wrong store, or a wrong year", file=sys.stderr)
-            missing.append(f"{zone}/{year}")
+        time_index = _store_slot(group, year, rows[0]["run_id"])
+        if isinstance(time_index, str):
+            print(f"  {zone}/{year}: FAILED — {time_index}", file=sys.stderr)
+            unusable.append(f"{zone}/{year}")
             continue
         sample = rows if len(rows) <= per_cell else rng.sample(rows, per_cell)
         result = _gate_rows(
@@ -280,9 +295,9 @@ def cmd_gate(args: argparse.Namespace) -> int:
     if args.json_out:
         with Path(args.json_out).open("w") as handle:
             json.dump({"checked": checked, "verdicts": dict(totals), "mismatches": mismatches}, handle, indent=2)
-    if missing:
-        print(f"\nFAILED — {len(missing)} cells have no time slot in the store: {', '.join(missing[:20])}")
-    return 1 if mismatches or missing else 0
+    if unusable:
+        print(f"\nFAILED — {len(unusable)} cells the store cannot stand behind: {', '.join(unusable[:20])}")
+    return 1 if mismatches or unusable else 0
 
 
 def cmd_rebuild(args: argparse.Namespace) -> int:
@@ -304,10 +319,10 @@ def cmd_rebuild(args: argparse.Namespace) -> int:
         if not targets:
             continue
         group = root[zone]
-        time_index = _time_index(group, year)
-        if time_index is None:
+        time_index = _store_slot(group, year, rows[0]["run_id"])
+        if isinstance(time_index, str):
             blocked += 1
-            print(f"  {zone}/{year}: BLOCKED — no time slot in the store", file=sys.stderr)
+            print(f"  {zone}/{year}: BLOCKED — {time_index}", file=sys.stderr)
             continue
         rule = int(targets[0]["optical_min_obs"])
 

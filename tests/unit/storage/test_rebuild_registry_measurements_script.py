@@ -170,6 +170,14 @@ def test_a_registry_without_parts_fails_rather_than_passing_vacuously(
         script.main([command, "--registry", str(tmp_path / "typo")])
 
 
+@pytest.mark.parametrize("command", ["gate", "rebuild"])
+def test_a_zone_the_registry_does_not_hold_fails(script: Any, tmp_path: Path, command: str) -> None:
+    """A mistyped zone in a zone-split run would otherwise select nothing and report success."""
+    _seed(tmp_path)
+    with pytest.raises(SystemExit, match="99X"):
+        script.main([command, "--registry", str(tmp_path), "--zones", "33N,99X"])
+
+
 class TestVerify:
     """The invariants, checked against the published parts rather than against the merge rule."""
 
