@@ -952,6 +952,46 @@ class ZarrWriter:
         logger.info("Staged coverage-only tile for refused chunk %s to %s", chunk.label, path)
         return path
 
+    def _top_up_embedded_records(
+        self, run_id: str, labels: list[str], records: Mapping[str, dict] | None
+    ) -> dict[str, dict]:
+        """``records``, plus the coverage attribute of every staged tile it has no entry for.
+
+        The registry's measurement columns are only as complete as this mapping, and a resumed run
+        arrives here with most of it missing: a leg that staged nothing for a tile an earlier leg
+        wrote reports it as a success carrying no record. The record is on the tile — the write
+        persists it (:meth:`write_chunk`) exactly as a refusal persists its own into a skip marker
+        — so the gap is a read rather than a re-inference.
+
+        Fail-soft, like every other provenance read on this path: losing the records must never
+        cost a cell whose inference is already paid for.
+        """
+        present = dict(records or {})
+        missing = [label for label in labels if label not in present]
+        if not missing:
+            return present
+        recovered, unreadable = read_staged_coverage(self.staging_base, run_id, missing)
+        if recovered or unreadable:
+            logger.info(
+                "Run %s: recovered %d of %d missing coverage record(s) from the staged tiles, %d unreadable",
+                run_id,
+                len(recovered),
+                len(missing),
+                unreadable,
+            )
+        still_missing = len(missing) - len(recovered)
+        if still_missing:
+            # LOUD, because this is exactly the state that published half a registry saying
+            # nothing, and it is invisible in every other signal a cell emits.
+            logger.warning(
+                "Run %s: %d embedded tile(s) will publish registry rows with NO measurements. Those "
+                "rows say nothing about the ground they name; every column is derivable from the "
+                "store, so they are repairable with scripts/maintenance/rebuild_registry_measurements.py",
+                run_id,
+                still_missing,
+            )
+        return present | recovered
+
     def publish_registry_part(
         self,
         registry_root: str,
@@ -1122,6 +1162,7 @@ class ZarrWriter:
         embeddings_std: np.ndarray | None = None,
         obs_counts: Mapping[str, np.ndarray | None] | None = None,
         month_covered: Mapping[str, np.ndarray | None] | None = None,
+        coverage: Mapping[str, Any] | None = None,
     ) -> str:
         """Write one chunk's embeddings to a staged intermediate (non-Icechunk) Zarr store.
 
@@ -1146,6 +1187,13 @@ class ZarrWriter:
                 its destination's axis order and assembly writes it without reordering.
             obs_counts: Optional dict of obs count variable names to (H, W) uint16 arrays. Keys
                 from ``OBS_COUNT_VARS``.
+            coverage: This chunk's coverage record (``actors._coverage_record``), persisted as a
+                tile attribute so it OUTLIVES THE PROCESS THAT MEASURED IT. A refused chunk writes
+                the same record into its skip marker, which is why every wholly-refused tile in the
+                published registry carries measurements while only half the embedded ones do: the
+                embedded path returned its record in the actor's result and a resumed leg never
+                sees it. Written with ``staged_complete`` and therefore before ``.done``, so the
+                marker keeps vouching for a tile whose attributes are already set.
 
         Returns:
             Path to the staged Zarr store.
@@ -1254,6 +1302,11 @@ class ZarrWriter:
         # implies `attribute set` implies `to_zarr returned`. A crash anywhere earlier leaves a tile
         # the listing reports as interrupted, which the resume scan re-infers (mode="w" overwrites).
         marker = zarr.open_group(path, mode="a", storage_options=_staged_storage_options(path))
+        if coverage is not None:
+            # BEFORE `staged_complete`, so the completeness flag keeps meaning "everything this
+            # tile carries is written". A reader gated on it can then take the record's absence as
+            # "this fill did not measure one" rather than "it may not have landed yet".
+            marker.attrs["coverage"] = dict(coverage)
         marker.attrs["staged_complete"] = True
         with done_fs.open(done_path, "wb") as f:
             f.write(b"")
@@ -2405,6 +2458,12 @@ class ZarrWriter:
         # Captured before the write, so the registry part reports what THIS call published rather
         # than whatever a later listing happens to see.
         registry_embedded, registry_refused = list(labels), list(skipped)
+        # TOP UP FROM THE STAGED TILES, before the staging prefix goes anywhere. A resumed leg's
+        # `results` report earlier legs' tiles as synthetic successes with no coverage record, so
+        # without this their registry rows publish null — the asymmetry that left half the
+        # published registry saying nothing. Reading here rather than in the runner means every
+        # caller gets it, and a run that staged everything itself reads nothing at all.
+        embedded_records = self._top_up_embedded_records(run_id, registry_embedded, embedded_records)
         snapshot = write_year_shards(
             repo,
             zone,
@@ -2580,6 +2639,50 @@ def read_skip_records(
             if bad:
                 unreadable += 1
             elif isinstance(record, dict):
+                out[label] = record
+    return out, unreadable
+
+
+def read_staged_coverage(
+    staging_base: str, run_id: str, labels: Iterable[str], *, workers: int = 32
+) -> tuple[dict[str, dict], int]:
+    """``({label: record}, n_unreadable)`` for every staged tile carrying a coverage attribute.
+
+    The embedded half of :func:`read_skip_records`, and it exists for the same reason: a record
+    that lives only in the process that measured it does not survive a resume. A resumed leg
+    reports earlier legs' tiles as synthetic successes with no ``coverage`` in their result, and
+    without this their registry rows publish null — which is how 1,519,045 of the published
+    registry's 3,247,410 rows came to say nothing about the ground they name.
+
+    Concurrent and fail-soft, like the skip-marker read: these are independent metadata GETs, and
+    losing a diagnostic must never cost a cell that has already been inferred. A tile with no
+    attribute is an ordinary outcome — a fill predating the attribute, which a resume across that
+    change must still assemble — while a read that FAILS is counted and reported, because "no
+    records" and "every read failed" are the same empty dict and mean opposite things.
+    """
+    labels = list(labels)
+    if not labels:
+        return {}, 0
+    base = f"{staging_base.rstrip('/')}/{run_id}"
+
+    def one(label: str) -> tuple[str, dict | None, bool]:
+        """``(label, record, unreadable)``. Absent is ordinary; a read error is not."""
+        try:
+            group = _open_staged_tile(f"{base}/{label}.zarr")
+        except (FileNotFoundError, IncompleteStageError):
+            return label, None, False
+        except Exception:
+            return label, None, True
+        record = group.attrs.get("coverage")
+        return label, (record if isinstance(record, dict) else None), False
+
+    out: dict[str, dict] = {}
+    unreadable = 0
+    with ThreadPoolExecutor(max_workers=min(workers, len(labels))) as pool:
+        for label, record, bad in pool.map(one, labels):
+            if bad:
+                unreadable += 1
+            elif record is not None:
                 out[label] = record
     return out, unreadable
 
