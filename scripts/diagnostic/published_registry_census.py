@@ -43,6 +43,7 @@ if TYPE_CHECKING:
 from tessera_embeddings.storage import published_store, zone_grid
 from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.registry import dataset_schema, registry_schema
+from tessera_embeddings.storage.registry_master import master_schema
 
 DEFAULT_STORE = "s3://tessera-embeddings/v1.1/dclimate.icechunk"
 DEFAULT_REGISTRY = "s3://tessera-embeddings/v1.1/dclimate.registry"
@@ -235,13 +236,19 @@ def _completeness(fs: pyarrow.fs.FileSystem, root: str) -> dict[str, Any]:
     embedded tile's comes from the actor's in-memory result and does not. So the split by
     ``embedded`` is diagnostic rather than decorative — unmeasured rows concentrated entirely on
     the embedded side is the signature of that asymmetry rather than of a broken writer.
+
+    Counted over the compacted ``master/`` once one exists, since that is what consumers read and
+    ``parts/`` keeps its null rows forever by design; over ``parts/`` before then.
     """
     import pyarrow.compute as pc
     import pyarrow.dataset as ds
+    from pyarrow.fs import FileType
 
-    prefix = root.removeprefix("s3://").rstrip("/") + "/parts"
+    base = root.removeprefix("s3://").rstrip("/")
+    compacted = fs.get_file_info(f"{base}/master").type == FileType.Directory
+    prefix, schema = (f"{base}/master", master_schema()) if compacted else (f"{base}/parts", dataset_schema())
     started = time.monotonic()
-    dataset = ds.dataset(prefix, filesystem=fs, partitioning="hive", schema=dataset_schema())
+    dataset = ds.dataset(prefix, filesystem=fs, partitioning="hive", schema=schema)
     table = dataset.to_table(columns=["zone", "year", "embedded", "chunk_px"])
     unmeasured = pc.is_null(table.column("chunk_px")).to_pylist()
     embedded = table.column("embedded").to_pylist()
@@ -255,6 +262,7 @@ def _completeness(fs: pyarrow.fs.FileSystem, root: str) -> dict[str, Any]:
     total_unmeasured = sum(unmeasured)
     return {
         "wall_s": round(time.monotonic() - started, 2),
+        "prefix": prefix.rsplit("/", 1)[1],
         "rows": table.num_rows,
         "rows_without_measurements": total_unmeasured,
         "fraction_without_measurements": round(total_unmeasured / table.num_rows, 6) if table.num_rows else 0.0,
@@ -611,7 +619,7 @@ def main(argv: list[str] | None = None) -> int:
 
     report["completeness"] = _completeness(fs, args.registry)
     complete = report["completeness"]
-    print(f"\nmeasurement completeness ({complete['wall_s']}s):")
+    print(f"\nmeasurement completeness of {complete['prefix']}/ ({complete['wall_s']}s):")
     print(
         f"  rows with no measurements: {complete['rows_without_measurements']:,} of {complete['rows']:,} "
         f"({complete['fraction_without_measurements']:.1%}), of which "
