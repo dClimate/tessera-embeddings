@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 from tessera_embeddings.config.store_layout import SHARD_PX
 from tessera_embeddings.storage.registry import REASONS, registry_schema
@@ -308,8 +309,6 @@ def write_rebuild_part(
     block rather than as columns — against :func:`rebuild_schema`. A separate writer rather than a
     schema argument on the original, for the code-identity reason in :func:`rebuild_schema`.
     """
-    import pyarrow.parquet as pq
-
     if not rows:
         return 0
     table = pa.Table.from_pylist(rows, schema=rebuild_schema())

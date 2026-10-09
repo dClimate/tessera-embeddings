@@ -259,7 +259,7 @@ def _completeness(fs: pyarrow.fs.FileSystem, root: str) -> dict[str, Any]:
         "rows_without_measurements": total_unmeasured,
         "fraction_without_measurements": round(total_unmeasured / table.num_rows, 6) if table.num_rows else 0.0,
         "unmeasured_rows_that_are_embedded": sum(
-            1 for is_unmeasured, was_embedded in zip(unmeasured, embedded, strict=True) if is_unmeasured and was_embedded
+            1 for missing, was_embedded in zip(unmeasured, embedded, strict=True) if missing and was_embedded
         ),
         "cells_wholly_unmeasured": sorted(k for k, v in per_cell.items() if v["unmeasured"] == v["rows"]),
         "cells_partly_unmeasured": sorted(k for k, v in per_cell.items() if 0 < v["unmeasured"] < v["rows"]),
@@ -614,8 +614,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nmeasurement completeness ({complete['wall_s']}s):")
     print(
         f"  rows with no measurements: {complete['rows_without_measurements']:,} of {complete['rows']:,} "
-        f"({complete['fraction_without_measurements']:.1%}), of which {complete['unmeasured_rows_that_are_embedded']:,} "
-        "are embedded tiles"
+        f"({complete['fraction_without_measurements']:.1%}), of which "
+        f"{complete['unmeasured_rows_that_are_embedded']:,} are embedded tiles"
     )
     print(
         f"  cells wholly unmeasured {len(complete['cells_wholly_unmeasured'])}, "

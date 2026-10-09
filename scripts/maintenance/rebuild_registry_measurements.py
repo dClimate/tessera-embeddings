@@ -42,8 +42,14 @@ import json
 import random
 import sys
 from collections import defaultdict
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import Any
 
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.dataset as ds
+import pyarrow.fs
+import pyarrow.parquet as pq
 import zarr
 
 from tessera_embeddings.storage import published_store, registry_rebuild
@@ -63,9 +69,6 @@ from tessera_embeddings.storage.registry_rebuild import (
     rebuilt_row,
     write_rebuild_part,
 )
-
-if TYPE_CHECKING:
-    import pyarrow.fs
 
 DEFAULT_STORE = "s3://tessera-embeddings/v1.1/dclimate.icechunk"
 DEFAULT_REGISTRY = "s3://tessera-embeddings/v1.1/dclimate.registry"
@@ -87,23 +90,18 @@ def _filesystem(root: str, region: str, *, anonymous: bool = False) -> pyarrow.f
     how the invariants get checked before anything is published, and a subcommand that only knows
     how to talk to the real bucket cannot be rehearsed at all.
     """
-    from pyarrow.fs import LocalFileSystem, S3FileSystem
-
     if root.startswith("s3://"):
-        return S3FileSystem(region=region, anonymous=anonymous)
-    return LocalFileSystem()
+        return pyarrow.fs.S3FileSystem(region=region, anonymous=anonymous)
+    return pyarrow.fs.LocalFileSystem()
 
 
-def _registry_table(fs: pyarrow.fs.FileSystem, root: str, prefix: str, schema: Any) -> Any:
+def _registry_table(fs: pyarrow.fs.FileSystem, root: str, prefix: str, schema: pa.Schema) -> pa.Table:
     """One of the registry's prefixes as a table, schema STATED rather than inferred.
 
     Inferring it from the first file in sorted path order is how a column added mid-campaign
     silently disappears from a whole-dataset read; the registry's own docstring says so and this is
     the script that would be most damaged by it.
     """
-    import pyarrow as pa
-    import pyarrow.dataset as ds
-
     path = root.removeprefix("s3://").rstrip("/") + "/" + prefix
     try:
         return ds.dataset(path, filesystem=fs, partitioning="hive", schema=schema).to_table()
@@ -113,28 +111,34 @@ def _registry_table(fs: pyarrow.fs.FileSystem, root: str, prefix: str, schema: A
         return pa.Table.from_pylist([], schema=schema)
 
 
-def _open_zone(store_uri: str, region: str, *, anonymous: bool) -> Any:
+def _open_zone(store_uri: str, region: str, *, anonymous: bool) -> zarr.Group:
     """The published store's root group, read-only."""
     session = open_global_repo(store_uri, region=region, anonymous=anonymous).readonly_session(branch="main")
     return zarr.open_group(session.store, mode="r")
 
 
-def _cells(table: Any) -> dict[tuple[str, int], list[dict[str, Any]]]:
-    """Registry rows grouped by ``(zone, year)``, which is the unit a fill — and a rebuild — works in."""
+def _cells(table: pa.Table, zones: list[str]) -> dict[tuple[str, int], list[dict[str, Any]]]:
+    """Registry rows grouped by ``(zone, year)``, which is the unit a fill — and a rebuild — works in.
+
+    ``zones`` is applied in Arrow, before rows become Python dicts: the whole registry as dicts is
+    ~6.7 GB of memory, so a run split across processes by ``--zones`` holds only its own share.
+    """
+    if zones:
+        table = table.filter(pc.is_in(table.column("zone"), value_set=pa.array(zones)))
     grouped: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
     for row in table.to_pylist():
         grouped[(row["zone"], int(row["year"]))].append(row)
     return dict(grouped)
 
 
-def _time_index(group: Any, year: int) -> int | None:
+def _time_index(group: zarr.Group, year: int) -> int | None:
     """The store's time index for a calendar year, or None if the zone has no slot for it."""
     years = published_store.calendar_years(group)
     return years.index(year) if year in years else None
 
 
 def _rebuild_many(
-    group: Any,
+    group: zarr.Group,
     *,
     time_index: int,
     rows: list[dict[str, Any]],
@@ -158,7 +162,7 @@ def _rebuild_many(
 
 
 def _gate_rows(
-    group: Any,
+    group: zarr.Group,
     *,
     time_index: int,
     rows: list[dict[str, Any]],
@@ -181,7 +185,9 @@ def _gate_rows(
         verdict, differences = registry_rebuild.compare_row(rebuilt[row["tile"]], row)
         verdicts[verdict] += 1
         if verdict == "mismatch":
-            mismatches.append({"zone": row["zone"], "year": row["year"], "tile": row["tile"], "differences": differences})
+            mismatches.append(
+                {"zone": row["zone"], "year": row["year"], "tile": row["tile"], "differences": differences}
+            )
     return {"checked": len(rows), "verdicts": dict(verdicts), "mismatches": mismatches}
 
 
@@ -189,11 +195,9 @@ def cmd_gate(args: argparse.Namespace) -> int:
     """Prove the rebuild reproduces measurements the fill already took. Writes nothing."""
     fs = _filesystem(args.registry, args.region, anonymous=args.anonymous)
     table = _registry_table(fs, args.registry, "parts", dataset_schema())
-    cells = _cells(table)
+    cells = _cells(table, args.zones)
     measured = [
-        (cell, [row for row in rows if row.get("chunk_px") is not None])
-        for cell, rows in sorted(cells.items())
-        if not args.zones or cell[0] in args.zones
+        (cell, [row for row in rows if row.get("chunk_px") is not None]) for cell, rows in sorted(cells.items())
     ]
     measured = [(cell, rows) for cell, rows in measured if rows]
     if not measured:
@@ -240,7 +244,7 @@ def cmd_gate(args: argparse.Namespace) -> int:
         for entry in mismatches[:20]:
             print(f"  {entry['zone']}/{entry['year']}/{entry['tile']}: {'; '.join(entry['differences'])}")
     if args.json_out:
-        with open(args.json_out, "w") as handle:
+        with Path(args.json_out).open("w") as handle:
             json.dump({"checked": checked, "verdicts": dict(totals), "mismatches": mismatches}, handle, indent=2)
     return 1 if mismatches else 0
 
@@ -249,15 +253,10 @@ def cmd_rebuild(args: argparse.Namespace) -> int:
     """Re-derive the null rows and write one part per cell under ``rebuild/``."""
     fs = _filesystem(args.registry, args.region, anonymous=args.anonymous)
     table = _registry_table(fs, args.registry, "parts", dataset_schema())
-    cells = _cells(table)
+    cells = _cells(table, args.zones)
     run_id = args.run_id or rebuild_run_id(suffix="optical" if args.skip_radar else "full")
     rebuild_root = args.registry.rstrip("/") + "/rebuild"
-    if not any(
-        row.get("chunk_px") is None
-        for (zone, _year), rows in cells.items()
-        if not args.zones or zone in args.zones
-        for row in rows
-    ):
+    if not any(row.get("chunk_px") is None for rows in cells.values() for row in rows):
         print("rebuild: every row already carries measurements, so there is nothing to re-derive")
         return 0
     root = _open_zone(args.store, args.region, anonymous=args.anonymous)
@@ -265,8 +264,6 @@ def cmd_rebuild(args: argparse.Namespace) -> int:
 
     written = blocked = 0
     for (zone, year), rows in sorted(cells.items()):
-        if args.zones and zone not in args.zones:
-            continue
         targets = [row for row in rows if row.get("chunk_px") is None]
         if not targets:
             continue
@@ -279,7 +276,9 @@ def cmd_rebuild(args: argparse.Namespace) -> int:
 
         # SELF-CHECK FIRST. A cell that holds measured tiles can prove the rebuild reproduces its
         # own geometry and rule before a single re-derived row is written for it.
-        known = [row for row in rows if row.get("chunk_px") is not None and row.get("eligible_px") == row.get("chunk_px")]
+        known = [
+            row for row in rows if row.get("chunk_px") is not None and row.get("eligible_px") == row.get("chunk_px")
+        ]
         if known and not args.no_in_cell_gate:
             sample = known if len(known) <= IN_CELL_GATE_TILES else rng.sample(known, IN_CELL_GATE_TILES)
             check = _gate_rows(
@@ -292,7 +291,10 @@ def cmd_rebuild(args: argparse.Namespace) -> int:
             )
             if check["mismatches"]:
                 blocked += 1
-                print(f"  {zone}/{year}: BLOCKED — in-cell gate failed on {len(check['mismatches'])} rows", file=sys.stderr)
+                print(
+                    f"  {zone}/{year}: BLOCKED — in-cell gate failed on {len(check['mismatches'])} rows",
+                    file=sys.stderr,
+                )
                 for entry in check["mismatches"][:3]:
                     print(f"      {entry['tile']}: {'; '.join(entry['differences'])}", file=sys.stderr)
                 continue
@@ -321,20 +323,20 @@ def cmd_rebuild(args: argparse.Namespace) -> int:
             )
         written += len(part)
 
-    print(f"\nrebuild {run_id}: {written} rows {'written' if args.write else 'would be written'}, {blocked} cells blocked")
+    print(
+        f"\nrebuild {run_id}: {written} rows {'written' if args.write else 'would be written'}, {blocked} cells blocked"
+    )
     return 1 if blocked else 0
 
 
 def cmd_compact(args: argparse.Namespace) -> int:
     """Merge ``parts/`` and ``rebuild/`` into ``master/``, one row per tile-year, one schema."""
-    import pyarrow.parquet as pq
-
     fs = _filesystem(args.registry, args.region, anonymous=args.anonymous)
     parts = _registry_table(fs, args.registry, "parts", dataset_schema())
     rebuilt = _registry_table(fs, args.registry, "rebuild", _rebuild_dataset_schema())
     master = merge(parts, rebuilt)
 
-    expected = len({f"{r['zone']}/{r['year']}/{r['tile']}" for r in parts.to_pylist()})
+    expected = parts.group_by(["zone", "year", "tile"]).aggregate([]).num_rows
     failures = invariant_failures(master, expected_rows=expected)
     origins = defaultdict(int)
     for tag in master.column("measured_by").to_pylist():
@@ -352,8 +354,6 @@ def cmd_compact(args: argparse.Namespace) -> int:
 
     out = args.registry.removeprefix("s3://").rstrip("/") + "/master"
     fs.create_dir(out)
-    import pyarrow.dataset as ds
-
     ds.write_dataset(
         master,
         out,
@@ -372,17 +372,13 @@ def cmd_compact(args: argparse.Namespace) -> int:
     return 0
 
 
-def pa_schema_subset(schema: Any, names: list[str]) -> Any:
+def pa_schema_subset(schema: pa.Schema, names: list[str]) -> pa.Schema:
     """``schema`` narrowed to ``names``, in that order — the partitioning keys, typed as the master has them."""
-    import pyarrow as pa
-
     return pa.schema([schema.field(schema.get_field_index(name)) for name in names])
 
 
-def _rebuild_dataset_schema() -> Any:
+def _rebuild_dataset_schema() -> pa.Schema:
     """:func:`rebuild_schema` plus the hive partition keys, for reading the whole ``rebuild/`` prefix."""
-    import pyarrow as pa
-
     return pa.schema([*rebuild_schema(), pa.field("zone", pa.string()), pa.field("year", pa.int32())])
 
 
@@ -391,7 +387,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
     fs = _filesystem(args.registry, args.region, anonymous=args.anonymous)
     parts = _registry_table(fs, args.registry, "parts", dataset_schema())
     master = _registry_table(fs, args.registry, "master", master_schema())
-    expected = len({f"{r['zone']}/{r['year']}/{r['tile']}" for r in parts.to_pylist()})
+    expected = parts.group_by(["zone", "year", "tile"]).aggregate([]).num_rows
     failures = invariant_failures(master, expected_rows=expected)
     altered = fill_rows_unchanged(master, parts, REBUILT_COLUMNS)
     print(f"master {master.num_rows} rows against {parts.num_rows} part rows ({expected} distinct tile-years)")
@@ -408,6 +404,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Parse the subcommand and run it; the exit status is the subcommand's."""
     # Every option lives on the SUBCOMMANDS rather than on the top-level parser, so a flag written
     # after the subcommand works — which is where anybody types it, and where a global-only
     # `--write` silently becomes an argparse error instead.
@@ -415,12 +412,18 @@ def main(argv: list[str] | None = None) -> int:
     common.add_argument("--registry", default=DEFAULT_REGISTRY, help="registry root; a non-s3 path reads locally")
     common.add_argument("--store", default=DEFAULT_STORE)
     common.add_argument("--region", default=DEFAULT_REGION)
-    common.add_argument("--anonymous", action="store_true", help="read with no credentials (published bucket allows it)")
+    common.add_argument(
+        "--anonymous", action="store_true", help="read with no credentials (published bucket allows it)"
+    )
     common.add_argument("--zones", default="", help="comma-separated zones to limit the pass to")
     common.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
     common.add_argument("--seed", type=int, default=0)
-    common.add_argument("--skip-radar", action="store_true", help="leave px_with_any_radar null — the optical-only pass")
-    common.add_argument("--write", action="store_true", help="actually publish; without it every subcommand is a dry run")
+    common.add_argument(
+        "--skip-radar", action="store_true", help="leave px_with_any_radar null — the optical-only pass"
+    )
+    common.add_argument(
+        "--write", action="store_true", help="actually publish; without it every subcommand is a dry run"
+    )
 
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
