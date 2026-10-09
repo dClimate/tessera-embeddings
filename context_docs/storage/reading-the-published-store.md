@@ -473,7 +473,8 @@ object storage and survives a resume, an embedded tile's rode back in the actor'
 not — so **every one of the 17,865 wholly-refused tiles is measured and only 53% of the embedded
 ones are**. The gap is at cell granularity: 299 zone-years have no measurements at all, 533 are
 complete, 162 partial. A consumer counting refusals across the dataset is counting the measured
-half only. Every column is derivable from the store, so this is repairable rather than lost:
+half only. Every column is derivable from the store, so this is repairable rather than lost; the
+repair is built and checked against the store but not yet run against the published registry:
 [`registry-backfill.md`](registry-backfill.md).
 
 **Row counts differ between the two, and both are right.** 3,247,410 registry rows against
