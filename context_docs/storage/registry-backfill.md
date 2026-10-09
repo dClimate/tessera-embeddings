@@ -164,7 +164,7 @@ per-tile decode and counting hold the GIL for part of their time — so a 16-vCP
 processes over disjoint `--zones` lists. `--zones` is applied in Arrow before rows become Python
 objects; the whole registry as dicts is ~6.7 GB, so each process holds only its share. Re-running a
 pass with the same `--run-id` overwrites the same parts, so a failed process is re-run for its zones
-alone. `compact` peaks at 8.7 GB and `verify` at 11.6 GB of memory, measured over the full registry.
+alone. `compact` peaks at 8.7 GB and `verify` at 12.1 GB of memory, measured over the full registry.
 
 **Failures fail.** A missing or empty `parts/` — a mistyped `--registry` — stops every subcommand
 rather than reading as a registry with nothing to check; only `rebuild/` may be absent. A cell with
@@ -188,7 +188,7 @@ the registry, every write to local disk. Four zone-years chosen for what they ho
 `compact` then merged the four cells' 4,200 part rows and 2,601 rebuilt rows into 4,200 master rows
 — 2,881 measured by the fill, 1,319 by the rebuild, every rebuilt row from the radar pass — and
 `verify` passed. Over the full registry plus a placeholder `rebuild/` of all 1,519,045 rows,
-`compact` took 7.7 s and `verify` 16 s, and `verify` passed.
+`compact` took 7.9 s and `verify` 22 s, and `verify` passed.
 
 The 09N/2021 gate is the proof: a cell the fill measured completely, re-derived from the store
 without reference to the fill's numbers, agrees on every refusal count, depth statistic and radar
