@@ -98,6 +98,10 @@ context_docs/
     │                                              conforms, measured speeds in two regions, and
     │                                              what would surprise a consumer
     ├── staging-identity-and-resume.md          what a run id identifies, and what resumes
+    ├── registry-backfill.md                    why 47% of the registry's rows measure nothing,
+    │                                              why re-deriving them from the store is a
+    │                                              re-derivation rather than an estimate, and the
+    │                                              compaction that gives consumers one row per tile
     └── icechunk-api-ledger.md                  signatures and gotchas the scale tests earned
 ```
 
