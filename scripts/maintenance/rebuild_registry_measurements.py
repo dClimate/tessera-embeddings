@@ -70,6 +70,7 @@ from tessera_embeddings.storage.registry_master import (
     invariant_failures,
     master_schema,
     merge,
+    newest_fill_runs,
 )
 from tessera_embeddings.storage.registry_rebuild import (
     REBUILT_COLUMNS,
@@ -107,20 +108,28 @@ def _filesystem(root: str, region: str, *, anonymous: bool = False) -> pyarrow.f
     return pyarrow.fs.LocalFileSystem()
 
 
-def _registry_table(fs: pyarrow.fs.FileSystem, root: str, prefix: str, schema: pa.Schema) -> pa.Table:
+def _registry_table(
+    fs: pyarrow.fs.FileSystem, root: str, prefix: str, schema: pa.Schema, *, optional: bool = False
+) -> pa.Table:
     """One of the registry's prefixes as a table, schema STATED rather than inferred.
 
     Inferring it from the first file in sorted path order is how a column added mid-campaign
     silently disappears from a whole-dataset read; the registry's own docstring says so and this is
     the script that would be most damaged by it.
+
+    Only an ``optional`` prefix may be absent — ``rebuild/`` before the first pass — and then it
+    reads as an empty table. Anything else that cannot be read raises: an empty ``parts/`` from a
+    mistyped ``--registry`` or a failed read would let every subcommand pass having checked nothing.
     """
     path = root.removeprefix("s3://").rstrip("/") + "/" + prefix
-    try:
-        return ds.dataset(path, filesystem=fs, partitioning="hive", schema=schema).to_table()
-    except (FileNotFoundError, OSError, pa.ArrowInvalid):
-        # A prefix that does not exist yet is the normal state before the first rebuild, not a
-        # fault: an empty table of the right schema concatenates and merges like any other.
-        return pa.Table.from_pylist([], schema=schema)
+    if fs.get_file_info(path).type == pyarrow.fs.FileType.NotFound:
+        if optional:
+            return pa.Table.from_pylist([], schema=schema)
+        raise SystemExit(f"{root.rstrip('/')}/{prefix} does not exist — is --registry right?")
+    table = ds.dataset(path, filesystem=fs, partitioning="hive", schema=schema).to_table()
+    if not optional and not table.num_rows:
+        raise SystemExit(f"{root.rstrip('/')}/{prefix} holds no rows — refusing to treat that as a registry")
+    return table
 
 
 def _open_zone(store_uri: str, region: str, *, anonymous: bool) -> zarr.Group:
@@ -235,11 +244,13 @@ def cmd_gate(args: argparse.Namespace) -> int:
     totals: dict[str, int] = defaultdict(int)
     mismatches: list[dict[str, Any]] = []
     checked = 0
+    missing: list[str] = []
     for (zone, year), rows in measured:
         group = root[zone]
         time_index = _time_index(group, year)
         if time_index is None:
-            print(f"  {zone}/{year}: no time slot in the store — skipped", file=sys.stderr)
+            print(f"  {zone}/{year}: no time slot in the store — a wrong store, or a wrong year", file=sys.stderr)
+            missing.append(f"{zone}/{year}")
             continue
         sample = rows if len(rows) <= per_cell else rng.sample(rows, per_cell)
         result = _gate_rows(
@@ -266,7 +277,9 @@ def cmd_gate(args: argparse.Namespace) -> int:
     if args.json_out:
         with Path(args.json_out).open("w") as handle:
             json.dump({"checked": checked, "verdicts": dict(totals), "mismatches": mismatches}, handle, indent=2)
-    return 1 if mismatches else 0
+    if missing:
+        print(f"\nFAILED — {len(missing)} cells have no time slot in the store: {', '.join(missing[:20])}")
+    return 1 if mismatches or missing else 0
 
 
 def cmd_rebuild(args: argparse.Namespace) -> int:
@@ -290,7 +303,8 @@ def cmd_rebuild(args: argparse.Namespace) -> int:
         group = root[zone]
         time_index = _time_index(group, year)
         if time_index is None:
-            print(f"  {zone}/{year}: no time slot in the store — skipped", file=sys.stderr)
+            blocked += 1
+            print(f"  {zone}/{year}: BLOCKED — no time slot in the store", file=sys.stderr)
             continue
         rule = int(targets[0]["optical_min_obs"])
 
@@ -357,10 +371,10 @@ def cmd_compact(args: argparse.Namespace) -> int:
     """Merge ``parts/`` and ``rebuild/`` into ``master/``, one row per tile-year, one schema."""
     fs = _filesystem(args.registry, args.region, anonymous=args.anonymous)
     parts = _registry_table(fs, args.registry, "parts", dataset_schema())
-    rebuilt = _registry_table(fs, args.registry, "rebuild", _rebuild_dataset_schema())
+    rebuilt = _registry_table(fs, args.registry, "rebuild", _rebuild_dataset_schema(), optional=True)
     master = merge(parts, rebuilt)
 
-    expected = parts.group_by(["zone", "year", "tile"]).aggregate([]).num_rows
+    expected = newest_fill_runs(parts).group_by(["zone", "year", "tile"]).aggregate([]).num_rows
     failures = invariant_failures(master, expected_rows=expected)
     origins = defaultdict(int)
     for tag in master.column("measured_by").to_pylist():
@@ -378,6 +392,9 @@ def cmd_compact(args: argparse.Namespace) -> int:
 
     out = args.registry.removeprefix("s3://").rstrip("/") + "/master"
     fs.create_dir(out)
+    # In place and not atomic, by design: S3 has no rename, and a staged prefix plus a pointer is a
+    # read protocol every consumer would have to learn. The write is ~1,000 small objects, seconds
+    # in-region; `verify` fails on a partial master, and re-running `compact` repairs one.
     ds.write_dataset(
         master,
         out,
@@ -411,7 +428,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
     fs = _filesystem(args.registry, args.region, anonymous=args.anonymous)
     parts = _registry_table(fs, args.registry, "parts", dataset_schema())
     master = _registry_table(fs, args.registry, "master", master_schema())
-    expected = parts.group_by(["zone", "year", "tile"]).aggregate([]).num_rows
+    expected = newest_fill_runs(parts).group_by(["zone", "year", "tile"]).aggregate([]).num_rows
     failures = invariant_failures(master, expected_rows=expected)
     altered = fill_rows_unchanged(master, parts, REBUILT_COLUMNS)
     print(f"master {master.num_rows} rows against {parts.num_rows} part rows ({expected} distinct tile-years)")

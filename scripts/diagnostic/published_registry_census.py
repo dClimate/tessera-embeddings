@@ -629,7 +629,8 @@ def main(argv: list[str] | None = None) -> int:
         f"  cells wholly unmeasured {len(complete['cells_wholly_unmeasured'])}, "
         f"partly {len(complete['cells_partly_unmeasured'])}, fully measured {complete['cells_fully_measured']}"
     )
-    incomplete = complete["fraction_without_measurements"] > args.max_unmeasured
+    # Counts, not the rounded fraction: one null row in 3.2 M rounds to 0.0 and would pass a zero threshold.
+    incomplete = complete["rows_without_measurements"] > args.max_unmeasured * complete["rows"]
     if incomplete:
         print(
             f"  ABOVE THE THRESHOLD ({args.max_unmeasured:.1%}) — every column is derivable from the store, so "

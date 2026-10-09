@@ -93,8 +93,14 @@ twice-filled cell to "the compaction step's decision", and
 master and `_common_metadata` as what forces every consumer to state the schema themselves. This
 closes both.
 
-**Precedence is not latest-wins.** A fill measured pixels as it wrote them; a rebuild re-derived
-them afterwards. Where a fill recorded a measurement, that measurement stands:
+**A refill supersedes a cell wholesale.** A part is one complete run of one cell, so only each
+cell's most recently assembled fill run is a candidate, and only rebuild rows re-derived against
+that run — their `filled_at` is its stamp. Choosing per tile across runs would build a union no
+run produced and keep an older run's numbers for a tile the store now holds from a newer one. No
+published cell has two runs today; every future refill will.
+
+**Within that run, precedence is not latest-wins.** A fill measured pixels as it wrote them; a
+rebuild re-derived them afterwards. Where a fill recorded a measurement, that measurement stands:
 
 1. a fill row carrying measurements beats everything;
 2. otherwise the most recent rebuild row carrying measurements — which is how a later pass adding
@@ -152,7 +158,14 @@ per-tile decode and counting hold the GIL for part of their time — so a 16-vCP
 processes over disjoint `--zones` lists. `--zones` is applied in Arrow before rows become Python
 objects; the whole registry as dicts is ~6.7 GB, so each process holds only its share. Re-running a
 pass with the same `--run-id` overwrites the same parts, so a failed process is re-run for its zones
-alone. `compact` peaks at 7.3 GB and `verify` at 11.1 GB of memory, measured over the full registry.
+alone. `compact` peaks at 8.7 GB and `verify` at 11.6 GB of memory, measured over the full registry.
+
+**Failures fail.** A missing or empty `parts/` — a mistyped `--registry` — stops every subcommand
+rather than reading as a registry with nothing to check; only `rebuild/` may be absent. A cell with
+no time slot in the store fails `gate` and blocks `rebuild`. `compact` rewrites `master/` in place,
+because S3 has no rename and a pointer to a staged prefix is a protocol every reader would have to
+learn: a reader during those seconds can see a partial master, `verify` fails on one, and
+re-running `compact` repairs it.
 
 ## Verified against the published store
 
@@ -169,7 +182,7 @@ the registry, every write to local disk. Four zone-years chosen for what they ho
 `compact` then merged the four cells' 4,200 part rows and 2,601 rebuilt rows into 4,200 master rows
 — 2,881 measured by the fill, 1,319 by the rebuild, every rebuilt row from the radar pass — and
 `verify` passed. Over the full registry plus a placeholder `rebuild/` of all 1,519,045 rows,
-`compact` took 6.5 s and `verify` 16 s, and `verify` passed.
+`compact` took 7.7 s and `verify` 16 s, and `verify` passed.
 
 The 09N/2021 gate is the proof: a cell the fill measured completely, re-derived from the store
 without reference to the fill's numbers, agrees on every refusal count, depth statistic and radar

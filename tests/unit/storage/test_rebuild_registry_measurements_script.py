@@ -161,6 +161,15 @@ class TestCompact:
         assert _master(tmp_path).num_rows == 4
 
 
+@pytest.mark.parametrize("command", ["gate", "rebuild", "compact", "verify"])
+def test_a_registry_without_parts_fails_rather_than_passing_vacuously(
+    script: Any, tmp_path: Path, command: str
+) -> None:
+    """A mistyped ``--registry`` must not read as an empty registry that every check passes."""
+    with pytest.raises(SystemExit, match="parts does not exist"):
+        script.main([command, "--registry", str(tmp_path / "typo")])
+
+
 class TestVerify:
     """The invariants, checked against the published parts rather than against the merge rule."""
 

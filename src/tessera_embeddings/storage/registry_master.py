@@ -23,10 +23,16 @@ reading the result. Two consequences the design always anticipated and never clo
              saying where each row's numbers came from. This is what consumers read.
 ```
 
-**Precedence is not latest-wins, and the difference matters.** A fill measured pixels as it wrote
-them; a rebuild re-derived them afterwards from what was written. They should agree — that is what
-:func:`~.registry_rebuild.compare_row` gates on — but where a fill recorded a measurement, that
-measurement stands. So:
+**A refill supersedes a cell wholesale.** A part is one complete run of one cell, so only the fill
+rows of each cell's most recently assembled run are candidates, and only rebuild rows re-derived
+against that run (their ``filled_at`` is its stamp). Choosing per tile across runs would build a
+union no run produced and keep an older run's numbers for a tile the store now holds from a newer
+one — the rule ``published_registry_census.py`` applies too.
+
+**Within that, precedence is not latest-wins, and the difference matters.** A fill measured pixels
+as it wrote them; a rebuild re-derived them afterwards from what was written. They should agree —
+that is what :func:`~.registry_rebuild.compare_row` gates on — but where a fill recorded a
+measurement, that measurement stands. So:
 
 1. a fill row carrying measurements beats everything;
 2. otherwise the most recent rebuild row carrying measurements wins, which is how a later pass
@@ -104,18 +110,45 @@ def merge(parts: pa.Table, rebuilt: pa.Table | None = None) -> pa.Table:
     and the only version that fails cleanly.
     """
     schema = master_schema()
-    fill = _aligned(parts, schema)
+    fill = _aligned(newest_fill_runs(parts), schema)
     # A fill part's own stamp IS when its cell was filled, so every master row answers that question.
     index = schema.get_field_index("filled_at")
     fill = fill.set_column(index, "filled_at", pc.coalesce(fill.column(index), fill.column("assembled_at")))
     tables = [_tagged(fill, MEASURED_BY_FILL)]
     if rebuilt is not None and rebuilt.num_rows:
-        tables.append(_tagged(_aligned(rebuilt, schema), MEASURED_BY_REBUILD))
+        # Only re-derivations of the run that stands: one made before a refill describes a run the
+        # store no longer holds.
+        current = pc.is_in(_cell_key(rebuilt, "filled_at"), value_set=_cell_key(fill, "assembled_at").unique())
+        tables.append(_tagged(_aligned(rebuilt.filter(current), schema), MEASURED_BY_REBUILD))
     combined = pa.concat_tables(tables)
     if not combined.num_rows:
         return combined
     keep = _winning_rows(combined)
     return combined.take(pa.array(keep)).sort_by([("zone", "ascending"), ("year", "ascending"), ("tile", "ascending")])
+
+
+def newest_fill_runs(parts: pa.Table) -> pa.Table:
+    """Only the rows of each cell's most recently assembled fill run.
+
+    ``assembled_at`` is the clock and ``run_id`` breaks a tie, as in the census's ``_newest_run``.
+    Every caller that compares against the fill — the merge, :func:`fill_rows_unchanged`, the
+    expected row count — goes through this, so all three agree on which run stands.
+    """
+    if not parts.num_rows:
+        return parts
+    runs = parts.group_by(["zone", "year", "run_id"]).aggregate([("assembled_at", "max")]).to_pylist()
+    newest: dict[tuple[str, int], tuple[str, str]] = {}
+    for run in runs:
+        cell, candidate = (run["zone"], run["year"]), (run["assembled_at_max"] or "", run["run_id"] or "")
+        newest[cell] = max(newest.get(cell, candidate), candidate)
+    winners = pa.array([f"{zone}/{year}/{run_id}" for (zone, year), (_, run_id) in newest.items()])
+    return parts.filter(pc.is_in(_cell_key(parts, "run_id"), value_set=winners))
+
+
+def _cell_key(table: pa.Table, column: str) -> pa.Array:
+    """``zone/year/<column>`` per row, for matching rows to a cell's run or stamp."""
+    year = pc.cast(table.column("year"), pa.string())
+    return pc.binary_join_element_wise(table.column("zone"), year, table.column(column), "/").combine_chunks()
 
 
 def _tagged(table: pa.Table, origin: str) -> pa.Table:
@@ -210,11 +243,13 @@ def fill_rows_unchanged(master: pa.Table, parts: pa.Table, columns: Sequence[str
     """Rows the master claims the fill measured, that differ from the fill's own part. Empty is correct.
 
     The compaction is only safe if it never alters an original measurement, and "never" is a claim
-    worth testing against the source rather than reasoning about from the merge rule.
+    worth testing against the source rather than reasoning about from the merge rule. The source is
+    each cell's newest run, the same one :func:`merge` keeps, so a refilled cell is compared against
+    the run that stands rather than whichever part a dataset scan happened to read last.
     """
     wanted = set(columns)
     by_key: dict[str, dict[str, Any]] = {}
-    for row in parts.to_pylist():
+    for row in newest_fill_runs(parts).to_pylist():
         if row.get(MEASURED_SENTINEL) is None:
             continue
         by_key[f"{row['zone']}/{row['year']}/{row['tile']}"] = row

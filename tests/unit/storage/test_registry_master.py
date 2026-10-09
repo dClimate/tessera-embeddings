@@ -56,9 +56,13 @@ def _parts(rows: list[dict]) -> pa.Table:
     return _table(rows, dataset_schema())
 
 
-def _rebuilt(rows: list[dict]) -> pa.Table:
+FILLED = "2026-08-01T00:00:00+00:00"
+
+
+def _rebuilt(rows: list[dict], *, filled_at: str = FILLED) -> pa.Table:
+    """Rebuild rows re-derived against the fill stamped ``filled_at`` unless a row says otherwise."""
     schema = pa.schema([*rebuild_schema(), pa.field("zone", pa.string()), pa.field("year", pa.int32())])
-    return _table(rows, schema)
+    return _table([{"filled_at": filled_at} | {k: v for k, v in row.items() if v is not None} for row in rows], schema)
 
 
 class TestPrecedence:
@@ -109,6 +113,23 @@ class TestPrecedence:
         assert master.num_rows == 1
         assert master.column("refused_thin_px").to_pylist() == [8]
         assert master.column("run_id").to_pylist() == ["run-b"]
+
+    def test_a_refill_supersedes_the_older_run_and_its_rebuilds(self) -> None:
+        """A newer run that left a tile null must not inherit the older run's numbers, nor a rebuild of it.
+
+        The store holds the newer run, so the older run's measurement — and a re-derivation made
+        against it — describe pixels that are no longer there.
+        """
+        parts = _parts(
+            [
+                _row("chunk_0_0", measured=True, stamp=FILLED, refused_thin_px=6, run_id="run-a"),
+                _row("chunk_0_0", measured=False, stamp="2026-08-09T00:00:00+00:00", run_id="run-b"),
+            ]
+        )
+        stale = _rebuilt([_row("chunk_0_0", measured=True, stamp="2026-09-21T00:00:00+00:00", refused_thin_px=7)])
+        master = merge(parts, stale)
+        assert master.column("run_id").to_pylist() == ["run-b"]
+        assert master.column("measured_by").to_pylist() == [None]
 
     def test_a_tile_nothing_has_measured_stays_in_the_master_as_a_null_row(self) -> None:
         """Dropping it would turn "nobody measured this" into "this ground does not exist"."""
@@ -213,8 +234,18 @@ class TestFillRowsUnchanged:
         differences = fill_rows_unchanged(tampered, parts, self.COLUMNS)
         assert any("refused_thin_px" in difference for difference in differences)
 
+    def test_a_refilled_cell_is_compared_against_its_newest_run_whatever_the_scan_order(self) -> None:
+        """Part order in a dataset scan is not run order; the source must be the run the merge kept."""
+        parts = _parts(
+            [
+                _row("chunk_0_0", measured=True, stamp="b", refused_thin_px=8, run_id="run-b"),
+                _row("chunk_0_0", measured=True, stamp="a", refused_thin_px=6, run_id="run-a"),
+            ]
+        )
+        assert fill_rows_unchanged(merge(parts), parts, self.COLUMNS) == []
+
     def test_a_rebuilt_row_is_not_compared_against_the_fill(self) -> None:
         """It is a re-derivation of a row the fill left null; there is nothing to differ from."""
         parts = _parts([_row("chunk_0_0", measured=False, stamp="a")])
-        rebuilt = _rebuilt([_row("chunk_0_0", measured=True, stamp="b", refused_thin_px=7)])
+        rebuilt = _rebuilt([_row("chunk_0_0", measured=True, stamp="b", refused_thin_px=7)], filled_at="a")
         assert fill_rows_unchanged(merge(parts, rebuilt), parts, self.COLUMNS) == []
