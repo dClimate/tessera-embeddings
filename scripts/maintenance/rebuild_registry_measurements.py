@@ -195,6 +195,14 @@ def cmd_gate(args: argparse.Namespace) -> int:
     """Prove the rebuild reproduces measurements the fill already took. Writes nothing."""
     fs = _filesystem(args.registry, args.region, anonymous=args.anonymous)
     table = _registry_table(fs, args.registry, "parts", dataset_schema())
+    violating, checked_rows = registry_rebuild.basis_violations(table)
+    print(
+        f"basis: {checked_rows - violating:,} of {checked_rows:,} measured rows satisfy "
+        "refused_no_optical_px == eligible_px - px_with_any_optical"
+    )
+    if violating:
+        print(f"\nFAILED — {violating:,} measured rows break the identity every re-derivation rests on")
+        return 1
     cells = _cells(table, args.zones)
     measured = [
         (cell, [row for row in rows if row.get("chunk_px") is not None]) for cell, rows in sorted(cells.items())

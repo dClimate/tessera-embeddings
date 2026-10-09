@@ -8,6 +8,7 @@ the drift guard against ``actors._coverage_record``, and the gate's verdicts.
 from __future__ import annotations
 
 import numpy as np
+import pyarrow as pa
 import pytest
 import zarr
 
@@ -201,6 +202,24 @@ class TestCompareRow:
         verdict, differences = rb.compare_row(rebuilt, self._recorded(px_with_any_radar=99))
         assert verdict == "mismatch"
         assert any("px_with_any_radar" in d for d in differences)
+
+
+@pytest.mark.parametrize(
+    ("no_optical", "violating"),
+    [(2, 0), (1, 1)],
+    ids=["optical-test-is-obs-gt-0", "reflectance-term-removed-a-pixel"],
+)
+def test_basis_violations_counts_measured_rows_that_break_the_identity(no_optical: int, violating: int) -> None:
+    """The registry-only check the gate runs before reading a pixel; an unmeasured row is not a violation."""
+    table = pa.table(
+        {
+            "chunk_px": [6, None],
+            "eligible_px": [6, None],
+            "px_with_any_optical": [4, None],
+            "refused_no_optical_px": [no_optical, None],
+        }
+    )
+    assert rb.basis_violations(table) == (violating, 1)
 
 
 class TestTileAddressing:

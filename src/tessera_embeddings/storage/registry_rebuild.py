@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from tessera_embeddings.config.store_layout import SHARD_PX
@@ -154,6 +155,21 @@ def measurements_from_obs(
         "px_with_any_radar": radar,
         "radar_rule_enforced": False,
     }
+
+
+def basis_violations(table: pa.Table) -> tuple[int, int]:
+    """``(violating, measured)``: measured rows where the fill's optical test was not ``obs > 0``.
+
+    The rebuild's whole basis, checked from the registry alone. A measured row satisfies
+    ``refused_no_optical_px == eligible_px - px_with_any_optical`` exactly when the fill's
+    reflectance term never removed a pixel; one row that does not means ``s2_obs_count`` cannot
+    reproduce that row's split, and no re-derivation from the store should be trusted until it is
+    explained. Every measured row is checked, not a sample: it costs no store reads.
+    """
+    measured = table.filter(pc.is_valid(table.column("chunk_px")))
+    expected = pc.subtract(measured.column("eligible_px"), measured.column("px_with_any_optical"))
+    agree = pc.fill_null(pc.equal(measured.column("refused_no_optical_px"), expected), False)
+    return measured.num_rows - int(pc.sum(agree).as_py() or 0), measured.num_rows
 
 
 def compare_row(rebuilt: Mapping[str, Any], recorded: Mapping[str, Any]) -> tuple[str, list[str]]:
