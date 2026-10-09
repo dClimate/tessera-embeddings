@@ -1228,3 +1228,115 @@ class TestAPartialCoverageTileCannotWedgeACell:
         """
         writer = ZarrWriter(str(tmp_path / "staging"))
         writer.discard_coverage(_chunk(4, 4), "run1")  # must not raise
+
+
+class TestTheEmbeddedHalfOfTheRecord:
+    """The same record, for a shard that DID embed something, persisted so it survives a resume.
+
+    A refused shard's record goes into its skip marker on object storage and is still there after
+    the process that measured it is gone. An embedded shard's used to ride back in the actor's Ray
+    result and nowhere else, so the leg that finished a resumed run — which reports earlier legs'
+    tiles as synthetic successes — had nothing to publish for them. That is how 1,519,045 of the
+    published registry's 3,247,410 rows came to carry null in every measurement column.
+    """
+
+    def _write(self, tmp_path: Path, chunk: ChunkSpec, coverage: dict | None) -> ZarrWriter:
+        writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=4)
+        writer.write_chunk(
+            chunk,
+            np.zeros((chunk.height, chunk.width, 4), dtype=np.int8),
+            "run1",
+            scales=np.ones((chunk.height, chunk.width), dtype=np.float32),
+            coverage=coverage,
+        )
+        return writer
+
+    def test_the_record_is_persisted_onto_the_staged_tile(self, tmp_path: Path) -> None:
+        chunk = _chunk(0, 0)
+        writer = self._write(tmp_path, chunk, _record("chunk_0_0", thin=5, obs_max=9))
+        staged = zarr.open_group(f"{writer.staging_base}/run1/{chunk.label}.zarr", mode="r")
+        assert staged.attrs["coverage"]["refused"]["thin"] == 5
+
+    def test_a_write_with_no_record_leaves_no_attribute(self, tmp_path: Path) -> None:
+        """Absent means "this fill did not measure one", which a resume across the change must allow."""
+        chunk = _chunk(0, 0)
+        writer = self._write(tmp_path, chunk, None)
+        staged = zarr.open_group(f"{writer.staging_base}/run1/{chunk.label}.zarr", mode="r")
+        assert "coverage" not in staged.attrs
+
+    def test_reading_recovers_what_the_actor_measured(self, tmp_path: Path) -> None:
+        chunk = _chunk(1, 2)
+        writer = self._write(tmp_path, chunk, _record(chunk.label, no_optical=3))
+        records, unreadable = _assembly_mod.read_staged_coverage(writer.staging_base, "run1", [chunk.label])
+        assert unreadable == 0
+        assert records[chunk.label]["refused"]["no_optical"] == 3
+
+    def test_a_tile_that_is_not_there_is_ordinary_rather_than_unreadable(self, tmp_path: Path) -> None:
+        """A label with no staged tile yields no entry and no alarm — the same contract the skip
+        markers have, so a resume across a code change still assembles.
+        """
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        records, unreadable = _assembly_mod.read_staged_coverage(writer.staging_base, "run1", ["chunk_9_9"])
+        assert (records, unreadable) == ({}, 0)
+
+    def test_no_labels_reads_nothing(self, tmp_path: Path) -> None:
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        assert _assembly_mod.read_staged_coverage(writer.staging_base, "run1", []) == ({}, 0)
+
+    def test_a_failing_read_is_counted_rather_than_swallowed(self, tmp_path: Path, monkeypatch) -> None:
+        """Nothing recorded and every read failing are the same empty dict and mean opposite things."""
+        chunk = _chunk(0, 0)
+        writer = self._write(tmp_path, chunk, _record(chunk.label, thin=1))
+
+        def _boom(_path: str) -> object:
+            raise OSError("S3 500")
+
+        monkeypatch.setattr(_assembly_mod, "_open_staged_tile", _boom)
+        records, unreadable = _assembly_mod.read_staged_coverage(writer.staging_base, "run1", [chunk.label])
+        assert (records, unreadable) == ({}, 1)
+
+
+class TestToppingUpTheRecords:
+    """What the assembly publishes when a resumed leg's results carry no coverage."""
+
+    def _staged(self, tmp_path: Path, labels: list[str]) -> ZarrWriter:
+        writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=4)
+        for label in labels:
+            row, col = (int(part) for part in label.split("_")[1:])
+            chunk = _chunk(row, col)
+            writer.write_chunk(
+                chunk,
+                np.zeros((8, 8, 4), dtype=np.int8),
+                "run1",
+                scales=np.ones((8, 8), dtype=np.float32),
+                coverage=_record(label, thin=row + 1),
+            )
+        return writer
+
+    def test_a_label_with_no_record_is_filled_from_its_staged_tile(self, tmp_path: Path) -> None:
+        writer = self._staged(tmp_path, ["chunk_0_0", "chunk_1_0"])
+        topped = writer._top_up_embedded_records("run1", ["chunk_0_0", "chunk_1_0"], {})
+        assert sorted(topped) == ["chunk_0_0", "chunk_1_0"]
+        assert topped["chunk_1_0"]["refused"]["thin"] == 2
+
+    def test_a_record_the_run_already_has_is_not_replaced(self, tmp_path: Path) -> None:
+        """This leg measured the tile itself; re-reading it would be a round trip for nothing."""
+        writer = self._staged(tmp_path, ["chunk_0_0"])
+        existing = {"chunk_0_0": _record("chunk_0_0", thin=99)}
+        topped = writer._top_up_embedded_records("run1", ["chunk_0_0"], existing)
+        assert topped["chunk_0_0"]["refused"]["thin"] == 99
+
+    def test_nothing_missing_reads_nothing(self, tmp_path: Path, monkeypatch) -> None:
+        """A run that staged everything itself must not pay a listing it has no use for."""
+        writer = ZarrWriter(str(tmp_path / "staging"))
+
+        def _never(*_args: object, **_kwargs: object) -> object:
+            raise AssertionError("read_staged_coverage must not be called when nothing is missing")
+
+        monkeypatch.setattr(_assembly_mod, "read_staged_coverage", _never)
+        assert writer._top_up_embedded_records("run1", ["chunk_0_0"], {"chunk_0_0": {}}) == {"chunk_0_0": {}}
+
+    def test_a_tile_nothing_can_measure_still_publishes_a_null_row(self, tmp_path: Path) -> None:
+        """Recovery is best-effort: a label with no record anywhere must not raise, it must publish null."""
+        writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=4)
+        assert writer._top_up_embedded_records("run1", ["chunk_7_7"], {}) == {}

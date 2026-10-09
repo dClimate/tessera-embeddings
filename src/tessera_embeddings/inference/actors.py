@@ -1240,6 +1240,11 @@ class InferenceActor:
                         scales=scales,
                         obs_counts=obs_buffers,
                         month_covered=month_buffers,
+                        # PERSISTED WITH THE TILE, not only returned in this result. A resumed leg
+                        # never sees the result, and that is why half the published registry's rows
+                        # carry no measurements — a refused chunk's identical record survives
+                        # because it goes into the skip marker.
+                        coverage=coverage,
                     )
                     # One line per chunk: how long the backgrounded upload took. The phase table's write_s is ~0 by
                     # design, so this is the off-critical-path cost, for post-run upload health checks.

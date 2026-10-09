@@ -243,19 +243,16 @@ own schemas rather than extending the registry's writer.
 
 ## Stopping it happening again
 
-The rebuild repairs what is published; it does not stop the next resumed fill from leaving the same
-gap. Two pieces close that, and only the second is part of the backfill.
+The rebuild repairs what is published; two pieces stop the next resumed fill from leaving the same
+gap.
 
-**The durable fix is a separate decision.** Branch `registry/persist-coverage-record` makes
-`write_chunk` persist the coverage record as a tile attribute, written with `staged_complete` and
-therefore before `.done`, and has `assemble_global` read it back from the staged tiles for any label
-that arrived without one — the embedded path then persists its record exactly as the refused path
-always has. Because `inference_code_identity` hashes the whole inference package, that change
-**moves the identity**, so a fill on the new code re-stages rather than resuming into a prefix
-staged by the old. `ingest_code_identity` does not move, so no mosaic's append identity changes.
-Whether that cost is worth paying now, or at the next store boundary, depends on what is staged at
-the time; see [`staging-identity-and-resume.md`](staging-identity-and-resume.md). Nothing in the
-backfill depends on it.
+**The embedded path persists its record.** `write_chunk` writes the coverage record as a tile
+attribute, with `staged_complete` and therefore before `.done`, and `assemble_global` reads it back
+from the staged tiles for any label that arrived without one, so the embedded path persists its
+record exactly as the refused path always has. Because `inference_code_identity` hashes the whole
+inference package, that change **moved the identity**: a fill on this code re-stages rather than
+resuming into a prefix staged by earlier code. `ingest_code_identity` did not move, so no mosaic's
+append identity changed. See [`staging-identity-and-resume.md`](staging-identity-and-resume.md).
 
 **The gap is now visible.** `scripts/diagnostic/published_registry_census.py` counts rows with no
 measurements, per cell and in total, and fails above `--max-unmeasured` — zero by default. It counts

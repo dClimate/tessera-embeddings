@@ -777,6 +777,8 @@ is recorded as its own signal, *after* the store is fully written:
                     ↓
                 ds.to_zarr(…, mode="w")           many objects, no atomic commit
                     ↓
+                coverage = {…}                    this shard's refusal reasons and depth
+                    ↓
                 staged_complete = True            in-store attribute
                     ↓
                 <label>.done  (zero bytes)        sibling object, written LAST
@@ -787,6 +789,35 @@ is recorded as its own signal, *after* the store is fully written:
 The marker is retracted *before* the rewrite, not after: `to_zarr` replaces a tile in
 place, so a marker left from an earlier write would keep vouching for the tile throughout,
 and a listing taken in that window would call a half-replaced tile complete.
+
+#### The coverage record rides on the tile, not on the result
+
+A shard's coverage record — its three refusal counts, its optical depth statistics and whether
+either radar orbit saw it — is what fills the published registry's measurement columns. A **refused**
+shard writes it into its `.skipped` marker, where it outlives the process that measured it. An
+**embedded** shard used to return it in the actor's Ray result and nowhere else, and that asymmetry
+had a consequence nothing detected:
+
+```text
+  refused shard   ── record ──▶ <label>.skipped      on S3, survives every resume
+  embedded shard  ── record ──▶ Ray result ──▶ RAM   ✗ gone the moment a leg ends
+```
+
+A resumed run's finishing leg reports earlier legs' tiles as **synthetic successes** carrying no
+record, so their registry rows published with every measurement column null. In the global campaign
+that was 1,519,045 of 3,247,410 rows — every wholly-refused tile measured, only about half the
+embedded ones.
+
+`write_chunk` now persists the record as a tile attribute, written with `staged_complete` and
+therefore before `.done`, so the completion marker keeps vouching for a tile whose attributes are
+already set. `read_staged_coverage` is the embedded half of `read_skip_records` — concurrent,
+fail-soft, counting unreadable objects rather than swallowing them — and `assemble_global` tops up
+the records it was handed from the staged tiles before the write. A run that staged everything
+itself reads nothing at all.
+
+The rows already published this way are repairable rather than lost, because every column is
+derivable from the store: `scripts/maintenance/rebuild_registry_measurements.py`, documented in
+[`context_docs/storage/registry-backfill.md`](../../../context_docs/storage/registry-backfill.md).
 
 **The gate is the listing.** A sibling `.done` object is something a prefix LIST can see, so one
 listing classifies every tile in a run without opening any of them — which is what keeps
