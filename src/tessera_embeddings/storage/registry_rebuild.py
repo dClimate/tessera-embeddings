@@ -209,6 +209,8 @@ def compare_row(rebuilt: Mapping[str, Any], recorded: Mapping[str, Any]) -> tupl
             continue
         if got is None and want is None:
             continue
+        # A recorded null against a re-derived value is a mismatch on purpose, even if a part predates
+        # the column: every published part carries every column, and a false stop is loud and cheap.
         if got is None or want is None or not _equal(got, want):
             differences.append(f"{column}: rebuilt {got!r} != recorded {want!r}")
     return ("match" if not differences else "mismatch"), differences
