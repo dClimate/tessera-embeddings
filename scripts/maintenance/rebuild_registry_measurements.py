@@ -85,9 +85,9 @@ DEFAULT_REGION = "us-west-2"
 
 #: Measured tiles re-derived per cell before that cell's null tiles are written. Only tiles that saw
 #: some optical count: in 122 of the 162 partly measured cells every measured tile is a wholly
-#: refused one, often never imaged, whose shard is absent and "reproduces" trivially. 95 partly
-#: measured cells hold a tile worth checking; the other 67, and the 299 with no measured tile at all,
-#: lean on `gate`.
+#: refused one, often never imaged, whose shard is absent and "reproduces" trivially. 87 partly
+#: measured cells hold an uncropped tile worth checking; the other 75, and the 299 with no measured
+#: tile at all, lean on `gate`.
 IN_CELL_GATE_TILES = 64
 
 #: Concurrent tile reads per process. Each tile is one GET of ~0.5 MB per array; from a laptop the
