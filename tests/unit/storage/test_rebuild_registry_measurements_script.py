@@ -191,6 +191,24 @@ class TestVerify:
         pq.write_table(pa.Table.from_pylist(rows, schema=master_schema()), target)
         assert script.main(["verify", "--registry", str(tmp_path)]) == 1
 
+    def test_a_master_compacted_before_a_later_rebuild_pass_fails(self, script: Any, tmp_path: Path) -> None:
+        """Every row is present and labelled, so only a comparison with a fresh merge can see it is stale."""
+        _seed(tmp_path)
+        script.main(["compact", "--registry", str(tmp_path), "--write"])
+        radar = _row(
+            rebuild_schema(),
+            "chunk_1_0",
+            measured=True,
+            stamp="2026-09-22T00:00:00+00:00",
+            run="rebuild-2",
+            eligible_px=None,
+            px_with_any_radar=123,
+            filled_at="2026-08-01T00:00:00+00:00",
+        )
+        cell = tmp_path / "rebuild" / "zone=33N" / "year=2017"
+        pq.write_table(pa.Table.from_pylist([radar], schema=rebuild_schema()), cell / "rebuild-2.parquet")
+        assert script.main(["verify", "--registry", str(tmp_path)]) == 1
+
     def test_a_missing_row_fails(self, script: Any, tmp_path: Path) -> None:
         _seed(tmp_path)
         script.main(["compact", "--registry", str(tmp_path), "--write"])

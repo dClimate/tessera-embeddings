@@ -23,12 +23,14 @@ is how that stays true rather than remembered: it re-derives rows that already c
 and demands they match.
 
 **What this deliberately does not recover.** ``eligible_px`` is the footprint the fill's reasons
-were counted over, and it shrinks when the read plan cropped a chunk in x. The crop lives in the
-read plan, not in the store, and the obs arrays are written at full chunk width regardless — so it
-is not derivable here and is left **null**, which is the registry's own word for "not measured".
-Rebuilt counts are therefore over the whole tile. The gap is small and bounded: 237 of 1,728,365
-measured rows (0.014%) have ``eligible_px < chunk_px``. :func:`compare_row` reports such tiles as
-``cropped`` rather than as mismatches, because a rebuild of one is expected to differ.
+were counted over, and it shrinks when the read plan cropped a chunk in x — to the columns holding
+any S2 observation, when that box is at most 90% of the width (``read_plan._chunk_read_plan``). That
+box is reproducible from the stored ``s2_obs_count``: it reproduces ``eligible_px`` on all 237
+cropped measured rows. Rebuilt rows nonetheless leave it **null** — the registry's own word for "not
+measured" — and count over the whole tile, by decision; applying the crop here is the open
+alternative. The gap is small and bounded: 237 of 1,728,365 measured rows (0.014%) have
+``eligible_px < chunk_px``. :func:`compare_row` reports such tiles as ``cropped`` rather than as
+mismatches, because a rebuild of one is expected to differ.
 """
 
 from __future__ import annotations
@@ -141,7 +143,7 @@ def measurements_from_obs(
             )
         radar = int(((s1_asc > 0) | (s1_desc > 0)).sum())
     return {
-        # NOT DERIVABLE — the read plan's crop is not in the store. See the module docstring.
+        # Left null by decision, though the crop is reproducible. See the module docstring.
         "eligible_px": None,
         "chunk_px": int(s2_obs.size),
         "refused_px": sum(counted.values()),
@@ -238,6 +240,9 @@ def tile_window(tile: str, shape: Sequence[int], *, shard_px: int = SHARD_PX) ->
     """
     row, col = parse_tile_label(tile)
     y0, x0 = row * shard_px, col * shard_px
+    # A negative or off-grid label would slice an empty or wrapped window and "measure" it as a tile.
+    if row < 0 or col < 0 or y0 >= int(shape[1]) or x0 >= int(shape[2]):
+        raise ValueError(f"{tile!r} lies outside an array of shape {tuple(shape)}")
     return y0, min(y0 + shard_px, int(shape[1])), x0, min(x0 + shard_px, int(shape[2]))
 
 

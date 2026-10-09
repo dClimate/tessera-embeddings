@@ -35,8 +35,9 @@ that is what :func:`~.registry_rebuild.compare_row` gates on — but where a fil
 measurement, that measurement stands. So:
 
 1. a fill row carrying measurements beats everything;
-2. otherwise the most recent rebuild row carrying measurements wins, which is how a later pass
-   that adds ``px_with_any_radar`` supersedes an earlier optical-only one;
+2. otherwise a rebuild row carrying measurements — one that measured radar ahead of an
+   optical-only one, then the most recent — which is how the radar pass supersedes the optical-only
+   pass and why a later optical-only retry cannot undo it;
 3. otherwise the most recent row of any kind, which keeps a tile that nothing has measured in the
    master as a null row rather than dropping it.
 
@@ -177,9 +178,12 @@ def _winning_rows(table: pa.Table) -> list[int]:
 
     measured = np.asarray(pc.is_valid(table.column(MEASURED_SENTINEL)).to_pylist(), dtype=bool)
     by_fill = np.asarray([value == MEASURED_BY_FILL for value in table.column("measured_by").to_pylist()], dtype=bool)
-    # 0 beats 1 beats 2. A measured fill row is authoritative; a measured rebuild row fills a gap;
-    # an unmeasured row of either kind keeps the tile present and says nothing about it.
-    rank = np.where(measured & by_fill, 0, np.where(measured, 1, 2))
+    # 0 beats 1 beats 2 beats 3. A measured fill row is authoritative; a measured rebuild row fills a
+    # gap, one that measured radar ahead of an optical-only one whatever their order, so a later
+    # `--skip-radar` retry cannot null a radar column a full pass already landed; an unmeasured row
+    # of either kind keeps the tile present and says nothing about it.
+    radar = np.asarray(pc.is_valid(table.column("px_with_any_radar")).to_pylist(), dtype=bool)
+    rank = np.where(measured & by_fill, 0, np.where(measured & radar, 1, np.where(measured, 2, 3)))
     stamp = np.array([value or "" for value in table.column("assembled_at").to_pylist()])
 
     order = np.lexsort((_descending(stamp), rank, key))

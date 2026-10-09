@@ -68,9 +68,14 @@ implementations of one record is how two registry rows stop being comparable.
 ### `eligible_px` is left null, on purpose
 
 It is the footprint the fill's reasons were counted over, and it shrinks when the read plan cropped
-a chunk in x. The crop lives in the read plan, not in the store, and the obs arrays are written at
-full chunk width regardless — so it is not derivable and a rebuilt row leaves it null, which is the
-registry's own word for "not measured". Rebuilt counts are therefore over the whole tile.
+a chunk in x: to the columns holding any S2 observation, when that box is at most 90% of the width
+(`read_plan._chunk_read_plan`). The obs arrays are written at full width regardless, but the box is
+reproducible from the stored `s2_obs_count` — the rule reproduces `eligible_px` exactly on all 237
+cropped measured rows, and predicts no crop on 200 sampled uncropped rows with partial optical
+coverage. A rebuilt row nonetheless leaves `eligible_px` null, the registry's own word for "not
+measured", and counts over the whole tile. Applying the crop instead is a small change to
+`measurements_from_obs` and an open decision; until it is taken, a rebuilt row for a cropped tile
+counts its never-imaged columns as `refused_no_optical_px`.
 
 The gap is small and bounded: **237 of 1,728,365 measured rows (0.014%)** have
 `eligible_px < chunk_px`, 157 of them in 2017. `compare_row` reports such a tile as `cropped`
@@ -103,8 +108,9 @@ published cell has two runs today; every future refill will.
 rebuild re-derived them afterwards. Where a fill recorded a measurement, that measurement stands:
 
 1. a fill row carrying measurements beats everything;
-2. otherwise the most recent rebuild row carrying measurements — which is how a later pass adding
-   `px_with_any_radar` supersedes an earlier optical-only one;
+2. otherwise a rebuild row carrying measurements — one that measured radar ahead of an optical-only
+   one, then the most recent — so the radar pass supersedes the optical-only pass and a later
+   optical-only retry cannot undo it;
 3. otherwise the most recent row of any kind, so a tile nothing has measured stays in the master as
    a null row rather than disappearing.
 
@@ -124,7 +130,7 @@ writing subcommand is a **dry run** without `--write`.
 gate      re-derive rows that ALREADY carry measurements and compare. Writes nothing, ever.
 rebuild   re-derive the null rows into rebuild/, one part per cell
 compact   merge parts/ + rebuild/ into master/
-verify    check master/ against its invariants and against parts/
+verify    check master/ against its invariants, against parts/, and against a fresh merge
 ```
 
 **The gate is the precondition, and it is checkable at scale rather than sampled on faith**: 1.73
@@ -247,7 +253,7 @@ backfill depends on it.
 
 **The gap is now visible.** `scripts/diagnostic/published_registry_census.py` counts rows with no
 measurements, per cell and in total, and fails above `--max-unmeasured` — zero by default. It counts
-over `master/` once one exists and over `parts/` before that, so it fails on the published registry
-until the backfill is compacted. The campaign finished green with half its coverage record absent
-because every other check asks whether the rows are shaped right and none asked whether they hold
-numbers.
+over `master/` once one exists — and fails a master short of the newest runs' tile-years — and over
+`parts/` before that, so it fails on the published registry until the backfill is compacted. The
+campaign finished green with half its coverage record absent because every other check asks whether
+the rows are shaped right and none asked whether they hold numbers.

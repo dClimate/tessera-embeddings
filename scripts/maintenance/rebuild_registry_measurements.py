@@ -143,9 +143,12 @@ def _cells(table: pa.Table, zones: list[str]) -> dict[tuple[str, int], list[dict
 
     ``zones`` is applied in Arrow, before rows become Python dicts: the whole registry as dicts is
     ~6.7 GB of memory, so a run split across processes by ``--zones`` holds only its own share.
+    Only each cell's newest fill run is kept — the run the store holds and the compaction keeps — so
+    a refilled cell is neither gated against an older run's numbers nor rebuilt under its rule.
     """
     if zones:
         table = table.filter(pc.is_in(table.column("zone"), value_set=pa.array(zones)))
+    table = newest_fill_runs(table)
     grouped: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
     for row in table.to_pylist():
         grouped[(row["zone"], int(row["year"]))].append(row)
@@ -423,14 +426,31 @@ def _rebuild_dataset_schema() -> pa.Schema:
     return pa.schema([*rebuild_schema(), pa.field("zone", pa.string()), pa.field("year", pa.int32())])
 
 
+def _columns_differing(master: pa.Table, fresh: pa.Table) -> list[str]:
+    """Columns where the published master and a fresh merge disagree, row for row.
+
+    Catches what the invariants cannot: a master compacted before a later rebuild pass landed, or a
+    rebuilt value altered after it was written, both of which leave every row present and labelled.
+    """
+    if master.num_rows != fresh.num_rows:
+        return ["row count"]
+    keys = [("zone", "ascending"), ("year", "ascending"), ("tile", "ascending")]
+    master, fresh = master.sort_by(keys), fresh.sort_by(keys)
+    return [name for name in master_schema().names if not master.column(name).equals(fresh.column(name))]
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
-    """Check the published master against its own invariants and against ``parts/``."""
+    """Check the published master against its invariants, against ``parts/``, and against a fresh merge."""
     fs = _filesystem(args.registry, args.region, anonymous=args.anonymous)
     parts = _registry_table(fs, args.registry, "parts", dataset_schema())
     master = _registry_table(fs, args.registry, "master", master_schema())
+    rebuilt = _registry_table(fs, args.registry, "rebuild", _rebuild_dataset_schema(), optional=True)
     expected = newest_fill_runs(parts).group_by(["zone", "year", "tile"]).aggregate([]).num_rows
     failures = invariant_failures(master, expected_rows=expected)
     altered = fill_rows_unchanged(master, parts, REBUILT_COLUMNS)
+    stale = _columns_differing(master, merge(parts, rebuilt))
+    if stale:
+        failures.append(f"master differs from a fresh merge of parts/ and rebuild/ in {stale} — re-run compact")
     print(f"master {master.num_rows} rows against {parts.num_rows} part rows ({expected} distinct tile-years)")
     unmeasured = sum(1 for tag in master.column("measured_by").to_pylist() if tag is None)
     from_fill = sum(1 for tag in master.column("measured_by").to_pylist() if tag == MEASURED_BY_FILL)

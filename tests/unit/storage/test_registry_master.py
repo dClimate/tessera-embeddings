@@ -101,6 +101,16 @@ class TestPrecedence:
         assert master.num_rows == 1
         assert master.column("px_with_any_radar").to_pylist() == [123]
 
+    def test_a_later_optical_only_retry_does_not_undo_the_radar_pass(self) -> None:
+        parts = _parts([_row("chunk_0_0", measured=False, stamp="2026-08-01T00:00:00+00:00")])
+        rebuilt = _rebuilt(
+            [
+                _row("chunk_0_0", measured=True, stamp="2026-09-21T00:00:00+00:00", px_with_any_radar=123),
+                _row("chunk_0_0", measured=True, stamp="2026-09-22T00:00:00+00:00", px_with_any_radar=None),
+            ]
+        )
+        assert merge(parts, rebuilt).column("px_with_any_radar").to_pylist() == [123]
+
     def test_a_cell_filled_twice_resolves_to_its_later_fill(self) -> None:
         """Parts are keyed by run so a refill ADDS a part; dedup was always the compaction's job."""
         parts = _parts(

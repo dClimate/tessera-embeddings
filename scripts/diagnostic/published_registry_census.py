@@ -43,7 +43,7 @@ if TYPE_CHECKING:
 from tessera_embeddings.storage import published_store, zone_grid
 from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.registry import dataset_schema, registry_schema
-from tessera_embeddings.storage.registry_master import master_schema
+from tessera_embeddings.storage.registry_master import master_schema, newest_fill_runs
 
 DEFAULT_STORE = "s3://tessera-embeddings/v1.1/dclimate.icechunk"
 DEFAULT_REGISTRY = "s3://tessera-embeddings/v1.1/dclimate.registry"
@@ -220,6 +220,16 @@ def _read_dataset(fs: pyarrow.fs.FileSystem, root: str, *, with_schema: bool) ->
     }
 
 
+def _consumer_view(fs: pyarrow.fs.FileSystem, root: str) -> tuple[str, Any, bool]:
+    """``(prefix, schema, compacted)`` for what a consumer reads: ``master/`` once one exists, else ``parts/``."""
+    from pyarrow.fs import FileType
+
+    base = root.removeprefix("s3://").rstrip("/")
+    if fs.get_file_info(f"{base}/master").type == FileType.Directory:
+        return f"{base}/master", master_schema(), True
+    return f"{base}/parts", dataset_schema(), False
+
+
 def _completeness(fs: pyarrow.fs.FileSystem, root: str) -> dict[str, Any]:
     """How much of the registry actually carries measurements, per cell and in total.
 
@@ -238,15 +248,21 @@ def _completeness(fs: pyarrow.fs.FileSystem, root: str) -> dict[str, Any]:
     the embedded side is the signature of that asymmetry rather than of a broken writer.
 
     Counted over the compacted ``master/`` once one exists, since that is what consumers read and
-    ``parts/`` keeps its null rows forever by design; over ``parts/`` before then.
+    ``parts/`` keeps its null rows forever by design; over ``parts/`` before then. A master is only
+    trusted if it holds a row for every tile-year of the newest fill runs: ``compact`` rewrites it in
+    place, so an interrupted one can leave it short, and a short master has no null rows to count.
     """
     import pyarrow.compute as pc
     import pyarrow.dataset as ds
-    from pyarrow.fs import FileType
 
-    base = root.removeprefix("s3://").rstrip("/")
-    compacted = fs.get_file_info(f"{base}/master").type == FileType.Directory
-    prefix, schema = (f"{base}/master", master_schema()) if compacted else (f"{base}/parts", dataset_schema())
+    prefix, schema, compacted = _consumer_view(fs, root)
+    expected = None
+    if compacted:
+        parts_prefix = prefix.rsplit("/", 1)[0] + "/parts"
+        parts = ds.dataset(parts_prefix, filesystem=fs, partitioning="hive", schema=dataset_schema()).to_table(
+            columns=["zone", "year", "tile", "run_id", "assembled_at"]
+        )
+        expected = newest_fill_runs(parts).group_by(["zone", "year", "tile"]).aggregate([]).num_rows
     started = time.monotonic()
     dataset = ds.dataset(prefix, filesystem=fs, partitioning="hive", schema=schema)
     table = dataset.to_table(columns=["zone", "year", "embedded", "chunk_px"])
@@ -264,6 +280,7 @@ def _completeness(fs: pyarrow.fs.FileSystem, root: str) -> dict[str, Any]:
         "wall_s": round(time.monotonic() - started, 2),
         "prefix": prefix.rsplit("/", 1)[1],
         "rows": table.num_rows,
+        "rows_expected": expected,
         "rows_without_measurements": total_unmeasured,
         "fraction_without_measurements": round(total_unmeasured / table.num_rows, 6) if table.num_rows else 0.0,
         "unmeasured_rows_that_are_embedded": sum(
@@ -288,8 +305,8 @@ def _aoi_query(
     import pyarrow.dataset as ds
 
     west, south, east, north = aoi
-    prefix = root.removeprefix("s3://").rstrip("/") + "/parts"
-    dataset = ds.dataset(prefix, filesystem=fs, partitioning="hive", schema=dataset_schema())
+    prefix, schema, compacted = _consumer_view(fs, root)
+    dataset = ds.dataset(prefix, filesystem=fs, partitioning="hive", schema=schema)
     started = time.monotonic()
     table = dataset.to_table(
         filter=(pc.field("year") == year)
@@ -320,7 +337,9 @@ def _aoi_query(
     by_cell: dict[tuple[str, int], list[dict[str, Any]]] = {}
     for row in raw:
         by_cell.setdefault((str(row["zone"]), int(row["year"] or year)), []).append(row)
-    rows = [r for cell_rows in by_cell.values() for r in _newest_run(cell_rows)]
+    # A master already holds one row per tile-year, and its rebuilt rows carry a rebuild run id that
+    # run selection would mistake for a refill.
+    rows = raw if compacted else [r for cell_rows in by_cell.values() for r in _newest_run(cell_rows)]
     embedded = [r["embedded"] for r in rows]
     refused = [r["refused_px"] for r in rows if r["refused_px"] is not None]
     # Malformed timestamps have to reach the REPORT, not just the run selection: `_newest_run` can
@@ -630,8 +649,15 @@ def main(argv: list[str] | None = None) -> int:
         f"partly {len(complete['cells_partly_unmeasured'])}, fully measured {complete['cells_fully_measured']}"
     )
     # Counts, not the rounded fraction: one null row in 3.2 M rounds to 0.0 and would pass a zero threshold.
-    incomplete = complete["rows_without_measurements"] > args.max_unmeasured * complete["rows"]
-    if incomplete:
+    above = complete["rows_without_measurements"] > args.max_unmeasured * complete["rows"]
+    short = complete["rows_expected"] is not None and complete["rows"] != complete["rows_expected"]
+    incomplete = above or short
+    if short:
+        print(
+            f"  master/ holds {complete['rows']:,} rows against {complete['rows_expected']:,} tile-years in the "
+            "newest fill runs — a partial or stale compaction; re-run compact"
+        )
+    if above:
         print(
             f"  ABOVE THE THRESHOLD ({args.max_unmeasured:.1%}) — every column is derivable from the store, so "
             "this is repairable: scripts/maintenance/rebuild_registry_measurements.py"

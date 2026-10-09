@@ -236,6 +236,11 @@ class TestTileAddressing:
         with pytest.raises(ValueError, match="chunk_<row>_<col>"):
             rb.parse_tile_label("tile_1_2")
 
+    @pytest.mark.parametrize("tile", ["chunk_-1_0", "chunk_0_4", "chunk_4_0"])
+    def test_a_label_off_the_grid_raises_rather_than_measuring_an_empty_window(self, tile: str) -> None:
+        with pytest.raises(ValueError, match="outside"):
+            rb.tile_window(tile, (9, 8192, 8192))
+
 
 class TestReadingTheStore:
     """Reading a real (small) store, so the window and year arithmetic is exercised end to end."""
