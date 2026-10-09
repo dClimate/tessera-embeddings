@@ -27,6 +27,15 @@ Run from the REPOSITORY ROOT::
     uv run python scripts/maintenance/rebuild_registry_measurements.py compact --write
     uv run python scripts/maintenance/rebuild_registry_measurements.py verify
 
+**Rehearsing needs no credentials.** ``--anonymous`` reads the public store and registry unsigned,
+and a non-``s3://`` ``--registry`` is the local filesystem, so a downloaded copy of ``parts/`` takes
+every subcommand end to end — ``rebuild --write`` and ``compact --write`` included — without
+touching the bucket.
+
+**One process saturates at three to four cores**, because the per-tile work holds the GIL for part
+of its time. A full pass on a bigger host runs several processes over disjoint ``--zones`` lists;
+``--zones`` is applied before rows are materialised, so each holds only its own share in memory.
+
 **The radar column is a second pass by design.** ``px_with_any_radar`` needs both Sentinel-1
 observation-count arrays, which triples the bytes moved for one informational column. Run
 ``rebuild --skip-radar`` first to land the optical answer, then ``rebuild`` in full; the later
@@ -74,12 +83,15 @@ DEFAULT_STORE = "s3://tessera-embeddings/v1.1/dclimate.icechunk"
 DEFAULT_REGISTRY = "s3://tessera-embeddings/v1.1/dclimate.registry"
 DEFAULT_REGION = "us-west-2"
 
-#: Measured tiles re-derived per cell before that cell's null tiles are written. Every cell that
-#: CAN check itself does; the 299 cells with no measured tile at all cannot, and lean on `gate`.
+#: Measured tiles re-derived per cell before that cell's null tiles are written. Only tiles that saw
+#: some optical count: in 122 of the 162 partly measured cells every measured tile is a wholly
+#: refused one, often never imaged, whose shard is absent and "reproduces" trivially. 95 partly
+#: measured cells hold a tile worth checking; the other 67, and the 299 with no measured tile at all,
+#: lean on `gate`.
 IN_CELL_GATE_TILES = 64
 
-#: Concurrent tile reads within a cell. A tile is one shard and one object, so this is the only
-#: dial that matters for wall clock.
+#: Concurrent tile reads per process. Each tile is one GET of ~0.5 MB per array; from a laptop the
+#: link is the limit, in-region the CPU is (see the module docstring on splitting by --zones).
 DEFAULT_CONCURRENCY = 32
 
 
@@ -282,10 +294,14 @@ def cmd_rebuild(args: argparse.Namespace) -> int:
             continue
         rule = int(targets[0]["optical_min_obs"])
 
-        # SELF-CHECK FIRST. A cell that holds measured tiles can prove the rebuild reproduces its
-        # own geometry and rule before a single re-derived row is written for it.
+        # SELF-CHECK FIRST. A cell that holds measured tiles with optical in them can prove the
+        # rebuild reproduces its own geometry and rule before a single re-derived row is written.
         known = [
-            row for row in rows if row.get("chunk_px") is not None and row.get("eligible_px") == row.get("chunk_px")
+            row
+            for row in rows
+            if row.get("chunk_px") is not None
+            and row.get("eligible_px") == row.get("chunk_px")
+            and row.get("px_with_any_optical")
         ]
         if known and not args.no_in_cell_gate:
             sample = known if len(known) <= IN_CELL_GATE_TILES else rng.sample(known, IN_CELL_GATE_TILES)
