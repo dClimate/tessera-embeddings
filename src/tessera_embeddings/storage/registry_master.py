@@ -104,7 +104,11 @@ def merge(parts: pa.Table, rebuilt: pa.Table | None = None) -> pa.Table:
     and the only version that fails cleanly.
     """
     schema = master_schema()
-    tables = [_tagged(_aligned(parts, schema), MEASURED_BY_FILL)]
+    fill = _aligned(parts, schema)
+    # A fill part's own stamp IS when its cell was filled, so every master row answers that question.
+    index = schema.get_field_index("filled_at")
+    fill = fill.set_column(index, "filled_at", pc.coalesce(fill.column(index), fill.column("assembled_at")))
+    tables = [_tagged(fill, MEASURED_BY_FILL)]
     if rebuilt is not None and rebuilt.num_rows:
         tables.append(_tagged(_aligned(rebuilt, schema), MEASURED_BY_REBUILD))
     combined = pa.concat_tables(tables)

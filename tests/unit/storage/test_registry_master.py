@@ -150,6 +150,11 @@ class TestProvenance:
         assert master.column("filled_at").to_pylist() == ["2026-08-01T00:00:00+00:00"]
         assert master.column("assembled_at").to_pylist() == ["2026-09-21T00:00:00+00:00"]
 
+    def test_a_fill_row_carries_its_own_stamp_as_filled_at(self) -> None:
+        """So ``filled_at`` answers "when was this cell filled" on every master row, not only rebuilt ones."""
+        master = merge(_parts([_row("chunk_0_0", measured=True, stamp="2026-08-01T00:00:00+00:00")]))
+        assert master.column("filled_at").to_pylist() == ["2026-08-01T00:00:00+00:00"]
+
     def test_the_master_schema_is_the_registrys_plus_provenance(self) -> None:
         names = [field.name for field in master_schema()]
         assert names[: len(dataset_schema())] == [field.name for field in dataset_schema()]
