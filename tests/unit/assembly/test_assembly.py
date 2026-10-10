@@ -2787,6 +2787,29 @@ class TestAssembleGuards:
                 n_workers=1,
             )
 
+    def test_projected_coords_get_cf_axis_attrs(self, tmp_path, monkeypatch):
+        """A store assembled over a metre CRS labels northing/easting for CF-only readers."""
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        output = str(tmp_path / "out.zarr")
+        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
+        axis = np.arange(4, dtype="float64") * 10.0
+        spatial = SpatialCoords(northing=axis[::-1], easting=axis, crs="EPSG:32633")
+        monkeypatch.setattr(_assembly_mod, "read_spatial_coords", lambda *a, **k: spatial)
+        self._stage_one(writer, chunk, "run1")
+        writer.assemble(
+            [chunk],
+            total_y=4,
+            total_x=4,
+            run_id="run1",
+            output_path=output,
+            roi_zarr_path=_make_full_roi_mask(tmp_path, 4, 4),
+            n_workers=1,
+            mosaic_base=str(tmp_path / "mosaic"),
+        )
+        root = zarr.open_group(open_or_create_repo(output)[0].readonly_session("main").store, mode="r")
+        assert root["northing"].attrs["axis"] == "Y"
+        assert root["easting"].attrs["standard_name"] == "projection_x_coordinate"
+
     def test_append_refuses_a_reordered_interior_on_matching_endpoints(self, tmp_path, monkeypatch):
         """Extent, CRS and endpoints do not pin an axis, and this phase writes POSITIONALLY.
 
