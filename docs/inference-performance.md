@@ -20,7 +20,7 @@ optimization below is tagged with the window it reclaims.
    COLD START (idle) ──▶ FORWARD PASS (busy) ──▶ WRITE (idle) ──▶ next tile
 
   1. COLD START — GPU idle: load SCL mask, read the 1st strip, build the dataset.
-       reclaimed by:  crop · prune · empty-strip skip · starter strip ·
+       reclaimed by:  crop · prune · empty-strip skip ·
                       cross-chunk prefetch (next tile's cold start already done)
 
   2. FORWARD PASS — GPU busy (the real work): sub-batch → sub-batch, across strips.
@@ -59,19 +59,24 @@ What the adaptive path exploits, both read from the Sentinel-2 SCL mask:
   skipping empty strips drops *rows*.
 
 Both are distinct from a tile's **valid-pixel count**, which is the volume of inference work left
-after them. That count drives the strip and prefetch plan, not how much gets read.
+after them. That count sets how long the GPU works and which strips run first, not how much gets
+read or where the strips are cut.
 
 ## What none of it changes
 
-**Outputs are bit-identical to `main`'s** except the batch-size change, and that exception is
-measured rather than assumed. Comparing `main` at batch 3584 against the shipped branch at 7168
+**Outputs are bit-identical to `main`'s** except for the two changes that regroup pixels into
+different GPU sub-batches, the batch size and the strip budget, and both exceptions are measured
+rather than assumed. Comparing `main` at batch 3584 against the shipped branch at 7168
 over ~512M values per tile: int8 values land within one level on **≥99.99%** of them, the largest
 observed deviation is **2 levels**, per-pixel scale drift stays **≤0.78%**, and the dequantized
 embeddings have **cosine similarity ≥0.9999** — which is the number that matters, since these
 vectors are used as features rather than read individually. Footprint and observation-count layers
 stay exact. The cause is cuBLAS picking different kernels for different batch shapes, not a change
 to the model; the envelope and the harness are in
-[ADR 012](../context_docs/decisions/012-validated-equivalence-for-inference-outputs.md).
+[ADR 012](../context_docs/decisions/012-validated-equivalence-for-inference-outputs.md). The
+strip budget, over a full Iowa year, leaves a median 99.95% of values identical, at most one value
+4 levels off, and 99.98% of each pixel's nearest neighbours unchanged
+([`simplifying-the-strip-loader.md`](../context_docs/inference/simplifying-the-strip-loader.md) §2).
 
 ## Terms and impact ratings
 
@@ -124,21 +129,21 @@ MID-FORWARD; the write hides the POST-FORWARD idle (see the three windows above)
 ## How a tile's path is chosen
 
 *[Adaptive family](#the-two-families-of-fix). Reclaims the cold-start [window](#why-the-card-idles) by reading less, and the route
-a tile takes is decided by its [sparsity](#the-two-kinds-of-sparsity) and its valid-pixel count.*
+a tile takes is decided by its [sparsity](#the-two-kinds-of-sparsity) and how many bytes are left to read.*
 
 A **dense interior tile** has little sparsity of either kind to exploit — it crops nothing and
-prunes little; its win comes from the striping and prefetch pipeline
+prunes little; its win comes from the strip and prefetch pipeline
 ([§4.2](../src/tessera_embeddings/inference/README.md#42-loading-a-tile-in-strips) and
 [§4.3](../src/tessera_embeddings/inference/README.md#43-starting-the-next-tile-early-and-finishing-the-last-one-late)),
-because its high valid-pixel count keeps the GPU busy enough to hide the strip loads. A **cloudy
+because its high valid-pixel count keeps the GPU busy long enough to hide each strip load. A **cloudy
 coastal sliver** is the opposite: high *temporal* sparsity (prune empty dates) and high *spatial*
 sparsity (crop to the bbox, skip empty row bands), so its win comes almost entirely from *reading
 less* ([§4.1](../src/tessera_embeddings/inference/README.md#41-read-as-little-as-possible)) — and
-since its low valid-pixel count makes it a single serial strip, reading less is the only lever it
-has. Same code, opposite paths.
+since what is left to read usually fits one strip, with nothing to hide it behind, reading less
+is the only lever it has. Same code, opposite paths.
 
-Each tile takes **one path** through the tree below, chosen from its valid-pixel count and
-where the valid data sits:
+Each tile takes **one path** through the tree below, chosen from how many bytes it has to read
+and where the valid data sits:
 
 ```
 A tile arrives → load its SCL mask → count valid pixels, find their bbox
@@ -153,30 +158,20 @@ A tile arrives → load its SCL mask → count valid pixels, find their bbox
 │           — cloudy dates the resampler would never read
 │
 ├─ Q2. Does bands + full mask fit ONE RAM budget?
-│        ├─ yes → single strip — no split, no prefetch (common interior)
+│        ├─ yes → single strip — no split (common on sparse and edge tiles)
 │        │
-│        └─ no  → SPLIT into northing strips  ● bounds peak host RAM    [§4.2]
-│                 │
-│                 └─ Q3. Enough valid data for the GPU to hide the strip
-│                        loads behind inference?
-│                          ├─ yes (dense) →
-│                          │     ◐ intra-chunk strip prefetch: strip     [§4.2]
-│                          │       i+1 loads while strip i runs the GPU
-│                          │     ○ starter strip: small first slice, GPU [§4.3]
-│                          │       starts one read sooner
-│                          └─ no (wide but few valid px) →
-│                                prefetch OFF, strips at the PAIR budget [§4.2]
-│                                (one set resident → bigger budget safe;
-│                                fewer, larger reads)
+│        └─ no  → SPLIT into budget-sized northing strips               [§4.2]
+│                 ● bounds peak host RAM
+│                 ◐ strip prefetch: strip i+1 loads while strip i
+│                   runs the GPU
+│                 ○ densest strip first, empty strips last, so no load
+│                   waits behind a strip with nothing to infer
 │
-├─ Q4. On the LAST strip, is this a RAM trough (≤ 1× budget)?
-│        ├─ yes, and a next tile is reserved →
-│        │     ● cross-chunk starter prefetch: preload the next tile's [§4.3]
-│        │       mask + 256-row starter NOW (mask-only when the rung says
-│        │       the starter wouldn't pay for its extra read), so its GPU
-│        │       work starts ~6 s later instead of ~24–36 s
-│        └─ no (pair budget) → skip it; the next tile takes the serial
-│              prologue (slower, but never over the RAM ceiling)
+├─ On the last strip WITH PIXELS, is a next tile reserved?
+│        ├─ yes → ● cross-chunk prefetch: the pipeline's next strip is  [§4.3]
+│        │        the next tile's first, loaded with its mask, so its
+│        │        GPU work starts without a serial prologue
+│        └─ no  → the next tile takes the serial prologue
 │
 └─ SPATIAL sparsity (per strip): ◐ empty-strip skip — a strip whose    [§4.1]
                            mask slice has zero valid pixels skips the S2 band read
@@ -186,8 +181,9 @@ A tile arrives → load its SCL mask → count valid pixels, find their bbox
 
 *Both [families](#the-two-families-of-fix), each tagged with the [window](#why-the-card-idles) it reclaims.*
 
-Every optimization here leaves outputs **bit-identical to `main`'s** except the batch-size
-change (¹) — the rest alter scheduling and I/O, not the math. *Window* is
+Every optimization here leaves outputs **bit-identical to `main`'s** except the two that change
+which pixels share a GPU sub-batch, the batch size and the strip budget (¹) — the rest alter
+scheduling and I/O, not the math. *Window* is
 which GPU-idle window each reclaims (see the three-windows diagram above).
 
 | Optimization | Family | Window | Triggers on… | Impact |
@@ -196,18 +192,19 @@ which GPU-idle window each reclaims (see the three-windows diagram above).
 | Async two-deep GPU pipeline ([§7](../src/tessera_embeddings/inference/README.md#7-the-forward-pass-on-the-gpu-inferencepy)) | core loop | mid-forward | always (CUDA) | ◐ medium |
 | Batch size 3584 → 7168 ([§7](../src/tessera_embeddings/inference/README.md#7-the-forward-pass-on-the-gpu-inferencepy)) | core loop | mid-forward | always | ◐ medium¹ |
 | Background staging write ([§4.3](../src/tessera_embeddings/inference/README.md#43-starting-the-next-tile-early-and-finishing-the-last-one-late)) | core loop | write (post) | always | ○ small |
-| Valid-pixel-aware northing striping ([§4.2](../src/tessera_embeddings/inference/README.md#42-loading-a-tile-in-strips)) | adaptive | *enabling* | tile exceeds one RAM budget | ● large² |
-| Intra-chunk strip prefetch ([§4.2](../src/tessera_embeddings/inference/README.md#42-loading-a-tile-in-strips)) | adaptive | mid-forward | dense/hideable split | ◐ medium |
-| Starter strip ([§4.3](../src/tessera_embeddings/inference/README.md#43-starting-the-next-tile-early-and-finishing-the-last-one-late)) | adaptive | cold-start | dense split with a real body | ○ small |
-| Cross-chunk starter prefetch ([§4.3](../src/tessera_embeddings/inference/README.md#43-starting-the-next-tile-early-and-finishing-the-last-one-late)) | adaptive | cold-start (next tile) | last strip is a RAM trough + next tile reserved | ● large |
+| Budget-sized northing strips ([§4.2](../src/tessera_embeddings/inference/README.md#42-loading-a-tile-in-strips)) | adaptive | *enabling* | tile exceeds one RAM budget | ● large¹ ² |
+| Strip prefetch ([§4.2](../src/tessera_embeddings/inference/README.md#42-loading-a-tile-in-strips)) | adaptive | mid-forward | any split tile | ◐ medium |
+| Cross-chunk prefetch ([§4.3](../src/tessera_embeddings/inference/README.md#43-starting-the-next-tile-early-and-finishing-the-last-one-late)) | adaptive | cold-start (next tile) | next tile reserved | ● large |
 | Timestep pruning ([§4.1](../src/tessera_embeddings/inference/README.md#41-read-as-little-as-possible)) | adaptive | cold-start | **temporal** sparsity (cloudy/empty dates) | ○ small–◐ |
 | Empty-strip skip ([§4.1](../src/tessera_embeddings/inference/README.md#41-read-as-little-as-possible)) | adaptive | cold-start (per strip) | **spatial** sparsity (a row band with no valid px) | ◐ medium |
 | Easting bbox crop ([§4.1](../src/tessera_embeddings/inference/README.md#41-read-as-little-as-possible)) | adaptive | cold-start | **spatial** sparsity (valid px in a narrow column window) | ◐ medium³ |
 
-¹ The only non-bit-identical change. It shifts a small fraction of int8 values by ±1–2
-levels (cuBLAS picks different kernels for different batch shapes), so a `main`-vs-branch
-diff is judged against the ADR-012 **cross-config** envelope (int8 within ±1 on ≥99.99% of
-values, max ≤3; observed max ±2) — not the same-config bit-identity gate the other rows meet.
+¹ Not bit-identical. Both regroup pixels into different GPU sub-batches, cuBLAS picks
+different kernels for different batch shapes, and a small fraction of int8 values shift by a
+level or two. A before-and-after diff is judged against the ADR-012 **cross-config** envelope
+(int8 within ±1 on ≥99.5% of values, scale drift ≤3%, worst-pixel cosine ≥0.999) — not the
+same-config bit-identity gate the other rows meet. Observed: ±2 for the batch size, ±4 on one
+value for the strip budget over a full Iowa year.
 
 ² Foundational — it bounds peak RAM, which is what makes every other adaptive choice
 safe; it also drops a ~13 s fixed read per dense tile.
@@ -269,9 +266,10 @@ Profiling ruled these out, so they're absent by design, not oversight:
 
 - **Greedily prefetching to fill RAM.** We deliberately **leave host RAM on the table.**
   Prefetching the whole next tile to use the spare RAM co-resides two full working sets
-  and spikes peak host RAM to ~92–95% — which OOM-killed a worker. The strip budget plus
-  the bounded (~2 GiB) cross-chunk prefetch instead hold peak at ~52%, well under the
-  60% ceiling, so tile-density spikes at UTM-zone scale can't OOM the node. The unused
+  and spikes peak host RAM to ~92–95% — which OOM-killed a worker. The strip budget, and
+  a cross-chunk prefetch that loads only the next tile's first strip in place of the
+  pipeline's next one, instead hold a full Iowa year at ~50%, under the 60% ceiling, so
+  tile-density spikes at UTM-zone scale can't OOM the node. The unused
   headroom is intentional insurance, not waste.
 - **FP16 fast-accumulate** — an L40S GEMM microbench showed BF16 already runs at the
   full dense tensor-core ceiling, so FP16 buys nothing here. BF16 stays.

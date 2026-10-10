@@ -220,14 +220,12 @@ def test_every_per_model_table_covers_every_model_version() -> None:
     from tessera_embeddings.config.inference import (
         MODEL_ARCHS,
         MODEL_ENCODER_URLS,
-        MODEL_EST_PX_PER_SEC,
     )
     from tessera_embeddings.inference.sampling import _CACHED_RESAMPLERS, _RESAMPLERS
 
     versions = set(MODEL_ARCHS)
     for name, table in (
         ("MODEL_ENCODER_URLS", MODEL_ENCODER_URLS),
-        ("MODEL_EST_PX_PER_SEC", MODEL_EST_PX_PER_SEC),
         ("sampling._RESAMPLERS", _RESAMPLERS),
         ("sampling._CACHED_RESAMPLERS", _CACHED_RESAMPLERS),
     ):
