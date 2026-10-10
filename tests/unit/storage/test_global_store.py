@@ -56,6 +56,8 @@ def test_coords_and_attrs(tmp_path):
     assert g["northing"].shape == (4096,)
     assert g["time"].shape == (3,)
     assert g["band"].shape == (EMBEDDING_DIM,)  # band coord present for xarray consumers
+    assert g["northing"].attrs["standard_name"] == "projection_y_coordinate"  # CF axis attrs for CF-only readers
+    assert g["easting"].attrs["axis"] == "X"
     # CF time bounds: (time, 2), linked via time.attrs["bounds"], seeded once to each
     # slot's calendar year, half-open so consecutive years leave no gap.
     assert g["time_bnds"].shape == (3, 2)

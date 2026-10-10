@@ -74,7 +74,11 @@ from tessera_embeddings.config.store_layout import (
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, chunk_label, filter_chunks_by_roi_mask, parse_chunk_label
 from tessera_embeddings.storage import zone_grid
-from tessera_embeddings.storage.conventions import assert_encoder_matches, build_convention_attrs
+from tessera_embeddings.storage.conventions import (
+    assert_encoder_matches,
+    build_convention_attrs,
+    stamp_cf_coord_attrs,
+)
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
 from tessera_embeddings.storage.global_store import create_layout_arrays, open_global_repo
 from tessera_embeddings.storage.icechunk_logging import traced_commit
@@ -2122,6 +2126,8 @@ class ZarrWriter:
         for stale in [k for k in node.attrs if str(k).startswith("tessera:")]:
             del node.attrs[stale]
         node.attrs.update(attrs)
+        # Every assemble, not only at creation, so a store created before the CF attrs gains them.
+        stamp_cf_coord_attrs(node, spatial.crs if spatial else None)
 
         t_commit = time.monotonic()
         commit_with_rebase(session, f"Run {run_id}: {len(chunks)} chunks assembled")

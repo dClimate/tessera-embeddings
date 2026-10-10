@@ -5,6 +5,7 @@ from typing import ClassVar
 
 import numpy as np
 import pytest
+import zarr
 
 from tessera_embeddings.config.inference import encoder_url
 from tessera_embeddings.storage.conventions import (
@@ -12,6 +13,7 @@ from tessera_embeddings.storage.conventions import (
     assert_encoder_matches,
     build_convention_attrs,
     build_geoemb_root_attrs,
+    stamp_cf_coord_attrs,
     tile_id_to_epsg,
 )
 
@@ -465,3 +467,16 @@ def test_one_comparison_serves_every_reader_of_the_encoder_identity() -> None:
     for published, wanted in ((encoder_url("v1.1"), "v2-large"), (None, "v2-large"), (encoder_url("v2-large"), "v1.1")):
         with pytest.raises(ValueError, match="Refusing to append"):
             assert_encoder_matches(published, model_version=wanted, where="s")
+
+
+@pytest.mark.parametrize(("epsg", "labelled"), [("EPSG:32633", True), ("EPSG:4326", False), (None, False)])
+def test_cf_coord_attrs_only_claim_metres_for_a_metre_crs(epsg: str | None, labelled: bool) -> None:
+    """A degree CRS or bare pixel indices must not be labelled as projected metres."""
+    node = zarr.group(store=zarr.storage.MemoryStore())
+    for name in ("northing", "easting"):
+        node.create_array(name, data=np.arange(3.0), dimension_names=(name,))
+    stamp_cf_coord_attrs(node, epsg)
+    assert dict(node["easting"].attrs) == (
+        {"standard_name": "projection_x_coordinate", "units": "m", "axis": "X"} if labelled else {}
+    )
+    assert dict(node["northing"].attrs).get("axis") == ("Y" if labelled else None)
