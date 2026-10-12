@@ -193,18 +193,20 @@ def _rebuild_many(
     *,
     time_index: int,
     rows: list[dict[str, Any]],
-    optical_min_obs: int,
     with_radar: bool,
     concurrency: int,
 ) -> dict[str, dict[str, Any]]:
-    """Re-derive measurements for ``rows``, keyed by tile label. Concurrent; order is irrelevant."""
+    """Re-derive measurements for ``rows``, keyed by tile label. Concurrent; order is irrelevant.
+
+    Each row under its own depth rule, since a cell built from several runs holds each run's rows.
+    """
 
     def one(row: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         return row["tile"], registry_rebuild.rebuild_tile(
             group,
             time_index=time_index,
             tile=row["tile"],
-            optical_min_obs=optical_min_obs,
+            optical_min_obs=int(row["optical_min_obs"]),
             with_radar=with_radar,
         )
 
@@ -217,19 +219,11 @@ def _gate_rows(
     *,
     time_index: int,
     rows: list[dict[str, Any]],
-    optical_min_obs: int,
     with_radar: bool,
     concurrency: int,
 ) -> dict[str, Any]:
     """Re-derive rows that ALREADY carry measurements and compare. The only verdict that passes is ``match``."""
-    rebuilt = _rebuild_many(
-        group,
-        time_index=time_index,
-        rows=rows,
-        optical_min_obs=optical_min_obs,
-        with_radar=with_radar,
-        concurrency=concurrency,
-    )
+    rebuilt = _rebuild_many(group, time_index=time_index, rows=rows, with_radar=with_radar, concurrency=concurrency)
     verdicts: dict[str, int] = defaultdict(int)
     mismatches: list[dict[str, Any]] = []
     for row in rows:
@@ -285,12 +279,7 @@ def cmd_gate(args: argparse.Namespace) -> int:
             continue
         sample = rows if len(rows) <= per_cell else rng.sample(rows, per_cell)
         result = _gate_rows(
-            group,
-            time_index=time_index,
-            rows=sample,
-            optical_min_obs=int(sample[0]["optical_min_obs"]),
-            with_radar=not args.skip_radar,
-            concurrency=args.concurrency,
+            group, time_index=time_index, rows=sample, with_radar=not args.skip_radar, concurrency=args.concurrency
         )
         checked += result["checked"]
         for verdict, count in result["verdicts"].items():
@@ -314,19 +303,19 @@ def cmd_gate(args: argparse.Namespace) -> int:
 
 
 def _rederive(
-    group: zarr.Group, year: int, rows: pa.Table, args: argparse.Namespace, rng: random.Random, run_id: str
+    group: zarr.Group,
+    time_index: int,
+    every: list[dict[str, Any]],
+    args: argparse.Namespace,
+    rng: random.Random,
+    run_id: str,
 ) -> pa.Table | str:
-    """Fresh master rows for the cell's unmeasured ``rows``, or why its store cannot supply them.
+    """Fresh master rows for the cell's unmeasured rows, or why the in-cell gate refused them.
 
     Self-checks first: a cell holding measured tiles with optical in them proves the re-derivation
     reproduces its own geometry and rule before a single re-derived value is accepted.
     """
-    every = rows.to_pylist()
-    time_index = _store_slot(group, year, every)
-    if isinstance(time_index, str):
-        return time_index
     targets = [row for row in every if row.get(MEASURED_SENTINEL) is None]
-    rule = int(targets[0]["optical_min_obs"])
     known = [
         row
         for row in every
@@ -337,12 +326,7 @@ def _rederive(
     if known and not args.no_in_cell_gate:
         sample = known if len(known) <= IN_CELL_GATE_TILES else rng.sample(known, IN_CELL_GATE_TILES)
         check = _gate_rows(
-            group,
-            time_index=time_index,
-            rows=sample,
-            optical_min_obs=rule,
-            with_radar=not args.skip_radar,
-            concurrency=args.concurrency,
+            group, time_index=time_index, rows=sample, with_radar=not args.skip_radar, concurrency=args.concurrency
         )
         if check["mismatches"]:
             first = check["mismatches"][0]
@@ -350,12 +334,7 @@ def _rederive(
                 f"in-cell gate failed on {len(check['mismatches'])} rows, e.g. {first['tile']}: {first['differences']}"
             )
     measurements = _rebuild_many(
-        group,
-        time_index=time_index,
-        rows=targets,
-        optical_min_obs=rule,
-        with_radar=not args.skip_radar,
-        concurrency=args.concurrency,
+        group, time_index=time_index, rows=targets, with_radar=not args.skip_radar, concurrency=args.concurrency
     )
     stamp = datetime.datetime.now(datetime.UTC).isoformat()
     rebuilt = [rebuilt_row(row, measurements[row["tile"]], run_id=run_id, assembled_at=stamp) for row in targets]
@@ -375,20 +354,24 @@ def cmd_repair(args: argparse.Namespace) -> int:
     }
     run_id = args.run_id or rebuild_run_id(suffix="optical" if args.skip_radar else "full")
     rng = random.Random(args.seed)
-    root: zarr.Group | None = None
+    root = _open_zone(args.store, args.region, anonymous=args.anonymous)
 
     written = rederived = blocked = 0
     for (zone, year), rows in sorted(cells.items()):
         # Parts first, so on a tie between identical rows the part's copy is the one kept.
         candidates = [rows, still_published(held_cells.get((zone, year), master_schema().empty_table()), rows)]
-        if pc.any(pc.is_null(rows.column(MEASURED_SENTINEL))).as_py():
-            # Opened only when a cell needs it: a repair with nothing to re-derive needs no store.
-            root = root if root is not None else _open_zone(args.store, args.region, anonymous=args.anonymous)
-            fresh = _rederive(root[zone], year, rows, args, rng, run_id)
-            if isinstance(fresh, str):
-                blocked += 1
-                print(f"  {zone}/{year}: BLOCKED, left as it is — {fresh}", file=sys.stderr)
-                continue
+        # Checked for EVERY cell, not only one with rows to re-derive: a store holding a run the
+        # registry has no part for means the parts no longer describe the cell, whatever they hold.
+        every = rows.to_pylist()
+        slot = _store_slot(root[zone], year, every)
+        needed = pc.any(pc.is_null(rows.column(MEASURED_SENTINEL))).as_py()
+        # The re-derived rows, the reason the cell is blocked, or the slot when nothing is null.
+        fresh = _rederive(root[zone], slot, every, args, rng, run_id) if isinstance(slot, int) and needed else slot
+        if isinstance(fresh, str):
+            blocked += 1
+            print(f"  {zone}/{year}: BLOCKED, left as it is — {fresh}", file=sys.stderr)
+            continue
+        if isinstance(fresh, pa.Table):
             candidates.append(fresh)
             rederived += fresh.num_rows
         master = merge(*candidates)

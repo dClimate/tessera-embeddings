@@ -102,10 +102,11 @@ future infill, not something this code can check.
 - **An existing master row survives only while its run still has a part** (`still_published`).
   A run withdrawn by deleting its part would otherwise keep winning through the master's copy of
   its rows, which carry the newest `filled_at`.
-- **Re-derivation checks the store holds the cell's newest run.** The zone group's `runs` attribute
-  names the last run that wrote each year, and it must be the newest run in the cell's parts. Then
-  every row's tile holds the pixels of the run that row names, so a cell built from several runs is
-  re-derivable tile by tile. A run that committed but never published its part blocks the cell.
+- **Repair checks, for every cell, that the store holds the cell's newest run.** The zone group's
+  `runs` attribute names the last run that wrote each year, and it must be the newest run in the
+  cell's parts. Then every row's tile holds the pixels of the run that row names, so a cell built
+  from several runs is re-derivable tile by tile, each row under its own depth rule. A run that
+  committed but never published its part blocks the cell, even one with nothing to re-derive.
 
 ## Checking and repairing it
 

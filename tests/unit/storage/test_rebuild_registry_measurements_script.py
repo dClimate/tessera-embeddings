@@ -147,11 +147,16 @@ class TestRepair:
         assert _repair(script, tmp_path, "--skip-radar", "--write") == 0
         assert _master(tmp_path)["chunk_1_0"]["px_with_any_radar"] == 123
 
+    @pytest.mark.parametrize("null_rows", [True, False], ids=["with-rows-to-re-derive", "fully-measured"])
     def test_a_cell_the_store_cannot_stand_behind_is_left_as_it_was(
-        self, script: Any, store: zarr.Group, tmp_path: Path
+        self, script: Any, store: zarr.Group, tmp_path: Path, null_rows: bool
     ) -> None:
-        """Rewriting it with the null rows it cannot re-derive would drop the measurements it holds."""
-        _seed(tmp_path)
+        """A store holding a run the registry has no part for: the parts no longer describe the cell.
+
+        Rewriting it would drop the measurements it holds, or, when nothing is null, report success on
+        rows the store has moved past.
+        """
+        _seed(tmp_path, PARTS if null_rows else [_row(row["tile"], measured=True) for row in PARTS])
         _seed_master(tmp_path, radar=None)
         before = (tmp_path / "master" / "zone=33N" / "year=2017" / "part-0.parquet").read_bytes()
         store.attrs["runs"] = {"2017": {"run_id": "a-refill-the-registry-never-saw"}}
