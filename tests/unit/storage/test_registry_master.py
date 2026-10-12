@@ -1,15 +1,19 @@
-"""The compacted registry master: precedence, provenance, and the invariants that guard both.
+"""The registry master: the per-tile merge, provenance, the invariants, and the per-cell update.
 
-The compaction is the only place a published measurement could be overwritten by a re-derived one,
-so most of these tests are about what it refuses to do.
+The merge is the only place a published measurement could be overwritten by a re-derived one, or a
+tile dropped by a run that never touched it, so most of these tests are about what it refuses to do.
 """
 
 from __future__ import annotations
 
-import pyarrow as pa
-import pytest
+from pathlib import Path
 
-from tessera_embeddings.storage.registry import dataset_schema
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
+from pyarrow.fs import LocalFileSystem
+
+from tessera_embeddings.storage.registry import dataset_schema, registry_schema
 from tessera_embeddings.storage.registry_master import (
     MEASURED_BY_FILL,
     MEASURED_BY_REBUILD,
@@ -17,8 +21,9 @@ from tessera_embeddings.storage.registry_master import (
     invariant_failures,
     master_schema,
     merge,
+    update_cell,
 )
-from tessera_embeddings.storage.registry_rebuild import rebuild_schema
+from tessera_embeddings.storage.registry_rebuild import rebuild_dataset_schema, rebuild_schema
 
 
 def _row(tile: str, *, zone: str = "33N", year: int = 2017, measured: bool, stamp: str, **extra: object) -> dict:
@@ -63,8 +68,8 @@ LATER = "2026-08-09T00:00:00+00:00"
 
 def _rebuilt(rows: list[dict], *, filled_at: str = FILLED) -> pa.Table:
     """Rebuild rows re-derived against the fill stamped ``filled_at`` unless a row says otherwise."""
-    schema = pa.schema([*rebuild_schema(), pa.field("zone", pa.string()), pa.field("year", pa.int32())])
-    return _table([{"filled_at": filled_at} | {k: v for k, v in row.items() if v is not None} for row in rows], schema)
+    rows = [{"filled_at": filled_at} | {k: v for k, v in row.items() if v is not None} for row in rows]
+    return _table(rows, rebuild_dataset_schema())
 
 
 class TestPrecedence:
@@ -129,8 +134,8 @@ class TestPrecedence:
     def test_a_refill_supersedes_the_older_run_and_its_rebuilds(self) -> None:
         """A newer run that left a tile null must not inherit the older run's numbers, nor a rebuild of it.
 
-        The store holds the newer run, so the older run's measurement — and a re-derivation made
-        against it — describe pixels that are no longer there.
+        The store holds the newer run's pixels for the tile, so the older run's measurement — and a
+        re-derivation made against it — describe pixels that are no longer there.
         """
         parts = _parts(
             [
@@ -142,6 +147,38 @@ class TestPrecedence:
         master = merge(parts, stale)
         assert master.column("run_id").to_pylist() == ["run-b"]
         assert master.column("measured_by").to_pylist() == [None]
+
+    def test_a_partial_run_supersedes_only_the_tiles_it_wrote(self) -> None:
+        """An infill writes some of a cell's tiles; every tile it did not touch keeps its run and rebuild.
+
+        Superseding the whole cell would drop ``chunk_0_1``, and no check would notice if every check
+        applied the same rule. The store keeps the older run's shard there, so the master must too.
+        """
+        parts = _parts(
+            [
+                _row("chunk_0_0", measured=True, stamp=FILLED, refused_thin_px=6, run_id="run-a"),
+                _row("chunk_0_1", measured=False, stamp=FILLED, run_id="run-a"),
+                _row("chunk_0_0", measured=True, stamp=LATER, refused_thin_px=1, run_id="infill"),
+            ]
+        )
+        rebuilt = _rebuilt([_row("chunk_0_1", measured=True, stamp="2026-09-21T00:00:00+00:00", refused_thin_px=7)])
+        by_tile = {row["tile"]: row for row in merge(parts, rebuilt).to_pylist()}
+        assert (by_tile["chunk_0_0"]["run_id"], by_tile["chunk_0_0"]["refused_thin_px"]) == ("infill", 1)
+        untouched = by_tile["chunk_0_1"]
+        assert (untouched["measured_by"], untouched["refused_thin_px"], untouched["filled_at"]) == (
+            MEASURED_BY_REBUILD,
+            7,
+            FILLED,
+        )
+
+    @pytest.mark.parametrize("step", [1, -1], ids=["read-a-first", "read-b-first"])
+    def test_two_runs_stamped_the_same_instant_resolve_by_run_id(self, step: int) -> None:
+        """A whole-registry sync and a one-cell update must agree, whatever order the parts are read in."""
+        rows = [
+            _row("chunk_0_0", measured=True, stamp=FILLED, refused_thin_px=n, run_id=run)
+            for n, run in ((6, "run-a"), (8, "run-b"))
+        ]
+        assert merge(_parts(rows[::step])).column("run_id").to_pylist() == ["run-b"]
 
     @pytest.mark.parametrize("stamp", ["not-a-time", "2026-08-09T00:00:00"], ids=["malformed", "naive"])
     def test_a_run_whose_stamp_cannot_be_ordered_is_refused(self, stamp: str) -> None:
@@ -258,7 +295,7 @@ class TestFillRowsUnchanged:
         differences = fill_rows_unchanged(tampered, parts, self.COLUMNS)
         assert any("refused_thin_px" in difference for difference in differences)
 
-    def test_a_refilled_cell_is_compared_against_its_newest_run_whatever_the_scan_order(self) -> None:
+    def test_a_refilled_tile_is_compared_against_its_current_run_whatever_the_scan_order(self) -> None:
         """Part order in a dataset scan is not run order; the source must be the run the merge kept."""
         parts = _parts(
             [
@@ -273,3 +310,63 @@ class TestFillRowsUnchanged:
         parts = _parts([_row("chunk_0_0", measured=False, stamp=FILLED)])
         rebuilt = _rebuilt([_row("chunk_0_0", measured=True, stamp=LATER, refused_thin_px=7)], filled_at=FILLED)
         assert fill_rows_unchanged(merge(parts, rebuilt), parts, self.COLUMNS) == []
+
+
+def _publish(root: Path, prefix: str, run: str, rows: list[dict], schema: pa.Schema) -> None:
+    """One part of cell 33N/2017 under ``prefix``, written the way the fill and the rebuild write theirs."""
+    cell = root / prefix / "zone=33N" / "year=2017"
+    cell.mkdir(parents=True, exist_ok=True)
+    pq.write_table(_table(rows, schema), cell / f"{run}.parquet")
+
+
+@pytest.fixture
+def registry(tmp_path: Path) -> Path:
+    """One cell: a fill of two tiles, an infill of one of them, and a rebuild of the other."""
+    _publish(
+        tmp_path,
+        "parts",
+        "run-a",
+        [
+            _row("chunk_0_0", measured=True, stamp=FILLED, run_id="run-a"),
+            _row("chunk_0_1", measured=False, stamp=FILLED),
+        ],
+        registry_schema(),
+    )
+    _publish(
+        tmp_path, "parts", "infill", [_row("chunk_0_0", measured=True, stamp=LATER, run_id="infill")], registry_schema()
+    )
+    rebuilt = _row("chunk_0_1", measured=True, stamp="2026-09-21T00:00:00+00:00", run_id="rebuild-1", filled_at=FILLED)
+    _publish(tmp_path, "rebuild", "rebuild-1", [rebuilt], rebuild_schema())
+    return tmp_path
+
+
+class TestUpdateCell:
+    """The update every fill runs: one cell's master file, recomputed from everything the cell has."""
+
+    MASTER = Path("master/zone=33N/year=2017/part-0.parquet")
+
+    def test_the_cell_file_holds_every_tile_from_the_run_that_last_wrote_it(self, registry: Path) -> None:
+        assert update_cell(LocalFileSystem(), str(registry), "33N", 2017) == []
+        master = pq.read_table(registry / self.MASTER)
+        assert master.column("tile").to_pylist() == ["chunk_0_0", "chunk_0_1"]
+        assert master.column("run_id").to_pylist() == ["infill", "rebuild-1"]
+        assert pq.read_schema(registry / "master" / "_common_metadata").names == master_schema().names
+
+    def test_running_it_again_writes_the_same_file(self, registry: Path) -> None:
+        """A fill retried after its update, and a sync after a fill, must both leave the cell as it was."""
+        update_cell(LocalFileSystem(), str(registry), "33N", 2017)
+        first = (registry / self.MASTER).read_bytes()
+        update_cell(LocalFileSystem(), str(registry), "33N", 2017)
+        assert (registry / self.MASTER).read_bytes() == first
+
+    def test_a_disagreement_with_the_store_is_reported_and_the_master_still_written(self, registry: Path) -> None:
+        """No run removes a tile, so a shard cleared by hand is caught here or nowhere."""
+        findings = update_cell(LocalFileSystem(), str(registry), "33N", 2017, live={(0, 1), (5, 5)})
+        assert len(findings) == 2
+        assert "chunk_0_0" in findings[0] and "chunk_5_5" in findings[1]
+        assert (registry / self.MASTER).exists()
+
+    def test_a_cell_with_no_part_raises_and_writes_nothing(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="no registry part"):
+            update_cell(LocalFileSystem(), str(tmp_path), "33N", 2017)
+        assert not (tmp_path / "master").exists()

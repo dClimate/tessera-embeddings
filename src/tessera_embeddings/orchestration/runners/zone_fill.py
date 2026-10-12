@@ -46,9 +46,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, cast
 
+import fsspec
 import icechunk
 import numpy as np
 import zarr
+from pyarrow.fs import FSSpecHandler, PyFileSystem
 
 from tessera_embeddings.config.assembly import AssemblyConfig
 from tessera_embeddings.config.fault_injection import ArmedFault
@@ -67,9 +69,11 @@ from tessera_embeddings.inference.data_loading import _active_orbits
 from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.storage.campaign import mark_zone_year_empty, tag_zone_year, zone_year_tag
 from tessera_embeddings.storage.global_store import check_destination_types, open_global_repo
+from tessera_embeddings.storage.published_store import calendar_years, live_shards
+from tessera_embeddings.storage.registry_master import update_cell
 from tessera_embeddings.storage.shard_writer import read_years_complete, shard_pitch
 from tessera_embeddings.storage.time_axis import time_index_of, year_timestamp
-from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group
+from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group, plain_zarr_storage_options
 from tessera_embeddings.storage.zone_grid import PIXEL_M, canonicalize_zone, tile_row_latitudes
 from tessera_embeddings.storage.zone_grid import zone as zone_spec
 
@@ -314,6 +318,58 @@ def _check_assembly_workers(n: int | None) -> None:
     """
     if n is not None and n < 1:
         raise ValueError(f"n_assembly_workers must be >= 1 when set, got {n}")
+
+
+def _update_registry_master(
+    registry_root: str | None,
+    store_path: str,
+    zone: str,
+    year: int,
+    *,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None,
+    s3_region: str | None,
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+) -> None:
+    """Bring the cell's ``master/`` file up to date with the part assembly just published. Never raises.
+
+    This is what keeps the master current: every fill recomputes its own cell from all of the
+    cell's parts (:func:`~tessera_embeddings.storage.registry_master.update_cell`), so a refill, a
+    new year or an infill reaches consumers without anybody running a compaction. Best-effort for
+    the reason ``publish_registry_part`` is: the cell has committed and is tagged, and a registry
+    failure must not fail it. A failure is logged loudly and leaves the cell stale, which the
+    registry census names and ``rebuild_registry_measurements.py sync --zones`` repairs.
+
+    The store's live shards for the year are compared with the master's embedded tiles on the way,
+    from the manifests alone, and a disagreement is logged at ERROR: no run removes a tile it did
+    not write, so a shard cleared by hand would otherwise leave the master describing it.
+    """
+    if not registry_root:
+        return
+    credentials = _store_credentials(store_path, get_credentials)
+    try:
+        session = open_global_repo(store_path, get_credentials=credentials, region=s3_region).readonly_session(
+            branch="main"
+        )
+        node = cast(zarr.Group, zarr.open_group(session.store, mode="r")[zone])
+        live = live_shards(session, zone).get(calendar_years(node).index(year), frozenset())
+        # The registry sits beside the store, in its bucket, so the store's credential writes it.
+        fs, _ = fsspec.url_to_fs(
+            registry_root, **(plain_zarr_storage_options(registry_root, credentials, s3_region) or {})
+        )
+        disagreements = update_cell(PyFileSystem(FSSpecHandler(fs)), registry_root, zone, year, live=live)
+    except Exception:
+        log.exception(
+            "Zone %s year %d: registry master NOT updated. The cell is committed and its part published, but "
+            "master/ — what consumers read — still describes this cell as it was before this fill. Repair: "
+            "scripts/maintenance/rebuild_registry_measurements.py sync --zones %s --write",
+            zone,
+            year,
+            zone,
+        )
+        return
+    for disagreement in disagreements:
+        log.error("Zone %s year %d: registry master and store disagree — %s", zone, year, disagreement)
+    log.info("Zone %s year %d: registry master updated", zone, year)
 
 
 def fill_zone_year(
@@ -996,6 +1052,10 @@ def assemble_zone_year(
             store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
         )
         tag = tag_zone_year(repo, zone, year, snapshot_id=snapshot)
+        if live:  # only the assembled branch published a part
+            _update_registry_master(
+                registry_root, store_path, zone, year, get_credentials=get_credentials, s3_region=s3_region, log=log
+            )
         result = {
             **summary,
             "empty": True,
@@ -1074,6 +1134,9 @@ def assemble_zone_year(
         store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
     )
     tag = tag_zone_year(repo, zone, year, snapshot_id=snapshot)
+    _update_registry_master(
+        registry_root, store_path, zone, year, get_credentials=get_credentials, s3_region=s3_region, log=log
+    )
     _run_cleanup()
 
     return {

@@ -43,7 +43,7 @@ if TYPE_CHECKING:
 from tessera_embeddings.storage import published_store, zone_grid
 from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.registry import dataset_schema, registry_schema
-from tessera_embeddings.storage.registry_master import master_schema, newest_fill_runs
+from tessera_embeddings.storage.registry_master import current_fill_rows, master_schema
 
 DEFAULT_STORE = "s3://tessera-embeddings/v1.1/dclimate.icechunk"
 DEFAULT_REGISTRY = "s3://tessera-embeddings/v1.1/dclimate.registry"
@@ -230,16 +230,14 @@ def _consumer_view(fs: pyarrow.fs.FileSystem, root: str) -> tuple[str, Any, bool
     return f"{base}/parts", dataset_schema(), False
 
 
-def _tile_years(table: pyarrow.Table, stamp: str) -> pyarrow.Array:
-    """Sorted ``zone/year/tile/<stamp>`` keys: which tile-years a table holds, and from which fill."""
+def _tile_years(table: pyarrow.Table, stamp: str) -> set[str]:
+    """``zone/year/tile/<stamp>`` keys: which tile-years a table holds, and from which fill."""
     import pyarrow as pa
     import pyarrow.compute as pc
 
     year = pc.cast(table.column("year"), pa.string())
-    keys = pc.binary_join_element_wise(
-        table.column("zone"), year, table.column("tile"), table.column(stamp), "/"
-    ).combine_chunks()
-    return keys.take(pc.array_sort_indices(keys))
+    keys = pc.binary_join_element_wise(table.column("zone"), year, table.column("tile"), table.column(stamp), "/")
+    return set(keys.to_pylist())
 
 
 def _completeness(fs: pyarrow.fs.FileSystem, root: str) -> dict[str, Any]:
@@ -254,16 +252,16 @@ def _completeness(fs: pyarrow.fs.FileSystem, root: str) -> dict[str, Any]:
     ``chunk_px`` stands in for all of them: a row's measurement columns are null together, and
     this is the one a rebuild can always populate.
 
-    A refused tile's record comes from its skip marker on object storage and survives a resume; an
-    embedded tile's comes from the actor's in-memory result and does not. So the split by
-    ``embedded`` is diagnostic rather than decorative — unmeasured rows concentrated entirely on
-    the embedded side is the signature of that asymmetry rather than of a broken writer.
+    The split by ``embedded`` is diagnostic rather than decorative. v1.1's null rows were all on
+    the embedded side: an embedded tile's record then lived only in the actor's in-memory result,
+    which a resume loses, while a refused tile's was in its skip marker on object storage. Both are
+    persisted now, so unmeasured rows concentrated on the embedded side mean that path regressed.
 
-    Counted over the compacted ``master/`` once one exists, since that is what consumers read and
-    ``parts/`` keeps its null rows forever by design; over ``parts/`` before then. A master is only
-    trusted if it holds exactly the newest fill runs' tile-years, each stamped with that run's fill
-    time: an interrupted ``compact`` leaves it short, a refill after it leaves it stale, and neither
-    has null rows to count.
+    Counted over ``master/`` once one exists, since that is what consumers read and ``parts/``
+    keeps its null rows forever by design; over ``parts/`` before then. A master is only trusted if
+    each cell holds exactly its tiles' current runs — every tile any part names, stamped with the
+    newest run that wrote it. A fill whose master update failed leaves its cell short or stale with
+    no null rows to count, so those cells are named, for ``sync --zones``.
     """
     import pyarrow.compute as pc
     import pyarrow.dataset as ds
@@ -274,13 +272,14 @@ def _completeness(fs: pyarrow.fs.FileSystem, root: str) -> dict[str, Any]:
     table = dataset.to_table(
         columns=["zone", "year", "tile", "embedded", "chunk_px", *(["filled_at"] if compacted else [])]
     )
-    current = None
+    stale = None
     if compacted:
         parts_prefix = prefix.rsplit("/", 1)[0] + "/parts"
         parts = ds.dataset(parts_prefix, filesystem=fs, partitioning="hive", schema=dataset_schema()).to_table(
             columns=["zone", "year", "tile", "run_id", "assembled_at"]
         )
-        current = _tile_years(newest_fill_runs(parts), "assembled_at").equals(_tile_years(table, "filled_at"))
+        differing = _tile_years(current_fill_rows(parts), "assembled_at") ^ _tile_years(table, "filled_at")
+        stale = sorted({"/".join(key.split("/")[:2]) for key in differing})
     unmeasured = pc.is_null(table.column("chunk_px")).to_pylist()
     embedded = table.column("embedded").to_pylist()
     zones, years = table.column("zone").to_pylist(), table.column("year").to_pylist()
@@ -295,7 +294,7 @@ def _completeness(fs: pyarrow.fs.FileSystem, root: str) -> dict[str, Any]:
         "wall_s": round(time.monotonic() - started, 2),
         "prefix": prefix.rsplit("/", 1)[1],
         "rows": table.num_rows,
-        "master_matches_newest_runs": current,
+        "cells_where_master_is_stale": stale,
         "rows_without_measurements": total_unmeasured,
         "fraction_without_measurements": round(total_unmeasured / table.num_rows, 6) if table.num_rows else 0.0,
         "unmeasured_rows_that_are_embedded": sum(
@@ -331,7 +330,7 @@ def _aoi_query(
         & (pc.field("bbox_north") >= south),
         columns=[
             # Everything read downstream, not only what the report prints: an unprojected column
-            # is simply absent from the returned rows, so the per-cell grouping and `_newest_run`
+            # is simply absent from the returned rows, so the per-cell grouping and `_current_rows`
             # raise on `year` and `run_id` rather than falling back to anything.
             "zone",
             "year",
@@ -346,18 +345,19 @@ def _aoi_query(
         ],
     )
     raw = table.to_pylist()
-    # Per (zone, year), because an area of interest can span both, and within each the newest RUN:
-    # a refill leaves the original part in place, so a tile filled twice would be counted twice
-    # here and its refused pixels added together, inflating the answer a consumer came for.
+    # Per (zone, year), because an area of interest can span both, and within each each tile's
+    # current run: a refill leaves the original part in place, so a tile filled twice would be
+    # counted twice here and its refused pixels added together, inflating the answer a consumer
+    # came for.
     by_cell: dict[tuple[str, int], list[dict[str, Any]]] = {}
     for row in raw:
         by_cell.setdefault((str(row["zone"]), int(row["year"] or year)), []).append(row)
     # A master already holds one row per tile-year, and its rebuilt rows carry a rebuild run id that
     # run selection would mistake for a refill.
-    rows = raw if compacted else [r for cell_rows in by_cell.values() for r in _newest_run(cell_rows)]
+    rows = raw if compacted else [r for cell_rows in by_cell.values() for r in _current_rows(cell_rows)]
     embedded = [r["embedded"] for r in rows]
     refused = [r["refused_px"] for r in rows if r["refused_px"] is not None]
-    # Malformed timestamps have to reach the REPORT, not just the run selection: `_newest_run` can
+    # Malformed timestamps have to reach the REPORT, not just the run selection: `_current_rows` can
     # never select a run it cannot order, so an AOI-only run would otherwise print a plausible
     # answer built on the older rows and exit 0.
     bad_stamps = unparsable_stamps(raw)
@@ -438,25 +438,24 @@ def _optical_skip_labels(group: zarr.Group, year: int) -> list[str]:
     return [str(label) for label in labels] if isinstance(labels, list) else []
 
 
-def _newest_run(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Only the rows of the most recently assembled run among ``rows``.
+def _current_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Per tile, only the rows of the most recently assembled run among ``rows`` that wrote it.
 
-    A part is one complete run of one cell, so "latest wins" chooses between RUNS, not rows:
-    picking per tile would build a union no run produced, which the store cannot match.
-    ``assembled_at`` is the clock the registry provides for this; a run id is not one. A run whose
-    timestamps will not parse cannot be ordered, so it is never selected.
+    The rule ``registry_master`` merges by, because it is what the store holds: a run writes only its
+    own tiles, so each tile keeps the newest run that wrote it, and an infill supersedes the tiles
+    it touched and no others. ``assembled_at`` is the clock and ``run_id`` breaks a tie. A run whose
+    timestamps will not parse cannot be ordered, so it is never selected over one that can.
     """
-    newest: tuple[datetime, str] | None = None
+    runs: dict[str, tuple[datetime, str]] = {}
     for row in rows:
-        stamp = _parse_stamp(row["assembled_at"])
-        if stamp is None:
-            continue
-        candidate = (stamp, str(row["run_id"]))
-        if newest is None or candidate > newest:
-            newest = candidate
-    if newest is None:
-        return list(rows)
-    return [r for r in rows if str(r["run_id"]) == newest[1]]
+        if (stamp := _parse_stamp(row["assembled_at"])) is not None:
+            run = str(row["run_id"])
+            runs[run] = max(runs.get(run, (stamp, run)), (stamp, run))
+    newest: dict[str, tuple[datetime, str]] = {}
+    for row in rows:
+        if (order := runs.get(str(row["run_id"]))) is not None:
+            newest[row["tile"]] = max(newest.get(row["tile"], order), order)
+    return [r for r in rows if r["tile"] not in newest or runs.get(str(r["run_id"])) == newest[r["tile"]]]
 
 
 def _verify_against_store(
@@ -514,7 +513,7 @@ def _verify_against_store(
                 key = (str(row["run_id"]), str(row["tile"]))
                 within_run[key] = within_run.get(key, 0) + 1
             duplicated = sorted(f"{run}/{tile}" for (run, tile), n in within_run.items() if n > 1)
-            registry_rows = _newest_run(all_rows)
+            registry_rows = _current_rows(all_rows)
             # The COORDINATES, not the count: one tile missing and one wrongly marked embedded
             # leaves the cardinalities equal while the registry points consumers at the wrong
             # ground and this audit says "agrees".
@@ -610,7 +609,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"cells with more than one part (a refill): {len(refilled)} {list(refilled)[:8]}")
     print(f"parts whose path does not parse or names no real zone: {len(unparsed)} {unparsed[:4]}")
 
-    # A compacted master and a dataset-level `_common_metadata` are what a consumer WITHOUT this
+    # A master and a dataset-level `_common_metadata` are what a consumer WITHOUT this
     # package needs, so one schema covers the whole read and comes from the dataset rather than
     # from a part they must know is current. Absence is a finding about who can read this.
     siblings = _siblings(fs, args.registry)
@@ -665,12 +664,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     # Counts, not the rounded fraction: one null row in 3.2 M rounds to 0.0 and would pass a zero threshold.
     above = complete["rows_without_measurements"] > args.max_unmeasured * complete["rows"]
-    stale = complete["master_matches_newest_runs"] is False
-    incomplete = above or stale
+    stale = complete["cells_where_master_is_stale"] or []
+    incomplete = above or bool(stale)
     if stale:
+        zones = ",".join(sorted({cell.split("/")[0] for cell in stale}))
         print(
-            "  master/ does not hold exactly the newest fill runs' tile-years — a partial or stale "
-            "compaction; re-run compact"
+            f"  master/ is stale in {len(stale)} cell(s), each a fill whose master update failed: "
+            f"{', '.join(stale[:20])}. Repair: rebuild_registry_measurements.py sync --zones {zones} --write"
         )
     if above:
         print(

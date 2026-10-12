@@ -876,6 +876,12 @@ def _published_part(registry_root: str) -> dict:
     return table.to_pydict()
 
 
+def _master_tiles(registry_root: str) -> list[str]:
+    """The tiles in the cell's ``master/`` file — present only if the fill brought it up to date."""
+    pq = pytest.importorskip("pyarrow.parquet")
+    return pq.read_table(f"{registry_root}/master/zone={_ZONE}/year=2025/part-0.parquet").column("tile").to_pylist()
+
+
 def test_the_registry_records_the_depth_rule_the_cell_was_filled_under(tmp_path, monkeypatch):
     """The runner's config must reach the published row, through three forwarding hops.
 
@@ -907,6 +913,31 @@ def test_the_registry_records_the_depth_rule_the_cell_was_filled_under(tmp_path,
     assert cols["tile"], "a part was published"
     assert set(cols["optical_min_obs"]) == {15}, "every row states the store's rule"
     assert set(cols["embedded"]) == {True}
+    assert _master_tiles(registry_root) == sorted(cols["tile"]), "and the cell's master is current"
+
+
+def test_a_failed_master_update_does_not_fail_a_landed_cell(tmp_path, monkeypatch, caplog):
+    """The cell has committed and is tagged by then; the master is an index beside it, and repairable."""
+    store = _seed_global_with_rule(tmp_path, 15)
+    registry_root = str(tmp_path / "registry")
+    monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub({}))
+
+    def unreachable(*_args: object, **_kwargs: object) -> list[str]:
+        raise OSError("S3 500")
+
+    monkeypatch.setattr(zone_fill, "update_cell", unreachable)
+    config = InferenceConfig(time_window=_window(2025), chunk_size=_TILE, num_gpus=0, optical_min_obs=15)
+    with caplog.at_level(logging.ERROR):
+        summary = _fill(
+            tmp_path,
+            store,
+            land_mask_path=_make_mask(tmp_path, [(0, 0)]),
+            mosaic_base=_make_mosaic(tmp_path),
+            registry_root=registry_root,
+            config=config,
+        )
+    assert summary["tag"], "the cell landed and was tagged"
+    assert "registry master NOT updated" in caplog.text
 
 
 def test_an_all_refused_cell_still_records_the_depth_rule(tmp_path, monkeypatch):
@@ -944,6 +975,7 @@ def test_an_all_refused_cell_still_records_the_depth_rule(tmp_path, monkeypatch)
     assert set(cols["embedded"]) == {False}, "every tile refused"
     assert set(cols["optical_min_obs"]) == {15}
     assert set(cols["refused_thin_px"]) == {4}, "and the reason survived alongside the rule"
+    assert _master_tiles(registry_root) == sorted(cols["tile"]), "this branch updates the master too"
 
 
 def test_a_store_with_no_depth_rule_publishes_null_not_zero(tmp_path, monkeypatch):

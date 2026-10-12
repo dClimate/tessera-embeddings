@@ -294,9 +294,10 @@ def rebuild_schema() -> pa.Schema:
     """The part schema for the ``rebuild/`` prefix: the registry's own, plus ``filled_at``.
 
     A rebuilt row's ``assembled_at`` is when the REBUILD produced it, because that is what the
-    compaction resolves latest-wins on and a run id is not a clock. That would otherwise lose when
-    the cell was originally filled, so the fill's own stamp is carried in ``filled_at``. On a fill
-    part the two are the same value and the column is absent; the compacted master carries it for
+    master's merge resolves latest-wins on and a run id is not a clock. That would otherwise lose
+    when the tile was filled, so the fill's own stamp is carried in ``filled_at`` — which is also
+    how the merge tells a re-derivation of the tile's current run from one of a superseded run. On
+    a fill part the two are the same value and the column is absent; the master carries it for
     every row.
 
     Declared here rather than by extending the registry's writer because ``storage/registry.py``
@@ -307,13 +308,18 @@ def rebuild_schema() -> pa.Schema:
     return pa.schema([*registry_schema(), pa.field("filled_at", pa.string())])
 
 
+def rebuild_dataset_schema() -> pa.Schema:
+    """:func:`rebuild_schema` plus the hive partition keys, for reading ``rebuild/`` as a dataset."""
+    return pa.schema([*rebuild_schema(), pa.field("zone", pa.string()), pa.field("year", pa.int32())])
+
+
 def part_uri(rebuild_root: str, zone: str, year: int, run_id: str) -> str:
     """Where one cell's rebuilt part lands, under a prefix of its own.
 
     ``rebuild/`` sits BESIDE ``parts/``, never inside it. A consumer reading ``parts/`` today sees
     exactly what the campaign published — same rows, same count, same schema — and a rebuild adds
-    a second row for a tile nowhere that anybody reads unfiltered. The compaction is what merges
-    the two, and rollback is deleting this prefix.
+    a second row for a tile nowhere that anybody reads unfiltered. The master is what merges the
+    two, and rollback is deleting this prefix.
     """
     return f"{rebuild_root.rstrip('/')}/zone={zone}/year={year}/{run_id}.parquet"
 
@@ -352,7 +358,7 @@ def rebuilt_row(
     """A full rebuilt row for one tile: carried identity, re-derived measurements.
 
     ``run_id`` and ``assembled_at`` are the REBUILD's, not the fill's — a row has to say which pass
-    produced it, and ``assembled_at`` is what lets the compaction resolve latest-wins without
+    produced it, and ``assembled_at`` is what lets the master's merge resolve latest-wins without
     treating a run id as a clock. The fill's own stamp is carried in ``filled_at`` so nothing is
     lost. The columns naming the fill (``code_version``, ``code_commit``, the bbox, the depth rule)
     are carried across unchanged: a rebuild does not become the build that refused the tile.
