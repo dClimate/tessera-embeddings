@@ -1,6 +1,6 @@
 # 012 — Validated equivalence, not bit-exactness, for inference outputs
 
-**Status:** Accepted (2026-07-16)
+**Status:** Accepted (2026-07-16). Cross-config envelope widened 2026-10-06 (repo owner).
 
 ## Context
 
@@ -84,32 +84,48 @@ worst-pixel cosine of 0.99981 ([ingest measurements
 
 The table above gates a **same-config** change — optimized code vs the
 reference at the *identical* batch size and software stack. Comparing two
-runs that differ in **config** (e.g. the `main` reference at batch 3584 vs
-the shipped branch at 7168) is a different question: per fact 2, cuBLAS
-selects different kernels for different batch shapes, so int8 values
-shimmer by more than one level with no change to the model or code. Judged
-against the same-config table, a config change would read as a regression;
-it is not one. Cross-run diffs of this kind are therefore held to a looser,
-empirically-derived envelope (implemented as `compare_outputs.py
---cross-config`):
+runs that differ in **config** (batch size, strip boundaries, tile order,
+library stack) is a different question: per fact 2, cuBLAS selects different
+kernels for different batch shapes, so int8 values shimmer by more than one
+level with no change to the model or code. Judged against the same-config
+table, a config change would read as a regression; it is not one. Cross-run
+diffs of this kind are therefore held to a looser envelope (implemented as
+`compare_outputs.py --cross-config`):
 
 | Metric | Same-config gate | Cross-config envelope |
 |---|---|---|
-| int8 within ±1 level | (max deviation ≤ 1) | ≥ 99.99% |
-| max int8 deviation | ≤ 1 level | ≤ 3 levels |
-| per-pixel scale relative drift | ≤ 0.1% | ≤ 1.6% (≈4 BF16 ULPs) |
-| cosine similarity of dequantized embeddings | ≥ 0.9999 | ≥ 0.9999 |
+| int8 within ±1 level | (max deviation ≤ 1) | ≥ 99.5%, on tiles of at least 10,000 pixels |
+| max int8 deviation | ≤ 1 level | reported, not gated |
+| per-pixel scale relative drift | ≤ 0.1% | ≤ 3% |
+| cosine similarity of dequantized embeddings | ≥ 0.9999 | ≥ 0.999 (worst pixel) |
 | footprint / obs-count layers | exact | exact |
 
-The bounds sit just outside the measured shimmer (2026-07-16, `main`@3584
-vs branch@7168, ~512M values/chunk: exact 95–98%, within-1 ≥ 99.99%,
-max |Δ| = 2, scale drift ≤ 0.78%), so anything worse signals a real defect,
-not config drift. Note this envelope does **not** gate *exactly-equal* — that
-metric legitimately falls to ~95% across a batch-size change — but footprint
-and observation-count layers are deterministic and stay **exact** in both
-classes. This envelope is for diffing across configs; it is **not** a
-relaxation of the same-config gate, which every shippable forward-pass
-reorder must still meet.
+**Where the bounds come from.** Two full Iowa years compared across configs,
+788 tile pairs: the sharded strip loader against the old one on v1.1, and
+the October 2026 optimisation stack against `main` on v2. Their worst tiles
+reached 4 levels, 1.97% scale drift and a worst-pixel cosine of 0.999865,
+and every tile of 10,000 pixels or more kept at least 99.994% of values
+within one level. What a user consumes did not move: 99.98% of each pixel's
+top-20 neighbours were kept on v1.1 and 99.99% on v2. A real defect sits far
+outside the bounds: the `nn.GRU` swap of ADR 026 left 41% of values within
+one level, 24% scale drift and a worst cosine of 0.99. The largest deviation
+is reported but not gated, because it is one value among hundreds of
+millions and grows with the number compared; the within-one share is not
+judged below 10,000 pixels, where a handful of values decides it. The
+per-pixel drift and cosine bounds apply to every tile. The first bounds,
+set on three chunks of a batch-size change (≥ 99.99% within one level, at
+most 3 levels, 1.6% drift, cosine 0.9999), failed both full years on their
+extremes alone.
+
+This envelope does **not** gate *exactly-equal*, which legitimately falls
+to ~95% across a batch-size change, but footprint and observation-count
+layers are deterministic and stay **exact** in both classes. It is for
+diffing across configs, **not** a relaxation of the same-config gate, which
+every shippable forward-pass reorder must still meet.
+
+**Usability is measured before such a change reaches a store:** top-20
+neighbour agreement on the same tiles, at or above the same-model ceiling of
+0.9940 ([`validating-a-model-change.md`](../inference/validating-a-model-change.md)).
 
 **Precision stays BF16.** FP16 with reduced-precision accumulation would
 roughly double the matmul ceiling on GA10x-class GPUs (FP32-accumulate
