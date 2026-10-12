@@ -18,7 +18,10 @@ tell what the numbers mean without asking us. A new metadata standard goes here.
 
 **`registry.py`** builds the summary table published beside the data: one row per tile per
 year saying whether it was filled and how good the coverage was. New columns that help
-someone judge whether an area is usable belong here.
+someone judge whether an area is usable belong here. `registry_rebuild.py` re-derives a row's
+measurements from the store when a fill left them null, and `registry_master.py` merges the
+campaign's parts and those rebuilt rows into the `master/` view consumers read. Both sit outside
+the inference code identity, so changing them never invalidates staged work.
 
 ## The rest
 

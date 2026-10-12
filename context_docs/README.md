@@ -102,6 +102,11 @@ context_docs/
     │                                              conforms, measured speeds in two regions, and
     │                                              what would surprise a consumer
     ├── staging-identity-and-resume.md          what a run id identifies, and what resumes
+    ├── registry-backfill.md                    how the 47% of registry rows the campaign left
+    │                                              unmeasured were re-derived from the store and
+    │                                              published, why that is a re-derivation rather
+    │                                              than an estimate, the master/ consumers read,
+    │                                              and the v1.1 run
     └── icechunk-api-ledger.md                  signatures and gotchas the scale tests earned
 ```
 
