@@ -75,7 +75,7 @@ from tessera_embeddings.inference.data_loading import (
 )
 from tessera_embeddings.ingest.catalogue_refusal import RefusalKind, refusal_in, repeat_is_deterministic
 from tessera_embeddings.ingest.duplicates import unreadable_source_in
-from tessera_embeddings.ingest.land_mask import export_zone_roi, live_chunk_count
+from tessera_embeddings.ingest.land_mask import coverage_identity, export_zone_roi, live_chunk_count
 from tessera_embeddings.orchestration.prefect.flows._child_runs import (
     _check_completed,
     child_run_tag,
@@ -83,6 +83,7 @@ from tessera_embeddings.orchestration.prefect.flows._child_runs import (
 )
 from tessera_embeddings.orchestration.runners.zone_fill import zone_has_live_tiles
 from tessera_embeddings.storage.manifest import IngestManifest, extract_manifest
+from tessera_embeddings.storage.update import load_update, roi_uri
 from tessera_embeddings.storage.zarr_store import (
     get_existing_dates,
     is_missing_repo,
@@ -120,10 +121,19 @@ def _mosaic_stores(mosaic_base: str, s1_orbit: str) -> list[str]:
 _Creds = Callable[[], "icechunk.S3StaticCredentials"] | None
 
 
-def _coverage_sha(land_mask_path: str, zone: str, *, get_credentials: _Creds, s3_region: str | None) -> str | None:
-    """The coverage delivery sha (``registry_sha256``) for ``zone``, or ``None``."""
+def _coverage_sha(
+    land_mask_path: str,
+    zone: str,
+    *,
+    get_credentials: _Creds,
+    s3_region: str | None,
+    tiles: frozenset[str] | None = None,
+) -> str | None:
+    """The coverage the mosaic is built for: the delivery sha (``registry_sha256``), with a
+    targeted update's shard set folded in (:func:`coverage_identity`), or ``None``.
+    """
     cov = open_store_as_zarr_group(land_mask_path, group=zone, get_credentials=get_credentials, region=s3_region)
-    return cast("str | None", cov.attrs.get("registry_sha256"))
+    return coverage_identity(cast("str | None", cov.attrs.get("registry_sha256")), tiles)
 
 
 def _probe_marker(store_path: str, *, get_credentials: _Creds, s3_region: str | None) -> tuple[bool, dict | None]:
@@ -422,6 +432,7 @@ async def ingest_zone_year(
     allow_ingest_code_mismatch: bool = False,
     s3_region: str | None = None,
     use_local: bool = False,
+    update: str | None = None,
 ) -> dict[str, Any]:
     """Ingest the S1/S2 mosaics for one ``(zone, year)`` onto the zone grid.
 
@@ -461,6 +472,10 @@ async def ingest_zone_year(
             us-west-2-only today — a pre-existing limitation independent of this flow, and
             all campaign data lives in us-west-2 by the RTC-archive constraint.
         use_local: Run ingestion on a local Dask cluster (dev).
+        update: Name of a targeted update (:mod:`tessera_embeddings.storage.update`) to ingest
+            for. Its plan supplies the mask, the shards (the ROI covers only their 4096-px
+            blocks), ``min_valid_coverage`` and ``allow_partial_window``, and the ROI and
+            mosaics go under the update's own prefix rather than the campaign's.
 
     Returns:
         ``{zone, year, status, ...}`` where status is ``skipped_ocean`` (no live
@@ -484,12 +499,24 @@ async def ingest_zone_year(
     # stores. `_active_orbits` would reject it, but only after that deletion has run.
     _active_orbits(s1_orbit)
     zone = canonicalize_zone(zone)
-    land_mask_path = paths.land_mask_store(mask_name)
     mosaic_base = f"{paths.inputs.rstrip('/')}/mosaics/{zone}/{year}"
     roi_path = paths.zone_roi_store(zone)
+    tiles: frozenset[str] | None = None
+    if update is not None:
+        # The plan decides what a campaign run takes from its parameters. Its own prefix keeps the
+        # ROI and mosaics away from the campaign's, which rewrites the one and sweeps the other.
+        plan = load_update(paths, update, mask_name=mask_name)
+        root = paths.update_root(update)
+        mask_name, tiles = plan.mask_name, plan.target(zone, year, root=root).tiles
+        ingest_settings = ingest_settings.model_copy(update={"min_valid_coverage": plan.min_valid_coverage})
+        allow_partial_window = plan.allow_partial_window
+        mosaic_base, roi_path = f"{root}/mosaics/{zone}/{year}", roi_uri(root, zone, year)
+    land_mask_path = paths.land_mask_store(mask_name)
 
     # (1) All-ocean zone: no ROI, no ingest — the fill marks it empty.
-    if not zone_has_live_tiles(land_mask_path, zone, get_credentials=iam_icechunk_credentials, s3_region=s3_region):
+    if not zone_has_live_tiles(
+        land_mask_path, zone, get_credentials=iam_icechunk_credentials, s3_region=s3_region, tiles=tiles
+    ):
         log.info("Zone %s has no live tiles (all-ocean) — skipping ingest", zone)
         return {"zone": zone, "year": year, "status": "skipped_ocean"}
 
@@ -510,7 +537,7 @@ async def ingest_zone_year(
         "s1_orbit": s1_orbit,
         "allow_partial_window": allow_partial_window,
         "coverage_sha256": _coverage_sha(
-            land_mask_path, zone, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+            land_mask_path, zone, get_credentials=iam_icechunk_credentials, s3_region=s3_region, tiles=tiles
         ),
     }
 
@@ -609,13 +636,14 @@ async def ingest_zone_year(
         dest_path=roi_path,
         get_credentials=iam_icechunk_credentials,
         s3_region=s3_region,
+        tiles=tiles,
     )
 
     # (4) Size the fleet from the cell's LIVE work. Writes are restricted to live windows, so
     # the live chunk count IS the work measure — the 03S incident showed extent-sized fleets
     # are wrong by orders of magnitude.
     n_chunks = live_chunk_count(
-        zone, land_mask_path=land_mask_path, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+        zone, land_mask_path=land_mask_path, get_credentials=iam_icechunk_credentials, s3_region=s3_region, tiles=tiles
     )
     max_workers = _scaled_max_workers(n_chunks, ingest_settings)
     log.info("Zone %s: %d live chunk(s) -> max_workers=%d", zone, n_chunks, max_workers)

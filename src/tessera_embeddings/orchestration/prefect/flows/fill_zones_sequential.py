@@ -40,7 +40,7 @@ import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import FIRST_COMPLETED, CancelledError, Future, ThreadPoolExecutor, wait
 from functools import cache, partial
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from prefect import flow, get_run_logger
 from prefect.client.orchestration import get_client
@@ -103,7 +103,9 @@ from tessera_embeddings.orchestration.runners.zone_fill import (
     zone_year_complete,
     zone_year_on_axis,
 )
+from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.object_store import delete_prefix
+from tessera_embeddings.storage.update import load_update, update_states
 from tessera_embeddings.storage.zone_grid import canonicalize_zone
 
 if TYPE_CHECKING:
@@ -627,7 +629,7 @@ _cancel_child_ingests_on_cancellation = make_child_cancel_hook(_INGEST_TAG_PREFI
 )
 def fill_zones_sequential_flow(
     *,
-    cells: list[tuple[str, int]],
+    cells: list[tuple[str, int]] | None = None,
     paths: BucketPaths,
     ami_ssm_name: str,
     ami_id: str | None = None,
@@ -667,6 +669,7 @@ def fill_zones_sequential_flow(
     ingest_settings: IngestSettings = IngestSettings(),  # noqa: B008
     fault_injection: FaultInjection | None = None,
     validation_deployment: str | None = None,
+    update: str | None = None,
 ) -> dict[str, Any]:
     """Fill many (zone, year) cells sequentially on a single shared Ray cluster.
 
@@ -799,6 +802,12 @@ def fill_zones_sequential_flow(
             never waited on (:mod:`._cell_validation`), so cell N is validated while cell N+1 is
             still inferring. ``None`` (the default) validates nothing: the validator is a
             consumer's flow, so the library names none.
+        update: Run a targeted update (:mod:`tessera_embeddings.storage.update`) of cells the
+            campaign has already filled, instead of filling. Its plan supplies the mask,
+            ``min_valid_coverage`` and ``allow_partial_window``; ``cells`` defaults to the plan's
+            and may name a subset, so one update can be split across runs. Triage counts what
+            each cell needs from the plan's shards, a cell the update already recorded is skipped
+            and one never filled is refused, and nothing is retagged or marked.
 
     Returns:
         Summary dict: triage counts (retag / empty / live), the sequential runner's outcome
@@ -853,7 +862,21 @@ def fill_zones_sequential_flow(
     # Canonicalize + dedupe, preserving caller order until the size sort. Dedupe on the PAIR:
     # one zone may legitimately appear for several years, and only an exact repeat is a caller
     # mistake (it would dispatch one cell twice).
-    cells = list(dict.fromkeys((canonicalize_zone(z), int(y)) for z, y in cells))
+    plan = load_update(paths, update, mask_name=mask_name) if update is not None else None
+    if plan is None and cells is None:
+        raise ValueError("cells is required unless an update supplies them")
+    if plan is not None:
+        # The plan, not the parameters, decides what an update reads and how strictly.
+        mask_name, allow_partial_window = plan.mask_name, plan.allow_partial_window
+        ingest_settings = ingest_settings.model_copy(update={"min_valid_coverage": plan.min_valid_coverage})
+        cells = plan.cell_list() if cells is None else cells
+    cells = list(dict.fromkeys((canonicalize_zone(z), int(y)) for z, y in cast("list[tuple[str, int]]", cells)))
+    if plan is not None and (outside := [c for c in cells if c not in set(plan.cell_list())]):
+        raise ValueError(f"Cell(s) {outside} are not in update {plan.name!r}")
+    # Where this run's mosaics and staging live: the campaign's, or the update's own.
+    update_root = paths.update_root(update) if update is not None else None
+    mosaic_root = update_root or paths.inputs
+    staging_root = paths.update_staging(update) if update is not None else f"{paths.outputs.rstrip('/')}/staging"
     cell_years = sorted({y for _, y in cells})
     if time_window_end is not None and len(cell_years) > 1:
         raise ValueError(
@@ -929,6 +952,19 @@ def fill_zones_sequential_flow(
     empty: list[dict[str, Any]] = []
     no_optical: list[dict[str, Any]] = []
     live: list[SequentialCell] = []
+    # An update's cells that need nothing: already recorded, or never filled (refused, as the runner
+    # would refuse them, but here before any ingest or cluster).
+    update_done: list[tuple[str, int]] = []
+    not_filled: list[tuple[str, int]] = []
+    states = (
+        update_states(
+            open_global_repo(store_path, get_credentials=iam_icechunk_credentials, region=s3_region),
+            plan.name,
+            cells,
+        )
+        if plan is not None
+        else {}
+    )
 
     # Resolved ONCE here, in the flow's own thread: the trailing assembly thread carries no
     # Prefect context, so reading the runtime id inside `_validate` would yield None for every
@@ -992,8 +1028,33 @@ def fill_zones_sequential_flow(
             ),
         )
 
+    def _update_no_cluster(zone: str, year: int) -> dict[str, Any]:
+        # The runner's no-Ray update path: no shard of the update is live in its mask, so planning
+        # records that and returns before any inference.
+        assert plan is not None
+        return fill_zone_year(
+            store_path=store_path,
+            zone=zone,
+            year=year,
+            land_mask_path=land_mask_path,
+            mosaic_base=f"{mosaic_root.rstrip('/')}/mosaics/{zone}/{year}",
+            staging_base=f"{staging_root}/{zone}/{year}",
+            config=_config_for(s1_orbit, year),
+            num_actors=1,
+            log=log,
+            run_id=f"{zone}-{year}-{plan.name}-none",
+            get_credentials=iam_icechunk_credentials,
+            s3_region=s3_region,
+            update=plan.target(zone, year, root=cast(str, update_root)),
+        )
+
     for zone, year in cells:
-        if zone_year_complete(store_path, zone, year, get_credentials=iam_icechunk_credentials, s3_region=s3_region):
+        if plan is not None and states[(zone, year)] != "pending":
+            (update_done if states[(zone, year)] == "done" else not_filled).append((zone, year))
+            continue
+        if plan is None and zone_year_complete(
+            store_path, zone, year, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+        ):
             retagged.append(_fill_no_cluster(zone, year, f"{zone}-{year}-retag"))
             continue
         if not zone_year_on_axis(store_path, zone, year, get_credentials=iam_icechunk_credentials, s3_region=s3_region):
@@ -1002,8 +1063,18 @@ def fill_zones_sequential_flow(
                 "reseed the store or drop the year."
             )
         n_tiles = zone_live_tile_count(
-            land_mask_path, zone, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+            land_mask_path,
+            zone,
+            get_credentials=iam_icechunk_credentials,
+            s3_region=s3_region,
+            # An update's work is its own shards, so the actors it asks for are too.
+            tiles=plan.target(zone, year, root=cast(str, update_root)).tiles if plan is not None else None,
         )
+        if n_tiles == 0 and plan is not None:
+            # None of the update's shards is live in its mask. The runner records that, with no
+            # cluster: an update never marks a cell empty, only itself done.
+            empty.append(_update_no_cluster(zone, year))
+            continue
         if n_tiles == 0:
             # No mosaic exists or is needed; run_id is provenance-only here (no staging to
             # fingerprint and no mosaic to read).
@@ -1054,6 +1125,14 @@ def fill_zones_sequential_flow(
         len(no_optical),
         [f"{c.zone}-{c.year}" for c in live],
     )
+    if plan is not None:
+        log.info(
+            "Update %s: %d cell(s) already recorded, %d never filled and refused: %s",
+            plan.name,
+            len(update_done),
+            len(not_filled),
+            [f"{z}-{y}" for z, y in not_filled],
+        )
 
     summary: dict[str, Any] = {
         "years": cell_years,
@@ -1062,6 +1141,11 @@ def fill_zones_sequential_flow(
         "empty": len(empty),
         "live": len(live),
         "no_optical": [[c["zone"], c["year"]] for c in no_optical],
+        **(
+            {"update": plan.name, "update_done": len(update_done), "not_filled": [list(c) for c in not_filled]}
+            if plan is not None
+            else {}
+        ),
     }
     if not live:
         log.info("No live cells — no Ray cluster needed")
@@ -1087,13 +1171,14 @@ def fill_zones_sequential_flow(
         allow_ingest_code_mismatch=allow_ingest_code_mismatch,
         s3_region=s3_region,
         branch=branch,
+        update=update,
     )
 
     inputs = (
         _DeploymentCellInputs(
             deployment=ingest_deployment,
             params_for=_ingest_params,
-            inputs_bucket=paths.inputs,
+            inputs_bucket=mosaic_root,
             cleanup_mosaics=cleanup_mosaics,
             # This cluster's SHARE of the fleet-wide ingest cap, so the clusters divide it
             # evenly by construction rather than racing for slots on the global gate
@@ -1137,7 +1222,7 @@ def fill_zones_sequential_flow(
         # any) has landed: orbit resolution probes the mosaic, the coverage gate reads its
         # months, and the run_id fingerprints its ingest marker (identical inputs → resume
         # staging; any change → fresh prefix).
-        mosaic_base = f"{paths.inputs.rstrip('/')}/mosaics/{cell.zone}/{cell.year}"
+        mosaic_base = f"{mosaic_root.rstrip('/')}/mosaics/{cell.zone}/{cell.year}"
         resolved = resolve_s1_orbit(
             mosaic_base,
             s1_orbit,
@@ -1159,11 +1244,11 @@ def fill_zones_sequential_flow(
         )
         return PreparedCell(
             mosaic_base=mosaic_base,
-            staging_base=f"{paths.outputs.rstrip('/')}/staging/{cell.zone}/{cell.year}",
+            staging_base=f"{staging_root}/{cell.zone}/{cell.year}",
             run_id=_staging_run_id(
                 cell.zone,
                 cell.year,
-                inputs_bucket=paths.inputs,
+                inputs_bucket=mosaic_root,
                 min_valid_coverage=ingest_settings.min_valid_coverage,
                 s1_orbit=s1_orbit,
                 allow_partial_window=allow_partial_window,
@@ -1195,6 +1280,7 @@ def fill_zones_sequential_flow(
             run_id=prep.run_id,
             get_credentials=iam_icechunk_credentials,
             s3_region=s3_region,
+            update=plan.target(cell.zone, cell.year, root=cast(str, update_root)) if plan is not None else None,
         )
 
     # The shared stream session: ONE set of actors for EVERY zone in the cluster, whatever orbit

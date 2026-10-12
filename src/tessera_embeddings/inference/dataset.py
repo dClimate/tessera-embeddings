@@ -62,6 +62,9 @@ class MosaicChunkInferenceDataset:
             Ignored by v2, which hard-codes one set. The band statistics are DERIVED from this and
             ``model_version`` rather than passed in, so normalisation and resampling cannot
             describe different students.
+        pixels: ``(H, W)`` mask of the only pixels this strip may embed, beside the depth and radar
+            gates rather than instead of them. A targeted update passes the store's holes here, so
+            pixels that already hold embeddings never reach the GPU. ``None`` gates nothing.
     """
 
     def __init__(
@@ -73,6 +76,7 @@ class MosaicChunkInferenceDataset:
         optical_min_obs: int | None = None,
         model_version: ModelVersion = DEFAULT_MODEL_VERSION,
         norm_source: str | None = None,
+        pixels: np.ndarray | None = None,
     ) -> None:
         if optical_min_obs is not None and optical_min_obs <= 0:
             # Zero refuses nothing while reading as a configured rule, making a caller that meant "no minimum"
@@ -107,9 +111,9 @@ class MosaicChunkInferenceDataset:
         self._cols = np.empty((0,), dtype=np.int64)
         self._global_idxs = np.empty((0,), dtype=np.int64)
 
-        self._find_and_bucket_pixels(chunk_data)
+        self._find_and_bucket_pixels(chunk_data, pixels)
 
-    def _find_and_bucket_pixels(self, chunk_data: ChunkData) -> None:
+    def _find_and_bucket_pixels(self, chunk_data: ChunkData, pixels: np.ndarray | None = None) -> None:
         """Identify valid pixels and assign each to a ``(s2_bin, s1_bin)`` bucket."""
         s2_bands = chunk_data.s2_bands
         s2_masks = chunk_data.s2_masks
@@ -156,6 +160,12 @@ class MosaicChunkInferenceDataset:
         valid_mask = has_optical & deep_enough
         if not self.allow_s2_only:
             valid_mask &= has_radar
+        # A targeted update's mask narrows WHAT is embedded, never the refusal counts below, which read
+        # the gates rather than `valid_mask` and so still describe the whole strip.
+        if pixels is not None:
+            if pixels.shape != valid_mask.shape:
+                raise ValueError(f"pixel mask shape {pixels.shape} does not match the strip's {valid_mask.shape}")
+            valid_mask &= pixels
         # For the per-chunk record: eligible-but-refused, by reason. "Thin" counts only pixels that HAD optical and
         # lost on depth, so the two optical reasons partition rather than overlap and their sum is the optical refusal
         # total.

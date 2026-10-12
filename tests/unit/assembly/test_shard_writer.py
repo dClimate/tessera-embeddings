@@ -75,13 +75,20 @@ def _slow_no_stats_worker(payload):
 
 
 class _OneInnerChunkSource:
-    """Writes shard (0,0): one 256^2 inner chunk of real data, the rest fill."""
+    """Writes shard (0,0): one 256^2 inner chunk of real data, the rest fill.
 
-    def __init__(self, seed: int = 0):
+    ``owned`` makes it a targeted update's source: only those pixels of the shard are its own.
+    """
+
+    def __init__(self, seed: int = 0, owned: np.ndarray | None = None):
         self.seed = seed
+        self.owned = owned
 
     def live_shards(self):
         return [(0, 0)]
+
+    def pixels(self, shard):
+        return self.owned
 
     def load(self, shard):
         rng = np.random.default_rng(self.seed)

@@ -76,6 +76,9 @@ dependencies = [
     # Data access request): one part per cell as it lands, merged into the cell's master file.
     # Written from the fill, so it is a runtime dependency rather than a dev one.
     "pyarrow",
+    # Queries the registry when planning a targeted update (`storage/update.py`). No transitive
+    # dependencies beyond its own runtime.
+    "polars>=2.0.0",
     "cloudpickle",
     "tqdm",
     "pyyaml",

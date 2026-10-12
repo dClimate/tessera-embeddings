@@ -80,6 +80,7 @@ from tessera_embeddings.storage.registry_master import (
     write_common_metadata,
 )
 from tessera_embeddings.storage.registry_rebuild import rebuild_run_id, rebuilt_row
+from tessera_embeddings.storage.update import last_run_id
 
 DEFAULT_STORE = "s3://tessera-embeddings/v1.1/dclimate.icechunk"
 DEFAULT_REGISTRY = "s3://tessera-embeddings/v1.1/dclimate.registry"
@@ -171,7 +172,8 @@ def _cells(parts: pa.Table, zones: list[str]) -> dict[tuple[str, int], pa.Table]
 def _store_slot(group: zarr.Group, year: int, rows: list[dict[str, Any]]) -> int | str:
     """The cell's time index in the store, or why the store cannot stand behind these registry rows.
 
-    The zone group records the last run that wrote each year, which must be the newest run among
+    The zone group records the last run that wrote each year — its fill, or a targeted update since
+    (:func:`~tessera_embeddings.storage.update.last_run_id`) — which must be the newest run among
     the cell's rows. Then every row's tile holds the pixels of the run that row names, because a
     run writes only its own tiles — so a cell built from several runs, an infill over a fill, is
     re-derivable tile by tile. A run that committed to the store but never published its registry
@@ -182,7 +184,7 @@ def _store_slot(group: zarr.Group, year: int, rows: list[dict[str, Any]]) -> int
     if year not in years:
         return "no time slot in the store"
     newest = max((datetime.datetime.fromisoformat(row["assembled_at"]), row["run_id"]) for row in rows)[1]
-    stored = ((dict(group.attrs).get("runs") or {}).get(str(year)) or {}).get("run_id")
+    stored = last_run_id(dict(group.attrs), year)
     if stored != newest:
         return f"the store holds run {stored!r}, the registry's newest is {newest!r}"
     return years.index(year)

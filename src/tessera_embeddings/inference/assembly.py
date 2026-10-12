@@ -72,7 +72,13 @@ from tessera_embeddings.config.store_layout import (
     StoreLayout,
     trailing_extent,
 )
-from tessera_embeddings.inference.chunk_spec import ChunkSpec, chunk_label, filter_chunks_by_roi_mask, parse_chunk_label
+from tessera_embeddings.inference.chunk_spec import (
+    ChunkSpec,
+    chunk_label,
+    filter_chunks_by_roi_mask,
+    parse_chunk_label,
+    read_pixel_mask,
+)
 from tessera_embeddings.storage import zone_grid
 from tessera_embeddings.storage.conventions import assert_encoder_matches, build_convention_attrs
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
@@ -249,6 +255,9 @@ _WORKER_SUM_KEYS: tuple[str, ...] = (
     "read_cpu_s",
     "write_s",
     "write_cpu_s",
+    # A targeted update's read of the shard it merges into (`ShardSource.pixels`); absent otherwise.
+    "merge_s",
+    "merge_cpu_s",
     "wall_s",
     "cpu_s",
 )
@@ -590,6 +599,9 @@ class StagedShardSource:
     # Written as fill rather than left alone — see `live_shards`.
     cleared: tuple[tuple[int, int], ...] = ()
     fill_values: tuple[tuple[str, float], ...] = ()  # (var, fill) for the cleared tiles
+    # A targeted update's pixel masks, as `((row, col), uri)` pairs. A staged shard listed here is
+    # MERGED into the store, replacing only the pixels its mask marks (see `pixels`).
+    owned: tuple[tuple[tuple[int, int], str], ...] = ()
 
     def live_shards(self) -> list[tuple[int, int]]:
         """Every ``(row, col)`` this run is responsible for — staged AND skipped.
@@ -657,6 +669,11 @@ class StagedShardSource:
                 f"{list(self.variables)} — heterogeneous staged run; re-stage with one config before assembling."
             )
         return blocks
+
+    def pixels(self, shard: tuple[int, int]) -> np.ndarray | None:
+        """The pixels a targeted update owns in ``shard``, or ``None`` when the run owns it whole."""
+        uri = next((uri for position, uri in self.owned if position == shard), None)
+        return None if uri is None else read_pixel_mask(uri)
 
     def _fill_block(self, shard: tuple[int, int] | None = None) -> dict[str, np.ndarray]:
         """A whole tile of fill for a position this run skipped — with any coverage it DID measure.
@@ -1003,6 +1020,7 @@ class ZarrWriter:
         refused: list[str],
         optical_min_obs: int | None = None,
         embedded_records: Mapping[str, dict] | None = None,
+        update_name: str | None = None,
         get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
         s3_region: str | None = None,
     ) -> str | None:
@@ -1049,6 +1067,7 @@ class ZarrWriter:
                     optical_min_obs=optical_min_obs,
                     bboxes=boxes,
                     code=build,
+                    update_name=update_name,
                 ),
                 open_output=lambda target: fs.open(target, "wb"),
                 zone=zone,
@@ -2226,6 +2245,9 @@ class ZarrWriter:
         registry_root: str | None = None,
         optical_min_obs: int | None = None,
         embedded_records: Mapping[str, dict] | None = None,
+        pixels: Mapping[str, str] | None = None,
+        commit_attrs: Callable[[icechunk.Repository, str, int], str] | None = None,
+        update_name: str | None = None,
     ) -> str:
         """Assemble a run's staged tiles into one (zone, year) of the global store.
 
@@ -2302,6 +2324,13 @@ class ZarrWriter:
                 the gap between its two commits. Inert unless the run was armed for
                 that fault and this cell
                 (:mod:`tessera_embeddings.config.fault_injection`).
+            pixels: A targeted update's pixel masks, label to URI. A staged tile listed here is
+                merged into the shard already in the store, replacing only the pixels its mask
+                marks; an unlisted one is written whole.
+            commit_attrs: Replaces the year-attrs commit
+                (:func:`~tessera_embeddings.storage.shard_writer.write_year_shards`). A targeted
+                update records itself this way and leaves ``years_complete`` and ``runs`` alone.
+            update_name: The targeted update writing this cell, stamped on its registry rows.
 
         Returns:
             The commit snapshot id.
@@ -2453,6 +2482,7 @@ class ZarrWriter:
             optional_present=dest_optional,
             cleared=cleared,
             fill_values=fill_values,
+            owned=tuple((parse_chunk_label(label), uri) for label, uri in sorted((pixels or {}).items())),
         )
         telemetry: dict[str, Any] = {}
         # Captured before the write, so the registry part reports what THIS call published rather
@@ -2487,6 +2517,7 @@ class ZarrWriter:
             log=_log,
             fault=fault,
             input_coverage=input_coverage,
+            commit_attrs=commit_attrs,
         )
         # THE CELL IS COMMITTED. Only now may the registry say so: nothing reconciles it against
         # the store, and consumers are told they need not open the store, so a part written any
@@ -2501,6 +2532,7 @@ class ZarrWriter:
                 refused=registry_refused,
                 optical_min_obs=optical_min_obs,
                 embedded_records=embedded_records,
+                update_name=update_name,
                 # The store's own callback: the registry is its sibling in the same bucket, so the
                 # credential that opened the store is the one that can write beside it.
                 get_credentials=get_credentials,

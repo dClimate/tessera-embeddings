@@ -12,6 +12,7 @@ URIs may use any fsspec-supported protocol: ``s3://``, ``gs://``, ``file://``,
 from __future__ import annotations
 
 import posixpath
+import re
 from typing import final
 
 from pydantic import BaseModel, Field
@@ -19,6 +20,18 @@ from pydantic import BaseModel, Field
 _INPUT_KINDS: frozenset[str] = frozenset({"reflectance", "sar_ascending", "sar_descending", "roi"})
 _OUTPUT_KINDS: frozenset[str] = frozenset({"embeddings"})
 _ALL_KINDS: frozenset[str] = _INPUT_KINDS | _OUTPUT_KINDS
+
+
+#: A targeted update's name: it becomes a path segment, a tag and a registry value, so it is held to
+#: what all three accept unquoted.
+UPDATE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
+
+
+def check_update_name(name: str) -> str:
+    """Return ``name`` if it is a valid :data:`UPDATE_NAME`; raise ``ValueError`` otherwise."""
+    if not UPDATE_NAME.fullmatch(name):
+        raise ValueError(f"Update name {name!r} must match {UPDATE_NAME.pattern}")
+    return name
 
 
 #: The derived store's basename, and the only ``name`` an override tolerates. Named here so the
@@ -151,6 +164,29 @@ class BucketPaths(BaseModel):
         # name ``/tessera.registry`` at the FILESYSTEM ROOT: a permissions failure if you are
         # lucky, a write unrelated to the configured store if you are not.
         return f"{base}{sep}{stem}.registry"
+
+    def update_root(self, name: str) -> str:
+        """Return the prefix holding everything a targeted update writes besides the store itself.
+
+        Its plan, and per cell its ingest ROI, mosaics and hole masks (layout in
+        :mod:`tessera_embeddings.storage.update`). Apart from the campaign's own ``rois/`` and
+        ``mosaics/`` deliberately: the campaign rewrites a zone's shared ROI whenever its coverage
+        changes and sweeps the mosaics of every complete cell, and an update's cells are complete.
+        Passed where the campaign passes ``inputs`` as a mosaic root, so ``{root}/mosaics/{zone}/{year}``
+        follows from the code that builds the campaign's.
+
+        Raises:
+            ValueError: If ``name`` is not a valid update name (:data:`UPDATE_NAME`).
+        """
+        return posixpath.join(self.inputs, "updates", check_update_name(name))
+
+    def update_staging(self, name: str) -> str:
+        """Return the staging root for a targeted update's inference, apart from the campaign's.
+
+        Staging resumes by run id under ``{root}/{zone}/{year}``, so an update sharing the
+        campaign's root could resume tiles staged for a different set of pixels.
+        """
+        return posixpath.join(self.outputs, "staging", "updates", check_update_name(name))
 
     def land_mask_store(self, name: str = "global") -> str:
         """Return the URI of the campaign land-mask coverage Icechunk repo.
