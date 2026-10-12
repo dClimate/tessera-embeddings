@@ -15,6 +15,7 @@ import zarr
 from tessera_embeddings.inference.actors import _coverage_record
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.storage import registry_rebuild as rb
+from tessera_embeddings.storage.registry import _measurement_fields
 
 RULE = 15
 
@@ -120,6 +121,21 @@ class TestDriftAgainstTheFill:
         assert rebuilt["median_obs_where_any"] == fill["s2_obs"]["median_where_any"]
         assert rebuilt["median_obs_where_thin"] == fill["s2_obs"]["median_where_thin"]
         assert rebuilt["px_with_any_radar"] == fill["px_with_any_radar"]
+
+    def test_re_derived_measurements_survive_the_fills_part_writer(self) -> None:
+        """A targeted update publishes a merged shard's re-derived measurements through the fill's part
+        writer, which reads coverage records. Passed as row columns, every count arrived as zero or null.
+        """
+        rng = np.random.default_rng(2)
+        s2 = rng.integers(0, 40, size=(32, 32)).astype(np.uint16)
+        radar = rng.integers(0, 3, size=(32, 32)).astype(np.uint16)
+        rebuilt = rb.measurements_from_obs(
+            s2, optical_min_obs=RULE, radar_rule_enforced=False, s1_asc=radar, s1_desc=radar
+        )
+        assert _measurement_fields(rb.as_coverage_record(rebuilt)) == {
+            k: rebuilt[k] for k in _measurement_fields(rb.as_coverage_record(rebuilt))
+        }
+        assert _measurement_fields(rb.as_coverage_record(rebuilt))["refused_thin_px"] > 0
 
     def test_the_refusal_split_matches_the_datasets_rule(self) -> None:
         """``has_optical`` is ``s2_obs_count > 0`` on the delivered product — the whole basis here.

@@ -158,6 +158,28 @@ def measurements_from_obs(
     }
 
 
+def as_coverage_record(measurements: Mapping[str, Any]) -> dict[str, Any]:
+    """:func:`measurements_from_obs`'s columns in the shape of an actor's coverage record.
+
+    The fill's part writer reads coverage records (``registry._measurement_fields``), and a targeted
+    update that merged a shard publishes re-derived measurements through it, so they travel in that
+    shape. The inverse of that writer, field for field.
+    """
+    return {
+        "eligible_px": measurements.get("eligible_px"),
+        "chunk_px": measurements.get("chunk_px"),
+        "refused": {reason: measurements.get(f"refused_{reason}_px") for reason in REASONS},
+        "s2_obs": {
+            "px_with_any": measurements.get("px_with_any_optical"),
+            "max": measurements.get("obs_max"),
+            "median_where_any": measurements.get("median_obs_where_any"),
+            "median_where_thin": measurements.get("median_obs_where_thin"),
+        },
+        "px_with_any_radar": measurements.get("px_with_any_radar"),
+        "radar_rule_enforced": measurements.get("radar_rule_enforced"),
+    }
+
+
 def basis_violations(table: pa.Table) -> tuple[int, int]:
     """``(violating, measured)``: measured rows where the fill's optical test was not ``obs > 0``.
 

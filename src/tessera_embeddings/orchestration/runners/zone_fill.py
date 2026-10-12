@@ -80,7 +80,7 @@ from tessera_embeddings.storage.campaign import mark_zone_year_empty, pin_tag, t
 from tessera_embeddings.storage.global_store import check_destination_types, open_global_repo
 from tessera_embeddings.storage.published_store import calendar_years, live_shards
 from tessera_embeddings.storage.registry_master import update_cell
-from tessera_embeddings.storage.registry_rebuild import rebuild_tile
+from tessera_embeddings.storage.registry_rebuild import as_coverage_record, rebuild_tile
 from tessera_embeddings.storage.shard_writer import read_years_complete, shard_pitch
 from tessera_embeddings.storage.time_axis import time_index_of, year_timestamp
 from tessera_embeddings.storage.update import (
@@ -1414,8 +1414,10 @@ def _publish_merged_rows(
             year_index = calendar_years(node).index(year)
             with ThreadPoolExecutor(max_workers=16) as pool:
                 rows = pool.map(
-                    lambda tile: rebuild_tile(
-                        node, time_index=year_index, tile=tile, optical_min_obs=optical_min_obs, with_radar=True
+                    lambda tile: as_coverage_record(
+                        rebuild_tile(
+                            node, time_index=year_index, tile=tile, optical_min_obs=optical_min_obs, with_radar=True
+                        )
                     ),
                     labels,
                 )
