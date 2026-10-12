@@ -29,9 +29,12 @@ The v1.1 backfill that first filled `master/` is a separate record:
 package takes the schema from the dataset. `parts/` needs `registry.dataset_schema()` stated, or
 `pyarrow` infers it from the first file and silently drops any column added later.
 
-`README.md` is uploaded by hand through the writer role, so a change to
-[`docs/registry.md`](../../docs/registry.md) that alters what readers are told is re-uploaded with
-it. Nothing reads it, and it sits outside both prefixes, so no `ds.dataset` over either one sees it.
+`README.md` is a copy of [`docs/registry.md`](../../docs/registry.md), uploaded by hand, so a
+change that alters what readers are told is re-uploaded with it. The writer role trusts only the
+runner task's role, so the upload runs as a one-off task of the flow-runner task definition, under a
+session policy granting that one key. It is served as `text/plain; charset=utf-8` so a browser
+shows it rather than downloading it. Nothing reads it, and it sits outside both prefixes, so no
+`ds.dataset` over either one sees it.
 
 ## How a fill keeps it current
 
