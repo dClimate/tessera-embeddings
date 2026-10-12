@@ -19,7 +19,7 @@ and maintains this table.
   ├── master/       READ THIS: one row per tile per year, describing the store as it is now
   │   ├── _common_metadata                          the dataset's schema
   │   └── zone=<ZONE>/year=<YEAR>/part-0.parquet    one file per zone-year
-  └── parts/        internal: each fill run's raw output, never rewritten
+  └── parts/        internal: one file per fill run, named by its run ID
       └── zone=<ZONE>/year=<YEAR>/<run_id>.parquet
 ```
 
@@ -29,8 +29,36 @@ in 994 zone-year files: every one of those groups in 2022–2025, and all but 14
 2017–2021, which were never filled and so have no file.
 
 **Read `master/`, not `parts/`.** `parts/` is the raw record the master is built from. It can hold
-a tile more than once, one row per run that filled its zone-year, and 47% of its v1.1 rows lack
-measurements that `master/` carries.
+a tile more than once, one row per run that wrote it, and 47% of its v1.1 rows lack measurements
+that `master/` carries.
+
+### Runs, and how `parts/` relates to `master/`
+
+A *run* is one fill of one zone-year under one set of inputs. Its ID is
+`<ZONE>-<YEAR>-<fingerprint>`, such as `43S-2020-090ca792`, where the fingerprint hashes
+everything that decides the run's pixels: the fill's settings, its code and the imagery it read.
+Each run writes one file, named by its ID, into its zone-year's folder, and never touches another
+run's file:
+
+```
+  parts/zone=43S/year=2020/
+  ├── 43S-2020-090ca792.parquet    the first fill: a row for every tile it evaluated
+  └── 43S-2020-<later-id>.parquet  a later run, such as an infill: rows for the tiles it wrote
+```
+
+- **A re-run with unchanged inputs keeps its ID**, such as a retry after an interruption, so it
+  replaces its own file rather than adding one.
+- **A run with any input changed gets a new ID** and a new file beside the old one, so `parts/`
+  keeps every run's own account of the tiles it wrote.
+- **`master/` combines a zone-year's runs tile by tile**, taking each tile's row from the newest
+  run that wrote it. The first fill's file goes on describing every tile no later run touched.
+- **v1.1 has one run per zone-year**, so `parts/` holds 994 files, one for each zone-year file in
+  `master/`.
+
+A master row's `run_id` names the file it came from, with one exception. The 1,519,045 re-derived
+rows (`measured_by = "rebuild"`) carry the re-derivation's ID, `rebuild-…`, which has no file;
+their fill's file is the one in the same zone-year whose rows' `assembled_at` equals the row's
+`filled_at`.
 
 ## Reading it
 
@@ -115,7 +143,7 @@ where `store_group` is the zone's group opened with xarray, as in the store's
 | `radar_rule_enforced` | whether pixels without radar were refused; false in v1.1 |
 | `measured_by` | `"fill"` if the fill measured this row's numbers, `"rebuild"` if they were re-derived from the store later |
 | `filled_at` | when the fill whose pixels the row describes landed |
-| `run_id`, `assembled_at` | the run that wrote the row, and when: the fill, or the re-derivation |
+| `run_id`, `assembled_at` | the run the row came from, and when it was written: the fill, or for a re-derived row the re-derivation |
 | `code_version`, `code_commit` | the build of the tessera-embeddings repository that ran the fill |
 
 The quality rule is the store's: a pixel is embedded only if it had at least 15 usable optical

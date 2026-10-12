@@ -16,8 +16,9 @@ The v1.1 backfill that first filled `master/` is a separate record:
   <store-stem>.registry/
   ├── README.md the readers' guide, a copy of docs/registry.md
   ├── parts/    zone=<Z>/year=<Y>/<run_id>.parquet
-  │             each fill's raw output: one part per zone-year per run, append-only, never
-  │             rewritten. Internal — the record the master is built from and checked against.
+  │             each run's raw output, one part per zone-year per run. A re-run under the
+  │             same run id replaces its own part; no run touches another's. Internal — the
+  │             record the master is built from and checked against.
   └── master/   zone=<Z>/year=<Y>/part-0.parquet  + _common_metadata
                 one row per (zone, year, tile), one schema, and two provenance columns:
                 measured_by  "fill" | "rebuild" | null   who measured the numbers
@@ -186,7 +187,7 @@ too; a one-day rule per prefix keeps it behaving as it does today. A rule cannot
 and where two expiration rules overlap S3 applies the shorter, so a bucket-wide one-day rule would
 also cut the registry's history to a day. Versioning, once enabled, can be suspended but not
 removed. The registry's cost is small: each fill overwrites one file of a few hundred kilobytes,
-and `parts/` is append-only.
+and `parts/` only gains a file when a run under a new id lands.
 
 To roll a zone-year's master file back to a prior version:
 
