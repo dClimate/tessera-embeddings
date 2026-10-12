@@ -38,6 +38,16 @@ the state was not what the evidence was gathered against, and be able to undo it
 | `fix_published_store_spatial_transform.py` | Moves each zone group's `spatial:transform` origin from the first pixel's centre to its outer corner, which is where the `spatial:` convention puts it, and re-pins the `proj:`/`spatial:` registration URLs to a tag that exists. Metadata only, one commit, 120 groups. Each corrected origin is derived from that group's own coordinate arrays and cross-checked against its own `spatial:bbox`; anything unrecognised is refused and nothing outside those two attrs may change. Idempotent, and dry run unless `--apply`. See [ADR 024](../context_docs/decisions/024-spatial-transform-origin-is-the-pixel-corner.md). |
 | `rebuild_registry_measurements.py` | Repairs the registry's `master/`, which every fill otherwise keeps current itself. `repair` rebuilds cells (all, or `--zones`) from their parts, their existing master rows and a fresh re-derivation, from the store's observation-count arrays, of every row their fills left null; a cell whose re-derivation is blocked is left untouched. `gate` re-checks the identity the re-derivation rests on over every measured row, then reproduces measured rows from the store, and `repair` self-checks each cell the same way. `verify` audits `master/` cell by cell against `parts/`. `parts/` is never touched. Dry run unless `--write`; `--anonymous` plus a local `--registry` rehearses everything without credentials. It repaired v1.1's 1,519,045 unmeasured rows (47%), in 3.4 h and about $7 on one 32-vCPU host in us-west-2. See [registry-master.md](../context_docs/storage/registry-master.md) and [registry-backfill.md](../context_docs/storage/registry-backfill.md). |
 
+## `update/` — supported tooling for targeted updates
+
+Plans re-runs of chosen shards in zone-years the campaign has already filled
+([ADR 027](../context_docs/decisions/027-targeted-updates.md)). Writes only an update's plan; the
+flows do the work.
+
+| script | what it does |
+|---|---|
+| `plan_update.py` | Writes a targeted update's immutable plan to `{inputs}/updates/<name>/plan.json`, from the registry's `master/` (a SQL `--where` and/or an `--aoi` box; `--anonymous` for the public registry) or from a CSV of `zone,year,tile`. Checks it against its land mask first, refusing a zone the mask lacks or a shard outside a zone's grid, and reports each cell's live and dead shards. Dry run unless `--write`. |
+
 ## `diagnostic/` — supported tooling
 
 Answers "why is this environment behaving that way?" and is expected to work on demand.

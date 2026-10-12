@@ -475,6 +475,12 @@ buckets.
    out-of-memory kill. Per-batch indexing costs about 7 ms per batch and removes the spike
    entirely.
 
+4. **A targeted update can narrow it further.** A tile whose `ChunkSpec.pixels` names a mask
+   embeds only the pixels it marks, beside the gates above
+   ([ADR 027](../../../context_docs/decisions/027-targeted-updates.md)). An update in `holes` mode
+   masks each tile to the pixels that are holes in the store, so pixels already embedded never
+   reach the GPU; the refusal counts still describe the whole strip.
+
 **When no pixel qualifies.** A tile inside the area of interest whose every pixel fails the
 filter takes the **skip path**: the actor writes a zero-byte `{chunk.label}.skipped` marker
 and returns, and assembly fills that footprint with constant fill values. The marker is
@@ -936,6 +942,13 @@ not pixels.) `years_complete` and the per-year run provenance advance in a **sec
 after the shards: a crash between the two leaves a year written but unmarked. The zone-fill runner
 ([`orchestration/runners/zone_fill.py`](../orchestration/runners/zone_fill.py)) drives the
 sequence: coverage mask → inference → `assemble_global` → `campaign.tag_zone_year`.
+
+**A targeted update** ([ADR 027](../../../context_docs/decisions/027-targeted-updates.md)) runs the
+same sequence over chosen shards of a year that is already filled, with three differences. A shard
+whose tile staged nothing is kept, not cleared; in `holes` mode each staged tile is **merged**,
+the worker reading the shard already in the store and replacing only its hole pixels, in every
+array; and the second commit appends the update's record to the group's `updates` attr instead of
+advancing `years_complete` and `runs`. No zone-year tag is created.
 
 **The campaign's land mask is not a pixel-resolution area of interest** but a per-zone
 *coverage bitmap* (`tile_live_2048`), built from the delivery registry by

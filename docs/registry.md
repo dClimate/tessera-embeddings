@@ -117,6 +117,7 @@ where `store_group` is the zone's group opened with xarray, as in the store's
 | `filled_at` | when the fill whose pixels the row describes landed |
 | `run_id`, `assembled_at` | the run that wrote the row, and when: the fill, or the re-derivation |
 | `code_version`, `code_commit` | the build of the tessera-embeddings repository that ran the fill |
+| `update_name` | the targeted update that last rewrote the tile ([ADR 027](../context_docs/decisions/027-targeted-updates.md)), null where the tile is still the campaign's fill |
 
 The quality rule is the store's: a pixel is embedded only if it had at least 15 usable optical
 observations in the year. Every count above comes from the store's own per-pixel observation-count
@@ -143,8 +144,8 @@ arrays, so any row can be checked against the store.
 
 ## How it is kept current
 
-Every fill, whether a zone-year's first fill, a refill or a later infill of thin pixels, updates
-the registry right after its pixels are committed to the store:
+Every fill, whether a zone-year's first fill, a refill or a targeted update of some of its tiles,
+updates the registry right after its pixels are committed to the store:
 
 ```
   fill commits to the store ──▶ writes its rows as a new file in parts/
@@ -152,8 +153,9 @@ the registry right after its pixels are committed to the store:
 ```
 
 - **A tile's row comes from the newest run that wrote that tile.** A full refill replaces every
-  row in its zone-year. A partial run, such as an infill, replaces only the tiles it rewrote, and
-  every other tile keeps its row. The master follows the store, which also keeps each tile as the
+  row in its zone-year. A targeted update replaces only the tiles it rewrote, and every other tile
+  keeps its row. An update that filled a tile's holes merged two runs' pixels, so its row is
+  re-derived from the tile as committed rather than taken from either run. The master follows the store, which also keeps each tile as the
   last run that wrote it left it.
 - **Each zone-year file is replaced in a single write**, so a reader sees the old file or the new
   one, never a mixture, and zone-years never wait on each other.

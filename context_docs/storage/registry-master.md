@@ -75,7 +75,7 @@ tile as the most recently assembled run that wrote it left it, and the master fo
 |---|---|
 | a new year | its tiles are added |
 | a full refill | every tile it wrote supersedes the old row |
-| a partial run, such as an infill | only the tiles it wrote are replaced; every other tile keeps its row |
+| a partial run, such as a targeted update | only the tiles it wrote are replaced; every other tile keeps its row |
 | a re-derived measurement | fills a row the fill left null, for the run that row describes |
 
 `filled_at` is what names the run: the newest parsed `filled_at` wins, so a measurement re-derived
@@ -92,10 +92,11 @@ rather than letting text order pick a run. Remaining ties fall to `run_id`, so e
 same rows writes the same file.
 
 **A run's row must describe the whole tile as that run leaves it.** Per-tile latest-wins makes the
-newest run's row the tile's only row. An infill that rewrites some of a tile's pixels must therefore
-publish measurements for the whole tile after the infill, not for the infilled pixels alone, or the
-master will describe a fraction of the tile as if it were all of it. This is a requirement on the
-future infill, not something this code can check.
+newest run's row the tile's only row. A run that rewrites some of a tile's pixels must therefore
+publish measurements for the whole tile afterwards, not for the rewritten pixels alone, or the
+master will describe a fraction of the tile as if it were all of it. A targeted update that fills a
+tile's holes does this by re-deriving the tile's row from the shard it committed; its rows also name
+it in `update_name` ([ADR 027](../decisions/027-targeted-updates.md)).
 
 ## What guards it
 
@@ -111,8 +112,9 @@ future infill, not something this code can check.
   A run whose part is deleted would otherwise keep winning through the master's copy of
   its rows, which carry the newest `filled_at`.
 - **Repair checks, for every cell, that the store holds the cell's newest run.** The zone group's
-  `runs` attribute names the last run that wrote each year, and it must be the newest run in the
-  cell's parts. Then every row's tile holds the pixels of the run that row names, so a cell built
+  `runs` attribute, or the newest record in its `updates` attribute where a targeted update has
+  rewritten tiles since, names the last run that wrote each year, and it must be the newest run in
+  the cell's parts. Then every row's tile holds the pixels of the run that row names, so a cell built
   from several runs is re-derivable tile by tile, each row under its own depth rule. A run that
   committed but never published its part blocks the cell, even one with nothing to re-derive.
 

@@ -1104,19 +1104,17 @@ commit, failing loudly costs nothing; after it, raising would fail complete work
 column is derivable from the store, which is what makes a lost part recoverable and that trade correct
 rather than lazy.
 
-### What is still missing
+### Partial runs and repeated fills
 
-- **The pipeline cannot consume the work list.** Threading an optional set of tile labels through a
-  fill is a real change, not a small one: the year record is replaced wholesale and the skipped set is
-  derived as live-minus-staged.
-- **Multi-contribution year provenance.** A refilled cell should append a contribution — run id,
-  timestamp, code identity, input coverage, and the tile labels it wrote — rather than replace the
-  original. Sketched and agreed; not built. Safe to do while no campaign has published. See
-  [`../inference/minimum-optical-depth.md`](../inference/minimum-optical-depth.md) §10 for the update-cycle
-  model this belongs to.
-- **Compaction.** Parts are keyed by run so a refill adds one rather than replacing the original.
-  Reading the raw parts double-counts a twice-filled cell unless the reader keeps the latest
-  `assembled_at` per `(zone, year, tile)`.
+- **A fill can be limited to chosen tiles.** A targeted update re-runs a list of shards in a cell the
+  campaign has already filled, and keeps every tile it does not stage as it was
+  ([ADR 027](../decisions/027-targeted-updates.md)).
+- **A cell's provenance accumulates.** An update appends its contribution — run id, timestamp, code
+  identity, input coverage, and the tiles it wrote, kept and cleared — to the group's `updates`
+  attr, beside the original fill's `runs[year]`, which it never replaces.
+- **The registry keeps each tile's newest row.** Parts stay keyed by run, so a cell filled twice
+  has two; `master/` merges them per `(zone, year, tile)`, newest wins
+  ([`registry-master.md`](registry-master.md)).
 
 ---
 

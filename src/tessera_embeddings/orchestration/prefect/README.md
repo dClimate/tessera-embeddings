@@ -306,6 +306,35 @@ unresolvable conflicts. See `context_docs/storage/writing-to-the-global-store.md
 cluster-less (they run on the flow runner like `generate_roi`); only
 `fill_zone_year` / `fill_zones_sequential` provision Ray.
 
+### Targeted updates of filled cells
+
+An **update** re-runs chosen shards of cells the campaign has already filled and writes nothing
+else ([ADR 027](../../../../context_docs/decisions/027-targeted-updates.md)). Three steps:
+
+1. **Plan it.** `scripts/update/plan_update.py` writes an immutable plan to
+   `{inputs}/updates/<name>/plan.json`: the cells, the shards in each (or all of them), the land
+   mask, the mode and the ingest settings. Shards come from the registry's `master/` (`--where`,
+   `--aoi`) or a CSV. Dry run unless `--write`; it reports how many of each cell's shards the mask
+   holds live.
+2. **Run it.** Pass `update=<name>` to `fill-zones-sequential` for one cluster (`cells` defaults to
+   the plan's, and a subset splits an update across runs), or to `run-global-campaign` for several,
+   balanced on the plan's shards. Each ingests only its target shards' 4096-px blocks, plans its
+   cells from the plan, and records itself on each cell.
+3. **Check and release it.** `update-<name>-base` pins the store before the first write and
+   `update-<name>-complete` once every planned cell holds the record. Compare the two, then delete
+   `{inputs}/updates/<name>/` and, once satisfied, the base tag, which holds the replaced shards.
+
+| | campaign fill | update |
+|---|---|---|
+| work list | cells not yet in `years_complete` | plan cells without the update's record; a never-filled cell is refused |
+| inferred | every valid pixel of every live tile | `holes`: only the store's hole pixels; `shards`: the target shards |
+| a tile that embeds nothing | cleared to fill | kept (`on_skip: "clear"` for a `shards` defect fix) |
+| recorded in | `years_complete`, `runs[year]`, the zone-year tag | `updates[year]` alone |
+| ROI, mosaics, staging | the campaign's paths | `{inputs}/updates/<name>/`, `{outputs}/staging/updates/<name>/` |
+| `min_valid_coverage`, month check | 0.1, every month | `1e-9`, relaxed: a partial-zone ROI must never block |
+
+Run one update per cell at a time: two updates of one cell conflict on its chunks.
+
 ## Master pipeline
 
 `tessera_full_pipeline.py` is the recommended entry point for end-to-end
