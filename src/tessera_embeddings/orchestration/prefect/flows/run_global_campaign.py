@@ -2,9 +2,9 @@
 
 Reads live fill progress from the seeded store
 (:func:`~tessera_embeddings.storage.campaign.campaign_status`) and dispatches every pending
-cell via ``arun_deployment`` — size-balanced ``fill-zones-sequential`` runs, each owning one
-long-lived Ray cluster (``fill_strategy="chained-clusters"``, the default), or one
-``fill-zone-year`` run per cell (``"cluster-per-zone"``) — mirroring
+cell via ``arun_deployment`` as size-balanced ``fill-zones-sequential`` runs, each owning one
+long-lived Ray cluster whose actors stream through its share of the zones — no per-zone
+teardown, actor churn or model reload (:mod:`.fill_zones_sequential`). Mirrors
 :mod:`tessera_full_pipeline`'s driver pattern.
 
 **Ingest runs WIDE and ahead of inference, under ONE fleet-wide cap.** Ingest is the cheap
@@ -45,7 +45,6 @@ import asyncio
 import hashlib
 import logging
 from collections.abc import Callable, Mapping
-from functools import partial
 from logging import LoggerAdapter
 from typing import Any
 
@@ -68,10 +67,7 @@ from tessera_embeddings.orchestration.prefect.flows._child_runs import (
     make_child_cancel_hook,
 )
 from tessera_embeddings.orchestration.prefect.flows._overrides import set_overrides
-from tessera_embeddings.orchestration.prefect.flows.fill_zone_year import (
-    _assert_seeded_model_matches,
-    _optical_min_obs_from_store,
-)
+from tessera_embeddings.orchestration.prefect.flows.fill_zone_year import _assert_seeded_model_matches
 from tessera_embeddings.orchestration.prefect.flows.ingest_zone_year import IngestDeployments
 from tessera_embeddings.orchestration.runners.zone_fill import (
     zone_has_live_tiles,
@@ -96,8 +92,7 @@ from tessera_embeddings.storage.zone_grid import canonicalize_zone
 _INGEST_DEPLOYMENT_DEFAULTS = IngestDeployments()
 
 
-#: Tag prefix for every deployment this campaign dispatches — ingests, per-cell
-#: fills and chained-fill clusters alike.
+#: Tag prefix for every chained fill this campaign dispatches.
 _CHILD_TAG_PREFIX = "campaign"
 
 
@@ -107,9 +102,9 @@ def _child_tag(flow_run_id: object) -> str | None:
 
 
 #: Cancelling the campaign must stop what it started. Each `arun_deployment` creates an
-#: INDEPENDENT run, so killing this flow otherwise leaves its many in-flight ingests and
-#: fills running — writing mosaics and store attrs a retry will race, with their Dask and Ray
-#: fleets still billing. Registered as both terminal hooks because a crashed parent orphans
+#: INDEPENDENT run, so killing this flow otherwise leaves its in-flight fills and their
+#: ingests running — writing mosaics and store attrs a retry will race, with their Dask and
+#: Ray fleets still billing. Registered as both terminal hooks because a crashed parent orphans
 #: children exactly like a cancelled one. The child flows keep their OWN teardown hooks; this
 #: one stops the runs those hooks then clean up after.
 _cancel_children_on_cancellation = make_child_cancel_hook(_CHILD_TAG_PREFIX, "campaign child run")
@@ -243,9 +238,8 @@ def _mosaic_identity(
     orbits) cannot affect the embeddings, yet fingerprinting it could raise (no identity) or
     perturb the run_id and needlessly restart a valid single-orbit fill.
 
-    Module-level rather than a flow closure because both fill strategies need it: the
-    cluster-per-zone dispatch here and the chained fill's ``prepare`` callable
-    (:mod:`.fill_zones_sequential`).
+    Module-level rather than a flow closure because the chained fill's ``prepare`` callable
+    (:mod:`.fill_zones_sequential`) calls it, through :func:`_staging_run_id`.
     """
     base = f"{inputs_bucket.rstrip('/')}/mosaics/{zone}/{year}"
     ids: list[str] = []
@@ -357,9 +351,8 @@ def _ingest_dispatch_params(
 ) -> dict[str, Any]:
     """Parameter dict for one ``ingest-zone-year`` deployment run.
 
-    Shared by both fill strategies' dispatch sites — the cluster-per-zone driver's per-cell
-    chain and the chained fill's look-ahead adapter (:mod:`.fill_zones_sequential`) — so the
-    two cannot drift from the deployment's signature independently. ``s3_region`` is the
+    Built for the chained fill's look-ahead adapter (:mod:`.fill_zones_sequential`), and kept
+    here beside :func:`_dpl` because it routes by the campaign's ``branch``. ``s3_region`` is the
     fill's region, so ingest's metadata opens (mask liveness, coverage sha, marker, coverage
     gate) hit the same stores rather than defaulting to us-west-2 on a non-default-region
     deployment. ``branch`` routes the S1/S2 grandchildren to their branch-scoped deployments
@@ -456,8 +449,10 @@ def _resolve_code_identity(
 ) -> str:
     """Lazy-import wrapper over the AWS provider's code-artifact resolver.
 
-    Module-level and thin so this flow still imports on non-AWS machines (arch tests) — boto3
-    lives only under ``providers/aws`` — and tests can stub it. Region ``None`` → us-west-2,
+    The chained fill (:mod:`.fill_zones_sequential`) uses it for a direct invocation, which has
+    no campaign staging identity to inherit. Module-level and thin so this flow still imports
+    on non-AWS machines (arch tests) — boto3 lives only under ``providers/aws`` — and tests can
+    stub it. Region ``None`` → us-west-2,
     the region the fills' ``ray_cluster`` PROVISIONS from, where the AMI SSM parameter and
     source tarball live; NOT the storage ``s3_region``, which may differ. ``ami_id`` pins the
     AMI component to a pre-resolved id so the fingerprint matches the image the fill will
@@ -502,7 +497,6 @@ async def run_global_campaign(
     paths: BucketPaths,
     ami_ssm_name: str,
     branch: str | None = None,
-    fill_deployment: str | None = None,
     store_name: str = "tessera",
     years: tuple[int, ...] | None = None,
     zones: list[str] | None = None,
@@ -512,7 +506,6 @@ async def run_global_campaign(
     gpu_fallback_vcpu_budget: int | None = None,
     actor_request_headroom: int | None = None,
     actor_request_batch_size: int | None = None,
-    fill_strategy: str = "chained-clusters",
     chained_fill_deployment: str | None = None,
     num_actors: int = 250,
     s1_orbit: str = "both",
@@ -555,12 +548,9 @@ async def run_global_campaign(
             ``-<slug>``: the fill, the ingest, and — crucially — the S1/S2 grandchildren
             ``ingest_zone_year`` dispatches, which are otherwise unreachable and 404 one
             level down on a branch campaign with ``ingest=True``. An explicitly-passed
-            ``fill_deployment``/``ingest_deployment`` is used verbatim and never
+            ``chained_fill_deployment``/``ingest_deployment`` is used verbatim and never
             re-suffixed. Orthogonal to ``code_suffix``, which scopes the source tarball
             rather than deployment names.
-        fill_deployment: ``flow-name/deployment-name`` of the fill deployment. ``None``
-            (default) derives ``fill-zone-year/fill-zone-year`` routed by ``branch``; an
-            explicit value is used verbatim.
         store_name: Global-store repo basename.
         years: Campaign years to drive (default: all campaign years).
         zones: Restrict the fill chain (inference + assembly) to these UTM zones in the
@@ -568,11 +558,9 @@ async def run_global_campaign(
             drives all 120. Either way only cells still needing work are dispatched, so a
             re-run of a partially-complete year fills only the unfinished zones (see
             :func:`campaign_work_list`).
-        max_parallel_clusters: Bounds simultaneous Ray clusters within a year (a cost knob,
-            distinct from the commit gate): the concurrent per-cell fill runs under
-            ``"cluster-per-zone"``, or the number of Ray clusters under
-            ``"chained-clusters"``. **Defaults to 10**, the campaign's planned width: 10 x
-            250 actors reaches the full 2,500-actor quota while keeping each cluster's
+        max_parallel_clusters: The number of Ray clusters — ``fill-zones-sequential`` runs —
+            dispatched per batch (a cost knob). **Defaults to 10**, the campaign's planned
+            width: 10 x 250 actors reaches the full 2,500-actor quota while keeping each cluster's
             assembly thread under its ~275-actor ceiling, and balance holds to ~16. Not to
             be confused with ``max_parallel_ingest`` (60), which caps simultaneous
             zone-INGESTS — and 60 divides evenly by 10, which matters: the per-cluster share
@@ -590,7 +578,7 @@ async def run_global_campaign(
             rate. It belongs at campaign level because contention is a property of the
             CAMPAIGN, not of a fill: one cluster growing alone contends with nothing, while
             ``n`` autoscalers requesting at the same moment drain the bucket and are refused.
-            Forwarded to whichever fill strategy runs; ``False`` (default) keeps today's
+            Forwarded to every fill; ``False`` (default) keeps today's
             launch behaviour, so enabling it is a deliberate act on a running campaign.
         gpu_fallback_instance_types: EC2 instance types this campaign may fall back to when
             the production rung has no capacity, e.g. ``["g5.2xlarge"]``. Named as instance
@@ -627,26 +615,9 @@ async def run_global_campaign(
             quota is a rate over CALLS, and a batch of B actors is ceil(B /
             instances-per-call) calls per cluster per placement round. ``None`` keeps the
             default.
-        fill_strategy: Named for the CLUSTER LIFECYCLE — both strategies run up to
-            ``max_parallel_clusters`` zones at once. ``"chained-clusters"`` (default)
-            dispatches up to ``max_parallel_clusters`` ``fill-zones-sequential`` runs per
-            year, each owning ONE long-lived Ray cluster whose actors stream through a
-            size-balanced share of the year's zones — strictly ordered, the next zone's tiles
-            interleaving only at queue exhaustion, so zone tails never idle the fleet and
-            there is no per-zone teardown, actor churn or model reload. It amortizes ``ray
-            up`` + per-worker bringup + model-load cold starts across the whole cluster;
-            ingest look-ahead and trailing assembly cover the remaining seams (see the
-            runner's module docstring). Each cluster ingests EVERY one of its cells before
-            requesting GPUs, so a fleet is never billed against an unfinished ingest — which
-            makes the up-front ingest scale with cluster size, and
-            ``max_parallel_clusters=1`` degenerate to a whole year of ingest before any
-            inference. ``"cluster-per-zone"`` dispatches one ``fill-zone-year`` run per cell
-            instead, each provisioning its own short-lived Ray cluster — simpler, and it pays
-            a full cluster bringup and model load per zone.
-        chained_fill_deployment: ``flow-name/deployment-name`` of the chained fill deployment
-            (``fill_strategy="chained-clusters"`` only). ``None`` (default) derives
-            ``fill-zones-sequential/fill-zones-sequential`` routed by ``branch``; an explicit
-            value is used verbatim.
+        chained_fill_deployment: ``flow-name/deployment-name`` of the chained fill deployment.
+            ``None`` (default) derives ``fill-zones-sequential/fill-zones-sequential`` routed
+            by ``branch``; an explicit value is used verbatim.
         num_actors: GPU actor count, forwarded to each fill.
         s1_orbit: S1 orbit selection, forwarded to both ingest and fill.
         s3_region: Optional S3 region for the global store, forwarded to the driver's
@@ -666,10 +637,8 @@ async def run_global_campaign(
             campaign, each provisioning its own Dask cluster. The only limit on ingestion:
             clusters submit every zone they own at once and each holds one slot for the
             duration of its ingest, so a cluster starts as many as fit under this cap and
-            queues the rest. Under ``"chained-clusters"`` it is enforced by
-            ``ingest_limit_name``, because the clusters are separate flow runs and the cap
-            has to live server-side; under ``"cluster-per-zone"`` an in-process semaphore is
-            equivalent, that strategy having one driver.
+            queues the rest. It is enforced by ``ingest_limit_name``, because the clusters
+            are separate flow runs and the cap has to live server-side.
         force_staging_reuse: Reuse staged tiles across an inference code change. All three
             staging levers move only the STAGING fingerprint — which S3 prefix intermediate
             tiles are written to and read back from. None of them touches the published store
@@ -699,9 +668,8 @@ async def run_global_campaign(
             staged tile exactly as a change to the model would, and on a deployment shipping a
             source tarball re-uploading it moves the fingerprint whatever the change was.
 
-            **Copy the value from the driver's log**, which announces it once per campaign: a
-            chained fill records it as a parameter too, but a ``cluster-per-zone`` campaign
-            hashes it irreversibly into its children's run ids. A value nothing was staged
+            **Copy the value from the driver's log**, which announces each distinct value once;
+            every chained fill records it as a parameter too. A value nothing was staged
             under simply starts a fresh prefix, costing re-inference and nothing else.
 
             It rests on the operator's judgement, the same one ``force_staging_reuse`` asks
@@ -776,19 +744,17 @@ async def run_global_campaign(
             Not part of the staging fingerprint: it changes WHEN work is dispatched, not what
             is computed. Design record:
             ``context_docs/campaign/campaign-plan.md`` (§3, ``immediate_refill``).
-        ingest_limit_name: Prefect global concurrency limit backing ``max_parallel_ingest``
-            under ``"chained-clusters"``. The campaign upserts it to that value at start, so
+        ingest_limit_name: Prefect global concurrency limit backing ``max_parallel_ingest``.
+            The campaign upserts it to that value at start, so
             the parameter is the single place the number is written and cannot drift from
             the server's.
         inference_pause_gate: Name of the global concurrency limit that PAUSES inference.
             Upserted to 1 at start (any positive value means run) and read — never acquired —
-            by every cluster's dispatch loop. **``"chained-clusters"`` only**, the campaign's
-            strategy: a ``cluster-per-zone`` per-cell run has no stream to hold, so the gate
-            is neither created nor forwarded there and cancelling is the only lever. Set it
-            to **0** and each cluster lands the chunks it has queued and then takes on no
-            further cell, keeping its actors and its run alive; set it back to 1 and they
-            carry on where they stopped. Nothing fails either way and no cell is
-            half-written, because a cell enters inference whole.
+            by every cluster's dispatch loop. Set it to **0** and each cluster lands the
+            chunks it has queued and then takes on no further cell, keeping its actors and
+            its run alive; set it back to 1 and they carry on where they stopped. Nothing
+            fails either way and no cell is half-written, because a cell enters inference
+            whole.
 
             **One of the two pause levers, covering different halves.** Zeroing
             ``ingest_limit_name`` stops mosaics being built; zeroing this stops embeddings
@@ -848,26 +814,26 @@ async def run_global_campaign(
     _tags = [t] if (t := _child_tag(flow_run_ctx.id)) else None
     # Branch-scoped deployment names, resolved once. A default (None) child ref derives from
     # `branch`; an explicit ref passes through verbatim. The S1/S2 grandchildren derive from
-    # the same `branch` in `_ingest_params`.
-    fill_deployment = fill_deployment or _dpl("fill-zone-year/fill-zone-year", branch)
+    # the same `branch` in the chained fill's `_ingest_dispatch_params`.
     ingest_deployment = ingest_deployment or _dpl("ingest-zone-year/ingest-zone-year", branch)
     chained_fill_deployment = chained_fill_deployment or _dpl("fill-zones-sequential/fill-zones-sequential", branch)
     if max_parallel_clusters < 1:
-        msg = f"max_parallel_clusters must be >= 1, got {max_parallel_clusters} (Semaphore(0) blocks forever)"
-        raise ValueError(msg)
+        raise ValueError(f"max_parallel_clusters must be >= 1, got {max_parallel_clusters}")
     if max_parallel_ingest < 1:
-        raise ValueError(f"max_parallel_ingest must be >= 1, got {max_parallel_ingest} (Semaphore(0) blocks forever)")
+        raise ValueError(
+            f"max_parallel_ingest must be >= 1, got {max_parallel_ingest} (a fleet-wide limit of 0 admits no ingest)"
+        )
     if max_dispatch_rounds < 1:
         raise ValueError(
             f"max_dispatch_rounds must be >= 1, got {max_dispatch_rounds} (no cell would ever be dispatched)"
         )
     # EVERY value this can reject on its own, BEFORE any shared control is touched.
     #
-    # Checked here rather than left to run_inference: the child validates only after both fill
-    # strategies have entered ray_cluster, and the chained strategy has primed its look-ahead
-    # ingests first. A typo would otherwise buy a Ray head and a round of multi-hour ingests
-    # before failing deterministically on a value known up front. The limit upserts sit after
-    # this whole read-only preflight for the same reason — see there.
+    # Checked here rather than left to run_inference: the child validates only after it has
+    # primed its look-ahead ingests and entered ray_cluster. A typo would otherwise buy a Ray
+    # head and a round of multi-hour ingests before failing deterministically on a value known
+    # up front. The limit upserts sit after this whole read-only preflight for the same reason
+    # — see there.
     if num_actors < 1:
         raise ValueError(f"num_actors must be >= 1, got {num_actors} (no actor would ever run inference)")
     # HERE, before any dispatch. `_apply_gpu_fallback` refuses the same values, but it runs
@@ -909,8 +875,6 @@ async def run_global_campaign(
                     f"gpu_fallback_vcpu_budget={gpu_fallback_vcpu_budget} cannot afford one "
                     "fallback instance (8 vCPU). Raise it, or drop the fallback request."
                 )
-    if fill_strategy not in ("cluster-per-zone", "chained-clusters"):
-        raise ValueError(f"fill_strategy must be 'cluster-per-zone' or 'chained-clusters', got {fill_strategy!r}")
     # Each of the three staging levers CLAIMS the identity, so any pair is a contradiction
     # rather than a combination, and resolving one silently lands the run on a prefix nobody
     # chose. Refused rather than ordered by precedence: guessing wrong costs a whole
@@ -1019,9 +983,9 @@ async def run_global_campaign(
     #
     # Cheap, idempotent and safe to repeat — the ordering is the only thing that matters.
     if work:
-        if ingest and fill_strategy == "chained-clusters":
+        if ingest:
             _upsert_limit(ingest_limit_name, max_parallel_ingest, what="ingest", log=log)
-        if inference_pause_gate and fill_strategy == "chained-clusters":
+        if inference_pause_gate:
             # Upserted to ONE, and one is not a cap: the gate is read as a flag rather than
             # acquired, so any positive value means "run" and nothing consumes a slot.
             # Created here so pausing is always available — a gate an operator has to create
@@ -1053,30 +1017,12 @@ async def run_global_campaign(
         log.info("Orphan-mosaic sweep: reclaimed %d completed-cell mosaic prefix(es)", swept)
 
     log.info(
-        "Campaign: %d (zone, year) cell(s) need work across %d year(s); <=%d concurrent fills/year",
+        "Campaign: %d (zone, year) cell(s) need work across %d year(s); <=%d Ray cluster(s) per batch",
         len(work),
         len({y for _, y in work}),
         max_parallel_clusters,
     )
 
-    optical_rule_cache: list[int | None] = []
-
-    def _campaign_optical_min_obs() -> int | None:
-        """The store's minimum-depth rule, for the staging fingerprint.
-
-        Read from the store because the store is the authority (its root attr is part of a
-        write-once identity), and cached because every cell writes the same store and the
-        root cannot change under it. In the fingerprint for the same reason
-        ``allow_s2_only`` is: it decides which pixels get embeddings, and staging is not
-        namespaced by store.
-        """
-        if not optical_rule_cache:
-            optical_rule_cache.append(
-                _optical_min_obs_from_store(store_path, get_credentials=store_credentials, s3_region=s3_region)
-            )
-        return optical_rule_cache[0]
-
-    code_identity_cache: list[str] = []
     announced_staging_identities: set[str] = set()
 
     def _staging_code_identity() -> str:
@@ -1106,11 +1052,10 @@ async def run_global_campaign(
         # never mix. (A pinned identity is a constant and never consults the tarball, so the
         # hazard belongs to the derived path alone.)
         #
-        # SAID BY THE DRIVER whatever the strategy, because a restart needs the earlier
-        # campaign's value and the child parameters are not a general source: a
-        # `cluster-per-zone` campaign hashes the identity irreversibly into its children's
-        # run_ids. Once per DISTINCT value, so a mid-campaign tarball swap announces itself
-        # rather than hiding behind the first line.
+        # SAID BY THE DRIVER, because a restart needs the earlier campaign's value and the
+        # driver's log is the one place it is stated for the whole campaign. Once per DISTINCT
+        # value, so a mid-campaign tarball swap announces itself rather than hiding behind the
+        # first line.
         if identity not in announced_staging_identities:
             announced_staging_identities.add(identity)
             log.info(
@@ -1145,185 +1090,22 @@ async def run_global_campaign(
             identity = f"{identity}|{tarball}"
         return f"{identity}+{force_staging_restage}" if force_staging_restage else identity
 
-    def _code_identity() -> str:
-        # Resolve the immutable code artifact (AMI ID + optional tarball ETag) once and reuse
-        # it for every cell: both are campaign-wide constants, so one SSM/S3 lookup suffices.
-        # Lazy, so a retag-only or all-ocean campaign (no fingerprint computed) makes no AWS
-        # call.
-        #
-        # region=None → us-west-2, the region the fill's ray_cluster PROVISIONS from (the
-        # campaign does not thread a Ray region through). The AMI SSM parameter and the
-        # source tarball live there, NOT in the storage `s3_region`, which may differ;
-        # resolving with s3_region would look up the AMI in the wrong SSM namespace and
-        # either fail or fingerprint an artifact the workers never boot.
-        if not code_identity_cache:
-            # Pin the AMI component to the SAME id every fill provisions (below), so the
-            # fingerprint and the booted image cannot disagree via two SSM reads at different
-            # instants.
-            code_identity_cache.append(_resolve_code_identity(ami_ssm_name, code_bucket, code_suffix, None, _ami_id()))
-        return code_identity_cache[0]
-
     ami_id_cache: list[str] = []
 
     def _ami_id() -> str:
         # Resolve the worker AMI ID ONCE per campaign and PIN it into every fill's
         # provisioning (below), so a mid-campaign re-bake that repoints ami_ssm_name cannot
-        # make a fill boot a different image than its staging fingerprint recorded (which
-        # keys on this same resolved id via _code_identity). Same region rationale as
-        # _code_identity: None → us-west-2, the Ray provisioning region.
+        # split one campaign across two images. The staging fingerprint does not key on the
+        # AMI, so this pin is the only thing preventing that. Lazy, so a retag-only or
+        # all-ocean campaign makes no SSM call.
+        #
+        # region=None → us-west-2, the region the fill's ray_cluster PROVISIONS from (the
+        # campaign does not thread a Ray region through). The AMI SSM parameter lives there,
+        # NOT in the storage `s3_region`, which may differ; resolving with s3_region would
+        # look up the AMI in the wrong SSM namespace.
         if not ami_id_cache:
             ami_id_cache.append(_resolve_ami_id(ami_ssm_name, None))
         return ami_id_cache[0]
-
-    def _fill_params(zone: str, year: int, run_id: str, *, needs_cluster: bool) -> dict[str, Any]:
-        return {
-            "zone": zone,
-            "year": year,
-            "paths": paths.model_dump(),
-            # run_id is computed by the caller (post-ingest): an input-fingerprinted id for a
-            # real fill, so a retry resumes staging only on identical inputs, or a stable
-            # "-retag" id for an already-complete cell, which does no inference/staging and
-            # must not inspect a possibly-cleaned-up mosaic.
-            "run_id": run_id,
-            "ami_ssm_name": ami_ssm_name,
-            # Pin the exact image the staging fingerprint recorded (see _ami_id), so the fill
-            # cannot re-resolve ami_ssm_name to a re-baked AMI mid-campaign.
-            #
-            # ONLY for a cell that will actually start Ray. Retag-only and all-ocean cells
-            # never provision, and _code_identity is lazy for the same reason: a pure
-            # tag-repair or all-ocean campaign should need no SSM read, and resolving here
-            # would turn a missing parameter or an SSM-less role into a failure on precisely
-            # the cheap recovery path that has no use for the answer. None leaves the fill's
-            # own fallback in place, which those cells never reach either.
-            "ami_id": _ami_id() if needs_cluster else None,
-            "store_name": store_name,
-            "mask_name": mask_name,
-            "num_actors": num_actors,
-            "s1_orbit": s1_orbit,
-            "s3_region": s3_region,
-            "allow_partial_window": allow_partial_window,
-            "allow_s2_only": allow_s2_only,
-            # Explicit, and it must stay explicit: `fill-zone-year` DEMANDS radar by default,
-            # because a lone cell dispatched by hand should report missing radar rather than
-            # quietly produce optical-only embeddings. A global campaign is the opposite case
-            # — parts of the globe have no dual-pol coverage at all, and refusing them fails
-            # those cells on every retry forever.
-            "require_s1": False,
-            # The child re-runs the model gate this flow cleared in preflight, so without
-            # forwarding the override it rejects the same store after its ingest has been
-            # paid for. The campaign-level flag has to reach the gate that fires.
-            "allow_model_mismatch": allow_model_mismatch,
-            # A fleet-wide rate the concurrent fills share: the account's RunInstances quota.
-            # There is no share to divide — each autoscaler runs the limiter client-side — so the
-            # campaign passes only whether to run it at all.
-            "launch_pacing": launch_pacing,
-            "gpu_fallback_instance_types": gpu_fallback_instance_types,
-            "gpu_fallback_vcpu_budget": gpu_fallback_vcpu_budget,
-            # The other half of that problem: pacing makes a launch request cheaper, this
-            # bounds how many a fill makes at all. Both OMITTED when unset so the fill's own
-            # default decides — keyed on None rather than truthiness, since 0 is a documented
-            # batch mode and not an absence.
-            **set_overrides(
-                actor_request_headroom=actor_request_headroom,
-                actor_request_batch_size=actor_request_batch_size,
-            ),
-            "ssm_prefix": ssm_prefix,
-            "cloudwatch_log_group": cloudwatch_log_group,
-            "code_bucket": code_bucket,
-            "code_suffix": code_suffix,
-            # OMITTED when this campaign names no validator — the difference between "the
-            # campaign decides" and "the campaign overrides". An omitted parameter takes the
-            # CHILD DEPLOYMENT's own registered value, which is where a consumer names its
-            # validator and where a branch-scoped registration already carries the suffix.
-            # Passing None would override that with nothing and silently switch validation
-            # off for every cell.
-            **({"validation_deployment": validation_deployment} if validation_deployment else {}),
-        }
-
-    _ingest_params = partial(
-        _ingest_dispatch_params,
-        paths=paths,
-        mask_name=mask_name,
-        s1_orbit=s1_orbit,
-        ingest_settings=ingest_settings,
-        allow_partial_window=allow_partial_window,
-        allow_ingest_code_mismatch=allow_ingest_code_mismatch,
-        s3_region=s3_region,
-        branch=branch,
-    )
-
-    fill_sem = asyncio.Semaphore(max_parallel_clusters)
-    ingest_sem = asyncio.Semaphore(max_parallel_ingest)
-    # NO cap on cells holding a live mosaic: ADR-011's in-flight bound was removed
-    # deliberately, because it made ingest wait on fill throughput and so throttled the cheap
-    # half of the campaign to protect a storage cost we would rather pay. Mosaics may
-    # accumulate up to a whole year's worth (~120 cells) before the fills drain them. What is
-    # gone is the BACKPRESSURE, not the cleanup: `cleanup_mosaics` still deletes each one as
-    # its fill lands and `sweep_orphan_mosaics` still collects what a crash left behind.
-    #
-    # `cluster-per-zone` only. Under `chained-clusters` (the default) the per-cell chain below
-    # is bypassed and the child bounds its mosaics not at all — peak storage is a cluster's
-    # mosaics by design, and the two semaphores that used to bound them throttled ingest and
-    # inference behind assembly (`context_docs/campaign/campaign-plan.md` §1).
-
-    async def _process(zone: str, year: int) -> str:
-        # Ingest (if enabled) → fill → drop the transient mosaic. ingest_sem/fill_sem cap the
-        # expensive Dask/Ray clusters; nothing gates the chain as a whole.
-        #
-        # A complete-but-untagged cell (in years_complete, missing its tag) is in the work
-        # list only so the fill re-creates the tag — no inference, no mosaic. Skip ingest and
-        # cleanup for it entirely.
-        retag_only = status.has(zone, year)
-        did_ingest = ingest and not retag_only
-        if did_ingest:
-            async with ingest_sem:  # each ingest provisions its own Dask cluster
-                irun = await arun_deployment(ingest_deployment, parameters=_ingest_params(zone, year), tags=_tags)
-                _check_completed(irun, f"ingest {zone}-{year}")
-        # An all-ocean cell (no live tiles) produces no mosaic: ingest returns skipped_ocean
-        # and the fill marks it empty + tags with no staging/inference. There is nothing to
-        # fingerprint — _staging_run_id would raise "No mosaic stores found" and strand the
-        # whole year — and nothing to clean up, so it gets a stable mosaic-free id. Checked
-        # for every non-retag cell at one cheap bitmap GET, ingest=False cells included; a
-        # live cell falls through to the input-fingerprinted id.
-        empty_cell = not retag_only and not zone_has_live_tiles(
-            land_mask_path, zone, get_credentials=iam_icechunk_credentials, s3_region=s3_region
-        )
-        # AFTER ingest, so ingest=True fingerprints the freshly-written mosaic marker. A
-        # retag-only cell does no inference/staging and its mosaic may already be cleaned up,
-        # so it gets a stable id that does NOT inspect the mosaic — fingerprinting would
-        # raise before the tag repair.
-        if retag_only:
-            run_id = f"{zone}-{year}-retag"
-        elif empty_cell:
-            run_id = f"{zone}-{year}-empty"
-        else:
-            run_id = _staging_run_id(
-                zone,
-                year,
-                inputs_bucket=paths.inputs,
-                min_valid_coverage=ingest_settings.min_valid_coverage,
-                s1_orbit=s1_orbit,
-                allow_partial_window=allow_partial_window,
-                allow_s2_only=allow_s2_only,
-                optical_min_obs=_campaign_optical_min_obs(),
-                code_identity=_staging_code_identity(),
-                get_credentials=iam_icechunk_credentials,
-                s3_region=s3_region,
-            )
-        async with fill_sem:  # bound concurrent fills (hence Ray clusters) within a year
-            frun = await arun_deployment(
-                fill_deployment,
-                parameters=_fill_params(zone, year, run_id, needs_cluster=not (retag_only or empty_cell)),
-                tags=_tags,
-            )
-            _check_completed(frun, f"fill {zone}-{year}")
-        # Only delete a mosaic THIS campaign produced: with ingest=False it is an upstream
-        # input we must not remove, and an empty cell produced none. Offloaded to a thread so
-        # a multi-TB teardown does not stall the event loop and freeze every other zone's
-        # deployment wait.
-        if did_ingest and not empty_cell and cleanup_mosaics:
-            await asyncio.to_thread(delete_prefix, f"{paths.inputs.rstrip('/')}/mosaics/{zone}/{year}", log=log)
-        return str(frun.id)
 
     runs_by_year: dict[int, list[str]] = {}
     #: Cells still missing after every attempt, per year. Collected rather than
@@ -1361,15 +1143,14 @@ async def run_global_campaign(
             round_runs: list[str] = []
             runs_this_round_by_year: dict[int, list[str]] = {}
 
-            if batch_zones and fill_strategy == "chained-clusters":
-                # Up to max_parallel_clusters child runs fill the year, each owning ONE shared
+            if batch_zones:
+                # Up to max_parallel_clusters child runs fill the batch, each owning ONE shared
                 # Ray cluster and draining its own zone list strictly sequentially — taking
                 # up the next zone without actor churn instead of being torn down per cell.
                 # Shards are size-balanced (LPT) so they finish together. Ingest, per-cell
                 # run_ids, retag/empty triage and mosaic cleanup all live inside the children,
-                # whose ingest look-ahead pipelines mosaics against each cluster, so the
-                # per-cell _process chain is bypassed; the global ingest bound is preserved by
-                # dividing max_parallel_ingest across the clusters.
+                # whose ingest look-ahead pipelines mosaics against each cluster; the global
+                # ingest bound is preserved by dividing max_parallel_ingest across the clusters.
                 clusters = _partition_by_live_tiles(
                     batch_zones,
                     min(max_parallel_clusters, len(batch_zones)),
@@ -1455,15 +1236,14 @@ async def run_global_campaign(
                         "cells": cells,
                         "paths": paths.model_dump(),
                         "ami_ssm_name": ami_ssm_name,
-                        # Pin the fingerprinted image (see _ami_id / _fill_params), but ONLY
-                        # for a cluster that will actually start Ray: one whose cells are all
-                        # retag or all-ocean never provisions, and forcing an SSM read there
-                        # breaks the cheap recovery paths when the parameter is missing or
-                        # the role lacks access. The ocean probe is one small bitmap GET per
-                        # zone — the price the per-cell path already pays — and runs only for
-                        # cells that are not already complete. The snapshot is passed THROUGH
-                        # rather than defaulted here, so an immediate refill probes against
-                        # the store it just read rather than the one the round opened on.
+                        # Pin the campaign's image (see _ami_id), but ONLY for a cluster that
+                        # will actually start Ray: one whose cells are all retag or all-ocean
+                        # never provisions, and forcing an SSM read there breaks the cheap
+                        # recovery paths when the parameter is missing or the role lacks
+                        # access. The ocean probe is one small bitmap GET per zone and runs
+                        # only for cells that are not already complete. The snapshot is passed
+                        # THROUGH rather than defaulted here, so an immediate refill probes
+                        # against the store it just read rather than the one the round opened on.
                         "ami_id": _ami_id() if _needs_ray(cells, snapshot) else None,
                         "store_name": store_name,
                         "mask_name": mask_name,
@@ -1473,19 +1253,21 @@ async def run_global_campaign(
                         "allow_partial_window": allow_partial_window,
                         "allow_ingest_code_mismatch": allow_ingest_code_mismatch,
                         "allow_s2_only": allow_s2_only,
-                        # As in _fill_params: the chained child must not demand radar either.
+                        # Explicit, and it must stay explicit: parts of the globe have no
+                        # dual-pol coverage at all, and demanding radar fails those cells on
+                        # every retry forever.
                         "require_s1": False,
-                        # As in _fill_params: the chained child gates on the seeded model too.
+                        # The child re-runs the model gate this flow cleared in preflight, so
+                        # without the override it rejects the same store after its ingest has
+                        # been paid for.
                         "allow_model_mismatch": allow_model_mismatch,
                         "ssm_prefix": ssm_prefix,
                         "cloudwatch_log_group": cloudwatch_log_group,
                         "code_bucket": code_bucket,
                         "code_suffix": code_suffix,
-                        # The narrowed staging identity with the force_staging_* overrides
-                        # applied — the same value the per-zone path folds into its run_id.
+                        # The narrowed staging identity with the staging levers applied.
                         # Without it the child recomputes the AMI/tarball artifact identity,
-                        # so the default strategy re-infers on every re-bake and ignores both
-                        # escape hatches.
+                        # so it would re-infer on every re-bake and ignore every lever.
                         "staging_code_identity": _staging_code_identity(),
                         "ingest": ingest,
                         "ingest_deployment": ingest_deployment,
@@ -1495,18 +1277,19 @@ async def run_global_campaign(
                         # This cluster's OWN zone count, so its admission gates never limit
                         # fleet fill (see the dispatch comment above).
                         "look_ahead": cell_look_ahead,
-                        # THE CHAINED FILL ONLY: `_fill_params` dispatches `fill-zone-year` on
-                        # the 64 GiB inference family, which must keep the library default.
+                        # This deployment runs on the 244 GiB `assembly_large` family; every
+                        # other caller keeps the library default.
                         "n_assembly_workers": ASSEMBLY_WORKERS_ON_THE_LARGE_RUNNER,
-                        # As in _fill_params: the account's RunInstances quota is the
-                        # fleet-wide rate these clusters share, and each autoscaler enforces
-                        # its own share client-side rather than being handed a divided count.
+                        # The account's RunInstances quota is the fleet-wide rate these
+                        # clusters share, and each autoscaler enforces its own share
+                        # client-side rather than being handed a divided count.
                         "launch_pacing": launch_pacing,
                         "gpu_fallback_instance_types": gpu_fallback_instance_types,
                         "gpu_fallback_vcpu_budget": gpu_fallback_vcpu_budget,
-                        # And as in _fill_params, the bound on how many launch requests a
-                        # cluster makes, beside the pacing that makes each one cheaper.
-                        # Omitted when unset so the child's own default stands.
+                        # The bound on how many launch requests a cluster makes, beside the
+                        # pacing that makes each one cheaper. Omitted when unset so the
+                        # child's own default stands — keyed on None rather than truthiness,
+                        # since 0 is a documented batch mode and not an absence.
                         **set_overrides(
                             actor_request_headroom=actor_request_headroom,
                             actor_request_batch_size=actor_request_batch_size,
@@ -1519,9 +1302,11 @@ async def run_global_campaign(
                         # And the shared pause. Same reason it is one name for every
                         # cluster: an operator pauses the CAMPAIGN, not a cluster.
                         "inference_pause_gate": inference_pause_gate,
-                        # As in _fill_params: omitted when unset, so the child's own registered
-                        # validator stands. The child dispatches each cell's validation off
-                        # its trailing assembly thread as that cell is tagged.
+                        # OMITTED when unset, so the child deployment's own registered
+                        # validator stands — where a consumer names it and where a branch
+                        # registration already carries the suffix. Passing None would switch
+                        # validation off for every cell. The child dispatches each cell's
+                        # validation off its trailing assembly thread as that cell is tagged.
                         **({"validation_deployment": validation_deployment} if validation_deployment else {}),
                     }
 
@@ -1875,77 +1660,8 @@ async def run_global_campaign(
                         refills_landed,
                         len(refills),
                     )
-            elif batch_cells:
-                log.info("Year(s) %s: dispatching %d zone fill(s)", batch_years, len(batch_cells))
-
-                # Different zones are different store groups, so they fill concurrently. A
-                # zone's own years go one at a time — but NOT because the store requires it:
-                # `write_year_shards` (d1a379c) makes every chunk and shard 1 in the time
-                # dimension, so a zone's years write strictly disjoint objects and rebase
-                # cleanly, and the only collision left is two group attrs, which commit
-                # separately and retry with each writer inserting only its own year's key.
-                # This serialisation is scheduling, not correctness, and is a candidate for
-                # removal; the open question is the attr retry budget
-                # (`commit_year_attrs(tries=8)`) once many years of one zone contend.
-                # return_exceptions=True so one zone's failure does not abandon its siblings
-                # mid-flight (a default gather() would leave them running orphaned): let the
-                # whole year settle, then fail loudly with every failure.
-                years_of: dict[str, list[int]] = {}
-                for z, y in batch_cells:
-                    years_of.setdefault(z, []).append(y)
-
-                async def _zone_years(zone: str, years: list[int]) -> list[Any]:
-                    """One zone's years, in order, each attempted whatever the last one did.
-
-                    Sequential, so a zone never has two years in flight; one result per year,
-                    so the round still accounts for every cell it was given.
-
-                    IT DOES NOT STOP AT THE FIRST FAILURE, and that is the point. Years are
-                    ordered oldest-first and every retry rebuilds the list the same way, so a
-                    repeating failure that belongs to ONE year — a coverage gate is evaluated
-                    per zone-year, and radar coverage genuinely varies year to year — would
-                    otherwise keep its zone's other years from ever being attempted on any
-                    round, and the no-progress guard below would eventually halt the campaign
-                    over a cell that was never going to succeed while the years behind it were
-                    fillable.
-
-                    Stopping would buy fail-fast, and that is worth little here: the
-                    deterministic zone-wide failures (unseeded group, destination dtype, year
-                    off the axis, no live tiles) surface in `fill_zone_year_flow`'s preflight
-                    BEFORE a GPU fleet is provisioned, so continuing past one costs a few
-                    metadata reads. Same rule the chained path above states for clusters.
-                    """
-                    out: list[Any] = []
-                    for y in years:
-                        try:
-                            out.append(await _process(zone, y))
-                        except Exception as exc:  # mirrors gather(return_exceptions=True)
-                            out.append(exc)
-                    return out
-
-                per_zone = await asyncio.gather(*(_zone_years(z, ys) for z, ys in years_of.items()))
-                by_cell = {
-                    (z, y): r
-                    for (z, ys), rs in zip(years_of.items(), per_zone, strict=True)
-                    for y, r in zip(ys, rs, strict=True)
-                }
-                cell_results = [by_cell[(z, y)] for z, y in batch_cells]
-                for (z, y), cr in zip(batch_cells, cell_results, strict=True):
-                    if isinstance(cr, BaseException):
-                        round_failures.append(f"{z}-{y}: {cr!r}")
-                    else:
-                        round_runs.append(str(cr))
-                        # Per-cell runs fill ONE year each, so each is attributed to its own.
-                        # Copying the whole round into every year would report each year as
-                        # holding the others' runs and overcount `dispatched` by the number of
-                        # years in the batch — invisible until `overlap_years` puts several
-                        # years in one batch.
-                        runs_this_round_by_year.setdefault(y, []).append(str(cr))
-                log.info("Year(s) %s: %d/%d fill(s) landed", batch_years, len(round_runs), len(batch_cells))
-
-            # Attribution is per strategy — a chained cluster spans the batch's years while a
-            # per-cell run fills exactly one — and both populate `runs_this_round_by_year`
-            # above, so this only merges it.
+            # Attribution happened above, per cluster and to the years it owns; this only
+            # merges it.
             for y, runs in runs_this_round_by_year.items():
                 runs_by_year.setdefault(y, []).extend(runs)
             # Re-read the STORE every round, including rounds that reported no failures. What

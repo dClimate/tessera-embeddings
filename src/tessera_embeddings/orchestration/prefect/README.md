@@ -57,24 +57,21 @@ from the single-ROI path above:
 
 ```text
 build_land_mask   →   seed_global_store   →   run_global_campaign
-(coverage bitmaps)    (metadata-only)          ├─ cluster-per-zone: per pending (zone, year): fill_zone_year (Ray cluster each)
-                                               └─ chained-clusters: per year: K fill_zones_sequential runs (K long-lived Ray clusters)
+(coverage bitmaps)    (metadata-only)          └─ per batch: K fill_zones_sequential runs (K long-lived Ray clusters)
 ```
 
 `run_global_campaign` reads live progress via `storage.campaign.campaign_status`
-and dispatches fills for every pending cell, **year by year** (outer serial
-loop), under one of two strategies:
-
-- **`fill_strategy="chained-clusters"`** (default): up to `max_parallel_clusters`
-  `fill-zones-sequential` runs per year, each owning ONE long-lived Ray
-  cluster whose actors are created once and **stream** through a
-  size-balanced share of the year's zones — strictly ordered, with the next
+and dispatches fills for every pending cell — by default every requested year in
+ONE batch (`overlap_years`; `False` restores a batch per year) — as up to
+`max_parallel_clusters` `fill-zones-sequential` runs, each owning ONE long-lived Ray
+cluster whose actors are created once and **stream** through a
+size-balanced share of the batch's zones — strictly ordered, with the next
   zone's tiles interleaving only once the current zone's queue is exhausted,
   so zone tails never idle the fleet and there is no per-zone teardown, actor
   churn, or model reload. Amortizes `ray up` (~5-10 min), per-worker EC2
   bringup (minutes of billed GPU idle each), the per-worker model-load cold
   start, and the EC2 capacity roll across the whole cluster instead of per zone
-  (`max_parallel_clusters=1` = a single cluster for the whole year). Zones whose
+  (`max_parallel_clusters=1` = a single cluster for the whole batch). Zones whose
   mosaics resolve a different S1 orbit stream anyway, under their own orbit. **A
   failed cell is retried on that same fleet**, from the back of the feeder's queue
   rather than through a second inference session; when the source has nothing ready
@@ -86,10 +83,12 @@ loop), under one of two strategies:
   ~10-15% of a zone's inference wall — while the next zone's inference keeps the
   GPUs busy). Retag-only and all-ocean cells settle before the cluster exists,
   and all-ocean cells are never ingested at all.
-- **`fill_strategy="cluster-per-zone"`**: a `fill-zone-year` run per cell, with
-  **bounded parallelism** within each year (`max_parallel_clusters`
-  simultaneous Ray clusters). Simpler, and every zone pays a full cluster
-  bringup and model load.
+
+`fill_zone_year` fills ONE cell on its own short-lived Ray cluster. The campaign
+never dispatches it; it is the single-cell flow an operator runs by hand — a
+deliberate refill that resumes a named `run_id`, a hand-provided mosaic
+(`mosaic_base`), and the `die_between_commits` drill, which the shared-cluster
+fill refuses (see [fault injection](#deliberate-fault-injection-supervised-drills-only)).
 
 > **Naming.** A **zone** is always a UTM zone. A **cluster** is one Ray cluster
 > and the UTM zones assigned to it. A **shard** is always a storage shard — never
@@ -295,11 +294,11 @@ current mask through the campaign's own partitioner.
 > of EC2; lower `num_actors` and `max_workers` alongside, since running many narrow
 > fleets rather than few wide ones is the point of these defaults.
 
-Zone-parallelism (either flavor) is safe because inference is independent
-across zones and only *same-zone* fills conflict (shared group attrs →
-`RebaseFailedError`) — the year-serial loop guarantees a zone never fills two
-years at once, and within a sequential run the depth-1 trailing assembly can
-never overlap a commit for the same zone group. **Commits are otherwise ungated.**
+Zone-parallelism is safe because inference is independent across zones and only
+*same-zone* fills conflict (shared group attrs → `RebaseFailedError`) — the
+partition is over ZONES, so all of a zone's years land in one cluster, and that
+cluster's single trailing-assembly thread never overlaps two commits for the same
+zone group. **Commits are otherwise ungated.**
 They contend on the branch-tip CAS, since all 120 zone groups share one repo, but
 run 1 measured that as 2.2 s at 16 committers and 15 s at 120 with zero
 unresolvable conflicts. See `context_docs/storage/writing-to-the-global-store.md`. `build_land_mask` and `seed_global_store` are
@@ -334,10 +333,10 @@ override.
 | `tessera_full_pipeline.py` | Async master flow chaining the four above via `arun_deployment`. |
 | `build_land_mask.py` | Global campaign: build per-zone coverage bitmaps from the partner delivery registry (ADR-010). Optional pre-build delivery verification + post-build validation. No cluster. |
 | `seed_global_store.py` | Global campaign: create the global-store repo and seed every unseeded UTM-zone group (metadata-only, ADR-008 D1). Idempotent. No cluster. |
-| `fill_zone_year.py` | Global campaign: fill one `(zone, year)` on a Ray cluster (coverage mask → inference → shard assembly → tag). Commits are ungated. |
+| `fill_zone_year.py` | Global campaign, single cell by hand: fill one `(zone, year)` on its own Ray cluster (coverage mask → inference → shard assembly → tag). Not dispatched by the campaign. |
 | `fill_zones_sequential.py` | Global campaign: fill one cluster's zones sequentially on a SINGLE shared Ray cluster (densest-first, ingest look-ahead, trailing assembly, idle-retirement gated until the final zone). Waits for its densest zone's mosaic before requesting GPUs. Pre-cluster triage settles retag/all-ocean cells. |
 | `ingest_zone_year.py` | Global campaign: build one cell's S1/S2 mosaics on the fixed zone grid by dispatching the ROI ingest deployments onto a synthesised zone-shaped ROI. Marker-gated and crash-safe: a stale or half-written mosaic is cleared and rebuilt, never appended onto. |
-| `run_global_campaign.py` | Global campaign driver: dispatch fills per pending `(zone, year)`, year-serial — per-cell `fill-zone-year` runs with bounded zone parallelism (`fill_strategy="cluster-per-zone"`), or size-balanced `fill-zones-sequential` runs on long-lived clusters (`"chained-clusters"`). |
+| `run_global_campaign.py` | Global campaign driver: dispatch every pending `(zone, year)` as size-balanced `fill-zones-sequential` runs on long-lived clusters, with bounded re-dispatch rounds. |
 
 ### A landed cell is handed to a validator, and nothing waits for it
 
@@ -374,8 +373,7 @@ runs terminal hooks in a fresh import after the flow process is gone. The shared
 machinery is `flows/_child_runs.py`; the chain is three deep:
 
 ```text
-run_global_campaign   --"campaign:<id>"-->        ingest-zone-year, fill-zone-year,
-                                                  fill-zones-sequential
+run_global_campaign   --"campaign:<id>"-->        fill-zones-sequential
 ingest_zone_year      --"ingest-zone-year:<id>"-->  ingest_s1_roi_sar, ingest_s2_roi_reflectance
 fill_zones_sequential --"chained-ingest:<id>"-->    ingest-zone-year (look-ahead)
 ```
