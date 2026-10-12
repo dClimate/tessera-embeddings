@@ -1,17 +1,16 @@
-"""Recomputing the registry measurements a resumed fill never recorded.
+"""Recomputing registry measurements a fill never recorded.
 
 **Why any of this is possible.** :mod:`~tessera_embeddings.storage.registry` promises that every
 column is derivable from the store, which is what makes a missing measurement a rebuildable
 inconvenience rather than lost data. This module is that promise cashed in: it recomputes a tile's
 refusal counts and depth statistics from the ``*_obs_count`` arrays the store already publishes.
 
-**Why measurements are missing at all.** A refused tile's coverage record is written into its skip
-marker on object storage and survives every resume. An embedded tile's record rides back in the
-actor's result and lives only in memory, so the leg that finishes a resumed run reports earlier
-legs' tiles as synthetic successes carrying no record, and those rows publish null. The asymmetry
-is the whole cause: every wholly-refused tile in the v1.1 campaign's parts was measured, and only
-about half the embedded ones were. This module re-derived the other 1,519,045 rows, published in
-the registry's ``rebuild/`` and ``master/``.
+**Why measurements go missing.** A tile's coverage record is persisted beside it — in a refused
+tile's skip marker, and on an embedded tile's staged store — so a resumed fill reads it back. A
+record that cannot be read publishes its row null. The v1.1 campaign ran before the embedded half
+was persisted, so a resumed leg had nothing for earlier legs' embedded tiles: every wholly-refused
+tile was measured and only about half the embedded ones were. This module re-derived the other
+1,519,045 rows, merged into the registry's ``master/`` with ``measured_by = "rebuild"``.
 
 **The rebuild is a re-derivation, not an estimate — and that is checkable.** The fill's optical test
 is ``has_optical = s2_nonzero & (s2_valid_count > 0)`` (:mod:`..inference.dataset`), where
@@ -37,21 +36,18 @@ mismatches, because a rebuild of one is expected to differ.
 from __future__ import annotations
 
 import datetime
-import io
 import numbers
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
-import pyarrow.parquet as pq
 
 from tessera_embeddings.config.store_layout import SHARD_PX
-from tessera_embeddings.storage.registry import REASONS, registry_schema
+from tessera_embeddings.storage.registry import REASONS
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
-    from contextlib import AbstractContextManager
+    from collections.abc import Mapping, Sequence
 
     import zarr
 
@@ -82,6 +78,8 @@ REBUILT_COLUMNS: tuple[str, ...] = (
 #: name the build that REFUSED the tile, which a rebuild does not become, and the bbox comes from
 #: zone grid geometry this module has no business re-deriving.
 CARRIED_COLUMNS: tuple[str, ...] = (
+    "zone",
+    "year",
     "tile",
     "embedded",
     "optical_min_obs",
@@ -290,78 +288,17 @@ def rebuild_tile(
     )
 
 
-def rebuild_schema() -> pa.Schema:
-    """The part schema for the ``rebuild/`` prefix: the registry's own, plus ``filled_at``.
-
-    A rebuilt row's ``assembled_at`` is when the REBUILD produced it, because that is what the
-    master's merge resolves latest-wins on and a run id is not a clock. That would otherwise lose
-    when the tile was filled, so the fill's own stamp is carried in ``filled_at`` — which is also
-    how the merge tells a re-derivation of the tile's current run from one of a superseded run. On
-    a fill part the two are the same value and the column is absent; the master carries it for
-    every row.
-
-    Declared here rather than by extending the registry's writer because ``storage/registry.py``
-    sits inside the inference code-identity closure — editing it moves ``inference_code_identity``
-    and invalidates every staged tile a future fill might have resumed into. Nothing about a
-    rebuild should cost that.
-    """
-    return pa.schema([*registry_schema(), pa.field("filled_at", pa.string())])
-
-
-def rebuild_dataset_schema() -> pa.Schema:
-    """:func:`rebuild_schema` plus the hive partition keys, for reading ``rebuild/`` as a dataset."""
-    return pa.schema([*rebuild_schema(), pa.field("zone", pa.string()), pa.field("year", pa.int32())])
-
-
-def part_uri(rebuild_root: str, zone: str, year: int, run_id: str) -> str:
-    """Where one cell's rebuilt part lands, under a prefix of its own.
-
-    ``rebuild/`` sits BESIDE ``parts/``, never inside it. A consumer reading ``parts/`` today sees
-    exactly what the campaign published — same rows, same count, same schema — and a rebuild adds
-    a second row for a tile nowhere that anybody reads unfiltered. The master is what merges the
-    two, and rollback is deleting this prefix.
-    """
-    return f"{rebuild_root.rstrip('/')}/zone={zone}/year={year}/{run_id}.parquet"
-
-
-def write_rebuild_part(
-    uri: str,
-    rows: list[dict[str, Any]],
-    *,
-    open_output: Callable[[str], AbstractContextManager[Any]],
-    zone: str,
-    year: int,
-    extra_metadata: Mapping[str, str] | None = None,
-) -> int:
-    """Write ``rows`` as one rebuilt part at ``uri``; returns the rows written.
-
-    Mirrors ``registry.write_registry_part`` — one shot, zstd, zone and year in the key-value
-    block rather than as columns — against :func:`rebuild_schema`. A separate writer rather than a
-    schema argument on the original, for the code-identity reason in :func:`rebuild_schema`.
-    """
-    if not rows:
-        return 0
-    table = pa.Table.from_pylist(rows, schema=rebuild_schema())
-    table = table.replace_schema_metadata(
-        {"zone": zone, "year": str(year), "run_id": str(rows[0]["run_id"]), **dict(extra_metadata or {})}
-    )
-    buf = io.BytesIO()
-    pq.write_table(table, buf, compression="zstd")
-    with open_output(uri) as handle:
-        handle.write(buf.getvalue())
-    return table.num_rows
-
-
 def rebuilt_row(
     source: Mapping[str, Any], measurements: Mapping[str, Any], *, run_id: str, assembled_at: str
 ) -> dict[str, Any]:
     """A full rebuilt row for one tile: carried identity, re-derived measurements.
 
     ``run_id`` and ``assembled_at`` are the REBUILD's, not the fill's — a row has to say which pass
-    produced it, and ``assembled_at`` is what lets the master's merge resolve latest-wins without
-    treating a run id as a clock. The fill's own stamp is carried in ``filled_at`` so nothing is
-    lost. The columns naming the fill (``code_version``, ``code_commit``, the bbox, the depth rule)
-    are carried across unchanged: a rebuild does not become the build that refused the tile.
+    produced it, and ``assembled_at`` is what lets the master's merge resolve latest-wins between
+    two re-derivations without treating a run id as a clock. The fill's own stamp is carried in
+    ``filled_at``, which is how the merge knows which run the row describes. The columns naming
+    the fill (``code_version``, ``code_commit``, the bbox, the depth rule) are carried across
+    unchanged: a rebuild does not become the build that refused the tile.
     """
     row: dict[str, Any] = {column: source.get(column) for column in CARRIED_COLUMNS}
     row["run_id"] = run_id
@@ -374,8 +311,8 @@ def rebuilt_row(
 def rebuild_run_id(*, when: datetime.datetime | None = None, suffix: str = "") -> str:
     """A run id for one rebuild pass, sortable and obviously not a fill's.
 
-    Parts are keyed by run, so this is what keeps a rebuild's output beside the campaign's rather
-    than over it, and what a later pass supersedes by ``assembled_at``.
+    It is the ``run_id`` of every master row the pass re-derives, so a reader can tell which pass
+    produced a row as well as that a re-derivation did.
     """
     stamp = (when or datetime.datetime.now(datetime.UTC)).strftime("%Y%m%dT%H%M%SZ")
     return f"rebuild-{stamp}{f'-{suffix}' if suffix else ''}"

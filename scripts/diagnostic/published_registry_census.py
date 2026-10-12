@@ -43,7 +43,7 @@ if TYPE_CHECKING:
 from tessera_embeddings.storage import published_store, zone_grid
 from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.registry import dataset_schema, registry_schema
-from tessera_embeddings.storage.registry_master import current_fill_rows, master_schema
+from tessera_embeddings.storage.registry_master import audit, invariant_failures, master_schema, tile_years
 
 DEFAULT_STORE = "s3://tessera-embeddings/v1.1/dclimate.icechunk"
 DEFAULT_REGISTRY = "s3://tessera-embeddings/v1.1/dclimate.registry"
@@ -230,16 +230,6 @@ def _consumer_view(fs: pyarrow.fs.FileSystem, root: str) -> tuple[str, Any, bool
     return f"{base}/parts", dataset_schema(), False
 
 
-def _tile_years(table: pyarrow.Table, stamp: str) -> set[str]:
-    """``zone/year/tile/<stamp>`` keys: which tile-years a table holds, and from which fill."""
-    import pyarrow as pa
-    import pyarrow.compute as pc
-
-    year = pc.cast(table.column("year"), pa.string())
-    keys = pc.binary_join_element_wise(table.column("zone"), year, table.column("tile"), table.column(stamp), "/")
-    return set(keys.to_pylist())
-
-
 def _completeness(fs: pyarrow.fs.FileSystem, root: str) -> dict[str, Any]:
     """How much of the registry actually carries measurements, per cell and in total.
 
@@ -258,28 +248,23 @@ def _completeness(fs: pyarrow.fs.FileSystem, root: str) -> dict[str, Any]:
     persisted now, so unmeasured rows concentrated on the embedded side mean that path regressed.
 
     Counted over ``master/`` once one exists, since that is what consumers read and ``parts/``
-    keeps its null rows forever by design; over ``parts/`` before then. A master is only trusted if
-    each cell holds exactly its tiles' current runs — every tile any part names, stamped with the
-    newest run that wrote it. A fill whose master update failed leaves its cell short or stale with
-    no null rows to count, so those cells are named, for ``sync --zones``.
+    keeps its null rows forever by design; over ``parts/`` before then. The master is also audited
+    against the parts, cell by cell (:func:`~tessera_embeddings.storage.registry_master.audit`):
+    a fill whose master update failed leaves its cell short or stale with no null rows to count, so
+    every cell that fails is named, for ``repair --zones``.
     """
     import pyarrow.compute as pc
     import pyarrow.dataset as ds
 
     prefix, schema, compacted = _consumer_view(fs, root)
     started = time.monotonic()
-    dataset = ds.dataset(prefix, filesystem=fs, partitioning="hive", schema=schema)
-    table = dataset.to_table(
-        columns=["zone", "year", "tile", "embedded", "chunk_px", *(["filled_at"] if compacted else [])]
-    )
-    stale = None
+    table = ds.dataset(prefix, filesystem=fs, partitioning="hive", schema=schema).to_table()
+    problems = invariants = None
     if compacted:
         parts_prefix = prefix.rsplit("/", 1)[0] + "/parts"
-        parts = ds.dataset(parts_prefix, filesystem=fs, partitioning="hive", schema=dataset_schema()).to_table(
-            columns=["zone", "year", "tile", "run_id", "assembled_at"]
-        )
-        differing = _tile_years(current_fill_rows(parts), "assembled_at") ^ _tile_years(table, "filled_at")
-        stale = sorted({"/".join(key.split("/")[:2]) for key in differing})
+        parts = ds.dataset(parts_prefix, filesystem=fs, partitioning="hive", schema=dataset_schema()).to_table()
+        problems = audit(table, parts)
+        invariants = invariant_failures(table, expected_rows=tile_years(parts))
     unmeasured = pc.is_null(table.column("chunk_px")).to_pylist()
     embedded = table.column("embedded").to_pylist()
     zones, years = table.column("zone").to_pylist(), table.column("year").to_pylist()
@@ -294,7 +279,8 @@ def _completeness(fs: pyarrow.fs.FileSystem, root: str) -> dict[str, Any]:
         "wall_s": round(time.monotonic() - started, 2),
         "prefix": prefix.rsplit("/", 1)[1],
         "rows": table.num_rows,
-        "cells_where_master_is_stale": stale,
+        "master_problems": problems,
+        "master_invariants": invariants,
         "rows_without_measurements": total_unmeasured,
         "fraction_without_measurements": round(total_unmeasured / table.num_rows, 6) if table.num_rows else 0.0,
         "unmeasured_rows_that_are_embedded": sum(
@@ -664,13 +650,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     # Counts, not the rounded fraction: one null row in 3.2 M rounds to 0.0 and would pass a zero threshold.
     above = complete["rows_without_measurements"] > args.max_unmeasured * complete["rows"]
-    stale = complete["cells_where_master_is_stale"] or []
-    incomplete = above or bool(stale)
-    if stale:
-        zones = ",".join(sorted({cell.split("/")[0] for cell in stale}))
+    problems = complete["master_problems"] or {}
+    incomplete = above or bool(problems) or bool(complete["master_invariants"])
+    for failure in complete["master_invariants"] or []:
+        print(f"  MASTER INVARIANT: {failure}")
+    for cell, found in list(problems.items())[:20]:
+        print(f"  MASTER {cell}: {'; '.join(found)}")
+    if problems:
+        zones = ",".join(sorted({cell.split("/")[0] for cell in problems}))
         print(
-            f"  master/ is stale in {len(stale)} cell(s), each a fill whose master update failed: "
-            f"{', '.join(stale[:20])}. Repair: rebuild_registry_measurements.py sync --zones {zones} --write"
+            f"  master/ fails its audit in {len(problems)} cell(s). "
+            f"Repair: rebuild_registry_measurements.py repair --zones {zones} --write"
         )
     if above:
         print(

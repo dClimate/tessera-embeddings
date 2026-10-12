@@ -1,45 +1,46 @@
-"""Repair the registry: re-derive measurements a fill left null, and re-sync ``master/``.
+"""Repair the registry's ``master/``: rebuild cells from their parts and re-derive what fills left null.
 
-Every fill keeps its own cell's ``master/`` file current (``registry_master.update_cell``, called
-by the zone-fill runner). This script is for what that cannot do on its own: re-deriving rows a
-fill published null, and rebuilding master files a failed update left stale. Its first use repaired
-the v1.1 campaign, whose resumed fills published 1,519,045 of 3,247,410 rows (47%) null in every
-measurement column (``context_docs/storage/registry-backfill.md``).
+Every fill merges its own cell into ``master/`` (``registry_master.update_cell``, called by the
+zone-fill runner). This script is for what that cannot do: re-deriving rows a fill published null,
+and rebuilding a cell whose update failed. Its first use repaired the v1.1 campaign, whose resumed
+fills published 1,519,045 of 3,247,410 rows (47%) null in every measurement column
+(``context_docs/storage/registry-backfill.md``).
 
 Every column is derivable from the store, so this is a re-derivation rather than an estimate — see
 :mod:`tessera_embeddings.storage.registry_rebuild` for the proof that the fill's optical test
 reduces to ``s2_obs_count > 0`` on the delivered product, and for the one column
 (``eligible_px``) deliberately left null.
 
-**Nothing here rewrites published input.** ``parts/`` is never touched; rebuilt rows land under a
-``rebuild/`` prefix of their own, and ``sync`` rewrites only ``master/``, which is derived from the
-other two. Every writing subcommand is a DRY RUN unless given ``--write``.
+**``repair`` rebuilds a cell from three inputs**: its parts, its existing master rows, and a fresh
+re-derivation of every row its fills left null, merged tile by tile. The parts supply every tile and
+every measurement a fill took, which the merge never overrides; the existing master keeps a radar
+column an optical-only pass would not re-measure. ``parts/`` is never touched, and a cell whose
+re-derivation is blocked is not written at all. Every writing subcommand is a DRY RUN unless given
+``--write``.
 
 Run from the REPOSITORY ROOT::
 
-    # 1. prove the rebuild reproduces measurements that already exist. Writes nothing, ever.
+    # 1. prove the re-derivation reproduces measurements that already exist. Writes nothing, ever.
     uv run python scripts/maintenance/rebuild_registry_measurements.py gate --sample 50000
 
-    # 2. re-derive the missing rows. --skip-radar is the cheap optical-only first pass.
-    uv run python scripts/maintenance/rebuild_registry_measurements.py rebuild --write
+    # 2. rebuild master/ (every cell, or --zones). --skip-radar is the cheap optical-only pass.
+    uv run python scripts/maintenance/rebuild_registry_measurements.py repair --write
 
-    # 3. rebuild master/ from parts/ + rebuild/ (every cell, or --zones), and check it
-    uv run python scripts/maintenance/rebuild_registry_measurements.py sync --write
+    # 3. check master/ itself, cell by cell, against parts/
     uv run python scripts/maintenance/rebuild_registry_measurements.py verify
 
 **Rehearsing needs no credentials.** ``--anonymous`` reads the public store and registry unsigned,
 and a non-``s3://`` ``--registry`` is the local filesystem, so a downloaded copy of the registry takes
-every subcommand end to end — ``rebuild --write`` and ``sync --write`` included — without touching
-the bucket.
+every subcommand end to end — ``repair --write`` included — without touching the bucket.
 
 **One process saturates at three to four cores**, because the per-tile work holds the GIL for part
 of its time. A full pass on a bigger host runs several processes over disjoint ``--zones`` lists;
 ``--zones`` is applied before rows are materialised, so each holds only its own share in memory.
 
-**The radar column is a second pass by design.** ``px_with_any_radar`` needs both Sentinel-1
-observation-count arrays, which triples the bytes moved for one informational column. Run
-``rebuild --skip-radar`` first to land the optical answer, then ``rebuild`` in full; the later
-pass's rows supersede the earlier ones in the merge, by ``assembled_at``.
+**The radar column can be a second pass.** ``px_with_any_radar`` needs both Sentinel-1
+observation-count arrays, which triples the bytes moved for one informational column. ``repair
+--skip-radar`` lands the optical answer; a later full ``repair`` replaces it with rows that measured
+radar too, and a later optical-only one cannot undo that.
 """
 
 from __future__ import annotations
@@ -65,24 +66,19 @@ from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.registry import dataset_schema
 from tessera_embeddings.storage.registry_master import (
     MEASURED_BY_FILL,
+    MEASURED_BY_REBUILD,
+    MEASURED_SENTINEL,
+    as_master_rows,
+    audit,
     cell_tables,
-    current_fill_rows,
-    fill_rows_unchanged,
     invariant_failures,
     master_schema,
     merge,
-    stale_cells,
     tile_years,
     write_cell,
     write_common_metadata,
 )
-from tessera_embeddings.storage.registry_rebuild import (
-    REBUILT_COLUMNS,
-    rebuild_dataset_schema,
-    rebuild_run_id,
-    rebuilt_row,
-    write_rebuild_part,
-)
+from tessera_embeddings.storage.registry_rebuild import rebuild_run_id, rebuilt_row
 
 DEFAULT_STORE = "s3://tessera-embeddings/v1.1/dclimate.icechunk"
 DEFAULT_REGISTRY = "s3://tessera-embeddings/v1.1/dclimate.registry"
@@ -121,9 +117,10 @@ def _registry_table(
     silently disappears from a whole-dataset read; the registry's own docstring says so and this is
     the script that would be most damaged by it.
 
-    Only an ``optional`` prefix may be absent — ``rebuild/`` before the first pass — and then it
-    reads as an empty table. Anything else that cannot be read raises: an empty ``parts/`` from a
-    mistyped ``--registry`` or a failed read would let every subcommand pass having checked nothing.
+    Only an ``optional`` prefix may be absent — ``master/`` before the first repair of a fresh
+    registry — and then it reads as an empty table. Anything else that cannot be read raises: an
+    empty ``parts/`` from a mistyped ``--registry`` or a failed read would let every subcommand pass
+    having checked nothing.
     """
     path = root.removeprefix("s3://").rstrip("/") + "/" + prefix
     if fs.get_file_info(path).type == pyarrow.fs.FileType.NotFound:
@@ -159,17 +156,15 @@ def _only_zones(table: pa.Table, zones: list[str]) -> pa.Table:
     return table
 
 
-def _cells(table: pa.Table, zones: list[str]) -> dict[tuple[str, int], list[dict[str, Any]]]:
-    """Registry rows grouped by ``(zone, year)``, which is the unit a fill — and a rebuild — works in.
+def _cells(parts: pa.Table, zones: list[str]) -> dict[tuple[str, int], pa.Table]:
+    """Each tile's current fill row, grouped by ``(zone, year)``: the unit a fill and a repair work in.
 
-    Only each tile's current row is kept — from the newest run that wrote it, the run the store
-    holds there and the master keeps — so a refilled tile is neither gated against an older run's
-    numbers nor rebuilt under its rule.
+    Current means from the newest run that wrote the tile — the run the store holds there and the
+    master keeps — so a refilled tile is neither gated against an older run's numbers nor
+    re-derived under its rule.
     """
-    grouped: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
-    for row in current_fill_rows(_only_zones(table, zones)).to_pylist():
-        grouped[(row["zone"], int(row["year"]))].append(row)
-    return dict(grouped)
+    fills = merge(as_master_rows(_only_zones(parts, zones), MEASURED_BY_FILL))
+    return {(zone, year): rows for zone, year, rows in cell_tables(fills)}
 
 
 def _store_slot(group: zarr.Group, year: int, rows: list[dict[str, Any]]) -> int | str:
@@ -260,7 +255,8 @@ def cmd_gate(args: argparse.Namespace) -> int:
         return 1
     cells = _cells(table, args.zones)
     measured = [
-        (cell, [row for row in rows if row.get("chunk_px") is not None]) for cell, rows in sorted(cells.items())
+        (cell, rows.filter(pc.is_valid(rows.column(MEASURED_SENTINEL))).to_pylist())
+        for cell, rows in sorted(cells.items())
     ]
     measured = [(cell, rows) for cell, rows in measured if rows]
     if not measured:
@@ -281,7 +277,7 @@ def cmd_gate(args: argparse.Namespace) -> int:
     unusable: list[str] = []
     for (zone, year), rows in measured:
         group = root[zone]
-        time_index = _store_slot(group, year, cells[zone, year])
+        time_index = _store_slot(group, year, cells[zone, year].to_pylist())
         if isinstance(time_index, str):
             print(f"  {zone}/{year}: FAILED — {time_index}", file=sys.stderr)
             unusable.append(f"{zone}/{year}")
@@ -316,153 +312,120 @@ def cmd_gate(args: argparse.Namespace) -> int:
     return 1 if mismatches or unusable else 0
 
 
-def cmd_rebuild(args: argparse.Namespace) -> int:
-    """Re-derive the null rows and write one part per cell under ``rebuild/``."""
-    fs = _filesystem(args.registry, args.region, anonymous=args.anonymous)
-    table = _registry_table(fs, args.registry, "parts", dataset_schema())
-    cells = _cells(table, args.zones)
-    run_id = args.run_id or rebuild_run_id(suffix="optical" if args.skip_radar else "full")
-    rebuild_root = args.registry.rstrip("/") + "/rebuild"
-    if not any(row.get("chunk_px") is None for rows in cells.values() for row in rows):
-        print("rebuild: every row already carries measurements, so there is nothing to re-derive")
-        return 0
-    root = _open_zone(args.store, args.region, anonymous=args.anonymous)
-    rng = random.Random(args.seed)
+def _rederive(
+    group: zarr.Group, year: int, rows: pa.Table, args: argparse.Namespace, rng: random.Random, run_id: str
+) -> pa.Table | str:
+    """Fresh master rows for the cell's unmeasured ``rows``, or why its store cannot supply them.
 
-    written = blocked = 0
-    for (zone, year), rows in sorted(cells.items()):
-        targets = [row for row in rows if row.get("chunk_px") is None]
-        if not targets:
-            continue
-        group = root[zone]
-        time_index = _store_slot(group, year, rows)
-        if isinstance(time_index, str):
-            blocked += 1
-            print(f"  {zone}/{year}: BLOCKED — {time_index}", file=sys.stderr)
-            continue
-        rule = int(targets[0]["optical_min_obs"])
-
-        # SELF-CHECK FIRST. A cell that holds measured tiles with optical in them can prove the
-        # rebuild reproduces its own geometry and rule before a single re-derived row is written.
-        known = [
-            row
-            for row in rows
-            if row.get("chunk_px") is not None
-            and row.get("eligible_px") == row.get("chunk_px")
-            and row.get("px_with_any_optical")
-        ]
-        if known and not args.no_in_cell_gate:
-            sample = known if len(known) <= IN_CELL_GATE_TILES else rng.sample(known, IN_CELL_GATE_TILES)
-            check = _gate_rows(
-                group,
-                time_index=time_index,
-                rows=sample,
-                optical_min_obs=rule,
-                with_radar=not args.skip_radar,
-                concurrency=args.concurrency,
-            )
-            if check["mismatches"]:
-                blocked += 1
-                print(
-                    f"  {zone}/{year}: BLOCKED — in-cell gate failed on {len(check['mismatches'])} rows",
-                    file=sys.stderr,
-                )
-                for entry in check["mismatches"][:3]:
-                    print(f"      {entry['tile']}: {'; '.join(entry['differences'])}", file=sys.stderr)
-                continue
-
-        measurements = _rebuild_many(
+    Self-checks first: a cell holding measured tiles with optical in them proves the re-derivation
+    reproduces its own geometry and rule before a single re-derived value is accepted.
+    """
+    every = rows.to_pylist()
+    time_index = _store_slot(group, year, every)
+    if isinstance(time_index, str):
+        return time_index
+    targets = [row for row in every if row.get(MEASURED_SENTINEL) is None]
+    rule = int(targets[0]["optical_min_obs"])
+    known = [
+        row
+        for row in every
+        if row.get(MEASURED_SENTINEL) is not None
+        and row.get("eligible_px") == row.get("chunk_px")
+        and row.get("px_with_any_optical")
+    ]
+    if known and not args.no_in_cell_gate:
+        sample = known if len(known) <= IN_CELL_GATE_TILES else rng.sample(known, IN_CELL_GATE_TILES)
+        check = _gate_rows(
             group,
             time_index=time_index,
-            rows=targets,
+            rows=sample,
             optical_min_obs=rule,
             with_radar=not args.skip_radar,
             concurrency=args.concurrency,
         )
-        stamp = datetime.datetime.now(datetime.UTC).isoformat()
-        part = [rebuilt_row(row, measurements[row["tile"]], run_id=run_id, assembled_at=stamp) for row in targets]
-        uri = registry_rebuild.part_uri(rebuild_root, zone, year, run_id)
-        print(f"  {zone}/{year}: {len(part):>5} rows -> {uri}{'' if args.write else '  (dry run)'}")
-        if args.write:
-            fs.create_dir(uri.removeprefix("s3://").rsplit("/", 1)[0])
-            write_rebuild_part(
-                uri,
-                part,
-                open_output=lambda target: fs.open_output_stream(target.removeprefix("s3://")),
-                zone=zone,
-                year=year,
-                extra_metadata={"rebuilt_columns": ",".join(REBUILT_COLUMNS), "with_radar": str(not args.skip_radar)},
+        if check["mismatches"]:
+            first = check["mismatches"][0]
+            return (
+                f"in-cell gate failed on {len(check['mismatches'])} rows, e.g. {first['tile']}: {first['differences']}"
             )
-        written += len(part)
-
-    print(
-        f"\nrebuild {run_id}: {written} rows {'written' if args.write else 'would be written'}, {blocked} cells blocked"
+    measurements = _rebuild_many(
+        group,
+        time_index=time_index,
+        rows=targets,
+        optical_min_obs=rule,
+        with_radar=not args.skip_radar,
+        concurrency=args.concurrency,
     )
+    stamp = datetime.datetime.now(datetime.UTC).isoformat()
+    rebuilt = [rebuilt_row(row, measurements[row["tile"]], run_id=run_id, assembled_at=stamp) for row in targets]
+    return as_master_rows(pa.Table.from_pylist(rebuilt, schema=master_schema()), MEASURED_BY_REBUILD)
+
+
+def cmd_repair(args: argparse.Namespace) -> int:
+    """Rebuild each cell's master file from its parts, its master rows and a fresh re-derivation."""
+    fs = _filesystem(args.registry, args.region, anonymous=args.anonymous)
+    cells = _cells(_registry_table(fs, args.registry, "parts", dataset_schema()), args.zones)
+    held = _registry_table(fs, args.registry, "master", master_schema(), optional=True)
+    if args.zones:
+        held = held.filter(pc.is_in(held.column("zone"), value_set=pa.array(args.zones)))
+    held_cells = {
+        (zone, year): rows
+        for zone, year, rows in cell_tables(held.sort_by([("zone", "ascending"), ("year", "ascending")]))
+    }
+    run_id = args.run_id or rebuild_run_id(suffix="optical" if args.skip_radar else "full")
+    rng = random.Random(args.seed)
+    root: zarr.Group | None = None
+
+    written = rederived = blocked = 0
+    for (zone, year), rows in sorted(cells.items()):
+        # Parts first, so on a tie between identical rows the part's copy is the one kept.
+        candidates = [rows, held_cells.get((zone, year), master_schema().empty_table())]
+        if pc.any(pc.is_null(rows.column(MEASURED_SENTINEL))).as_py():
+            # Opened only when a cell needs it: a repair with nothing to re-derive needs no store.
+            root = root if root is not None else _open_zone(args.store, args.region, anonymous=args.anonymous)
+            fresh = _rederive(root[zone], year, rows, args, rng, run_id)
+            if isinstance(fresh, str):
+                blocked += 1
+                print(f"  {zone}/{year}: BLOCKED, left as it is — {fresh}", file=sys.stderr)
+                continue
+            candidates.append(fresh)
+            rederived += fresh.num_rows
+        master = merge(*candidates)
+        if failures := invariant_failures(master, expected_rows=rows.num_rows):
+            blocked += 1
+            print(f"  {zone}/{year}: BLOCKED — the merged master breaks its invariants: {failures}", file=sys.stderr)
+            continue
+        if args.write:
+            # One object per cell, replaced whole: a reader mid-repair sees each cell before or after.
+            write_cell(fs, args.registry, zone, year, master)
+        written += 1
+    if args.write and written:
+        # Rewritten here, where a fill writes it only when absent: a repair is how a schema change lands.
+        write_common_metadata(fs, args.registry)
+    action = "written" if args.write else "would be written (dry run — pass --write to publish)"
+    print(f"\nrepair {run_id}: {written} cell(s) {action}, {rederived} rows re-derived, {blocked} cells blocked")
     return 1 if blocked else 0
 
 
-def cmd_sync(args: argparse.Namespace) -> int:
-    """Rebuild every cell's ``master/`` file (or ``--zones``'s) from ``parts/`` and ``rebuild/``.
-
-    The per-cell update every fill runs, for all cells at once: the repair for a cell whose update
-    failed, and for a rebuild pass that has landed in ``rebuild/`` but not yet in the master.
-    """
-    fs = _filesystem(args.registry, args.region, anonymous=args.anonymous)
-    parts = _only_zones(_registry_table(fs, args.registry, "parts", dataset_schema()), args.zones)
-    rebuilt = _registry_table(fs, args.registry, "rebuild", rebuild_dataset_schema(), optional=True)
-    if args.zones:
-        rebuilt = rebuilt.filter(pc.is_in(rebuilt.column("zone"), value_set=pa.array(args.zones)))
-    master = merge(parts, rebuilt)
-
-    failures = invariant_failures(master, expected_rows=tile_years(parts))
-    origins = defaultdict(int)
-    for tag in master.column("measured_by").to_pylist():
-        origins[tag or "unmeasured"] += 1
-    print(f"parts {parts.num_rows} rows, rebuild {rebuilt.num_rows} rows -> master {master.num_rows} rows")
-    print(f"  measured_by: {dict(origins)}")
-    if failures:
-        print("\nFAILED — the merged master breaks its own invariants:")
-        for failure in failures:
-            print(f"  {failure}")
-        return 1
-    if not args.write:
-        print("  (dry run — pass --write to publish)")
-        return 0
-    # One object per cell, each replaced whole: a reader mid-sync sees every cell either before or
-    # after, never half-written, and an interrupted sync is repaired by running it again.
-    cells = [write_cell(fs, args.registry, zone, year, rows) for zone, year, rows in cell_tables(master)]
-    # Rewritten here, where a fill only writes it when absent: a sync is how a schema change lands.
-    write_common_metadata(fs, args.registry)
-    print(f"  {len(cells)} cell(s) written to {args.registry.rstrip('/')}/master")
-    return 0
-
-
 def cmd_verify(args: argparse.Namespace) -> int:
-    """Check the published master against its invariants, against ``parts/``, and against a fresh merge."""
+    """Check ``master/`` itself: its invariants, and every cell against its parts."""
     fs = _filesystem(args.registry, args.region, anonymous=args.anonymous)
     parts = _registry_table(fs, args.registry, "parts", dataset_schema())
     master = _registry_table(fs, args.registry, "master", master_schema())
-    rebuilt = _registry_table(fs, args.registry, "rebuild", rebuild_dataset_schema(), optional=True)
     expected = tile_years(parts)
     failures = invariant_failures(master, expected_rows=expected)
-    altered = fill_rows_unchanged(master, parts, REBUILT_COLUMNS)
-    stale = stale_cells(master, merge(parts, rebuilt))
-    if stale:
-        failures.append(
-            f"{len(stale)} cell(s) differ from a fresh merge of parts/ and rebuild/: {', '.join(stale[:20])} "
-            "— re-run sync with --zones"
-        )
-    print(f"master {master.num_rows} rows against {parts.num_rows} part rows ({expected} distinct tile-years)")
-    unmeasured = sum(1 for tag in master.column("measured_by").to_pylist() if tag is None)
-    from_fill = sum(1 for tag in master.column("measured_by").to_pylist() if tag == MEASURED_BY_FILL)
-    print(f"  measured by fill {from_fill}, still unmeasured {unmeasured}")
+    problems = audit(master, parts)
+    origins = master.column("measured_by").to_pylist()
+    print(f"master {master.num_rows} rows against {expected} distinct tile-years in parts/")
+    print(f"  measured by fill {origins.count(MEASURED_BY_FILL)}, by rebuild {origins.count(MEASURED_BY_REBUILD)}")
     for failure in failures:
         print(f"  INVARIANT: {failure}")
-    for difference in altered[:20]:
-        print(f"  ALTERED: {difference}")
-    if len(altered) > 20:
-        print(f"  ... and {len(altered) - 20} more altered rows")
-    return 1 if failures or altered else 0
+    for cell, found in list(problems.items())[:20]:
+        print(f"  {cell}: {'; '.join(found)}")
+    if problems:
+        zones = ",".join(sorted({cell.split("/")[0] for cell in problems}))
+        print(f"  {len(problems)} cell(s) need repair: repair --zones {zones} --write")
+    return 1 if failures or problems else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -495,15 +458,12 @@ def main(argv: list[str] | None = None) -> int:
     gate.add_argument("--json", dest="json_out")
     gate.set_defaults(func=cmd_gate)
 
-    rebuild = sub.add_parser("rebuild", parents=[common], help="re-derive the null rows into rebuild/")
-    rebuild.add_argument("--run-id", default="")
-    rebuild.add_argument("--no-in-cell-gate", action="store_true", help="skip each cell's self-check (not advised)")
-    rebuild.set_defaults(func=cmd_rebuild)
+    repair = sub.add_parser("repair", parents=[common], help="rebuild master/ cells, re-deriving rows fills left null")
+    repair.add_argument("--run-id", default="")
+    repair.add_argument("--no-in-cell-gate", action="store_true", help="skip each cell's self-check (not advised)")
+    repair.set_defaults(func=cmd_repair)
 
-    sync = sub.add_parser("sync", parents=[common], help="rebuild master/ from parts/ and rebuild/, per cell")
-    sync.set_defaults(func=cmd_sync)
-
-    verify = sub.add_parser("verify", parents=[common], help="check master/ against its invariants and against parts/")
+    verify = sub.add_parser("verify", parents=[common], help="check master/ itself, cell by cell, against parts/")
     verify.set_defaults(func=cmd_verify)
 
     args = parser.parse_args(argv)
