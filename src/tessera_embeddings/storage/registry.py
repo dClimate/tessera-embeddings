@@ -22,7 +22,7 @@ the same terms and are directly comparable.
 **A convenience layer, never a second source of truth.** Every column is derivable from the store
 itself, so a wrong row is a rebuildable inconvenience rather than a data defect and a correction
 never touches published data. That property is what the Open Data access request promises Cambridge,
-and it is why a later compaction may replace the whole dataset.
+and it is why ``registry_master`` may rebuild any zone-year of the master from parts and store.
 
 **READING THE WHOLE DATASET REQUIRES STATING THE SCHEMA.** A nine-year campaign will cross code
 versions, so an older part will be missing a column a newer one has — and ``ds.dataset(...)`` infers
@@ -35,15 +35,14 @@ schema explicitly::
     ds.dataset(f"{root}/parts", schema=dataset_schema(), partitioning="hive")
 
 which backfills the missing column as null on the older parts — the honest answer, since those runs
-did not measure it. Consumers without this package should read the compacted master, which is written
-with one schema, or take the schema from a part they know to be current. The compaction is where a
-dataset-level ``_common_metadata`` belongs; parts are written concurrently by cells that cannot agree
-on one.
+did not measure it. Consumers should read ``master/`` instead (``registry_master``), which is written
+with one schema and a dataset-level ``_common_metadata``; parts are written concurrently by cells that
+cannot agree on one.
 
 **One part per cell, keyed by run.** Parts land under ``parts/zone=<Z>/year=<Y>/<run_id>.parquet``.
 Keying by run rather than a fixed name means a refill writes a NEW part instead of overwriting the
 original fill's: the registry holds both, the honest record of a cell filled twice, and dedup becomes
-the compaction step's decision rather than a silent overwrite's. ``assembled_at`` is what makes that
+the master merge's decision rather than a silent overwrite's. ``assembled_at`` is what makes that
 decision possible — latest-wins needs a clock, and a run id is not one.
 
 Three things this module does deliberately, each because the obvious version is broken:
@@ -51,7 +50,7 @@ Three things this module does deliberately, each because the obvious version is 
 * **The schema is DECLARED, never inferred.** A cell that refused nothing leaves every refusal
   column null, and ``pa.Table.from_pylist`` then types those columns ``null`` — which fails to
   concatenate against a cell that did refuse something (``ArrowInvalid: Schema at index 1 was
-  different``). Since most cells refuse nothing, an inferred schema breaks the compaction and any
+  different``). Since most cells refuse nothing, an inferred schema breaks the master merge and any
   read across the whole dataset while every individual part looks fine.
 * **``zone`` and ``year`` are NOT columns.** They are the hive partition keys, and carrying them as
   columns too makes the dataset unreadable: pyarrow infers ``year=2021`` from the path as ``int32``

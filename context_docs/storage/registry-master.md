@@ -14,6 +14,7 @@ The v1.1 backfill that first filled `master/` is a separate record:
 
 ```
   <store-stem>.registry/
+  ├── README.md the readers' guide, a copy of docs/registry.md
   ├── parts/    zone=<Z>/year=<Y>/<run_id>.parquet
   │             each fill's raw output: one part per zone-year per run, append-only, never
   │             rewritten. Internal — the record the master is built from and checked against.
@@ -26,6 +27,10 @@ The v1.1 backfill that first filled `master/` is a separate record:
 `master/` is written with one schema and a dataset-level `_common_metadata`, so a reader without this
 package takes the schema from the dataset. `parts/` needs `registry.dataset_schema()` stated, or
 `pyarrow` infers it from the first file and silently drops any column added later.
+
+`README.md` is uploaded by hand through the writer role, so a change to
+[`docs/registry.md`](../../docs/registry.md) that alters what readers are told is re-uploaded with
+it. Nothing reads it, and it sits outside both prefixes, so no `ds.dataset` over either one sees it.
 
 ## How a fill keeps it current
 

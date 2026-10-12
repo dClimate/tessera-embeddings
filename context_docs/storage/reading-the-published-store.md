@@ -446,7 +446,7 @@ two prefixes:
 
 | prefix | contents | what it is |
 |---|---|---|
-| `master/` | 994 files at `master/zone=<ZONE>/year=<YEAR>/part-0.parquet` + `_common_metadata`, 151 MB | **what a consumer reads**: one row per tile-year, one schema, measurements on every row |
+| `master/` | 994 files at `master/zone=<ZONE>/year=<YEAR>/part-0.parquet` + `_common_metadata`, 151 MB | **what a consumer reads**: one row per tile-year, one schema, measurements on every row; its guide is [`docs/registry.md`](../../docs/registry.md), published beside it as `README.md` |
 | `parts/` | 994 files, 142 MB, at `parts/zone=<ZONE>/year=<YEAR>/<run_id>.parquet` | the fills' raw output, one part per cell per run, never rewritten; internal |
 
 **`master/` describes what the store holds now.** Every fill merges its rows into its zone-year's
@@ -510,8 +510,8 @@ dataset = ds.dataset(master, filesystem=fs, schema=schema, partitioning="hive")
 **Reading `parts/` needs the schema stated**, or a column added mid-campaign is silently dropped:
 `pyarrow` infers a dataset's schema from the first file in sorted path order. Pass
 `schema=tessera_embeddings.storage.registry.dataset_schema()`. On v1.1 the hazard is latent rather
-than live: the whole campaign ran on one commit (`bbb9d836b3667f579c18a052e8d456d9a58c4e11`), so
-every part has the same schema.
+than live: the campaign's parts span nine commits (their `code_commit`), but all of them wrote the
+same 23 columns, so every part has the same schema.
 
 ## 6. What is missing, and what would surprise a consumer
 
