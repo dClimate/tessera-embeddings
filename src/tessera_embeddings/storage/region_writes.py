@@ -63,7 +63,7 @@ def _slab_array_from_zarr(
         if axis == band_axis:
             dim_blocks.append([(slice(start, stop), stop - start)])
             continue
-        chunk = zarr_arr.chunks[axis]
+        chunk = (zarr_arr.shards or zarr_arr.chunks)[axis]
         blocks: list[tuple[slice, int]] = []
         pos = start
         while pos < stop:
@@ -84,12 +84,15 @@ def _slab_array_from_zarr(
 
 
 def _store_chunk_sizes(existing: xr.Dataset, dims: "tuple[str, ...]") -> dict[str, int]:
-    """Read the on-disk chunk size per dimension from the existing store.
+    """Read the on-disk write unit per dimension from the existing store: the shard, else the chunk.
 
     The store is authoritative for chunking (config may have drifted), so we
     read it off the opened arrays rather than INGEST_CHUNKS. All data_vars in
     our stores share identical chunking on the spatial/temporal dims; we assert
     that here so the single widened region we compute is valid for every var.
+    A sharded array is opened with its INNER chunks as the dask chunks, so the
+    shard comes from the encoding: widening to inner chunks would write partial
+    shards, which zarr turns into read-modify-write.
     """
     sizes: dict[str, int] = {}
     for dim in dims:
@@ -98,7 +101,8 @@ def _store_chunk_sizes(existing: xr.Dataset, dims: "tuple[str, ...]") -> dict[st
             if chunks is None or dim not in existing[var].dims:
                 continue
             axis = existing[var].dims.index(dim)
-            size = chunks[axis][0]  # first block = nominal chunk size
+            shards = existing[var].encoding.get("shards")
+            size = shards[axis] if shards else chunks[axis][0]  # first block = nominal chunk size
             if dim in sizes and sizes[dim] != size:
                 raise ValueError(
                     f"Store data_vars disagree on chunk size for {dim!r}: {sizes[dim]} vs {size}. "
@@ -135,13 +139,14 @@ def _assert_zarr_layout_matches_dims(zarr_arr: zarr.Array, var: xr.DataArray, na
             f"Zarr array {name!r} axis order {tuple(zarr_dim_names)} does not match store view dims {dims}; "
             "the zarr-direct padding shell indexes axes positionally and would slice the wrong axes."
         )
-    # Per-axis nominal chunk size must agree between the raw array (used to build the
-    # shell blocks) and the xarray view (used to widen the region).
+    # Per-axis write unit (the shard, else the chunk) must agree between the raw array (used to
+    # build the shell blocks) and the xarray view (used to widen the region).
     view_chunks = var.chunks
+    view_shards = var.encoding.get("shards")
     if view_chunks is not None:
         for axis, dim in enumerate(dims):
-            zarr_chunk = zarr_arr.chunks[axis]
-            view_chunk = view_chunks[axis][0]  # first block = nominal chunk size
+            zarr_chunk = (zarr_arr.shards or zarr_arr.chunks)[axis]
+            view_chunk = view_shards[axis] if view_shards else view_chunks[axis][0]
             if zarr_chunk != view_chunk:
                 raise ValueError(
                     f"Chunk grid for {name!r} dim {dim!r} disagrees: zarr {zarr_chunk} vs store view "

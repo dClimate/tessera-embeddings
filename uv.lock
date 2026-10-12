@@ -4581,8 +4581,8 @@ requires-dist = [
     { name = "tessera-embeddings", extras = ["inference", "prefect", "aws"], marker = "extra == 'all'" },
     { name = "torch", marker = "extra == 'inference'", index = "https://download.pytorch.org/whl/cpu" },
     { name = "tqdm" },
-    { name = "xarray" },
-    { name = "zarr" },
+    { name = "xarray", specifier = ">=2026.2.0" },
+    { name = "zarr", specifier = ">=3.1.2" },
 ]
 provides-extras = ["inference", "prefect", "aws", "all", "architecture-tests"]
 

@@ -122,7 +122,7 @@ A Python library for:
   at configurable resolution.
 
 Output stores are self-describing via GeoZarr conventions: every embedding
-store carries the [`proj:`](https://github.com/zarr-conventions/geo-proj) and
+store carries the [`proj:`](https://github.com/zarr-conventions/proj) and
 [`spatial:`](https://github.com/zarr-conventions/spatial) conventions for
 CRS/affine metadata, plus the
 [`geoemb:` geoembeddings convention](https://github.com/geo-embeddings/embeddings-zarr-convention)

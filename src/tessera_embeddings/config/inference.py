@@ -495,16 +495,6 @@ MODEL_ENCODER_URLS: dict[str, str] = {
     "v2-large": "https://huggingface.co/geotessera/TESSERA-V-2.0-2B-L",
 }
 
-#: Planning-only inference throughput (px/s/worker). Strip and prefetch
-#: planning divides by this to ask "will the GPU stay busy long enough to hide
-#: this read?", so a faster model must not inherit a slower one's figure.
-#: Strategy only — never correctness, never a RAM bound. Calibration in
-#: context_docs.
-MODEL_EST_PX_PER_SEC: dict[str, float] = {
-    "v1.1": 16_000.0,
-    "v2-large": 22_000.0,
-}
-
 
 def encoder_url(model_version: ModelVersion = DEFAULT_MODEL_VERSION) -> str:
     """Public ``geoemb:model`` URL for *model_version*.
@@ -527,15 +517,6 @@ def encoder_url(model_version: ModelVersion = DEFAULT_MODEL_VERSION) -> str:
         raise ValueError(msg) from None
 
 
-def est_px_per_sec(model_version: str = DEFAULT_MODEL_VERSION) -> float:
-    """Planning-only inference-rate estimate; unknown versions fall back.
-
-    Falls back rather than raising because this is a speed hint — planning with
-    a stale number beats refusing to plan.
-    """
-    return MODEL_EST_PX_PER_SEC.get(model_version, MODEL_EST_PX_PER_SEC[DEFAULT_MODEL_VERSION])
-
-
 # v1.1 observation-count buckets. Every pixel with k valid observations is resampled
 # to the next bucket size; pixels sharing a bucket form rectangular batches for the
 # transformer. Multiples of 8 from 8 to 256 match tessera v1.1 defaults.
@@ -543,9 +524,7 @@ DEFAULT_NUM_OBS_CHECKPOINTS: tuple[int, ...] = tuple(range(8, 257, 8))
 
 # CPU batch-prep pipeline depth for the inference loop, and the number of prep workers.
 # Depth 1 starved the GPU whenever a forward ran shorter than one prep; depth 2 keeps a batch
-# ready across consecutive short forwards. Lives in this torch-free module because actors.py
-# sizes its background-load CPU reservation to match (one reserved core per prep worker) and
-# cannot import inference.py at module scope — the Fargate flow runner has no torch.
+# ready across consecutive short forwards.
 PREFETCH_DEPTH = 2
 
 # Spatial read-tile size for inference, on both paths: one tile is exactly one 2048-px output

@@ -8,6 +8,7 @@ Four measurement campaigns are folded together here. The July 2026 optimization 
 (§1–§10); the fleet-scale throughput investigation that corrected its duration basis is §11; the
 graph and catalogue budgets that limit it now are §12; the live-tile cropping derivation that §3.1
 and §3.2 summarise is §13; and the region-write primitive the whole windowed design rests on is §14.
+§15 measures Dask workers on Graviton (ARM64) against x86, the result that moves them to ARM.
 
 > **The duration basis was re-measured, and the correction matters more than it looks.** A 2026-08
 > reading found every zone running 1.8–2.1× slower than the figures here. **That claim is
@@ -586,7 +587,152 @@ noted again in §4.9's open items for S1.
 was adopted globally on one favourable point and had to be withdrawn when four more regions were
 tried. Sweep before generalising, or scope the setting to where it was measured.
 
-### 3.18 Six task threads per worker — a few percent on dense zones, nothing elsewhere
+### 3.18 Blosc-LZ4 for the mosaics — read for inference, not for ingest (October 2026)
+
+The mosaics are written once by ingest and read many times by inference. On an unsharded mosaic
+every strip of a tile decompresses the whole storage chunk of every band and date it touches, so a
+tile split into three strips decodes its data three times (§3.19 shards the mosaics to avoid it). That decode is CPU-bound and already uses every core of a
+4-vCPU GPU worker, and it is what a tile's first, exposed load mostly waits on. So the codec was
+chosen for decompression speed, measured on 60 real Iowa uint16 chunks (one band, one date, 2048²)
+on an `m6a` core, and end to end through icechunk on S3:
+
+| codec | size vs zstd | compress | decompress | strip read, 256 / 1,024 rows × 40 dates |
+|---|---|---|---|---|
+| zstd, zarr's default (before) | — | 30.6 ms | 9.5 ms | 2.4 / 3.2 s |
+| plain LZ4 | +25% | 5.0 ms | 4.2 ms | — |
+| **Blosc-LZ4, byte shuffle (now)** | **−6%** | **6.4 ms** | **3.7 ms** | **1.7 / 2.5 s** |
+| Blosc-zstd level 1, byte shuffle | −15% | 17.8 ms | 6.0 ms | — |
+
+A strip read is 20–30% faster rather than 2.6×, because the rest of it is fetching, TLS and zarr's
+own overhead. For inference that shortens the exposed first load by about 4–5 s of ~25 s, worth
+about 0.7% of card time on the edge-heavy Iowa year (the inference experiments in PR #207). For ingest, compressing a
+chunk is 4.8× cheaper, but compression was only about 1.5% of a date's worker CPU, so ingest gains
+about 1%. The values read back are identical: the codec is lossless. It is set in one place,
+`config.ingest.INGEST_COMPRESSORS`, used by both store-creation paths, and a store keeps the codec
+it was created with.
+
+### 3.19 Sharding the mosaics — a strip decompresses little more than its own rows (October 2026)
+
+Each band, date and 4096-px block of a mosaic used to be one chunk, and reading any part of it
+decompressed all of it. An inference tile is a quarter of a block, read in strips of rows, so a
+256-row strip decompressed 32 times the pixels it used. The block is now a **shard**: still one
+stored object and still the unit ingest writes, but holding 16 separately compressed inner chunks
+of 512 rows × 2048 px (`INGEST_INNER_CHUNKS`) and an index of where each one sits. A read fetches
+and decompresses only the inner chunks it touches. The global embedding store already uses the
+same codec (ADR 008, D3); the cost ADR 008 warns about, a read-modify-write when a write covers
+part of a shard (2.8× slower), does not arise because ingest writes whole blocks.
+
+```
+ one band-date block, 4096 × 4096 px
+
+ before   [               one chunk               ]   any read decompresses all of it
+
+ after    +-------------------+-------------------+
+          |  512 x 2048 (A)   |  512 x 2048 (B)   |   x 8 rows of inner chunks, plus an index;
+          +-------------------+-------------------+   a strip of tile A decompresses only the
+          |        ...        |        ...        |   column-A chunks its rows touch
+          +-------------------+-------------------+
+```
+
+**Reads, and why 512 rows.** One real Iowa block (30 dates × 10 bands, Blosc-LZ4), one tile's
+strip read the way inference reads it (two band threads, 64 requests in flight, four cores), each
+read in a fresh process, two rounds, on an `m6a` machine in the same region:
+
+| strip | | unsharded | 256-row inner | **512-row inner** |
+|---|---|---|---|---|
+| 256 rows | time / CPU | 5.4 s / 20 s | 0.9–2.1 s / 1.3 s | 1.0–2.0 s / 1.8 s |
+| rows 256–768, straddling 512-row chunks | time / CPU | 5.3–5.6 s / 20 s | 1.2–2.0 s / 2.2 s | 1.6–1.9 s / 3.1 s |
+| 1,024 rows | time / CPU | 5.4–5.5 s / 20 s | 1.9–2.6 s / 3.9 s | 1.9 s / 3.6 s |
+| the whole 2048-px tile | time / CPU | 5.7 s / 20.5 s | 3.1–3.5 s / 7.1 s | 2.5–2.9 s / 6.2 s |
+| the whole tile | memory held briefly while reading | 2.25 GB | 0.93–0.98 GB | 1.01–1.07 GB |
+
+Every inner chunk is its own ranged S3 request, and the index is fetched once more per strip, so the
+inner-chunk height trades decode waste against requests. Counted on a local S3 emulator with real
+data, one tile's strips cost these GET requests per band and date:
+
+| strips | unsharded | 256-row inner | 512-row inner |
+|---|---|---|---|
+| 3 (768, 768, 512 rows) | 5.5 | 11 | 8 |
+| 4 of 512 rows | 7.3 | 12 | 8 |
+
+Unsharded costs more than one request per strip because icechunk splits each ~14 MB block fetch
+into two ranges. 512-row inner chunks read as fast as 256-row ones and keep the memory saving, at
+1.1–1.6× today's requests against 1.6–2.4× (strip heights follow the memory budget and rarely land
+on a chunk boundary, which adds a request at each). The planner does not round strip heights to
+512 rows: a misaligned strip decompresses up to one extra inner chunk, which costs CPU (3.1 against
+2.2 s above) but not read time. Inference actors raise zarr's requests in flight from 10 to 64
+(`MOSAIC_READ_CONCURRENCY`): at 10, a sharded read waits on S3 latency. Every read returned
+identical values.
+
+The ingest and inference runs below used 256-row inner chunks. Values are identical whatever the
+inner chunk, and the benchmark above reads 512-row chunks at least as fast.
+
+**Ingest.** The Iowa year (November 2024 to October 2025) was ingested side by side in
+`global-tessera-dev`, with identical code apart from the layout, on 60 workers for Sentinel-2 and 13
+for Sentinel-1. Sentinel-1 was then repeated twice per layout, to separate the layout from the
+variation between runs:
+
+| | unsharded | sharded |
+|---|---|---|
+| Sentinel-2 (one run each): wall time, measured cost | 67 min, $17.95 | 70 min, $18.65 |
+| Sentinel-1 ascending (three runs each): measured cost | $1.85, $1.91, $1.93 | $1.92, $1.92, $1.88 |
+| Sentinel-1 write stage, summed over batches | 1,713, 1,765, 1,780 s | 1,768, 1,777, 1,744 s |
+
+The layout costs nothing measurable. The Sentinel-1 runs of the two layouts overlap completely, and
+the 4% between the single Sentinel-2 pair is the size of the spread between identical runs. Writing
+one block costs about the same CPU either way: on one thread, 104 ms sharded against 110 ms
+unsharded per 4096-px block-date; with zarr's thread pool compressing a shard's 32 (256-row) inner chunks in
+parallel, 111 against 94 ms. Encoding is about a fifth of a write task, so even that difference is
+under 1% of ingest.
+
+**Values.** Every block of every array in the two stores compared equal: 21,294 blocks for each
+radar polarization and 27,846 for each of the eleven reflectance variables, with the same dates and
+coordinates. The stores differ only in run attributes (timestamps, ROI path) and the ingest code
+identity.
+
+**Inference.** The Iowa year was then embedded from both stores side by side, with `main`'s loader,
+8 L40S workers each and the whole pipeline including assembly, and every tile paired across the two
+runs:
+
+| | unsharded | sharded |
+|---|---|---|
+| total tile time, 394 tiles | 91,643 s | 88,900 s (−3.0%) |
+| GPU computing | 86,780 s | 86,429 s (−0.4%) |
+| GPU idle, share of tile time | 5.3% | 2.7% |
+| of which, waiting for a tile's first strip | 3.5% | 1.4% |
+| peak host memory per worker | 18.8 GB (61%) | 17.1 GB (55%) |
+| GPU instance-hours | 26.1 | 25.4 |
+
+Computing time is unchanged, as it should be. What fell is the time the card waits for data, on
+interior tiles (−3.0%) as much as on edge tiles (−2.8%): about 2.6% of GPU time, or roughly $14K of
+the last campaign's $537K GPU line. Peak memory fell because a strip no longer decompresses whole
+blocks, which brings `main`'s loader back under the 60% ceiling it crosses on this run.
+
+The embeddings are **bit-identical** on all 390 tiles that both runs cut into the same strips. The
+other 4 were cut differently because `main`'s loader gives a tile a starter strip depending on
+which tile its worker handled before (found while measuring the PyTorch upgrade, #209). One of
+them still came out identical, and the other three are within ADR 012's cross-config envelope (at
+most 3 levels, cosine ≥ 0.99993), as two runs of `main` on the same store would be.
+
+**Compatibility.** Inference reads either layout. The ingest code identity changes, so sharded
+code refuses to append to a mosaic written unsharded, which is the right refusal: one array cannot
+mix layouts. Three things had to change for sharded writes to stay correct, each with a test that
+fails without it:
+
+- Region writes widen an unaligned window to whole shards, not inner chunks
+  (`storage/region_writes.py`).
+- xarray must be 2026.2.0 or later. Earlier releases align parallel writes to the inner chunk, so
+  several tasks rewrite one shard and lose each other's data (pydata/xarray#10831).
+  `pyproject.toml` requires it, and zarr 3.1.2 as ADR 008 records.
+- yield-embeddings' ROI merge sized its copy units from the master's `.chunks`, which on a sharded
+  master is the inner chunk; it now uses the shard (yield-embeddings#94). yield-embeddings tracks
+  this repository's `main`, so that fix has to merge before this layout does.
+
+**What this reopens.** §4.1 rejected a coarser store chunk because inference read whole chunks.
+With sharding the unit ingest writes and the unit inference reads are independent, so a larger
+block no longer costs readers anything. Not measured.
+
+### 3.20 Six task threads per worker — a few percent on dense zones, nothing elsewhere
 
 Ingest workers are 4 vCPU and ran dask-cloudprovider's default of one task thread per vCPU. A band
 read waits on S3 for part of each task, so a worker can have CPU to spare with every thread busy.
@@ -629,7 +775,7 @@ are cited by number elsewhere in this document.
 
 | approach | verdict | why |
 |---|---|---|
-| **4.1** coarsen the STORE chunk to 8192 | rejected | the GPU side vetoes it: inference reads whole chunks, so a coarser store chunk multiplies read volume for every consumer. Measured, not argued |
+| **4.1** coarsen the STORE chunk to 8192 | rejected | the GPU side vetoes it: inference reads whole chunks, so a coarser store chunk multiplies read volume for every consumer. Measured, not argued. Sharding (§3.19) removes the reason; untested since |
 | **4.2** cost-model window grouping | rejected | over-merged into the scheduler; the optimiser traded real area for a boundary cost that had already stopped existing (§3.17) |
 | **4.3** spatial manifest sharding | rejected | a **30–50% regression** — the axis matters more than the size, and time is the right axis |
 | **4.4** double load blocks again, 8192 → 16384 | not worth it | measured **1.35×**, against a prediction of 2–3×, at 537 MB per band-block |
@@ -1626,7 +1772,7 @@ defect fix.
 | hottest worker | 10.16 GiB of 16 at 8192 blocks; spill 0 throughout | run telemetry |
 | inference baseline (do not regress) | GPU util 99% in-phase, VRAM 97% peak, host RAM 46% of a 60% ceiling, GPU-idle ~6 s/chunk | 2,352 RESOURCES samples |
 | **ingest worker size (CURRENT)** | 4 vCPU / **24576 MiB** | Superseding, in order: 16384 → 30720 → 20480 → 24576 → 16384 → **24576**. **16384 is WITHDRAWN**, and with it §4.8's claim that pruning made the original size affordable: its 7.91 GiB peak over 91 dates was measured on 2017–18 optical at ~8 windows per date, and 2019 carries 14–16. The overlapped write (§3.11) holds a date's windows concurrently, so demand scales with that count — six workers on 2019 optical paused at **11.92 GiB**, 80% of the 14.90 GiB limit this size gives Dask, and never resumed, stalling four zone-years. 20480 was not chosen instead because §3.13 already records it as short: it was itself sized against a ~12.4 GiB short-run peak against a true ceiling of ~15. Whether 24576 holds at 60 concurrent cells on 2019-density data is **UNMEASURED**. With Dask task definitions PINNED the constant sets only Dask's `--memory-limit`, so the consumer's registered definition must be raised to match or the pause threshold lands above the container's hard limit. vCPU stays at 4 — the quota counts vCPU. |
-| **ingest worker task threads (CURRENT)** | **6** per 4 vCPU | 35N S2 paired: 134 → 130 s/date, $4.45 → $4.34, peak memory 3.7 → 5.7 GiB; Iowa S2 and S1 level (§3.18). Travels in the per-run worker command, so pinned task definitions need no change |
+| **ingest worker task threads (CURRENT)** | **6** per 4 vCPU | 35N S2 paired: 134 → 130 s/date, $4.45 → $4.34, peak memory 3.7 → 5.7 GiB; Iowa S2 and S1 level (§3.20). Travels in the per-run worker command, so pinned task definitions need no change |
 | streaming retention cost | +1 month of items on the ingest worker; 1.25 GiB spill at 16 GiB | run telemetry |
 | items deferred across a month boundary | 1,084 of 31,507 (one day's worth) | live cluster |
 | write floor | graph ≈ store_chunks × bands; 2,992 covered vs 2,415 live (19% dead) | measured, all 7 windows |
@@ -2480,3 +2626,160 @@ path is current.
 12. **Storage hang protection.** Icechunk defaults to unbounded timeouts and a single try, so a wedged
     socket blocks a write forever. `_default_repo_config` applies finite per-attempt timeouts and
     backed-off retries at every repo open — region writes inherit it for free.
+
+---
+
+## 15. Graviton (ARM64) Dask workers — measured on yield dev (2026-10-02)
+
+**On Fargate at production width, ARM workers write 1.6–2× faster than x86 on every leg, runs finish
+18–41% sooner, and each rung costs 45–53% less.** Fargate's ARM tasks run on Graviton3; its x86
+tasks run on 2017–2019 Xeons. The mosaics are not bit-identical: a small share of pixels round one
+count differently, which is physically meaningless (§15.4). That reaches the embeddings as a mean
+cosine similarity of 0.999983, slightly beyond ADR 012's gates on the worst pixels, and the
+maintainers accepted it (§15.6). yield-embeddings now runs every Dask worker, and the inference and
+assembly runners, on ARM (§15.5).
+
+### 15.1 How it was measured
+
+Two yield dev branches, `dev/graviton-workers` (x86) and `dev/graviton-workers-arm` (ARM), identical
+except that the second registered its Dask workers as ARM64. Both ran tessera `bbb9d836`, with x86
+schedulers and runners. Each rung's arms were dispatched within seconds of each other with the same
+parameters, into fresh stores. Cost is each task's billed lifetime at its own architecture's list
+rate, using the `ecs.cpu-architecture` ECS reports per task. Timings come from the ingest's own
+`Stage timings`, `Batch timings` and `S1 stage timings` lines, attributed to a run by log stream.
+
+| Rung | Leg (workers) | Wall clock, x86 → ARM | Cost, x86 → ARM | Write per date, x86 → ARM |
+|---|---|---|---|---|
+| tiny ROI, July 2024 | S2 (4) / S1 asc (4) | 4:10 → 4:10 / 4:10 → 3:39 | $0.04 → $0.03 / $0.03 → $0.03 | equal (17.6 s vs 17.7 s for 11 dates) |
+| Iowa, July 2024 | S2 (60), 18 dates | 9:44 → 7:44 | $1.68 → $0.91 | 14.9 → 8.0 s |
+| | S1 asc (13), 8 dates | 5:41 → 4:40 | $0.17 → $0.11 | 11.2 → 6.5 s |
+| Iowa, Nov 2024 – Oct 2025 | S2 (60), 221 dates | 1:20:21 → 47:25 | $18.65 → $8.71 | 16.8 → 8.5 s |
+| | S1 asc (13), 169 dates | 35:15 → 23:03 | $1.75 → $0.88 | 10.3 → 6.1 s |
+| 35N, 2024-01-01 – 01-07 | S2 (60), 6 dates | 20:23 → 14:48 | $4.20 → $2.35 | 134.2 → 78.2 s (cycle 152.7 → 97.5 s) |
+| | S1 asc (13), 7 dates | 11:16 → 8:16 | $0.47 → $0.24 | 55.9 → 30.1 s |
+| | S1 desc (13), 7 dates | 13:17 → 9:18 | $0.59 → $0.31 | 77.1 → 40.2 s |
+
+Costs are scheduler plus workers. Per-date figures are medians, except Iowa S2, which batches dates
+and is total write time divided by dates.
+
+- **The gain is stable.** Over the Iowa year, the x86 ÷ ARM S2 write ratio is between 1.73 and 2.15
+  in every month, November to October.
+- **The x86 arm behaves as on record.** Its Iowa S1 year (35 minutes) matches the 33–35 minutes
+  recorded for this window, and its 35N cycle (152.7 s a date at 60 workers) sits just under the
+  167.9 s of the July 60-worker cell on older code (yield-embeddings
+  `context_docs/measurements/fleet_scaling_report.md`). At 60 workers, ARM's 97.5 s beats that
+  record's 120-worker cell (102.1 s).
+- **One stage is slower on ARM.** The single-threaded S2 graph build on 35N, about 1,000 scenes a
+  day, takes 9.4 s a date against 5.0 s. On Iowa it is faster on ARM (50 s against 84 s over the
+  year). It is under 5% of a 35N date.
+- **Concurrency did not flatter ARM.** The other experiment ran in the same account throughout,
+  and the last 13 batches of the x86 Iowa-year S2 overlapped the 35N rung. Their median ratio,
+  2.01, is 3% above the 1.94 before.
+
+### 15.2 Why ARM is faster
+
+Five probe tasks per architecture printed `lscpu`. Every ARM task ran on **Neoverse-V1
+(Graviton3)**. The x86 tasks ran on Xeon Platinum 8259CL (Cascade Lake, four tasks) and 8175M
+(Skylake, one), all with AVX-512. A Graviton vCPU is a whole core, and an x86 vCPU is one
+hyperthread of a 2017–2019 core. In the Iowa July rung, Container Insights put x86 workers at about
+60% CPU in their busy minutes, and ARM workers at about 30% while finishing sooner.
+
+### 15.3 What it saves
+
+**Most of the saving is speed.** ARM's list price is 20% lower ($0.03238 against $0.04048 per
+vCPU-hour, $0.00356 against $0.004445 per GB-hour). Each production-width rung cost 45–53% less, and
+each leg 35–53% less, because ARM workers also finish sooner. The tiny ROI, a three-minute run on
+four workers, cost $0.07 against $0.06. Workers are 94–95% of a cell's hourly cost, and schedulers
+and ingest runners stay x86.
+
+Applied to the last campaign's container line, $187,441 ([cost model
+§12](../campaign/campaign-cost-model.md)), most of which is ingest, ARM workers would have saved
+**about $75,000–95,000, or $8,000–11,000 per global year**. This assumes the campaign account's
+Fargate hosts match the ones measured here (same service, same region). That account was not
+examined. The campaign is GPU-bound ([campaign plan §1](../campaign/campaign-plan.md)), so the speed
+buys cost, not schedule: narrowing fleets to the old pace keeps the saving and leaves the mosaic
+backlog where it was.
+
+### 15.4 The mosaics differ by one count, and it does not matter
+
+| | Iowa, July and year (EPSG:5070 grid) | 35N (UTM zone grid) |
+|---|---|---|
+| S2 10 m bands | 0–4 pixels per band in about 1 billion sampled | identical |
+| S2 20 m bands | 0–5 pixels per band in about 1 billion sampled | 2.85% of valid pixels, all −1 on ARM |
+| SCL (cloud classes) | identical | identical |
+| S1 (VH / VV) | 0.029–0.036% / 0.012–0.015%, nearly all +1 on ARM | 0.036–0.041% / 0.018–0.020% |
+| Valid and nodata swapped | S1 only: 10 in 6.7 billion (July), 22 in 1.4 billion (year) | S1 only: 18 in about 730 million |
+
+The 35N and Iowa-year figures come from seeded random samples of chunks. Iowa July's S2 figures come
+from a sample, and its S1 figures from every chunk.
+
+**Why it is not worth worrying about.** One count is 0.0001 reflectance for S2 and 0.005 dB for S1.
+At every differing S2 pixel, the exact interpolated value is precisely halfway between two integers.
+Both architectures are therefore off by the same half count that every stored integer already
+carries, in opposite directions, and neither is more correct. On campaign grids, the S2 bias averages
+−0.03 counts over a 20 m band, and no sampled pixel differs by more than one count.
+
+**Where it comes from.**
+
+- **S2: GDAL's bilinear warp.** It rounds some exact half-count ties differently on each
+  architecture, with ARM always one lower. This was reproduced locally without AVX-512. In a 20 m →
+  10 m warp onto an aligned grid in the scene's own UTM zone, 3.14% of pixels differed, and all of
+  20,000 sampled differing pixels were exact ties. Campaign zone grids align with Sentinel-2's 20 m
+  grid, so ties are common there. Iowa's grid does not align, so they are rare.
+- **S1: `log10`.** The Fargate x86 hosts, all with AVX-512, round differently from every other
+  machine tried. The S1 formula on 20 M seeded amplitudes hashes identically on Graviton3, on
+  Apple-silicon ARM and on x86 without AVX-512, but not on the Fargate x86 hosts. Disabling numpy's
+  AVX-512 kernels through `NPY_DISABLE_CPU_FEATURES` did not change the result.
+
+**What it does downstream.** It nudges the embeddings by a mean cosine similarity of 0.999983
+(§15.6).
+
+**The one practical consequence.** The ingest code identity hashes source only, so it cannot see
+which architecture built a mosaic. Do not let one mosaic hold dates from both. Mosaics are deleted
+after publication, so deploying the change between campaigns is enough.
+
+### 15.5 The change
+
+yield-embeddings PR #90 makes every deployment's Dask worker task definitions ARM64, with no switch.
+It does the same for the inference and large-assembly runners: the ARM Ray driver steers the x86 GPU
+cluster, and assembly output is bit-identical on 28% less CPU ([assembly
+record](../assembly/what-bounds-assembly-2026-09-09.md)). Schedulers, the other flow runners and the
+EC2 merge family stay x86, so the ingestion and inference images are built for both architectures.
+Branch clones copy each definition's architecture.
+
+**Coarsen moves with ingest.** Every Dask fleet in a deployment pins the same worker definition.
+Coarsen was not part of these rungs.
+
+### 15.6 Deploying it
+
+Deploying the consumer stack is what moves an account's workers and runners to ARM.
+
+1. **The embedding difference is accepted** (maintainers, 2026-10-02). ADR 012's gates decide
+   forward-pass changes; a change to the ingest hosts is outside them, so the harness measured this
+   one and the maintainers decided it (ADR 012, "Scope"). A one-chunk crop of 35N's grid (41 km of
+   Moldovan farmland, November 2024 to October 2025) was ingested on each architecture, and both
+   were embedded on the same GPU type (L40S):
+
+   - 92.2–92.9% of int8 values are identical, and 99.995% are within one level, with a maximum of
+     three.
+   - Mean cosine similarity is 0.999983, and the worst pixel is 0.99981.
+   - Per-pixel scale drifts by up to 1.8%.
+
+   Inference itself is bit-reproducible: rerunning it on the same x86 mosaics matched to the bit.
+   All of the difference is therefore the mosaics' one-count rounding passing through the encoder.
+   Nearly every pixel has about a hundred observations a year, so nearly every pixel has at least
+   one nudged input. Held to ADR 012's gates anyway, it fails them on the worst pixels: cosine below
+   0.9999 in every chunk, and scale drift above the 1.6% cross-configuration bound in one of four.
+2. **Deploy between campaigns,** with no mosaic half-built (§15.4).
+3. **`cost_accrual.py` prices Fargate at ARM rates.** The usage series it reads does not split by
+   architecture, so the x86 schedulers and runners read about 20% low. They are about 6% of a cell's
+   Fargate cost once workers are on ARM, so the total reads about 1% low.
+
+### 15.7 Out of scope
+
+- **Fargate Spot** saves up to 70% and stacks with ARM. dask-cloudprovider's `fargate_spot=True`
+  puts workers on Spot and keeps the scheduler on demand. The hazard is particular to us: the
+  ingest body runs on one Dask worker, so reclaiming that worker restarts the run's driver.
+- **The other ingestion-image families** (runner, coarsen, Fargate `merge_kind`) become a
+  one-property change each. `merge_kind_ec2` would need a Graviton instance type instead.
+- **GPU inference** stays on x86 CUDA instances.

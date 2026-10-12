@@ -5,13 +5,11 @@
 * **v1.1** — two ``modules.V11TransformerEncoder`` backbones (GRU-based ``TemporalAwarePooling``)
   + the MLP ``build_dim_reducer``. Loads the encoder checkpoint (``model_state`` /
   ``model_state_dict``), strips FSDP/compile prefixes and training-only keys (projector,
-  segmented-matryoshka-projector) so it loads ``strict=False``, then fuses CustomGRU to ``nn.GRU``
-  for cuDNN performance.
+  segmented-matryoshka-projector) so it loads ``strict=False``.
 * **v2-large** — two ``student_v2.StudentTransformerEncoder`` backbones (plain attention pooling,
   no recurrence) + ``build_v2_dim_reducer``. The published student payload is
   ``{"model": state_dict, "args": {...}}`` with no prefixes and no training-only heads, so it
   loads ``strict=True``; the stored ``args`` are cross-checked against the config's architecture.
-  There is no GRU, so the fusion step is skipped.
 
 Both paths then freeze the model, zero the TransformerEncoderLayer dropouts for the SDPA fast
 path, and move to the target device in eval mode.
@@ -30,7 +28,7 @@ import torch
 
 from tessera_embeddings.config.inference import MODEL_ARCHS, V2_FUSION_METHOD
 
-from .modules import CustomGRU, TemporalAwarePooling, V11TransformerEncoder
+from .modules import V11TransformerEncoder
 from .ssl_model import MultimodalBTInferenceModel, build_dim_reducer
 from .student_v2 import StudentTransformerEncoder, build_v2_dim_reducer
 
@@ -42,49 +40,6 @@ logger = logging.getLogger(__name__)
 # State-dict prefixes emitted by v1.1 training that are not part of the inference graph: ``projector`` is the
 # BarlowTwins head, the segmented matryoshka projector serves the variable-width training objective.
 _TRAINING_ONLY_PREFIXES: tuple[str, ...] = ("projector.", "segmented_matryoshka_projector.")
-
-
-def _fuse_custom_gru(module: torch.nn.Module) -> None:
-    """Replace CustomGRU with nn.GRU by fusing per-gate weights.
-
-    Walks the module tree, finds TemporalAwarePooling instances holding a CustomGRU, and swaps in
-    nn.GRU with fused weight matrices — recovering cuDNN performance (~1 kernel launch vs ~480).
-
-    The tessera CustomGRUCell differs from nn.GRU in two ways:
-
-    1. **Update gate convention is inverted.** Tessera: h' = (1-z)*h + z*n (z selects the new
-       candidate). nn.GRU: h' = (1-z)*n + z*h (z keeps old state). Since 1 - sigmoid(x) =
-       sigmoid(-x), all z gate weights and biases are negated.
-
-    2. **Reset gate placement differs.** Tessera applies reset BEFORE the matmul, W_hh @ (r * h);
-       nn.GRU applies it after, r * (W_hh @ h + b_hh). NOT equivalent for dense weight matrices,
-       but a small approximation in practice because the reset gate is close to 1 for most
-       dimensions after training. b_h goes in bias_ih (input-side) since tessera adds it outside
-       the reset gate product.
-    """
-    for _name, child in module.named_modules():
-        if not isinstance(child, TemporalAwarePooling):
-            continue
-        custom_gru = child.temporal_context
-        if not isinstance(custom_gru, CustomGRU):
-            continue
-
-        cell = custom_gru.gru_cell
-        h = cell.hidden_size
-        d = cell.input_size
-
-        src_device = cell.W_ir.weight.device
-        src_dtype = cell.W_ir.weight.dtype
-        zeros_h = torch.zeros(h, device=src_device, dtype=src_dtype)
-        fused = torch.nn.GRU(d, h, batch_first=True, device=src_device, dtype=src_dtype)
-        with torch.no_grad():
-            fused.weight_ih_l0.copy_(torch.cat([cell.W_ir.weight, -cell.W_iz.weight, cell.W_ih.weight]))
-            fused.weight_hh_l0.copy_(torch.cat([cell.W_hr.weight, -cell.W_hz.weight, cell.W_hh.weight]))
-            fused.bias_ih_l0.copy_(torch.cat([cell.b_r, -cell.b_z, cell.b_h]))
-            fused.bias_hh_l0.copy_(torch.cat([zeros_h, zeros_h, zeros_h]))
-
-        child.temporal_context = fused  # type: ignore[assignment]
-        logger.info("Fused CustomGRU -> nn.GRU (input=%d, hidden=%d)", d, h)
 
 
 def _build_inference_model(config: InferenceConfig, device: torch.device) -> MultimodalBTInferenceModel:
@@ -327,9 +282,9 @@ def build_inference_model(
     """Build the inference model for ``config.model_version`` from its checkpoint.
 
     Constructs the model on CPU, loads the checkpoint (v1.1: ``strict=False``, since
-    projector/matryoshka keys are filtered in ``load_v11_checkpoint``; v2: ``strict=True``), fuses
-    CustomGRU to nn.GRU where one exists (v1.1 only), freezes, zeros TransformerEncoderLayer
-    dropouts for the fused-attention fast path, and moves to *device* in eval mode.
+    projector/matryoshka keys are filtered in ``load_v11_checkpoint``; v2: ``strict=True``), freezes,
+    zeros TransformerEncoderLayer dropouts for the fused-attention fast path, and moves to *device*
+    in eval mode.
 
     Args:
         config: Inference configuration.
@@ -361,10 +316,6 @@ def build_inference_model(
             logger.warning("Checkpoint missing %d expected params (first few): %s", len(missing), list(missing)[:5])
         if unexpected:
             logger.warning("Checkpoint has %d unexpected params (first few): %s", len(unexpected), list(unexpected)[:5])
-
-        # Must run on CPU before .to(device)/.bfloat16() so the fused nn.GRU inherits
-        # correct weights. v2 has no recurrence in its pooling head — nothing to fuse.
-        _fuse_custom_gru(model)
 
     for param in model.parameters():
         param.requires_grad = False

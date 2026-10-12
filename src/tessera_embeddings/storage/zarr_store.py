@@ -56,6 +56,7 @@ from tenacity import (
     wait_random,
 )
 
+from tessera_embeddings.config.ingest import INGEST_COMPRESSORS, mosaic_chunk_layout
 from tessera_embeddings.errors import CorruptedStoreError, NonMonotonicDateError
 from tessera_embeddings.storage.manifest import MIXED_CODE_IDENTITIES_ATTR, IngestManifest, extract_manifest
 from tessera_embeddings.storage.region_writes import (
@@ -1889,7 +1890,10 @@ def write_dataset(
             min(chunks["northing"], data.sizes["northing"]),
             min(chunks["easting"], data.sizes["easting"]),
         )
-        encoding: dict[str, Any] = {str(var): {"chunks": chunk_sizes} for var in data.data_vars}
+        inner, shards = mosaic_chunk_layout(chunk_sizes)
+        encoding: dict[str, Any] = {
+            str(var): {"chunks": inner, "shards": shards, "compressors": INGEST_COMPRESSORS} for var in data.data_vars
+        }
         encoding["time"] = TIME_ENCODING
 
         store_attrs: dict[str, Any] = {

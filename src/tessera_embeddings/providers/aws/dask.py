@@ -104,7 +104,7 @@ DEFAULT_INGEST_WORKER_MEM = 24576
 # when every thread is busy. Where a date's work fills the fleet (dense zones) six take up that
 # slack, about 3% faster and cheaper a date; where it does not, they change nothing. Peak worker
 # memory grows about 1.5x and stays near a quarter of the size above. Measured in
-# context_docs/ingest/campaign-ingest-measurements.md §3.18.
+# context_docs/ingest/campaign-ingest-measurements.md §3.20.
 DEFAULT_INGEST_WORKER_NTHREADS = 6
 
 # Schedulers don't need much memory but benefit from a few cores so

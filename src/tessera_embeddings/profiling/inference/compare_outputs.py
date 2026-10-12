@@ -40,15 +40,16 @@ MAX_ABS_DELTA = 1
 MAX_SCALE_REL_DRIFT = 1e-3
 MIN_COSINE = 0.9999
 
-# Cross-config thresholds (--cross-config): runs differing in batch size or library stack
-# are not bit-comparable — cuBLAS kernel selection alone moves outputs. Measured envelope
-# (main@3584 vs Phase-1@7168, 3 chunks x 512M values): exact 95.4-98.3%, max|d|=2 at ~0.002%
-# rate, scale drift <= 0.78% (2 BF16 ULPs), cosine >= 0.99990, zero NaN-mask mismatches.
-# These bounds sit just outside it; anything worse is a real defect, not config shimmer.
-XCFG_MIN_WITHIN_ONE_FRAC = 0.9999
-XCFG_MAX_ABS_DELTA = 3
-XCFG_MAX_SCALE_REL_DRIFT = 1.6e-2  # 4 BF16 ULPs
-XCFG_MIN_COSINE = 0.9999
+# Cross-config envelope (--cross-config): runs that differ in batch shape, strip boundaries, tile
+# order or library stack are not bit-comparable; cuBLAS kernel selection alone moves outputs. Set
+# from two full Iowa years (788 tile pairs), whose worst tiles reached 4 levels, 1.97% scale drift
+# and cosine 0.999865 while keeping 99.98% of each pixel's top-20 neighbours. The largest deviation
+# is reported, not gated: it is one value among hundreds of millions and grows with the number
+# compared. A real defect misses by far (the nn.GRU swap: 41% within one level, cosine 0.99).
+XCFG_MIN_WITHIN_ONE_FRAC = 0.995
+XCFG_WITHIN_ONE_MIN_PIXELS = 10_000  # below this a share is noise; the per-pixel bounds still apply
+XCFG_MAX_SCALE_REL_DRIFT = 3e-2
+XCFG_MIN_COSINE = 0.999
 
 ROW_BLOCK = 500  # stream comparison in row slabs to bound memory
 
@@ -77,6 +78,7 @@ class ChunkComparison:
     # `compare_chunk` for why they need their own counter.
     malformed_scales: int = 0
 
+    n_pixels: int = 0
     cross_config: bool = False
 
     @property
@@ -90,8 +92,7 @@ class ChunkComparison:
             return False
         if self.cross_config:
             return (
-                self.within_one_frac >= XCFG_MIN_WITHIN_ONE_FRAC
-                and self.max_abs_delta <= XCFG_MAX_ABS_DELTA
+                (self.n_pixels < XCFG_WITHIN_ONE_MIN_PIXELS or self.within_one_frac >= XCFG_MIN_WITHIN_ONE_FRAC)
                 and self.scale_max_rel_drift <= XCFG_MAX_SCALE_REL_DRIFT
                 and self.nan_mask_mismatches == 0
                 and self.obs_count_mismatches == 0
@@ -132,6 +133,7 @@ def compare_chunk(ref_path: str, test_path: str, label: str, *, cross_config: bo
 
     h = ref["embeddings"].shape[0]
     n_values = 0
+    n_pixels = 0
     n_exact = 0
     n_within_one = 0
     max_abs_delta = 0
@@ -171,6 +173,7 @@ def compare_chunk(ref_path: str, test_path: str, label: str, *, cross_config: bo
             sr, st = s_ref[valid], s_test[valid]
             delta = np.abs(er - et)  # (n_valid, D)
             n_values += delta.size
+            n_pixels += len(delta)
             n_exact += int((delta == 0).sum())
             n_within_one += int((delta <= 1).sum())
             max_abs_delta = max(max_abs_delta, int(delta.max(initial=0)))
@@ -182,13 +185,15 @@ def compare_chunk(ref_path: str, test_path: str, label: str, *, cross_config: bo
             deq_ref = er.astype(np.float32) * sr[:, None]
             deq_test = et.astype(np.float32) * st[:, None]
             num = (deq_ref * deq_test).sum(axis=1)
-            den = np.linalg.norm(deq_ref, axis=1) * np.linalg.norm(deq_test, axis=1)
-            nz = den > 0
-            if nz.any():
-                cos = num[nz] / den[nz]
-                cosine_min = min(cosine_min, float(cos.min()))
-                cosine_sum += float(cos.sum())
-                cosine_count += int(nz.sum())
+            n_ref, n_test = np.linalg.norm(deq_ref, axis=1), np.linalg.norm(deq_test, axis=1)
+            # A zero vector against a real one scores 0 rather than dropping out, or an all-zero artifact
+            # with valid scales would pass; two zero vectors agree (the quantizer writes zeros only for a
+            # zero row).
+            den = n_ref * n_test
+            cos = np.divide(num, den, out=(n_ref == n_test).astype(num.dtype), where=den > 0)
+            cosine_min = min(cosine_min, float(cos.min()))
+            cosine_sum += float(cos.sum())
+            cosine_count += len(cos)
 
     # Obs-count layers: deterministic counts, EXACT and PRESENT in both stores. (H, W) uint16
     # — small enough to compare whole. A required layer missing from one store, or from BOTH,
@@ -218,6 +223,7 @@ def compare_chunk(ref_path: str, test_path: str, label: str, *, cross_config: bo
         cosine_mean=cosine_sum / cosine_count if cosine_count else 1.0,
         obs_count_mismatches=obs_count_mismatches,
         malformed_scales=malformed_scales,
+        n_pixels=n_pixels,
         cross_config=cross_config,
     )
 
@@ -268,9 +274,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--cross-config",
         action="store_true",
-        help="Runs differ in batch size / library stack: judge against the relaxed "
-        "cross-config envelope (within-1 >= 99.99%%, max|d| <= 3, scale <= 1.6%%, "
-        "cosine >= 0.9999) instead of the same-config bit-drift gate.",
+        help="Runs differ in batch shape, strips, tile order or library stack: judge against the "
+        "cross-config envelope (within-1 >= 99.5%% on tiles of 10,000+ pixels, scale drift <= 3%%, "
+        "cosine >= 0.999) instead of the same-config bit-drift gate.",
     )
     args = parser.parse_args(argv)
 

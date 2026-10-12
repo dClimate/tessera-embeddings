@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import importlib.util
 import math
+from pathlib import Path
 
 import pytest
 import torch
@@ -20,6 +22,7 @@ from tessera_embeddings.inference.models.ssl_model import (
     build_dim_reducer,
 )
 from tessera_embeddings.inference.models.student_v2 import StudentTransformerEncoder
+from tests._paths import FIXTURES
 
 
 class TestTransformerEncoder:
@@ -38,6 +41,15 @@ class TestTransformerEncoder:
         assert enc(x).shape == (4, 128)
 
 
+def _upstream_encoder(file: str) -> type[torch.nn.Module]:
+    """An upstream model file's own ``TemporalPositionalEncoder``, imported by path."""
+    spec = importlib.util.spec_from_file_location(f"upstream_{Path(file).stem}", FIXTURES / "upstream" / file)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.TemporalPositionalEncoder
+
+
 class TestTemporalPositionalEncoder:
     """Tests for positional encoding output shape."""
 
@@ -47,15 +59,62 @@ class TestTemporalPositionalEncoder:
         doy = torch.randint(1, 366, (4, 20))
         assert pe(doy).shape == (4, 20, 64)
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="exp() rounds the same either way on a CPU-only host")
+    @pytest.mark.parametrize(
+        ("upstream_file", "d_model", "on_cpu"),
+        [("v1_1_reference/modules.py", 768, True), ("v2_student_reference.py", 640, False)],
+    )
+    def test_matches_its_upstream_on_gpu(self, upstream_file, d_model, on_cpu):
+        """Each model's encoding is bit-identical to its own upstream's on the GPU."""
+        doy = torch.arange(1, 366, device="cuda", dtype=torch.float32).repeat(3, 1)
+        ours = TemporalPositionalEncoder(d_model, frequencies_on_cpu=on_cpu)(doy, out_dtype=torch.float32)
+        theirs = _upstream_encoder(upstream_file)(d_model)(doy)
+        torch.testing.assert_close(ours, theirs, atol=0.0, rtol=0.0)
+
+
+def _reference_pool(pool: TemporalAwarePooling, x: torch.Tensor) -> torch.Tensor:
+    """The pooling head as the model was trained: CustomGRU over the sequence, LayerNorm, attention."""
+    context, _ = pool.temporal_context(x)
+    weights = torch.softmax(pool.query(pool.layer_norm(context)), dim=1)
+    return (weights * x).sum(dim=1)
+
+
+def _trained_like_pool(dim: int) -> TemporalAwarePooling:
+    """A pooling head with biases spread out, so its reset gate is far from 1, as the real checkpoint's is."""
+    torch.manual_seed(0)
+    pool = TemporalAwarePooling(dim).eval()
+    with torch.no_grad():
+        for b in (pool.temporal_context.gru_cell.b_r, pool.temporal_context.gru_cell.b_z, pool.query.bias):
+            b.normal_(0.0, 1.0)
+    return pool
+
 
 class TestTemporalAwarePooling:
-    """Tests for temporal-aware pooling."""
+    """The fused pooling head must reproduce the trained, step-at-a-time head."""
 
-    def test_output_shape(self):
-        """Pooling collapses the temporal axis: (B, T, dim) -> (B, dim)."""
-        pool = TemporalAwarePooling(64)
-        x = torch.randn(4, 10, 64)
-        assert pool(x).shape == (4, 64)
+    @pytest.mark.parametrize(("batch", "steps"), [(4, 1), (4, 10), (7, 40), (1, 33)])
+    def test_matches_the_trained_formula(self, batch, steps):
+        """Matches CustomGRU + LayerNorm + attention across the 32-step projection block and at odd batches."""
+        pool = _trained_like_pool(64)
+        x = torch.randn(batch, steps, 64)
+        with torch.no_grad():
+            torch.testing.assert_close(pool(x), _reference_pool(pool, x), atol=1e-5, rtol=1e-5)
+
+    def test_empty_sequence_pools_to_zeros(self):
+        """A zero-length sequence returns zeros, as upstream's pooling head does."""
+        assert torch.equal(_trained_like_pool(64)(torch.randn(3, 0, 64)), torch.zeros(3, 64))
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="the compiled step runs on CUDA only")
+    @pytest.mark.parametrize("batch", [1, 7, 7167])
+    def test_compiled_step_matches_the_trained_formula_on_gpu(self, batch):
+        """The compiled BF16 path stays at rounding distance from the FP32 reference, odd batches included."""
+        pool = _trained_like_pool(128).cuda()
+        x = torch.randn(batch, 40, 128, device="cuda")
+        with torch.no_grad():
+            reference = _reference_pool(pool, x)
+            fused = pool.to(torch.bfloat16)(x.to(torch.bfloat16)).float()
+        cos = torch.nn.functional.cosine_similarity(fused, reference, dim=-1)
+        assert cos.min() > 0.9999
 
 
 class TestCustomGRU:
@@ -86,33 +145,6 @@ class TestCustomGRU:
             n = torch.tanh(cell.W_ih(x_t) + cell.W_hh(r * h_prev) + cell.b_h)
             expected = (1 - z) * h_prev + z * n
         torch.testing.assert_close(cell(x_t, h_prev), expected, atol=1e-6, rtol=1e-6)
-
-    def test_custom_gru_to_nn_gru_fusion_approx(self):
-        """Fusing CustomGRU into nn.GRU with negated z gate produces close output.
-
-        Reset gate placement differs between tessera (``W_hh(r*h)``) and nn.GRU
-        (``r*(W_hh(h)+b)``); when r ~ 1 (forced here via large ``b_r``), the
-        approximation is tight.
-        """
-        input_size, hidden_size, seq_len, batch = 64, 32, 15, 4
-        custom = CustomGRU(input_size, hidden_size)
-        cell = custom.gru_cell
-        with torch.no_grad():
-            cell.b_r.fill_(5.0)
-
-        fused = torch.nn.GRU(input_size, hidden_size, batch_first=True)
-        zeros_h = torch.zeros(hidden_size)
-        with torch.no_grad():
-            fused.weight_ih_l0.copy_(torch.cat([cell.W_ir.weight, -cell.W_iz.weight, cell.W_ih.weight]))
-            fused.weight_hh_l0.copy_(torch.cat([cell.W_hr.weight, -cell.W_hz.weight, cell.W_hh.weight]))
-            fused.bias_ih_l0.copy_(torch.cat([cell.b_r, -cell.b_z, cell.b_h]))
-            fused.bias_hh_l0.copy_(torch.cat([zeros_h, zeros_h, zeros_h]))
-
-        torch.manual_seed(0)
-        x = torch.randn(batch, seq_len, input_size)
-        out_custom, _ = custom(x)
-        out_fused, _ = fused(x)
-        torch.testing.assert_close(out_custom, out_fused, atol=1e-2, rtol=1e-2)
 
 
 class TestMultimodalBTInferenceModel:
