@@ -1,11 +1,11 @@
-r"""Loosen a global store's minimum optical depth rule, for the whole store or named zones. Dry run unless ``--go``.
+r"""Loosen a global store's minimum optical depth rule, for the whole store or named zones. Dry run unless ``--write``.
 
 The rule (``optical_min_obs``) only ever moves down (ADR 028): every pixel already embedded stays
 compliant with the new line, and every pixel it newly admits is a hole that a ``holes`` update
 then fills (``scripts/update/plan_update.py``, ADR 027)::
 
     loosen_optical_min_obs.py --store s3://tessera-embeddings/v1.1/dclimate.icechunk --line 1 --zones 18N,19N
-    loosen_optical_min_obs.py --store ... --line 1 --zones 18N,19N --go
+    loosen_optical_min_obs.py --store ... --line 1 --zones 18N,19N --write
 
 Without ``--zones`` the store root moves, and any zone's own rule at or above the new line goes with
 it. Prints the root rule, each affected zone's effective rule and every history, before and after.
@@ -49,7 +49,7 @@ def _report(repo: icechunk.Repository, zones: Sequence[str] | None) -> zarr.Grou
 
 
 def _planned(root: zarr.Group, line: int, zones: Sequence[str] | None) -> None:
-    """What ``--go`` would do to each target, by the rules :func:`loosen_optical_min_obs` enforces."""
+    """What ``--write`` would do to each target, by the rules :func:`loosen_optical_min_obs` enforces."""
     raw = root.attrs.get("optical_min_obs")
     targets = (
         [("store", None if raw is None else int(cast(int, raw)))]
@@ -67,13 +67,13 @@ def _planned(root: zarr.Group, line: int, zones: Sequence[str] | None) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Report the rule, and with ``--go`` loosen it."""
+    """Report the rule, and with ``--write`` loosen it."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--store", required=True, help="the global store's URI (s3:// or a local path)")
     parser.add_argument("--line", required=True, type=int, help="the new, looser minimum valid optical observations")
     parser.add_argument("--zones", help="comma-separated zones to loosen; omit to loosen the whole store")
     parser.add_argument("--region", default=None, help="S3 region of the store")
-    parser.add_argument("--go", action="store_true", help="commit the change; without it this is a dry run")
+    parser.add_argument("--write", action="store_true", help="commit the change; without it this is a dry run")
     args = parser.parse_args(argv)
 
     zones = sorted({canonicalize_zone(z) for z in args.zones.split(",")}) if args.zones else None
@@ -83,8 +83,8 @@ def main(argv: list[str] | None = None) -> int:
     repo = open_global_repo(args.store, get_credentials=credentials, region=args.region)
     print(f"Before ({args.store}):")
     root = _report(repo, zones)
-    if not args.go:
-        print(f"Dry run: pass --go to loosen {'the store' if zones is None else ', '.join(zones)} to {args.line}")
+    if not args.write:
+        print(f"Dry run: pass --write to loosen {'the store' if zones is None else ', '.join(zones)} to {args.line}")
         _planned(root, args.line, zones)
         return 0
     snapshot = loosen_optical_min_obs(repo, args.line, zones=zones)

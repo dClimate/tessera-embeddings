@@ -48,7 +48,7 @@ The flows do the inference.
 | script | what it does |
 |---|---|
 | `plan_update.py` | Writes a targeted update's immutable plan to `{inputs}/updates/<name>/plan.json`, from the registry's `master/` (a SQL `--where` and/or an `--aoi` box; `--anonymous` for the public registry) or from a CSV of `zone,year,tile`. Checks it against its land mask first, refusing a zone the mask lacks or a shard outside a zone's grid, and reports each cell's live and dead shards. Dry run unless `--write`. |
-| `loosen_optical_min_obs.py` | Loosens a store's minimum optical depth rule (`optical_min_obs`) to `--line`, for the whole store or for `--zones`, in one commit. Only ever down: a tightening, a store with no rule and an unseeded zone are refused. Records each line given up in the root's or zone's `optical_min_obs_history`, and prints every rule and history before and after. Dry run unless `--go`. |
+| `loosen_optical_min_obs.py` | Loosens a store's minimum optical depth rule (`optical_min_obs`) to `--line`, for the whole store or for `--zones`, in one commit. Only ever down: a tightening, a store with no rule and an unseeded zone are refused. Records each line given up in the root's or zone's `optical_min_obs_history`, and prints every rule and history before and after. Dry run unless `--write`. |
 
 ## `diagnostic/` — supported tooling
 

@@ -36,7 +36,7 @@ row and update record. Zero stays refused, as a rule that refuses nothing.
 Each line given up is appended to that root's or zone's `optical_min_obs_history` as
 `{"line", "until", "snapshot"}`, the snapshot being the last one judged against it. Loosening to the
 current line commits nothing; a tightening, a store with no rule and an unstamped store are refused,
-each saying why. Operators use `scripts/update/loosen_optical_min_obs.py`, a dry run unless `--go`.
+each saying why. Operators use `scripts/update/loosen_optical_min_obs.py`, a dry run unless `--write`.
 
 **The rule in force for a zone is its own attr when present, else the root's**
 (`effective_optical_min_obs`), and everything that reads the rule goes through it: the per-cell and
