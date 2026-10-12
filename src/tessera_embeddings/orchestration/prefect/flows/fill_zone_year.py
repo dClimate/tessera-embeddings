@@ -50,6 +50,7 @@ from tessera_embeddings.orchestration.runners.zone_fill import (
     zone_year_on_axis,
 )
 from tessera_embeddings.storage.conventions import expected_model_url
+from tessera_embeddings.storage.global_store import effective_optical_min_obs
 from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group
 from tessera_embeddings.storage.zone_grid import canonicalize_zone
 
@@ -59,25 +60,25 @@ if TYPE_CHECKING:
 
 def _optical_min_obs_from_store(
     store_path: str,
+    zone: str,
     *,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None,
     s3_region: str | None = None,
 ) -> int | None:
-    """The minimum-depth rule the STORE advertises, which is the only one this fill may apply.
+    """The minimum-depth rule the STORE advertises for ``zone``, which is the only one this fill may apply.
 
-    Read from the root rather than taken as a parameter, and that is the whole point: the value is
-    part of the root's write-once identity, so the store is the authority on what rule its zones
-    were filled under. A fill that took it from a dispatch parameter could write one zone under 25
-    and its neighbour under 30, and nothing afterwards could tell which pixels came from which.
+    Read from the store rather than taken as a parameter, and that is the whole point: the store is
+    the authority on what rule its zones were filled under. A fill that took it from a dispatch
+    parameter could write one zone under 25 and its neighbour under 30, and nothing afterwards
+    could tell which pixels came from which. Resolved per zone
+    (:func:`~tessera_embeddings.storage.global_store.effective_optical_min_obs`), since a zone may
+    carry a looser rule than the root.
 
     ``None`` means the store declares no rule — every store seeded before 2026-08-13 — and the fill
     then embeds everything with any optical input, which is what those stores already contain.
     """
     root = open_store_as_zarr_group(store_path, get_credentials=get_credentials, region=s3_region)
-    value = root.attrs.get("optical_min_obs")
-    if value is None:
-        return None
-    return int(cast("int", value))
+    return effective_optical_min_obs(root, zone)
 
 
 def _assert_seeded_model_matches(
@@ -397,10 +398,12 @@ def fill_zone_year_flow(
     # here rather than inside the cluster branch; it is a metadata-only read.
     config = dataclasses.replace(
         config,
-        optical_min_obs=_optical_min_obs_from_store(store_path, get_credentials=store_credentials, s3_region=s3_region),
+        optical_min_obs=_optical_min_obs_from_store(
+            store_path, zone, get_credentials=store_credentials, s3_region=s3_region
+        ),
     )
     log.info(
-        "Minimum optical depth for this fill: %s (from the store's root)",
+        "Minimum optical depth for this fill: %s (from the store)",
         config.optical_min_obs if config.optical_min_obs is not None else "no rule",
     )
 

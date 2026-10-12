@@ -1427,6 +1427,25 @@ def test_a_store_declaring_no_rule_leaves_the_config_unconstrained(wired, monkey
     assert built and {c.get("optical_min_obs") for c in built} == {None}
 
 
+def test_each_zone_in_a_chained_fill_is_judged_against_its_own_rule(wired, monkeypatch) -> None:
+    """A zone may carry a looser rule than the root, and one cluster spans many zones: each cell's
+    config and staging fingerprint must carry its own zone's rule, not the first cell's.
+    """
+    rules = {"33N": 15, "34N": 1}
+    fingerprinted: dict[str, int] = {}
+
+    def fingerprint(zone, year, **k):
+        fingerprinted[zone] = k["optical_min_obs"]
+        return f"{zone}-{year}-fingerprint"
+
+    monkeypatch.setattr(mod, "_optical_min_obs_from_store", lambda store, zone, **k: rules[zone])
+    monkeypatch.setattr(mod, "_staging_run_id", fingerprint)
+    _run(zones=list(rules))
+    prepare = wired["seq_kwargs"]["prepare"]
+    configs = {z: prepare(SimpleNamespace(zone=z, year=2025, num_actors=5)).config.optical_min_obs for z in rules}
+    assert configs == fingerprinted == rules
+
+
 # --- a wedged trailing assembly ends the process rather than reporting FAILED (2026-09-04) ------
 
 

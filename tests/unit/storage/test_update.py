@@ -137,14 +137,14 @@ def _node(repo: icechunk.Repository) -> zarr.Group:
 
 
 def test_an_update_record_appends_and_leaves_the_fill_alone(zone_repo):
-    record = upd.update_record(_target(), run_id="u-run", written=["chunk_0_0"], kept=[])
+    record = upd.update_record(_target(), run_id="u-run", written=["chunk_0_0"], kept=[], optical_min_obs=1)
     upd.commit_update_record(zone_repo, "01N", 2024, record=record)
     tip = zone_repo.lookup_branch("main")
     upd.commit_update_record(zone_repo, "01N", 2024, record=record)  # idempotent per update
 
     node = _node(zone_repo)
     assert zone_repo.lookup_branch("main") == tip
-    assert [r["update"] for r in upd.read_updates(node, 2024)] == ["fix-1"]
+    assert [(r["update"], r["optical_min_obs"]) for r in upd.read_updates(node, 2024)] == [("fix-1", 1)]
     assert node.attrs["years_complete"] == [2024] and node.attrs["runs"]["2024"]["run_id"] == "fill"
     assert upd.last_run_id(dict(node.attrs), 2024) == "u-run"
     # An update that wrote nothing published no part, so it does not become the cell's last writer.
@@ -170,7 +170,7 @@ def test_an_update_record_retries_a_concurrent_attr_commit(zone_repo, monkeypatc
 
     monkeypatch.setattr(upd, "commit_with_rebase", flaky)
     upd.commit_update_record(
-        zone_repo, "01N", 2024, record=upd.update_record(_target(), run_id="r", written=[], kept=[])
+        zone_repo, "01N", 2024, record=upd.update_record(_target(), run_id="r", written=[], kept=[], optical_min_obs=1)
     )
     assert calls["n"] == 2 and len(upd.read_updates(_node(zone_repo), 2024)) == 1
 
@@ -179,7 +179,7 @@ def test_the_complete_tag_waits_for_every_planned_cell(zone_repo):
     plan = upd.UpdatePlan(name="fix-1", mode="shards", cells={"01N/2024": None, "01N/2025": None})
     assert upd.finish_update(zone_repo, plan) is None
     upd.commit_update_record(
-        zone_repo, "01N", 2024, record=upd.update_record(_target(), run_id="r", written=[], kept=[])
+        zone_repo, "01N", 2024, record=upd.update_record(_target(), run_id="r", written=[], kept=[], optical_min_obs=1)
     )
     assert upd.finish_update(zone_repo, plan) is None, "2025 was never filled, so the update is not complete"
     single = upd.UpdatePlan(name="fix-1", mode="shards", cells={"01N/2024": None})
@@ -190,7 +190,7 @@ def test_a_base_tag_pins_the_first_snapshot_only(zone_repo):
     first = zone_repo.lookup_branch("main")
     pin_tag(zone_repo, upd.base_tag("fix-1"))
     upd.commit_update_record(
-        zone_repo, "01N", 2024, record=upd.update_record(_target(), run_id="r", written=[], kept=[])
+        zone_repo, "01N", 2024, record=upd.update_record(_target(), run_id="r", written=[], kept=[], optical_min_obs=1)
     )
     pin_tag(zone_repo, upd.base_tag("fix-1"))
     assert zone_repo.lookup_tag(upd.base_tag("fix-1")) == first

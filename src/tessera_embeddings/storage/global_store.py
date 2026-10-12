@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterable, Mapping
+from datetime import UTC, datetime
 from typing import cast
 
 import icechunk
@@ -48,7 +49,14 @@ from tessera_embeddings.storage.time_axis import (
     year_of,
 )
 from tessera_embeddings.storage.zarr_store import _create_storage, global_store_config
-from tessera_embeddings.storage.zone_grid import PIXEL_M, ZONE_SCHEME, ZoneSpec, easting_coords, northing_coords
+from tessera_embeddings.storage.zone_grid import (
+    PIXEL_M,
+    ZONE_SCHEME,
+    ZoneSpec,
+    canonicalize_zone,
+    easting_coords,
+    northing_coords,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -455,8 +463,9 @@ def check_root_identity(
     if mismatched:
         raise ValueError(
             f"Refusing to reseed: the store root's published identity is write-once, but this seed "
-            f"would change {mismatched}. Seed a fresh store for a new encoder or a new minimum-depth "
-            "rule (mixing either under one store would corrupt already-published zones)."
+            f"would change {mismatched}. Seed a fresh store for a new encoder (mixing two under one "
+            "store would corrupt already-published zones); to loosen an existing store's minimum-depth "
+            "rule use `loosen_optical_min_obs`."
         )
 
 
@@ -491,6 +500,102 @@ def stamp_root_identity(
         return None
     root.attrs.update(_root_attrs(layout, model_version, optical_min_obs))
     return session.commit(commit_msg or "stamp root identity on an already-seeded store")
+
+
+#: Root or zone attr listing each line that root or zone was judged against before a loosening.
+OPTICAL_RULE_HISTORY_ATTR = "optical_min_obs_history"
+
+
+def _rule(attrs: Mapping[str, object]) -> int | None:
+    raw = attrs.get("optical_min_obs")
+    return None if raw is None else int(cast("int", raw))
+
+
+def effective_optical_min_obs(root: zarr.Group, zone: str) -> int | None:
+    """The minimum-depth rule in force for ``zone``: the zone group's own ``optical_min_obs``, else the root's.
+
+    The one resolver every fill and check reads the rule through. A zone carries its own value only
+    once :func:`loosen_optical_min_obs` has loosened it below the root's; ``None`` means the store
+    declares no rule.
+    """
+    own = _rule(cast(zarr.Group, root[zone]).attrs) if zone in root else None
+    return own if own is not None else _rule(root.attrs)
+
+
+def loosen_optical_min_obs(
+    repo: icechunk.Repository,
+    new_line: int,
+    *,
+    zones: Iterable[str] | None = None,
+    commit_msg: str | None = None,
+) -> str | None:
+    """Loosen the minimum-depth rule to ``new_line`` for the whole store, or for ``zones`` only.
+
+    The only way a stamped rule moves, and only DOWN. Loosening leaves every embedded pixel
+    compliant with the new line, and every pixel it newly admits is identifiable in the store as
+    ``isnan(scales) & (s2_obs_count >= new_line)`` — the holes a targeted update in ``holes`` mode
+    then fills. Tightening would leave embedded pixels below the advertised line with nothing to
+    tell a reader which, so it is refused, as are a store with no identity or no rule (seed the
+    rule wanted instead).
+
+    With ``zones=None`` the ROOT moves; a zone override at or above the new line is removed with it,
+    since it would otherwise read as a tightening. With ``zones``, each named zone gains its own
+    ``optical_min_obs`` below its current effective rule and the root is untouched. Every line given
+    up is appended to that root's or zone's ``optical_min_obs_history`` as ``{"line", "until",
+    "snapshot"}``, the snapshot being the last one judged against it.
+
+    Returns the commit snapshot, or ``None`` when every target already sits at ``new_line``.
+    """
+    if new_line <= 0:
+        raise ValueError(f"optical_min_obs={new_line} refuses nothing — loosen to a positive number of observations.")
+    session = repo.writable_session("main")
+    root = zarr.open_group(session.store, mode="a")
+    root_rule = _rule(root.attrs)
+    if "geoemb:model" not in root.attrs or root_rule is None:
+        raise ValueError(
+            "The store root declares no minimum-depth rule, so there is nothing to loosen: an unstamped store "
+            "takes its rule at seeding, and a store with no rule already embeds every pixel with optical input."
+        )
+    given_up = {"until": datetime.now(UTC).isoformat(), "snapshot": session.snapshot_id}
+
+    def _give_up(node: zarr.Group, old: int) -> None:
+        history = list(cast("list[dict]", node.attrs.get(OPTICAL_RULE_HISTORY_ATTR) or []))
+        node.attrs[OPTICAL_RULE_HISTORY_ATTR] = [*history, {"line": old, **given_up}]
+
+    def _check(where: str, current: int) -> bool:
+        if new_line > current:
+            raise ValueError(
+                f"Refusing to tighten {where} from optical_min_obs={current} to {new_line}: pixels already "
+                "embedded below the new line would stay, and no reader could tell them from compliant ones."
+            )
+        return new_line < current
+
+    if zones is None:
+        if not _check("the store", root_rule):
+            return None
+        root.attrs["optical_min_obs"] = new_line
+        _give_up(root, root_rule)
+        for gname in root.group_keys():
+            node = cast(zarr.Group, root[gname])
+            if (own := _rule(node.attrs)) is not None and own >= new_line:
+                del node.attrs["optical_min_obs"]
+                if own > new_line:
+                    _give_up(node, own)
+        return session.commit(commit_msg or f"loosen optical_min_obs {root_rule} -> {new_line}")
+
+    moved = []
+    for zone in sorted({canonicalize_zone(z) for z in zones}):
+        if zone not in root:
+            raise ValueError(f"Zone {zone} is not seeded in this store, so it has no rule to loosen.")
+        current = cast(int, effective_optical_min_obs(root, zone))
+        if _check(f"zone {zone}", current):
+            node = cast(zarr.Group, root[zone])
+            node.attrs["optical_min_obs"] = new_line
+            _give_up(node, current)
+            moved.append(zone)
+    if not moved:
+        return None
+    return session.commit(commit_msg or f"loosen optical_min_obs to {new_line} for {', '.join(moved)}")
 
 
 def seed_zone_groups(
@@ -537,9 +642,8 @@ def seed_zone_groups(
     if stamped_now:
         # optical_min_obs is in the identity for the same reason the encoder is: a fill reads it to
         # decide which pixels it may embed, so re-stamping it would let zones filled under one rule
-        # sit beside zones filled under another, under a root advertising only the second. The
-        # consequence to know is that it makes the rule UNCHANGEABLE for this store — moving the
-        # line means a new store, not a migration.
+        # sit beside zones filled under another, under a root advertising only the second. A seed
+        # therefore never moves it; `loosen_optical_min_obs` is the one way it moves, and only down.
         root.attrs.update(_root_attrs(layout, model_version, optical_min_obs))
     # The time axis is fixed and UNIFORM across all zone groups (ADR-008 D1): campaign status and
     # fill code assume every group shares one axis. An incremental seed passing a different

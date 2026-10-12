@@ -25,11 +25,12 @@ the ingest ROI (``rois/<zone>/<year>.zarr``), the mosaics (``mosaics/<zone>/<yea
 campaign's own, which it rewrites and sweeps (:meth:`BucketPaths.update_root`).
 
 **What the store records.** Each cell an update lands in gains one entry in its zone group's
-``updates`` attr, per year an append-only list of records naming the update, its run, its code and
-the shards it ``written``/``kept``/``cleared``. ``years_complete``, ``runs`` and the zone-year tags
-stay exactly as the original fill left them, so a cell's state is ``runs[year]`` with
-``updates[year]`` applied on top, in order. ``update-<name>-base`` pins the store before an update's
-first write and ``update-<name>-complete`` the store once every cell has landed.
+``updates`` attr, per year an append-only list of records naming the update, its run, its code,
+the depth rule it applied (``optical_min_obs``) and the shards it ``written``/``kept``/``cleared``.
+``years_complete``, ``runs`` and the zone-year tags stay exactly as the original fill left them,
+so a cell's state is ``runs[year]`` with ``updates[year]`` applied on top, in order.
+``update-<name>-base`` pins the store before an update's first write and ``update-<name>-complete``
+the store once every cell has landed.
 """
 
 from __future__ import annotations
@@ -378,17 +379,23 @@ def update_record(
     run_id: str,
     written: Sequence[str],
     kept: Sequence[str],
+    optical_min_obs: int | None,
     cleared: Sequence[str] = (),
     radar_coverage: Mapping[str, Any] | None = None,
     input_coverage: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """One cell's record of an update: what it wrote, what it kept, and with which code."""
+    """One cell's record of an update: what it wrote, what it kept, under which depth rule and with which code.
+
+    ``optical_min_obs`` is the line the update judged its pixels against (``None``: no rule), which
+    after a loosening differs from the one the original fill applied.
+    """
     record: dict[str, Any] = {
         "update": target.name,
         "mode": target.mode,
         "run_id": run_id,
         "assembled_at": datetime.now(UTC).isoformat(),
         "mask_name": target.mask_name,
+        "optical_min_obs": optical_min_obs,
         "written": sorted(written),
         "kept": sorted(kept),
         "cleared": sorted(cleared),

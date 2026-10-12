@@ -323,37 +323,31 @@ def test_an_unusable_assembly_worker_override_is_refused_before_inference(tmp_pa
         _fill(tmp_path, store, n_assembly_workers=bad)
 
 
-def test_the_runner_refuses_a_rule_the_store_does_not_advertise(tmp_path):
-    """The store's minimum-depth rule is write-once root identity, so the STORE is the
-    authority on what rule its zones were filled under — not the caller's config.
+@pytest.mark.parametrize(
+    ("root_rule", "zone_rule", "config_rule", "refused"),
+    [(None, None, 25, True), (None, None, None, False), (15, 1, 1, False), (15, 1, 15, True)],
+)
+def test_the_runner_applies_only_the_rule_the_store_advertises_for_the_zone(
+    tmp_path, root_rule, zone_rule, config_rule, refused
+):
+    """The STORE is the authority on what rule a zone is filled under — the zone's own once
+    loosened, else the root's — not the caller's config.
 
-    The Prefect adapter reads the root and substitutes the value before calling. This runner
-    is the orchestrator-agnostic entry point and was trusting that: called directly, it would
-    run inference under any threshold, publish, and mark the year complete. Zones filled under
-    different lines would then sit under one root advertising a single rule, and no later check
-    could tell which pixels came from which — a refused pixel is indistinguishable from one
-    that had no optical input.
-
-    Asserted rather than substituted: silently replacing a caller's value would let a direct
-    caller believe it had configured a line it had not.
+    The Prefect adapter reads the store and substitutes the value before calling. This runner
+    is the orchestrator-agnostic entry point: trusting the config, a direct call would fill
+    under any threshold, and no later check could tell which pixels came from which — a refused
+    pixel is indistinguishable from one that had no optical input. Asserted rather than
+    substituted, so a direct caller never believes it configured a line it had not.
     """
-    store = _seed_global(tmp_path)  # seeded with no rule, so the store advertises None
-    config = InferenceConfig(time_window=_WINDOW, chunk_size=_TILE, num_gpus=0, optical_min_obs=25)
-    with pytest.raises(ValueError, match="write-once root identity"):
-        _fill(tmp_path, store, config=config)
-
-
-def test_the_runner_accepts_a_config_matching_the_store(tmp_path):
-    """The adapter's substitution must satisfy the check, not trip it — otherwise every
-    Prefect fill would fail on the guard meant to protect direct callers.
-    """
-    store = _seed_global(tmp_path)
-    config = InferenceConfig(time_window=_WINDOW, chunk_size=_TILE, num_gpus=0, optical_min_obs=None)
-    # This wiring points at an absent mask on purpose, so the fill still fails — just LATER,
-    # on the mask, which is what proves the rule check passed rather than short-circuited.
+    store = _seed_global_with_rule(tmp_path, root_rule)
+    if zone_rule is not None:
+        global_store.loosen_optical_min_obs(global_store.open_global_repo(store), zone_rule, zones=[_ZONE])
+    config = InferenceConfig(time_window=_WINDOW, chunk_size=_TILE, num_gpus=0, optical_min_obs=config_rule)
+    # A config that clears the check still fails LATER, on the absent mask, which proves the check
+    # passed rather than short-circuited.
     with pytest.raises(Exception) as exc:
         _fill(tmp_path, store, config=config)
-    assert "write-once root identity" not in str(exc.value), "the matching config must clear the rule check"
+    assert ("advertises" in str(exc.value)) is refused
 
 
 def test_chunk_size_shard_mismatch_raises(tmp_path):
@@ -861,8 +855,8 @@ def test_the_flow_actually_defers_both_deletes():
     )
 
 
-def _seed_global_with_rule(tmp_path, rule: int) -> str:
-    """A store whose write-once root declares a depth rule, so the fill's gate accepts one."""
+def _seed_global_with_rule(tmp_path, rule: int | None) -> str:
+    """A store whose root declares a depth rule (or none), so the fill's gate accepts that one."""
     store = str(tmp_path / "global.icechunk")
     repo = global_store.create_global_repo(store)
     global_store.seed_zone_groups(repo, [_SPEC], years=_YEARS, layout=SMALL, optical_min_obs=rule)

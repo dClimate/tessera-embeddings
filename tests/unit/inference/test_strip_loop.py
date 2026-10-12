@@ -912,7 +912,7 @@ class TestPerCellTimeWindow:
     """
 
     @staticmethod
-    def _run(inference_config, test_model, *, time_window=None):
+    def _run(inference_config, test_model, **cell):
         inference_config.s1_orbit = "both"
         inference_config.time_window = parse_time_window("December 2024")
         actor = _make_actor(inference_config, test_model)
@@ -922,7 +922,7 @@ class TestPerCellTimeWindow:
             patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_open_store_side_effect()),
             patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
         ):
-            result = actor.process_chunk(_CHUNK, "s3://b/m", "/tmp/staging", "run-1", time_window=time_window)
+            result = actor.process_chunk(_CHUNK, "s3://b/m", "/tmp/staging", "run-1", **cell)
             flushed = actor.flush_writes()
             assert flushed is None or flushed["ok"], f"deferred write failed: {flushed}"
         return result, _CapturingWriter.last_write
@@ -965,6 +965,17 @@ class TestPerCellTimeWindow:
         res_2022, _ = self._run(inference_config, test_model, time_window=parse_time_window("December 2022"))
         assert res_2022["status"] == "failed", res_2022
         assert "time window (2022" in res_2022.get("error", ""), res_2022
+
+    def test_a_cell_depth_rule_overrides_the_actors(self, inference_config, test_model):
+        """The depth rule rides the work item the same way: a zone may carry a looser rule than its
+        store's root, and the actor was built from another cell's config. A line no pixel reaches
+        must refuse the chunk as thin, which only the passed rule reaching the dataset can do.
+        """
+        res_default, _ = self._run(inference_config, test_model)
+        res_strict, _ = self._run(inference_config, test_model, optical_min_obs=10_000)
+        assert res_default["valid_pixels"] > 0
+        assert res_strict["status"] == "skipped", res_strict
+        assert _CapturingWriter.last_skip_record["refused"]["thin"] > 0
 
     def test_the_zone_context_carries_the_window_to_the_dispatch(self):
         """The wiring, unit-tested without a fleet: ZoneContext holds it and defaults to None.

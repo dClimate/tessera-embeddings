@@ -906,28 +906,30 @@ def fill_zones_sequential_flow(
     for cell_year in cell_years:
         _window_for(cell_year)
 
-    # The STORE is the authority on the depth rule, exactly as in the per-cell flow: it is part
-    # of the root's write-once identity, so a fill that took it from a dispatch parameter could
-    # write one zone under 25 and its neighbour under 30 with nothing afterwards able to tell
-    # them apart. Read ONCE rather than per cell — every cell in this run writes the same store,
-    # and the root cannot change under it.
+    # The STORE is the authority on the depth rule, exactly as in the per-cell flow: a fill that
+    # took it from a dispatch parameter could write one zone under 25 and its neighbour under 30
+    # with nothing afterwards able to tell them apart. Read ONCE PER ZONE — a zone may carry a looser
+    # rule than the root (`loosen_optical_min_obs`), and no rule changes under a running fill.
     @cache
-    def _store_optical_min_obs() -> int | None:
-        """The rule, read once and only if a cell actually reaches inference.
+    def _store_optical_min_obs(zone: str) -> int | None:
+        """The zone's rule, read once and only if one of its cells actually reaches inference.
 
         LAZY for the same reason the per-cell flow resolves it inside its preflight: a run
         whose cells all settle in triage — a retag, an empty mark, an all-ocean zone — must not
         touch the store at all, and reading at flow start makes every such path need a live repo.
         """
-        value = _optical_min_obs_from_store(store_path, get_credentials=iam_icechunk_credentials, s3_region=s3_region)
+        value = _optical_min_obs_from_store(
+            store_path, zone, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+        )
         log.info(
-            "Optical depth rule for this fill, from the store root: %s",
+            "Optical depth rule for %s, from the store: %s",
+            zone,
             value if value is not None else "no rule",
         )
         return value
 
     @cache
-    def _config_for(resolved_orbit: str, cell_year: int) -> InferenceConfig:
+    def _config_for(resolved_orbit: str, cell_year: int, zone: str) -> InferenceConfig:
         return build_inference_config(
             s1_orbit=resolved_orbit,
             time_window=_window_for(cell_year),
@@ -936,7 +938,7 @@ def fill_zones_sequential_flow(
             output_bucket=paths.outputs,
             chunk_size=SHARD_PX,  # 1 inference tile == 1 shard (D3)
             allow_s2_only=allow_s2_only,
-            optical_min_obs=_store_optical_min_obs(),
+            optical_min_obs=_store_optical_min_obs(zone),
             actor_request_headroom=actor_request_headroom,
             # Omitted when unset so the inference default stands — keyed on None, not on
             # truthiness, because 0 is a documented mode here rather than an absent value.
@@ -1032,7 +1034,7 @@ def fill_zones_sequential_flow(
                 land_mask_path=land_mask_path,
                 mosaic_base=f"{paths.inputs.rstrip('/')}/mosaics/{zone}/{year}",
                 staging_base=f"{paths.outputs.rstrip('/')}/staging/{zone}/{year}",
-                config=_config_for(s1_orbit, year),
+                config=_config_for(s1_orbit, year, zone),
                 num_actors=1,
                 log=log,
                 run_id=run_id,
@@ -1052,7 +1054,7 @@ def fill_zones_sequential_flow(
             land_mask_path=land_mask_path,
             mosaic_base=f"{mosaic_root.rstrip('/')}/mosaics/{zone}/{year}",
             staging_base=f"{staging_root}/{zone}/{year}",
-            config=_config_for(s1_orbit, year),
+            config=_config_for(s1_orbit, year, zone),
             num_actors=1,
             log=log,
             run_id=f"{zone}-{year}-{plan.name}-none",
@@ -1266,12 +1268,12 @@ def fill_zones_sequential_flow(
                 s1_orbit=s1_orbit,
                 allow_partial_window=allow_partial_window,
                 allow_s2_only=allow_s2_only,
-                optical_min_obs=_store_optical_min_obs(),
+                optical_min_obs=_store_optical_min_obs(cell.zone),
                 code_identity=code_identity,
                 get_credentials=iam_icechunk_credentials,
                 s3_region=s3_region,
             ),
-            config=_config_for(resolved, cell.year),
+            config=_config_for(resolved, cell.year, cell.zone),
             input_coverage=coverage,
         )
 
@@ -1307,7 +1309,7 @@ def fill_zones_sequential_flow(
     # The window here is likewise only a DEFAULT, since every work item carries its own cell's
     # window. Pinning the config to live[0] — the densest live cell, NOT a leaked triage loop
     # variable — keeps it deterministic and matches the cell the session is sized for.
-    session_config = _config_for(s1_orbit, live[0].year)
+    session_config = _config_for(s1_orbit, live[0].year, live[0].zone)
 
     # Size the shared session by the LARGEST cell's clamped request, not the raw fleet ceiling:
     # the session provisions its first actor batch before any streamed work arrives, so a small
@@ -1375,7 +1377,7 @@ def fill_zones_sequential_flow(
                 # (`fill_zone_year` is the other); omitting it publishes rows whose `obs_max` and
                 # `median_obs_where_any` have no line to be measured from, with `None` reading as
                 # "this fill applied no depth rule".
-                optical_min_obs=_store_optical_min_obs(),
+                optical_min_obs=_store_optical_min_obs(handoff.zone),
                 input_coverage=prep.input_coverage,
                 log=log,
                 cleanup_staging=cleanup_staging,

@@ -78,7 +78,11 @@ from tessera_embeddings.inference.data_loading import _active_orbits
 from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.ingest.land_mask import narrow_tile_live
 from tessera_embeddings.storage.campaign import mark_zone_year_empty, pin_tag, tag_zone_year, zone_year_tag
-from tessera_embeddings.storage.global_store import check_destination_types, open_global_repo
+from tessera_embeddings.storage.global_store import (
+    check_destination_types,
+    effective_optical_min_obs,
+    open_global_repo,
+)
 from tessera_embeddings.storage.published_store import calendar_years, live_shards
 from tessera_embeddings.storage.registry_master import update_cell
 from tessera_embeddings.storage.registry_rebuild import as_coverage_record, rebuild_tile
@@ -620,22 +624,20 @@ def plan_zone_inference(
         raise ValueError(f"Zone group {zone!r} is not seeded in {store_path} — run seed_zone_groups first (D1).")
     node = cast(zarr.Group, root[zone])
 
-    # The store's minimum-depth rule is part of its write-once root identity, so the store —
-    # not this call's config — is the authority on what rule its zones were filled under. The
-    # Prefect adapter substitutes the store's value into the config before calling; this
-    # ASSERTS that rather than trusting it, so the domain API is safe to call directly. Free:
-    # `root` is already open above. A check and not a substitution, deliberately: silently
-    # replacing a caller's value would let a direct caller believe it had configured a line it
-    # had not, the same class of surprise as the gap it closes.
-    raw_rule = root.attrs.get("optical_min_obs")
-    store_rule = int(cast("int", raw_rule)) if raw_rule is not None else None
+    # The store — not this call's config — is the authority on what minimum-depth rule each zone
+    # is filled under: the zone's own if it has been loosened, else the root's. The Prefect adapter
+    # substitutes that value into the config before calling; this ASSERTS it rather than trusting
+    # it, so the domain API is safe to call directly. Free: `root` is already open above. A check
+    # and not a substitution, deliberately: silently replacing a caller's value would let a direct
+    # caller believe it had configured a line it had not.
+    store_rule = effective_optical_min_obs(root, zone)
     if config.optical_min_obs != store_rule:
         raise ValueError(
             f"This fill would apply optical_min_obs={config.optical_min_obs!r} to {zone}-{year}, but "
-            f"{store_path} advertises {store_rule!r}. The rule is part of the store's write-once root "
-            "identity: filling one zone under a different line than its neighbours is undetectable "
-            "afterwards, because a refused pixel is indistinguishable from one with no optical input. "
-            "Pass the store's value (None when it declares no rule), or seed a new store for a new rule."
+            f"{store_path} advertises {store_rule!r} for that zone. Filling a zone under a different "
+            "line than the store states is undetectable afterwards, because a refused pixel is "
+            "indistinguishable from one with no optical input. Pass the store's value (None when it "
+            "declares no rule), or loosen the store's rule first with `loosen_optical_min_obs`."
         )
 
     # Validate the year BEFORE any expensive work: assemble_global re-checks,
@@ -788,7 +790,12 @@ def plan_zone_inference(
             # Nothing to infer is still an answer, and recording it is what stops the cell being
             # dispatched again. Never marked empty: the cell keeps everything it held.
             snapshot = commit_update_record(
-                repo, zone, year, record=update_record(update, run_id=run_id, written=[], kept=update.kept)
+                repo,
+                zone,
+                year,
+                record=update_record(
+                    update, run_id=run_id, written=[], kept=update.kept, optical_min_obs=config.optical_min_obs
+                ),
             )
             result = {**summary, "snapshot_id": snapshot, "elapsed_sec": time.monotonic() - t0}
             return ZonePlan(zone=zone, year=year, run_id=run_id, t0=t0, summary={}, live=[], done=result, update=update)
@@ -1311,6 +1318,7 @@ def _assemble_update(
         run_id=run_id,
         written=sorted(staged),
         kept=sorted({*update.kept, *([] if cleared else skipped)}),
+        optical_min_obs=optical_min_obs,
         cleared=cleared,
         radar_coverage=radar_coverage,
         input_coverage=input_coverage,

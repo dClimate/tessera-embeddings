@@ -454,6 +454,7 @@ class InferenceActor:
         mosaic_base: str,
         time_window: TimeWindow,
         s1_orbit: S1Orbit,
+        optical_min_obs: int | None,
         *,
         y_sub: slice,
         store_opener: StoreOpener,
@@ -489,7 +490,7 @@ class InferenceActor:
             num_obs_checkpoints=self.config.num_obs_checkpoints,
             s1_orbit=s1_orbit,
             allow_s2_only=allow_s2_only,
-            optical_min_obs=self.config.optical_min_obs,
+            optical_min_obs=optical_min_obs,
             model_version=self.config.model_version,
             norm_source=self.config.norm_source,
             pixels=None if chunk.pixels is None else _pixel_mask(chunk.pixels)[y_sub, x_sub or slice(None)],
@@ -502,6 +503,7 @@ class InferenceActor:
         mosaic_base: str,
         time_window: TimeWindow,
         s1_orbit: S1Orbit,
+        optical_min_obs: int | None,
         *,
         prefetched: bool = False,
     ) -> _ChunkPrologue:
@@ -518,6 +520,7 @@ class InferenceActor:
             mosaic_base,
             time_window,
             s1_orbit,
+            optical_min_obs,
             y_sub=strips[0],
             store_opener=store_opener,
             mask_bundle=mask_bundle,
@@ -526,7 +529,12 @@ class InferenceActor:
         return _ChunkPrologue(store_opener, mask_bundle, strips, live_strips, x_sub, first_strip, prefetched=prefetched)
 
     def _load_chunk_prologue(
-        self, chunk: ChunkSpec, mosaic_base: str, time_window: TimeWindow, s1_orbit: S1Orbit
+        self,
+        chunk: ChunkSpec,
+        mosaic_base: str,
+        time_window: TimeWindow,
+        s1_orbit: S1Orbit,
+        optical_min_obs: int | None,
     ) -> _ChunkPrologue:
         """Load everything _process_chunk needs before its first forward pass.
 
@@ -535,7 +543,7 @@ class InferenceActor:
         """
         prologue = self._take_prefetched(chunk.label)
         if prologue is None:
-            return self._load_prologue(chunk, mosaic_base, time_window, s1_orbit)
+            return self._load_prologue(chunk, mosaic_base, time_window, s1_orbit, optical_min_obs)
         logger.info("xchunk prefetch: hit for %s", chunk.label)
         # The stash's opener was created on the prefetch thread; if that thread's store opens outlived the PRIOR
         # chunk's credential scope (the icechunk provider is a process-wide global, not thread-local) its repo
@@ -561,7 +569,12 @@ class InferenceActor:
         return self._xchunk_prefetch_pool, self._xchunk_prefetched
 
     def _start_chunk_prefetch(
-        self, chunk: ChunkSpec, mosaic_base: str, time_window: TimeWindow, s1_orbit: S1Orbit
+        self,
+        chunk: ChunkSpec,
+        mosaic_base: str,
+        time_window: TimeWindow,
+        s1_orbit: S1Orbit,
+        optical_min_obs: int | None,
     ) -> None:
         """Kick off the next chunk's prologue load on the prefetch thread.
 
@@ -582,6 +595,7 @@ class InferenceActor:
             mosaic_base,
             time_window,
             s1_orbit,
+            optical_min_obs,
             prefetched=True,
         )
 
@@ -717,6 +731,7 @@ class InferenceActor:
         prefetch_hint: ChunkSpec | None = None,
         time_window: TimeWindow | None = None,
         s1_orbit: S1Orbit | None = None,
+        optical_min_obs: int | None = None,
     ) -> dict[str, Any]:
         """Process a single spatial chunk: load data, run inference, write output.
 
@@ -751,6 +766,9 @@ class InferenceActor:
                 different year read the wrong months — and the session's only mismatch check is
                 on ``s1_orbit``, so nothing would catch it. ``None`` uses the actor's config,
                 which is what the single-ROI path does.
+            optical_min_obs: This CELL's minimum-depth rule, overriding the actor's own config for
+                the same reason: a zone may carry a looser rule than its store's root, and a
+                chained session's cells span zones. ``None`` uses the actor's config.
 
         Returns:
             Result dict with chunk label, status, pixel count, and timing.
@@ -762,7 +780,15 @@ class InferenceActor:
         )
         with cred_scope:
             return self._process_chunk(
-                chunk, mosaic_base, staging_base, run_id, tracker, prefetch_hint, time_window, s1_orbit
+                chunk,
+                mosaic_base,
+                staging_base,
+                run_id,
+                tracker,
+                prefetch_hint,
+                time_window,
+                s1_orbit,
+                optical_min_obs,
             )
 
     def _process_chunk(
@@ -775,6 +801,7 @@ class InferenceActor:
         prefetch_hint: ChunkSpec | None = None,
         time_window: TimeWindow | None = None,
         s1_orbit: S1Orbit | None = None,
+        optical_min_obs: int | None = None,
     ) -> dict[str, Any]:
         """Run the load → inference → write pipeline for one chunk.
 
@@ -788,6 +815,7 @@ class InferenceActor:
         # A chained session's cells may resolve DIFFERENT orbits, because parts of the globe are radar-free in
         # principle.
         orbit = s1_orbit if s1_orbit is not None else self.config.s1_orbit
+        rule = optical_min_obs if optical_min_obs is not None else self.config.optical_min_obs
         from tessera_embeddings.inference.inference import run_inference
 
         t0 = time.monotonic()
@@ -808,7 +836,7 @@ class InferenceActor:
             # The prologue — repo handles, full-chunk SCL mask (which sizes the density-based strips), and the first
             # strip's bands + dataset — loads serially here (GPU idle) unless the cross-chunk prefetch loaded it during
             # the PREVIOUS chunk's last strip; see _load_chunk_prologue.
-            prologue = self._load_chunk_prologue(chunk, mosaic_base, window, orbit)
+            prologue = self._load_chunk_prologue(chunk, mosaic_base, window, orbit, rule)
             store_opener = prologue.store_opener
             mask_bundle = prologue.mask_bundle
             strips = prologue.strips
@@ -855,6 +883,7 @@ class InferenceActor:
                     mosaic_base,
                     window,
                     orbit,
+                    rule,
                     y_sub=y_sub,
                     store_opener=store_opener,
                     mask_bundle=bundle,
@@ -947,7 +976,7 @@ class InferenceActor:
                     # The NEXT chunk's mask and first strip load from the last strip with pixels, so they hide behind
                     # real inference: any strips after it are empty and load little more than their radar counts.
                     if i + 1 == max(live_strips, 1) and prefetch_hint is not None:
-                        self._start_chunk_prefetch(prefetch_hint, mosaic_base, window, orbit)
+                        self._start_chunk_prefetch(prefetch_hint, mosaic_base, window, orbit, rule)
 
                     # The chunk's radar sequence lengths. Every strip sees the same ones — SAR is read full-width
                     # regardless of the crop — so any strip's value is the chunk's and the last assignment wins. A
@@ -1047,7 +1076,7 @@ class InferenceActor:
                     radar_rule_enforced=radar_rule_enforced,
                     obs_buffers=obs_buffers,
                     x_sub=x_sub,
-                    optical_min_obs=self.config.optical_min_obs or OPTICAL_MIN_OBS,
+                    optical_min_obs=rule or OPTICAL_MIN_OBS,
                 )
                 logger.info(
                     "Chunk %s has no valid pixels, skipping (assembly will fill) — refused %s",
@@ -1134,11 +1163,10 @@ class InferenceActor:
             # ordinary data even though a year seen a handful of times and one seen weekly are not the same embedding.
             # No optical-free count is needed — that case IS the skip, and a skipped chunk never reaches here.
             s2_at_embedded = obs_buffers["s2_obs_count"][embedded]
-            # The rule this RUN applied, not the module default. The dataset gates on `config.optical_min_obs`, which
-            # comes from the store root, so counting against the constant would report a thin share measured by a line
-            # the fill never used — and would read as a non-zero count on a store whose rule already refuses every
-            # pixel it names.
-            thin_below = self.config.optical_min_obs or OPTICAL_MIN_OBS
+            # The rule this CELL applied, not the module default. The dataset gates on `rule`, which comes from the
+            # store, so counting against the constant would report a thin share measured by a line the fill never
+            # used — and would read as a non-zero count on a store whose rule already refuses every pixel it names.
+            thin_below = rule or OPTICAL_MIN_OBS
             s2_thin_px = int((s2_at_embedded < thin_below).sum())
             del embedded, obs_at_embedded, s2_at_embedded
 

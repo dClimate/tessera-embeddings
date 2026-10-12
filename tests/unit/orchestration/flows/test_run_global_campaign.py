@@ -1694,6 +1694,24 @@ def test_the_staging_fingerprint_changes_with_the_stores_depth_rule(wired, monke
     assert at_25 == mod._staging_run_id("33N", 2025, optical_min_obs=25, **common), "and be stable"
 
 
+def test_each_zone_is_fingerprinted_under_its_own_rule(wired, monkeypatch):
+    """A zone may carry a looser rule than the root, so its staging prefix must be its own rule's —
+    otherwise a loosened zone would resume tiles staged under the root's line.
+    """
+    rules = {"01N": 15, "02N": 1}
+    fingerprinted: dict[str, int] = {}
+
+    def fingerprint(zone, year, **k):
+        fingerprinted[zone] = k["optical_min_obs"]
+        return f"{zone}-{year}-fingerprint"
+
+    _multi_year(monkeypatch, list(rules), [2025], wired)
+    monkeypatch.setattr(mod, "_optical_min_obs_from_store", lambda store, zone, **k: rules[zone])
+    monkeypatch.setattr(mod, "_staging_run_id", fingerprint)
+    _per_cell(max_parallel_clusters=2)
+    assert fingerprinted == rules
+
+
 def test_overlap_years_does_not_overcount_per_cell_runs(wired, monkeypatch):
     """Under `overlap_years` with per-cell dispatch, a round holds one run PER CELL.
 

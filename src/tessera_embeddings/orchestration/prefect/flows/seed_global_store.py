@@ -57,11 +57,11 @@ def seed_global_store(
             distinguish the concrete checkpoint (the ``aws``/``mpc`` v1.1 checkpoints
             share one ``geoemb:model`` URL); without it that gate is a no-op.
         optical_min_obs: Minimum valid optical observations for a pixel to be embedded,
-            stamped on the root as part of its write-once identity. **Deliberately has no
-            default and is not read from the config constant**: it decides what the product
-            contains, can never be changed for this store afterwards, and a value inherited
-            from whatever a module happened to hold is not a decision anyone took. ``None``
-            seeds a store with no such rule, as older stores have.
+            stamped on the root as part of its identity. **Deliberately has no default and is
+            not read from the config constant**: it decides what the product contains, a seed
+            never changes it afterwards (only ``loosen_optical_min_obs`` moves it, and only
+            down), and a value inherited from whatever a module happened to hold is not a
+            decision anyone took. ``None`` seeds a store with no such rule, as older stores have.
         s3_region: Optional S3 region for the global store, forwarded to open/create — like
             the campaign and fill paths, so a non-default-region deployment can seed at all.
 
