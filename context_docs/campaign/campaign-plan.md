@@ -693,7 +693,9 @@ rather than impossible. Our own buckets — mosaics, staging, figures, verdicts 
 * **Versioning stays OFF** With versioning on, deletes leave markers and prior
   versions, so mosaics deleted after consumption keep billing and the true footprint silently
   diverges from the intended one. The ~$3,000 storage figure depends on deletion actually
-  reclaiming space.
+  reclaiming space. The published bucket is not one of ours; the versioning its owner can enable
+  for the registry keeps the store prefix unversioned with a one-day lifecycle rule
+  ([`registry-master.md`](../storage/registry-master.md)).
 * **Verify a deletion by listing the prefix, never by an exit code.** One pass is not reliably
   complete: a run has reported a single error while leaving residue in three prefixes, two of them
   with no error at all.

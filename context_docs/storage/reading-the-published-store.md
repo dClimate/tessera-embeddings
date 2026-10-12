@@ -442,13 +442,18 @@ what a second traversal would cost.
 `s3://tessera-embeddings/v1.1/dclimate.registry`: **3,247,410 rows**, one per tile per year, each
 with a WGS84 bounding box, whether the tile was embedded, how many of its pixels the depth rule
 refused and for which of three reasons, and how deep the imagery was where it fell short. It has
-three prefixes:
+two prefixes:
 
 | prefix | contents | what it is |
 |---|---|---|
-| `master/` | 994 files + `_common_metadata`, 151 MB | **what a consumer reads**: one row per tile-year, one schema, measurements on every row |
-| `parts/` | 994 files, 142 MB, at `parts/zone=<ZONE>/year=<YEAR>/<run_id>.parquet` | the campaign's own output, one part per cell, never rewritten |
-| `rebuild/` | 461 files, 70 MB | measurements re-derived from the store for the rows the campaign left null |
+| `master/` | 994 files at `master/zone=<ZONE>/year=<YEAR>/part-0.parquet` + `_common_metadata`, 151 MB | **what a consumer reads**: one row per tile-year, one schema, measurements on every row |
+| `parts/` | 994 files, 142 MB, at `parts/zone=<ZONE>/year=<YEAR>/<run_id>.parquet` | the fills' raw output, one part per cell per run, never rewritten; internal |
+
+**`master/` describes what the store holds now.** Every fill merges its rows into its zone-year's
+master file tile by tile as it lands: a tile's row comes from the newest run that wrote that tile,
+and a tile no later run touched keeps its row. A refill or a future infill therefore reaches
+`master/` without anybody re-running anything, and a reader never has to choose between runs. See
+[`registry-master.md`](registry-master.md).
 
 **The campaign's parts are written as designed, on every check.** All 994 parts carry all 23
 declared columns at the declared types; every part's key-value metadata agrees with the zone and
@@ -477,7 +482,7 @@ three reasons, the depth statistics, `px_with_any_radar`. The cause is an asymme
 record reached the registry. A refused tile's went into its skip marker on object storage and
 survived a resume; an embedded tile's rode back in the actor's result and did not. So all 17,865
 wholly refused tiles were measured, and only 53% of embedded ones. Every column is derivable from
-the store, so those rows were re-derived into `rebuild/` and merged into `master/` on 2026-10-12:
+the store, so those rows were re-derived from it and published in `master/` on 2026-10-12:
 1,728,365 rows are `measured_by = "fill"`, 1,519,045 are `"rebuild"`, and none are unmeasured.
 **Read `master/`, not `parts/`**: counting refusals over `parts/` counts the measured half only.
 One column differs by origin. Rebuilt rows leave `eligible_px` null and count over the whole tile,

@@ -222,15 +222,16 @@ Coverage across a wide area is better answered without opening the store, from a
 beside it:
 
 ```
-s3://tessera-embeddings/v1.1/dclimate.registry/parts/zone=<ZONE>/year=<YEAR>/<run_id>.parquet
+s3://tessera-embeddings/v1.1/dclimate.registry/master/zone=<ZONE>/year=<YEAR>/part-0.parquet
 ```
 
-994 parts, 142 MB, 3,247,410 rows — one per 2048-pixel tile per year, except that parts are keyed
-by `run_id`, so a refilled zone-year keeps both rows: take the latest `assembled_at` per `(zone,
-year, tile)` or you will double-count. In zones 01 and 60 a row crossing the antimeridian encodes
-`bbox_west > bbox_east`, which a plain west-to-east overlap test drops. Each row carries a WGS84
-bounding box, whether the tile was embedded, how many of its pixels the depth rule refused and
-why, and how deep the imagery was where it fell short.
+3,247,410 rows, one per 2048-pixel tile per year, in one file per zone-year with a dataset-level
+`_common_metadata` for the schema. Every fill merges its rows into its zone-year's file, so each
+tile's row describes what the store holds now and there is nothing to deduplicate. Each row carries
+a WGS84 bounding box, whether the tile was embedded, how many of its pixels the depth rule refused
+and why, and how deep the imagery was where it fell short. In zones 01 and 60 a row crossing the
+antimeridian encodes `bbox_west > bbox_east`, which a plain west-to-east overlap test drops. The
+fills' raw parts sit beside it under `parts/`, keyed by run; read `master/` instead.
 
 Partitioning by zone and year makes "is my area covered, and how well" a 1.7-second query
 in-region against 14 seconds for the whole dataset, so use it to screen areas before committing

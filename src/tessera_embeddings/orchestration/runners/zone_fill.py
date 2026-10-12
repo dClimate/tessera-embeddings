@@ -35,6 +35,10 @@ crash landed the fill untagged. Zone-year tags are permanent — icechunk forbid
 even a deleted tag name — so a deliberate refill keeps the old tag on the old snapshot and
 must pin its new snapshot under a fresh, manually chosen name; campaign history is never
 silently rewritten.
+
+Once a cell with live tiles is tagged, its registry parts are merged into the registry's
+``master/`` file for the cell (:func:`_update_registry_master`), best-effort, so the registry
+consumers read is current as each cell lands.
 """
 
 from __future__ import annotations
@@ -330,14 +334,15 @@ def _update_registry_master(
     s3_region: str | None,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
 ) -> None:
-    """Bring the cell's ``master/`` file up to date with the part assembly just published. Never raises.
+    """Merge the part assembly just published into the cell's ``master/`` file. Never raises.
 
-    This is what keeps the master current: every fill recomputes its own cell from all of the
-    cell's parts (:func:`~tessera_embeddings.storage.registry_master.update_cell`), so a refill, a
-    new year or an infill reaches consumers without anybody running a compaction. Best-effort for
-    the reason ``publish_registry_part`` is: the cell has committed and is tagged, and a registry
-    failure must not fail it. A failure is logged loudly and leaves the cell stale, which the
-    registry census names and ``rebuild_registry_measurements.py sync --zones`` repairs.
+    This is what keeps the master current: every fill merges its cell's parts into the cell's
+    existing master file, tile by tile
+    (:func:`~tessera_embeddings.storage.registry_master.update_cell`), so a refill, a new year or
+    an infill reaches consumers as it lands. Best-effort for the reason ``publish_registry_part``
+    is: the cell has committed and is tagged, and a registry failure must not fail it. A failure is
+    logged loudly and leaves the cell stale, which the registry census names and
+    ``rebuild_registry_measurements.py repair --zones`` rebuilds.
 
     The store's live shards for the year are compared with the master's embedded tiles on the way,
     from the manifests alone, and a disagreement is logged at ERROR: no run removes a tile it did
@@ -345,8 +350,8 @@ def _update_registry_master(
     """
     if not registry_root:
         return
-    credentials = _store_credentials(store_path, get_credentials)
     try:
+        credentials = _store_credentials(store_path, get_credentials)
         session = open_global_repo(store_path, get_credentials=credentials, region=s3_region).readonly_session(
             branch="main"
         )
@@ -361,7 +366,7 @@ def _update_registry_master(
         log.exception(
             "Zone %s year %d: registry master NOT updated. The cell is committed and its part published, but "
             "master/ — what consumers read — still describes this cell as it was before this fill. Repair: "
-            "scripts/maintenance/rebuild_registry_measurements.py sync --zones %s --write",
+            "scripts/maintenance/rebuild_registry_measurements.py repair --zones %s --write",
             zone,
             year,
             zone,
