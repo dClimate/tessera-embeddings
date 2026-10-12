@@ -345,18 +345,36 @@ def write_common_metadata(fs: FileSystem, registry_root: str) -> None:
         pq.ParquetWriter(out, master_schema()).close()
 
 
+def still_published(held: pa.Table, fills: pa.Table) -> pa.Table:
+    """The ``held`` master rows whose run still has a part among ``fills``' rows for that tile.
+
+    A withdrawn run — its part deleted — must not outlive its part in the master: its rows carry the
+    newest ``filled_at`` and would otherwise beat every run that remains.
+    """
+    return held.filter(pc.is_in(_key(held, "tile", "filled_at"), value_set=_key(fills, "tile", "filled_at")))
+
+
+def _key(table: pa.Table, *columns: str) -> pa.Array:
+    """``zone/year/<columns>`` per row, for matching rows across tables."""
+    year = pc.cast(table.column("year"), pa.string())
+    fields = [table.column("zone"), year, *(table.column(column) for column in columns)]
+    return pc.binary_join_element_wise(*fields, "/").combine_chunks()
+
+
 def update_cell(
     fs: FileSystem,
     registry_root: str,
     zone: str,
     year: int,
     *,
+    run_id: str | None = None,
     live: Collection[tuple[int, int]] | None = None,
 ) -> list[str]:
     """Merge one cell's parts into its existing master file, tile by tile, and replace the file.
 
     Idempotent, and independent of every other cell. Raises, writing nothing, when the cell has no
-    part or the merge breaks an invariant.
+    part, has none for ``run_id`` — the run the caller just landed, whose part publishing is
+    best-effort and may have failed — or the merge breaks an invariant.
 
     ``live`` is the store's live ``(shard_y, shard_x)`` shards for this zone-year, from
     :func:`~.published_store.live_shards`. Returns where the master's embedded tiles disagree with
@@ -368,9 +386,12 @@ def update_cell(
     parts = read_cell(fs, registry_root, "parts", zone, year, dataset_schema())
     if not parts.num_rows:
         raise ValueError(f"{zone}/{year} has no registry part to merge into the master")
+    if run_id is not None and run_id not in set(parts.column("run_id").to_pylist()):
+        raise ValueError(f"{zone}/{year} has no registry part for run {run_id!r}, so the master would miss it")
+    fills = as_master_rows(parts, MEASURED_BY_FILL)
     # Parts first, so on a tie between identical rows the part's copy is the one kept.
-    held = read_cell(fs, registry_root, "master", zone, year, master_schema())
-    master = merge(as_master_rows(parts, MEASURED_BY_FILL), held)
+    held = still_published(read_cell(fs, registry_root, "master", zone, year, master_schema()), fills)
+    master = merge(fills, held)
     if failures := invariant_failures(master, expected_rows=tile_years(parts)):
         raise ValueError(f"{zone}/{year} master breaks its invariants: {'; '.join(failures)}")
     write_cell(fs, registry_root, zone, year, master)

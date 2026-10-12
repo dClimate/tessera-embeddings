@@ -329,6 +329,21 @@ class TestUpdateCell:
         assert "chunk_0_0" in findings[0] and "chunk_5_5" in findings[1]
         assert (registry / self.MASTER).exists()
 
+    def test_a_withdrawn_run_does_not_outlive_its_part(self, registry: Path) -> None:
+        """Deleting a run's part and updating must restore the run before it, not keep the master's copy."""
+        _publish(registry, "infill", [_row("chunk_0_0", measured=True, stamp=LATER, run_id="infill")])
+        update_cell(LocalFileSystem(), str(registry), "33N", 2017)
+        (registry / "parts" / "zone=33N" / "year=2017" / "infill.parquet").unlink()
+        update_cell(LocalFileSystem(), str(registry), "33N", 2017)
+        assert pq.read_table(registry / self.MASTER).column("run_id").to_pylist() == ["run-a", "rebuild-1"]
+
+    def test_a_run_whose_part_never_published_is_refused_rather_than_reported_merged(self, registry: Path) -> None:
+        """Part publishing is best-effort; merging the older parts would report a fill the master lacks."""
+        before = (registry / self.MASTER).read_bytes()
+        with pytest.raises(ValueError, match="no registry part for run 'refill'"):
+            update_cell(LocalFileSystem(), str(registry), "33N", 2017, run_id="refill")
+        assert (registry / self.MASTER).read_bytes() == before
+
     def test_a_cell_with_no_part_raises_and_writes_nothing(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="no registry part"):
             update_cell(LocalFileSystem(), str(tmp_path), "33N", 2017)

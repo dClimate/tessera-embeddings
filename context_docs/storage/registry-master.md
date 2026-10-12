@@ -45,12 +45,14 @@ package takes the schema from the dataset. `parts/` needs `registry.dataset_sche
 `orchestration/runners/zone_fill.py`, the ordinary one and the all-refused `empty=True` one. It
 writes `_common_metadata` only if absent.
 
-- **Zone-years are independent.** Each update reads and replaces one object, so concurrent fills
-  of different cells never contend, and a reader sees a cell's old file or its new one, never a
-  mixture.
+- **Zone-years are independent.** Each update reads and replaces one object with a single S3 PUT,
+  so concurrent fills of different cells never contend, and a reader sees a cell's old file or
+  its new one, never a mixture.
 - **It is idempotent.** Re-running it over the same inputs writes the same bytes.
 - **It merges all of the cell's parts, not only the new one.** That costs a few small reads and
   means a cell whose earlier update failed is healed by its next fill.
+- **It refuses a run whose own part is missing.** Publishing a part is best-effort, and merging
+  the older parts alone would rewrite the cell as it was and report success.
 - **It never fails a committed cell.** The cell is committed and tagged by then. Raising would undo
   nothing and lose the tag's record, which is `publish_registry_part`'s rationale too. A failure is
   logged at ERROR with the repair command, and the stale cell is visible to the checks below.
@@ -97,6 +99,9 @@ future infill, not something this code can check.
   still written, because it describes the registry faithfully.
 - **A re-derived row must name its fill.** `as_master_rows` refuses one without `filled_at`, which
   would otherwise pass for a newer run and beat the fill's measurement.
+- **An existing master row survives only while its run still has a part** (`still_published`).
+  A run withdrawn by deleting its part would otherwise keep winning through the master's copy of
+  its rows, which carry the newest `filled_at`.
 - **Re-derivation checks the store holds the cell's newest run.** The zone group's `runs` attribute
   names the last run that wrote each year, and it must be the newest run in the cell's parts. Then
   every row's tile holds the pixels of the run that row names, so a cell built from several runs is
@@ -121,7 +126,8 @@ inputs, merged by the rule above: the cell's parts, its existing master rows, an
 re-derivation from the store of every row its fills left null. The parts supply every tile and every
 fill measurement; the existing rows keep a radar column an optical-only repair would not re-measure.
 A cell whose re-derivation is blocked is not written, so a repair never replaces measurements with
-nulls. `gate` proves the re-derivation reproduces measured rows before any repair; the method and
+nulls. Nothing locks a cell between a repair and a fill, so repair zones no fill is writing; a
+fill that does land after a repair re-merges every part and heals the cell. `gate` proves the re-derivation reproduces measured rows before any repair; the method and
 its proof are in [`registry-backfill.md`](registry-backfill.md).
 
 **The fill does not re-derive inline.** A fill records every tile's coverage record on object

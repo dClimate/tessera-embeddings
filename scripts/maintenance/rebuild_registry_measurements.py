@@ -74,6 +74,7 @@ from tessera_embeddings.storage.registry_master import (
     invariant_failures,
     master_schema,
     merge,
+    still_published,
     tile_years,
     write_cell,
     write_common_metadata,
@@ -379,7 +380,7 @@ def cmd_repair(args: argparse.Namespace) -> int:
     written = rederived = blocked = 0
     for (zone, year), rows in sorted(cells.items()):
         # Parts first, so on a tie between identical rows the part's copy is the one kept.
-        candidates = [rows, held_cells.get((zone, year), master_schema().empty_table())]
+        candidates = [rows, still_published(held_cells.get((zone, year), master_schema().empty_table()), rows)]
         if pc.any(pc.is_null(rows.column(MEASURED_SENTINEL))).as_py():
             # Opened only when a cell needs it: a repair with nothing to re-derive needs no store.
             root = root if root is not None else _open_zone(args.store, args.region, anonymous=args.anonymous)

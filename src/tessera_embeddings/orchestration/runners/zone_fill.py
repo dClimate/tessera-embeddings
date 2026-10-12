@@ -329,6 +329,7 @@ def _update_registry_master(
     store_path: str,
     zone: str,
     year: int,
+    run_id: str,
     *,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None,
     s3_region: str | None,
@@ -340,9 +341,10 @@ def _update_registry_master(
     existing master file, tile by tile
     (:func:`~tessera_embeddings.storage.registry_master.update_cell`), so a refill, a new year or
     an infill reaches consumers as it lands. Best-effort for the reason ``publish_registry_part``
-    is: the cell has committed and is tagged, and a registry failure must not fail it. A failure is
-    logged loudly and leaves the cell stale, which the registry census names and
-    ``rebuild_registry_measurements.py repair --zones`` rebuilds.
+    is: the cell has committed and is tagged, and a registry failure must not fail it. A failure —
+    including ``run_id``'s own part never having published, which would otherwise rewrite the master
+    from the older runs and report success — is logged loudly and leaves the cell stale.
+    ``rebuild_registry_measurements.py repair --zones`` rebuilds it once the part exists.
 
     The store's live shards for the year are compared with the master's embedded tiles on the way,
     from the manifests alone, and a disagreement is logged at ERROR: no run removes a tile it did
@@ -361,11 +363,13 @@ def _update_registry_master(
         fs, _ = fsspec.url_to_fs(
             registry_root, **(plain_zarr_storage_options(registry_root, credentials, s3_region) or {})
         )
-        disagreements = update_cell(PyFileSystem(FSSpecHandler(fs)), registry_root, zone, year, live=live)
+        disagreements = update_cell(
+            PyFileSystem(FSSpecHandler(fs)), registry_root, zone, year, run_id=run_id, live=live
+        )
     except Exception:
         log.exception(
-            "Zone %s year %d: registry master NOT updated. The cell is committed and its part published, but "
-            "master/ — what consumers read — still describes this cell as it was before this fill. Repair: "
+            "Zone %s year %d: registry master NOT updated. The cell is committed, but master/ — what "
+            "consumers read — still describes it as it was before this fill. Repair: "
             "scripts/maintenance/rebuild_registry_measurements.py repair --zones %s --write",
             zone,
             year,
@@ -1059,7 +1063,14 @@ def assemble_zone_year(
         tag = tag_zone_year(repo, zone, year, snapshot_id=snapshot)
         if live:  # only the assembled branch published a part
             _update_registry_master(
-                registry_root, store_path, zone, year, get_credentials=get_credentials, s3_region=s3_region, log=log
+                registry_root,
+                store_path,
+                zone,
+                year,
+                run_id,
+                get_credentials=get_credentials,
+                s3_region=s3_region,
+                log=log,
             )
         result = {
             **summary,
@@ -1140,7 +1151,7 @@ def assemble_zone_year(
     )
     tag = tag_zone_year(repo, zone, year, snapshot_id=snapshot)
     _update_registry_master(
-        registry_root, store_path, zone, year, get_credentials=get_credentials, s3_region=s3_region, log=log
+        registry_root, store_path, zone, year, run_id, get_credentials=get_credentials, s3_region=s3_region, log=log
     )
     _run_cleanup()
 
