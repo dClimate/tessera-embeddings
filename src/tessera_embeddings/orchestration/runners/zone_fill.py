@@ -36,9 +36,10 @@ even a deleted tag name — so a deliberate refill keeps the old tag on the old 
 must pin its new snapshot under a fresh, manually chosen name; campaign history is never
 silently rewritten.
 
-Once a cell with live tiles is tagged, its registry parts are merged into the registry's
-``master/`` file for the cell (:func:`_update_registry_master`), best-effort, so the registry
-consumers read is current as each cell lands.
+Once a cell with live tiles has committed and published its registry part, and before it is
+tagged, its parts are merged into the registry's ``master/`` file for the cell
+(:func:`_update_registry_master`), best-effort, so the registry consumers read is current as each
+cell lands — including a deliberate refill, which fails at the tag step by design.
 """
 
 from __future__ import annotations
@@ -340,8 +341,10 @@ def _update_registry_master(
     This is what keeps the master current: every fill merges its cell's parts into the cell's
     existing master file, tile by tile
     (:func:`~tessera_embeddings.storage.registry_master.update_cell`), so a refill, a new year or
-    an infill reaches consumers as it lands. Best-effort for the reason ``publish_registry_part``
-    is: the cell has committed and is tagged, and a registry failure must not fail it. A failure —
+    an infill reaches consumers as it lands. Called before the tag, because a deliberate refill
+    fails at the tag step once its data and part have landed. Best-effort for the reason
+    ``publish_registry_part`` is: the cell has committed, and a registry failure must not fail it
+    or keep it from being tagged. A failure —
     including ``run_id``'s own part never having published, which would otherwise rewrite the master
     from the older runs and report success — is logged loudly and leaves the cell stale.
     ``rebuild_registry_measurements.py repair --zones`` rebuilds it once the part exists.
@@ -1046,6 +1049,18 @@ def assemble_zone_year(
                 fault=fault,
                 input_coverage=input_coverage,
             )
+            # Before the tag, not after it: a deliberate refill FAILS at the tag step by design,
+            # once its data and part have landed, and the master must still learn of it.
+            _update_registry_master(
+                registry_root,
+                store_path,
+                zone,
+                year,
+                run_id,
+                get_credentials=get_credentials,
+                s3_region=s3_region,
+                log=log,
+            )
         else:
             # No live tiles at all: nothing was ever written here, so there is nothing to
             # clear and the attrs alone are the whole job.
@@ -1061,17 +1076,6 @@ def assemble_zone_year(
             store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
         )
         tag = tag_zone_year(repo, zone, year, snapshot_id=snapshot)
-        if live:  # only the assembled branch published a part
-            _update_registry_master(
-                registry_root,
-                store_path,
-                zone,
-                year,
-                run_id,
-                get_credentials=get_credentials,
-                s3_region=s3_region,
-                log=log,
-            )
         result = {
             **summary,
             "empty": True,
@@ -1146,13 +1150,14 @@ def assemble_zone_year(
         fault=fault,
         input_coverage=input_coverage,
     )
+    # Before the tag, as on the all-refused branch: a deliberate refill fails at the tag step.
+    _update_registry_master(
+        registry_root, store_path, zone, year, run_id, get_credentials=get_credentials, s3_region=s3_region, log=log
+    )
     repo = open_global_repo(
         store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
     )
     tag = tag_zone_year(repo, zone, year, snapshot_id=snapshot)
-    _update_registry_master(
-        registry_root, store_path, zone, year, run_id, get_credentials=get_credentials, s3_region=s3_region, log=log
-    )
     _run_cleanup()
 
     return {

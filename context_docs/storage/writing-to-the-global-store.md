@@ -988,8 +988,8 @@ infill campaign's *"which tiles were short of imagery, and would more of it help
 Location and layout: `<store-stem>.registry/parts/zone=<Z>/year=<Y>/<run_id>.parquet`, a **sibling**
 of the store rather than a path inside it, because Icechunk owns every key under its own prefix and
 its garbage collection reconciles that prefix against its own manifests. Those parts are the fills'
-raw record; once a cell is tagged, the runner merges them into the cell's file under `master/`, the
-one registry consumers read ([`registry-master.md`](registry-master.md)).
+raw record; once a cell's part is published, the runner merges its parts into the cell's file under
+`master/`, the one registry consumers read ([`registry-master.md`](registry-master.md)).
 
 **Status: the schema and the producer are built and exercised against live campaign runs. The
 consumer side — a pipeline that can act on the work list this produces — is not built.**

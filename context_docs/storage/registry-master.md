@@ -32,18 +32,21 @@ package takes the schema from the dataset. `parts/` needs `registry.dataset_sche
 ```
   assemble_global ── commit the zone-year ──▶ publish parts/…/<run_id>.parquet
         │
-  zone_fill ── tag the zone-year ──▶ _update_registry_master
-                                       │  read the cell's master file + all of its parts
-                                       │  merge tile by tile, check the invariants
-                                       │  replace master/zone=Z/year=Y/part-0.parquet  (one PUT)
-                                       │  compare embedded tiles with the store's live shards
-                                       ▼
-                                     on any failure: ERROR log, cell left stale, fill succeeds
+  zone_fill ──▶ _update_registry_master
+                  │  read the cell's master file + all of its parts
+                  │  merge tile by tile, check the invariants
+                  │  replace master/zone=Z/year=Y/part-0.parquet  (one PUT)
+                  │  compare embedded tiles with the store's live shards
+                  │  on any failure: ERROR log, cell left stale, fill carries on
+                  ▼
+              tag the zone-year
 ```
 
 `registry_master.update_cell` does the work, called from both assembled branches of
 `orchestration/runners/zone_fill.py`, the ordinary one and the all-refused `empty=True` one. It
-writes `_common_metadata` only if absent.
+writes `_common_metadata` only if absent. It runs before the tag because a deliberate refill fails
+at the tag step by design (`reopen_zone_year.py`), after its data and part have landed, and the
+master must still describe it.
 
 - **Zone-years are independent.** Each update reads and replaces one object with a single S3 PUT,
   so concurrent fills of different cells never contend, and a reader sees a cell's old file or
@@ -53,9 +56,9 @@ writes `_common_metadata` only if absent.
   means a cell whose earlier update failed is healed by its next fill.
 - **It refuses a run whose own part is missing.** Publishing a part is best-effort, and merging
   the older parts alone would rewrite the cell as it was and report success.
-- **It never fails a committed cell.** The cell is committed and tagged by then. Raising would undo
-  nothing and lose the tag's record, which is `publish_registry_part`'s rationale too. A failure is
-  logged at ERROR with the repair command, and the stale cell is visible to the checks below.
+- **It never fails a committed cell.** The cell is committed by then. Raising would undo nothing
+  and keep the cell from being tagged, which is `publish_registry_part`'s rationale too. A failure
+  is logged at ERROR with the repair command, and the stale cell is visible to the checks below.
 
 ## The merge rule: a tile's row comes from the newest run that wrote it
 

@@ -361,9 +361,10 @@ and is worth finishing even when its parent fill is cancelled.
 
 ### A landed cell updates the registry master
 
-Once a cell with live tiles is tagged, the runner merges its registry parts into the
-cell's file under the registry's `master/` (`runners/zone_fill.py`,
-`_update_registry_master`), so consumers read every fill as soon as it lands. Like the
+Once a cell with live tiles has committed and published its part, and before the tag, the
+runner merges its registry parts into the cell's file under the registry's `master/`
+(`runners/zone_fill.py`, `_update_registry_master`), so consumers read every fill as soon as
+it lands, including a deliberate refill, which fails at the tag step by design. Like the
 validator dispatch, a failure there is logged and never fails the landed cell; the registry
 census names the cell and `scripts/maintenance/rebuild_registry_measurements.py repair`
 rebuilds it. See

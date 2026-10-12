@@ -916,28 +916,46 @@ def test_the_registry_records_the_depth_rule_the_cell_was_filled_under(tmp_path,
     assert _master_tiles(registry_root) == sorted(cols["tile"]), "and the cell's master is current"
 
 
+def _fill_one_tile(tmp_path, registry_root: str):
+    """A one-tile cell filled under a depth rule, with its registry beside it."""
+    return _fill(
+        tmp_path,
+        _seed_global_with_rule(tmp_path, 15),
+        land_mask_path=_make_mask(tmp_path, [(0, 0)]),
+        mosaic_base=_make_mosaic(tmp_path),
+        registry_root=registry_root,
+        config=InferenceConfig(time_window=_window(2025), chunk_size=_TILE, num_gpus=0, optical_min_obs=15),
+    )
+
+
 def test_a_failed_master_update_does_not_fail_a_landed_cell(tmp_path, monkeypatch, caplog):
-    """The cell has committed and is tagged by then; the master is an index beside it, and repairable."""
-    store = _seed_global_with_rule(tmp_path, 15)
-    registry_root = str(tmp_path / "registry")
+    """The cell has committed by then; the master is an index beside it, and repairable."""
     monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub({}))
 
     def unreachable(*_args: object, **_kwargs: object) -> list[str]:
         raise OSError("S3 500")
 
     monkeypatch.setattr(zone_fill, "update_cell", unreachable)
-    config = InferenceConfig(time_window=_window(2025), chunk_size=_TILE, num_gpus=0, optical_min_obs=15)
     with caplog.at_level(logging.ERROR):
-        summary = _fill(
-            tmp_path,
-            store,
-            land_mask_path=_make_mask(tmp_path, [(0, 0)]),
-            mosaic_base=_make_mosaic(tmp_path),
-            registry_root=registry_root,
-            config=config,
-        )
+        summary = _fill_one_tile(tmp_path, str(tmp_path / "registry"))
     assert summary["tag"], "the cell landed and was tagged"
     assert "registry master NOT updated" in caplog.text
+
+
+def test_the_master_learns_of_a_refill_that_fails_at_the_tag_step(tmp_path, monkeypatch):
+    """A deliberate refill fails at tagging by design — zone-year tags are write-once — after its data
+    and part have landed. Updating the master after the tag would never reach it.
+    """
+    monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub({}))
+
+    def spent(*_args: object, **_kwargs: object) -> str:
+        raise ValueError("tag zone-01N-2025 already exists")
+
+    monkeypatch.setattr(zone_fill, "tag_zone_year", spent)
+    registry_root = str(tmp_path / "registry")
+    with pytest.raises(ValueError, match="already exists"):
+        _fill_one_tile(tmp_path, registry_root)
+    assert _master_tiles(registry_root) == ["chunk_0_0"]
 
 
 def test_an_all_refused_cell_still_records_the_depth_rule(tmp_path, monkeypatch):
