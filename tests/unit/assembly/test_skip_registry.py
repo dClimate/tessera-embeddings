@@ -641,6 +641,17 @@ class TestTheDatasetIsActuallyReadable:
         assert set(table.column("zone").to_pylist()) == {"32S", "09S"}, "from the path, not a column"
         assert set(table.column("year").to_pylist()) == {2021, 2022}
 
+    def test_an_update_names_itself_on_its_rows_and_a_fill_leaves_it_null(self, tmp_path: Path) -> None:
+        """The master keeps each tile's newest row, so this is how a tile says which update its data came from."""
+        pq = pytest.importorskip("pyarrow.parquet")
+        root = str(tmp_path / "reg")
+        fill = self._write(root, "32S", 2021, "fill", registry_rows("fill", "t1", embedded=["chunk_0_0"], refused=[]))
+        update = self._write(
+            root, "32S", 2021, "upd", registry_rows("upd", "t2", embedded=["chunk_0_0"], refused=[], update_name="u1")
+        )
+        assert pq.read_table(fill).column("update_name").to_pylist() == [None]
+        assert pq.read_table(update).column("update_name").to_pylist() == ["u1"]
+
     def test_a_refill_adds_a_part_rather_than_replacing_one(self, tmp_path: Path) -> None:
         """Keyed by run so the registry holds both fills of a cell. A fixed name would silently
         replace the original, and dedup is the compaction's decision to make, not a write's.

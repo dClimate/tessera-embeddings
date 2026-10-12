@@ -24,6 +24,7 @@ from prefect.states import StateType
 import tessera_embeddings.orchestration.prefect.flows._child_runs as _child_runs
 import tessera_embeddings.orchestration.prefect.flows.fill_zones_sequential as mod
 from tessera_embeddings.config.paths import BucketPaths
+from tessera_embeddings.storage.update import UpdatePlan
 from tests.unit.deadline import run_under_deadline
 
 _PATHS = BucketPaths(inputs="s3://in", outputs="s3://out")
@@ -161,6 +162,65 @@ def test_retag_and_ocean_cells_never_touch_the_cluster(wired, monkeypatch):
     # ...and no cluster was ever provisioned.
     assert wired["ray_kwargs"] is None and result["sequential"] is None
     assert result["retagged"] == 1 and result["empty"] == 1 and result["live"] == 0
+
+
+class TestAnUpdate:
+    """A targeted update triages by its own record and shards, and never retags or marks."""
+
+    PLAN = UpdatePlan(
+        name="u1",
+        mode="shards",
+        mask_name="alt",
+        cells={"01N/2025": ["chunk_0_0"], "02N/2025": None, "03N/2025": None, "04N/2025": ["chunk_5_5"]},
+    )
+
+    @pytest.fixture()
+    def update_wired(self, wired, monkeypatch):
+        monkeypatch.setattr(mod, "load_update", lambda paths, name, mask_name: self.PLAN)
+        monkeypatch.setattr(mod, "open_global_repo", lambda *a, **k: object())
+        states = {
+            ("01N", 2025): "pending",
+            ("02N", 2025): "done",
+            ("03N", 2025): "not_complete",
+            ("04N", 2025): "pending",
+        }
+        monkeypatch.setattr(mod, "update_states", lambda repo, name, cells: {c: states[c] for c in cells})
+        monkeypatch.setattr(mod, "zone_year_complete", lambda *a, **k: pytest.fail("an update must never retag"))
+        wired["tiles"], wired["ingests"] = {}, []
+
+        def count(mask, zone, **k):
+            wired["tiles"][zone] = (mask, k["tiles"])
+            return 0 if zone == "04N" else 3
+
+        monkeypatch.setattr(mod, "zone_live_tile_count", count)
+        real = mod.run_deployment
+
+        def record(dep, parameters, timeout, tags=None):
+            wired["ingests"].append(parameters)
+            return real(dep, parameters, timeout, tags)
+
+        monkeypatch.setattr(mod, "run_deployment", record)
+        return wired
+
+    def test_cells_come_from_the_plan_and_settle_by_its_record(self, update_wired):
+        result = _run(cells=None, update="u1")
+
+        root = _PATHS.update_root("u1")
+        assert (result["update"], result["update_done"], result["not_filled"]) == ("u1", 1, [["03N", 2025]])
+        assert result["live"] == 1 and result["empty"] == 1
+        assert update_wired["tiles"]["01N"] == (_PATHS.land_mask_store("alt"), frozenset({"chunk_0_0"}))
+        # The dead-target cell records itself through the runner, with no cluster and as an update.
+        [dead] = update_wired["no_cluster_fills"]
+        assert dead["update"].tiles == frozenset({"chunk_5_5"})
+        assert dead["mosaic_base"] == f"{root}/mosaics/04N/2025"
+        assert dead["staging_base"] == f"{_PATHS.update_staging('u1')}/04N/2025"
+        # The live cell's ingest runs as the update, and its fill is planned as one.
+        assert [p["update"] for p in update_wired["ingests"]] == ["u1"]
+        assert update_wired["seq_kwargs"]["cells"][0].zone == "01N"
+
+    def test_a_cell_outside_the_plan_is_refused(self, update_wired):
+        with pytest.raises(ValueError, match="not in update 'u1'"):
+            _run(cells=[("09N", 2025)], update="u1")
 
 
 class TestPerCellValidation:

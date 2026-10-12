@@ -256,8 +256,8 @@ _WORKER_SUM_KEYS: tuple[str, ...] = (
     "write_s",
     "write_cpu_s",
     # A targeted update's read of the shard it merges into (`ShardSource.pixels`); absent otherwise.
-    "merge_s",
-    "merge_cpu_s",
+    "pixel_merge_s",
+    "pixel_merge_cpu_s",
     "wall_s",
     "cpu_s",
 )

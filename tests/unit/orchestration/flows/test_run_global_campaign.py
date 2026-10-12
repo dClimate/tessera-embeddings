@@ -19,6 +19,7 @@ from prefect.states import StateType
 
 import tessera_embeddings.orchestration.prefect.flows.run_global_campaign as mod
 from tessera_embeddings.config.paths import BucketPaths
+from tessera_embeddings.storage.update import UpdatePlan
 
 _PATHS = BucketPaths(inputs="s3://in", outputs="s3://out")
 
@@ -1050,6 +1051,55 @@ def test_every_cluster_opens_on_one_of_the_densest_zones(wired, monkeypatch):
     for zs in dispatched:
         tiles = [counts[z] for z in zs]
         assert tiles == sorted(tiles, reverse=True), zs
+
+
+class TestAnUpdateAcrossClusters:
+    """A targeted update: the plan is the work list, every chained child runs it, clusters balance on its shards."""
+
+    PLAN = UpdatePlan(
+        name="u1",
+        mode="holes",
+        mask_name="alt",
+        cells={"01N/2025": ["chunk_0_0", "chunk_0_1"], "02N/2025": ["chunk_3_3"], "03N/2024": None},
+    )
+
+    @pytest.fixture()
+    def update_wired(self, wired, monkeypatch):
+        monkeypatch.setattr(mod, "load_update", lambda paths, name, mask_name: self.PLAN)
+        # Every cell is complete — an update's cells always are — so the campaign's own list is empty.
+        status = SimpleNamespace(zones={"01N": (), "02N": (), "03N": ()}, has=lambda z, y: True)
+        monkeypatch.setattr(mod, "campaign_status", lambda *a, **k: status)
+        monkeypatch.setattr(mod, "campaign_work_list", lambda *a, **k: pytest.fail("an update has its own work list"))
+
+        def states(repo, name, cells):
+            return {
+                c: "not_complete" if c == ("03N", 2024) else "done" if c in wired["landed"] else "pending"
+                for c in cells
+            }
+
+        monkeypatch.setattr(mod, "update_states", states)
+        monkeypatch.setattr(mod, "zone_live_tile_count", lambda mask, zone, **k: len(k["tiles"] or ()))
+        wired["finished"] = []
+        monkeypatch.setattr(mod, "finish_update", lambda repo, plan: wired["finished"].append(plan.name) or "t")
+        return wired
+
+    def test_the_plan_is_the_work_list_and_every_child_runs_it(self, update_wired):
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", update="u1", max_parallel_clusters=2))
+
+        dispatched = [p for _, p in update_wired["arun"] if "cells" in p]
+        assert {tuple(c) for p in dispatched for c in p["cells"]} == {("01N", 2025), ("02N", 2025)}
+        assert all(p["update"] == "u1" and p["mask_name"] == "alt" for p in dispatched)
+        assert update_wired["finished"] == ["u1"]
+
+    def test_clusters_balance_on_the_update_shards_not_the_zone(self, monkeypatch):
+        monkeypatch.setattr(mod, "zone_work_weight", lambda *a, **k: pytest.fail("an update weighs its shards"))
+        monkeypatch.setattr(mod, "zone_live_tile_count", lambda mask, zone, **k: len(k["tiles"] or ()))
+        work = mod._update_work(self.PLAN, [("01N", 2025), ("02N", 2025)], "mask")
+        assert work == {"01N": 2.0, "02N": 1.0}
+        clusters = mod._partition_by_live_tiles(
+            ["02N", "01N", "03N"], 2, land_mask_path="mask", work=work | {"03N": 1.5}
+        )
+        assert clusters == [["01N"], ["03N", "02N"]]
 
 
 def test_sequential_single_shard_reads_no_tile_counts(wired, monkeypatch):

@@ -791,7 +791,7 @@ def _write_shards_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 - retu
             region = (slice(year, year + 1), slice(y0, y0 + h), slice(x0, x0 + w))
             if owned is not None:
                 # One variable at a time, so the extra memory is one shard of the widest array.
-                with timer.phase("merge"):
+                with timer.phase("pixel_merge"):
                     merged = np.asarray(arr[region])
                     merged[:, owned] = block[:, owned]
                     block = merged

@@ -148,6 +148,43 @@ def test_years_complete_updated_in_commit(tmp_path):
     assert g.attrs["years_complete"] == [2025]
 
 
+@pytest.mark.parametrize("n_workers", [1, 2])
+def test_a_source_that_owns_some_pixels_merges_into_the_shard(tmp_path, n_workers):
+    """A targeted update's merge: owned pixels take the new values in every array, the rest stay."""
+    store, repo = _seed(tmp_path)
+    write_year_shards(repo, "01N", year_index=2, source=_OneInnerChunkSource(seed=1), n_workers=1, shard_px=_SHARD)
+    before = zarr_store.open_store_as_zarr_group(store, group="01N")
+    old_emb, old_scl = (
+        np.asarray(before["embeddings"][2, :_SHARD, :_SHARD]),
+        np.asarray(before["scales"][2, :_SHARD, :_SHARD]),
+    )
+    owned = np.zeros((_SHARD, _SHARD), dtype=bool)
+    owned[:16, :16] = True
+    recorded: list[tuple[str, int]] = []
+
+    write_year_shards(
+        repo,
+        "01N",
+        year_index=2,
+        source=_OneInnerChunkSource(seed=2, owned=owned),
+        n_workers=n_workers,
+        shard_px=_SHARD,
+        commit_attrs=lambda repo_, group, year: recorded.append((group, year)) or repo_.lookup_branch("main"),
+    )
+
+    after = zarr_store.open_store_as_zarr_group(store, group="01N")
+    new = _OneInnerChunkSource(seed=2).load((0, 0))
+    emb, scl = np.asarray(after["embeddings"][2, :_SHARD, :_SHARD]), np.asarray(after["scales"][2, :_SHARD, :_SHARD])
+    np.testing.assert_array_equal(emb[owned], new["embeddings"][0][owned])
+    np.testing.assert_array_equal(scl[owned], new["scales"][0][owned])
+    np.testing.assert_array_equal(emb[~owned], old_emb[~owned])
+    np.testing.assert_array_equal(scl[~owned], old_scl[~owned])
+    # The hook REPLACED the year attrs commit: the update recorded itself, and the fill's mark
+    # is exactly as the first write left it.
+    assert recorded == [("01N", 2025)]
+    assert after.attrs["years_complete"] == [2025]
+
+
 def test_other_years_stay_empty(tmp_path):
     store, repo = _seed(tmp_path)
     write_year_shards(repo, "01N", year_index=2, source=_OneInnerChunkSource(), n_workers=1, shard_px=_SHARD)
