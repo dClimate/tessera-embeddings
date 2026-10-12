@@ -1,17 +1,21 @@
-# The minimum optical depth line: refuse a pixel below 15 observations
+# The minimum optical depth line: embed any pixel with one valid observation
 
-**The one data-quality rule in the campaign, and the only reason a pixel is refused.** A pixel with
-fewer than fifteen clear Sentinel-2 observations in the calendar year being filled is not embedded.
-It is written as fill, exactly as an out-of-ROI pixel is, and the reason is recorded.
+**The one data-quality rule in the campaign.** A pixel with at least one clear Sentinel-2
+observation in the calendar year being filled is embedded. A pixel with none is written as fill,
+exactly as an out-of-ROI pixel is, and the reason is recorded.
 
-The decision is [ADR-018](../decisions/018-refuse-pixels-below-minimum-optical-depth.md). **This
-document is the evidence behind it** — four measurement campaigns, taken over six days in August
-2026, that between them moved the number three times. It is one document because the four are
-useless separately: each answers a question the others raise, and two of them were taken
-specifically to overturn a third.
+The line is [ADR 028](../decisions/028-embed-every-pixel-with-an-optical-observation.md), which
+supersedes the line of 15 in [ADR-018](../decisions/018-refuse-pixels-below-minimum-optical-depth.md).
+**This document is the evidence** — four measurement campaigns, taken over six days in August 2026
+to choose that line of 15, which between them moved the number three times. They remain the account
+of what depth buys: how reproducibility varies with it, what each line costs in pixels, and why
+count is a weak proxy for a covered year. It is one document because the four are useless
+separately: each answers a question the others raise, and two of them were taken specifically to
+overturn a third.
 
-**Status: BUILT.** `OPTICAL_MIN_OBS = 15`, the gate applies it per pixel per year, the store stamps
-it as write-once root identity, and refused shards record why.
+**Status: BUILT.** `OPTICAL_MIN_OBS = 1`, the gate applies it per pixel per year, the store stamps
+it on the root, and refused shards record why. A stamped rule can be loosened, never tightened, for
+the whole store or one zone, after which a `holes` update embeds what the looser line admits.
 
 | § | question | instrument | when |
 |---|---|---|---|
@@ -25,48 +29,59 @@ it as write-once root identity, and refused shards record why.
 
 ## 1. The rule, and how the number was chosen
 
-**The line is 15**, decided by Robert and a colleague on **2026-08-17**. `OPTICAL_MIN_OBS` is 15 and
-the campaign's seeder registers 15. **The line is STRICTLY FEWER than 15**: a pixel with exactly
-fifteen valid optical observations is embedded; fourteen is refused. The gate reads
-`s2_valid_count >= optical_min_obs` and the thin count reads `< thin_below`, so both agree, and a
-test pins 13/14/15/16 at the campaign's own value rather than at a stand-in line.
+**The line is one** (Robert, 2026-10-12): a pixel with at least one valid optical observation in
+the year is embedded. The dataset refuses a pixel with none as `no_optical` under any rule, so at
+this line nothing is refused as thin, and `refused_thin`, `s2_thin_px` and the registry's
+`refused_thin_px` are invariants at 0. A test pins the imported constant: zero observations is
+refused as no optical input, one and two are embedded, nothing is thin.
 
-**Coverage was chosen over reproducibility, knowingly.** The line keeps **94% of pixels against 79%
-at 25** (pixel-weighted over 40 cells), and the accepted cost is that two independent embeddings of
-the same ground agree less well.
+**Why one: downstream users need wall-to-wall coverage.** A hole changes the geometry of a study
+area and the length of a time series, and refusal is irreversible while filtering is not:
+`s2_obs_count` is published per pixel, so any user can apply a stricter line at read time and
+nobody can recover a pixel the store refused.
 
-**15 is not the reproducibility elbow, and that is the point of the decision rather than an
+**What it costs.** Embeddings from few observations agree less well between independent runs:
+below 25 observations, at two to four times the pipeline's own floor (§4). The 1–14 band is the
+part of that population the line of 15 refused.
+
+### The line of 15, 2026-08-17 to 2026-10-12
+
+**v1.1 was filled at 15**, decided by Robert and a colleague on **2026-08-17**: strictly fewer than
+15 valid optical observations refused, exactly fifteen embedded.
+
+**Coverage was chosen over reproducibility, knowingly.** The line kept **94% of pixels against 79%
+at 25** (pixel-weighted over 40 cells), and the accepted cost was that two independent embeddings
+of the same ground agree less well.
+
+**15 was not the reproducibility elbow, and that was the point of the decision rather than an
 oversight.** The elbow is at 25 (§4): agreement runs three to four times the pipeline's own floor
-everywhere below 25 and halves crossing into 25–30. A line at 15 therefore **admits the
+from 15 to 25 and halves crossing into 25–30. A line at 15 therefore **admitted the
 worst-reproducing band in the whole measurement** — 15–19 sits at 3.83× the floor, worse even than
-under-15 at 2.21×. Whoever revisits this should know the trade was made with that in front of them,
-not around it.
+under-15 at 2.21×.
 
-**Two things weigh on the other side, and both post-date the elbow.** Refusal is irreversible while
-filtering is not: `s2_obs_count` is published per pixel, so any user can apply a stricter line at
-read time and nobody can recover a pixel we refused. And **count is not a reliable proxy for
-temporal spread** (§6) — 33.7% of pixels at 15–19 observations already cover ten or more months of
-the year, so some of what the elbow refuses does describe a year. Neither makes 15 *better* than 25
-on the evidence; they are why a coverage-first reading is defensible.
+**Two things weighed on the other side, and both post-date the elbow.** Refusal is irreversible
+while filtering is not. And **count is not a reliable proxy for temporal spread** (§6) — 33.7% of
+pixels at 15–19 observations already cover ten or more months of the year, so some of what the
+elbow refuses does describe a year.
 
-**The history, because the number moved three times and the record matters more than the number.**
-The original 30 rested on how the pictures looked; blind re-measurement (§3) showed legibility was
-tracking rendered contrast rather than information, and spatial organisation is flat across 12 to 45
-observations. That put 25 in as an explicit **placeholder** (2026-08-13) so the machinery could be
-built while the evidence was gathered. 15 replaces it as a decision.
+**The number moved three times before that.** The original 30 rested on how the pictures looked;
+blind re-measurement (§3) showed legibility was tracking rendered contrast rather than information,
+and spatial organisation is flat across 12 to 45 observations. That put 25 in as an explicit
+**placeholder** (2026-08-13) so the machinery could be built while the evidence was gathered, and
+15 replaced it as a decision.
 
-> **Measurements below that name the 25 line stay as they are.** They are what was measured, at the
-> line in force when they were taken, and several are line-independent in the way that matters (the
-> chunk-versus-pixel comparison, the count-versus-spread relationship). Where a figure is specific
-> to 25 it says so.
+> **Measurements below that name the 25 or 15 line stay as they are.** They are what was measured,
+> at the line in force when they were taken, and several are line-independent in the way that
+> matters (the chunk-versus-pixel comparison, the count-versus-spread relationship). Where a figure
+> is specific to a line it says so.
 
 ### Three decisions taken with the rule, not open for revisiting
 
 | decision | ruling |
 |---|---|
-| **2017**, where the census brackets the line between 38.7% of shard-years below 20 and 65.7% below 30 | **Same rule, populate it anyway, warn about it.** No per-year threshold — one rule keeps the product consistent. 2017 publishes roughly a third populated, and that must be stated where a user meets it, not left for them to discover |
-| **Temporal consistency** — a pixel can clear 15 in 2020 and fail in 2021 | **Per pixel, per year.** Holes move between years. No all-years gate, no stability mask in this iteration |
-| **Scope** | **Global campaign only.** The single-ROI path (`tessera_embeddings` flow, `plain` runner) keeps today's behaviour |
+| **2017**, where the census brackets 15 between 38.7% of shard-years below 20 and 65.7% below 30 | **Same rule, warn about it.** No per-year threshold — one rule keeps the product consistent. 2017 is the thinnest year, so it is where the least reproducible embeddings concentrate, and that must be stated where a user meets it, not left for them to discover |
+| **Temporal consistency** — a pixel can be imaged in 2020 and not in 2021 | **Per pixel, per year.** Holes move between years. No all-years gate, no stability mask in this iteration |
+| **Scope** | **Both paths embed the same pixels.** The single-ROI path (`tessera_embeddings` flow, `plain` runner) applies no rule, which selects exactly what the campaign's line of one does |
 
 ### Optical depth is the ONLY refusal rule — and radar was silently refusing land too
 
@@ -842,12 +857,14 @@ better record than a plan is:
 
 | what it specified | where it lives now |
 |---|---|
-| the threshold, recorded once | `config/inference.py` (`OPTICAL_MIN_OBS = 15`), stamped into the store root as write-once identity by `storage/global_store.py` |
+| the threshold, recorded once | `config/inference.py` (`OPTICAL_MIN_OBS = 1`), stamped on the store root at seeding by `storage/global_store.py` |
+| loosening it, and reading it per zone | `storage/global_store.py`: `loosen_optical_min_obs` (root or zones, with `optical_min_obs_history`), `effective_optical_min_obs` (the zone's own rule, else the root's); `scripts/update/loosen_optical_min_obs.py` |
 | the gate | `inference/dataset.py`, applied per pixel per year |
-| the store's rule is the only rule a fill may apply | `orchestration/runners/zone_fill.py` asserts it; the Prefect adapter substitutes it |
+| the store's rule is the only rule a fill may apply | `orchestration/runners/zone_fill.py` asserts the zone's rule; the Prefect adapters substitute it per zone, and a chained session carries it per cell to the actors (`ZoneContext.optical_min_obs`) |
+| an update says which rule it applied | `storage/update.py` (`update_record`), beside each registry row's own `optical_min_obs` |
 | refusal recorded per shard, with a reason | `inference/actors.py` writes the marker, `inference/assembly.py` reads it at assembly |
 | the registry beside the store | `config/paths.py` (`optical_registry()`), a sibling of the Icechunk prefix rather than inside it |
-| the tests | `tests/unit/assembly/test_skip_registry.py`, `test_dataset_v11.py`, `test_assembly.py` |
+| the tests | `tests/unit/assembly/test_skip_registry.py`, `test_dataset_v11.py`, `test_assembly.py`, `tests/unit/storage/test_global_store.py` (loosening) |
 
 What already existed and had to be built on rather than reinvented:
 
@@ -871,20 +888,25 @@ Parquet file living there is at best unrecognised and at worst collected. Its sc
 its first live run exposed are in
 [`../storage/writing-to-the-global-store.md`](../storage/writing-to-the-global-store.md) §6.
 
-**The rule is part of the store's write-once root identity.** Not a per-run parameter, because a cell
-filled under a different line than its neighbours is undetectable afterwards: a refused pixel is
-indistinguishable from one that had no optical input. **Moving the line therefore means a new store,
-not a migration** — which is the cost the decision in §1 was taken with in view.
+**The rule is part of the store's root identity, and it moves only down.** Not a per-run parameter,
+because a cell filled under a different line than its store states is undetectable afterwards: a
+refused pixel is indistinguishable from one that had no optical input. A seed never changes it;
+`loosen_optical_min_obs` lowers it for the store or for named zones and records each line given up.
+Down only, because loosening leaves every embedded pixel compliant and makes every newly eligible
+pixel identifiable as `isnan(scales) & (s2_obs_count >= line)` — exactly what a `holes` update fills
+— while tightening would leave embedded pixels below the advertised line with no way to find them.
 
 **Three categories, not two.** Not-eligible (ocean or outside the ROI), eligible-and-embedded, and
 eligible-and-refused. A percentage over the wrong denominator was the error this replaced: the land
 mask extends about 11 km into the sea, so "share of the grid" and "share of eligible land" differ by
 enough to change what a reader concludes.
 
-**Why the top-up spend is deferred:**
-[ADR-018](../decisions/018-refuse-pixels-below-minimum-optical-depth.md) carries the decision, the
-deferral premium (a ~$50K deferral that costs MORE to recover later, not a saving), the top-up unit,
-and the two objections raised against refusing rather than flagging.
+**The deferred spend:** [ADR-018](../decisions/018-refuse-pixels-below-minimum-optical-depth.md)
+recorded refusal as a ~$50K deferral that costs MORE to recover later, not a saving, and the two
+objections raised against refusing rather than flagging.
+[ADR 028](../decisions/028-embed-every-pixel-with-an-optical-observation.md) pays it: the update
+re-runs only the holes of the shards that hold thin refusals, priced from `plan_update.py`'s shard
+counts.
 
 ---
 

@@ -515,9 +515,11 @@ same 23 columns, so every part has the same schema.
 
 ## 6. What is missing, and what would surprise a consumer
 
-**Nothing records the run's parameters.** The store's root carries `optical_min_obs = 15`, the depth
-rule, but not `allow_s2_only` or `min_valid_coverage` — so exactly reproducing a cell needs the
-run's parameters from `context_docs/campaign/campaign-plan.md` rather than from the product.
+**Nothing records the run's parameters.** The store's root carries `optical_min_obs`, the depth
+rule (15 for v1.1's campaign fill; a zone group's own value and `optical_min_obs_history` once a
+line is loosened, ADR 028), but not `allow_s2_only` or `min_valid_coverage` — so exactly reproducing
+a cell needs the run's parameters from `context_docs/campaign/campaign-plan.md` rather than from the
+product.
 
 **Point access is expensive, and the store is not built for it** (§4.1). That is the geometry
 working as intended: whole-chunk reads are what make block reads fast and object counts manageable.

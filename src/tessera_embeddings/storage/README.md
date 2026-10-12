@@ -34,7 +34,10 @@ writers on one dataset. `manifest.py` refuses a write whose settings do not matc
 dataset's.
 
 `empty_store.py` creates a dataset with the right shape but no values in it, and
-`global_store.py` does that for all 120 groups at once, so filling never resizes anything.
+`global_store.py` does that for all 120 groups at once, so filling never resizes anything. It also
+owns the store's minimum optical depth rule: stamped on the root at seeding, loosened (never
+tightened) for the store or one zone by `loosen_optical_min_obs`, and read per zone through
+`effective_optical_min_obs` ([ADR 028](../../../context_docs/decisions/028-embed-every-pixel-with-an-optical-observation.md)).
 `shard_writer.py` then fills one group-year in parallel and `region_writes.py` works out where a
 block of data belongs. What stops two writers overwriting each other is the conflict check at
 commit time; `session_catch_up.py` only shortens the work that check has to do.

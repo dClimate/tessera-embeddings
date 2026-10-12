@@ -336,6 +336,26 @@ else ([ADR 027](../../../../context_docs/decisions/027-targeted-updates.md)). Th
 
 Run one update per cell at a time: two updates of one cell conflict on its chunks.
 
+#### Loosening the optical line, then updating
+
+A store's minimum optical depth rule moves only down, for the whole store or for named zones, and a
+`holes` update then embeds exactly the pixels the looser line admits
+([ADR 028](../../../../context_docs/decisions/028-embed-every-pixel-with-an-optical-observation.md)):
+
+1. **Loosen.** `scripts/update/loosen_optical_min_obs.py --store <uri> --line 1 [--zones 18N,19N] --go`
+   (a dry run without `--go`). The root, or each named zone, records the line it gives up in
+   `optical_min_obs_history`; every fill from then on reads its zone's rule from the store.
+2. **Plan.** `plan_update.py from-registry --name line1-<scope> --mode holes --where "refused_thin_px > 0"`
+   with the same `--zones` (a zone still at the old line would re-infer its holes and refuse them
+   again), optionally narrowed by `--aoi` or a mask built with `build-land-mask`. Every thin-refused
+   pixel is now a hole. The dry run prints each cell's shard counts: price them against
+   `context_docs/campaign/campaign-cost-model.md` and the holes-mode measurement (ADR 027 §3), not
+   an estimate.
+3. **Run** it as any update.
+4. **Check.** Updated tiles' `master/` rows carry `update_name`, `optical_min_obs = 1` and
+   `refused_thin_px = 0`; each cell's `updates[year]` record carries `optical_min_obs: 1`; the same
+   `plan_update.py` over the updated registry returns no cells.
+
 ## Master pipeline
 
 `tessera_full_pipeline.py` is the recommended entry point for end-to-end
