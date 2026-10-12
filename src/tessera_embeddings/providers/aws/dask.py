@@ -81,8 +81,8 @@ from tornado.ioloop import PeriodicCallback
 # hundred MiB — undersizing costs a whole run, not a retry.
 #
 # Raising the limit is a WEAK lever: a worker settles at ~72% of whatever it is given (caches
-# and allocator arenas expand into the space) while Dask pauses at 80%, leaving ~8% margin at
-# ANY size. Demand scales with a date's window count — the overlapped write holds every
+# and allocator arenas expand into the space) while Dask pauses at 90% (set below), leaving ~18%
+# margin at ANY size. Demand scales with a date's window count — the overlapped write holds every
 # window of a date concurrently — and that count varies by year, so the size follows the
 # asymptote of a long run over the densest dates. Measured peaks and the margin chosen
 # against them: context_docs/ingest/campaign-ingest-measurements.md.
@@ -593,6 +593,9 @@ class FargateConfig:
                 "DASK_DISTRIBUTED__ADMIN__TICK__LIMIT": "10s",
                 "DASK_DISTRIBUTED__COMM__TIMEOUTS__CONNECT": "60s",
                 "DASK_DISTRIBUTED__COMM__TIMEOUTS__TCP": "120s",
+                # Pause at 90%, not Dask's 80%: 2019 optical carries denser per-date metadata than
+                # other vintages and lifts the driver worker's peak toward the old threshold.
+                "DASK_DISTRIBUTED__WORKER__MEMORY__PAUSE": "0.90",
                 # Use unsigned requests for public S3 buckets (e.g. sentinel-s2-l1c)
                 "AWS_NO_SIGN_REQUEST": "YES",
                 # Task logs from Dask containers ship to the orchestrator API — Prefect's
