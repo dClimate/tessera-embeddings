@@ -1,10 +1,12 @@
 """Re-derive the registry measurements a resumed fill never recorded, and compact the result.
 
-47% of the published registry's rows (1,519,045 of 3,247,410) carry null in every measurement
-column. A refused tile's coverage record is written into its skip marker on object storage and
-survives every resume; an embedded tile's rides back in the actor's result and lives only in
-memory, so a resumed leg reports earlier legs' tiles as synthetic successes with no record. Every
-one of the 17,865 wholly-refused tiles is measured; only about half the embedded ones are.
+A refused tile's coverage record is written into its skip marker on object storage and survives
+every resume; an embedded tile's rides back in the actor's result and lives only in memory, so a
+resumed leg reports earlier legs' tiles as synthetic successes with no record. The v1.1 campaign
+published 1,519,045 of its 3,247,410 registry rows (47%) that way, null in every measurement
+column: every one of the 17,865 wholly-refused tiles was measured and only about half the embedded
+ones were. This script re-derived all of them; its output is the published registry's
+``rebuild/`` and ``master/`` (2026-10-12, ``context_docs/storage/registry-backfill.md``).
 
 Every column is derivable from the store, so this is a re-derivation rather than an estimate — see
 :mod:`tessera_embeddings.storage.registry_rebuild` for the proof that the fill's optical test

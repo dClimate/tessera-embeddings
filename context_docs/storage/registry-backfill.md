@@ -1,14 +1,17 @@
 # Re-deriving the registry measurements a resumed fill never recorded
 
 The published registry is the Parquet dataset beside the store that answers "is my area covered,
-and how well" without opening a petabyte. On the global campaign, **1,519,045 of its 3,247,410 rows
-(47%) carry null in every measurement column** — they name a tile and say nothing about it. Those
-columns are what an infill of refused pixels ranks shards by: how many pixels the depth rule
-refused, and how close the thin ones came to the line. Half the dataset cannot be ranked.
+and how well" without opening a petabyte. The global campaign published **1,519,045 of its
+3,247,410 rows (47%) with null in every measurement column**: they named a tile and said nothing
+about it. Those columns are what an infill of refused pixels ranks shards by: how many pixels the
+depth rule refused, and how close the thin ones came to the line.
 
-This is the code path that repairs them, what a full run costs, and what stops it happening again.
+**All 1,519,045 were re-derived from the store and published on 2026-10-12.** The registry's
+`master/` now carries measurements on every row, and `measured_by` says whether the fill or the
+rebuild produced them. This is the code path that did it, the run, and what stops it happening
+again.
 
-## Why the rows are empty
+## Why the rows were empty
 
 A shard's coverage record — three refusal counts, optical depth statistics, radar presence — is
 built once, in `actors._coverage_record`, and reaches the registry by one of two routes:
@@ -22,9 +25,9 @@ A resumed run's finishing leg reports earlier legs' tiles as synthetic successes
 record, so `registry_rows` writes their measurements as null — correctly, since null is how the
 registry says "nothing measured this" and a zero would assert a measurement nobody took.
 
-The evidence matches the mechanism exactly: **all 17,865 wholly-refused tiles are measured, and
-only 53% of embedded ones are.** The gap is at cell granularity — 299 zone-years have no
-measurements at all, 533 are complete, 162 partial.
+The campaign's parts match the mechanism exactly: **all 17,865 wholly-refused tiles were measured,
+and only 53% of embedded ones were.** The gap was at cell granularity: 299 zone-years had no
+measurements at all, 533 were complete, and 162 were partial.
 
 ## The rebuild is a re-derivation, and that is provable
 
@@ -92,11 +95,11 @@ rather than as a mismatch, because a whole-tile rebuild of one is expected to di
              _common_metadata, and two columns saying where each row's numbers came from.
 ```
 
-The compaction is not new work invented here: `registry.py` already defers deduplication of a
-twice-filled cell to "the compaction step's decision", and
-[`reading-the-published-store.md`](reading-the-published-store.md) §6 records the absent compacted
-master and `_common_metadata` as what forces every consumer to state the schema themselves. This
-closes both.
+The compaction is not new work invented here. `registry.py` already defers deduplication of a
+twice-filled cell to "the compaction step's decision". Without a compacted master and its
+`_common_metadata`, every consumer had to state the schema themselves or risk `pyarrow` dropping a
+column. The master closes both; [`reading-the-published-store.md`](reading-the-published-store.md)
+§5 has the reader's recipe.
 
 **A refill supersedes a cell wholesale.** A part is one complete run of one cell, so only each
 cell's most recently assembled fill run is a candidate, and only rebuild rows re-derived against
@@ -123,8 +126,9 @@ own `assembled_at`.
 
 ## Running it
 
-`scripts/maintenance/rebuild_registry_measurements.py`, four subcommands run in this order. Every
-writing subcommand is a **dry run** without `--write`.
+`scripts/maintenance/rebuild_registry_measurements.py`, four subcommands run in this order. It is
+how v1.1 was repaired (next section), and how a future store is repaired after a resumed fill
+until the durable fix below lands. Every writing subcommand is a **dry run** without `--write`.
 
 ```
 gate      re-derive rows that ALREADY carry measurements and compare. Writes nothing, ever.
@@ -159,9 +163,10 @@ uv run python $S compact --registry ./reg --write
 uv run python $S verify  --registry ./reg
 ```
 
-**Split a full run across processes by zone.** One process saturates at about 3.6 cores — the
-per-tile decode and counting hold the GIL for part of their time — so a 16-vCPU host runs four
-processes over disjoint `--zones` lists. `--zones` is applied in Arrow before rows become Python
+**Split a full run across processes by zone.** The per-tile decode and counting hold the GIL for
+part of their time, so one process keeps only a few cores busy: about 3.6 on a laptop, and about
+2.2 in-region, where it also waits on reads. The v1.1 run used eight processes on 32 vCPU, each
+over its own `--zones` list. `--zones` is applied in Arrow before rows become Python
 objects; the whole registry as dicts is ~6.7 GB, so each process holds only its share. Re-running a
 pass with the same `--run-id` overwrites the same parts, so a failed process is re-run for its zones
 alone. `compact` peaks at 8.7 GB and `verify` at 12.1 GB of memory, measured over the full registry.
@@ -179,10 +184,32 @@ place, because S3 has no rename and a pointer to a staged prefix is a protocol e
 have to learn: a reader during those seconds can see a partial master, `verify` fails on one, and
 re-running `compact` repairs it.
 
-## Verified against the published store
+## The v1.1 run
 
-Rehearsed read-only on 2026-10-08 from a laptop: anonymous reads of the public store, a local copy of
-the registry, every write to local disk. Four zone-years chosen for what they hold:
+Commit `dff02e9e` ran on 2026-10-10 on one `c7i.8xlarge` (32 vCPU) in us-west-2. It read the
+public store and a copy of `parts/` anonymously, wrote to local disk, and ran `rebuild` as 8
+processes over zone lists balanced by null rows. The output was uploaded to a staging prefix and
+verified there. On 2026-10-12, `rebuild/` and `master/` were copied into
+`s3://tessera-embeddings/v1.1/dclimate.registry/`, and `verify` passed against the published
+registry.
+
+| step | wall time | read | result |
+|---|---|---|---|
+| `gate --sample 50000` | 28 min | 41 GB | 39,578 rows across 695 cells: 39,539 identical, 39 `cropped`, **0 mismatches**; the identity held on 1,728,365 of 1,728,365 rows |
+| `rebuild`, full pass with radar | 2 h 52 min | 1,553 GB | 1,519,045 rows in 461 parts, one per cell; 0 cells blocked |
+| `compact`, then `verify` | under 1 min each | — | 3,247,410 rows: 1,728,365 measured by the fill, 1,519,045 by the rebuild, 0 unmeasured |
+
+An independent read of the published `master/` confirms 3,247,410 distinct tile-years, no null
+`refused_px` or `px_with_any_radar`, and `refused_no_optical_px == chunk_px - px_with_any_optical`
+on every rebuilt row. `master/` is 995 objects and 151 MB (one file per cell plus
+`_common_metadata`); `rebuild/` is 461 objects and 70 MB. The run cost about $7: $5 of instance
+time and $1.50 of GETs.
+
+## The proof, rehearsed first
+
+The run was rehearsed read-only on 2026-10-08 from a laptop: anonymous reads of the public store, a
+local copy of the registry, and every write to local disk. Four zone-years were chosen for what they
+hold:
 
 | zone-year | what it holds | what ran | result |
 |---|---|---|---|
@@ -191,46 +218,23 @@ the registry, every write to local disk. Four zone-years chosen for what they ho
 | 23N/2017 | 1,063 wholly refused tiles never imaged, 339 null | `rebuild`, both passes | 339 rebuilt; optical columns identical across the two passes |
 | 49S/2021 | wholly null, 943 tiles | `rebuild`, both passes | 943 rebuilt |
 
-`compact` then merged the four cells' 4,200 part rows and 2,601 rebuilt rows into 4,200 master rows
-— 2,881 measured by the fill, 1,319 by the rebuild, every rebuilt row from the radar pass — and
-`verify` passed. Over the full registry plus a placeholder `rebuild/` of all 1,519,045 rows,
-`compact` took 7.9 s and `verify` 22 s, and `verify` passed.
+The 09N/2021 gate is the proof. A cell the fill measured completely was re-derived from the store
+without reference to the fill's numbers, and it agrees on every refusal count, depth statistic and
+radar count of every tile.
 
-The 09N/2021 gate is the proof: a cell the fill measured completely, re-derived from the store
-without reference to the fill's numbers, agrees on every refusal count, depth statistic and radar
-count of every tile. The identity in the previous section also holds on all 1,728,365 measured rows
-of a fresh download of the registry.
+## What a run costs
 
-## What a full run costs
+Per embedded tile, the full pass reads about 1.0 MB in 2.5 GETs: 1,553 GB over 1,519,045 rows in
+the v1.1 run. The optical-only pass reads about 0.7 MB in one GET, since `s2_obs_count` is a single
+~0.5–0.75 MB shard; radar shards are smaller and often absent. An absent shard costs no request,
+because Icechunk answers it from the manifest.
 
-The rebuild re-derives 1,519,045 null rows in 461 zone-years (299 wholly null, 162 partly), plus
-3,573 in-cell gate tiles. Measured per embedded tile in the sample: **0.69 MB and one GET** for the
-optical pass (`s2_obs_count`, one ~0.5–0.75 MB shard), **1.25 MB and 2.5 GETs** for the full pass;
-**46 ms and 81 ms of CPU** on the laptop (an M3 Max), network handling included. An absent shard
-costs no request: Icechunk answers it from the manifest.
-
-| step | data | GETs | laptop, this link | laptop $ | us-west-2 | us-west-2 $ |
-|---|---|---|---|---|---|---|
-| `gate --sample 50000` | 50 GB | 0.10 M | 8 h | $5 | ~6 min | $0.10 |
-| `rebuild --skip-radar` | 1.05 TB | 1.52 M | 7 days | $100 | 2.1–2.8 h | $1.80–2.20 |
-| `rebuild` (radar) | 1.91 TB | 3.87 M | 13 days | $182 | 3.7–4.9 h | $3.70–4.40 |
-| `compact` + `verify` | 0.5 GB | ~3 k | ~6 min | <$0.05 | ~1 min | ~$0 |
-
-**Measured:** per-tile bytes, GETs and CPU; the laptop's link (1.8 MB/s, saturated through every
-run); the row and tile counts; `compact` and `verify` at full scale. **Extrapolated:** every
-full-run time and dollar figure, from these assumptions —
-
-* S3 GET at $0.0004 per 1,000; in-region transfer free.
-* From a laptop the data leaves AWS: internet egress at $0.09/GB, billed to the **bucket owner**
-  because anonymous reads cannot be requester-pays. That is the laptop's whole cost.
-* In-region: one `c7g.4xlarge` (16 vCPU, 32 GB, $0.58/h on demand), four processes keeping ~14
-  vCPUs busy, a cloud vCPU 1.5–2× slower than an M3 Max core. The run is CPU-bound there at about
-  145 MB/s; a 16 vCPU / 32 GB Fargate task ($0.79/h) costs about a third more.
-
-The laptop is link-bound, not CPU-bound: on a 1 Gbps link the optical pass would take ~3 h, with
-the same egress bill. **Run it in us-west-2.** There, skipping the optical-only pass and running
-the full pass alone lands every column in ~4–5 h for ~$4; the separate optical pass buys an earlier
-answer for about two more hours and two more dollars.
+**Run it in us-west-2.** In-region, transfer is free and the whole repair costs a few dollars.
+From a laptop the run is bound by the link: about 7 days for the optical pass and 13 for the full
+one on a 1.8 MB/s link. It also costs about $290 of internet egress, billed to the **bucket owner**
+because anonymous reads cannot be requester-pays. On a fresh host, set `UV_PYTHON=3.13`. Left to
+itself, `uv` picked a Python release that `msgpack` publishes no wheel for, and the environment
+failed to build.
 
 ## Why the new modules sit outside `inference/`
 
@@ -243,8 +247,8 @@ own schemas rather than extending the registry's writer.
 
 ## Stopping it happening again
 
-The rebuild repairs what is published; it does not stop the next resumed fill from leaving the same
-gap. Two pieces close that, and only the second is part of the backfill.
+The rebuild repaired what was published; it does not stop the next resumed fill from leaving the
+same gap. Two pieces close that, and only the second is part of the backfill.
 
 **The durable fix is a separate decision.** Branch `registry/persist-coverage-record` makes
 `write_chunk` persist the coverage record as a tile attribute, written with `staged_complete` and
@@ -258,8 +262,9 @@ the time; see [`staging-identity-and-resume.md`](staging-identity-and-resume.md)
 backfill depends on it.
 
 **The gap is now visible.** `scripts/diagnostic/published_registry_census.py` counts rows with no
-measurements, per cell and in total, and fails above `--max-unmeasured` — zero by default. It counts
-over `master/` once one exists — and fails a master that does not hold exactly the newest runs'
-tile-years — and over `parts/` before that, so it fails on the published registry until the backfill
-is compacted. The campaign finished green with half its coverage record absent because every other
-check asks whether the rows are shaped right and none asked whether they hold numbers.
+measurements, per cell and in total, and fails above `--max-unmeasured` (zero by default). It counts
+over `master/` when one exists, and fails a master that does not hold exactly the newest runs'
+tile-years. Over a registry without a master it counts `parts/`. On the published v1.1 registry it
+counts `master/` and finds no unmeasured row. The campaign finished green with half its coverage
+record absent because every other check asked whether the rows were shaped right, and none asked
+whether they held numbers.

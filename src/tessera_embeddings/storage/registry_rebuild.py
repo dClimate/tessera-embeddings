@@ -9,13 +9,14 @@ refusal counts and depth statistics from the ``*_obs_count`` arrays the store al
 marker on object storage and survives every resume. An embedded tile's record rides back in the
 actor's result and lives only in memory, so the leg that finishes a resumed run reports earlier
 legs' tiles as synthetic successes carrying no record, and those rows publish null. The asymmetry
-is the whole cause: every wholly-refused tile in the published registry is measured, and only about
-half the embedded ones are.
+is the whole cause: every wholly-refused tile in the v1.1 campaign's parts was measured, and only
+about half the embedded ones were. This module re-derived the other 1,519,045 rows, published in
+the registry's ``rebuild/`` and ``master/``.
 
 **The rebuild is a re-derivation, not an estimate — and that is checkable.** The fill's optical test
 is ``has_optical = s2_nonzero & (s2_valid_count > 0)`` (:mod:`..inference.dataset`), where
 ``s2_nonzero`` tests reflectance bands the store does not keep. If that term had ever removed a
-pixel the split could not be reproduced from the store. Across all 1,728,365 measured rows of the
+pixel the split could not be reproduced from the store. Across all 1,728,365 rows the fill measured in the
 published registry, ``refused_no_optical_px == eligible_px - px_with_any_optical`` holds exactly,
 with zero pixels of discrepancy — so on the delivered product ``has_optical`` *is*
 ``s2_obs_count > 0``, and every refusal column reduces to counting one array. :func:`compare_row`
