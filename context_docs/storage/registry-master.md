@@ -103,7 +103,7 @@ future infill, not something this code can check.
 - **A re-derived row must name its fill.** `as_master_rows` refuses one without `filled_at`, which
   would otherwise pass for a newer run and beat the fill's measurement.
 - **An existing master row survives only while its run still has a part** (`still_published`).
-  A run withdrawn by deleting its part would otherwise keep winning through the master's copy of
+  A run whose part is deleted would otherwise keep winning through the master's copy of
   its rows, which carry the newest `filled_at`.
 - **Repair checks, for every cell, that the store holds the cell's newest run.** The zone group's
   `runs` attribute names the last run that wrote each year, and it must be the newest run in the
@@ -195,8 +195,13 @@ aws s3api copy-object --bucket tessera-embeddings --key "$KEY" \
 
 The copy becomes the current version and the replaced one stays recoverable. The master is merged
 from `parts/`, though, so a rollback that disagrees with the parts is flagged by `verify` and undone
-by the cell's next fill. To withdraw a run, delete its part (also versioned) and then `repair` the
-cell.
+by the cell's next fill.
+
+**A run cannot be withdrawn from the registry alone**, because the master describes what the store
+holds. To replace a run's data, refill the cell: the refill's part supersedes it tile by tile.
+Deleting a part (also versioned) and then running `repair` is only for a part that describes nothing
+the store holds, such as a run whose commit was itself rolled back. `repair` refuses a cell whose
+store still names the deleted run.
 
 ## Why none of this moves a code identity
 
