@@ -105,7 +105,7 @@ from tessera_embeddings.orchestration.runners.zone_fill import (
 )
 from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.object_store import delete_prefix
-from tessera_embeddings.storage.update import load_update, update_states
+from tessera_embeddings.storage.update import finish_update, load_update, update_states
 from tessera_embeddings.storage.zone_grid import canonicalize_zone
 
 if TYPE_CHECKING:
@@ -852,7 +852,7 @@ def fill_zones_sequential_flow(
 
     # Lazily import the AWS providers so the flow file imports on machines without ray/boto
     # installed (arch tests, local inspection).
-    from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
+    from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials, icechunk_credentials_for
     from tessera_embeddings.providers.aws.ray import (
         cluster_name_for_flow_run,
         make_instance_terminator,
@@ -956,15 +956,27 @@ def fill_zones_sequential_flow(
     # would refuse them, but here before any ingest or cluster).
     update_done: list[tuple[str, int]] = []
     not_filled: list[tuple[str, int]] = []
+    # The STORE's credential: in production the store is the partner's published bucket, which the
+    # task role cannot read.
+    store_credentials = icechunk_credentials_for(store_path, iam_icechunk_credentials)
     states = (
         update_states(
-            open_global_repo(store_path, get_credentials=iam_icechunk_credentials, region=s3_region),
-            plan.name,
-            cells,
+            open_global_repo(store_path, get_credentials=store_credentials, region=s3_region), plan.name, cells
         )
         if plan is not None
         else {}
     )
+
+    def _finish(result: dict[str, Any]) -> dict[str, Any]:
+        """Pin the update's complete tag once every planned cell holds its record, whichever run lands last."""
+        if plan is not None and (
+            tag := finish_update(
+                open_global_repo(store_path, get_credentials=store_credentials, region=s3_region), plan
+            )
+        ):
+            log.info("Update %s has landed in every planned cell: tagged %s", plan.name, tag)
+            result["update_complete_tag"] = tag
+        return result
 
     # Resolved ONCE here, in the flow's own thread: the trailing assembly thread carries no
     # Prefect context, so reading the runtime id inside `_validate` would yield None for every
@@ -1149,7 +1161,7 @@ def fill_zones_sequential_flow(
     }
     if not live:
         log.info("No live cells — no Ray cluster needed")
-        return {**summary, "sequential": None}
+        return _finish({**summary, "sequential": None})
 
     # Fail loudly BEFORE provisioning Ray if the store was seeded for a
     # different encoder/checkpoint than this build embeds with.
@@ -1516,4 +1528,4 @@ def fill_zones_sequential_flow(
         len(retagged),
         len(empty),
     )
-    return {**summary, "sequential": seq}
+    return _finish({**summary, "sequential": seq})

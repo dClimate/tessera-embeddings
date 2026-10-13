@@ -186,7 +186,8 @@ class TestAnUpdate:
         }
         monkeypatch.setattr(mod, "update_states", lambda repo, name, cells: {c: states[c] for c in cells})
         monkeypatch.setattr(mod, "zone_year_complete", lambda *a, **k: pytest.fail("an update must never retag"))
-        wired["tiles"], wired["ingests"] = {}, []
+        wired["tiles"], wired["ingests"], wired["finished"] = {}, [], []
+        monkeypatch.setattr(mod, "finish_update", lambda repo, plan: wired["finished"].append(plan.name) or "t")
 
         def count(mask, zone, **k):
             wired["tiles"][zone] = (mask, k["tiles"])
@@ -217,6 +218,8 @@ class TestAnUpdate:
         # The live cell's ingest runs as the update, and its fill is planned as one.
         assert [p["update"] for p in update_wired["ingests"]] == ["u1"]
         assert update_wired["seq_kwargs"]["cells"][0].zone == "01N"
+        # A one-cluster update pins its complete tag too, once every planned cell holds the record.
+        assert update_wired["finished"] == ["u1"] and result["update_complete_tag"] == "t"
 
     def test_a_cell_outside_the_plan_is_refused(self, update_wired):
         with pytest.raises(ValueError, match="not in update 'u1'"):
