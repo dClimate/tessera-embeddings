@@ -257,17 +257,27 @@ class TestVerify:
         _seed_master(tmp_path, radar=None)
         assert script.main(["verify", "--registry", str(tmp_path)]) == 0
 
+    @pytest.mark.parametrize("zones", [[], ["--zones", "35N"]], ids=["every-zone", "only-that-zone"])
     def test_a_first_fill_whose_part_never_published_fails(
-        self, script: Any, store: zarr.Group, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: Any
+        self,
+        script: Any,
+        store: zarr.Group,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: Any,
+        zones: list[str],
     ) -> None:
-        """Its cell has no part and no master file, so only the store's tagged commit shows it."""
+        """Its zone has no part and no master file, so only the store's tagged commit shows it, named or not."""
         _seed(tmp_path)
         _seed_master(tmp_path, radar=None)
-        writes = {("33N", 2018): [Commit("first-fill", FILLED, "s-a")]}
-        monkeypatch.setattr(script, "_open_store", lambda *_args, **_kwargs: (None, {"33N": store}, lambda: writes))
+        zone = zarr.open_group(str(tmp_path / "35N.zarr"), mode="w")
+        zone.create_array("time", data=store["time"][:])
+        writes = {("35N", 2017): [Commit("first-fill", FILLED, "s-a")]}
+        root = {"33N": store, "35N": zone}
+        monkeypatch.setattr(script, "_open_store", lambda *_args, **_kwargs: (None, root, lambda: writes))
         monkeypatch.setattr(published_store, "commit_tiles", lambda *_args: frozenset({"chunk_0_0"}))
-        assert script.main(["verify", "--registry", str(tmp_path)]) == 1
-        assert "33N/2018: the store cannot stand behind its parts: run 'first-fill'" in capsys.readouterr().out
+        assert script.main(["verify", "--registry", str(tmp_path), *zones]) == 1
+        assert "35N/2017: the store cannot stand behind its parts: run 'first-fill'" in capsys.readouterr().out
 
     @pytest.mark.parametrize(
         "damage",

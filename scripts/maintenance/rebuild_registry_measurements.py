@@ -460,8 +460,9 @@ def cmd_verify(args: argparse.Namespace) -> int:
     parts = _registry_table(fs, args.registry, "parts", dataset_schema())
     master = _registry_table(fs, args.registry, "master", master_schema())
     if args.zones:
+        # With the store checked, `_every_cell` checks the zones against its commits too, below.
         held = set(parts.column("zone").to_pylist()) | set(master.column("zone").to_pylist())
-        if absent := sorted(set(args.zones) - held):
+        if args.parts_only and (absent := sorted(set(args.zones) - held)):
             raise SystemExit(f"--zones names zones the registry does not hold: {', '.join(absent)}")
         parts, master = (
             table.filter(pc.is_in(table.column("zone"), pa.array(args.zones))) for table in (parts, master)
