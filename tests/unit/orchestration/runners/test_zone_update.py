@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import zarr
 
+from tessera_embeddings.config.inference import InferenceConfig
 from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.orchestration.runners import zone_fill
 from tessera_embeddings.storage import global_store
@@ -24,6 +25,8 @@ from tests.unit.orchestration.runners.test_zone_fill import (
 )
 
 _LIVE = [(0, 0), (0, 1), (1, 1)]
+#: The campaign's radar policy, which a holes update must share (`check_radar_policy`).
+_S2_ONLY = InferenceConfig(time_window=_config().time_window, chunk_size=_TILE, num_gpus=0, allow_s2_only=True)
 _YEAR_INDEX = 1  # 2025 on the (2024, 2025) axis
 
 
@@ -83,6 +86,7 @@ def _update(filled, monkeypatch, target: UpdateTarget, *, seed: int = 11, skip: 
         land_mask_path=filled["mask"],
         mosaic_base=filled["mosaic"],
         staging_base=str(filled["tmp"] / "update-staging"),
+        config=_S2_ONLY,
         run_id=run_id,
         update=target,
     )
@@ -155,6 +159,13 @@ def test_a_target_that_embeds_nothing_is_kept_unless_the_plan_clears_it(filled, 
         np.testing.assert_array_equal(_tile(after["scales"], 0, 1), _tile(before["scales"], 0, 1))
     [record] = node.attrs["updates"]["2025"]
     assert (record["kept"], record["cleared"]) == (([], ["chunk_0_1"]) if cleared else (["chunk_0_1"], []))
+
+
+def test_a_holes_update_refuses_the_radar_rule(filled, monkeypatch):
+    """Its registry rows are re-derived from the store, which cannot reproduce a radar refusal."""
+    monkeypatch.setattr(zone_fill, "run_inference", lambda *a, **k: pytest.fail("inferred under the radar rule"))
+    with pytest.raises(ValueError, match="allow_s2_only"):
+        _fill(filled["tmp"], filled["store"], land_mask_path=filled["mask"], update=_target(filled, mode="holes"))
 
 
 def test_an_update_already_recorded_does_nothing(filled, monkeypatch):

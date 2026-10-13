@@ -105,7 +105,7 @@ from tessera_embeddings.orchestration.runners.zone_fill import (
 )
 from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.object_store import delete_prefix
-from tessera_embeddings.storage.update import finish_update, load_update, update_states
+from tessera_embeddings.storage.update import check_radar_policy, finish_update, load_update, update_states
 from tessera_embeddings.storage.zone_grid import canonicalize_zone
 
 if TYPE_CHECKING:
@@ -866,6 +866,7 @@ def fill_zones_sequential_flow(
     if plan is None and cells is None:
         raise ValueError("cells is required unless an update supplies them")
     if plan is not None:
+        check_radar_policy(plan, allow_s2_only=allow_s2_only)
         # The plan, not the parameters, decides what an update reads and how strictly.
         mask_name, allow_partial_window = plan.mask_name, plan.allow_partial_window
         ingest_settings = ingest_settings.model_copy(update={"min_valid_coverage": plan.min_valid_coverage})

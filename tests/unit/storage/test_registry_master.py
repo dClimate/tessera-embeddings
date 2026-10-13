@@ -315,6 +315,16 @@ class TestUpdateCell:
         assert master.column("run_id").to_pylist() == ["infill", "rebuild-1"], "the re-derived row survives"
         assert pq.read_schema(registry / "master" / "_common_metadata").names == master_schema().names
 
+    def test_a_stale_dataset_schema_is_replaced_when_a_column_is_added(self, registry: Path) -> None:
+        """Readers take the master's schema from `_common_metadata`; one written before a column was added
+        (``update_name``, say) would silently drop that column from every read until something rewrote it.
+        """
+        meta = registry / "master" / "_common_metadata"
+        with meta.open("wb") as out:
+            pq.ParquetWriter(out, master_schema().remove(master_schema().get_field_index("update_name"))).close()
+        update_cell(LocalFileSystem(), str(registry), "33N", 2017)
+        assert "update_name" in pq.read_schema(meta).names
+
     def test_running_it_again_writes_the_same_file(self, registry: Path) -> None:
         """A fill retried after its update, and a repair after a fill, must both leave the cell as it was."""
         update_cell(LocalFileSystem(), str(registry), "33N", 2017)

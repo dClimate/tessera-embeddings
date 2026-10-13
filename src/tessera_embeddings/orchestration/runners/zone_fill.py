@@ -86,6 +86,7 @@ from tessera_embeddings.storage.time_axis import time_index_of, year_timestamp
 from tessera_embeddings.storage.update import (
     UpdateTarget,
     base_tag,
+    check_radar_policy,
     commit_update_record,
     stage_hole_masks,
     update_record,
@@ -663,6 +664,7 @@ def plan_zone_inference(
     # Zone-year tags are write-once forever — icechunk forbids tag-name reuse even after
     # deletion — so deliberate refills need a fresh tag name.
     if update is not None:
+        check_radar_policy(update, allow_s2_only=config.allow_s2_only)
         state = update_state(node, year, update.name)
         if state == "not_complete":
             raise ValueError(

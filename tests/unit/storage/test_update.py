@@ -11,6 +11,7 @@ import zarr
 
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.inference.chunk_spec import enumerate_chunks, read_pixel_mask
+from tessera_embeddings.storage import campaign
 from tessera_embeddings.storage import update as upd
 from tessera_embeddings.storage.campaign import pin_tag
 from tessera_embeddings.storage.zarr_store import open_or_create_repo
@@ -87,6 +88,8 @@ def _row(tile: str, refused: int, box: tuple[float, float, float, float]) -> dic
         (None, (-100.0, 40.0, -99.0, 41.0), {"14N/2019": ("chunk_0_0", "chunk_0_1")}),
         # Zone 60's antimeridian row (west > east) intersects a box just east of -180.
         (None, (-179.9, 10.0, -179.0, 11.0), {"60N/2019": ("chunk_0_0",)}),
+        # And an AOI that itself crosses the antimeridian still finds the crossing row.
+        (None, (179.0, 10.0, -179.0, 11.0), {"60N/2019": ("chunk_0_0",)}),
     ],
 )
 def test_a_plan_can_come_from_the_registry(tmp_path, where, aoi, cells):
@@ -97,7 +100,8 @@ def test_a_plan_can_come_from_the_registry(tmp_path, where, aoi, cells):
                 _row("chunk_0_0", 0, (-99.8, 40.2, -99.6, 40.4)),
                 _row("chunk_0_1", 5, (-99.6, 40.2, -99.4, 40.4)),
             ],
-            ("60N", 2019): [_row("chunk_0_0", 3, (179.9, 10.2, -179.8, 10.4))],
+            # A cell file written after a column was added: the scan must still read the others.
+            ("60N", 2019): [_row("chunk_0_0", 3, (179.9, 10.2, -179.8, 10.4)) | {"update_name": "earlier"}],
         },
     )
     plan = upd.plan_from_registry(root, name="fill-thin", mode="holes", where=where, aoi=aoi)
@@ -143,6 +147,10 @@ def test_an_update_record_appends_and_leaves_the_fill_alone(zone_repo):
     assert [r["update"] for r in upd.read_updates(node, 2024)] == ["fix-1"]
     assert node.attrs["years_complete"] == [2024] and node.attrs["runs"]["2024"]["run_id"] == "fill"
     assert upd.last_run_id(dict(node.attrs), 2024) == "u-run"
+    # An update that wrote nothing published no part, so it does not become the cell's last writer.
+    noop = upd.update_record(_target("noop"), run_id="noop-run", written=[], kept=["chunk_0_0"])
+    upd.commit_update_record(zone_repo, "01N", 2024, record=noop)
+    assert upd.last_run_id(dict(_node(zone_repo).attrs), 2024) == "u-run"
     assert upd.update_states(zone_repo, "fix-1", [("01N", 2024), ("01N", 2025)]) == {
         ("01N", 2024): "done",
         ("01N", 2025): "not_complete",
@@ -206,3 +214,26 @@ def test_hole_masks_cover_the_holes_and_are_reused(tmp_path, zone_repo):
     zarr.open_group(session.store, mode="a")["01N"]["scales"][0, :2, :2] = 1.0
     session.commit("the update filled it")
     assert upd.stage_hole_masks(_node(zone_repo), year_index=0, chunks=chunks, prefix=prefix) == masks
+
+
+def test_a_base_tag_race_lost_to_another_cluster_still_succeeds(zone_repo, monkeypatch):
+    """Two clusters plan cells of one update at once; the one whose create collides finds the tag pinned."""
+
+    def collide(repo, tag, sid, *, explicit):
+        repo.create_tag(tag, sid)
+        raise icechunk.IcechunkError("tag already exists")
+
+    monkeypatch.setattr(campaign, "_ensure_tag", collide)
+    assert pin_tag(zone_repo, upd.base_tag("fix-1")) == upd.base_tag("fix-1")
+
+
+@pytest.mark.parametrize(
+    ("mode", "allow_s2_only", "refused"), [("holes", False, True), ("holes", True, False), ("shards", False, False)]
+)
+def test_a_holes_update_needs_the_campaigns_radar_policy(mode, allow_s2_only, refused):
+    plan = _plan(mode=mode)
+    if refused:
+        with pytest.raises(ValueError, match="allow_s2_only"):
+            upd.check_radar_policy(plan, allow_s2_only=allow_s2_only)
+    else:
+        upd.check_radar_policy(plan, allow_s2_only=allow_s2_only)

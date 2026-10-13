@@ -325,7 +325,8 @@ def write_cell(fs: FileSystem, registry_root: str, zone: str, year: int, rows: p
 
     One object per cell, replaced whole, so a reader sees the old file or the new one and never a
     mixture, and no two cells share an object. ``_common_metadata`` is the same bytes for every
-    cell, so it is written only when absent rather than raced by every fill.
+    cell, so it is written only when absent or behind the current schema (a column added since, which
+    readers taking their schema from it would otherwise drop) rather than raced by every fill.
     """
     path = f"{_bare(registry_root)}/master/zone={zone}/year={year}/part-0.parquet"
     buf = io.BytesIO()
@@ -334,9 +335,16 @@ def write_cell(fs: FileSystem, registry_root: str, zone: str, year: int, rows: p
     fs.create_dir(path.rsplit("/", 1)[0])
     with fs.open_output_stream(path) as out:
         out.write(buf.getvalue())
-    if fs.get_file_info(f"{_bare(registry_root)}/master/_common_metadata").type == FileType.NotFound:
+    meta = f"{_bare(registry_root)}/master/_common_metadata"
+    if fs.get_file_info(meta).type == FileType.NotFound or not _schema_is_current(fs, meta):
         write_common_metadata(fs, registry_root)
     return path
+
+
+def _schema_is_current(fs: FileSystem, meta: str) -> bool:
+    """Whether the ``_common_metadata`` at ``meta`` declares :func:`master_schema`'s columns."""
+    with fs.open_input_file(meta) as f:
+        return pq.read_schema(f).remove_metadata().equals(master_schema().remove_metadata())
 
 
 def write_common_metadata(fs: FileSystem, registry_root: str) -> None:

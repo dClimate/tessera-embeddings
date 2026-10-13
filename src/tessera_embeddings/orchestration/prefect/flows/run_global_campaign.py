@@ -89,7 +89,13 @@ from tessera_embeddings.storage.campaign import (
 from tessera_embeddings.storage.global_store import open_global_repo, set_saved_manifest_preload
 from tessera_embeddings.storage.object_store import delete_prefix
 from tessera_embeddings.storage.time_axis import CAMPAIGN_YEARS
-from tessera_embeddings.storage.update import UpdatePlan, finish_update, load_update, update_states
+from tessera_embeddings.storage.update import (
+    UpdatePlan,
+    check_radar_policy,
+    finish_update,
+    load_update,
+    update_states,
+)
 from tessera_embeddings.storage.zarr_store import is_missing_repo, open_store_group_and_tip
 from tessera_embeddings.storage.zone_grid import canonicalize_zone
 
@@ -461,7 +467,14 @@ def _partition_by_live_tiles(
     return [cl for cl in clusters if cl]
 
 
-def _update_work(plan: UpdatePlan, cells: Iterable[tuple[str, int]], land_mask_path: str) -> dict[str, float]:
+def _update_work(
+    plan: UpdatePlan,
+    cells: Iterable[tuple[str, int]],
+    land_mask_path: str,
+    *,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+    s3_region: str | None = None,
+) -> dict[str, float]:
     """Each zone's share of an update's work: its cells' live target shards, summed.
 
     What balances an update's clusters, since its cells are all complete and the campaign's own
@@ -471,7 +484,9 @@ def _update_work(plan: UpdatePlan, cells: Iterable[tuple[str, int]], land_mask_p
     work: dict[str, float] = {}
     for zone, year in cells:
         tiles = plan.cells[f"{zone}/{year}"]
-        work[zone] = work.get(zone, 0.0) + zone_live_tile_count(land_mask_path, zone, tiles=tiles)
+        work[zone] = work.get(zone, 0.0) + zone_live_tile_count(
+            land_mask_path, zone, get_credentials=get_credentials, s3_region=s3_region, tiles=tiles
+        )
     return work
 
 
@@ -968,6 +983,7 @@ async def run_global_campaign(
     plan: UpdatePlan | None = load_update(paths, update, mask_name=mask_name) if update is not None else None
     if plan is not None:
         mask_name = plan.mask_name
+        check_radar_policy(plan, allow_s2_only=allow_s2_only)
     campaign_years = (
         tuple(years)
         if years is not None
@@ -1450,7 +1466,17 @@ async def run_global_campaign(
                         z: sum(1 for zz, y in batch_cells if zz == z and not status.has(z, y)) for z in batch_zones
                     },
                     # An update's cells are all complete, so its work is its shards instead.
-                    work=_update_work(plan, batch_cells, land_mask_path) if plan is not None else None,
+                    work=(
+                        _update_work(
+                            plan,
+                            batch_cells,
+                            land_mask_path,
+                            get_credentials=iam_icechunk_credentials,
+                            s3_region=s3_region,
+                        )
+                        if plan is not None
+                        else None
+                    ),
                     get_credentials=iam_icechunk_credentials,
                     s3_region=s3_region,
                 )

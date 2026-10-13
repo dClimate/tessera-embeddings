@@ -44,18 +44,23 @@ import fsspec
 import icechunk
 import numpy as np
 import polars as pl
+import pyarrow as pa
 import zarr
 
 from tessera_embeddings.config.environment import code_identity
 from tessera_embeddings.config.paths import BucketPaths, check_update_name
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, parse_chunk_label, read_pixel_mask, write_pixel_mask
 from tessera_embeddings.storage.campaign import pin_tag
+from tessera_embeddings.storage.registry_master import master_schema
 from tessera_embeddings.storage.shard_writer import commit_with_rebase, read_years_complete
 from tessera_embeddings.storage.zone_grid import canonicalize_zone
 
 UpdateMode = Literal["holes", "shards"]
 OnSkip = Literal["keep", "clear"]
 UpdateState = Literal["pending", "done", "not_complete"]
+
+#: The registry's hive partition keys, which come from the path rather than the files.
+_PARTITION_KEYS = ("zone", "year")
 
 #: The zone-group attr holding each year's update records.
 UPDATES_ATTR = "updates"
@@ -222,6 +227,23 @@ def load_plan(uri: str) -> UpdatePlan:
         return UpdatePlan.from_json(f.read().decode())
 
 
+def check_radar_policy(plan: UpdatePlan | UpdateTarget, *, allow_s2_only: bool) -> None:
+    """Refuse a ``holes`` update run with the radar rule on.
+
+    A merged shard's registry rows are re-derived from the store, and the store records whether a
+    pixel had radar but not which pixels a radar rule refused, so those rows cannot describe a run
+    that enforced one. The campaign embeds radar-free pixels (``allow_s2_only``); its updates must too.
+
+    Raises:
+        ValueError: If ``plan`` is a ``holes`` update and ``allow_s2_only`` is false.
+    """
+    if plan.mode == "holes" and not allow_s2_only:
+        raise ValueError(
+            f"Update {plan.name!r} fills holes, which needs allow_s2_only=True: the registry rows of a merged "
+            "shard are re-derived from the store, which cannot reproduce a radar refusal"
+        )
+
+
 def load_update(paths: BucketPaths, name: str, *, mask_name: str = "global") -> UpdatePlan:
     """Load update ``name``'s plan for a flow, refusing a mask that contradicts it.
 
@@ -254,15 +276,22 @@ def plan_from_registry(
 
     ``where`` is a SQL expression over the master's columns, e.g. ``"refused_thin_px > 0"`` (rank
     by ``median_obs_where_thin``, not ``median_obs_where_any``; see :mod:`.registry`). ``aoi`` is a
-    WGS84 ``(west, south, east, north)`` box; a row matches when its tile's box intersects it,
-    including the antimeridian rows of zones 01 and 60, whose ``bbox_west > bbox_east``.
+    WGS84 ``(west, south, east, north)`` box; a row matches when its tile's box intersects it. Either
+    box may cross the antimeridian (``west > east``), as the rows of zones 01 and 60 do.
 
     Raises:
         ValueError: If nothing matches.
     """
+    # THE SCHEMA IS STATED, as every whole-registry read must (`registry.py`): inferred, it comes from
+    # the first file, and cell files written before and after a column was added then fail to scan.
+    columns = pa.schema([f for f in master_schema() if f.name not in _PARTITION_KEYS])
     rows = pl.scan_parquet(
         f"{registry_root.rstrip('/')}/master/**/*.parquet",
+        schema=pl.from_arrow(columns.empty_table()).schema,
         hive_partitioning=True,
+        hive_schema={"zone": pl.String, "year": pl.Int64},
+        missing_columns="insert",
+        extra_columns="ignore",
         storage_options=dict(storage_options) if storage_options else None,
     )
     if zones is not None:
@@ -273,12 +302,20 @@ def plan_from_registry(
         rows = rows.filter(pl.sql_expr(where))
     if aoi is not None:
         west, south, east, north = aoi
-        crosses = pl.col("bbox_west") > pl.col("bbox_east")
-        overlaps_lon = (
-            pl.when(crosses)
-            .then((pl.col("bbox_west") <= east) | (pl.col("bbox_east") >= west))
-            .otherwise((pl.col("bbox_west") <= east) & (pl.col("bbox_east") >= west))
-        )
+        # Either box may cross the antimeridian (west > east). Each is the union of its intervals on
+        # [-180, 180], and two boxes overlap when any pair of those intervals does.
+        tile_spans = [
+            (
+                pl.col("bbox_west"),
+                pl.when(pl.col("bbox_west") > pl.col("bbox_east")).then(180.0).otherwise(pl.col("bbox_east")),
+            ),
+            (
+                pl.when(pl.col("bbox_west") > pl.col("bbox_east")).then(-180.0).otherwise(pl.col("bbox_west")),
+                pl.col("bbox_east"),
+            ),
+        ]
+        aoi_spans = [(west, east)] if west <= east else [(west, 180.0), (-180.0, east)]
+        overlaps_lon = pl.any_horizontal([(tw <= ae) & (te >= aw) for tw, te in tile_spans for aw, ae in aoi_spans])
         rows = rows.filter(overlaps_lon & (pl.col("bbox_south") <= north) & (pl.col("bbox_north") >= south))
     matched = rows.select("zone", "year", "tile").collect()
     if matched.is_empty():
@@ -391,10 +428,13 @@ def commit_update_record(
 
 
 def last_run_id(attrs: Mapping[str, Any], year: int) -> str | None:
-    """The run that last wrote ``year`` of a zone group: its fill, or the newest update since."""
+    """The run that last wrote ``year`` of a zone group: its fill, or the newest update since that wrote a shard."""
     runs = cast("Mapping[str, Mapping[str, Any]]", attrs.get("runs") or {})
     updates = cast("Mapping[str, Sequence[Mapping[str, Any]]]", attrs.get(UPDATES_ATTR) or {})
-    entries = [e for e in (runs.get(str(year)), *updates.get(str(year), ())) if e]
+    # An update that wrote and cleared nothing published no registry part, so it is not the run the
+    # registry's newest row names, and treating it as one would block that cell's repair.
+    wrote = [u for u in updates.get(str(year), ()) if u.get("written") or u.get("cleared")]
+    entries = [e for e in (runs.get(str(year)), *wrote) if e]
     if not entries:
         return None
     return str(max(entries, key=lambda e: str(e.get("assembled_at", "")))["run_id"])
