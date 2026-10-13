@@ -143,6 +143,9 @@ def test_a_holes_update_fills_only_the_holes(filled, monkeypatch):
         np.testing.assert_array_equal(_tile(after[var], 1, 1), _tile(before[var], 1, 1))
     [record] = node.attrs["updates"]["2025"]
     assert (record["mode"], record["written"], record["kept"]) == ("holes", ["chunk_0_0"], ["chunk_1_1"])
+    # The masks are filed under the destination store, so a plan run against another store reads its own.
+    [store_dir] = list((filled["tmp"] / "holes").iterdir())
+    assert sorted(p.name for p in store_dir.iterdir()) == ["chunk_0_0.npz", "chunk_1_1.npz"]
 
 
 @pytest.mark.parametrize(("on_skip", "cleared"), [("keep", False), ("clear", True)])

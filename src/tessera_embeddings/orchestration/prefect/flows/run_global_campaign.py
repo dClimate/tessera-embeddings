@@ -1530,7 +1530,12 @@ async def run_global_campaign(
                     return any(
                         (plan is not None or not snapshot.has(z, y))
                         and zone_has_live_tiles(
-                            land_mask_path, z, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+                            land_mask_path,
+                            z,
+                            get_credentials=iam_icechunk_credentials,
+                            s3_region=s3_region,
+                            # An update provisions Ray only for its own live shards.
+                            tiles=plan.cells.get(f"{z}/{y}") if plan is not None else None,
                         )
                         for z, y in cells
                     )

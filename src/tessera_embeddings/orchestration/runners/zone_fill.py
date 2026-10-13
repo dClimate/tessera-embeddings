@@ -45,6 +45,7 @@ cell lands — including a deliberate refill, which fails at the tag step by des
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import logging
 import time
 import uuid
@@ -765,7 +766,12 @@ def plan_zone_inference(
         pin_tag(repo, base_tag(update.name))
         if update.mode == "holes":
             holes = stage_hole_masks(
-                node, year_index=cast(int, time_index_of(node, year_timestamp(year))), chunks=live, prefix=update.holes
+                node,
+                year_index=cast(int, time_index_of(node, year_timestamp(year))),
+                chunks=live,
+                # Per destination store: a mask describes one store's holes, and one plan may be run
+                # against more than one store sharing the inputs bucket.
+                prefix=f"{update.holes}/{hashlib.sha256(store_path.encode()).hexdigest()[:12]}",
             )
             update = dataclasses.replace(update, kept=tuple(sorted(c.label for c in live if c.label not in holes)))
             live = [dataclasses.replace(c, pixels=holes[c.label]) for c in live if c.label in holes]

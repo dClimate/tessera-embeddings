@@ -1095,6 +1095,17 @@ class TestAnUpdateAcrossClusters:
         assert all(p["update"] == "u1" and p["mask_name"] == "alt" for p in dispatched)
         assert update_wired["finished"] == ["u1"]
 
+    def test_an_update_whose_targets_are_dead_never_resolves_the_ami(self, update_wired, monkeypatch):
+        """Its child records the update without a cluster, so the parent must not need the AMI either."""
+        monkeypatch.setattr(mod, "zone_has_live_tiles", lambda mask, zone, **k: k["tiles"] is None)
+        monkeypatch.setattr(mod, "_resolve_ami_id", lambda *a, **k: pytest.fail("resolved an AMI for dead targets"))
+        asyncio.run(
+            mod.run_global_campaign.fn(
+                paths=_PATHS, ami_ssm_name="ami", update="u1", max_parallel_clusters=2, allow_s2_only=True
+            )
+        )
+        assert all(p["ami_id"] is None for _, p in update_wired["arun"] if "cells" in p)
+
     def test_clusters_balance_on_the_update_shards_not_the_zone(self, monkeypatch):
         monkeypatch.setattr(mod, "zone_work_weight", lambda *a, **k: pytest.fail("an update weighs its shards"))
         monkeypatch.setattr(mod, "zone_live_tile_count", lambda mask, zone, **k: len(k["tiles"] or ()))

@@ -89,6 +89,8 @@ CARRIED_COLUMNS: tuple[str, ...] = (
     "bbox_north",
     "code_version",
     "code_commit",
+    # Which targeted update wrote the tile: a re-derivation measures it again, it does not rewrite it.
+    "update_name",
 )
 
 

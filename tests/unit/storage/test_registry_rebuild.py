@@ -297,12 +297,14 @@ class TestRebuiltRow:
             "bbox_north": 4.0,
             "code_version": "0.1.0",
             "code_commit": "abc123",
+            "update_name": "fill-thin-2026",
             "assembled_at": "2026-08-01T00:00:00+00:00",
             "run_id": "fill-run",
         }
         measurements = rb.measurements_from_obs(_obs([[20]]), optical_min_obs=15, radar_rule_enforced=False)
         row = rb.rebuilt_row(source, measurements, run_id="rebuild-1", assembled_at="2026-09-21T00:00:00+00:00")
         assert row["code_commit"] == "abc123"
+        assert row["update_name"] == "fill-thin-2026", "a repair measures the update's tile again; it did not write it"
         assert row["run_id"] == "rebuild-1"
         assert row["filled_at"] == "2026-08-01T00:00:00+00:00"
         assert row["chunk_px"] == 1

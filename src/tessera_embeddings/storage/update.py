@@ -20,7 +20,8 @@ may instead clear it (``on_skip="clear"``), for a defect whose output must go.
 
 **Where things live.** The plan is ``{update_root}/plan.json``, written once. Beside it, per cell:
 the ingest ROI (``rois/<zone>/<year>.zarr``), the mosaics (``mosaics/<zone>/<year>``) and, in
-``holes`` mode, one mask per target shard (``holes/<zone>/<year>/<label>.npz``) — all apart from the
+``holes`` mode, one mask per target shard and destination store
+(``holes/<zone>/<year>/<store digest>/<label>.npz``) — all apart from the
 campaign's own, which it rewrites and sweeps (:meth:`BucketPaths.update_root`).
 
 **What the store records.** Each cell an update lands in gains one entry in its zone group's
