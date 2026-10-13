@@ -148,7 +148,7 @@ def test_an_update_record_appends_and_leaves_the_fill_alone(zone_repo):
     assert node.attrs["years_complete"] == [2024] and node.attrs["runs"]["2024"]["run_id"] == "fill"
     assert upd.last_run_id(dict(node.attrs), 2024) == "u-run"
     # An update that wrote nothing published no part, so it does not become the cell's last writer.
-    noop = upd.update_record(_target("noop"), run_id="noop-run", written=[], kept=["chunk_0_0"])
+    noop = upd.update_record(_target("noop"), run_id="noop-run", written=[], kept=["chunk_0_0"], optical_min_obs=1)
     upd.commit_update_record(zone_repo, "01N", 2024, record=noop)
     assert upd.last_run_id(dict(_node(zone_repo).attrs), 2024) == "u-run"
     assert upd.update_states(zone_repo, "fix-1", [("01N", 2024), ("01N", 2025)]) == {
