@@ -181,7 +181,8 @@ a fill that lands mid-update, or mid-way through an hours-long repair, is merged
   would otherwise pass for a newer run and beat the fill's measurement.
 - **An existing master row survives only while its run still has a part** (`still_published`).
   A run whose part is deleted would otherwise keep winning through the master's copy of
-  its rows, which carry the newest `filled_at`.
+  its rows, which carry the newest `filled_at`. And only its re-derived rows are taken from the
+  existing file: a fill row always comes from its part, so a damaged copy cannot outlive a repair.
 - **The parts are checked against the store's record of the year's runs**, as above. Then every
   row's tile holds the pixels of the run that row names, so a cell built from several runs is
   re-derivable tile by tile, each row under its own depth rule.
@@ -200,7 +201,7 @@ its cell has no part at all. `--parts-only` skips the store for a registry copy 
 | one row per tile-year; `measured_by` agrees with the numbers | a duplicated or mislabelled row |
 | every tile in `parts/` present, and none that no part names | a cell whose update failed, or a stray row |
 | each row from its tile's latest run | a refill or infill whose update failed |
-| fill-measured values equal `parts/` for the latest run | a measurement the master altered |
+| fill-measured rows equal `parts/` for the latest run: measurements, `run_id` and `assembled_at` | a fill row the master altered |
 | `embedded`, the bounding box, the depth rule and the build equal the latest run's fill row | a row, re-derived or not, carrying another row's fields |
 | no unmeasured rows | a fill that published nulls |
 | the master's embedded tiles against the store's live shards (census `--verify-zones` only) | a shard cleared by hand, which no part records |

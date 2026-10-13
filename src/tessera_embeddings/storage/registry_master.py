@@ -269,13 +269,14 @@ def audit(master: pa.Table, parts: pa.Table) -> dict[str, list[str]]:
     Checks the master itself, the file consumers read: every tile any part names is present and no
     other; each row describes its tile's latest run and carries that run's fill fields — ``embedded``,
     the bounding box, the depth rule, the build — whoever measured it; wherever that run's fill
-    measured the tile, the master carries the fill's own numbers, labelled ``"fill"``; and no row is
+    measured the tile, the master carries the fill's own row, numbers and provenance alike, labelled
+    ``"fill"``; and no row is
     unmeasured. A cell with no master file at all reports every tile missing. Pair it with
     :func:`invariant_failures`.
     """
     want = merge(as_master_rows(parts, MEASURED_BY_FILL))
     carried = [column for column in CARRIED_COLUMNS if column not in _KEYS]
-    columns = [*_KEYS, "filled_at", "measured_by", *carried, *REBUILT_COLUMNS]
+    columns = [*_KEYS, "filled_at", "measured_by", "run_id", "assembled_at", *carried, *REBUILT_COLUMNS]
     joined = want.select(columns).join(
         master.select(columns), keys=_KEYS, join_type="full outer", left_suffix=":want", right_suffix=":held"
     )
@@ -298,7 +299,9 @@ def audit(master: pa.Table, parts: pa.Table) -> dict[str, list[str]]:
         "tile(s) no part names": pc.invert(wanted),
         "row(s) not from the tile's latest run": pc.and_(both, differs("filled_at")),
         "fill field(s) altered": pc.and_(both, differs(*carried)),
-        "fill measurement(s) altered": pc.and_(pc.and_(held, fill_measured), differs("measured_by", *REBUILT_COLUMNS)),
+        "fill row(s) altered": pc.and_(
+            pc.and_(held, fill_measured), differs("measured_by", "run_id", "assembled_at", *REBUILT_COLUMNS)
+        ),
         "row(s) unmeasured": pc.and_(held, pc.is_null(joined.column(f"{MEASURED_SENTINEL}:held"))),
     }
     counts = pa.table(
@@ -563,8 +566,10 @@ def update_cell(
         if store is not None and (found := store_disagreements(parts, store())):
             raise ValueError(f"{zone}/{year}: the store cannot stand behind the registry parts: {'; '.join(found)}")
         fills = as_master_rows(parts, MEASURED_BY_FILL)
-        # Parts first, so on a tie between identical rows the part's copy is the one kept.
         held = still_published(read_cell(fs, registry_root, "master", zone, year, master_schema()), fills)
+        # A held fill row is a copy of a part's, so the part's own copy is merged: only the rows the
+        # parts cannot supply, re-derived ones, come from the existing file, and a damaged copy cannot win.
+        held = held.filter(pc.invert(pc.fill_null(pc.equal(held.column("measured_by"), MEASURED_BY_FILL), False)))
         master = merge(fills, held, *extra)
         if failures := invariant_failures(master, expected_rows=tile_years(parts)):
             raise ValueError(f"{zone}/{year} master breaks its invariants: {'; '.join(failures)}")

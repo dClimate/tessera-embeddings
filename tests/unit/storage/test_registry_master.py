@@ -275,7 +275,11 @@ class TestAudit:
         [
             (lambda m: m.filter(pc.equal(m.column("tile"), "chunk_0_0")), "tile(s) missing"),
             (lambda m: merge(m, _fill([_row("chunk_9_9", measured=True, stamp=FILLED)])), "no part names"),
-            (_altered, "fill measurement(s) altered"),
+            (_altered, "fill row(s) altered"),
+            (
+                lambda m: m.set_column(m.schema.get_field_index("run_id"), "run_id", pa.array(["x"] * m.num_rows)),
+                "fill row(s) altered",
+            ),
             (
                 lambda m: m.set_column(m.schema.get_field_index("embedded"), "embedded", pc.invert(m["embedded"])),
                 "fill field(s) altered",
@@ -286,6 +290,7 @@ class TestAudit:
             "a-dropped-tile",
             "a-tile-no-part-names",
             "an-altered-fill-measurement",
+            "an-altered-fill-run-id",
             "an-altered-fill-field",
             "an-unmeasured-row",
         ],
@@ -330,6 +335,18 @@ class TestUpdateCell:
         assert master.column("tile").to_pylist() == ["chunk_0_0", "chunk_0_1"]
         assert master.column("run_id").to_pylist() == ["infill", "rebuild-1"], "the re-derived row survives"
         assert pq.read_schema(registry / "master" / "_common_metadata").names == master_schema().names
+
+    def test_a_damaged_copy_of_a_fill_row_loses_to_its_part(self, registry: Path) -> None:
+        """The file's fill rows are copies of the parts'; a later stamp on a damaged one must not let it win."""
+        held = registry_master.read_cell(LOCAL, str(registry), "master", "33N", 2017, master_schema()).to_pylist()
+        held[0] |= {"assembled_at": LATER, "refused_thin_px": 999}
+        version = cell_version(LOCAL, str(registry), "33N", 2017)
+        assert write_cell(
+            LOCAL, str(registry), "33N", 2017, pa.Table.from_pylist(held, schema=master_schema()), version=version
+        )
+        update_cell(LOCAL, str(registry), "33N", 2017)
+        row = pq.read_table(registry / self.MASTER).to_pylist()[0]
+        assert (row["assembled_at"], row["refused_thin_px"]) == (FILLED, 6)
 
     def test_running_it_again_writes_the_same_file(self, registry: Path) -> None:
         """A fill retried after its update, and a repair after a fill, must both leave the cell as it was."""

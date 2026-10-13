@@ -385,17 +385,20 @@ class TestWhoWroteAYear:
     """The store's own account of which runs wrote a zone-year, and which tiles each commit wrote."""
 
     def test_a_commit_s_tiles_are_its_diff_in_that_year_written_cleared_and_refused_alike(self, seeded):
-        """A refused tile writes its observation counts and leaves ``scales`` absent, before and after."""
+        """A refused tile writes its observation counts and leaves ``scales`` absent, before and after, and
+        fill written where nothing was still counts: Zarr deletes the chunk, and the log records the delete.
+        """
         _fill_shard(seeded, "01N", 1, (0, 0))
         session = global_store.open_global_repo(seeded).writable_session("main")
         node = zarr.open_group(session.store, mode="r+")["01N"]
         writes = ((1, (0, 0), np.nan, "scales"), (1, (3, 1), 0.5, "scales"), (0, (2, 0), 0.5, "scales"))
-        for time_index, shard, value, var in (*writes, (1, (1, 1), 3, "s2_obs_count")):
+        for time_index, shard, value, var in (*writes, (1, (1, 1), 3, "s2_obs_count"), (1, (2, 1), np.nan, "scales")):
             y0, y1, x0, x1 = published_store.shard_pixel_window(shard, node[var].shape)
             node[var][time_index, y0:y1, x0:x1] = value
         snapshot = session.commit("clear one tile, write another, refuse a third, and one in the other year")
         repo = global_store.open_global_repo(seeded)
-        assert published_store.commit_tiles(repo, "01N", 1, snapshot) == {"chunk_0_0", "chunk_3_1", "chunk_1_1"}
+        expected = {"chunk_0_0", "chunk_3_1", "chunk_1_1", "chunk_2_1"}
+        assert published_store.commit_tiles(repo, "01N", 1, snapshot) == expected
 
     def test_tagged_shard_commits_are_listed_by_zone_year_oldest_first(self, seeded):
         repo = global_store.open_global_repo(seeded)

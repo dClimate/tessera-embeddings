@@ -271,7 +271,9 @@ def commit_tiles(repo: icechunk.Repository, zone: str, time_index: int, snapshot
     what that write changed, so it needs no record kept anywhere else. A cleared tile is a deleted
     shard, which the diff lists as changed too. Every per-tile array counts, not only ``scales``: a
     refused tile writes its observation counts and month coverage while its embeddings stay absent,
-    so re-refusing a tile that was already refused changes nothing in ``scales``. Every such array
+    so re-refusing a tile that was already refused changes nothing in ``scales``. A tile written
+    wholly with fill counts too, even where nothing was stored: Zarr deletes the chunk rather than
+    storing fill, and the transaction log records the delete. Every such array
     shares the tile grid, one shard per tile in its first three coordinates; the coordinate arrays
     have fewer.
     """
