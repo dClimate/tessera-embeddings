@@ -189,9 +189,11 @@ def basis_violations(table: pa.Table) -> tuple[int, int]:
     ``refused_no_optical_px == eligible_px - px_with_any_optical`` exactly when the fill's
     reflectance term never removed a pixel; one row that does not means ``s2_obs_count`` cannot
     reproduce that row's split, and no re-derivation from the store should be trusted until it is
-    explained. Every measured row is checked, not a sample: it costs no store reads.
+    explained. Every measured row is checked, not a sample: it costs no store reads. A row with
+    no ``eligible_px`` was itself re-derived from the store, as a targeted update's merged tile is,
+    so it cannot test the identity it was computed by and is not counted.
     """
-    measured = table.filter(pc.is_valid(table.column("chunk_px")))
+    measured = table.filter(pc.and_(pc.is_valid(table.column("chunk_px")), pc.is_valid(table.column("eligible_px"))))
     expected = pc.subtract(measured.column("eligible_px"), measured.column("px_with_any_optical"))
     agree = pc.fill_null(pc.equal(measured.column("refused_no_optical_px"), expected), False)
     return measured.num_rows - int(pc.sum(agree).as_py() or 0), measured.num_rows

@@ -257,9 +257,13 @@ def load_update(paths: BucketPaths, name: str, *, mask_name: str = "global") -> 
     and is told rather than silently overruled; the default ``"global"`` is taken to mean "unset".
 
     Raises:
-        ValueError: If ``mask_name`` is not the default and differs from the plan's.
+        ValueError: If the plan names another update, or ``mask_name`` is not the default and
+            differs from the plan's.
     """
     plan = load_plan(plan_uri(paths.update_root(name)))
+    # Paths follow the folder and records follow the plan, so the two must be the same update.
+    if plan.name != name:
+        raise ValueError(f"The plan under update {name!r} is for update {plan.name!r}")
     if mask_name not in ("global", plan.mask_name):
         raise ValueError(f"Update {name!r} was planned under mask {plan.mask_name!r}, not {mask_name!r}")
     return plan

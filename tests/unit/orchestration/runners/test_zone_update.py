@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pathlib
+
 import numpy as np
 import pyarrow.parquet as pq
 import pytest
@@ -184,10 +186,14 @@ def test_a_holes_update_refuses_the_radar_rule(filled, monkeypatch):
         _fill(filled["tmp"], filled["store"], land_mask_path=filled["mask"], update=_target(filled, mode="holes"))
 
 
-def test_an_update_already_recorded_does_nothing(filled, monkeypatch):
-    """Re-running an update is free: the cell is recorded, so no inference and no new snapshot."""
+def test_an_update_already_recorded_does_nothing_but_reconcile_the_master(filled, monkeypatch):
+    """Re-running an update is free: the cell is recorded, so no inference and no new snapshot. It does
+    bring the master up to date, which is the only way a run that died before doing so reaches it.
+    """
     _update(filled, monkeypatch, _target(filled))
     tip = global_store.open_global_repo(filled["store"]).lookup_branch("main")
+    master = pathlib.Path(filled["registry"]) / "master" / f"zone={_ZONE}" / "year=2025" / "part-0.parquet"
+    master.unlink()  # as if the first run died between its commits and the master update
     monkeypatch.setattr(zone_fill, "run_inference", lambda *a, **k: pytest.fail("a recorded update re-inferred"))
 
     summary = _fill(
@@ -195,12 +201,15 @@ def test_an_update_already_recorded_does_nothing(filled, monkeypatch):
         filled["store"],
         land_mask_path=filled["mask"],
         mosaic_base=filled["mosaic"],
+        registry_root=filled["registry"],
         run_id="upd2",
         update=_target(filled),
     )
 
     assert summary["already_recorded"] is True
     assert global_store.open_global_repo(filled["store"]).lookup_branch("main") == tip
+    rows = {r["tile"]: (r["run_id"], r["update_name"]) for r in pq.read_table(master).to_pylist()}
+    assert rows["chunk_0_1"] == ("upd1", "u1")
 
 
 def test_a_retry_updates_the_master_an_update_died_before_reaching(filled, monkeypatch):

@@ -1068,6 +1068,7 @@ async def run_global_campaign(
         return [cell for cell, state in states.items() if state == "pending"]
 
     work = _work(status, zones_=expected_zones, years_=campaign_years)
+    never_filled: list[str] = []
     if plan is not None:
         never_filled = [
             f"{z}-{y}"
@@ -1114,26 +1115,35 @@ async def run_global_campaign(
 
     # Orphan-mosaic recovery: a per-cell cleanup that failed after tagging leaves the mosaic
     # behind, and that cell has left `work`, so it is never retried. Best-effort sweep of
-    # complete-and-tagged cells in scope. Opt-in; the zero-cost backstop is an S3 lifecycle
-    # rule.
+    # complete-and-tagged cells in scope, or of an update's finished cells under its own root.
+    # Opt-in; the zero-cost backstop is an S3 lifecycle rule.
     if sweep_orphan_mosaics and ingest and cleanup_mosaics:
-        work_set = set(work)
-        sweep_zones = expected_zones if expected_zones is not None else sorted(status.zones)
-        swept = 0
-        for y in set(campaign_years):
-            for z in sweep_zones:
-                if (z, y) not in work_set and status.has(z, y) and zone_year_tag(z, y) in existing_tags:
-                    delete_prefix(
-                        f"{paths.inputs.rstrip('/')}/mosaics/{z}/{y}",
-                        log=log,
-                        # Campaign buckets have versioning OFF (measured; the CDK creates them
-                        # that way, Icechunk carrying its own history), so all-versions buys
-                        # nothing here and costs a heavier request pattern and a wider
-                        # permission. Asserted at the call site rather than assumed by default.
-                        all_versions=False,
-                    )
-                    swept += 1
-        log.info("Orphan-mosaic sweep: reclaimed %d completed-cell mosaic prefix(es)", swept)
+        if plan is not None:
+            # Recorded cells only: one the campaign has yet to fill is out of the work list too.
+            mosaic_root = paths.update_root(plan.name)
+            in_scope = plan.cell_list(zones=expected_zones, years=campaign_years)
+            finished = [c for c, state in update_states(repo, plan.name, in_scope).items() if state == "done"]
+        else:
+            mosaic_root = paths.inputs
+            work_set = set(work)
+            sweep_zones = expected_zones if expected_zones is not None else sorted(status.zones)
+            finished = [
+                (z, y)
+                for y in set(campaign_years)
+                for z in sweep_zones
+                if (z, y) not in work_set and status.has(z, y) and zone_year_tag(z, y) in existing_tags
+            ]
+        for z, y in finished:
+            delete_prefix(
+                f"{mosaic_root.rstrip('/')}/mosaics/{z}/{y}",
+                log=log,
+                # Campaign buckets have versioning OFF (measured; the CDK creates them
+                # that way, Icechunk carrying its own history), so all-versions buys
+                # nothing here and costs a heavier request pattern and a wider
+                # permission. Asserted at the call site rather than assumed by default.
+                all_versions=False,
+            )
+        log.info("Orphan-mosaic sweep: reclaimed %d completed-cell mosaic prefix(es)", len(finished))
 
     log.info(
         "Campaign: %d (zone, year) cell(s) need work across %d year(s); <=%d concurrent fills/year",
@@ -2103,8 +2113,9 @@ async def run_global_campaign(
         # cannot stamp the global tag prematurely, which matters because tags are write-once
         # forever. Attempted for EVERY year in the batch: an unfinished year raises
         # ValueError and is free, which is what lets the overlapping path use the same code
-        # as the year-serial one instead of detecting "was that the year's last cell".
-        for y in batch_years:
+        # as the year-serial one instead of detecting "was that the year's last cell". Never
+        # in an update, which must not pin a campaign tag at a snapshot holding its writes.
+        for y in batch_years if plan is None else ():
             try:
                 year_tag = tag_year_complete(repo, y)
                 log.info("Year %d tagged complete (all 120 zones): %s", y, year_tag)
@@ -2160,4 +2171,7 @@ async def run_global_campaign(
         # Always present, empty when everything landed: a caller testing for the KEY rather
         # than for its truthiness must not have to know which shape it gets.
         "unfilled": {year: sorted(zones) for year, zones in sorted(unfilled.items())},
+        # An update's planned cells the campaign has yet to fill: never dispatched, and until they
+        # are filled and updated the update has no complete tag.
+        "never_filled": never_filled,
     }

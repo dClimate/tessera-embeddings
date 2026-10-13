@@ -936,9 +936,28 @@ def test_a_failed_master_update_does_not_fail_a_landed_cell(tmp_path, monkeypatc
     assert "registry master NOT updated" in caplog.text
 
 
-def test_a_retry_updates_the_master_a_fill_died_before_reaching(tmp_path, monkeypatch):
-    """The retry finds the cell complete and skips the fill, so the update runs there or never."""
-    monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub({}))
+def _all_skip_inference(num_actors, config, chunks, mosaic_base, staging_base, run_id, t0, log, **kwargs):
+    """Every tile refused, with nothing staged: the store holds nothing for them before or after."""
+    writer = ZarrWriter(staging_base, embedding_dim=_BAND)
+    for chunk in chunks:
+        writer.write_skip_marker(chunk, run_id, {"label": chunk.label, "refused": {"no_optical": 4}})
+    return [{"chunk": c.label, "status": "skipped", "valid_pixels": 0, "elapsed_sec": 0.0} for c in chunks]
+
+
+@pytest.mark.parametrize(
+    ("inference", "part_survives"),
+    [(_staging_inference_stub({}), True), (_all_skip_inference, False)],
+    ids=["its-part-published", "an-all-refused-run-whose-part-never-published"],
+)
+def test_a_retry_updates_the_master_a_fill_died_before_reaching(
+    tmp_path, monkeypatch, caplog, inference, part_survives
+):
+    """The retry finds the cell complete and skips the fill, so the update runs there or never.
+
+    An all-refused run over a tile the store held nothing for still shows in its commit's diff, so
+    its retry refuses while its part is missing.
+    """
+    monkeypatch.setattr(zone_fill, "run_inference", inference)
     store, registry_root = _seed_global_with_rule(tmp_path, 15), str(tmp_path / "registry")
     cell = {
         "land_mask_path": _make_mask(tmp_path, [(0, 0)]),
@@ -954,9 +973,16 @@ def test_a_retry_updates_the_master_a_fill_died_before_reaching(tmp_path, monkey
     monkeypatch.setattr(zone_fill, "_update_registry_master", died)
     with pytest.raises(KeyboardInterrupt):
         _fill(tmp_path, store, **cell)
+    if not part_survives:
+        for part in (tmp_path / "registry" / "parts").rglob("*.parquet"):
+            part.unlink()
     monkeypatch.setattr(zone_fill, "_update_registry_master", update)
-    assert _fill(tmp_path, store, **cell)["already_complete"] is True
-    assert _master_tiles(registry_root) == ["chunk_0_0"]
+    with caplog.at_level(logging.ERROR):
+        assert _fill(tmp_path, store, **cell)["already_complete"] is True
+    if part_survives:
+        assert _master_tiles(registry_root) == ["chunk_0_0"]
+    else:
+        assert "last wrote 1 tile(s) no part describes" in caplog.text
 
 
 def test_the_master_learns_of_a_refill_that_fails_at_the_tag_step(tmp_path, monkeypatch):

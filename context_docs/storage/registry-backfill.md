@@ -54,7 +54,8 @@ column reduces to counting one array.
 
 That identity is the whole basis, so it is checked rather than remembered: `gate` evaluates it over
 every measured row of the registry it is given (`registry_rebuild.basis_violations`) before it
-reads a pixel, and fails on a single violation.
+reads a pixel, and fails on a single violation. A row with no `eligible_px` was itself re-derived
+from the store, as a targeted update's merged tile is, so it is not counted.
 
 | column | rebuild rule over the tile's `s2_obs_count` |
 |---|---|

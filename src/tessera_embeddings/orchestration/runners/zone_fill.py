@@ -61,7 +61,7 @@ import zarr
 
 from tessera_embeddings.config.assembly import AssemblyConfig
 from tessera_embeddings.config.fault_injection import ArmedFault
-from tessera_embeddings.config.inference import OPTICAL_MIN_OBS, InferenceConfig
+from tessera_embeddings.config.inference import InferenceConfig
 from tessera_embeddings.config.paths import store_key
 from tessera_embeddings.config.store_layout import GLOBAL, REQUIRED_VARS
 from tessera_embeddings.config.time_windows import TimeWindow
@@ -405,7 +405,7 @@ def _update_registry_master(
             year,
             run_id=run_id,
             live=live,
-            store=store_year(repo, node, zone, year, shard_writes(repo)),
+            store=lambda: store_year(repo, node, zone, year, shard_writes(repo)),
         )
     except Exception:
         log.exception(
@@ -1470,8 +1470,8 @@ def _publish_merged_rows(
         )
         return
     records: dict[str, dict] = {}
-    # A store with no depth rule is measured against the default line, as the actors measure it.
-    thin_below = optical_min_obs or OPTICAL_MIN_OBS
+    # A store with no depth rule refused no pixel as thin, so none may be counted below a line.
+    thin_below = optical_min_obs or 0
     try:
         year_index = calendar_years(node).index(year)
         with ThreadPoolExecutor(max_workers=16) as pool:
@@ -1484,9 +1484,11 @@ def _publish_merged_rows(
             records = dict(zip(labels, rows, strict=True))
     except Exception:
         log.exception(
-            "Zone %s year %d: merged tiles' registry rows could not be re-derived; publishing them unmeasured",
+            "Zone %s year %d: merged tiles' registry rows could not be re-derived; publishing them unmeasured. "
+            "Repair: scripts/maintenance/rebuild_registry_measurements.py repair --zones %s --write",
             zone,
             year,
+            zone,
         )
     writer.publish_registry_part(
         registry_root,

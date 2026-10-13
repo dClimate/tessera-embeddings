@@ -391,9 +391,9 @@ override.
 
 ### A landed cell is handed to a validator, and nothing waits for it
 
-Both fill flows take a `validation_deployment`. As each cell is tagged they create one run
-of it and return immediately (`flows/_cell_validation.py`), so cell N is checked while cell
-N+1 is still being filled — on the chained path the dispatch happens on the trailing
+Both fill flows take a `validation_deployment`. As each cell is tagged, or a targeted update
+writes or clears shards in it, they create one run of it and return immediately
+(`flows/_cell_validation.py`), so cell N is checked while cell N+1 is still being filled — on the chained path the dispatch happens on the trailing
 assembly thread, which already has that pipelining.
 
 Three properties are deliberate. The default is `None`, because the validator is a

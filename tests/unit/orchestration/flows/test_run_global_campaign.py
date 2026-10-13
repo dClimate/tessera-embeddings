@@ -1070,6 +1070,7 @@ class TestAnUpdateAcrossClusters:
         status = SimpleNamespace(zones={"01N": (), "02N": (), "03N": ()}, has=lambda z, y: True)
         monkeypatch.setattr(mod, "campaign_status", lambda *a, **k: status)
         monkeypatch.setattr(mod, "campaign_work_list", lambda *a, **k: pytest.fail("an update has its own work list"))
+        monkeypatch.setattr(mod, "tag_year_complete", lambda *a, **k: pytest.fail("an update pins no campaign tag"))
 
         def states(repo, name, cells):
             return {
@@ -1084,16 +1085,30 @@ class TestAnUpdateAcrossClusters:
         return wired
 
     def test_the_plan_is_the_work_list_and_every_child_runs_it(self, update_wired):
-        asyncio.run(
+        result = asyncio.run(
             mod.run_global_campaign.fn(
                 paths=_PATHS, ami_ssm_name="ami", update="u1", max_parallel_clusters=2, allow_s2_only=True
             )
         )
+        assert result["never_filled"] == ["03N-2024"], "a planned cell the campaign never filled is reported"
 
         dispatched = [p for _, p in update_wired["arun"] if "cells" in p]
         assert {tuple(c) for p in dispatched for c in p["cells"]} == {("01N", 2025), ("02N", 2025)}
         assert all(p["update"] == "u1" and p["mask_name"] == "alt" for p in dispatched)
         assert update_wired["finished"] == ["u1"]
+
+    def test_the_orphan_sweep_reclaims_the_update_s_own_mosaics(self, update_wired):
+        """A recorded cell's leftover mosaic is under the update's root; the campaign's are not its to delete."""
+        update_wired["landed"].add(("01N", 2025))  # recorded by an earlier run whose cleanup failed
+        asyncio.run(
+            mod.run_global_campaign.fn(
+                paths=_PATHS, ami_ssm_name="ami", update="u1", sweep_orphan_mosaics=True, allow_s2_only=True
+            )
+        )
+        assert "s3://in/updates/u1/mosaics/01N/2025" in update_wired["deletes"]
+        assert all(d.startswith("s3://in/updates/u1/") for d in update_wired["deletes"]), update_wired["deletes"]
+        # 03N/2024 is out of the work list too, but the campaign has yet to fill it, so its mosaic may yet be used.
+        assert "s3://in/updates/u1/mosaics/03N/2024" not in update_wired["deletes"]
 
     def test_an_update_whose_targets_are_dead_never_resolves_the_ami(self, update_wired, monkeypatch):
         """Its child records the update without a cluster, so the parent must not need the AMI either."""

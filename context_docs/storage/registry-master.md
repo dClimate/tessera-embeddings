@@ -45,7 +45,7 @@ shows it rather than downloading it. Nothing reads it, and it sits outside both 
         │
   zone_fill ──▶ _update_registry_master
                   │  read the master file's version, then the file and all of the cell's parts
-                  │  check the parts against the store's record of the year's runs
+                  │  then the store's record of the year's runs, and check the parts against it
                   │  merge tile by tile, check the invariants
                   │  replace master/zone=Z/year=Y/part-0.parquet if it is still at that version
                   │    (one conditional PUT; refused → read and merge again, up to 8 times)
@@ -61,11 +61,13 @@ shows it rather than downloading it. Nothing reads it, and it sits outside both 
 
 `registry_master.update_cell` does the work, called from both assembled branches of
 `orchestration/runners/zone_fill.py`, the ordinary one and the all-refused `empty=True` one, and
-from planning when a retry finds the cell already landed. It
-rewrites `_common_metadata` when it is absent or names other columns than the current schema, so a
-column added later reaches readers who take the schema from the dataset. It runs before the tag
-because a deliberate refill fails at the tag step by design (`reopen_zone_year.py`), after its data
-and part have landed, and the master must still describe it.
+from planning when a retry finds the cell already landed. It rewrites `_common_metadata` when it is
+absent or lacks a column of the current schema, so a column added later reaches readers who take the
+schema from the dataset. It never rewrites one that has a column the current schema lacks, so a
+worker still on an older release cannot take a newer column away mid-deploy. That write is
+conditional too, so of two workers that both found it stale, the second is refused and checks again.
+It runs before the tag because a deliberate refill fails at the tag step by design
+(`reopen_zone_year.py`), after its data and part have landed, and the master must still describe it.
 
 - **Two writers of one zone-year cannot lose each other's rows.** An update reads the file's
   version, its S3 ETag, before anything the new file is built from, and writes on condition that
@@ -151,6 +153,11 @@ tag, under the update's run, so the check below treats it like any other run.
   entry with no `commit` key, the year's own or one a refill kept in `previous`. One marked `empty`
   left no embeddings, so it needs no part. `commit` is null for a year marked without writing
   shards, which wrote no tile.
+- **Snapshot expiry drops shard commits from the history** (`campaign.expire_and_gc` keeps tagged
+  snapshots, and a zone-year's tag is on its attrs commit). A recorded run whose commit has gone is
+  then known from its `runs` entry, like a v1.1 run, or a targeted update's from its `updates`
+  entry: its part still describes it, and without one nothing bounds its tiles, so the zone-year
+  blocks. Run `verify` before expiring.
 - **Which tiles a commit wrote** comes from Icechunk's diff of that commit against its parent, the
   store's own transaction log (`published_store.commit_tiles`), in every per-tile array rather
   than `scales` alone: a refused tile writes its observation counts and month coverage and no
@@ -169,7 +176,9 @@ tag, under the update's run, so the check below treats it like any other run.
 A commit no part describes whose every tile a later commit wrote over describes nothing the store
 holds, so it does not block. **That is also how a blocked cell recovers.** Rewrite the tiles the refusal names
 under a run that publishes its part, such as a refill of the zone-year, and the cell's next update
-goes through. Every update and repair runs this check, and so does `verify`.
+goes through. Every update and repair runs this check, and so does `verify`. An update reads the
+store's record after the parts, on every attempt: a run publishes its part only after its commit, so
+a fill that lands mid-update, or mid-way through an hours-long repair, is merged rather than refused.
 
 ## What guards it
 
@@ -183,7 +192,8 @@ goes through. Every update and repair runs this check, and so does `verify`.
   would otherwise pass for a newer run and beat the fill's measurement.
 - **An existing master row survives only while its run still has a part** (`still_published`).
   A run whose part is deleted would otherwise keep winning through the master's copy of
-  its rows, which carry the newest `filled_at`.
+  its rows, which carry the newest `filled_at`. And only its re-derived rows are taken from the
+  existing file: a fill row always comes from its part, so a damaged copy cannot outlive a repair.
 - **The parts are checked against the store's record of the year's runs**, as above. Then every
   row's tile holds the pixels of the run that row names, so a cell built from several runs is
   re-derivable tile by tile, each row under its own depth rule.
@@ -202,9 +212,10 @@ its cell has no part at all. `--parts-only` skips the store for a registry copy 
 | one row per tile-year; `measured_by` agrees with the numbers | a duplicated or mislabelled row |
 | every tile in `parts/` present, and none that no part names | a cell whose update failed, or a stray row |
 | each row from its tile's latest run | a refill or infill whose update failed |
-| fill-measured values equal `parts/` for the latest run | a measurement the master altered |
+| fill-measured rows equal `parts/` for the latest run: measurements, `run_id` and `assembled_at` | a fill row the master altered |
 | `embedded`, the bounding box, the depth rule and the build equal the latest run's fill row | a row, re-derived or not, carrying another row's fields |
 | no unmeasured rows | a fill that published nulls |
+| the master's embedded tiles against the store's live shards (census `--verify-zones` only) | a shard cleared by hand, which no part records |
 | `parts/` against the store's run record (`verify` only) | a run with no part that holds a tile, a part out of commit order, a withdrawn run's part |
 
 Both name every failing cell. `repair --zones <Z,...> --write` rebuilds those cells from three
