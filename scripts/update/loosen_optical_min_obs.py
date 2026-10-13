@@ -76,7 +76,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--write", action="store_true", help="commit the change; without it this is a dry run")
     args = parser.parse_args(argv)
 
-    zones = sorted({canonicalize_zone(z) for z in args.zones.split(",")}) if args.zones else None
+    zones = None if args.zones is None else sorted({canonicalize_zone(z) for z in args.zones.split(",") if z.strip()})
+    if zones == []:
+        # A root loosen cannot be undone, so an empty list (an unset `--zones "$ZONES"`) must not become one.
+        parser.error("--zones names no zone; omit --zones to loosen the whole store")
     credentials = (
         icechunk_credentials_for(args.store, iam_icechunk_credentials) if args.store.startswith("s3://") else None
     )

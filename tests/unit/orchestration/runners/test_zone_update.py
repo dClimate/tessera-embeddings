@@ -203,6 +203,23 @@ def test_an_update_already_recorded_does_nothing(filled, monkeypatch):
     assert global_store.open_global_repo(filled["store"]).lookup_branch("main") == tip
 
 
+def test_a_retry_updates_the_master_an_update_died_before_reaching(filled, monkeypatch):
+    """The retry finds the update recorded and skips it, so the master update runs there or never."""
+    reach = zone_fill._update_registry_master
+
+    def died(*_args: object, **_kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(zone_fill, "_update_registry_master", died)
+    with pytest.raises(KeyboardInterrupt):
+        _update(filled, monkeypatch, _target(filled))
+    monkeypatch.setattr(zone_fill, "_update_registry_master", reach)
+    assert _update(filled, monkeypatch, _target(filled), run_id="upd2")["already_recorded"] is True
+
+    master = pq.read_table(f"{filled['registry']}/master/zone={_ZONE}/year=2025/part-0.parquet").to_pylist()
+    assert {r["tile"]: r["update_name"] for r in master}["chunk_0_1"] == "u1"
+
+
 def test_an_update_refuses_a_year_the_campaign_never_filled(filled, monkeypatch):
     """An update inserts into existing data; filling an empty year is the campaign's job."""
     with pytest.raises(ValueError, match="has not been filled"):

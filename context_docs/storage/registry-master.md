@@ -54,7 +54,8 @@ shows it rather than downloading it. Nothing reads it, and it sits outside both 
                   ▼
               tag the zone-year
 
-  a retry of a cell that already landed ──▶ _update_registry_master, with no run id
+  a retry of a cell that already landed,
+  or of an update already recorded       ──▶ _update_registry_master, with no run id
 ```
 
 `registry_master.update_cell` does the work, called from both assembled branches of
