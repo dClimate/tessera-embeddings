@@ -23,6 +23,7 @@ import pytest
 import zarr
 
 from tessera_embeddings.storage import published_store
+from tessera_embeddings.storage.published_store import Commit
 from tessera_embeddings.storage.registry import registry_schema
 from tessera_embeddings.storage.registry_master import (
     MEASURED_BY_FILL,
@@ -108,7 +109,7 @@ def store(script: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> zarr.
     for name in ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count"):
         group.create_array(name, shape=(1, 4096, 4096), dtype="uint16", chunks=(1, 2048, 2048))
     group.attrs["runs"] = V11_RUNS
-    monkeypatch.setattr(script, "_open_store", lambda *_args, **_kwargs: (None, {"33N": group}))
+    monkeypatch.setattr(script, "_open_store", lambda *_args, **_kwargs: (None, {"33N": group}, {}))
     return group
 
 
@@ -200,18 +201,19 @@ def test_a_refill_that_never_published_blocks_only_while_it_holds_a_tile(
     refill_wrote: set[str],
     expected: int,
 ) -> None:
-    """A refill whose part never published, then an infill that did. The store's newest run has a part,
-    so only the store's record of every run that wrote the year shows the refill at all, and only its
-    commit's diff says whether a tile it wrote is still its own.
+    """A refill that died after its shard commit, so it published no part and never reached the year's
+    ``runs`` record, then an infill that landed whole. Only the refill's tagged commit in the store's
+    history shows it at all, and only its diff says whether a tile it wrote is still its own.
     """
     infill_at = "2026-08-09T00:00:00+00:00"
     _seed(tmp_path)
     _seed(tmp_path, [_row("chunk_1_1", measured=True, run_id="infill", assembled_at=infill_at)], run="infill")
     _seed_master(tmp_path, radar=None)
-    runs = run_provenance(
-        V11_RUNS, 2017, "refill", commit={"snapshot": "s-b", "committed_at": "2026-08-05T00:00:00+00:00"}
+    store.attrs["runs"] = run_provenance(
+        V11_RUNS, 2017, "infill", commit={"snapshot": "s-c", "committed_at": infill_at}
     )
-    store.attrs["runs"] = run_provenance(runs, 2017, "infill", commit={"snapshot": "s-c", "committed_at": infill_at})
+    writes = {("33N", 2017): [Commit("refill", "2026-08-05T00:00:00+00:00", "s-b"), Commit("infill", infill_at, "s-c")]}
+    monkeypatch.setattr(script, "_open_store", lambda *_args, **_kwargs: (None, {"33N": store}, writes))
     wrote = {"s-b": refill_wrote, "s-c": {"chunk_1_1"}}
     monkeypatch.setattr(published_store, "commit_tiles", lambda _repo, _zone, _t, snapshot: frozenset(wrote[snapshot]))
     master = tmp_path / "master" / "zone=33N" / "year=2017" / "part-0.parquet"

@@ -180,6 +180,7 @@ def commit_with_rebase(
     message: str,
     *,
     tries: int = 1000,
+    metadata: dict[str, Any] | None = None,
 ) -> str:
     """Commit, auto-rebasing on a moved branch tip; return the snapshot id.
 
@@ -200,7 +201,9 @@ def commit_with_rebase(
     completions. One line per commit, so the volume is one per zone-year.
     """
     started = time.monotonic()
-    snapshot = traced_commit(session, message, rebase_with=icechunk.ConflictDetector(), rebase_tries=tries)
+    snapshot = traced_commit(
+        session, message, rebase_with=icechunk.ConflictDetector(), rebase_tries=tries, metadata=metadata
+    )
     _log.info("COMMIT %.2fs: %s", time.monotonic() - started, message)
     return snapshot
 
@@ -543,6 +546,11 @@ def run_forked(
     return telemetry
 
 
+#: The snapshot-metadata key on every shard commit a run makes: ``{"run_id", "zone", "year"}``. Read
+#: back by :func:`~tessera_embeddings.storage.published_store.shard_writes`.
+SHARD_WRITE = "shard_write"
+
+
 def _group_node(store: Any, group: str) -> zarr.Group:  # noqa: ANN401 — icechunk store handle
     """Open a repo's zarr root and return the named group node (typed as Group)."""
     return cast(zarr.Group, zarr.open_group(store, mode="a")[group])
@@ -569,11 +577,11 @@ def run_provenance(
     """Merge a per-year run record into a group's ``runs`` attr (the schema's one owner).
 
     ``commit`` is the run's shard commit, ``{"snapshot", "committed_at"}``, recorded as null for
-    a year marked without writing shards. **A refill keeps the runs before it** in ``previous``,
-    as ``run_id``, ``assembled_at`` and ``commit`` alone: the year's record otherwise names only
-    the last run, and a run whose registry part never published would vanish from the store's
-    account the moment another run wrote the year, leaving the registry describing its tiles by an
-    older run with nothing able to tell. A record with no ``commit`` key predates this field.
+    a year marked without writing shards; a record with no ``commit`` key predates the field. The
+    commit itself is tagged with the run (``SHARD_WRITE``), and that tag, not this record, is the
+    store's authority on who wrote a year: this record lands in a second commit, which a dying
+    process can miss. **A refill keeps the runs before it** in ``previous``, as ``run_id``,
+    ``assembled_at`` and ``commit`` alone, which is all that is known of a run from before tags.
 
     ``input_coverage`` answers the question the calendar-year guarantee below does NOT: not
     what window was *requested*, but **how much of it the input actually held** — per source
@@ -919,7 +927,13 @@ def write_year_shards(
 
     year_label = _year_label(_group_node(session.store, group), year_index)
     t_commit = time.monotonic()
-    shard_snapshot = commit_with_rebase(session, commit_msg or f"fill {group} year {year_label}")
+    # Tagged with the run on the commit itself, so the store's history names every run that wrote
+    # this year even when the process dies before the attrs commit below records it.
+    shard_snapshot = commit_with_rebase(
+        session,
+        commit_msg or f"fill {group} year {year_label}",
+        metadata={SHARD_WRITE: {"run_id": run_id, "zone": group, "year": year_label}} if run_id else None,
+    )
     # The store's own clock for this write. Icechunk refuses a snapshot older than its parent, so
     # along `main` these stamps are commit order, which is the order a tile's pixels were written
     # in, whatever order the attrs commits below land in.

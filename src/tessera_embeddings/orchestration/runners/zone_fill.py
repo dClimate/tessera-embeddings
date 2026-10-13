@@ -73,7 +73,7 @@ from tessera_embeddings.inference.data_loading import _active_orbits
 from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.storage.campaign import mark_zone_year_empty, tag_zone_year, zone_year_tag
 from tessera_embeddings.storage.global_store import check_destination_types, open_global_repo
-from tessera_embeddings.storage.published_store import calendar_years, live_shards, store_year
+from tessera_embeddings.storage.published_store import calendar_years, live_shards, shard_writes, store_year
 from tessera_embeddings.storage.registry_master import update_cell
 from tessera_embeddings.storage.shard_writer import read_years_complete, shard_pitch
 from tessera_embeddings.storage.time_axis import time_index_of, year_timestamp
@@ -367,7 +367,13 @@ def _update_registry_master(
             registry_root, **(plain_zarr_storage_options(registry_root, credentials, s3_region) or {})
         )
         disagreements = update_cell(
-            fs, registry_root, zone, year, run_id=run_id, live=live, store=store_year(repo, node, zone, year)
+            fs,
+            registry_root,
+            zone,
+            year,
+            run_id=run_id,
+            live=live,
+            store=store_year(repo, node, zone, year, shard_writes(repo)),
         )
     except Exception:
         log.exception(

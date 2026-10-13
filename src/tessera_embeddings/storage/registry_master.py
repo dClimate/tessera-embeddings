@@ -39,10 +39,10 @@ run's shard commit time: Icechunk refuses a commit older than its parent, so the
 superseded run loses to the newer run's row, measured or not.
 
 **The store stands behind the parts, or the cell is not written.** Newest-part-wins is right only
-if every run that wrote the year has a part. The store's run record names them all, and Icechunk's
-diff of each commit says which tiles it wrote, so :func:`store_disagreements` refuses a cell in
-which a run with no part is the last to have written any tile, a part is stamped out of commit
-order, or a part names a run the store never committed.
+if every run that wrote the year has a part. Every shard commit is tagged with its run, in the same
+commit as the pixels, and Icechunk's diff of each commit says which tiles it wrote, so
+:func:`store_disagreements` refuses a cell in which a run with no part is the last to have written
+any tile, a part is stamped out of commit order, or a part names a run the store never committed.
 
 **Within that run, precedence is not latest-wins, and the difference matters.** A fill measured pixels
 as it wrote them; a re-derivation recomputed them afterwards from what was written. They should

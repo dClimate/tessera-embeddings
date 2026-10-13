@@ -40,7 +40,7 @@ shows it rather than downloading it. Nothing reads it, and it sits outside both 
 ## How a fill keeps it current
 
 ```
-  assemble_global ── commit the shards ──▶ record the run and its commit in the zone's runs attr
+  assemble_global ── commit the shards, tagged with the run ──▶ record the run in the zone's runs attr
         │         ──▶ publish parts/…/<run_id>.parquet, stamped with that commit's timestamp
         │
   zone_fill ──▶ _update_registry_master
@@ -115,22 +115,29 @@ future infill, not something this code can check.
 
 Newest-part-wins is right only if the parts account for every run that wrote the year. Publishing
 a part is best-effort, so a run can commit without one. Its tiles then keep the previous run's rows,
-and once any later run lands, nothing in the registry shows it. The store therefore keeps the
-account, in each zone group's `runs` attribute, which the shard writer owns:
+and once any later run lands, nothing in the registry shows it. So the store keeps the account, and
+keeps it where no crash can separate it from the pixels: **every shard commit is tagged with its
+run.** `write_year_shards` puts `{"shard_write": {run_id, zone, year}}` in the commit's own Icechunk
+metadata, in the same commit as the shards.
 
 ```
-  runs["2024"] = {run_id, assembled_at, commit: {snapshot, committed_at}, ...,
-                  previous: [{run_id, assembled_at, commit}, ...]}     every run it replaced
+  main:  … ─ shard commit  metadata.shard_write = {run_id, zone, year}   ← the authority
+           ─ attrs commit  runs[year] = {run_id, assembled_at, commit: {snapshot, committed_at},
+                                         ..., previous: [{run_id, assembled_at, commit}, ...]}
 ```
 
-- **`commit`** is the run's shard commit. It is null for a year marked without writing shards, and
-  absent from a record that predates it, which is all of v1.1.
-- **`previous`** keeps each replaced run's identity and commit, and no tile list. Which tiles a
-  commit wrote comes from Icechunk's diff of that commit against its parent, the store's own
-  transaction log (`published_store.commit_tiles`). It is read only for a run with no part.
-- **Two runs of one zone-year at once** mark in whichever order they finish, so the record at the
-  top may be the run that marked last rather than the one that committed last. Each entry carries
-  its own commit, and `published_store.committed_runs` orders them by it.
+- **The tagged commits are read from `main`'s history** (`published_store.shard_writes`). A
+  spec-version-2 repository keeps every snapshot record, metadata included, in its one `repo`
+  object, so the whole history is one read: 3,002 commits took 10 ms locally. A run that died
+  between its two commits has no `runs` record and no part, but its tagged commit is there.
+- **A run is taken at its latest write**, so a retry under the same run id that rewrites its
+  shards supersedes its earlier commit.
+- **Runs from before commits were tagged**, all of v1.1, are known only from the `runs` record: an
+  entry with no `commit` key, the year's own or one a refill kept in `previous`. `commit` is null
+  for a year marked without writing shards, which wrote no tile.
+- **Which tiles a commit wrote** comes from Icechunk's diff of that commit against its parent, the
+  store's own transaction log (`published_store.commit_tiles`). It is read only for a run with no
+  part, so the run records carry no tile lists.
 
 `registry_master.store_disagreements` refuses a cell, and writes nothing, when:
 
@@ -139,7 +146,7 @@ account, in each zone group's `runs` attribute, which the shard writer owns:
 | include a run the store records no commit by | the run is not in the store; its part must be deleted |
 | include a part not stamped with its run's commit | the merge would order it by the wrong clock |
 | lack a run that was the last to write some tile | that tile's row describes an older run |
-| lack a run whose record predates commits | nothing bounds which tiles it wrote |
+| lack a run from before commits were tagged | nothing bounds which tiles it wrote |
 
 A run with no part whose every tile a later run wrote over describes nothing the store holds, so it
 does not block. **That is also how a blocked cell recovers.** Rewrite the tiles the refusal names

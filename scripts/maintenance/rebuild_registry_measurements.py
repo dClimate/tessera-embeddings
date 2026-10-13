@@ -138,10 +138,16 @@ def _registry_table(
     return table
 
 
-def _open_store(store_uri: str, region: str, *, anonymous: bool) -> tuple[icechunk.Repository, zarr.Group]:
-    """The published store's repository, and its root group read-only."""
+#: The published store as the checks read it: its repository, its root group read-only, and every
+#: tagged shard commit on ``main`` by zone-year (``published_store.shard_writes``).
+_Store = tuple[icechunk.Repository, zarr.Group, dict[tuple[str, int], list[published_store.Commit]]]
+
+
+def _open_store(store_uri: str, region: str, *, anonymous: bool) -> _Store:
+    """The published store, opened once for however many cells a subcommand checks."""
     repo = open_global_repo(store_uri, region=region, anonymous=anonymous)
-    return repo, zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
+    root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
+    return repo, root, published_store.shard_writes(repo)
 
 
 def _only_zones(table: pa.Table, zones: list[str]) -> pa.Table:
@@ -175,9 +181,7 @@ def _current(parts: pa.Table) -> pa.Table:
     return merge(as_master_rows(parts, MEASURED_BY_FILL))
 
 
-def _store_slot(
-    repo: icechunk.Repository, root: zarr.Group, zone: str, year: int, parts: pa.Table
-) -> tuple[int, published_store.StoreYear] | str:
+def _store_slot(store: _Store, zone: str, year: int, parts: pa.Table) -> tuple[int, published_store.StoreYear] | str:
     """The cell's time index and store record, or why the store cannot stand behind its parts.
 
     The store's record of the year must account for every part, and a part for every tile a run
@@ -187,13 +191,14 @@ def _store_slot(
     but never published its part breaks that, and re-deriving rows from its pixels would publish a
     mixture neither run produced.
     """
+    repo, root, writes = store
     if zone not in root:
         return "no such zone in the store"
     group = root[zone]
     years = published_store.calendar_years(group)
     if year not in years:
         return "no time slot in the store"
-    record = published_store.store_year(repo, group, zone, year)
+    record = published_store.store_year(repo, group, zone, year, writes)
     if found := store_disagreements(parts, record):
         return "; ".join(found)
     return years.index(year), record
@@ -275,14 +280,15 @@ def cmd_gate(args: argparse.Namespace) -> int:
     # geometry or its rule, and a row-uniform sample would spend most of its budget in the largest
     # zone-years and check one latitude.
     per_cell = max(1, args.sample // max(1, len(measured)))
-    repo, root = _open_store(args.store, args.region, anonymous=args.anonymous)
+    store = _open_store(args.store, args.region, anonymous=args.anonymous)
+    root = store[1]
 
     totals: dict[str, int] = defaultdict(int)
     mismatches: list[dict[str, Any]] = []
     checked = 0
     unusable: list[str] = []
     for (zone, year), rows in measured:
-        slot = _store_slot(repo, root, zone, year, cells[zone, year])
+        slot = _store_slot(store, zone, year, cells[zone, year])
         if isinstance(slot, str):
             print(f"  {zone}/{year}: FAILED — {slot}", file=sys.stderr)
             unusable.append(f"{zone}/{year}")
@@ -353,7 +359,7 @@ def _rederive(
 
 def _repair_cell(
     fs: AbstractFileSystem,
-    store: tuple[icechunk.Repository, zarr.Group],
+    store: _Store,
     zone: str,
     year: int,
     parts: pa.Table,
@@ -367,7 +373,7 @@ def _repair_cell(
     """
     # Checked for EVERY cell, not only one with rows to re-derive: a run the store committed that
     # the parts do not account for means they no longer describe the cell, whatever they hold.
-    slot = _store_slot(*store, zone, year, parts)
+    slot = _store_slot(store, zone, year, parts)
     if isinstance(slot, str):
         raise ValueError(slot)
     current = _current(parts)
@@ -419,9 +425,9 @@ def cmd_verify(args: argparse.Namespace) -> int:
     if not args.parts_only:
         # The parts themselves against the store's record of who wrote each year: a run with no
         # part leaves the parts, and so the master, describing its tiles by the run before it.
-        repo, root = _open_store(args.store, args.region, anonymous=args.anonymous)
+        store = _open_store(args.store, args.region, anonymous=args.anonymous)
         for (zone, year), cell in _cells(parts, []).items():
-            if isinstance(slot := _store_slot(repo, root, zone, year, cell), str):
+            if isinstance(slot := _store_slot(store, zone, year, cell), str):
                 problems.setdefault(f"{zone}/{year}", []).append(f"the store cannot stand behind its parts: {slot}")
         problems = dict(sorted(problems.items()))
     origins = master.column("measured_by").to_pylist()

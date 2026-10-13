@@ -23,6 +23,7 @@ from tessera_embeddings.inference import assembly
 from tessera_embeddings.storage import (
     global_store,
     icechunk_logging,
+    published_store,
     session_catch_up,
     shard_writer,
     zarr_store,
@@ -156,6 +157,22 @@ def test_the_year_records_its_shard_commit_and_a_refill_keeps_the_run_before_it(
     record = zarr_store.open_store_as_zarr_group(store, group="01N").attrs["runs"]["2025"]
     assert (record["run_id"], record["commit"]) == ("refill", commits[1])
     assert [(p["run_id"], p["commit"]) for p in record["previous"]] == [("fill", commits[0])]
+
+
+def test_a_write_that_dies_before_its_record_is_still_in_the_commit_history(tmp_path, monkeypatch):
+    """The runs record lands in a second commit, which a dying process misses. The shard commit's own
+    tag is what lets the registry see such a run, so it must land with the pixels.
+    """
+    store, repo = _seed(tmp_path)
+
+    def dies(*_args, **_kwargs):
+        raise RuntimeError("process died between the two commits")
+
+    monkeypatch.setattr(shard_writer, "commit_year_attrs", dies)
+    with pytest.raises(RuntimeError, match="between the two commits"):
+        write_year_shards(repo, "01N", 2, _OneInnerChunkSource(), n_workers=1, shard_px=_SHARD, run_id="lost")
+    assert "runs" not in zarr_store.open_store_as_zarr_group(store, group="01N").attrs
+    assert [c.run_id for c in published_store.shard_writes(repo)["01N", 2025]] == ["lost"]
 
 
 def test_other_years_stay_empty(tmp_path):

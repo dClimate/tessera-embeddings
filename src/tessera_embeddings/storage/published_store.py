@@ -18,6 +18,7 @@ import numpy as np
 
 from tessera_embeddings.config.store_layout import GLOBAL, SHARD_PX, StoreLayout, clamp_chunks_and_shards
 from tessera_embeddings.storage.global_store import _codec_id, missing_seeded_arrays
+from tessera_embeddings.storage.shard_writer import SHARD_WRITE
 
 if TYPE_CHECKING:
     import icechunk
@@ -212,11 +213,11 @@ async def live_shards_async(
 
 
 class Commit(NamedTuple):
-    """One run that wrote shards into a zone-year, as the zone group's ``runs`` attr records it.
+    """One run's write into a zone-year: a tagged shard commit, or a ``runs`` record from before tags.
 
-    ``at`` orders runs: the shard commit's own timestamp, or for a record predating that field the
-    time it was marked. ``snapshot`` is the shard commit, ``None`` for such a record, and is what
-    :func:`commit_tiles` reads the tiles it wrote from.
+    ``at`` orders runs: the commit's own timestamp, or for an untagged run the time it was marked.
+    ``snapshot`` is the shard commit, ``None`` for an untagged run, and is what :func:`commit_tiles`
+    reads the tiles it wrote from.
     """
 
     run_id: str
@@ -224,22 +225,36 @@ class Commit(NamedTuple):
     snapshot: str | None
 
 
-def committed_runs(attrs: Mapping[str, Any], year: int) -> list[Commit]:
-    """Every run that wrote shards into ``year``, oldest first: the record's run and the ones it replaced.
+def shard_writes(repo: icechunk.Repository) -> dict[tuple[str, int], list[Commit]]:
+    """Every tagged shard commit on ``main``, by ``(zone, year)``, oldest first.
 
-    A run marked without writing shards (``commit`` recorded as null) wrote no tile, so it is left
-    out; a record with no ``commit`` key predates the field and is taken to have written.
+    The shard writer tags its commit with its run, zone and year (``shard_writer.SHARD_WRITE``), in
+    the same commit as the pixels, so a run that died before the attrs commit recording it is here
+    all the same. One read: a spec-version-2 repository keeps every snapshot record, metadata
+    included, in its single ``repo`` object.
+    """
+    found: dict[tuple[str, int], list[Commit]] = {}
+    for info in repo.ancestry(branch="main"):
+        tag = (info.metadata or {}).get(SHARD_WRITE)
+        if isinstance(tag, dict):
+            commit = Commit(str(tag["run_id"]), info.written_at.isoformat(), info.id)
+            found.setdefault((str(tag["zone"]), int(tag["year"])), []).append(commit)
+    return {cell: commits[::-1] for cell, commits in found.items()}
+
+
+def committed_runs(attrs: Mapping[str, Any], year: int, writes: Sequence[Commit]) -> list[Commit]:
+    """Every run that wrote shards into ``year``, oldest first, each by its latest write.
+
+    ``writes`` is :func:`shard_writes`' list for the zone-year, the authority for every run since
+    shard commits were tagged. A run from before is known only from the zone group's ``runs``
+    record, as an entry with no ``commit`` key: the year's own, or one a refill kept in
+    ``previous``. An entry with a ``commit`` key is a tagged run, or a year marked without shards.
     """
     head = (attrs.get("runs") or {}).get(str(year))
     entries = [head, *head.get("previous", [])] if isinstance(head, dict) else []
-    commits = [
-        Commit(str(e["run_id"]), str(e["commit"]["committed_at"]), str(e["commit"]["snapshot"]))
-        if "commit" in e
-        else Commit(str(e["run_id"]), str(e["assembled_at"]), None)
-        for e in entries
-        if e.get("commit", True)
-    ]
-    return sorted(commits, key=lambda c: datetime.fromisoformat(c.at))
+    untagged = [Commit(str(e["run_id"]), str(e["assembled_at"]), None) for e in entries if "commit" not in e]
+    latest = {c.run_id: c for c in sorted([*untagged, *writes], key=lambda c: datetime.fromisoformat(c.at))}
+    return sorted(latest.values(), key=lambda c: datetime.fromisoformat(c.at))
 
 
 def commit_tiles(repo: icechunk.Repository, zone: str, time_index: int, snapshot: str) -> frozenset[str]:
@@ -262,10 +277,20 @@ class StoreYear(NamedTuple):
     tiles_of: Callable[[str], frozenset[str]]
 
 
-def store_year(repo: icechunk.Repository, group: zarr.Group, zone: str, year: int) -> StoreYear:
-    """``year`` of ``zone`` as :func:`committed_runs` and :func:`commit_tiles` read it; diffs are lazy."""
+def store_year(
+    repo: icechunk.Repository,
+    group: zarr.Group,
+    zone: str,
+    year: int,
+    writes: Mapping[tuple[str, int], Sequence[Commit]],
+) -> StoreYear:
+    """``year`` of ``zone`` as :func:`committed_runs` and :func:`commit_tiles` read it; diffs are lazy.
+
+    ``writes`` is :func:`shard_writes`, read once for however many zone-years are being checked.
+    """
     time_index = calendar_years(group).index(year)
-    return StoreYear(committed_runs(group.attrs, year), lambda snapshot: commit_tiles(repo, zone, time_index, snapshot))
+    runs = committed_runs(group.attrs, year, writes.get((zone, year), ()))
+    return StoreYear(runs, lambda snapshot: commit_tiles(repo, zone, time_index, snapshot))
 
 
 def shard_pixel_window(
