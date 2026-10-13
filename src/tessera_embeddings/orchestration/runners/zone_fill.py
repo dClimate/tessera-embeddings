@@ -1450,9 +1450,11 @@ def _publish_merged_rows(
             records = dict(zip(labels, rows, strict=True))
     except Exception:
         log.exception(
-            "Zone %s year %d: merged tiles' registry rows could not be re-derived; publishing them unmeasured",
+            "Zone %s year %d: merged tiles' registry rows could not be re-derived; publishing them unmeasured. "
+            "Repair: scripts/maintenance/rebuild_registry_measurements.py repair --zones %s --write",
             zone,
             year,
+            zone,
         )
     writer.publish_registry_part(
         registry_root,
