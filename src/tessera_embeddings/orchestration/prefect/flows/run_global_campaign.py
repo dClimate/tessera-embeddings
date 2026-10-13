@@ -1117,12 +1117,14 @@ async def run_global_campaign(
     # complete-and-tagged cells in scope, or of an update's finished cells under its own root.
     # Opt-in; the zero-cost backstop is an S3 lifecycle rule.
     if sweep_orphan_mosaics and ingest and cleanup_mosaics:
-        work_set = set(work)
         if plan is not None:
+            # Recorded cells only: one the campaign has yet to fill is out of the work list too.
             mosaic_root = paths.update_root(plan.name)
-            finished = [c for c in plan.cell_list(zones=expected_zones, years=campaign_years) if c not in work_set]
+            in_scope = plan.cell_list(zones=expected_zones, years=campaign_years)
+            finished = [c for c, state in update_states(repo, plan.name, in_scope).items() if state == "done"]
         else:
             mosaic_root = paths.inputs
+            work_set = set(work)
             sweep_zones = expected_zones if expected_zones is not None else sorted(status.zones)
             finished = [
                 (z, y)

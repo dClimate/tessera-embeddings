@@ -1106,6 +1106,8 @@ class TestAnUpdateAcrossClusters:
         )
         assert "s3://in/updates/u1/mosaics/01N/2025" in update_wired["deletes"]
         assert all(d.startswith("s3://in/updates/u1/") for d in update_wired["deletes"]), update_wired["deletes"]
+        # 03N/2024 is out of the work list too, but the campaign has yet to fill it, so its mosaic may yet be used.
+        assert "s3://in/updates/u1/mosaics/03N/2024" not in update_wired["deletes"]
 
     def test_an_update_whose_targets_are_dead_never_resolves_the_ami(self, update_wired, monkeypatch):
         """Its child records the update without a cluster, so the parent must not need the AMI either."""
