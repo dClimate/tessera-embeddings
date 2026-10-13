@@ -13,7 +13,7 @@ change. Only a read that states the schema is safe; this reads both ways and rep
 
 **Agreement with the store.** Every column is derivable from the store, so the registry is a
 convenience layer and never a second source of truth — which is only true if it agrees.
-``--verify-zones`` compares, per cell, the registry's embedded tiles against the store's shards.
+``--verify-zones`` compares, per cell, the embedded tiles ``master/`` names against the store's shards.
 
 Run from the REPOSITORY ROOT::
 
@@ -408,26 +408,6 @@ def _optical_skip_labels(group: zarr.Group, year: int) -> list[str]:
     return [str(label) for label in labels] if isinstance(labels, list) else []
 
 
-def _current_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Per tile, only the rows of the most recently assembled run among ``rows`` that wrote it.
-
-    The rule ``registry_master`` merges by, because it is what the store holds: a run writes only its
-    own tiles, so each tile keeps the newest run that wrote it, and an infill supersedes the tiles
-    it touched and no others. ``assembled_at`` is the clock and ``run_id`` breaks a tie. A run whose
-    timestamps will not parse cannot be ordered, so it is never selected over one that can.
-    """
-    runs: dict[str, tuple[datetime, str]] = {}
-    for row in rows:
-        if (stamp := _parse_stamp(row["assembled_at"])) is not None:
-            run = str(row["run_id"])
-            runs[run] = max(runs.get(run, (stamp, run)), (stamp, run))
-    newest: dict[str, tuple[datetime, str]] = {}
-    for row in rows:
-        if (order := runs.get(str(row["run_id"]))) is not None:
-            newest[row["tile"]] = max(newest.get(row["tile"], order), order)
-    return [r for r in rows if r["tile"] not in newest or runs.get(str(r["run_id"])) == newest[r["tile"]]]
-
-
 def _verify_against_store(
     fs: pyarrow.fs.FileSystem,
     root: str,
@@ -437,12 +417,15 @@ def _verify_against_store(
     *,
     anonymous: bool = False,
 ) -> list[dict[str, Any]]:
-    """Per cell, compare the registry's embedded tiles with the store's live shards."""
+    """Per cell, compare the master's embedded tiles with the store's live shards.
+
+    The master and not ``parts/``, because it is what consumers read: a shard cleared by hand, which
+    no run's part records, leaves the master naming a tile the store no longer holds.
+    """
     import pyarrow.compute as pc
     import pyarrow.dataset as ds
 
-    prefix = root.removeprefix("s3://").rstrip("/") + "/parts"
-    dataset = ds.dataset(prefix, filesystem=fs, partitioning="hive", schema=dataset_schema())
+    dataset = ds.dataset(_master(fs, root), filesystem=fs, partitioning="hive", schema=master_schema())
     session = open_global_repo(store_uri, region=region, anonymous=anonymous).readonly_session(branch="main")
     root_group = zarr.open_group(session.store, mode="r")
 
@@ -474,16 +457,7 @@ def _verify_against_store(
         registry_years = {int(r["year"]) for r in rows if r["year"] is not None}
         for year in sorted(set(calendar) | registry_years):
             time_index = calendar.index(year) if year in calendar else None
-            all_rows = [r for r in rows if r["year"] == year]
-            # Duplicates WITHIN one run, before latest-wins hides them. Cross-run duplication is
-            # by design; the same `(run_id, tile)` twice doubles that tile's counts for anyone
-            # reading the Parquet directly.
-            within_run: dict[tuple[str, str], int] = {}
-            for row in all_rows:
-                key = (str(row["run_id"]), str(row["tile"]))
-                within_run[key] = within_run.get(key, 0) + 1
-            duplicated = sorted(f"{run}/{tile}" for (run, tile), n in within_run.items() if n > 1)
-            registry_rows = _current_rows(all_rows)
+            registry_rows = [r for r in rows if r["year"] == year]
             # The COORDINATES, not the count: one tile missing and one wrongly marked embedded
             # leaves the cardinalities equal while the registry points consumers at the wrong
             # ground and this audit says "agrees".
@@ -504,7 +478,7 @@ def _verify_against_store(
             must_be_refused = ((observed_tiles - store_tiles) | skipped) - store_tiles
             unrecorded_refusals = sorted(must_be_refused - refused_tiles)
             unparsed_tiles = sorted({r["tile"] for r in registry_rows if not _tile_coordinate(r["tile"])})
-            bad_stamps = unparsable_stamps(all_rows)
+            bad_stamps = unparsable_stamps(registry_rows)
             findings.append(
                 {
                     "zone": zone,
@@ -512,8 +486,7 @@ def _verify_against_store(
                     "in_store_time_axis": time_index is not None,
                     "marked_complete": year in years,
                     "registry_rows": len(registry_rows),
-                    "registry_rows_before_dedup": len(all_rows),
-                    "runs_present": sorted({r["run_id"] for r in all_rows}),
+                    "runs_present": sorted({r["run_id"] for r in registry_rows}),
                     "registry_embedded": sum(1 for r in registry_rows if r["embedded"]),
                     "registry_not_embedded": sum(1 for r in registry_rows if not r["embedded"]),
                     "store_live_shards": len(store_tiles),
@@ -523,7 +496,6 @@ def _verify_against_store(
                     "refused_tiles_the_registry_omits": unrecorded_refusals[:20],
                     "unparsable_tile_labels": unparsed_tiles[:10],
                     "unparsable_assembled_at": bad_stamps[:10],
-                    "duplicated_within_a_run": duplicated[:10],
                     "refusal_reasons_do_not_sum": [r["tile"] for r in registry_rows if not _refusals_add_up(r)][:10],
                 }
             )
@@ -682,7 +654,6 @@ def main(argv: list[str] | None = None) -> int:
                     finding["tiles_disagreeing"],
                     finding["unparsable_tile_labels"],
                     finding["unparsable_assembled_at"],
-                    finding["duplicated_within_a_run"],
                     finding["refusal_reasons_do_not_sum"],
                     finding["refused_tiles_the_registry_omits"],
                 )

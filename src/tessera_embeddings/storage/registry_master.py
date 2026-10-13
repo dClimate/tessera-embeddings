@@ -436,8 +436,9 @@ def write_cell(
     the first lands, and the other is told rather than silently discarding the first's rows. A local
     registry, for rehearsals, checks the same under a lock. Either way a reader sees the old file or
     the new one, never a mixture. ``_common_metadata`` is the same bytes for every cell, so it is
-    written only when absent or behind :func:`master_schema` — a column added since — rather than
-    raced by every fill.
+    written only when absent or missing a column of :func:`master_schema` — one added since —
+    rather than raced by every fill. Never on a schema it lacks a column of, so a worker still on an
+    older release cannot take a newer column away from readers mid-deploy.
     """
     path = _master_path(registry_root, zone, year)
     buf = io.BytesIO()
@@ -450,12 +451,13 @@ def write_cell(
 
 
 def _schema_is_current(fs: AbstractFileSystem, meta: str) -> bool:
-    """Whether ``_common_metadata`` at ``meta`` exists and declares :func:`master_schema`'s columns."""
+    """Whether ``_common_metadata`` at ``meta`` exists and declares every column of :func:`master_schema`."""
     try:
         with fs.open(meta, "rb") as f:
-            return pq.read_schema(f).remove_metadata().equals(master_schema().remove_metadata())
+            declared = set(pq.read_schema(f).remove_metadata())
     except FileNotFoundError:
         return False
+    return set(master_schema().remove_metadata()) <= declared
 
 
 def _on_s3(fs: AbstractFileSystem) -> bool:

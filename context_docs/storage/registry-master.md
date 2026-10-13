@@ -59,10 +59,11 @@ shows it rather than downloading it. Nothing reads it, and it sits outside both 
 
 `registry_master.update_cell` does the work, called from both assembled branches of
 `orchestration/runners/zone_fill.py`, the ordinary one and the all-refused `empty=True` one. It
-rewrites `_common_metadata` when it is absent or names other columns than the current schema, so a
-column added later reaches readers who take the schema from the dataset. It runs before the tag
-because a deliberate refill fails at the tag step by design (`reopen_zone_year.py`), after its data
-and part have landed, and the master must still describe it.
+rewrites `_common_metadata` when it is absent or lacks a column of the current schema, so a column
+added later reaches readers who take the schema from the dataset. It never rewrites one that has a
+column the current schema lacks, so a worker still on an older release cannot take a newer column
+away mid-deploy. It runs before the tag because a deliberate refill fails at the tag step by design
+(`reopen_zone_year.py`), after its data and part have landed, and the master must still describe it.
 
 - **Two writers of one zone-year cannot lose each other's rows.** An update reads the file's
   version, its S3 ETag, before anything the new file is built from, and writes on condition that
@@ -202,6 +203,7 @@ its cell has no part at all. `--parts-only` skips the store for a registry copy 
 | fill-measured values equal `parts/` for the latest run | a measurement the master altered |
 | `embedded`, the bounding box, the depth rule and the build equal the latest run's fill row | a row, re-derived or not, carrying another row's fields |
 | no unmeasured rows | a fill that published nulls |
+| the master's embedded tiles against the store's live shards (census `--verify-zones` only) | a shard cleared by hand, which no part records |
 | `parts/` against the store's run record (`verify` only) | a run with no part that holds a tile, a part out of commit order, a withdrawn run's part |
 
 Both name every failing cell. `repair --zones <Z,...> --write` rebuilds those cells from three

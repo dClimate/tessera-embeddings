@@ -371,11 +371,15 @@ class TestUpdateCell:
         assert update_cell(LOCAL, str(tmp_path), "33N", 2017) == []
         assert not (tmp_path / "master").exists()
 
-    def test_a_stale_dataset_schema_is_replaced(self, registry: Path) -> None:
-        """A column added since the last write must reach readers who take the schema from the dataset."""
-        pq.write_metadata(pa.schema([pa.field("tile", pa.string())]), registry / "master" / "_common_metadata")
+    @pytest.mark.parametrize("newer", [False, True], ids=["an-older-schema-is-replaced", "a-newer-one-is-kept"])
+    def test_the_dataset_schema_only_gains_columns(self, registry: Path, newer: bool) -> None:
+        """A column added since must reach readers, and a worker still on an older release must not take one away."""
+        meta = registry / "master" / "_common_metadata"
+        added = master_schema().append(pa.field("added_later", pa.int64()))
+        declared = added if newer else pa.schema([pa.field("tile", pa.string())])
+        pq.write_metadata(declared, meta)
         update_cell(LOCAL, str(registry), "33N", 2017)
-        assert pq.read_schema(registry / "master" / "_common_metadata").names == master_schema().names
+        assert pq.read_schema(meta).names == (added if newer else master_schema()).names
 
     def test_a_file_uri_root_writes_the_real_path(self, registry: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """A ``file://`` root read through fsspec and written through ``pathlib`` must be one path."""
