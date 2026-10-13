@@ -92,8 +92,31 @@ over the same zones, run, and check that the updated rows say `optical_min_obs =
   measurement (ADR 027 §3) before a large update, rather than estimating.
 - **A tile no update has reached reflects the earlier line.** Its registry row still says
   `optical_min_obs = 15` with its `refused_thin_px`, which is exactly the update's work list.
-- **yield-embeddings follows:** `CAMPAIGN_OPTICAL_MIN_OBS = 1` with the pin bump (its test asserts
-  equality with this constant); its validator resolves the rule per zone rather than from the root;
-  its update runbook gains the loosen step.
+- **yield-embeddings follows** (Arbol-Project/yield-embeddings#96): `CAMPAIGN_OPTICAL_MIN_OBS = 1`
+  with the pin bump (its test asserts equality with this constant); its validator resolves the rule
+  per zone and counts thin pixels against that same rule; its runbook gains the loosen step.
 - **Unchanged:** the ingest date filter `min_valid_coverage` (campaign 0.1%, updates 1e-9), and
   ADR 027's drivers and modes.
+
+## 4. Verified on global-tessera-dev, 2026-10-12
+
+Two cloudy tiles the published store refuses about 60% of under 15, both fully land with radar,
+year 2023: 18N `chunk_448_1` (Colombia–Ecuador, 1.3°N) and 18S `chunk_28_1` (northern Peru, 5.2°S).
+A fresh dev store seeded at 15 was filled through `fill-zones-sequential` on the campaign path; its
+registry rows reproduced the published `refused_thin_px` exactly (2,505,700 and 2,514,335). Only 18N
+was then loosened to 1, and one `holes` update over both tiles ran on one cluster. Checked against
+the update's base tag:
+
+| zone | rule applied | embedded before | after | newly embedded below the zone's rule | baseline pixels changed |
+|---|---:|---:|---:|---:|---|
+| 18N | 1 | 1,684,989 | 4,190,689 | 0 | none, in all eight arrays |
+| 18S | 15 | 1,679,709 | 1,679,709 | 0 | none (tile kept) |
+
+- **Every 18N hole with an optical observation was filled**; the 3,615 left empty have none.
+- **One chained session applied two rules**: the run logged 1 for 18N and 15 for 18S, the update
+  records state the same, and the registry rows read `optical_min_obs` 1 with `refused_thin_px` 0
+  for 18N and 15 with 2,514,335 for 18S.
+- **The new embeddings look like the rest**: in a sampled 256-px window, pixels with 3–14
+  observations have a median L2 norm of 9.63 against 9.96 for those with 15–25, and no zero vectors.
+- Baseline and update each took about 30 minutes end to end. Everything the test wrote was deleted
+  afterwards.
