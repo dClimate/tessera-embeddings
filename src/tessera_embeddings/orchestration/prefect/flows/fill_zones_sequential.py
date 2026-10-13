@@ -1042,12 +1042,15 @@ def fill_zones_sequential_flow(
                 run_id=run_id,
                 get_credentials=iam_icechunk_credentials,
                 s3_region=s3_region,
+                # A retagged cell's master is caught up in planning, in case its fill died before that.
+                registry_root=paths.optical_registry(store_path),
             ),
         )
 
     def _update_no_cluster(zone: str, year: int) -> dict[str, Any]:
         # The runner's no-Ray update path: no shard of the update is live in its mask, so planning
-        # records that and returns before any inference.
+        # records that and returns before any inference; or the update is already recorded, and
+        # planning catches up the cell's master in case the run died before merging it.
         assert plan is not None
         return fill_zone_year(
             store_path=store_path,
@@ -1063,11 +1066,16 @@ def fill_zones_sequential_flow(
             get_credentials=iam_icechunk_credentials,
             s3_region=s3_region,
             update=plan.target(zone, year, root=cast(str, update_root)),
+            registry_root=paths.optical_registry(store_path),
         )
 
     for zone, year in cells:
+        if plan is not None and states[(zone, year)] == "done":
+            _update_no_cluster(zone, year)
+            update_done.append((zone, year))
+            continue
         if plan is not None and states[(zone, year)] != "pending":
-            (update_done if states[(zone, year)] == "done" else not_filled).append((zone, year))
+            not_filled.append((zone, year))
             continue
         if plan is None and zone_year_complete(
             store_path, zone, year, get_credentials=iam_icechunk_credentials, s3_region=s3_region
@@ -1298,6 +1306,8 @@ def fill_zones_sequential_flow(
             get_credentials=iam_icechunk_credentials,
             s3_region=s3_region,
             update=plan.target(cell.zone, cell.year, root=cast(str, update_root)) if plan is not None else None,
+            # A cell this session finds already landed has its master caught up here, as triage's do.
+            registry_root=paths.optical_registry(store_path),
         )
 
     # The shared stream session: ONE set of actors for EVERY zone in the cluster, whatever orbit

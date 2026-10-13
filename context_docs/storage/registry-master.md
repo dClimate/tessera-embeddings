@@ -54,12 +54,14 @@ shows it rather than downloading it. Nothing reads it, and it sits outside both 
                   ▼
               tag the zone-year
 
-  a retry of a cell that already landed,
-  or of an update already recorded       ──▶ _update_registry_master, with no run id
+  planning a cell that already landed,
+  or an update already recorded there   ──▶ _update_registry_master, with no run id
+  (every runner plans every retry, triage's included)
 ```
 
 `registry_master.update_cell` does the work, called from both assembled branches of
-`orchestration/runners/zone_fill.py`, the ordinary one and the all-refused `empty=True` one. It
+`orchestration/runners/zone_fill.py`, the ordinary one and the all-refused `empty=True` one, and
+from planning when a retry finds the cell already landed. It
 rewrites `_common_metadata` when it is absent or names other columns than the current schema, so a
 column added later reaches readers who take the schema from the dataset. It runs before the tag
 because a deliberate refill fails at the tag step by design (`reopen_zone_year.py`), after its data
