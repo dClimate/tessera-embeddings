@@ -22,19 +22,27 @@ reading the result. Two consequences the master closes:
 
 **It is updated in place, by every fill.** The zone-fill runner calls :func:`update_cell` as soon as
 a cell's part is published. That merges the cell's parts into the cell's existing master file and
-replaces the file in one PUT. Cells are independent, so concurrent fills never write the same
-object, and the update is idempotent. Merging every part rather than only the newest costs a few
-small reads and means a cell whose earlier update failed is healed by its next one.
+replaces the file in one conditional PUT, so two writers of one cell — two fills, or a fill and a
+repair — cannot lose each other's rows: the one that read first is refused and merges again. The
+update is idempotent, and merging every part rather than only the newest costs a few small reads
+and means a cell whose earlier update failed is healed by its next one.
 
 **A tile's row comes from the newest run that wrote that tile.** A run writes only the tiles it
 staged or refused and leaves the year's other shards as they were (``assemble_global``'s refill
-caveat). So the store holds each tile as the most recently assembled run that wrote it left it,
+caveat). So the store holds each tile as the most recently committed run that wrote it left it,
 whichever run supplied the cell's other tiles, and the master follows the store: a full refill
 supersedes every tile, and a partial run such as an infill supersedes only its own and removes
 none. A run's row must therefore describe the whole tile as that run leaves it, because it becomes
-the tile's only row. ``filled_at`` names the run a row describes, by its fill stamp: the newest
-parsed ``filled_at`` wins, so a measurement re-derived against a superseded run loses to the newer
-run's row, measured or not.
+the tile's only row. ``filled_at`` names the run a row describes, by its part's stamp, which is the
+run's shard commit time: Icechunk refuses a commit older than its parent, so the newest parsed
+``filled_at`` is the run whose pixels the store holds, and a measurement re-derived against a
+superseded run loses to the newer run's row, measured or not.
+
+**The store stands behind the parts, or the cell is not written.** Newest-part-wins is right only
+if every run that wrote the year has a part. Every shard commit is tagged with its run, in the same
+commit as the pixels, and Icechunk's diff of each commit says which tiles it wrote, so
+:func:`store_disagreements` refuses a cell in which a run with no part is the last to have written
+any tile, a part is stamped out of commit order, or a part names a run the store never committed.
 
 **Within that run, precedence is not latest-wins, and the difference matters.** A fill measured pixels
 as it wrote them; a re-derivation recomputed them afterwards from what was written. They should
@@ -58,7 +66,10 @@ meaning "not measured" and does not quietly come to mean "measured by something 
 from __future__ import annotations
 
 import datetime
+import fcntl
+import hashlib
 import io
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -66,15 +77,16 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
-from pyarrow.fs import FileType
 
 from tessera_embeddings.storage.registry import dataset_schema
 from tessera_embeddings.storage.registry_rebuild import REBUILT_COLUMNS
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Iterator
+    from collections.abc import Collection, Iterator, Sequence
 
-    from pyarrow.fs import FileSystem
+    from fsspec import AbstractFileSystem
+
+    from tessera_embeddings.storage.published_store import StoreYear
 
 #: Value of ``measured_by`` for a row whose numbers the fill itself recorded.
 MEASURED_BY_FILL = "fill"
@@ -306,50 +318,172 @@ def cell_tables(table: pa.Table) -> Iterator[tuple[str, int, pa.Table]]:
             start = end
 
 
+def store_disagreements(parts: pa.Table, store: StoreYear) -> list[str]:
+    """Why the store cannot stand behind one cell's ``parts``, as sentences. Empty means it can.
+
+    A tile's master row comes from the newest part naming it, so the master is right only if the
+    parts account for every commit that wrote the year, in the order the store wrote them. A commit
+    no part describes leaves its tiles described by an older run, and nothing in the registry can
+    tell; a part stamped out of commit order picks the wrong run. The store records every commit
+    that wrote the year (:func:`~.published_store.committed_runs`), so:
+
+    * every part's run is one the store records — a withdrawn run's part must be deleted;
+    * every part is stamped with one of its run's shard commits, the one it describes;
+    * no commit that no part describes is the last to have written any tile, as the store's own diff
+      of it says (:func:`~.published_store.commit_tiles`). That covers a run with no part and also a
+      retry: a part describes one commit of its run, so an earlier attempt's commit counts on its
+      own. One that later commits superseded on every tile it wrote describes nothing, so it does
+      not block.
+    """
+    stamps: dict[str, set[datetime.datetime]] = {}
+    tiles: dict[str, set[str]] = {}
+    for row in parts.select(["run_id", "assembled_at", "tile"]).to_pylist():
+        stamps.setdefault(row["run_id"], set()).add(_aware(row["assembled_at"]))
+        tiles.setdefault(row["run_id"], set()).add(row["tile"])
+    runs = {commit.run_id for commit in store.commits}
+    found = [
+        f"run {run!r} has a part, but the store records no commit by it; a withdrawn run's part must be deleted"
+        for run in sorted(set(tiles) - runs)
+    ]
+    # The one commit each part describes: the one it is stamped with, or a run's only, untagged one.
+    described = {
+        run: next(
+            (c for c in store.commits if c.run_id == run and (c.snapshot is None or _aware(c.at) in stamps[run])), None
+        )
+        for run in sorted(set(tiles) & runs)
+    }
+    found += [
+        f"run {run!r} has a part stamped at none of its commits, so it would be misordered"
+        for run, commit in described.items()
+        if commit is None
+    ]
+    later: set[str] = set()
+    for commit in reversed(store.commits):
+        if described.get(commit.run_id) == commit:
+            written = tiles[commit.run_id]
+        elif commit.snapshot is None:
+            found.append(f"run {commit.run_id!r} wrote the year with no part, and no recorded commit bounds its tiles")
+            continue
+        else:
+            written = set(store.tiles_of(commit.snapshot))
+            if own := sorted(written - later):
+                found.append(
+                    f"run {commit.run_id!r} committed at {commit.at} and last wrote {len(own)} tile(s) no part "
+                    f"describes, so the master would describe them by an older run: {own[:5]}"
+                )
+        later |= written
+    return found
+
+
 def _bare(registry_root: str) -> str:
-    """``registry_root`` as a pyarrow filesystem path: no scheme, no trailing slash."""
+    """``registry_root`` as an fsspec path: no scheme, no trailing slash."""
     return registry_root.removeprefix("s3://").rstrip("/")
 
 
-def read_cell(fs: FileSystem, registry_root: str, prefix: str, zone: str, year: int, schema: pa.Schema) -> pa.Table:
-    """One cell's rows under ``prefix``, partition keys included; empty when the cell has none there."""
+def _master_path(registry_root: str, zone: str, year: int) -> str:
+    return f"{_bare(registry_root)}/master/zone={zone}/year={year}/part-0.parquet"
+
+
+def read_cell(
+    fs: AbstractFileSystem, registry_root: str, prefix: str, zone: str, year: int, schema: pa.Schema
+) -> pa.Table:
+    """One cell's rows under ``prefix``, partition keys included; empty when the cell has none there.
+
+    The listing is dropped first, because a filesystem instance is shared within a process and its
+    cached listing would hide a part another process published since.
+    """
     base = f"{_bare(registry_root)}/{prefix}"
     path = f"{base}/zone={zone}/year={year}"
-    if fs.get_file_info(path).type == FileType.NotFound:
+    fs.invalidate_cache(path)
+    if not fs.exists(path):
         return schema.empty_table()
     return ds.dataset(path, filesystem=fs, schema=schema, partitioning="hive", partition_base_dir=base).to_table()
 
 
-def write_cell(fs: FileSystem, registry_root: str, zone: str, year: int, rows: pa.Table) -> str:
-    """Replace one cell's master file with ``rows`` in a single PUT; returns the path written.
+def cell_version(fs: AbstractFileSystem, registry_root: str, zone: str, year: int) -> str | None:
+    """What names the version of the cell's master file now: S3's ETag, or a local file's hash.
 
-    One object per cell, replaced whole, so a reader sees the old file or the new one and never a
-    mixture, and no two cells share an object. ``_common_metadata`` is the same bytes for every
-    cell, so it is written only when absent or behind the current schema (a column added since, which
-    readers taking their schema from it would otherwise drop) rather than raced by every fill.
+    ``None`` when the cell has no master file. Read BEFORE anything the new file is built from, so
+    a write landing after any of those reads changes it and :func:`write_cell` refuses.
     """
-    path = f"{_bare(registry_root)}/master/zone={zone}/year={year}/part-0.parquet"
+    path = _master_path(registry_root, zone, year)
+    fs.invalidate_cache(path)
+    try:
+        return str(fs.info(path)["ETag"]) if _on_s3(fs) else hashlib.sha256(fs.cat_file(path)).hexdigest()
+    except FileNotFoundError:
+        return None
+
+
+def write_cell(
+    fs: AbstractFileSystem, registry_root: str, zone: str, year: int, rows: pa.Table, *, version: str | None
+) -> bool:
+    """Replace one cell's master file with ``rows`` if it is still at ``version``; whether it was.
+
+    ``version`` is :func:`cell_version` as read before ``rows`` were built, ``None`` for a cell with
+    no file yet. On S3 it is a conditional PUT, so of two writers that read the same version only
+    the first lands, and the other is told rather than silently discarding the first's rows. A local
+    registry, for rehearsals, checks the same under a lock. Either way a reader sees the old file or
+    the new one, never a mixture. ``_common_metadata`` is the same bytes for every cell, so it is
+    written only when absent or behind the current schema (a column added since, which readers
+    taking their schema from it would otherwise drop) rather than raced by every fill.
+    """
+    path = _master_path(registry_root, zone, year)
     buf = io.BytesIO()
     # The partition keys live in the path, as in every hive dataset.
     pq.write_table(rows.drop_columns(["zone", "year"]), buf, compression="zstd")
-    fs.create_dir(path.rsplit("/", 1)[0])
-    with fs.open_output_stream(path) as out:
-        out.write(buf.getvalue())
-    meta = f"{_bare(registry_root)}/master/_common_metadata"
-    if fs.get_file_info(meta).type == FileType.NotFound or not _schema_is_current(fs, meta):
+    written = _put_if(fs, path, buf.getvalue(), version)
+    if written and not _schema_is_current(fs, f"{_bare(registry_root)}/master/_common_metadata"):
         write_common_metadata(fs, registry_root)
-    return path
+    return written
 
 
-def _schema_is_current(fs: FileSystem, meta: str) -> bool:
-    """Whether the ``_common_metadata`` at ``meta`` declares :func:`master_schema`'s columns."""
-    with fs.open_input_file(meta) as f:
-        return pq.read_schema(f).remove_metadata().equals(master_schema().remove_metadata())
+def _schema_is_current(fs: AbstractFileSystem, meta: str) -> bool:
+    """Whether ``_common_metadata`` at ``meta`` exists and declares :func:`master_schema`'s columns."""
+    try:
+        with fs.open(meta, "rb") as f:
+            return pq.read_schema(f).remove_metadata().equals(master_schema().remove_metadata())
+    except FileNotFoundError:
+        return False
 
 
-def write_common_metadata(fs: FileSystem, registry_root: str) -> None:
+def _on_s3(fs: AbstractFileSystem) -> bool:
+    return hasattr(fs, "call_s3")
+
+
+def _put_if(fs: AbstractFileSystem, path: str, data: bytes, version: str | None) -> bool:
+    """Write ``data`` at ``path`` only if the object there is still at ``version``."""
+    if not _on_s3(fs) and "file" not in fs.protocol:
+        raise ValueError(f"no conditional write for a {fs.protocol} filesystem; the master needs S3 or local")
+    if _on_s3(fs):
+        bucket, key, _ = fs.split_path(path)
+        condition = {"IfMatch": version} if version else {"IfNoneMatch": "*"}
+        try:
+            fs.call_s3("put_object", Bucket=bucket, Key=key, Body=data, **condition)
+        except OSError as error:
+            code = getattr(error.__cause__, "response", {}).get("Error", {}).get("Code")
+            if isinstance(error, FileExistsError) or code in ("PreconditionFailed", "ConditionalRequestConflict"):
+                return False
+            raise
+        finally:
+            fs.invalidate_cache(path)
+        return True
+    folder = Path(path).parent
+    folder.mkdir(parents=True, exist_ok=True)
+    with (folder / ".lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        current = hashlib.sha256(Path(path).read_bytes()).hexdigest() if Path(path).exists() else None
+        if current != version:
+            return False
+        # Dot-prefixed, so a dataset read of master/ never takes it for a part.
+        staged = folder / f".{Path(path).name}.tmp"
+        staged.write_bytes(data)
+        staged.replace(path)
+    return True
+
+
+def write_common_metadata(fs: AbstractFileSystem, registry_root: str) -> None:
     """The master's dataset-level schema, so a reader takes it from the dataset rather than a file."""
-    with fs.open_output_stream(f"{_bare(registry_root)}/master/_common_metadata") as out:
+    with fs.open(f"{_bare(registry_root)}/master/_common_metadata", "wb") as out:
         pq.ParquetWriter(out, master_schema()).close()
 
 
@@ -370,19 +504,30 @@ def _key(table: pa.Table, *columns: str) -> pa.Array:
 
 
 def update_cell(
-    fs: FileSystem,
+    fs: AbstractFileSystem,
     registry_root: str,
     zone: str,
     year: int,
     *,
     run_id: str | None = None,
     live: Collection[tuple[int, int]] | None = None,
+    store: StoreYear | None = None,
+    extra: Sequence[pa.Table] = (),
+    write: bool = True,
+    tries: int = 8,
 ) -> list[str]:
     """Merge one cell's parts into its existing master file, tile by tile, and replace the file.
 
-    Idempotent, and independent of every other cell. Raises, writing nothing, when the cell has no
-    part, has none for ``run_id`` — the run the caller just landed, whose part publishing is
-    best-effort and may have failed — or the merge breaks an invariant.
+    The one writer of a cell's master, used by every fill and by repair. Idempotent, and independent
+    of every other cell. Raises, writing nothing, when the cell has no part, has none for ``run_id``
+    — the run the caller just landed, whose part publishing is best-effort and may have failed — the
+    store cannot stand behind the parts (:func:`store_disagreements`, when ``store`` is given), or
+    the merge breaks an invariant. ``extra`` is more master rows to merge, a repair's re-derived
+    ones; ``write=False`` checks everything and writes nothing.
+
+    **Two writers of one cell cannot lose each other's rows.** The file's version is read first and
+    the write is conditional on it (:func:`write_cell`), so a writer that read before another
+    landed is refused and merges again from what is there now, up to ``tries`` times.
 
     ``live`` is the store's live ``(shard_y, shard_x)`` shards for this zone-year, from
     :func:`~.published_store.live_shards`. Returns where the master's embedded tiles disagree with
@@ -391,18 +536,28 @@ def update_cell(
     written either way, because it describes the registry faithfully; the disagreement is the
     caller's to report. Empty means they agree, or that nothing was checked.
     """
-    parts = read_cell(fs, registry_root, "parts", zone, year, dataset_schema())
-    if not parts.num_rows:
-        raise ValueError(f"{zone}/{year} has no registry part to merge into the master")
-    if run_id is not None and run_id not in set(parts.column("run_id").to_pylist()):
-        raise ValueError(f"{zone}/{year} has no registry part for run {run_id!r}, so the master would miss it")
-    fills = as_master_rows(parts, MEASURED_BY_FILL)
-    # Parts first, so on a tie between identical rows the part's copy is the one kept.
-    held = still_published(read_cell(fs, registry_root, "master", zone, year, master_schema()), fills)
-    master = merge(fills, held)
-    if failures := invariant_failures(master, expected_rows=tile_years(parts)):
-        raise ValueError(f"{zone}/{year} master breaks its invariants: {'; '.join(failures)}")
-    write_cell(fs, registry_root, zone, year, master)
+    for _ in range(tries):
+        version = cell_version(fs, registry_root, zone, year)
+        parts = read_cell(fs, registry_root, "parts", zone, year, dataset_schema())
+        if not parts.num_rows:
+            raise ValueError(f"{zone}/{year} has no registry part to merge into the master")
+        if run_id is not None and run_id not in set(parts.column("run_id").to_pylist()):
+            raise ValueError(f"{zone}/{year} has no registry part for run {run_id!r}, so the master would miss it")
+        if store is not None and (found := store_disagreements(parts, store)):
+            raise ValueError(f"{zone}/{year}: the store cannot stand behind the registry parts: {'; '.join(found)}")
+        fills = as_master_rows(parts, MEASURED_BY_FILL)
+        # Parts first, so on a tie between identical rows the part's copy is the one kept.
+        held = still_published(read_cell(fs, registry_root, "master", zone, year, master_schema()), fills)
+        master = merge(fills, held, *extra)
+        if failures := invariant_failures(master, expected_rows=tile_years(parts)):
+            raise ValueError(f"{zone}/{year} master breaks its invariants: {'; '.join(failures)}")
+        if not write or write_cell(fs, registry_root, zone, year, master, version=version):
+            return _live_disagreements(master, live)
+    raise ValueError(f"{zone}/{year} master changed under each of {tries} attempts to update it")
+
+
+def _live_disagreements(master: pa.Table, live: Collection[tuple[int, int]] | None) -> list[str]:
+    """Where the master's embedded tiles and the store's ``live`` shards disagree; empty if unchecked."""
     if live is None:
         return []
     tiles, embedded = master.column("tile").to_pylist(), master.column("embedded").to_pylist()

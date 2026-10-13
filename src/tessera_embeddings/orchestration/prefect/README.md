@@ -397,7 +397,8 @@ runner merges its registry parts into the cell's file under the registry's `mast
 it lands, including a deliberate refill, which fails at the tag step by design. Like the
 validator dispatch, a failure there is logged and never fails the landed cell; the registry
 census names the cell and `scripts/maintenance/rebuild_registry_measurements.py repair`
-rebuilds it. See
+rebuilds it. The update refuses while a run the store records writing the year has no part for a
+tile it last wrote; refilling those tiles clears it. See
 [`registry-master.md`](../../../../context_docs/storage/registry-master.md).
 
 ### Cancelling reaches every level

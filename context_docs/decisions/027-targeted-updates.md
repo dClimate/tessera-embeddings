@@ -46,8 +46,8 @@ has no such attempt to fear, and blanking would lose good data to a bad run. A `
 
 **The update records itself beside the fill, never over it.** `years_complete`, `runs[year]` and the
 zone-year tags are untouched. Each cell gains one record in its zone group's `updates[year]` list:
-the update, its mode and run, its code, its mask, and which shards it `written`, `kept` and
-`cleared`. A cell is therefore `runs[year]` with `updates[year]` applied on top, in order, and an
+the update, its mode and run, its code, its mask, its shard `commit`, and which shards it
+`written`, `kept` and `cleared`. A cell is therefore `runs[year]` with `updates[year]` applied on top, in order, and an
 update is done on a cell exactly when that cell holds its record — which is what makes a rerun free.
 
 **Two tags per update, none per cell.** `update-<name>-base` pins the store before the update's first
@@ -73,8 +73,10 @@ never did. Both are plan fields, overridable.
 **The registry describes each tile as it now stands.** Update parts land in `parts/` like any fill's
 and #219's per-tile merge keeps `master/` current, a tile's newest row winning. Rows carry a new
 `update_name` column (null for the campaign). A merged shard holds two runs' pixels, so its rows are
-re-derived from the committed shard rather than taken from either run's record. An update that wrote
-nothing publishes no part and does not count as a cell's last writer. `master/_common_metadata` is
+re-derived from the committed shard rather than taken from either run's record. An update's shard
+commit carries #219's run tag like a fill's, and its part is stamped with that commit, so #219's store
+check covers updates unchanged; an update that wrote nothing made no shard commit and has no part.
+`master/_common_metadata` is
 rewritten when its schema falls behind, so the new column is visible to readers that take the schema
 from it, and the planner reads `master/` with the declared schema, so cell files from before and
 after the column read together.
