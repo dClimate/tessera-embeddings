@@ -55,9 +55,14 @@ write, for comparison and rollback; `update-<name>-complete` pins it once every 
 the record. A cell the campaign never filled is refused: an update inserts into existing data.
 
 **Everything an update writes outside the store is its own.** Its ROI, mosaics and hole masks live
-under `{inputs}/updates/<name>/`, its staging under `{outputs}/staging/updates/<name>/`. The campaign
-rewrites a zone's shared ROI whenever its coverage changes and sweeps the mosaics of complete cells,
-and every cell an update touches is complete.
+under `{inputs}/updates/<name>/`, its staging under `{outputs}/staging/updates/<name>/<store>/`. The
+campaign rewrites a zone's shared ROI whenever its coverage changes and sweeps the mosaics of complete
+cells, and every cell an update touches is complete.
+
+**Hole masks and staging are keyed by destination store** (`<store>`: the first 12 hex digits of the
+SHA-256 of its URI). A `holes` update infers only the pixels that are holes in its own store, so if
+one plan run against two stores shared either, a retry could resume tiles inferred for the other
+store's holes, write nothing into its own, and record the cell as done.
 
 **Partial-zone ingests must not be blocked by settings sized for whole zones.** The date threshold
 `min_valid_coverage` is a percentage of the ROI's pixels, so on an update's small ROI the campaign's

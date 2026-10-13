@@ -7,6 +7,7 @@ import pytest
 import zarr
 
 from tessera_embeddings.config.inference import InferenceConfig
+from tessera_embeddings.config.paths import store_key
 from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.orchestration.runners import zone_fill
 from tessera_embeddings.storage import global_store
@@ -145,6 +146,7 @@ def test_a_holes_update_fills_only_the_holes(filled, monkeypatch):
     assert (record["mode"], record["written"], record["kept"]) == ("holes", ["chunk_0_0"], ["chunk_1_1"])
     # The masks are filed under the destination store, so a plan run against another store reads its own.
     [store_dir] = list((filled["tmp"] / "holes").iterdir())
+    assert store_dir.name == store_key(filled["store"])
     assert sorted(p.name for p in store_dir.iterdir()) == ["chunk_0_0.npz", "chunk_1_1.npz"]
 
 

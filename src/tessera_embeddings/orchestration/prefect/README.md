@@ -330,7 +330,7 @@ else ([ADR 027](../../../../context_docs/decisions/027-targeted-updates.md)). Th
 | inferred | every valid pixel of every live tile | `holes`: only the store's hole pixels; `shards`: the target shards |
 | a tile that embeds nothing | cleared to fill | kept (`on_skip: "clear"` for a `shards` defect fix) |
 | recorded in | `years_complete`, `runs[year]`, the zone-year tag | `updates[year]` alone |
-| ROI, mosaics, staging | the campaign's paths | `{inputs}/updates/<name>/`, `{outputs}/staging/updates/<name>/` |
+| ROI, mosaics, staging | the campaign's paths | `{inputs}/updates/<name>/`, `{outputs}/staging/updates/<name>/<store>/`; hole masks and staging per destination store |
 | `min_valid_coverage`, month check | 0.1, every month | `1e-9`, relaxed: a partial-zone ROI must never block |
 | radar policy | any | `holes` requires `allow_s2_only=True`, the campaign's, refused before ingest otherwise |
 

@@ -45,7 +45,6 @@ cell lands — including a deliberate refill, which fails at the tag step by des
 from __future__ import annotations
 
 import dataclasses
-import hashlib
 import logging
 import time
 import uuid
@@ -64,6 +63,7 @@ from pyarrow.fs import FSSpecHandler, PyFileSystem
 from tessera_embeddings.config.assembly import AssemblyConfig
 from tessera_embeddings.config.fault_injection import ArmedFault
 from tessera_embeddings.config.inference import InferenceConfig
+from tessera_embeddings.config.paths import store_key
 from tessera_embeddings.config.store_layout import GLOBAL, REQUIRED_VARS
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import (
@@ -771,7 +771,7 @@ def plan_zone_inference(
                 chunks=live,
                 # Per destination store: a mask describes one store's holes, and one plan may be run
                 # against more than one store sharing the inputs bucket.
-                prefix=f"{update.holes}/{hashlib.sha256(store_path.encode()).hexdigest()[:12]}",
+                prefix=f"{update.holes}/{store_key(store_path)}",
             )
             update = dataclasses.replace(update, kept=tuple(sorted(c.label for c in live if c.label not in holes)))
             live = [dataclasses.replace(c, pixels=holes[c.label]) for c in live if c.label in holes]
