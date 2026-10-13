@@ -228,17 +228,17 @@ def test_a_refill_that_never_published_blocks_only_while_it_holds_a_tile(
     expected: int,
 ) -> None:
     """A refill that died after its shard commit, so it published no part and never reached the year's
-    ``runs`` record, then an infill that landed whole. Only the refill's tagged commit in the store's
+    ``runs`` record, then an update that landed whole. Only the refill's tagged commit in the store's
     history shows it at all, and only its diff says whether a tile it wrote is still its own.
     """
-    infill_at = "2026-08-09T00:00:00+00:00"
+    update_at = "2026-08-09T00:00:00+00:00"
     _seed(tmp_path)
-    _seed(tmp_path, [_row("chunk_1_1", measured=True, run_id="infill", assembled_at=infill_at)], run="infill")
+    _seed(tmp_path, [_row("chunk_1_1", measured=True, run_id="update", assembled_at=update_at)], run="update")
     _seed_master(tmp_path, radar=None)
     store.attrs["runs"] = run_provenance(
-        V11_RUNS, 2017, "infill", commit={"snapshot": "s-c", "committed_at": infill_at}
+        V11_RUNS, 2017, "update", commit={"snapshot": "s-c", "committed_at": update_at}
     )
-    writes = {("33N", 2017): [Commit("refill", "2026-08-05T00:00:00+00:00", "s-b"), Commit("infill", infill_at, "s-c")]}
+    writes = {("33N", 2017): [Commit("refill", "2026-08-05T00:00:00+00:00", "s-b"), Commit("update", update_at, "s-c")]}
     monkeypatch.setattr(script, "_open_store", lambda *_args, **_kwargs: (None, {"33N": store}, lambda: writes))
     wrote = {"s-b": refill_wrote, "s-c": {"chunk_1_1"}}
     monkeypatch.setattr(published_store, "commit_tiles", lambda _repo, _zone, _t, snapshot: frozenset(wrote[snapshot]))

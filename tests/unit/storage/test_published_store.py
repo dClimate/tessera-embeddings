@@ -422,15 +422,15 @@ class TestWhoWroteAYear:
         """A retry under the same run id is a commit of its own, and runs from before tags are known only
         from the record, which a refill keeps.
         """
-        old, first, retry, infill = (f"2026-0{m}-01T00:00:00+00:00" for m in (7, 8, 9, 9))
-        infill = infill.replace("01T", "02T")
+        old, first, retry, update = (f"2026-0{m}-01T00:00:00+00:00" for m in (7, 8, 9, 9))
+        update = update.replace("01T", "02T")
         runs = shard_writer.run_provenance({"2024": {"run_id": "v11", "assembled_at": old}}, 2024, "refill", code={})
-        writes = [Commit("refill", first, "s1"), Commit("infill", infill, "s3"), Commit("refill", retry, "s2")]
+        writes = [Commit("refill", first, "s1"), Commit("update", update, "s3"), Commit("refill", retry, "s2")]
         assert published_store.committed_runs({"runs": runs}, 2024, writes) == [
             Commit("v11", old, None),
             Commit("refill", first, "s1"),
             Commit("refill", retry, "s2"),
-            Commit("infill", infill, "s3"),
+            Commit("update", update, "s3"),
         ]
 
     def test_a_refill_keeps_that_the_run_it_replaced_marked_the_year_empty(self):
