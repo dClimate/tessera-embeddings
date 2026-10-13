@@ -2104,8 +2104,9 @@ async def run_global_campaign(
         # cannot stamp the global tag prematurely, which matters because tags are write-once
         # forever. Attempted for EVERY year in the batch: an unfinished year raises
         # ValueError and is free, which is what lets the overlapping path use the same code
-        # as the year-serial one instead of detecting "was that the year's last cell".
-        for y in batch_years:
+        # as the year-serial one instead of detecting "was that the year's last cell". Never
+        # in an update, which must not pin a campaign tag at a snapshot holding its writes.
+        for y in batch_years if plan is None else ():
             try:
                 year_tag = tag_year_complete(repo, y)
                 log.info("Year %d tagged complete (all 120 zones): %s", y, year_tag)

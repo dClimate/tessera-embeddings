@@ -1070,6 +1070,7 @@ class TestAnUpdateAcrossClusters:
         status = SimpleNamespace(zones={"01N": (), "02N": (), "03N": ()}, has=lambda z, y: True)
         monkeypatch.setattr(mod, "campaign_status", lambda *a, **k: status)
         monkeypatch.setattr(mod, "campaign_work_list", lambda *a, **k: pytest.fail("an update has its own work list"))
+        monkeypatch.setattr(mod, "tag_year_complete", lambda *a, **k: pytest.fail("an update pins no campaign tag"))
 
         def states(repo, name, cells):
             return {
