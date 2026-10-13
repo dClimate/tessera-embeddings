@@ -421,7 +421,11 @@ def cell_version(fs: AbstractFileSystem, registry_root: str, zone: str, year: in
     ``None`` when the cell has no master file. Read BEFORE anything the new file is built from, so
     a write landing after any of those reads changes it and :func:`write_cell` refuses.
     """
-    path = _master_path(registry_root, zone, year)
+    return _version(fs, _master_path(registry_root, zone, year))
+
+
+def _version(fs: AbstractFileSystem, path: str) -> str | None:
+    """The version of the object at ``path`` now, as :func:`_put_if` conditions on it; ``None`` if absent."""
     fs.invalidate_cache(path)
     try:
         return str(fs.info(path)["ETag"]) if _on_s3(fs) else hashlib.sha256(fs.cat_file(path)).hexdigest()
@@ -438,19 +442,36 @@ def write_cell(
     no file yet. On S3 it is a conditional PUT, so of two writers that read the same version only
     the first lands, and the other is told rather than silently discarding the first's rows. A local
     registry, for rehearsals, checks the same under a lock. Either way a reader sees the old file or
-    the new one, never a mixture. ``_common_metadata`` is the same bytes for every cell, so it is
-    written only when absent or missing a column of :func:`master_schema` — one added since —
-    rather than raced by every fill. Never on a schema it lacks a column of, so a worker still on an
-    older release cannot take a newer column away from readers mid-deploy.
+    the new one, never a mixture. Then ``_common_metadata`` is widened if it needs to be
+    (:func:`_widen_dataset_schema`).
     """
     path = _master_path(registry_root, zone, year)
     buf = io.BytesIO()
     # The partition keys live in the path, as in every hive dataset.
     pq.write_table(rows.drop_columns(["zone", "year"]), buf, compression="zstd")
     written = _put_if(fs, path, buf.getvalue(), version)
-    if written and not _schema_is_current(fs, f"{_bare(registry_root)}/master/_common_metadata"):
-        write_common_metadata(fs, registry_root)
+    if written:
+        _widen_dataset_schema(fs, registry_root)
     return written
+
+
+def _widen_dataset_schema(fs: AbstractFileSystem, registry_root: str, tries: int = 8) -> None:
+    """Write ``_common_metadata`` if it is absent or lacks a column of :func:`master_schema`.
+
+    The same bytes for every cell, so it is written only then rather than raced by every fill, and
+    never over a schema that has a column this one lacks: a worker still on an older release must
+    not take a newer column away from readers mid-deploy. Conditional on the copy checked, like a
+    cell's write, so of two workers that both found it stale, the second is refused and checks again.
+    """
+    meta = f"{_bare(registry_root)}/master/_common_metadata"
+    for _ in range(tries):
+        version = _version(fs, meta)
+        if version is not None and _schema_is_current(fs, meta):
+            return
+        buf = io.BytesIO()
+        pq.ParquetWriter(buf, master_schema()).close()
+        if _put_if(fs, meta, buf.getvalue(), version):
+            return
 
 
 def _schema_is_current(fs: AbstractFileSystem, meta: str) -> bool:
@@ -496,12 +517,6 @@ def _put_if(fs: AbstractFileSystem, path: str, data: bytes, version: str | None)
         staged.write_bytes(data)
         staged.replace(path)
     return True
-
-
-def write_common_metadata(fs: AbstractFileSystem, registry_root: str) -> None:
-    """The master's dataset-level schema, so a reader takes it from the dataset rather than a file."""
-    with fs.open(f"{_bare(registry_root)}/master/_common_metadata", "wb") as out:
-        pq.ParquetWriter(out, master_schema()).close()
 
 
 def still_published(held: pa.Table, fills: pa.Table) -> pa.Table:

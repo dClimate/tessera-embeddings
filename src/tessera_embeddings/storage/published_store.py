@@ -251,17 +251,27 @@ def committed_runs(attrs: Mapping[str, Any], year: int, writes: Sequence[Commit]
     shard commits were tagged. Not one per run: a retry under the same run id is a commit of its own,
     and its earlier attempt's tiles are the store's until something rewrites them. A run from before
     tags is known only from the zone group's ``runs`` record, as an entry with no ``commit`` key: the
-    year's own, or one a refill kept in ``previous``. An entry with a ``commit`` key is a tagged run,
-    or a year marked without shards.
+    year's own, or one a refill kept in ``previous``. So is a run whose recorded commit is no longer
+    in ``writes``: snapshot expiry (``campaign.expire_and_gc``) keeps tagged snapshots, and the
+    zone-year tag points at the attrs commit, not the shard commit before it. Either way the record
+    says when the run wrote and not what, so the entry has no snapshot to diff. A ``commit`` of null
+    is a year marked without shards, which wrote nothing.
     """
     head = (attrs.get("runs") or {}).get(str(year))
     entries = [head, *head.get("previous", [])] if isinstance(head, dict) else []
-    untagged = [
-        Commit(str(e["run_id"]), str(e["assembled_at"]), None, bool(e.get("empty")))
-        for e in entries
-        if "commit" not in e
-    ]
-    return sorted([*untagged, *writes], key=lambda c: datetime.fromisoformat(c.at))
+    tagged = {commit.snapshot for commit in writes}
+    recorded = [commit for entry in entries if (commit := _recorded(entry, tagged)) is not None]
+    return sorted([*recorded, *writes], key=lambda c: datetime.fromisoformat(c.at))
+
+
+def _recorded(entry: Mapping[str, Any], tagged: set[str | None]) -> Commit | None:
+    """A ``runs`` record entry as a commit with no snapshot, unless the tagged history has it or it wrote nothing."""
+    if "commit" not in entry:
+        return Commit(str(entry["run_id"]), str(entry["assembled_at"]), None, bool(entry.get("empty")))
+    commit = entry["commit"]
+    if isinstance(commit, Mapping) and commit.get("snapshot") not in tagged:
+        return Commit(str(entry["run_id"]), str(commit["committed_at"]), None)
+    return None
 
 
 def commit_tiles(repo: icechunk.Repository, zone: str, time_index: int, snapshot: str) -> frozenset[str]:

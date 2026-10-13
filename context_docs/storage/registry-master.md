@@ -62,7 +62,8 @@ shows it rather than downloading it. Nothing reads it, and it sits outside both 
 rewrites `_common_metadata` when it is absent or lacks a column of the current schema, so a column
 added later reaches readers who take the schema from the dataset. It never rewrites one that has a
 column the current schema lacks, so a worker still on an older release cannot take a newer column
-away mid-deploy. It runs before the tag because a deliberate refill fails at the tag step by design
+away mid-deploy. That write is conditional too, so of two workers that both found it stale, the
+second is refused and checks again. It runs before the tag because a deliberate refill fails at the tag step by design
 (`reopen_zone_year.py`), after its data and part have landed, and the master must still describe it.
 
 - **Two writers of one zone-year cannot lose each other's rows.** An update reads the file's
@@ -147,6 +148,10 @@ metadata, in the same commit as the shards.
   entry with no `commit` key, the year's own or one a refill kept in `previous`. One marked `empty`
   left no embeddings, so it needs no part. `commit` is null for a year marked without writing
   shards, which wrote no tile.
+- **Snapshot expiry drops shard commits from the history** (`campaign.expire_and_gc` keeps tagged
+  snapshots, and a zone-year's tag is on its attrs commit). A recorded run whose commit has gone is
+  then known from its `runs` entry, like a v1.1 run: its part still describes it, and without one
+  nothing bounds its tiles, so the zone-year blocks. Run `verify` before expiring.
 - **Which tiles a commit wrote** comes from Icechunk's diff of that commit against its parent, the
   store's own transaction log (`published_store.commit_tiles`), in every per-tile array rather
   than `scales` alone: a refused tile writes its observation counts and month coverage and no

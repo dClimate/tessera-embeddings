@@ -459,6 +459,13 @@ def cmd_verify(args: argparse.Namespace) -> int:
     fs = _filesystem(args.registry, args.region, anonymous=args.anonymous)
     parts = _registry_table(fs, args.registry, "parts", dataset_schema())
     master = _registry_table(fs, args.registry, "master", master_schema())
+    if args.zones:
+        held = set(parts.column("zone").to_pylist()) | set(master.column("zone").to_pylist())
+        if absent := sorted(set(args.zones) - held):
+            raise SystemExit(f"--zones names zones the registry does not hold: {', '.join(absent)}")
+        parts, master = (
+            table.filter(pc.is_in(table.column("zone"), pa.array(args.zones))) for table in (parts, master)
+        )
     expected = tile_years(parts)
     failures = invariant_failures(master, expected_rows=expected)
     problems = audit(master, parts)
@@ -466,7 +473,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
         # The parts themselves against the store's record of who wrote each year: a run with no
         # part leaves the parts, and so the master, describing its tiles by the run before it.
         store = _one_read(_open_store(args.store, args.region, anonymous=args.anonymous))
-        for (zone, year), cell in _every_cell(fs, args.registry, store, _cells(parts, []), []).items():
+        for (zone, year), cell in _every_cell(fs, args.registry, store, _cells(parts, []), args.zones).items():
             if isinstance(slot := _store_slot(store, zone, year, cell), str):
                 problems.setdefault(f"{zone}/{year}", []).append(f"the store cannot stand behind its parts: {slot}")
         problems = dict(sorted(problems.items()))

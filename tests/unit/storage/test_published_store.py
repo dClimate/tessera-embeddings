@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import icechunk
 import numpy as np
 import pytest
@@ -438,6 +440,24 @@ class TestWhoWroteAYear:
         assert published_store.committed_runs({"runs": runs}, 2024, []) == [
             Commit("v11", "2026-07-01T00:00:00+00:00", None, empty=True)
         ]
+
+    def test_a_run_whose_shard_commit_expired_is_known_from_its_record(self, seeded):
+        """Expiry keeps tagged snapshots, and the zone-year tag is on the attrs commit, not the shard commit."""
+        repo = global_store.open_global_repo(seeded)
+        session = repo.writable_session("main")
+        zarr.open_group(session.store, mode="r+")["01N"].attrs["touch"] = "shards"
+        tag = {shard_writer.SHARD_WRITE: {"run_id": "fill", "zone": "01N", "year": 2024}}
+        shard = shard_writer.commit_with_rebase(session, "shards", metadata=tag)
+        at = repo.lookup_snapshot(shard).written_at.isoformat()
+        session = repo.writable_session("main")
+        commit = {"snapshot": shard, "committed_at": at}
+        runs = shard_writer.run_provenance(None, 2024, "fill", commit=commit, code={})
+        zarr.open_group(session.store, mode="r+")["01N"].attrs["runs"] = runs
+        repo.create_tag("zone-01N-2024", session.commit("attrs"))
+        repo.expire_snapshots(datetime.now(UTC))
+        assert published_store.shard_writes(repo) == {}
+        attrs = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")["01N"].attrs
+        assert published_store.committed_runs(attrs, 2024, []) == [Commit("fill", at, None)]
 
     def test_a_year_marked_without_shards_contributes_no_run(self):
         marked = shard_writer.run_provenance(None, 2024, "ocean", empty=True, code={})

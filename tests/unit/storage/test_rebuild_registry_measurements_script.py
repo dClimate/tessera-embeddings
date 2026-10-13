@@ -286,3 +286,14 @@ class TestVerify:
             LOCAL, str(tmp_path), "33N", 2017, damaged, version=cell_version(LOCAL, str(tmp_path), "33N", 2017)
         )
         assert script.main(["verify", "--registry", str(tmp_path)]) == 1
+
+    def test_zones_narrow_what_is_checked(self, script: Any, store: zarr.Group, tmp_path: Path) -> None:
+        """A zone-split verification must pass or fail on its own zones, and a mistyped one must not pass."""
+        _seed(tmp_path)
+        _seed_master(tmp_path, radar=None)
+        stray = pa.Table.from_pylist([_row("chunk_0_0", measured=True, zone="34N")], schema=master_schema())
+        write_cell(LOCAL, str(tmp_path), "34N", 2017, as_master_rows(stray, MEASURED_BY_FILL), version=None)
+        assert script.main(["verify", "--registry", str(tmp_path)]) == 1
+        assert script.main(["verify", "--registry", str(tmp_path), "--zones", "33N"]) == 0
+        with pytest.raises(SystemExit, match="99X"):
+            script.main(["verify", "--registry", str(tmp_path), "--zones", "33N,99X"])

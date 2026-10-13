@@ -398,6 +398,26 @@ class TestUpdateCell:
         update_cell(LOCAL, str(registry), "33N", 2017)
         assert pq.read_schema(meta).names == (added if newer else master_schema()).names
 
+    def test_an_older_worker_overtaken_by_a_newer_one_leaves_the_newer_schema(
+        self, registry: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Both found the dataset schema stale; the newer one wrote between the older one's check and its write."""
+        meta = registry / "master" / "_common_metadata"
+        newer = master_schema().append(pa.field("added_later", pa.int64()))
+        pq.write_metadata(pa.schema([pa.field("tile", pa.string())]), meta)
+        check, raced = registry_master._schema_is_current, []
+
+        def overtaken(fs: object, path: str) -> bool:
+            current = check(fs, path)
+            if not raced:
+                raced.append(True)
+                pq.write_metadata(newer, meta)
+            return current
+
+        monkeypatch.setattr(registry_master, "_schema_is_current", overtaken)
+        update_cell(LOCAL, str(registry), "33N", 2017)
+        assert raced and pq.read_schema(meta).names == newer.names
+
     def test_a_file_uri_root_writes_the_real_path(self, registry: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """A ``file://`` root read through fsspec and written through ``pathlib`` must be one path."""
         monkeypatch.chdir(registry)
