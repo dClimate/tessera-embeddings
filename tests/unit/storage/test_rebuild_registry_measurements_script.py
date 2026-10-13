@@ -205,7 +205,11 @@ def test_a_targeted_update_is_the_newest_run_the_store_holds(script: Any) -> Non
     group = zarr.open_group(zarr.storage.MemoryStore(), mode="w")
     group.create_array("time", data=np.array(["2017-01-01"], dtype="datetime64[ns]").astype("int64"))
     group.attrs["runs"] = {"2017": {"run_id": "fill", "assembled_at": FILLED}}
-    group.attrs["updates"] = {"2017": [{"update": "u1", "run_id": "upd", "assembled_at": "2026-10-12T00:00:00+00:00"}]}
+    group.attrs["updates"] = {
+        "2017": [
+            {"update": "u1", "run_id": "upd", "assembled_at": "2026-10-12T00:00:00+00:00", "written": ["chunk_0_0"]}
+        ]
+    }
     rows = [{"run_id": "fill", "assembled_at": FILLED}, {"run_id": "upd", "assembled_at": "2026-10-12T00:00:00+00:00"}]
     assert script._store_slot(group, 2017, rows) == 0
 

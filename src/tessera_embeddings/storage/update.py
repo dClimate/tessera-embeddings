@@ -287,7 +287,7 @@ def plan_from_registry(
     columns = pa.schema([f for f in master_schema() if f.name not in _PARTITION_KEYS])
     rows = pl.scan_parquet(
         f"{registry_root.rstrip('/')}/master/**/*.parquet",
-        schema=pl.from_arrow(columns.empty_table()).schema,
+        schema=pl.DataFrame(columns.empty_table()).schema,
         hive_partitioning=True,
         hive_schema={"zone": pl.String, "year": pl.Int64},
         missing_columns="insert",
