@@ -61,7 +61,7 @@ import zarr
 
 from tessera_embeddings.config.assembly import AssemblyConfig
 from tessera_embeddings.config.fault_injection import ArmedFault
-from tessera_embeddings.config.inference import OPTICAL_MIN_OBS, InferenceConfig
+from tessera_embeddings.config.inference import InferenceConfig
 from tessera_embeddings.config.paths import store_key
 from tessera_embeddings.config.store_layout import GLOBAL, REQUIRED_VARS
 from tessera_embeddings.config.time_windows import TimeWindow
@@ -1436,8 +1436,8 @@ def _publish_merged_rows(
         )
         return
     records: dict[str, dict] = {}
-    # A store with no depth rule is measured against the default line, as the actors measure it.
-    thin_below = optical_min_obs or OPTICAL_MIN_OBS
+    # A store with no depth rule refused no pixel as thin, so none may be counted below a line.
+    thin_below = optical_min_obs or 0
     try:
         year_index = calendar_years(node).index(year)
         with ThreadPoolExecutor(max_workers=16) as pool:
