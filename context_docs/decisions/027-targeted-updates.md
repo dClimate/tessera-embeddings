@@ -93,9 +93,12 @@ re-derived from the committed shard rather than taken from either run's record.
   and registry schema). `ingest_code_identity` does not: the plan, the paths and the shard narrowing
   sit outside both closures, and a test keeps them there.
 - **A `holes` merge reads the shard it writes.** Assembly reads each merged shard back before
-  replacing its holes, about 700 MiB logical across the eight arrays, one variable at a time. That
-  is time and roughly 512 MiB per assembly worker a campaign fill does not spend; it is measured in
-  the dev verification before a large update runs.
+  replacing its holes, about 700 MiB logical across the eight arrays, one variable at a time:
+  measured at about 3 s and 0.9 GiB per merging worker, well inside the assembly runner
+  ([`update-dev-verification.md`](../campaign/update-dev-verification.md)).
+- **A `holes` tile costs at least its reads.** The GPU skips every pixel outside the mask, but the
+  tile's imagery is still read and resampled: about 30–40 s a tile on dev, against 52–169 s for a
+  full re-run of the same tiles.
 - **The base tag retains the replaced shards** against any future garbage collection. Deleting it
   once an update is verified releases them.
 - **One update per cell at a time.** Two updates of the same cell conflict on its chunks; the

@@ -49,8 +49,10 @@ context_docs/
 │   │                                              how work balances across N clusters (§5b)
 │   ├── campaign-validation-and-monitoring.md   how each published cell is checked, and how a
 │   │                                              finding reaches a person
-│   └── radar-coverage-by-zone.md               which zones publish no usable radar, and why
-│                                                  three quarters of that is a polarisation choice
+│   ├── radar-coverage-by-zone.md               which zones publish no usable radar, and why
+│   │                                              three quarters of that is a polarisation choice
+│   └── update-dev-verification.md              targeted updates checked end to end on dev: only
+│                                                  target shards change, holes match full inference
 │
 ├── ingest/                        BUILDING THE MOSAICS
 │   ├── campaign-ingest-measurements.md         what ingest costs, what made it faster, and what
