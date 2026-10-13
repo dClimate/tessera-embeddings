@@ -1085,11 +1085,12 @@ class TestAnUpdateAcrossClusters:
         return wired
 
     def test_the_plan_is_the_work_list_and_every_child_runs_it(self, update_wired):
-        asyncio.run(
+        result = asyncio.run(
             mod.run_global_campaign.fn(
                 paths=_PATHS, ami_ssm_name="ami", update="u1", max_parallel_clusters=2, allow_s2_only=True
             )
         )
+        assert result["never_filled"] == ["03N-2024"], "a planned cell the campaign never filled is reported"
 
         dispatched = [p for _, p in update_wired["arun"] if "cells" in p]
         assert {tuple(c) for p in dispatched for c in p["cells"]} == {("01N", 2025), ("02N", 2025)}

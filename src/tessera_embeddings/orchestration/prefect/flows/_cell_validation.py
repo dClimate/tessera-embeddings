@@ -64,8 +64,8 @@ def dispatch_cell_validation(
         year: Campaign calendar year the cell covers.
         summary: The cell's own fill summary. Read for two facts only: whether the cell is
             EMPTY (no pixels to check) and whether it landed — it carries a ``tag``, or is a
-            targeted update that ``written`` shards into a tagged cell. Without either no
-            committed change exists for a validator to judge.
+            targeted update that ``written`` or ``cleared`` shards in a tagged cell. Without
+            either no committed change exists for a validator to judge.
         parameters: Flow parameters for the validation run. Built by the caller so the
             fill's own resolved paths are validated, not whatever the validation
             deployment was registered with.
@@ -88,7 +88,7 @@ def dispatch_cell_validation(
     if summary.get("empty"):
         log.info("Cell validation NOT dispatched: %s-%d is marked empty (nothing embedded to check)", zone, year)
         return None
-    if not (summary.get("tag") or summary.get("written")):
+    if not (summary.get("tag") or summary.get("written") or summary.get("cleared")):
         log.warning(
             "Cell validation NOT dispatched: %s-%d carries no zone-year tag and no update wrote to it, "
             "so nothing landed to validate",

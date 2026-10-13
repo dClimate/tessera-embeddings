@@ -1068,6 +1068,7 @@ async def run_global_campaign(
         return [cell for cell, state in states.items() if state == "pending"]
 
     work = _work(status, zones_=expected_zones, years_=campaign_years)
+    never_filled: list[str] = []
     if plan is not None:
         never_filled = [
             f"{z}-{y}"
@@ -2171,4 +2172,7 @@ async def run_global_campaign(
         # Always present, empty when everything landed: a caller testing for the KEY rather
         # than for its truthiness must not have to know which shape it gets.
         "unfilled": {year: sorted(zones) for year, zones in sorted(unfilled.items())},
+        # An update's planned cells the campaign has yet to fill: never dispatched, and until they
+        # are filled and updated the update has no complete tag.
+        "never_filled": never_filled,
     }

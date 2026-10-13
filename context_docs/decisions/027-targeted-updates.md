@@ -53,6 +53,8 @@ update is done on a cell exactly when that cell holds its record — which is wh
 **Two tags per update, none per cell.** `update-<name>-base` pins the store before the update's first
 write, for comparison and rollback; `update-<name>-complete` pins it once every planned cell holds
 the record. A cell the campaign never filled is refused: an update inserts into existing data.
+`run-global-campaign` returns such cells as `never_filled`, and the update gets no complete tag
+until they are filled and updated.
 
 **Everything an update writes outside the store is its own.** Its ROI, mosaics and hole masks live
 under `{inputs}/updates/<name>/`, its staging under `{outputs}/staging/updates/<name>/<store>/`. The

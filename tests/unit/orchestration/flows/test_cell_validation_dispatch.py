@@ -108,8 +108,13 @@ class TestWhatIsDeclined:
 
     @pytest.mark.parametrize(
         ("summary", "validated"),
-        [({}, False), ({"update": "u1", "written": 0}, False), ({"update": "u1", "written": 3}, True)],
-        ids=["untagged", "update-wrote-nothing", "update-wrote-shards"],
+        [
+            ({}, False),
+            ({"update": "u1", "written": 0, "cleared": 0}, False),
+            ({"update": "u1", "written": 3, "cleared": 0}, True),
+            ({"update": "u1", "written": 0, "cleared": 2}, True),
+        ],
+        ids=["untagged", "update-changed-nothing", "update-wrote-shards", "update-cleared-shards"],
     )
     def test_only_a_cell_that_landed_or_was_updated_is_validated(self, dispatched, summary, validated):
         """No tag means no committed snapshot. An update leaves the tag at the fill, so its writes are the trigger."""
