@@ -14,6 +14,7 @@ from tessera_embeddings.inference.chunk_spec import enumerate_chunks, read_pixel
 from tessera_embeddings.storage import campaign
 from tessera_embeddings.storage import update as upd
 from tessera_embeddings.storage.campaign import pin_tag
+from tessera_embeddings.storage.published_store import Commit, committed_runs
 from tessera_embeddings.storage.zarr_store import open_or_create_repo
 
 
@@ -126,7 +127,7 @@ def zone_repo(tmp_path) -> icechunk.Repository:
     node = zarr.open_group(session.store, mode="a").require_group("01N")
     node.create_array("scales", shape=(2, 8, 8), chunks=(1, 4, 4), dtype="float32", fill_value=float("nan"))
     node.attrs.update(
-        {"years_complete": [2024], "runs": {"2024": {"run_id": "fill", "assembled_at": "2026-01-01T00:00:00"}}}
+        {"years_complete": [2024], "runs": {"2024": {"run_id": "fill", "assembled_at": "2026-01-01T00:00:00+00:00"}}}
     )
     session.commit("seed")
     return repo
@@ -155,6 +156,21 @@ def test_an_update_record_appends_and_leaves_the_fill_alone(zone_repo):
         ("01N", 2024): "done",
         ("01N", 2025): "not_complete",
     }
+
+
+def test_an_update_whose_shard_commit_expired_is_still_known_to_the_store_check(zone_repo):
+    """An update records itself in ``updates[year]``, not ``runs``, so after snapshot expiry that record is
+    the store's only account of the write; without it the update's registry part names a run the store lacks.
+    """
+    commit = {"snapshot": "expired", "committed_at": "2026-10-13T00:00:00+00:00"}
+    wrote = upd.update_record(_target(), run_id="u-run", written=["chunk_0_0"], kept=[])
+    upd.commit_update_record(zone_repo, "01N", 2024, commit, record=wrote)
+    nothing = upd.update_record(_target("noop"), run_id="noop", written=[], kept=["chunk_0_0"])
+    upd.commit_update_record(zone_repo, "01N", 2024, record=nothing)
+    assert committed_runs(_node(zone_repo).attrs, 2024, []) == [
+        Commit("fill", "2026-01-01T00:00:00+00:00", None),
+        Commit("u-run", commit["committed_at"], None),
+    ]
 
 
 def test_an_update_record_retries_a_concurrent_attr_commit(zone_repo, monkeypatch):

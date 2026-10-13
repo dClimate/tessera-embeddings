@@ -103,13 +103,13 @@ def _seed_master(root: Path, *, radar: int | None) -> None:
 
 @pytest.fixture
 def store(script: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> zarr.Group:
-    """A one-zone store that holds run ``fill-1`` for 2017 and never imaged anything."""
+    """A one-zone store that holds run ``fill-1`` for 2017, nothing for 2018, and never imaged anything."""
     group = zarr.open_group(str(tmp_path / "store.zarr"), mode="w")
-    group.create_array("time", data=np.array(["2017-01-01"], dtype="datetime64[ns]").astype("int64"))
+    group.create_array("time", data=np.array(["2017-01-01", "2018-01-01"], dtype="datetime64[ns]").astype("int64"))
     for name in ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count"):
-        group.create_array(name, shape=(1, 4096, 4096), dtype="uint16", chunks=(1, 2048, 2048))
+        group.create_array(name, shape=(2, 4096, 4096), dtype="uint16", chunks=(1, 2048, 2048))
     group.attrs["runs"] = V11_RUNS
-    monkeypatch.setattr(script, "_open_store", lambda *_args, **_kwargs: (None, {"33N": group}, {}))
+    monkeypatch.setattr(script, "_open_store", lambda *_args, **_kwargs: (None, {"33N": group}, dict))
     return group
 
 
@@ -154,6 +154,18 @@ class TestRepair:
         assert _repair(script, tmp_path, "--skip-radar", "--write") == 0
         assert _master(tmp_path)["chunk_1_0"]["px_with_any_radar"] == 123
 
+    def test_a_master_file_whose_last_part_was_withdrawn_is_emptied(
+        self, script: Any, store: zarr.Group, tmp_path: Path
+    ) -> None:
+        """No part is left to list the cell, so the pass has to find it from the master file itself."""
+        _seed(tmp_path)
+        withdrawn = pa.Table.from_pylist([_row("chunk_0_0", measured=True, year=2018)], schema=master_schema())
+        write_cell(LOCAL, str(tmp_path), "33N", 2018, as_master_rows(withdrawn, MEASURED_BY_FILL), version=None)
+        assert script.main(["verify", "--registry", str(tmp_path)]) == 1
+        assert _repair(script, tmp_path, "--write") == 0
+        assert pq.read_table(tmp_path / "master" / "zone=33N" / "year=2018" / "part-0.parquet").num_rows == 0
+        assert script.main(["verify", "--registry", str(tmp_path)]) == 0
+
     @pytest.mark.parametrize("null_rows", [True, False], ids=["with-rows-to-re-derive", "fully-measured"])
     def test_a_cell_the_store_cannot_stand_behind_is_left_as_it_was(
         self, script: Any, store: zarr.Group, tmp_path: Path, null_rows: bool
@@ -181,11 +193,25 @@ def test_a_registry_without_parts_fails_rather_than_passing_vacuously(
 
 
 @pytest.mark.parametrize("command", ["gate", "repair"])
-def test_a_zone_the_registry_does_not_hold_fails(script: Any, tmp_path: Path, command: str) -> None:
+def test_a_zone_the_registry_does_not_hold_fails(script: Any, store: zarr.Group, tmp_path: Path, command: str) -> None:
     """A mistyped zone in a zone-split run would otherwise select nothing and report success."""
     _seed(tmp_path)
     with pytest.raises(SystemExit, match="99X"):
         script.main([command, "--registry", str(tmp_path), "--zones", "33N,99X"])
+
+
+def test_repair_reaches_a_zone_with_no_part_left(
+    script: Any, store: zarr.Group, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every part of zone 34N was withdrawn, so only its master file names it, and ``--zones`` must still find it."""
+    _seed(tmp_path)
+    withdrawn = pa.Table.from_pylist([_row("chunk_0_0", measured=True, zone="34N")], schema=master_schema())
+    write_cell(LOCAL, str(tmp_path), "34N", 2017, as_master_rows(withdrawn, MEASURED_BY_FILL), version=None)
+    zone = zarr.open_group(str(tmp_path / "34N.zarr"), mode="w")
+    zone.create_array("time", data=store["time"][:])
+    monkeypatch.setattr(script, "_open_store", lambda *_args, **_kwargs: (None, {"33N": store, "34N": zone}, dict))
+    assert _repair(script, tmp_path, "--zones", "34N", "--write") == 0
+    assert pq.read_table(tmp_path / "master" / "zone=34N" / "year=2017" / "part-0.parquet").num_rows == 0
 
 
 @pytest.mark.parametrize(
@@ -213,7 +239,7 @@ def test_a_refill_that_never_published_blocks_only_while_it_holds_a_tile(
         V11_RUNS, 2017, "infill", commit={"snapshot": "s-c", "committed_at": infill_at}
     )
     writes = {("33N", 2017): [Commit("refill", "2026-08-05T00:00:00+00:00", "s-b"), Commit("infill", infill_at, "s-c")]}
-    monkeypatch.setattr(script, "_open_store", lambda *_args, **_kwargs: (None, {"33N": store}, writes))
+    monkeypatch.setattr(script, "_open_store", lambda *_args, **_kwargs: (None, {"33N": store}, lambda: writes))
     wrote = {"s-b": refill_wrote, "s-c": {"chunk_1_1"}}
     monkeypatch.setattr(published_store, "commit_tiles", lambda _repo, _zone, _t, snapshot: frozenset(wrote[snapshot]))
     master = tmp_path / "master" / "zone=33N" / "year=2017" / "part-0.parquet"
@@ -230,6 +256,28 @@ class TestVerify:
         _seed(tmp_path)
         _seed_master(tmp_path, radar=None)
         assert script.main(["verify", "--registry", str(tmp_path)]) == 0
+
+    @pytest.mark.parametrize("zones", [[], ["--zones", "35N"]], ids=["every-zone", "only-that-zone"])
+    def test_a_first_fill_whose_part_never_published_fails(
+        self,
+        script: Any,
+        store: zarr.Group,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: Any,
+        zones: list[str],
+    ) -> None:
+        """Its zone has no part and no master file, so only the store's tagged commit shows it, named or not."""
+        _seed(tmp_path)
+        _seed_master(tmp_path, radar=None)
+        zone = zarr.open_group(str(tmp_path / "35N.zarr"), mode="w")
+        zone.create_array("time", data=store["time"][:])
+        writes = {("35N", 2017): [Commit("first-fill", FILLED, "s-a")]}
+        root = {"33N": store, "35N": zone}
+        monkeypatch.setattr(script, "_open_store", lambda *_args, **_kwargs: (None, root, lambda: writes))
+        monkeypatch.setattr(published_store, "commit_tiles", lambda *_args: frozenset({"chunk_0_0"}))
+        assert script.main(["verify", "--registry", str(tmp_path), *zones]) == 1
+        assert "35N/2017: the store cannot stand behind its parts: run 'first-fill'" in capsys.readouterr().out
 
     @pytest.mark.parametrize(
         "damage",
@@ -248,3 +296,14 @@ class TestVerify:
             LOCAL, str(tmp_path), "33N", 2017, damaged, version=cell_version(LOCAL, str(tmp_path), "33N", 2017)
         )
         assert script.main(["verify", "--registry", str(tmp_path)]) == 1
+
+    def test_zones_narrow_what_is_checked(self, script: Any, store: zarr.Group, tmp_path: Path) -> None:
+        """A zone-split verification must pass or fail on its own zones, and a mistyped one must not pass."""
+        _seed(tmp_path)
+        _seed_master(tmp_path, radar=None)
+        stray = pa.Table.from_pylist([_row("chunk_0_0", measured=True, zone="34N")], schema=master_schema())
+        write_cell(LOCAL, str(tmp_path), "34N", 2017, as_master_rows(stray, MEASURED_BY_FILL), version=None)
+        assert script.main(["verify", "--registry", str(tmp_path)]) == 1
+        assert script.main(["verify", "--registry", str(tmp_path), "--zones", "33N"]) == 0
+        with pytest.raises(SystemExit, match="99X"):
+            script.main(["verify", "--registry", str(tmp_path), "--zones", "33N,99X"])

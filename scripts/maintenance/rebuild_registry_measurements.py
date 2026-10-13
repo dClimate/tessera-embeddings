@@ -15,7 +15,9 @@ reduces to ``s2_obs_count > 0`` on the delivered product, and for the one column
 re-derivation of every row its fills left null, merged tile by tile. The parts supply every tile and
 every measurement a fill took, which the merge never overrides; the existing master keeps a radar
 column an optical-only pass would not re-measure. ``parts/`` is never touched, and a cell whose
-re-derivation or store check is blocked is not written at all. Each cell is written through the
+re-derivation or store check is blocked is not written at all. Every cell with a part, a master
+file or a shard commit is visited: a master file whose last part was deleted is emptied, and a
+commit with no part is reported. Each cell is written through the
 fill's own ``registry_master.update_cell``, conditionally, so a fill landing mid-repair is merged in
 rather than overwritten. Every writing subcommand is a DRY RUN unless given ``--write``.
 
@@ -29,6 +31,9 @@ Run from the REPOSITORY ROOT::
 
     # 3. check master/ itself, cell by cell, against parts/, and parts/ against the store
     uv run python scripts/maintenance/rebuild_registry_measurements.py verify
+
+**An ``s3://`` registry needs ``s3fs``**, from the ``aws`` extra (``uv sync --all-extras`` installs it):
+the master write is a conditional PUT, which pyarrow's own S3 filesystem cannot make.
 
 **Rehearsing needs no credentials.** ``--anonymous`` reads the public store and registry unsigned,
 and a non-``s3://`` ``--registry`` is the local filesystem, so a downloaded copy of the registry takes
@@ -49,10 +54,13 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import datetime
+import functools
 import json
 import random
+import re
 import sys
 from collections import defaultdict
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -80,7 +88,6 @@ from tessera_embeddings.storage.registry_master import (
     store_disagreements,
     tile_years,
     update_cell,
-    write_common_metadata,
 )
 from tessera_embeddings.storage.registry_rebuild import rebuild_run_id, rebuilt_row
 
@@ -138,16 +145,22 @@ def _registry_table(
     return table
 
 
-#: The published store as the checks read it: its repository, its root group read-only, and every
-#: tagged shard commit on ``main`` by zone-year (``published_store.shard_writes``).
-_Store = tuple[icechunk.Repository, zarr.Group, dict[tuple[str, int], list[published_store.Commit]]]
+#: The published store as the checks read it: its repository, its root group read-only, and a
+#: read of every tagged shard commit on ``main`` by zone-year (``published_store.shard_writes``),
+#: made afresh on each call so a repair sees the commits of fills that land while it runs.
+_Store = tuple[icechunk.Repository, zarr.Group, Callable[[], dict[tuple[str, int], list[published_store.Commit]]]]
 
 
 def _open_store(store_uri: str, region: str, *, anonymous: bool) -> _Store:
     """The published store, opened once for however many cells a subcommand checks."""
     repo = open_global_repo(store_uri, region=region, anonymous=anonymous)
     root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
-    return repo, root, published_store.shard_writes(repo)
+    return repo, root, lambda: published_store.shard_writes(repo)
+
+
+def _one_read(store: _Store) -> _Store:
+    """``store`` with its commit history read once, for a pass that checks a single snapshot."""
+    return store[0], store[1], functools.cache(store[2])
 
 
 def _only_zones(table: pa.Table, zones: list[str]) -> pa.Table:
@@ -173,6 +186,30 @@ def _cells(parts: pa.Table, zones: list[str]) -> dict[tuple[str, int], pa.Table]
     return {(zone, year): rows for zone, year, rows in cell_tables(parts)}
 
 
+def _every_cell(
+    fs: AbstractFileSystem, root: str, store: _Store, cells: dict[tuple[str, int], pa.Table], zones: list[str]
+) -> dict[tuple[str, int], pa.Table]:
+    """``cells`` plus every cell with a master file or a shard commit but no part, narrowed to ``zones``.
+
+    A cell with no part has no rows. A master file outlives its last part when that run is
+    withdrawn, and a fill whose part never published leaves only its commit; neither is in
+    ``parts/`` for a pass over it to find, so a zone named in ``zones`` need only be in one of them.
+    """
+    base = root.removeprefix("s3://").rstrip("/")
+    held = {
+        (match["zone"], int(match["year"]))
+        for path in fs.glob(f"{base}/master/zone=*/year=*/part-0.parquet")
+        if (match := re.search(r"zone=(?P<zone>[^/]+)/year=(?P<year>\d+)/", path))
+    }
+    empty = dataset_schema().empty_table()
+    every = {
+        cell: cells.get(cell, empty) for cell in sorted({*cells, *held, *store[2]()}) if not zones or cell[0] in zones
+    }
+    if absent := sorted(set(zones) - {zone for zone, _ in every}):
+        raise SystemExit(f"--zones names zones neither the registry nor the store holds: {', '.join(absent)}")
+    return every
+
+
 def _current(parts: pa.Table) -> pa.Table:
     """Each tile's current fill row: from the newest run that wrote it, the run the store holds there.
 
@@ -181,8 +218,10 @@ def _current(parts: pa.Table) -> pa.Table:
     return merge(as_master_rows(parts, MEASURED_BY_FILL))
 
 
-def _store_slot(store: _Store, zone: str, year: int, parts: pa.Table) -> tuple[int, published_store.StoreYear] | str:
-    """The cell's time index and store record, or why the store cannot stand behind its parts.
+def _store_slot(
+    store: _Store, zone: str, year: int, parts: pa.Table
+) -> tuple[int, Callable[[], published_store.StoreYear]] | str:
+    """The cell's time index and a read of its store record, or why the store cannot stand behind its parts.
 
     The store's record of the year must account for every part, and a part for every tile a run
     last wrote (``registry_master.store_disagreements``). Then every current row's tile holds the
@@ -198,8 +237,11 @@ def _store_slot(store: _Store, zone: str, year: int, parts: pa.Table) -> tuple[i
     years = published_store.calendar_years(group)
     if year not in years:
         return "no time slot in the store"
-    record = published_store.store_year(repo, group, zone, year, writes)
-    if found := store_disagreements(parts, record):
+
+    def record() -> published_store.StoreYear:
+        return published_store.store_year(repo, group, zone, year, writes())
+
+    if found := store_disagreements(parts, record()):
         return "; ".join(found)
     return years.index(year), record
 
@@ -280,7 +322,7 @@ def cmd_gate(args: argparse.Namespace) -> int:
     # geometry or its rule, and a row-uniform sample would spend most of its budget in the largest
     # zone-years and check one latitude.
     per_cell = max(1, args.sample // max(1, len(measured)))
-    store = _open_store(args.store, args.region, anonymous=args.anonymous)
+    store = _one_read(_open_store(args.store, args.region, anonymous=args.anonymous))
     root = store[1]
 
     totals: dict[str, int] = defaultdict(int)
@@ -392,10 +434,11 @@ def _repair_cell(
 def cmd_repair(args: argparse.Namespace) -> int:
     """Rebuild each cell's master file from its parts, its master rows and a fresh re-derivation."""
     fs = _filesystem(args.registry, args.region, anonymous=args.anonymous)
-    cells = _cells(_registry_table(fs, args.registry, "parts", dataset_schema()), args.zones)
+    parts = _cells(_registry_table(fs, args.registry, "parts", dataset_schema()), [])
+    store = _open_store(args.store, args.region, anonymous=args.anonymous)
+    cells = _every_cell(fs, args.registry, store, parts, args.zones)
     run_id = args.run_id or rebuild_run_id(suffix="optical" if args.skip_radar else "full")
     rng = random.Random(args.seed)
-    store = _open_store(args.store, args.region, anonymous=args.anonymous)
 
     written = rederived = blocked = 0
     for (zone, year), parts in sorted(cells.items()):
@@ -406,9 +449,6 @@ def cmd_repair(args: argparse.Namespace) -> int:
             print(f"  {zone}/{year}: BLOCKED, left as it is — {error}", file=sys.stderr)
             continue
         written += 1
-    if args.write and written:
-        # Rewritten here, where a fill writes it only when absent: a repair is how a schema change lands.
-        write_common_metadata(fs, args.registry)
     action = "written" if args.write else "would be written (dry run — pass --write to publish)"
     print(f"\nrepair {run_id}: {written} cell(s) {action}, {rederived} rows re-derived, {blocked} cells blocked")
     return 1 if blocked else 0
@@ -419,14 +459,22 @@ def cmd_verify(args: argparse.Namespace) -> int:
     fs = _filesystem(args.registry, args.region, anonymous=args.anonymous)
     parts = _registry_table(fs, args.registry, "parts", dataset_schema())
     master = _registry_table(fs, args.registry, "master", master_schema())
+    if args.zones:
+        # With the store checked, `_every_cell` checks the zones against its commits too, below.
+        held = set(parts.column("zone").to_pylist()) | set(master.column("zone").to_pylist())
+        if args.parts_only and (absent := sorted(set(args.zones) - held)):
+            raise SystemExit(f"--zones names zones the registry does not hold: {', '.join(absent)}")
+        parts, master = (
+            table.filter(pc.is_in(table.column("zone"), pa.array(args.zones))) for table in (parts, master)
+        )
     expected = tile_years(parts)
     failures = invariant_failures(master, expected_rows=expected)
     problems = audit(master, parts)
     if not args.parts_only:
         # The parts themselves against the store's record of who wrote each year: a run with no
         # part leaves the parts, and so the master, describing its tiles by the run before it.
-        store = _open_store(args.store, args.region, anonymous=args.anonymous)
-        for (zone, year), cell in _cells(parts, []).items():
+        store = _one_read(_open_store(args.store, args.region, anonymous=args.anonymous))
+        for (zone, year), cell in _every_cell(fs, args.registry, store, _cells(parts, []), args.zones).items():
             if isinstance(slot := _store_slot(store, zone, year, cell), str):
                 problems.setdefault(f"{zone}/{year}", []).append(f"the store cannot stand behind its parts: {slot}")
         problems = dict(sorted(problems.items()))

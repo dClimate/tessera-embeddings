@@ -217,12 +217,14 @@ class Commit(NamedTuple):
 
     ``at`` orders runs: the commit's own timestamp, or for an untagged run the time it was marked.
     ``snapshot`` is the shard commit, ``None`` for an untagged run, and is what :func:`commit_tiles`
-    reads the tiles it wrote from.
+    reads the tiles it wrote from. ``empty`` is an untagged run that marked the year as holding no
+    data, so it left no embeddings for a part to describe.
     """
 
     run_id: str
     at: str
     snapshot: str | None
+    empty: bool = False
 
 
 def shard_writes(repo: icechunk.Repository) -> dict[tuple[str, int], list[Commit]]:
@@ -249,13 +251,30 @@ def committed_runs(attrs: Mapping[str, Any], year: int, writes: Sequence[Commit]
     shard commits were tagged. Not one per run: a retry under the same run id is a commit of its own,
     and its earlier attempt's tiles are the store's until something rewrites them. A run from before
     tags is known only from the zone group's ``runs`` record, as an entry with no ``commit`` key: the
-    year's own, or one a refill kept in ``previous``. An entry with a ``commit`` key is a tagged run,
-    or a year marked without shards.
+    year's own, or one a refill kept in ``previous``. So is a run whose recorded commit is no longer
+    in ``writes``: snapshot expiry (``campaign.expire_and_gc``) keeps tagged snapshots, and the
+    zone-year tag points at the attrs commit, not the shard commit before it. Either way the record
+    says when the run wrote and not what, so the entry has no snapshot to diff. A ``commit`` of null
+    is a year marked without shards, which wrote nothing. A targeted update records itself in the
+    same shape beside the fill, in ``updates[year]`` (``storage.update``), so its expired commits
+    are found the same way.
     """
     head = (attrs.get("runs") or {}).get(str(year))
     entries = [head, *head.get("previous", [])] if isinstance(head, dict) else []
-    untagged = [Commit(str(e["run_id"]), str(e["assembled_at"]), None) for e in entries if "commit" not in e]
-    return sorted([*untagged, *writes], key=lambda c: datetime.fromisoformat(c.at))
+    entries += (attrs.get("updates") or {}).get(str(year), [])
+    tagged = {commit.snapshot for commit in writes}
+    recorded = [commit for entry in entries if (commit := _recorded(entry, tagged)) is not None]
+    return sorted([*recorded, *writes], key=lambda c: datetime.fromisoformat(c.at))
+
+
+def _recorded(entry: Mapping[str, Any], tagged: set[str | None]) -> Commit | None:
+    """A ``runs`` record entry as a commit with no snapshot, unless the tagged history has it or it wrote nothing."""
+    if "commit" not in entry:
+        return Commit(str(entry["run_id"]), str(entry["assembled_at"]), None, bool(entry.get("empty")))
+    commit = entry["commit"]
+    if isinstance(commit, Mapping) and commit.get("snapshot") not in tagged:
+        return Commit(str(entry["run_id"]), str(commit["committed_at"]), None)
+    return None
 
 
 def commit_tiles(repo: icechunk.Repository, zone: str, time_index: int, snapshot: str) -> frozenset[str]:
@@ -263,12 +282,23 @@ def commit_tiles(repo: icechunk.Repository, zone: str, time_index: int, snapshot
 
     From the commit's own transaction log, by diffing it against its parent: the store's account of
     what that write changed, so it needs no record kept anywhere else. A cleared tile is a deleted
-    shard, which the diff lists as changed too.
+    shard, which the diff lists as changed too. Every per-tile array counts, not only ``scales``: a
+    refused tile writes its observation counts and month coverage while its embeddings stay absent,
+    so re-refusing a tile that was already refused changes nothing in ``scales``. A tile written
+    wholly with fill counts too, even where nothing was stored: Zarr deletes the chunk rather than
+    storing fill, and the transaction log records the delete. Every such array
+    shares the tile grid, one shard per tile in its first three coordinates; the coordinate arrays
+    have fewer.
     """
     parent = repo.lookup_snapshot(snapshot).parent_id
     diff = repo.diff(from_snapshot_id=parent, to_snapshot_id=snapshot)
-    coords = diff.updated_chunks.get(f"/{zone}/{COVERAGE_VAR}", [])
-    return frozenset(f"chunk_{c[1]}_{c[2]}" for c in coords if c[0] == time_index)
+    return frozenset(
+        f"chunk_{c[1]}_{c[2]}"
+        for path, coords in diff.updated_chunks.items()
+        if path.startswith(f"/{zone}/")
+        for c in coords
+        if len(c) >= 3 and c[0] == time_index
+    )
 
 
 class StoreYear(NamedTuple):

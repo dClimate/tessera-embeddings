@@ -275,10 +275,25 @@ class TestAudit:
         [
             (lambda m: m.filter(pc.equal(m.column("tile"), "chunk_0_0")), "tile(s) missing"),
             (lambda m: merge(m, _fill([_row("chunk_9_9", measured=True, stamp=FILLED)])), "no part names"),
-            (_altered, "fill measurement(s) altered"),
+            (_altered, "fill row(s) altered"),
+            (
+                lambda m: m.set_column(m.schema.get_field_index("run_id"), "run_id", pa.array(["x"] * m.num_rows)),
+                "fill row(s) altered",
+            ),
+            (
+                lambda m: m.set_column(m.schema.get_field_index("embedded"), "embedded", pc.invert(m["embedded"])),
+                "fill field(s) altered",
+            ),
             (lambda _: merge(_fill(_AUDITED)), "unmeasured"),
         ],
-        ids=["a-dropped-tile", "a-tile-no-part-names", "an-altered-fill-measurement", "an-unmeasured-row"],
+        ids=[
+            "a-dropped-tile",
+            "a-tile-no-part-names",
+            "an-altered-fill-measurement",
+            "an-altered-fill-run-id",
+            "an-altered-fill-field",
+            "an-unmeasured-row",
+        ],
     )
     def test_damage_is_reported_against_its_cell(self, damage: Callable[[pa.Table], pa.Table], problem: str) -> None:
         found = audit(damage(_sound()), _parts(_AUDITED))
@@ -321,23 +336,17 @@ class TestUpdateCell:
         assert master.column("run_id").to_pylist() == ["infill", "rebuild-1"], "the re-derived row survives"
         assert pq.read_schema(registry / "master" / "_common_metadata").names == master_schema().names
 
-    def test_a_stale_dataset_schema_is_replaced_when_a_column_is_added(self, registry: Path) -> None:
-        """Readers take the master's schema from `_common_metadata`; one written before a column was added
-        (``update_name``, say) would silently drop that column from every read until something rewrote it.
-        """
-        meta = registry / "master" / "_common_metadata"
-        with meta.open("wb") as out:
-            pq.ParquetWriter(out, master_schema().remove(master_schema().get_field_index("update_name"))).close()
+    def test_a_damaged_copy_of_a_fill_row_loses_to_its_part(self, registry: Path) -> None:
+        """The file's fill rows are copies of the parts'; a later stamp on a damaged one must not let it win."""
+        held = registry_master.read_cell(LOCAL, str(registry), "master", "33N", 2017, master_schema()).to_pylist()
+        held[0] |= {"assembled_at": LATER, "refused_thin_px": 999}
+        version = cell_version(LOCAL, str(registry), "33N", 2017)
+        assert write_cell(
+            LOCAL, str(registry), "33N", 2017, pa.Table.from_pylist(held, schema=master_schema()), version=version
+        )
         update_cell(LOCAL, str(registry), "33N", 2017)
-        assert "update_name" in pq.read_schema(meta).names
-
-    def test_a_newer_dataset_schema_is_not_downgraded(self, registry: Path) -> None:
-        """A worker on older code, mid rolling deploy, must leave a declaration with more columns alone."""
-        meta = registry / "master" / "_common_metadata"
-        with meta.open("wb") as out:
-            pq.ParquetWriter(out, master_schema().append(pa.field("added_later", pa.string()))).close()
-        update_cell(LOCAL, str(registry), "33N", 2017)
-        assert "added_later" in pq.read_schema(meta).names
+        row = pq.read_table(registry / self.MASTER).to_pylist()[0]
+        assert (row["assembled_at"], row["refused_thin_px"]) == (FILLED, 6)
 
     def test_running_it_again_writes_the_same_file(self, registry: Path) -> None:
         """A fill retried after its update, and a repair after a fill, must both leave the cell as it was."""
@@ -368,10 +377,53 @@ class TestUpdateCell:
             update_cell(LOCAL, str(registry), "33N", 2017, run_id="refill")
         assert (registry / self.MASTER).read_bytes() == before
 
-    def test_a_cell_with_no_part_raises_and_writes_nothing(self, tmp_path: Path) -> None:
-        with pytest.raises(ValueError, match="no registry part"):
-            update_cell(LOCAL, str(tmp_path), "33N", 2017)
+    def test_a_cell_whose_last_part_is_withdrawn_is_emptied(self, registry: Path) -> None:
+        """Withdrawal deletes the run's part; with none left, the master must not keep describing it."""
+        (registry / "parts" / "zone=33N" / "year=2017" / "run-a.parquet").unlink()
+        assert update_cell(LOCAL, str(registry), "33N", 2017) == []
+        assert pq.read_table(registry / self.MASTER).num_rows == 0
+
+    def test_a_cell_with_neither_a_part_nor_a_master_file_is_left_alone(self, tmp_path: Path) -> None:
+        """A retried all-ocean cell lands here, and must not get a file describing nothing."""
+        assert update_cell(LOCAL, str(tmp_path), "33N", 2017) == []
         assert not (tmp_path / "master").exists()
+
+    @pytest.mark.parametrize("newer", [False, True], ids=["an-older-schema-is-replaced", "a-newer-one-is-kept"])
+    def test_the_dataset_schema_only_gains_columns(self, registry: Path, newer: bool) -> None:
+        """A column added since must reach readers, and a worker still on an older release must not take one away."""
+        meta = registry / "master" / "_common_metadata"
+        added = master_schema().append(pa.field("added_later", pa.int64()))
+        declared = added if newer else pa.schema([pa.field("tile", pa.string())])
+        pq.write_metadata(declared, meta)
+        update_cell(LOCAL, str(registry), "33N", 2017)
+        assert pq.read_schema(meta).names == (added if newer else master_schema()).names
+
+    def test_an_older_worker_overtaken_by_a_newer_one_leaves_the_newer_schema(
+        self, registry: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Both found the dataset schema stale; the newer one wrote between the older one's check and its write."""
+        meta = registry / "master" / "_common_metadata"
+        newer = master_schema().append(pa.field("added_later", pa.int64()))
+        pq.write_metadata(pa.schema([pa.field("tile", pa.string())]), meta)
+        check, raced = registry_master._schema_is_current, []
+
+        def overtaken(fs: object, path: str) -> bool:
+            current = check(fs, path)
+            if not raced:
+                raced.append(True)
+                pq.write_metadata(newer, meta)
+            return current
+
+        monkeypatch.setattr(registry_master, "_schema_is_current", overtaken)
+        update_cell(LOCAL, str(registry), "33N", 2017)
+        assert raced and pq.read_schema(meta).names == newer.names
+
+    def test_a_file_uri_root_writes_the_real_path(self, registry: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A ``file://`` root read through fsspec and written through ``pathlib`` must be one path."""
+        monkeypatch.chdir(registry)
+        update_cell(LOCAL, registry.as_uri(), "33N", 2017)
+        assert not (registry / "file:").exists()
+        assert pq.read_table(registry / self.MASTER).num_rows == 2
 
 
 #: What each commit of cell 33N/2017 wrote, as the store's diff of it would say.
@@ -443,11 +495,18 @@ class TestTheStoreStandsBehindTheParts:
         [
             ([Commit("run-a", FILLED, None), _C], []),
             ([Commit("run-a", FILLED, None), Commit("run-x", MIDWAY, None), _C], ["no recorded commit bounds"]),
+            ([Commit("run-a", FILLED, None), Commit("ocean", MIDWAY, None, empty=True), _C], []),
         ],
-        ids=["recorded-before-commits-were-and-published", "recorded-before-commits-were-and-never-published"],
+        ids=[
+            "recorded-before-commits-were-and-published",
+            "recorded-before-commits-were-and-never-published",
+            "recorded-before-commits-were-marking-the-year-empty",
+        ],
     )
     def test_a_run_recorded_before_commits_were(self, commits: list[Commit], expected: list[str]) -> None:
-        """v1.1's records name no commit: one with a part is taken on trust, one without cannot be bounded."""
+        """v1.1's records name no commit: one with a part is taken on trust, one without cannot be bounded,
+        and one that marked the year empty left no embeddings to describe.
+        """
         found = store_disagreements(_FILL_AND_INFILL, _store(*commits))
         assert [phrase for phrase in expected if any(phrase in entry for entry in found)] == expected
         assert len(found) == len(expected)
@@ -486,11 +545,27 @@ class TestConcurrentWriters:
         assert not write_cell(LOCAL, str(registry), "33N", 2017, _fill(_AUDITED), version=stale)
         assert (registry / self.MASTER).read_bytes() == current
 
+    def test_a_fill_landing_mid_update_is_merged_not_refused(
+        self, registry: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Its commit precedes its part, so a store record read after the parts names the run of every part read."""
+        read, commits = registry_master.read_cell, [_A]
+
+        def landing(fs: object, root: str, prefix: str, zone: str, year: int, schema: pa.Schema) -> pa.Table:
+            if prefix == "parts" and len(commits) == 1:
+                commits.append(_C)
+                _publish(registry, "run-c", [_row("chunk_0_1", measured=True, stamp=LATER, run_id="run-c")])
+            return read(fs, root, prefix, zone, year, schema)
+
+        monkeypatch.setattr(registry_master, "read_cell", landing)
+        update_cell(LOCAL, str(registry), "33N", 2017, store=lambda: _store(*commits))
+        assert pq.read_table(registry / self.MASTER).column("run_id").to_pylist() == ["run-a", "run-c"]
+
     def test_a_cell_the_store_cannot_stand_behind_is_not_written(self, registry: Path) -> None:
         before = (registry / self.MASTER).read_bytes()
         store = _store(_A._replace(snapshot=None), Commit("run-b", LATER, "snap-b"))
         with pytest.raises(ValueError, match=r"run 'run-b' committed at .* last wrote 1 tile"):
-            update_cell(LOCAL, str(registry), "33N", 2017, store=store)
+            update_cell(LOCAL, str(registry), "33N", 2017, store=lambda: store)
         assert (registry / self.MASTER).read_bytes() == before
 
 
