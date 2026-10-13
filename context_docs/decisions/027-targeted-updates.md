@@ -57,7 +57,8 @@ the record. A cell the campaign never filled is refused: an update inserts into 
 **Everything an update writes outside the store is its own.** Its ROI, mosaics and hole masks live
 under `{inputs}/updates/<name>/`, its staging under `{outputs}/staging/updates/<name>/<store>/`. The
 campaign rewrites a zone's shared ROI whenever its coverage changes and sweeps the mosaics of complete
-cells, and every cell an update touches is complete.
+cells, and every cell an update touches is complete. In an update run, `sweep_orphan_mosaics` sweeps
+the leftover mosaics of the update's own recorded cells, under its root, and never the campaign's.
 
 **Hole masks and staging are keyed by destination store** (`<store>`: the first 12 hex digits of the
 SHA-256 of its URI). A `holes` update infers only the pixels that are holes in its own store, so if

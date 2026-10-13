@@ -58,6 +58,9 @@ def test_a_plan_is_written_once(tmp_path):
     assert upd.load_update(paths, "fix-1") == _plan(created_at=upd.load_plan(uri).created_at)
     with pytest.raises(ValueError, match="planned under mask"):
         upd.load_update(paths, "fix-1", mask_name="other")
+    upd.save_plan(_plan(), upd.plan_uri(paths.update_root("copied")))
+    with pytest.raises(ValueError, match="is for update 'fix-1'"):
+        upd.load_update(paths, "copied")
 
 
 def _master(tmp_path, rows_by_cell: dict[tuple[str, int], list[dict]]) -> str:

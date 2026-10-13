@@ -1114,26 +1114,33 @@ async def run_global_campaign(
 
     # Orphan-mosaic recovery: a per-cell cleanup that failed after tagging leaves the mosaic
     # behind, and that cell has left `work`, so it is never retried. Best-effort sweep of
-    # complete-and-tagged cells in scope. Opt-in; the zero-cost backstop is an S3 lifecycle
-    # rule.
+    # complete-and-tagged cells in scope, or of an update's finished cells under its own root.
+    # Opt-in; the zero-cost backstop is an S3 lifecycle rule.
     if sweep_orphan_mosaics and ingest and cleanup_mosaics:
         work_set = set(work)
-        sweep_zones = expected_zones if expected_zones is not None else sorted(status.zones)
-        swept = 0
-        for y in set(campaign_years):
-            for z in sweep_zones:
-                if (z, y) not in work_set and status.has(z, y) and zone_year_tag(z, y) in existing_tags:
-                    delete_prefix(
-                        f"{paths.inputs.rstrip('/')}/mosaics/{z}/{y}",
-                        log=log,
-                        # Campaign buckets have versioning OFF (measured; the CDK creates them
-                        # that way, Icechunk carrying its own history), so all-versions buys
-                        # nothing here and costs a heavier request pattern and a wider
-                        # permission. Asserted at the call site rather than assumed by default.
-                        all_versions=False,
-                    )
-                    swept += 1
-        log.info("Orphan-mosaic sweep: reclaimed %d completed-cell mosaic prefix(es)", swept)
+        if plan is not None:
+            mosaic_root = paths.update_root(plan.name)
+            finished = [c for c in plan.cell_list(zones=expected_zones, years=campaign_years) if c not in work_set]
+        else:
+            mosaic_root = paths.inputs
+            sweep_zones = expected_zones if expected_zones is not None else sorted(status.zones)
+            finished = [
+                (z, y)
+                for y in set(campaign_years)
+                for z in sweep_zones
+                if (z, y) not in work_set and status.has(z, y) and zone_year_tag(z, y) in existing_tags
+            ]
+        for z, y in finished:
+            delete_prefix(
+                f"{mosaic_root.rstrip('/')}/mosaics/{z}/{y}",
+                log=log,
+                # Campaign buckets have versioning OFF (measured; the CDK creates them
+                # that way, Icechunk carrying its own history), so all-versions buys
+                # nothing here and costs a heavier request pattern and a wider
+                # permission. Asserted at the call site rather than assumed by default.
+                all_versions=False,
+            )
+        log.info("Orphan-mosaic sweep: reclaimed %d completed-cell mosaic prefix(es)", len(finished))
 
     log.info(
         "Campaign: %d (zone, year) cell(s) need work across %d year(s); <=%d concurrent fills/year",

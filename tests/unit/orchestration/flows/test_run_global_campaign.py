@@ -1096,6 +1096,17 @@ class TestAnUpdateAcrossClusters:
         assert all(p["update"] == "u1" and p["mask_name"] == "alt" for p in dispatched)
         assert update_wired["finished"] == ["u1"]
 
+    def test_the_orphan_sweep_reclaims_the_update_s_own_mosaics(self, update_wired):
+        """A recorded cell's leftover mosaic is under the update's root; the campaign's are not its to delete."""
+        update_wired["landed"].add(("01N", 2025))  # recorded by an earlier run whose cleanup failed
+        asyncio.run(
+            mod.run_global_campaign.fn(
+                paths=_PATHS, ami_ssm_name="ami", update="u1", sweep_orphan_mosaics=True, allow_s2_only=True
+            )
+        )
+        assert "s3://in/updates/u1/mosaics/01N/2025" in update_wired["deletes"]
+        assert all(d.startswith("s3://in/updates/u1/") for d in update_wired["deletes"]), update_wired["deletes"]
+
     def test_an_update_whose_targets_are_dead_never_resolves_the_ami(self, update_wired, monkeypatch):
         """Its child records the update without a cluster, so the parent must not need the AMI either."""
         monkeypatch.setattr(mod, "zone_has_live_tiles", lambda mask, zone, **k: k["tiles"] is None)
