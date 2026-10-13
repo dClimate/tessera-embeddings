@@ -32,6 +32,9 @@ Run from the REPOSITORY ROOT::
     # 3. check master/ itself, cell by cell, against parts/, and parts/ against the store
     uv run python scripts/maintenance/rebuild_registry_measurements.py verify
 
+**An ``s3://`` registry needs ``s3fs``**, from the ``aws`` extra (``uv sync --all-extras`` installs it):
+the master write is a conditional PUT, which pyarrow's own S3 filesystem cannot make.
+
 **Rehearsing needs no credentials.** ``--anonymous`` reads the public store and registry unsigned,
 and a non-``s3://`` ``--registry`` is the local filesystem, so a downloaded copy of the registry takes
 every subcommand end to end — ``repair --write`` included — without touching the bucket.
