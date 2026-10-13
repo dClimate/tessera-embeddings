@@ -113,7 +113,7 @@ future infill, not something this code can check.
 
 ## The store stands behind the parts
 
-Newest-part-wins is right only if the parts account for every run that wrote the year. Publishing
+Newest-part-wins is right only if the parts account for every commit that wrote the year. Publishing
 a part is best-effort, so a run can commit without one. Its tiles then keep the previous run's rows,
 and once any later run lands, nothing in the registry shows it. So the store keeps the account, and
 keeps it where no crash can separate it from the pixels: **every shard commit is tagged with its
@@ -130,26 +130,28 @@ metadata, in the same commit as the shards.
   spec-version-2 repository keeps every snapshot record, metadata included, in its one `repo`
   object, so the whole history is one read: 3,002 commits took 10 ms locally. A run that died
   between its two commits has no `runs` record and no part, but its tagged commit is there.
-- **A run is taken at its latest write**, so a retry under the same run id that rewrites its
-  shards supersedes its earlier commit.
+- **Every commit counts on its own, a retry's included.** A part describes the one commit it is
+  stamped with. Any other commit by the same run, such as an earlier attempt that died after its
+  shard commit, is checked like a run with no part: its tiles are the store's until something
+  rewrites them, so a retry that rewrote every one clears it, and one that skipped a tile does not.
 - **Runs from before commits were tagged**, all of v1.1, are known only from the `runs` record: an
   entry with no `commit` key, the year's own or one a refill kept in `previous`. `commit` is null
   for a year marked without writing shards, which wrote no tile.
 - **Which tiles a commit wrote** comes from Icechunk's diff of that commit against its parent, the
-  store's own transaction log (`published_store.commit_tiles`). It is read only for a run with no
-  part, so the run records carry no tile lists.
+  store's own transaction log (`published_store.commit_tiles`). It is read only for a commit no
+  part describes, so the run records carry no tile lists.
 
 `registry_master.store_disagreements` refuses a cell, and writes nothing, when:
 
 | the parts | why that is wrong |
 |---|---|
 | include a run the store records no commit by | the run is not in the store; its part must be deleted |
-| include a part not stamped with its run's commit | the merge would order it by the wrong clock |
-| lack a run that was the last to write some tile | that tile's row describes an older run |
+| include a part stamped at none of its run's commits | the merge would order it by the wrong clock |
+| describe no commit that was the last to write some tile | that tile's row describes an older run |
 | lack a run from before commits were tagged | nothing bounds which tiles it wrote |
 
-A run with no part whose every tile a later run wrote over describes nothing the store holds, so it
-does not block. **That is also how a blocked cell recovers.** Rewrite the tiles the refusal names
+A commit no part describes whose every tile a later commit wrote over describes nothing the store
+holds, so it does not block. **That is also how a blocked cell recovers.** Rewrite the tiles the refusal names
 under a run that publishes its part, such as a refill of the zone-year, and the cell's next update
 goes through. Every update and repair runs this check, and so does `verify`.
 

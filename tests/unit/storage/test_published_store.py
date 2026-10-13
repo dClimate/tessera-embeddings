@@ -411,19 +411,19 @@ class TestWhoWroteAYear:
         assert [(c.run_id, c.snapshot) for c in writes["01N", 2024]] == [("fill", sids[0]), ("refill", sids[2])]
         assert writes["01N", 2024][1].at == repo.lookup_snapshot(sids[2]).written_at.isoformat()
 
-    def test_a_run_is_its_latest_write_and_an_untagged_one_comes_from_the_runs_record(self):
-        """Runs from before shard commits were tagged are known only from the record, which a refill keeps."""
-        old, retry, new = "2026-07-01T00:00:00+00:00", "2026-08-01T00:00:00+00:00", "2026-08-09T00:00:00+00:00"
+    def test_every_write_is_listed_a_retry_s_too_and_an_untagged_run_comes_from_the_runs_record(self):
+        """A retry under the same run id is a commit of its own, and runs from before tags are known only
+        from the record, which a refill keeps.
+        """
+        old, first, retry, infill = (f"2026-0{m}-01T00:00:00+00:00" for m in (7, 8, 9, 9))
+        infill = infill.replace("01T", "02T")
         runs = shard_writer.run_provenance({"2024": {"run_id": "v11", "assembled_at": old}}, 2024, "refill", code={})
-        writes = [
-            Commit("refill", retry, "s1"),
-            Commit("infill", new, "s3"),
-            Commit("refill", new[:-6] + ".5+00:00", "s2"),
-        ]
+        writes = [Commit("refill", first, "s1"), Commit("infill", infill, "s3"), Commit("refill", retry, "s2")]
         assert published_store.committed_runs({"runs": runs}, 2024, writes) == [
             Commit("v11", old, None),
-            Commit("infill", new, "s3"),
-            Commit("refill", new[:-6] + ".5+00:00", "s2"),
+            Commit("refill", first, "s1"),
+            Commit("refill", retry, "s2"),
+            Commit("infill", infill, "s3"),
         ]
 
     def test_a_year_marked_without_shards_contributes_no_run(self):

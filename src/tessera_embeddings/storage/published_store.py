@@ -243,18 +243,19 @@ def shard_writes(repo: icechunk.Repository) -> dict[tuple[str, int], list[Commit
 
 
 def committed_runs(attrs: Mapping[str, Any], year: int, writes: Sequence[Commit]) -> list[Commit]:
-    """Every run that wrote shards into ``year``, oldest first, each by its latest write.
+    """Every write of shards into ``year``, oldest first: one entry per commit, a retry's included.
 
     ``writes`` is :func:`shard_writes`' list for the zone-year, the authority for every run since
-    shard commits were tagged. A run from before is known only from the zone group's ``runs``
-    record, as an entry with no ``commit`` key: the year's own, or one a refill kept in
-    ``previous``. An entry with a ``commit`` key is a tagged run, or a year marked without shards.
+    shard commits were tagged. Not one per run: a retry under the same run id is a commit of its own,
+    and its earlier attempt's tiles are the store's until something rewrites them. A run from before
+    tags is known only from the zone group's ``runs`` record, as an entry with no ``commit`` key: the
+    year's own, or one a refill kept in ``previous``. An entry with a ``commit`` key is a tagged run,
+    or a year marked without shards.
     """
     head = (attrs.get("runs") or {}).get(str(year))
     entries = [head, *head.get("previous", [])] if isinstance(head, dict) else []
     untagged = [Commit(str(e["run_id"]), str(e["assembled_at"]), None) for e in entries if "commit" not in e]
-    latest = {c.run_id: c for c in sorted([*untagged, *writes], key=lambda c: datetime.fromisoformat(c.at))}
-    return sorted(latest.values(), key=lambda c: datetime.fromisoformat(c.at))
+    return sorted([*untagged, *writes], key=lambda c: datetime.fromisoformat(c.at))
 
 
 def commit_tiles(repo: icechunk.Repository, zone: str, time_index: int, snapshot: str) -> frozenset[str]:

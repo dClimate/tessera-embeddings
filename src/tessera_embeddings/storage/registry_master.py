@@ -322,31 +322,44 @@ def store_disagreements(parts: pa.Table, store: StoreYear) -> list[str]:
     """Why the store cannot stand behind one cell's ``parts``, as sentences. Empty means it can.
 
     A tile's master row comes from the newest part naming it, so the master is right only if the
-    parts account for every run that wrote the year, in the order the store wrote them. A run that
-    committed and never published its part leaves its tiles described by the run before it, and
-    nothing in the registry can tell; a part stamped out of commit order picks the wrong run. The
-    store records every run that wrote the year (:func:`~.published_store.committed_runs`), so:
+    parts account for every commit that wrote the year, in the order the store wrote them. A commit
+    no part describes leaves its tiles described by an older run, and nothing in the registry can
+    tell; a part stamped out of commit order picks the wrong run. The store records every commit
+    that wrote the year (:func:`~.published_store.committed_runs`), so:
 
     * every part's run is one the store records — a withdrawn run's part must be deleted;
-    * every part is stamped with its run's shard commit, the order its pixels landed in;
-    * no run without a part is the last to have written any tile, as the store's own diff of its
-      commit says (:func:`~.published_store.commit_tiles`). One that later runs superseded on every
-      tile it wrote no longer describes anything, so it does not block.
+    * every part is stamped with one of its run's shard commits, the one it describes;
+    * no commit that no part describes is the last to have written any tile, as the store's own diff
+      of it says (:func:`~.published_store.commit_tiles`). That covers a run with no part and also a
+      retry: a part describes one commit of its run, so an earlier attempt's commit counts on its
+      own. One that later commits superseded on every tile it wrote describes nothing, so it does
+      not block.
     """
     stamps: dict[str, set[datetime.datetime]] = {}
     tiles: dict[str, set[str]] = {}
     for row in parts.select(["run_id", "assembled_at", "tile"]).to_pylist():
         stamps.setdefault(row["run_id"], set()).add(_aware(row["assembled_at"]))
         tiles.setdefault(row["run_id"], set()).add(row["tile"])
+    runs = {commit.run_id for commit in store.commits}
     found = [
         f"run {run!r} has a part, but the store records no commit by it; a withdrawn run's part must be deleted"
-        for run in sorted(set(tiles) - {commit.run_id for commit in store.commits})
+        for run in sorted(set(tiles) - runs)
+    ]
+    # The one commit each part describes: the one it is stamped with, or a run's only, untagged one.
+    described = {
+        run: next(
+            (c for c in store.commits if c.run_id == run and (c.snapshot is None or _aware(c.at) in stamps[run])), None
+        )
+        for run in sorted(set(tiles) & runs)
+    }
+    found += [
+        f"run {run!r} has a part stamped at none of its commits, so it would be misordered"
+        for run, commit in described.items()
+        if commit is None
     ]
     later: set[str] = set()
     for commit in reversed(store.commits):
-        if commit.run_id in tiles:
-            if commit.snapshot is not None and stamps[commit.run_id] != {_aware(commit.at)}:
-                found.append(f"run {commit.run_id!r}'s part is not stamped {commit.at}, its commit, so is misordered")
+        if described.get(commit.run_id) == commit:
             written = tiles[commit.run_id]
         elif commit.snapshot is None:
             found.append(f"run {commit.run_id!r} wrote the year with no part, and no recorded commit bounds its tiles")
@@ -355,8 +368,8 @@ def store_disagreements(parts: pa.Table, store: StoreYear) -> list[str]:
             written = set(store.tiles_of(commit.snapshot))
             if own := sorted(written - later):
                 found.append(
-                    f"run {commit.run_id!r} last wrote {len(own)} tile(s) and has no part, so the master would "
-                    f"describe them by an older run: {own[:5]}"
+                    f"run {commit.run_id!r} committed at {commit.at} and last wrote {len(own)} tile(s) no part "
+                    f"describes, so the master would describe them by an older run: {own[:5]}"
                 )
         later |= written
     return found

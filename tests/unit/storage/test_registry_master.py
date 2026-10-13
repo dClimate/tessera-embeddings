@@ -384,7 +384,7 @@ class TestTheStoreStandsBehindTheParts:
         but ``chunk_0_0`` holds the refill's pixels, and the parts describe it by the original fill.
         """
         (found,) = store_disagreements(_FILL_AND_INFILL, _store(_A, _B, _C))
-        assert "run 'run-b' last wrote 1 tile(s)" in found and "chunk_0_0" in found
+        assert "run 'run-b' committed at" in found and "last wrote 1 tile(s)" in found and "chunk_0_0" in found
 
     def test_a_run_with_no_part_that_later_runs_wrote_over_does_not_block(self) -> None:
         """It describes nothing the store still holds, so refilling its tiles is how a cell recovers."""
@@ -392,8 +392,29 @@ class TestTheStoreStandsBehindTheParts:
 
     def test_a_part_stamped_away_from_its_commit_is_refused(self) -> None:
         """Commit order is the order a tile's pixels landed in; any other stamp can pick the wrong run."""
-        (found,) = store_disagreements(_FILL_AND_INFILL, _store(_A, _C._replace(at="2026-08-09T00:00:01+00:00")))
-        assert "run 'run-c'" in found and "misordered" in found
+        found = store_disagreements(_FILL_AND_INFILL, _store(_A, _C._replace(at="2026-08-09T00:00:01+00:00")))
+        assert any("run 'run-c'" in entry and "misordered" in entry for entry in found)
+
+    @pytest.mark.parametrize(
+        ("first_attempt_wrote", "blocks"),
+        [({"chunk_0_0", "chunk_0_1"}, False), ({"chunk_0_0", "chunk_0_1", "chunk_9_9"}, True)],
+        ids=["the-retry-rewrote-every-tile", "the-first-attempt-wrote-a-tile-the-retry-did-not"],
+    )
+    def test_a_retry_s_earlier_attempt_counts_on_its_own(self, first_attempt_wrote: set[str], blocks: bool) -> None:
+        """One run id, two commits: the part describes the retry, so the first attempt is a commit no part
+        describes, and its tiles are the store's until something rewrites them.
+        """
+        parts = _parts_of(("run-a", MIDWAY, ["chunk_0_0", "chunk_0_1"]))
+        attempts = (Commit("run-a", FILLED, "snap-a1"), Commit("run-a", MIDWAY, "snap-a2"))
+        found = store_disagreements(parts, _store(*attempts, wrote={"snap-a1": first_attempt_wrote}))
+        assert [("chunk_9_9" in entry) for entry in found] == ([True] if blocks else [])
+
+    def test_a_retry_that_rewrote_its_tiles_but_never_republished_is_refused(self) -> None:
+        """The part describes the first attempt; the store holds the retry's pixels."""
+        parts = _parts_of(("run-a", FILLED, ["chunk_0_0", "chunk_0_1"]))
+        retry = Commit("run-a", MIDWAY, "snap-a2")
+        (found,) = store_disagreements(parts, _store(_A, retry, wrote=_WROTE | {"snap-a2": {"chunk_0_0"}}))
+        assert f"committed at {MIDWAY} and last wrote 1 tile(s) no part describes" in found
 
     def test_a_part_naming_a_run_the_store_never_committed_is_refused(self) -> None:
         (found,) = store_disagreements(_FILL_AND_INFILL, _store(_A))
@@ -450,7 +471,7 @@ class TestConcurrentWriters:
     def test_a_cell_the_store_cannot_stand_behind_is_not_written(self, registry: Path) -> None:
         before = (registry / self.MASTER).read_bytes()
         store = _store(_A._replace(snapshot=None), Commit("run-b", LATER, "snap-b"))
-        with pytest.raises(ValueError, match="run 'run-b' last wrote 1 tile"):
+        with pytest.raises(ValueError, match="run 'run-b' committed at .* last wrote 1 tile"):
             update_cell(LOCAL, str(registry), "33N", 2017, store=store)
         assert (registry / self.MASTER).read_bytes() == before
 
