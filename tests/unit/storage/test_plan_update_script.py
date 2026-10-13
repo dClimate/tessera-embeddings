@@ -34,7 +34,8 @@ def _csv(tmp_path: Path, rows: list[str]) -> str:
 def test_a_plan_from_cells_is_checked_then_written(script: Any, tmp_path: Path, capsys) -> None:
     inputs = tmp_path / "in"
     make_coverage(inputs / "masks", "31N", [(10, 5), (11, 5)])  # -> masks/coverage.icechunk
-    cells = _csv(tmp_path, ["31N,2024,chunk_10_5", "31N,2024,chunk_12_5", "31N,2025,"])
+    # Two spellings of one zone are one cell.
+    cells = _csv(tmp_path, ["31N,2024,chunk_10_5", "31n,2024,chunk_12_5", "31N,2025,"])
     argv = ["from-cells", "--name", "u1", "--mode", "shards", "--inputs", str(inputs), "--mask", "coverage"]
 
     assert script.main([*argv, "--cells", cells]) == 0

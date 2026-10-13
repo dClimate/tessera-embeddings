@@ -61,7 +61,7 @@ import zarr
 
 from tessera_embeddings.config.assembly import AssemblyConfig
 from tessera_embeddings.config.fault_injection import ArmedFault
-from tessera_embeddings.config.inference import InferenceConfig
+from tessera_embeddings.config.inference import OPTICAL_MIN_OBS, InferenceConfig
 from tessera_embeddings.config.paths import store_key
 from tessera_embeddings.config.store_layout import GLOBAL, REQUIRED_VARS
 from tessera_embeddings.config.time_windows import TimeWindow
@@ -1436,25 +1436,24 @@ def _publish_merged_rows(
         )
         return
     records: dict[str, dict] = {}
-    if optical_min_obs is not None:
-        try:
-            year_index = calendar_years(node).index(year)
-            with ThreadPoolExecutor(max_workers=16) as pool:
-                rows = pool.map(
-                    lambda tile: as_coverage_record(
-                        rebuild_tile(
-                            node, time_index=year_index, tile=tile, optical_min_obs=optical_min_obs, with_radar=True
-                        )
-                    ),
-                    labels,
-                )
-                records = dict(zip(labels, rows, strict=True))
-        except Exception:
-            log.exception(
-                "Zone %s year %d: merged tiles' registry rows could not be re-derived; publishing them unmeasured",
-                zone,
-                year,
+    # A store with no depth rule is measured against the default line, as the actors measure it.
+    thin_below = optical_min_obs or OPTICAL_MIN_OBS
+    try:
+        year_index = calendar_years(node).index(year)
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            rows = pool.map(
+                lambda tile: as_coverage_record(
+                    rebuild_tile(node, time_index=year_index, tile=tile, optical_min_obs=thin_below, with_radar=True)
+                ),
+                labels,
             )
+            records = dict(zip(labels, rows, strict=True))
+    except Exception:
+        log.exception(
+            "Zone %s year %d: merged tiles' registry rows could not be re-derived; publishing them unmeasured",
+            zone,
+            year,
+        )
     writer.publish_registry_part(
         registry_root,
         zone,

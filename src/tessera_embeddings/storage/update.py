@@ -148,7 +148,10 @@ class UpdatePlan:
                 raise ValueError(f"Cell {key} lists no shards; use null for every live shard")
             for label in tiles or ():
                 parse_chunk_label(label)
-            cells[cell_key(*parse_cell_key(key))] = None if tiles is None else tuple(sorted(set(tiles)))
+            canonical = cell_key(*parse_cell_key(key))
+            if canonical in cells:
+                raise ValueError(f"Cell {canonical} is named more than once; list each cell once")
+            cells[canonical] = None if tiles is None else tuple(sorted(set(tiles)))
         object.__setattr__(self, "cells", cells)
 
     def cell_list(

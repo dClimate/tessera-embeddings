@@ -153,8 +153,8 @@ def test_a_holes_update_fills_only_the_holes(filled, monkeypatch):
     assert sorted(p.name for p in store_dir.iterdir()) == ["chunk_0_0.npz", "chunk_1_1.npz"]
     # The merged tile's row is now the update's, stamped with its shard commit so the store stands
     # behind it; the rest stay the fill's.
-    master = pq.read_table(f"{filled['registry']}/master/zone={_ZONE}/year=2025/part-0.parquet").to_pydict()
-    assert {t: (r, u) for t, r, u in zip(master["tile"], master["run_id"], master["update_name"], strict=True)} == {
+    master = pq.read_table(f"{filled['registry']}/master/zone={_ZONE}/year=2025/part-0.parquet").to_pylist()
+    assert {r["tile"]: (r["run_id"], r["update_name"]) for r in master} == {
         "chunk_0_0": ("upd1", "u1"),
         "chunk_0_1": ("fill1", None),
         "chunk_1_1": ("fill1", None),

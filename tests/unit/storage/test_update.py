@@ -41,6 +41,7 @@ def test_a_plan_round_trips_and_normalises_its_cells():
         ({"cells": {"14N/2019": []}}, "lists no shards"),
         ({"cells": {"14N/2019": ["tile_1_2"]}}, "chunk_<row>_<col>"),
         ({"cells": {"14N-2019": None}}, "<zone>/<year>"),
+        ({"cells": {"7S/2024": None, "07S/2024": ["chunk_1_2"]}}, "more than once"),
     ],
 )
 def test_a_plan_the_flows_could_not_run_is_refused(overrides, match):
