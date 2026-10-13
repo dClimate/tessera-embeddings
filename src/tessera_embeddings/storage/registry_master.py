@@ -84,7 +84,7 @@ from tessera_embeddings.storage.registry import dataset_schema
 from tessera_embeddings.storage.registry_rebuild import CARRIED_COLUMNS, REBUILT_COLUMNS
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Iterator, Sequence
+    from collections.abc import Callable, Collection, Iterator, Sequence
 
     from fsspec import AbstractFileSystem
 
@@ -523,7 +523,7 @@ def update_cell(
     *,
     run_id: str | None = None,
     live: Collection[tuple[int, int]] | None = None,
-    store: StoreYear | None = None,
+    store: Callable[[], StoreYear] | None = None,
     extra: Sequence[pa.Table] = (),
     write: bool = True,
     tries: int = 8,
@@ -542,6 +542,10 @@ def update_cell(
     the write is conditional on it (:func:`write_cell`), so a writer that read before another
     landed is refused and merges again from what is there now, up to ``tries`` times.
 
+    ``store`` reads the store's record of the year, and is called after the parts on every attempt:
+    a run publishes its part only after its commit, so a record read then names the run of every
+    part read, and a fill landing mid-update is merged rather than refused.
+
     ``live`` is the store's live ``(shard_y, shard_x)`` shards for this zone-year, from
     :func:`~.published_store.live_shards`. Returns where the master's embedded tiles disagree with
     it: no run removes a tile it did not write, so a tile whose shard something else cleared — an
@@ -554,7 +558,7 @@ def update_cell(
         parts = read_cell(fs, registry_root, "parts", zone, year, dataset_schema())
         if run_id is not None and run_id not in set(parts.column("run_id").to_pylist()):
             raise ValueError(f"{zone}/{year} has no registry part for run {run_id!r}, so the master would miss it")
-        if store is not None and (found := store_disagreements(parts, store)):
+        if store is not None and (found := store_disagreements(parts, store())):
             raise ValueError(f"{zone}/{year}: the store cannot stand behind the registry parts: {'; '.join(found)}")
         fills = as_master_rows(parts, MEASURED_BY_FILL)
         # Parts first, so on a tie between identical rows the part's copy is the one kept.

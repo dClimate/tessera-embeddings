@@ -109,7 +109,7 @@ def store(script: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> zarr.
     for name in ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count"):
         group.create_array(name, shape=(2, 4096, 4096), dtype="uint16", chunks=(1, 2048, 2048))
     group.attrs["runs"] = V11_RUNS
-    monkeypatch.setattr(script, "_open_store", lambda *_args, **_kwargs: (None, {"33N": group}, {}))
+    monkeypatch.setattr(script, "_open_store", lambda *_args, **_kwargs: (None, {"33N": group}, dict))
     return group
 
 
@@ -193,11 +193,25 @@ def test_a_registry_without_parts_fails_rather_than_passing_vacuously(
 
 
 @pytest.mark.parametrize("command", ["gate", "repair"])
-def test_a_zone_the_registry_does_not_hold_fails(script: Any, tmp_path: Path, command: str) -> None:
+def test_a_zone_the_registry_does_not_hold_fails(script: Any, store: zarr.Group, tmp_path: Path, command: str) -> None:
     """A mistyped zone in a zone-split run would otherwise select nothing and report success."""
     _seed(tmp_path)
     with pytest.raises(SystemExit, match="99X"):
         script.main([command, "--registry", str(tmp_path), "--zones", "33N,99X"])
+
+
+def test_repair_reaches_a_zone_with_no_part_left(
+    script: Any, store: zarr.Group, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every part of zone 34N was withdrawn, so only its master file names it, and ``--zones`` must still find it."""
+    _seed(tmp_path)
+    withdrawn = pa.Table.from_pylist([_row("chunk_0_0", measured=True, zone="34N")], schema=master_schema())
+    write_cell(LOCAL, str(tmp_path), "34N", 2017, as_master_rows(withdrawn, MEASURED_BY_FILL), version=None)
+    zone = zarr.open_group(str(tmp_path / "34N.zarr"), mode="w")
+    zone.create_array("time", data=store["time"][:])
+    monkeypatch.setattr(script, "_open_store", lambda *_args, **_kwargs: (None, {"33N": store, "34N": zone}, dict))
+    assert _repair(script, tmp_path, "--zones", "34N", "--write") == 0
+    assert pq.read_table(tmp_path / "master" / "zone=34N" / "year=2017" / "part-0.parquet").num_rows == 0
 
 
 @pytest.mark.parametrize(
@@ -225,7 +239,7 @@ def test_a_refill_that_never_published_blocks_only_while_it_holds_a_tile(
         V11_RUNS, 2017, "infill", commit={"snapshot": "s-c", "committed_at": infill_at}
     )
     writes = {("33N", 2017): [Commit("refill", "2026-08-05T00:00:00+00:00", "s-b"), Commit("infill", infill_at, "s-c")]}
-    monkeypatch.setattr(script, "_open_store", lambda *_args, **_kwargs: (None, {"33N": store}, writes))
+    monkeypatch.setattr(script, "_open_store", lambda *_args, **_kwargs: (None, {"33N": store}, lambda: writes))
     wrote = {"s-b": refill_wrote, "s-c": {"chunk_1_1"}}
     monkeypatch.setattr(published_store, "commit_tiles", lambda _repo, _zone, _t, snapshot: frozenset(wrote[snapshot]))
     master = tmp_path / "master" / "zone=33N" / "year=2017" / "part-0.parquet"
@@ -250,7 +264,7 @@ class TestVerify:
         _seed(tmp_path)
         _seed_master(tmp_path, radar=None)
         writes = {("33N", 2018): [Commit("first-fill", FILLED, "s-a")]}
-        monkeypatch.setattr(script, "_open_store", lambda *_args, **_kwargs: (None, {"33N": store}, writes))
+        monkeypatch.setattr(script, "_open_store", lambda *_args, **_kwargs: (None, {"33N": store}, lambda: writes))
         monkeypatch.setattr(published_store, "commit_tiles", lambda *_args: frozenset({"chunk_0_0"}))
         assert script.main(["verify", "--registry", str(tmp_path)]) == 1
         assert "33N/2018: the store cannot stand behind its parts: run 'first-fill'" in capsys.readouterr().out

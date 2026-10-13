@@ -45,7 +45,7 @@ shows it rather than downloading it. Nothing reads it, and it sits outside both 
         │
   zone_fill ──▶ _update_registry_master
                   │  read the master file's version, then the file and all of the cell's parts
-                  │  check the parts against the store's record of the year's runs
+                  │  then the store's record of the year's runs, and check the parts against it
                   │  merge tile by tile, check the invariants
                   │  replace master/zone=Z/year=Y/part-0.parquet if it is still at that version
                   │    (one conditional PUT; refused → read and merge again, up to 8 times)
@@ -164,7 +164,9 @@ metadata, in the same commit as the shards.
 A commit no part describes whose every tile a later commit wrote over describes nothing the store
 holds, so it does not block. **That is also how a blocked cell recovers.** Rewrite the tiles the refusal names
 under a run that publishes its part, such as a refill of the zone-year, and the cell's next update
-goes through. Every update and repair runs this check, and so does `verify`.
+goes through. Every update and repair runs this check, and so does `verify`. An update reads the
+store's record after the parts, on every attempt: a run publishes its part only after its commit, so
+a fill that lands mid-update, or mid-way through an hours-long repair, is merged rather than refused.
 
 ## What guards it
 

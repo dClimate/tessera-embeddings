@@ -377,7 +377,7 @@ def _update_registry_master(
             year,
             run_id=run_id,
             live=live,
-            store=store_year(repo, node, zone, year, shard_writes(repo)),
+            store=lambda: store_year(repo, node, zone, year, shard_writes(repo)),
         )
     except Exception:
         log.exception(

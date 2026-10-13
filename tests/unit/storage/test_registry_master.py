@@ -504,11 +504,27 @@ class TestConcurrentWriters:
         assert not write_cell(LOCAL, str(registry), "33N", 2017, _fill(_AUDITED), version=stale)
         assert (registry / self.MASTER).read_bytes() == current
 
+    def test_a_fill_landing_mid_update_is_merged_not_refused(
+        self, registry: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Its commit precedes its part, so a store record read after the parts names the run of every part read."""
+        read, commits = registry_master.read_cell, [_A]
+
+        def landing(fs: object, root: str, prefix: str, zone: str, year: int, schema: pa.Schema) -> pa.Table:
+            if prefix == "parts" and len(commits) == 1:
+                commits.append(_C)
+                _publish(registry, "run-c", [_row("chunk_0_1", measured=True, stamp=LATER, run_id="run-c")])
+            return read(fs, root, prefix, zone, year, schema)
+
+        monkeypatch.setattr(registry_master, "read_cell", landing)
+        update_cell(LOCAL, str(registry), "33N", 2017, store=lambda: _store(*commits))
+        assert pq.read_table(registry / self.MASTER).column("run_id").to_pylist() == ["run-a", "run-c"]
+
     def test_a_cell_the_store_cannot_stand_behind_is_not_written(self, registry: Path) -> None:
         before = (registry / self.MASTER).read_bytes()
         store = _store(_A._replace(snapshot=None), Commit("run-b", LATER, "snap-b"))
         with pytest.raises(ValueError, match=r"run 'run-b' committed at .* last wrote 1 tile"):
-            update_cell(LOCAL, str(registry), "33N", 2017, store=store)
+            update_cell(LOCAL, str(registry), "33N", 2017, store=lambda: store)
         assert (registry / self.MASTER).read_bytes() == before
 
 
