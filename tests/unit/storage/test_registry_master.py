@@ -471,7 +471,7 @@ class TestConcurrentWriters:
     def test_a_cell_the_store_cannot_stand_behind_is_not_written(self, registry: Path) -> None:
         before = (registry / self.MASTER).read_bytes()
         store = _store(_A._replace(snapshot=None), Commit("run-b", LATER, "snap-b"))
-        with pytest.raises(ValueError, match="run 'run-b' committed at .* last wrote 1 tile"):
+        with pytest.raises(ValueError, match=r"run 'run-b' committed at .* last wrote 1 tile"):
             update_cell(LOCAL, str(registry), "33N", 2017, store=store)
         assert (registry / self.MASTER).read_bytes() == before
 
