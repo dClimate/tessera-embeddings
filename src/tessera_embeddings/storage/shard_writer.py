@@ -43,7 +43,7 @@ import multiprocessing
 import threading
 import time
 from collections import Counter
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
@@ -564,8 +564,16 @@ def run_provenance(
     optical_skips: dict | None = None,
     input_coverage: dict | None = None,
     code: dict | None = None,
+    commit: Mapping[str, str] | None = None,
 ) -> dict:
     """Merge a per-year run record into a group's ``runs`` attr (the schema's one owner).
+
+    ``commit`` is the run's shard commit, ``{"snapshot", "committed_at"}``, recorded as null for
+    a year marked without writing shards. **A refill keeps the runs before it** in ``previous``,
+    as ``run_id``, ``assembled_at`` and ``commit`` alone: the year's record otherwise names only
+    the last run, and a run whose registry part never published would vanish from the store's
+    account the moment another run wrote the year, leaving the registry describing its tiles by an
+    older run with nothing able to tell. A record with no ``commit`` key predates this field.
 
     ``input_coverage`` answers the question the calendar-year guarantee below does NOT: not
     what window was *requested*, but **how much of it the input actually held** — per source
@@ -612,7 +620,7 @@ def run_provenance(
     the flag already states the whole live footprint is fill, and the label list would
     restate the land mask at zone size.
     """
-    record: dict = {"run_id": run_id, "assembled_at": datetime.now(UTC).isoformat()}
+    record: dict = {"run_id": run_id, "assembled_at": datetime.now(UTC).isoformat(), "commit": _or_none(commit)}
     if empty:
         record["empty"] = True
     if radar_coverage:
@@ -627,7 +635,24 @@ def run_provenance(
     resolved_code = code if code is not None else code_identity()
     if resolved_code:
         record["code"] = dict(resolved_code)
-    return {**(dict(existing) if isinstance(existing, dict) else {}), str(year): record}
+    runs = dict(existing) if isinstance(existing, dict) else {}
+    prior = runs.get(str(year))
+    if isinstance(prior, dict):
+        # A re-run under the same id replaces its own entry; any other run joins the history.
+        replaced = [] if prior.get("run_id") == run_id else [{k: prior[k] for k in _HISTORY if k in prior}]
+        previous = [p for p in [*prior.get("previous", []), *replaced] if p.get("run_id") != run_id]
+        if previous:
+            record["previous"] = previous
+    return {**runs, str(year): record}
+
+
+#: What ``previous`` keeps of a replaced run: enough to know it wrote the year, when, and in which commit.
+_HISTORY = ("run_id", "assembled_at", "commit")
+
+
+def _or_none(value: Mapping[str, Any] | None) -> dict | None:
+    """``value`` as a plain dict, or ``None``."""
+    return dict(value) if value else None
 
 
 def commit_year_attrs(
@@ -640,6 +665,7 @@ def commit_year_attrs(
     radar_coverage: dict | None = None,
     optical_skips: dict | None = None,
     input_coverage: dict | None = None,
+    commit: Mapping[str, str] | None = None,
     tries: int = 8,
     skip_if_marked: bool = False,
 ) -> str:
@@ -661,7 +687,9 @@ def commit_year_attrs(
     a loser that re-reads the winner's value and re-applies its own key produces exactly
     the state both writers intended, in either order. That makes this a plain
     optimistic-concurrency loop rather than a lossy merge. Each attempt opens a FRESH
-    session, so it cannot re-apply onto a stale read.
+    session, so it cannot re-apply onto a stale read. Two runs of the SAME year both survive
+    too: the loser's re-applied record keeps the winner in ``previous``, and each carries its
+    shard ``commit``, so the order their pixels landed in is recorded whichever marks last.
 
     **The two callers want different idempotency, and the difference is deliberate.**
     ``skip_if_marked=True`` returns the branch tip untouched when the year is already in
@@ -690,6 +718,7 @@ def commit_year_attrs(
                 radar_coverage=radar_coverage,
                 optical_skips=optical_skips,
                 input_coverage=input_coverage,
+                commit=commit,
             )
         try:
             return commit_with_rebase(session, f"mark {group} year {year_label} complete")
@@ -842,9 +871,10 @@ def write_year_shards(
     ``telemetry`` is an out-parameter: pass a dict to receive the fill's timing
     facts — the per-worker stats and ``wall_s``/``merge_s`` from
     :func:`run_forked`, its ``catch_ups`` tally, plus ``commit_s`` and
-    ``attrs_commit_s`` (each measured around its commit). An out-parameter
-    rather than a changed return, so the snapshot id the callers and tags key on
-    stays a plain string; the caller that wants a summary record owns emitting it.
+    ``attrs_commit_s`` (each measured around its commit) — and ``commit``, the shard
+    commit's ``snapshot`` and ``committed_at``, which the registry part is stamped with.
+    An out-parameter rather than a changed return, so the snapshot id the callers and
+    tags key on stays a plain string; the caller that wants a summary record owns emitting it.
 
     ``log`` is where the coordinator's progress lines go while the fill's forks
     are outstanding — the longest phase of a fill. A caller inside a flow passes
@@ -889,7 +919,14 @@ def write_year_shards(
 
     year_label = _year_label(_group_node(session.store, group), year_index)
     t_commit = time.monotonic()
-    commit_with_rebase(session, commit_msg or f"fill {group} year {year_label}")
+    shard_snapshot = commit_with_rebase(session, commit_msg or f"fill {group} year {year_label}")
+    # The store's own clock for this write. Icechunk refuses a snapshot older than its parent, so
+    # along `main` these stamps are commit order, which is the order a tile's pixels were written
+    # in, whatever order the attrs commits below land in.
+    commit = {
+        "snapshot": shard_snapshot,
+        "committed_at": repo.lookup_snapshot(shard_snapshot).written_at.isoformat(),
+    }
     if fault is not None:
         # The drill's death lands HERE, between the two commits, and nowhere else can
         # produce this state on purpose. Inert for any other fault or any other cell.
@@ -908,9 +945,11 @@ def write_year_shards(
         optical_skips=optical_skips,
         input_coverage=input_coverage,
         empty=empty,
+        commit=commit,
     )
     if telemetry is not None:
         telemetry.update(
+            commit=commit,
             workers=fill["workers"],
             fill_wall_s=fill["wall_s"],
             merge_s=fill["merge_s"],

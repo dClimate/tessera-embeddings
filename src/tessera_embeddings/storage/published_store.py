@@ -1,4 +1,5 @@
-"""Reading the published global store from the outside: layout conformance and shard discovery.
+"""Reading the published global store from the outside: layout conformance, shard discovery, and
+which runs wrote each zone-year.
 
 :func:`layout_departures` is deliberately separate from
 :func:`~tessera_embeddings.storage.global_store.check_destination_types`, which checks the same
@@ -9,8 +10,9 @@ existing store must take that store's granularity. An audit wants geometry under
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable, Sequence
-from typing import TYPE_CHECKING, cast
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from datetime import datetime
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import numpy as np
 
@@ -207,6 +209,63 @@ async def live_shards_async(
         time_index, shard_y, shard_x = int(coord[0]), int(coord[1]), int(coord[2])
         by_year.setdefault(time_index, set()).add((shard_y, shard_x))
     return {year: frozenset(shards) for year, shards in sorted(by_year.items())}
+
+
+class Commit(NamedTuple):
+    """One run that wrote shards into a zone-year, as the zone group's ``runs`` attr records it.
+
+    ``at`` orders runs: the shard commit's own timestamp, or for a record predating that field the
+    time it was marked. ``snapshot`` is the shard commit, ``None`` for such a record, and is what
+    :func:`commit_tiles` reads the tiles it wrote from.
+    """
+
+    run_id: str
+    at: str
+    snapshot: str | None
+
+
+def committed_runs(attrs: Mapping[str, Any], year: int) -> list[Commit]:
+    """Every run that wrote shards into ``year``, oldest first: the record's run and the ones it replaced.
+
+    A run marked without writing shards (``commit`` recorded as null) wrote no tile, so it is left
+    out; a record with no ``commit`` key predates the field and is taken to have written.
+    """
+    head = (attrs.get("runs") or {}).get(str(year))
+    entries = [head, *head.get("previous", [])] if isinstance(head, dict) else []
+    commits = [
+        Commit(str(e["run_id"]), str(e["commit"]["committed_at"]), str(e["commit"]["snapshot"]))
+        if "commit" in e
+        else Commit(str(e["run_id"]), str(e["assembled_at"]), None)
+        for e in entries
+        if e.get("commit", True)
+    ]
+    return sorted(commits, key=lambda c: datetime.fromisoformat(c.at))
+
+
+def commit_tiles(repo: icechunk.Repository, zone: str, time_index: int, snapshot: str) -> frozenset[str]:
+    """The labels of the tiles ``snapshot`` wrote or cleared in one year of ``zone``.
+
+    From the commit's own transaction log, by diffing it against its parent: the store's account of
+    what that write changed, so it needs no record kept anywhere else. A cleared tile is a deleted
+    shard, which the diff lists as changed too.
+    """
+    parent = repo.lookup_snapshot(snapshot).parent_id
+    diff = repo.diff(from_snapshot_id=parent, to_snapshot_id=snapshot)
+    coords = diff.updated_chunks.get(f"/{zone}/{COVERAGE_VAR}", [])
+    return frozenset(f"chunk_{c[1]}_{c[2]}" for c in coords if c[0] == time_index)
+
+
+class StoreYear(NamedTuple):
+    """What the store says about one zone-year's writers: who committed, and what a commit wrote."""
+
+    commits: list[Commit]
+    tiles_of: Callable[[str], frozenset[str]]
+
+
+def store_year(repo: icechunk.Repository, group: zarr.Group, zone: str, year: int) -> StoreYear:
+    """``year`` of ``zone`` as :func:`committed_runs` and :func:`commit_tiles` read it; diffs are lazy."""
+    time_index = calendar_years(group).index(year)
+    return StoreYear(committed_runs(group.attrs, year), lambda snapshot: commit_tiles(repo, zone, time_index, snapshot))
 
 
 def shard_pixel_window(

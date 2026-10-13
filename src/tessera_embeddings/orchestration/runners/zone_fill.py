@@ -55,7 +55,6 @@ import fsspec
 import icechunk
 import numpy as np
 import zarr
-from pyarrow.fs import FSSpecHandler, PyFileSystem
 
 from tessera_embeddings.config.assembly import AssemblyConfig
 from tessera_embeddings.config.fault_injection import ArmedFault
@@ -74,7 +73,7 @@ from tessera_embeddings.inference.data_loading import _active_orbits
 from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.storage.campaign import mark_zone_year_empty, tag_zone_year, zone_year_tag
 from tessera_embeddings.storage.global_store import check_destination_types, open_global_repo
-from tessera_embeddings.storage.published_store import calendar_years, live_shards
+from tessera_embeddings.storage.published_store import calendar_years, live_shards, store_year
 from tessera_embeddings.storage.registry_master import update_cell
 from tessera_embeddings.storage.shard_writer import read_years_complete, shard_pitch
 from tessera_embeddings.storage.time_axis import time_index_of, year_timestamp
@@ -351,15 +350,16 @@ def _update_registry_master(
 
     The store's live shards for the year are compared with the master's embedded tiles on the way,
     from the manifests alone, and a disagreement is logged at ERROR: no run removes a tile it did
-    not write, so a shard cleared by hand would otherwise leave the master describing it.
+    not write, so a shard cleared by hand would otherwise leave the master describing it. The
+    store's run record is checked against the cell's parts too (``store_disagreements``), which
+    refuses the update when a run that wrote the year has no part to describe its tiles.
     """
     if not registry_root:
         return
     try:
         credentials = _store_credentials(store_path, get_credentials)
-        session = open_global_repo(store_path, get_credentials=credentials, region=s3_region).readonly_session(
-            branch="main"
-        )
+        repo = open_global_repo(store_path, get_credentials=credentials, region=s3_region)
+        session = repo.readonly_session(branch="main")
         node = cast(zarr.Group, zarr.open_group(session.store, mode="r")[zone])
         live = live_shards(session, zone).get(calendar_years(node).index(year), frozenset())
         # The registry sits beside the store, in its bucket, so the store's credential writes it.
@@ -367,13 +367,13 @@ def _update_registry_master(
             registry_root, **(plain_zarr_storage_options(registry_root, credentials, s3_region) or {})
         )
         disagreements = update_cell(
-            PyFileSystem(FSSpecHandler(fs)), registry_root, zone, year, run_id=run_id, live=live
+            fs, registry_root, zone, year, run_id=run_id, live=live, store=store_year(repo, node, zone, year)
         )
     except Exception:
         log.exception(
             "Zone %s year %d: registry master NOT updated. The cell is committed, but master/ — what "
-            "consumers read — still describes it as it was before this fill. Repair: "
-            "scripts/maintenance/rebuild_registry_measurements.py repair --zones %s --write",
+            "consumers read — still describes it as it was before this fill. Repair, once the cause "
+            "above is resolved: scripts/maintenance/rebuild_registry_measurements.py repair --zones %s --write",
             zone,
             year,
             zone,

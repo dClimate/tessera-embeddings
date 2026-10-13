@@ -47,6 +47,9 @@ from tessera_embeddings.inference.assembly import (
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.storage.registry import REASONS, part_uri, registry_rows, write_registry_part
 
+#: A shard commit's timestamp, as `write_year_shards` reports it.
+COMMITTED = "2026-08-01T00:00:00.123456+00:00"
+
 
 def _chunk(row: int, col: int) -> ChunkSpec:
     return ChunkSpec(row=row, col=col, y_start=0, y_stop=8, x_start=0, x_stop=8)
@@ -528,12 +531,19 @@ class TestThePartIsPublishedOnlyAfterTheCellCommits:
         writer._skip_summary("run1", ["chunk_9_9"], ["chunk_0_0", "chunk_0_1"])
 
         uri = writer.publish_registry_part(
-            root, "32S", 2021, "run1", embedded=["chunk_9_9"], refused=["chunk_0_0", "chunk_0_1"]
+            root,
+            "32S",
+            2021,
+            "run1",
+            committed_at=COMMITTED,
+            embedded=["chunk_9_9"],
+            refused=["chunk_0_0", "chunk_0_1"],
         )
 
         assert uri == part_uri(root, "32S", 2021, "run1")
         by_tile = {r["tile"]: r for r in pq.read_table(uri).to_pylist()}
         assert set(by_tile) == {"chunk_9_9", "chunk_0_0", "chunk_0_1"}, "every live tile"
+        assert {r["assembled_at"] for r in by_tile.values()} == {COMMITTED}, "stamped with the commit, not the clock"
         assert by_tile["chunk_9_9"]["embedded"] is True
         assert by_tile["chunk_9_9"]["refused_px"] is None, "nothing counted this, so nothing is claimed"
         assert by_tile["chunk_0_0"]["refused_thin_px"] == 64
@@ -557,7 +567,9 @@ class TestThePartIsPublishedOnlyAfterTheCellCommits:
 
         monkeypatch.setattr(_assembly_mod, "_fs_for", _boom)
         assert (
-            writer.publish_registry_part(str(tmp_path / "reg"), "32S", 2021, "run1", embedded=[], refused=[chunk.label])
+            writer.publish_registry_part(
+                str(tmp_path / "reg"), "32S", 2021, "run1", committed_at=COMMITTED, embedded=[], refused=[chunk.label]
+            )
             is None
         ), "reported as not published rather than raised"
 
@@ -878,6 +890,7 @@ class TestOneCellsRefusalsNeverReachAnother:
             "60S",
             2024,
             "run-B",
+            committed_at=COMMITTED,
             embedded=[chunk.label],
             refused=[],
             optical_min_obs=15,
@@ -904,6 +917,7 @@ class TestOneCellsRefusalsNeverReachAnother:
             "60S",
             2024,
             "run-B",
+            committed_at=COMMITTED,
             embedded=[chunk.label],
             refused=[],
             optical_min_obs=15,

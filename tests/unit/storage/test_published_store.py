@@ -8,7 +8,7 @@ import pytest
 import zarr
 
 from tessera_embeddings.config.store_layout import GLOBAL, SHARD_PX
-from tessera_embeddings.storage import global_store, published_store, zarr_store
+from tessera_embeddings.storage import global_store, published_store, shard_writer, zarr_store
 from tessera_embeddings.storage.zone_grid import PIXEL_M, ZoneSpec
 
 # Two shards of easting by four of northing, so a shard grid exists without a large store.
@@ -378,3 +378,39 @@ class TestSavedManifestPreload:
         monkeypatch.setattr(icechunk.Repository, "save_config", lambda self: None)
         with pytest.raises(RuntimeError, match="preload did not change"):
             global_store.set_saved_manifest_preload(seeded, enabled=False)
+
+
+class TestWhoWroteAYear:
+    """The store's own account of which runs wrote a zone-year, and which tiles each commit wrote."""
+
+    def test_a_commit_s_tiles_are_its_diff_in_that_year_written_and_cleared_alike(self, seeded):
+        _fill_shard(seeded, "01N", 1, (0, 0))
+        session = global_store.open_global_repo(seeded).writable_session("main")
+        scales = zarr.open_group(session.store, mode="r+")["01N"]["scales"]
+        for time_index, shard, value in ((1, (0, 0), np.nan), (1, (3, 1), 0.5), (0, (2, 0), 0.5)):
+            y0, y1, x0, x1 = published_store.shard_pixel_window(shard, scales.shape)
+            scales[time_index, y0:y1, x0:x1] = value
+        snapshot = session.commit("clear one tile, write another, and one in the other year")
+        repo = global_store.open_global_repo(seeded)
+        assert published_store.commit_tiles(repo, "01N", 1, snapshot) == {"chunk_0_0", "chunk_3_1"}
+
+    def test_every_run_that_wrote_the_year_is_listed_in_commit_order(self):
+        """Marked last is not written last: two runs of one cell record in whichever order they finish."""
+        later, earlier = (
+            {"snapshot": "s2", "committed_at": "2026-08-09T00:00:00+00:00"},
+            {"snapshot": "s1", "committed_at": "2026-08-01T00:00:00+00:00"},
+        )
+        runs = shard_writer.run_provenance(None, 2024, "refill", commit=later, code={})
+        runs = shard_writer.run_provenance(runs, 2024, "fill", commit=earlier, code={})
+        assert published_store.committed_runs({"runs": runs}, 2024) == [
+            published_store.Commit("fill", earlier["committed_at"], "s1"),
+            published_store.Commit("refill", later["committed_at"], "s2"),
+        ]
+
+    def test_a_year_marked_without_shards_wrote_nothing_and_an_older_record_wrote_something(self):
+        legacy = {"run_id": "v11", "assembled_at": "2026-07-01T00:00:00+00:00"}
+        assert published_store.committed_runs({"runs": {"2024": legacy}}, 2024) == [
+            published_store.Commit("v11", legacy["assembled_at"], None)
+        ]
+        marked = shard_writer.run_provenance(None, 2024, "ocean", empty=True, code={})
+        assert published_store.committed_runs({"runs": marked}, 2024) == []

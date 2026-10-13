@@ -61,8 +61,10 @@ authority**, and it distinguishes what nothing else can: a year deliberately lef
 with no qualifying land that year — *is* in the list, while a year that never landed is absent.
 
 Reading `zone.attrs` pulls the whole metadata document, including a `runs` entry per year carrying
-that fill's run id, its input coverage per source store and the commit it was built from. Useful
-provenance, and not small: a reader who only wants `years_complete` pays for all of it per zone.
+that fill's run id, its input coverage per source store and the commit it was built from. A fill
+since v1.1 also records its shard commit in the store and the runs it replaced, which the registry
+is checked against ([`registry-master.md`](registry-master.md)). Useful provenance, and not small: a
+reader who only wants `years_complete` pays for all of it per zone.
 
 ## 2. What is published
 

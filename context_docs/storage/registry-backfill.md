@@ -96,7 +96,7 @@ without `--write`.
 ```
 gate      re-derive rows that ALREADY carry measurements and compare. Writes nothing, ever.
 repair    rebuild master/ cells, re-deriving every row their fills left null
-verify    check master/ itself, cell by cell, against parts/
+verify    check master/ itself, cell by cell, against parts/, and parts/ against the store
 ```
 
 **The gate is the precondition, and it is checkable at scale rather than sampled on faith**: 1.73
@@ -122,7 +122,7 @@ registry copied into `./reg`:
 S=scripts/maintenance/rebuild_registry_measurements.py
 uv run python $S gate   --anonymous --registry ./reg --zones 09N --sample 100000
 uv run python $S repair --anonymous --registry ./reg --zones 49S --skip-radar --write
-uv run python $S verify --registry ./reg
+uv run python $S verify --anonymous --registry ./reg
 ```
 
 **Split a full run across processes by zone.** The per-tile decode and counting hold the GIL for
@@ -136,9 +136,11 @@ a failed process is re-run for its zones alone.
 rather than reading as a registry with nothing to check. So does a `--zones` entry the registry does
 not hold, which in a zone-split run would otherwise leave that share unmeasured while every later
 step passed. A cell fails `gate`, and is left untouched by `repair`, unless the store holds a time
-slot for it and the zone group's `runs` attribute names the cell's newest run: a refill that
-committed to the store but never published its part would otherwise be re-derived from pixels its
-rows do not describe. Every one of the 994 published cells matches.
+slot for it and the store's record of the year accounts for the cell's parts
+([`registry-master.md`](registry-master.md)): a refill that committed to the store but never
+published its part would otherwise be re-derived from pixels its rows do not describe. In v1.1 that
+record is the zone group's `runs` attribute naming the cell's one run, and every one of the 994
+published cells matches.
 
 ## The v1.1 run
 

@@ -14,26 +14,32 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import fsspec
 import numpy as np
 import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 import pytest
 import zarr
-from pyarrow.fs import LocalFileSystem
 
+from tessera_embeddings.storage import published_store
 from tessera_embeddings.storage.registry import registry_schema
 from tessera_embeddings.storage.registry_master import (
     MEASURED_BY_FILL,
     MEASURED_BY_REBUILD,
     as_master_rows,
+    cell_version,
     master_schema,
     merge,
     write_cell,
 )
+from tessera_embeddings.storage.shard_writer import run_provenance
 
 _SCRIPT = Path(__file__).parents[3] / "scripts" / "maintenance" / "rebuild_registry_measurements.py"
 FILLED = "2026-08-01T00:00:00+00:00"
+LOCAL = fsspec.filesystem("file")
+#: The store's record of cell 33N/2017 as v1.1 left it: one run, recorded before commits were.
+V11_RUNS = {"2017": {"run_id": "fill-1", "assembled_at": FILLED}}
 
 
 @pytest.fixture(scope="module")
@@ -76,11 +82,11 @@ PARTS = [
 ]
 
 
-def _seed(root: Path, rows: list[dict[str, Any]] = PARTS) -> None:
+def _seed(root: Path, rows: list[dict[str, Any]] = PARTS, run: str = "fill-1") -> None:
     cell = root / "parts" / "zone=33N" / "year=2017"
-    cell.mkdir(parents=True)
+    cell.mkdir(parents=True, exist_ok=True)
     trimmed = [{field.name: row.get(field.name) for field in registry_schema()} for row in rows]
-    pq.write_table(pa.Table.from_pylist(trimmed, schema=registry_schema()), cell / "fill-1.parquet")
+    pq.write_table(pa.Table.from_pylist(trimmed, schema=registry_schema()), cell / f"{run}.parquet")
 
 
 def _seed_master(root: Path, *, radar: int | None) -> None:
@@ -91,7 +97,7 @@ def _seed_master(root: Path, *, radar: int | None) -> None:
     ]
     table = pa.Table.from_pylist(rebuilt, schema=master_schema())
     fill = as_master_rows(pa.Table.from_pylist(PARTS, schema=master_schema()), MEASURED_BY_FILL)
-    write_cell(LocalFileSystem(), str(root), "33N", 2017, merge(fill, as_master_rows(table, MEASURED_BY_REBUILD)))
+    write_cell(LOCAL, str(root), "33N", 2017, merge(fill, as_master_rows(table, MEASURED_BY_REBUILD)), version=None)
 
 
 @pytest.fixture
@@ -101,8 +107,8 @@ def store(script: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> zarr.
     group.create_array("time", data=np.array(["2017-01-01"], dtype="datetime64[ns]").astype("int64"))
     for name in ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count"):
         group.create_array(name, shape=(1, 4096, 4096), dtype="uint16", chunks=(1, 2048, 2048))
-    group.attrs["runs"] = {"2017": {"run_id": "fill-1"}}
-    monkeypatch.setattr(script, "_open_zone", lambda *_args, **_kwargs: {"33N": group})
+    group.attrs["runs"] = V11_RUNS
+    monkeypatch.setattr(script, "_open_store", lambda *_args, **_kwargs: (None, {"33N": group}))
     return group
 
 
@@ -159,7 +165,7 @@ class TestRepair:
         _seed(tmp_path, PARTS if null_rows else [_row(row["tile"], measured=True) for row in PARTS])
         _seed_master(tmp_path, radar=None)
         before = (tmp_path / "master" / "zone=33N" / "year=2017" / "part-0.parquet").read_bytes()
-        store.attrs["runs"] = {"2017": {"run_id": "a-refill-the-registry-never-saw"}}
+        store.attrs["runs"] = {"2017": {"run_id": "a-refill-the-registry-never-saw", "assembled_at": FILLED}}
         assert _repair(script, tmp_path, "--write") == 1
         assert (tmp_path / "master" / "zone=33N" / "year=2017" / "part-0.parquet").read_bytes() == before
 
@@ -182,28 +188,43 @@ def test_a_zone_the_registry_does_not_hold_fails(script: Any, tmp_path: Path, co
 
 
 @pytest.mark.parametrize(
-    ("runs", "expected"),
-    [(["fill", "infill"], 0), (["fill"], "the store holds run 'infill'")],
-    ids=["infill-over-fill-is-rebuildable", "unpublished-run-blocks"],
+    ("refill_wrote", "expected"),
+    [({"chunk_1_1"}, 0), ({"chunk_0_0"}, 1)],
+    ids=["refilled-tiles-since-rewritten-repair", "refilled-tile-still-held-blocks"],
 )
-def test_the_store_must_hold_the_cells_newest_run(script: Any, runs: list[str], expected: int | str) -> None:
-    """A cell built from several runs is re-derivable tile by tile once the store holds the newest.
-
-    A run writes only its own tiles, so each row's tile holds the pixels of the run it names. A run the
-    store committed and the registry never received breaks that, and must block.
+def test_a_refill_that_never_published_blocks_only_while_it_holds_a_tile(
+    script: Any,
+    store: zarr.Group,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    refill_wrote: set[str],
+    expected: int,
+) -> None:
+    """A refill whose part never published, then an infill that did. The store's newest run has a part,
+    so only the store's record of every run that wrote the year shows the refill at all, and only its
+    commit's diff says whether a tile it wrote is still its own.
     """
-    group = zarr.open_group(zarr.storage.MemoryStore(), mode="w")
-    group.create_array("time", data=np.array(["2017-01-01"], dtype="datetime64[ns]").astype("int64"))
-    group.attrs["runs"] = {"2017": {"run_id": "infill"}}
-    stamps = {"fill": FILLED, "infill": "2026-08-09T00:00:00+00:00"}
-    slot = script._store_slot(group, 2017, [{"run_id": run, "assembled_at": stamps[run]} for run in runs])
-    assert slot == expected if isinstance(expected, int) else str(slot).startswith(expected)
+    infill_at = "2026-08-09T00:00:00+00:00"
+    _seed(tmp_path)
+    _seed(tmp_path, [_row("chunk_1_1", measured=True, run_id="infill", assembled_at=infill_at)], run="infill")
+    _seed_master(tmp_path, radar=None)
+    runs = run_provenance(
+        V11_RUNS, 2017, "refill", commit={"snapshot": "s-b", "committed_at": "2026-08-05T00:00:00+00:00"}
+    )
+    store.attrs["runs"] = run_provenance(runs, 2017, "infill", commit={"snapshot": "s-c", "committed_at": infill_at})
+    wrote = {"s-b": refill_wrote, "s-c": {"chunk_1_1"}}
+    monkeypatch.setattr(published_store, "commit_tiles", lambda _repo, _zone, _t, snapshot: frozenset(wrote[snapshot]))
+    master = tmp_path / "master" / "zone=33N" / "year=2017" / "part-0.parquet"
+    before = master.read_bytes()
+    assert _repair(script, tmp_path, "--write") == expected
+    assert script.main(["verify", "--registry", str(tmp_path)]) == expected
+    assert (master.read_bytes() == before) == bool(expected), "a blocked cell is left exactly as it was"
 
 
 class TestVerify:
     """The master itself, checked against the parts it should describe."""
 
-    def test_a_sound_master_verifies(self, script: Any, tmp_path: Path) -> None:
+    def test_a_sound_master_verifies(self, script: Any, store: zarr.Group, tmp_path: Path) -> None:
         _seed(tmp_path)
         _seed_master(tmp_path, radar=None)
         assert script.main(["verify", "--registry", str(tmp_path)]) == 0
@@ -216,9 +237,12 @@ class TestVerify:
         ],
         ids=["an-altered-fill-measurement", "a-missing-tile"],
     )
-    def test_a_damaged_master_fails(self, script: Any, tmp_path: Path, damage: Any) -> None:
+    def test_a_damaged_master_fails(self, script: Any, store: zarr.Group, tmp_path: Path, damage: Any) -> None:
         _seed(tmp_path)
         _seed_master(tmp_path, radar=None)
         rows = damage(list(_master(tmp_path).values()))
-        write_cell(LocalFileSystem(), str(tmp_path), "33N", 2017, pa.Table.from_pylist(rows, schema=master_schema()))
+        damaged = pa.Table.from_pylist(rows, schema=master_schema())
+        assert write_cell(
+            LOCAL, str(tmp_path), "33N", 2017, damaged, version=cell_version(LOCAL, str(tmp_path), "33N", 2017)
+        )
         assert script.main(["verify", "--registry", str(tmp_path)]) == 1

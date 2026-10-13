@@ -1,4 +1,4 @@
-"""The registry master: the per-tile merge, provenance, the audit, and the in-place cell update.
+"""The registry master: the per-tile merge, provenance, the audit, the store check, and the cell update.
 
 The merge is the only place a published measurement could be overwritten by a re-derived one, or a
 tile dropped by a run that never touched it, so most of these tests are about what it refuses to do.
@@ -9,28 +9,34 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
+import fsspec
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytest
-from pyarrow.fs import LocalFileSystem
 
+from tessera_embeddings.storage import registry_master
+from tessera_embeddings.storage.published_store import Commit, StoreYear
 from tessera_embeddings.storage.registry import dataset_schema, registry_schema
 from tessera_embeddings.storage.registry_master import (
     MEASURED_BY_FILL,
     MEASURED_BY_REBUILD,
     as_master_rows,
     audit,
+    cell_version,
     invariant_failures,
     master_schema,
     merge,
+    store_disagreements,
     update_cell,
     write_cell,
 )
 
 FILLED = "2026-08-01T00:00:00+00:00"
+MIDWAY = "2026-08-05T00:00:00+00:00"
 LATER = "2026-08-09T00:00:00+00:00"
 REBUILT = "2026-09-21T00:00:00+00:00"
+LOCAL = fsspec.filesystem("file")
 
 
 def _row(tile: str, *, zone: str = "33N", year: int = 2017, measured: bool, stamp: str, **extra: object) -> dict:
@@ -298,7 +304,7 @@ def registry(tmp_path: Path) -> Path:
     fill = [_row("chunk_0_0", measured=True, stamp=FILLED), _row("chunk_0_1", measured=False, stamp=FILLED)]
     _publish(tmp_path, "run-a", fill)
     rebuilt = _rebuilt([_row("chunk_0_1", measured=True, stamp=REBUILT, run_id="rebuild-1")])
-    write_cell(LocalFileSystem(), str(tmp_path), "33N", 2017, merge(_fill(fill), rebuilt))
+    write_cell(LOCAL, str(tmp_path), "33N", 2017, merge(_fill(fill), rebuilt), version=None)
     return tmp_path
 
 
@@ -309,7 +315,7 @@ class TestUpdateCell:
 
     def test_an_infill_replaces_its_tiles_and_keeps_every_other_row(self, registry: Path) -> None:
         _publish(registry, "infill", [_row("chunk_0_0", measured=True, stamp=LATER, run_id="infill")])
-        assert update_cell(LocalFileSystem(), str(registry), "33N", 2017) == []
+        assert update_cell(LOCAL, str(registry), "33N", 2017) == []
         master = pq.read_table(registry / self.MASTER)
         assert master.column("tile").to_pylist() == ["chunk_0_0", "chunk_0_1"]
         assert master.column("run_id").to_pylist() == ["infill", "rebuild-1"], "the re-derived row survives"
@@ -317,14 +323,14 @@ class TestUpdateCell:
 
     def test_running_it_again_writes_the_same_file(self, registry: Path) -> None:
         """A fill retried after its update, and a repair after a fill, must both leave the cell as it was."""
-        update_cell(LocalFileSystem(), str(registry), "33N", 2017)
+        update_cell(LOCAL, str(registry), "33N", 2017)
         first = (registry / self.MASTER).read_bytes()
-        update_cell(LocalFileSystem(), str(registry), "33N", 2017)
+        update_cell(LOCAL, str(registry), "33N", 2017)
         assert (registry / self.MASTER).read_bytes() == first
 
     def test_a_disagreement_with_the_store_is_reported_and_the_master_still_written(self, registry: Path) -> None:
         """No run removes a tile, so a shard cleared by hand is caught here or nowhere."""
-        findings = update_cell(LocalFileSystem(), str(registry), "33N", 2017, live={(0, 1), (5, 5)})
+        findings = update_cell(LOCAL, str(registry), "33N", 2017, live={(0, 1), (5, 5)})
         assert len(findings) == 2
         assert "chunk_0_0" in findings[0] and "chunk_5_5" in findings[1]
         assert (registry / self.MASTER).exists()
@@ -332,19 +338,133 @@ class TestUpdateCell:
     def test_a_withdrawn_run_does_not_outlive_its_part(self, registry: Path) -> None:
         """Deleting a run's part and updating must restore the run before it, not keep the master's copy."""
         _publish(registry, "infill", [_row("chunk_0_0", measured=True, stamp=LATER, run_id="infill")])
-        update_cell(LocalFileSystem(), str(registry), "33N", 2017)
+        update_cell(LOCAL, str(registry), "33N", 2017)
         (registry / "parts" / "zone=33N" / "year=2017" / "infill.parquet").unlink()
-        update_cell(LocalFileSystem(), str(registry), "33N", 2017)
+        update_cell(LOCAL, str(registry), "33N", 2017)
         assert pq.read_table(registry / self.MASTER).column("run_id").to_pylist() == ["run-a", "rebuild-1"]
 
     def test_a_run_whose_part_never_published_is_refused_rather_than_reported_merged(self, registry: Path) -> None:
         """Part publishing is best-effort; merging the older parts would report a fill the master lacks."""
         before = (registry / self.MASTER).read_bytes()
         with pytest.raises(ValueError, match="no registry part for run 'refill'"):
-            update_cell(LocalFileSystem(), str(registry), "33N", 2017, run_id="refill")
+            update_cell(LOCAL, str(registry), "33N", 2017, run_id="refill")
         assert (registry / self.MASTER).read_bytes() == before
 
     def test_a_cell_with_no_part_raises_and_writes_nothing(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="no registry part"):
-            update_cell(LocalFileSystem(), str(tmp_path), "33N", 2017)
+            update_cell(LOCAL, str(tmp_path), "33N", 2017)
         assert not (tmp_path / "master").exists()
+
+
+#: What each commit of cell 33N/2017 wrote, as the store's diff of it would say.
+_WROTE = {"snap-a": {"chunk_0_0", "chunk_0_1"}, "snap-b": {"chunk_0_0"}, "snap-c": {"chunk_0_1"}}
+_A, _B, _C = Commit("run-a", FILLED, "snap-a"), Commit("run-b", MIDWAY, "snap-b"), Commit("run-c", LATER, "snap-c")
+
+
+def _store(*commits: Commit, wrote: dict[str, set[str]] = _WROTE) -> StoreYear:
+    return StoreYear(list(commits), lambda snapshot: frozenset(wrote[snapshot]))
+
+
+def _parts_of(*runs: tuple[str, str, list[str]]) -> pa.Table:
+    """Parts for ``(run, stamp, tiles)``, as each run published them."""
+    return _parts([_row(t, measured=True, stamp=stamp, run_id=run) for run, stamp, tiles in runs for t in tiles])
+
+
+_FILL_AND_INFILL = _parts_of(("run-a", FILLED, ["chunk_0_0", "chunk_0_1"]), ("run-c", LATER, ["chunk_0_1"]))
+
+
+class TestTheStoreStandsBehindTheParts:
+    """Newest-part-wins is right only if the parts account for every run the store says wrote the year."""
+
+    def test_parts_for_every_run_stamped_with_their_commits_pass(self) -> None:
+        assert store_disagreements(_FILL_AND_INFILL, _store(_A, _C)) == []
+
+    def test_a_run_with_no_part_that_last_wrote_a_tile_is_refused(self) -> None:
+        """A refill that never published, then an infill that did: the store's latest run has a part,
+        but ``chunk_0_0`` holds the refill's pixels, and the parts describe it by the original fill.
+        """
+        (found,) = store_disagreements(_FILL_AND_INFILL, _store(_A, _B, _C))
+        assert "run 'run-b' last wrote 1 tile(s)" in found and "chunk_0_0" in found
+
+    def test_a_run_with_no_part_that_later_runs_wrote_over_does_not_block(self) -> None:
+        """It describes nothing the store still holds, so refilling its tiles is how a cell recovers."""
+        assert store_disagreements(_FILL_AND_INFILL, _store(_A, _B, _C, wrote=_WROTE | {"snap-b": {"chunk_0_1"}})) == []
+
+    def test_a_part_stamped_away_from_its_commit_is_refused(self) -> None:
+        """Commit order is the order a tile's pixels landed in; any other stamp can pick the wrong run."""
+        (found,) = store_disagreements(_FILL_AND_INFILL, _store(_A, _C._replace(at="2026-08-09T00:00:01+00:00")))
+        assert "run 'run-c'" in found and "misordered" in found
+
+    def test_a_part_naming_a_run_the_store_never_committed_is_refused(self) -> None:
+        (found,) = store_disagreements(_FILL_AND_INFILL, _store(_A))
+        assert "run 'run-c' has a part" in found
+
+    @pytest.mark.parametrize(
+        ("commits", "expected"),
+        [
+            ([Commit("run-a", FILLED, None), _C], []),
+            ([Commit("run-a", FILLED, None), Commit("run-x", MIDWAY, None), _C], ["no recorded commit bounds"]),
+        ],
+        ids=["recorded-before-commits-were-and-published", "recorded-before-commits-were-and-never-published"],
+    )
+    def test_a_run_recorded_before_commits_were(self, commits: list[Commit], expected: list[str]) -> None:
+        """v1.1's records name no commit: one with a part is taken on trust, one without cannot be bounded."""
+        found = store_disagreements(_FILL_AND_INFILL, _store(*commits))
+        assert [phrase for phrase in expected if any(phrase in entry for entry in found)] == expected
+        assert len(found) == len(expected)
+
+
+class TestConcurrentWriters:
+    """Two writers of one cell — two fills, or a fill and a repair — must not lose each other's rows."""
+
+    MASTER = Path("master/zone=33N/year=2017/part-0.parquet")
+
+    def test_a_writer_overtaken_between_its_reads_and_its_write_merges_again(
+        self, registry: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The infill lands after this writer read the parts and before it writes, which an unconditional
+        write would then overwrite with the cell as it was, both updates reporting success.
+        """
+        read, landed = registry_master.read_cell, []
+
+        def overtaken(fs: object, root: str, prefix: str, zone: str, year: int, schema: pa.Schema) -> pa.Table:
+            if prefix == "master" and not landed:
+                landed.append(True)
+                _publish(registry, "infill", [_row("chunk_0_0", measured=True, stamp=LATER, run_id="infill")])
+                update_cell(LOCAL, str(registry), "33N", 2017)
+            return read(fs, root, prefix, zone, year, schema)
+
+        monkeypatch.setattr(registry_master, "read_cell", overtaken)
+        update_cell(LOCAL, str(registry), "33N", 2017)
+        assert landed, "the race was staged"
+        assert pq.read_table(registry / self.MASTER).column("run_id").to_pylist() == ["infill", "rebuild-1"]
+
+    def test_a_write_built_on_a_stale_read_is_refused_and_changes_nothing(self, registry: Path) -> None:
+        stale = cell_version(LOCAL, str(registry), "33N", 2017)
+        _publish(registry, "infill", [_row("chunk_0_0", measured=True, stamp=LATER, run_id="infill")])
+        update_cell(LOCAL, str(registry), "33N", 2017)
+        current = (registry / self.MASTER).read_bytes()
+        assert not write_cell(LOCAL, str(registry), "33N", 2017, _fill(_AUDITED), version=stale)
+        assert (registry / self.MASTER).read_bytes() == current
+
+    def test_a_cell_the_store_cannot_stand_behind_is_not_written(self, registry: Path) -> None:
+        before = (registry / self.MASTER).read_bytes()
+        store = _store(_A._replace(snapshot=None), Commit("run-b", LATER, "snap-b"))
+        with pytest.raises(ValueError, match="run 'run-b' last wrote 1 tile"):
+            update_cell(LOCAL, str(registry), "33N", 2017, store=store)
+        assert (registry / self.MASTER).read_bytes() == before
+
+
+class TestConditionalWriteOnS3:
+    """The S3 path of the conditional write, against moto: the ETag condition, and the create-only one."""
+
+    def test_only_a_write_from_the_current_version_lands(self, moto_server: str, test_bucket: str) -> None:
+        s3fs = pytest.importorskip("s3fs")
+        fs = s3fs.S3FileSystem(key="testing", secret="testing", client_kwargs={"endpoint_url": moto_server})
+        root, rows = f"s3://{test_bucket}/registry", _fill(_AUDITED)
+        assert write_cell(fs, root, "33N", 2017, rows, version=None)
+        assert not write_cell(fs, root, "33N", 2017, rows, version=None), "a second create is refused"
+        version = cell_version(fs, root, "33N", 2017)
+        assert write_cell(fs, root, "33N", 2017, _fill(_AUDITED[:1]), version=version), "different bytes, so a new ETag"
+        assert not write_cell(fs, root, "33N", 2017, rows, version=version), "a stale version is refused"
+        assert cell_version(fs, root, "33N", 2017) != version

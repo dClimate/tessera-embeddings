@@ -999,6 +999,7 @@ class ZarrWriter:
         year: int,
         run_id: str,
         *,
+        committed_at: str,
         embedded: list[str],
         refused: list[str],
         optical_min_obs: int | None = None,
@@ -1012,6 +1013,11 @@ class ZarrWriter:
         nothing reconciles the two — so a part written while assembly was still running advertises
         embedded and refused tiles for a zone-year that may never land, permanently. Publishing
         after the commit makes the part's existence mean the cell exists.
+
+        ``committed_at`` is the shard commit's own timestamp, stamped on every row as
+        ``assembled_at``. The master keeps each tile's newest row, so the stamp must order runs as
+        the store wrote their pixels; the clock at publication would not, when one run commits
+        first and publishes last.
 
         Returns the URI on success, ``None`` on failure. Best-effort in this direction only: losing
         a part costs a future infill campaign some precision, while raising would fail a cell that
@@ -1042,7 +1048,7 @@ class ZarrWriter:
                 uri,
                 registry_rows(
                     run_id,
-                    datetime.datetime.now(datetime.UTC).isoformat(),
+                    committed_at,
                     embedded=embedded,
                     refused=refused,
                     records=records,
@@ -2497,6 +2503,7 @@ class ZarrWriter:
                 zone,
                 year,
                 run_id,
+                committed_at=telemetry["commit"]["committed_at"],
                 embedded=registry_embedded,
                 refused=registry_refused,
                 optical_min_obs=optical_min_obs,
