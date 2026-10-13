@@ -528,6 +528,7 @@ def loosen_optical_min_obs(
     *,
     zones: Iterable[str] | None = None,
     commit_msg: str | None = None,
+    write: bool = True,
 ) -> str | None:
     """Loosen the minimum-depth rule to ``new_line`` for the whole store, or for ``zones`` only.
 
@@ -545,6 +546,8 @@ def loosen_optical_min_obs(
     "snapshot"}``, the snapshot being the last one judged against it.
 
     Returns the commit snapshot, or ``None`` when every target already sits at ``new_line``.
+    ``write=False`` makes every check and change in a session it never commits, and returns ``None``:
+    a dry run that refuses exactly what a write would.
     """
     if new_line <= 0:
         raise ValueError(f"optical_min_obs={new_line} refuses nothing — loosen to a positive number of observations.")
@@ -581,7 +584,7 @@ def loosen_optical_min_obs(
                 del node.attrs["optical_min_obs"]
                 if own > new_line:
                     _give_up(node, own)
-        return session.commit(commit_msg or f"loosen optical_min_obs {root_rule} -> {new_line}")
+        return session.commit(commit_msg or f"loosen optical_min_obs {root_rule} -> {new_line}") if write else None
 
     moved = []
     for zone in sorted({canonicalize_zone(z) for z in zones}):
@@ -593,7 +596,7 @@ def loosen_optical_min_obs(
             node.attrs["optical_min_obs"] = new_line
             _give_up(node, current)
             moved.append(zone)
-    if not moved:
+    if not moved or not write:
         return None
     return session.commit(commit_msg or f"loosen optical_min_obs to {new_line} for {', '.join(moved)}")
 

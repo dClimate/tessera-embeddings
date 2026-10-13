@@ -1,4 +1,4 @@
-"""``scripts/update/loosen_optical_min_obs.py``: an empty ``--zones`` is refused, never read as the whole store."""
+"""``scripts/update/loosen_optical_min_obs.py``: a dry run refuses what a write would, as does an empty ``--zones``."""
 
 from __future__ import annotations
 
@@ -30,3 +30,14 @@ def test_an_empty_zone_list_is_refused_not_read_as_the_whole_store(script: Any, 
     with pytest.raises(SystemExit):
         script.main(["--store", str(tmp_path / "g.icechunk"), "--line", "1", "--zones", zones, "--write"])
     assert _root(repo).attrs["optical_min_obs"] == 15
+
+
+@pytest.mark.parametrize(("line", "code"), [(1, 0), (0, 1), (20, 1)])
+def test_a_dry_run_refuses_what_a_write_would_and_commits_nothing(
+    script: Any, tmp_path: Path, line: int, code: int
+) -> None:
+    """A loosen passes, a line of zero and a tightening are refused, and none of them moves the store."""
+    repo = _ruled(tmp_path)
+    tip = repo.lookup_branch("main")
+    assert script.main(["--store", str(tmp_path / "g.icechunk"), "--line", str(line)]) == code
+    assert repo.lookup_branch("main") == tip
