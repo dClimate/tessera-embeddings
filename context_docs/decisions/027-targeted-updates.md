@@ -34,6 +34,11 @@ month coverage included, even where it is still refused, so the store shows the 
 every pixel the update touched. A pixel that already held an embedding keeps the counts that
 embedding was built from: the per-pixel provenance stays exact.
 
+**`holes` runs under the campaign's radar policy** (`allow_s2_only`). A merged shard's registry rows
+are re-derived from the store, which records whether a pixel had radar but not which pixels a radar
+rule refused, so they could not describe a run that enforced one. Both drivers refuse the
+combination before any ingest.
+
 **A target shard where nothing new embeds is kept, not blanked.** The campaign clears a skipped tile
 to fill, so that a retry cannot leave an earlier attempt's data under its completion mark; an update
 has no such attempt to fear, and blanking would lose good data to a bad run. A `shards` plan may set
@@ -63,7 +68,11 @@ never did. Both are plan fields, overridable.
 **The registry describes each tile as it now stands.** Update parts land in `parts/` like any fill's
 and #219's per-tile merge keeps `master/` current, a tile's newest row winning. Rows carry a new
 `update_name` column (null for the campaign). A merged shard holds two runs' pixels, so its rows are
-re-derived from the committed shard rather than taken from either run's record.
+re-derived from the committed shard rather than taken from either run's record. An update that wrote
+nothing publishes no part and does not count as a cell's last writer. `master/_common_metadata` is
+rewritten when its schema falls behind, so the new column is visible to readers that take the schema
+from it, and the planner reads `master/` with the declared schema, so cell files from before and
+after the column read together.
 
 **Both drivers run updates.** `fill-zones-sequential` (one cluster) and `run-global-campaign`
 (chained clusters) take `update=<name>`; the second balances its clusters on the plan's shards.

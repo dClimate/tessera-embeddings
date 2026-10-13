@@ -332,6 +332,7 @@ else ([ADR 027](../../../../context_docs/decisions/027-targeted-updates.md)). Th
 | recorded in | `years_complete`, `runs[year]`, the zone-year tag | `updates[year]` alone |
 | ROI, mosaics, staging | the campaign's paths | `{inputs}/updates/<name>/`, `{outputs}/staging/updates/<name>/` |
 | `min_valid_coverage`, month check | 0.1, every month | `1e-9`, relaxed: a partial-zone ROI must never block |
+| radar policy | any | `holes` requires `allow_s2_only=True`, the campaign's, refused before ingest otherwise |
 
 Run one update per cell at a time: two updates of one cell conflict on its chunks.
 

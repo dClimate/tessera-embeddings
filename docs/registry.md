@@ -159,6 +159,9 @@ updates the registry right after its pixels are committed to the store:
   last run that wrote it left it.
 - **Each zone-year file is replaced in a single write**, so a reader sees the old file or the new
   one, never a mixture, and zone-years never wait on each other.
+- **`_common_metadata` follows the schema.** When a column is added, the next update rewrites it, so
+  a reader taking the dataset's schema from it sees the new column; cell files written before it
+  read it as null.
 - **`measured_by` records where the numbers came from.** Fills that resumed after an interruption
   published 1,519,045 of v1.1's rows without their measurements. Those were re-derived from the
   store's observation counts on 2026-10-12, by a method that matched the fill's own numbers
