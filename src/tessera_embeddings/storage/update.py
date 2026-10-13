@@ -149,7 +149,10 @@ class UpdatePlan:
                 raise ValueError(f"Cell {key} lists no shards; use null for every live shard")
             for label in tiles or ():
                 parse_chunk_label(label)
-            cells[cell_key(*parse_cell_key(key))] = None if tiles is None else tuple(sorted(set(tiles)))
+            canonical = cell_key(*parse_cell_key(key))
+            if canonical in cells:
+                raise ValueError(f"Cell {canonical} is named more than once; list each cell once")
+            cells[canonical] = None if tiles is None else tuple(sorted(set(tiles)))
         object.__setattr__(self, "cells", cells)
 
     def cell_list(
@@ -410,14 +413,22 @@ def update_record(
 
 
 def commit_update_record(
-    repo: icechunk.Repository, group: str, year: int, *, record: Mapping[str, Any], tries: int = 8
+    repo: icechunk.Repository,
+    group: str,
+    year: int,
+    commit: Mapping[str, str] | None = None,
+    *,
+    record: Mapping[str, Any],
+    tries: int = 8,
 ) -> str:
     """Append ``record`` to ``year``'s update records in its own commit, retrying; return the snapshot.
 
-    The same optimistic loop as :func:`~tessera_embeddings.storage.shard_writer.commit_year_attrs`,
-    for the same reason: attrs cannot be merged by icechunk's conflict detector, and each writer
-    only appends its own record, so re-reading and re-applying is exact. Idempotent per update: a
-    record already present for this update and year is left as it is.
+    ``commit`` is the update's shard commit, ``{"snapshot", "committed_at"}``, recorded as null when
+    it wrote no shard, as a fill's ``runs`` record does. The same optimistic loop as
+    :func:`~tessera_embeddings.storage.shard_writer.commit_year_attrs`, for the same reason: attrs
+    cannot be merged by icechunk's conflict detector, and each writer only appends its own record,
+    so re-reading and re-applying is exact. Idempotent per update: a record already present for this
+    update and year is left as it is.
     """
     for attempt in range(1, tries + 1):
         session = repo.writable_session("main")
@@ -425,7 +436,7 @@ def commit_update_record(
         if update_state(node, year, str(record["update"])) == "done":
             return repo.lookup_branch("main")
         updates = dict(cast("dict[str, list[dict[str, Any]]]", node.attrs.get(UPDATES_ATTR) or {}))
-        updates[str(year)] = [*updates.get(str(year), []), dict(record)]
+        updates[str(year)] = [*updates.get(str(year), []), {**record, "commit": dict(commit) if commit else None}]
         node.attrs[UPDATES_ATTR] = updates
         try:
             return commit_with_rebase(session, f"update {record['update']}: record {group} year {year}")
@@ -433,19 +444,6 @@ def commit_update_record(
             if attempt == tries:
                 raise
     raise AssertionError("unreachable")  # pragma: no cover
-
-
-def last_run_id(attrs: Mapping[str, Any], year: int) -> str | None:
-    """The run that last wrote ``year`` of a zone group: its fill, or the newest update since that wrote a shard."""
-    runs = cast("Mapping[str, Mapping[str, Any]]", attrs.get("runs") or {})
-    updates = cast("Mapping[str, Sequence[Mapping[str, Any]]]", attrs.get(UPDATES_ATTR) or {})
-    # An update that wrote and cleared nothing published no registry part, so it is not the run the
-    # registry's newest row names, and treating it as one would block that cell's repair.
-    wrote = [u for u in updates.get(str(year), ()) if u.get("written") or u.get("cleared")]
-    entries = [e for e in (runs.get(str(year)), *wrote) if e]
-    if not entries:
-        return None
-    return str(max(entries, key=lambda e: str(e.get("assembled_at", "")))["run_id"])
 
 
 def stage_hole_masks(

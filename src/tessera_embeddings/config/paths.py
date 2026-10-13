@@ -11,6 +11,7 @@ URIs may use any fsspec-supported protocol: ``s3://``, ``gs://``, ``file://``,
 
 from __future__ import annotations
 
+import hashlib
 import posixpath
 import re
 from typing import final
@@ -32,6 +33,15 @@ def check_update_name(name: str) -> str:
     if not UPDATE_NAME.fullmatch(name):
         raise ValueError(f"Update name {name!r} must match {UPDATE_NAME.pattern}")
     return name
+
+
+def store_key(store_path: str) -> str:
+    """One destination store as a path segment: the first 12 hex digits of its URI's SHA-256.
+
+    Keys everything an update derives from a store's contents — its hole masks and the staging
+    inferred against them — so one plan run against two stores never mixes the two.
+    """
+    return hashlib.sha256(store_path.encode()).hexdigest()[:12]
 
 
 #: The derived store's basename, and the only ``name`` an override tolerates. Named here so the
@@ -180,13 +190,16 @@ class BucketPaths(BaseModel):
         """
         return posixpath.join(self.inputs, "updates", check_update_name(name))
 
-    def update_staging(self, name: str) -> str:
-        """Return the staging root for a targeted update's inference, apart from the campaign's.
+    def update_staging(self, name: str, store_path: str) -> str:
+        """Return the staging root for a targeted update's inference into one store.
 
-        Staging resumes by run id under ``{root}/{zone}/{year}``, so an update sharing the
-        campaign's root could resume tiles staged for a different set of pixels.
+        Staging resumes by run id under ``{root}/{zone}/{year}``, and a ``holes`` update infers only
+        the pixels that are holes in its destination store. Under the campaign's root, or a root
+        shared by two stores, a retry could resume tiles staged for another set of pixels and leave
+        holes unfilled under a record that says they were done. Hence per update AND per store
+        (:func:`store_key`, the same key as the hole masks).
         """
-        return posixpath.join(self.outputs, "staging", "updates", check_update_name(name))
+        return posixpath.join(self.outputs, "staging", "updates", check_update_name(name), store_key(store_path))
 
     def land_mask_store(self, name: str = "global") -> str:
         """Return the URI of the campaign land-mask coverage Icechunk repo.

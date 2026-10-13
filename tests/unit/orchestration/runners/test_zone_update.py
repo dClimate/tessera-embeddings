@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import numpy as np
+import pyarrow.parquet as pq
 import pytest
 import zarr
 
 from tessera_embeddings.config.inference import InferenceConfig
+from tessera_embeddings.config.paths import store_key
 from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.orchestration.runners import zone_fill
 from tessera_embeddings.storage import global_store
@@ -68,14 +70,15 @@ def filled(tmp_path, monkeypatch):
     mosaic = _make_mosaic(tmp_path)
     mask = _make_mask(tmp_path, _LIVE)
     monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub({}))
-    _fill(tmp_path, store, land_mask_path=mask, mosaic_base=mosaic, run_id="fill1")
+    registry = str(tmp_path / "registry")
+    _fill(tmp_path, store, land_mask_path=mask, mosaic_base=mosaic, registry_root=registry, run_id="fill1")
     repo = global_store.open_global_repo(store)
     session = repo.writable_session("main")
     node = zarr.open_group(session.store, mode="a")[_ZONE]
     node["scales"][_YEAR_INDEX, :8, :8] = np.nan
     node["embeddings"][_YEAR_INDEX, :8, :8] = 0
     session.commit("punch a hole")
-    return {"store": store, "mosaic": mosaic, "mask": mask, "tmp": tmp_path}
+    return {"store": store, "mosaic": mosaic, "mask": mask, "registry": registry, "tmp": tmp_path}
 
 
 def _update(filled, monkeypatch, target: UpdateTarget, *, seed: int = 11, skip: tuple[str, ...] = (), run_id="upd1"):
@@ -86,6 +89,7 @@ def _update(filled, monkeypatch, target: UpdateTarget, *, seed: int = 11, skip: 
         land_mask_path=filled["mask"],
         mosaic_base=filled["mosaic"],
         staging_base=str(filled["tmp"] / "update-staging"),
+        registry_root=filled["registry"],
         config=_S2_ONLY,
         run_id=run_id,
         update=target,
@@ -145,7 +149,16 @@ def test_a_holes_update_fills_only_the_holes(filled, monkeypatch):
     assert (record["mode"], record["written"], record["kept"]) == ("holes", ["chunk_0_0"], ["chunk_1_1"])
     # The masks are filed under the destination store, so a plan run against another store reads its own.
     [store_dir] = list((filled["tmp"] / "holes").iterdir())
+    assert store_dir.name == store_key(filled["store"])
     assert sorted(p.name for p in store_dir.iterdir()) == ["chunk_0_0.npz", "chunk_1_1.npz"]
+    # The merged tile's row is now the update's, stamped with its shard commit so the store stands
+    # behind it; the rest stay the fill's.
+    master = pq.read_table(f"{filled['registry']}/master/zone={_ZONE}/year=2025/part-0.parquet").to_pylist()
+    assert {r["tile"]: (r["run_id"], r["update_name"]) for r in master} == {
+        "chunk_0_0": ("upd1", "u1"),
+        "chunk_0_1": ("fill1", None),
+        "chunk_1_1": ("fill1", None),
+    }
 
 
 @pytest.mark.parametrize(("on_skip", "cleared"), [("keep", False), ("clear", True)])

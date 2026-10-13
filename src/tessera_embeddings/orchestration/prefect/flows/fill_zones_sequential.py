@@ -874,10 +874,13 @@ def fill_zones_sequential_flow(
     cells = list(dict.fromkeys((canonicalize_zone(z), int(y)) for z, y in cast("list[tuple[str, int]]", cells)))
     if plan is not None and (outside := [c for c in cells if c not in set(plan.cell_list())]):
         raise ValueError(f"Cell(s) {outside} are not in update {plan.name!r}")
+    store_path = paths.global_store(store_name)
     # Where this run's mosaics and staging live: the campaign's, or the update's own.
     update_root = paths.update_root(update) if update is not None else None
     mosaic_root = update_root or paths.inputs
-    staging_root = paths.update_staging(update) if update is not None else f"{paths.outputs.rstrip('/')}/staging"
+    staging_root = (
+        paths.update_staging(update, store_path) if update is not None else f"{paths.outputs.rstrip('/')}/staging"
+    )
     cell_years = sorted({y for _, y in cells})
     if time_window_end is not None and len(cell_years) > 1:
         raise ValueError(
@@ -885,7 +888,6 @@ def fill_zones_sequential_flow(
             "One literal window cannot describe several years; drop the override (each cell then "
             "takes its own calendar year) or dispatch one year per flow run."
         )
-    store_path = paths.global_store(store_name)
     land_mask_path = paths.land_mask_store(mask_name)
     checkpoint_path = f"{paths.inputs.rstrip('/')}/models/{checkpoint_filename()}"
 

@@ -41,6 +41,7 @@ def test_a_plan_round_trips_and_normalises_its_cells():
         ({"cells": {"14N/2019": []}}, "lists no shards"),
         ({"cells": {"14N/2019": ["tile_1_2"]}}, "chunk_<row>_<col>"),
         ({"cells": {"14N-2019": None}}, "<zone>/<year>"),
+        ({"cells": {"7S/2024": None, "07S/2024": ["chunk_1_2"]}}, "more than once"),
     ],
 )
 def test_a_plan_the_flows_could_not_run_is_refused(overrides, match):
@@ -138,19 +139,17 @@ def _node(repo: icechunk.Repository) -> zarr.Group:
 
 def test_an_update_record_appends_and_leaves_the_fill_alone(zone_repo):
     record = upd.update_record(_target(), run_id="u-run", written=["chunk_0_0"], kept=[], optical_min_obs=1)
-    upd.commit_update_record(zone_repo, "01N", 2024, record=record)
+    commit = {"snapshot": "s-1", "committed_at": "2026-10-13T00:00:00+00:00"}
+    upd.commit_update_record(zone_repo, "01N", 2024, commit, record=record)
     tip = zone_repo.lookup_branch("main")
-    upd.commit_update_record(zone_repo, "01N", 2024, record=record)  # idempotent per update
+    upd.commit_update_record(zone_repo, "01N", 2024, commit, record=record)  # idempotent per update
 
     node = _node(zone_repo)
     assert zone_repo.lookup_branch("main") == tip
-    assert [(r["update"], r["optical_min_obs"]) for r in upd.read_updates(node, 2024)] == [("fix-1", 1)]
+    assert [(r["update"], r["commit"], r["optical_min_obs"]) for r in upd.read_updates(node, 2024)] == [
+        ("fix-1", commit, 1)
+    ]
     assert node.attrs["years_complete"] == [2024] and node.attrs["runs"]["2024"]["run_id"] == "fill"
-    assert upd.last_run_id(dict(node.attrs), 2024) == "u-run"
-    # An update that wrote nothing published no part, so it does not become the cell's last writer.
-    noop = upd.update_record(_target("noop"), run_id="noop-run", written=[], kept=["chunk_0_0"], optical_min_obs=1)
-    upd.commit_update_record(zone_repo, "01N", 2024, record=noop)
-    assert upd.last_run_id(dict(_node(zone_repo).attrs), 2024) == "u-run"
     assert upd.update_states(zone_repo, "fix-1", [("01N", 2024), ("01N", 2025)]) == {
         ("01N", 2024): "done",
         ("01N", 2025): "not_complete",

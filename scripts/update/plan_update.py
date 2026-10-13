@@ -33,6 +33,7 @@ from tessera_embeddings.ingest.land_mask import narrow_tile_live
 from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
 from tessera_embeddings.storage.update import UpdatePlan, cell_key, plan_from_registry, plan_uri, save_plan
 from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group
+from tessera_embeddings.storage.zone_grid import canonicalize_zone
 
 
 def _credentials(uri: str) -> Callable[[], icechunk.S3StaticCredentials] | None:
@@ -59,8 +60,12 @@ def check_against_mask(plan: UpdatePlan, mask_path: str, *, region: str | None =
 
 
 def _cells_from_csv(path: str) -> dict[str, tuple[str, ...] | None]:
-    """``zone,year,tile`` rows grouped by cell; a blank tile asks for every live shard."""
+    """``zone,year,tile`` rows grouped by cell; a blank tile asks for every live shard.
+
+    Zones are canonicalised before grouping, so ``7S`` and ``07S`` rows land in one cell.
+    """
     rows = pl.read_csv(path, schema={"zone": pl.String, "year": pl.Int64, "tile": pl.String})
+    rows = rows.with_columns(pl.col("zone").map_elements(canonicalize_zone, return_dtype=pl.String))
     cells: dict[str, tuple[str, ...] | None] = {}
     for (zone, year), group in rows.group_by("zone", "year"):
         tiles = group["tile"].drop_nulls().to_list()

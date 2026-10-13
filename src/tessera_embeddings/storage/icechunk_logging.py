@@ -17,6 +17,7 @@ import os
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
+from typing import Any
 
 import icechunk
 
@@ -135,6 +136,7 @@ def traced_commit(
     *,
     rebase_with: icechunk.ConflictSolver | None = None,
     rebase_tries: int = 1_000,
+    metadata: dict[str, Any] | None = None,
 ) -> str:
     """Commit with icechunk's tracing raised — the ONE way an assembly reaches a commit.
 
@@ -149,12 +151,13 @@ def traced_commit(
         rebase_with: Conflict solver for the fill's two commits; ``None`` for the schema
             and time-axis commits, which are the only writer on a fresh work branch.
         rebase_tries: How many times to rebase and retry, when a solver is given.
+        metadata: Stored on the snapshot itself, so it lands atomically with the commit's data.
 
     Returns:
         The new snapshot id.
     """
     with commit_tracing(), _commit_alarm(message):
-        return session.commit(message, rebase_with=rebase_with, rebase_tries=rebase_tries)
+        return session.commit(message, metadata=metadata, rebase_with=rebase_with, rebase_tries=rebase_tries)
 
 
 @contextmanager

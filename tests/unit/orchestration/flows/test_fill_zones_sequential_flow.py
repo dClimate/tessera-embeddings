@@ -214,12 +214,20 @@ class TestAnUpdate:
         [dead] = update_wired["no_cluster_fills"]
         assert dead["update"].tiles == frozenset({"chunk_5_5"})
         assert dead["mosaic_base"] == f"{root}/mosaics/04N/2025"
-        assert dead["staging_base"] == f"{_PATHS.update_staging('u1')}/04N/2025"
+        assert dead["staging_base"] == f"{_PATHS.update_staging('u1', _PATHS.global_store())}/04N/2025"
         # The live cell's ingest runs as the update, and its fill is planned as one.
         assert [p["update"] for p in update_wired["ingests"]] == ["u1"]
         assert update_wired["seq_kwargs"]["cells"][0].zone == "01N"
         # A one-cluster update pins its complete tag too, once every planned cell holds the record.
         assert update_wired["finished"] == ["u1"] and result["update_complete_tag"] == "t"
+
+    def test_staging_is_per_destination_store(self, update_wired):
+        # A holes update infers only its own store's holes, so a second store must never resume its tiles.
+        for store in ("tessera", "other"):
+            _run(cells=[("04N", 2025)], update="u1", store_name=store)
+        first, second = (f["staging_base"] for f in update_wired["no_cluster_fills"])
+        assert first != second
+        assert second == f"{_PATHS.update_staging('u1', _PATHS.global_store('other'))}/04N/2025"
 
     def test_a_cell_outside_the_plan_is_refused(self, update_wired):
         with pytest.raises(ValueError, match="not in update 'u1'"):

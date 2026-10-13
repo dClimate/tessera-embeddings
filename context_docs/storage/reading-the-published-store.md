@@ -61,8 +61,10 @@ authority**, and it distinguishes what nothing else can: a year deliberately lef
 with no qualifying land that year — *is* in the list, while a year that never landed is absent.
 
 Reading `zone.attrs` pulls the whole metadata document, including a `runs` entry per year carrying
-that fill's run id, its input coverage per source store and the commit it was built from. Useful
-provenance, and not small: a reader who only wants `years_complete` pays for all of it per zone.
+that fill's run id, its input coverage per source store and the commit it was built from. A fill
+since v1.1 also records its shard commit in the store and the runs it replaced, which the registry
+is checked against ([`registry-master.md`](registry-master.md)). Useful provenance, and not small: a
+reader who only wants `years_complete` pays for all of it per zone.
 
 ## 2. What is published
 
@@ -447,7 +449,7 @@ two prefixes:
 | prefix | contents | what it is |
 |---|---|---|
 | `master/` | 994 files at `master/zone=<ZONE>/year=<YEAR>/part-0.parquet` + `_common_metadata`, 151 MB | **what a consumer reads**: one row per tile-year, one schema, measurements on every row; its guide is [`docs/registry.md`](../../docs/registry.md), published beside it as `README.md` |
-| `parts/` | 994 files, 142 MB, at `parts/zone=<ZONE>/year=<YEAR>/<run_id>.parquet` | the fills' raw output, one part per cell per run, never rewritten; internal |
+| `parts/` | 994 files, 142 MB, at `parts/zone=<ZONE>/year=<YEAR>/<run_id>.parquet` | the fills' raw output, one part per cell per run, named by run id; internal |
 
 **`master/` describes what the store holds now.** Every fill merges its rows into its zone-year's
 master file tile by tile as it lands: a tile's row comes from the newest run that wrote that tile,

@@ -330,7 +330,7 @@ else ([ADR 027](../../../../context_docs/decisions/027-targeted-updates.md)). Th
 | inferred | every valid pixel of every live tile | `holes`: only the store's hole pixels; `shards`: the target shards |
 | a tile that embeds nothing | cleared to fill | kept (`on_skip: "clear"` for a `shards` defect fix) |
 | recorded in | `years_complete`, `runs[year]`, the zone-year tag | `updates[year]` alone |
-| ROI, mosaics, staging | the campaign's paths | `{inputs}/updates/<name>/`, `{outputs}/staging/updates/<name>/` |
+| ROI, mosaics, staging | the campaign's paths | `{inputs}/updates/<name>/`, `{outputs}/staging/updates/<name>/<store>/`; hole masks and staging per destination store |
 | `min_valid_coverage`, month check | 0.1, every month | `1e-9`, relaxed: a partial-zone ROI must never block |
 | radar policy | any | `holes` requires `allow_s2_only=True`, the campaign's, refused before ingest otherwise |
 
@@ -417,7 +417,8 @@ runner merges its registry parts into the cell's file under the registry's `mast
 it lands, including a deliberate refill, which fails at the tag step by design. Like the
 validator dispatch, a failure there is logged and never fails the landed cell; the registry
 census names the cell and `scripts/maintenance/rebuild_registry_measurements.py repair`
-rebuilds it. See
+rebuilds it. The update refuses while a run the store records writing the year has no part for a
+tile it last wrote; refilling those tiles clears it. See
 [`registry-master.md`](../../../../context_docs/storage/registry-master.md).
 
 ### Cancelling reaches every level
