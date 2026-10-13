@@ -942,6 +942,29 @@ def test_a_failed_master_update_does_not_fail_a_landed_cell(tmp_path, monkeypatc
     assert "registry master NOT updated" in caplog.text
 
 
+def test_a_retry_updates_the_master_a_fill_died_before_reaching(tmp_path, monkeypatch):
+    """The retry finds the cell complete and skips the fill, so the update runs there or never."""
+    monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub({}))
+    store, registry_root = _seed_global_with_rule(tmp_path, 15), str(tmp_path / "registry")
+    cell = {
+        "land_mask_path": _make_mask(tmp_path, [(0, 0)]),
+        "mosaic_base": _make_mosaic(tmp_path),
+        "registry_root": registry_root,
+        "config": InferenceConfig(time_window=_window(2025), chunk_size=_TILE, num_gpus=0, optical_min_obs=15),
+    }
+    update = zone_fill._update_registry_master
+
+    def died(*_args: object, **_kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(zone_fill, "_update_registry_master", died)
+    with pytest.raises(KeyboardInterrupt):
+        _fill(tmp_path, store, **cell)
+    monkeypatch.setattr(zone_fill, "_update_registry_master", update)
+    assert _fill(tmp_path, store, **cell)["already_complete"] is True
+    assert _master_tiles(registry_root) == ["chunk_0_0"]
+
+
 def test_the_master_learns_of_a_refill_that_fails_at_the_tag_step(tmp_path, monkeypatch):
     """A deliberate refill fails at tagging by design — zone-year tags are write-once — after its data
     and part have landed. Updating the master after the tag would never reach it.

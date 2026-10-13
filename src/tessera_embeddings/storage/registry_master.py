@@ -67,11 +67,13 @@ from __future__ import annotations
 
 import datetime
 import fcntl
+import functools
 import hashlib
 import io
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import fsspec
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -79,7 +81,7 @@ import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
 from tessera_embeddings.storage.registry import dataset_schema
-from tessera_embeddings.storage.registry_rebuild import REBUILT_COLUMNS
+from tessera_embeddings.storage.registry_rebuild import CARRIED_COLUMNS, REBUILT_COLUMNS
 
 if TYPE_CHECKING:
     from collections.abc import Collection, Iterator, Sequence
@@ -265,32 +267,38 @@ def audit(master: pa.Table, parts: pa.Table) -> dict[str, list[str]]:
     """Per cell ``zone/year``, what is wrong with its master rows against its parts. Empty is sound.
 
     Checks the master itself, the file consumers read: every tile any part names is present and no
-    other; each row describes its tile's latest run; wherever that run's fill measured the tile, the
-    master carries the fill's own numbers, labelled ``"fill"``; and no row is unmeasured. A cell
-    with no master file at all reports every tile missing. Pair it with :func:`invariant_failures`.
+    other; each row describes its tile's latest run and carries that run's fill fields — ``embedded``,
+    the bounding box, the depth rule, the build — whoever measured it; wherever that run's fill
+    measured the tile, the master carries the fill's own numbers, labelled ``"fill"``; and no row is
+    unmeasured. A cell with no master file at all reports every tile missing. Pair it with
+    :func:`invariant_failures`.
     """
     want = merge(as_master_rows(parts, MEASURED_BY_FILL))
-    columns = [*_KEYS, "filled_at", "measured_by", *REBUILT_COLUMNS]
+    carried = [column for column in CARRIED_COLUMNS if column not in _KEYS]
+    columns = [*_KEYS, "filled_at", "measured_by", *carried, *REBUILT_COLUMNS]
     joined = want.select(columns).join(
         master.select(columns), keys=_KEYS, join_type="full outer", left_suffix=":want", right_suffix=":held"
     )
 
-    def differs(column: str) -> pa.ChunkedArray:
-        """Null-aware inequality: one side null and the other not counts as a difference."""
-        a, b = joined.column(f"{column}:want"), joined.column(f"{column}:held")
-        return pc.or_(pc.xor(pc.is_null(a), pc.is_null(b)), pc.fill_null(pc.not_equal(a, b), False))
+    def differs(*names: str) -> pa.ChunkedArray:
+        """Null-aware inequality in any of ``names``: one side null and the other not is a difference."""
+
+        def one(column: str) -> pa.ChunkedArray:
+            a, b = joined.column(f"{column}:want"), joined.column(f"{column}:held")
+            return pc.or_(pc.xor(pc.is_null(a), pc.is_null(b)), pc.fill_null(pc.not_equal(a, b), False))
+
+        return functools.reduce(pc.or_, map(one, names))
 
     held = pc.is_valid(joined.column("filled_at:held"))
     wanted = pc.is_valid(joined.column("filled_at:want"))
+    both = pc.and_(held, wanted)
     fill_measured = pc.fill_null(pc.equal(joined.column("measured_by:want"), MEASURED_BY_FILL), False)
-    altered = differs("measured_by")
-    for column in REBUILT_COLUMNS:
-        altered = pc.or_(altered, differs(column))
     flags = {
         "tile(s) missing": pc.invert(held),
         "tile(s) no part names": pc.invert(wanted),
-        "row(s) not from the tile's latest run": pc.and_(pc.and_(held, wanted), differs("filled_at")),
-        "fill measurement(s) altered": pc.and_(pc.and_(held, fill_measured), altered),
+        "row(s) not from the tile's latest run": pc.and_(both, differs("filled_at")),
+        "fill field(s) altered": pc.and_(both, differs(*carried)),
+        "fill measurement(s) altered": pc.and_(pc.and_(held, fill_measured), differs("measured_by", *REBUILT_COLUMNS)),
         "row(s) unmeasured": pc.and_(held, pc.is_null(joined.column(f"{MEASURED_SENTINEL}:held"))),
     }
     counts = pa.table(
@@ -333,7 +341,8 @@ def store_disagreements(parts: pa.Table, store: StoreYear) -> list[str]:
       of it says (:func:`~.published_store.commit_tiles`). That covers a run with no part and also a
       retry: a part describes one commit of its run, so an earlier attempt's commit counts on its
       own. One that later commits superseded on every tile it wrote describes nothing, so it does
-      not block.
+      not block, and neither does an untagged run that marked the year empty, which left no
+      embeddings behind.
     """
     stamps: dict[str, set[datetime.datetime]] = {}
     tiles: dict[str, set[str]] = {}
@@ -362,7 +371,10 @@ def store_disagreements(parts: pa.Table, store: StoreYear) -> list[str]:
         if described.get(commit.run_id) == commit:
             written = tiles[commit.run_id]
         elif commit.snapshot is None:
-            found.append(f"run {commit.run_id!r} wrote the year with no part, and no recorded commit bounds its tiles")
+            if not commit.empty:
+                found.append(
+                    f"run {commit.run_id!r} wrote the year with no part, and no recorded commit bounds its tiles"
+                )
             continue
         else:
             written = set(store.tiles_of(commit.snapshot))
@@ -376,8 +388,8 @@ def store_disagreements(parts: pa.Table, store: StoreYear) -> list[str]:
 
 
 def _bare(registry_root: str) -> str:
-    """``registry_root`` as an fsspec path: no scheme, no trailing slash."""
-    return registry_root.removeprefix("s3://").rstrip("/")
+    """``registry_root`` as a filesystem path: no scheme, so ``file://`` is a real local path, no trailing slash."""
+    return str(fsspec.core.strip_protocol(registry_root)).rstrip("/")
 
 
 def _master_path(registry_root: str, zone: str, year: int) -> str:
@@ -424,16 +436,26 @@ def write_cell(
     the first lands, and the other is told rather than silently discarding the first's rows. A local
     registry, for rehearsals, checks the same under a lock. Either way a reader sees the old file or
     the new one, never a mixture. ``_common_metadata`` is the same bytes for every cell, so it is
-    written only when absent rather than raced by every fill.
+    written only when absent or behind :func:`master_schema` — a column added since — rather than
+    raced by every fill.
     """
     path = _master_path(registry_root, zone, year)
     buf = io.BytesIO()
     # The partition keys live in the path, as in every hive dataset.
     pq.write_table(rows.drop_columns(["zone", "year"]), buf, compression="zstd")
     written = _put_if(fs, path, buf.getvalue(), version)
-    if written and not fs.exists(f"{_bare(registry_root)}/master/_common_metadata"):
+    if written and not _schema_is_current(fs, f"{_bare(registry_root)}/master/_common_metadata"):
         write_common_metadata(fs, registry_root)
     return written
+
+
+def _schema_is_current(fs: AbstractFileSystem, meta: str) -> bool:
+    """Whether ``_common_metadata`` at ``meta`` exists and declares :func:`master_schema`'s columns."""
+    try:
+        with fs.open(meta, "rb") as f:
+            return pq.read_schema(f).remove_metadata().equals(master_schema().remove_metadata())
+    except FileNotFoundError:
+        return False
 
 
 def _on_s3(fs: AbstractFileSystem) -> bool:
@@ -509,11 +531,12 @@ def update_cell(
     """Merge one cell's parts into its existing master file, tile by tile, and replace the file.
 
     The one writer of a cell's master, used by every fill and by repair. Idempotent, and independent
-    of every other cell. Raises, writing nothing, when the cell has no part, has none for ``run_id``
-    — the run the caller just landed, whose part publishing is best-effort and may have failed — the
-    store cannot stand behind the parts (:func:`store_disagreements`, when ``store`` is given), or
-    the merge breaks an invariant. ``extra`` is more master rows to merge, a repair's re-derived
-    ones; ``write=False`` checks everything and writes nothing.
+    of every other cell. Raises, writing nothing, when the cell has no part for ``run_id`` — the run
+    the caller just landed, whose part publishing is best-effort and may have failed — the store
+    cannot stand behind the parts (:func:`store_disagreements`, when ``store`` is given), or the
+    merge breaks an invariant. ``extra`` is more master rows to merge, a repair's re-derived ones;
+    ``write=False`` checks everything and writes nothing. A cell whose last part was deleted, its
+    run withdrawn, has its master file emptied; one with neither a part nor a file is left alone.
 
     **Two writers of one cell cannot lose each other's rows.** The file's version is read first and
     the write is conditional on it (:func:`write_cell`), so a writer that read before another
@@ -529,8 +552,6 @@ def update_cell(
     for _ in range(tries):
         version = cell_version(fs, registry_root, zone, year)
         parts = read_cell(fs, registry_root, "parts", zone, year, dataset_schema())
-        if not parts.num_rows:
-            raise ValueError(f"{zone}/{year} has no registry part to merge into the master")
         if run_id is not None and run_id not in set(parts.column("run_id").to_pylist()):
             raise ValueError(f"{zone}/{year} has no registry part for run {run_id!r}, so the master would miss it")
         if store is not None and (found := store_disagreements(parts, store)):
@@ -541,7 +562,9 @@ def update_cell(
         master = merge(fills, held, *extra)
         if failures := invariant_failures(master, expected_rows=tile_years(parts)):
             raise ValueError(f"{zone}/{year} master breaks its invariants: {'; '.join(failures)}")
-        if not write or write_cell(fs, registry_root, zone, year, master, version=version):
+        if not write or (version is None and not master.num_rows):
+            return _live_disagreements(master, live)
+        if write_cell(fs, registry_root, zone, year, master, version=version):
             return _live_disagreements(master, live)
     raise ValueError(f"{zone}/{year} master changed under each of {tries} attempts to update it")
 

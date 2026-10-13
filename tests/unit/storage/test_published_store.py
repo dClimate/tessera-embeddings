@@ -384,16 +384,18 @@ class TestSavedManifestPreload:
 class TestWhoWroteAYear:
     """The store's own account of which runs wrote a zone-year, and which tiles each commit wrote."""
 
-    def test_a_commit_s_tiles_are_its_diff_in_that_year_written_and_cleared_alike(self, seeded):
+    def test_a_commit_s_tiles_are_its_diff_in_that_year_written_cleared_and_refused_alike(self, seeded):
+        """A refused tile writes its observation counts and leaves ``scales`` absent, before and after."""
         _fill_shard(seeded, "01N", 1, (0, 0))
         session = global_store.open_global_repo(seeded).writable_session("main")
-        scales = zarr.open_group(session.store, mode="r+")["01N"]["scales"]
-        for time_index, shard, value in ((1, (0, 0), np.nan), (1, (3, 1), 0.5), (0, (2, 0), 0.5)):
-            y0, y1, x0, x1 = published_store.shard_pixel_window(shard, scales.shape)
-            scales[time_index, y0:y1, x0:x1] = value
-        snapshot = session.commit("clear one tile, write another, and one in the other year")
+        node = zarr.open_group(session.store, mode="r+")["01N"]
+        writes = ((1, (0, 0), np.nan, "scales"), (1, (3, 1), 0.5, "scales"), (0, (2, 0), 0.5, "scales"))
+        for time_index, shard, value, var in (*writes, (1, (1, 1), 3, "s2_obs_count")):
+            y0, y1, x0, x1 = published_store.shard_pixel_window(shard, node[var].shape)
+            node[var][time_index, y0:y1, x0:x1] = value
+        snapshot = session.commit("clear one tile, write another, refuse a third, and one in the other year")
         repo = global_store.open_global_repo(seeded)
-        assert published_store.commit_tiles(repo, "01N", 1, snapshot) == {"chunk_0_0", "chunk_3_1"}
+        assert published_store.commit_tiles(repo, "01N", 1, snapshot) == {"chunk_0_0", "chunk_3_1", "chunk_1_1"}
 
     def test_tagged_shard_commits_are_listed_by_zone_year_oldest_first(self, seeded):
         repo = global_store.open_global_repo(seeded)
@@ -424,6 +426,14 @@ class TestWhoWroteAYear:
             Commit("refill", first, "s1"),
             Commit("refill", retry, "s2"),
             Commit("infill", infill, "s3"),
+        ]
+
+    def test_a_refill_keeps_that_the_run_it_replaced_marked_the_year_empty(self):
+        """A v1.1 year marked empty published no part, and the store check must not mistake it for a write."""
+        marked = {"2024": {"run_id": "v11", "assembled_at": "2026-07-01T00:00:00+00:00", "empty": True}}
+        runs = shard_writer.run_provenance(marked, 2024, "refill", code={})
+        assert published_store.committed_runs({"runs": runs}, 2024, []) == [
+            Commit("v11", "2026-07-01T00:00:00+00:00", None, empty=True)
         ]
 
     def test_a_year_marked_without_shards_contributes_no_run(self):

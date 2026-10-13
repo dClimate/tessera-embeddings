@@ -581,7 +581,8 @@ def run_provenance(
     commit itself is tagged with the run (``SHARD_WRITE``), and that tag, not this record, is the
     store's authority on who wrote a year: this record lands in a second commit, which a dying
     process can miss. **A refill keeps the runs before it** in ``previous``, as ``run_id``,
-    ``assembled_at`` and ``commit`` alone, which is all that is known of a run from before tags.
+    ``assembled_at``, ``commit`` and ``empty`` alone, which is all that is known of a run from
+    before tags.
 
     ``input_coverage`` answers the question the calendar-year guarantee below does NOT: not
     what window was *requested*, but **how much of it the input actually held** — per source
@@ -654,8 +655,9 @@ def run_provenance(
     return {**runs, str(year): record}
 
 
-#: What ``previous`` keeps of a replaced run: enough to know it wrote the year, when, and in which commit.
-_HISTORY = ("run_id", "assembled_at", "commit")
+#: What ``previous`` keeps of a replaced run: enough to know it wrote the year, when, in which commit,
+#: and whether it left the year empty.
+_HISTORY = ("run_id", "assembled_at", "commit", "empty")
 
 
 def _or_none(value: Mapping[str, Any] | None) -> dict | None:

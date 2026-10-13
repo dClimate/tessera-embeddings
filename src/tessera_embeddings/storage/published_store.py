@@ -217,12 +217,14 @@ class Commit(NamedTuple):
 
     ``at`` orders runs: the commit's own timestamp, or for an untagged run the time it was marked.
     ``snapshot`` is the shard commit, ``None`` for an untagged run, and is what :func:`commit_tiles`
-    reads the tiles it wrote from.
+    reads the tiles it wrote from. ``empty`` is an untagged run that marked the year as holding no
+    data, so it left no embeddings for a part to describe.
     """
 
     run_id: str
     at: str
     snapshot: str | None
+    empty: bool = False
 
 
 def shard_writes(repo: icechunk.Repository) -> dict[tuple[str, int], list[Commit]]:
@@ -254,7 +256,11 @@ def committed_runs(attrs: Mapping[str, Any], year: int, writes: Sequence[Commit]
     """
     head = (attrs.get("runs") or {}).get(str(year))
     entries = [head, *head.get("previous", [])] if isinstance(head, dict) else []
-    untagged = [Commit(str(e["run_id"]), str(e["assembled_at"]), None) for e in entries if "commit" not in e]
+    untagged = [
+        Commit(str(e["run_id"]), str(e["assembled_at"]), None, bool(e.get("empty")))
+        for e in entries
+        if "commit" not in e
+    ]
     return sorted([*untagged, *writes], key=lambda c: datetime.fromisoformat(c.at))
 
 
@@ -263,12 +269,21 @@ def commit_tiles(repo: icechunk.Repository, zone: str, time_index: int, snapshot
 
     From the commit's own transaction log, by diffing it against its parent: the store's account of
     what that write changed, so it needs no record kept anywhere else. A cleared tile is a deleted
-    shard, which the diff lists as changed too.
+    shard, which the diff lists as changed too. Every per-tile array counts, not only ``scales``: a
+    refused tile writes its observation counts and month coverage while its embeddings stay absent,
+    so re-refusing a tile that was already refused changes nothing in ``scales``. Every such array
+    shares the tile grid, one shard per tile in its first three coordinates; the coordinate arrays
+    have fewer.
     """
     parent = repo.lookup_snapshot(snapshot).parent_id
     diff = repo.diff(from_snapshot_id=parent, to_snapshot_id=snapshot)
-    coords = diff.updated_chunks.get(f"/{zone}/{COVERAGE_VAR}", [])
-    return frozenset(f"chunk_{c[1]}_{c[2]}" for c in coords if c[0] == time_index)
+    return frozenset(
+        f"chunk_{c[1]}_{c[2]}"
+        for path, coords in diff.updated_chunks.items()
+        if path.startswith(f"/{zone}/")
+        for c in coords
+        if len(c) >= 3 and c[0] == time_index
+    )
 
 
 class StoreYear(NamedTuple):

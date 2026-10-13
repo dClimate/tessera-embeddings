@@ -276,9 +276,19 @@ class TestAudit:
             (lambda m: m.filter(pc.equal(m.column("tile"), "chunk_0_0")), "tile(s) missing"),
             (lambda m: merge(m, _fill([_row("chunk_9_9", measured=True, stamp=FILLED)])), "no part names"),
             (_altered, "fill measurement(s) altered"),
+            (
+                lambda m: m.set_column(m.schema.get_field_index("embedded"), "embedded", pc.invert(m["embedded"])),
+                "fill field(s) altered",
+            ),
             (lambda _: merge(_fill(_AUDITED)), "unmeasured"),
         ],
-        ids=["a-dropped-tile", "a-tile-no-part-names", "an-altered-fill-measurement", "an-unmeasured-row"],
+        ids=[
+            "a-dropped-tile",
+            "a-tile-no-part-names",
+            "an-altered-fill-measurement",
+            "an-altered-fill-field",
+            "an-unmeasured-row",
+        ],
     )
     def test_damage_is_reported_against_its_cell(self, damage: Callable[[pa.Table], pa.Table], problem: str) -> None:
         found = audit(damage(_sound()), _parts(_AUDITED))
@@ -350,10 +360,29 @@ class TestUpdateCell:
             update_cell(LOCAL, str(registry), "33N", 2017, run_id="refill")
         assert (registry / self.MASTER).read_bytes() == before
 
-    def test_a_cell_with_no_part_raises_and_writes_nothing(self, tmp_path: Path) -> None:
-        with pytest.raises(ValueError, match="no registry part"):
-            update_cell(LOCAL, str(tmp_path), "33N", 2017)
+    def test_a_cell_whose_last_part_is_withdrawn_is_emptied(self, registry: Path) -> None:
+        """Withdrawal deletes the run's part; with none left, the master must not keep describing it."""
+        (registry / "parts" / "zone=33N" / "year=2017" / "run-a.parquet").unlink()
+        assert update_cell(LOCAL, str(registry), "33N", 2017) == []
+        assert pq.read_table(registry / self.MASTER).num_rows == 0
+
+    def test_a_cell_with_neither_a_part_nor_a_master_file_is_left_alone(self, tmp_path: Path) -> None:
+        """A retried all-ocean cell lands here, and must not get a file describing nothing."""
+        assert update_cell(LOCAL, str(tmp_path), "33N", 2017) == []
         assert not (tmp_path / "master").exists()
+
+    def test_a_stale_dataset_schema_is_replaced(self, registry: Path) -> None:
+        """A column added since the last write must reach readers who take the schema from the dataset."""
+        pq.write_metadata(pa.schema([pa.field("tile", pa.string())]), registry / "master" / "_common_metadata")
+        update_cell(LOCAL, str(registry), "33N", 2017)
+        assert pq.read_schema(registry / "master" / "_common_metadata").names == master_schema().names
+
+    def test_a_file_uri_root_writes_the_real_path(self, registry: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A ``file://`` root read through fsspec and written through ``pathlib`` must be one path."""
+        monkeypatch.chdir(registry)
+        update_cell(LOCAL, registry.as_uri(), "33N", 2017)
+        assert not (registry / "file:").exists()
+        assert pq.read_table(registry / self.MASTER).num_rows == 2
 
 
 #: What each commit of cell 33N/2017 wrote, as the store's diff of it would say.
@@ -425,11 +454,18 @@ class TestTheStoreStandsBehindTheParts:
         [
             ([Commit("run-a", FILLED, None), _C], []),
             ([Commit("run-a", FILLED, None), Commit("run-x", MIDWAY, None), _C], ["no recorded commit bounds"]),
+            ([Commit("run-a", FILLED, None), Commit("ocean", MIDWAY, None, empty=True), _C], []),
         ],
-        ids=["recorded-before-commits-were-and-published", "recorded-before-commits-were-and-never-published"],
+        ids=[
+            "recorded-before-commits-were-and-published",
+            "recorded-before-commits-were-and-never-published",
+            "recorded-before-commits-were-marking-the-year-empty",
+        ],
     )
     def test_a_run_recorded_before_commits_were(self, commits: list[Commit], expected: list[str]) -> None:
-        """v1.1's records name no commit: one with a part is taken on trust, one without cannot be bounded."""
+        """v1.1's records name no commit: one with a part is taken on trust, one without cannot be bounded,
+        and one that marked the year empty left no embeddings to describe.
+        """
         found = store_disagreements(_FILL_AND_INFILL, _store(*commits))
         assert [phrase for phrase in expected if any(phrase in entry for entry in found)] == expected
         assert len(found) == len(expected)
