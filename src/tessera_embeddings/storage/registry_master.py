@@ -438,12 +438,17 @@ def write_cell(
 
 
 def _schema_is_current(fs: AbstractFileSystem, meta: str) -> bool:
-    """Whether ``_common_metadata`` at ``meta`` exists and declares :func:`master_schema`'s columns."""
+    """Whether ``_common_metadata`` at ``meta`` exists and declares every :func:`master_schema` column.
+
+    A superset counts: during a rolling deploy a worker on older code must not replace a newer
+    declaration with its own.
+    """
     try:
         with fs.open(meta, "rb") as f:
-            return pq.read_schema(f).remove_metadata().equals(master_schema().remove_metadata())
+            declared = pq.read_schema(f)
     except FileNotFoundError:
         return False
+    return all(f.name in declared.names and declared.field(f.name).type == f.type for f in master_schema())
 
 
 def _on_s3(fs: AbstractFileSystem) -> bool:

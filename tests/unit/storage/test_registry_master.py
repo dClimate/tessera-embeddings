@@ -331,6 +331,14 @@ class TestUpdateCell:
         update_cell(LOCAL, str(registry), "33N", 2017)
         assert "update_name" in pq.read_schema(meta).names
 
+    def test_a_newer_dataset_schema_is_not_downgraded(self, registry: Path) -> None:
+        """A worker on older code, mid rolling deploy, must leave a declaration with more columns alone."""
+        meta = registry / "master" / "_common_metadata"
+        with meta.open("wb") as out:
+            pq.ParquetWriter(out, master_schema().append(pa.field("added_later", pa.string()))).close()
+        update_cell(LOCAL, str(registry), "33N", 2017)
+        assert "added_later" in pq.read_schema(meta).names
+
     def test_running_it_again_writes_the_same_file(self, registry: Path) -> None:
         """A fill retried after its update, and a repair after a fill, must both leave the cell as it was."""
         update_cell(LOCAL, str(registry), "33N", 2017)
