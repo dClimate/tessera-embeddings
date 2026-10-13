@@ -357,7 +357,7 @@ def _update_registry_master(
     store_path: str,
     zone: str,
     year: int,
-    run_id: str,
+    run_id: str | None,
     *,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None,
     s3_region: str | None,
@@ -375,6 +375,10 @@ def _update_registry_master(
     including ``run_id``'s own part never having published, which would otherwise rewrite the master
     from the older runs and report success — is logged loudly and leaves the cell stale.
     ``rebuild_registry_measurements.py repair --zones`` rebuilds it once the part exists.
+
+    A retry of a cell that already landed runs it again with no ``run_id`` (:func:`assemble_zone_year`):
+    a process that died between the commit and this update would otherwise leave the master stale
+    for good, since the retry skips the fill.
 
     The store's live shards for the year are compared with the master's embedded tiles on the way,
     from the manifests alone, and a disagreement is logged at ERROR: no run removes a tile it did
@@ -1075,7 +1079,7 @@ def assemble_zone_year(
     skipped), tags the landed commit, and cleans up staging. Opens its own repo/writer
     connections so the sequential multi-zone runner can run it on a trailing thread while the
     caller's thread starts the next cell's inference. A terminal handoff (``done`` set) passes
-    straight through.
+    straight through, after the master update for a cell that had already landed.
 
     ``fault`` is the supervised-drill hook, forwarded to the assembly call on both the data
     and the all-skipped path so the drill does not depend on which one a cell takes. Inert
@@ -1084,6 +1088,18 @@ def assemble_zone_year(
     """
     _check_assembly_workers(n_assembly_workers)
     if handoff.done is not None:
+        if handoff.done.get("already_complete"):
+            # Idempotent, and the only way a fill that died before its update reaches the master.
+            _update_registry_master(
+                registry_root,
+                store_path,
+                handoff.zone,
+                handoff.year,
+                None,
+                get_credentials=get_credentials,
+                s3_region=s3_region,
+                log=log,
+            )
         return handoff.done
     zone, year, run_id, t0 = handoff.zone, handoff.year, handoff.run_id, handoff.t0
     summary, live, results = handoff.summary, handoff.live, handoff.results

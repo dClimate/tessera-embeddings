@@ -15,7 +15,9 @@ reduces to ``s2_obs_count > 0`` on the delivered product, and for the one column
 re-derivation of every row its fills left null, merged tile by tile. The parts supply every tile and
 every measurement a fill took, which the merge never overrides; the existing master keeps a radar
 column an optical-only pass would not re-measure. ``parts/`` is never touched, and a cell whose
-re-derivation or store check is blocked is not written at all. Each cell is written through the
+re-derivation or store check is blocked is not written at all. Every cell with a part, a master
+file or a shard commit is visited: a master file whose last part was deleted is emptied, and a
+commit with no part is reported. Each cell is written through the
 fill's own ``registry_master.update_cell``, conditionally, so a fill landing mid-repair is merged in
 rather than overwritten. Every writing subcommand is a DRY RUN unless given ``--write``.
 
@@ -51,6 +53,7 @@ import concurrent.futures
 import datetime
 import json
 import random
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -80,7 +83,6 @@ from tessera_embeddings.storage.registry_master import (
     store_disagreements,
     tile_years,
     update_cell,
-    write_common_metadata,
 )
 from tessera_embeddings.storage.registry_rebuild import rebuild_run_id, rebuilt_row
 
@@ -171,6 +173,26 @@ def _cells(parts: pa.Table, zones: list[str]) -> dict[tuple[str, int], pa.Table]
     """Each ``(zone, year)``'s parts, every run's rows: the unit a fill and a repair work in."""
     parts = _only_zones(parts, zones).sort_by([("zone", "ascending"), ("year", "ascending")])
     return {(zone, year): rows for zone, year, rows in cell_tables(parts)}
+
+
+def _every_cell(
+    fs: AbstractFileSystem, root: str, store: _Store, cells: dict[tuple[str, int], pa.Table], zones: list[str]
+) -> dict[tuple[str, int], pa.Table]:
+    """``cells`` plus every cell with a master file or a shard commit but no part, which has no rows.
+
+    A master file outlives its last part when that run is withdrawn, and a fill whose part never
+    published leaves only its commit; neither is in ``parts/`` for a pass over it to find.
+    """
+    base = root.removeprefix("s3://").rstrip("/")
+    held = {
+        (match["zone"], int(match["year"]))
+        for path in fs.glob(f"{base}/master/zone=*/year=*/part-0.parquet")
+        if (match := re.search(r"zone=(?P<zone>[^/]+)/year=(?P<year>\d+)/", path))
+    }
+    empty = dataset_schema().empty_table()
+    return {
+        cell: cells.get(cell, empty) for cell in sorted({*cells, *held, *store[2]}) if not zones or cell[0] in zones
+    }
 
 
 def _current(parts: pa.Table) -> pa.Table:
@@ -392,10 +414,11 @@ def _repair_cell(
 def cmd_repair(args: argparse.Namespace) -> int:
     """Rebuild each cell's master file from its parts, its master rows and a fresh re-derivation."""
     fs = _filesystem(args.registry, args.region, anonymous=args.anonymous)
-    cells = _cells(_registry_table(fs, args.registry, "parts", dataset_schema()), args.zones)
+    parts = _cells(_registry_table(fs, args.registry, "parts", dataset_schema()), args.zones)
+    store = _open_store(args.store, args.region, anonymous=args.anonymous)
+    cells = _every_cell(fs, args.registry, store, parts, args.zones)
     run_id = args.run_id or rebuild_run_id(suffix="optical" if args.skip_radar else "full")
     rng = random.Random(args.seed)
-    store = _open_store(args.store, args.region, anonymous=args.anonymous)
 
     written = rederived = blocked = 0
     for (zone, year), parts in sorted(cells.items()):
@@ -406,9 +429,6 @@ def cmd_repair(args: argparse.Namespace) -> int:
             print(f"  {zone}/{year}: BLOCKED, left as it is — {error}", file=sys.stderr)
             continue
         written += 1
-    if args.write and written:
-        # Rewritten here, where a fill writes it only when absent: a repair is how a schema change lands.
-        write_common_metadata(fs, args.registry)
     action = "written" if args.write else "would be written (dry run — pass --write to publish)"
     print(f"\nrepair {run_id}: {written} cell(s) {action}, {rederived} rows re-derived, {blocked} cells blocked")
     return 1 if blocked else 0
@@ -426,7 +446,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
         # The parts themselves against the store's record of who wrote each year: a run with no
         # part leaves the parts, and so the master, describing its tiles by the run before it.
         store = _open_store(args.store, args.region, anonymous=args.anonymous)
-        for (zone, year), cell in _cells(parts, []).items():
+        for (zone, year), cell in _every_cell(fs, args.registry, store, _cells(parts, []), []).items():
             if isinstance(slot := _store_slot(store, zone, year, cell), str):
                 problems.setdefault(f"{zone}/{year}", []).append(f"the store cannot stand behind its parts: {slot}")
         problems = dict(sorted(problems.items()))
