@@ -45,7 +45,9 @@ has no such attempt to fear, and blanking would lose good data to a bad run. A `
 `on_skip: "clear"` for the case where the old values are the defect; it refuses to run if it lists
 a tile its mask has no land in, since clearing never reaches such a tile. In `holes` mode a kept
 tile is not written at all, so where none of a tile's holes embeds, its still-refused pixels keep
-their old observation counts rather than taking the new run's.
+their old observation counts rather than taking the new run's. Under a line of one optical
+observation (#223) such a pixel has no optical observation before or after, so nothing stale remains
+that drives refusal or planning.
 
 **The update records itself beside the fill, never over it.** `years_complete`, `runs[year]` and the
 zone-year tags are untouched. Each cell gains one record in its zone group's `updates[year]` list:
