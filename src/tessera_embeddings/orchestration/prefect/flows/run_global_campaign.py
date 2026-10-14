@@ -170,9 +170,9 @@ def _still_running(live: dict[asyncio.Task[Any], int | None]) -> bool:
 def _upsert_limit(name: str, limit: int, *, what: str, log: logging.Logger | LoggerAdapter) -> None:
     """Set a Prefect global concurrency limit to ``limit``.
 
-    Both fleet-wide caps this campaign relies on — simultaneous ingests and simultaneous
-    committers — are enforced by gates in CHILD flow runs on other machines, which nothing
-    in-process can see across, so the number lives on the Prefect server. Writing it from
+    Both fleet-wide limits this campaign relies on — the ingest cap and the inference pause
+    flag — are read by CHILD flow runs on other machines, which nothing in-process can see
+    across, so the number lives on the Prefect server. Writing it from
     the flow parameter makes that parameter the single source of truth, instead of a
     server-side number an operator keeps in step by hand.
 
@@ -568,8 +568,8 @@ async def run_global_campaign(
             drives all 120. Either way only cells still needing work are dispatched, so a
             re-run of a partially-complete year fills only the unfinished zones (see
             :func:`campaign_work_list`).
-        max_parallel_clusters: Bounds simultaneous Ray clusters within a year (a cost knob,
-            distinct from the commit gate): the concurrent per-cell fill runs under
+        max_parallel_clusters: Bounds simultaneous Ray clusters within a year (a cost knob):
+            the concurrent per-cell fill runs under
             ``"cluster-per-zone"``, or the number of Ray clusters under
             ``"chained-clusters"``. **Defaults to 10**, the campaign's planned width: 10 x
             250 actors reaches the full 2,500-actor quota while keeping each cluster's
@@ -754,7 +754,7 @@ async def run_global_campaign(
             The round is a BARRIER: a cluster owns a roster of zones, so when one dies early
             its whole roster waits on the slowest sibling before the store is re-read. On,
             the settled cluster's cells are re-dispatched into the slot it just vacated,
-            inheriting its ingest share, its committer share and its place under
+            inheriting its ingest share and its place under
             ``max_parallel_clusters`` — the fleet's width and cost do not change.
 
             Two conditions must BOTH hold, and either failing returns the cells to the round,
@@ -1716,7 +1716,7 @@ async def run_global_campaign(
                         if planned is None:
                             return
                         replacement, take_zones, take_years = planned
-                        # THE COMMIT GATE, and nothing between it and the dispatch may await or
+                        # THE DISPATCH GATE, and nothing between it and the dispatch may await or
                         # raise. Planning waits out the settling delay and re-reads the store,
                         # and the round can finish across that, so the check made before
                         # planning is stale by now. Re-read here, where the answer cannot go
@@ -1769,7 +1769,7 @@ async def run_global_campaign(
                             chained_results[settled_slot] = outcome
                             # A cheap pre-filter, not the safety gate: it keeps a round that is
                             # already over from paying for a store read and a settling wait for a
-                            # dispatch that the commit gate would refuse anyway.
+                            # replacement that the dispatch gate would refuse anyway.
                             if not immediate_refill or not _still_running(dispatches):
                                 continue
                             planners.add(

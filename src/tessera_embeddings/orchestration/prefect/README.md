@@ -30,7 +30,7 @@ orchestration/prefect/
 │   ├── _child_runs.py               # child deployment runs: cancel sweeps, terminal-state check
 │   ├── _dask_lifecycle.py           # Dask/ECS teardown hook + the DaskTaskRunner factory
 │   ├── _ray_lifecycle.py            # Ray teardown hook (the Ray analogue of the above)
-│   ├── _fleet_gate.py               # hold dispatch while the GPU fleet is saturated
+│   ├── _fleet_gate.py               # ingest gate (zero = pause) + inference pause flag
 │   └── _overrides.py                # per-run flow option overrides
 └── tasks/                  Layer 2: thin @task wrappers (~20 LOC each, ADR-002)
     ├── ingest.py                    # process_roi_reflectance, process_roi_sar
@@ -122,7 +122,7 @@ the store. Since a cluster owns a roster of zones, one dying early costs that wh
 roster the wait for the round's slowest sibling. `immediate_refill` (default **off**,
 and off is byte-for-byte the behaviour above) re-dispatches a settled cluster's
 still-missing cells into the slot it just vacated — so the replacement inherits its
-ingest share, its committer share and its place under `max_parallel_clusters`, and the
+ingest share and its place under `max_parallel_clusters`, and the
 fleet's width and cost do not change.
 
 **Nothing locks a zone; the zone partition IS the guarantee that a zone's years never
