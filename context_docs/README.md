@@ -39,7 +39,10 @@ context_docs/
 │   ├── 020-boa-offset-applies-to-every-valid-dn.md
 │   ├── 021-correct-the-boa-offset-per-image.md
 │   ├── 022-resolve-the-roi-mask-credential-at-read-time.md
-│   └── 023-the-single-path-end-to-end-is-the-quickstart-run.md
+│   ├── 023-the-single-path-end-to-end-is-the-quickstart-run.md
+│   ├── 024-spatial-transform-origin-is-the-pixel-corner.md
+│   ├── 026-v1-1-runs-the-gru-it-was-trained-with.md
+│   └── 027-targeted-updates.md
 │
 ├── campaign/                      THE GLOBAL CAMPAIGN — start here
 │   ├── campaign-plan.md                        <- START HERE. What runs, with what settings, in

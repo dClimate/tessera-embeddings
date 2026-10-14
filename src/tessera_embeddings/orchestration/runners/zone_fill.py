@@ -48,10 +48,9 @@ import dataclasses
 import logging
 import time
 import uuid
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from functools import partial
 from typing import Any, cast
 
 import fsspec
@@ -88,7 +87,6 @@ from tessera_embeddings.storage.update import (
     base_tag,
     check_radar_policy,
     commit_update_record,
-    read_updates,
     stage_hole_masks,
     update_record,
     update_state,
@@ -1360,6 +1358,12 @@ def _assemble_update(
     )
     store_credentials = _store_credentials(store_path, get_credentials)
     merged = update.mode == "holes"
+    committed: dict[str, str] = {}
+
+    def _record(repo: icechunk.Repository, group: str, year_label: int, commit: Mapping[str, str]) -> str:
+        committed.update(commit)  # the shard commit, which stamps the merged tiles' part
+        return commit_update_record(repo, group, year_label, commit, record=record)
+
     if staged or cleared:
         snapshot = writer.assemble_global(
             store_path,
@@ -1381,7 +1385,7 @@ def _assemble_update(
                 if r.get("status") == "success" and isinstance(r.get("coverage"), dict) and r.get("chunk")
             },
             pixels={c.label: c.pixels for c in live if c.pixels is not None and c.label in staged} or None,
-            commit_attrs=partial(commit_update_record, record=record),
+            commit_attrs=_record,
             update_name=update.name,
             get_credentials=store_credentials,
             s3_region=s3_region,
@@ -1397,6 +1401,7 @@ def _assemble_update(
                 zone,
                 year,
                 run_id,
+                committed_at=committed["committed_at"],
                 labels=sorted(staged),
                 optical_min_obs=optical_min_obs,
                 update_name=update.name,
@@ -1441,6 +1446,7 @@ def _publish_merged_rows(
     year: int,
     run_id: str,
     *,
+    committed_at: str,
     labels: list[str],
     optical_min_obs: int | None,
     update_name: str,
@@ -1453,28 +1459,17 @@ def _publish_merged_rows(
     A merged shard holds two runs' pixels, so neither run's coverage record describes it, and the
     master keeps only each tile's newest row. Re-deriving from the store is exact — the registry
     repair proved it on every published row — and costs one read of each tile's observation counts.
-    The part is stamped with the update's shard commit, read back from its record, as every part
-    is. Best-effort, like every registry write after a commit: the cell has landed.
+    The part is stamped with the update's shard commit, as every part is. Best-effort, like every
+    registry write after a commit: the cell has landed.
     """
+    records: dict[str, dict] = {}
+    # A store with no depth rule refused no pixel as thin, so none may be counted below a line.
+    thin_below = optical_min_obs or 0
     try:
         session = open_global_repo(store_path, get_credentials=get_credentials, region=s3_region).readonly_session(
             branch="main"
         )
         node = cast(zarr.Group, zarr.open_group(session.store, mode="r")[zone])
-        committed_at = next(r["commit"]["committed_at"] for r in read_updates(node, year) if r["run_id"] == run_id)
-    except Exception:
-        log.exception(
-            "Zone %s year %d: the update's record could not be read, so its merged tiles have NO registry part. "
-            "Repair: scripts/maintenance/rebuild_registry_measurements.py repair --zones %s --write",
-            zone,
-            year,
-            zone,
-        )
-        return
-    records: dict[str, dict] = {}
-    # A store with no depth rule refused no pixel as thin, so none may be counted below a line.
-    thin_below = optical_min_obs or 0
-    try:
         year_index = calendar_years(node).index(year)
         with ThreadPoolExecutor(max_workers=16) as pool:
             rows = pool.map(

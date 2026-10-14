@@ -322,7 +322,9 @@ else ([ADR 027](../../../../context_docs/decisions/027-targeted-updates.md)). Th
    cells from the plan, and records itself on each cell.
 3. **Check and release it.** `update-<name>-base` pins the store before the first write and
    `update-<name>-complete` once every planned cell holds the record. Compare the two, then delete
-   `{inputs}/updates/<name>/` and, once satisfied, the base tag, which holds the replaced shards.
+   the update's `rois/`, `mosaics/` and `holes/` under `{inputs}/updates/<name>/`, keeping
+   `plan.json`, which reserves the name, and, once satisfied, the base tag, which holds the replaced
+   shards.
 
 | | campaign fill | update |
 |---|---|---|
