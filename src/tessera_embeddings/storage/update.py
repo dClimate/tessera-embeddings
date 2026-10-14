@@ -36,6 +36,7 @@ the store once every cell has landed.
 from __future__ import annotations
 
 import json
+import zipfile
 from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
@@ -465,7 +466,8 @@ def stage_hole_masks(
     A shard with no hole is left out of the result: in ``holes`` mode there is nothing to do there,
     so it is neither inferred nor written. A mask already present is reused rather than recomputed,
     so a retry after the shards landed — when the store has no holes left — still infers and merges
-    exactly the pixels the first attempt did.
+    exactly the pixels the first attempt did. One an interrupted write cut short is recomputed:
+    nothing was inferred from it.
     """
     scales = cast(zarr.Array, node["scales"])
 
@@ -473,7 +475,10 @@ def stage_hole_masks(
         uri = f"{prefix.rstrip('/')}/{chunk.label}.npz"
         fs, path = fsspec.url_to_fs(uri)
         if fs.exists(path):
-            return chunk.label, uri if read_pixel_mask(uri).any() else None
+            try:
+                return chunk.label, uri if read_pixel_mask(uri).any() else None
+            except (EOFError, ValueError, zipfile.BadZipFile):
+                pass
         holes = np.isnan(np.asarray(scales[year_index, chunk.y_start : chunk.y_stop, chunk.x_start : chunk.x_stop]))
         write_pixel_mask(uri, holes)
         return chunk.label, uri if holes.any() else None

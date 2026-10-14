@@ -99,7 +99,8 @@ with no embedding, `shards` rewrites the listed tiles whole, and every other pix
 The record goes in the root's `updates[year]`, the year being the window's last, and
 `update-<name>-base` pins the store first. There is no plan file, registry or complete tag, since one
 run is the whole update. A single-area store's last row and column of tiles can be narrower than a
-shard, so the shard writer takes each tile's size from the store's edge (`tile_extent`). The update
+shard, so the shard writer takes each tile's size from the store's edge (`tile_extent`), and since
+tiles are written by position, the mosaics must lie on the store's grid (`assert_on_store_grid`). The update
 infers from the area's mosaics as they stand; ingest resumes them rather than redoing them, so taking
 in new imagery means deleting the mosaics first.
 

@@ -496,11 +496,13 @@ class TestTheStoreStandsBehindTheParts:
             ([Commit("run-a", FILLED, None), _C], []),
             ([Commit("run-a", FILLED, None), Commit("run-x", MIDWAY, None), _C], ["no recorded commit bounds"]),
             ([Commit("run-a", FILLED, None), Commit("ocean", MIDWAY, None, empty=True), _C], []),
+            ([Commit("run-a", FILLED, None, empty=True), _C], []),
         ],
         ids=[
             "recorded-before-commits-were-and-published",
             "recorded-before-commits-were-and-never-published",
             "recorded-before-commits-were-marking-the-year-empty",
+            "replaced-and-expired-with-its-part",
         ],
     )
     def test_a_run_recorded_before_commits_were(self, commits: list[Commit], expected: list[str]) -> None:
