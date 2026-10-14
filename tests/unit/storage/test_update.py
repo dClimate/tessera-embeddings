@@ -24,7 +24,7 @@ def _plan(**overrides) -> upd.UpdatePlan:
 
 
 def test_a_plan_round_trips_and_normalises_its_cells():
-    plan = _plan(cells={"14n/2019": ["chunk_1_2", "chunk_0_1", "chunk_1_2"], "15S/2020": None})
+    plan = _plan(cells={"14n/2019": ["chunk_1_2", "chunk_0_1", "chunk_01_02"], "15S/2020": None})
     assert plan.cells == {"14N/2019": ("chunk_0_1", "chunk_1_2"), "15S/2020": None}
     assert upd.UpdatePlan.from_json(plan.to_json()) == plan
     assert plan.cell_list(zones=["14N"]) == [("14N", 2019)]

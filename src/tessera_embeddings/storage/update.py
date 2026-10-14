@@ -50,7 +50,13 @@ import zarr
 
 from tessera_embeddings.config.environment import code_identity
 from tessera_embeddings.config.paths import BucketPaths, check_update_name
-from tessera_embeddings.inference.chunk_spec import ChunkSpec, parse_chunk_label, read_pixel_mask, write_pixel_mask
+from tessera_embeddings.inference.chunk_spec import (
+    ChunkSpec,
+    chunk_label,
+    parse_chunk_label,
+    read_pixel_mask,
+    write_pixel_mask,
+)
 from tessera_embeddings.storage.campaign import pin_tag
 from tessera_embeddings.storage.registry_master import master_schema
 from tessera_embeddings.storage.shard_writer import commit_with_rebase, read_years_complete
@@ -146,12 +152,13 @@ class UpdatePlan:
         for key, tiles in self.cells.items():
             if tiles is not None and not tiles:
                 raise ValueError(f"Cell {key} lists no shards; use null for every live shard")
-            for label in tiles or ():
-                parse_chunk_label(label)
             canonical = cell_key(*parse_cell_key(key))
             if canonical in cells:
                 raise ValueError(f"Cell {canonical} is named more than once; list each cell once")
-            cells[canonical] = None if tiles is None else tuple(sorted(set(tiles)))
+            # One spelling per shard (``chunk_01_02`` is ``chunk_1_2``), so labels compare as the runner's do.
+            cells[canonical] = (
+                None if tiles is None else tuple(sorted({chunk_label(*parse_chunk_label(t)) for t in tiles}))
+            )
         object.__setattr__(self, "cells", cells)
 
     def cell_list(
