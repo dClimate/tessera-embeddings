@@ -226,7 +226,7 @@ def _store_slot(
     The store's record of the year must account for every part, and a part for every tile a run
     last wrote (``registry_master.store_disagreements``). Then every current row's tile holds the
     pixels of the run that row names, because a run writes only its own tiles — so a cell built
-    from several runs, an infill over a fill, is re-derivable tile by tile. A run that committed
+    from several runs, an update over a first fill, is re-derivable tile by tile. A run that committed
     but never published its part breaks that, and re-deriving rows from its pixels would publish a
     mixture neither run produced.
     """

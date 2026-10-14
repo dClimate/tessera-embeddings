@@ -43,7 +43,7 @@ run's file:
 ```
   parts/zone=43S/year=2020/
   ├── 43S-2020-090ca792.parquet    the first fill: a row for every tile it evaluated
-  └── 43S-2020-<later-id>.parquet  a later run, such as an infill: rows for the tiles it wrote
+  └── 43S-2020-<later-id>.parquet  a later run, such as an update: rows for the tiles it wrote
 ```
 
 - **A re-run with unchanged inputs keeps its ID**, such as a retry after an interruption, so it
@@ -172,19 +172,19 @@ arrays, so any row can be checked against the store.
 
 ## How it is kept current
 
-Every fill, whether a zone-year's first fill, a refill or a targeted update of some of its tiles,
-updates the registry right after its pixels are committed to the store:
+Every run, whether a zone-year's first fill, a refill or a later update of some of its tiles,
+reaches the registry right after its pixels are committed to the store:
 
 ```
-  fill commits to the store ──▶ writes its rows as a new file in parts/
-                            ──▶ merges them into master/zone=Z/year=Y/part-0.parquet
+  a run commits to the store ──▶ writes its rows as a new file in parts/
+                             ──▶ merges them into master/zone=Z/year=Y/part-0.parquet
 ```
 
 - **A tile's row comes from the newest run that wrote that tile.** A full refill replaces every
-  row in its zone-year. A targeted update replaces only the tiles it rewrote, and every other tile
-  keeps its row. An update that filled a tile's holes merged two runs' pixels, so its row is
-  re-derived from the tile as committed rather than taken from either run. The master follows the store, which also keeps each tile as the
-  last run that wrote it left it.
+  row in its zone-year. An update of some tiles replaces only the tiles it rewrote, and every other
+  tile keeps its row. An update that filled a tile's holes merged two runs' pixels, so its row is
+  re-derived from the tile as committed rather than taken from either run. The master follows the
+  store, which also keeps each tile as the last run that wrote it left it.
 - **Each zone-year file is replaced in a single write**, so a reader sees the old file or the new
   one, never a mixture, and zone-years never wait on each other.
 - **`_common_metadata` follows the schema.** When a column is added, the next update rewrites it, so

@@ -144,7 +144,7 @@ class TestPrecedence:
         assert master.column("measured_by").to_pylist() == [None]
 
     def test_a_partial_run_supersedes_only_the_tiles_it_wrote(self) -> None:
-        """An infill writes some of a cell's tiles; every tile it did not touch keeps its run and rebuild.
+        """An update writes some of a cell's tiles; every tile it did not touch keeps its run and rebuild.
 
         Superseding the whole cell would drop ``chunk_0_1``, and no check would notice if every check
         applied the same rule. The store keeps the older run's shard there, so the master must too.
@@ -153,9 +153,9 @@ class TestPrecedence:
             _fill([_row("chunk_0_0", measured=True, stamp=FILLED), _row("chunk_0_1", measured=False, stamp=FILLED)]),
             _rebuilt([_row("chunk_0_1", measured=True, stamp=REBUILT, refused_thin_px=7)]),
         )
-        infill = _fill([_row("chunk_0_0", measured=True, stamp=LATER, refused_thin_px=1, run_id="infill")])
-        tiles = _by_tile(merge(infill, held))
-        assert (tiles["chunk_0_0"]["run_id"], tiles["chunk_0_0"]["refused_thin_px"]) == ("infill", 1)
+        update = _fill([_row("chunk_0_0", measured=True, stamp=LATER, refused_thin_px=1, run_id="update")])
+        tiles = _by_tile(merge(update, held))
+        assert (tiles["chunk_0_0"]["run_id"], tiles["chunk_0_0"]["refused_thin_px"]) == ("update", 1)
         untouched = tiles["chunk_0_1"]
         assert (untouched["measured_by"], untouched["refused_thin_px"], untouched["filled_at"]) == (
             MEASURED_BY_REBUILD,
@@ -328,12 +328,12 @@ class TestUpdateCell:
 
     MASTER = Path("master/zone=33N/year=2017/part-0.parquet")
 
-    def test_an_infill_replaces_its_tiles_and_keeps_every_other_row(self, registry: Path) -> None:
-        _publish(registry, "infill", [_row("chunk_0_0", measured=True, stamp=LATER, run_id="infill")])
+    def test_an_update_replaces_its_tiles_and_keeps_every_other_row(self, registry: Path) -> None:
+        _publish(registry, "update", [_row("chunk_0_0", measured=True, stamp=LATER, run_id="update")])
         assert update_cell(LOCAL, str(registry), "33N", 2017) == []
         master = pq.read_table(registry / self.MASTER)
         assert master.column("tile").to_pylist() == ["chunk_0_0", "chunk_0_1"]
-        assert master.column("run_id").to_pylist() == ["infill", "rebuild-1"], "the re-derived row survives"
+        assert master.column("run_id").to_pylist() == ["update", "rebuild-1"], "the re-derived row survives"
         assert pq.read_schema(registry / "master" / "_common_metadata").names == master_schema().names
 
     def test_a_damaged_copy_of_a_fill_row_loses_to_its_part(self, registry: Path) -> None:
@@ -364,9 +364,9 @@ class TestUpdateCell:
 
     def test_a_withdrawn_run_does_not_outlive_its_part(self, registry: Path) -> None:
         """Deleting a run's part and updating must restore the run before it, not keep the master's copy."""
-        _publish(registry, "infill", [_row("chunk_0_0", measured=True, stamp=LATER, run_id="infill")])
+        _publish(registry, "update", [_row("chunk_0_0", measured=True, stamp=LATER, run_id="update")])
         update_cell(LOCAL, str(registry), "33N", 2017)
-        (registry / "parts" / "zone=33N" / "year=2017" / "infill.parquet").unlink()
+        (registry / "parts" / "zone=33N" / "year=2017" / "update.parquet").unlink()
         update_cell(LOCAL, str(registry), "33N", 2017)
         assert pq.read_table(registry / self.MASTER).column("run_id").to_pylist() == ["run-a", "rebuild-1"]
 
@@ -440,29 +440,29 @@ def _parts_of(*runs: tuple[str, str, list[str]]) -> pa.Table:
     return _parts([_row(t, measured=True, stamp=stamp, run_id=run) for run, stamp, tiles in runs for t in tiles])
 
 
-_FILL_AND_INFILL = _parts_of(("run-a", FILLED, ["chunk_0_0", "chunk_0_1"]), ("run-c", LATER, ["chunk_0_1"]))
+_FILL_AND_UPDATE = _parts_of(("run-a", FILLED, ["chunk_0_0", "chunk_0_1"]), ("run-c", LATER, ["chunk_0_1"]))
 
 
 class TestTheStoreStandsBehindTheParts:
     """Newest-part-wins is right only if the parts account for every run the store says wrote the year."""
 
     def test_parts_for_every_run_stamped_with_their_commits_pass(self) -> None:
-        assert store_disagreements(_FILL_AND_INFILL, _store(_A, _C)) == []
+        assert store_disagreements(_FILL_AND_UPDATE, _store(_A, _C)) == []
 
     def test_a_run_with_no_part_that_last_wrote_a_tile_is_refused(self) -> None:
-        """A refill that never published, then an infill that did: the store's latest run has a part,
+        """A refill that never published, then an update that did: the store's latest run has a part,
         but ``chunk_0_0`` holds the refill's pixels, and the parts describe it by the original fill.
         """
-        (found,) = store_disagreements(_FILL_AND_INFILL, _store(_A, _B, _C))
+        (found,) = store_disagreements(_FILL_AND_UPDATE, _store(_A, _B, _C))
         assert "run 'run-b' committed at" in found and "last wrote 1 tile(s)" in found and "chunk_0_0" in found
 
     def test_a_run_with_no_part_that_later_runs_wrote_over_does_not_block(self) -> None:
         """It describes nothing the store still holds, so refilling its tiles is how a cell recovers."""
-        assert store_disagreements(_FILL_AND_INFILL, _store(_A, _B, _C, wrote=_WROTE | {"snap-b": {"chunk_0_1"}})) == []
+        assert store_disagreements(_FILL_AND_UPDATE, _store(_A, _B, _C, wrote=_WROTE | {"snap-b": {"chunk_0_1"}})) == []
 
     def test_a_part_stamped_away_from_its_commit_is_refused(self) -> None:
         """Commit order is the order a tile's pixels landed in; any other stamp can pick the wrong run."""
-        found = store_disagreements(_FILL_AND_INFILL, _store(_A, _C._replace(at="2026-08-09T00:00:01+00:00")))
+        found = store_disagreements(_FILL_AND_UPDATE, _store(_A, _C._replace(at="2026-08-09T00:00:01+00:00")))
         assert any("run 'run-c'" in entry and "misordered" in entry for entry in found)
 
     @pytest.mark.parametrize(
@@ -487,7 +487,7 @@ class TestTheStoreStandsBehindTheParts:
         assert f"committed at {MIDWAY} and last wrote 1 tile(s) no part describes" in found
 
     def test_a_part_naming_a_run_the_store_never_committed_is_refused(self) -> None:
-        (found,) = store_disagreements(_FILL_AND_INFILL, _store(_A))
+        (found,) = store_disagreements(_FILL_AND_UPDATE, _store(_A))
         assert "run 'run-c' has a part" in found
 
     @pytest.mark.parametrize(
@@ -507,7 +507,7 @@ class TestTheStoreStandsBehindTheParts:
         """v1.1's records name no commit: one with a part is taken on trust, one without cannot be bounded,
         and one that marked the year empty left no embeddings to describe.
         """
-        found = store_disagreements(_FILL_AND_INFILL, _store(*commits))
+        found = store_disagreements(_FILL_AND_UPDATE, _store(*commits))
         assert [phrase for phrase in expected if any(phrase in entry for entry in found)] == expected
         assert len(found) == len(expected)
 
@@ -520,7 +520,7 @@ class TestConcurrentWriters:
     def test_a_writer_overtaken_between_its_reads_and_its_write_merges_again(
         self, registry: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The infill lands after this writer read the parts and before it writes, which an unconditional
+        """An update run lands after this writer read the parts and before it writes, which an unconditional
         write would then overwrite with the cell as it was, both updates reporting success.
         """
         read, landed = registry_master.read_cell, []
@@ -528,18 +528,18 @@ class TestConcurrentWriters:
         def overtaken(fs: object, root: str, prefix: str, zone: str, year: int, schema: pa.Schema) -> pa.Table:
             if prefix == "master" and not landed:
                 landed.append(True)
-                _publish(registry, "infill", [_row("chunk_0_0", measured=True, stamp=LATER, run_id="infill")])
+                _publish(registry, "update", [_row("chunk_0_0", measured=True, stamp=LATER, run_id="update")])
                 update_cell(LOCAL, str(registry), "33N", 2017)
             return read(fs, root, prefix, zone, year, schema)
 
         monkeypatch.setattr(registry_master, "read_cell", overtaken)
         update_cell(LOCAL, str(registry), "33N", 2017)
         assert landed, "the race was staged"
-        assert pq.read_table(registry / self.MASTER).column("run_id").to_pylist() == ["infill", "rebuild-1"]
+        assert pq.read_table(registry / self.MASTER).column("run_id").to_pylist() == ["update", "rebuild-1"]
 
     def test_a_write_built_on_a_stale_read_is_refused_and_changes_nothing(self, registry: Path) -> None:
         stale = cell_version(LOCAL, str(registry), "33N", 2017)
-        _publish(registry, "infill", [_row("chunk_0_0", measured=True, stamp=LATER, run_id="infill")])
+        _publish(registry, "update", [_row("chunk_0_0", measured=True, stamp=LATER, run_id="update")])
         update_cell(LOCAL, str(registry), "33N", 2017)
         current = (registry / self.MASTER).read_bytes()
         assert not write_cell(LOCAL, str(registry), "33N", 2017, _fill(_AUDITED), version=stale)

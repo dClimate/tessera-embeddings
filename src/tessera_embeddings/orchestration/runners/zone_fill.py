@@ -364,7 +364,7 @@ def _update_registry_master(
     This is what keeps the master current: every fill merges its cell's parts into the cell's
     existing master file, tile by tile
     (:func:`~tessera_embeddings.storage.registry_master.update_cell`), so a refill, a new year or
-    an infill reaches consumers as it lands. Called before the tag, because a deliberate refill
+    an update of some tiles reaches consumers as it lands. Called before the tag, because a deliberate refill
     fails at the tag step once its data and part have landed. Best-effort for the reason
     ``publish_registry_part`` is: the cell has committed, and a registry failure must not fail it
     or keep it from being tagged. A failure —

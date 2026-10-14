@@ -31,9 +31,9 @@ and means a cell whose earlier update failed is healed by its next one.
 staged or refused and leaves the year's other shards as they were (``assemble_global``'s refill
 caveat). So the store holds each tile as the most recently committed run that wrote it left it,
 whichever run supplied the cell's other tiles, and the master follows the store: a full refill
-supersedes every tile, and a partial run such as an infill supersedes only its own and removes
-none. A run's row must therefore describe the whole tile as that run leaves it, because it becomes
-the tile's only row. ``filled_at`` names the run a row describes, by its part's stamp, which is the
+supersedes every tile, and an update of some tiles supersedes only its own and removes none. A
+run's row must therefore describe the whole tile as that run leaves it, because it becomes the
+tile's only row. ``filled_at`` names the run a row describes, by its part's stamp, which is the
 run's shard commit time: Icechunk refuses a commit older than its parent, so the newest parsed
 ``filled_at`` is the run whose pixels the store holds, and a measurement re-derived against a
 superseded run loses to the newer run's row, measured or not.

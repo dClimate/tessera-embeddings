@@ -96,7 +96,7 @@ tile as the most recently committed run that wrote it left it, and the master fo
 |---|---|
 | a new year | its tiles are added |
 | a full refill | every tile it wrote supersedes the old row |
-| a partial run, such as a targeted update | only the tiles it wrote are replaced; every other tile keeps its row |
+| an update, which rewrites only some tiles | only the tiles it wrote are replaced; every other tile keeps its row |
 | a re-derived measurement | fills a row the fill left null, for the run that row describes |
 
 `filled_at` is what names the run. A part is stamped with its run's shard commit timestamp, taken
@@ -116,11 +116,11 @@ rather than letting text order pick a run. Remaining ties fall to `run_id`, so e
 same rows writes the same file.
 
 **A run's row must describe the whole tile as that run leaves it.** Per-tile latest-wins makes the
-newest run's row the tile's only row. A run that rewrites some of a tile's pixels must therefore
-publish measurements for the whole tile afterwards, not for the rewritten pixels alone, or the
-master will describe a fraction of the tile as if it were all of it. A targeted update that fills a
-tile's holes does this by re-deriving the tile's row from the shard it committed; its rows also name
-it in `update_name` ([ADR 027](../decisions/027-targeted-updates.md)).
+newest run's row the tile's only row. An update that rewrites some of a tile's pixels must therefore
+publish measurements for the whole tile after the update, not for the rewritten pixels alone, or the
+master will describe a fraction of the tile as if it were all of it. An update that fills a tile's
+holes does this by re-deriving the tile's row from the shard it committed; its rows also name it in
+`update_name` ([ADR 027](../decisions/027-targeted-updates.md)).
 
 ## The store stands behind the parts
 
@@ -208,7 +208,7 @@ its cell has no part at all. `--parts-only` skips the store for a registry copy 
 |---|---|
 | one row per tile-year; `measured_by` agrees with the numbers | a duplicated or mislabelled row |
 | every tile in `parts/` present, and none that no part names | a cell whose update failed, or a stray row |
-| each row from its tile's latest run | a refill or infill whose update failed |
+| each row from its tile's latest run | a refill or an update whose master write failed |
 | fill-measured rows equal `parts/` for the latest run: measurements, `run_id` and `assembled_at` | a fill row the master altered |
 | `embedded`, the bounding box, the depth rule and the build equal the latest run's fill row | a row, re-derived or not, carrying another row's fields |
 | no unmeasured rows | a fill that published nulls |
