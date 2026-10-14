@@ -91,7 +91,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--zones", help="comma-separated zones")
     parser.add_argument("--years", help="comma-separated years")
     parser.add_argument("--cells", help="from-cells: CSV of zone,year,tile")
-    parser.add_argument("--region", default=None, help="S3 region for the mask read")
+    parser.add_argument("--region", default=None, help="S3 region of the registry and the mask (default us-west-2)")
     parser.add_argument("--write", action="store_true", help="save the plan; without it this is a dry run")
     args = parser.parse_args(argv)
 
@@ -117,9 +117,11 @@ def main(argv: list[str] | None = None) -> int:
             years=[int(y) for y in args.years.split(",")] if args.years else None,
             where=args.where,
             aoi=aoi,
-            storage_options={"skip_signature": "true", "aws_region": args.region or "us-west-2"}
-            if args.anonymous
-            else None,
+            # The region always: without it the scan asks us-east-1 and S3 answers with a redirect.
+            storage_options={
+                "aws_region": args.region or "us-west-2",
+                **({"skip_signature": "true"} if args.anonymous else {}),
+            },
             **fields,
         )
     else:
