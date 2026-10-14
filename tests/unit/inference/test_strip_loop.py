@@ -10,6 +10,7 @@ result must not depend on how the input is tiled.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import threading
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -31,7 +32,7 @@ from tessera_embeddings.config.store_layout import (
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.actors import InferenceActor
 from tessera_embeddings.inference.assembly import summarise_optical_skips
-from tessera_embeddings.inference.chunk_spec import ChunkSpec
+from tessera_embeddings.inference.chunk_spec import ChunkSpec, write_pixel_mask
 from tessera_embeddings.inference.read_plan import (
     _MIN_STRIP_H,
     _S2_STRIP_BYTE_BUDGET,
@@ -136,6 +137,32 @@ class TestStripPlan:
         assert strips == [slice(8, 12), slice(4, 8), slice(0, 4)]
         assert live == 2
 
+    def test_a_holes_plan_reads_only_the_rows_and_columns_with_holes(self):
+        """An update infers only its holes, so the plan crops to them and drops strips with none.
+
+        A hole with no optical observation can never be inferred, so it neither widens the crop nor
+        keeps a strip alive.
+        """
+        obs = np.ones((12, 10), dtype=np.uint16)
+        obs[0, :] = 0
+        holes = np.zeros((12, 10), dtype=bool)
+        holes[0, 0] = True  # no optical observation
+        holes[5:7, 2:4] = True
+        holes[9, 3] = True
+        bundle = SimpleNamespace(mask=np.zeros((3, 12, 10), dtype=bool), obs_count=obs)
+        with patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(4)):
+            x_sub, strips, live = _read_plan_mod._chunk_read_plan(_CHUNK, bundle, pixels=holes)
+        assert x_sub == slice(2, 4)
+        assert (strips, live) == ([slice(5, 9), slice(9, 10)], 2)
+
+    def test_a_holes_plan_with_nothing_to_infer_keeps_one_strip(self):
+        """The chunk must still resolve to a skip, so one (empty) strip remains to run."""
+        obs = np.zeros((12, 10), dtype=np.uint16)
+        bundle = SimpleNamespace(mask=np.zeros((3, 12, 10), dtype=bool), obs_count=obs)
+        with patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(4)):
+            _x_sub, strips, live = _read_plan_mod._chunk_read_plan(_CHUNK, bundle, pixels=np.ones((12, 10), bool))
+        assert (len(strips), live) == (1, 0)
+
     def test_a_cropped_read_still_charges_the_full_width_mask(self):
         # Bands are read at the cropped width, but the SCL mask stays full chunk width.
         assert _strip_plan(120, 2000, 1000, mask_width=2000)[0].stop < _strip_plan(120, 2000, 1000)[0].stop
@@ -210,7 +237,7 @@ def _open_store_side_effect(n_t_sar: int = 5):
     return store_opener(_CHUNK, n_t_s2=8, n_t_sar=n_t_sar)
 
 
-def _run_process_chunk(inference_config, test_model, n_t_sar: int = 5):
+def _run_process_chunk(inference_config, test_model, n_t_sar: int = 5, chunk: ChunkSpec = _CHUNK):
     """Run process_chunk capturing the single whole-chunk write."""
     inference_config.s1_orbit = "both"
     # Synthetic stores carry 2024 dates; align the window so the filter keeps them.
@@ -224,7 +251,7 @@ def _run_process_chunk(inference_config, test_model, n_t_sar: int = 5):
         patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_open_store_side_effect(n_t_sar)),
         patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
     ):
-        result = actor.process_chunk(_CHUNK, "s3://b/m", "/tmp/staging", "run-1")
+        result = actor.process_chunk(chunk, "s3://b/m", "/tmp/staging", "run-1")
         # The staging write is deferred to the actor's writer thread; drain it
         # so last_write reflects this chunk before we read it.
         flushed = actor.flush_writes()
@@ -274,6 +301,31 @@ class TestProcessChunkStriping:
             # whole-chunk mask bundle, radar is assigned from each strip's own array.
             for var in MONTH_COVERED_FOR_OBS.values():
                 np.testing.assert_array_equal(write_one["month_covered"][var], other["month_covered"][var], err_msg=var)
+
+    def test_a_holes_tile_reads_only_its_holes_and_infers_them_as_a_full_run_does(
+        self, inference_config, test_model, tmp_path
+    ):
+        """Rows and columns without holes are never loaded, and the hole pixels come out as in a full run."""
+        holes = np.zeros((_CHUNK.height, _CHUNK.width), dtype=bool)
+        holes[9:11, 2:5] = True
+        write_pixel_mask(str(tmp_path / "holes.npz"), holes)
+        real_load, loaded = _actors_mod.load_chunk, []
+
+        def _spy(*args, **kwargs):
+            loaded.append((kwargs["y_sub"], kwargs["x_sub"]))
+            return real_load(*args, **kwargs)
+
+        with patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(4)):
+            _, full = _run_process_chunk(inference_config, test_model)
+            with patch.object(_actors_mod, "load_chunk", side_effect=_spy):
+                result, part = _run_process_chunk(
+                    inference_config, test_model, chunk=dataclasses.replace(_CHUNK, pixels=str(tmp_path / "holes.npz"))
+                )
+
+        assert loaded == [(slice(9, 11), slice(2, 5))]
+        assert result["valid_pixels"] == holes.sum()
+        np.testing.assert_array_equal(part["embeddings"][holes], full["embeddings"][holes])
+        np.testing.assert_allclose(part["scales"][holes], full["scales"][holes], rtol=1e-6)
 
     def test_month_coverage_is_populated_and_agrees_with_the_obs_count(self, inference_config, test_model):
         """The actor must pass month flags that describe its own observations.
@@ -1019,8 +1071,8 @@ class TestTheRecordTheConsumerWillRead:
             # the crop is derived from the columns holding valid pixels, and here there are none.
             real_plan = _actors_mod._chunk_read_plan
 
-            def _cropped(chunk, mask_bundle):
-                _x_sub, strips, live = real_plan(chunk, mask_bundle)
+            def _cropped(chunk, mask_bundle, pixels=None):
+                _x_sub, strips, live = real_plan(chunk, mask_bundle, pixels)
                 return crop, strips, live
 
             monkeypatch.setattr(_actors_mod, "_chunk_read_plan", _cropped)

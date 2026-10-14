@@ -512,7 +512,9 @@ class InferenceActor:
         """
         store_opener = make_store_opener(region=self._s3_region)
         mask_bundle = load_s2_mask_bundle(mosaic_base, chunk, time_window, store_opener=store_opener)
-        x_sub, strips, live_strips = _chunk_read_plan(chunk, mask_bundle)
+        x_sub, strips, live_strips = _chunk_read_plan(
+            chunk, mask_bundle, pixels=None if chunk.pixels is None else _pixel_mask(chunk.pixels)
+        )
         first_strip = self._load_strip_dataset(
             chunk,
             mosaic_base,

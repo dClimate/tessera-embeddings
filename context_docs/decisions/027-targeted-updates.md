@@ -28,8 +28,9 @@ explicit list (`scripts/update/plan_update.py`).
 | `shards` | every valid pixel | the whole shard, every array | a model or defect fix |
 
 `holes` is the cheap one. The model embeds each pixel independently and the dataset batches only
-valid pixels, so a pixel excluded by the hole mask costs the GPU nothing; what remains per tile is
-reading its imagery. A hole pixel takes every array the new run produced, its observation counts and
+valid pixels, so a pixel excluded by the hole mask costs the GPU nothing, and the read plan covers
+only the rows and columns holding holes (`inference/read_plan.py`), so imagery around no hole is
+never read. A hole pixel takes every array the new run produced, its observation counts and
 month coverage included, even where it is still refused, so the store shows the newest imagery for
 every pixel the update touched. A pixel that already held an embedding keeps the counts that
 embedding was built from: the per-pixel provenance stays exact.
