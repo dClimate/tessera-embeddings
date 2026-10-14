@@ -25,7 +25,7 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
-from typing import Any, Literal, NamedTuple, get_args
+from typing import Any, Literal, NamedTuple, cast, get_args
 
 import numpy as np
 import yaml
@@ -44,7 +44,7 @@ from tessera_embeddings.config.inference import (
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
 from tessera_embeddings.config.paths import BucketPaths, check_update_name
 from tessera_embeddings.config.time_windows import parse_time_window
-from tessera_embeddings.inference.assembly import ZarrWriter
+from tessera_embeddings.inference.assembly import SpatialCoords, ZarrWriter, assert_on_store_grid, read_spatial_coords
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, filter_chunks_by_roi_mask
 from tessera_embeddings.inference.data_loading import _active_orbits, resolve_s1_orbit
 from tessera_embeddings.inference.orchestration_helpers import (
@@ -272,6 +272,8 @@ def _plan_update(
     roi_name: str,
     window: str,
     chunks: list[ChunkSpec],
+    spatial: SpatialCoords | None,
+    extent: tuple[int, int],
     holes_prefix: str,
     log: logging.Logger,
 ) -> _Update | None:
@@ -281,6 +283,8 @@ def _plan_update(
     ``holes`` (the default), which infers only the pixels the store holds no embedding for, or
     ``shards``, which rewrites whole tiles; ``tiles`` narrows it to those tiles of the area. The
     update is recorded in the store's root ``updates`` attr under its window's year, once per name.
+    The mosaics (``spatial``, ``extent``) must lie on the store's grid, since tiles are written by
+    position.
     """
     if unknown := sorted(set(update) - {"name", "mode", "tiles"}):
         raise ValueError(f"update takes name, mode and tiles; got {unknown}")
@@ -288,6 +292,8 @@ def _plan_update(
     if mode not in get_args(UpdateMode):
         raise ValueError(f"update mode must be 'holes' or 'shards'; got {mode!r}")
     root = zarr.open_group(open_global_repo(output_path).readonly_session(branch="main").store, mode="r")
+    width = int(cast(zarr.Array, root["embeddings"]).shape[3])
+    assert_on_store_grid(root, spatial, total_y=extent[0], total_x=extent[1], embedding_dim=width, where=output_path)
     time_index = time_index_of(root, np.datetime64(window, "ns"))
     if time_index is None:
         raise ValueError(f"{output_path} holds no {window} window to update; run without `update` first")
@@ -455,6 +461,8 @@ def _run_inference_and_assemble(
             roi_name=roi_name,
             window=time_window.window_end_label,
             chunks=live_chunks,
+            spatial=read_spatial_coords(mosaic_base),
+            extent=(total_y, total_x),
             # Beside the run's staging and removed with it; a retry reuses them, so it infers the
             # pixels the first attempt did even after those landed.
             holes_prefix=f"{run_staging}-holes",

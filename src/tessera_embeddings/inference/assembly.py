@@ -570,6 +570,87 @@ class StagedResume:
     skipped: set[str]
 
 
+def assert_on_store_grid(
+    root: zarr.Group,
+    spatial: SpatialCoords | None,
+    *,
+    total_y: int,
+    total_x: int,
+    embedding_dim: int,
+    where: str,
+) -> None:
+    """Refuse mosaics whose grid is not the store's: a write into an existing store is positional.
+
+    Shared by an append to a single-area store and an update of one, which both write staged pixels
+    into the store's existing coordinate arrays.
+    """
+    # The store's own grid is authoritative: on a mismatched extent a raw region write
+    # would silently land in a corner, or be clamp-truncated.
+    emb = cast(zarr.Array, root["embeddings"])
+    if emb.shape[1] != total_y or emb.shape[2] != total_x or emb.shape[3] != embedding_dim:
+        raise ValueError(
+            f"Mosaic extent ({total_y} x {total_x} x {embedding_dim} bands) does not match "
+            f"existing store {where} ({emb.shape[1]} x {emb.shape[2]} x {emb.shape[3]} bands) "
+            "— wrong output path, ROI grid, or model width."
+        )
+    # Shape alone cannot catch a shifted or reversed mosaic on the same grid size (the
+    # manifest omits origin), which would append under the existing coordinates and be
+    # silently misgeoreferenced. So compare CRS and coordinate endpoints against the
+    # stored grid, at half-pixel absolute tolerance as in the zone-fill runner.
+    #
+    # CRS is checked only when present: atomic publish means `main` only ever exposes a
+    # COMPLETE store, so a normal re-append always sees one, and the None guard covers
+    # only a legacy store left partial by a pre-atomic-publish engine. The coordinate
+    # ARRAYS are the real check.
+    if spatial is not None:
+        stored_crs = root.attrs.get("crs")
+        if stored_crs is not None and spatial.crs != stored_crs:
+            raise ValueError(
+                f"Mosaic CRS {spatial.crs!r} does not match existing store {where} "
+                f"CRS {stored_crs!r} — appending would misgeoreference the timestep."
+            )
+        z_north = cast(zarr.Array, root["northing"])
+        z_east = cast(zarr.Array, root["easting"])
+        atol = PIXEL_M / 2
+        if not (
+            np.isclose(spatial.northing[0], z_north[0], rtol=0.0, atol=atol)
+            and np.isclose(spatial.northing[-1], z_north[-1], rtol=0.0, atol=atol)
+            and np.isclose(spatial.easting[0], z_east[0], rtol=0.0, atol=atol)
+            and np.isclose(spatial.easting[-1], z_east[-1], rtol=0.0, atol=atol)
+        ):
+            raise ValueError(
+                f"Mosaic coordinates do not lie on existing store {where}'s grid "
+                "(shifted or reversed axes) — appending would silently misgeoreference the timestep."
+            )
+        # Extent, CRS and endpoints still do not pin an axis: a reordered or non-affine
+        # interior satisfies all three, and this phase writes staged pixels POSITIONALLY
+        # against the store's existing coordinate arrays, so such an append publishes real
+        # pixels at the wrong coordinates with nothing to signal it. Hence the full-vector
+        # comparison the zone-fill runner also makes — two 1-D reads per append. A
+        # per-step spacing test cannot substitute: whatever slack it admits per step, an
+        # axis that wanders and returns accumulates it while still matching the length and
+        # both endpoints. Reachable on the supported hand-provided mosaic path.
+        for axis, values, stored in (
+            ("northing", spatial.northing, z_north),
+            ("easting", spatial.easting, z_east),
+        ):
+            got = np.asarray(values, dtype="float64")
+            want = np.asarray(stored[:], dtype="float64")
+            # A float round-trip allowance, not a geometric one: coordinates round-trip
+            # through float32 at ~1 m near a 9.3e6 m northing, while any real displacement
+            # is a whole pixel.
+            bad = ~np.isclose(got, want, rtol=0.0, atol=1.0)
+            if bad.any():
+                i = int(np.argmax(bad))
+                raise ValueError(
+                    f"Mosaic {axis} does not match existing store {where}'s axis: "
+                    f"index {i} is {got[i]} where the store says {want[i]} "
+                    f"({int(bad.sum())} of {got.size} coordinates differ). Extent, CRS and "
+                    "endpoints all match, so this is a reordered or non-affine interior — "
+                    "appending would write real pixels at the wrong coordinates."
+                )
+
+
 def tile_extent(shard: tuple[int, int], shard_px: int, extent: tuple[int, int] | None) -> tuple[int, int]:
     """A tile's pixel size: one whole shard, cut short only where the destination's edge cuts it.
 
@@ -1996,71 +2077,9 @@ class ZarrWriter:
                 where=output_path,
             )
 
-            # The store's own grid is authoritative: on a mismatched extent a raw region write
-            # would silently land in a corner, or be clamp-truncated.
-            emb = cast(zarr.Array, root["embeddings"])
-            if emb.shape[1] != total_y or emb.shape[2] != total_x or emb.shape[3] != self.embedding_dim:
-                raise ValueError(
-                    f"Mosaic extent ({total_y} x {total_x} x {self.embedding_dim} bands) does not match "
-                    f"existing store {output_path} ({emb.shape[1]} x {emb.shape[2]} x {emb.shape[3]} bands) "
-                    "— wrong output path, ROI grid, or model width."
-                )
-            # Shape alone cannot catch a shifted or reversed mosaic on the same grid size (the
-            # manifest omits origin), which would append under the existing coordinates and be
-            # silently misgeoreferenced. So compare CRS and coordinate endpoints against the
-            # stored grid, at half-pixel absolute tolerance as in the zone-fill runner.
-            #
-            # CRS is checked only when present: atomic publish means `main` only ever exposes a
-            # COMPLETE store, so a normal re-append always sees one, and the None guard covers
-            # only a legacy store left partial by a pre-atomic-publish engine. The coordinate
-            # ARRAYS are the real check.
-            if spatial is not None:
-                stored_crs = root.attrs.get("crs")
-                if stored_crs is not None and spatial.crs != stored_crs:
-                    raise ValueError(
-                        f"Mosaic CRS {spatial.crs!r} does not match existing store {output_path} "
-                        f"CRS {stored_crs!r} — appending would misgeoreference the timestep."
-                    )
-                z_north = cast(zarr.Array, root["northing"])
-                z_east = cast(zarr.Array, root["easting"])
-                atol = PIXEL_M / 2
-                if not (
-                    np.isclose(spatial.northing[0], z_north[0], rtol=0.0, atol=atol)
-                    and np.isclose(spatial.northing[-1], z_north[-1], rtol=0.0, atol=atol)
-                    and np.isclose(spatial.easting[0], z_east[0], rtol=0.0, atol=atol)
-                    and np.isclose(spatial.easting[-1], z_east[-1], rtol=0.0, atol=atol)
-                ):
-                    raise ValueError(
-                        f"Mosaic coordinates do not lie on existing store {output_path}'s grid "
-                        "(shifted or reversed axes) — appending would silently misgeoreference the timestep."
-                    )
-                # Extent, CRS and endpoints still do not pin an axis: a reordered or non-affine
-                # interior satisfies all three, and this phase writes staged pixels POSITIONALLY
-                # against the store's existing coordinate arrays, so such an append publishes real
-                # pixels at the wrong coordinates with nothing to signal it. Hence the full-vector
-                # comparison the zone-fill runner also makes — two 1-D reads per append. A
-                # per-step spacing test cannot substitute: whatever slack it admits per step, an
-                # axis that wanders and returns accumulates it while still matching the length and
-                # both endpoints. Reachable on the supported hand-provided mosaic path.
-                for axis, values, stored in (
-                    ("northing", spatial.northing, z_north),
-                    ("easting", spatial.easting, z_east),
-                ):
-                    got = np.asarray(values, dtype="float64")
-                    want = np.asarray(stored[:], dtype="float64")
-                    # A float round-trip allowance, not a geometric one: coordinates round-trip
-                    # through float32 at ~1 m near a 9.3e6 m northing, while any real displacement
-                    # is a whole pixel.
-                    bad = ~np.isclose(got, want, rtol=0.0, atol=1.0)
-                    if bad.any():
-                        i = int(np.argmax(bad))
-                        raise ValueError(
-                            f"Mosaic {axis} does not match existing store {output_path}'s axis: "
-                            f"index {i} is {got[i]} where the store says {want[i]} "
-                            f"({int(bad.sum())} of {got.size} coordinates differ). Extent, CRS and "
-                            "endpoints all match, so this is a reordered or non-affine interior — "
-                            "appending would write real pixels at the wrong coordinates."
-                        )
+            assert_on_store_grid(
+                root, spatial, total_y=total_y, total_x=total_x, embedding_dim=self.embedding_dim, where=output_path
+            )
             # Variables staged by this run but absent from the store (a store created before obs
             # counts, or compute_std newly on) are created schema-only at the current time extent;
             # prior timesteps read back as the layout fill.

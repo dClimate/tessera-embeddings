@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pathlib
+
 import icechunk
 import numpy as np
 import pyarrow as pa
@@ -213,7 +215,9 @@ def test_a_base_tag_pins_the_first_snapshot_only(zone_repo):
 
 
 def test_hole_masks_cover_the_holes_and_are_reused(tmp_path, zone_repo):
-    """Tiles with holes get a mask; a hole-free tile is left out; a retry reads the first mask back."""
+    """Tiles with holes get a mask; a hole-free tile is left out; a retry reads the first mask back,
+    unless an interrupted write cut it short.
+    """
     session = zone_repo.writable_session("main")
     scales = zarr.open_group(session.store, mode="a")["01N"]["scales"]
     scales[0] = np.ones((8, 8), dtype="float32")
@@ -225,6 +229,9 @@ def test_hole_masks_cover_the_holes_and_are_reused(tmp_path, zone_repo):
     masks = upd.stage_hole_masks(_node(zone_repo), year_index=0, chunks=chunks, prefix=prefix)
 
     assert list(masks) == ["chunk_0_0"]
+    assert read_pixel_mask(masks["chunk_0_0"]).sum() == 4
+    pathlib.Path(masks["chunk_0_0"]).write_bytes(b"PK\x03\x04")
+    assert upd.stage_hole_masks(_node(zone_repo), year_index=0, chunks=chunks, prefix=prefix) == masks
     assert read_pixel_mask(masks["chunk_0_0"]).sum() == 4
     session = zone_repo.writable_session("main")
     zarr.open_group(session.store, mode="a")["01N"]["scales"][0, :2, :2] = 1.0

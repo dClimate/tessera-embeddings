@@ -10,7 +10,7 @@ import zarr
 
 from tessera_embeddings.config.store_layout import DIMS_3D, DIMS_4D, ArrayLayout, StoreLayout
 from tessera_embeddings.config.time_windows import parse_time_window
-from tessera_embeddings.inference.assembly import ZarrWriter
+from tessera_embeddings.inference.assembly import SpatialCoords, ZarrWriter
 from tessera_embeddings.inference.chunk_spec import enumerate_chunks
 from tessera_embeddings.orchestration.runners.plain import _plan_update, _write_update
 from tessera_embeddings.storage.global_store import open_global_repo
@@ -26,6 +26,8 @@ _SCL = ArrayLayout(DIMS_3D, (1, _INNER, _INNER), "float32", float("nan"), "pcode
 SMALL = StoreLayout(name="small", arrays={"embeddings": _EMB, "scales": _SCL})
 WINDOW = parse_time_window("June 2025")
 CHUNKS = enumerate_chunks(_NY, _NX, chunk_size=_TILE)
+#: The grid a store assembled without mosaics is given: pixel indices.
+GRID = SpatialCoords(northing=np.arange(_NY), easting=np.arange(_NX))
 
 
 def _stage(writer: ZarrWriter, run_id: str, value: int, *, holes: bool) -> None:
@@ -54,13 +56,15 @@ def area(tmp_path):
     return {"writer": writer, "output": output, "holes": str(tmp_path / "holes")}
 
 
-def _plan(area, **update):
+def _plan(area, window: str = WINDOW.window_end_label, spatial: SpatialCoords = GRID, **update):
     return _plan_update(
         {"name": "u1", **update},
         output_path=area["output"],
         roi_name="roi",
-        window=WINDOW.window_end_label,
+        window=window,
         chunks=CHUNKS,
+        spatial=spatial,
+        extent=(_NY, _NX),
         holes_prefix=area["holes"],
         log=log,
     )
@@ -95,26 +99,19 @@ def test_a_shards_update_rewrites_only_its_tiles_whole(area):
 
 
 @pytest.mark.parametrize(
-    ("update", "match"),
+    ("plan", "match"),
     [
         ({"tile": ["chunk_0_0"]}, "takes name, mode and tiles"),
         ({"mode": "all"}, "mode must be"),
         ({"tiles": ["chunk_9_9"]}, "outside the area"),
+        ({"window": parse_time_window("June 2024").window_end_label}, "run without `update` first"),
+        # Tiles are written by position, so mosaics a pixel off the store's grid would land a pixel off.
+        (
+            {"spatial": SpatialCoords(northing=GRID.northing, easting=GRID.easting + 10.0)},
+            "do not lie on existing store",
+        ),
     ],
 )
-def test_a_malformed_update_is_refused(area, update, match):
+def test_an_update_that_cannot_be_planned_is_refused(area, plan, match):
     with pytest.raises(ValueError, match=match):
-        _plan(area, **update)
-
-
-def test_an_update_needs_its_window_in_the_store(area):
-    with pytest.raises(ValueError, match="run without `update` first"):
-        _plan_update(
-            {"name": "u1"},
-            output_path=area["output"],
-            roi_name="roi",
-            window=parse_time_window("June 2024").window_end_label,
-            chunks=CHUNKS,
-            holes_prefix=area["holes"],
-            log=log,
-        )
+        _plan(area, **plan)
