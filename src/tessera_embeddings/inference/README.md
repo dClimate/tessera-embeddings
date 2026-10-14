@@ -359,6 +359,13 @@ strip's inference, so an empty or sparse strip early in the order — the top ro
 footprint's edge — would leave the next load exposed with the card idle. The order does not change
 which pixels share a sub-batch, so the outputs are the same in any order.
 
+**A `holes` update reads only where its holes are.** Given a tile's hole mask (`ChunkSpec.pixels`),
+`_chunk_read_plan` plans from the holes that have an optical observation: the column crop and the
+rows it tiles shrink to their bounding box, and a strip without one is not read at all, since the
+update keeps the store's values outside its holes. A read still decompresses whole 512-row inner
+chunks (below), so a hole costs the rows of its chunk; the column crop saves the per-pixel work
+after the read.
+
 **Peak host memory has one ceiling.** The load pipeline is one strip deep, so at most two
 band sets co-reside — the strip being inferred and the strip being read — and the pair is
 bounded at twice the budget. A full year of Iowa peaked at 50% of a 32 GB worker, under the
