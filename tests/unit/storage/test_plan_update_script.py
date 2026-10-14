@@ -48,6 +48,12 @@ def test_a_plan_from_cells_is_checked_then_written(script: Any, tmp_path: Path, 
     plan = load_update(BucketPaths(inputs=str(inputs), outputs=""), "u1", mask_name="coverage")
     assert plan.cells == {"31N/2024": ("chunk_10_5", "chunk_12_5"), "31N/2025": None}
 
+    # Clearing never reaches a dead shard, so such a plan could never run; it is refused, not written.
+    clearing = [*argv[:2], "u2", *argv[3:], "--cells", cells, "--on-skip", "clear", "--write"]
+    with pytest.raises(SystemExit, match="dead in the mask"):
+        script.main(clearing)
+    assert not (inputs / "updates" / "u2").exists()
+
 
 def test_a_plan_for_another_grid_is_refused(script: Any, tmp_path: Path) -> None:
     inputs = tmp_path / "in"
