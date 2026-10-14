@@ -777,6 +777,16 @@ def plan_zone_inference(
     # the single-ROI pixel mask needs.
     chunks = enumerate_chunks(ny, nx, shard_px)
     live = [c for c in chunks if bool(tile_live[c.row, c.col])]
+    if update is not None and update.on_skip == "clear":
+        # Clearing only reaches tiles the mask calls land, so a listed dead tile would keep its old
+        # data while the update recorded the cell as done.
+        dead = sorted(set(update.tiles or ()) - {c.label for c in live})
+        if dead:
+            raise ValueError(
+                f"Update {update.name!r} would clear {dead} in {zone}/{year}, but its mask has no land "
+                "there, so they would never be written. Plan them under a mask where they are land, or "
+                "leave them out."
+            )
     log.info(
         "Zone %s year %d: %d/%d tiles are live in the campaign coverage mask (run %s)",
         zone,

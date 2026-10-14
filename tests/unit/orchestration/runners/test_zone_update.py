@@ -179,6 +179,13 @@ def test_a_target_that_embeds_nothing_is_kept_unless_the_plan_clears_it(filled, 
     assert (record["kept"], record["cleared"]) == (([], ["chunk_0_1"]) if cleared else (["chunk_0_1"], []))
 
 
+def test_a_clearing_update_refuses_a_target_the_mask_has_no_land_in(filled, monkeypatch):
+    """Clearing never reaches a dead tile, so listing one would leave its old data under a done record."""
+    monkeypatch.setattr(zone_fill, "run_inference", lambda *a, **k: pytest.fail("inferred a refused plan"))
+    with pytest.raises(ValueError, match=r"would clear \['chunk_1_0'\]"):
+        _update(filled, monkeypatch, _target(filled, tiles=("chunk_0_1", "chunk_1_0"), on_skip="clear"))
+
+
 def test_a_holes_update_refuses_the_radar_rule(filled, monkeypatch):
     """Its registry rows are re-derived from the store, which cannot reproduce a radar refusal."""
     monkeypatch.setattr(zone_fill, "run_inference", lambda *a, **k: pytest.fail("inferred under the radar rule"))
