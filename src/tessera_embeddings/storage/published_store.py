@@ -260,13 +260,14 @@ def committed_runs(attrs: Mapping[str, Any], year: int, writes: Sequence[Commit]
     the commit is still there to diff, and nothing can afterwards.
     """
     head = (attrs.get("runs") or {}).get(str(year))
-    entries = [head, *head.get("previous", [])] if isinstance(head, dict) else []
+    current, replaced = ([head], head.get("previous", [])) if isinstance(head, dict) else ([], [])
     tagged = {commit.snapshot for commit in writes}
-    recorded = [c for i, entry in enumerate(entries) if (c := _recorded(entry, tagged, replaced=i > 0)) is not None]
+    recorded = [c for entry in current if (c := _recorded(entry, tagged)) is not None]
+    recorded += [c for entry in replaced if (c := _recorded(entry, tagged, replaced=True)) is not None]
     return sorted([*recorded, *writes], key=lambda c: datetime.fromisoformat(c.at))
 
 
-def _recorded(entry: Mapping[str, Any], tagged: set[str | None], *, replaced: bool) -> Commit | None:
+def _recorded(entry: Mapping[str, Any], tagged: set[str | None], *, replaced: bool = False) -> Commit | None:
     """A ``runs`` record entry as a commit with no snapshot, unless the tagged history has it, it wrote
     nothing, or a refill replaced it.
     """
