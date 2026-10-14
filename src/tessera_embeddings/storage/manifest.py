@@ -376,8 +376,8 @@ class EmbeddingManifest(StoreManifest):
     #: Here for the same reason as ``allow_s2_only`` above and by the same argument: it
     #: decides which pixels become embeddings and which stay fill, so two appends under
     #: different lines leave time slices that are not comparable and no other field would
-    #: notice. A store's advertised root rule is write-once for the same reason; this is the
-    #: per-append half of it.
+    #: notice. A global store's rule is only ever loosened, deliberately and on record, for the
+    #: same reason; this is the per-append half of it.
     #:
     #: In :data:`ABSENT_MEANS_OFF`, so a store written before this field existed still
     #: matches a later no-rule run — it genuinely had no rule — while an append that

@@ -929,11 +929,11 @@ def test_a_failed_master_update_does_not_fail_a_landed_cell(tmp_path, monkeypatc
     def unreachable(*_args: object, **_kwargs: object) -> list[str]:
         raise OSError("S3 500")
 
-    monkeypatch.setattr(zone_fill, "update_cell", unreachable)
+    monkeypatch.setattr(zone_fill, "merge_cell", unreachable)
     with caplog.at_level(logging.ERROR):
         summary = _fill_one_tile(tmp_path, str(tmp_path / "registry"))
     assert summary["tag"], "the cell landed and was tagged"
-    assert "registry master NOT updated" in caplog.text
+    assert "registry master NOT merged" in caplog.text
 
 
 def _all_skip_inference(num_actors, config, chunks, mosaic_base, staging_base, run_id, t0, log, **kwargs):
@@ -949,10 +949,8 @@ def _all_skip_inference(num_actors, config, chunks, mosaic_base, staging_base, r
     [(_staging_inference_stub({}), True), (_all_skip_inference, False)],
     ids=["its-part-published", "an-all-refused-run-whose-part-never-published"],
 )
-def test_a_retry_updates_the_master_a_fill_died_before_reaching(
-    tmp_path, monkeypatch, caplog, inference, part_survives
-):
-    """The retry finds the cell complete and skips the fill, so the update runs there or never.
+def test_a_retry_merges_the_master_a_fill_died_before_reaching(tmp_path, monkeypatch, caplog, inference, part_survives):
+    """The retry finds the cell complete and skips the fill, so planning merges the master or nothing does.
 
     An all-refused run over a tile the store held nothing for still shows in its commit's diff, so
     its retry refuses while its part is missing.
@@ -965,18 +963,18 @@ def test_a_retry_updates_the_master_a_fill_died_before_reaching(
         "registry_root": registry_root,
         "config": InferenceConfig(time_window=_window(2025), chunk_size=_TILE, num_gpus=0, optical_min_obs=15),
     }
-    update = zone_fill._update_registry_master
+    merge = zone_fill._merge_registry_master
 
     def died(*_args: object, **_kwargs: object) -> None:
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(zone_fill, "_update_registry_master", died)
+    monkeypatch.setattr(zone_fill, "_merge_registry_master", died)
     with pytest.raises(KeyboardInterrupt):
         _fill(tmp_path, store, **cell)
     if not part_survives:
         for part in (tmp_path / "registry" / "parts").rglob("*.parquet"):
             part.unlink()
-    monkeypatch.setattr(zone_fill, "_update_registry_master", update)
+    monkeypatch.setattr(zone_fill, "_merge_registry_master", merge)
     with caplog.at_level(logging.ERROR):
         assert _fill(tmp_path, store, **cell)["already_complete"] is True
     if part_survives:

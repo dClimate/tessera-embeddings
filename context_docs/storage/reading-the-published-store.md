@@ -451,9 +451,9 @@ two prefixes:
 | `master/` | 994 files at `master/zone=<ZONE>/year=<YEAR>/part-0.parquet` + `_common_metadata`, 151 MB | **what a consumer reads**: one row per tile-year, one schema, measurements on every row; its guide is [`docs/registry.md`](../../docs/registry.md), published beside it as `README.md` |
 | `parts/` | 994 files, 142 MB, at `parts/zone=<ZONE>/year=<YEAR>/<run_id>.parquet` | the fills' raw output, one part per cell per run, named by run id; internal |
 
-**`master/` describes what the store holds now.** Every fill merges its rows into its zone-year's
+**`master/` describes what the store holds now.** Every run merges its rows into its zone-year's
 master file tile by tile as it lands: a tile's row comes from the newest run that wrote that tile,
-and a tile no later run touched keeps its row. A refill or a future infill therefore reaches
+and a tile no later run touched keeps its row. A refill or a future update therefore reaches
 `master/` without anybody re-running anything, and a reader never has to choose between runs. See
 [`registry-master.md`](registry-master.md).
 

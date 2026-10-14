@@ -322,7 +322,9 @@ else ([ADR 027](../../../../context_docs/decisions/027-targeted-updates.md)). Th
    cells from the plan, and records itself on each cell.
 3. **Check and release it.** `update-<name>-base` pins the store before the first write and
    `update-<name>-complete` once every planned cell holds the record. Compare the two, then delete
-   `{inputs}/updates/<name>/` and, once satisfied, the base tag, which holds the replaced shards.
+   the update's `rois/`, `mosaics/` and `holes/` under `{inputs}/updates/<name>/`, keeping
+   `plan.json`, which reserves the name, and, once satisfied, the base tag, which holds the replaced
+   shards.
 
 | | campaign fill | update |
 |---|---|---|
@@ -411,18 +413,17 @@ The trace tag (`validates-cell-of:<id>`) is deliberately *not* the tag the cance
 hooks below sweep. A validation describes a cell that has already landed, holds no fleet,
 and is worth finishing even when its parent fill is cancelled.
 
-### A landed cell updates the registry master
+### A landed cell is merged into the registry master
 
 Once a cell with live tiles has committed and published its part, and before the tag, the
 runner merges its registry parts into the cell's file under the registry's `master/`
-(`runners/zone_fill.py`, `_update_registry_master`), so consumers read every fill as soon as
+(`runners/zone_fill.py`, `_merge_registry_master`), so consumers read every fill as soon as
 it lands, including a deliberate refill, which fails at the tag step by design. Like the
 validator dispatch, a failure there is logged and never fails the landed cell; the registry
 census names the cell and `scripts/maintenance/rebuild_registry_measurements.py repair`
-rebuilds it. A retry of a cell that already landed, or of an update already recorded, runs the
-master update again, so a process that died before it still reaches the master. The master update
-refuses while a run the store records writing the year has no part for a tile it last wrote;
-refilling those tiles clears it. See
+rebuilds it. Planning a retry of a cell that already landed, or of an update already recorded there, runs the merge again, on every runner
+and in triage, so a process that died before it still reaches the master. The merge refuses while a run the store records writing the
+year has no part for a tile it last wrote; refilling those tiles clears it. See
 [`registry-master.md`](../../../../context_docs/storage/registry-master.md).
 
 ### Cancelling reaches every level

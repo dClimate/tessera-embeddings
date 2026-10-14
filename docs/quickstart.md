@@ -193,6 +193,23 @@ Denver, CO — one inference chunk at 10 m resolution. To use your own AOI:
 3. Update `time_range` in `config.yaml` if you need a different
    season.
 
+## Updating part of an output
+
+A run writes a whole window. To redo part of one already in the store, after new imagery or a fix,
+add an `update` block to the config and run the pipeline again:
+
+```yaml
+update:
+  name: more-imagery    # recorded on the store; an update already recorded does nothing
+  mode: holes           # holes: only pixels with no embedding; shards: whole tiles
+  tiles: [chunk_0_1]    # optional; every tile of the area when omitted
+```
+
+Every pixel outside the update keeps its values. The store records the update in its root `updates`
+attribute and tags its state beforehand as `update-<name>-base`. The update infers from the area's
+mosaics as they are on disk, and ingest resumes them rather than redoing them, so delete the mosaics
+first to take in new imagery.
+
 ## Troubleshooting
 
 - **HTTP 401 on `datapool.asf.alaska.edu`** → either

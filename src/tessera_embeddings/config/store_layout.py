@@ -72,9 +72,9 @@ MONTH_COORD = tuple(range(1, MONTHS_IN_YEAR + 1))
 #: different things about what the embedding saw. Or-ing the three would report a pixel as covered in a month it was
 #: seen only by the sensor a given reader cannot use.
 #:
-#: **They gate nothing.** ``config.inference.OPTICAL_MIN_OBS`` remains the only rule deciding whether a pixel is
-#: embedded. These let a reader apply their own view of sufficiency without re-deriving it from imagery we do not
-#: publish — the mosaics behind them are deleted after a fill, so it is captured here or nowhere.
+#: **They gate nothing.** The fill's optical depth rule, the store's ``optical_min_obs`` for the zone, decides
+#: whether a pixel is embedded. These let a reader apply their own view of sufficiency without re-deriving it from
+#: imagery we do not publish — the mosaics behind them are deleted after a fill, so it is captured here or nowhere.
 #:
 #: Presence, not counts, and each mask partitions ITS OWN count: a month is covered when at least one timestep that
 #: month passed the same validity test the paired ``*_obs_count`` totals — SCL classes for optical, a non-zero

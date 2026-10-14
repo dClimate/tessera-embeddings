@@ -23,7 +23,9 @@ registry's `refused_thin_px` are invariants at 0, and a non-zero one means the g
 had a rule carries — every store seeded before 2026-08-13 — and it gives a reader nothing to check:
 the thin invariant has no line to be measured from, and a fill's assertion against the store
 compares nothing. `1` is stamped on the root, asserted by every fill, and written on every registry
-row and update record. Zero stays refused, as a rule that refuses nothing.
+row and update record. Zero stays refused, as a rule that refuses nothing. This is the global store's
+statement: a single-area run keeps `None`, which embeds the same pixels, because its manifest treats
+an absent rule as none and would refuse the next append to every existing single-area store.
 
 **A stamped rule can be loosened, never tightened, for the whole store or one zone at a time.**
 `storage/global_store.loosen_optical_min_obs`, one commit:
