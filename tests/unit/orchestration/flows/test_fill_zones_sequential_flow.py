@@ -159,9 +159,22 @@ def test_retag_and_ocean_cells_never_touch_the_cluster(wired, monkeypatch):
     # Both cells settled by the no-cluster fill path with the right run_ids...
     run_ids = {f["zone"]: f["run_id"] for f in wired["no_cluster_fills"]}
     assert run_ids == {"01N": "01N-2025-retag", "02N": "02N-2025-empty"}
+    # ...with the registry, so planning can catch up the master of a fill that died before merging it.
+    assert {f["registry_root"] for f in wired["no_cluster_fills"]} == {_PATHS.optical_registry(_PATHS.global_store())}
     # ...and no cluster was ever provisioned.
     assert wired["ray_kwargs"] is None and result["sequential"] is None
     assert result["retagged"] == 1 and result["empty"] == 1 and result["live"] == 0
+
+
+def test_a_streamed_cell_is_planned_with_the_registry(wired, monkeypatch):
+    """A cell the session finds already landed has its master caught up in planning, which needs the registry."""
+    seen: dict = {}
+    monkeypatch.setattr(mod, "plan_zone_inference", lambda **k: seen.update(k))
+    _run(zones=["33N"])
+    wired["seq_kwargs"]["plan"](
+        SimpleNamespace(zone="33N", year=2025), SimpleNamespace(mosaic_base="m", config=None, run_id="r")
+    )
+    assert seen["registry_root"] == _PATHS.optical_registry(_PATHS.global_store())
 
 
 class TestAnUpdate:
@@ -210,8 +223,11 @@ class TestAnUpdate:
         assert (result["update"], result["update_done"], result["not_filled"]) == ("u1", 1, [["03N", 2025]])
         assert result["live"] == 1 and result["empty"] == 1
         assert update_wired["tiles"]["01N"] == (_PATHS.land_mask_store("alt"), frozenset({"chunk_0_0"}))
-        # The dead-target cell records itself through the runner, with no cluster and as an update.
-        [dead] = update_wired["no_cluster_fills"]
+        # The recorded cell goes through the runner too, so planning catches up its master; the
+        # dead-target cell records itself there. Both with no cluster, as the update.
+        recorded, dead = sorted(update_wired["no_cluster_fills"], key=lambda f: f["zone"])
+        assert recorded["zone"] == "02N" and recorded["update"].name == "u1"
+        assert recorded["registry_root"] == dead["registry_root"] == _PATHS.optical_registry(_PATHS.global_store())
         assert dead["update"].tiles == frozenset({"chunk_5_5"})
         assert dead["mosaic_base"] == f"{root}/mosaics/04N/2025"
         assert dead["staging_base"] == f"{_PATHS.update_staging('u1', _PATHS.global_store())}/04N/2025"

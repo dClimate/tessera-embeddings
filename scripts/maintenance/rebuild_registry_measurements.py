@@ -1,6 +1,6 @@
 """Repair the registry's ``master/``: rebuild cells from their parts and re-derive what fills left null.
 
-Every fill merges its own cell into ``master/`` (``registry_master.update_cell``, called by the
+Every fill merges its own cell into ``master/`` (``registry_master.merge_cell``, called by the
 zone-fill runner). This script is for what that cannot do: re-deriving rows a fill published null,
 and rebuilding a cell whose update failed. Its first use repaired the v1.1 campaign, whose resumed
 fills published 1,519,045 of 3,247,410 rows (47%) null in every measurement column
@@ -18,7 +18,7 @@ column an optical-only pass would not re-measure. ``parts/`` is never touched, a
 re-derivation or store check is blocked is not written at all. Every cell with a part, a master
 file or a shard commit is visited: a master file whose last part was deleted is emptied, and a
 commit with no part is reported. Each cell is written through the
-fill's own ``registry_master.update_cell``, conditionally, so a fill landing mid-repair is merged in
+fill's own ``registry_master.merge_cell``, conditionally, so a fill landing mid-repair is merged in
 rather than overwritten. Every writing subcommand is a DRY RUN unless given ``--write``.
 
 Run from the REPOSITORY ROOT::
@@ -85,9 +85,9 @@ from tessera_embeddings.storage.registry_master import (
     invariant_failures,
     master_schema,
     merge,
+    merge_cell,
     store_disagreements,
     tile_years,
-    update_cell,
 )
 from tessera_embeddings.storage.registry_rebuild import rebuild_run_id, rebuilt_row
 
@@ -409,7 +409,7 @@ def _repair_cell(
     rng: random.Random,
     run_id: str,
 ) -> int:
-    """Rebuild one cell's master through ``update_cell``; returns the rows re-derived.
+    """Rebuild one cell's master through ``merge_cell``; returns the rows re-derived.
 
     Raises ``ValueError`` with the reason when the cell is blocked, writing nothing.
     """
@@ -427,7 +427,7 @@ def _repair_cell(
         extra.append(fresh)
     # The cell's one writer, conditional on its file as it is now: a fill landing mid-repair is
     # merged in, not overwritten, and the parts and master rows are re-read for this cell alone.
-    update_cell(fs, args.registry, zone, year, store=slot[1], extra=extra, write=args.write)
+    merge_cell(fs, args.registry, zone, year, store=slot[1], extra=extra, write=args.write)
     return sum(table.num_rows for table in extra)
 
 

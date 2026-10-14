@@ -195,7 +195,7 @@ reaches the registry right after its pixels are committed to the store:
   store's observation counts on 2026-10-12, by a method that matched the fill's own numbers
   exactly on every uncropped tile of a 39,578-row sample the fill had measured. Fills now keep
   their measurements across a resume.
-- **The registry is checked against the store.** Each update compares the master's embedded
+- **The registry is checked against the store.** Each merge compares the master's embedded
   tiles with the shards the store actually holds, and a census checks `master/` against `parts/`
   zone-year by zone-year. Either names any zone-year that fails, for repair from `parts/` and the
   store. Every column can be derived from the store, so the registry is a convenience, never a

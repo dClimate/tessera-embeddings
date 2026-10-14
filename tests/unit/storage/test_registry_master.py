@@ -27,8 +27,8 @@ from tessera_embeddings.storage.registry_master import (
     invariant_failures,
     master_schema,
     merge,
+    merge_cell,
     store_disagreements,
-    update_cell,
     write_cell,
 )
 
@@ -330,7 +330,7 @@ class TestUpdateCell:
 
     def test_an_update_replaces_its_tiles_and_keeps_every_other_row(self, registry: Path) -> None:
         _publish(registry, "update", [_row("chunk_0_0", measured=True, stamp=LATER, run_id="update")])
-        assert update_cell(LOCAL, str(registry), "33N", 2017) == []
+        assert merge_cell(LOCAL, str(registry), "33N", 2017) == []
         master = pq.read_table(registry / self.MASTER)
         assert master.column("tile").to_pylist() == ["chunk_0_0", "chunk_0_1"]
         assert master.column("run_id").to_pylist() == ["update", "rebuild-1"], "the re-derived row survives"
@@ -344,20 +344,20 @@ class TestUpdateCell:
         assert write_cell(
             LOCAL, str(registry), "33N", 2017, pa.Table.from_pylist(held, schema=master_schema()), version=version
         )
-        update_cell(LOCAL, str(registry), "33N", 2017)
+        merge_cell(LOCAL, str(registry), "33N", 2017)
         row = pq.read_table(registry / self.MASTER).to_pylist()[0]
         assert (row["assembled_at"], row["refused_thin_px"]) == (FILLED, 6)
 
     def test_running_it_again_writes_the_same_file(self, registry: Path) -> None:
         """A fill retried after its update, and a repair after a fill, must both leave the cell as it was."""
-        update_cell(LOCAL, str(registry), "33N", 2017)
+        merge_cell(LOCAL, str(registry), "33N", 2017)
         first = (registry / self.MASTER).read_bytes()
-        update_cell(LOCAL, str(registry), "33N", 2017)
+        merge_cell(LOCAL, str(registry), "33N", 2017)
         assert (registry / self.MASTER).read_bytes() == first
 
     def test_a_disagreement_with_the_store_is_reported_and_the_master_still_written(self, registry: Path) -> None:
         """No run removes a tile, so a shard cleared by hand is caught here or nowhere."""
-        findings = update_cell(LOCAL, str(registry), "33N", 2017, live={(0, 1), (5, 5)})
+        findings = merge_cell(LOCAL, str(registry), "33N", 2017, live={(0, 1), (5, 5)})
         assert len(findings) == 2
         assert "chunk_0_0" in findings[0] and "chunk_5_5" in findings[1]
         assert (registry / self.MASTER).exists()
@@ -365,27 +365,27 @@ class TestUpdateCell:
     def test_a_withdrawn_run_does_not_outlive_its_part(self, registry: Path) -> None:
         """Deleting a run's part and updating must restore the run before it, not keep the master's copy."""
         _publish(registry, "update", [_row("chunk_0_0", measured=True, stamp=LATER, run_id="update")])
-        update_cell(LOCAL, str(registry), "33N", 2017)
+        merge_cell(LOCAL, str(registry), "33N", 2017)
         (registry / "parts" / "zone=33N" / "year=2017" / "update.parquet").unlink()
-        update_cell(LOCAL, str(registry), "33N", 2017)
+        merge_cell(LOCAL, str(registry), "33N", 2017)
         assert pq.read_table(registry / self.MASTER).column("run_id").to_pylist() == ["run-a", "rebuild-1"]
 
     def test_a_run_whose_part_never_published_is_refused_rather_than_reported_merged(self, registry: Path) -> None:
         """Part publishing is best-effort; merging the older parts would report a fill the master lacks."""
         before = (registry / self.MASTER).read_bytes()
         with pytest.raises(ValueError, match="no registry part for run 'refill'"):
-            update_cell(LOCAL, str(registry), "33N", 2017, run_id="refill")
+            merge_cell(LOCAL, str(registry), "33N", 2017, run_id="refill")
         assert (registry / self.MASTER).read_bytes() == before
 
     def test_a_cell_whose_last_part_is_withdrawn_is_emptied(self, registry: Path) -> None:
         """Withdrawal deletes the run's part; with none left, the master must not keep describing it."""
         (registry / "parts" / "zone=33N" / "year=2017" / "run-a.parquet").unlink()
-        assert update_cell(LOCAL, str(registry), "33N", 2017) == []
+        assert merge_cell(LOCAL, str(registry), "33N", 2017) == []
         assert pq.read_table(registry / self.MASTER).num_rows == 0
 
     def test_a_cell_with_neither_a_part_nor_a_master_file_is_left_alone(self, tmp_path: Path) -> None:
         """A retried all-ocean cell lands here, and must not get a file describing nothing."""
-        assert update_cell(LOCAL, str(tmp_path), "33N", 2017) == []
+        assert merge_cell(LOCAL, str(tmp_path), "33N", 2017) == []
         assert not (tmp_path / "master").exists()
 
     @pytest.mark.parametrize("newer", [False, True], ids=["an-older-schema-is-replaced", "a-newer-one-is-kept"])
@@ -395,7 +395,7 @@ class TestUpdateCell:
         added = master_schema().append(pa.field("added_later", pa.int64()))
         declared = added if newer else pa.schema([pa.field("tile", pa.string())])
         pq.write_metadata(declared, meta)
-        update_cell(LOCAL, str(registry), "33N", 2017)
+        merge_cell(LOCAL, str(registry), "33N", 2017)
         assert pq.read_schema(meta).names == (added if newer else master_schema()).names
 
     def test_an_older_worker_overtaken_by_a_newer_one_leaves_the_newer_schema(
@@ -415,13 +415,13 @@ class TestUpdateCell:
             return current
 
         monkeypatch.setattr(registry_master, "_schema_is_current", overtaken)
-        update_cell(LOCAL, str(registry), "33N", 2017)
+        merge_cell(LOCAL, str(registry), "33N", 2017)
         assert raced and pq.read_schema(meta).names == newer.names
 
     def test_a_file_uri_root_writes_the_real_path(self, registry: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """A ``file://`` root read through fsspec and written through ``pathlib`` must be one path."""
         monkeypatch.chdir(registry)
-        update_cell(LOCAL, registry.as_uri(), "33N", 2017)
+        merge_cell(LOCAL, registry.as_uri(), "33N", 2017)
         assert not (registry / "file:").exists()
         assert pq.read_table(registry / self.MASTER).num_rows == 2
 
@@ -529,18 +529,18 @@ class TestConcurrentWriters:
             if prefix == "master" and not landed:
                 landed.append(True)
                 _publish(registry, "update", [_row("chunk_0_0", measured=True, stamp=LATER, run_id="update")])
-                update_cell(LOCAL, str(registry), "33N", 2017)
+                merge_cell(LOCAL, str(registry), "33N", 2017)
             return read(fs, root, prefix, zone, year, schema)
 
         monkeypatch.setattr(registry_master, "read_cell", overtaken)
-        update_cell(LOCAL, str(registry), "33N", 2017)
+        merge_cell(LOCAL, str(registry), "33N", 2017)
         assert landed, "the race was staged"
         assert pq.read_table(registry / self.MASTER).column("run_id").to_pylist() == ["update", "rebuild-1"]
 
     def test_a_write_built_on_a_stale_read_is_refused_and_changes_nothing(self, registry: Path) -> None:
         stale = cell_version(LOCAL, str(registry), "33N", 2017)
         _publish(registry, "update", [_row("chunk_0_0", measured=True, stamp=LATER, run_id="update")])
-        update_cell(LOCAL, str(registry), "33N", 2017)
+        merge_cell(LOCAL, str(registry), "33N", 2017)
         current = (registry / self.MASTER).read_bytes()
         assert not write_cell(LOCAL, str(registry), "33N", 2017, _fill(_AUDITED), version=stale)
         assert (registry / self.MASTER).read_bytes() == current
@@ -558,14 +558,14 @@ class TestConcurrentWriters:
             return read(fs, root, prefix, zone, year, schema)
 
         monkeypatch.setattr(registry_master, "read_cell", landing)
-        update_cell(LOCAL, str(registry), "33N", 2017, store=lambda: _store(*commits))
+        merge_cell(LOCAL, str(registry), "33N", 2017, store=lambda: _store(*commits))
         assert pq.read_table(registry / self.MASTER).column("run_id").to_pylist() == ["run-a", "run-c"]
 
     def test_a_cell_the_store_cannot_stand_behind_is_not_written(self, registry: Path) -> None:
         before = (registry / self.MASTER).read_bytes()
         store = _store(_A._replace(snapshot=None), Commit("run-b", LATER, "snap-b"))
         with pytest.raises(ValueError, match=r"run 'run-b' committed at .* last wrote 1 tile"):
-            update_cell(LOCAL, str(registry), "33N", 2017, store=lambda: store)
+            merge_cell(LOCAL, str(registry), "33N", 2017, store=lambda: store)
         assert (registry / self.MASTER).read_bytes() == before
 
 

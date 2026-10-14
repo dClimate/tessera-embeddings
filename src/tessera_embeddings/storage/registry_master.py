@@ -20,12 +20,12 @@ reading the result. Two consequences the master closes:
              schema, and two columns saying where each row's numbers came from. Consumers read this.
 ```
 
-**It is updated in place, by every fill.** The zone-fill runner calls :func:`update_cell` as soon as
+**It is merged in place, by every fill.** The zone-fill runner calls :func:`merge_cell` as soon as
 a cell's part is published. That merges the cell's parts into the cell's existing master file and
 replaces the file in one conditional PUT, so two writers of one cell — two fills, or a fill and a
 repair — cannot lose each other's rows: the one that read first is refused and merges again. The
-update is idempotent, and merging every part rather than only the newest costs a few small reads
-and means a cell whose earlier update failed is healed by its next one.
+merge is idempotent, and merging every part rather than only the newest costs a few small reads
+and means a cell whose earlier merge failed is healed by its next one.
 
 **A tile's row comes from the newest run that wrote that tile.** A run writes only the tiles it
 staged or refused and leaves the year's other shards as they were (``assemble_global``'s refill
@@ -535,7 +535,7 @@ def _key(table: pa.Table, *columns: str) -> pa.Array:
     return pc.binary_join_element_wise(*fields, "/").combine_chunks()
 
 
-def update_cell(
+def merge_cell(
     fs: AbstractFileSystem,
     registry_root: str,
     zone: str,
@@ -564,7 +564,7 @@ def update_cell(
 
     ``store`` reads the store's record of the year, and is called after the parts on every attempt:
     a run publishes its part only after its commit, so a record read then names the run of every
-    part read, and a fill landing mid-update is merged rather than refused.
+    part read, and a fill landing mid-merge is merged rather than refused.
 
     ``live`` is the store's live ``(shard_y, shard_x)`` shards for this zone-year, from
     :func:`~.published_store.live_shards`. Returns where the master's embedded tiles disagree with
@@ -592,7 +592,7 @@ def update_cell(
             return _live_disagreements(master, live)
         if write_cell(fs, registry_root, zone, year, master, version=version):
             return _live_disagreements(master, live)
-    raise ValueError(f"{zone}/{year} master changed under each of {tries} attempts to update it")
+    raise ValueError(f"{zone}/{year} master changed under each of {tries} attempts to merge it")
 
 
 def _live_disagreements(master: pa.Table, live: Collection[tuple[int, int]] | None) -> list[str]:

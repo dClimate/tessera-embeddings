@@ -1137,5 +1137,5 @@ rather than lazy.
 | the one record builder, on both the refused and embedded paths | `inference/actors.py`, `_coverage_record` |
 | publishing a cell's part once its commit lands | `inference/assembly.py`, `publish_registry_part` |
 | an embedded shard's record, persisted on its staged tile and read back on resume | `inference/assembly.py`, `write_chunk`, `read_staged_coverage` |
-| merging the landed cell into `master/` | `orchestration/runners/zone_fill.py`, `_update_registry_master`; `storage/registry_master.py`, `update_cell` |
+| merging the landed cell into `master/` | `orchestration/runners/zone_fill.py`, `_merge_registry_master`; `storage/registry_master.py`, `merge_cell` |
 | the registry's declared schema, its rows and its part writer | `storage/registry.py`, `dataset_schema`, `registry_rows`, `write_registry_part` |

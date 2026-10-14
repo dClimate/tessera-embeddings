@@ -255,24 +255,29 @@ def committed_runs(attrs: Mapping[str, Any], year: int, writes: Sequence[Commit]
     in ``writes``: snapshot expiry (``campaign.expire_and_gc``) keeps tagged snapshots, and the
     zone-year tag points at the attrs commit, not the shard commit before it. Either way the record
     says when the run wrote and not what, so the entry has no snapshot to diff. A ``commit`` of null
-    is a year marked without shards, which wrote nothing. A targeted update records itself in the
-    same shape beside the fill, in ``updates[year]`` (``storage.update``), so its expired commits
-    are found the same way.
+    is a year marked without shards, which wrote nothing. A run a refill replaced whose commit has
+    expired is left out: the refill rewrote every tile it wrote, which the store check confirms while
+    the commit is still there to diff, and nothing can afterwards. A targeted update records itself
+    in the same shape beside the fill, in ``updates[year]`` (``storage.update``), so its expired
+    commits are found the same way.
     """
     head = (attrs.get("runs") or {}).get(str(year))
-    entries = [head, *head.get("previous", [])] if isinstance(head, dict) else []
-    entries += (attrs.get("updates") or {}).get(str(year), [])
+    current, replaced = ([head], head.get("previous", [])) if isinstance(head, dict) else ([], [])
+    current += (attrs.get("updates") or {}).get(str(year), [])
     tagged = {commit.snapshot for commit in writes}
-    recorded = [commit for entry in entries if (commit := _recorded(entry, tagged)) is not None]
+    recorded = [c for entry in current if (c := _recorded(entry, tagged)) is not None]
+    recorded += [c for entry in replaced if (c := _recorded(entry, tagged, replaced=True)) is not None]
     return sorted([*recorded, *writes], key=lambda c: datetime.fromisoformat(c.at))
 
 
-def _recorded(entry: Mapping[str, Any], tagged: set[str | None]) -> Commit | None:
-    """A ``runs`` record entry as a commit with no snapshot, unless the tagged history has it or it wrote nothing."""
+def _recorded(entry: Mapping[str, Any], tagged: set[str | None], *, replaced: bool = False) -> Commit | None:
+    """A ``runs`` record entry as a commit with no snapshot, unless the tagged history has it, it wrote
+    nothing, or a refill replaced it.
+    """
     if "commit" not in entry:
         return Commit(str(entry["run_id"]), str(entry["assembled_at"]), None, bool(entry.get("empty")))
     commit = entry["commit"]
-    if isinstance(commit, Mapping) and commit.get("snapshot") not in tagged:
+    if isinstance(commit, Mapping) and commit.get("snapshot") not in tagged and not replaced:
         return Commit(str(entry["run_id"]), str(commit["committed_at"]), None)
     return None
 

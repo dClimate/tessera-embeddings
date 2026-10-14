@@ -2498,8 +2498,9 @@ class ZarrWriter:
         # `results` report earlier legs' tiles as synthetic successes with no coverage record, so
         # without this their registry rows publish null — the asymmetry that left half the
         # published registry saying nothing. Reading here rather than in the runner means every
-        # caller gets it, and a run that staged everything itself reads nothing at all.
-        embedded_records = self._top_up_embedded_records(run_id, registry_embedded, embedded_records)
+        # caller gets it, and a run that staged everything itself, or publishes no part, reads nothing at all.
+        if registry_root:
+            embedded_records = self._top_up_embedded_records(run_id, registry_embedded, embedded_records)
         snapshot = write_year_shards(
             repo,
             zone,
