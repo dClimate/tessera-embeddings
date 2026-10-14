@@ -302,6 +302,7 @@ def _staging_run_id(
     code_identity: str,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
+    update: str | None = None,
 ) -> str:
     """Deterministic staging run_id fingerprinting everything that determines the embeddings.
 
@@ -316,6 +317,11 @@ def _staging_run_id(
     still resolved and pinned into every fill's provisioning, it just no longer decides
     staging reuse. Mechanism and failure modes:
     ``context_docs/storage/staging-identity-and-resume.md``.
+
+    ``update`` names a targeted update, whose run must never share an id with another update's or
+    the campaign's: registry parts are named by run id, and the mosaic identity is content, so two
+    runs on identical mosaics would otherwise publish over each other. ``None`` adds nothing, so
+    campaign ids are unchanged.
     """
     key = (
         year,
@@ -347,7 +353,8 @@ def _staging_run_id(
             s3_region=s3_region,
         ),
     )
-    return f"{zone}-{year}-{hashlib.sha256(repr(key).encode()).hexdigest()[:8]}"
+    named = key if update is None else (*key, update)
+    return f"{zone}-{year}-{hashlib.sha256(repr(named).encode()).hexdigest()[:8]}"
 
 
 def _ingest_dispatch_params(

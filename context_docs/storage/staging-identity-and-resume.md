@@ -28,6 +28,7 @@ holds the mechanism and the failure modes it is shaped by.
 | the coverage threshold and the S1 orbit | they change which tiles exist and what each one holds |
 | `allow_s2_only` | it changes which PIXELS are embedded, not just which tiles |
 | the inference source hash (`inference_code_identity`) | the code that turns input into output |
+| a targeted update's name, for an update's run only | registry parts are named by run id, so an update must never share one with another update or the campaign ([ADR 027](../decisions/027-targeted-updates.md)) |
 
 **The code component is the inference source only.** An orchestration or ingest fix therefore reuses
 staged tiles rather than abandoning them. Two overrides exist for the judgement a hash cannot make

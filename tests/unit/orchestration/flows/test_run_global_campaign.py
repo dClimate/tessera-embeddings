@@ -1707,6 +1707,9 @@ def test_the_staging_fingerprint_changes_with_the_stores_depth_rule(wired, monke
     at_none = mod._staging_run_id("33N", 2025, optical_min_obs=None, **common)
     assert len({at_25, at_30, at_none}) == 3, "each rule must own its staging prefix"
     assert at_25 == mod._staging_run_id("33N", 2025, optical_min_obs=25, **common), "and be stable"
+    # Registry parts are named by run id, so an update's run never shares one with another's or the campaign's.
+    updates = {mod._staging_run_id("33N", 2025, optical_min_obs=25, update=u, **common) for u in ("u1", "u2")}
+    assert len(updates | {at_25}) == 3
 
 
 def test_overlap_years_does_not_overcount_per_cell_runs(wired, monkeypatch):

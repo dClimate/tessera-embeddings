@@ -1272,6 +1272,7 @@ def fill_zones_sequential_flow(
                 code_identity=code_identity,
                 get_credentials=iam_icechunk_credentials,
                 s3_region=s3_region,
+                update=update,
             ),
             config=_config_for(resolved, cell.year),
             input_coverage=coverage,
