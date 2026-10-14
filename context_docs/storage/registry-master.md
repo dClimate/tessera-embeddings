@@ -4,7 +4,7 @@ The published registry answers "is my area covered, and how well" without openin
 `master/` prefix is that answer: **one file per zone-year and one row per tile, describing what the
 store holds now.** Every fill merges its rows into its zone-year's file as it lands, tile by tile, so
 the master never waits on a compaction, never needs a reader to know which run is current, and never
-drops a tile that a later run did not touch. The store stands behind it: a fill updates the master
+drops a tile that a later run did not touch. The store stands behind it: a fill merges into the master
 only when the store's own record of who wrote the zone-year accounts for every row. This doc is the
 design, the checks that hold it, how to repair it, and how to roll it back.
 
@@ -43,7 +43,7 @@ shows it rather than downloading it. Nothing reads it, and it sits outside both 
   assemble_global ── commit the shards, tagged with the run ──▶ record the run in the zone's runs attr
         │         ──▶ publish parts/…/<run_id>.parquet, stamped with that commit's timestamp
         │
-  zone_fill ──▶ _update_registry_master
+  zone_fill ──▶ _merge_registry_master
                   │  read the master file's version, then the file and all of the cell's parts
                   │  then the store's record of the year's runs, and check the parts against it
                   │  merge tile by tile, check the invariants
@@ -54,11 +54,12 @@ shows it rather than downloading it. Nothing reads it, and it sits outside both 
                   ▼
               tag the zone-year
 
-  a retry of a cell that already landed ──▶ _update_registry_master, with no run id
+  a retry of a cell that already landed ──▶ plan_zone_inference ──▶ _merge_registry_master, with no run id
 ```
 
-`registry_master.update_cell` does the work, called from both assembled branches of
-`orchestration/runners/zone_fill.py`, the ordinary one and the all-refused `empty=True` one. It
+`registry_master.merge_cell` does the work, called from both assembled branches of
+`orchestration/runners/zone_fill.py`, the ordinary one and the all-refused `empty=True` one, and from
+planning for a cell that already landed. It
 rewrites `_common_metadata` when it is absent or lacks a column of the current schema, so a column
 added later reaches readers who take the schema from the dataset. It never rewrites one that has a
 column the current schema lacks, so a worker still on an older release cannot take a newer column
@@ -66,7 +67,7 @@ away mid-deploy. That write is conditional too, so of two workers that both foun
 second is refused and checks again. It runs before the tag because a deliberate refill fails at the tag step by design
 (`reopen_zone_year.py`), after its data and part have landed, and the master must still describe it.
 
-- **Two writers of one zone-year cannot lose each other's rows.** An update reads the file's
+- **Two writers of one zone-year cannot lose each other's rows.** A merge reads the file's
   version, its S3 ETag, before anything the new file is built from, and writes on condition that
   the version is unchanged. Of two fills, or a fill and a repair, that read the same version, only
   the first lands; the second is refused, and reads and merges again. Different zone-years never
@@ -74,12 +75,13 @@ second is refused and checks again. It runs before the tag because a deliberate 
   for rehearsals, checks a content hash under a file lock instead.
 - **It is idempotent.** Re-running it over the same inputs writes the same bytes.
 - **It merges all of the cell's parts, not only the new one.** That costs a few small reads and
-  means a cell whose earlier update failed is healed by its next fill.
+  means a cell whose earlier merge failed is healed by its next fill.
 - **It refuses a run whose own part is missing.** Publishing a part is best-effort, and merging
   the older parts alone would rewrite the cell as it was and report success.
 - **A retry of a cell that already landed runs it again.** A process that dies between the commit
-  and the update leaves no tag, and its retry finds the cell complete and skips the fill, so
-  `assemble_zone_year` runs the update on that path too, with no run id. The store check below then
+  and the merge leaves no tag, and its retry finds the cell complete and skips the fill, so
+  planning (`plan_zone_inference`) runs the merge on that path too, with no run id. Every runner
+  plans every retry, the campaign's triage included, so this is the one place it happens. The store check below then
   refuses the cell if the dead run's part never published. A cell with neither a part nor a master
   file, an all-ocean one, is left alone.
 - **It never fails a committed cell.** The cell is committed by then. Raising would undo nothing
@@ -151,7 +153,9 @@ metadata, in the same commit as the shards.
 - **Snapshot expiry drops shard commits from the history** (`campaign.expire_and_gc` keeps tagged
   snapshots, and a zone-year's tag is on its attrs commit). A recorded run whose commit has gone is
   then known from its `runs` entry, like a v1.1 run: its part still describes it, and without one
-  nothing bounds its tiles, so the zone-year blocks. Run `verify` before expiring.
+  nothing bounds its tiles, so the zone-year blocks. A run a refill replaced is dropped instead, since
+  the refill rewrote every tile it wrote; the store check confirms that only while the commit is there
+  to diff, so run `verify` before expiring.
 - **Which tiles a commit wrote** comes from Icechunk's diff of that commit against its parent, the
   store's own transaction log (`published_store.commit_tiles`), in every per-tile array rather
   than `scales` alone: a refused tile writes its observation counts and month coverage and no
@@ -169,14 +173,14 @@ metadata, in the same commit as the shards.
 
 A commit no part describes whose every tile a later commit wrote over describes nothing the store
 holds, so it does not block. **That is also how a blocked cell recovers.** Rewrite the tiles the refusal names
-under a run that publishes its part, such as a refill of the zone-year, and the cell's next update
-goes through. Every update and repair runs this check, and so does `verify`. An update reads the
+under a run that publishes its part, such as a refill of the zone-year, and the cell's next merge
+goes through. Every merge and repair runs this check, and so does `verify`. A merge reads the
 store's record after the parts, on every attempt: a run publishes its part only after its commit, so
-a fill that lands mid-update, or mid-way through an hours-long repair, is merged rather than refused.
+a fill that lands mid-merge, or mid-way through an hours-long repair, is merged rather than refused.
 
 ## What guards it
 
-- **Every update checks its invariants before writing**: one row per tile-year, every tile any part
+- **Every merge checks its invariants before writing**: one row per tile-year, every tile any part
   names present, and `measured_by` agreeing with the numbers. A breach raises and writes nothing.
 - **The store's live shards are compared with the master's embedded tiles**, from the manifests
   alone (`published_store.live_shards`). No run removes a tile, so a shard an operator cleared by hand
@@ -204,7 +208,7 @@ its cell has no part at all. `--parts-only` skips the store for a registry copy 
 | check | catches |
 |---|---|
 | one row per tile-year; `measured_by` agrees with the numbers | a duplicated or mislabelled row |
-| every tile in `parts/` present, and none that no part names | a cell whose update failed, or a stray row |
+| every tile in `parts/` present, and none that no part names | a cell whose merge failed, or a stray row |
 | each row from its tile's latest run | a refill or an update whose master write failed |
 | fill-measured rows equal `parts/` for the latest run: measurements, `run_id` and `assembled_at` | a fill row the master altered |
 | `embedded`, the bounding box, the depth rule and the build equal the latest run's fill row | a row, re-derived or not, carrying another row's fields |
@@ -218,7 +222,7 @@ re-derivation from the store of every row its fills left null. The parts supply 
 fill measurement; the existing rows keep a radar column an optical-only repair would not re-measure.
 A cell whose re-derivation or store check is blocked is not written, so a repair never replaces
 measurements with nulls. Repair visits the same cells `verify` does, so a master file whose last
-part was deleted is emptied and a tagged commit with no part is reported. Repair writes each cell through `update_cell`, the fill's own path, which
+part was deleted is emptied and a tagged commit with no part is reported. Repair writes each cell through `merge_cell`, the fill's own path, which
 re-reads that cell's parts and master and writes conditionally, so a fill landing mid-repair is
 merged in rather than overwritten. `gate` proves the re-derivation reproduces measured rows before
 any repair; the method and its proof are in [`registry-backfill.md`](registry-backfill.md).
@@ -295,11 +299,13 @@ any tile, and refuses a part the store has no record of until it is deleted.
 
 ## Which code identity it moves
 
-`inference/assembly.py`, `storage/registry.py` and `storage/shard_writer.py` are inside
+`inference/assembly.py`, `inference/actors.py`, `storage/registry.py`, `storage/shard_writer.py` and
+`storage/icechunk_logging.py` are inside
 `inference_code_identity`'s closure, which is everything `inference/` and `config/inference.py`
-import, transitively, so editing any of them re-stages every in-progress tile. This design edits two:
-assembly persists the coverage record on the staged tile and stamps the part with the commit, and
-the shard writer records the commit and the runs before it. So it moves the inference identity, and
+import, transitively, so editing any of them re-stages every in-progress tile. This design edits five:
+assembly persists the coverage record on the staged tile and stamps the part with the commit, the
+actor hands it the record, the shard writer and `storage/icechunk_logging.py` tag the commit with
+its run and record the runs before it, and `storage/registry.py` changes a docstring. So it moves the inference identity, and
 a tile staged under the old code is re-staged after a deploy. The ingest identity, and so every
 mosaic, is unchanged. `registry_master.py`, `registry_rebuild.py`, `published_store.py` and the
 zone-fill runner are outside both closures, so the merge and its checks can change without touching
