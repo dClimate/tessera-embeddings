@@ -344,12 +344,12 @@ A store's minimum optical depth rule moves only down, for the whole store or for
 `holes` update then embeds exactly the pixels the looser line admits
 ([ADR 028](../../../../context_docs/decisions/028-embed-every-pixel-with-an-optical-observation.md)):
 
-1. **Loosen.** `scripts/update/loosen_optical_min_obs.py --store <uri> --line 1 [--zones 18N,19N] --write`
+1. **Loosen.** `uv run python scripts/update/loosen_optical_min_obs.py --store <uri> --line 1 [--zones 18N,19N] --write`
    (a dry run without `--write`). The root, or each named zone, records the line it gives up in
    `optical_min_obs_history`; every fill from then on reads its zone's rule from the store. Loosen
    between runs: a chained fill already running in the zone refuses its next cell there, because the
    rule it read at the start no longer matches the store.
-2. **Plan.** `plan_update.py from-registry --name line1-<scope> --mode holes --where "refused_thin_px > 0"`
+2. **Plan.** `uv run python scripts/update/plan_update.py from-registry --name line1-<scope> --mode holes --where "refused_thin_px > 0"`
    with the same `--zones` (a zone still at the old line would re-infer its holes and refuse them
    again), optionally narrowed by `--aoi` or a mask built with `build-land-mask`. Every thin-refused
    pixel is now a hole. The dry run prints each cell's shard counts: price them against
