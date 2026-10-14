@@ -7,21 +7,29 @@ real — every step calls the same domain function the Prefect flows do.
 Device comes from the ``device`` key in the YAML config (``"auto"`` | ``"cpu"`` | ``"cuda"``;
 ``"auto"`` uses a GPU when one is available). ``--skip-inference`` short-circuits after ingestion
 for fast contributor iteration on the ingest path.
+
+An ``update`` block in the config rewrites part of a window the store already holds instead of all
+of it: some of its tiles, or in ``holes`` mode only their pixels with no embedding, leaving every
+other pixel as it was (:func:`_plan_update`; the global store's targeted updates, ADR 027).
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import json
 import logging
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from functools import partial
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple, get_args
 
+import numpy as np
 import yaml
+import zarr
 from dask.distributed import Client
 
 from tessera_embeddings.config.assembly import AssemblyConfig
@@ -34,10 +42,10 @@ from tessera_embeddings.config.inference import (
     run_id_prefix,
 )
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
-from tessera_embeddings.config.paths import BucketPaths
+from tessera_embeddings.config.paths import BucketPaths, check_update_name
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.assembly import ZarrWriter
-from tessera_embeddings.inference.chunk_spec import filter_chunks_by_roi_mask
+from tessera_embeddings.inference.chunk_spec import ChunkSpec, filter_chunks_by_roi_mask
 from tessera_embeddings.inference.data_loading import _active_orbits, resolve_s1_orbit
 from tessera_embeddings.inference.orchestration_helpers import (
     assert_output_store_accepts,
@@ -54,8 +62,20 @@ from tessera_embeddings.ingest.s1_roi import ingest_s1_roi_sar
 from tessera_embeddings.ingest.s2_roi import ingest_s2_roi_reflectance
 from tessera_embeddings.providers.local.dask import local_cluster
 from tessera_embeddings.providers.local.ray import ray_cluster
+from tessera_embeddings.storage.campaign import pin_tag
+from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.manifest import EmbeddingManifest
 from tessera_embeddings.storage.object_store import delete_prefix
+from tessera_embeddings.storage.time_axis import read_time_values, time_index_of, year_of
+from tessera_embeddings.storage.update import (
+    UpdateMode,
+    UpdateTarget,
+    base_tag,
+    commit_update_record,
+    read_updates,
+    stage_hole_masks,
+    update_record,
+)
 
 
 def _resolve_num_gpus(device: str) -> int:
@@ -97,7 +117,9 @@ def _dask_client(n_workers: int) -> Iterator[Client]:
 _MOSAIC_CONTENT_KEYS: frozenset[str] = frozenset({"roi_manifest_hash", "coverage_sha256", "min_valid_coverage"})
 
 
-def _staging_run_id(*, roi_name: str, config: InferenceConfig, upstream: dict[str, Any]) -> str:
+def _staging_run_id(
+    *, roi_name: str, config: InferenceConfig, upstream: dict[str, Any], update: Mapping[str, Any] | None = None
+) -> str:
     """A staging identity that repeats for the same run, so an interrupted run resumes.
 
     Derived from everything the OUTPUT depends on, so re-running the same config finds the tiles
@@ -137,6 +159,9 @@ def _staging_run_id(*, roi_name: str, config: InferenceConfig, upstream: dict[st
 
     Staging is removed after a successful assemble, so in practice a prefix only survives a run
     that failed — which is exactly the run worth resuming.
+
+    An ``update`` is a term too, when there is one: its tiles are inferred against the store's holes
+    rather than whole, so they must never resume a full run's, nor another update's.
     """
     # Only the content keys, and sorted, so the digest is a fact about what the mosaics HOLD
     # rather than about dict ordering or about which code wrote them.
@@ -152,6 +177,7 @@ def _staging_run_id(*, roi_name: str, config: InferenceConfig, upstream: dict[st
             config.checkpoint_path,
             f"s2_only={config.allow_s2_only}",
             json.dumps(content, sort_keys=True, default=str),
+            *([json.dumps(dict(update), sort_keys=True)] if update else []),
         ]
     )
     return hashlib.sha256(terms.encode()).hexdigest()[:12]
@@ -230,6 +256,102 @@ def _run_ingest(
             log.info("S1 ingestion (%s): %s", orbit, s1_result)
 
 
+class _Update(NamedTuple):
+    """An update planned against the store: where it writes and which tiles it infers."""
+
+    target: UpdateTarget
+    time_index: int
+    year: int
+    chunks: list[ChunkSpec]
+
+
+def _plan_update(
+    update: Mapping[str, Any],
+    *,
+    output_path: str,
+    roi_name: str,
+    window: str,
+    chunks: list[ChunkSpec],
+    holes_prefix: str,
+    log: logging.Logger,
+) -> _Update | None:
+    """Plan an update of a window the store already holds; ``None`` when it is already recorded there.
+
+    The single-area counterpart of the global store's targeted updates (ADR 027). ``mode`` is
+    ``holes`` (the default), which infers only the pixels the store holds no embedding for, or
+    ``shards``, which rewrites whole tiles; ``tiles`` narrows it to those tiles of the area. The
+    update is recorded in the store's root ``updates`` attr under its window's year, once per name.
+    """
+    if unknown := sorted(set(update) - {"name", "mode", "tiles"}):
+        raise ValueError(f"update takes name, mode and tiles; got {unknown}")
+    name, mode, tiles = check_update_name(update["name"]), update.get("mode", "holes"), update.get("tiles")
+    if mode not in get_args(UpdateMode):
+        raise ValueError(f"update mode must be 'holes' or 'shards'; got {mode!r}")
+    root = zarr.open_group(open_global_repo(output_path).readonly_session(branch="main").store, mode="r")
+    time_index = time_index_of(root, np.datetime64(window, "ns"))
+    if time_index is None:
+        raise ValueError(f"{output_path} holds no {window} window to update; run without `update` first")
+    year = year_of(read_time_values(root)[time_index])
+    if any(record.get("update") == name for record in read_updates(root, year)):
+        log.info("Update %s is already recorded on %s for %d — nothing to do", name, output_path, year)
+        return None
+    if tiles is not None:
+        if outside := sorted(set(tiles) - {c.label for c in chunks}):
+            raise ValueError(f"Update {name!r} names tiles outside the area: {outside}")
+        chunks = [c for c in chunks if c.label in set(tiles)]
+    target = UpdateTarget(
+        name=name,
+        mode=mode,
+        on_skip="keep",
+        mask_name=roi_name,
+        tiles=None if tiles is None else frozenset(tiles),
+        holes=holes_prefix,
+    )
+    if mode == "holes":
+        holes = stage_hole_masks(root, year_index=time_index, chunks=chunks, prefix=holes_prefix)
+        target = dataclasses.replace(target, kept=tuple(sorted(c.label for c in chunks if c.label not in holes)))
+        chunks = [dataclasses.replace(c, pixels=holes[c.label]) for c in chunks if c.label in holes]
+        log.info("Update %s infers the holes of %d tile(s); %d have none", name, len(chunks), len(target.kept))
+    return _Update(target, time_index, year, chunks)
+
+
+def _write_update(
+    writer: ZarrWriter,
+    planned: _Update,
+    *,
+    output_path: str,
+    run_id: str,
+    results: list[dict[str, Any]],
+    log: logging.Logger,
+) -> str:
+    """Write an update's staged tiles into the store and record it there; return the snapshot.
+
+    The global store's shard writer does the writing, at this store's root: a ``holes`` tile is
+    merged, replacing only the pixels its mask marks in every array, and a ``shards`` tile is
+    written whole. A tile where nothing embedded is kept, as is every tile outside the update.
+    """
+    target, chunks = planned.target, planned.chunks
+    staged = sorted(str(r["chunk"]) for r in results if r["status"] == "success")
+    kept = sorted({*target.kept, *(c.label for c in chunks if c.label not in staged)})
+    record = update_record(target, run_id=run_id, written=staged, kept=kept)
+    repo = open_global_repo(output_path)
+    pin_tag(repo, base_tag(target.name))  # the store as it was, to compare against or roll back to
+    if not staged:
+        return commit_update_record(repo, "", planned.year, record=record)
+    return writer.assemble_global(
+        output_path,
+        "",
+        year=planned.year,
+        time_index=planned.time_index,
+        run_id=run_id,
+        n_workers=AssemblyConfig().compute_n_workers(len(staged)),
+        staged_labels=staged,
+        pixels={c.label: c.pixels for c in chunks if c.pixels is not None and c.label in staged} or None,
+        commit_attrs=partial(commit_update_record, record=record),
+        log=log,
+    )
+
+
 def _run_inference_and_assemble(
     *,
     roi_path: str,
@@ -242,9 +364,14 @@ def _run_inference_and_assemble(
     model_version: ModelVersion,
     num_gpus: int,
     allow_s2_only: bool = False,
+    update: Mapping[str, Any] | None = None,
     log: logging.Logger,
 ) -> dict[str, Any]:
-    """Run inference under local Ray, then assemble with local worker processes."""
+    """Run inference under local Ray, then assemble with local worker processes.
+
+    With ``update`` (:func:`_plan_update`), only the update's tiles are inferred, and they are
+    written into the window the store already holds rather than assembled over it.
+    """
     inputs_bucket = paths.inputs
     output_bucket = paths.outputs
 
@@ -314,10 +441,28 @@ def _run_inference_and_assemble(
     # tiles look identical either way. Unprefixed for v1.1, so nothing about the historical path
     # changes.
     run_id = run_id_prefix(config.model_version) + _staging_run_id(
-        roi_name=roi_name, config=config, upstream=upstream_manifests
+        roi_name=roi_name, config=config, upstream=upstream_manifests, update=update
     )
     run_staging = f"{staging_base.rstrip('/')}/{run_id}"
     log.info("Staging prefix for this run: %s (delete it to force a clean re-inference)", run_staging)
+    output_path = f"{output_bucket.rstrip('/')}/embeddings/{roi_name}.zarr"
+    summary: dict[str, Any] = {"run_id": run_id, "roi_name": roi_name, "output_path": output_path}
+    planned: _Update | None = None
+    if update is not None:
+        planned = _plan_update(
+            update,
+            output_path=output_path,
+            roi_name=roi_name,
+            window=time_window.window_end_label,
+            chunks=live_chunks,
+            # Beside the run's staging and removed with it; a retry reuses them, so it infers the
+            # pixels the first attempt did even after those landed.
+            holes_prefix=f"{run_staging}-holes",
+            log=log,
+        )
+        if planned is None:
+            return {**summary, "update": update["name"], "already_recorded": True}
+        live_chunks = planned.chunks
 
     t0 = time.monotonic()
 
@@ -330,17 +475,19 @@ def _run_inference_and_assemble(
     else:
         log.info("Running GPU inference on %d chunks (num_gpus=%d).", len(live_chunks), num_gpus)
 
-    with ray_cluster(num_gpus=num_gpus):
-        results = run_inference(
-            num_actors=1,
-            config=config,
-            chunks=live_chunks,
-            mosaic_base=mosaic_base,
-            staging_base=staging_base,
-            run_id=run_id,
-            t0=t0,
-            log=log,
-        )
+    results: list[dict[str, Any]] = []
+    if live_chunks:  # an update can have nothing to infer: every target tile already embedded
+        with ray_cluster(num_gpus=num_gpus):
+            results = run_inference(
+                num_actors=1,
+                config=config,
+                chunks=live_chunks,
+                mosaic_base=mosaic_base,
+                staging_base=staging_base,
+                run_id=run_id,
+                t0=t0,
+                log=log,
+            )
 
     failed = [r for r in results if r["status"] == "failed"]
     if failed:
@@ -349,34 +496,37 @@ def _run_inference_and_assemble(
 
     # Assembly: worker processes on this host (raw-zarr fork/merge — no Dask)
     n_live = len(live_chunks)
-    n_assembly_workers = AssemblyConfig().compute_n_workers(n_live)
-    output_path = f"{output_bucket.rstrip('/')}/embeddings/{roi_name}.zarr"
     writer = ZarrWriter(staging_base)
-    # Provenance id: the checkpoint filename stem, not the ModelVersion literal.
-    checkpoint_id = checkpoint_to_version(config.checkpoint_path)
-    manifest = EmbeddingManifest.from_upstream_stores(
-        model_checkpoint=checkpoint_id,
-        num_obs_checkpoints=config.num_obs_checkpoints,
-        upstream_manifests=upstream_manifests,
-        allow_s2_only=config.allow_s2_only,
-    )
-
-    writer.assemble(
-        chunks,
-        total_y,
-        total_x,
-        run_id,
-        output_path,
-        roi_zarr_path=roi_path,
-        mosaic_base=mosaic_base,
-        log=log,
-        time_window=time_window,
-        tile_id=roi_name,
-        model_version=checkpoint_id,
-        encoder_version=config.model_version,
-        manifest=manifest,
-        n_workers=n_assembly_workers,
-    )
+    if planned is not None:
+        summary["update"] = planned.target.name
+        summary["snapshot_id"] = _write_update(
+            writer, planned, output_path=output_path, run_id=run_id, results=results, log=log
+        )
+    else:
+        # Provenance id: the checkpoint filename stem, not the ModelVersion literal.
+        checkpoint_id = checkpoint_to_version(config.checkpoint_path)
+        manifest = EmbeddingManifest.from_upstream_stores(
+            model_checkpoint=checkpoint_id,
+            num_obs_checkpoints=config.num_obs_checkpoints,
+            upstream_manifests=upstream_manifests,
+            allow_s2_only=config.allow_s2_only,
+        )
+        writer.assemble(
+            chunks,
+            total_y,
+            total_x,
+            run_id,
+            output_path,
+            roi_zarr_path=roi_path,
+            mosaic_base=mosaic_base,
+            log=log,
+            time_window=time_window,
+            tile_id=roi_name,
+            model_version=checkpoint_id,
+            encoder_version=config.model_version,
+            manifest=manifest,
+            n_workers=AssemblyConfig().compute_n_workers(n_live),
+        )
 
     # Only after assemble RETURNS. A failed run keeps its staged tiles so the next attempt
     # resumes onto them (see `_staging_run_id`); a successful one has them in the output store
@@ -395,18 +545,13 @@ def _run_inference_and_assemble(
         # `strict` turns a missing s5cmd binary into a leaked prefix. Opting out lets the
         # fallback do the job, which is what `delete_prefix` documents for callers that only
         # need current objects.
-        delete_prefix(run_staging, log=log, all_versions=False, strict=True)
-        log.info("Removed staging prefix %s", run_staging)
+        for prefix in (run_staging, *([planned.target.holes] if planned and planned.target.mode == "holes" else [])):
+            delete_prefix(prefix, log=log, all_versions=False, strict=True)
+            log.info("Removed staging prefix %s", prefix)
     except Exception:
         log.warning("Could not remove staging prefix %s; it is safe to delete by hand", run_staging, exc_info=True)
 
-    return {
-        "run_id": run_id,
-        "roi_name": roi_name,
-        "output_path": output_path,
-        "n_live_chunks": n_live,
-        "elapsed_sec": time.monotonic() - t0,
-    }
+    return {**summary, "n_live_chunks": n_live, "elapsed_sec": time.monotonic() - t0}
 
 
 def run_plain(
@@ -443,6 +588,10 @@ def run_plain(
             model_version: v1.1     # "v1.1" or "v2-large" (43.8M v2 student, 128-d native)
             device: auto            # "auto" | "cpu" | "cuda"
             storage_options: null
+            update:                 # optional: rewrite part of this window, already in the store
+              name: more-imagery    # recorded on the store; an update already recorded is not rerun
+              mode: holes           # "holes": only pixels with no embedding; "shards": whole tiles
+              tiles: [chunk_0_1]    # optional; every tile of the area when omitted
 
         skip_inference: When True, stop after ingestion. Useful for iterating on the ingest path
             without paying CPU inference cost.
@@ -523,6 +672,7 @@ def run_plain(
         model_version=cfg.get("model_version", DEFAULT_MODEL_VERSION),
         num_gpus=num_gpus,
         allow_s2_only=cfg.get("allow_s2_only", False),
+        update=cfg.get("update"),
         log=log,
     )
     log.info("Pipeline complete: %s", summary)

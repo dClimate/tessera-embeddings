@@ -92,6 +92,17 @@ after the column read together.
 **Both drivers run updates.** `fill-zones-sequential` (one cluster) and `run-global-campaign`
 (chained clusters) take `update=<name>`; the second balances its clusters on the plan's shards.
 
+**A single-area store takes updates too** (`orchestration/runners/plain.py`). An `update` block in
+the plain runner's config (`name`, `mode`, optional `tiles`) rewrites part of a window the store
+already holds, through the same shard writer at the store's root: `holes` merges only the pixels
+with no embedding, `shards` rewrites the listed tiles whole, and every other pixel is left as it was.
+The record goes in the root's `updates[year]`, the year being the window's last, and
+`update-<name>-base` pins the store first. There is no plan file, registry or complete tag, since one
+run is the whole update. A single-area store's last row and column of tiles can be narrower than a
+shard, so the shard writer takes each tile's size from the store's edge (`tile_extent`). The update
+infers from the area's mosaics as they stand; ingest resumes them rather than redoing them, so taking
+in new imagery means deleting the mosaics first.
+
 ## 2. Rejected alternatives
 
 - **`runs[year]` as an append-only list** (sketched in

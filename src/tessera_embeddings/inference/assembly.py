@@ -570,6 +570,17 @@ class StagedResume:
     skipped: set[str]
 
 
+def tile_extent(shard: tuple[int, int], shard_px: int, extent: tuple[int, int] | None) -> tuple[int, int]:
+    """A tile's pixel size: one whole shard, cut short only where the destination's edge cuts it.
+
+    A zone is a whole number of shards; a single-area store is the area's size, so its last row and
+    column of tiles can be narrower.
+    """
+    if extent is None:
+        return shard_px, shard_px
+    return min(shard_px, extent[0] - shard[0] * shard_px), min(shard_px, extent[1] - shard[1] * shard_px)
+
+
 @dataclasses.dataclass(frozen=True)
 class StagedShardSource:
     """:class:`~tessera_embeddings.storage.shard_writer.ShardSource` over staged tiles.
@@ -602,6 +613,8 @@ class StagedShardSource:
     # A targeted update's pixel masks, as `((row, col), uri)` pairs. A staged shard listed here is
     # MERGED into the store, replacing only the pixels its mask marks (see `pixels`).
     owned: tuple[tuple[tuple[int, int], str], ...] = ()
+    # The destination's (northing, easting) size, which cuts its last tiles short; None is whole tiles.
+    extent: tuple[int, int] | None = None
 
     def live_shards(self) -> list[tuple[int, int]]:
         """Every ``(row, col)`` this run is responsible for — staged AND skipped.
@@ -643,7 +656,7 @@ class StagedShardSource:
                     "write would silently C-cast (wraparound); mixed-version or corrupt staged run."
                 )
             h, w = block.shape[1:3]
-            if (h, w) != (self.shard_px, self.shard_px):
+            if (h, w) != tile_extent(shard, self.shard_px, self.extent):
                 raise ValueError(
                     f"Staged tile {path} has {var} extent {h} x {w} px but shards are {self.shard_px} px — "
                     "truncated or off-grid tile (ADR-008 D3 requires whole tiles)."
@@ -2254,6 +2267,7 @@ class ZarrWriter:
         pixels: Mapping[str, str] | None = None,
         commit_attrs: Callable[[icechunk.Repository, str, int, Mapping[str, str]], str] | None = None,
         update_name: str | None = None,
+        time_index: int | None = None,
     ) -> str:
         """Assemble a run's staged tiles into one (zone, year) of the global store.
 
@@ -2337,6 +2351,9 @@ class ZarrWriter:
                 (:func:`~tessera_embeddings.storage.shard_writer.write_year_shards`). A targeted
                 update records itself this way and leaves ``years_complete`` and ``runs`` alone.
             update_name: The targeted update writing this cell, stamped on its registry rows.
+            time_index: The time step to write, in place of ``year``'s calendar slot: an update of a
+                single-area store, whose arrays sit at its root (``zone=""``) on a time axis of
+                window ends.
 
         Returns:
             The commit snapshot id.
@@ -2381,7 +2398,7 @@ class ZarrWriter:
 
         # One readonly probe of the zone group: year index, shard pitch, variables.
         node = cast(zarr.Group, zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[zone])
-        year_index = time_index_of(node, year_timestamp(year))
+        year_index = time_index if time_index is not None else time_index_of(node, year_timestamp(year))
         if year_index is None:
             raise ValueError(
                 f"Year {year} is not on {zone}'s pre-allocated time axis "
@@ -2389,6 +2406,7 @@ class ZarrWriter:
                 "the axis is fixed at seeding (ADR-008 D1)."
             )
         shard_px = shard_pitch(cast(zarr.Array, node["embeddings"]))
+        extent = cast("tuple[int, int]", tuple(cast(zarr.Array, node["embeddings"]).shape[1:3]))
         # Destination band width is the authority for the staged-tile band check, NOT
         # ZarrWriter.embedding_dim, which defaults to 128 and need not match a zone seeded wider.
         dest_band = int(cast(zarr.Array, node["embeddings"]).shape[-1])
@@ -2424,7 +2442,7 @@ class ZarrWriter:
                         "a raw-zarr write would silently C-cast (wraparound); re-stage correctly."
                     )
             staged_shape = tuple(cast(zarr.Array, staged_group["embeddings"]).shape[:2])
-            if staged_shape != (shard_px, shard_px):
+            if staged_shape != tile_extent(parse_chunk_label(labels[0]), shard_px, extent):
                 raise ValueError(
                     f"Staged tiles are {staged_shape[0]} x {staged_shape[1]} px but {zone} shards are "
                     f"{shard_px} px — the global write path requires 1 inference tile == 1 shard (ADR-008 D3)."
@@ -2489,6 +2507,7 @@ class ZarrWriter:
             cleared=cleared,
             fill_values=fill_values,
             owned=tuple((parse_chunk_label(label), uri) for label, uri in sorted((pixels or {}).items())),
+            extent=extent,
         )
         telemetry: dict[str, Any] = {}
         # Captured before the write, so the registry part reports what THIS call published rather
