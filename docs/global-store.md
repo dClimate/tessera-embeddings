@@ -207,7 +207,7 @@ array's fill value. The published v1.1 store was filled at 15
 A store's line can be loosened after it is filled, never tightened, for the whole store or one zone
 at a time. The line in force for a zone is its zone group's own `optical_min_obs` when it carries
 one, else the root's, and `optical_min_obs_history` on either lists each earlier line with the
-snapshot last judged against it. A targeted update then embeds the pixels the looser line admits, so
+store's tip when it was given up. A targeted update then embeds the pixels the looser line admits, so
 a tile no update has reached still reflects the earlier line: its registry row (`optical_min_obs`,
 `update_name`) and the zone's `updates[year]` records say which line each tile was last judged
 against.

@@ -543,7 +543,8 @@ def loosen_optical_min_obs(
     since it would otherwise read as a tightening. With ``zones``, each named zone gains its own
     ``optical_min_obs`` below its current effective rule and the root is untouched. Every line given
     up is appended to that root's or zone's ``optical_min_obs_history`` as ``{"line", "until",
-    "snapshot"}``, the snapshot being the last one judged against it.
+    "snapshot"}``, the snapshot being the store's tip when the line was given up. A fill already
+    running under the old line can still land after it; its registry rows state the line it applied.
 
     Returns the commit snapshot, or ``None`` when every target already sits at ``new_line``.
     ``write=False`` makes every check and change in a session it never commits, and returns ``None``:
