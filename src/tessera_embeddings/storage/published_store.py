@@ -217,8 +217,9 @@ class Commit(NamedTuple):
 
     ``at`` orders runs: the commit's own timestamp, or for an untagged run the time it was marked.
     ``snapshot`` is the shard commit, ``None`` for an untagged run, and is what :func:`commit_tiles`
-    reads the tiles it wrote from. ``empty`` is an untagged run that marked the year as holding no
-    data, so it left no embeddings for a part to describe.
+    reads the tiles it wrote from. ``empty`` is a run that holds no tile now, so it needs no part: an
+    untagged run that marked the year as holding no data, or a run a refill replaced whose commit has
+    expired, every tile of which the refill rewrote.
     """
 
     run_id: str
@@ -256,8 +257,9 @@ def committed_runs(attrs: Mapping[str, Any], year: int, writes: Sequence[Commit]
     zone-year tag points at the attrs commit, not the shard commit before it. Either way the record
     says when the run wrote and not what, so the entry has no snapshot to diff. A ``commit`` of null
     is a year marked without shards, which wrote nothing. A run a refill replaced whose commit has
-    expired is left out: the refill rewrote every tile it wrote, which the store check confirms while
-    the commit is still there to diff, and nothing can afterwards.
+    expired is marked ``empty``: its part, if it has one, is still the store's, but the refill rewrote
+    every tile it wrote, which the store check confirms while the commit is still there to diff, and
+    nothing can afterwards.
     """
     head = (attrs.get("runs") or {}).get(str(year))
     current, replaced = ([head], head.get("previous", [])) if isinstance(head, dict) else ([], [])
@@ -268,14 +270,12 @@ def committed_runs(attrs: Mapping[str, Any], year: int, writes: Sequence[Commit]
 
 
 def _recorded(entry: Mapping[str, Any], tagged: set[str | None], *, replaced: bool = False) -> Commit | None:
-    """A ``runs`` record entry as a commit with no snapshot, unless the tagged history has it, it wrote
-    nothing, or a refill replaced it.
-    """
+    """A ``runs`` record entry as a commit with no snapshot, unless the tagged history has it or it wrote nothing."""
     if "commit" not in entry:
         return Commit(str(entry["run_id"]), str(entry["assembled_at"]), None, bool(entry.get("empty")))
     commit = entry["commit"]
-    if isinstance(commit, Mapping) and commit.get("snapshot") not in tagged and not replaced:
-        return Commit(str(entry["run_id"]), str(commit["committed_at"]), None)
+    if isinstance(commit, Mapping) and commit.get("snapshot") not in tagged:
+        return Commit(str(entry["run_id"]), str(commit["committed_at"]), None, empty=replaced)
     return None
 
 

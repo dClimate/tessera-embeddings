@@ -153,9 +153,10 @@ metadata, in the same commit as the shards.
 - **Snapshot expiry drops shard commits from the history** (`campaign.expire_and_gc` keeps tagged
   snapshots, and a zone-year's tag is on its attrs commit). A recorded run whose commit has gone is
   then known from its `runs` entry, like a v1.1 run: its part still describes it, and without one
-  nothing bounds its tiles, so the zone-year blocks. A run a refill replaced is dropped instead, since
-  the refill rewrote every tile it wrote; the store check confirms that only while the commit is there
-  to diff, so run `verify` before expiring.
+  nothing bounds its tiles, so the zone-year blocks. A run a refill replaced is taken to hold no tile
+  instead, since the refill rewrote every tile it wrote: its part is still recognised, and a missing
+  one does not block. The store check confirms that only while the commit is there to diff, so run
+  `verify` before expiring.
 - **Which tiles a commit wrote** comes from Icechunk's diff of that commit against its parent, the
   store's own transaction log (`published_store.commit_tiles`), in every per-tile array rather
   than `scales` alone: a refused tile writes its observation counts and month coverage and no
