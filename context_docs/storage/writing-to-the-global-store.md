@@ -20,7 +20,7 @@ no longer exists. The fifth is the index published beside the store, which the s
 | 3 | seven of nine assemblies hung before committing, and the fix relocated the wedge | 2026-08-29 → 31 |
 | 4 | 227 writes refused as incorrectly signed, in two accounts at once | 2026-08-28 |
 | 2a | the request cap removed — it was §3's hang all along | 2026-09-09 |
-| 5 | why nothing bounds committers any more, and what would reopen it | 2026-08-27 |
+| 5 | why nothing bounds committers | 2026-08-27 |
 | 6 | the per-tile registry published beside the store | 2026-08-19 |
 
 **The reader's side is a separate document.** What a consumer needs to open the finished store (as
@@ -568,34 +568,12 @@ neighbour would show up: none did.
 mid-run SSO expiry killed four coordinators outright, writing no result at all. Neither was in the
 subject.
 
-#### What is still open: spacing publications apart
+#### Spacing publications apart: not built, and ruled out
 
-Shortening the interval buys odds. **The guarantee needs a minimum spacing between publications set
-strictly above the tick interval**, so at most one publication can land between consecutive ticks —
-a 30 s interval with publications at least 31 s apart, and the arithmetic holds provided a tick's own
-work stays inside the one-second margin.
-
-**It is not built, and the reason is a prior decision rather than a technical one.** A minimum spacing
-needs a fleet-wide lock, and this repo removed exactly that (§5): `_PrefectCommitGate` is deleted,
-`commit_limit_name` is gone from `run_global_campaign`, and a test asserts no knob remains to
-reintroduce one. That removal was argued on cost — the gate bound queueing on a 0.5–2.2 s commit and
-had misled its own operator when read as a progress signal.
-
-Those reasons do not carry over cleanly, because **spacing is a different intervention from a
-concurrency cap**, and its cost is bounded: ten coordinators finishing at once would delay the last
-publication by about five minutes against assemblies measured in hours. But reversing a documented
-decision guarded by a test belongs in its own change, with its own review.
-
-Two things also worth stating before that is built. A store-side implementation cannot work: two
-coordinators reading the same branch tip would both wait the same amount and then both commit
-together, so mutual exclusion is genuinely required. And the one-second margin is thin — the spacing
-should be derived from `CATCH_UP_INTERVAL_S` rather than written as a second literal, so the two
-cannot drift apart.
-
-Note this contradicts an earlier claim in this document that *"serialising commits does not address
-the cause, because the gap opens during the write rather than during the commit."* That is right
-about serialising and wrong about **spacing**: the gap does open during the write, but its depth is
-set by how many publications land in it, which is a property of the commit side.
+A minimum spacing between publications, set above the tick interval, would bound the catch-up's
+depth. It is not needed: depth was the hang's precondition, not its cause, and the cause — the
+request cap — is gone (§2a). It would also need a fleet-wide lock around commits, which §5 rules
+out.
 
 ---
 
@@ -843,14 +821,17 @@ release notes contain no change to the credential-caching code, so upgrading doe
 
 ---
 
-## 5. Commits are ungated, and what would reopen that
+## 5. Commits are ungated
 
 **Decided 2026-08-27 by Robert**, on the reasoning that the gate guarded a minuscule possibility, that
 if it does occur the slowdown is manageable and easily overcome, and that an extra gate is complexity
 the campaign does not need. **The `tessera-global-commits` Prefect global concurrency limit and all
-of its plumbing are removed.** This section records the measurement that supports it, the evidence
-the gate was built on — which is *not* retracted — and the scale at which that evidence would matter
-again.
+of its plumbing are removed.** **Made final 2026-10-14:** the cap solved nothing in the campaign and
+caused problems there, so no fleet-wide limit on commits — a cap, a lock, or publication spacing
+(§3) — is to be reintroduced. No limit tried on this write path bought anything, and the request
+cap (§2a) deadlocked `Session.commit` in production. This section records the measurement behind
+the removal and the evidence the gate was built on, which is *not* retracted: it measures latency,
+not failure.
 
 ### What the gate was
 
@@ -859,7 +840,7 @@ A Prefect global concurrency limit, one slot held around `session.commit`, forwa
 `min(max_parallel_clusters, 8)`. It existed because ADR-008's run 1 measured rebase retries scaling
 with the number of racing writers.
 
-**The run-1 curve, kept because it is the reopen criterion:**
+**The run-1 curve:**
 
 | simultaneous committers | rebase retries | commit duration |
 |---:|---:|---:|
@@ -932,34 +913,19 @@ terminal**. Collisions are likelier than an assembly-only model suggests. It doe
 conclusion, because the cost of one is seconds, but it is the part of the reasoning most easily got
 wrong.
 
-### The threshold, in cluster counts, and the detector
+### The detector
 
-| `max_parallel_clusters` | committer ceiling (2N) | versus the N≥16 breach |
-|---:|---:|---|
-| 7 | 14 | below — safe |
-| **8** | **16** | **AT the breach** |
-| 10 (the campaign) | 20 | above |
-| 16 | 32 | far above |
-
-**So the boundary is `max_parallel_clusters` ≥ 8, and the safe cap is ≤ 7.** (An earlier version of
-this section said "above ~12", which is arithmetically wrong — 2N reaches 16 at N=8 — and would have
-left every configuration from 8 to 12 at or above the breach with no gate. Caught in review. It also
-contradicted the ≤7 bound stated elsewhere in the same document: **I swept the withdrawn premise but
-did not re-check the arithmetic that depended on it**, which is exactly the failure mode a sweep is
-supposed to prevent.)
-
-Two other conditions would put committers back in contention regardless of N: more than one cluster
-owning the same zone, which would put two committers on one zone group; and a change making assembly
-commit per-shard or per-tile rather than once per zone-year.
-
-**The detector is the `COMMIT <secs>: <message>` line in `commit_with_rebase`** (`storage/shard_writer.py`)**.** Every commit goes
-through that function — the assembly path and the terminal path both — so it is the only place that
-sees all of them. `commit_s` in `ASSEMBLY_SUMMARY` was the obvious candidate and is **not
+**Commit latency is read off the `COMMIT <secs>: <message>` line in `commit_with_rebase`**
+(`storage/shard_writer.py`). Every commit goes through that function — the assembly path and the
+terminal path both — so it is the only place that sees all of them. `commit_s` in `ASSEMBLY_SUMMARY` was the obvious candidate and is **not
 sufficient**: a terminal cell marks itself through `mark_zone_year_empty` and returns without ever
 reaching `assemble_global`, so the summary never fires for it. Since terminal cells were 72 of the
 first 78 completions, that detector would have missed the dominant source of concurrent commits and
-stayed silent exactly when the gate should be restored. **A commit time drifting above a couple of
-seconds is the signal.**
+stayed silent exactly when contention rose. **A commit time drifting above a couple of seconds is
+the signal**, and the response is to find what raised contention, not to gate commits. Three
+things would: more than one cluster owning the same zone, assembly committing per shard or per
+tile rather than once per zone-year, or a fleet far wider than the campaign's — run 1's 2.2 s is
+at 16 simultaneous committers, and N clusters can reach 2N.
 
 One line per COMMIT is not one per zone-year: an assembled cell emits **two** (shard data, then
 completion attrs), a terminal cell **one**. So the line is a reliable signal of commit LATENCY, but
