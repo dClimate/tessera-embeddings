@@ -308,23 +308,11 @@ cluster-less (they run on the flow runner like `generate_roi`); only
 
 ### Targeted updates of filled cells
 
-An **update** re-runs chosen shards of cells the campaign has already filled and writes nothing
-else ([ADR 027](../../../../context_docs/decisions/027-targeted-updates.md)). Three steps:
-
-1. **Plan it.** `scripts/update/plan_update.py` writes an immutable plan to
-   `{inputs}/updates/<name>/plan.json`: the cells, the shards in each (or all of them), the land
-   mask, the mode and the ingest settings. Shards come from the registry's `master/` (`--refused`,
-   `--aoi`, `--zones`, `--years`) or a CSV. Dry run unless `--write`; it reports how many of each cell's shards the mask
-   holds live.
-2. **Run it.** Pass `update=<name>` to `fill-zones-sequential` for one cluster (`cells` defaults to
-   the plan's, and a subset splits an update across runs), or to `run-global-campaign` for several,
-   balanced on the plan's shards. Each ingests only its target shards' 4096-px blocks, plans its
-   cells from the plan, and records itself on each cell.
-3. **Check and release it.** `update-<name>-base` pins the store before the first write and
-   `update-<name>-complete` once every planned cell holds the record. Compare the two, then delete
-   the update's `rois/`, `mosaics/` and `holes/` under `{inputs}/updates/<name>/`, keeping
-   `plan.json`, which reserves the name, and, once satisfied, the base tag, which holds the replaced
-   shards.
+An **update** re-runs chosen tiles of cells the campaign has already filled and writes nothing
+else. How to plan, run, check and clean up an update is
+[`docs/updates.md`](../../../../docs/updates.md); the design is
+[ADR 027](../../../../context_docs/decisions/027-targeted-updates.md). Both fill flows take the
+update's name as `update=<name>`, and treat its cells differently from a fill's:
 
 | | campaign fill | update |
 |---|---|---|
@@ -336,31 +324,16 @@ else ([ADR 027](../../../../context_docs/decisions/027-targeted-updates.md)). Th
 | `min_valid_coverage`, month check | 0.1, every month | `1e-9`, relaxed: a partial-zone ROI must never block |
 | radar policy | any | `holes` requires `allow_s2_only=True`, the campaign's, refused before ingest otherwise |
 
-Run one update per cell at a time: two updates of one cell conflict on its chunks. The whole
-procedure, checks and recovery included, is the
-[`run-update`](../../../../.agents/skills/run-update/SKILL.md) skill.
+Run one update per cell at a time: two updates of one cell conflict on its chunks.
 
 #### Loosening the optical line, then updating
 
 A store's minimum optical depth rule moves only down, for the whole store or for named zones, and a
 `holes` update then embeds exactly the pixels the looser line admits
-([ADR 028](../../../../context_docs/decisions/028-embed-every-pixel-with-an-optical-observation.md)):
-
-1. **Loosen.** `uv run python scripts/update/loosen_optical_min_obs.py --store <uri> --line 1 [--zones 18N,19N] --write`
-   (a dry run without `--write`). The root, or each named zone, records the line it gives up in
-   `optical_min_obs_history`; every fill from then on reads its zone's rule from the store. Loosen
-   between runs: a chained fill already running in the zone refuses its next cell there, because the
-   rule it read at the start no longer matches the store.
-2. **Plan.** `uv run python scripts/update/plan_update.py from-registry --name line1-<scope> --mode holes --refused thin`
-   with the same `--zones` (a zone still at the old line would re-infer its holes and refuse them
-   again), optionally narrowed by `--aoi` or a mask built with `build-land-mask`. Every thin-refused
-   pixel is now a hole. The dry run prints each cell's shard counts: price them against
-   `context_docs/campaign/campaign-cost-model.md` and the holes-mode measurement (ADR 027 §3), not
-   an estimate.
-3. **Run** it as any update.
-4. **Check.** Updated tiles' `master/` rows carry `update_name`, `optical_min_obs = 1` and
-   `refused_thin_px = 0`; each cell's `updates[year]` record carries `optical_min_obs: 1`; the same
-   `plan_update.py` over the updated registry returns no cells.
+([ADR 028](../../../../context_docs/decisions/028-embed-every-pixel-with-an-optical-observation.md)).
+The steps are in [`docs/updates.md`](../../../../docs/updates.md) ("Filling pixels a looser rule now
+admits"). Every fill reads its zone's rule from the store, and a chained fill already running in a
+zone refuses its next cell there once the rule changes, so loosen between runs.
 
 ## Master pipeline
 
