@@ -190,4 +190,6 @@ whole year empty, a different path from a published zone-year.
 The four test folders were deleted in-region from both dev buckets, apart from the 35N mosaics,
 kept for reuse at `s3://global-tessera-inputs-dev/_stack-test/mosaics/35n-7d-{s2,s1-asc,s1-desc}/`
 (about 660 GB). The fills' and updates' mosaics had already gone with the pipeline's own cleanup.
-`dev/global-tessera-hole-reads` and its deployments were removed.
+`dev/global-tessera-hole-reads` and its deployments were removed. The 2026-10-15 run's
+`_unwritten-tile/` and `_unwritten-tile-2/` folders were deleted in-region from both dev buckets,
+and `dev/global-tessera-unwritten-tile` and its deployments were removed.
