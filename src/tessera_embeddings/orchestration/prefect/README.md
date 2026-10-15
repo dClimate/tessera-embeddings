@@ -313,8 +313,8 @@ else ([ADR 027](../../../../context_docs/decisions/027-targeted-updates.md)). Th
 
 1. **Plan it.** `scripts/update/plan_update.py` writes an immutable plan to
    `{inputs}/updates/<name>/plan.json`: the cells, the shards in each (or all of them), the land
-   mask, the mode and the ingest settings. Shards come from the registry's `master/` (`--where`,
-   `--aoi`) or a CSV. Dry run unless `--write`; it reports how many of each cell's shards the mask
+   mask, the mode and the ingest settings. Shards come from the registry's `master/` (`--refused`,
+   `--aoi`, `--zones`, `--years`) or a CSV. Dry run unless `--write`; it reports how many of each cell's shards the mask
    holds live.
 2. **Run it.** Pass `update=<name>` to `fill-zones-sequential` for one cluster (`cells` defaults to
    the plan's, and a subset splits an update across runs), or to `run-global-campaign` for several,

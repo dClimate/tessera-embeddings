@@ -17,8 +17,8 @@ done without disturbing anything else.
 re-run, or every live shard; it names the land mask its shards were chosen under, its mode, and the
 ingest settings it needs. It is written once to `{inputs}/updates/<name>/plan.json`
 (`storage/update.py`) and every flow that runs it reads it from there, so a run is identified by
-its name alone. A plan comes from the registry's `master/` (a SQL `where` and/or an AOI) or from an
-explicit list (`scripts/update/plan_update.py`).
+its name alone. A plan comes from the registry's `master/` (the tiles that refused pixels, by zone, year
+and area) or from an explicit list (`scripts/update/plan_update.py`).
 
 **Two modes, because there are two reasons to re-run a shard.**
 

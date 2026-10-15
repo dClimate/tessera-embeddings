@@ -4,15 +4,17 @@ An update re-runs chosen shards of zone-years the campaign has already filled
 (``src/tessera_embeddings/storage/update.py``, ADR 027). This writes the plan the flows read —
 ``fill-zones-sequential`` and ``run-global-campaign`` both take ``update=<name>`` — from either:
 
-* ``from-registry``: the shards whose ``master/`` rows match a SQL ``--where`` and/or an ``--aoi``
-  box, e.g. every shard with thin refusals in a cloudy region::
+* ``from-registry``: the shards whose ``master/`` rows refused pixels (``--refused``, for one reason
+  or any), narrowed by ``--zones``, ``--years`` and an ``--aoi`` box, e.g. every shard with thin
+  refusals in a cloudy region::
 
       plan_update.py from-registry --name amazon-thin-2026-10 --mode holes \
           --registry s3://tessera-embeddings/v1.1/dclimate.registry --anonymous \
-          --where "refused_thin_px > 0" --aoi=-75,-15,-50,5 --years 2021,2022 \
+          --refused thin --aoi=-75,-15,-50,5 --years 2021,2022 \
           --inputs s3://global-tessera-inputs-prod
 
-* ``from-cells``: a CSV of ``zone,year,tile`` rows, a blank ``tile`` meaning every live shard.
+* ``from-cells``: a CSV of ``zone,year,tile`` rows, a blank ``tile`` meaning every live shard. Any
+  other selection is a CSV, built however you like.
 
 Before anything is written the plan is checked against its mask: a zone the mask lacks, or a shard
 outside a zone's grid, refuses; shards the mask holds dead are reported, since the fill drops them.
@@ -22,7 +24,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast, get_args
 
 import icechunk
 import numpy as np
@@ -31,9 +33,16 @@ import polars as pl
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.ingest.land_mask import narrow_tile_live
 from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
-from tessera_embeddings.storage.update import UpdatePlan, cell_key, plan_from_registry, plan_uri, save_plan
+from tessera_embeddings.storage.update import (
+    Refused,
+    UpdatePlan,
+    cell_key,
+    plan_from_registry,
+    plan_from_tiles,
+    plan_uri,
+    save_plan,
+)
 from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group
-from tessera_embeddings.storage.zone_grid import canonicalize_zone
 
 
 def _credentials(uri: str) -> Callable[[], icechunk.S3StaticCredentials] | None:
@@ -59,20 +68,6 @@ def check_against_mask(plan: UpdatePlan, mask_path: str, *, region: str | None =
     return report
 
 
-def _cells_from_csv(path: str) -> dict[str, tuple[str, ...] | None]:
-    """``zone,year,tile`` rows grouped by cell; a blank tile asks for every live shard.
-
-    Zones are canonicalised before grouping, so ``7S`` and ``07S`` rows land in one cell.
-    """
-    rows = pl.read_csv(path, schema={"zone": pl.String, "year": pl.Int64, "tile": pl.String})
-    rows = rows.with_columns(pl.col("zone").map_elements(canonicalize_zone, return_dtype=pl.String))
-    cells: dict[str, tuple[str, ...] | None] = {}
-    for (zone, year), group in rows.group_by("zone", "year"):
-        tiles = group["tile"].drop_nulls().to_list()
-        cells[cell_key(str(zone), int(year))] = None if group["tile"].null_count() else tuple(tiles)
-    return cells
-
-
 def main(argv: list[str] | None = None) -> int:
     """Build, check and (with ``--write``) save one plan."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -82,11 +77,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--inputs", required=True, help="the deployment's inputs URI (BucketPaths.inputs)")
     parser.add_argument("--mask", default="global", help="land-mask name (BucketPaths.land_mask_store)")
     parser.add_argument("--on-skip", default="keep", choices=["keep", "clear"])
-    parser.add_argument("--min-valid-coverage", type=float, default=None, help="percent of the ROI; default 1e-9")
-    parser.add_argument("--strict-window", action="store_true", help="require a valid date in every month")
     parser.add_argument("--registry", help="from-registry: the registry root (beside the store)")
     parser.add_argument("--anonymous", action="store_true", help="from-registry: read a public registry unsigned")
-    parser.add_argument("--where", help="from-registry: SQL over master/ columns")
+    parser.add_argument(
+        "--refused", choices=get_args(Refused), help="from-registry: keep tiles that refused pixels for this reason"
+    )
     parser.add_argument("--aoi", help="from-registry: west,south,east,north in WGS84 degrees, as --aoi=W,S,E,N")
     parser.add_argument("--zones", help="comma-separated zones")
     parser.add_argument("--years", help="comma-separated years")
@@ -95,28 +90,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--write", action="store_true", help="save the plan; without it this is a dry run")
     args = parser.parse_args(argv)
 
-    fields: dict[str, Any] = {
-        "mask_name": args.mask,
-        "on_skip": args.on_skip,
-        "allow_partial_window": not args.strict_window,
-    }
-    if args.min_valid_coverage is not None:
-        fields["min_valid_coverage"] = args.min_valid_coverage
+    fields: dict[str, Any] = {"mask_name": args.mask, "on_skip": args.on_skip}
     if args.source == "from-registry":
         if not args.registry:
             parser.error("from-registry needs --registry")
-        aoi = None
-        if args.aoi:
-            west, south, east, north = (float(v) for v in args.aoi.split(","))
-            aoi = (west, south, east, north)
         plan = plan_from_registry(
             args.registry,
             name=args.name,
             mode=args.mode,
+            refused=args.refused,
             zones=args.zones.split(",") if args.zones else None,
             years=[int(y) for y in args.years.split(",")] if args.years else None,
-            where=args.where,
-            aoi=aoi,
+            aoi=cast("tuple[float, float, float, float]", tuple(map(float, args.aoi.split(",")))) if args.aoi else None,
             # The region always: without it the scan asks us-east-1 and S3 answers with a redirect.
             storage_options={
                 "aws_region": args.region or "us-west-2",
@@ -127,9 +112,8 @@ def main(argv: list[str] | None = None) -> int:
     else:
         if not args.cells:
             parser.error("from-cells needs --cells")
-        plan = UpdatePlan(
-            name=args.name, mode=args.mode, cells=_cells_from_csv(args.cells), source=args.cells, **fields
-        )
+        tiles = pl.read_csv(args.cells, schema={"zone": pl.String, "year": pl.Int64, "tile": pl.String})
+        plan = plan_from_tiles(tiles, name=args.name, mode=args.mode, source=args.cells, **fields)
 
     paths = BucketPaths(inputs=args.inputs, outputs="")
     report = check_against_mask(plan, paths.land_mask_store(plan.mask_name), region=args.region)
