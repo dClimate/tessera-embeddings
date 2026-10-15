@@ -41,8 +41,9 @@ Why updates work the way they do is in
   `paths.inputs` holds imagery, land masks and update plans, and `paths.outputs` holds stores. For a
   single-area run they are in the config file. For the global flows they are the deployment's
   `paths` parameter: `prefect deployment inspect 'fill-zones-sequential/<deployment>'` prints it if
-  it was set when the deployment was registered, and otherwise it is the value you pass with
-  `-p paths=...` when you run it. `prefect deployment ls` lists the deployment names.
+  it was set when the deployment was registered, and otherwise you pass it when you run a flow, as
+  `-p paths='{"inputs": "s3://my-inputs", "outputs": "s3://my-outputs"}'`. `prefect deployment ls`
+  lists the deployment names.
 - **Replace the example values** below (`s3://my-inputs`, `amazon-thin-2024`, `18S`, and so on) with
   your own.
 
@@ -116,6 +117,8 @@ You need the config file of the run that made the store, and the store itself, a
    ```
 
    `written` lists the tiles that changed and `kept` the tiles that had nothing to update.
+5. **Delete the tag once you are satisfied:** `repo.delete_tag("update-more-imagery-2025-base")`.
+   Until then the store keeps the old version of every tile the update rewrote.
 
 ## Update the global store
 
@@ -127,8 +130,8 @@ You need:
 - **the deployment of the global flows** that filled it (`run-global-campaign` and
   `fill-zones-sequential`), on a Prefect server you can reach
   ([`prefect-setup.md`](prefect-setup.md));
-- **AWS access** that can read the store, its registry and the land mask, and write under
-  `{paths.inputs}/updates/`.
+- **AWS access** that can read the store, its registry and the land mask, write under
+  `{paths.inputs}/updates/`, and write to the store itself for clean-up.
 
 Open the store this way for every check on this page:
 
@@ -216,7 +219,8 @@ prefect deployment run 'fill-zones-sequential/<deployment>' -p update=amazon-thi
 - **A `holes` update needs `allow_s2_only=true`**, which embeds pixels that have optical
   (Sentinel-2) observations but no radar (Sentinel-1) ones, as the campaign does. Without it the
   run refuses before doing any work.
-- **Parameters you leave out keep the deployment's values.** To run part of the plan, add
+- **Parameters you leave out keep the deployment's values.** Any parameter the deployment does
+  not set, such as `paths` in some setups, must be passed with `-p` too. To run part of the plan, add
   `-p zones='["18S"]' -p years='[2024]'` to `run-global-campaign`, or `-p cells='[["18S", 2024]]'` to
   `fill-zones-sequential`.
 - **It starts GPU machines in your cloud account,** so it costs money while it runs; see "How long
@@ -236,15 +240,16 @@ from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.storage.update import load_update, update_states
 
 name = "amazon-thin-2024"
-plan = load_update(BucketPaths(inputs="s3://my-inputs", outputs=""), name)
+plan = load_update(BucketPaths(inputs="s3://my-inputs", outputs=""), name)  # only inputs is read
 print(update_states(repo, name, plan.cell_list()))  # every zone-year should be "done"
 print(f"update-{name}-complete" in repo.list_tags())  # True
 
-# Every tile that changed should be in the plan.
+# Every tile that changed should be in the plan. Zones planned with a blank tile are left out.
 planned = {(key.split("/")[0], tile) for key, tiles in plan.cells.items() for tile in tiles or ()}
+whole = {key.split("/")[0] for key, tiles in plan.cells.items() if tiles is None}
 diff = repo.diff(from_tag=f"update-{name}-base", to_tag=f"update-{name}-complete")
 changed = {(path.split("/")[1], f"chunk_{c[1]}_{c[2]}") for path, chunks in diff.updated_chunks.items() for c in chunks}
-print(changed - planned)  # should print set()
+print({c for c in changed if c[0] not in whole} - planned)  # passes when it prints set()
 ```
 
 Then check that the registry agrees with the store:
@@ -257,9 +262,9 @@ python scripts/maintenance/rebuild_registry_measurements.py verify \
 
 The registry rows of the tiles the update wrote now carry its name in `update_name`.
 
-The tile comparison prints more than `set()` in two cases, both expected: a zone-year planned with a
-blank `tile` lists none of its tiles in `planned`, and anything another writer committed between the
-two tags appears in `changed`.
+If the tile check prints any tile, something outside the plan changed between the two tags: either
+another writer committed to the store meanwhile, or the update wrote outside its plan, which is a
+bug to report.
 
 ### 4. Clean up
 
@@ -272,14 +277,16 @@ two tags appears in `changed`.
 2. **Delete the base tag once you are satisfied:** `repo.delete_tag("update-amazon-thin-2024-base")`.
    Until then the store keeps the old version of every tile the update rewrote, and you pay to store
    it.
-3. **Reclaim the space,** if you want it back now. This deletes old versions for good, and must only
-   run while nothing is writing to the store:
+3. **Reclaim the space,** if you want it back now. This permanently deletes every version of the
+   store older than the update's completion that no tag holds, not only this update's. Run it only
+   while nothing is writing to the store, and look at the dry run first:
 
    ```python
-   from datetime import UTC, datetime
    from tessera_embeddings.storage.campaign import expire_and_gc
 
-   expire_and_gc(repo, older_than=datetime(2026, 10, 1, tzinfo=UTC))  # a time before any write still running
+   cutoff = repo.lookup_snapshot(repo.lookup_tag("update-amazon-thin-2024-complete")).written_at
+   print(expire_and_gc(repo, older_than=cutoff, dry_run=True))  # what would be deleted
+   expire_and_gc(repo, older_than=cutoff)
    ```
 
 There is no undo for one update: going back to the base tag would also discard everything written
