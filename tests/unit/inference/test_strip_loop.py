@@ -137,23 +137,20 @@ class TestStripPlan:
         assert strips == [slice(8, 12), slice(4, 8), slice(0, 4)]
         assert live == 2
 
-    def test_a_holes_plan_reads_only_the_rows_and_columns_with_holes(self):
-        """An update infers only its holes, so the plan crops to them and drops strips with none.
-
-        A hole with no optical observation can never be inferred, so it neither widens the crop nor
-        keeps a strip alive.
+    def test_a_holes_plan_crops_to_embeddable_holes_and_skips_strips_with_none(self):
+        """Rows 4-7 hold no hole and are never read. Row 0's hole has no optical observation, so it
+        does not widen the crop, but its strip is still read, last: the update writes its radar counts.
         """
         obs = np.ones((12, 10), dtype=np.uint16)
         obs[0, :] = 0
         holes = np.zeros((12, 10), dtype=bool)
-        holes[0, 0] = True  # no optical observation
-        holes[5:7, 2:4] = True
-        holes[9, 3] = True
+        holes[0, 0] = True
+        holes[9, 3] = holes[10, 2] = True
         bundle = SimpleNamespace(mask=np.zeros((3, 12, 10), dtype=bool), obs_count=obs)
         with patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(4)):
             x_sub, strips, live = _read_plan_mod._chunk_read_plan(_CHUNK, bundle, pixels=holes)
         assert x_sub == slice(2, 4)
-        assert (strips, live) == ([slice(5, 9), slice(9, 10)], 2)
+        assert (strips, live) == ([slice(8, 11), slice(0, 4)], 1)
 
     def test_a_holes_plan_with_nothing_to_infer_keeps_one_strip(self):
         """The chunk must still resolve to a skip, so one (empty) strip remains to run."""

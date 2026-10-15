@@ -9,7 +9,7 @@ An update re-runs chosen shards of zone-years the campaign has already filled
 
       plan_update.py from-registry --name amazon-thin-2026-10 --mode holes \
           --registry s3://tessera-embeddings/v1.1/dclimate.registry --anonymous \
-          --where "refused_thin_px > 0" --aoi -75,-15,-50,5 --years 2021,2022 \
+          --where "refused_thin_px > 0" --aoi=-75,-15,-50,5 --years 2021,2022 \
           --inputs s3://global-tessera-inputs-prod
 
 * ``from-cells``: a CSV of ``zone,year,tile`` rows, a blank ``tile`` meaning every live shard.
@@ -87,7 +87,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--registry", help="from-registry: the registry root (beside the store)")
     parser.add_argument("--anonymous", action="store_true", help="from-registry: read a public registry unsigned")
     parser.add_argument("--where", help="from-registry: SQL over master/ columns")
-    parser.add_argument("--aoi", help="from-registry: west,south,east,north in WGS84 degrees")
+    parser.add_argument("--aoi", help="from-registry: west,south,east,north in WGS84 degrees, as --aoi=W,S,E,N")
     parser.add_argument("--zones", help="comma-separated zones")
     parser.add_argument("--years", help="comma-separated years")
     parser.add_argument("--cells", help="from-cells: CSV of zone,year,tile")

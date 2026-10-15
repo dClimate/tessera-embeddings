@@ -302,6 +302,8 @@ def _plan_update(
         log.info("Update %s is already recorded on %s for %d — nothing to do", name, output_path, year)
         return None
     if tiles is not None:
+        if not tiles:
+            raise ValueError(f"Update {name!r} lists no tiles; omit `tiles` to update every tile")
         if outside := sorted(set(tiles) - {c.label for c in chunks}):
             raise ValueError(f"Update {name!r} names tiles outside the area: {outside}")
         chunks = [c for c in chunks if c.label in set(tiles)]

@@ -137,10 +137,11 @@ def _chunk_read_plan(
     observation counts, run last; the returned count of live strips tells the actor where they
     begin.
 
-    ``pixels`` is a targeted update's hole mask (``ChunkSpec.pixels``). The update infers only those
-    pixels and keeps the store's values everywhere else, so the plan is made from them alone: the
-    crop covers the rows and columns holding a hole with an optical observation, and strips with
-    none are not returned, so they are never read.
+    ``pixels`` is a targeted update's hole mask (``ChunkSpec.pixels``). The update keeps the store's
+    values outside its holes, so the plan is made from them alone: the crop covers the columns
+    holding a hole with an optical observation, the only holes it can embed, and a strip holding no
+    hole is not returned, so it is never read. A strip whose holes cannot embed is still read, after
+    the live ones, because the update writes every hole's observation counts, radar's included.
     """
     t_kept = int(mask_bundle.mask.shape[0])
     # (H, W): pixels with >=1 valid S2 observation. Equivalent to mask.any(axis=0) — obs_count sums the pre-prune mask
@@ -173,8 +174,9 @@ def _chunk_read_plan(
     # Bands read at effective_width (possibly cropped); the SCL mask stays full chunk width, so charge it at
     # chunk.width in the budget.
     rows = slice(0, chunk.height)
-    if pixels is not None and (live_rows := np.flatnonzero(valid_any.any(axis=1))).size:
-        rows = slice(int(live_rows[0]), int(live_rows[-1]) + 1)
+    hole_rows: np.ndarray | None = None if pixels is None else np.asarray(pixels.any(axis=1))
+    if hole_rows is not None and (held := np.flatnonzero(hole_rows)).size:
+        rows = slice(int(held[0]), int(held[-1]) + 1)
     # The strip height is sized for the whole chunk, whose SCL mask stays resident whatever rows are
     # read; only the rows it tiles shrink.
     strips = [
@@ -186,6 +188,8 @@ def _chunk_read_plan(
     counts = [int(valid_rows[s].sum()) for s in strips]
     order = sorted(range(len(strips)), key=lambda k: -counts[k])  # stable: equal strips keep their order
     live = sum(c > 0 for c in counts)
-    # An update writes nothing outside its holes, so an empty strip has no counts worth recording; one
-    # is kept when none is live, so the chunk still resolves to a skip.
-    return x_sub, [strips[k] for k in order][: max(live, 1) if pixels is not None else None], live
+    if hole_rows is None:
+        return x_sub, [strips[k] for k in order], live
+    # With nothing to embed the tile is kept unwritten, so one strip is enough to resolve it to a skip.
+    keep = [k for k in order if hole_rows[strips[k]].any()] if live else order[:1]
+    return x_sub, [strips[k] for k in keep], live

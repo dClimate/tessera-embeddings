@@ -92,7 +92,9 @@ The read plan now skips every strip of a tile that holds no hole (`74ee8ea6`). I
 paired run: two stores filled with the same eight 18S/2024 tiles at a line of 15, loosened to 1,
 and updated in `holes` mode concurrently, one on the code before the change (A) and one after (B),
 both through #223's branch. The tiles were picked from the published registry to span its
-distribution of thin refusals, from 0.003% of a tile to 56%.
+distribution of thin refusals, from 0.003% of a tile to 56%. The code that merged also reads a strip
+whose holes have no optical observation, to rewrite their radar counts; that plans these tiles the
+same: every hole on the three tiles that skipped a strip embedded, so the skipped strips held none.
 
 | tile | holes filled | strips read, A → B | time outside inference, A → B |
 |---|---|---|---|
