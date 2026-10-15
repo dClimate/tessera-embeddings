@@ -768,6 +768,8 @@ is recorded as its own signal, *after* the store is fully written:
                     ↓
                 ds.to_zarr(…, mode="w")           many objects, no atomic commit
                     ↓
+                coverage = {…}                    this shard's refusal reasons and depth
+                    ↓
                 staged_complete = True            in-store attribute
                     ↓
                 <label>.done  (zero bytes)        sibling object, written LAST
@@ -811,6 +813,32 @@ second gate to maintain.
 
 All of this guards the *staging* layer only. The final store is Icechunk, whose
 transactional commit already rolls back cleanly on a crash during assembly.
+
+#### The coverage record rides on the tile, not only on the result
+
+A shard's coverage record — its three refusal counts, its optical depth statistics and whether
+either radar orbit saw it — fills the published registry's measurement columns. Both kinds of
+shard persist it on object storage, so it outlives the process that measured it:
+
+```text
+  refused shard   ── record ──▶ <label>.skipped                 on S3, survives every resume
+  embedded shard  ── record ──▶ <label>.zarr  attrs["coverage"]  on S3, survives every resume
+                         └────▶ Ray result                       this leg only
+```
+
+A resumed run's finishing leg reports earlier legs' tiles as **synthetic successes** carrying no
+record. `assemble_global` therefore reads the record back from the staged tile for every label
+that arrived without one: `read_staged_coverage` is the embedded half of `read_skip_records` —
+concurrent, fail-soft, counting unreadable objects rather than swallowing them — and a run that
+staged everything itself reads nothing at all. `write_chunk` sets the attribute with
+`staged_complete`, so before `.done`, and the completion marker keeps vouching for a tile whose
+attributes are already set.
+
+A record that cannot be read publishes its row null, "not measured", with a warning naming the
+count. Every column is derivable from the store, so such rows are repairable:
+`scripts/maintenance/rebuild_registry_measurements.py`. That script also repaired the 1,519,045
+null rows of the v1.1 campaign, which ran before the embedded path persisted its record
+([`registry-backfill.md`](../../../context_docs/storage/registry-backfill.md)).
 
 ### 2. Assembling the staged tiles into the store
 

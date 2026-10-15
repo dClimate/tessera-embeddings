@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import icechunk
 import numpy as np
 import pytest
 import zarr
 
 from tessera_embeddings.config.store_layout import GLOBAL, SHARD_PX
-from tessera_embeddings.storage import global_store, published_store, zarr_store
+from tessera_embeddings.storage import global_store, published_store, shard_writer, zarr_store
+from tessera_embeddings.storage.published_store import Commit
 from tessera_embeddings.storage.zone_grid import PIXEL_M, ZoneSpec
 
 # Two shards of easting by four of northing, so a shard grid exists without a large store.
@@ -378,3 +381,98 @@ class TestSavedManifestPreload:
         monkeypatch.setattr(icechunk.Repository, "save_config", lambda self: None)
         with pytest.raises(RuntimeError, match="preload did not change"):
             global_store.set_saved_manifest_preload(seeded, enabled=False)
+
+
+class TestWhoWroteAYear:
+    """The store's own account of which runs wrote a zone-year, and which tiles each commit wrote."""
+
+    def test_a_commit_s_tiles_are_its_diff_in_that_year_written_cleared_and_refused_alike(self, seeded):
+        """A refused tile writes its observation counts and leaves ``scales`` absent, before and after, and
+        fill written where nothing was still counts: Zarr deletes the chunk, and the log records the delete.
+        """
+        _fill_shard(seeded, "01N", 1, (0, 0))
+        session = global_store.open_global_repo(seeded).writable_session("main")
+        node = zarr.open_group(session.store, mode="r+")["01N"]
+        writes = ((1, (0, 0), np.nan, "scales"), (1, (3, 1), 0.5, "scales"), (0, (2, 0), 0.5, "scales"))
+        for time_index, shard, value, var in (*writes, (1, (1, 1), 3, "s2_obs_count"), (1, (2, 1), np.nan, "scales")):
+            y0, y1, x0, x1 = published_store.shard_pixel_window(shard, node[var].shape)
+            node[var][time_index, y0:y1, x0:x1] = value
+        snapshot = session.commit("clear one tile, write another, refuse a third, and one in the other year")
+        repo = global_store.open_global_repo(seeded)
+        expected = {"chunk_0_0", "chunk_3_1", "chunk_1_1", "chunk_2_1"}
+        assert published_store.commit_tiles(repo, "01N", 1, snapshot) == expected
+
+    def test_tagged_shard_commits_are_listed_by_zone_year_oldest_first(self, seeded):
+        repo = global_store.open_global_repo(seeded)
+        sids = []
+        for run, year in (("fill", 2024), ("other-year", 2025), ("refill", 2024)):
+            session = repo.writable_session("main")
+            zarr.open_group(session.store, mode="r+")["01N"].attrs["touch"] = run
+            tag = {shard_writer.SHARD_WRITE: {"run_id": run, "zone": "01N", "year": year}}
+            sids.append(shard_writer.commit_with_rebase(session, run, metadata=tag))
+        session = repo.writable_session("main")
+        zarr.open_group(session.store, mode="r+")["01N"].attrs["touch"] = "untagged"
+        session.commit("an untagged commit, such as a seed")
+        writes = published_store.shard_writes(repo)
+        assert set(writes) == {("01N", 2024), ("01N", 2025)}
+        assert [(c.run_id, c.snapshot) for c in writes["01N", 2024]] == [("fill", sids[0]), ("refill", sids[2])]
+        assert writes["01N", 2024][1].at == repo.lookup_snapshot(sids[2]).written_at.isoformat()
+
+    def test_every_write_is_listed_a_retry_s_too_and_an_untagged_run_comes_from_the_runs_record(self):
+        """A retry under the same run id is a commit of its own, and runs from before tags are known only
+        from the record, which a refill keeps.
+        """
+        old, first, retry, update = (f"2026-0{m}-01T00:00:00+00:00" for m in (7, 8, 9, 9))
+        update = update.replace("01T", "02T")
+        runs = shard_writer.run_provenance({"2024": {"run_id": "v11", "assembled_at": old}}, 2024, "refill", code={})
+        writes = [Commit("refill", first, "s1"), Commit("update", update, "s3"), Commit("refill", retry, "s2")]
+        assert published_store.committed_runs({"runs": runs}, 2024, writes) == [
+            Commit("v11", old, None),
+            Commit("refill", first, "s1"),
+            Commit("refill", retry, "s2"),
+            Commit("update", update, "s3"),
+        ]
+
+    def test_a_refill_keeps_that_the_run_it_replaced_marked_the_year_empty(self):
+        """A v1.1 year marked empty published no part, and the store check must not mistake it for a write."""
+        marked = {"2024": {"run_id": "v11", "assembled_at": "2026-07-01T00:00:00+00:00", "empty": True}}
+        runs = shard_writer.run_provenance(marked, 2024, "refill", code={})
+        assert published_store.committed_runs({"runs": runs}, 2024, []) == [
+            Commit("v11", "2026-07-01T00:00:00+00:00", None, empty=True)
+        ]
+
+    def test_a_run_whose_shard_commit_expired_is_known_from_its_record(self, seeded):
+        """Expiry keeps tagged snapshots, and the zone-year tag is on the attrs commit, not the shard commit."""
+        repo = global_store.open_global_repo(seeded)
+        session = repo.writable_session("main")
+        zarr.open_group(session.store, mode="r+")["01N"].attrs["touch"] = "shards"
+        tag = {shard_writer.SHARD_WRITE: {"run_id": "fill", "zone": "01N", "year": 2024}}
+        shard = shard_writer.commit_with_rebase(session, "shards", metadata=tag)
+        at = repo.lookup_snapshot(shard).written_at.isoformat()
+        session = repo.writable_session("main")
+        commit = {"snapshot": shard, "committed_at": at}
+        runs = shard_writer.run_provenance(None, 2024, "fill", commit=commit, code={})
+        zarr.open_group(session.store, mode="r+")["01N"].attrs["runs"] = runs
+        repo.create_tag("zone-01N-2024", session.commit("attrs"))
+        repo.expire_snapshots(datetime.now(UTC))
+        assert published_store.shard_writes(repo) == {}
+        attrs = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")["01N"].attrs
+        assert published_store.committed_runs(attrs, 2024, []) == [Commit("fill", at, None)]
+
+    def test_a_replaced_run_whose_shard_commit_expired_holds_nothing(self):
+        """The refill rewrote every tile of the run it replaced, which the store check confirms before expiry;
+        the replaced run is still known, so its part is not mistaken for a stranger's.
+        """
+        first, refill = (
+            {"snapshot": s, "committed_at": f"2026-0{m}-01T00:00:00+00:00"} for s, m in (("s1", 7), ("s2", 8))
+        )
+        runs = shard_writer.run_provenance(None, 2024, "fill", commit=first, code={})
+        runs = shard_writer.run_provenance(runs, 2024, "refill", commit=refill, code={})
+        assert published_store.committed_runs({"runs": runs}, 2024, []) == [
+            Commit("fill", first["committed_at"], None, empty=True),
+            Commit("refill", refill["committed_at"], None),
+        ]
+
+    def test_a_year_marked_without_shards_contributes_no_run(self):
+        marked = shard_writer.run_provenance(None, 2024, "ocean", empty=True, code={})
+        assert published_store.committed_runs({"runs": marked}, 2024, []) == []

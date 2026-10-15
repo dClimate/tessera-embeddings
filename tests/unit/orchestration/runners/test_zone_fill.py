@@ -876,6 +876,12 @@ def _published_part(registry_root: str) -> dict:
     return table.to_pydict()
 
 
+def _master_tiles(registry_root: str) -> list[str]:
+    """The tiles in the cell's ``master/`` file — present only if the fill brought it up to date."""
+    pq = pytest.importorskip("pyarrow.parquet")
+    return pq.read_table(f"{registry_root}/master/zone={_ZONE}/year=2025/part-0.parquet").column("tile").to_pylist()
+
+
 def test_the_registry_records_the_depth_rule_the_cell_was_filled_under(tmp_path, monkeypatch):
     """The runner's config must reach the published row, through three forwarding hops.
 
@@ -907,6 +913,96 @@ def test_the_registry_records_the_depth_rule_the_cell_was_filled_under(tmp_path,
     assert cols["tile"], "a part was published"
     assert set(cols["optical_min_obs"]) == {15}, "every row states the store's rule"
     assert set(cols["embedded"]) == {True}
+    assert _master_tiles(registry_root) == sorted(cols["tile"]), "and the cell's master is current"
+
+
+def _fill_one_tile(tmp_path, registry_root: str):
+    """A one-tile cell filled under a depth rule, with its registry beside it."""
+    return _fill(
+        tmp_path,
+        _seed_global_with_rule(tmp_path, 15),
+        land_mask_path=_make_mask(tmp_path, [(0, 0)]),
+        mosaic_base=_make_mosaic(tmp_path),
+        registry_root=registry_root,
+        config=InferenceConfig(time_window=_window(2025), chunk_size=_TILE, num_gpus=0, optical_min_obs=15),
+    )
+
+
+def test_a_failed_master_update_does_not_fail_a_landed_cell(tmp_path, monkeypatch, caplog):
+    """The cell has committed by then; the master is an index beside it, and repairable."""
+    monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub({}))
+
+    def unreachable(*_args: object, **_kwargs: object) -> list[str]:
+        raise OSError("S3 500")
+
+    monkeypatch.setattr(zone_fill, "merge_cell", unreachable)
+    with caplog.at_level(logging.ERROR):
+        summary = _fill_one_tile(tmp_path, str(tmp_path / "registry"))
+    assert summary["tag"], "the cell landed and was tagged"
+    assert "registry master NOT merged" in caplog.text
+
+
+def _all_skip_inference(num_actors, config, chunks, mosaic_base, staging_base, run_id, t0, log, **kwargs):
+    """Every tile refused, with nothing staged: the store holds nothing for them before or after."""
+    writer = ZarrWriter(staging_base, embedding_dim=_BAND)
+    for chunk in chunks:
+        writer.write_skip_marker(chunk, run_id, {"label": chunk.label, "refused": {"no_optical": 4}})
+    return [{"chunk": c.label, "status": "skipped", "valid_pixels": 0, "elapsed_sec": 0.0} for c in chunks]
+
+
+@pytest.mark.parametrize(
+    ("inference", "part_survives"),
+    [(_staging_inference_stub({}), True), (_all_skip_inference, False)],
+    ids=["its-part-published", "an-all-refused-run-whose-part-never-published"],
+)
+def test_a_retry_merges_the_master_a_fill_died_before_reaching(tmp_path, monkeypatch, caplog, inference, part_survives):
+    """The retry finds the cell complete and skips the fill, so planning merges the master or nothing does.
+
+    An all-refused run over a tile the store held nothing for still shows in its commit's diff, so
+    its retry refuses while its part is missing.
+    """
+    monkeypatch.setattr(zone_fill, "run_inference", inference)
+    store, registry_root = _seed_global_with_rule(tmp_path, 15), str(tmp_path / "registry")
+    cell = {
+        "land_mask_path": _make_mask(tmp_path, [(0, 0)]),
+        "mosaic_base": _make_mosaic(tmp_path),
+        "registry_root": registry_root,
+        "config": InferenceConfig(time_window=_window(2025), chunk_size=_TILE, num_gpus=0, optical_min_obs=15),
+    }
+    merge = zone_fill._merge_registry_master
+
+    def died(*_args: object, **_kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(zone_fill, "_merge_registry_master", died)
+    with pytest.raises(KeyboardInterrupt):
+        _fill(tmp_path, store, **cell)
+    if not part_survives:
+        for part in (tmp_path / "registry" / "parts").rglob("*.parquet"):
+            part.unlink()
+    monkeypatch.setattr(zone_fill, "_merge_registry_master", merge)
+    with caplog.at_level(logging.ERROR):
+        assert _fill(tmp_path, store, **cell)["already_complete"] is True
+    if part_survives:
+        assert _master_tiles(registry_root) == ["chunk_0_0"]
+    else:
+        assert "last wrote 1 tile(s) no part describes" in caplog.text
+
+
+def test_the_master_learns_of_a_refill_that_fails_at_the_tag_step(tmp_path, monkeypatch):
+    """A deliberate refill fails at tagging by design — zone-year tags are write-once — after its data
+    and part have landed. Updating the master after the tag would never reach it.
+    """
+    monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub({}))
+
+    def spent(*_args: object, **_kwargs: object) -> str:
+        raise ValueError("tag zone-01N-2025 already exists")
+
+    monkeypatch.setattr(zone_fill, "tag_zone_year", spent)
+    registry_root = str(tmp_path / "registry")
+    with pytest.raises(ValueError, match="already exists"):
+        _fill_one_tile(tmp_path, registry_root)
+    assert _master_tiles(registry_root) == ["chunk_0_0"]
 
 
 def test_an_all_refused_cell_still_records_the_depth_rule(tmp_path, monkeypatch):
@@ -944,6 +1040,7 @@ def test_an_all_refused_cell_still_records_the_depth_rule(tmp_path, monkeypatch)
     assert set(cols["embedded"]) == {False}, "every tile refused"
     assert set(cols["optical_min_obs"]) == {15}
     assert set(cols["refused_thin_px"]) == {4}, "and the reason survived alongside the rule"
+    assert _master_tiles(registry_root) == sorted(cols["tile"]), "this branch updates the master too"
 
 
 def test_a_store_with_no_depth_rule_publishes_null_not_zero(tmp_path, monkeypatch):

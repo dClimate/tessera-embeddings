@@ -334,7 +334,7 @@ override.
 | `tessera_full_pipeline.py` | Async master flow chaining the four above via `arun_deployment`. |
 | `build_land_mask.py` | Global campaign: build per-zone coverage bitmaps from the partner delivery registry (ADR-010). Optional pre-build delivery verification + post-build validation. No cluster. |
 | `seed_global_store.py` | Global campaign: create the global-store repo and seed every unseeded UTM-zone group (metadata-only, ADR-008 D1). Idempotent. No cluster. |
-| `fill_zone_year.py` | Global campaign: fill one `(zone, year)` on a Ray cluster (coverage mask → inference → shard assembly → tag). Commits are ungated. |
+| `fill_zone_year.py` | Global campaign: fill one `(zone, year)` on a Ray cluster (coverage mask → inference → shard assembly → tag → registry master). Commits are ungated. |
 | `fill_zones_sequential.py` | Global campaign: fill one cluster's zones sequentially on a SINGLE shared Ray cluster (densest-first, ingest look-ahead, trailing assembly, idle-retirement gated until the final zone). Waits for its densest zone's mosaic before requesting GPUs. Pre-cluster triage settles retag/all-ocean cells. |
 | `ingest_zone_year.py` | Global campaign: build one cell's S1/S2 mosaics on the fixed zone grid by dispatching the ROI ingest deployments onto a synthesised zone-shaped ROI. Marker-gated and crash-safe: a stale or half-written mosaic is cleared and rebuilt, never appended onto. |
 | `run_global_campaign.py` | Global campaign driver: dispatch fills per pending `(zone, year)`, year-serial — per-cell `fill-zone-year` runs with bounded zone parallelism (`fill_strategy="cluster-per-zone"`), or size-balanced `fill-zones-sequential` runs on long-lived clusters (`"chained-clusters"`). |
@@ -358,6 +358,19 @@ consumer's monitoring reads published cells against the verdicts on file.
 The trace tag (`validates-cell-of:<id>`) is deliberately *not* the tag the cancellation
 hooks below sweep. A validation describes a cell that has already landed, holds no fleet,
 and is worth finishing even when its parent fill is cancelled.
+
+### A landed cell is merged into the registry master
+
+Once a cell with live tiles has committed and published its part, and before the tag, the
+runner merges its registry parts into the cell's file under the registry's `master/`
+(`runners/zone_fill.py`, `_merge_registry_master`), so consumers read every fill as soon as
+it lands, including a deliberate refill, which fails at the tag step by design. Like the
+validator dispatch, a failure there is logged and never fails the landed cell; the registry
+census names the cell and `scripts/maintenance/rebuild_registry_measurements.py repair`
+rebuilds it. Planning a retry of a cell that already landed runs the merge again, on every runner
+and in triage, so a process that died before it still reaches the master. The merge refuses while a run the store records writing the
+year has no part for a tile it last wrote; refilling those tiles clears it. See
+[`registry-master.md`](../../../../context_docs/storage/registry-master.md).
 
 ### Cancelling reaches every level
 

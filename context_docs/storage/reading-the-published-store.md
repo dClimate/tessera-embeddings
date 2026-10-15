@@ -61,8 +61,10 @@ authority**, and it distinguishes what nothing else can: a year deliberately lef
 with no qualifying land that year — *is* in the list, while a year that never landed is absent.
 
 Reading `zone.attrs` pulls the whole metadata document, including a `runs` entry per year carrying
-that fill's run id, its input coverage per source store and the commit it was built from. Useful
-provenance, and not small: a reader who only wants `years_complete` pays for all of it per zone.
+that fill's run id, its input coverage per source store and the commit it was built from. A fill
+since v1.1 also records its shard commit in the store and the runs it replaced, which the registry
+is checked against ([`registry-master.md`](registry-master.md)). Useful provenance, and not small: a
+reader who only wants `years_complete` pays for all of it per zone.
 
 ## 2. What is published
 
@@ -442,13 +444,18 @@ what a second traversal would cost.
 `s3://tessera-embeddings/v1.1/dclimate.registry`: **3,247,410 rows**, one per tile per year, each
 with a WGS84 bounding box, whether the tile was embedded, how many of its pixels the depth rule
 refused and for which of three reasons, and how deep the imagery was where it fell short. It has
-three prefixes:
+two prefixes:
 
 | prefix | contents | what it is |
 |---|---|---|
-| `master/` | 994 files + `_common_metadata`, 151 MB | **what a consumer reads**: one row per tile-year, one schema, measurements on every row |
-| `parts/` | 994 files, 142 MB, at `parts/zone=<ZONE>/year=<YEAR>/<run_id>.parquet` | the campaign's own output, one part per cell, never rewritten |
-| `rebuild/` | 461 files, 70 MB | measurements re-derived from the store for the rows the campaign left null |
+| `master/` | 994 files at `master/zone=<ZONE>/year=<YEAR>/part-0.parquet` + `_common_metadata`, 151 MB | **what a consumer reads**: one row per tile-year, one schema, measurements on every row; its guide is [`docs/registry.md`](../../docs/registry.md), published beside it as `README.md` |
+| `parts/` | 994 files, 142 MB, at `parts/zone=<ZONE>/year=<YEAR>/<run_id>.parquet` | the fills' raw output, one part per cell per run, named by run id; internal |
+
+**`master/` describes what the store holds now.** Every run merges its rows into its zone-year's
+master file tile by tile as it lands: a tile's row comes from the newest run that wrote that tile,
+and a tile no later run touched keeps its row. A refill or a future update therefore reaches
+`master/` without anybody re-running anything, and a reader never has to choose between runs. See
+[`registry-master.md`](registry-master.md).
 
 **The campaign's parts are written as designed, on every check.** All 994 parts carry all 23
 declared columns at the declared types; every part's key-value metadata agrees with the zone and
@@ -477,7 +484,7 @@ three reasons, the depth statistics, `px_with_any_radar`. The cause is an asymme
 record reached the registry. A refused tile's went into its skip marker on object storage and
 survived a resume; an embedded tile's rode back in the actor's result and did not. So all 17,865
 wholly refused tiles were measured, and only 53% of embedded ones. Every column is derivable from
-the store, so those rows were re-derived into `rebuild/` and merged into `master/` on 2026-10-12:
+the store, so those rows were re-derived from it and published in `master/` on 2026-10-12:
 1,728,365 rows are `measured_by = "fill"`, 1,519,045 are `"rebuild"`, and none are unmeasured.
 **Read `master/`, not `parts/`**: counting refusals over `parts/` counts the measured half only.
 One column differs by origin. Rebuilt rows leave `eligible_px` null and count over the whole tile,
@@ -505,8 +512,8 @@ dataset = ds.dataset(master, filesystem=fs, schema=schema, partitioning="hive")
 **Reading `parts/` needs the schema stated**, or a column added mid-campaign is silently dropped:
 `pyarrow` infers a dataset's schema from the first file in sorted path order. Pass
 `schema=tessera_embeddings.storage.registry.dataset_schema()`. On v1.1 the hazard is latent rather
-than live: the whole campaign ran on one commit (`bbb9d836b3667f579c18a052e8d456d9a58c4e11`), so
-every part has the same schema.
+than live: the campaign's parts span nine commits (their `code_commit`), but all of them wrote the
+same 23 columns, so every part has the same schema.
 
 ## 6. What is missing, and what would surprise a consumer
 

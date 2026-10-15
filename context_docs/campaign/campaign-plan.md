@@ -278,8 +278,8 @@ Three records, in increasing detail:
    Tags are write-once, so a tag is a permanent, reproducible handle:
    `repo.readonly_session(snapshot_id=repo.lookup_tag("zone-33N-2025"))` reads that cell exactly
    as it was published, regardless of what landed afterwards.
-3. **`runs`** in the zone group `attrs`, one entry per year: the run id, when it was assembled, the
-   input window it was built over, which live tiles produced no data at all
+3. **`runs`** in the zone group `attrs`, one entry per year: the run id, when it was assembled, its
+   shard commit and the runs a refill replaced (for fills since v1.1), the input window it was built over, which live tiles produced no data at all
    (`optical_skips` — this is what separates ocean from a tile that yielded nothing), and the
    observation-depth summary (`s1_free_pct`, `s1_thin_pct`, `s2_thin_pct`).
 
@@ -691,7 +691,9 @@ rather than impossible. Our own buckets — mosaics, staging, figures, verdicts 
 * **Versioning stays OFF** With versioning on, deletes leave markers and prior
   versions, so mosaics deleted after consumption keep billing and the true footprint silently
   diverges from the intended one. The ~$3,000 storage figure depends on deletion actually
-  reclaiming space.
+  reclaiming space. The published bucket is not one of ours; the versioning its owner can enable
+  for the registry keeps the store prefix unversioned with a one-day lifecycle rule
+  ([`registry-master.md`](../storage/registry-master.md)).
 * **Verify a deletion by listing the prefix, never by an exit code.** One pass is not reliably
   complete: a run has reported a single error while leaving residue in three prefixes, two of them
   with no error at all.
