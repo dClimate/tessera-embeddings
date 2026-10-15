@@ -278,15 +278,16 @@ bug to report.
    Until then the store keeps the old version of every tile the update rewrote, and you pay to store
    it.
 3. **Reclaim the space,** if you want it back now. This permanently deletes every version of the
-   store older than the update's completion that no tag holds, not only this update's. Run it only
-   while nothing is writing to the store, and look at the dry run first:
+   store older than the update's completion that no tag holds, not only this update's, and there is
+   no preview: `dry_run=True` skips deleting the old versions and reports only data nothing uses
+   already, so it understates. Before running it, check that every version you want to keep has a
+   tag (`print(repo.list_tags())`), and run it only while nothing is writing to the store:
 
    ```python
    from tessera_embeddings.storage.campaign import expire_and_gc
 
    cutoff = repo.lookup_snapshot(repo.lookup_tag("update-amazon-thin-2024-complete")).written_at
-   print(expire_and_gc(repo, older_than=cutoff, dry_run=True))  # what would be deleted
-   expire_and_gc(repo, older_than=cutoff)
+   print(expire_and_gc(repo, older_than=cutoff))  # what it expired and deleted
    ```
 
 There is no undo for one update: going back to the base tag would also discard everything written
