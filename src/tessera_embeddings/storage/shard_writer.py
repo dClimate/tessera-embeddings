@@ -4,7 +4,8 @@ Fills one (zone, year) with whole shards in a single Icechunk commit. The
 d3v2-verified write path: each worker reads its assigned shard *sources* and
 writes each shard's region in one raw-zarr assignment - real data in land inner
 chunks, fill (elided by the sharding codec) elsewhere - so every shard object is
-emitted once, no read-modify-write, no dense nodata.
+emitted once, no dense nodata, and no read-modify-write except where a targeted
+update merges into the pixels a source owns (:meth:`ShardSource.pixels`).
 
 Cooperative fork/merge: the coordinator forks the session, workers write into
 their fork, the coordinator merges and makes **one commit per (zone, year)**,
@@ -171,6 +172,15 @@ class ShardSource(Protocol):
         """Return ``{var_name: block}`` for a shard - each block covers the whole
         (edge-clamped) shard region with ocean inner chunks at the array fill
         value. Return ``{}`` to skip a shard entirely.
+        """
+        ...
+
+    def pixels(self, shard: tuple[int, int]) -> np.ndarray | None:
+        """Return the ``(h, w)`` pixels of ``shard`` this source owns, or ``None`` for all of them.
+
+        A mask makes the write a MERGE: the worker reads the shard already in the store and
+        replaces only the masked pixels, in every variable, so a targeted update can fill a
+        shard's holes without touching the pixels around them.
         """
         ...
 
@@ -807,6 +817,7 @@ def _write_shards_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 - retu
             last_report = time.monotonic()
         with timer.phase("read"):
             blocks = source.load((sy, sx))
+            owned = source.pixels((sy, sx))
         tiles += 1
         for var, block in blocks.items():
             arr = arrays.get(var)
@@ -816,8 +827,15 @@ def _write_shards_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 - retu
             h, w = block.shape[1], block.shape[2]
             # Trailing dims (band) not indexed are written in full, so one
             # assignment covers both the 3-D and 4-D arrays.
+            region = (slice(year, year + 1), slice(y0, y0 + h), slice(x0, x0 + w))
+            if owned is not None:
+                # One variable at a time, so the extra memory is one shard of the widest array.
+                with timer.phase("pixel_merge"):
+                    merged = np.asarray(arr[region])
+                    merged[:, owned] = block[:, owned]
+                    block = merged
             with timer.phase("write"):
-                arr[year : year + 1, y0 : y0 + h, x0 : x0 + w] = block
+                arr[region] = block
             writes += 1
             nbytes += block.nbytes
     # And the final count, which no timed checkpoint reaches: the loop exits without one, so a
@@ -844,6 +862,7 @@ def write_year_shards(
     telemetry: dict[str, Any] | None = None,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     fault: ArmedFault | None = None,
+    commit_attrs: Callable[[icechunk.Repository, str, int, Mapping[str, str]], str] | None = None,
 ) -> str:
     """Fill one (zone, year) with whole shards from ``source`` in one commit.
 
@@ -900,6 +919,11 @@ def write_year_shards(
     one function, there is nothing outside the process to aim a kill at, and a state
     documented as benign but never observed is an assumption.
 
+    ``commit_attrs(repo, group, year, commit)`` replaces the second commit, given the shard commit
+    as ``commit_year_attrs`` is. A targeted update passes its own record writer here, so writing
+    shards into a year that is already complete records the update and leaves ``years_complete``
+    and ``runs`` exactly as the original fill left them.
+
     Returns the ATTR commit's snapshot id — a tag must point at a state where the
     year is both written and marked.
     """
@@ -952,16 +976,20 @@ def write_year_shards(
     # collision costs a sub-second retry instead of this whole assembly. Return that
     # snapshot rather than the shard one: a tag must point at a state where the year is
     # both written AND marked.
-    snapshot = commit_year_attrs(
-        repo,
-        group,
-        year_label,
-        run_id=run_id,
-        radar_coverage=radar_coverage,
-        optical_skips=optical_skips,
-        input_coverage=input_coverage,
-        empty=empty,
-        commit=commit,
+    snapshot = (
+        commit_attrs(repo, group, year_label, commit)
+        if commit_attrs is not None
+        else commit_year_attrs(
+            repo,
+            group,
+            year_label,
+            run_id=run_id,
+            radar_coverage=radar_coverage,
+            optical_skips=optical_skips,
+            input_coverage=input_coverage,
+            empty=empty,
+            commit=commit,
+        )
     )
     if telemetry is not None:
         telemetry.update(

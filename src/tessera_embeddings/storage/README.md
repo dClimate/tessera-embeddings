@@ -41,6 +41,13 @@ dataset's.
 block of data belongs. What stops two writers overwriting each other is the conflict check at
 commit time; `session_catch_up.py` only shortens the work that check has to do.
 
+**`update.py`** is how a group-year that is already filled gets some of its tiles redone: a named,
+write-once plan of which tiles, under which land mask, either filling only the store's holes or
+rewriting tiles whole. It records each update beside the original fill in the group's `updates`
+attr, never over it, and `shard_writer.py` merges a holes update into the tiles it touches
+([ADR 027](../../../context_docs/decisions/027-targeted-updates.md)). It sits outside both code
+identities, like `campaign.py`.
+
 `campaign.py` tracks what is finished and clears out old versions, `published_store.py`
 checks a finished dataset from outside, and `object_store.py` deletes what we no longer need.
 `time_axis.py` and `icechunk_logging.py` are small shared helpers.

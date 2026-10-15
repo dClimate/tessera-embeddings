@@ -288,6 +288,21 @@ class TestTheMinimumOpticalDepthGate:
         ds = MosaicChunkInferenceDataset(chunk, allow_s2_only=True, optical_min_obs=30)
         assert (ds.refused_no_optical, ds.refused_thin, len(ds)) == (2, 1, 1)
 
+    def test_an_update_mask_narrows_what_is_embedded_but_not_the_refusals(self):
+        """A targeted update's holes are the only pixels the GPU sees; the refusal reasons still
+        describe the whole strip, because the update's registry rows are re-derived from it.
+        """
+        chunk = self._chunk(np.array([[5, 20, 30, 40]]))
+        ds = MosaicChunkInferenceDataset(
+            chunk, allow_s2_only=True, optical_min_obs=15, pixels=np.array([[True, True, False, True]])
+        )
+        assert sorted(ds._global_idxs.tolist()) == [1, 3]
+        assert ds.refused_thin == 1
+
+    def test_an_update_mask_of_the_wrong_shape_is_refused(self):
+        with pytest.raises(ValueError, match="pixel mask shape"):
+            MosaicChunkInferenceDataset(self._chunk(np.array([[20, 30]])), pixels=np.ones((2, 2), dtype=bool))
+
     def test_a_radar_refusal_counts_only_pixels_that_passed_the_optical_test(self):
         """Otherwise a thin pixel with no radar lands in two counters at once."""
         chunk = self._chunk(np.array([[5, 40]]))

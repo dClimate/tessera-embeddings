@@ -76,13 +76,20 @@ def _slow_no_stats_worker(payload):
 
 
 class _OneInnerChunkSource:
-    """Writes shard (0,0): one 256^2 inner chunk of real data, the rest fill."""
+    """Writes shard (0,0): one 256^2 inner chunk of real data, the rest fill.
 
-    def __init__(self, seed: int = 0):
+    ``owned`` makes it a targeted update's source: only those pixels of the shard are its own.
+    """
+
+    def __init__(self, seed: int = 0, owned: np.ndarray | None = None):
         self.seed = seed
+        self.owned = owned
 
     def live_shards(self):
         return [(0, 0)]
+
+    def pixels(self, shard):
+        return self.owned
 
     def load(self, shard):
         rng = np.random.default_rng(self.seed)
@@ -140,6 +147,45 @@ def test_years_complete_updated_in_commit(tmp_path):
     write_year_shards(repo, "01N", year_index=2, source=_OneInnerChunkSource(), n_workers=1, shard_px=_SHARD)
     g = zarr_store.open_store_as_zarr_group(store, group="01N")
     assert g.attrs["years_complete"] == [2025]
+
+
+@pytest.mark.parametrize("n_workers", [1, 2])
+def test_a_source_that_owns_some_pixels_merges_into_the_shard(tmp_path, n_workers):
+    """A targeted update's merge: owned pixels take the new values in every array, the rest stay."""
+    store, repo = _seed(tmp_path)
+    write_year_shards(repo, "01N", year_index=2, source=_OneInnerChunkSource(seed=1), n_workers=1, shard_px=_SHARD)
+    before = zarr_store.open_store_as_zarr_group(store, group="01N")
+    old_emb, old_scl = (
+        np.asarray(before["embeddings"][2, :_SHARD, :_SHARD]),
+        np.asarray(before["scales"][2, :_SHARD, :_SHARD]),
+    )
+    owned = np.zeros((_SHARD, _SHARD), dtype=bool)
+    owned[:16, :16] = True
+    recorded: list[tuple[str, int]] = []
+
+    write_year_shards(
+        repo,
+        "01N",
+        year_index=2,
+        source=_OneInnerChunkSource(seed=2, owned=owned),
+        n_workers=n_workers,
+        shard_px=_SHARD,
+        commit_attrs=lambda repo_, group, year, commit: (
+            recorded.append((group, year, commit["snapshot"])) or repo_.lookup_branch("main")
+        ),
+    )
+
+    after = zarr_store.open_store_as_zarr_group(store, group="01N")
+    new = _OneInnerChunkSource(seed=2).load((0, 0))
+    emb, scl = np.asarray(after["embeddings"][2, :_SHARD, :_SHARD]), np.asarray(after["scales"][2, :_SHARD, :_SHARD])
+    np.testing.assert_array_equal(emb[owned], new["embeddings"][0][owned])
+    np.testing.assert_array_equal(scl[owned], new["scales"][0][owned])
+    np.testing.assert_array_equal(emb[~owned], old_emb[~owned])
+    np.testing.assert_array_equal(scl[~owned], old_scl[~owned])
+    # The hook REPLACED the year attrs commit: the update recorded itself, and the fill's mark
+    # is exactly as the first write left it.
+    assert recorded == [("01N", 2025, repo.lookup_branch("main"))]
+    assert after.attrs["years_complete"] == [2025]
 
 
 def test_the_year_records_its_shard_commit_and_a_refill_keeps_the_run_before_it(tmp_path):

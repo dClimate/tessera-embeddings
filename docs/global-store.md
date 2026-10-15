@@ -29,7 +29,10 @@ The store records all of this in its root attributes, so you can check it agains
 `geoemb:model` (`https://geotessera.org/model/1.1`), `checkpoint_id`, `geoemb:gsd`,
 `geoemb:dimensions`, `geoemb:source_data` listing the Sentinel-2 and OPERA archives it read,
 and `optical_min_obs` (`15`), the quality rule described below. Each zone group adds its own
-`crs`, `proj:*` and `spatial:*` metadata, plus `years_complete`.
+`crs`, `proj:*` and `spatial:*` metadata, plus `years_complete` and `runs`, the fill behind each
+year. A year a targeted update has since rewritten in part also has `updates`, a list per year of
+which tiles each update rewrote: read `runs[year]`, then `updates[year]` in order
+([`updates.md`](updates.md)).
 
 Sentinel-2B reached routine operations partway through 2017, so that year rests on fewer
 observations than the rest. Fourteen zone-years across 2017–2021 were also never filled, and a

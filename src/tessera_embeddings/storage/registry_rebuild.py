@@ -89,6 +89,8 @@ CARRIED_COLUMNS: tuple[str, ...] = (
     "bbox_north",
     "code_version",
     "code_commit",
+    # Which targeted update wrote the tile: a re-derivation measures it again, it does not rewrite it.
+    "update_name",
 )
 
 
@@ -158,6 +160,28 @@ def measurements_from_obs(
     }
 
 
+def as_coverage_record(measurements: Mapping[str, Any]) -> dict[str, Any]:
+    """:func:`measurements_from_obs`'s columns in the shape of an actor's coverage record.
+
+    The fill's part writer reads coverage records (``registry._measurement_fields``), and a targeted
+    update that merged a shard publishes re-derived measurements through it, so they travel in that
+    shape. The inverse of that writer, field for field.
+    """
+    return {
+        "eligible_px": measurements.get("eligible_px"),
+        "chunk_px": measurements.get("chunk_px"),
+        "refused": {reason: measurements.get(f"refused_{reason}_px") for reason in REASONS},
+        "s2_obs": {
+            "px_with_any": measurements.get("px_with_any_optical"),
+            "max": measurements.get("obs_max"),
+            "median_where_any": measurements.get("median_obs_where_any"),
+            "median_where_thin": measurements.get("median_obs_where_thin"),
+        },
+        "px_with_any_radar": measurements.get("px_with_any_radar"),
+        "radar_rule_enforced": measurements.get("radar_rule_enforced"),
+    }
+
+
 def basis_violations(table: pa.Table) -> tuple[int, int]:
     """``(violating, measured)``: measured rows where the fill's optical test was not ``obs > 0``.
 
@@ -165,9 +189,11 @@ def basis_violations(table: pa.Table) -> tuple[int, int]:
     ``refused_no_optical_px == eligible_px - px_with_any_optical`` exactly when the fill's
     reflectance term never removed a pixel; one row that does not means ``s2_obs_count`` cannot
     reproduce that row's split, and no re-derivation from the store should be trusted until it is
-    explained. Every measured row is checked, not a sample: it costs no store reads.
+    explained. Every measured row is checked, not a sample: it costs no store reads. A row with
+    no ``eligible_px`` was itself re-derived from the store, as a targeted update's merged tile is,
+    so it cannot test the identity it was computed by and is not counted.
     """
-    measured = table.filter(pc.is_valid(table.column("chunk_px")))
+    measured = table.filter(pc.and_(pc.is_valid(table.column("chunk_px")), pc.is_valid(table.column("eligible_px"))))
     expected = pc.subtract(measured.column("eligible_px"), measured.column("px_with_any_optical"))
     agree = pc.fill_null(pc.equal(measured.column("refused_no_optical_px"), expected), False)
     return measured.num_rows - int(pc.sum(agree).as_py() or 0), measured.num_rows

@@ -939,6 +939,11 @@ rather than replace, and give each record a `cycle` field. Then generation of a 
 `len(runs["2021"])`, what changed in a top-up is the last two records, and what is in a release is
 every cell whose runs contain that cycle.
 
+**As built, the history is a separate list.** By the time top-ups were built the v1.1 store had
+published with `runs[year]` as a dict, so a top-up is a targeted update that appends its record to
+the group's `updates[year]` and leaves `runs[year]` as the first fill wrote it
+([ADR 027](../decisions/027-targeted-updates.md)). Generation is `1 + len(updates["2021"])`.
+
 ### The contract: attrs alone must answer every user question
 
 The registry is an **efficiency layer, never a source of truth**. Anything a data user needs must be

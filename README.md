@@ -485,6 +485,8 @@ context_docs/            why it is shaped this way, and what was measured
 examples/quickstart/     the bundled Denver, CO area of interest and its config
 scripts/                 scoping and analysis scripts, not part of the library
 tests/                   unit, architecture, integration, parity and GPU tiers
+.agents/skills/          step-by-step procedures for AI agents (Agent Skills format;
+                         .claude/skills links here)
 ```
 
 ## Documentation

@@ -15,6 +15,7 @@ import zarr
 from tessera_embeddings.inference.actors import _coverage_record
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.storage import registry_rebuild as rb
+from tessera_embeddings.storage.registry import _measurement_fields
 
 RULE = 15
 
@@ -121,6 +122,21 @@ class TestDriftAgainstTheFill:
         assert rebuilt["median_obs_where_thin"] == fill["s2_obs"]["median_where_thin"]
         assert rebuilt["px_with_any_radar"] == fill["px_with_any_radar"]
 
+    def test_re_derived_measurements_survive_the_fills_part_writer(self) -> None:
+        """A targeted update publishes a merged shard's re-derived measurements through the fill's part
+        writer, which reads coverage records. Passed as row columns, every count arrived as zero or null.
+        """
+        rng = np.random.default_rng(2)
+        s2 = rng.integers(0, 40, size=(32, 32)).astype(np.uint16)
+        radar = rng.integers(0, 3, size=(32, 32)).astype(np.uint16)
+        rebuilt = rb.measurements_from_obs(
+            s2, optical_min_obs=RULE, radar_rule_enforced=False, s1_asc=radar, s1_desc=radar
+        )
+        assert _measurement_fields(rb.as_coverage_record(rebuilt)) == {
+            k: rebuilt[k] for k in _measurement_fields(rb.as_coverage_record(rebuilt))
+        }
+        assert _measurement_fields(rb.as_coverage_record(rebuilt))["refused_thin_px"] > 0
+
     def test_the_refusal_split_matches_the_datasets_rule(self) -> None:
         """``has_optical`` is ``s2_obs_count > 0`` on the delivered product — the whole basis here.
 
@@ -210,13 +226,15 @@ class TestCompareRow:
     ids=["optical-test-is-obs-gt-0", "reflectance-term-removed-a-pixel"],
 )
 def test_basis_violations_counts_measured_rows_that_break_the_identity(no_optical: int, violating: int) -> None:
-    """The registry-only check the gate runs before reading a pixel; an unmeasured row is not a violation."""
+    """The registry-only check the gate runs before reading a pixel. Neither an unmeasured row nor one
+    re-derived from the store (no ``eligible_px``, as a targeted update's merged tile) is checked.
+    """
     table = pa.table(
         {
-            "chunk_px": [6, None],
-            "eligible_px": [6, None],
-            "px_with_any_optical": [4, None],
-            "refused_no_optical_px": [no_optical, None],
+            "chunk_px": [6, None, 6],
+            "eligible_px": [6, None, None],
+            "px_with_any_optical": [4, None, 4],
+            "refused_no_optical_px": [no_optical, None, 2],
         }
     )
     assert rb.basis_violations(table) == (violating, 1)
@@ -281,12 +299,14 @@ class TestRebuiltRow:
             "bbox_north": 4.0,
             "code_version": "0.1.0",
             "code_commit": "abc123",
+            "update_name": "fill-thin-2026",
             "assembled_at": "2026-08-01T00:00:00+00:00",
             "run_id": "fill-run",
         }
         measurements = rb.measurements_from_obs(_obs([[20]]), optical_min_obs=15, radar_rule_enforced=False)
         row = rb.rebuilt_row(source, measurements, run_id="rebuild-1", assembled_at="2026-09-21T00:00:00+00:00")
         assert row["code_commit"] == "abc123"
+        assert row["update_name"] == "fill-thin-2026", "a repair measures the update's tile again; it did not write it"
         assert row["run_id"] == "rebuild-1"
         assert row["filled_at"] == "2026-08-01T00:00:00+00:00"
         assert row["chunk_px"] == 1

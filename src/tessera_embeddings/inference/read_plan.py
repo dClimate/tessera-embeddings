@@ -122,7 +122,9 @@ def _strip_plan(t_kept: int, height: int, width: int, mask_width: int | None = N
     return _strip_slices(height, _strip_height_for_density(t_kept, width, height, mask_width=mask_width))
 
 
-def _chunk_read_plan(chunk: ChunkSpec, mask_bundle: S2MaskBundle) -> tuple[slice | None, list[slice], int]:
+def _chunk_read_plan(
+    chunk: ChunkSpec, mask_bundle: S2MaskBundle, pixels: np.ndarray | None = None
+) -> tuple[slice | None, list[slice], int]:
     """Easting crop, northing strips in run order, and how many of them hold valid pixels.
 
     Shared by the serial prologue and the cross-chunk prefetch so both make identical decisions
@@ -134,12 +136,20 @@ def _chunk_read_plan(chunk: ChunkSpec, mask_bundle: S2MaskBundle) -> tuple[slice
     sub-batch, so the outputs are bit-identical. Empty strips, which still record their
     observation counts, run last; the returned count of live strips tells the actor where they
     begin.
+
+    ``pixels`` is a targeted update's hole mask (``ChunkSpec.pixels``). The update keeps the store's
+    values outside its holes, so the plan is made from them alone: the crop covers the columns
+    holding a hole with an optical observation, the only holes it can embed, and a strip holding no
+    hole is not returned, so it is never read. A strip whose holes cannot embed is still read, after
+    the live ones, because the update writes every hole's observation counts, radar's included.
     """
     t_kept = int(mask_bundle.mask.shape[0])
     # (H, W): pixels with >=1 valid S2 observation. Equivalent to mask.any(axis=0) — obs_count sums the pre-prune mask
     # and pruning drops only all-False timestep planes — but reads (H, W) instead of scanning the full (T_kept, H, W)
     # mask (up to ~1 GB) once per chunk.
     valid_any = mask_bundle.obs_count > 0
+    if pixels is not None:
+        valid_any &= pixels
 
     # S2 valid-pixel bounding box in easting. On sparse/edge chunks (a coastline sliver, a UTM zone boundary) the
     # valid columns can be a small fraction of the width, and the S2 band read (20 B/px) shrinks to the box. Columns
@@ -163,8 +173,23 @@ def _chunk_read_plan(chunk: ChunkSpec, mask_bundle: S2MaskBundle) -> tuple[slice
     effective_width = chunk.width if x_sub is None else (x_sub.stop - x_sub.start)
     # Bands read at effective_width (possibly cropped); the SCL mask stays full chunk width, so charge it at
     # chunk.width in the budget.
-    strips = _strip_plan(t_kept, chunk.height, effective_width, mask_width=chunk.width)
+    rows = slice(0, chunk.height)
+    hole_rows: np.ndarray | None = None if pixels is None else np.asarray(pixels.any(axis=1))
+    if hole_rows is not None and (held := np.flatnonzero(hole_rows)).size:
+        rows = slice(int(held[0]), int(held[-1]) + 1)
+    # The strip height is sized for the whole chunk, whose SCL mask stays resident whatever rows are
+    # read; only the rows it tiles shrink.
+    strips = [
+        slice(rows.start + s.start, min(rows.start + s.stop, rows.stop))
+        for s in _strip_plan(t_kept, chunk.height, effective_width, mask_width=chunk.width)
+        if rows.start + s.start < rows.stop
+    ]
     valid_rows = valid_any[:, x_sub].sum(axis=1) if x_sub is not None else valid_any.sum(axis=1)
     counts = [int(valid_rows[s].sum()) for s in strips]
     order = sorted(range(len(strips)), key=lambda k: -counts[k])  # stable: equal strips keep their order
-    return x_sub, [strips[k] for k in order], sum(c > 0 for c in counts)
+    live = sum(c > 0 for c in counts)
+    if hole_rows is None:
+        return x_sub, [strips[k] for k in order], live
+    # With nothing to embed the tile is kept unwritten, so one strip is enough to resolve it to a skip.
+    keep = [k for k in order if hole_rows[strips[k]].any()] if live else order[:1]
+    return x_sub, [strips[k] for k in keep], live

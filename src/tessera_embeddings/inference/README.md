@@ -359,6 +359,14 @@ strip's inference, so an empty or sparse strip early in the order — the top ro
 footprint's edge — would leave the next load exposed with the card idle. The order does not change
 which pixels share a sub-batch, so the outputs are the same in any order.
 
+**A `holes` update reads only where its holes are.** Given a tile's hole mask (`ChunkSpec.pixels`),
+`_chunk_read_plan` tiles only the rows between the first and last hole and drops every strip that
+holds none, since the update keeps the store's values outside its holes. The column crop covers
+the holes with an optical observation, the only ones it can embed. A strip whose holes cannot embed
+is still read, last, because the update rewrites every hole's observation counts, radar's included.
+A read still decompresses whole 512-row inner chunks (below), so a hole costs the rows of its
+chunk; the column crop saves the per-pixel work after the read.
+
 **Peak host memory has one ceiling.** The load pipeline is one strip deep, so at most two
 band sets co-reside — the strip being inferred and the strip being read — and the pair is
 bounded at twice the budget. A full year of Iowa peaked at 50% of a 32 GB worker, under the
@@ -474,6 +482,12 @@ buckets.
    double peak memory — 14 GB of source arrays plus a 17 GB copy, which was an
    out-of-memory kill. Per-batch indexing costs about 7 ms per batch and removes the spike
    entirely.
+
+4. **A targeted update can narrow it further.** A tile whose `ChunkSpec.pixels` names a mask
+   embeds only the pixels it marks, beside the gates above
+   ([ADR 027](../../../context_docs/decisions/027-targeted-updates.md)). An update in `holes` mode
+   masks each tile to the pixels that are holes in the store, so pixels already embedded never
+   reach the GPU; the refusal counts still describe the whole strip.
 
 **When no pixel qualifies.** A tile inside the area of interest whose every pixel fails the
 filter takes the **skip path**: the actor writes a zero-byte `{chunk.label}.skipped` marker
@@ -936,6 +950,13 @@ not pixels.) `years_complete` and the per-year run provenance advance in a **sec
 after the shards: a crash between the two leaves a year written but unmarked. The zone-fill runner
 ([`orchestration/runners/zone_fill.py`](../orchestration/runners/zone_fill.py)) drives the
 sequence: coverage mask → inference → `assemble_global` → `campaign.tag_zone_year`.
+
+**A targeted update** ([ADR 027](../../../context_docs/decisions/027-targeted-updates.md)) runs the
+same sequence over chosen shards of a year that is already filled, with three differences. A shard
+whose tile staged nothing is kept, not cleared; in `holes` mode each staged tile is **merged**,
+the worker reading the shard already in the store and replacing only its hole pixels, in every
+array; and the second commit appends the update's record to the group's `updates` attr instead of
+advancing `years_complete` and `runs`. No zone-year tag is created.
 
 **The campaign's land mask is not a pixel-resolution area of interest** but a per-zone
 *coverage bitmap* (`tile_live_2048`), built from the delivery registry by

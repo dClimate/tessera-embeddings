@@ -306,6 +306,26 @@ unresolvable conflicts. See `context_docs/storage/writing-to-the-global-store.md
 cluster-less (they run on the flow runner like `generate_roi`); only
 `fill_zone_year` / `fill_zones_sequential` provision Ray.
 
+### Targeted updates of filled cells
+
+An **update** re-runs chosen tiles of cells the campaign has already filled and writes nothing
+else. How to plan, run, check and clean up an update is
+[`docs/updates.md`](../../../../docs/updates.md); the design is
+[ADR 027](../../../../context_docs/decisions/027-targeted-updates.md). Both fill flows take the
+update's name as `update=<name>`, and treat its cells differently from a fill's:
+
+| | campaign fill | update |
+|---|---|---|
+| work list | cells not yet in `years_complete` | plan cells without the update's record; a never-filled cell is refused |
+| inferred | every valid pixel of every live tile | `holes`: only the store's hole pixels; `shards`: the target shards |
+| a tile that embeds nothing | cleared to fill | kept (`on_skip: "clear"` for a `shards` defect fix) |
+| recorded in | `years_complete`, `runs[year]`, the zone-year tag | `updates[year]` alone |
+| ROI, mosaics, staging | the campaign's paths | `{inputs}/updates/<name>/`, `{outputs}/staging/updates/<name>/<store>/`; hole masks and staging per destination store |
+| `min_valid_coverage`, month check | 0.1, every month | `1e-9`, relaxed: a partial-zone ROI must never block |
+| radar policy | any | `holes` requires `allow_s2_only=True`, the campaign's, refused before ingest otherwise |
+
+Run one update per cell at a time: two updates of one cell conflict on its chunks.
+
 ## Master pipeline
 
 `tessera_full_pipeline.py` is the recommended entry point for end-to-end
@@ -341,9 +361,9 @@ override.
 
 ### A landed cell is handed to a validator, and nothing waits for it
 
-Both fill flows take a `validation_deployment`. As each cell is tagged they create one run
-of it and return immediately (`flows/_cell_validation.py`), so cell N is checked while cell
-N+1 is still being filled — on the chained path the dispatch happens on the trailing
+Both fill flows take a `validation_deployment`. As each cell is tagged, or a targeted update
+writes or clears shards in it, they create one run of it and return immediately
+(`flows/_cell_validation.py`), so cell N is checked while cell N+1 is still being filled — on the chained path the dispatch happens on the trailing
 assembly thread, which already has that pipelining.
 
 Three properties are deliberate. The default is `None`, because the validator is a
@@ -367,7 +387,7 @@ runner merges its registry parts into the cell's file under the registry's `mast
 it lands, including a deliberate refill, which fails at the tag step by design. Like the
 validator dispatch, a failure there is logged and never fails the landed cell; the registry
 census names the cell and `scripts/maintenance/rebuild_registry_measurements.py repair`
-rebuilds it. Planning a retry of a cell that already landed runs the merge again, on every runner
+rebuilds it. Planning a retry of a cell that already landed, or of an update already recorded there, runs the merge again, on every runner
 and in triage, so a process that died before it still reaches the master. The merge refuses while a run the store records writing the
 year has no part for a tile it last wrote; refilling those tiles clears it. See
 [`registry-master.md`](../../../../context_docs/storage/registry-master.md).

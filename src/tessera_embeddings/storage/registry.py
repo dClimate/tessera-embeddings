@@ -181,6 +181,10 @@ def registry_schema() -> pa.Schema:
             # stamped on every row; null on a wheel install with no VCS metadata.
             pa.field("code_version", pa.string()),
             pa.field("code_commit", pa.string()),
+            # WHICH TARGETED UPDATE WROTE THIS ROW, if one did: null for the campaign fill. Each
+            # update rewrites only its own tiles, and the master keeps every tile's newest row, so
+            # this names the update a tile's current data came from (ADR 027).
+            pa.field("update_name", pa.string()),
         ]
     )
 
@@ -238,6 +242,7 @@ def registry_rows(
     optical_min_obs: int | None = None,
     bboxes: Mapping[str, tuple[float, float, float, float]] | None = None,
     code: Mapping[str, Any] | None = None,
+    update_name: str | None = None,
 ) -> list[dict[str, Any]]:
     """One row per live tile: what it holds, and for a refused tile why, and how close it came.
 
@@ -257,7 +262,7 @@ def registry_rows(
 
     ``code`` is the build that produced the cell, as
     :func:`~tessera_embeddings.config.environment.code_identity` reports it — cell-level, so it is
-    stamped on every row.
+    stamped on every row. ``update_name`` names the targeted update that wrote these rows, if any.
     """
     records = {**(embedded_records or {}), **(records or {})}
     rule = _int_or_none(optical_min_obs)
@@ -278,6 +283,7 @@ def registry_rows(
         row["optical_min_obs"] = rule
         row |= _bbox_fields(boxes.get(label))
         row |= build
+        row["update_name"] = update_name
         row |= _measurement_fields(records.get(label) or {})
         rows.append(row)
     return rows

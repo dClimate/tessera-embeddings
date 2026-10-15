@@ -26,6 +26,7 @@ from tessera_embeddings.ingest.catalogue_refusal import (
     CatalogueRequest,
     classify_refusal,
 )
+from tessera_embeddings.storage.update import UpdatePlan
 
 _PATHS = BucketPaths(inputs="s3://in", outputs="s3://out")
 
@@ -150,6 +151,40 @@ def test_matching_markers_skip_ingest(wired, monkeypatch):
     assert result["status"] == "already_ingested"
     assert result["fingerprint"] == fp
     assert wired["arun"] == [] and wired["roi_exported"] == []
+
+
+def test_an_update_ingests_only_its_shards_under_its_own_prefix(wired, monkeypatch):
+    """The plan decides the mask, the shards and the date threshold; the paths are the update's own."""
+    plan = UpdatePlan(name="u1", mode="holes", cells={"33N/2025": ["chunk_1_1"]}, mask_name="alt")
+    monkeypatch.setattr(mod, "load_update", lambda paths, name, mask_name: plan)
+    seen: dict = {}
+
+    def live(path, zone, **kw):
+        seen["mask"], seen["live_tiles"] = path, kw["tiles"]
+        return True
+
+    monkeypatch.setattr(mod, "zone_has_live_tiles", live)
+    monkeypatch.setattr(mod, "_coverage_sha", lambda *a, **k: seen.setdefault("sha_tiles", k["tiles"]) and "cov")
+    monkeypatch.setattr(mod, "live_chunk_count", lambda zone, **kw: seen.setdefault("count_tiles", kw["tiles"]) and 1)
+    monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
+
+    result = _run(s1_orbit="ascending", update="u1")
+
+    root = _PATHS.update_root("u1")
+    tiles = frozenset({"chunk_1_1"})
+    assert result["status"] == "ingested"
+    assert seen == {
+        "mask": _PATHS.land_mask_store("alt"),
+        "live_tiles": tiles,
+        "sha_tiles": tiles,
+        "count_tiles": tiles,
+    }
+    [(_, export)] = wired["roi_exported"]
+    assert (export["dest_path"], export["tiles"]) == (f"{root}/rois/33N/2025.zarr", tiles)
+    params = [p for _, p in wired["arun"]]
+    assert all(p["store_path"] == f"{root}/mosaics/33N/2025" for p in params)
+    assert next(p for p in params if "min_valid_coverage" in p)["min_valid_coverage"] == plan.min_valid_coverage
+    assert all(kw["skip_coverage_check"] is True for _, kw in wired["coverage_checked"])
 
 
 def test_dispatches_and_marks_on_success(wired, monkeypatch):

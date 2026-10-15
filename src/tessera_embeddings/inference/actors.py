@@ -11,6 +11,7 @@ but not torch. Ray serializes only the actor class reference; torch is needed on
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import logging
 import time
@@ -37,7 +38,7 @@ from tessera_embeddings.config.inference import (
 from tessera_embeddings.config.store_layout import MONTH_COVERED_VARS, MONTHS_IN_YEAR
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import OBS_COUNT_VARS, ZarrWriter
-from tessera_embeddings.inference.chunk_spec import ChunkSpec
+from tessera_embeddings.inference.chunk_spec import ChunkSpec, read_pixel_mask
 from tessera_embeddings.inference.data_loading import (
     configure_mosaic_reads,
     load_chunk,
@@ -306,6 +307,17 @@ def _accelerator_index() -> str | None:
     return str(ids[0]) if ids else None
 
 
+@functools.lru_cache(maxsize=4)
+def _pixel_mask(uri: str) -> np.ndarray:
+    """A tile's update pixel mask, read once per tile rather than once per strip.
+
+    Read-only, because every strip of the tile slices the same cached array.
+    """
+    mask = read_pixel_mask(uri)
+    mask.setflags(write=False)
+    return mask
+
+
 # Memory env vars, all on runtime_env rather than the decorator process, so Ray exports them into the worker
 # environment BEFORE this module imports torch / instantiates the C allocator — each is read once at init and ignored
 # if set later. On the decorator so they cover every creation site: the initial pool, the ActorPool replacement path
@@ -480,6 +492,7 @@ class InferenceActor:
             optical_min_obs=self.config.optical_min_obs,
             model_version=self.config.model_version,
             norm_source=self.config.norm_source,
+            pixels=None if chunk.pixels is None else _pixel_mask(chunk.pixels)[y_sub, x_sub or slice(None)],
         )
         return data, dataset
 
@@ -499,7 +512,9 @@ class InferenceActor:
         """
         store_opener = make_store_opener(region=self._s3_region)
         mask_bundle = load_s2_mask_bundle(mosaic_base, chunk, time_window, store_opener=store_opener)
-        x_sub, strips, live_strips = _chunk_read_plan(chunk, mask_bundle)
+        x_sub, strips, live_strips = _chunk_read_plan(
+            chunk, mask_bundle, pixels=None if chunk.pixels is None else _pixel_mask(chunk.pixels)
+        )
         first_strip = self._load_strip_dataset(
             chunk,
             mosaic_base,

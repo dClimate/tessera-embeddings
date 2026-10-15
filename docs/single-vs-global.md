@@ -128,6 +128,7 @@ most often: which optical-depth line a cell was held to, and which model wrote i
 | output | one store per area, one entry per window | one store for the world, one entry per zone per year |
 | scale | one machine, one GPU or a few | **up to a 1,307-card daily average** (964 across the campaign), plus a large container fleet; **16 days** end to end |
 | you run it | yourself, when you want | as a campaign, with restart and recovery machinery |
+| redoing part of it | an `update` block in the run's config ([`updates.md`](updates.md)) | a named update plan, run by the campaign flows ([`updates.md`](updates.md)) |
 
 \* A **UTM zone** is a common convention in geography. The UTM system divides the world into 
 60 northern and southern strips for mapping, each six degrees of longitude wide. 

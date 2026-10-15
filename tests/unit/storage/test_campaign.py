@@ -34,6 +34,9 @@ class _OneInnerChunkSource:
     def live_shards(self):
         return [(0, 0)]
 
+    def pixels(self, shard):
+        return None
+
     def load(self, shard):
         emb = np.zeros((1, _SHARD, _SHARD, _BAND), dtype="int8")
         scl = np.full((1, _SHARD, _SHARD), np.nan, dtype="float32")
