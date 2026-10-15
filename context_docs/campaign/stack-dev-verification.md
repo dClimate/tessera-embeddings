@@ -130,3 +130,10 @@ one on `dev/global-tessera-hole-reads`. The per-tile table is in
 - **The planner could not read a signed registry outside us-east-1.** `plan_update.py from-registry`
   passed the region to Polars only for an anonymous read, so a signed scan asked us-east-1 and S3
   redirected. Fixed in #221 (`ff5bfe59`); the anonymous path, the published registry's, was fine.
+
+## Teardown
+
+The four test folders were deleted in-region from both dev buckets, apart from the 35N mosaics,
+kept for reuse at `s3://global-tessera-inputs-dev/_stack-test/mosaics/35n-7d-{s2,s1-asc,s1-desc}/`
+(about 660 GB). The fills' and updates' mosaics had already gone with the pipeline's own cleanup.
+`dev/global-tessera-hole-reads` and its deployments were removed.
