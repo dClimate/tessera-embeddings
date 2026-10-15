@@ -105,9 +105,12 @@ samples of 10–18 s assemblies, so lower bounds):
 | `shards` updates, one tile per cell | 1 | 1.0 GiB |
 | mock baselines, four tiles | 4 | 1.5 and 5.6 GiB |
 
-Memory scales with workers, not tiles. At about 1.4 GiB a worker, the runner's 32 workers need about
-45 GiB for a fill; a `holes` merge also holds the shard it merges into, about 0.7 GB more a worker,
-so at most about 67 GiB. Both are well inside the runner.
+Memory scales with workers, not tiles, and these runs used one to four. The campaign's 32-worker
+fills peaked at 93.5 GiB in production
+([`what-bounds-assembly-2026-09-09.md`](../assembly/what-bounds-assembly-2026-09-09.md)); a `holes`
+merge also holds the shard it merges into, about 0.9 GiB more a worker
+([`update-dev-verification.md`](update-dev-verification.md)), so about 122 GiB at 32 workers, half
+the runner.
 
 ### Hole-aware reads: eight tiles, paired
 
