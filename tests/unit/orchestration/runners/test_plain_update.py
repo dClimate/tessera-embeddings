@@ -104,6 +104,7 @@ def test_a_shards_update_rewrites_only_its_tiles_whole(area):
         ({"tile": ["chunk_0_0"]}, "takes name, mode and tiles"),
         ({"mode": "all"}, "mode must be"),
         ({"tiles": ["chunk_9_9"]}, "outside the area"),
+        ({"tiles": []}, "lists no tiles"),
         ({"window": parse_time_window("June 2024").window_end_label}, "run without `update` first"),
         # Tiles are written by position, so mosaics a pixel off the store's grid would land a pixel off.
         (

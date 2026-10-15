@@ -360,11 +360,12 @@ footprint's edge — would leave the next load exposed with the card idle. The o
 which pixels share a sub-batch, so the outputs are the same in any order.
 
 **A `holes` update reads only where its holes are.** Given a tile's hole mask (`ChunkSpec.pixels`),
-`_chunk_read_plan` plans from the holes that have an optical observation: the column crop and the
-rows it tiles shrink to their bounding box, and a strip without one is not read at all, since the
-update keeps the store's values outside its holes. A read still decompresses whole 512-row inner
-chunks (below), so a hole costs the rows of its chunk; the column crop saves the per-pixel work
-after the read.
+`_chunk_read_plan` tiles only the rows between the first and last hole and drops every strip that
+holds none, since the update keeps the store's values outside its holes. The column crop covers
+the holes with an optical observation, the only ones it can embed. A strip whose holes cannot embed
+is still read, last, because the update rewrites every hole's observation counts, radar's included.
+A read still decompresses whole 512-row inner chunks (below), so a hole costs the rows of its
+chunk; the column crop saves the per-pixel work after the read.
 
 **Peak host memory has one ceiling.** The load pipeline is one strip deep, so at most two
 band sets co-reside — the strip being inferred and the strip being read — and the pair is
