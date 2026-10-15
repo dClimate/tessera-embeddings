@@ -101,12 +101,18 @@ plan now selects nothing.
 - **Unchanged:** the ingest date filter `min_valid_coverage` (campaign 0.1%, updates 1e-9), and
   ADR 027's drivers and modes.
 
-## 4. Verified on global-tessera-dev, 2026-10-12
+## 4. Verified on global-tessera-dev
 
-This test ran the in-place loosen that §2 records as withdrawn: 18N's zone attr was loosened to 1
-and 18S kept 15, so one run applied two lines. What carries over is the `holes` update at a line of
-one: it filled every eligible hole, changed no embedded pixel, and its embeddings look like the
-rest. An update now applies one line, its plan's, to all its cells.
+**2026-10-15, as built** ([`stack-dev-verification.md`](../campaign/stack-dev-verification.md)): a
+`holes` update planned with `--optical-min-obs 1`, against a store seeded at 15, on a 17S/2024 tile
+the store never wrote because the line of 15 refused all of it. It embedded every one of its
+4,134,860 pixels with an optical observation, left its 59,444 with none empty, did not touch the
+neighbouring tile, and left the root at 15 with the update record stating 1.
+
+**2026-10-12**, the run below, used the in-place loosen that §2 records as withdrawn: 18N's zone
+attr was loosened to 1 and 18S kept 15, so one run applied two lines. What carries over is the
+`holes` update at a line of one: it filled every eligible hole, changed no embedded pixel, and its
+embeddings look like the rest.
 
 Two cloudy tiles the published store refuses about 60% of under 15, both fully land with radar,
 year 2023: 18N `chunk_448_1` (Colombia–Ecuador, 1.3°N) and 18S `chunk_28_1` (northern Peru, 5.2°S).

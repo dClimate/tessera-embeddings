@@ -5,9 +5,10 @@ The end-to-end check of #219 (an always-current registry `master/`), #221 (targe
 check passed, and the run found one defect**: the update planner could not read a signed registry
 outside us-east-1, fixed in #221. It also measured #221's hole-aware reads, added during the run.
 Earlier dev runs of #221 and #223 alone are recorded in
-[`update-dev-verification.md`](update-dev-verification.md) and ADR 028 §4. The runs below lowered
-the line by loosening a zone's rule in place (`loosen_optical_min_obs`), which was withdrawn before
-merging (ADR 028 §2); an update now carries its own line in its plan.
+[`update-dev-verification.md`](update-dev-verification.md) and ADR 028 §4. The 2026-10-14 runs below
+lowered the line by loosening a zone's rule in place (`loosen_optical_min_obs`), which was withdrawn
+before merging (ADR 028 §2). The last section, from 2026-10-15, verifies what replaced it: an update
+that carries its own line, on a tile the store never wrote.
 
 ## Setup
 
@@ -129,6 +130,54 @@ one on `dev/global-tessera-hole-reads`. The per-tile table is in
   about 20 s instead of 30–36 s. Narrowing a strip's rows and columns saves nothing measurable.
 - **Outputs:** byte-identical where the read plan did not change; where it did, inside ADR 012's
   cross-config envelope (worst-pixel cosine 0.99993), with observation counts exact.
+
+### The update's own line, on a tile the store never wrote (2026-10-15)
+
+The plan-carried line, and the case the Latin America update meets 18 times: a target the store
+never wrote, because the line of 15 refused every one of its pixels. TE #223 at `3b5253a3`, deployed
+from the yield-embeddings branch `dev/global-tessera-unwritten-tile` at #96's `b0b7548`. Zone 17S,
+2024, a store seeded at 15 and a land mask of two tiles near Santo Domingo, Ecuador:
+
+- `chunk_3_25`, the target. No pixel reaches 15 observations, so the fill skipped it and wrote no shard.
+- `chunk_3_26`, its eastern neighbour, written by the fill and left out of the update's plan.
+
+A one-tile mask does not reproduce production: with its only live tile skipped, the fill marks the
+whole year empty, a different path from a published zone-year.
+
+1. **Baseline**, `fill-zones-sequential`, 38 min: ingest 20 min, the Ray cluster and its actor 14 min,
+   inference and assembly 4 min. It reported `1 staged + 1 skipped = 2/2`.
+2. **Plan**, `plan_update.py from-cells --mode holes --optical-min-obs 1`, the target only.
+3. **Update**, `fill-zones-sequential` with `update=`, 33 min: ingest 16 min, cluster and actor 11 min,
+   inference and assembly 6 min. It logged `Optical depth rule for this fill: 1 (the store root's: 15)`.
+
+| | `chunk_3_25`, the target | `chunk_3_26`, not in the plan |
+|---|---|---|
+| embedded before → after | 0 → 4,134,860 | 1,069,780 → 1,069,780 |
+| embedded below the zone-year's line (1) | 0 | 0 |
+| holes left with an optical observation | 0 | 3,124,404 |
+| holes left with none | 59,444 | 120 |
+| pixels changed, any of the eight arrays | `embeddings` and `scales` at the 4,134,860 new pixels | 0 |
+| `master/` row | the update's: `optical_min_obs` 1, `refused_thin_px` 0, embedded | the fill's, unchanged (15) |
+
+- **The store kept its rule.** The root still says 15 and the zone group has no rule attr; the
+  zone-year's update record states 1, and `cell_optical_min_obs` reads 1 for 2024 and 15 for 2023.
+- **The update's ingest reproduced the baseline's observation counts exactly**, under its own date
+  filter (1e-9), so only `embeddings` and `scales` changed.
+- **The baseline does not match the published counts exactly.** `chunk_3_25` is close (59,444 pixels
+  with no optical observation, against 60,220 published); `chunk_3_26` is not (1,069,780 embedded with
+  up to 31 observations, against about 62,000 with up to 20). The likely cause is the date filter, a
+  share of a two-tile mask here and of the whole zone in the campaign. It does not bear on the update.
+- **yield-embeddings' validator** (`audit_cell`, run from a laptop against this store) passed the
+  baseline, and on the updated zone-year:
+
+  | check | before #96's fix (`b0b7548`) | after it (`4af3cc9`) |
+  |---|---|---|
+  | written + skipped == live (blocking) | disagrees: 2 written + 1 skipped = 3, mask live 2 | passes: 2 + 0 = 2 |
+  | skipped tiles hold no shard | disagrees: `chunk_3_25` holds one | passes |
+  | published pixels honour the minimum optical depth (blocking) | passes, at the line of 1 | passes |
+
+  The fix applies the year's update records to the fill's skip record. The one disagreement left
+  does not block: the fill's `radar_coverage` record summarises one tile and the year now holds two.
 
 ## Found and fixed
 
