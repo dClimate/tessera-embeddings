@@ -91,8 +91,9 @@ cython_debug/
 # PyPI / publish
 .pypirc
 
-# Local scratch / agent dirs
-.claude/
+# Local scratch / agent dirs; .claude/skills links to the repo's shared .agents/skills
+.claude/*
+!.claude/skills
 plans/
 temp/
 ai/
