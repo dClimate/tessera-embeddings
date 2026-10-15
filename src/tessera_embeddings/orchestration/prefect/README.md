@@ -336,7 +336,9 @@ else ([ADR 027](../../../../context_docs/decisions/027-targeted-updates.md)). Th
 | `min_valid_coverage`, month check | 0.1, every month | `1e-9`, relaxed: a partial-zone ROI must never block |
 | radar policy | any | `holes` requires `allow_s2_only=True`, the campaign's, refused before ingest otherwise |
 
-Run one update per cell at a time: two updates of one cell conflict on its chunks.
+Run one update per cell at a time: two updates of one cell conflict on its chunks. The whole
+procedure, checks and recovery included, is the
+[`run-update`](../../../../.agents/skills/run-update/SKILL.md) skill.
 
 ## Master pipeline
 
