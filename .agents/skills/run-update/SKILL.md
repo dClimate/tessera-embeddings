@@ -10,12 +10,10 @@ step. This skill adds only what an agent must do on top of it.
 
 ## Before anything is written
 
-- **Agree the name, the mode and the tiles with the person.** A name runs once, and a written plan
-  cannot be changed.
+- **Agree the name, the mode, the tiles and any `--optical-min-obs` with the person.** A name runs
+  once, and a written plan cannot be changed.
 - **Show the plan's dry run** (`plan_update.py` without `--write`) and get a yes before writing it.
 - **Get a yes before starting a run.** It provisions GPUs and writes to the store.
-- **Lowering a store's depth rule is a write of its own** (the guide's "Before step 1, only when
-  lowering the depth rule"): show its dry run and get a yes before `--write`.
 - **Check that nothing else is updating the same zone-years.** Two updates of one tile conflict.
 
 ## While it runs

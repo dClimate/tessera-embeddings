@@ -46,26 +46,23 @@ def _cells(n: int) -> list[SequentialCell]:
 
 
 class _Config:
-    """Minimal config stand-in (orbit, the scan's compute_std probe, the cell's window and depth rule)."""
+    """Minimal config stand-in (orbit, the scan's compute_std probe, the cell's window)."""
 
-    def __init__(
-        self, s1_orbit: str = "both", time_window: object | None = None, optical_min_obs: int | None = None
-    ) -> None:
+    def __init__(self, s1_orbit: str = "both", time_window: object | None = None) -> None:
         self.s1_orbit = s1_orbit
-        self.optical_min_obs = optical_min_obs
         self.compute_std = False
         # Carried onto every work item as ZoneContext.time_window, so a chained session's
         # cells can span campaign years without being inferred over the session's months.
         self.time_window = time_window if time_window is not None else parse_time_window("December 2025")
 
 
-def _prepare_for(orbits: dict[str, str] | None = None, rules: dict[str, int] | None = None):
+def _prepare_for(orbits: dict[str, str] | None = None):
     def _prepare(cell: SequentialCell) -> PreparedCell:
         return PreparedCell(
             mosaic_base=f"m/{cell.zone}",
             staging_base=f"s/{cell.zone}",
             run_id=f"r-{cell.zone}",
-            config=_Config((orbits or {}).get(cell.zone, "both"), optical_min_obs=(rules or {}).get(cell.zone)),
+            config=_Config((orbits or {}).get(cell.zone, "both")),
         )
 
     return _prepare
@@ -228,10 +225,10 @@ def _no_scan(monkeypatch):
     )
 
 
-def _run(cells, *, orbits=None, rules=None, plan=None, session=None, assemble=None, log=LOG, **kw):
+def _run(cells, *, orbits=None, plan=None, session=None, assemble=None, log=LOG, **kw):
     return fill_zones_sequential(
         cells=cells,
-        prepare=_prepare_for(orbits, rules),
+        prepare=_prepare_for(orbits),
         plan=plan or _plan_for(),
         session=session or _sync_session(),
         assemble=assemble or _assemble(),
@@ -438,13 +435,13 @@ def test_a_cell_with_a_different_orbit_streams_under_its_own_orbit():
     assert summary["succeeded"] == 3
 
 
-def test_the_streamed_work_carries_each_cell_s_own_orbit_and_depth_rule():
-    """Streaming it is only correct if the actor is TOLD the cell's orbit and depth rule.
+def test_the_streamed_work_carries_each_cell_s_own_orbit():
+    """Streaming it is only correct if the actor is TOLD the cell's orbit.
 
-    Without this a mismatched cell would stream and be read under the session's orbit, or a zone
-    with its own rule be judged against the first cell's — silently the wrong data.
+    Without this the mismatched cell would stream and be read under the session's orbit —
+    silently the wrong data, which is worse than the deferral it replaces.
     """
-    seen: dict[str, tuple[str | None, int | None]] = {}
+    seen: dict[str, str | None] = {}
 
     def session(more_work, on_item_done):
         """Drain the stream, recording the orbit each work item carried."""
@@ -454,14 +451,14 @@ def test_the_streamed_work_carries_each_cell_s_own_orbit_and_depth_rule():
             if batch is None:
                 return results
             for item in batch:
-                seen[item.ctx.run_id.removeprefix("r-")] = (item.ctx.s1_orbit, item.ctx.optical_min_obs)
+                seen[item.ctx.run_id.removeprefix("r-")] = item.ctx.s1_orbit
                 result = {"chunk": item.chunk.label, "status": "success"}
                 results.append(result)
                 on_item_done(item, result)
 
-    _run(_cells(3), orbits={"02N": "ascending"}, rules={"02N": 1}, session=session, assemble=_assemble([]))
-    assert seen.get("02N") == ("ascending", 1), seen
-    assert {v for k, v in seen.items() if k != "02N"} <= {("both", None)}, seen
+    _run(_cells(3), orbits={"02N": "ascending"}, session=session, assemble=_assemble([]))
+    assert seen.get("02N") == "ascending", seen
+    assert {v for k, v in seen.items() if k != "02N"} <= {"both"}, seen
 
 
 def test_assembly_failure_recorded_run_continues():

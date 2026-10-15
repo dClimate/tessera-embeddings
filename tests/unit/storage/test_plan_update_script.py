@@ -40,13 +40,14 @@ def test_a_plan_from_cells_is_checked_then_written(script: Any, tmp_path: Path, 
 
     assert script.main([*argv, "--cells", cells]) == 0
     assert "Dry run" in capsys.readouterr().out
-    assert script.main([*argv, "--cells", cells, "--write"]) == 0
+    assert script.main([*argv, "--cells", cells, "--optical-min-obs", "1", "--write"]) == 0
 
     out = capsys.readouterr().out
     assert "31N/2024       2 planned       1 live       1 dead" in out
     assert "31N/2025       2 planned       2 live" in out
     plan = load_update(BucketPaths(inputs=str(inputs), outputs=""), "u1", mask_name="coverage")
     assert plan.cells == {"31N/2024": ("chunk_10_5", "chunk_12_5"), "31N/2025": None}
+    assert plan.optical_min_obs == 1
 
     # Clearing never reaches a dead shard, so such a plan could never run; it is refused, not written.
     clearing = [*argv[:2], "u2", *argv[3:], "--cells", cells, "--on-skip", "clear", "--write"]

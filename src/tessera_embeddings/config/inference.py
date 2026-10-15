@@ -374,11 +374,12 @@ S1Orbit = Literal["ascending", "descending", "both", "none"]
 #:
 #: The seeder takes the value explicitly rather than defaulting to this constant, so nothing can
 #: stamp a store by inheriting whatever happens to be here, and stamps it on the global store's
-#: root. A stamped rule can be LOOSENED later, for the whole store or for one zone, and never
-#: tightened (:func:`~tessera_embeddings.storage.global_store.loosen_optical_min_obs`): loosening
-#: leaves every embedded pixel compliant, tightening would leave embedded pixels below the line the
-#: store advertises. Each cell's provenance records the line its own numbers were produced under.
-#: The evidence on depth against agreement is ``context_docs/inference/minimum-optical-depth.md``.
+#: root, where it never moves: a store seeded at 15 keeps 15. A targeted update may apply a looser
+#: line to its own cells (``UpdatePlan.optical_min_obs``), recorded in each cell's update record
+#: and never on the root or a zone group, so
+#: :func:`~tessera_embeddings.storage.update.cell_optical_min_obs` is the line a cell's pixels were
+#: judged against. The evidence on depth against agreement is
+#: ``context_docs/inference/minimum-optical-depth.md``.
 OPTICAL_MIN_OBS = 1
 
 #: Resolved value meaning "this ROI has no usable radar at all, and that is a finding".

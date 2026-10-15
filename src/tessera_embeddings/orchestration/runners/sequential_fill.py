@@ -1121,11 +1121,10 @@ def fill_zones_sequential(
                 tally = _ZoneTally(
                     cell=cell, prep=prep, plan=zplan, remaining=len(live), attempt=attempt, results=resumed
                 )
-                # The cell's OWN window and depth rule travel with its work items. Actors are
-                # built once from the session config, so a cell of a different campaign year
-                # would otherwise be inferred over the session's months, and a cell of a zone
-                # with its own rule under the session's line — silently, since the session only
-                # checks s1_orbit.
+                # The cell's OWN window travels with its work items. Actors are built once
+                # from the session config, so a cell of a different campaign year would
+                # otherwise be inferred over the session's months rather than its own —
+                # silently, since the session only checks s1_orbit.
                 ctx = ZoneContext(
                     prep.mosaic_base,
                     prep.staging_base,
@@ -1137,7 +1136,6 @@ def fill_zones_sequential(
                     # exhausted counts of the one that failed.
                     attempt,
                     cell=f"{cell.zone}-{cell.year}",
-                    optical_min_obs=prep.config.optical_min_obs,
                 )
                 with lock:
                     tallies[prep.run_id] = tally

@@ -76,11 +76,7 @@ from tessera_embeddings.inference.data_loading import _active_orbits
 from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.ingest.land_mask import narrow_tile_live
 from tessera_embeddings.storage.campaign import mark_zone_year_empty, pin_tag, tag_zone_year, zone_year_tag
-from tessera_embeddings.storage.global_store import (
-    check_destination_types,
-    effective_optical_min_obs,
-    open_global_repo,
-)
+from tessera_embeddings.storage.global_store import check_destination_types, open_global_repo
 from tessera_embeddings.storage.published_store import calendar_years, live_shards, shard_writes, store_year
 from tessera_embeddings.storage.registry_master import merge_cell
 from tessera_embeddings.storage.registry_rebuild import as_coverage_record, rebuild_tile
@@ -88,6 +84,7 @@ from tessera_embeddings.storage.shard_writer import read_years_complete, shard_p
 from tessera_embeddings.storage.time_axis import time_index_of, year_timestamp
 from tessera_embeddings.storage.update import (
     UpdateTarget,
+    applied_optical_min_obs,
     base_tag,
     check_radar_policy,
     commit_update_record,
@@ -640,20 +637,23 @@ def plan_zone_inference(
         raise ValueError(f"Zone group {zone!r} is not seeded in {store_path} — run seed_zone_groups first (D1).")
     node = cast(zarr.Group, root[zone])
 
-    # The store — not this call's config — is the authority on what minimum-depth rule each zone
-    # is filled under: the zone's own if it has been loosened, else the root's. The Prefect adapter
-    # substitutes that value into the config before calling; this ASSERTS it rather than trusting
-    # it, so the domain API is safe to call directly. Free: `root` is already open above. A check
-    # and not a substitution, deliberately: silently replacing a caller's value would let a direct
-    # caller believe it had configured a line it had not.
-    store_rule = effective_optical_min_obs(root, zone)
-    if config.optical_min_obs != store_rule:
+    # The store's minimum-depth rule is part of its write-once root identity, so the store —
+    # not this call's config — is the authority on what rule its zones are filled under; only an
+    # update's plan may loosen it, for that update's cells. The Prefect adapter substitutes that
+    # value into the config before calling; this ASSERTS it rather than trusting it, so the domain
+    # API is safe to call directly. Free: `root` is already open above. A check and not a
+    # substitution, deliberately: silently replacing a caller's value would let a direct caller
+    # believe it had configured a line it had not, the same class of surprise as the gap it closes.
+    raw_rule = root.attrs.get("optical_min_obs")
+    store_rule = int(cast("int", raw_rule)) if raw_rule is not None else None
+    rule = store_rule if update is None else applied_optical_min_obs(store_rule, update.optical_min_obs)
+    if config.optical_min_obs != rule:
         raise ValueError(
             f"This fill would apply optical_min_obs={config.optical_min_obs!r} to {zone}-{year}, but "
-            f"{store_path} advertises {store_rule!r} for that zone. Filling a zone under a different "
-            "line than the store states is undetectable afterwards, because a refused pixel is "
-            "indistinguishable from one with no optical input. Pass the store's value (None when it "
-            "declares no rule), or loosen the store's rule first with `loosen_optical_min_obs`."
+            f"{store_path} advertises {store_rule!r} and this run must apply {rule!r}. Filling one "
+            "zone under a different line than the store states is undetectable afterwards, because a "
+            "refused pixel is indistinguishable from one with no optical input. Pass that value, or "
+            "plan an update with a looser line of its own (plan_update.py --optical-min-obs)."
         )
 
     # Validate the year BEFORE any expensive work: assemble_global re-checks,

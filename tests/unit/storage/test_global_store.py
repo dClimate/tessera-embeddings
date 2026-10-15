@@ -287,9 +287,10 @@ def test_a_rule_that_refuses_nothing_is_refused(tmp_path):
 
 
 def test_reseed_with_a_different_minimum_depth_rejected(tmp_path):
-    """The rule is in the root identity so that zones filled under one minimum depth never end up
-    beside zones filled under another, under a root advertising only the second. A seed never
-    moves it; loosening is a separate, recorded act (below).
+    """The consequence of putting the rule in the write-once identity, and the reason it is
+    there: zones filled under one minimum depth must not end up beside zones filled under
+    another, under a root advertising only the second. It also means the rule can never be
+    changed for this store — moving the line is a new store, not a migration.
     """
     store = str(tmp_path / "g.icechunk")
     repo = global_store.create_global_repo(store)
@@ -334,81 +335,3 @@ def test_seeding_a_zone_that_already_exists_is_a_no_op(tmp_path):
     # idempotent reseed this skip exists to allow into a hard failure.
     snapshot = global_store.seed_zone_groups(repo, [_ZA, _ZB], years=(2025,))
     assert isinstance(snapshot, str) and snapshot, "an all-seeded reseed returns the current tip"
-
-
-def _ruled(tmp_path, rule: int | None = 15):
-    repo = global_store.create_global_repo(str(tmp_path / "g.icechunk"))
-    global_store.seed_zone_groups(repo, [_ZA, _ZB], years=(2025,), model_version="v1", optical_min_obs=rule)
-    return repo
-
-
-def _root(repo) -> zarr.Group:
-    return zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
-
-
-def _lines(node: zarr.Group) -> list[int]:
-    return [entry["line"] for entry in node.attrs.get("optical_min_obs_history", [])]
-
-
-class TestLooseningTheDepthRule:
-    """The rule moves only down, for the store or for one zone, and records each line given up (ADR 028)."""
-
-    def test_a_root_loosen_moves_the_store_and_records_the_line_given_up(self, tmp_path):
-        repo = _ruled(tmp_path)
-        tip = repo.lookup_branch("main")
-        assert global_store.loosen_optical_min_obs(repo, 1)
-        root = _root(repo)
-        assert root.attrs["optical_min_obs"] == 1
-        [entry] = root.attrs["optical_min_obs_history"]
-        assert (entry["line"], entry["snapshot"]) == (15, tip)
-        assert global_store.effective_optical_min_obs(root, "01N") == 1
-        # Seeding at the new line now passes; the old one is refused, naming the way to loosen.
-        global_store.check_root_identity(root.attrs, layout=GLOBAL, model_version="v1", optical_min_obs=1)
-        with pytest.raises(ValueError, match="loosen_optical_min_obs"):
-            global_store.check_root_identity(root.attrs, layout=GLOBAL, model_version="v1", optical_min_obs=15)
-
-    def test_a_zone_loosen_overrides_the_root_for_that_zone_only(self, tmp_path):
-        repo = _ruled(tmp_path)
-        global_store.loosen_optical_min_obs(repo, 5, zones=["1n"])
-        root = _root(repo)
-        assert (root.attrs["optical_min_obs"], _lines(root)) == (15, [])
-        assert [global_store.effective_optical_min_obs(root, z) for z in ("01N", "01S")] == [5, 15]
-        global_store.loosen_optical_min_obs(repo, 1, zones=["01N"])
-        assert _lines(_root(repo)["01N"]) == [15, 5]
-
-    def test_a_root_loosen_removes_zone_rules_it_reaches_and_keeps_looser_ones(self, tmp_path):
-        repo = _ruled(tmp_path)
-        global_store.loosen_optical_min_obs(repo, 10, zones=["01N"])
-        global_store.loosen_optical_min_obs(repo, 2, zones=["01S"])
-        global_store.loosen_optical_min_obs(repo, 5)
-        root = _root(repo)
-        assert "optical_min_obs" not in root["01N"].attrs, "10 would now read as a tightening"
-        assert _lines(root["01N"]) == [15, 10]
-        assert [global_store.effective_optical_min_obs(root, z) for z in ("01N", "01S")] == [5, 2]
-
-    def test_loosening_to_the_current_line_commits_nothing(self, tmp_path):
-        repo = _ruled(tmp_path)
-        tip = repo.lookup_branch("main")
-        assert global_store.loosen_optical_min_obs(repo, 15) is None
-        assert global_store.loosen_optical_min_obs(repo, 15, zones=["01N"]) is None
-        assert repo.lookup_branch("main") == tip
-
-    @pytest.mark.parametrize(
-        ("rule", "line", "zones", "match"),
-        [
-            (15, 20, None, "tighten"),
-            (15, 20, ["01N"], "tighten"),
-            (15, 0, None, "refuses nothing"),
-            (15, 1, ["02N"], "not seeded"),
-            (None, 1, None, "no minimum-depth rule"),
-        ],
-    )
-    def test_what_cannot_be_loosened_is_refused(self, tmp_path, rule, line, zones, match):
-        repo = _ruled(tmp_path, rule)
-        with pytest.raises(ValueError, match=match):
-            global_store.loosen_optical_min_obs(repo, line, zones=zones)
-
-    def test_an_unstamped_store_is_refused(self, tmp_path):
-        repo = global_store.create_global_repo(str(tmp_path / "g.icechunk"))
-        with pytest.raises(ValueError, match="no minimum-depth rule"):
-            global_store.loosen_optical_min_obs(repo, 1)

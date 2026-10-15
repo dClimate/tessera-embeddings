@@ -15,6 +15,7 @@ from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.orchestration.runners import zone_fill
 from tessera_embeddings.storage import global_store, shard_writer
 from tessera_embeddings.storage.empty_store import VarSpec, create_empty_store_from_coords
+from tessera_embeddings.storage.update import UpdateTarget
 from tessera_embeddings.storage.zarr_store import open_or_create_repo
 from tessera_embeddings.storage.zone_grid import ZoneSpec, easting_coords, northing_coords
 
@@ -324,14 +325,20 @@ def test_an_unusable_assembly_worker_override_is_refused_before_inference(tmp_pa
 
 
 @pytest.mark.parametrize(
-    ("root_rule", "zone_rule", "config_rule", "refused"),
-    [(None, None, 25, True), (None, None, None, False), (15, 1, 1, False), (15, 1, 15, True)],
+    ("root_rule", "update_line", "config_rule", "refused"),
+    [
+        (None, None, 25, "advertises"),
+        (None, None, None, None),
+        (15, 1, 1, None),
+        (15, 1, 15, "advertises"),
+        (15, 20, 20, "only loosen"),
+    ],
 )
-def test_the_runner_applies_only_the_rule_the_store_advertises_for_the_zone(
-    tmp_path, root_rule, zone_rule, config_rule, refused
+def test_the_runner_applies_only_the_stores_rule_or_an_updates_looser_line(
+    tmp_path, root_rule, update_line, config_rule, refused
 ):
-    """The STORE is the authority on what rule a zone is filled under — the zone's own once
-    loosened, else the root's — not the caller's config.
+    """The STORE is the authority on what rule a cell is filled under — the root's, or a looser line
+    an update's plan sets for its own cells — not the caller's config.
 
     The Prefect adapter reads the store and substitutes the value before calling. This runner
     is the orchestrator-agnostic entry point: trusting the config, a direct call would fill
@@ -340,14 +347,15 @@ def test_the_runner_applies_only_the_rule_the_store_advertises_for_the_zone(
     substituted, so a direct caller never believes it configured a line it had not.
     """
     store = _seed_global_with_rule(tmp_path, root_rule)
-    if zone_rule is not None:
-        global_store.loosen_optical_min_obs(global_store.open_global_repo(store), zone_rule, zones=[_ZONE])
+    update = None
+    if update_line is not None:
+        update = UpdateTarget("u", "holes", "keep", "global", None, "h", optical_min_obs=update_line)
     config = InferenceConfig(time_window=_WINDOW, chunk_size=_TILE, num_gpus=0, optical_min_obs=config_rule)
-    # A config that clears the check still fails LATER, on the absent mask, which proves the check
-    # passed rather than short-circuited.
+    # A config that clears the check still fails LATER (the cell is unfilled, the mask absent),
+    # which proves the check passed rather than short-circuited.
     with pytest.raises(Exception) as exc:
-        _fill(tmp_path, store, config=config)
-    assert ("advertises" in str(exc.value)) is refused
+        _fill(tmp_path, store, config=config, update=update)
+    assert all((word in str(exc.value)) is (word == refused) for word in ("advertises", "only loosen"))
 
 
 def test_chunk_size_shard_mismatch_raises(tmp_path):

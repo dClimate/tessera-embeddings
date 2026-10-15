@@ -100,15 +100,15 @@ global store and the pixels disagree, check these settings before looking for a 
 **For parity, pass `allow_s2_only=True` and match the coverage threshold.** `optical_min_obs` is
 not exposed on either single-area path and needs no exposing: unset embeds the same pixels as the
 campaign's line of one. A published cell filled under an earlier, stricter line is the exception —
-the store says which line each zone and tile was held to (below).
+the store says which line each zone-year and tile was held to (below).
 
 **What the published store lets you check, and what it does not.** Only one of the three is
-recorded: the optical line, on the ROOT attributes unless a zone group carries its own, with each
-earlier line in `optical_min_obs_history`:
+recorded: the optical line, on the ROOT attributes, with a lower one in a zone-year's `updates`
+records wherever a targeted update used one (`storage.update.cell_optical_min_obs` reads both):
 
 ```python
 ds_root = xr.open_zarr(session.store, consolidated=False)   # no group=
-ds_root.attrs["optical_min_obs"]     # the line in force, unless a zone group carries its own
+ds_root.attrs["optical_min_obs"]     # the store's line; an update may have used a lower one
 ds_root.attrs["checkpoint_id"]       # which model produced it, plus the geoemb: provenance
 ```
 

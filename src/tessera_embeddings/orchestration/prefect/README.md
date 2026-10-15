@@ -326,14 +326,15 @@ update's name as `update=<name>`, and treat its cells differently from a fill's:
 
 Run one update per cell at a time: two updates of one cell conflict on its chunks.
 
-#### Loosening the optical line, then updating
+#### An update with a looser optical line
 
-A store's minimum optical depth rule moves only down, for the whole store or for named zones, and a
-`holes` update then embeds exactly the pixels the looser line admits
+The store's minimum optical depth rule sits on its root and never moves. An update can apply a
+looser line to its own cells: plan it with `--optical-min-obs`, and a `holes` update embeds exactly
+the pixels the looser line admits
 ([ADR 028](../../../../context_docs/decisions/028-embed-every-pixel-with-an-optical-observation.md)).
-The steps are in [`docs/updates.md`](../../../../docs/updates.md) ("Before step 1, only when lowering the depth
-rule"). Every fill reads its zone's rule from the store, and a chained fill already running in a
-zone refuses its next cell there once the rule changes, so loosen between runs.
+The root and zone groups keep the store's rule, so they understate an updated cell; its update
+records state the line, and `storage.update.cell_optical_min_obs` reads it back. A line stricter
+than the store's is refused. The steps are in [`docs/updates.md`](../../../../docs/updates.md).
 
 ## Master pipeline
 

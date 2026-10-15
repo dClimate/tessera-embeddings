@@ -14,8 +14,8 @@ separately: each answers a question the others raise, and two of them were taken
 overturn a third.
 
 **Status: BUILT.** `OPTICAL_MIN_OBS = 1`, the gate applies it per pixel per year, the store stamps
-it on the root, and refused shards record why. A stamped rule can be loosened, never tightened, for
-the whole store or one zone, after which a `holes` update embeds what the looser line admits.
+it on the root, and refused shards record why. A filled store's rule never moves; a `holes` update
+with a lower line of its own embeds what that line admits, in its own tiles only (ADR 028).
 
 | § | question | instrument | when |
 |---|---|---|---|
@@ -858,13 +858,13 @@ better record than a plan is:
 | what it specified | where it lives now |
 |---|---|
 | the threshold, recorded once | `config/inference.py` (`OPTICAL_MIN_OBS = 1`), stamped on the store root at seeding by `storage/global_store.py` |
-| loosening it, and reading it per zone | `storage/global_store.py`: `loosen_optical_min_obs` (root or zones, with `optical_min_obs_history`), `effective_optical_min_obs` (the zone's own rule, else the root's); `scripts/update/loosen_optical_min_obs.py` |
+| an update's own lower line, and a cell's line | `storage/update.py`: `UpdatePlan.optical_min_obs` (`plan_update.py --optical-min-obs`), `applied_optical_min_obs` (the plan's line, else the root's; lower only), `cell_optical_min_obs` (the loosest line any write to a cell applied) |
 | the gate | `inference/dataset.py`, applied per pixel per year |
-| the store's rule is the only rule a fill may apply | `orchestration/runners/zone_fill.py` asserts the zone's rule; the Prefect adapters substitute it per zone, and a chained session carries it per cell to the actors (`ZoneContext.optical_min_obs`) |
+| the store's rule is the only rule a fill may apply | `orchestration/runners/zone_fill.py` asserts the root's rule, or an update's lower line; the Prefect adapters substitute it into the run's config |
 | an update says which rule it applied | `storage/update.py` (`update_record`), beside each registry row's own `optical_min_obs` |
 | refusal recorded per shard, with a reason | `inference/actors.py` writes the marker, `inference/assembly.py` reads it at assembly |
 | the registry beside the store | `config/paths.py` (`optical_registry()`), a sibling of the Icechunk prefix rather than inside it |
-| the tests | `tests/unit/assembly/test_skip_registry.py`, `test_dataset_v11.py`, `test_assembly.py`, `tests/unit/storage/test_global_store.py` (loosening) |
+| the tests | `tests/unit/assembly/test_skip_registry.py`, `test_dataset_v11.py`, `test_assembly.py`, `tests/unit/storage/test_update.py` (an update's line) |
 
 What already existed and had to be built on rather than reinvented:
 
@@ -888,13 +888,15 @@ Parquet file living there is at best unrecognised and at worst collected. Its sc
 its first live run exposed are in
 [`../storage/writing-to-the-global-store.md`](../storage/writing-to-the-global-store.md) §6.
 
-**The rule is part of the store's root identity, and it moves only down.** Not a per-run parameter,
+**The rule is part of the store's root identity, and it never moves.** Not a per-run parameter,
 because a cell filled under a different line than its store states is undetectable afterwards: a
-refused pixel is indistinguishable from one that had no optical input. A seed never changes it;
-`loosen_optical_min_obs` lowers it for the store or for named zones and records each line given up.
-Down only, because loosening leaves every embedded pixel compliant and makes every newly eligible
-pixel identifiable as `isnan(scales) & (s2_obs_count >= line)` — exactly what a `holes` update fills
-— while tightening would leave embedded pixels below the advertised line with no way to find them.
+refused pixel is indistinguishable from one that had no optical input. A targeted update may apply a
+lower line to its own cells, recorded in their update records. Lower only, because that leaves every
+embedded pixel compliant and makes every newly eligible pixel identifiable as
+`isnan(scales) & (s2_obs_count >= line)` — exactly what a `holes` update fills — while a higher one
+would leave embedded pixels below the line their records state. The root then understates the
+updated cells, which ADR 028 accepts: writing the line onto a zone group would misdescribe that
+zone's other years.
 
 **Three categories, not two.** Not-eligible (ocean or outside the ROI), eligible-and-embedded, and
 eligible-and-refused. A percentage over the wrong denominator was the error this replaced: the land

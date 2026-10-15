@@ -10,6 +10,7 @@ provisioned once with the idle-timeout override.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import threading
 import time
@@ -248,6 +249,26 @@ class TestAnUpdate:
     def test_a_cell_outside_the_plan_is_refused(self, update_wired):
         with pytest.raises(ValueError, match="not in update 'u1'"):
             _run(cells=[("09N", 2025)], update="u1")
+
+    @pytest.mark.parametrize(("line", "applied"), [(None, 15), (1, 1)])
+    def test_the_plans_own_line_reaches_the_config_and_the_fingerprint(self, update_wired, monkeypatch, line, applied):
+        """The store root stays at 15: an update planned at 1 fills its cells at 1, and stages them
+        apart from a run at 15; a plan without a line applies the store's.
+        """
+        plan = dataclasses.replace(self.PLAN, optical_min_obs=line)
+        monkeypatch.setattr(mod, "load_update", lambda paths, name, mask_name: plan)
+        monkeypatch.setattr(mod, "_optical_min_obs_from_store", lambda *a, **k: 15)
+        fingerprinted: list[int] = []
+
+        def fingerprint(zone, year, **k):
+            fingerprinted.append(k["optical_min_obs"])
+            return f"{zone}-{year}-fingerprint"
+
+        monkeypatch.setattr(mod, "_staging_run_id", fingerprint)
+        _run(cells=None, update="u1")
+        prepare = update_wired["seq_kwargs"]["prepare"]
+        assert prepare(SimpleNamespace(zone="01N", year=2025, num_actors=5)).config.optical_min_obs == applied
+        assert set(fingerprinted) == {applied}
 
 
 class TestPerCellValidation:
@@ -1449,25 +1470,6 @@ def test_a_store_declaring_no_rule_leaves_the_config_unconstrained(wired, monkey
     monkeypatch.setattr(mod, "_optical_min_obs_from_store", lambda *a, **k: None)
     _run(zones=["33N"])
     assert built and {c.get("optical_min_obs") for c in built} == {None}
-
-
-def test_each_zone_in_a_chained_fill_is_judged_against_its_own_rule(wired, monkeypatch) -> None:
-    """A zone may carry a looser rule than the root, and one cluster spans many zones: each cell's
-    config and staging fingerprint must carry its own zone's rule, not the first cell's.
-    """
-    rules = {"33N": 15, "34N": 1}
-    fingerprinted: dict[str, int] = {}
-
-    def fingerprint(zone, year, **k):
-        fingerprinted[zone] = k["optical_min_obs"]
-        return f"{zone}-{year}-fingerprint"
-
-    monkeypatch.setattr(mod, "_optical_min_obs_from_store", lambda store, zone, **k: rules[zone])
-    monkeypatch.setattr(mod, "_staging_run_id", fingerprint)
-    _run(zones=list(rules))
-    prepare = wired["seq_kwargs"]["prepare"]
-    configs = {z: prepare(SimpleNamespace(zone=z, year=2025, num_actors=5)).config.optical_min_obs for z in rules}
-    assert configs == fingerprinted == rules
 
 
 # --- a wedged trailing assembly ends the process rather than reporting FAILED (2026-09-04) ------

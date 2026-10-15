@@ -26,11 +26,12 @@ def _plan(**overrides) -> upd.UpdatePlan:
 
 
 def test_a_plan_round_trips_and_normalises_its_cells():
-    plan = _plan(cells={"14n/2019": ["chunk_1_2", "chunk_0_1", "chunk_01_02"], "15S/2020": None})
+    plan = _plan(cells={"14n/2019": ["chunk_1_2", "chunk_0_1", "chunk_01_02"], "15S/2020": None}, optical_min_obs=1)
     assert plan.cells == {"14N/2019": ("chunk_0_1", "chunk_1_2"), "15S/2020": None}
     assert upd.UpdatePlan.from_json(plan.to_json()) == plan
     assert plan.cell_list(zones=["14N"]) == [("14N", 2019)]
-    assert plan.target("15S", 2020, root="s3://b/updates/fix-1").holes == "s3://b/updates/fix-1/holes/15S/2020"
+    target = plan.target("15S", 2020, root="s3://b/updates/fix-1")
+    assert (target.holes, target.optical_min_obs) == ("s3://b/updates/fix-1/holes/15S/2020", 1)
 
 
 @pytest.mark.parametrize(
@@ -40,6 +41,7 @@ def test_a_plan_round_trips_and_normalises_its_cells():
         ({"mode": "pixels"}, "mode must be"),
         ({"mode": "holes", "on_skip": "clear"}, "nothing to clear"),
         ({"min_valid_coverage": 0}, "percentage"),
+        ({"optical_min_obs": 0}, "refuses nothing"),
         ({"cells": {}}, "at least one cell"),
         ({"cells": {"14N/2019": []}}, "lists no shards"),
         ({"cells": {"14N/2019": ["tile_1_2"]}}, "chunk_<row>_<col>"),
@@ -165,6 +167,33 @@ def test_an_update_record_appends_and_leaves_the_fill_alone(zone_repo):
         ("01N", 2024): "done",
         ("01N", 2025): "not_complete",
     }
+
+
+@pytest.mark.parametrize(("store_rule", "line", "applied"), [(15, None, 15), (None, None, None), (15, 1, 1)])
+def test_an_update_applies_its_own_line_else_the_stores(store_rule, line, applied):
+    assert upd.applied_optical_min_obs(store_rule, line) == applied
+
+
+@pytest.mark.parametrize(("store_rule", "line"), [(15, 20), (None, 1)])
+def test_an_update_may_only_loosen_the_stores_rule(store_rule, line):
+    with pytest.raises(ValueError, match="only loosen"):
+        upd.applied_optical_min_obs(store_rule, line)
+
+
+def test_a_cells_line_is_the_loosest_any_write_to_it_applied(zone_repo):
+    """The root keeps the store's 15 (ADR 028): a cell an update filled at 1 reads 1, its other years 15."""
+
+    def root() -> zarr.Group:
+        return zarr.open_group(zone_repo.readonly_session(branch="main").store, mode="r")
+
+    assert upd.cell_optical_min_obs(root(), "01N", 2024) is None, "the store declares no rule"
+    session = zone_repo.writable_session("main")
+    zarr.open_group(session.store, mode="a").attrs["optical_min_obs"] = 15
+    session.commit("stamp")
+    for name, line in (("old", None), ("loose", 1)):
+        record = upd.update_record(_target(name), run_id=name, written=[], kept=[], optical_min_obs=line)
+        upd.commit_update_record(zone_repo, "01N", 2024, record=record)
+    assert [upd.cell_optical_min_obs(root(), "01N", year) for year in (2024, 2025)] == [1, 15]
 
 
 def test_an_update_whose_shard_commit_expired_is_still_known_to_the_store_check(zone_repo):

@@ -5,7 +5,9 @@ The end-to-end check of #219 (an always-current registry `master/`), #221 (targe
 check passed, and the run found one defect**: the update planner could not read a signed registry
 outside us-east-1, fixed in #221. It also measured #221's hole-aware reads, added during the run.
 Earlier dev runs of #221 and #223 alone are recorded in
-[`update-dev-verification.md`](update-dev-verification.md) and ADR 028 §4.
+[`update-dev-verification.md`](update-dev-verification.md) and ADR 028 §4. The runs below lowered
+the line by loosening a zone's rule in place (`loosen_optical_min_obs`), which was withdrawn before
+merging (ADR 028 §2); an update now carries its own line in its plan.
 
 ## Setup
 

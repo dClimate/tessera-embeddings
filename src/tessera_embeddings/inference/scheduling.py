@@ -46,9 +46,7 @@ class ZoneContext:
     cell of another year silently reads the wrong months, and an orbit mismatch can only be
     handled by deferring the cell and holding its mosaic against a bounded budget — past which
     the cell fails and its mosaic is deleted, so a full population of zones never completes.
-    ``optical_min_obs`` is the cell's for the same reason: a chained session's cells span zones,
-    and a zone may carry a looser depth rule than its store's root. ``None`` means "use the
-    actor's own config", which is what the single-ROI path passes.
+    ``None`` means "use the actor's own config", which is what the single-ROI path passes.
     """
 
     mosaic_base: str
@@ -64,7 +62,6 @@ class ZoneContext:
     #: What to call this cell in the progress line, e.g. ``"15N-2019"``. ``None`` for a
     #: single-area run, whose ``run_id`` is a content digest that would name nothing to a reader.
     cell: str | None = None
-    optical_min_obs: int | None = None
 
 
 @dataclass(frozen=True)
@@ -474,7 +471,6 @@ class ActorPool:
             prefetch_hint=hint.chunk if hint is not None else None,
             time_window=item.ctx.time_window,
             s1_orbit=item.ctx.s1_orbit,
-            optical_min_obs=item.ctx.optical_min_obs,
         )
         self.pending[ref] = (item, actor_idx)
         self.chunk_attempts[item.retry_key] = self.chunk_attempts.get(item.retry_key, 0) + 1

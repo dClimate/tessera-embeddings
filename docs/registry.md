@@ -148,9 +148,10 @@ where `store_group` is the zone's group opened with xarray, as in the store's
 | `update_name` | the targeted update that last rewrote the tile ([ADR 027](../context_docs/decisions/027-targeted-updates.md)), null where the tile is still the campaign's fill |
 
 The quality rule is the store's: a pixel is embedded only if it had at least `optical_min_obs`
-usable optical observations in the year, the zone group's own value where it carries one and the
-root's otherwise. The campaign's line is one, at which `refused_thin_px` is always 0; a row still at
-15 is a tile no update has reached since the line was loosened
+usable optical observations in the year: the store root's value, or a lower one a targeted update
+used for its tiles, and each row's own `optical_min_obs` says which. The campaign's line is one, at
+which `refused_thin_px` is always 0; a v1.1 row still at 15 is a tile no update has yet reached at a
+lower line
 ([ADR 028](../context_docs/decisions/028-embed-every-pixel-with-an-optical-observation.md)). Every
 count above comes from the store's own per-pixel observation-count arrays, so any row can be checked
 against the store.

@@ -204,13 +204,11 @@ imaged clearly at least once is embedded; a pixel with none is left empty and re
 array's fill value. The published v1.1 store was filled at 15
 ([ADR 028](../context_docs/decisions/028-embed-every-pixel-with-an-optical-observation.md)).
 
-A store's line can be loosened after it is filled, never tightened, for the whole store or one zone
-at a time. The line in force for a zone is its zone group's own `optical_min_obs` when it carries
-one, else the root's, and `optical_min_obs_history` on either lists each earlier line with the
-store's tip when it was given up. A targeted update then embeds the pixels the looser line admits, so
-a tile no update has reached still reflects the earlier line: its registry row (`optical_min_obs`,
-`update_name`) and the zone's `updates[year]` records say which line each tile was last judged
-against.
+A filled store's line never changes. A targeted update can embed the pixels a lower line admits,
+with a line of its own that applies to its tiles only ([`updates.md`](updates.md)), so the root's
+`optical_min_obs` understates a zone-year an update has reached. Each tile's registry row
+(`optical_min_obs`, `update_name`) and the zone's `updates[year]` records say which line it was last
+judged against, and `cell_optical_min_obs` in `storage/update.py` gives a zone-year's loosest.
 
 Fewer observations make a less reproducible embedding: below about 25, two independent embeddings
 of the same ground disagree at two to four times the pipeline's own noise floor

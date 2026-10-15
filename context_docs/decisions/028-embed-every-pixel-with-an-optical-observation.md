@@ -1,4 +1,4 @@
-# 028 — Embed every pixel with an optical observation, and loosen a filled store's line in place
+# 028 — Embed every pixel with an optical observation
 
 **Status:** Accepted 2026-10-12 (Robert). Supersedes [ADR 018](018-refuse-pixels-below-minimum-optical-depth.md).
 Built on `rule/optical-line-one`, stacked on the targeted updates of [ADR 027](027-targeted-updates.md).
@@ -7,7 +7,8 @@ ADR 018 refused any pixel with fewer than 15 valid Sentinel-2 observations in it
 dataset's reputation ahead of coverage. Downstream users need wall-to-wall coverage: a hole changes
 the geometry of a study area and the length of a time series, which is the objection ADR 018
 recorded and overruled. This reverses that ruling, and says how a store already filled at 15 — the
-published v1.1 store among them — gets there without re-embedding anything it already holds.
+published v1.1 store among them — gets there without re-embedding anything it already holds, and
+without its attrs claiming a line its other cells were never judged against.
 
 ---
 
@@ -27,42 +28,31 @@ row and update record. Zero stays refused, as a rule that refuses nothing. This 
 statement: a single-area run keeps `None`, which embeds the same pixels, because its manifest treats
 an absent rule as none and would refuse the next append to every existing single-area store.
 
-**A stamped rule can be loosened, never tightened, for the whole store or one zone at a time.**
-`storage/global_store.loosen_optical_min_obs`, one commit:
+**A filled store's rule never moves; an update carries its own, looser line.** The root's
+`optical_min_obs` stays write-once. An update plan may set `optical_min_obs`
+(`plan_update.py --optical-min-obs 1`), and that line holds for the plan's cells only: the fill
+applies it in place of the root's (`storage/update.applied_optical_min_obs`), the runner asserts
+it, and every cell of the run takes the same line through the run's config. A line stricter than
+the store's is refused, as is any line on a store that declares no rule.
 
-| call | writes | also |
-|---|---|---|
-| `zones=None` | the root's `optical_min_obs` | removes any zone's own rule at or above the new line, which would otherwise read as a tightening |
-| `zones=[...]` | each named zone group's own `optical_min_obs` | the root is untouched; an unseeded zone is refused |
+**The store's attrs then understate an updated cell, and that is accepted** (Robert, 2026-10-15).
+The root says 15 while an updated 2024 cell holds pixels with 1–14 observations. Writing the new
+line onto a zone group instead would misdescribe that zone's other years, and onto the root every
+zone. The truth is kept per cell: each `updates[year]` record states the line its update applied,
+each registry row its own, and `storage/update.cell_optical_min_obs` returns the loosest line any
+write to a cell applied, the line to judge that cell's pixels against.
 
-Each line given up is appended to that root's or zone's `optical_min_obs_history` as
-`{"line", "until", "snapshot"}`, the snapshot being the store's tip when the line was given up. A fill
-already running under the old line can still land after it, which leaves the same holes a loosen always
-leaves, and its registry rows state the line it applied, so the update that follows finds them. Loosening
-to the current line commits nothing; a tightening, a store with no rule and an unstamped store are refused,
-each saying why. Operators use `scripts/update/loosen_optical_min_obs.py`, a dry run unless `--write`.
-
-**The rule in force for a zone is its own attr when present, else the root's**
-(`effective_optical_min_obs`), and everything that reads the rule goes through it: the per-cell and
-chained fills, the campaign driver's staging fingerprint and the runner's assertion. A chained
-session spans zones, so the rule rides each cell's work items to the actors beside its window and
-orbit (`ZoneContext.optical_min_obs`); an actor built from another zone's config would otherwise
-judge the cell against the wrong line.
-
-**Down only**, because loosening leaves every embedded pixel compliant with the new line and makes
-every newly eligible pixel identifiable in the store as `isnan(scales) & (s2_obs_count >= line)`.
-Tightening would leave embedded pixels below the advertised line, with nothing to tell a reader
-which. **Per zone**, because updating the whole published store is a large spend run zone by zone,
-and a zone that has been updated should advertise the line its pixels were judged against while the
-rest of the store keeps its own.
+**Looser only**, because a looser line leaves every embedded pixel compliant and makes every newly
+eligible pixel identifiable in the store as `isnan(scales) & (s2_obs_count >= line)`. A stricter one
+would leave embedded pixels below the line their cell's records state, with nothing to tell a reader
+which.
 
 **The update is ADR 027's `holes` mode over `refused_thin_px > 0`.** Under a looser line every
 thin-refused pixel is a hole, so `holes` infers exactly the newly eligible pixels and merges them;
-an embedded pixel is never touched. Each cell's `updates[year]` record carries the
-`optical_min_obs` the update applied, and each registry row its own. The steps are in
-[`docs/updates.md`](../../docs/updates.md) ("Before step 1, only when lowering the depth rule"): loosen, plan with `plan_update.py from-registry --mode holes --refused thin`
-over the same zones, run, and check that the updated rows say `optical_min_obs = 1` and
-`refused_thin_px = 0` and that the same plan now selects nothing.
+an embedded pixel is never touched. The steps are in [`docs/updates.md`](../../docs/updates.md):
+plan with `plan_update.py from-registry --mode holes --refused thin --optical-min-obs 1`, run, and
+check that the updated rows say `optical_min_obs = 1` and `refused_thin_px = 0` and that the same
+plan now selects nothing.
 
 ## 2. Rejected alternatives
 
@@ -71,10 +61,14 @@ over the same zones, run, and check that the updated rows say `optical_min_obs =
   already kept (pixel-weighted over its 40 measured cells) to add the rest. `holes` pays only for
   the pixels it adds and the imagery reads of their shards.
 - **Re-stamping through the seeder.** The seed's identity check exists so that a rerun cannot
-  silently change what a store advertises. A separate, explicit and recorded loosen keeps that
-  check strict, and `check_root_identity` now names it when it refuses.
-- **Allowing either direction.** A tightened store would advertise a line some of its embedded
-  pixels do not meet.
+  silently change what a store advertises.
+- **Loosening the rule in place, for the store or per zone.** Built and verified on dev (§4) as
+  `loosen_optical_min_obs`, which wrote the new line and a history of old ones onto the root or
+  named zone groups, then withdrawn before merging (Robert, 2026-10-15). A zone attr spans every
+  year of its zone, so loosening it for a 2024–2025 update misdescribes the zone's 2017–2023, and a
+  root loosen misdescribes every zone. Leaving the attrs alone misdescribes only the updated cells,
+  whose own records are exact.
+- **A stricter update line.** It would leave embedded pixels below the line their records state.
 
 ## 3. Consequences
 
@@ -95,13 +89,21 @@ over the same zones, run, and check that the updated rows say `optical_min_obs =
   measurement (ADR 027 §3) before a large update, rather than estimating.
 - **A tile no update has reached reflects the earlier line.** Its registry row still says
   `optical_min_obs = 15` with its `refused_thin_px`, which is exactly the update's work list.
+- **The attrs understate updated cells.** A reader judging pixels by the root's `optical_min_obs`
+  finds pixels below it in an updated cell; `cell_optical_min_obs`, or the cell's update records,
+  give the right line ([`reading-the-published-store.md`](../storage/reading-the-published-store.md)).
 - **yield-embeddings follows** (Arbol-Project/yield-embeddings#96): `CAMPAIGN_OPTICAL_MIN_OBS = 1`
-  with the pin bump (its test asserts equality with this constant); its validator resolves the rule
-  per zone and counts thin pixels against that same rule; its runbook gains the loosen step.
+  with the pin bump (its test asserts equality with this constant); its validator grades each cell,
+  and counts its thin pixels, against `cell_optical_min_obs`; its runbook plans updates with the line.
 - **Unchanged:** the ingest date filter `min_valid_coverage` (campaign 0.1%, updates 1e-9), and
   ADR 027's drivers and modes.
 
 ## 4. Verified on global-tessera-dev, 2026-10-12
+
+This test ran the in-place loosen that §2 records as withdrawn: 18N's zone attr was loosened to 1
+and 18S kept 15, so one run applied two lines. What carries over is the `holes` update at a line of
+one: it filled every eligible hole, changed no embedded pixel, and its embeddings look like the
+rest. An update now applies one line, its plan's, to all its cells.
 
 Two cloudy tiles the published store refuses about 60% of under 15, both fully land with radar,
 year 2023: 18N `chunk_448_1` (Colombia–Ecuador, 1.3°N) and 18S `chunk_28_1` (northern Peru, 5.2°S).

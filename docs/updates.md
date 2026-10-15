@@ -68,7 +68,7 @@ and otherwise does nothing. To run another update, choose a new name.
 
 | mode | what runs on the GPU | what is written | use it for |
 |---|---|---|---|
-| `holes` (the default) | only the holes | the holes, in all the embedding arrays; every other pixel keeps its exact values | new imagery, an outage, pixels a lowered depth rule now admits (see "Before step 1" below) |
+| `holes` (the default) | only the holes | the holes, in all the embedding arrays; every other pixel keeps its exact values | new imagery, an outage, pixels a lower depth rule now admits (see "To embed pixels the depth rule left empty" below) |
 | `shards` | every pixel of each chosen tile | each chosen tile, whole | a fix to ingest or inference, where existing values are wrong |
 
 If nothing new can be embedded in a chosen tile, that tile is left as it was.
@@ -131,8 +131,7 @@ You need:
   `fill-zones-sequential`), on a Prefect server you can reach
   ([`prefect-setup.md`](prefect-setup.md));
 - **AWS access** that can read the store, its registry and the land mask, write under
-  `{paths.inputs}/updates/`, and write to the store itself for clean-up and, if you do it, for
-  lowering the depth rule.
+  `{paths.inputs}/updates/`, and write to the store itself for clean-up.
 
 Open the store this way for every check on this page:
 
@@ -147,33 +146,6 @@ repo = open_global_repo(
 root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
 print(root["18S"].attrs["years_complete"])  # the years of zone 18S that are filled, e.g. [2023, 2024]
 ```
-
-### Before step 1, only when lowering the depth rule
-
-A global store has a depth rule, `optical_min_obs`: the minimum number of valid optical (Sentinel-2)
-observations a pixel needs in its year to be embedded. Pixels below it were left as holes, and the
-registry counts them as `thin`. To embed them, lower the rule first, then plan a `holes` update of
-the tiles with thin pixels.
-
-1. **Check that no fill is running in the zones you will change.** In the Prefect UI, open each
-   running `run-global-campaign` or `fill-zones-sequential` flow run and read its `zones`, `years`
-   or `cells` parameters, which say where it is working (a campaign run with no `zones` may work in
-   any zone). A run already working in a zone you change would stop at its next zone-year there, because
-   the rule it started with no longer matches the store.
-2. **Lower the rule,** for the whole store or, with `--zones`, for some zones. `--line` is the new
-   minimum. The rule can only go down, and each value given up is kept in the store's history. The
-   first command is a dry run that prints each rule before and after; the second writes it:
-
-   ```bash
-   python scripts/update/loosen_optical_min_obs.py --store s3://my-outputs/global/tessera.icechunk --line 1 --zones 18S,19S
-   python scripts/update/loosen_optical_min_obs.py --store s3://my-outputs/global/tessera.icechunk --line 1 --zones 18S,19S --write
-   ```
-
-3. **Plan as in step 1, with `--refused thin` and the same `--zones`.** A zone still at the old rule
-   would run its holes again and leave them empty.
-
-After the update, the registry rows of the updated tiles show the new `optical_min_obs` and
-`refused_thin_px = 0`, and running the same plan command again selects nothing.
 
 ### 1. Choose the tiles and write the plan
 
@@ -222,6 +194,7 @@ Both commands print a dry run and write nothing:
   18S/2024      42 planned      42 live       0 dead in the mask
   19S/2024     310 planned     305 live       5 dead in the mask
 2 zone-year(s), 347 live tile(s) to update
+Optical depth rule: the store's own
 Dry run: pass --write to save the plan to s3://my-inputs/updates/amazon-thin-2024/plan.json
 ```
 
@@ -232,6 +205,24 @@ written plan cannot be changed:** to change it, write a new plan under a new nam
 Two more options: `--mask` names a land mask other than the campaign's `global`, and
 `--on-skip clear` makes a `shards` update blank a chosen tile where nothing embeds any more, instead
 of keeping it.
+
+**To embed pixels the depth rule left empty**, give the update a lower rule of its own. A global
+store has a depth rule, `optical_min_obs`: the minimum number of valid optical (Sentinel-2)
+observations a pixel needs in its year to be embedded. Pixels below it were left as holes, and the
+registry counts them as `thin`. Plan a `holes` update of those tiles with `--refused thin` and
+`--optical-min-obs` set to the new minimum; `1` embeds every pixel with any optical observation:
+
+```bash
+python scripts/update/plan_update.py from-registry \
+    --name amazon-thin-2024 --mode holes --optical-min-obs 1 \
+    --inputs s3://my-inputs --registry s3://my-outputs/global/tessera.registry --region us-west-2 \
+    --refused thin --zones 18S,19S --years 2024
+```
+
+The lower rule applies to this update's tiles only, and must be lower than the store's. The store's
+own `optical_min_obs` keeps its value, so afterwards it understates the zone-years you updated; each
+one's update record states the rule its update used. The registry rows of the updated tiles show the
+new `optical_min_obs` and `refused_thin_px = 0`, and the same plan command then selects nothing.
 
 ### 2. Run it
 

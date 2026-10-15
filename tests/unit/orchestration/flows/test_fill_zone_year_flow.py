@@ -14,7 +14,6 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
-import zarr
 
 import tessera_embeddings.orchestration.prefect.flows.fill_zone_year as mod
 from tessera_embeddings.config.paths import BucketPaths
@@ -303,8 +302,8 @@ class TestPerCellValidation:
 class TestTheMinimumDepthRuleComesFromTheStore:
     """A fill applies the rule its STORE advertises, never one a dispatch supplied.
 
-    The store is the authority on what rule each zone is filled under (the zone's own once
-    loosened, else the root's). If a dispatch could set it, one zone could land under 25 and its
+    The value is part of the root's write-once identity, so the store is the authority on what rule
+    its zones were filled under. If a dispatch could set it, one zone could land under 25 and its
     neighbour under 30, and nothing afterwards could tell which pixels came from which — the
     refused pixels leave no trace to compare.
     """
@@ -319,34 +318,25 @@ class TestTheMinimumDepthRuleComesFromTheStore:
         params = inspect.signature(flow).parameters
         assert "optical_min_obs" not in params
 
-    @pytest.mark.parametrize(
-        ("root_attrs", "zone_attrs", "want"),
-        [({}, {}, None), ({"optical_min_obs": 15}, {}, 15), ({"optical_min_obs": 15}, {"optical_min_obs": 1}, 1)],
-    )
-    def test_the_reader_resolves_the_zones_rule_else_the_roots(self, monkeypatch, root_attrs, zone_attrs, want):
-        """``None`` for a store declaring no rule (every store seeded before 2026-08-13, which
-        already holds everything with any optical input); else a loosened zone's own; else the root's.
+    def test_the_reader_returns_none_for_a_store_that_declares_no_rule(self, monkeypatch):
+        """Every store seeded before 2026-08-13 declares none, and those stores already contain
+        everything with any optical input — applying a line retrospectively would claim their
+        existing zones were filled under one that never touched them.
         """
-        root = zarr.open_group(zarr.storage.MemoryStore(), mode="w", attributes=root_attrs)
-        root.create_group("33N", attributes=zone_attrs)
-        monkeypatch.setattr(mod, "open_store_as_zarr_group", lambda *a, **k: root)
-        assert mod._optical_min_obs_from_store("s3://x", "33N", get_credentials=None) == want
+        monkeypatch.setattr(mod, "open_store_as_zarr_group", lambda *a, **k: SimpleNamespace(attrs={}))
+        assert mod._optical_min_obs_from_store("s3://x", get_credentials=None) is None
 
-    def test_each_zone_is_filled_under_its_own_rule(self, wired):
-        rules = {"33N": 15, "34N": 1}
-        wired.setattr(mod, "_optical_min_obs_from_store", lambda store, zone, **k: rules[zone])
-        wired.setattr(mod, "zone_year_complete", lambda *a, **k: True)  # retag-only: no cluster
-        seen: dict[str, int | None] = {}
-        wired.setattr(mod, "fill_zone_year", lambda **kw: seen.update({kw["zone"]: kw["config"].optical_min_obs}))
-        for zone in rules:
-            mod.fill_zone_year_flow.fn(zone=zone, year=2025, paths=_PATHS, ami_ssm_name="ami")
-        assert seen == rules
+    def test_the_reader_returns_the_stamped_rule(self, monkeypatch):
+        monkeypatch.setattr(
+            mod, "open_store_as_zarr_group", lambda *a, **k: SimpleNamespace(attrs={"optical_min_obs": 25})
+        )
+        assert mod._optical_min_obs_from_store("s3://x", get_credentials=None) == 25
 
 
 @pytest.mark.parametrize(
     ("reader", "kwargs"),
     [
-        ("_optical_min_obs_from_store", {"zone": "01N"}),
+        ("_optical_min_obs_from_store", {}),
         ("_assert_seeded_model_matches", {"build_checkpoint": "c", "allow_model_mismatch": False}),
     ],
 )
@@ -357,7 +347,7 @@ def test_the_store_readers_take_the_store_s_credential_not_the_caller_s(monkeypa
     monkeypatch.setattr(
         mod,
         "open_store_as_zarr_group",
-        lambda path, **k: opened.append(k["get_credentials"]) or zarr.group(),
+        lambda path, **k: opened.append(k["get_credentials"]) or SimpleNamespace(attrs={}),
     )
     getattr(mod, reader)("s3://theirs/global.icechunk", get_credentials="task role", **kwargs)
     assert opened == [("store's own", "s3://theirs/global.icechunk")]

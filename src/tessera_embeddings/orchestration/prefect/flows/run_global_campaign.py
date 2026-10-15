@@ -1172,21 +1172,22 @@ async def run_global_campaign(
         max_parallel_clusters,
     )
 
-    optical_rule_cache: dict[str, int | None] = {}
+    optical_rule_cache: list[int | None] = []
 
-    def _campaign_optical_min_obs(zone: str) -> int | None:
-        """The zone's minimum-depth rule, for the staging fingerprint.
+    def _campaign_optical_min_obs() -> int | None:
+        """The store's minimum-depth rule, for the staging fingerprint.
 
-        Read from the store because the store is the authority (a zone may carry a looser rule
-        than the root), and cached per zone because no rule changes under a running campaign. In
-        the fingerprint for the same reason ``allow_s2_only`` is: it decides which pixels get
-        embeddings, and staging is not namespaced by store.
+        Read from the store because the store is the authority (its root attr is part of a
+        write-once identity), and cached because every cell writes the same store and the
+        root cannot change under it. In the fingerprint for the same reason
+        ``allow_s2_only`` is: it decides which pixels get embeddings, and staging is not
+        namespaced by store.
         """
-        if zone not in optical_rule_cache:
-            optical_rule_cache[zone] = _optical_min_obs_from_store(
-                store_path, zone, get_credentials=store_credentials, s3_region=s3_region
+        if not optical_rule_cache:
+            optical_rule_cache.append(
+                _optical_min_obs_from_store(store_path, get_credentials=store_credentials, s3_region=s3_region)
             )
-        return optical_rule_cache[zone]
+        return optical_rule_cache[0]
 
     code_identity_cache: list[str] = []
     announced_staging_identities: set[str] = set()
@@ -1417,7 +1418,7 @@ async def run_global_campaign(
                 s1_orbit=s1_orbit,
                 allow_partial_window=allow_partial_window,
                 allow_s2_only=allow_s2_only,
-                optical_min_obs=_campaign_optical_min_obs(zone),
+                optical_min_obs=_campaign_optical_min_obs(),
                 code_identity=_staging_code_identity(),
                 get_credentials=iam_icechunk_credentials,
                 s3_region=s3_region,
