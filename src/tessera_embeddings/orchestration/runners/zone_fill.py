@@ -86,6 +86,7 @@ from tessera_embeddings.storage.update import (
     UpdateTarget,
     applied_optical_min_obs,
     base_tag,
+    cell_optical_min_obs,
     check_radar_policy,
     commit_update_record,
     stage_hole_masks,
@@ -654,6 +655,14 @@ def plan_zone_inference(
             "zone under a different line than the store states is undetectable afterwards, because a "
             "refused pixel is indistinguishable from one with no optical input. Pass that value, or "
             "plan an update with a looser line of its own (plan_update.py --optical-min-obs)."
+        )
+    # Nor may an update tighten what an earlier, looser update embedded in this cell: a `shards`
+    # rewrite would drop those pixels, and a `holes` merge would count them as thin refusals.
+    earlier = cell_optical_min_obs(root, zone, year) if update is not None else None
+    if update is not None and rule is not None and earlier is not None and rule > earlier:
+        raise ValueError(
+            f"Update {update.name!r} would apply optical_min_obs={rule} to {zone}-{year}, where an "
+            f"earlier update embedded pixels at {earlier}. Plan it with --optical-min-obs {earlier} or lower."
         )
 
     # Validate the year BEFORE any expensive work: assemble_global re-checks,

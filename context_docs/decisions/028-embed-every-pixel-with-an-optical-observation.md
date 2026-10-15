@@ -38,9 +38,12 @@ the store's is refused, as is any line on a store that declares no rule.
 **The store's attrs then understate an updated cell, and that is accepted** (Robert, 2026-10-15).
 The root says 15 while an updated 2024 cell holds pixels with 1–14 observations. Writing the new
 line onto a zone group instead would misdescribe that zone's other years, and onto the root every
-zone. The truth is kept per cell: each `updates[year]` record states the line its update applied,
-each registry row its own, and `storage/update.cell_optical_min_obs` returns the loosest line any
-write to a cell applied, the line to judge that cell's pixels against.
+zone. The truth is kept per cell and per tile: each `updates[year]` record states the line its
+update applied, each registry row its own, and `storage/update.cell_optical_min_obs` returns the
+loosest line any write to a cell applied, the floor every pixel embedded there meets. It is not a
+promise of coverage: an update may reach only some of a cell's tiles. A later update may not apply
+a stricter line to a cell than an earlier one did; the runner refuses it, since a `shards` rewrite
+would drop the pixels the earlier update embedded and a `holes` merge would count them as thin.
 
 **Looser only**, because a looser line leaves every embedded pixel compliant and makes every newly
 eligible pixel identifiable in the store as `isnan(scales) & (s2_obs_count >= line)`. A stricter one

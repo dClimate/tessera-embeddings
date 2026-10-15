@@ -525,8 +525,9 @@ than from the product.
 **The root's `optical_min_obs` understates a cell a targeted update reached.** An update may embed
 pixels below the store's line with a lower line of its own, and records that line only in the zone
 group's `updates[year]` records and the registry rows, never on the root or the zone group
-(ADR 028). Judge a cell's pixels against `storage.update.cell_optical_min_obs(root, zone, year)`, or
-read `s2_obs_count` per pixel.
+(ADR 028). Every pixel embedded in a cell meets `storage.update.cell_optical_min_obs(root, zone,
+year)`; a tile's own line is its registry row's `optical_min_obs`, and `s2_obs_count` gives each
+pixel's depth.
 
 **Point access is expensive, and the store is not built for it** (§4.1). That is the geometry
 working as intended: whole-chunk reads are what make block reads fast and object counts manageable.

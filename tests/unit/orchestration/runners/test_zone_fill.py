@@ -15,7 +15,7 @@ from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.orchestration.runners import zone_fill
 from tessera_embeddings.storage import global_store, shard_writer
 from tessera_embeddings.storage.empty_store import VarSpec, create_empty_store_from_coords
-from tessera_embeddings.storage.update import UpdateTarget
+from tessera_embeddings.storage.update import UpdateTarget, commit_update_record, update_record
 from tessera_embeddings.storage.zarr_store import open_or_create_repo
 from tessera_embeddings.storage.zone_grid import ZoneSpec, easting_coords, northing_coords
 
@@ -356,6 +356,22 @@ def test_the_runner_applies_only_the_stores_rule_or_an_updates_looser_line(
     with pytest.raises(Exception) as exc:
         _fill(tmp_path, store, config=config, update=update)
     assert all((word in str(exc.value)) is (word == refused) for word in ("advertises", "only loosen"))
+
+
+@pytest.mark.parametrize(("line", "refused"), [(None, True), (5, True), (1, False)])
+def test_an_update_may_not_tighten_a_cell_an_earlier_update_loosened(tmp_path, line, refused):
+    """After an update at 1, a later one at the root's 15 or at 5 would drop (``shards``) or count as
+    thin (``holes``) the pixels the first one embedded, so the runner refuses it before inference.
+    """
+    store = _seed_global_with_rule(tmp_path, 15)
+    earlier = UpdateTarget("earlier", "holes", "keep", "global", None, "h")
+    record = update_record(earlier, run_id="r", written=["chunk_0_0"], kept=[], optical_min_obs=1)
+    commit_update_record(global_store.open_global_repo(store), _ZONE, 2025, record=record)
+    update = UpdateTarget("later", "holes", "keep", "global", None, "h", optical_min_obs=line)
+    config = InferenceConfig(time_window=_WINDOW, chunk_size=_TILE, num_gpus=0, optical_min_obs=line or 15)
+    with pytest.raises(Exception) as exc:
+        _fill(tmp_path, store, config=config, update=update)
+    assert ("earlier update" in str(exc.value)) is refused
 
 
 def test_chunk_size_shard_mismatch_raises(tmp_path):

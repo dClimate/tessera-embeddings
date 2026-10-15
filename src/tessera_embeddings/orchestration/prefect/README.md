@@ -333,8 +333,9 @@ looser line to its own cells: plan it with `--optical-min-obs`, and a `holes` up
 the pixels the looser line admits
 ([ADR 028](../../../../context_docs/decisions/028-embed-every-pixel-with-an-optical-observation.md)).
 The root and zone groups keep the store's rule, so they understate an updated cell; its update
-records state the line, and `storage.update.cell_optical_min_obs` reads it back. A line stricter
-than the store's is refused. The steps are in [`docs/updates.md`](../../../../docs/updates.md).
+records state the line, and `storage.update.cell_optical_min_obs` reads back the floor every
+embedded pixel meets. A line stricter than the store's is refused, as is one stricter than an
+earlier update applied to the same cell. The steps are in [`docs/updates.md`](../../../../docs/updates.md).
 
 ## Master pipeline
 

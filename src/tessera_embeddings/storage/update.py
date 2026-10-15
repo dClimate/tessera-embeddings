@@ -34,8 +34,10 @@ the store once every cell has landed.
 
 **Depth rule.** An update applies the store root's ``optical_min_obs`` unless its plan sets a looser
 line, which then holds for the plan's cells only (ADR 028): the root and the zone groups keep the
-store's rule, so they understate what an updated cell holds. Its update records state the truth,
-and :func:`cell_optical_min_obs` reads it back.
+store's rule, so they understate what an updated cell holds. Its update records state the truth:
+:func:`cell_optical_min_obs` reads back the floor every embedded pixel meets, and each tile's
+registry row its own line. A later update may not apply a stricter line to a cell than an earlier
+one did.
 """
 
 from __future__ import annotations
@@ -392,8 +394,10 @@ def applied_optical_min_obs(store_rule: int | None, line: int | None) -> int | N
 def cell_optical_min_obs(root: zarr.Group, zone: str, year: int) -> int | None:
     """The loosest depth rule any write to one cell applied: the store root's, or an update's below it.
 
-    The line to judge a cell's pixels against. The root's ``optical_min_obs`` alone understates a cell
-    that an update filled under a looser line. ``None`` means the store declares no rule.
+    A floor: every pixel embedded in the cell meets it, which the root's ``optical_min_obs`` alone
+    does not promise once an update used a lower line. It is not a promise of coverage, since an
+    update may have reached only some of the cell's tiles; each tile's own line is its registry
+    row's ``optical_min_obs``. ``None`` means the store declares no rule.
     """
     rule = root.attrs.get("optical_min_obs")
     if rule is None:

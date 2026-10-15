@@ -219,7 +219,8 @@ python scripts/update/plan_update.py from-registry \
     --refused thin --zones 18S,19S --years 2024
 ```
 
-The lower rule applies to this update's tiles only, and must be lower than the store's. The store's
+The lower rule applies to this update's tiles only, and must be lower than the store's. A later
+update of the same zone-years must use that rule or a lower one, or it is refused. The store's
 own `optical_min_obs` keeps its value, so afterwards it understates the zone-years you updated; each
 one's update record states the rule its update used. The registry rows of the updated tiles show the
 new `optical_min_obs` and `refused_thin_px = 0`, and the same plan command then selects nothing.
