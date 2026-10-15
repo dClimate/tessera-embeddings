@@ -72,8 +72,8 @@ python scripts/update/loosen_optical_min_obs.py --store <store-uri> --line 1 --z
 python scripts/update/loosen_optical_min_obs.py --store <store-uri> --line 1 --zones 18N,18S --write
 ```
 
-Then plan with `--where "refused_thin_px > 0"`. A zone left at the old line embeds nothing new, and
-its tiles are kept.
+Then plan with `--where "refused_thin_px > 0"`, over the zones you loosened: a zone left at the old
+line re-infers its holes, refuses them again and keeps its tiles.
 
 ### Plan
 
