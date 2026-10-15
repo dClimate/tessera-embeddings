@@ -81,6 +81,7 @@ def _row(tile: str, refused: int, box: tuple[float, float, float, float]) -> dic
     return {
         "tile": tile,
         "refused_thin_px": refused,
+        "refused_px": refused,
         "bbox_west": west,
         "bbox_south": south,
         "bbox_east": east,
@@ -89,17 +90,17 @@ def _row(tile: str, refused: int, box: tuple[float, float, float, float]) -> dic
 
 
 @pytest.mark.parametrize(
-    ("where", "aoi", "cells"),
+    ("refused", "aoi", "cells"),
     [
-        ("refused_thin_px > 0", None, {"14N/2019": ("chunk_0_1",), "60N/2019": ("chunk_0_0",)}),
+        ("thin", None, {"14N/2019": ("chunk_0_1",), "60N/2019": ("chunk_0_0",)}),
+        ("any", None, {"14N/2019": ("chunk_0_1",), "60N/2019": ("chunk_0_0",)}),
         (None, (-100.0, 40.0, -99.0, 41.0), {"14N/2019": ("chunk_0_0", "chunk_0_1")}),
-        # Zone 60's antimeridian row (west > east) intersects a box just east of -180.
+        # Zone 60's antimeridian row (west > east) intersects a box on either side of it.
         (None, (-179.9, 10.0, -179.0, 11.0), {"60N/2019": ("chunk_0_0",)}),
-        # And an AOI that itself crosses the antimeridian still finds the crossing row.
-        (None, (179.0, 10.0, -179.0, 11.0), {"60N/2019": ("chunk_0_0",)}),
+        (None, (179.0, 10.0, 180.0, 11.0), {"60N/2019": ("chunk_0_0",)}),
     ],
 )
-def test_a_plan_can_come_from_the_registry(tmp_path, where, aoi, cells):
+def test_a_plan_can_come_from_the_registry(tmp_path, refused, aoi, cells):
     root = _master(
         tmp_path,
         {
@@ -111,14 +112,18 @@ def test_a_plan_can_come_from_the_registry(tmp_path, where, aoi, cells):
             ("60N", 2019): [_row("chunk_0_0", 3, (179.9, 10.2, -179.8, 10.4)) | {"update_name": "earlier"}],
         },
     )
-    plan = upd.plan_from_registry(root, name="fill-thin", mode="holes", where=where, aoi=aoi)
+    plan = upd.plan_from_registry(root, name="fill-thin", mode="holes", refused=refused, aoi=aoi)
     assert plan.cells == cells
 
 
-def test_a_registry_query_matching_nothing_is_refused(tmp_path):
+@pytest.mark.parametrize(
+    ("query", "match"),
+    [({"refused": "thin"}, "selects no tiles"), ({"aoi": (179.0, 0.0, -179.0, 1.0)}, "crosses the antimeridian")],
+)
+def test_a_registry_query_that_cannot_be_planned_is_refused(tmp_path, query, match):
     root = _master(tmp_path, {("14N", 2019): [_row("chunk_0_0", 0, (0.0, 0.0, 1.0, 1.0))]})
-    with pytest.raises(ValueError, match="No registry rows"):
-        upd.plan_from_registry(root, name="none", mode="shards", where="refused_thin_px > 0")
+    with pytest.raises(ValueError, match=match):
+        upd.plan_from_registry(root, name="none", mode="shards", **query)
 
 
 @pytest.fixture

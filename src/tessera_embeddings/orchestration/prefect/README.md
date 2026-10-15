@@ -313,8 +313,8 @@ else ([ADR 027](../../../../context_docs/decisions/027-targeted-updates.md)). Th
 
 1. **Plan it.** `scripts/update/plan_update.py` writes an immutable plan to
    `{inputs}/updates/<name>/plan.json`: the cells, the shards in each (or all of them), the land
-   mask, the mode and the ingest settings. Shards come from the registry's `master/` (`--where`,
-   `--aoi`) or a CSV. Dry run unless `--write`; it reports how many of each cell's shards the mask
+   mask, the mode and the ingest settings. Shards come from the registry's `master/` (`--refused`,
+   `--aoi`, `--zones`, `--years`) or a CSV. Dry run unless `--write`; it reports how many of each cell's shards the mask
    holds live.
 2. **Run it.** Pass `update=<name>` to `fill-zones-sequential` for one cluster (`cells` defaults to
    the plan's, and a subset splits an update across runs), or to `run-global-campaign` for several,
@@ -351,7 +351,7 @@ A store's minimum optical depth rule moves only down, for the whole store or for
    `optical_min_obs_history`; every fill from then on reads its zone's rule from the store. Loosen
    between runs: a chained fill already running in the zone refuses its next cell there, because the
    rule it read at the start no longer matches the store.
-2. **Plan.** `uv run python scripts/update/plan_update.py from-registry --name line1-<scope> --mode holes --where "refused_thin_px > 0"`
+2. **Plan.** `uv run python scripts/update/plan_update.py from-registry --name line1-<scope> --mode holes --refused thin`
    with the same `--zones` (a zone still at the old line would re-infer its holes and refuse them
    again), optionally narrowed by `--aoi` or a mask built with `build-land-mask`. Every thin-refused
    pixel is now a hole. The dry run prints each cell's shard counts: price them against

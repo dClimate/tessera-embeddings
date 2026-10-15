@@ -72,7 +72,7 @@ python scripts/update/loosen_optical_min_obs.py --store <store-uri> --line 1 --z
 python scripts/update/loosen_optical_min_obs.py --store <store-uri> --line 1 --zones 18N,18S --write
 ```
 
-Then plan with `--where "refused_thin_px > 0"`, over the zones you loosened: a zone left at the old
+Then plan with `--refused thin`, over the zones you loosened: a zone left at the old
 line re-infers its holes, refuses them again and keeps its tiles.
 
 ### Plan
@@ -81,25 +81,27 @@ line re-infers its holes, refuses them again and keeps its tiles.
 registry beside the store or from a list of tiles:
 
 ```bash
-# shards whose registry master/ rows match a SQL filter, an area, zones and years
+# shards whose registry master/ rows refused pixels, in an area, zones and years
 python scripts/update/plan_update.py from-registry --name <name> --mode holes \
     --inputs <inputs-uri> --registry <registry-uri> --region <s3-region> \
-    --where "refused_thin_px > 0" --aoi=<west>,<south>,<east>,<north> --zones 18N,18S --years 2024
+    --refused thin --aoi=<west>,<south>,<east>,<north> --zones 18N,18S --years 2024
 
 # a CSV with a zone,year,tile header; a blank tile means every live shard of that zone-year
 python scripts/update/plan_update.py from-cells --name <name> --mode shards \
     --inputs <inputs-uri> --cells targets.csv
 ```
 
-- **The registry** sits beside the store: `<path>/<store>.icechunk` has `<path>/<store>.registry`.
-  `--where` is SQL over its `master/` columns ([`docs/registry.md`](../../../docs/registry.md));
-  add `--anonymous` for a public registry.
+- **The registry** sits beside the store: `<path>/<store>.icechunk` has `<path>/<store>.registry`
+  ([`docs/registry.md`](../../../docs/registry.md)); add `--anonymous` for a public registry.
+- **`--refused`** keeps the tiles that refused pixels for one reason (`thin`, `no_optical`,
+  `no_radar`) or for `any`; without it every tile in the zones, years and area is planned. Any other
+  selection is a CSV, built however you like.
 - **Read the dry run's report** before writing. Per zone-year it gives the shards planned, those the
   land mask holds live, and those it holds dead, which the fill drops. A zone missing from the mask
   is refused, and a `clear` plan cannot target dead shards.
-- **Keep the ingest defaults** (`--min-valid-coverage` 1e-9 and a partial window). An update ingests
-  only the blocks around its targets, and stricter settings drop dates and months on an area that
-  small which the zone-wide fill kept.
+- **The ingest is relaxed on purpose.** A plan admits a date with one valid pixel and a month with
+  no data, because an update ingests only the blocks around its targets, and stricter settings would
+  drop dates and months the zone-wide fill kept.
 - `--mask` names the land mask under `{inputs}/masks/` (default `global`); `--on-skip clear` sets the
   plan's `on_skip`.
 - **Then rerun with `--write`.**

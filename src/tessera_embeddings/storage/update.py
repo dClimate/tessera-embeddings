@@ -67,6 +67,8 @@ from tessera_embeddings.storage.zone_grid import canonicalize_zone
 UpdateMode = Literal["holes", "shards"]
 OnSkip = Literal["keep", "clear"]
 UpdateState = Literal["pending", "done", "not_complete"]
+#: Which refusals select a tile from the registry: one reason of `registry.REASONS`, or any of them.
+Refused = Literal["no_optical", "thin", "no_radar", "any"]
 
 #: The registry's hive partition keys, which come from the path rather than the files.
 _PARTITION_KEYS = ("zone", "year")
@@ -282,22 +284,21 @@ def plan_from_registry(
     *,
     name: str,
     mode: UpdateMode,
+    refused: Refused | None = None,
     zones: Iterable[str] | None = None,
     years: Iterable[int] | None = None,
-    where: str | None = None,
     aoi: tuple[float, float, float, float] | None = None,
     storage_options: Mapping[str, Any] | None = None,
     **plan_fields: Any,  # noqa: ANN401 — forwarded to UpdatePlan unchanged
 ) -> UpdatePlan:
     """Build a plan from the registry's ``master/``: one shard per matching row.
 
-    ``where`` is a SQL expression over the master's columns, e.g. ``"refused_thin_px > 0"`` (rank
-    by ``median_obs_where_thin``, not ``median_obs_where_any``; see :mod:`.registry`). ``aoi`` is a
-    WGS84 ``(west, south, east, north)`` box; a row matches when its tile's box intersects it. Either
-    box may cross the antimeridian (``west > east``), as the rows of zones 01 and 60 do.
+    ``refused`` keeps the tiles that refused pixels for that reason (``refused_<reason>_px > 0``), or
+    for any reason; ``None`` keeps every tile. ``aoi`` is a WGS84 ``(west, south, east, north)`` box
+    that a tile's box must intersect. Any other selection is a CSV of tiles (:func:`plan_from_tiles`).
 
     Raises:
-        ValueError: If nothing matches.
+        ValueError: If nothing matches, or the AOI crosses the antimeridian.
     """
     # THE SCHEMA IS STATED, as every whole-registry read must (`registry.py`): inferred, it comes from
     # the first file, and cell files written before and after a column was added then fail to scan.
@@ -315,32 +316,45 @@ def plan_from_registry(
         rows = rows.filter(pl.col("zone").is_in([canonicalize_zone(z) for z in zones]))
     if years is not None:
         rows = rows.filter(pl.col("year").is_in([int(y) for y in years]))
-    if where:
-        rows = rows.filter(pl.sql_expr(where))
+    if refused is not None:
+        rows = rows.filter(pl.col("refused_px" if refused == "any" else f"refused_{refused}_px") > 0)
     if aoi is not None:
         west, south, east, north = aoi
-        # Either box may cross the antimeridian (west > east). Each is the union of its intervals on
-        # [-180, 180], and two boxes overlap when any pair of those intervals does.
-        tile_spans = [
-            (
-                pl.col("bbox_west"),
-                pl.when(pl.col("bbox_west") > pl.col("bbox_east")).then(180.0).otherwise(pl.col("bbox_east")),
-            ),
-            (
-                pl.when(pl.col("bbox_west") > pl.col("bbox_east")).then(-180.0).otherwise(pl.col("bbox_west")),
-                pl.col("bbox_east"),
-            ),
-        ]
-        aoi_spans = [(west, east)] if west <= east else [(west, 180.0), (-180.0, east)]
-        overlaps_lon = pl.any_horizontal([(tw <= ae) & (te >= aw) for tw, te in tile_spans for aw, ae in aoi_spans])
-        rows = rows.filter(overlaps_lon & (pl.col("bbox_south") <= north) & (pl.col("bbox_north") >= south))
-    matched = rows.select("zone", "year", "tile").collect()
-    if matched.is_empty():
-        raise ValueError(f"No registry rows under {registry_root} match where={where!r} aoi={aoi}")
-    grouped = matched.group_by("zone", "year").agg(pl.col("tile"))
-    cells = {cell_key(zone, year): tuple(sorted(tiles)) for zone, year, tiles in grouped.iter_rows()}
-    source = f"registry {registry_root} where={where!r} aoi={aoi} zones={zones} years={years}"
-    return UpdatePlan(name=name, mode=mode, cells=cells, source=plan_fields.pop("source", source), **plan_fields)
+        if west > east:
+            raise ValueError(f"The AOI {aoi} crosses the antimeridian; plan each side separately")
+        # A tile of zone 01 or 60 may cross it (west > east): unwrap its east past 180, and test that
+        # span and the same span a turn west.
+        tile_west = pl.col("bbox_west")
+        tile_east = (
+            pl.when(pl.col("bbox_east") < tile_west).then(pl.col("bbox_east") + 360).otherwise(pl.col("bbox_east"))
+        )
+        overlaps = ((tile_west <= east) & (tile_east >= west)) | ((tile_west - 360 <= east) & (tile_east - 360 >= west))
+        rows = rows.filter(overlaps & (pl.col("bbox_south") <= north) & (pl.col("bbox_north") >= south))
+    source = f"registry {registry_root} refused={refused} aoi={aoi} zones={zones} years={years}"
+    return plan_from_tiles(
+        rows.select("zone", "year", "tile").collect(),
+        name=name,
+        mode=mode,
+        **({"source": source} | plan_fields),
+    )
+
+
+def plan_from_tiles(tiles: pl.DataFrame, *, name: str, mode: UpdateMode, **plan_fields: Any) -> UpdatePlan:  # noqa: ANN401
+    """Build a plan from ``zone, year, tile`` rows; a null tile asks for every live shard of its cell.
+
+    Zones are canonicalised before grouping, so ``7S`` and ``07S`` rows land in one cell.
+
+    Raises:
+        ValueError: If there are no rows.
+    """
+    if tiles.is_empty():
+        raise ValueError(f"Update {name!r} selects no tiles")
+    zoned = tiles.with_columns(pl.col("zone").map_elements(canonicalize_zone, return_dtype=pl.String))
+    cells: dict[str, tuple[str, ...] | None] = {
+        cell_key(zone, year): None if any(t is None for t in group) else tuple(sorted(group))
+        for zone, year, group in zoned.group_by("zone", "year").agg("tile").iter_rows()
+    }
+    return UpdatePlan(name=name, mode=mode, cells=cells, **plan_fields)
 
 
 def read_updates(node: zarr.Group, year: int) -> list[dict[str, Any]]:
