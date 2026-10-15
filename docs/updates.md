@@ -157,8 +157,8 @@ the tiles with thin pixels.
 
 1. **Check that no fill is running in the zones you will change.** In the Prefect UI, open each
    running `run-global-campaign` or `fill-zones-sequential` flow run and read its `zones`, `years`
-   or `cells` parameters, which say where it is working (a campaign run with no `zones` covers every
-   zone). A run already working in a zone you change would stop at its next zone-year there, because
+   or `cells` parameters, which say where it is working (a campaign run with no `zones` may work in
+   any zone). A run already working in a zone you change would stop at its next zone-year there, because
    the rule it started with no longer matches the store.
 2. **Lower the rule,** for the whole store or, with `--zones`, for some zones. `--line` is the new
    minimum. The rule can only go down, and each value given up is kept in the store's history. The
