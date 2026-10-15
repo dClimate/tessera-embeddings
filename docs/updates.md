@@ -242,7 +242,8 @@ print(diff.updated_chunks)  # per array, the (year index, row, column, ...) of e
 | `FileNotFoundError` when the run starts | no plan with that name under the deployment's `{inputs}` | write the plan with the deployment's own `--inputs` |
 | `needs allow_s2_only=True` | a `holes` update ran with radar required | pass `allow_s2_only=true` |
 | the run stopped part way | some zone-years are not done | run the same command again |
-| `could not be re-derived` in the log, after a commit | the store is correct, but some registry rows were not written | `rebuild_registry_measurements.py repair --registry ... --store ... --zones <zone> --write` |
+| `could not be re-derived` or `registry master NOT merged` in the log, or `verify` names a zone-year | the store is correct, but the registry is behind for that zone-year | `rebuild_registry_measurements.py repair --registry ... --store ... --zones <zone> --write` |
+| `registry part ... could not be published` in the log | the store is correct, but the update's registry rows were never written, and `repair` cannot rebuild them | fix the cause (usually permissions), then run a `shards` update of the same tiles under a new name |
 
 ## How long it takes
 
