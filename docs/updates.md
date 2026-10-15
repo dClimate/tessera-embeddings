@@ -131,7 +131,8 @@ You need:
   `fill-zones-sequential`), on a Prefect server you can reach
   ([`prefect-setup.md`](prefect-setup.md));
 - **AWS access** that can read the store, its registry and the land mask, write under
-  `{paths.inputs}/updates/`, and write to the store itself for clean-up.
+  `{paths.inputs}/updates/`, and write to the store itself for clean-up and, if you do it, for
+  lowering the depth rule.
 
 Open the store this way for every check on this page:
 
@@ -154,9 +155,11 @@ observations a pixel needs in its year to be embedded. Pixels below it were left
 registry counts them as `thin`. To embed them, lower the rule first, then plan a `holes` update of
 the tiles with thin pixels.
 
-1. **Check that no fill is running in the zones you will change**, in the Prefect UI. A
-   `run-global-campaign` or `fill-zones-sequential` run already working there would stop at its
-   next zone-year, because the rule it started with no longer matches the store.
+1. **Check that no fill is running in the zones you will change.** In the Prefect UI, open each
+   running `run-global-campaign` or `fill-zones-sequential` flow run and read its `zones`, `years`
+   or `cells` parameters, which say where it is working (a campaign run with no `zones` covers every
+   zone). A run already working in a zone you change would stop at its next zone-year there, because
+   the rule it started with no longer matches the store.
 2. **Lower the rule,** for the whole store or, with `--zones`, for some zones. `--line` is the new
    minimum. The rule can only go down, and each value given up is kept in the store's history. The
    first command is a dry run that prints each rule before and after; the second writes it:
