@@ -358,20 +358,42 @@ def test_the_runner_applies_only_the_stores_rule_or_an_updates_looser_line(
     assert all((word in str(exc.value)) is (word == refused) for word in ("advertises", "only loosen"))
 
 
+def _record_updates(store: str, *lines: tuple[str, int]) -> None:
+    """Mark the test cell filled and record earlier updates of it, each at its own line."""
+    session = global_store.open_global_repo(store).writable_session("main")
+    zarr.open_group(session.store, mode="a")[_ZONE].attrs["years_complete"] = [2025]
+    session.commit("filled")
+    for name, line in lines:
+        target = UpdateTarget(name, "shards", "keep", "global", None, "h")
+        record = update_record(target, run_id=name, written=["chunk_0_0"], kept=[], optical_min_obs=line)
+        commit_update_record(global_store.open_global_repo(store), _ZONE, 2025, record=record)
+
+
+def _update_at(tmp_path, store: str, name: str, line: int | None):
+    config = InferenceConfig(time_window=_WINDOW, chunk_size=_TILE, num_gpus=0, optical_min_obs=line or 15)
+    update = UpdateTarget(name, "shards", "keep", "global", None, "h", optical_min_obs=line)
+    return _fill(tmp_path, store, config=config, update=update)
+
+
 @pytest.mark.parametrize(("line", "refused"), [(None, True), (5, True), (1, False)])
 def test_an_update_may_not_tighten_a_cell_an_earlier_update_loosened(tmp_path, line, refused):
     """After an update at 1, a later one at the root's 15 or at 5 would drop (``shards``) or count as
     thin (``holes``) the pixels the first one embedded, so the runner refuses it before inference.
     """
     store = _seed_global_with_rule(tmp_path, 15)
-    earlier = UpdateTarget("earlier", "holes", "keep", "global", None, "h")
-    record = update_record(earlier, run_id="r", written=["chunk_0_0"], kept=[], optical_min_obs=1)
-    commit_update_record(global_store.open_global_repo(store), _ZONE, 2025, record=record)
-    update = UpdateTarget("later", "holes", "keep", "global", None, "h", optical_min_obs=line)
-    config = InferenceConfig(time_window=_WINDOW, chunk_size=_TILE, num_gpus=0, optical_min_obs=line or 15)
+    _record_updates(store, ("earlier", 1))
     with pytest.raises(Exception) as exc:
-        _fill(tmp_path, store, config=config, update=update)
+        _update_at(tmp_path, store, "later", line)
     assert ("earlier update" in str(exc.value)) is refused
+
+
+def test_rerunning_a_recorded_update_is_not_a_tightening(tmp_path):
+    """Update a at 5, then b at 1: rerunning a (to catch up its registry master) does no inference and
+    writes no pixel, so it settles as already recorded rather than being refused.
+    """
+    store = _seed_global_with_rule(tmp_path, 15)
+    _record_updates(store, ("a", 5), ("b", 1))
+    assert _update_at(tmp_path, store, "a", 5)["already_recorded"]
 
 
 def test_chunk_size_shard_mismatch_raises(tmp_path):

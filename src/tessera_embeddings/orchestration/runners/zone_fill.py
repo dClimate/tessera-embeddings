@@ -656,15 +656,6 @@ def plan_zone_inference(
             "refused pixel is indistinguishable from one with no optical input. Pass that value, or "
             "plan an update with a looser line of its own (plan_update.py --optical-min-obs)."
         )
-    # Nor may an update tighten what an earlier, looser update embedded in this cell: a `shards`
-    # rewrite would drop those pixels, and a `holes` merge would count them as thin refusals.
-    earlier = cell_optical_min_obs(root, zone, year) if update is not None else None
-    if update is not None and rule is not None and earlier is not None and rule > earlier:
-        raise ValueError(
-            f"Update {update.name!r} would apply optical_min_obs={rule} to {zone}-{year}, where an "
-            f"earlier update embedded pixels at {earlier}. Plan it with --optical-min-obs {earlier} or lower."
-        )
-
     # Validate the year BEFORE any expensive work: assemble_global re-checks,
     # but hitting that check after hours of GPU inference would be brutal.
     if time_index_of(node, year_timestamp(year)) is None:
@@ -713,6 +704,15 @@ def plan_zone_inference(
             )
             result = {"zone": zone, "year": year, "run_id": run_id, "update": update.name, "already_recorded": True}
             return ZonePlan(zone=zone, year=year, run_id=run_id, t0=t0, summary={}, live=[], done=result, update=update)
+        # Nor may a pending update tighten what an earlier, looser update embedded in this cell: a
+        # `shards` rewrite would drop those pixels, and a `holes` merge would count them as thin.
+        # Checked after the recorded branch, so rerunning an update that already landed still works.
+        earlier = cell_optical_min_obs(root, zone, year)
+        if rule is not None and earlier is not None and rule > earlier:
+            raise ValueError(
+                f"Update {update.name!r} would apply optical_min_obs={rule} to {zone}-{year}, where an "
+                f"earlier update embedded pixels at {earlier}. Plan it with --optical-min-obs {earlier} or lower."
+            )
     tag = zone_year_tag(zone, year)
     if update is None and year in read_years_complete(node):
         if tag in repo.list_tags():
