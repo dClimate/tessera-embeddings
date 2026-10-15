@@ -28,9 +28,8 @@ explicit list (`scripts/update/plan_update.py`).
 | `shards` | every valid pixel | the whole shard, every array | a model or defect fix |
 
 `holes` is the cheap one. The model embeds each pixel independently and the dataset batches only
-valid pixels, so a pixel excluded by the hole mask costs the GPU nothing, and the read plan covers
-only the rows and columns holding holes (`inference/read_plan.py`), so imagery around no hole is
-never read. A hole pixel takes every array the new run produced, its observation counts and
+valid pixels, so a pixel excluded by the hole mask costs the GPU nothing, and the read plan skips
+every strip of the tile that holds no hole (`inference/read_plan.py`). A hole pixel takes every array the new run produced, its observation counts and
 month coverage included, even where it is still refused, so the store shows the newest imagery for
 every pixel the update touched. A pixel that already held an embedding keeps the counts that
 embedding was built from: the per-pixel provenance stays exact.
@@ -133,9 +132,12 @@ in new imagery means deleting the mosaics first.
   replacing its holes, about 700 MiB logical across the eight arrays, one variable at a time:
   measured at about 3 s and 0.9 GiB per merging worker, well inside the assembly runner
   ([`update-dev-verification.md`](../campaign/update-dev-verification.md)).
-- **A `holes` tile costs at least its reads.** The GPU skips every pixel outside the mask, but the
-  tile's imagery is still read and resampled: about 30–40 s a tile on dev, against 52–169 s for a
-  full re-run of the same tiles.
+- **A `holes` tile costs at least its reads.** The GPU skips every pixel outside the mask, but a
+  strip holding a single hole is read whole, and every tile reads its cloud mask: about 20 s for a
+  sparse tile whose holes fit in one strip, 30–36 s for one that needs two, against 170–330 s for a
+  full fill of the same tiles. Skipping empty strips mostly helps the sparsest tiles; narrowing a
+  strip to its holes' rows and columns saves nothing measurable, because the mosaics' inner chunks
+  span the tile's width ([`update-dev-verification.md`](../campaign/update-dev-verification.md)).
 - **The base tag retains the replaced shards** against any future garbage collection. Deleting it
   once an update is verified releases them.
 - **One update per cell at a time.** Two updates of the same cell conflict on its chunks; the

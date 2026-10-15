@@ -3,6 +3,7 @@
 The end-to-end check of [ADR 027](../decisions/027-targeted-updates.md) on global-tessera-dev,
 before the update code reached a store anyone reads. **Both modes did exactly what the ADR says, on
 both drivers, and found one defect**, in the registry rows of merged shards, fixed in the same PR.
+A paired run on 2026-10-14 measured hole-aware reads, added afterwards.
 
 ## Setup
 
@@ -84,6 +85,45 @@ of `pixel_merge_s` over 4 shards), and assembly took 15.7–17.8 s against 14.7�
 baseline. The runner peaked at 5.1–5.7 GiB against 1.2–2.2 GiB, about 0.9 GiB per merging worker,
 on a 32-vCPU, 244 GiB task; at 32 workers that is roughly 28 GiB on top of a fill's measured ~94
 GiB. CPU stayed under 2 vCPU.
+
+## Hole-aware reads (2026-10-14)
+
+The read plan now skips every strip of a tile that holds no hole (`74ee8ea6`). It was measured as a
+paired run: two stores filled with the same eight 18S/2024 tiles at a line of 15, loosened to 1,
+and updated in `holes` mode concurrently, one on the code before the change (A) and one after (B),
+both through #223's branch. The tiles were picked from the published registry to span its
+distribution of thin refusals, from 0.003% of a tile to 56%.
+
+| tile | holes filled | strips read, A → B | time outside inference, A → B |
+|---|---|---|---|
+| `chunk_205_24` | 104 | 2 → 1 | 36.1 → 20.6 s |
+| `chunk_58_31` | 924 | 2 → 1, and 1,382 of 2,048 columns | 26.9* → 28.0 s |
+| `chunk_27_19` | 3,408 | 2 → 2 | 29.6 → 21.1* s |
+| `chunk_39_32` | 17,508 | 2 → 1 | 22.1* → 19.3* s |
+| `chunk_70_20` | 140,592 | 2 → 2 | 30.2 → 32.5 s |
+| `chunk_21_0` | 398,356 | 3 → 3 | 37.6* → 34.7* s |
+| `chunk_69_23` | 1,097,384 | 2 → 2 | 24.6* → 24.7 s |
+| `chunk_30_3` | 2,334,228 | 2 → 2 | 25.8 → 27.7 s |
+
+\* The actor's first tile, which carries its one-off warm-up (75–120 s, counted as inference). A
+second strip loads behind it, so for a tile of two or more strips the time shown understates the
+read.
+
+- **A skipped strip saves 10–15 s.** On warm actors a sparse tile read as two strips took 30–36 s,
+  and read as one, 20–28 s. The rest is the floor every tile pays: the tile's cloud mask and its
+  first strip.
+- **Narrower reads save nothing measurable.** Read time follows the strip count, not its rows or
+  columns: the mosaics' inner chunks span the tile's full width and 512 rows, and radar is read at
+  full width whatever the crop.
+- **The saving is confined to the sparsest tiles.** Three of the four tiles under 0.5% holes held
+  them within one strip's rows; every denser tile has holes in all its strips. In all, the eight
+  tiles read 14 strips instead of 17.
+- **Outputs.** Both arms filled the same pixels, and no pixel that already held an embedding
+  changed in either. The five tiles whose read plan did not change are byte-identical in all eight
+  arrays. The three whose strips changed batch their pixels differently, which moves GPU results
+  (ADR 012 fact 2): observation counts and month coverage are exact, and the embeddings are inside
+  the cross-config envelope, with at most 3 levels of difference, scale drift at most 1.2%, and a
+  worst-pixel cosine of 0.99993.
 
 ## The defect, and the fix
 
