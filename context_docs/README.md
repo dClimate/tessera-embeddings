@@ -55,6 +55,8 @@ context_docs/
 │   │                                              finding reaches a person
 │   ├── radar-coverage-by-zone.md               which zones publish no usable radar, and why
 │   │                                              three quarters of that is a polarisation choice
+│   ├── stack-dev-verification.md               #219, #221 and #223 checked together on dev, and
+│   │                                              what hole-aware reads save
 │   └── update-dev-verification.md              targeted updates checked end to end on dev: only
 │                                                  target shards change, holes match full inference
 │
