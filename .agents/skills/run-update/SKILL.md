@@ -174,7 +174,7 @@ diff = repo.diff(from_tag=f"update-{name}-base", to_tag=f"update-{name}-complete
 |---|---|
 | the run died before a zone-year's shards committed | re-run; staged tiles and hole masks are reused |
 | it died after the shards committed, before the record | re-run; the same hole masks merge the same pixels again |
-| registry rows failed after the commit (the log names the repair) | `rebuild_registry_measurements.py repair --zones <zone> --write` |
+| registry rows failed after the commit (the log names the repair) | `rebuild_registry_measurements.py repair --registry <registry-uri> --store <store-uri> --zones <zone> --write` |
 | a `master/` file is missing for an updated zone-year | re-run; finding the update recorded, it merges the file back without a commit |
 | the plan was wrong | write a new plan under a new name |
 
