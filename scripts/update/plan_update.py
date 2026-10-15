@@ -121,7 +121,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"{row['cell']:>10}  {row['planned']:>6} planned  {row['live']:>6} live  {row['dead']:>6} dead in the mask"
         )
-    print(f"{len(report)} cell(s), {sum(r['live'] for r in report)} live shard(s) to update")
+    print(f"{len(report)} zone-year(s), {sum(r['live'] for r in report)} live tile(s) to update")
     # The runner refuses to clear a tile the mask has no land in, and a written plan cannot be redone.
     if plan.on_skip == "clear" and (dead := [r["cell"] for r in report if r["dead"]]):
         raise SystemExit(f"A clearing plan cannot target shards dead in the mask, as in {dead}; leave them out")

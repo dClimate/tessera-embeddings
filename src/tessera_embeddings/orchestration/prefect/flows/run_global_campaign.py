@@ -884,11 +884,24 @@ async def run_global_campaign(
             is where a consumer names its validator and where a branch-scoped registration
             already carries the suffix. Forwarding None would override that with nothing and
             switch validation off for every cell of the run.
-        update: Run a targeted update (:mod:`tessera_embeddings.storage.update`) across
-            clusters instead of filling. The work list is the plan's cells, narrowed by
-            ``zones`` and ``years``, that have not recorded it yet; clusters are balanced on the
-            plan's shards; each chained fill runs its cells as an update; and once every planned
-            cell has recorded it, ``update-<name>-complete`` is pinned. Chained clusters only.
+        update: The NAME of a targeted update to run across clusters instead of a fill, e.g.
+            ``"amazon-thin-2024"``; ``None`` (the default) runs the campaign as usual. An update
+            re-runs chosen tiles of cells the campaign has already filled and writes nothing else.
+
+            The name is not a description of the work: it names a plan written beforehand with
+            ``scripts/update/plan_update.py --name <name> ... --write``, read from
+            ``{paths.inputs}/updates/<name>/plan.json``. The plan fixes the cells and tiles, the
+            mode (``holes`` fills only pixels with no embedding; ``shards`` rewrites whole tiles),
+            the land mask and relaxed ingest settings; see ``fill_zones_sequential_flow``'s
+            ``update`` for what each means.
+
+            The work list is the plan's cells, narrowed by ``zones`` and ``years``, that do not yet
+            hold this update's record, so rerunning the same call resumes; cells the campaign never
+            filled are skipped with a warning. Clusters are balanced on the plan's tile counts, and
+            each runs its cells through ``fill-zones-sequential`` with the same ``update``. A
+            ``holes`` update needs ``allow_s2_only=True``. Once every planned cell holds the record,
+            the store is tagged ``update-<name>-complete``. The full walk-through is
+            ``docs/updates.md``.
 
     Returns:
         Summary: pending count at start, dispatched run ids per year, totals.
