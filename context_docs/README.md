@@ -107,7 +107,11 @@ context_docs/
     │                                              published, why that is a re-derivation rather
     │                                              than an estimate, the master/ consumers read,
     │                                              and the v1.1 run
-    └── icechunk-api-ledger.md                  signatures and gotchas the scale tests earned
+    ├── icechunk-api-ledger.md                  signatures and gotchas the scale tests earned
+    └── multiscales.md                          PLAN for v2: pooled statistics at 80 m–20.48 km
+                                                   in multiscales levels, correlations in Parquet;
+                                                   the scales, statistics, storage and compute
+                                                   scoped, and what is still open
 ```
 
 ## How to read these
