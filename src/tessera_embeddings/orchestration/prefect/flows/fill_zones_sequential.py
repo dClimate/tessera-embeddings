@@ -1,12 +1,11 @@
 """Fill many zones of one campaign year through a SINGLE shared Ray cluster.
 
-The per-cell path (:mod:`.run_global_campaign` dispatching :mod:`.fill_zone_year`)
-provisions a cluster per (zone, year), re-paying ``ray up`` (~5-10 min), per-worker EC2
-bringup, the model-load cold start, and a fresh roll of the EC2 capacity dice every
-time. This flow amortizes all of it: ONE cluster, ONE set of actors, zones streamed
-**near-sequentially** — strictly ordered, the next zone's tiles interleaving only once
-the current zone's queue is exhausted, so zone tails never idle the fleet and actors are
-never re-created between zones. The stream itself (interleaving, ingest look-ahead,
+Filling one cell per run (:mod:`.fill_zone_year`) provisions a cluster per (zone, year),
+re-paying ``ray up`` (~5-10 min), per-worker EC2 bringup, the model-load cold start, and a
+fresh roll of the EC2 capacity dice every time. This flow amortizes all of it: ONE cluster,
+ONE set of actors, zones streamed **near-sequentially** — strictly ordered, the next zone's
+tiles interleaving only once the current zone's queue is exhausted, so zone tails never idle
+the fleet and actors are never re-created between zones. The stream itself (interleaving, ingest look-ahead,
 trailing assembly) belongs to
 :mod:`tessera_embeddings.orchestration.runners.sequential_fill`; this flow supplies the
 Prefect-facing pieces (deployment-backed ingest, fingerprinted run_ids, per-cell config,
@@ -15,7 +14,7 @@ ingest-starved gaps in the stream never shed workers.
 
 Cheap cells never touch the cluster: complete cells are retagged and all-ocean cells
 marked complete-empty *before* Ray is provisioned, and an all-ocean cell is never
-ingested at all (unlike the per-cell path). Live cells are ordered largest-first (clamped
+ingested at all. Live cells are ordered largest-first (clamped
 ``min(num_actors, live tiles)`` requests) so the autoscaled fleet only ever shrinks.
 
 Triage also preflights each live cell's OPTICAL source
@@ -138,8 +137,7 @@ class _DeploymentCellInputs:
     limits how many actually RUN is ``ingest_limit_name``, a Prefect global concurrency limit
     shared by every cluster; the clusters are separate flow runs, so only a server-side gate
     can bound them together. ``cleanup`` deletes only mosaics THIS adapter produced (a cell
-    never started here is someone else's input), matching the parallel driver's
-    ``did_ingest and cleanup_mosaics`` rule.
+    never started here is someone else's input).
 
     Threads don't inherit the flow's Prefect context, so ingest runs dispatch without a
     parent-run link — they are still tracked as ordinary runs of the ingest deployment.
@@ -699,7 +697,7 @@ def fill_zones_sequential_flow(
         staging_code_identity: The campaign's code component for the staging fingerprint —
             the narrowed inference-source hash, with its ``force_staging_reuse`` /
             ``force_staging_restage`` overrides already applied — passed by
-            ``run_global_campaign`` so both fill strategies resume and restage identically.
+            ``run_global_campaign`` so its staging levers reach every cell.
             ``None`` (a direct call) falls back to the AMI-plus-tarball artifact identity.
         num_actors: Fleet-size ceiling; each cell requests ``min(num_actors, its live tiles)``.
         s1_orbit: ``"ascending"``, ``"descending"``, or ``"both"`` (resolved per cell against
@@ -922,7 +920,7 @@ def fill_zones_sequential_flow(
     # ------------------------------------------------------------------
     # Triage (cheap metadata reads, all before any cluster exists): cells needing
     # only a retag or an empty mark are settled right here — and an all-ocean cell
-    # is never ingested at all, unlike the per-cell path. An off-axis year is a
+    # is never ingested at all. An off-axis year is a
     # configuration error worth failing the whole run for.
     # ------------------------------------------------------------------
     retagged: list[dict[str, Any]] = []
@@ -1125,7 +1123,7 @@ def fill_zones_sequential_flow(
     # between them boots a different image than the prefix was fingerprinted against.
     ami_id = ami_id or _resolve_ami_id(ami_ssm_name, None)
     # The campaign's staging identity when it supplied one, and only otherwise the
-    # AMI-plus-tarball artifact identity. This is the DEFAULT fill strategy: recomputing the
+    # AMI-plus-tarball artifact identity. This is the campaign's fill: recomputing the
     # artifact identity here would undo the narrowing for the path that actually runs — any AMI
     # re-bake or tarball change would abandon every staged tile, and the campaign's documented
     # `force_staging_reuse` / `force_staging_restage` parameters would do nothing here. The

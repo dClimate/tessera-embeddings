@@ -1,8 +1,7 @@
-"""run_global_campaign: ingest → fill → cleanup chaining per cell.
+"""run_global_campaign: preflight, chained-fill dispatch, retry rounds, staging identity.
 
-The work-list logic itself is covered in test_campaign (campaign_work_list); here
-the flow body is driven via ``.fn`` with mocked dispatch to check the per-cell
-sequence, the ingest bypass, and mosaic cleanup.
+The work-list logic itself is covered in test_campaign (campaign_work_list); here the flow
+body is driven via ``.fn`` with mocked dispatch.
 """
 
 from __future__ import annotations
@@ -23,15 +22,8 @@ from tessera_embeddings.config.paths import BucketPaths
 _PATHS = BucketPaths(inputs="s3://in", outputs="s3://out")
 
 
-def _per_cell(**kwargs):
-    """Drive the campaign on the PER-CELL chain (ingest → fill → cleanup).
-
-    Explicit because the default strategy is now ``"chained-clusters"``, which
-    bypasses that chain entirely — these tests would otherwise silently assert
-    against a code path they are not about. Strategy-agnostic tests use it too;
-    the default itself is pinned by ``test_default_strategy_is_chained_clusters``.
-    """
-    kwargs.setdefault("fill_strategy", "cluster-per-zone")
+def _campaign(**kwargs) -> dict:
+    """Drive the campaign flow body with mocked dispatch."""
     return asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", **kwargs))
 
 
@@ -68,17 +60,8 @@ def _shrinking(cells: list[tuple[str, int]], wired: dict):
 
 
 def _dispatched_cells(params: dict) -> list[tuple[str, int]]:
-    """The (zone, year) cells one dispatch covers, for either fill strategy.
-
-    ``cluster-per-zone`` and ``ingest-zone-year`` pass a single ``zone``/``year``;
-    ``chained-clusters`` passes a ``cells`` list. Anything else (a milestone tag, say)
-    covers no cells.
-    """
-    if "cells" in params:
-        return [(z, y) for z, y in params["cells"]]
-    if "zone" in params and "year" in params:
-        return [(params["zone"], params["year"])]
-    return []
+    """The (zone, year) cells one chained-fill dispatch covers; anything else covers none."""
+    return [(z, y) for z, y in params.get("cells", [])]
 
 
 @pytest.fixture()
@@ -112,18 +95,12 @@ def wired(monkeypatch):
     rec["land"] = _land
     monkeypatch.setattr(mod, "campaign_work_list", lambda *a, **k: [c for c in [("33N", 2025)] if c not in _landed])
     monkeypatch.setattr(mod, "tag_year_complete", _defer_milestone)
-    # Immutable code identity (AMI ID + optional tarball ETag) — mocked so tests make no
-    # SSM/S3 call; resolved once per campaign and folded into the staging fingerprint.
-    monkeypatch.setattr(mod, "_resolve_code_identity", lambda *a, **k: "ami=ami-test")
     # Pinned AMI id (resolved once, threaded into every fill's provisioning) — mocked
     # so tests make no SSM call.
     monkeypatch.setattr(mod, "_resolve_ami_id", lambda *a, **k: "ami-test-id")
     # Seeded-model gate: real in production (a metadata read of the store root),
     # stubbed here so tests exercise dispatch rather than store contents.
     monkeypatch.setattr(mod, "_assert_seeded_model_matches", lambda *a, **k: None)
-    # The staging fingerprint now includes the store's depth rule, which is read from the
-    # store root — stubbed here like the model gate beside it.
-    monkeypatch.setattr(mod, "_optical_min_obs_from_store", lambda *a, **k: None)
     # Store reads for the staging fingerprint: each mosaic store's branch-tip snapshot
     # (the authoritative term) plus its provenance attrs.
     monkeypatch.setattr(
@@ -159,11 +136,6 @@ class TestCampaignDefaults:
     Pinned as literals rather than derived, so a change has to be made on purpose
     and shows up as a failing test rather than a surprise on a live campaign.
     """
-
-    def test_the_default_strategy_is_chained_clusters(self, wired):
-        """GPUs stream through a cluster instead of paying a cluster per zone."""
-        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
-        assert [d for d, _ in wired["arun"]] == ["fill-zones-sequential/fill-zones-sequential"]
 
     def test_ten_clusters_share_sixty_ingest_slots(self):
         """Six UTM zones ingesting per cluster: 10 x 6 = the 60-zone fleet-wide cap.
@@ -229,7 +201,6 @@ class TestCampaignDefaults:
         ("kwargs", "match"),
         [
             ({"num_actors": 0}, "num_actors must be >= 1"),
-            ({"fill_strategy": "cluster-per-zne"}, "fill_strategy must be"),
             # A card name is checked HERE and not only inside the child. The child's own
             # refusal arrives after it has primed its look-ahead mosaics and entered
             # `ray_cluster`, so a typo would spend real ingest work per cluster before
@@ -284,68 +255,6 @@ class TestCampaignDefaults:
         asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", ingest=False))
         assert dict(wired["limits"]) == {"tessera-global-inference": 1}
 
-    def test_nothing_bounds_mosaics_in_flight(self, wired, monkeypatch):
-        """A whole year's mosaics may coexist: no backpressure from fill onto ingest.
-
-        Measured as PEAK MOSAICS ALIVE — ingested but not yet cleaned — because that
-        is the quantity the removed semaphore actually bounded. Concurrent-ingest
-        counts cannot detect it: the old bound was ``zones + ingests``, always
-        greater than the ``ingests`` cap that limits ingestion anyway.
-
-        Fills are held until every mosaic exists, which is satisfiable only without
-        a chain-wide gate. With one, a cell could not begin ingesting until an
-        earlier cell's fill had returned, so the peak would stall at that bound —
-        the wait then times out and the assertion reports how far it got, rather
-        than the test hanging. ADR-011 records why the trade was accepted.
-        """
-        names = [f"{i + 1:02d}N" for i in range(12)]
-        status = SimpleNamespace(zones=dict.fromkeys(names, ()), has=lambda z, y: False)
-        monkeypatch.setattr(mod, "campaign_status", lambda *a, **k: status)
-        monkeypatch.setattr(mod, "campaign_work_list", _shrinking([(z, 2025) for z in names], wired))
-
-        alive = 0
-        peak = 0
-        all_ingested = asyncio.Event()
-
-        def _cleaned(_uri, **_k):
-            nonlocal alive
-            alive -= 1  # a mosaic stops being alive at ITS cleanup, not at its ingest
-
-        async def gated_arun(dep, parameters=None, tags=None):
-            nonlocal alive, peak
-            wired["arun"].append((dep, parameters))
-            if "ingest-zone-year" in dep:
-                alive += 1
-                peak = max(peak, alive)
-                if alive == len(names):
-                    all_ingested.set()
-            else:
-                try:
-                    await asyncio.wait_for(all_ingested.wait(), timeout=2)
-                except TimeoutError:
-                    pass  # regression: report the peak reached instead of hanging
-            wired["land"](parameters)
-            return _completed_run()
-
-        monkeypatch.setattr(mod, "arun_deployment", gated_arun)
-        monkeypatch.setattr(mod, "delete_prefix", _cleaned)
-        # Both caps well below the cell count, so only the absence of a chain-wide
-        # gate can let all twelve mosaics exist at once.
-        _per_cell(max_parallel_clusters=2, max_parallel_ingest=3)
-        assert peak == len(names), f"only {peak} of {len(names)} mosaics coexisted"
-
-
-def test_ingest_then_fill_then_cleanup(wired):
-    result = _per_cell()
-    deps = [d for d, _ in wired["arun"]]
-    assert deps == ["ingest-zone-year/ingest-zone-year", "fill-zone-year/fill-zone-year"]  # ingest BEFORE fill
-    # Ingest + fill both target the same (zone, year).
-    ingest_params = wired["arun"][0][1]
-    assert ingest_params["zone"] == "33N" and ingest_params["year"] == 2025
-    # The transient mosaic is dropped after the fill lands.
-    assert wired["deletes"] == ["s3://in/mosaics/33N/2025"]
-    assert result["dispatched"] == 1
-
 
 def test_driver_reads_are_credentialed(wired, monkeypatch):
     """The driver's own store reads (open_global_repo + the on-axis probe) carry the
@@ -359,7 +268,7 @@ def test_driver_reads_are_credentialed(wired, monkeypatch):
     onaxis: dict = {}
     monkeypatch.setattr(mod, "zone_year_on_axis", lambda *a, **k: onaxis.update(k) or True)
 
-    _per_cell()
+    _campaign()
     assert captured["open_kw"].get("get_credentials") is not None
     assert onaxis.get("get_credentials") is not None
 
@@ -367,94 +276,113 @@ def test_driver_reads_are_credentialed(wired, monkeypatch):
 def _dispatched_zones(params: dict) -> list[str]:
     """The zones of a chained dispatch, from its `(zone, year)` pairs.
 
-    The child takes pairs so a cluster can span years. This driver is still year-serial,
-    so every pair in one dispatch shares a year; asserting on zones keeps these tests
-    about the PARTITION rather than about the parameter shape.
+    The child takes pairs so a cluster can span years. The tests that use this carry one
+    year, so every pair in one dispatch shares it; asserting on zones keeps them about the
+    PARTITION rather than about the parameter shape.
     """
     years = {y for _, y in params["cells"]}
-    assert len(years) == 1, f"a year-serial driver must dispatch one year per cluster, got {years}"
+    assert len(years) == 1, f"a single-year work list must dispatch one year per cluster, got {years}"
     return [z for z, _ in params["cells"]]
 
 
-def _fill_run_id(rec: dict, **kwargs) -> str:
-    rec["arun"].clear()
-    rec["landed"].clear()  # a fresh campaign, not a second round
-    _per_cell(**kwargs)
-    return next(p for d, p in rec["arun"] if d == "fill-zone-year/fill-zone-year")["run_id"]
+_STAGING = {
+    "inputs_bucket": "s3://in",
+    "min_valid_coverage": 0.001,
+    "s1_orbit": "both",
+    "allow_partial_window": False,
+    "allow_s2_only": False,
+    "optical_min_obs": None,
+    "code_identity": "infcode-x",
+}
+
+#: An ingest marker is policy, so a rebuild under identical settings reproduces it exactly.
+_MARKER = {"window": ["2025-01-01", "2025-12-31"], "coverage_sha256": "cov"}
 
 
-def test_fill_run_id_is_stable_and_input_fingerprinted(wired):
-    """The fill run_id is deterministic per (zone, year) — so a retry resumes the
-    same staging prefix — AND carries an input fingerprint, so a changed input
-    (here min_valid_coverage) yields a DIFFERENT prefix (no stale resume).
+def _run_id(monkeypatch, *, attrs: dict | None = None, tip: str = "SNAPSHOT0", **overrides) -> str:
+    """The staging run_id of 33N-2025 over mosaic stores carrying ``attrs`` at snapshot ``tip``."""
+    attrs = {"last_appended": "2026-01-01T00:00:00Z"} if attrs is None else attrs
+    monkeypatch.setattr(mod, "open_store_group_and_tip", lambda *a, **k: (SimpleNamespace(attrs=attrs), tip))
+    return mod._staging_run_id("33N", 2025, **(_STAGING | overrides))
+
+
+class TestStagingRunId:
+    """The prefix the chained fill stages each cell under (:func:`_staging_run_id`).
+
+    Deterministic per input set, so a retry resumes the same prefix; any change to what decides
+    the embeddings starts a fresh one, so tiles staged under old inputs are never resumed.
     """
-    base = _fill_run_id(wired)
-    assert base.startswith("33N-2025-")  # cell-scoped prefix + fingerprint suffix
-    assert _fill_run_id(wired) == base  # deterministic across identical runs
-    changed = _fill_run_id(wired, ingest_settings=mod.IngestSettings(min_valid_coverage=0.5))
-    assert changed.startswith("33N-2025-") and changed != base  # input change → new prefix
 
+    def test_it_is_cell_scoped_and_stable(self, monkeypatch):
+        rid = _run_id(monkeypatch)
+        assert rid.startswith("33N-2025-") and _run_id(monkeypatch) == rid
 
-def test_fill_run_id_changes_when_the_mosaic_is_rebuilt(wired, monkeypatch):
-    """A rebuilt mosaic must not resume tiles staged against the previous one.
+    @pytest.mark.parametrize(
+        "override",
+        [
+            {"min_valid_coverage": 0.5},
+            # allow_s2_only changes WHICH pixels get embeddings, so a retry across a flipped
+            # flag must never resume mixed tiles.
+            {"allow_s2_only": True},
+            # Staging lives under `outputs/staging/{zone}/{year}`, not namespaced by store, so
+            # a store with a different depth rule must not resume tiles staged under the old.
+            {"optical_min_obs": 25},
+            {"optical_min_obs": 30},
+            {"code_identity": "infcode-y"},
+        ],
+        ids=lambda o: next(iter(o)),
+    )
+    def test_every_input_that_decides_the_embeddings_moves_it(self, monkeypatch, override):
+        assert _run_id(monkeypatch, **override) != _run_id(monkeypatch)
 
-    The ingest marker is policy only, so re-ingesting the same window under the same
-    settings reproduces it exactly — while the pixels can differ (a reprocessed or
-    late-published granule). Keying on the marker alone would resume the old tiles
-    and publish a zone-year mixing two mosaic revisions.
-    """
-    marker = {"window": ["2025-01-01", "2025-12-31"], "coverage_sha256": "cov"}
-
-    def _mosaic(completed_at):
-        return lambda *a, **k: (
-            SimpleNamespace(
-                attrs={"registry_sha256": "cov-sha-test", "ingest_marker": marker, "ingest_completed_at": completed_at}
+    @pytest.mark.parametrize(
+        ("before", "after"),
+        [
+            # Rebuilt under identical policy: the marker is byte-identical while the pixels can
+            # differ (a reprocessed or late-published granule); ingest_completed_at moves.
+            (
+                {"attrs": {"ingest_marker": _MARKER, "ingest_completed_at": "2026-01-01T00:00:00Z"}},
+                {"attrs": {"ingest_marker": _MARKER, "ingest_completed_at": "2026-02-02T00:00:00Z"}},
             ),
-            "SNAPSHOT0",
-        )
+            # A prebuilt (ingest=False) mosaic replaced upstream: its own last_appended moves.
+            (
+                {"attrs": {"last_appended": "2026-01-01T00:00:00Z"}},
+                {"attrs": {"last_appended": "2026-06-01T00:00:00Z"}},
+            ),
+            # The snapshot tip is the authority: a region overwrite or hand repair changes
+            # pixels while every provenance attr stays exactly as it was.
+            (
+                {"attrs": {"ingest_marker": _MARKER, "ingest_completed_at": "2026-01-01"}, "tip": "SNAPSHOT_BEFORE"},
+                {"attrs": {"ingest_marker": _MARKER, "ingest_completed_at": "2026-01-01"}, "tip": "SNAPSHOT_AFTER"},
+            ),
+            # A store with no provenance attrs at all is identified by its tip alone.
+            ({"attrs": {}, "tip": "SNAPSHOT_A"}, {"attrs": {}, "tip": "SNAPSHOT_B"}),
+        ],
+        ids=["rebuilt", "prebuilt-replaced", "snapshot-moved", "attrless"],
+    )
+    def test_a_changed_mosaic_moves_it(self, monkeypatch, before, after):
+        first = _run_id(monkeypatch, **before)
+        assert _run_id(monkeypatch, **before) == first, "the same mosaic must resume"
+        assert _run_id(monkeypatch, **after) != first
 
-    monkeypatch.setattr(mod, "open_store_group_and_tip", _mosaic("2026-01-01T00:00:00Z"))
-    first = _fill_run_id(wired)
-    assert _fill_run_id(wired) == first  # same build → same prefix, so a retry resumes
+    def test_only_active_orbits_are_fingerprinted(self, monkeypatch):
+        """A single requested orbit opens reflectance + that SAR store only — never the opposite
+        orbit, even if a stale one is present, which the fill never reads and which could
+        wrongly raise or perturb the run_id.
+        """
+        opened: list[str] = []
 
-    monkeypatch.setattr(mod, "open_store_group_and_tip", _mosaic("2026-02-02T00:00:00Z"))
-    assert _fill_run_id(wired) != first  # identical marker, new build → fresh prefix
+        def _capture(path, **_k):
+            opened.append(path)
+            return SimpleNamespace(attrs={}), "SNAPSHOT0"
 
-
-def test_fill_run_id_changes_with_allow_s2_only(wired):
-    """allow_s2_only changes WHICH pixels get embeddings, so it must flip the
-    staging fingerprint — a retry across a flipped flag never resumes mixed tiles.
-    The flag is also forwarded to the fill deployment.
-    """
-    base = _fill_run_id(wired)
-    flagged = _fill_run_id(wired, allow_s2_only=True)
-    assert flagged.startswith("33N-2025-") and flagged != base
-    fill_params = next(p for d, p in wired["arun"] if d == "fill-zone-year/fill-zone-year")
-    assert fill_params["allow_s2_only"] is True
-
-
-def test_fill_run_id_ignores_the_build_and_keys_on_inference_code(wired, monkeypatch):
-    """NARROWED 2026-07-30: staging reuse keys on the INFERENCE SOURCE, not the build.
-
-    The fingerprint used to be the resolved AMI ID plus the tarball ETag, so re-baking the
-    AMI or a hotfix anywhere in the repo abandoned every staged tile. Neither should move
-    it now — only a change to the code that decides what a staged tile contains.
-    """
-    base = _fill_run_id(wired)
-    # A `code_suffix` label change: never mattered, still doesn't.
-    assert _fill_run_id(wired, code_suffix="-branchB") == base
-    # A RE-BAKED AMI now REUSES the prefix. This assertion is the inverse of the one it
-    # replaces, and that inversion is the whole point of the change.
-    monkeypatch.setattr(mod, "_resolve_code_identity", lambda *a, **k: "ami=ami-REBAKED")
-    assert _fill_run_id(wired) == base
-    # A change to the inference source DOES start a fresh prefix.
-    monkeypatch.setattr(mod, "inference_code_identity", lambda: "infcode-DIFFERENT")
-    changed = _fill_run_id(wired)
-    assert changed.startswith("33N-2025-") and changed != base
+        monkeypatch.setattr(mod, "open_store_group_and_tip", _capture)
+        mod._staging_run_id("33N", 2025, **(_STAGING | {"s1_orbit": "ascending"}))
+        assert [p.rsplit("/", 1)[-1] for p in opened] == ["reflectance.zarr", "sar_ascending.zarr"]
 
 
 def _chained_staging_identity(wired, **kwargs) -> str:
-    """The staging identity the DEFAULT strategy hands its child."""
+    """The staging identity the campaign hands its chained fill."""
     wired["arun"].clear()
     wired["landed"].clear()
     asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", **kwargs))
@@ -462,13 +390,12 @@ def _chained_staging_identity(wired, **kwargs) -> str:
     return params["staging_code_identity"]
 
 
-class TestBothStrategiesShareOneStagingIdentity:
-    """The narrowing and its escape hatches have to reach the DEFAULT path.
+class TestTheChainedFillGetsTheNarrowedStagingIdentity:
+    """The narrowing and its escape hatches have to reach the child that stages.
 
-    `chained-clusters` is the strategy campaigns actually run, and it used to recompute
-    the AMI-plus-tarball artifact identity for itself — so a re-bake abandoned every
-    staged tile on the path that runs, and `force_staging_reuse`/`force_staging_restage`
-    were documented on a flow that never forwarded them.
+    Left to itself the chained fill recomputes the AMI-plus-tarball artifact identity — so a
+    re-bake would abandon every staged tile and `force_staging_reuse`/`force_staging_restage`
+    would be documented on a flow that never forwarded them.
     """
 
     def test_the_chained_child_is_handed_the_narrowed_identity(self, wired, monkeypatch):
@@ -476,7 +403,7 @@ class TestBothStrategiesShareOneStagingIdentity:
         assert _chained_staging_identity(wired) == "infcode-FIXED"
 
     def test_a_rebaked_ami_does_not_change_it(self, wired, monkeypatch):
-        """The inversion the narrowing was for, asserted on the default path too."""
+        """The inversion the narrowing was for."""
         base = _chained_staging_identity(wired)
         monkeypatch.setattr(mod, "_resolve_code_identity", lambda *a, **k: "ami=ami-REBAKED")
         assert _chained_staging_identity(wired) == base
@@ -491,26 +418,22 @@ class TestBothStrategiesShareOneStagingIdentity:
         assert _chained_staging_identity(wired, force_staging_reuse=True) != base
         assert _chained_staging_identity(wired, force_staging_restage="tok") != base
 
-    def test_the_two_strategies_agree(self, wired):
-        """Same campaign, same inputs — the identity must not depend on the strategy."""
-        chained = _chained_staging_identity(wired)
-        wired["arun"].clear()
-        wired["landed"].clear()
-        _per_cell()
-        per_zone = next(p for d, p in wired["arun"] if d == "fill-zone-year/fill-zone-year")["run_id"]
-        # The per-zone path folds the identity into the run_id rather than passing it,
-        # so recompute that id with the chained identity and require a match.
-        assert per_zone.startswith("33N-2025-")
-        assert chained == mod.inference_code_identity()
+    def test_force_staging_reuse_survives_an_inference_change(self, wired, monkeypatch):
+        """The escape hatch for a change the author knows is output-neutral."""
+        base = _chained_staging_identity(wired, force_staging_reuse=True)
+        monkeypatch.setattr(mod, "inference_code_identity", lambda: "infcode-DIFFERENT")
+        assert _chained_staging_identity(wired, force_staging_reuse=True) == base
+        # ...and it really is an override, not a no-op: without it the same change moves it.
+        assert _chained_staging_identity(wired) != base
 
-
-def test_force_staging_reuse_survives_an_inference_change(wired, monkeypatch):
-    """The escape hatch for a change the author knows is output-neutral."""
-    base = _fill_run_id(wired, force_staging_reuse=True)
-    monkeypatch.setattr(mod, "inference_code_identity", lambda: "infcode-DIFFERENT")
-    assert _fill_run_id(wired, force_staging_reuse=True) == base
-    # ...and it really is an override, not a no-op: without it the same change moves it.
-    assert _fill_run_id(wired) != base
+    def test_force_staging_restage_forces_a_fresh_prefix(self, wired):
+        """The escape hatch for a change the source hash cannot see — a torch upgrade."""
+        base = _chained_staging_identity(wired)
+        bumped = _chained_staging_identity(wired, force_staging_restage="torch-2.9")
+        assert bumped != base
+        # Same token → same prefix, so a retry after the upgrade still resumes.
+        assert _chained_staging_identity(wired, force_staging_restage="torch-2.9") == bumped
+        assert _chained_staging_identity(wired, force_staging_restage="torch-3.0") not in {base, bumped}
 
 
 class TestAPinnedStagingIdentityReachesAnEarlierCampaignsPrefix:
@@ -535,13 +458,6 @@ class TestAPinnedStagingIdentityReachesAnEarlierCampaignsPrefix:
             "infcode-EARLIER|tarball=OLD"
         )
 
-    def test_it_reaches_the_per_zone_path_too(self, wired, monkeypatch):
-        """Both strategies, as the narrowing already requires of the other two hatches."""
-        base = _fill_run_id(wired, staging_code_identity="infcode-EARLIER")
-        monkeypatch.setattr(mod, "inference_code_identity", lambda: "infcode-DIFFERENT")
-        assert _fill_run_id(wired, staging_code_identity="infcode-EARLIER") == base
-        assert _fill_run_id(wired) != base
-
     def test_an_empty_pin_derives_exactly_as_before(self, wired, monkeypatch):
         """The control and the default: off must cost nothing, including the derivation."""
         monkeypatch.setattr(mod, "inference_code_identity", lambda: "infcode-FIXED")
@@ -550,10 +466,9 @@ class TestAPinnedStagingIdentityReachesAnEarlierCampaignsPrefix:
     def test_the_identity_is_announced_so_a_later_campaign_can_state_it(self, wired, monkeypatch, caplog):
         """The value has to be READABLE or the lever cannot be used.
 
-        A chained fill records it as a parameter, but that is not a general answer: a
-        `cluster-per-zone` campaign hashes it irreversibly into its children's run ids. The
-        driver's own log is the one source that answers for both strategies, and by the time
-        anyone wants it the code that produced it has moved.
+        Each chained fill records it as a parameter, but the driver's own log is the one place
+        it is stated once for the whole campaign, and by the time anyone wants it the code that
+        produced it has moved.
         """
         monkeypatch.setattr(mod, "inference_code_identity", lambda: "infcode-FIXED")
         with caplog.at_level("INFO"):
@@ -617,16 +532,6 @@ class TestAPinnedStagingIdentityReachesAnEarlierCampaignsPrefix:
         assert "force_staging_reuse and force_staging_restage" in str(excinfo.value)
 
 
-def test_force_staging_restage_forces_a_fresh_prefix(wired) -> None:
-    """The escape hatch for a change the source hash cannot see — a torch upgrade."""
-    base = _fill_run_id(wired)
-    bumped = _fill_run_id(wired, force_staging_restage="torch-2.9")
-    assert bumped != base
-    # Same token → same prefix, so a retry after the upgrade still resumes.
-    assert _fill_run_id(wired, force_staging_restage="torch-2.9") == bumped
-    assert _fill_run_id(wired, force_staging_restage="torch-3.0") not in {base, bumped}
-
-
 def test_the_ami_is_still_pinned_even_though_it_no_longer_fingerprints(wired, monkeypatch):
     """Narrowing the fingerprint must not stop the AMI being resolved once and pinned.
 
@@ -636,63 +541,22 @@ def test_the_ami_is_still_pinned_even_though_it_no_longer_fingerprints(wired, mo
     """
     calls: list = []
     monkeypatch.setattr(mod, "_resolve_ami_id", lambda *a, **k: calls.append(a) or "ami-test")
-    _per_cell(s3_region="eu-west-1")
+    _campaign(s3_region="eu-west-1")
     assert calls, "the AMI must still be resolved"
     assert all(c[-1] != "eu-west-1" for c in calls), calls
-
-
-def test_mosaic_identity_fingerprints_only_active_orbits(wired, monkeypatch):
-    """With a single requested orbit, _mosaic_identity opens reflectance + the active
-    SAR store only — never the opposite orbit, even if a stale one is present (which
-    the fill never reads and which could wrongly raise or perturb the run_id).
-    """
-    opened: list[str] = []
-
-    def _capture(path, **k):
-        opened.append(path)
-        return SimpleNamespace(attrs={"registry_sha256": "cov", "last_appended": "2026-01-01T00:00:00Z"}), "SNAPSHOT0"
-
-    monkeypatch.setattr(mod, "open_store_group_and_tip", _capture)
-    _per_cell(ingest=False, cleanup_mosaics=False, s1_orbit="ascending")
-    assert any("reflectance.zarr" in p for p in opened)
-    assert any("sar_ascending.zarr" in p for p in opened)
-    assert not any("sar_descending.zarr" in p for p in opened)  # inactive orbit never touched
-
-
-def test_all_ocean_cell_uses_empty_run_id_and_skips_cleanup(wired, monkeypatch):
-    """An all-ocean cell (no live tiles) gets a stable '-empty' run id and never
-    fingerprints a (nonexistent) mosaic — _staging_run_id would raise 'No mosaic stores
-    found' and strand the year — and no mosaic cleanup runs (ingest produced none).
-    """
-    monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: False)
-
-    def _boom(*a, **k):
-        raise AssertionError("an empty cell must NOT read the mosaic for a staging fingerprint")
-
-    monkeypatch.setattr(mod, "open_store_group_and_tip", _boom)
-    _per_cell()
-    deps = [d for d, _ in wired["arun"]]
-    assert deps == ["ingest-zone-year/ingest-zone-year", "fill-zone-year/fill-zone-year"]  # ingest still probes+skips
-    fill = next(p for d, p in wired["arun"] if d == "fill-zone-year/fill-zone-year")
-    assert fill["run_id"] == "33N-2025-empty"
-    assert wired["deletes"] == []  # no mosaic produced → nothing to clean up
+    assert _dep(wired, "fill-zones-sequential")[1]["ami_id"] == "ami-test", "and pinned into the fill"
 
 
 class TestValidationDeploymentForwarding:
-    """An explicit validator reaches both fill strategies; an absent one is left ALONE.
+    """An explicit validator reaches the chained fill; an absent one is left ALONE.
 
     The absent case is the load-bearing one and it is not symmetric with the rest of this
     flow's parameters. Every other setting is forwarded unconditionally, which is right when
     the campaign is the authority. Here it is not: the validator is a consumer's flow, named
-    on the fill deployments themselves, so passing None would override a correctly-registered
+    on the fill deployment itself, so passing None would override a correctly-registered
     ref with nothing and run a whole campaign unvalidated while every deployment still looked
     configured.
     """
-
-    def test_the_per_cell_fill_receives_an_explicit_ref(self, wired):
-        _per_cell(validation_deployment="validate-zone-year/validate-zone-year-x")
-        fill = next(p for d, p in wired["arun"] if "fill-zone-year" in d)
-        assert fill["validation_deployment"] == "validate-zone-year/validate-zone-year-x"
 
     def test_the_chained_fill_receives_an_explicit_ref(self, wired):
         asyncio.run(
@@ -715,94 +579,13 @@ class TestValidationDeploymentForwarding:
         params = next(p for d, p in wired["arun"] if "fill-zones-sequential" in d)
         assert "validation_deployment" not in params
 
-    def test_an_unset_validator_is_omitted_on_the_per_cell_path_too(self, wired):
-        _per_cell()
-        fill = next(p for d, p in wired["arun"] if "fill-zone-year" in d)
-        assert "validation_deployment" not in fill
 
-
-def test_ingest_params_carry_s3_region(wired):
-    """The campaign's s3_region reaches the ingest deployment (not just the fill), so a
-    non-default-region deployment's ingest metadata opens hit the right bucket.
+def test_the_fill_carries_the_campaigns_s3_region(wired):
+    """A non-default-region deployment's fill — and the ingests it dispatches — must read and
+    write the right buckets.
     """
-    _per_cell(s3_region="eu-west-1")
-    ingest = next(p for d, p in wired["arun"] if d == "ingest-zone-year/ingest-zone-year")
-    fill = next(p for d, p in wired["arun"] if d == "fill-zone-year/fill-zone-year")
-    assert ingest["s3_region"] == "eu-west-1" and fill["s3_region"] == "eu-west-1"
-
-
-def test_ingest_false_run_id_tracks_prebuilt_mosaic_identity(wired, monkeypatch):
-    """With ingest=False the staging fingerprint tracks the prebuilt mosaic's own
-    identity (reflectance last_appended), so replacing the mosaic and rerunning with
-    the same config yields a FRESH staging prefix (no stale-tile resume).
-    """
-
-    def _run_with_mosaic_ts(ts: str) -> str:
-        monkeypatch.setattr(
-            mod,
-            "open_store_group_and_tip",
-            lambda *a, **k: (SimpleNamespace(attrs={"registry_sha256": "cov", "last_appended": ts}), "SNAPSHOT0"),
-        )
-        wired["arun"].clear()
-        wired["landed"].clear()
-        _per_cell(ingest=False, cleanup_mosaics=False)
-        return next(p for d, p in wired["arun"] if d == "fill-zone-year/fill-zone-year")["run_id"]
-
-    rid1 = _run_with_mosaic_ts("2026-01-01T00:00:00Z")
-    rid2 = _run_with_mosaic_ts("2026-06-01T00:00:00Z")  # mosaic replaced → new last_appended
-    assert rid1.startswith("33N-2025-") and rid1 != rid2
-
-
-def test_retag_only_uses_stable_run_id_without_mosaic(wired, monkeypatch):
-    """A retag-only cell (already complete) gets a stable '-retag' run id and does NOT
-    fingerprint the mosaic — which may be cleaned up, so inspecting it would raise
-    before the fill's documented tag repair.
-    """
-    monkeypatch.setattr(
-        mod, "campaign_status", lambda *a, **k: SimpleNamespace(zones={"33N": (2025,)}, has=lambda z, y: True)
-    )
-
-    def _boom(*a, **k):
-        raise AssertionError("retag-only must NOT read the mosaic for a staging fingerprint")
-
-    monkeypatch.setattr(mod, "open_store_group_and_tip", _boom)
-    _per_cell()
-    fill = next(p for d, p in wired["arun"] if d == "fill-zone-year/fill-zone-year")
-    assert fill["run_id"] == "33N-2025-retag"
-
-
-def _prebuilt_run_id(wired, monkeypatch, *, attrs: dict, tip: str) -> str:
-    """run_id of the ingest=False fill for a prebuilt mosaic with these attrs/tip."""
-    monkeypatch.setattr(mod, "open_store_group_and_tip", lambda *a, **k: (SimpleNamespace(attrs=attrs), tip))
-    wired["arun"].clear()
-    wired["landed"].clear()
-    _per_cell(ingest=False, cleanup_mosaics=False)
-    return next(p for d, p in wired["arun"] if d == "fill-zone-year/fill-zone-year")["run_id"]
-
-
-def test_run_id_tracks_the_snapshot_even_when_provenance_attrs_are_unchanged(wired, monkeypatch):
-    """The snapshot tip — not the attrs — is what makes the fingerprint safe.
-
-    A region overwrite (a re-run of one date's write, a hand repair, a prebuilt mosaic
-    maintained outside this pipeline) changes pixels while leaving `ingest_marker` /
-    `ingest_completed_at` exactly as they were. Keyed on attrs alone the retry would
-    reuse the prefix, skip the already-staged tiles, and publish a zone-year mixing
-    both mosaic revisions — silently. Keyed on the tip, it starts fresh.
-    """
-    attrs = {"ingest_marker": {"window": ["2025-01-01", "2025-12-31"]}, "ingest_completed_at": "2026-01-01T00:00:00Z"}
-    before = _prebuilt_run_id(wired, monkeypatch, attrs=attrs, tip="SNAPSHOT_BEFORE")
-    assert _prebuilt_run_id(wired, monkeypatch, attrs=attrs, tip="SNAPSHOT_BEFORE") == before  # retry resumes
-    assert _prebuilt_run_id(wired, monkeypatch, attrs=attrs, tip="SNAPSHOT_AFTER") != before
-
-
-def test_attrless_prebuilt_mosaic_is_identified_by_its_snapshot(wired, monkeypatch):
-    """A store with no provenance attrs is no longer fatal: the tip is a complete
-    identity on its own, so a prebuilt mosaic that never learned this pipeline's
-    bookkeeping still gets a correct, change-detecting staging prefix.
-    """
-    rid = _prebuilt_run_id(wired, monkeypatch, attrs={}, tip="SNAPSHOT_A")
-    assert rid.startswith("33N-2025-")
-    assert _prebuilt_run_id(wired, monkeypatch, attrs={}, tip="SNAPSHOT_B") != rid
+    _campaign(s3_region="eu-west-1")
+    assert _dep(wired, "fill-zones-sequential")[1]["s3_region"] == "eu-west-1"
 
 
 def test_default_run_rejects_unseeded_work_zone(wired, monkeypatch):
@@ -811,78 +594,44 @@ def test_default_run_rejects_unseeded_work_zone(wired, monkeypatch):
     """
     monkeypatch.setattr(mod, "campaign_work_list", lambda *a, **k: [("02N", 2025)])  # 02N not in status.zones
     with pytest.raises(ValueError, match="not seeded"):
-        _per_cell()
+        _campaign()
     assert wired["arun"] == []  # nothing dispatched
-
-
-def test_ingest_disabled_skips_ingest_and_cleanup(wired):
-    _per_cell(ingest=False, cleanup_mosaics=False)
-    deps = [d for d, _ in wired["arun"]]
-    assert deps == ["fill-zone-year/fill-zone-year"]  # fill only
-    assert wired["deletes"] == []
-
-
-def test_the_per_cell_fill_is_never_given_the_large_runners_worker_count(wired):
-    """`fill-zone-year` runs on the 16 vCPU / 64 GiB inference family, where a 32-process
-    assembly pool does not fit at all: measured per task, it peaks near 94 GiB. Only
-    the chained fill's deployment is the 244 GiB `assembly_large` family, so only it is told 32.
-    """
-    _per_cell()
-    for dep, params in wired["arun"]:
-        if dep.startswith("fill-zone-year"):
-            assert "n_assembly_workers" not in params, (
-                "the per-cell fill was handed the large runner's worker count; its host cannot hold it"
-            )
 
 
 def test_rejects_zero_parallel_ingest(wired):
     with pytest.raises(ValueError, match="max_parallel_ingest"):
-        _per_cell(max_parallel_ingest=0)
+        _campaign(max_parallel_ingest=0)
 
 
 def test_off_axis_year_rejected(wired, monkeypatch):
     """An off-axis year fails up front, before any ingest/fill is dispatched."""
     monkeypatch.setattr(mod, "zone_year_on_axis", lambda *a, **k: False)
     with pytest.raises(ValueError, match="not on the store's pre-allocated axis"):
-        _per_cell(years=(2026,))
+        _campaign(years=(2026,))
     assert wired["arun"] == []  # nothing dispatched
-
-
-def test_retag_only_cell_skips_ingest(wired, monkeypatch):
-    """A complete-but-untagged cell only needs a retag — no ingest, no cleanup."""
-    status = SimpleNamespace(zones={"33N": (2025,)}, has=lambda z, y: True)  # already complete
-    monkeypatch.setattr(mod, "campaign_status", lambda *a, **k: status)
-    _per_cell()
-    deps = [d for d, _ in wired["arun"]]
-    assert deps == ["fill-zone-year/fill-zone-year"]  # fill (retag) only, no ingest
-    assert wired["deletes"] == []
 
 
 def test_unseeded_explicit_zone_rejected(wired):
     """An explicit zones= entry that isn't seeded fails before dispatch."""
     with pytest.raises(ValueError, match="not seeded"):
-        _per_cell(zones=["02N"])
+        _campaign(zones=["02N"])
     assert wired["arun"] == []
 
 
 def test_duplicate_years_dispatch_once(wired):
     """The dispatch loop dedupes years — years=(2025, 2025) runs the cell once."""
-    _per_cell(years=(2025, 2025))
-    assert len(wired["arun"]) == 2  # one ingest + one fill, not two of each
+    _campaign(years=(2025, 2025))
+    assert [p["cells"] for _, p in wired["arun"]] == [[["33N", 2025]]]
 
 
-def test_sequential_strategy_dispatches_one_run_per_year(wired):
-    """fill_strategy="chained-clusters" replaces the per-cell chain with ONE
-    fill-zones-sequential run per year: no driver-side ingest (the child's
-    look-ahead owns it), no driver-side mosaic cleanup, cells passed as (zone, year) pairs.
+def test_chained_fill_dispatches_one_run_per_year(wired):
+    """ONE fill-zones-sequential run per year under the year barrier: no driver-side ingest
+    (the child's look-ahead owns it), no driver-side mosaic cleanup, cells passed as
+    (zone, year) pairs.
     """
     # overlap_years is the DEFAULT now, and this test is about the per-year dispatch shape, so the
     # barrier is asked for explicitly rather than relied on.
-    result = asyncio.run(
-        mod.run_global_campaign.fn(
-            paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters", overlap_years=False
-        )
-    )
+    result = asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", overlap_years=False))
     deps = [d for d, _ in wired["arun"]]
     assert deps == ["fill-zones-sequential/fill-zones-sequential"]
     params = wired["arun"][0][1]
@@ -900,21 +649,13 @@ def test_sequential_strategy_dispatches_one_run_per_year(wired):
     assert result["dispatched"] == 1
 
 
-def test_sequential_strategy_forwards_ingest_false(wired):
-    asyncio.run(
-        mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters", ingest=False)
-    )
+def test_chained_fill_forwards_ingest_false(wired):
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", ingest=False))
     assert wired["arun"][0][1]["ingest"] is False
 
 
-def test_invalid_fill_strategy_rejected(wired):
-    with pytest.raises(ValueError, match="fill_strategy"):
-        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="both"))
-    assert wired["arun"] == []
-
-
-def test_sequential_strategy_shards_by_live_tiles(wired, monkeypatch):
-    """max_parallel_clusters > 1 in sequential mode = that many chained clusters:
+def test_chained_fills_shard_by_live_tiles(wired, monkeypatch):
+    """max_parallel_clusters > 1 = that many chained clusters:
     zones are LPT-partitioned by WORK (tiles weighted by the latitude band's observation
     count) and each cluster's child divides the global ingest look-ahead bound.
     """
@@ -928,7 +669,6 @@ def test_sequential_strategy_shards_by_live_tiles(wired, monkeypatch):
         mod.run_global_campaign.fn(
             paths=_PATHS,
             ami_ssm_name="ami",
-            fill_strategy="chained-clusters",
             max_parallel_clusters=2,
             max_parallel_ingest=6,
         )
@@ -966,7 +706,6 @@ class TestIngestBoundAcrossClusters:
             mod.run_global_campaign.fn(
                 paths=_PATHS,
                 ami_ssm_name="ami",
-                fill_strategy="chained-clusters",
                 max_parallel_clusters=clusters,
                 max_parallel_ingest=ingest_cap,
             )
@@ -1012,11 +751,7 @@ def test_every_cluster_opens_on_one_of_the_densest_zones(wired, monkeypatch):
     monkeypatch.setattr(mod, "campaign_work_list", _shrinking([(z, 2025) for z in counts], wired))
     monkeypatch.setattr(mod, "zone_work_weight", lambda mask, zone, **k: float(counts[zone]))
 
-    asyncio.run(
-        mod.run_global_campaign.fn(
-            paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters", max_parallel_clusters=3
-        )
-    )
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=3))
     dispatched = [_dispatched_zones(p) for _, p in wired["arun"]]
     assert {zs[0] for zs in dispatched} == {"01N", "02N", "03N"}, dispatched
     # ...and each cluster tapers from dense to sparse rather than the reverse.
@@ -1032,7 +767,7 @@ def test_sequential_single_shard_reads_no_tile_counts(wired, monkeypatch):
         raise AssertionError("zone weights must not be read for a single cluster")
 
     monkeypatch.setattr(mod, "zone_work_weight", boom)
-    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters"))
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
     assert len(wired["arun"]) == 1
 
 
@@ -1097,32 +832,33 @@ def test_dpl_routes_only_when_branch_is_a_real_slug() -> None:
     assert mod._dpl("flow/name", "x") == "flow/name-x"
 
 
-def test_branch_none_keeps_prod_refs_everywhere(wired):
-    """Regression guard: with no branch, every child ref — direct AND grandchild —
-    is the unsuffixed production default (today's behaviour, byte-for-byte).
-    """
-    _per_cell()
-    deps = [d for d, _ in wired["arun"]]
-    assert deps == ["ingest-zone-year/ingest-zone-year", "fill-zone-year/fill-zone-year"]
-    _, ingest_params = _dep(wired, "ingest-zone-year")
-    assert ingest_params["deployments"] == {
-        "ingest_s1_roi_sar": "ingest_s1_roi_sar/ingest-s1-roi-sar",
-        "ingest_s2_roi_reflectance": "ingest_s2_roi_reflectance/ingest-s2-roi-reflectance",
-    }
+def _ingest_deployments(branch: str | None) -> dict:
+    """The S1/S2 grandchild refs one ingest dispatch carries, as the chained fill builds it."""
+    return mod._ingest_dispatch_params(
+        "33N",
+        2025,
+        paths=_PATHS,
+        mask_name="global",
+        s1_orbit="both",
+        ingest_settings=mod.IngestSettings(),
+        allow_partial_window=False,
+        branch=branch,
+    )["deployments"]
 
 
-def test_branch_suffixes_all_four_derived_refs(wired):
-    """The fix: a branch slug routes the fill, the ingest, AND the S1/S2
-    grandchildren that ingest_zone_year dispatches (the ones that used to 404).
+@pytest.mark.parametrize(("branch", "suffix"), [(None, ""), ("global-tessera", "-global-tessera")])
+def test_branch_routes_every_derived_ref(wired, branch, suffix):
+    """No branch keeps every child ref — direct AND grandchild — at its unsuffixed production
+    default. A slug routes the fill, the ingest, AND the S1/S2 grandchildren that
+    ingest_zone_year dispatches (the ones that used to 404).
     """
-    _per_cell(branch="global-tessera")
-    fill_dep, _ = _dep(wired, "fill-zone-year")
-    ingest_dep, ingest_params = _dep(wired, "ingest-zone-year")
-    assert fill_dep == "fill-zone-year/fill-zone-year-global-tessera"
-    assert ingest_dep == "ingest-zone-year/ingest-zone-year-global-tessera"
-    assert ingest_params["deployments"] == {
-        "ingest_s1_roi_sar": "ingest_s1_roi_sar/ingest-s1-roi-sar-global-tessera",
-        "ingest_s2_roi_reflectance": "ingest_s2_roi_reflectance/ingest-s2-roi-reflectance-global-tessera",
+    _campaign(branch=branch)
+    dep, params = _dep(wired, "fill-zones-sequential")
+    assert dep == f"fill-zones-sequential/fill-zones-sequential{suffix}"
+    assert params["ingest_deployment"] == f"ingest-zone-year/ingest-zone-year{suffix}"
+    assert _ingest_deployments(params["branch"]) == {
+        "ingest_s1_roi_sar": f"ingest_s1_roi_sar/ingest-s1-roi-sar{suffix}",
+        "ingest_s2_roi_reflectance": f"ingest_s2_roi_reflectance/ingest-s2-roi-reflectance{suffix}",
     }
 
 
@@ -1130,89 +866,55 @@ def test_explicit_direct_ref_is_verbatim_but_grandchildren_still_route(wired):
     """Precedence: an explicit fill/ingest ref is used verbatim (never re-suffixed),
     yet the S1/S2 grandchildren still follow `branch` — they have no explicit knob.
     """
-    _per_cell(branch="b", fill_deployment="custom/fill", ingest_deployment="custom/ingest")
-    fill_dep, _ = _dep(wired, "custom/fill")
-    ingest_dep, ingest_params = _dep(wired, "custom/ingest")
-    assert fill_dep == "custom/fill"  # not custom/fill-b
-    assert ingest_dep == "custom/ingest"
-    assert ingest_params["deployments"]["ingest_s1_roi_sar"].endswith("-b")
+    _campaign(branch="b", chained_fill_deployment="custom/fill", ingest_deployment="custom/ingest")
+    dep, params = _dep(wired, "custom/fill")
+    assert dep == "custom/fill"  # not custom/fill-b
+    assert params["ingest_deployment"] == "custom/ingest"
+    assert _ingest_deployments(params["branch"])["ingest_s1_roi_sar"].endswith("-b")
 
 
 def test_branch_routes_fill_when_ingest_disabled(wired):
-    """ingest=False: no ingest dispatch, but the fill ref is still branch-routed."""
-    _per_cell(ingest=False, branch="b")
-    deps = [d for d, _ in wired["arun"]]
-    assert deps == ["fill-zone-year/fill-zone-year-b"]  # fill only, suffixed
+    """ingest=False: the fill ref is still branch-routed."""
+    _campaign(ingest=False, branch="b")
+    assert [d for d, _ in wired["arun"]] == ["fill-zones-sequential/fill-zones-sequential-b"]
 
 
-def test_both_strategies_pin_the_resolved_ami_id(wired):
-    """The campaign resolves the worker AMI once and pins it into every dispatched
-    fill — cluster-per-zone AND chained — so a fill boots the exact image its
-    staging fingerprint recorded instead of re-reading the SSM pointer.
+@pytest.mark.parametrize("flag", ["allow_model_mismatch", "allow_s2_only"])
+def test_operator_overrides_reach_the_fill(wired, flag: str):
+    """A campaign-level flag has to reach the gate that fires, which is in the child.
+
+    The campaign checks the seeded model once before dispatching, but the child re-checks it;
+    without forwarding, it falls back to its default and rejects the same store after the
+    cell's ingest has been paid for. ``allow_s2_only`` decides which pixels get embeddings.
     """
-    _per_cell()
-    fill = next(p for d, p in wired["arun"] if "fill-zone-year" in d)
-    assert fill["ami_id"] == "ami-test-id"
-
-    wired["arun"].clear()
-    wired["landed"].clear()
-    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters"))
-    chained = next(p for d, p in wired["arun"] if "fill-zones-sequential" in d)
-    assert chained["ami_id"] == "ami-test-id"
+    _campaign(**{flag: True})
+    assert _dep(wired, "fill-zones-sequential")[1][flag] is True
 
 
-@pytest.mark.parametrize(
-    ("strategy", "dep"),
-    [("cluster-per-zone", "fill-zone-year"), ("chained-clusters", "fill-zones-sequential")],
-)
-def test_both_strategies_forward_the_model_mismatch_override(wired, strategy: str, dep: str):
-    """An operator override cleared in preflight must reach the gate that fires.
+@pytest.mark.parametrize("case", ["retag-only", "all-ocean"])
+def test_a_cluster_that_starts_no_ray_neither_resolves_nor_pins_the_ami(wired, monkeypatch, case):
+    """A cluster whose cells never provision Ray must not force an SSM read.
 
-    The campaign checks the seeded model once before dispatching, but every child
-    re-checks it. Without forwarding, the child falls back to its default and rejects
-    the same store — after the cell's ingest has already been paid for.
-    """
-    asyncio.run(
-        mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy=strategy, allow_model_mismatch=True)
-    )
-    fill = next(p for d, p in wired["arun"] if dep in d)
-    assert fill["allow_model_mismatch"] is True
-
-
-class TestAmiIsResolvedOnlyForCellsThatStartRay:
-    """A cell that never provisions Ray must not force an SSM read.
-
-    ``_code_identity`` is deliberately lazy so a pure tag-repair or all-ocean
-    campaign makes no AWS call; pinning the AMI into every dispatch would undo
-    that and turn a missing parameter — or a role without SSM access — into a
-    failure on exactly the cheap recovery path that has no use for the answer.
+    ``_ami_id`` is deliberately lazy so a pure tag-repair or all-ocean campaign makes no AWS
+    call; pinning the AMI into every dispatch would undo that and turn a missing parameter —
+    or a role without SSM access — into a failure on exactly the cheap recovery path that has
+    no use for the answer.
     """
 
-    def _no_ssm(self, monkeypatch):
-        def _boom(*a, **k):
-            raise AssertionError("a cell that starts no cluster must not resolve the AMI")
+    def _boom(*a, **k):
+        raise AssertionError("a cluster that starts no Ray must not resolve the AMI")
 
-        monkeypatch.setattr(mod, "_resolve_ami_id", _boom)
-
-    def test_retag_only_cell_neither_resolves_nor_pins(self, wired, monkeypatch):
-        self._no_ssm(monkeypatch)
-        monkeypatch.setattr(
-            mod, "campaign_status", lambda *a, **k: SimpleNamespace(zones={"33N": (2025,)}, has=lambda z, y: True)
-        )
-        _per_cell()
-        fill = next(p for d, p in wired["arun"] if "fill-zone-year" in d)
-        assert fill["run_id"].endswith("-retag")
-        assert fill["ami_id"] is None
-        # The SSM pointer still travels, so the fill's own fallback stays available.
-        assert fill["ami_ssm_name"] == "ami"
-
-    def test_all_ocean_cell_neither_resolves_nor_pins(self, wired, monkeypatch):
-        self._no_ssm(monkeypatch)
+    monkeypatch.setattr(mod, "_resolve_ami_id", _boom)
+    if case == "retag-only":
+        status = SimpleNamespace(zones={"33N": (2025,)}, has=lambda z, y: True)
+        monkeypatch.setattr(mod, "campaign_status", lambda *a, **k: status)
+    else:
         monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: False)
-        _per_cell()
-        fill = next(p for d, p in wired["arun"] if "fill-zone-year" in d)
-        assert fill["run_id"].endswith("-empty")
-        assert fill["ami_id"] is None
+    _campaign()
+    fill = _dep(wired, "fill-zones-sequential")[1]
+    assert fill["ami_id"] is None
+    # The SSM pointer still travels, so the fill's own fallback stays available.
+    assert fill["ami_ssm_name"] == "ami"
 
 
 def test_every_dispatched_child_carries_the_campaign_tag(wired):
@@ -1222,14 +924,14 @@ def test_every_dispatched_child_carries_the_campaign_tag(wired):
     memory records what was dispatched — an untagged child is an unsweepable one.
     """
     with patch.object(mod.flow_run_ctx, "id", "run-abc"):
-        _per_cell()
+        _campaign()
     assert wired["tags"], "no children dispatched"
     assert all(t == ["campaign:run-abc"] for t in wired["tags"]), wired["tags"]
 
 
 def test_children_go_untagged_outside_a_flow_run(wired):
     """A direct .fn() call has no run id, and dispatches nothing worth sweeping."""
-    _per_cell()
+    _campaign()
     assert all(t is None for t in wired["tags"])
 
 
@@ -1257,7 +959,7 @@ def test_model_gate_runs_before_any_dispatch(wired, monkeypatch):
 
     monkeypatch.setattr(mod, "_assert_seeded_model_matches", _reject)
     with pytest.raises(ValueError, match="seeded for encoder"):
-        _per_cell()
+        _campaign()
     assert wired["arun"] == [], "nothing may be dispatched once the gate fails"
 
 
@@ -1265,7 +967,7 @@ def test_model_gate_override_lets_the_campaign_proceed(wired, monkeypatch):
     """The escape hatch is threaded through rather than reimplemented."""
     seen: dict = {}
     monkeypatch.setattr(mod, "_assert_seeded_model_matches", lambda *a, **k: seen.update(k))
-    _per_cell(allow_model_mismatch=True)
+    _campaign(allow_model_mismatch=True)
     assert seen["allow_model_mismatch"] is True
 
 
@@ -1407,11 +1109,7 @@ def test_overlapping_years_is_now_the_default(wired, monkeypatch):
     ingest cap reachable; with the barrier in place the ceiling is 45 regardless of the cap.
     """
     _multi_year(monkeypatch, ["01N", "02N"], [2025, 2024], wired)
-    asyncio.run(
-        mod.run_global_campaign.fn(
-            paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters", max_parallel_clusters=1
-        )
-    )
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=1))
     # One dispatch carrying BOTH years, so year N+1's ingest overlaps year N's inference.
     years_per_dispatch = [{y for _z, y in p["cells"]} for _, p in wired["arun"]]
     assert years_per_dispatch == [{2025, 2024}], years_per_dispatch
@@ -1427,7 +1125,6 @@ def test_the_year_barrier_is_still_reachable_when_asked_for(wired, monkeypatch):
         mod.run_global_campaign.fn(
             paths=_PATHS,
             ami_ssm_name="ami",
-            fill_strategy="chained-clusters",
             max_parallel_clusters=1,
             overlap_years=False,
         )
@@ -1445,7 +1142,6 @@ def test_overlap_years_dispatches_every_year_in_one_batch(wired, monkeypatch):
         mod.run_global_campaign.fn(
             paths=_PATHS,
             ami_ssm_name="ami",
-            fill_strategy="chained-clusters",
             max_parallel_clusters=1,
             overlap_years=True,
         )
@@ -1468,7 +1164,6 @@ def test_overlap_years_keeps_every_year_of_a_zone_in_one_cluster(wired, monkeypa
         mod.run_global_campaign.fn(
             paths=_PATHS,
             ami_ssm_name="ami",
-            fill_strategy="chained-clusters",
             max_parallel_clusters=4,
             overlap_years=True,
         )
@@ -1503,7 +1198,6 @@ def test_a_resumed_cluster_is_credited_only_with_the_years_it_owns(wired, monkey
         mod.run_global_campaign.fn(
             paths=_PATHS,
             ami_ssm_name="ami",
-            fill_strategy="chained-clusters",
             max_parallel_clusters=2,
             overlap_years=True,
         )
@@ -1511,42 +1205,6 @@ def test_a_resumed_cluster_is_credited_only_with_the_years_it_owns(wired, monkey
     # Two clusters, one cell each, so exactly two runs — not two runs counted twice.
     assert summary["dispatched"] == 2, summary["runs_by_year"]
     assert {y: len(runs) for y, runs in summary["runs_by_year"].items()} == {2024: 1, 2025: 1}
-
-
-def test_a_failing_year_does_not_block_its_zones_later_years(wired, monkeypatch):
-    """A repeatable failure that belongs to ONE year must not take the zone's others down.
-
-    The per-cell path used to copy the first failing year's exception into every later
-    year of that zone WITHOUT dispatching it. Years come out oldest-first and every
-    retry rebuilds the list the same way, so a deterministic 2024 failure — a coverage
-    gate is evaluated per zone-year — meant 2025 was never attempted on any round, and
-    was then reported unfilled having never been tried.
-
-    2024 fails here on every attempt; 2025 must still be dispatched and must still land.
-    """
-    _multi_year(monkeypatch, ["01N"], [2024, 2025], wired)
-
-    async def arun(dep, parameters=None, tags=None):
-        wired["arun"].append((dep, parameters))
-        if "fill-zone-year" in dep and (parameters or {}).get("year") == 2024:
-            raise RuntimeError("2024 coverage gate — deterministic")
-        wired["land"](parameters)
-        return _completed_run()
-
-    monkeypatch.setattr(mod, "arun_deployment", arun)
-    asyncio.run(
-        mod.run_global_campaign.fn(
-            paths=_PATHS,
-            ami_ssm_name="ami",
-            fill_strategy="cluster-per-zone",
-            overlap_years=True,
-            max_dispatch_rounds=1,
-        )
-    )
-    filled = {p["year"] for d, p in wired["arun"] if "fill-zone-year" in d}
-    assert 2024 in filled, "the failing year should still have been attempted"
-    assert 2025 in filled, "2025 was never dispatched — the failing year blocked it"
-    assert ("01N", 2025) in wired["landed"], "2025 was dispatched but did not land"
 
 
 def test_overlap_years_still_reports_unfilled_cells_per_year(wired, monkeypatch):
@@ -1568,7 +1226,6 @@ def test_overlap_years_still_reports_unfilled_cells_per_year(wired, monkeypatch)
         mod.run_global_campaign.fn(
             paths=_PATHS,
             ami_ssm_name="ami",
-            fill_strategy="chained-clusters",
             max_parallel_clusters=1,
             overlap_years=True,
         )
@@ -1576,55 +1233,6 @@ def test_overlap_years_still_reports_unfilled_cells_per_year(wired, monkeypatch)
     # Both years accounted for SEPARATELY, each with its zone: one run spanning years must not
     # collapse into one entry, because the second wave is dispatched per cell.
     assert summary["unfilled"] == {2024: ["01N"], 2025: ["01N"]}, summary["unfilled"]
-
-
-def test_the_staging_fingerprint_changes_with_the_stores_depth_rule(wired, monkeypatch):
-    """Staging lives under `outputs/staging/{zone}/{year}` — not namespaced by store.
-
-    So re-running the same mosaics into a store with a different `optical_min_obs` would
-    otherwise resume tiles staged under the OLD rule and publish a mix of two depth
-    policies under one fingerprint. Same reasoning as `allow_s2_only`, which is already
-    in the key.
-    """
-    common = {
-        "inputs_bucket": "s3://in",
-        "min_valid_coverage": 0.001,
-        "s1_orbit": "both",
-        "allow_partial_window": False,
-        "allow_s2_only": False,
-        "code_identity": "code=x",
-    }
-    monkeypatch.setattr(mod, "ingest_marker_identity", lambda *a, **k: "mosaic=1", raising=False)
-    at_25 = mod._staging_run_id("33N", 2025, optical_min_obs=25, **common)
-    at_30 = mod._staging_run_id("33N", 2025, optical_min_obs=30, **common)
-    at_none = mod._staging_run_id("33N", 2025, optical_min_obs=None, **common)
-    assert len({at_25, at_30, at_none}) == 3, "each rule must own its staging prefix"
-    assert at_25 == mod._staging_run_id("33N", 2025, optical_min_obs=25, **common), "and be stable"
-
-
-def test_overlap_years_does_not_overcount_per_cell_runs(wired, monkeypatch):
-    """Under `overlap_years` with per-cell dispatch, a round holds one run PER CELL.
-
-    The attribution loop copied the whole round's run list into every year in the batch, so
-    each year reported the other years' runs and `dispatched` — summed over years — came out
-    multiplied by the number of years in the batch. Invisible while every batch carried one
-    year, which is every batch until this flag puts several into one.
-
-    Two zones over two years is four cells, so `dispatched` must be 4 and not 8.
-    """
-    _multi_year(monkeypatch, ["01N", "02N"], [2025, 2024], wired)
-    result = asyncio.run(
-        mod.run_global_campaign.fn(
-            paths=_PATHS,
-            ami_ssm_name="ami",
-            fill_strategy="cluster-per-zone",
-            max_parallel_clusters=2,
-            overlap_years=True,
-        )
-    )
-    assert result["dispatched"] == 4, (
-        f"four cells were dispatched; {result['dispatched']} means each year was credited with the other years' runs"
-    )
 
 
 def test_production_staging_identity_is_unchanged_by_the_tarball_term(monkeypatch):
@@ -1735,9 +1343,7 @@ class _Round:
         driver that needed more would fail these tests rather than hang. Pumped in a loop
         rather than once, so a held cluster works in every round.
         """
-        task = asyncio.ensure_future(
-            mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters", **kwargs)
-        )
+        task = asyncio.ensure_future(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", **kwargs))
         for _ in range(50):  # rounds, generously; the assert below catches a real hang
             if task.done():
                 break
@@ -2184,7 +1790,6 @@ class TestTheDispatchDecisionIsAtomic:
                 mod.run_global_campaign.fn(
                     paths=_PATHS,
                     ami_ssm_name="ami",
-                    fill_strategy="chained-clusters",
                     max_parallel_clusters=2,
                     immediate_refill=True,
                 )

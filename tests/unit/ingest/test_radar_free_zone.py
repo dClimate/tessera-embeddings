@@ -236,16 +236,12 @@ class TestWhoDemandsRadarAndWhoDoesNot:
         """Every cell of a sweep is chosen by breadth, so some will be radar-free."""
         assert self._default("fill_zones_sequential.py", "require_s1") is False
 
-    def test_the_campaign_overrides_the_single_cell_default_on_every_dispatch_path(self) -> None:
-        """Both dispatch modes must pass it — chained clusters AND cluster-per-cell.
-
-        Counted rather than merely found, because covering one path and missing the other is
-        the realistic regression, and it only shows up on a radar-free zone.
+    def test_the_campaign_states_the_radar_policy_explicitly(self) -> None:
+        """The campaign passes ``require_s1=False`` rather than inheriting the sweep's default,
+        so a change to that default cannot start refusing radar-free cells mid-campaign.
         """
         src = (_SRC / "orchestration" / "prefect" / "flows" / "run_global_campaign.py").read_text()
-        assert src.count('"require_s1": False,') == 2, (
-            "the campaign dispatches fills two ways; both must allow radar-free cells"
-        )
+        assert src.count('"require_s1": False,') == 1, "the campaign's fill dispatch must allow radar-free cells"
 
     def test_the_local_runner_demands_radar(self) -> None:
         """Same reasoning as the single-cell flows: it fills one named ROI."""
