@@ -199,10 +199,8 @@ class TestCampaignDefaults:
         """Both gates live in CHILD flow runs, so a gate only binds if it reaches the
         Prefect limit they name. Writing them from this flow is what stops the server's
         numbers drifting from the ones chosen here — and, for the pause gate, what makes
-        pausing reachable without an operator creating anything first.
-
-        There were three. The commit gate is gone — nothing bounds committers any more, and
-        `test_no_committer_gate_is_published` pins that it stays gone.
+        pausing reachable without an operator creating anything first. Commits are ungated, so
+        there is no third.
         """
         asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
         assert dict(wired["limits"]) == {
@@ -286,31 +284,6 @@ class TestCampaignDefaults:
         """
         asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", ingest=False))
         assert dict(wired["limits"]) == {"tessera-global-inference": 1}
-
-    @pytest.mark.parametrize("clusters", [1, 4, 8, 16, 40])
-    def test_no_committer_gate_is_published_at_any_cluster_count(self, wired, clusters):
-        """Commits are ungated, and the cluster count no longer implies a committer cap.
-
-        The removed gate derived ``min(clusters, 8)`` from the run-1 contention curve. It was
-        removed because what it bounded is a SLOWDOWN, not a failure: all 120 zone groups do
-        share one repo and one branch tip, and run 1 measured that contention as 2.2 s commits
-        at 16 simultaneous committers and 15 s at 120, with ZERO unresolvable conflicts at every
-        N. The curve itself is kept in
-        ``context_docs/storage/writing-to-the-global-store.md`` together with the scale
-        (N>=16) at which it would matter again — this is parametrised past that scale on
-        purpose, so a reader sees the removal is unconditional rather than tuned.
-        """
-        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=clusters))
-        assert "tessera-global-commits" not in dict(wired["limits"])
-
-    def test_the_flow_takes_no_commit_limit_parameter(self):
-        """Structural: there is no knob left to re-enable a fleet-wide committer bound, so a
-        dispatch cannot reintroduce one without a code change.
-        """
-        import inspect
-
-        flow = getattr(mod.run_global_campaign, "fn", mod.run_global_campaign)
-        assert "commit_limit_name" not in inspect.signature(flow).parameters
 
     def test_nothing_bounds_mosaics_in_flight(self, wired, monkeypatch):
         """A whole year's mosaics may coexist: no backpressure from fill onto ingest.
@@ -2207,7 +2180,7 @@ class TestImmediateRefill:
     def test_a_round_that_is_already_over_is_not_even_planned_for(self, wired, monkeypatch):
         """The gate before planning is a COST filter, not the safety one.
 
-        The commit gate below it is what actually prevents a pointless replacement, and it
+        The dispatch gate below it is what actually prevents a pointless replacement, and it
         would decline this case on its own. This one exists so the driver does not pay for
         a store re-read and a full live-run scan per settled cluster once the round is
         over — which, at the fleet's cluster count, is a burst of orchestrator queries for
