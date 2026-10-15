@@ -308,23 +308,11 @@ cluster-less (they run on the flow runner like `generate_roi`); only
 
 ### Targeted updates of filled cells
 
-An **update** re-runs chosen shards of cells the campaign has already filled and writes nothing
-else ([ADR 027](../../../../context_docs/decisions/027-targeted-updates.md)). Three steps:
-
-1. **Plan it.** `scripts/update/plan_update.py` writes an immutable plan to
-   `{inputs}/updates/<name>/plan.json`: the cells, the shards in each (or all of them), the land
-   mask, the mode and the ingest settings. Shards come from the registry's `master/` (`--refused`,
-   `--aoi`, `--zones`, `--years`) or a CSV. Dry run unless `--write`; it reports how many of each cell's shards the mask
-   holds live.
-2. **Run it.** Pass `update=<name>` to `fill-zones-sequential` for one cluster (`cells` defaults to
-   the plan's, and a subset splits an update across runs), or to `run-global-campaign` for several,
-   balanced on the plan's shards. Each ingests only its target shards' 4096-px blocks, plans its
-   cells from the plan, and records itself on each cell.
-3. **Check and release it.** `update-<name>-base` pins the store before the first write and
-   `update-<name>-complete` once every planned cell holds the record. Compare the two, then delete
-   the update's `rois/`, `mosaics/` and `holes/` under `{inputs}/updates/<name>/`, keeping
-   `plan.json`, which reserves the name, and, once satisfied, the base tag, which holds the replaced
-   shards.
+An **update** re-runs chosen tiles of cells the campaign has already filled and writes nothing
+else. How to plan, run, check and clean up an update is
+[`docs/updates.md`](../../../../docs/updates.md); the design is
+[ADR 027](../../../../context_docs/decisions/027-targeted-updates.md). Both fill flows take the
+update's name as `update=<name>`, and treat its cells differently from a fill's:
 
 | | campaign fill | update |
 |---|---|---|
@@ -336,9 +324,7 @@ else ([ADR 027](../../../../context_docs/decisions/027-targeted-updates.md)). Th
 | `min_valid_coverage`, month check | 0.1, every month | `1e-9`, relaxed: a partial-zone ROI must never block |
 | radar policy | any | `holes` requires `allow_s2_only=True`, the campaign's, refused before ingest otherwise |
 
-Run one update per cell at a time: two updates of one cell conflict on its chunks. The whole
-procedure, checks and recovery included, is the
-[`run-update`](../../../../.agents/skills/run-update/SKILL.md) skill.
+Run one update per cell at a time: two updates of one cell conflict on its chunks.
 
 ## Master pipeline
 

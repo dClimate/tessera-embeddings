@@ -46,7 +46,7 @@ flows do the work.
 
 | script | what it does |
 |---|---|
-| `plan_update.py` | Writes a targeted update's immutable plan to `{inputs}/updates/<name>/plan.json`, from the registry's `master/` (tiles that refused pixels, `--refused`, narrowed by `--zones`, `--years` and an `--aoi` box; `--anonymous` for the public registry) or from a CSV of `zone,year,tile`. Checks it against its land mask first, refusing a zone the mask lacks or a shard outside a zone's grid, and reports each cell's live and dead shards. Dry run unless `--write`. |
+| `plan_update.py` | Writes a targeted update's immutable plan to `{inputs}/updates/<name>/plan.json`, from the registry's `master/` (tiles that refused pixels, `--refused`, narrowed by `--zones`, `--years` and an `--aoi` box; `--anonymous` for the public registry) or from a CSV of `zone,year,tile`. Checks it against its land mask first, refusing a zone the mask lacks or a shard outside a zone's grid, and reports each cell's live and dead shards. Dry run unless `--write`. How to use it: [`docs/updates.md`](../docs/updates.md). |
 
 ## `diagnostic/` — supported tooling
 
