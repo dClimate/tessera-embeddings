@@ -17,7 +17,7 @@ nothing. The design is [ADR 027](../../../context_docs/decisions/027-targeted-up
 - **Names and plans are permanent.** A global plan cannot be edited, and a name already recorded on
   a store's year does nothing when run again. To change anything, use a new name.
 - **The store's identity still rules.** An update runs under the store's model and depth rule; it
-  cannot change either.
+  cannot change either. The depth rule can only be loosened, in a step of its own (§2b).
 - **Dry-run, then write, then check.** Every writing script is a dry run without `--write`, and
   nothing is released until §4 passes.
 
@@ -59,6 +59,21 @@ update:
    update, with the tiles it `written` and `kept`, and `update-<name>-base` pins the store as it was.
 
 ## 2b. Update the global store
+
+### Loosen the depth rule first, when that is the goal
+
+To embed pixels the store refused for too few optical observations, move its minimum
+(`optical_min_obs`) down, for the whole store or for named zones, then plan a `holes` update over the
+tiles with thin refusals. The rule only ever moves down, and every line given up stays in the store's
+history ([ADR 028](../../../context_docs/decisions/028-embed-every-pixel-with-an-optical-observation.md)):
+
+```bash
+python scripts/update/loosen_optical_min_obs.py --store <store-uri> --line 1 --zones 18N,18S   # dry run
+python scripts/update/loosen_optical_min_obs.py --store <store-uri> --line 1 --zones 18N,18S --write
+```
+
+Then plan with `--where "refused_thin_px > 0"`. A zone left at the old line embeds nothing new, and
+its tiles are kept.
 
 ### Plan
 
