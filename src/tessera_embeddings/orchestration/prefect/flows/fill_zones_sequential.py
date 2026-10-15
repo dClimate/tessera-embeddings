@@ -802,12 +802,34 @@ def fill_zones_sequential_flow(
             never waited on (:mod:`._cell_validation`), so cell N is validated while cell N+1 is
             still inferring. ``None`` (the default) validates nothing: the validator is a
             consumer's flow, so the library names none.
-        update: Run a targeted update (:mod:`tessera_embeddings.storage.update`) of cells the
-            campaign has already filled, instead of filling. Its plan supplies the mask,
-            ``min_valid_coverage`` and ``allow_partial_window``; ``cells`` defaults to the plan's
-            and may name a subset, so one update can be split across runs. Triage counts what
-            each cell needs from the plan's shards, a cell the update already recorded is skipped
-            and one never filled is refused, and nothing is retagged or marked.
+        update: The NAME of a targeted update to run instead of a fill, e.g.
+            ``"amazon-thin-2024"``; ``None`` (the default) fills as usual. An update re-runs chosen
+            tiles of cells the campaign has already filled and writes nothing else.
+
+            The name is not a description of the work: it names a plan written beforehand with
+            ``scripts/update/plan_update.py --name <name> ... --write``, which this flow reads from
+            ``{paths.inputs}/updates/<name>/plan.json``. The plan fixes everything about the run:
+
+            - the cells and, per cell, the tiles to redo;
+            - the mode: ``holes`` infers only the pixels with no embedding and merges them into
+              the existing tiles, leaving every embedded pixel byte-identical; ``shards`` rewrites
+              each chosen tile whole;
+            - the land mask, which replaces ``mask_name`` (an explicit ``mask_name`` that differs is
+              refused);
+            - relaxed ingest settings, ``min_valid_coverage`` and ``allow_partial_window``, which
+              replace this flow's, since an update ingests only the area around its tiles.
+
+            ``cells`` defaults to the plan's cells and may name a subset, to split one update across
+            runs. A ``holes`` update needs ``allow_s2_only=True``. Before any work, each cell is
+            checked against the store: one already holding this update's record is skipped, so
+            rerunning the same call resumes, and one the campaign never filled is refused.
+
+            What the run leaves behind: each finished cell records the update in its zone's
+            ``updates[year]`` attr, while ``years_complete``, ``runs`` and the zone-year tags stay as
+            the fill left them; the store is tagged ``update-<name>-base`` before the first write
+            and ``update-<name>-complete`` once every planned cell is recorded; and the registry
+            rows of the tiles it rewrote carry ``update_name = <name>``. The full walk-through is
+            ``docs/updates.md``.
 
     Returns:
         Summary dict: triage counts (retag / empty / live), the sequential runner's outcome
