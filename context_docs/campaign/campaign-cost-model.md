@@ -601,9 +601,8 @@ built 2026-07-24 from `s3://tessera-embeddings/v1.1/global_0.1_degree_tiff_all/`
 `5ea80dd9…c794e`. That is the **dev** coverage store; the distribution of land does not change, but
 regenerate the snapshot against production once its mask is built.
 
-**Commits do not constrain the cluster count.** This was once thought to, and the gate that enforced
-it has been removed — [`../storage/writing-to-the-global-store.md`](../storage/writing-to-the-global-store.md)
-§5 carries the measurement, the committer-count threshold, and the signal that would reopen it.
+**Commits do not constrain the cluster count**: they are ungated, and each takes about a second —
+[`../storage/writing-to-the-global-store.md`](../storage/writing-to-the-global-store.md) §5.
 
 ---
 

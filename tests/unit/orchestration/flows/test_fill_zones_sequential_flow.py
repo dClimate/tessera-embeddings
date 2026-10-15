@@ -158,9 +158,22 @@ def test_retag_and_ocean_cells_never_touch_the_cluster(wired, monkeypatch):
     # Both cells settled by the no-cluster fill path with the right run_ids...
     run_ids = {f["zone"]: f["run_id"] for f in wired["no_cluster_fills"]}
     assert run_ids == {"01N": "01N-2025-retag", "02N": "02N-2025-empty"}
+    # ...with the registry, so planning can catch up the master of a fill that died before merging it.
+    assert {f["registry_root"] for f in wired["no_cluster_fills"]} == {_PATHS.optical_registry(_PATHS.global_store())}
     # ...and no cluster was ever provisioned.
     assert wired["ray_kwargs"] is None and result["sequential"] is None
     assert result["retagged"] == 1 and result["empty"] == 1 and result["live"] == 0
+
+
+def test_a_streamed_cell_is_planned_with_the_registry(wired, monkeypatch):
+    """A cell the session finds already landed has its master caught up in planning, which needs the registry."""
+    seen: dict = {}
+    monkeypatch.setattr(mod, "plan_zone_inference", lambda **k: seen.update(k))
+    _run(zones=["33N"])
+    wired["seq_kwargs"]["plan"](
+        SimpleNamespace(zone="33N", year=2025), SimpleNamespace(mosaic_base="m", config=None, run_id="r")
+    )
+    assert seen["registry_root"] == _PATHS.optical_registry(_PATHS.global_store())
 
 
 class TestPerCellValidation:

@@ -102,11 +102,14 @@ context_docs/
     │                                              conforms, measured speeds in two regions, and
     │                                              what would surprise a consumer
     ├── staging-identity-and-resume.md          what a run id identifies, and what resumes
+    ├── registry-master.md                      the one registry consumers read: merged in place
+    │                                              by every fill, tile by tile, never dropping an
+    │                                              untouched tile; its checks, repair, versioned
+    │                                              rollback, and the v1.1 equivalence check
     ├── registry-backfill.md                    how the 47% of registry rows the campaign left
-    │                                              unmeasured were re-derived from the store and
-    │                                              published, why that is a re-derivation rather
-    │                                              than an estimate, the master/ consumers read,
-    │                                              and the v1.1 run
+    │                                              unmeasured were re-derived from the store, why
+    │                                              that is a re-derivation rather than an
+    │                                              estimate, and the v1.1 run
     └── icechunk-api-ledger.md                  signatures and gotchas the scale tests earned
 ```
 

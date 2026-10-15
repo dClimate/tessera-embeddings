@@ -12,7 +12,7 @@ follow-up ADRs only if production reveals something these runs didn't.
 **Evidence runs (all 2026-07-14, S3 bench, icechunk 2.1.1,
 `arbol-tessera-embeddings-dev`):**
 - `run1` — full T0–T7 incl. the 5-variant T1 sweep → D1, D2, D4 FIRM;
-  D5/D6 commit-concurrency constraint; D7 mechanism validated.
+  D5/D6 commit-contention curve; D7 mechanism validated.
 - `d3` / `d3v2` — t8 sharding experiments (E1–E4), the second with the
   land-masked production writer → **D3 FIRM: adopt `c256_sharded`, shard
   `scales` too.** Reads are leaner *and* faster (wire 1.23 vs 8.69 MB/pt,
@@ -204,12 +204,13 @@ probe in T2: icechunk #1600 (open) observed append times growing linearly
 with cumulative refs *despite* splitting. Note `rewrite_manifests()` is
 repo-wide only — no per-group targeting.
 
-### D5 — One repo, 120 groups — adopted *with a commit-concurrency cap* (FIRM; commit constraint FIRM from run 1)
+### D5 — One repo, 120 groups (FIRM; commits ungated)
 
 Adopt the single-repo/120-group layout the partner expects, subject to:
 
-- T5: ≥16 concurrent zone-committers complete with clean auto-rebases and
-  ≤2× serial wall-clock;
+- T5: concurrent zone-committers complete with clean auto-rebases — zero
+  unresolvable conflicts. Commit latency under contention is measured, not a
+  condition (see the run 1 result);
 - T4: snapshot-file growth and single-group open times stay acceptable at
   120 groups (incl. manifest-preload tuning: `max_arrays_to_scan` default 50
   < our node count — must be raised; probe icechunk #1462 `list_prefix`
@@ -225,18 +226,17 @@ partner conversation to have **before** implementation, with test evidence.
 groups → a 38 KB snapshot re-serialized per commit, single-group opens ~0.15 s,
 per-group commit flat (~0.25 s) regardless of group count. But **uncoordinated
 concurrent commits storm**: auto-rebase retries grow ≈ linearly with the number
-of simultaneous committers (O(N²) aggregate), so the N=16 kill criterion above
-is *breached* under the pathological all-at-once pattern (median 7.5 retries,
-commit ~10× the uncontended 0.2 s). This does **not** kill one-repo — it kills
-letting all zones commit to `main` at once. **Constraint (now FIRM): a
-commit-concurrency cap of ~4–8 simultaneous committers** (a queue/semaphore in
-the orchestration layer), or per-zone repos. Reader-side: whole-repo
-`open_datatree` over 120 groups took ~31 s (vs 0.15 s per group) — readers must
-open a single zone group, never the datatree (icechunk #1462). With D2/D3
-settled by the T1/d3/d3v2 sweeps, the one-repo layout is the decision — capped
-committers, single-group readers; the naive-concurrency question is settled.
+of simultaneous committers (O(N²) aggregate), so at N=16 under the
+pathological all-at-once pattern a commit takes far longer than serial (median
+7.5 retries, ~10× the uncontended 0.2 s). This does **not** kill one-repo: what
+contention costs is commit latency, not correctness — zero unresolvable
+conflicts at every N, including 120 — so commits are ungated (D6). Reader-side:
+whole-repo `open_datatree` over 120 groups took ~31 s (vs 0.15 s per group) —
+readers must open a single zone group, never the datatree (icechunk #1462). With
+D2/D3 settled by the T1/d3/d3v2 sweeps, the one-repo layout is the decision —
+ungated committers, single-group readers.
 
-### D6 — Commit strategy: cooperative fork/merge, TWO commits per zone-year (FIRM shape; pacing cap FIRM from run 1)
+### D6 — Commit strategy: cooperative fork/merge, TWO commits per zone-year (FIRM; commits ungated)
 
 Within a zone-year: `session.fork()` → pickled ForkSessions to workers →
 `merge(*sessions)` → **one commit for the shards**, then a **second, small commit for
@@ -257,10 +257,11 @@ spawn/forkserver — fork deadlocks icechunk's runtime).
 > **2,200 commits** for the campaign rather than 1,100, still far below icechunk's
 > "tens of thousands" target. Consequence for a crash: dying between the two leaves a
 > year holding DATA that nothing marks complete, which the work list reads as pending,
-> so a retry rewrites the same shards and re-marks. Across zones: commits
-to distinct groups with a bounded rebase-retry loop (`ConflictDetector`;
-cross-group commits auto-rebase cleanly — confirmed in run 1 T0), **paced
-behind a concurrency cap** so the branch-tip CAS isn't slammed.
+> so a retry rewrites the same shards and re-marks.
+
+Across zones: commits to distinct groups with a bounded rebase-retry loop
+(`ConflictDetector`; cross-group commits auto-rebase cleanly — confirmed in run 1
+T0), with nothing limiting how many commit at once.
 
 Why: commit-time memory is ~400 B/ref and single commits ≥ ~7×10⁷ refs panic
 (icechunk #1558 open) — zone-year commits (~10⁵–10⁶ refs) sit far below that.
@@ -269,54 +270,18 @@ zone-year ≈ 1,100 total (vs. yield-embeddings' per-slab pattern, ~400
 commits/timestep, which would blow past it). Never mix array-metadata updates
 with concurrent chunk writes (see D1).
 
-**Run 1 made the pacing non-optional (see D5):** retries scale ≈ N−1 with N
-simultaneous committers, so the orchestration layer MUST cap simultaneous
-zone-year committers to ~4–8 (measured: N=2 → ~0.5 retries/0.5 s commit; N=8 →
-~3.5/1.3 s; N=16 → ~7.5/2.2 s; N=120 → ~58/15 s). Cross-group conflict-freedom
-held: zero unresolvable conflicts at every N.
+**Run 1's contention curve (see D5):** retries scale ≈ N−1 with N simultaneous
+committers (measured: N=2 → ~0.5 retries/0.5 s commit; N=8 → ~3.5/1.3 s; N=16 →
+~7.5/2.2 s; N=120 → ~58/15 s). Cross-group conflict-freedom held: zero
+unresolvable conflicts at every N. The curve measures commit LATENCY, not failure.
 
-> **The cap does NOT bound assembly throughput, and reading it that way cost real
-> effort (noted 2026-07-30).** The gate wraps `session.commit` only — not the shard
-> writing that precedes it — so it limits how many commits are *in flight*, each about
-> 0.5-1.3 s, not how many zone-years may assemble at once. At a campaign supply of ~11
-> zone-years/hour that is one commit every five minutes against eight slots: under 0.1%
-> utilisation. Two consequences. Any argument of the form "assembly is capped at 8
-> concurrent, therefore throughput is limited to 8/duration" is wrong. And at the shipped
-> 8 clusters the limit equals the number of possible committers, so **it cannot bind at
-> all** — its value is protecting the configurations we do not currently run (balance
-> holds to ~16 clusters, where the measured cost is 7.5 retries and 2.2 s commits) and
-> the mixed case, since `mark_zone_year_empty` and the year-milestone tags commit through
-> the same gate and so concurrent committers can exceed the cluster count. Kept for those
-> reasons, not for throughput.
-
-> **REMOVED 2026-08-27. The cap no longer exists in code**, and the paragraph below describes
-> what it did until then.
->
-> The curve below is NOT retracted — it is the reason the removal is safe rather than an argument
-> against it. What it measures is LATENCY: `N=16` is where a commit reaches **2.2 s** against ~1 s
-> serial, and `N=120` where it reaches **15 s**. "Cross-group conflict-freedom held: zero
-> unresolvable conflicts at every N", including 120 — six times this campaign's `2N=20` ceiling at
-> `max_parallel_clusters=10`. So the gate bounded a slowdown measured in seconds, not a failure.
->
-> **Two corrections to my own reasoning, recorded because both were load-bearing.** The removal was
-> first argued from a claim that the campaign writes per-ROI stores; it does not, and that premise
-> is withdrawn — `global_store()` returns one repo holding all 120 zone groups, and commits share a
-> branch tip. And this note first said N≥16 was "twice the cluster count this campaign runs", as
-> reassurance; it is the reverse — the fleet's ceiling is 2N, so 10 clusters reach 20.
->
-> Reopen criterion is now **N ≥ 120**, detected by the `COMMIT <secs>` line in
-> `commit_with_rebase`, which is the only site every commit passes through. See
-> [`../storage/writing-to-the-global-store.md`](../storage/writing-to-the-global-store.md).
-
-**Enforced in code from 2026-07-28 until 2026-08-27.** The cap was a Prefect global
-concurrency limit (`commit_limit_name`) held around each commit, and `run_global_campaign`
-upserted its VALUE at preflight to
-`min(max_parallel_clusters, MAX_SIMULTANEOUS_COMMITTERS=8)`. Previously only the
-limit's *name* was threaded through and the number lived on the server, where it
-could silently drift from this constraint. The simultaneous-committer timings, the
-queueing this actually bound, and the threshold that would reopen it are in
-[`../storage/writing-to-the-global-store.md`](../storage/writing-to-the-global-store.md) §5 —
-**which also records that this limit is now REMOVED**, so read it before restoring one.
+> **Commits are ungated, and stay that way (ruled 2026-10-14).** A fleet-wide cap
+> of ~4–8 committers was built on this curve and removed on 2026-08-27: it bounded a
+> slowdown of seconds inside multi-hour assemblies, measured zero queueing in
+> production, and misled its operator. No fleet-wide limit on commits — a cap, a
+> lock, or publication spacing — is to be reintroduced. The evidence and the
+> commit-latency detector are in
+> [`../storage/writing-to-the-global-store.md`](../storage/writing-to-the-global-store.md) §5.
 
 ### D7 — Snapshot hygiene: tags + expiry policy (FIRM policy; cadence PENDING T6)
 
@@ -372,8 +337,7 @@ would poison every read benchmark run on our current 2.0.4 pin.
   threading through write/open/resolve paths, per-group attrs (CRS,
   `_manifest`, `years_complete`), a repo+group path model in `BucketPaths`,
   a commit-retry/rebase helper, GC/expiry helpers, and a zone-fill
-  orchestration layer (fork/merge batching) that **caps simultaneous zone-year
-  committers to ~4–8** (run-1-mandated; see D5/D6).
+  orchestration layer (fork/merge batching). Commits are ungated (D5/D6).
 - **Sharded output (D3): both `embeddings` and `scales` are written in 2048²
   shards of 256-px inner chunks, by a shard-aligned + land-masked writer** (real
   data into land inner chunks, ocean left at fill so the codec elides it → one
@@ -416,8 +380,8 @@ Full T0–T7 pass against `s3://arbol-tessera-embeddings-dev/global-embeddings`
   shifts; shift-vs-writer conflict `unresolvable`. → D1 FIRM.
 - **T4 (120 groups):** snapshot 5 KB→38 KB (12→120 groups), per-group commit
   flat (~0.25 s), single-group open 0.15 s, **whole-repo `open_datatree` ~31 s**.
-- **T5 (contention):** retries ≈ N−1; N=16 breaches the kill threshold. → the
-  D5/D6 commit-concurrency cap.
+- **T5 (contention):** retries ≈ N−1; at N=16 commits take ~10× serial, with
+  zero unresolvable conflicts at any N. → D5/D6 (commits ungated).
 - **T6 (GC):** expire/GC/rollback work; 8.4 MB reclaimed; tiny repo → no
   scale-duration number.
 - **T7 (ramp):** 0× `503 SlowDown` at 50→400 PUTs on this (warm) bucket.
@@ -470,9 +434,8 @@ to this:
 - **Writer: cooperative fork/merge, TWO commits per (zone, year)** — shards, then that
   year's attrs (D6, amended 2026-07-30; this is what lets two years of one zone be
   written concurrently) — shard-aligned
-  + land-masked (whole lean shards, ocean elided), spawn/forkserver only. Cap
-  simultaneous zone-year committers to ~4–8 (uncoordinated commits storm,
-  O(N²)). (D6)
+  + land-masked (whole lean shards, ocean elided), spawn/forkserver only.
+  Commits ungated: contention costs seconds of latency, never a conflict. (D6)
 - **Hygiene:** tag each completed zone-year; expire+GC with cutoffs older than
   the campaign start; `reset_branch` for rollback. (D7)
 - **All new functionality opt-in**; vanilla single-group stores unchanged. Pin
@@ -483,6 +446,6 @@ measure against a large repo before setting the production GC cadence. Watch
 zarr PR #3004 (partial-shard-read); it only improves the sharded read path.
 
 **Next:** implement this write path in `tessera_embeddings.storage` (group-aware
-seeding, sharded land-masked writer, commit-concurrency cap, GC/expiry helpers).
+seeding, sharded land-masked writer, GC/expiry helpers).
 The scale-test scripts (`scripts/scoping/scale_tests/`) remain as regression harness and
 for the deferred GC-at-scale measurement.

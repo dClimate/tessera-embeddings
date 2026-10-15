@@ -218,27 +218,18 @@ A radar-free pixel is exactly one with a finite `scales` value and
 
 ### The registry
 
-Coverage across a wide area is better answered without opening the store, from a Parquet dataset
-beside it:
-
-```
-s3://tessera-embeddings/v1.1/dclimate.registry/parts/zone=<ZONE>/year=<YEAR>/<run_id>.parquet
-```
-
-994 parts, 142 MB, 3,247,410 rows — one per 2048-pixel tile per year, except that parts are keyed
-by `run_id`, so a refilled zone-year keeps both rows: take the latest `assembled_at` per `(zone,
-year, tile)` or you will double-count. In zones 01 and 60 a row crossing the antimeridian encodes
-`bbox_west > bbox_east`, which a plain west-to-east overlap test drops. Each row carries a WGS84
-bounding box, whether the tile was embedded, how many of its pixels the depth rule refused and
-why, and how deep the imagery was where it fell short.
-
-Partitioning by zone and year makes "is my area covered, and how well" a 1.7-second query
-in-region against 14 seconds for the whole dataset, so use it to screen areas before committing
-to a read. Read `refused_px` alongside `embedded`, since a tile can be marked embedded and still
-be largely holes.
+Coverage across a wide area is better answered without opening the store, from a Parquet table
+beside it at `s3://tessera-embeddings/v1.1/dclimate.registry/master/`: one row per 2048-pixel tile
+per year, with its WGS84 bounding box, whether it was embedded, how many of its pixels the quality
+rule refused and why, and how deep the imagery was where it fell short. Every fill keeps it
+current, and a zone-year query takes about 1.7 seconds in-region, so use it to screen areas before
+committing to a read. Read `refused_px` alongside `embedded`, since a tile can be marked embedded
+and still be largely holes. [`registry.md`](registry.md) is the guide: the columns, example
+queries, the traps, and how it is maintained.
 
 ## Going deeper
 
+- The coverage registry beside the store: [`registry.md`](registry.md).
 - The model and the method: [`ucam-eo/tessera`](https://github.com/ucam-eo/tessera), the
   University of Cambridge repository and papers.
 - One area versus the whole world, and when to use which:

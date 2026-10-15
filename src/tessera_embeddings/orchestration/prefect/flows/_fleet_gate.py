@@ -1,8 +1,8 @@
 """Fleet-wide concurrency gates that HOLD when their limit is lowered below what they need.
 
-The campaign is throttled by two named Prefect global concurrency limits — one bounding how many
-zone ingests run at once, one bounding simultaneous commits. Both are acquired through
-:class:`FleetGate`.
+The campaign bounds how many zone ingests run at once with a named Prefect global concurrency
+limit, acquired through :class:`FleetGate`. A second limit is only read, as the inference pause
+flag (:func:`pause_signal`).
 
 **Why this exists rather than a bare ``concurrency()`` call.** Prefect's server refuses a request
 for more slots than a limit holds with ``422``, a client error the acquisition service does not
@@ -116,14 +116,11 @@ def gate_is_holding(exc: BaseException) -> bool:
 class FleetGate(AbstractContextManager):
     """One slot of a named Prefect global concurrency limit, held for the ``with`` body.
 
-    THREAD-SAFE: the active context lives in a per-thread stack rather than an instance slot. One
-    gate object is shared between a chained fill's feeder thread (terminal plans commit inside
-    ``plan``) and its trailing-assembly thread, and an instance slot would let a concurrent enter
-    overwrite the other thread's context and release the wrong slot on exit.
+    THREAD-SAFE: the active context lives in a per-thread stack rather than an instance slot, so a
+    gate shared across threads always releases the slot its own thread acquired.
 
     ``strict=True`` on every acquisition: an absent or misspelled limit must fail closed. Prefect
-    defaults to warning and proceeding UNGATED, which would silently reintroduce exactly the
-    contention these gates bound.
+    defaults to warning and proceeding UNGATED, which would silently lift the bound the gate is for.
     """
 
     def __init__(

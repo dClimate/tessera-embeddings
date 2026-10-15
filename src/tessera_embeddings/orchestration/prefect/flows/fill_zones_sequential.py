@@ -987,6 +987,8 @@ def fill_zones_sequential_flow(
                 run_id=run_id,
                 get_credentials=iam_icechunk_credentials,
                 s3_region=s3_region,
+                # A retagged cell's master is caught up in planning, in case its fill died before that.
+                registry_root=paths.optical_registry(store_path),
             ),
         )
 
@@ -1193,6 +1195,8 @@ def fill_zones_sequential_flow(
             run_id=prep.run_id,
             get_credentials=iam_icechunk_credentials,
             s3_region=s3_region,
+            # A cell this session finds already landed has its master caught up here, as triage's do.
+            registry_root=paths.optical_registry(store_path),
         )
 
     # The shared stream session: ONE set of actors for EVERY zone in the cluster, whatever orbit

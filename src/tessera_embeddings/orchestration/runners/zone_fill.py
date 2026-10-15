@@ -35,6 +35,11 @@ crash landed the fill untagged. Zone-year tags are permanent — icechunk forbid
 even a deleted tag name — so a deliberate refill keeps the old tag on the old snapshot and
 must pin its new snapshot under a fresh, manually chosen name; campaign history is never
 silently rewritten.
+
+Once a cell with live tiles has committed and published its registry part, and before it is
+tagged, its parts are merged into the registry's ``master/`` file for the cell
+(:func:`_merge_registry_master`), best-effort, so the registry consumers read is current as each
+cell lands — including a deliberate refill, which fails at the tag step by design.
 """
 
 from __future__ import annotations
@@ -46,6 +51,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, cast
 
+import fsspec
 import icechunk
 import numpy as np
 import zarr
@@ -67,9 +73,11 @@ from tessera_embeddings.inference.data_loading import _active_orbits
 from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.storage.campaign import mark_zone_year_empty, tag_zone_year, zone_year_tag
 from tessera_embeddings.storage.global_store import check_destination_types, open_global_repo
+from tessera_embeddings.storage.published_store import calendar_years, live_shards, shard_writes, store_year
+from tessera_embeddings.storage.registry_master import merge_cell
 from tessera_embeddings.storage.shard_writer import read_years_complete, shard_pitch
 from tessera_embeddings.storage.time_axis import time_index_of, year_timestamp
-from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group
+from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group, plain_zarr_storage_options
 from tessera_embeddings.storage.zone_grid import PIXEL_M, canonicalize_zone, tile_row_latitudes
 from tessera_embeddings.storage.zone_grid import zone as zone_spec
 
@@ -316,6 +324,76 @@ def _check_assembly_workers(n: int | None) -> None:
         raise ValueError(f"n_assembly_workers must be >= 1 when set, got {n}")
 
 
+def _merge_registry_master(
+    registry_root: str | None,
+    store_path: str,
+    zone: str,
+    year: int,
+    run_id: str | None,
+    *,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None,
+    s3_region: str | None,
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+) -> None:
+    """Merge the part assembly just published into the cell's ``master/`` file. Never raises.
+
+    This is what keeps the master current: every fill merges its cell's parts into the cell's
+    existing master file, tile by tile
+    (:func:`~tessera_embeddings.storage.registry_master.merge_cell`), so a refill, a new year or
+    an update of some tiles reaches consumers as it lands. Called before the tag, because a deliberate refill
+    fails at the tag step once its data and part have landed. Best-effort for the reason
+    ``publish_registry_part`` is: the cell has committed, and a registry failure must not fail it
+    or keep it from being tagged. A failure —
+    including ``run_id``'s own part never having published, which would otherwise rewrite the master
+    from the older runs and report success — is logged loudly and leaves the cell stale.
+    ``rebuild_registry_measurements.py repair --zones`` rebuilds it once the part exists.
+
+    A retry of a cell that already landed runs it again with no ``run_id`` (:func:`plan_zone_inference`):
+    a process that died between the commit and this merge would otherwise leave the master stale
+    for good, since the retry skips the fill.
+
+    The store's live shards for the year are compared with the master's embedded tiles on the way,
+    from the manifests alone, and a disagreement is logged at ERROR: no run removes a tile it did
+    not write, so a shard cleared by hand would otherwise leave the master describing it. The
+    store's run record is checked against the cell's parts too (``store_disagreements``), which
+    refuses the update when a run that wrote the year has no part to describe its tiles.
+    """
+    if not registry_root:
+        return
+    try:
+        credentials = _store_credentials(store_path, get_credentials)
+        repo = open_global_repo(store_path, get_credentials=credentials, region=s3_region)
+        session = repo.readonly_session(branch="main")
+        node = cast(zarr.Group, zarr.open_group(session.store, mode="r")[zone])
+        live = live_shards(session, zone).get(calendar_years(node).index(year), frozenset())
+        # The registry sits beside the store, in its bucket, so the store's credential writes it.
+        fs, _ = fsspec.url_to_fs(
+            registry_root, **(plain_zarr_storage_options(registry_root, credentials, s3_region) or {})
+        )
+        disagreements = merge_cell(
+            fs,
+            registry_root,
+            zone,
+            year,
+            run_id=run_id,
+            live=live,
+            store=lambda: store_year(repo, node, zone, year, shard_writes(repo)),
+        )
+    except Exception:
+        log.exception(
+            "Zone %s year %d: registry master NOT merged. The cell is committed, but master/ — what "
+            "consumers read — still describes it as it was before this fill. Repair, once the cause "
+            "above is resolved: scripts/maintenance/rebuild_registry_measurements.py repair --zones %s --write",
+            zone,
+            year,
+            zone,
+        )
+        return
+    for disagreement in disagreements:
+        log.error("Zone %s year %d: registry master and store disagree — %s", zone, year, disagreement)
+    log.info("Zone %s year %d: registry master merged", zone, year)
+
+
 def fill_zone_year(
     *,
     store_path: str,
@@ -400,6 +478,7 @@ def fill_zone_year(
         s3_region=s3_region,
         on_actor_retire=on_actor_retire,
         on_fleet_demand=on_fleet_demand,
+        registry_root=registry_root,
     )
     return assemble_zone_year(
         handoff,
@@ -496,6 +575,7 @@ def plan_zone_inference(
     run_id: str | None = None,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
+    registry_root: str | None = None,
 ) -> ZonePlan:
     """Validate a (zone, year) cell and enumerate its live tiles — no GPU work.
 
@@ -503,6 +583,10 @@ def plan_zone_inference(
     validation, the coverage-mask read (with identity checks), the live-tile enumeration, and
     the mosaic grid asserts. Terminal cells — already complete (retagged here) or all-ocean
     (marked complete empty, committed and tagged here) — come back with ``ZonePlan.done`` set.
+
+    A cell that already landed also has its registry master merged again (``registry_root``;
+    :func:`_merge_registry_master`). Every retry of a landed cell is planned, by every runner, so
+    this is the one place a run that died between its commit and its merge is caught up.
     """
     t0 = time.monotonic()
     run_id = run_id or uuid.uuid4().hex[:12]
@@ -569,6 +653,9 @@ def plan_zone_inference(
             snapshot = repo.lookup_branch("main")
             tag_zone_year(repo, zone, year, snapshot_id=snapshot)
             log.info("Zone %s year %d landed but was untagged (crash before tag) — tagged %s", zone, year, tag)
+        _merge_registry_master(
+            registry_root, store_path, zone, year, None, get_credentials=get_credentials, s3_region=s3_region, log=log
+        )
         result = {
             "zone": zone,
             "year": year,
@@ -759,6 +846,7 @@ def infer_zone_year(
     on_actor_retire: Callable[[str], None] | None = None,
     on_fleet_demand: Callable[[int], None] | None = None,
     retire_idle_actors: bool = True,
+    registry_root: str | None = None,
 ) -> ZoneFillHandoff:
     """Inference phase of a (zone, year) fill: plan → run_inference.
 
@@ -785,6 +873,7 @@ def infer_zone_year(
         run_id=run_id,
         get_credentials=get_credentials,
         s3_region=s3_region,
+        registry_root=registry_root,
     )
     return (
         complete_zone_inference(plan, results=None)
@@ -908,7 +997,7 @@ def assemble_zone_year(
     skipped), tags the landed commit, and cleans up staging. Opens its own repo/writer
     connections so the sequential multi-zone runner can run it on a trailing thread while the
     caller's thread starts the next cell's inference. A terminal handoff (``done`` set) passes
-    straight through.
+    straight through: :func:`plan_zone_inference` already caught up a landed cell's master.
 
     ``fault`` is the supervised-drill hook, forwarded to the assembly call on both the data
     and the all-skipped path so the drill does not depend on which one a cell takes. Inert
@@ -980,6 +1069,18 @@ def assemble_zone_year(
                 log=log,
                 fault=fault,
                 input_coverage=input_coverage,
+            )
+            # Before the tag, not after it: a deliberate refill FAILS at the tag step by design,
+            # once its data and part have landed, and the master must still learn of it.
+            _merge_registry_master(
+                registry_root,
+                store_path,
+                zone,
+                year,
+                run_id,
+                get_credentials=get_credentials,
+                s3_region=s3_region,
+                log=log,
             )
         else:
             # No live tiles at all: nothing was ever written here, so there is nothing to
@@ -1069,6 +1170,10 @@ def assemble_zone_year(
         log=log,
         fault=fault,
         input_coverage=input_coverage,
+    )
+    # Before the tag, as on the all-refused branch: a deliberate refill fails at the tag step.
+    _merge_registry_master(
+        registry_root, store_path, zone, year, run_id, get_credentials=get_credentials, s3_region=s3_region, log=log
     )
     repo = open_global_repo(
         store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
