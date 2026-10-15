@@ -67,7 +67,7 @@ and otherwise does nothing. To run another update, choose a new name.
 
 | mode | what runs on the GPU | what is written | use it for |
 |---|---|---|---|
-| `holes` (the default) | only the holes | the holes, in all the embedding arrays; every other pixel keeps its exact values | new imagery, an outage, pixels a looser rule now admits |
+| `holes` (the default) | only the holes | the holes, in all the embedding arrays; every other pixel keeps its exact values | new imagery, an outage, pixels a lowered depth rule now admits (see "Before step 1" below) |
 | `shards` | every pixel of each chosen tile | each chosen tile, whole | a fix to ingest or inference, where existing values are wrong |
 
 If nothing new can be embedded in a chosen tile, that tile is left as it was.
@@ -143,6 +143,31 @@ repo = open_global_repo(
 root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
 print(root["18S"].attrs["years_complete"])  # the years of zone 18S that are filled, e.g. [2023, 2024]
 ```
+
+### Before step 1, only when lowering the depth rule
+
+A global store has a depth rule, `optical_min_obs`: the minimum number of valid optical (Sentinel-2)
+observations a pixel needs in its year to be embedded. Pixels below it were left as holes, and the
+registry counts them as `thin`. To embed them, lower the rule first, then plan a `holes` update of
+the tiles with thin pixels.
+
+1. **Check that no fill is running in the zones you will change**, in the Prefect UI. A
+   `run-global-campaign` or `fill-zones-sequential` run already working there would stop at its
+   next zone-year, because the rule it started with no longer matches the store.
+2. **Lower the rule,** for the whole store or, with `--zones`, for some zones. `--line` is the new
+   minimum. The rule can only go down, and each value given up is kept in the store's history. The
+   first command is a dry run that prints each rule before and after; the second writes it:
+
+   ```bash
+   python scripts/update/loosen_optical_min_obs.py --store s3://my-outputs/global/tessera.icechunk --line 1 --zones 18S,19S
+   python scripts/update/loosen_optical_min_obs.py --store s3://my-outputs/global/tessera.icechunk --line 1 --zones 18S,19S --write
+   ```
+
+3. **Plan as in step 1, with `--refused thin` and the same `--zones`.** A zone still at the old rule
+   would run its holes again and leave them empty.
+
+After the update, the registry rows of the updated tiles show the new `optical_min_obs` and
+`refused_thin_px = 0`, and running the same plan command again selects nothing.
 
 ### 1. Choose the tiles and write the plan
 
@@ -260,29 +285,6 @@ The registry rows of the tiles the update wrote now carry its name in `update_na
 The tile comparison prints more than `set()` in two cases, both expected: a zone-year planned with a
 blank `tile` lists none of its tiles in `planned`, and anything another writer committed between the
 two tags appears in `changed`.
-
-### Filling pixels a looser rule now admits
-
-A global store has a depth rule, `optical_min_obs`: a pixel needs at least that many valid optical
-observations in its year to be embedded. Pixels below the rule were left empty, and the registry
-counts them as `thin`. To embed them, lower the rule first, then run a `holes` update over the tiles
-with thin pixels.
-
-1. **Lower the rule**, for the whole store or for some zones. It can only go down, and each value
-   given up is kept in the store's history:
-
-   ```bash
-   python scripts/update/loosen_optical_min_obs.py --store s3://my-bucket/tessera.icechunk --line 1 --zones 18S,19S
-   python scripts/update/loosen_optical_min_obs.py --store s3://my-bucket/tessera.icechunk --line 1 --zones 18S,19S --write
-   ```
-
-   The first command is a dry run that prints each rule before and after. Lower it while no fill is
-   running in those zones: a fill already running there stops at its next zone-year, because the
-   rule it started with no longer matches the store.
-2. **Plan with `--refused thin` and the same `--zones`** (step 1). A zone still at the old rule would
-   re-infer its holes and leave them empty again.
-3. **Run and check it** as in steps 2 and 3. The registry rows of the updated tiles then show the new
-   `optical_min_obs` and `refused_thin_px = 0`, and the same plan command selects nothing.
 
 ### 4. Clean up
 

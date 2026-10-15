@@ -60,7 +60,7 @@ rest of the store keeps its own.
 thin-refused pixel is a hole, so `holes` infers exactly the newly eligible pixels and merges them;
 an embedded pixel is never touched. Each cell's `updates[year]` record carries the
 `optical_min_obs` the update applied, and each registry row its own. The steps are in
-[`docs/updates.md`](../../docs/updates.md) ("Filling pixels a looser rule now admits"): loosen, plan with `plan_update.py from-registry --mode holes --refused thin`
+[`docs/updates.md`](../../docs/updates.md) ("Before step 1, only when lowering the depth rule"): loosen, plan with `plan_update.py from-registry --mode holes --refused thin`
 over the same zones, run, and check that the updated rows say `optical_min_obs = 1` and
 `refused_thin_px = 0` and that the same plan now selects nothing.
 

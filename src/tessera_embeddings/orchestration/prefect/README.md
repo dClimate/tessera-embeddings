@@ -331,8 +331,8 @@ Run one update per cell at a time: two updates of one cell conflict on its chunk
 A store's minimum optical depth rule moves only down, for the whole store or for named zones, and a
 `holes` update then embeds exactly the pixels the looser line admits
 ([ADR 028](../../../../context_docs/decisions/028-embed-every-pixel-with-an-optical-observation.md)).
-The steps are in [`docs/updates.md`](../../../../docs/updates.md) ("Filling pixels a looser rule now
-admits"). Every fill reads its zone's rule from the store, and a chained fill already running in a
+The steps are in [`docs/updates.md`](../../../../docs/updates.md) ("Before step 1, only when lowering the depth
+rule"). Every fill reads its zone's rule from the store, and a chained fill already running in a
 zone refuses its next cell there once the rule changes, so loosen between runs.
 
 ## Master pipeline
