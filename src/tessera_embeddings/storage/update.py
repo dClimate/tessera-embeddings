@@ -127,8 +127,6 @@ class UpdateTarget:
     holes: str
     #: Target shards planning found nothing to do in — no holes — so they are kept untouched.
     kept: tuple[str, ...] = ()
-    #: The plan's own depth rule; ``None`` applies the store's (:func:`applied_optical_min_obs`).
-    optical_min_obs: int | None = None
 
 
 @dataclass(frozen=True)
@@ -146,7 +144,8 @@ class UpdatePlan:
     #: threshold is low: a small cloudy ROI can lack a valid date in a month a zone never did.
     allow_partial_window: bool = True
     #: A depth rule looser than the store root's, for this plan's cells only, e.g. 1 to embed the
-    #: pixels an older line refused as thin. ``None`` applies the store's own.
+    #: pixels an older line refused as thin. ``None`` applies the store's own. Only the flow reads
+    #: it, into the run's config, so no runner holds a copy it could fail to apply.
     optical_min_obs: int | None = None
     source: str = ""
     created_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
@@ -205,7 +204,6 @@ class UpdatePlan:
             mask_name=self.mask_name,
             tiles=None if tiles is None else frozenset(tiles),
             holes=holes_prefix(root, *parse_cell_key(key)),
-            optical_min_obs=self.optical_min_obs,
         )
 
     def to_json(self) -> str:

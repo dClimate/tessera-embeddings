@@ -325,20 +325,22 @@ def test_an_unusable_assembly_worker_override_is_refused_before_inference(tmp_pa
 
 
 @pytest.mark.parametrize(
-    ("root_rule", "update_line", "config_rule", "refused"),
+    ("root_rule", "is_update", "config_rule", "refused"),
     [
-        (None, None, 25, "advertises"),
-        (None, None, None, None),
-        (15, 1, 1, None),
-        (15, 1, 15, "advertises"),
-        (15, 20, 20, "only loosen"),
+        (None, False, 25, "advertises"),
+        (None, False, None, None),
+        (15, False, 1, "advertises"),
+        (15, True, 1, None),
+        (15, True, None, "advertises"),
+        (15, True, 20, "only loosen"),
+        (None, True, 1, "only loosen"),
     ],
 )
-def test_the_runner_applies_only_the_stores_rule_or_an_updates_looser_line(
-    tmp_path, root_rule, update_line, config_rule, refused
+def test_the_runner_applies_only_the_stores_rule_or_an_updates_looser_one(
+    tmp_path, root_rule, is_update, config_rule, refused
 ):
-    """The STORE is the authority on what rule a cell is filled under — the root's, or a looser line
-    an update's plan sets for its own cells — not the caller's config.
+    """The STORE is the authority on what rule a cell is filled under, not the caller's config: a
+    fill applies the root's rule exactly, and an update may apply a looser one but never a stricter.
 
     The Prefect adapter reads the store and substitutes the value before calling. This runner
     is the orchestrator-agnostic entry point: trusting the config, a direct call would fill
@@ -347,9 +349,7 @@ def test_the_runner_applies_only_the_stores_rule_or_an_updates_looser_line(
     substituted, so a direct caller never believes it configured a line it had not.
     """
     store = _seed_global_with_rule(tmp_path, root_rule)
-    update = None
-    if update_line is not None:
-        update = UpdateTarget("u", "holes", "keep", "global", None, "h", optical_min_obs=update_line)
+    update = UpdateTarget("u", "holes", "keep", "global", None, "h") if is_update else None
     config = InferenceConfig(time_window=_WINDOW, chunk_size=_TILE, num_gpus=0, optical_min_obs=config_rule)
     # A config that clears the check still fails LATER (the cell is unfilled, the mask absent),
     # which proves the check passed rather than short-circuited.
@@ -371,7 +371,7 @@ def _record_updates(store: str, *lines: tuple[str, int]) -> None:
 
 def _update_at(tmp_path, store: str, name: str, line: int | None):
     config = InferenceConfig(time_window=_WINDOW, chunk_size=_TILE, num_gpus=0, optical_min_obs=line or 15)
-    update = UpdateTarget(name, "shards", "keep", "global", None, "h", optical_min_obs=line)
+    update = UpdateTarget(name, "shards", "keep", "global", None, "h")
     return _fill(tmp_path, store, config=config, update=update)
 
 

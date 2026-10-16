@@ -639,22 +639,24 @@ def plan_zone_inference(
     node = cast(zarr.Group, root[zone])
 
     # The store's minimum-depth rule is part of its write-once root identity, so the store —
-    # not this call's config — is the authority on what rule its zones are filled under; only an
-    # update's plan may loosen it, for that update's cells. The Prefect adapter substitutes that
-    # value into the config before calling; this ASSERTS it rather than trusting it, so the domain
-    # API is safe to call directly. Free: `root` is already open above. A check and not a
-    # substitution, deliberately: silently replacing a caller's value would let a direct caller
-    # believe it had configured a line it had not, the same class of surprise as the gap it closes.
+    # not this call's config — is the authority on what rule its zones are filled under. A fill
+    # applies exactly that rule. An update may apply a looser one, which its flow takes from the
+    # plan and checks before any ingest; the runner sees only the config. The Prefect adapter
+    # substitutes the value into the config before calling; this ASSERTS it rather than trusting
+    # it, so the domain API is safe to call directly. Free: `root` is already open above. A check
+    # and not a substitution, deliberately: silently replacing a caller's value would let a direct
+    # caller believe it had configured a line it had not, the same class of surprise as the gap it
+    # closes.
     raw_rule = root.attrs.get("optical_min_obs")
     store_rule = int(cast("int", raw_rule)) if raw_rule is not None else None
-    rule = store_rule if update is None else applied_optical_min_obs(store_rule, update.optical_min_obs)
+    rule = store_rule if update is None else applied_optical_min_obs(store_rule, config.optical_min_obs)
     if config.optical_min_obs != rule:
         raise ValueError(
-            f"This fill would apply optical_min_obs={config.optical_min_obs!r} to {zone}-{year}, but "
-            f"{store_path} advertises {store_rule!r} and this run must apply {rule!r}. Filling one "
-            "zone under a different line than the store states is undetectable afterwards, because a "
-            "refused pixel is indistinguishable from one with no optical input. Pass that value, or "
-            "plan an update with a looser line of its own (plan_update.py --optical-min-obs)."
+            f"This run would apply optical_min_obs={config.optical_min_obs!r} to {zone}-{year}, but "
+            f"{store_path} advertises {store_rule!r}. Filling one zone under a different line than the "
+            "store states is undetectable afterwards, because a refused pixel is indistinguishable from "
+            "one with no optical input. Pass the store's value, or plan an update with a looser line of "
+            "its own (plan_update.py --optical-min-obs)."
         )
     # Validate the year BEFORE any expensive work: assemble_global re-checks,
     # but hitting that check after hours of GPU inference would be brutal.

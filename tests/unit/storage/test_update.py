@@ -30,8 +30,7 @@ def test_a_plan_round_trips_and_normalises_its_cells():
     assert plan.cells == {"14N/2019": ("chunk_0_1", "chunk_1_2"), "15S/2020": None}
     assert upd.UpdatePlan.from_json(plan.to_json()) == plan
     assert plan.cell_list(zones=["14N"]) == [("14N", 2019)]
-    target = plan.target("15S", 2020, root="s3://b/updates/fix-1")
-    assert (target.holes, target.optical_min_obs) == ("s3://b/updates/fix-1/holes/15S/2020", 1)
+    assert plan.target("15S", 2020, root="s3://b/updates/fix-1").holes == "s3://b/updates/fix-1/holes/15S/2020"
 
 
 @pytest.mark.parametrize(

@@ -30,10 +30,13 @@ an absent rule as none and would refuse the next append to every existing single
 
 **A filled store's rule never moves; an update carries its own, looser line.** The root's
 `optical_min_obs` stays write-once. An update plan may set `optical_min_obs`
-(`plan_update.py --optical-min-obs 1`), and that line holds for the plan's cells only: the fill
-applies it in place of the root's (`storage/update.applied_optical_min_obs`), the runner asserts
-it, and every cell of the run takes the same line through the run's config. A line stricter than
-the store's is refused, as is any line on a store that declares no rule.
+(`plan_update.py --optical-min-obs 1`), and that line holds for the plan's cells only. The line
+lives in the plan alone: the flow reads it once, during triage and before any ingest or GPU, checks
+it (`storage/update.applied_optical_min_obs`, `check_no_tightening`), and puts it in the run's
+config, which every cell takes. No runner holds a copy it could fail to apply; the runner checks its
+config against the store again for direct callers. Refused: a line stricter than the store's, any
+line on a store that declares no rule, and a line stricter than an earlier update used on the same
+zone-year. A single-area update cannot carry a line, since single-area stores keep no rule.
 
 **The store's attrs then understate an updated cell, and that is accepted** (Robert, 2026-10-15).
 The root says 15 while an updated 2024 cell holds pixels with 1–14 observations. Writing the new
@@ -41,9 +44,9 @@ line onto a zone group instead would misdescribe that zone's other years, and on
 zone. The truth is kept per cell and per tile: each `updates[year]` record states the line its
 update applied, each registry row its own, and `storage/update.cell_optical_min_obs` returns the
 loosest line any write to a cell applied, the floor every pixel embedded there meets. It is not a
-promise of coverage: an update may reach only some of a cell's tiles. A later update may not apply
-a stricter line to a cell than an earlier one did; the runner refuses it, since a `shards` rewrite
-would drop the pixels the earlier update embedded and a `holes` merge would count them as thin.
+promise of coverage: an update may reach only some of a cell's tiles. It is also why a later
+update may not tighten a cell: a `shards` rewrite would drop the pixels an earlier update embedded,
+and a `holes` merge would count them as thin.
 
 **Looser only**, because a looser line leaves every embedded pixel compliant and makes every newly
 eligible pixel identifiable in the store as `isnan(scales) & (s2_obs_count >= line)`. A stricter one
