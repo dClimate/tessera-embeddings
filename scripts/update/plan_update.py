@@ -16,6 +16,10 @@ An update re-runs chosen shards of zone-years the campaign has already filled
 * ``from-cells``: a CSV of ``zone,year,tile`` rows, a blank ``tile`` meaning every live shard. Any
   other selection is a CSV, built however you like.
 
+``--optical-min-obs`` gives the update a minimum optical depth looser than the store's, for its own
+cells only (ADR 028): ``--mode holes --refused thin --optical-min-obs 1`` embeds every pixel an older
+line refused as thin. The store's attrs keep its own rule; each cell's update record states this one.
+
 Before anything is written the plan is checked against its mask: a zone the mask lacks, or a shard
 outside a zone's grid, refuses; shards the mask holds dead are reported, since the fill drops them.
 """
@@ -77,6 +81,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--inputs", required=True, help="the deployment's inputs URI (BucketPaths.inputs)")
     parser.add_argument("--mask", default="global", help="land-mask name (BucketPaths.land_mask_store)")
     parser.add_argument("--on-skip", default="keep", choices=["keep", "clear"])
+    parser.add_argument(
+        "--optical-min-obs", type=int, help="a depth rule looser than the store's, for this update only"
+    )
     parser.add_argument("--registry", help="from-registry: the registry root (beside the store)")
     parser.add_argument("--anonymous", action="store_true", help="from-registry: read a public registry unsigned")
     parser.add_argument(
@@ -90,7 +97,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--write", action="store_true", help="save the plan; without it this is a dry run")
     args = parser.parse_args(argv)
 
-    fields: dict[str, Any] = {"mask_name": args.mask, "on_skip": args.on_skip}
+    fields: dict[str, Any] = {"mask_name": args.mask, "on_skip": args.on_skip, "optical_min_obs": args.optical_min_obs}
     if args.source == "from-registry":
         if not args.registry:
             parser.error("from-registry needs --registry")
@@ -122,6 +129,7 @@ def main(argv: list[str] | None = None) -> int:
             f"{row['cell']:>10}  {row['planned']:>6} planned  {row['live']:>6} live  {row['dead']:>6} dead in the mask"
         )
     print(f"{len(report)} zone-year(s), {sum(r['live'] for r in report)} live tile(s) to update")
+    print("Optical depth rule:", plan.optical_min_obs or "the store's own")
     # The runner refuses to clear a tile the mask has no land in, and a written plan cannot be redone.
     if plan.on_skip == "clear" and (dead := [r["cell"] for r in report if r["dead"]]):
         raise SystemExit(f"A clearing plan cannot target shards dead in the mask, as in {dead}; leave them out")

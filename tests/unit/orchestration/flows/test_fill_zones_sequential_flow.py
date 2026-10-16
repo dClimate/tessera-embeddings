@@ -10,6 +10,7 @@ provisioned once with the idle-timeout override.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import threading
 import time
@@ -199,7 +200,14 @@ class TestAnUpdate:
         }
         monkeypatch.setattr(mod, "update_states", lambda repo, name, cells: {c: states[c] for c in cells})
         monkeypatch.setattr(mod, "zone_year_complete", lambda *a, **k: pytest.fail("an update must never retag"))
-        wired["tiles"], wired["ingests"], wired["finished"] = {}, [], []
+        wired["tiles"], wired["ingests"], wired["finished"], wired["tightening"] = {}, [], [], []
+        monkeypatch.setattr(
+            mod,
+            "check_no_tightening",
+            lambda repo, name, rule, cells: wired["tightening"].append(
+                (name, rule, list(cells), len(wired["ingests"]))
+            ),
+        )
         monkeypatch.setattr(mod, "finish_update", lambda repo, plan: wired["finished"].append(plan.name) or "t")
 
         def count(mask, zone, **k):
@@ -245,9 +253,36 @@ class TestAnUpdate:
         assert first != second
         assert second == f"{_PATHS.update_staging('u1', _PATHS.global_store('other'))}/04N/2025"
 
+    def test_a_stricter_line_is_checked_before_any_ingest(self, update_wired, monkeypatch):
+        """Only the cells still pending, at the run's own rule, and before a single ingest is dispatched."""
+        monkeypatch.setattr(mod, "_optical_min_obs_from_store", lambda *a, **k: 15)
+        _run(cells=None, update="u1")
+        [(name, rule, cells, ingests_before)] = update_wired["tightening"]
+        assert (name, rule, cells, ingests_before) == ("u1", 15, [("01N", 2025), ("04N", 2025)], 0)
+
     def test_a_cell_outside_the_plan_is_refused(self, update_wired):
         with pytest.raises(ValueError, match="not in update 'u1'"):
             _run(cells=[("09N", 2025)], update="u1")
+
+    @pytest.mark.parametrize(("line", "applied"), [(None, 15), (1, 1)])
+    def test_the_plans_own_line_reaches_the_config_and_the_fingerprint(self, update_wired, monkeypatch, line, applied):
+        """The store root stays at 15: an update planned at 1 fills its cells at 1, and stages them
+        apart from a run at 15; a plan without a line applies the store's.
+        """
+        plan = dataclasses.replace(self.PLAN, optical_min_obs=line)
+        monkeypatch.setattr(mod, "load_update", lambda paths, name, mask_name: plan)
+        monkeypatch.setattr(mod, "_optical_min_obs_from_store", lambda *a, **k: 15)
+        fingerprinted: list[int] = []
+
+        def fingerprint(zone, year, **k):
+            fingerprinted.append(k["optical_min_obs"])
+            return f"{zone}-{year}-fingerprint"
+
+        monkeypatch.setattr(mod, "_staging_run_id", fingerprint)
+        _run(cells=None, update="u1")
+        prepare = update_wired["seq_kwargs"]["prepare"]
+        assert prepare(SimpleNamespace(zone="01N", year=2025, num_actors=5)).config.optical_min_obs == applied
+        assert set(fingerprinted) == {applied}
 
 
 class TestPerCellValidation:

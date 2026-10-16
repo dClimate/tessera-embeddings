@@ -341,7 +341,8 @@ def _write_update(
     target, chunks = planned.target, planned.chunks
     staged = sorted(str(r["chunk"]) for r in results if r["status"] == "success")
     kept = sorted({*target.kept, *(c.label for c in chunks if c.label not in staged)})
-    record = update_record(target, run_id=run_id, written=staged, kept=kept)
+    # The single-area path applies no depth rule (ADR 028), so none is recorded.
+    record = update_record(target, run_id=run_id, written=staged, kept=kept, optical_min_obs=None)
     repo = open_global_repo(output_path)
     pin_tag(repo, base_tag(target.name))  # the store as it was, to compare against or roll back to
     if not staged:

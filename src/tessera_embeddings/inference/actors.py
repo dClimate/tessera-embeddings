@@ -1137,9 +1137,9 @@ class InferenceActor:
             # No optical-free count is needed — that case IS the skip, and a skipped chunk never reaches here.
             s2_at_embedded = obs_buffers["s2_obs_count"][embedded]
             # The rule this RUN applied, not the module default. The dataset gates on `config.optical_min_obs`, which
-            # comes from the store root, so counting against the constant would report a thin share measured by a line
-            # the fill never used — and would read as a non-zero count on a store whose rule already refuses every
-            # pixel it names.
+            # comes from the store root or an update's plan, so counting against the constant would report a thin
+            # share measured by a line the fill never used — and would read as a non-zero count on a store whose rule
+            # already refuses every pixel it names.
             thin_below = self.config.optical_min_obs or OPTICAL_MIN_OBS
             s2_thin_px = int((s2_at_embedded < thin_below).sum())
             del embedded, obs_at_embedded, s2_at_embedded

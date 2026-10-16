@@ -105,7 +105,14 @@ from tessera_embeddings.orchestration.runners.zone_fill import (
 )
 from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.object_store import delete_prefix
-from tessera_embeddings.storage.update import check_radar_policy, finish_update, load_update, update_states
+from tessera_embeddings.storage.update import (
+    applied_optical_min_obs,
+    check_no_tightening,
+    check_radar_policy,
+    finish_update,
+    load_update,
+    update_states,
+)
 from tessera_embeddings.storage.zone_grid import canonicalize_zone
 
 if TYPE_CHECKING:
@@ -943,10 +950,15 @@ def fill_zones_sequential_flow(
         whose cells all settle in triage — a retag, an empty mark, an all-ocean zone — must not
         touch the store at all, and reading at flow start makes every such path need a live repo.
         """
-        value = _optical_min_obs_from_store(store_path, get_credentials=iam_icechunk_credentials, s3_region=s3_region)
+        store_rule = _optical_min_obs_from_store(
+            store_path, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+        )
+        # An update's plan may loosen it for the update's own cells (ADR 028).
+        value = applied_optical_min_obs(store_rule, plan.optical_min_obs if plan is not None else None)
         log.info(
-            "Optical depth rule for this fill, from the store root: %s",
+            "Optical depth rule for this fill: %s (the store root's: %s)",
             value if value is not None else "no rule",
+            store_rule if store_rule is not None else "no rule",
         )
         return value
 
@@ -991,6 +1003,15 @@ def fill_zones_sequential_flow(
         if plan is not None
         else {}
     )
+    if plan is not None:
+        # Before any ingest or cluster: a line stricter than an earlier update used in a pending
+        # cell would otherwise fail in the runner only once both were paid for.
+        check_no_tightening(
+            open_global_repo(store_path, get_credentials=store_credentials, region=s3_region),
+            plan.name,
+            _store_optical_min_obs(),
+            [cell for cell, state in states.items() if state == "pending"],
+        )
 
     def _finish(result: dict[str, Any]) -> dict[str, Any]:
         """Pin the update's complete tag once every planned cell holds its record, whichever run lands last."""

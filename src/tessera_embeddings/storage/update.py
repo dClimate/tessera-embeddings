@@ -25,11 +25,19 @@ the ingest ROI (``rois/<zone>/<year>.zarr``), the mosaics (``mosaics/<zone>/<yea
 campaign's own, which it rewrites and sweeps (:meth:`BucketPaths.update_root`).
 
 **What the store records.** Each cell an update lands in gains one entry in its zone group's
-``updates`` attr, per year an append-only list of records naming the update, its run, its code and
-the shards it ``written``/``kept``/``cleared``. ``years_complete``, ``runs`` and the zone-year tags
-stay exactly as the original fill left them, so a cell's state is ``runs[year]`` with
-``updates[year]`` applied on top, in order. ``update-<name>-base`` pins the store before an update's
-first write and ``update-<name>-complete`` the store once every cell has landed.
+``updates`` attr, per year an append-only list of records naming the update, its run, its code,
+the depth rule it applied (``optical_min_obs``) and the shards it ``written``/``kept``/``cleared``.
+``years_complete``, ``runs`` and the zone-year tags stay exactly as the original fill left them,
+so a cell's state is ``runs[year]`` with ``updates[year]`` applied on top, in order.
+``update-<name>-base`` pins the store before an update's first write and ``update-<name>-complete``
+the store once every cell has landed.
+
+**Depth rule.** An update applies the store root's ``optical_min_obs`` unless its plan sets a looser
+line, which then holds for the plan's cells only (ADR 028): the root and the zone groups keep the
+store's rule, so they understate what an updated cell holds. Its update records state the truth:
+:func:`cell_optical_min_obs` reads back the floor every embedded pixel meets, and each tile's
+registry row its own line. A later update may not apply a stricter line to a cell than an earlier
+one did.
 """
 
 from __future__ import annotations
@@ -135,6 +143,10 @@ class UpdatePlan:
     #: Relaxes the ingest's every-month check to "non-empty". On by default for the same reason the
     #: threshold is low: a small cloudy ROI can lack a valid date in a month a zone never did.
     allow_partial_window: bool = True
+    #: A depth rule looser than the store root's, for this plan's cells only, e.g. 1 to embed the
+    #: pixels an older line refused as thin. ``None`` applies the store's own. Only the flow reads
+    #: it, into the run's config, so no runner holds a copy it could fail to apply.
+    optical_min_obs: int | None = None
     source: str = ""
     created_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
 
@@ -147,6 +159,8 @@ class UpdatePlan:
             raise ValueError(f"on_skip must be one of {get_args(OnSkip)}, got {self.on_skip!r}")
         if self.mode == "holes" and self.on_skip != "keep":
             raise ValueError("A holes update only adds pixels, so it has nothing to clear: use on_skip='keep'")
+        if self.optical_min_obs is not None and self.optical_min_obs < 1:
+            raise ValueError(f"optical_min_obs={self.optical_min_obs} refuses nothing; use a positive line")
         if not 0 < self.min_valid_coverage <= 100:
             raise ValueError(f"min_valid_coverage is a percentage in (0, 100], got {self.min_valid_coverage}")
         if not self.cells:
@@ -362,6 +376,54 @@ def read_updates(node: zarr.Group, year: int) -> list[dict[str, Any]]:
     return list(cast("dict[str, list[dict[str, Any]]]", raw).get(str(year), []))
 
 
+def applied_optical_min_obs(store_rule: int | None, line: int | None) -> int | None:
+    """The depth rule an update's cells are filled under: the plan's ``line``, else the store's ``store_rule``.
+
+    A plan's line may only be looser. A stricter one would leave pixels the store already holds below
+    the line its records state, so it is refused, as is any line on a store that declares no rule.
+    """
+    if line is None:
+        return store_rule
+    if store_rule is None or line > store_rule:
+        raise ValueError(f"An update may only loosen the store's depth rule ({store_rule!r}), not apply {line}")
+    return line
+
+
+def cell_optical_min_obs(root: zarr.Group, zone: str, year: int) -> int | None:
+    """The loosest depth rule any write to one cell applied: the store root's, or an update's below it.
+
+    A floor: every pixel embedded in the cell meets it, which the root's ``optical_min_obs`` alone
+    does not promise once an update used a lower line. It is not a promise of coverage, since an
+    update may have reached only some of the cell's tiles; each tile's own line is its registry
+    row's ``optical_min_obs``. ``None`` means the store declares no rule.
+    """
+    rule = root.attrs.get("optical_min_obs")
+    if rule is None:
+        return None
+    records = read_updates(cast(zarr.Group, root[zone]), year)
+    return min([int(cast("int", rule)), *(int(r["optical_min_obs"]) for r in records if r.get("optical_min_obs"))])
+
+
+def check_no_tightening(
+    repo: icechunk.Repository, name: str, rule: int | None, cells: Iterable[tuple[str, int]]
+) -> None:
+    """Refuse update ``name`` applying ``rule`` to a cell where an earlier update embedded pixels below it.
+
+    A ``shards`` rewrite would drop those pixels, and a ``holes`` merge would count them as thin.
+    Pass only the cells the update has yet to land in: rerunning one it already landed in writes nothing.
+    """
+    if rule is None:
+        return
+    root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
+    for zone, year in cells:
+        earlier = cell_optical_min_obs(root, zone, year)
+        if earlier is not None and rule > earlier:
+            raise ValueError(
+                f"Update {name!r} would apply optical_min_obs={rule} to {zone}-{year}, where an earlier "
+                f"update embedded pixels at {earlier}. Plan it with --optical-min-obs {earlier} or lower."
+            )
+
+
 def update_state(node: zarr.Group, year: int, name: str) -> UpdateState:
     """Where update ``name`` stands on one cell.
 
@@ -407,17 +469,23 @@ def update_record(
     run_id: str,
     written: Sequence[str],
     kept: Sequence[str],
+    optical_min_obs: int | None,
     cleared: Sequence[str] = (),
     radar_coverage: Mapping[str, Any] | None = None,
     input_coverage: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """One cell's record of an update: what it wrote, what it kept, and with which code."""
+    """One cell's record of an update: what it wrote, what it kept, under which depth rule and with which code.
+
+    ``optical_min_obs`` is the line the update judged its pixels against (``None``: no rule), which
+    differs from the original fill's when the plan set a looser one.
+    """
     record: dict[str, Any] = {
         "update": target.name,
         "mode": target.mode,
         "run_id": run_id,
         "assembled_at": datetime.now(UTC).isoformat(),
         "mask_name": target.mask_name,
+        "optical_min_obs": optical_min_obs,
         "written": sorted(written),
         "kept": sorted(kept),
         "cleared": sorted(cleared),

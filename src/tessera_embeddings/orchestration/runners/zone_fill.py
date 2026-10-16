@@ -84,7 +84,9 @@ from tessera_embeddings.storage.shard_writer import read_years_complete, shard_p
 from tessera_embeddings.storage.time_axis import time_index_of, year_timestamp
 from tessera_embeddings.storage.update import (
     UpdateTarget,
+    applied_optical_min_obs,
     base_tag,
+    check_no_tightening,
     check_radar_policy,
     commit_update_record,
     stage_hole_masks,
@@ -637,23 +639,25 @@ def plan_zone_inference(
     node = cast(zarr.Group, root[zone])
 
     # The store's minimum-depth rule is part of its write-once root identity, so the store —
-    # not this call's config — is the authority on what rule its zones were filled under. The
-    # Prefect adapter substitutes the store's value into the config before calling; this
-    # ASSERTS that rather than trusting it, so the domain API is safe to call directly. Free:
-    # `root` is already open above. A check and not a substitution, deliberately: silently
-    # replacing a caller's value would let a direct caller believe it had configured a line it
-    # had not, the same class of surprise as the gap it closes.
+    # not this call's config — is the authority on what rule its zones are filled under. A fill
+    # applies exactly that rule. An update may apply a looser one, which its flow takes from the
+    # plan and checks before any ingest; the runner sees only the config. The Prefect adapter
+    # substitutes the value into the config before calling; this ASSERTS it rather than trusting
+    # it, so the domain API is safe to call directly. Free: `root` is already open above. A check
+    # and not a substitution, deliberately: silently replacing a caller's value would let a direct
+    # caller believe it had configured a line it had not, the same class of surprise as the gap it
+    # closes.
     raw_rule = root.attrs.get("optical_min_obs")
     store_rule = int(cast("int", raw_rule)) if raw_rule is not None else None
-    if config.optical_min_obs != store_rule:
+    rule = store_rule if update is None else applied_optical_min_obs(store_rule, config.optical_min_obs)
+    if config.optical_min_obs != rule:
         raise ValueError(
-            f"This fill would apply optical_min_obs={config.optical_min_obs!r} to {zone}-{year}, but "
-            f"{store_path} advertises {store_rule!r}. The rule is part of the store's write-once root "
-            "identity: filling one zone under a different line than its neighbours is undetectable "
-            "afterwards, because a refused pixel is indistinguishable from one with no optical input. "
-            "Pass the store's value (None when it declares no rule), or seed a new store for a new rule."
+            f"This run would apply optical_min_obs={config.optical_min_obs!r} to {zone}-{year}, but "
+            f"{store_path} advertises {store_rule!r}. Filling one zone under a different line than the "
+            "store states is undetectable afterwards, because a refused pixel is indistinguishable from "
+            "one with no optical input. Pass the store's value, or plan an update with a looser line of "
+            "its own (plan_update.py --optical-min-obs)."
         )
-
     # Validate the year BEFORE any expensive work: assemble_global re-checks,
     # but hitting that check after hours of GPU inference would be brutal.
     if time_index_of(node, year_timestamp(year)) is None:
@@ -702,6 +706,10 @@ def plan_zone_inference(
             )
             result = {"zone": zone, "year": year, "run_id": run_id, "update": update.name, "already_recorded": True}
             return ZonePlan(zone=zone, year=year, run_id=run_id, t0=t0, summary={}, live=[], done=result, update=update)
+        # Nor may a pending update tighten what an earlier, looser update embedded here. The flows
+        # check this before any ingest; asserted again so a direct caller cannot skip it. After the
+        # recorded branch, so rerunning an update that already landed still works.
+        check_no_tightening(repo, update.name, rule, [(zone, year)])
     tag = zone_year_tag(zone, year)
     if update is None and year in read_years_complete(node):
         if tag in repo.list_tags():
@@ -827,7 +835,12 @@ def plan_zone_inference(
             # Nothing to infer is still an answer, and recording it is what stops the cell being
             # dispatched again. Never marked empty: the cell keeps everything it held.
             snapshot = commit_update_record(
-                repo, zone, year, record=update_record(update, run_id=run_id, written=[], kept=update.kept)
+                repo,
+                zone,
+                year,
+                record=update_record(
+                    update, run_id=run_id, written=[], kept=update.kept, optical_min_obs=config.optical_min_obs
+                ),
             )
             result = {**summary, "snapshot_id": snapshot, "elapsed_sec": time.monotonic() - t0}
             return ZonePlan(zone=zone, year=year, run_id=run_id, t0=t0, summary={}, live=[], done=result, update=update)
@@ -1352,6 +1365,7 @@ def _assemble_update(
         run_id=run_id,
         written=sorted(staged),
         kept=sorted({*update.kept, *([] if cleared else skipped)}),
+        optical_min_obs=optical_min_obs,
         cleared=cleared,
         radar_coverage=radar_coverage,
         input_coverage=input_coverage,

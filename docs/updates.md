@@ -68,7 +68,7 @@ and otherwise does nothing. To run another update, choose a new name.
 
 | mode | what runs on the GPU | what is written | use it for |
 |---|---|---|---|
-| `holes` (the default) | only the holes | the holes, in all the embedding arrays; every other pixel keeps its exact values | new imagery, an outage, pixels a looser rule now admits |
+| `holes` (the default) | only the holes | the holes, in all the embedding arrays; every other pixel keeps its exact values | new imagery, an outage, pixels a lower depth rule now admits (see "To embed pixels the depth rule left empty" below) |
 | `shards` | every pixel of each chosen tile | each chosen tile, whole | a fix to ingest or inference, where existing values are wrong |
 
 If nothing new can be embedded in a chosen tile, that tile is left as it was.
@@ -194,6 +194,7 @@ Both commands print a dry run and write nothing:
   18S/2024      42 planned      42 live       0 dead in the mask
   19S/2024     310 planned     305 live       5 dead in the mask
 2 zone-year(s), 347 live tile(s) to update
+Optical depth rule: the store's own
 Dry run: pass --write to save the plan to s3://my-inputs/updates/amazon-thin-2024/plan.json
 ```
 
@@ -204,6 +205,25 @@ written plan cannot be changed:** to change it, write a new plan under a new nam
 Two more options: `--mask` names a land mask other than the campaign's `global`, and
 `--on-skip clear` makes a `shards` update blank a chosen tile where nothing embeds any more, instead
 of keeping it.
+
+**To embed pixels the depth rule left empty**, give the update a lower rule of its own. A global
+store has a depth rule, `optical_min_obs`: the minimum number of valid optical (Sentinel-2)
+observations a pixel needs in its year to be embedded. Pixels below it were left as holes, and the
+registry counts them as `thin`. Plan a `holes` update of those tiles with `--refused thin` and
+`--optical-min-obs` set to the new minimum; `1` embeds every pixel with any optical observation:
+
+```bash
+python scripts/update/plan_update.py from-registry \
+    --name amazon-thin-2024 --mode holes --optical-min-obs 1 \
+    --inputs s3://my-inputs --registry s3://my-outputs/global/tessera.registry --region us-west-2 \
+    --refused thin --zones 18S,19S --years 2024
+```
+
+The lower rule applies to this update's tiles only, and must be lower than the store's. A later
+update of the same zone-years must use that rule or a lower one, or it is refused. The store's
+own `optical_min_obs` keeps its value, so afterwards it understates the zone-years you updated; each
+one's update record states the rule its update used. The registry rows of the updated tiles show the
+new `optical_min_obs` and `refused_thin_px = 0`, and the same plan command then selects nothing.
 
 ### 2. Run it
 

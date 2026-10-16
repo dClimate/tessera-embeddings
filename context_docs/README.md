@@ -42,7 +42,8 @@ context_docs/
 │   ├── 023-the-single-path-end-to-end-is-the-quickstart-run.md
 │   ├── 024-spatial-transform-origin-is-the-pixel-corner.md
 │   ├── 026-v1-1-runs-the-gru-it-was-trained-with.md
-│   └── 027-targeted-updates.md
+│   ├── 027-targeted-updates.md
+│   └── 028-embed-every-pixel-with-an-optical-observation.md
 │
 ├── campaign/                      THE GLOBAL CAMPAIGN — start here
 │   ├── campaign-plan.md                        <- START HERE. What runs, with what settings, in
@@ -54,6 +55,8 @@ context_docs/
 │   │                                              finding reaches a person
 │   ├── radar-coverage-by-zone.md               which zones publish no usable radar, and why
 │   │                                              three quarters of that is a polarisation choice
+│   ├── stack-dev-verification.md               #219, #221 and #223 checked together on dev, and
+│   │                                              what hole-aware reads save
 │   └── update-dev-verification.md              targeted updates checked end to end on dev: only
 │                                                  target shards change, holes match full inference
 │
@@ -80,8 +83,8 @@ context_docs/
 │   │                                              same-model ceiling they were calibrated from
 │   ├── v1.1-against-the-published-store.md     what PR #98's precision fix did to v1.1: one
 │   │                                              published tile re-made at three commits
-│   ├── minimum-optical-depth.md                the one data-quality rule: refuse a pixel below
-│   │                                              15 observations. Four measurement campaigns
+│   ├── minimum-optical-depth.md                the one data-quality rule: embed any pixel with
+│   │                                              one observation. Four measurement campaigns
 │   ├── gpu-fleet-launch-throttling.md          why several clusters asking EC2 for GPUs at once
 │   │                                              throttle each other, and the two bounds
 │   └── the-fleet-and-the-work-source.md        a fleet lives for one `run_inference` call, so a

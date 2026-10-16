@@ -51,6 +51,12 @@ class TestMeasurementsFromObs:
         assert got["median_obs_where_thin"] is None
         assert got["median_obs_where_any"] == 25.0
 
+    def test_at_a_line_of_one_nothing_is_thin(self) -> None:
+        """The campaign's line: every observed pixel clears it, so only zeros are refused."""
+        got = rb.measurements_from_obs(_obs([[0, 0, 1], [3, 14, 40]]), optical_min_obs=1, radar_rule_enforced=False)
+        assert (got["refused_no_optical_px"], got["refused_thin_px"]) == (2, 0)
+        assert got["median_obs_where_thin"] is None
+
     def test_median_where_any_is_zero_on_a_tile_nothing_imaged(self) -> None:
         """Mirrors the fill: no observed pixel gives 0.0, not NaN and not null."""
         got = rb.measurements_from_obs(_obs([[0, 0]]), optical_min_obs=RULE, radar_rule_enforced=False)

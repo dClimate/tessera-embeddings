@@ -326,6 +326,17 @@ update's name as `update=<name>`, and treat its cells differently from a fill's:
 
 Run one update per cell at a time: two updates of one cell conflict on its chunks.
 
+#### An update with a looser optical line
+
+The store's minimum optical depth rule sits on its root and never moves. An update can apply a
+looser line to its own cells: plan it with `--optical-min-obs`, and a `holes` update embeds exactly
+the pixels the looser line admits
+([ADR 028](../../../../context_docs/decisions/028-embed-every-pixel-with-an-optical-observation.md)).
+The root and zone groups keep the store's rule, so they understate an updated cell; its update
+records state the line, and `storage.update.cell_optical_min_obs` reads back the floor every
+embedded pixel meets. A line stricter than the store's is refused, as is one stricter than an
+earlier update applied to the same cell. The steps are in [`docs/updates.md`](../../../../docs/updates.md).
+
 ## Master pipeline
 
 `tessera_full_pipeline.py` is the recommended entry point for end-to-end

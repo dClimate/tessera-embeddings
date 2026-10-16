@@ -102,6 +102,8 @@ def test_a_shards_update_rewrites_only_its_tiles_whole(area):
     ("plan", "match"),
     [
         ({"tile": ["chunk_0_0"]}, "takes name, mode and tiles"),
+        # A single-area store has no depth rule (ADR 028), so an update cannot carry one either.
+        ({"optical_min_obs": 10}, "takes name, mode and tiles"),
         ({"mode": "all"}, "mode must be"),
         ({"tiles": ["chunk_9_9"]}, "outside the area"),
         ({"tiles": []}, "lists no tiles"),

@@ -28,7 +28,7 @@ has a `NaN` scale, which makes `scales` the array to ask about coverage.
 The store records all of this in its root attributes, so you can check it against the data:
 `geoemb:model` (`https://geotessera.org/model/1.1`), `checkpoint_id`, `geoemb:gsd`,
 `geoemb:dimensions`, `geoemb:source_data` listing the Sentinel-2 and OPERA archives it read,
-and `optical_min_obs` (`15`), the quality rule described below. Each zone group adds its own
+and `optical_min_obs`, the quality rule described below. Each zone group adds its own
 `crs`, `proj:*` and `spatial:*` metadata, plus `years_complete` and `runs`, the fill behind each
 year. A year a targeted update has since rewritten in part also has `updates`, a list per year of
 which tiles each update rewrote: read `runs[year]`, then `updates[year]` in order
@@ -198,9 +198,22 @@ low latitudes and over small islands, and equatorial cloud cover is persistently
 
 ## Quality rules
 
-One rule decides whether a pixel is embedded: it needs at least 15 valid, sufficiently
-cloud-free optical observations across the year. Below that the pixel is left empty and reads
-back as the array's fill value.
+One rule decides whether a pixel is embedded: a minimum number of valid, cloud-free optical
+observations across the year, `optical_min_obs`. The campaign's line is **one**, so every pixel
+imaged clearly at least once is embedded; a pixel with none is left empty and reads back as the
+array's fill value. The published v1.1 store was filled at 15
+([ADR 028](../context_docs/decisions/028-embed-every-pixel-with-an-optical-observation.md)).
+
+A filled store's line never changes. A targeted update can embed the pixels a lower line admits,
+with a line of its own that applies to its tiles only ([`updates.md`](updates.md)), so the root's
+`optical_min_obs` understates a zone-year an update has reached. Each tile's registry row
+(`optical_min_obs`, `update_name`) and the zone's `updates[year]` records say which line it was last
+judged against, and `cell_optical_min_obs` in `storage/update.py` gives a zone-year's loosest.
+
+Fewer observations make a less reproducible embedding: below about 25, two independent embeddings
+of the same ground disagree at two to four times the pipeline's own noise floor
+([evidence](../context_docs/inference/minimum-optical-depth.md)). `s2_obs_count` is published per
+pixel, so apply a stricter line when you read if your use needs one.
 
 There is no radar threshold. A pixel with zero Sentinel-1 observations, ascending or
 descending, is still embedded, and is fed a neutral radar input in place of the missing data.

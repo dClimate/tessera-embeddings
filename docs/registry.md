@@ -139,7 +139,7 @@ where `store_group` is the zone's group opened with xarray, as in the store's
 | `median_obs_where_any` | the median optical observation count over pixels with at least one |
 | `median_obs_where_thin` | the median over the refused thin pixels only, null when there are none |
 | `px_with_any_radar` | pixels with at least one radar observation |
-| `optical_min_obs` | the quality rule's line, 15 observations in v1.1 |
+| `optical_min_obs` | the quality rule's line this row was judged against: 15 for v1.1's campaign fill, the update's line for a tile an update rewrote |
 | `radar_rule_enforced` | whether pixels without radar were refused; false in v1.1 |
 | `measured_by` | `"fill"` if the fill measured this row's numbers, `"rebuild"` if they were re-derived from the store later |
 | `filled_at` | when the fill whose pixels the row describes landed |
@@ -147,9 +147,14 @@ where `store_group` is the zone's group opened with xarray, as in the store's
 | `code_version`, `code_commit` | the build of the tessera-embeddings repository that ran the fill |
 | `update_name` | the targeted update that last rewrote the tile ([ADR 027](../context_docs/decisions/027-targeted-updates.md)), null where the tile is still the campaign's fill |
 
-The quality rule is the store's: a pixel is embedded only if it had at least 15 usable optical
-observations in the year. Every count above comes from the store's own per-pixel observation-count
-arrays, so any row can be checked against the store.
+The quality rule is the store's: a pixel is embedded only if it had at least `optical_min_obs`
+usable optical observations in the year: the store root's value, or a lower one a targeted update
+used for its tiles, and each row's own `optical_min_obs` says which. The campaign's line is one, at
+which `refused_thin_px` is always 0; a v1.1 row still at 15 is a tile no update has yet reached at a
+lower line
+([ADR 028](../context_docs/decisions/028-embed-every-pixel-with-an-optical-observation.md)). Every
+count above comes from the store's own per-pixel observation-count arrays, so any row can be checked
+against the store.
 
 ## What catches people out
 
