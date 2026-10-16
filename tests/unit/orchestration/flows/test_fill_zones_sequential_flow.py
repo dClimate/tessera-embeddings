@@ -200,7 +200,14 @@ class TestAnUpdate:
         }
         monkeypatch.setattr(mod, "update_states", lambda repo, name, cells: {c: states[c] for c in cells})
         monkeypatch.setattr(mod, "zone_year_complete", lambda *a, **k: pytest.fail("an update must never retag"))
-        wired["tiles"], wired["ingests"], wired["finished"] = {}, [], []
+        wired["tiles"], wired["ingests"], wired["finished"], wired["tightening"] = {}, [], [], []
+        monkeypatch.setattr(
+            mod,
+            "check_no_tightening",
+            lambda repo, name, rule, cells: wired["tightening"].append(
+                (name, rule, list(cells), len(wired["ingests"]))
+            ),
+        )
         monkeypatch.setattr(mod, "finish_update", lambda repo, plan: wired["finished"].append(plan.name) or "t")
 
         def count(mask, zone, **k):
@@ -245,6 +252,13 @@ class TestAnUpdate:
         first, second = (f["staging_base"] for f in update_wired["no_cluster_fills"])
         assert first != second
         assert second == f"{_PATHS.update_staging('u1', _PATHS.global_store('other'))}/04N/2025"
+
+    def test_a_stricter_line_is_checked_before_any_ingest(self, update_wired, monkeypatch):
+        """Only the cells still pending, at the run's own rule, and before a single ingest is dispatched."""
+        monkeypatch.setattr(mod, "_optical_min_obs_from_store", lambda *a, **k: 15)
+        _run(cells=None, update="u1")
+        [(name, rule, cells, ingests_before)] = update_wired["tightening"]
+        assert (name, rule, cells, ingests_before) == ("u1", 15, [("01N", 2025), ("04N", 2025)], 0)
 
     def test_a_cell_outside_the_plan_is_refused(self, update_wired):
         with pytest.raises(ValueError, match="not in update 'u1'"):

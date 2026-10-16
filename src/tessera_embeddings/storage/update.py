@@ -406,6 +406,26 @@ def cell_optical_min_obs(root: zarr.Group, zone: str, year: int) -> int | None:
     return min([int(cast("int", rule)), *(int(r["optical_min_obs"]) for r in records if r.get("optical_min_obs"))])
 
 
+def check_no_tightening(
+    repo: icechunk.Repository, name: str, rule: int | None, cells: Iterable[tuple[str, int]]
+) -> None:
+    """Refuse update ``name`` applying ``rule`` to a cell where an earlier update embedded pixels below it.
+
+    A ``shards`` rewrite would drop those pixels, and a ``holes`` merge would count them as thin.
+    Pass only the cells the update has yet to land in: rerunning one it already landed in writes nothing.
+    """
+    if rule is None:
+        return
+    root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
+    for zone, year in cells:
+        earlier = cell_optical_min_obs(root, zone, year)
+        if earlier is not None and rule > earlier:
+            raise ValueError(
+                f"Update {name!r} would apply optical_min_obs={rule} to {zone}-{year}, where an earlier "
+                f"update embedded pixels at {earlier}. Plan it with --optical-min-obs {earlier} or lower."
+            )
+
+
 def update_state(node: zarr.Group, year: int, name: str) -> UpdateState:
     """Where update ``name`` stands on one cell.
 

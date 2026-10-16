@@ -86,7 +86,7 @@ from tessera_embeddings.storage.update import (
     UpdateTarget,
     applied_optical_min_obs,
     base_tag,
-    cell_optical_min_obs,
+    check_no_tightening,
     check_radar_policy,
     commit_update_record,
     stage_hole_masks,
@@ -704,15 +704,10 @@ def plan_zone_inference(
             )
             result = {"zone": zone, "year": year, "run_id": run_id, "update": update.name, "already_recorded": True}
             return ZonePlan(zone=zone, year=year, run_id=run_id, t0=t0, summary={}, live=[], done=result, update=update)
-        # Nor may a pending update tighten what an earlier, looser update embedded in this cell: a
-        # `shards` rewrite would drop those pixels, and a `holes` merge would count them as thin.
-        # Checked after the recorded branch, so rerunning an update that already landed still works.
-        earlier = cell_optical_min_obs(root, zone, year)
-        if rule is not None and earlier is not None and rule > earlier:
-            raise ValueError(
-                f"Update {update.name!r} would apply optical_min_obs={rule} to {zone}-{year}, where an "
-                f"earlier update embedded pixels at {earlier}. Plan it with --optical-min-obs {earlier} or lower."
-            )
+        # Nor may a pending update tighten what an earlier, looser update embedded here. The flows
+        # check this before any ingest; asserted again so a direct caller cannot skip it. After the
+        # recorded branch, so rerunning an update that already landed still works.
+        check_no_tightening(repo, update.name, rule, [(zone, year)])
     tag = zone_year_tag(zone, year)
     if update is None and year in read_years_complete(node):
         if tag in repo.list_tags():
