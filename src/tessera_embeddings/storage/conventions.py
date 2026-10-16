@@ -1,7 +1,8 @@
 """GeoZarr convention attribute builders for embedding stores.
 
 Implements the proj:, spatial:, and geoemb: Zarr conventions as purely additive
-metadata on the root group. No store layout changes.
+metadata on the root group, plus CF axis attrs on the ``northing``/``easting``
+coordinate arrays. No store layout changes.
 
 The geoembeddings (``geoemb:``) convention supersedes the earlier ``tessera:`` one
 (still stripped from pre-existing stores by ``assembly``): it records encoder-model
@@ -9,7 +10,7 @@ provenance, source datasets, and a structured quantization/dequantization descri
 following the convention repo's own ``tessera_example.json``.
 
 References:
-    - proj:    https://github.com/zarr-conventions/geo-proj
+    - proj:    https://github.com/zarr-conventions/proj
     - spatial: https://github.com/zarr-conventions/spatial
     - geoemb:  https://github.com/geo-embeddings/embeddings-zarr-convention
 """
@@ -19,11 +20,15 @@ from __future__ import annotations
 import logging
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _dist_version
+from typing import TYPE_CHECKING
 
 import numpy as np
 from pyproj import CRS
 
 from tessera_embeddings.config.inference import DEFAULT_MODEL_VERSION, ModelVersion, encoder_url
+
+if TYPE_CHECKING:
+    import zarr
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +212,26 @@ def _crs_fields_from_epsg(epsg_code: str) -> dict[str, str | dict]:
     except Exception:
         logger.debug("Failed to derive CRS fields from %s", epsg_code, exc_info=True)
     return result
+
+
+#: CF attributes for the projected coordinate arrays (CF Appendix A standard names), so CF-reading
+#: tools identify the X/Y axes and their units without knowing the ``spatial:`` convention.
+_CF_COORD_ATTRS: dict[str, dict[str, str]] = {
+    "northing": {"standard_name": "projection_y_coordinate", "units": "m", "axis": "Y"},
+    "easting": {"standard_name": "projection_x_coordinate", "units": "m", "axis": "X"},
+}
+
+
+def stamp_cf_coord_attrs(node: zarr.Group, epsg_code: str | None) -> None:
+    """Add CF ``standard_name``/``units``/``axis`` to *node*'s ``northing`` and ``easting`` arrays.
+
+    Only for a metre-based CRS, the same rule as ``geoemb:gsd``: the attrs claim projected metres, so
+    a geographic or foot CRS, or a store whose coordinates are bare pixel indices, is left unlabelled
+    rather than mislabelled.
+    """
+    if _is_metre_crs(epsg_code):
+        for name, attrs in _CF_COORD_ATTRS.items():
+            node[name].attrs.update(attrs)
 
 
 def _compute_affine_transform(y_coords: np.ndarray, x_coords: np.ndarray) -> list[float]:

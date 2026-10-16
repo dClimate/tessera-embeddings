@@ -38,7 +38,11 @@ from tessera_embeddings.config.store_layout import (
     REQUIRED_VARS,
     StoreLayout,
 )
-from tessera_embeddings.storage.conventions import build_convention_attrs, build_geoemb_root_attrs
+from tessera_embeddings.storage.conventions import (
+    build_convention_attrs,
+    build_geoemb_root_attrs,
+    stamp_cf_coord_attrs,
+)
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
 from tessera_embeddings.storage.time_axis import (
     CAMPAIGN_YEARS,
@@ -627,6 +631,7 @@ def seed_zone_groups(
                 "month": np.asarray(MONTH_COORD, dtype="int16"),
             },
         )
+        stamp_cf_coord_attrs(node, spec.crs)
         bnds = node.create_array("time_bnds", data=default_bnds, chunks=(nt, 2), dimension_names=("time", "bnds"))
         bnds.attrs.update(TIME_ENCODING)  # same int64-ns encoding as `time`
         node["time"].attrs["bounds"] = "time_bnds"  # CF: this coordinate represents an interval
