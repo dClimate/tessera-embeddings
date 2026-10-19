@@ -180,7 +180,7 @@ def test_an_update_ingests_only_its_shards_under_its_own_prefix(wired, monkeypat
         "count_tiles": tiles,
     }
     [(_, export)] = wired["roi_exported"]
-    assert (export["dest_path"], export["tiles"]) == (f"{root}/rois/33N/2025.zarr", tiles)
+    assert (export["dest_path"], export["tiles"]) == (f"{root}/rois/2025/zone_33N.zarr", tiles)
     params = [p for _, p in wired["arun"]]
     assert all(p["store_path"] == f"{root}/mosaics/33N/2025" for p in params)
     assert next(p for p in params if "min_valid_coverage" in p)["min_valid_coverage"] == plan.min_valid_coverage
