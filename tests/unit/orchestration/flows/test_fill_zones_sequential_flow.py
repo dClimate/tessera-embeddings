@@ -746,6 +746,25 @@ def test_ingest_runs_are_created_inside_the_fills_run_context(monkeypatch):
     assert seen == [(True, ["in"])] and entered == ["in", "out"]
 
 
+def test_a_dispatch_queued_while_shutdown_begins_creates_no_run(monkeypatch):
+    """A worker past the first stop check but still waiting for the lock must create nothing:
+    shutdown has already snapshotted the runs it will cancel, so a run made now is never swept.
+    """
+    created = []
+    monkeypatch.setattr(
+        mod, "run_deployment", lambda *a, **k: created.append(1) or SimpleNamespace(id="fr-late", state=None)
+    )
+    adapter = _adapter()
+    with adapter._lock:
+        adapter.start("33N", 2025)
+        time.sleep(0.2)  # the worker is now queued on the lock
+        adapter._stopping.set()
+    with pytest.raises(RuntimeError, match="not dispatched"):
+        adapter._futures[("33N", 2025)].result(timeout=5)
+    adapter.shutdown()
+    assert created == []
+
+
 def test_adapter_shutdown_cancels_in_flight_child_runs(monkeypatch):
     """The reviewer's orphan scenario: parent dies while a child ingest runs.
     shutdown() must request cancellation of the in-flight child flow run —

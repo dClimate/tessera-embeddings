@@ -191,7 +191,6 @@ class _DeploymentCellInputs:
         self._stopping = threading.Event()
         # Captured here, on the flow's thread: worker threads inherit none of its context.
         self._parent = FlowRunContext.get()
-        self._link_lock = threading.Lock()
 
     def _run(self, zone: str, year: int) -> None:
         """Hold a fleet-wide ingest slot for this zone, then dispatch and poll it.
@@ -239,15 +238,19 @@ class _DeploymentCellInputs:
         # form); in these worker threads it always runs synchronously.
         # Entering a copy of the fill's run context makes the run a subflow of the fill. Only
         # that context: copying the thread's whole context would share the flow's sync client
-        # across threads. The copies share the fill's task-key counter, hence the lock.
-        with self._link_lock, self._as_subflow():
+        # across threads. Created and registered under the lock `shutdown` snapshots under, after
+        # a second stop check: a run then either makes the snapshot or is never created, so a
+        # thread that queued here while shutdown began cannot leave a child the sweep missed. The
+        # same lock serializes the copies, which share the fill's task-key counter.
+        with self._lock, self._as_subflow():
+            if self._stopping.is_set():
+                raise RuntimeError(f"ingest {zone}-{year} not dispatched: adapter shutting down")
             run: Any = run_deployment(
                 self._deployment,
                 parameters=self._params_for(zone, year),
                 timeout=0,
                 tags=[self._child_tag] if self._child_tag else None,
             )
-        with self._lock:
             self._inflight[(zone, year)] = run.id
         run = self._poll_until_terminal(run.id, f"{zone}-{year}")
         # Deregister ONLY after a CONFIRMED terminal state. A transient poll error or a
@@ -570,11 +573,12 @@ class _DeploymentCellInputs:
         makes confirmation impossible rather than merely slow, and re-asking a server that is
         not answering delays a teardown whose whole job is to stop costing money.
         """
-        # Snapshot BEFORE waking the pollers: a woken worker deregisters its run id on the way
-        # out, and an id that leaves the map un-swept is an un-cancelled child still running.
+        # Stop and snapshot in ONE hold of the lock. A dispatcher re-checks `_stopping` under it
+        # before creating a run, so every child either makes this snapshot or is never created;
+        # and a woken poller deregisters only under it, so no id leaves the map un-swept.
         with self._lock:
+            self._stopping.set()
             inflight = dict(self._inflight)
-        self._stopping.set()
         self._executor.shutdown(wait=False, cancel_futures=True)
         if not inflight:
             return
