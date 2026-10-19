@@ -19,7 +19,7 @@ A target shard where nothing new embeds is kept as it was (``on_skip="keep"``); 
 may instead clear it (``on_skip="clear"``), for a defect whose output must go.
 
 **Where things live.** The plan is ``{update_root}/plan.json``, written once. Beside it, per cell:
-the ingest ROI (``rois/<zone>/<year>.zarr``), the mosaics (``mosaics/<zone>/<year>``) and, in
+the ingest ROI (``rois/<year>/zone_<zone>.zarr``), the mosaics (``mosaics/<zone>/<year>``) and, in
 ``holes`` mode, one mask per target shard and destination store
 (``holes/<zone>/<year>/<store digest>/<label>.npz``) — all apart from the
 campaign's own, which it rewrites and sweeps (:meth:`BucketPaths.update_root`).
@@ -226,8 +226,12 @@ def plan_uri(root: str) -> str:
 
 
 def roi_uri(root: str, zone: str, year: int) -> str:
-    """One cell's ingest ROI. Per year, because an update's shards may differ from year to year."""
-    return f"{root.rstrip('/')}/rois/{zone}/{year}.zarr"
+    """One cell's ingest ROI. Per year, because an update's shards may differ from year to year.
+
+    Named ``zone_<zone>`` like the campaign's zone ROIs, because the ingest labels its commits with
+    the ROI file's stem and campaign monitoring attributes commits to a zone by that label.
+    """
+    return f"{root.rstrip('/')}/rois/{year}/zone_{zone}.zarr"
 
 
 def holes_prefix(root: str, zone: str, year: int) -> str:
