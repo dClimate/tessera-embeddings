@@ -360,9 +360,9 @@ def ingest_s2_roi_reflectance(
             failure commits none of its dates and the retry re-ingests exactly those (per-date
             sessions are impossible — each date's append resizes the time axis, so sibling
             sessions conflict on array metadata). Identical stores either way. COMPOSES with
-            ``pipeline_dates``: the look-ahead then follows the batch the latest date implies, so
-            the next batch's whole preparation overlaps this batch's write, while a dense date
-            is prepared only one ahead. ``None``
+            ``pipeline_dates``: the look-ahead is then held to the same chunk budget, weighed
+            before each date is prepared, so the next batch's whole preparation overlaps this
+            batch's write while a dense date is prepared only one ahead. ``None``
             (the default) caps it at :data:`~tessera_embeddings.config.ingest.AUTO_BATCH_DATES`;
             1 forces the one-commit-per-date path.
         batch_chunk_budget: The most storage chunks one batch may write. Batching pays for
@@ -533,6 +533,28 @@ def ingest_s2_roi_reflectance(
     # catalogue metadata was reporting it as coverage filtering.
     producer_conflict_dates: list[dict[str, str]] = []
 
+    def _narrow(day_items: list) -> list:
+        """The live windows a date's imagery reaches: pure geometry, no read."""
+        return windows_for_date(
+            run_windows,
+            [getattr(item, "bbox", None) for item in day_items],  # type: ignore[misc]
+            roi.geobox,
+            chunk_px=INGEST_CHUNK_SIZE,
+            window_cost_in_chunks=window_cost,
+        )
+
+    # Narrowings the look-ahead computed while weighing a date, handed to that date's preparation
+    # so the two cannot disagree. Keyed by the item list's identity: weighed on the driving thread
+    # before the date is submitted, popped on the preparing thread after.
+    narrowed_ahead: dict[int, list] = {}
+
+    def _date_chunks(day_items: list) -> int:
+        """Chunks a date will write, known before it is prepared: what the look-ahead weighs."""
+        if not run_windows:
+            return _covered_chunks(live_windows)
+        narrowed_ahead[id(day_items)] = _narrow(day_items)
+        return _covered_chunks((w.y0, w.y1, w.x0, w.x1) for w in narrowed_ahead[id(day_items)])
+
     def _prepare_date(day_items: list) -> _PreparedDate:
         """Build one solar day's write-ready dataset, or the reason it has none.
 
@@ -690,13 +712,9 @@ def ingest_s2_roi_reflectance(
         # footprint to count.
         date_windows: list[tuple[int, int, int, int]] = live_windows
         if run_windows:
-            narrowed = windows_for_date(
-                run_windows,
-                [getattr(item, "bbox", None) for item in day_items],  # type: ignore[misc]
-                roi.geobox,
-                chunk_px=INGEST_CHUNK_SIZE,
-                window_cost_in_chunks=window_cost,
-            )
+            narrowed = narrowed_ahead.pop(id(day_items), None)
+            if narrowed is None:
+                narrowed = _narrow(day_items)
             if not narrowed:
                 # No live cell is reachable today. Nothing to write, and writing an
                 # empty window set would commit a date holding nothing.
@@ -1132,12 +1150,11 @@ def ingest_s2_roi_reflectance(
             # consume, so a depth-1 buffer would hide one date's preparation out of k. Depth k has
             # the next batch ready as this one lands. Preparation stays single-threaded either way
             # (see ingest._pipeline).
-            # The look-ahead follows the batch the latest date implies: a full batch of sparse
-            # dates, but one dense date at a time, so a dense run holds no more prepared dates
-            # than writing one date per commit does.
-            expected = 1
+            # The look-ahead holds the same budget as a batch, weighed before each date is
+            # prepared: up to a batch of sparse dates, but one dense date at a time, so a dense
+            # run holds no more prepared dates than writing one date per commit does.
             supply = (
-                pipelined(by_date.values(), prepare, depth=lambda: expected)
+                pipelined(by_date.values(), prepare, depth=batch_dates, weigh=_date_chunks, budget=batch_chunk_budget)
                 if pipeline_dates
                 # Unpipelined: prepare inline and report the whole preparation as stall,
                 # so the two modes stay comparable from one log line.
@@ -1171,7 +1188,6 @@ def ingest_s2_roi_reflectance(
                 # would push the batch past its budget starts a new one, so a dense date writes
                 # alone.
                 chunks = _covered_chunks(prepared.windows)
-                expected = max(1, min(batch_dates, batch_chunk_budget // max(chunks, 1)))
                 if batch and batch_chunks + chunks > batch_chunk_budget:
                     _write_batch_or_isolate(batch, batch_stall)
                     batch, batch_stall, batch_chunks = [], 0.0, 0

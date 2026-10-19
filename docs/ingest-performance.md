@@ -592,9 +592,11 @@ Three practical details:
 
 **Combining it with pipelining.** The two fix different idleness. Batching fills gaps
 *inside* a date's write; pipelining removes the serial preparation *between* writes. When both
-are on, the look-ahead follows the batch the latest date implies: up to four dates while dates are
-sparse, so a whole batch's preparation hides behind the previous batch's write, and one while they
-are dense, so a dense run holds no more prepared dates than writing one date per commit. A batch is
+are on, the look-ahead is held to the same budget as a batch, weighing each date by the chunks it
+will write before preparing it (its footprint against the live windows, which needs no read): up to
+four sparse dates, so a whole batch's preparation hides behind the previous batch's write, but one
+dense date, so a dense run holds no more prepared dates than writing one date per commit, even
+straight after a run of sparse ones. A batch is
 written as soon as it holds four dates or reaches its budget, so a dense date never waits for the
 next one.
 

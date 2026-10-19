@@ -8,8 +8,9 @@ runtime.
 ``depth`` is how many prepared results may be buffered ahead. Depth 1 suits a consumer that
 takes items one at a time; when it instead BATCHES k items before acting (the S2 date loop
 under ``batch_dates``), the look-ahead has to reach k for the next batch to be ready when the
-current one finishes. A callable depth is re-read at every refill, for a consumer whose batch
-size follows the items it has seen.
+current one finishes. With ``weigh`` and ``budget`` the buffer also stops growing once the
+queued items' weights would pass the budget (it always holds at least one), so a consumer whose
+items vary in size buffers many small ones but only one large one.
 
 Preparation stays SINGLE-THREADED at any depth: one worker, items prepared in order. Depth
 buys buffering, never concurrency.
@@ -29,7 +30,12 @@ from concurrent.futures import Future, ThreadPoolExecutor
 
 
 def pipelined[T, P](
-    items: Iterable[T], prepare: Callable[[T], P], *, depth: int | Callable[[], int] = 1
+    items: Iterable[T],
+    prepare: Callable[[T], P],
+    *,
+    depth: int = 1,
+    weigh: Callable[[T], int] | None = None,
+    budget: int | None = None,
 ) -> Iterator[tuple[P, float]]:
     """Yield ``(prepared, stall_seconds)`` per item, preparing up to ``depth`` ahead.
 
@@ -37,7 +43,7 @@ def pipelined[T, P](
     finish — the pipeline's own health metric: near zero when preparation hides fully
     inside consumption, and approaching the preparation cost when something starves it.
     """
-    if isinstance(depth, int) and depth < 1:
+    if depth < 1:
         raise ValueError(f"depth must be >= 1, got {depth}")
     it = iter(items)
     # A sentinel rather than None: an item may legitimately BE None, and exhausting on
@@ -54,20 +60,29 @@ def pipelined[T, P](
         # Exactly `depth` in flight, so depth=1 keeps the original one-ahead behaviour:
         # the FIRST item's preparation is never hidden (nothing precedes it to hide
         # behind), and every later one overlaps the consumption of its predecessor.
-        pending: deque[Future[P]] = deque()
+        pending: deque[tuple[Future[P], int]] = deque()
+        held: list[tuple[T, int]] = []  # drawn and weighed once, waiting for room under the budget
 
         def refill() -> None:
-            """Top the buffer up to the current depth (at least one) while items remain."""
-            while len(pending) < max(1, depth() if callable(depth) else depth):
-                nxt = next(it, done)
-                if nxt is done:
+            """Top the buffer up to ``depth`` items, and to ``budget`` weight, while items remain."""
+            while len(pending) < depth:
+                if held:
+                    nxt, weight = held.pop()
+                else:
+                    drawn = next(it, done)
+                    if drawn is done:
+                        return
+                    nxt = drawn  # type: ignore[assignment]
+                    weight = weigh(nxt) if weigh is not None else 0
+                if pending and budget is not None and sum(w for _, w in pending) + weight > budget:
+                    held.append((nxt, weight))
                     return
-                pending.append(pool.submit(prepare, nxt))  # type: ignore[arg-type]
+                pending.append((pool.submit(prepare, nxt), weight))
 
         refill()
         while pending:
             waited_from = time.monotonic()
-            prepared = pending.popleft().result()
+            prepared = pending.popleft()[0].result()
             stall = time.monotonic() - waited_from
             # Refill BEFORE yielding, so the background thread has work for the whole of
             # the consumer's runtime rather than waiting to be asked once it returns.

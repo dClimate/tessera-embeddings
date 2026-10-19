@@ -531,17 +531,22 @@ def test_a_batch_failure_that_is_not_a_read_error_still_fails_the_leg(run_ingest
         run_ingest(dates, pipeline_dates=False, fail_on="2024-01-02", batch_dates=2)
 
 
-def test_dense_dates_are_written_at_once_and_prepared_one_ahead(run_ingest, monkeypatch):
-    """A date over the budget writes alone, and straight away, so a dense run holds no more
-    prepared dates than writing one date per commit: the next-but-one date is not loaded until
-    the first has been written.
+@pytest.mark.parametrize("chunks", [[20, 20, 20, 20], [1, 1, 1, 1, 20, 20, 20]], ids=["dense", "sparse-then-dense"])
+def test_dense_dates_are_written_at_once_and_prepared_one_ahead(run_ingest, monkeypatch, chunks):
+    """A date over the budget writes alone, straight away, and the look-ahead weighs dates before
+    preparing them, so even after a run of sparse dates a dense run holds no more prepared dates
+    than writing one date per commit: the date after next is not loaded until the first dense date
+    has been written.
     """
+    per_date = iter(chunks)
     one_chunk = SimpleNamespace(y0=0, y1=SIZE, x0=0, x1=SIZE)
-    monkeypatch.setattr(s2_roi, "windows_for_date", lambda *_a, **_k: [one_chunk] * 20)
-    dates = {f"2024-01-0{d}": True for d in range(1, 5)}
+    monkeypatch.setattr(s2_roi, "windows_for_date", lambda *_a, **_k: [one_chunk] * next(per_date))
+    dates = {f"2024-01-{d:02d}": True for d in range(1, len(chunks) + 1)}
     run = run_ingest(dates, pipeline_dates=True, batch_dates=None, write_s=0.2)
     assert run.written == list(dates)
-    assert run.load_started["2024-01-03"] >= run.write_ended["2024-01-01"]
+    first_dense = chunks.index(20)
+    order = list(dates)
+    assert run.load_started[order[first_dense + 2]] >= run.write_ended[order[first_dense]]
 
 
 @pytest.mark.parametrize(
