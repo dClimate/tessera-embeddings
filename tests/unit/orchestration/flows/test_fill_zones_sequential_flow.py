@@ -765,6 +765,18 @@ def test_a_dispatch_queued_while_shutdown_begins_creates_no_run(monkeypatch):
     assert created == []
 
 
+def test_shutdown_raises_the_stop_flag_before_waiting_for_the_lock():
+    """Dispatchers queued on the lock must see the flag the moment they get it, so none of them
+    creates a run while shutdown is still waiting its turn behind an in-progress creation.
+    """
+    adapter = _adapter()
+    with adapter._lock:  # stands in for a creation in progress
+        stopper = threading.Thread(target=adapter.shutdown)
+        stopper.start()
+        assert adapter._stopping.wait(2), "the flag must rise before shutdown takes the lock"
+    stopper.join(5)
+
+
 def test_adapter_shutdown_cancels_in_flight_child_runs(monkeypatch):
     """The reviewer's orphan scenario: parent dies while a child ingest runs.
     shutdown() must request cancellation of the in-flight child flow run —

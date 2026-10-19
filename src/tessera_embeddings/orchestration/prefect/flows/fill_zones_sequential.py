@@ -573,11 +573,13 @@ class _DeploymentCellInputs:
         makes confirmation impossible rather than merely slow, and re-asking a server that is
         not answering delays a teardown whose whole job is to stop costing money.
         """
-        # Stop and snapshot in ONE hold of the lock. A dispatcher re-checks `_stopping` under it
-        # before creating a run, so every child either makes this snapshot or is never created;
-        # and a woken poller deregisters only under it, so no id leaves the map un-swept.
+        # Stop FIRST, then snapshot under the lock. A dispatcher creates and registers its run
+        # under that lock after re-checking `_stopping`, so a creation already in progress
+        # registers before the snapshot, and every dispatcher still queued on the lock sees the
+        # flag and creates nothing; shutdown waits on at most that one creation. A woken poller
+        # deregisters only a run it has seen finish, so no live id leaves the map un-swept.
+        self._stopping.set()
         with self._lock:
-            self._stopping.set()
             inflight = dict(self._inflight)
         self._executor.shutdown(wait=False, cancel_futures=True)
         if not inflight:
