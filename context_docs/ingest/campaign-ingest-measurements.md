@@ -807,11 +807,14 @@ threshold misread the update's sparse large zone-years, and "every update batche
 a dense update. The S2 ingest now counts the storage chunks each date's footprint-narrowed windows
 cover, and fills a batch with up to four dates while their chunks stay within
 `BATCH_CHUNKS_PER_WORKER` (12) per worker; a date that would cross the budget starts a new batch,
-so a dense date writes alone. One rule for campaign fills, updates and single-area runs.
+so a dense date writes alone. One rule for campaign fills, updates and single-area runs: the S2
+flow passes the budget from its planned width, and any other caller gets it from the workers its
+Dask client reports.
 
-The budget is a draft. Twelve chunks a worker is about 720 a batch on 60 workers, inside the
-sweep's gain: 59S at about 188 chunks a date won at four dates a batch, about 750 chunks, on
-fleets of 40 to 60 workers (the sweep did not record its width). **To tune it from the restarted
+The budget is empirical and deliberately conservative: no theory sets it. The largest batch the
+sweep measured to gain was 59S's, about 750 chunks at four dates on fleets of 40 to 60 workers
+(the width was not recorded), so 12.5 to 19 chunks a worker; twelve, about 720 a batch on 60
+workers, sits at or below the low end of that. **To tune it from the restarted
 production run:** compare the `Batch timings` lines of 18S, 19S and 20N, which now carry
 `chunks=N`, against run 1's one-date writes of about 31 s at about six windows a date, and watch
 for writes on 60-worker fleets that lengthen as batches grow. The six-thread workers (§3.20, PR
@@ -820,7 +823,7 @@ for writes on 60-worker fleets that lengthen as batches grow. The six-thread wor
 `config.ingest.auto_batch_dates` and its threshold are no longer called but stay defined:
 `config/ingest.py` is inside the inference code identity's closure, so removing them would move
 that identity. They go with the next change that moves it anyway. The ingest code identity moves
-(`ingest/s2_roi.py` changed): `ingcode-67740a8483141eda` → `ingcode-b42aead5209ce75d`, so resuming
+(`ingest/s2_roi.py` changed): `ingcode-67740a8483141eda` → `ingcode-b8067f91620cc613`, so resuming
 mosaics built before this change needs `allow_ingest_code_mismatch=true`. The inference identity
 is unchanged (`infcode-44bbc47265fcb6a8`). Batched stores are byte-identical (batching parity test).
 

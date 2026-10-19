@@ -98,6 +98,11 @@ class _FakeClient:
         return SimpleNamespace(result=obj.compute)
 
     @staticmethod
+    def scheduler_info():
+        """One worker, so a run given no batch budget derives one worker's worth."""
+        return {"workers": {"inproc://fake": {}}}
+
+    @staticmethod
     def register_plugin(_plugin):
         """Accept the plugin. A worker's ``setup`` is what installs the rescues on a real
         cluster; here the in-process install has already run, which is what ``run`` reports.
@@ -529,7 +534,8 @@ def test_a_batch_failure_that_is_not_a_read_error_still_fails_the_leg(run_ingest
 @pytest.mark.parametrize(
     ("chunks", "budget", "sizes"),
     [
-        ([1, 1, 1, 1, 1], None, [4, 1]),  # no budget: the cap alone
+        ([1, 1, 1, 1, 1], None, [4, 1]),  # no budget passed: sparse dates still fill to the cap
+        ([20, 1, 1], None, [1, 2]),  # no budget passed: one worker's budget, so a dense date writes alone
         ([1, 1, 1, 1, 1], 10, [4, 1]),  # sparse dates fill a batch to the cap
         ([2, 2, 3, 1, 1], 5, [2, 3]),  # a date that would cross the budget closes the batch first
         ([1, 9, 1, 1], 5, [1, 1, 2]),  # a date over the budget on its own writes alone

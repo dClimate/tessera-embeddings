@@ -480,14 +480,11 @@ workers idle: where the write keeps every worker busy, the check's tasks take tu
 write's and lengthen it. So the overlap saves at least the read-plan time, plus whatever part of
 the check fits into idle worker time.
 
-**Why preparation does not shrink with width the way the write does is not settled.** Measured on
-full zone-years: preparation took 20.6 s a date at 45 workers, 18.5 s at 60 and 12.5 s at 120,
-about 5.8 s of it the read plan at every width, so it shrank 1.6× while the fleet widened 2.7×;
-the write fell about 2.4× over the same widths. On the sparse 2026-10-19 production update at 60
-workers, the read plan took about 1.7 s and the check about 4.9 s a date, however few windows the
-date touched. Suspected, not established: the read plan is one thread, so more workers cannot
-speed it; and the check is a small graph, so once a fleet has more workers than its tasks,
-per-request read latency rather than worker count sets its time.
+**Why preparation shrinks far less than the write as the fleet widens is not settled.** That it
+does is measured; the suspicion, not established, is that the read plan is one thread, so more
+workers cannot speed it, and that the check is a small graph, so once a fleet has more workers than
+its tasks, per-request read latency rather than worker count sets its time. The measurements are in
+`context_docs/ingest/campaign-ingest-measurements.md` §3.21.
 
 ```text
 One date at a time — every date waits out its own preparation:
@@ -505,10 +502,9 @@ two modes produce identical stores — pinned by a parity test including a date 
 coverage gate mid-run.
 
 **It has no setting.** Every fleet up to `MAX_PIPELINE_DATES_WORKERS` (140 workers) pipelines,
-and so does every local cluster. Paired runs measured it 1.14× faster per date at 60 workers and
-1.01× at 120, never slower. Nothing wider than 120 workers has been measured, so a wider Fargate
-fleet prepares dates one at a time as a precaution, not because a loss was seen there, and logs one
-line saying so. The domain function keeps a `pipeline_dates` argument, off by default, for direct
+and so does every local cluster. In paired tests it was never slower, and it gained most on narrower
+fleets. No fleet wider than the bound has been measured, so a wider Fargate fleet prepares dates one
+at a time as a precaution, not because a loss was seen there, and logs one line saying so. The domain function keeps a `pipeline_dates` argument, off by default, for direct
 callers: the single-area runner passes it on, and the parity test compares both modes. Evidence,
 including what preparing dates one at a time cost a production update, is in
 `context_docs/ingest/campaign-ingest-measurements.md` §3.21.
@@ -534,8 +530,7 @@ Normally each date is computed and written on its own. This fuses several consec
 one computation and one write. The number fused is `k`.
 
 **It targets sparse writes.** Batching saves each write's fixed overhead (graph submission, the
-drain tail and the commit: about 10 s a write on the 2026-10-19 production update) and nothing
-else. It cannot make the write itself faster, so it pays where a date writes little compared with
+drain tail and the commit) and nothing else. It cannot make the write itself faster, so it pays where a date writes little compared with
 the fleet and loses where one date's write already fills it:
 
 ```
@@ -546,24 +541,24 @@ per-date wall clock  ≈  max( W, P )  +  overhead / k
 ```
 
 On a dense date `W` already keeps every worker busy, so a bigger batch only queues, and it crowds
-out the preparation running beside it, whose cloud-mask check runs on the same workers. That is how
-batching lost 29% on 21N and 7% on 35N in the July sweep, while it gained 1.61× on 26S and 1.12×
-on 59S.
+out the preparation running beside it, whose cloud-mask check runs on the same workers. Measured
+gains on sparse regions and losses on dense ones are in `context_docs/ingest/campaign-ingest-measurements.md` §3.16.
 
 **Sparsity is measured per date, as the chunks the date writes.** Each date's preparation narrows
 its write to the live windows its satellite pass reaches, and the storage chunks those windows
 cover are what that date writes. The S2 ingest fills a batch with up to four dates
 (`AUTO_BATCH_DATES`) while their chunks stay within a budget of `BATCH_CHUNKS_PER_WORKER` (12)
 chunks per worker: 720 on 60 workers, 120 on 10. A date that would push the batch past the budget
-starts a new one, so a dense date writes alone. A local cluster has no budget. The same rule serves
+starts a new one, so a dense date writes alone. A caller that passes no budget, such as a local
+cluster or the single-area runner, gets the same 12 per worker, counted from the workers its Dask
+client reports. The same rule serves
 campaign fills, updates and single-area runs, because the payoff depends on what each date writes,
 not on whether the run is an update or how much area it covers in all: an update's scattered
 shards can cover a large area while each date touches a few of them, and an update can equally be
 dense. Passing an integer `batch_dates` changes the cap, which is what one arm of an A/B needs.
 
-**The budget is a draft.** Twelve chunks a worker sits inside the gain the July sweep measured at
-the 40 to 60 workers it ran on: 59S, at about 188 chunks a date, gained at four dates a batch
-(about 750 chunks). It is to be tuned from production runs: each `Batch timings` line ends with
+**The budget is empirical and deliberately conservative.** No theory sets it: twelve chunks a
+worker sits at or below the smallest per-worker batch measured to gain. It is to be tuned from production runs: each `Batch timings` line ends with
 `chunks=N`, the batch's size in what the budget measures. The count depends on the window merge
 (`live_windows.WINDOW_COST_IN_CHUNKS*`), since a coarser merge covers more chunks a date, so retune
 the budget when that rate changes. Evidence and the tuning plan:

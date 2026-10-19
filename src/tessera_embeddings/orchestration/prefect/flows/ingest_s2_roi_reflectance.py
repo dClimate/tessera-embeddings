@@ -17,6 +17,7 @@ from prefect import flow, get_run_logger
 from prefect.runtime import flow_run as flow_run_ctx
 
 from tessera_embeddings.ingest.roi_processing import DEFAULT_MIN_VALID_COVERAGE
+from tessera_embeddings.ingest.s2_roi import BATCH_CHUNKS_PER_WORKER
 from tessera_embeddings.orchestration.prefect.flows._dask_lifecycle import (
     dask_cleanup_on_cancellation,
     dask_resource_tags,
@@ -35,33 +36,16 @@ the current one. The read plan then costs nothing, because the driver would othe
 the write. The cloud-mask check costs nothing only where the write leaves workers idle; where the
 write keeps every worker busy, the check's tasks take turns with the write's and lengthen it.
 
-Preparation does not shrink with fleet width the way the write does, and why is not settled.
-Measured on full zone-years (yield-embeddings test plan, F-22 to F-25): preparation took 20.6 s
-a date at 45 workers, 18.5 s at 60 and 12.5 s at 120, about 5.8 s of it the read plan at every
-width, so it shrank 1.6x while the fleet widened 2.7x. Over the same widths the write's
-worker-seconds stayed nearly constant (9,144 to 10,356), so its time fell about 2.4x. On the
-sparse 2026-10-19 Latin America update at 60 workers, the read plan took about 1.7 s and the
-check about 4.9 s a date, however few windows the date touched. Suspected, not established: the
-read plan is one thread, so more workers cannot speed it; and the cloud-mask check is a small
-graph, so once a fleet has more workers than its tasks, per-request read latency rather than
-worker count sets its time.
+Empirically, preparation shrinks far less than the write as the fleet widens, and why is not
+settled. The suspicion, not established: the read plan is one thread, so more workers cannot speed
+it; and the cloud-mask check is a small graph, so once a fleet has more workers than its tasks,
+per-request read latency rather than worker count sets its time.
 
 So the overlap saves at least the read-plan time, plus whatever part of the check fits into idle
-worker time. Paired runs measured it 1.14x faster per date at 60 workers and 1.01x at 120, never
-slower. Nothing wider than 120 workers was measured: this bound turns the overlap off above 140
-workers as a precaution, not because a loss was seen there.
-"""
-
-BATCH_CHUNKS_PER_WORKER = 12
-"""Storage chunks one S2 batch may write per worker in the fleet: the batch's budget.
-
-Batching saves each write's fixed overhead (graph submission, drain and commit: about 10 s a write
-on the 2026-10-19 production update) and cannot make the write itself faster, so it pays for
-sparse writes and loses where one date's write already fills the fleet. Basis, a draft to tune
-from production: in the July sweep (yield-embeddings test plan F-32, pipelined, fleets of 40 to
-60 workers), 59S at about 188 chunks a date gained 1.12x at 4 dates a batch (about 750 chunks),
-while 21N (644 live chunks) lost 29% and 35N lost 7%. 12 a worker (720 chunks at 60 workers, 120
-at 10) sits inside the measured gain at either width.
+worker time. In paired tests it was never slower, and it gained most on narrower fleets. No fleet
+wider than this bound has been measured, so the overlap is off above it as a precaution, not
+because a loss was seen there. Evidence: ``context_docs/ingest/campaign-ingest-measurements.md``
+§3.21.
 """
 
 
@@ -207,8 +191,7 @@ def ingest_s2_roi_reflectance(
             ``AUTO_BATCH_DATES`` (4). How many dates a batch actually holds is set per date by a
             budget of ``BATCH_CHUNKS_PER_WORKER`` storage chunks per worker: batching pays only
             for sparse writes, so sparse dates fill a batch and a date that would push it past
-            the budget starts a new one (a local cluster has no budget). Pin an int only for one
-            arm of a comparison.
+            the budget starts a new one. Pin an int only for one arm of a comparison.
         worker_env_overrides: Env vars merged into every Dask worker's environment for THIS
             run only, to A/B worker-side tuning (allocator, cache behaviour) one arm at a
             time. Not a configuration channel — anything meant to hold for every run belongs
@@ -228,7 +211,8 @@ def ingest_s2_roi_reflectance(
     log.info("Starting ingest_s2_roi_reflectance for %s", roi_zarr_path)
 
     pipeline_dates = _pipelines_dates(use_local=use_local, max_workers=max_workers, log=log)
-    # Local clusters have no fleet width to budget against; see BATCH_CHUNKS_PER_WORKER.
+    # From the fleet's planned width, since a Fargate fleet may still be starting when the ingest
+    # counts its workers. A local cluster is up already, so the ingest counts it itself (None).
     batch_chunk_budget = None if use_local else BATCH_CHUNKS_PER_WORKER * max_workers
 
     if use_local:

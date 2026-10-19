@@ -228,6 +228,18 @@ def _coverage_from_scl(
     return (True, any_valid) if passes else (False, None)
 
 
+BATCH_CHUNKS_PER_WORKER = 12
+"""Storage chunks one S2 batch may write per worker in the fleet: the batch's budget.
+
+Empirical, and deliberately conservative; no theory sets it. Batching saves each write's fixed
+overhead (graph submission, drain and commit) and cannot make the write itself faster, so it pays
+for sparse writes and loses where one date's write already fills the fleet. Twelve a worker sits at
+or below the smallest per-worker batch size measured to gain. Tune it from production
+``Batch timings`` lines, which end with ``chunks=N``. Evidence:
+``context_docs/ingest/campaign-ingest-measurements.md`` §3.16 and §3.21.
+"""
+
+
 def _covered_chunks(windows: Iterable[tuple[int, int, int, int]]) -> int:
     """Storage chunks that ``(y0, y1, x0, x1)`` windows cover: what writing them touches.
 
@@ -358,8 +370,10 @@ def ingest_s2_roi_reflectance(
             queues and crowds out the preparation running beside it. Sparsity is measured per
             date, as the chunks its footprint-narrowed windows cover, so a batch fills with
             sparse dates up to ``batch_dates`` and a date that would push it past the budget
-            starts a new one; a date over the budget on its own writes alone. ``None`` applies
-            no budget. The S2 flow sizes it to the fleet.
+            starts a new one; a date over the budget on its own writes alone. ``None`` derives
+            it as :data:`BATCH_CHUNKS_PER_WORKER` per worker the client reports when the ingest
+            starts. The S2 flow passes it from the fleet's planned width instead, because a
+            Fargate fleet may still be starting.
         allow_ingest_code_mismatch: Off by default. See the field of the same name on
             :class:`~tessera_embeddings.storage.manifest.IngestManifest`.
 
@@ -422,10 +436,11 @@ def ingest_s2_roi_reflectance(
 
     if batch_dates is None:
         batch_dates = AUTO_BATCH_DATES
+    if batch_chunk_budget is None:
+        # At least one worker: a client that reports none (a test double) still gets a budget.
+        batch_chunk_budget = BATCH_CHUNKS_PER_WORKER * max(1, len(client.scheduler_info()["workers"]))
     if batch_dates == 1:
         log.info("Writing one date per commit")
-    elif batch_chunk_budget is None:
-        log.info("Batching up to %d dates per write", batch_dates)
     else:
         log.info(
             "Batching up to %d dates per write while a batch writes at most %d storage chunks; "
@@ -1151,7 +1166,7 @@ def ingest_s2_roi_reflectance(
                 # would push the batch past its budget starts a new one, so a dense date writes
                 # alone.
                 chunks = _covered_chunks(prepared.windows)
-                if batch and batch_chunk_budget is not None and batch_chunks + chunks > batch_chunk_budget:
+                if batch and batch_chunks + chunks > batch_chunk_budget:
                     _write_batch_or_isolate(batch, batch_stall)
                     batch, batch_stall, batch_chunks = [], 0.0, 0
                 batch.append(prepared)
