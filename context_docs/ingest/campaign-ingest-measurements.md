@@ -823,7 +823,7 @@ for writes on 60-worker fleets that lengthen as batches grow. The six-thread wor
 `config.ingest.auto_batch_dates` and its threshold are no longer called but stay defined:
 `config/ingest.py` is inside the inference code identity's closure, so removing them would move
 that identity. They go with the next change that moves it anyway. The ingest code identity moves
-(`ingest/s2_roi.py` changed): `ingcode-67740a8483141eda` → `ingcode-0d61d3a5fe48717b`, so resuming
+away from `ingcode-67740a8483141eda` (`ingest/s2_roi.py` changed), so resuming
 mosaics built before this change needs `allow_ingest_code_mismatch=true`. The inference identity
 is unchanged (`infcode-44bbc47265fcb6a8`). Batched stores are byte-identical (batching parity test).
 
