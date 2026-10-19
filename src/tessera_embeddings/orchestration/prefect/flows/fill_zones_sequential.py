@@ -39,11 +39,13 @@ import threading
 import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import ALL_COMPLETED, FIRST_COMPLETED, CancelledError, Future, ThreadPoolExecutor, wait
+from contextlib import AbstractContextManager, nullcontext
 from functools import cache, partial
 from typing import TYPE_CHECKING, Any, cast
 
 from prefect import flow, get_run_logger
 from prefect.client.orchestration import get_client
+from prefect.context import FlowRunContext
 from prefect.deployments import run_deployment
 from prefect.runtime import flow_run as flow_run_ctx
 from prefect.states import Cancelling
@@ -151,8 +153,9 @@ class _DeploymentCellInputs:
     THIS adapter produced (a cell never started here is someone else's input), matching the
     parallel driver's ``did_ingest and cleanup_mosaics`` rule.
 
-    Threads don't inherit the flow's Prefect context, so ingest runs dispatch without a
-    parent-run link — they are still tracked as ordinary runs of the ingest deployment.
+    Each ingest run is created as a subflow of the fill (``_dispatch_and_wait``), so the UI lists
+    it under the fill. Cancellation does not rely on that link: a crashed fill gets no
+    server-side cascade, so the tag and ``shutdown`` stay the mechanism.
     """
 
     def __init__(
@@ -186,6 +189,8 @@ class _DeploymentCellInputs:
         self._lock = threading.Lock()
         self._inflight: dict[tuple[str, int], Any] = {}  # (zone, year) → flow-run id
         self._stopping = threading.Event()
+        # Captured here, on the flow's thread: worker threads inherit none of its context.
+        self._parent = FlowRunContext.get()
 
     def _run(self, zone: str, year: int) -> None:
         """Hold a fleet-wide ingest slot for this zone, then dispatch and poll it.
@@ -231,13 +236,21 @@ class _DeploymentCellInputs:
         # run_deployment() only yields the run AFTER it finishes, leaving shutdown nothing to
         # cancel. run_deployment is @sync_compatible (typed as a union with its coroutine
         # form); in these worker threads it always runs synchronously.
-        run: Any = run_deployment(
-            self._deployment,
-            parameters=self._params_for(zone, year),
-            timeout=0,
-            tags=[self._child_tag] if self._child_tag else None,
-        )
-        with self._lock:
+        # Entering a copy of the fill's run context makes the run a subflow of the fill. Only
+        # that context: copying the thread's whole context would share the flow's sync client
+        # across threads. Created and registered under the lock `shutdown` snapshots under, after
+        # a second stop check: a run then either makes the snapshot or is never created, so a
+        # thread that queued here while shutdown began cannot leave a child the sweep missed. The
+        # same lock serializes the copies, which share the fill's task-key counter.
+        with self._lock, self._as_subflow():
+            if self._stopping.is_set():
+                raise RuntimeError(f"ingest {zone}-{year} not dispatched: adapter shutting down")
+            run: Any = run_deployment(
+                self._deployment,
+                parameters=self._params_for(zone, year),
+                timeout=0,
+                tags=[self._child_tag] if self._child_tag else None,
+            )
             self._inflight[(zone, year)] = run.id
         run = self._poll_until_terminal(run.id, f"{zone}-{year}")
         # Deregister ONLY after a CONFIRMED terminal state. A transient poll error or a
@@ -246,6 +259,9 @@ class _DeploymentCellInputs:
         with self._lock:
             self._inflight.pop((zone, year), None)
         _check_completed(run, f"ingest {zone}-{year}")
+
+    def _as_subflow(self) -> AbstractContextManager[object]:
+        return self._parent.model_copy() if self._parent is not None else nullcontext()
 
     def _poll_until_terminal(self, flow_run_id: Any, label: str) -> Any:  # noqa: ANN401 — Prefect FlowRun
         errors = 0
@@ -557,11 +573,14 @@ class _DeploymentCellInputs:
         makes confirmation impossible rather than merely slow, and re-asking a server that is
         not answering delays a teardown whose whole job is to stop costing money.
         """
-        # Snapshot BEFORE waking the pollers: a woken worker deregisters its run id on the way
-        # out, and an id that leaves the map un-swept is an un-cancelled child still running.
+        # Stop FIRST, then snapshot under the lock. A dispatcher creates and registers its run
+        # under that lock after re-checking `_stopping`, so a creation already in progress
+        # registers before the snapshot, and every dispatcher still queued on the lock sees the
+        # flag and creates nothing; shutdown waits on at most that one creation. A woken poller
+        # deregisters only a run it has seen finish, so no live id leaves the map un-swept.
+        self._stopping.set()
         with self._lock:
             inflight = dict(self._inflight)
-        self._stopping.set()
         self._executor.shutdown(wait=False, cancel_futures=True)
         if not inflight:
             return
@@ -653,8 +672,8 @@ def _ingest_child_tag(flow_run_id: object) -> str | None:
 
 
 #: The in-process ``inputs.shutdown()`` covers normal failure paths; a cancelled or crashed
-#: flow is killed before its ``finally`` runs, and its child ingests — dispatched from threads,
-#: so carrying no parent-run link — keep writing the mosaic prefix a retry will race.
+#: flow is killed before its ``finally`` runs, and its child ingests keep writing the mosaic prefix
+#: a retry will race: their subflow link gets no server-side cancellation when the parent crashed.
 _cancel_child_ingests_on_cancellation = make_child_cancel_hook(_INGEST_TAG_PREFIX, "child ingest run")
 
 

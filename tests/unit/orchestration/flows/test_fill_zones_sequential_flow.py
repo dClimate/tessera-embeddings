@@ -720,6 +720,68 @@ def test_adapter_wait_polls_child_run_to_completion(monkeypatch):
     assert client.cancelled == []  # nothing in flight at shutdown
 
 
+def test_ingest_runs_are_created_inside_the_fills_run_context(monkeypatch):
+    """Worker threads inherit none of the flow's context, so without entering a copy of the fill's
+    run context around the dispatch, every ingest run is created unattached to the fill.
+    """
+    entered: list[str] = []
+
+    @contextmanager
+    def fill_context():
+        entered.append("in")
+        yield
+        entered.append("out")
+
+    monkeypatch.setattr(mod, "FlowRunContext", SimpleNamespace(get=lambda: SimpleNamespace(model_copy=fill_context)))
+    seen = []
+
+    def run_deployment(dep, parameters, timeout, tags=None):
+        seen.append((threading.current_thread().name.startswith("cell-ingest"), list(entered)))
+        return SimpleNamespace(id="fr-1", state=None)
+
+    monkeypatch.setattr(mod, "run_deployment", run_deployment)
+    monkeypatch.setattr(
+        mod, "get_client", lambda sync_client=True: _FakeClient([_state(StateType.COMPLETED, final=True)])
+    )
+    adapter = _adapter()
+    try:
+        adapter.wait("33N", 2025)
+    finally:
+        adapter.shutdown()
+    assert seen == [(True, ["in"])] and entered == ["in", "out"]
+
+
+def test_a_dispatch_queued_while_shutdown_begins_creates_no_run(monkeypatch):
+    """A worker past the first stop check but still waiting for the lock must create nothing:
+    shutdown has already snapshotted the runs it will cancel, so a run made now is never swept.
+    """
+    created = []
+    monkeypatch.setattr(
+        mod, "run_deployment", lambda *a, **k: created.append(1) or SimpleNamespace(id="fr-late", state=None)
+    )
+    adapter = _adapter()
+    with adapter._lock:
+        adapter.start("33N", 2025)
+        time.sleep(0.2)  # the worker is now queued on the lock
+        adapter._stopping.set()
+    with pytest.raises(RuntimeError, match="not dispatched"):
+        adapter._futures[("33N", 2025)].result(timeout=5)
+    adapter.shutdown()
+    assert created == []
+
+
+def test_shutdown_raises_the_stop_flag_before_waiting_for_the_lock():
+    """Dispatchers queued on the lock must see the flag the moment they get it, so none of them
+    creates a run while shutdown is still waiting its turn behind an in-progress creation.
+    """
+    adapter = _adapter()
+    with adapter._lock:  # stands in for a creation in progress
+        stopper = threading.Thread(target=adapter.shutdown)
+        stopper.start()
+        assert adapter._stopping.wait(2), "the flag must rise before shutdown takes the lock"
+    stopper.join(5)
+
+
 def test_adapter_shutdown_cancels_in_flight_child_runs(monkeypatch):
     """The reviewer's orphan scenario: parent dies while a child ingest runs.
     shutdown() must request cancellation of the in-flight child flow run —
