@@ -21,10 +21,12 @@ racing for slots.
 
 GPUs are the resource that must not wait, and DENSITY ORDERING keeps them fed. Zones are
 dealt to clusters densest-first, so each opens on one of the year's biggest zones and tapers
-towards sparse ones: a cluster waits for that opening zone alone before requesting a fleet,
-never booting GPUs speculatively or paying for a whole cluster's ingest up front, and the
-opening zone is dense enough that the rest of the window lands behind it. Inference is slower
-than ingest in almost every case, so the stream does not run dry.
+towards sparse ones: a cluster waits only for its first mosaic to land, any of them, before
+requesting a fleet, never booting GPUs speculatively or paying for a whole cluster's ingest up
+front, and its dense zones take long enough to infer that the rest land behind them. Inference
+is slower than ingest in almost every case, so the stream does not run dry. A small job, where
+every zone-year infers in minutes, can hold the request for a backlog with
+``inference_start_delay_minutes``.
 
 **Scheduling (ADR-008 D6 + the runner contract).** Inference is parallel across zones; only
 commits contend, and only *same-zone* fills conflict (shared ``years_complete``/``runs``
@@ -574,6 +576,7 @@ async def run_global_campaign(
     max_parallel_ingest: int = 60,
     max_dispatch_rounds: int = 2,
     immediate_refill: bool = False,
+    inference_start_delay_minutes: float = 0.0,
     # Staging-reuse escape hatches. All THREE default off; see `_staging_code_identity`.
     force_staging_reuse: bool = False,
     force_staging_restage: str = "",
@@ -685,7 +688,8 @@ async def run_global_campaign(
             ingest look-ahead and trailing assembly cover the remaining seams (see the
             runner's module docstring). Each cluster requests GPUs as soon as its first mosaic
             lands — any of them — so a fleet is never booted speculatively nor held for the
-            slowest ingest. ``"cluster-per-zone"`` dispatches one ``fill-zone-year`` run per cell
+            slowest ingest (``inference_start_delay_minutes`` can hold it a little longer).
+            ``"cluster-per-zone"`` dispatches one ``fill-zone-year`` run per cell
             instead, each provisioning its own short-lived Ray cluster — simpler, and it pays
             a full cluster bringup and model load per zone.
         chained_fill_deployment: ``flow-name/deployment-name`` of the chained fill deployment
@@ -821,6 +825,16 @@ async def run_global_campaign(
             Not part of the staging fingerprint: it changes WHEN work is dispatched, not what
             is computed. Design record:
             ``context_docs/campaign/campaign-plan.md`` (§3, ``immediate_refill``).
+        inference_start_delay_minutes: Forwarded to every chained fill: once a cluster's first
+            mosaic lands, hold its GPU request up to this many more minutes so a backlog lands
+            first, ending early once all of the cluster's ingests have finished. ``0`` (the
+            default) requests GPUs at the first landing, which suits the full campaign, where
+            dense zones take hours to infer. Set it per dispatch for a small, scattered job such
+            as a targeted update, whose zone-years infer in minutes, so a fleet does not boot on
+            the first small mosaic and idle between the rest
+            (``-p inference_start_delay_minutes=30``). ``"chained-clusters"`` only: a
+            ``cluster-per-zone`` fill ingests its one cell before its cluster starts, so there is
+            nothing to accumulate and the value is not forwarded.
         ingest_limit_name: Prefect global concurrency limit backing ``max_parallel_ingest``
             under ``"chained-clusters"``. The campaign upserts it to that value at start, so
             the parameter is the single place the number is written and cannot drift from
@@ -933,6 +947,8 @@ async def run_global_campaign(
     # this whole read-only preflight for the same reason — see there.
     if num_actors < 1:
         raise ValueError(f"num_actors must be >= 1, got {num_actors} (no actor would ever run inference)")
+    if inference_start_delay_minutes < 0:
+        raise ValueError(f"inference_start_delay_minutes must be >= 0, got {inference_start_delay_minutes}")
     # HERE, before any dispatch. `_apply_gpu_fallback` refuses the same values, but it runs
     # inside the child, AFTER that child has upserted shared limits and primed its look-ahead
     # mosaics — so a deterministic configuration error would spend real ingest work per
@@ -1623,6 +1639,7 @@ async def run_global_campaign(
                         # This cluster's OWN zone count, so its admission gates never limit
                         # fleet fill (see the dispatch comment above).
                         "look_ahead": cell_look_ahead,
+                        "inference_start_delay_minutes": inference_start_delay_minutes,
                         # THE CHAINED FILL ONLY: `_fill_params` dispatches `fill-zone-year` on
                         # the 64 GiB inference family, which must keep the library default.
                         "n_assembly_workers": ASSEMBLY_WORKERS_ON_THE_LARGE_RUNNER,

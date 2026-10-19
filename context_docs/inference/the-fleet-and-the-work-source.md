@@ -263,6 +263,32 @@ and the assembly drain carry on for hours. The cap now names those cells to
 running ingest is inside the concurrency the campaign already budgeted, and cancelling it needs a
 confirmation wait the feeder cannot afford while it still owes an answer to every streaming cell.
 
+### Holding the first request for a backlog
+
+The wind-down makes an ingest gap cheap, not free: each one costs the 120 s idle grace at full
+width, then a regrow through batch requests and model loads. On the full campaign that is noise,
+because a cluster opens on a dense zone that infers for hours. On a small, scattered job, such as a
+targeted update whose zone-years ingest in minutes to hours and infer in minutes, it is most of the
+run: the first small mosaic boots the fleet, which finishes it, winds down, and regrows at the next
+landing, several times over. An estimate for one planned update put GPU busy time at 41-58% of
+billed time at 65 GPUs per cluster.
+
+`inference_start_delay_minutes` holds the cluster's GPU request for up to that many minutes after
+the first mosaic lands, so the fleet boots onto a backlog. It is measured from the first landing,
+not from priming, so a slow first ingest is still followed by the whole hold; measured from
+priming, it would already be spent in exactly the case where no backlog has had time to form. It
+ends early once every ingest in the cluster has finished, landed or failed, since nothing more can
+arrive, and it waits on the ingest futures with that timeout rather than sleeping. It runs inside
+the flow's shutdown guard like the priming, so a cancellation during the hold still cancels the
+child ingests. The default is 0, the behaviour above; `cluster-per-zone` ingests each cell before
+its own cluster, so the parameter does not apply there.
+
+**The inference pause gate cannot do this job.** It is read by the runner's dispatch loop, which
+starts only after `ray up`, so a paused cluster still boots its fleet and requests the first actor
+batch. And a pause over landed work is withheld work rather than absent work ("Available means
+deliverable", above), so the fleet is kept at full width while it waits. The gate also binds every
+cluster at once and is lifted by hand. Before `ray up` is the only point where waiting costs nothing.
+
 ## The gate that caused most of it
 
 Of 71 cell failures in ten days — 62 ingest, 7 inference, 2 assembly — **42 were not failures.**

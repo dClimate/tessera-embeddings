@@ -38,7 +38,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable, Iterable
-from concurrent.futures import FIRST_COMPLETED, CancelledError, Future, ThreadPoolExecutor, wait
+from concurrent.futures import ALL_COMPLETED, FIRST_COMPLETED, CancelledError, Future, ThreadPoolExecutor, wait
 from functools import cache, partial
 from typing import TYPE_CHECKING, Any, cast
 
@@ -144,7 +144,8 @@ class _DeploymentCellInputs:
     race the orphan on the same mosaic prefix). The flow submits every cell of a cluster at
     once; ``max_parallel`` (``1 + look_ahead``, this cluster's share of the fleet-wide ingest
     cap) sizes the executor, so that many run at a time, and the cluster requests GPUs as soon
-    as any one mosaic lands (``wait_first``). The hard ceiling is ``ingest_limit_name``, a
+    as any one mosaic lands (``wait_first``), or after an optional hold for a backlog
+    (``hold_for_backlog``). The hard ceiling is ``ingest_limit_name``, a
     Prefect global concurrency limit shared by every cluster; the clusters are separate flow
     runs, so only a server-side gate can bound them together. ``cleanup`` deletes only mosaics
     THIS adapter produced (a cell never started here is someone else's input), matching the
@@ -395,6 +396,37 @@ class _DeploymentCellInputs:
             f"{len(cells)} ingest(s) failed with none landing ({listed}) — there is no mosaic "
             f"to infer, so no GPU fleet is requested. The first failure is chained below."
         ) from cause
+
+    def hold_for_backlog(self, cells: list[tuple[str, int]], minutes: float) -> None:
+        """After the first mosaic lands, hold the GPU request up to ``minutes`` for more to land.
+
+        Called straight after ``wait_first``, so the hold is measured from the first landing
+        and a slow first ingest is still followed by the whole hold. It ends early once every
+        one of ``cells`` has finished, landed or failed, since nothing more can arrive. It
+        blocks on the ingest futures rather than sleeping, so it returns the moment the last
+        one settles, and it raises nothing of its own: a failed ingest surfaces when the
+        runner reaches that cell, as it would without the hold.
+        """
+        futs = [self._futures[c] for c in cells if c in self._futures]
+
+        def landed() -> int:
+            return sum(1 for f in futs if f.done() and not f.cancelled() and f.exception() is None)
+
+        self._log.info(
+            "Holding the GPU request up to %.1f min for a backlog: %d of %d mosaic(s) landed",
+            minutes,
+            landed(),
+            len(futs),
+        )
+        t0 = time.monotonic()
+        _, pending = wait(futs, timeout=minutes * 60, return_when=ALL_COMPLETED)
+        self._log.info(
+            "GPU hold ended after %.1f min (%s): %d of %d mosaic(s) landed — requesting GPUs",
+            (time.monotonic() - t0) / 60,
+            "limit reached" if pending else "every ingest finished",
+            landed(),
+            len(futs),
+        )
 
     def cleanup(self, zone: str, year: int) -> None:
         """Delete the cell's mosaics, and RAISE if that did not happen.
@@ -668,6 +700,7 @@ def fill_zones_sequential_flow(
     ingest_deployment: str = "ingest-zone-year/ingest-zone-year",
     branch: str | None = None,
     look_ahead: int = 2,
+    inference_start_delay_minutes: float = 0.0,
     max_retained_failures: int = 100,
     attempts_per_cell_in_cluster: int = 2,
     inference_pause_gate: str | None = None,
@@ -787,6 +820,14 @@ def fill_zones_sequential_flow(
             a time, which also sets the priming abort quorum. It does not bound in-flight
             mosaics (peak storage is a cluster's mosaics by design, ADR-011) and does not set
             the retained-failure cap — see ``max_retained_failures``.
+        inference_start_delay_minutes: How much longer to hold the GPU request once the first
+            mosaic has landed, so more mosaics land and the fleet boots onto a backlog. The hold
+            ends early once every cell's ingest has finished, landed or failed, since nothing
+            more can arrive. ``0`` (the default) requests GPUs at the first landing. Worth
+            setting for a small, scattered job such as a targeted update, whose zone-years
+            ingest in minutes to hours and infer in minutes: without it the first small mosaic
+            boots the fleet, which then idles and regrows between landings. Has no effect with
+            ``ingest=False``, where the mosaics already exist.
         max_retained_failures: Failed cells holding mosaics off-budget before the feeder stops
             admitting and the run logs ``FAILURE CAP EXCEEDED``. A ceiling against a SYSTEMATIC
             fault, not a tripwire for a bad hour, so set it near the roster size: a value a bad
@@ -850,6 +891,8 @@ def fill_zones_sequential_flow(
     # ever ingest — and it would only wedge AFTER priming and cluster bringup.
     if look_ahead < 0:
         raise ValueError(f"look_ahead must be >= 0, got {look_ahead}")
+    if inference_start_delay_minutes < 0:
+        raise ValueError(f"inference_start_delay_minutes must be >= 0, got {inference_start_delay_minutes}")
     if attempts_per_cell_in_cluster < 1:
         raise ValueError(
             f"attempts_per_cell_in_cluster must be >= 1, got {attempts_per_cell_in_cluster} "
@@ -1456,6 +1499,10 @@ def fill_zones_sequential_flow(
     # densest-first ORDER still sizes the session from the largest cell and puts the island tail
     # last; it is simply no longer a barrier.
     #
+    # `inference_start_delay_minutes` then holds the request a while longer, for a job too small
+    # for that to pay: when every cell infers in minutes, the first landing boots a fleet that
+    # finishes it and idles until the next one lands.
+    #
     # INSIDE the shutdown guard, deliberately. `start` submits every cell at once, so from the
     # first submission onward there are child ingest runs only `shutdown()` can cancel. Priming
     # above the `try` let any failure in between — a raising `start`, an unexpected error in the
@@ -1480,19 +1527,23 @@ def fill_zones_sequential_flow(
                 ", ".join(f"{c.n_tiles:,}" for c in ingest_window[:6]),
             )
             t0 = time.monotonic()
-            first = inputs.wait_first([(c.zone, c.year) for c in ingest_window])
+            window_cells = [(c.zone, c.year) for c in ingest_window]
+            first = inputs.wait_first(window_cells)
             if first is None:  # nothing was started (no adapter cells) — nothing to wait for
                 log.warning("No ingest was started for this cluster; requesting GPUs without waiting")
             else:
                 landed = next(c for c in ingest_window if (c.zone, c.year) == first)
                 log.info(
-                    "Mosaic for %s-%d (%s tiles) ready after %.1fs — requesting GPUs; %d zone(s) still ingesting",
+                    "Mosaic for %s-%d (%s tiles) ready after %.1fs%s; %d zone(s) still ingesting",
                     landed.zone,
                     landed.year,
                     f"{landed.n_tiles:,}",
                     time.monotonic() - t0,
+                    "" if inference_start_delay_minutes else " — requesting GPUs",
                     len(ingest_window) - 1,
                 )
+                if inference_start_delay_minutes:
+                    inputs.hold_for_backlog(window_cells, inference_start_delay_minutes)
 
         # Pin a deterministic cluster name from the flow-run id so the cancellation hook can
         # re-derive it and terminate the fleet by tag even in a fresh module import (globals
