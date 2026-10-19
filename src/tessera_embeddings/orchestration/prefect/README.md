@@ -339,7 +339,6 @@ update's name as `update=<name>`, and treat its cells differently from a fill's:
 | recorded in | `years_complete`, `runs[year]`, the zone-year tag | `updates[year]` alone |
 | ROI, mosaics, staging | the campaign's paths | `{inputs}/updates/<name>/`, `{outputs}/staging/updates/<name>/<store>/`; hole masks and staging per destination store |
 | `min_valid_coverage`, month check | 0.1, every month | `1e-9`, relaxed: a partial-zone ROI must never block |
-| S2 dates per commit | sized from covered area (`auto_batch_dates`) | 4 when the plan names shards, whose scattered windows make each date small ([why](../../../../docs/ingest-performance.md#batching-dates-into-one-compute-batch_dates)); a cell planned whole is sized like a fill |
 | radar policy | any | `holes` requires `allow_s2_only=True`, the campaign's, refused before ingest otherwise |
 
 Run one update per cell at a time: two updates of one cell conflict on its chunks.

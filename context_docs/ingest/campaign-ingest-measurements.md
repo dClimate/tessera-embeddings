@@ -574,8 +574,8 @@ snapshot.
 
 **An earlier reading of "1.14x, adopt it globally" is SUPERSEDED.** That figure is real but it is
 one point on a curve that is **not monotonic**: the same setting measured on four further regions
-*loses* on two of them. Batching is therefore not a global setting — it is sized per region from
-covered area, and every targeted update of chosen shards fuses four dates (§3.21).
+*loses* on two of them. Batching is therefore not a global setting: it pays for sparse writes and
+loses on dense ones, and is now sized per date by the chunks each date writes (§3.21).
 
 **Why it can lose.** Batching trades commit count for graph size and peak memory. Where the fleet
 has idle capacity the larger graph packs into it and the saved commits are free; where it does not,
@@ -764,51 +764,65 @@ gained 15% from six; main's workers do not have that headroom. Six threads with
 worker hours, so the saving there is real money at campaign scale, at most about $4,700 of the
 nine-year campaign's $187,441 container bill (`context_docs/campaign/campaign-cost-model.md`).
 
-### 3.21 Pipelining becomes automatic, and every update batches — the Latin America update (October 2026)
+### 3.21 Pipelining becomes automatic, and batching is sized by sparsity — the Latin America update (October 2026)
 
 **What the run showed.** The production Latin America update of 2026-10-19 ran its S2 legs on
 60-worker fleets with date pipelining off, as every campaign run until then had. All 659 S2
 `Stage timings` and `Batch timings` lines report `hidden=0.0`: no date's preparation overlapped a
-write. Each date paid fixed costs of about 1.7 s of graph build, 4.9 s of coverage gate and 10 s
-of write overhead, against about 2.3 s per window written, and an update's date touches a median
-of about six windows — so the fixed costs were most of every date. The fleets averaged between 110
-and 450 tasks in flight against 360 task slots (60 workers of six threads); the least loaded left
-most of their slots idle.
+write. Each date paid fixed costs of about 1.7 s to build its read plan, 4.9 s for the cloud-mask
+check and 10 s of write overhead, against about 2.3 s per window written, and an update's date
+touches a median of about six windows, so the fixed costs were most of every date. The fleets
+averaged between 110 and 450 tasks in flight against 360 task slots (60 workers of six threads).
 
 Three zone-years (18S, 19S, 20N) also wrote one date at a time. Their scattered update windows
 covered more than 500 chunks in all, so `auto_batch_dates` (§3.16) read them as large regions,
-while each date touched only a handful of windows and paid the 10 s write overhead alone.
+while each date touched only a handful of windows and paid the 10 s write overhead alone. The
+smaller zone-years, which did batch, paid about 5 s of write overhead a date on fleets of 10 to 53
+workers.
 
 **Decision 1: pipelining is automatic.** The S2 flow takes no `pipeline_dates` parameter. It
 pipelines on every Fargate fleet up to `MAX_PIPELINE_DATES_WORKERS` (140 workers) and on every
-local cluster, and prepares dates one at a time on a wider fleet. The paired tests recorded in the
-yield-embeddings test plan (F-22 to F-25) and its fleet scaling report (§8, correction of
-2026-07-26) support it:
+local cluster. The paired tests recorded in the yield-embeddings test plan (F-22 to F-25) and its
+fleet scaling report (§8, correction of 2026-07-26) support it:
 
 | Measure | 120 workers | 60 workers | 45 workers |
 |---|---|---|---|
-| hideable preparation (an unpipelined arm's build + gate, s/date) | 12.5 | 18.5 | 20.6 |
+| preparation an unpipelined arm paid (read plan + cloud-mask check, s/date) | 12.5 | 18.5 | 20.6 |
 | median per-date gain, first paired test at that width | +0.7 s (1.01×) | +21.8 s (1.14×) | not measured |
 
 The cycle saving was positive in all four paired tests (4.8, 22.1, 20.9 and 6.7 s a date), so no
-pipelined run has been slower end to end. The preparation there is to hide grows as a fleet
-narrows, so narrower fleets gain more. Nothing has been measured below 45 workers or above 120.
-The only estimated loss is above about 140 workers on a saturated fleet, where the gate the
-overlap adds to the write outweighs the preparation it hides, which is why that bound stays, as
-an automatic decision rather than a setting. Stores are byte-identical either way (parity test). The
-domain function `ingest_s2_roi_reflectance` keeps its `pipeline_dates` argument, so the ingest
-code identity does not move (`ingcode-67740a8483141eda`).
+pipelined run has been slower end to end. The read plan, about 5.8 s of each figure above, is one
+thread in the ingest's driver and is always hidden; the cloud-mask check runs as fleet tasks and is
+hidden only into idle worker time. Why preparation shrank only 1.6× from 45 to 120 workers while
+the write shrank about 2.4× is not settled; the working suspicion is that the read plan cannot use
+more workers and that the check is a small graph bound by per-request read latency. Nothing has
+been measured below 45 workers or above 120, so the 140-worker bound is a precaution, not a
+measured loss. Stores are byte-identical either way (parity test). The domain function keeps its
+`pipeline_dates` argument for direct callers.
 
-**Decision 2: every update of chosen shards batches four dates.** `ingest_zone_year` passes
-`batch_dates=AUTO_BATCH_DATES` (4) to the S2 leg whenever it runs for an update that names its
-shards. Campaign fills stay on the covered-area rule, which was calibrated on full zone-years,
-where covered area does track how much a date writes, and so does an update planned over every
-shard of a cell: it covers the whole zone, and forcing four dates there would risk the
-mid-size loss §3.16 measured. Batched stores are byte-identical (batching parity test).
+**Decision 2: batching is sized by what each date writes.** Batching saves per-write overhead and
+nothing else, so it pays for sparse writes and loses on dense ones (§3.16: 1.61× on 26S and 1.12×
+on 59S, but 29% slower on 21N and 7% on 35N). Neither proxy measured that: the covered-area
+threshold misread the update's sparse large zone-years, and "every update batches" would misread
+a dense update. The S2 ingest now counts the storage chunks each date's footprint-narrowed windows
+cover, and fills a batch with up to four dates while their chunks stay within
+`BATCH_CHUNKS_PER_WORKER` (12) per worker; a date that would cross the budget starts a new batch,
+so a dense date writes alone. One rule for campaign fills, updates and single-area runs.
 
-**Not yet measured:** both changes together on an update. The confirmation is a small update of a
-sparse zone on dev, comparing its `Stage timings`, `Batch timings` and `Pipeline` lines against
-the figures above.
+The budget is a draft. Twelve chunks a worker is about 720 a batch on 60 workers, inside the
+sweep's gain: 59S at about 188 chunks a date won at four dates a batch, about 750 chunks, on
+fleets of 40 to 60 workers (the sweep did not record its width). **To tune it from the restarted
+production run:** compare the `Batch timings` lines of 18S, 19S and 20N, which now carry
+`chunks=N`, against run 1's one-date writes of about 31 s at about six windows a date, and watch
+for writes on 60-worker fleets that lengthen as batches grow. The six-thread workers (§3.20, PR
+#214) arrived after the July sweep, so where batching starts to crowd the fleet may have moved.
+
+`config.ingest.auto_batch_dates` and its threshold are no longer called but stay defined:
+`config/ingest.py` is inside the inference code identity's closure, so removing them would move
+that identity. They go with the next change that moves it anyway. The ingest code identity moves
+(`ingest/s2_roi.py` changed): `ingcode-67740a8483141eda` → `ingcode-b42aead5209ce75d`, so resuming
+mosaics built before this change needs `allow_ingest_code_mismatch=true`. The inference identity
+is unchanged (`infcode-44bbc47265fcb6a8`). Batched stores are byte-identical (batching parity test).
 
 ## 4. What did not work, and why
 

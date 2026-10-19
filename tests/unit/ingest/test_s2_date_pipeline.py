@@ -526,6 +526,28 @@ def test_a_batch_failure_that_is_not_a_read_error_still_fails_the_leg(run_ingest
         run_ingest(dates, pipeline_dates=False, fail_on="2024-01-02", batch_dates=2)
 
 
+@pytest.mark.parametrize(
+    ("chunks", "budget", "sizes"),
+    [
+        ([1, 1, 1, 1, 1], None, [4, 1]),  # no budget: the cap alone
+        ([1, 1, 1, 1, 1], 10, [4, 1]),  # sparse dates fill a batch to the cap
+        ([2, 2, 3, 1, 1], 5, [2, 3]),  # a date that would cross the budget closes the batch first
+        ([1, 9, 1, 1], 5, [1, 1, 2]),  # a date over the budget on its own writes alone
+    ],
+)
+def test_a_batch_holds_sparse_dates_up_to_its_chunk_budget(run_ingest, monkeypatch, caplog, chunks, budget, sizes):
+    """Batching pays for sparse writes only, so a batch is sized by the chunks each date writes."""
+    per_date = iter(chunks)
+    one_chunk = SimpleNamespace(y0=0, y1=SIZE, x0=0, x1=SIZE)
+    monkeypatch.setattr(s2_roi, "windows_for_date", lambda *_a, **_k: [one_chunk] * next(per_date))
+    dates = {f"2024-01-{d:02d}": True for d in range(1, len(chunks) + 1)}
+    log = logging.getLogger("s2-batch-budget-test")
+    with caplog.at_level(logging.INFO, logger=log.name):
+        run = run_ingest(dates, pipeline_dates=True, batch_dates=None, batch_chunk_budget=budget, log=log)
+    assert [int(n) for n in re.findall(r"Batch timings .* n=(\d+):", caplog.text)] == sizes
+    assert run.written == list(dates)
+
+
 # ---------------------------------------------------------------------------
 # The recovery ladder must cover every read, and carry its own baselines.
 # ---------------------------------------------------------------------------

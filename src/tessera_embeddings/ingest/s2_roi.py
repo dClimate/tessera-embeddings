@@ -34,7 +34,7 @@ import logging
 import math
 import operator
 import time
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from functools import reduce
 from typing import final
@@ -44,7 +44,7 @@ import dask.distributed
 import numpy as np
 import xarray as xr
 
-from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE, INGEST_CHUNKS, auto_batch_dates
+from tessera_embeddings.config.ingest import AUTO_BATCH_DATES, INGEST_CHUNK_SIZE, INGEST_CHUNKS
 from tessera_embeddings.config.providers import PROVIDERS
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
 from tessera_embeddings.ingest._pipeline import pipelined
@@ -191,7 +191,7 @@ def _coverage_from_scl(
 
     Takes the SCL array rather than loading it so the gate and the write share one
     ``odc.stac.load`` graph: SCL is one of the written bands, so loading it separately costs a
-    second client-side graph build and a second read of the same data for no information.
+    second graph build in the driver and a second read of the same data for no information.
 
     Both sides of the coverage ratio must be cropped together or every percentage is skewed:
     under ``windows`` the numerator reduces over the windows only, which equals the full-extent
@@ -226,6 +226,18 @@ def _coverage_from_scl(
 
     passes = float(100.0 * valid_count_val / roi_pixel_count) >= min_valid_coverage
     return (True, any_valid) if passes else (False, None)
+
+
+def _covered_chunks(windows: Iterable[tuple[int, int, int, int]]) -> int:
+    """Storage chunks that ``(y0, y1, x0, x1)`` windows cover: what writing them touches.
+
+    CEIL, not floor: windows are clamped to the ROI extent, so an edge window can be narrower or
+    shorter than one chunk, and floor would count a tall narrow window as covering nothing.
+    """
+    return sum(
+        math.ceil((y1 - y0) / INGEST_CHUNK_SIZE) * math.ceil((x1 - x0) / INGEST_CHUNK_SIZE)
+        for y0, y1, x0, x1 in windows
+    )
 
 
 @dataclass
@@ -295,6 +307,7 @@ def ingest_s2_roi_reflectance(
     overlap_window_writes: bool = True,
     pipeline_dates: bool = False,
     batch_dates: int | None = None,
+    batch_chunk_budget: int | None = None,
     allow_ingest_code_mismatch: bool = False,
     s3_region: str | None = None,
 ) -> IngestResult:
@@ -330,16 +343,23 @@ def ingest_s2_roi_reflectance(
             which rests on preparation being side-effect-free.
         batch_dates: Write up to this many consecutive PASSING dates as one dask compute and one
             commit, so the dates' graphs pack the fleet together — one date's straggling reads
-            backfill with another's work — and the per-date drain tail and commit gap are paid
-            once per batch. The commit unit becomes the batch: a mid-batch failure commits none
-            of its dates and the retry re-ingests exactly those (per-date sessions are impossible
-            — each date's append resizes the time axis, so sibling sessions conflict on array
-            metadata). Identical stores either way. COMPOSES with ``pipeline_dates``: the
-            look-ahead is then sized to the batch, so the next batch's whole preparation overlaps
-            this batch's write instead of only one date's. ``None`` (the default) derives it from
-            the ROI's covered window area via
-            :func:`~tessera_embeddings.config.ingest.auto_batch_dates`, because the benefit is
-            not monotonic in ROI size; 1 forces the one-commit-per-date path.
+            backfill with another's work — and the per-write overhead (graph submission, drain
+            tail, commit) is paid once per batch. The commit unit becomes the batch: a mid-batch
+            failure commits none of its dates and the retry re-ingests exactly those (per-date
+            sessions are impossible — each date's append resizes the time axis, so sibling
+            sessions conflict on array metadata). Identical stores either way. COMPOSES with
+            ``pipeline_dates``: the look-ahead is then sized to the batch, so the next batch's
+            whole preparation overlaps this batch's write instead of only one date's. ``None``
+            (the default) caps it at :data:`~tessera_embeddings.config.ingest.AUTO_BATCH_DATES`;
+            1 forces the one-commit-per-date path.
+        batch_chunk_budget: The most storage chunks one batch may write. Batching pays for
+            SPARSE writes only: it saves per-write overhead and cannot make the write itself
+            faster, so where one date's write already fills the fleet a bigger batch just
+            queues and crowds out the preparation running beside it. Sparsity is measured per
+            date, as the chunks its footprint-narrowed windows cover, so a batch fills with
+            sparse dates up to ``batch_dates`` and a date that would push it past the budget
+            starts a new one; a date over the budget on its own writes alone. ``None`` applies
+            no budget. The S2 flow sizes it to the fleet.
         allow_ingest_code_mismatch: Off by default. See the field of the same name on
             :class:`~tessera_embeddings.storage.manifest.IngestManifest`.
 
@@ -400,23 +420,18 @@ def ingest_s2_roi_reflectance(
     live_windows: list[tuple[int, int, int, int]] = [(w.y0, w.y1, w.x0, w.x1) for w in run_windows]
     log.info("Writing %d live window(s)", len(run_windows))
 
-    # Resolve `batch_dates=None` (auto) now that the windows are known. Derived from
-    # the area those windows COVER, which is what the write graph touches.
     if batch_dates is None:
-        # CEIL, not floor. Windows are clamped to the ROI extent, so an edge window can be
-        # narrower or shorter than one chunk; floor counts that dimension as zero, and a tall
-        # narrow ROI (one partial-width column over many rows) then totals zero covered chunks.
-        # auto_batch_dates would read that large graph as empty and enable 4-date batching on it,
-        # which is exactly the case the threshold exists to prevent.
-        covered_chunks = sum(
-            math.ceil((w.y1 - w.y0) / INGEST_CHUNK_SIZE) * math.ceil((w.x1 - w.x0) / INGEST_CHUNK_SIZE)
-            for w in run_windows
-        )
-        batch_dates = auto_batch_dates(covered_chunks)
+        batch_dates = AUTO_BATCH_DATES
+    if batch_dates == 1:
+        log.info("Writing one date per commit")
+    elif batch_chunk_budget is None:
+        log.info("Batching up to %d dates per write", batch_dates)
+    else:
         log.info(
-            "batch_dates=auto -> %d (%d chunk(s) covered by live windows)",
+            "Batching up to %d dates per write while a batch writes at most %d storage chunks; "
+            "a date over that writes alone",
             batch_dates,
-            covered_chunks,
+            batch_chunk_budget,
         )
 
     # Load blocks match the store's chunks, so a date's read parallelism is one task
@@ -528,7 +543,7 @@ def ingest_s2_roi_reflectance(
 
         # ONE load per date, serving both the coverage gate and the write: SCL is among the
         # written bands, so a separate gate-only load would re-read it and pay a second
-        # client-side graph build. A date that then fails the gate discards a graph it built,
+        # graph build in the driver. A date that then fails the gate discards a graph it built,
         # which is cheap — construction is the same order either way and nothing was computed.
         stage_started = time.monotonic()
         try:
@@ -734,7 +749,7 @@ def ingest_s2_roi_reflectance(
                         parallel_windows=overlap_window_writes,
                         s3_region=s3_region,
                     )
-        # One line per kept date, partitioning its wall clock into the client-side graph build,
+        # One line per kept date, partitioning its wall clock into the graph build in the driver,
         # the coverage-gate compute and the write (windows + commit). Stable format: CloudWatch
         # queries and the pipeline analysis key off it. `total` is build+gate+write, the date's
         # SERIAL-EQUIVALENT cost, so it stays comparable across modes however much was hidden.
@@ -811,7 +826,7 @@ def ingest_s2_roi_reflectance(
         prepare_s = sum(p.build_s + p.gate_s for p in batch)
         log.info(
             "Batch timings roi=%s dates=%s..%s n=%d: build=%.1fs gate=%.1fs write=%.1fs windows=%d "
-            "prepare=%.1fs hidden=%.1fs stall=%.1fs",
+            "prepare=%.1fs hidden=%.1fs stall=%.1fs chunks=%d",
             roi_label,
             batch[0].date,
             batch[-1].date,
@@ -828,6 +843,9 @@ def ingest_s2_roi_reflectance(
             # figure inflated by contention.
             max(prepare_s - stall_s, 0.0),
             stall_s,
+            # Appended LAST so parsers of the fields before it are unaffected: the batch's size in
+            # what the budget measures.
+            _covered_chunks(w for p in batch for w in p.windows),
         )
 
     def _drive(items: list) -> None:
@@ -1107,6 +1125,7 @@ def ingest_s2_roi_reflectance(
             )
             batch: list[_PreparedDate] = []
             batch_stall = 0.0
+            batch_chunks = 0
             for prepared, stall_s in supply:
                 if prepared.read_error is not None:
                     # Preparation could not read a source: no dataset to batch, and the duplicate
@@ -1122,17 +1141,25 @@ def ingest_s2_roi_reflectance(
                     # preserve here and impossible to repair afterwards.
                     if batch:
                         _write_batch_or_isolate(batch, batch_stall)
-                        batch, batch_stall = [], 0.0
+                        batch, batch_stall, batch_chunks = [], 0.0, 0
                     _consume(prepared, stall_s)
                     continue
                 if prepared.day_ds is None:
                     _record_skip(prepared)
                     continue
+                # Sized by what each date WRITES: sparse dates share a write, and a date that
+                # would push the batch past its budget starts a new one, so a dense date writes
+                # alone.
+                chunks = _covered_chunks(prepared.windows)
+                if batch and batch_chunk_budget is not None and batch_chunks + chunks > batch_chunk_budget:
+                    _write_batch_or_isolate(batch, batch_stall)
+                    batch, batch_stall, batch_chunks = [], 0.0, 0
                 batch.append(prepared)
                 batch_stall += stall_s
+                batch_chunks += chunks
                 if len(batch) == batch_dates:
                     _write_batch_or_isolate(batch, batch_stall)
-                    batch, batch_stall = [], 0.0
+                    batch, batch_stall, batch_chunks = [], 0.0, 0
             if batch:
                 _write_batch_or_isolate(batch, batch_stall)
         elif pipeline_dates:

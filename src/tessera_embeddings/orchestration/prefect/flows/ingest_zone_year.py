@@ -63,7 +63,7 @@ from prefect.deployments import arun_deployment
 from prefect.runtime import flow_run as flow_run_ctx
 from pydantic import BaseModel
 
-from tessera_embeddings.config.ingest import AUTO_BATCH_DATES, IngestSettings
+from tessera_embeddings.config.ingest import IngestSettings
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.errors import ConfigMismatchError, InsufficientCoverageError, ProviderRefusedReadsError
@@ -475,8 +475,7 @@ async def ingest_zone_year(
         update: Name of a targeted update (:mod:`tessera_embeddings.storage.update`) to ingest
             for. Its plan supplies the mask, the shards (the ROI covers only their 4096-px
             blocks), ``min_valid_coverage`` and ``allow_partial_window``, and the ROI and
-            mosaics go under the update's own prefix rather than the campaign's. When it names
-            shards, its S2 leg always batches ``AUTO_BATCH_DATES`` dates per commit.
+            mosaics go under the update's own prefix rather than the campaign's.
 
     Returns:
         ``{zone, year, status, ...}`` where status is ``skipped_ocean`` (no live
@@ -709,11 +708,6 @@ async def ingest_zone_year(
                 **common,
                 "min_valid_coverage": ingest_settings.min_valid_coverage,
                 "perf_report_uri": f"{perf_base}/s2.html" if perf_base else None,
-                # An update of chosen shards always batches. The automatic rule reads covered area
-                # as how much a date writes, which holds for a whole zone but not for scattered
-                # shards: each date touches a few of them however much area they cover in all. An
-                # update of every shard (`tiles is None`) is a whole zone and keeps the rule.
-                **({"batch_dates": AUTO_BATCH_DATES} if tiles is not None else {}),
             },
             _leg_store(mosaic_base, None),
         )

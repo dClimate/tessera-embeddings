@@ -25,15 +25,43 @@ from tessera_embeddings.orchestration.prefect.flows._dask_lifecycle import (
 from tessera_embeddings.orchestration.prefect.tasks.ingest import process_roi_reflectance
 
 MAX_PIPELINE_DATES_WORKERS = 140
-"""Widest Fargate fleet on which the flow pipelines S2 dates.
+"""Widest Fargate fleet on which the flow prepares the next S2 date during the current write.
 
-Overlapping the next date's preparation with the current date's write pays while the write
-leaves the fleet room to absorb the coverage gate. That gate is worker-side work, so on a fleet
-the write already keeps busy it is additive however it is scheduled. The preparation left to
-hide grows as the fleet narrows (12.5 s a date at 120 workers, 18.5 s at 60, 20.6 s at 45), and
-every paired test, at 60 and 120 workers, gained. Past this width the overlap is estimated to
-cost more than the client-side graph build it saves. An estimate over an unmeasured region, not
-a property of the code: see `yield-embeddings/context_docs/measurements/`.
+Preparing a date has two parts. Building its read plan runs in the ingest's driver: one thread,
+in the task that drives the ingest on one worker. Checking its cloud mask reads the date's
+cloud-mask (SCL) data as tasks spread across the fleet, on the same workers that run the write.
+The overlap prepares the next date on a background thread of the driver while the fleet writes
+the current one. The read plan then costs nothing, because the driver would otherwise wait on
+the write. The cloud-mask check costs nothing only where the write leaves workers idle; where the
+write keeps every worker busy, the check's tasks take turns with the write's and lengthen it.
+
+Preparation does not shrink with fleet width the way the write does, and why is not settled.
+Measured on full zone-years (yield-embeddings test plan, F-22 to F-25): preparation took 20.6 s
+a date at 45 workers, 18.5 s at 60 and 12.5 s at 120, about 5.8 s of it the read plan at every
+width, so it shrank 1.6x while the fleet widened 2.7x. Over the same widths the write's
+worker-seconds stayed nearly constant (9,144 to 10,356), so its time fell about 2.4x. On the
+sparse 2026-10-19 Latin America update at 60 workers, the read plan took about 1.7 s and the
+check about 4.9 s a date, however few windows the date touched. Suspected, not established: the
+read plan is one thread, so more workers cannot speed it; and the cloud-mask check is a small
+graph, so once a fleet has more workers than its tasks, per-request read latency rather than
+worker count sets its time.
+
+So the overlap saves at least the read-plan time, plus whatever part of the check fits into idle
+worker time. Paired runs measured it 1.14x faster per date at 60 workers and 1.01x at 120, never
+slower. Nothing wider than 120 workers was measured: this bound turns the overlap off above 140
+workers as a precaution, not because a loss was seen there.
+"""
+
+BATCH_CHUNKS_PER_WORKER = 12
+"""Storage chunks one S2 batch may write per worker in the fleet: the batch's budget.
+
+Batching saves each write's fixed overhead (graph submission, drain and commit: about 10 s a write
+on the 2026-10-19 production update) and cannot make the write itself faster, so it pays for
+sparse writes and loses where one date's write already fills the fleet. Basis, a draft to tune
+from production: in the July sweep (yield-embeddings test plan F-32, pipelined, fleets of 40 to
+60 workers), 59S at about 188 chunks a date gained 1.12x at 4 dates a batch (about 750 chunks),
+while 21N (644 live chunks) lost 29% and 35N lost 7%. 12 a worker (720 chunks at 60 workers, 120
+at 10) sits inside the measured gain at either width.
 """
 
 
@@ -76,12 +104,13 @@ def _ingest_s2_roi_impl(
     overlap_window_writes: bool = True,
     pipeline_dates: bool,
     batch_dates: int | None = None,
+    batch_chunk_budget: int | None,
     allow_ingest_code_mismatch: bool = False,
     s3_region: str | None = None,
 ) -> dict[str, Any]:
     """Inner flow: submits the S2 ingestion task to the configured Dask runner.
 
-    ``pipeline_dates`` is the outer flow's decision (see :func:`_pipelines_dates`), never a
+    ``pipeline_dates`` and ``batch_chunk_budget`` are the outer flow's decisions, never a
     caller's.
     """
     future = process_roi_reflectance.submit(
@@ -97,6 +126,7 @@ def _ingest_s2_roi_impl(
         overlap_window_writes=overlap_window_writes,
         pipeline_dates=pipeline_dates,
         batch_dates=batch_dates,
+        batch_chunk_budget=batch_chunk_budget,
         allow_ingest_code_mismatch=allow_ingest_code_mismatch,
         s3_region=s3_region,
     )
@@ -169,16 +199,15 @@ def ingest_s2_roi_reflectance(
             blocking compute per window, so their critical paths overlap across the fleet
             instead of summing. Identical stores either way; falls back to the sequential
             write when the overlapped machinery is unavailable.
-        batch_dates: Compute up to this many consecutive passing dates as one dask graph and
-            land them as ONE commit, so their work packs the fleet together and the per-date
-            drain tail and commit gap are paid once per batch. The commit unit becomes the
-            batch: a mid-batch failure commits none of its dates, and the retry re-ingests
-            exactly those. Identical stores either way. When dates are pipelined the
-            look-ahead becomes the batch, so a whole batch's preparation hides behind the
-            previous batch's write. Leave at ``None`` to size it from the ROI, which is what a
-            campaign fill wants: the benefit is not monotonic in ROI size, so one global value
-            regresses part of the range. ``ingest_zone_year`` pins it for a targeted update,
-            whose scattered windows the size rule misreads; otherwise pin an int only for one
+        batch_dates: The most consecutive passing dates computed as one dask graph and landed
+            as ONE commit, so the per-write overhead (graph submission, drain tail, commit) is
+            paid once per batch. The commit unit becomes the batch: a mid-batch failure commits
+            none of its dates, and the retry re-ingests exactly those. Identical stores either
+            way. When dates are pipelined the look-ahead becomes the batch. ``None`` caps it at
+            ``AUTO_BATCH_DATES`` (4). How many dates a batch actually holds is set per date by a
+            budget of ``BATCH_CHUNKS_PER_WORKER`` storage chunks per worker: batching pays only
+            for sparse writes, so sparse dates fill a batch and a date that would push it past
+            the budget starts a new one (a local cluster has no budget). Pin an int only for one
             arm of a comparison.
         worker_env_overrides: Env vars merged into every Dask worker's environment for THIS
             run only, to A/B worker-side tuning (allocator, cache behaviour) one arm at a
@@ -199,6 +228,8 @@ def ingest_s2_roi_reflectance(
     log.info("Starting ingest_s2_roi_reflectance for %s", roi_zarr_path)
 
     pipeline_dates = _pipelines_dates(use_local=use_local, max_workers=max_workers, log=log)
+    # Local clusters have no fleet width to budget against; see BATCH_CHUNKS_PER_WORKER.
+    batch_chunk_budget = None if use_local else BATCH_CHUNKS_PER_WORKER * max_workers
 
     if use_local:
         from tessera_embeddings.providers.local.dask import local_cluster
@@ -223,6 +254,7 @@ def ingest_s2_roi_reflectance(
                 overlap_window_writes=overlap_window_writes,
                 pipeline_dates=pipeline_dates,
                 batch_dates=batch_dates,
+                batch_chunk_budget=batch_chunk_budget,
                 allow_ingest_code_mismatch=allow_ingest_code_mismatch,
                 s3_region=s3_region,
             )
@@ -258,6 +290,7 @@ def ingest_s2_roi_reflectance(
                 overlap_window_writes=overlap_window_writes,
                 pipeline_dates=pipeline_dates,
                 batch_dates=batch_dates,
+                batch_chunk_budget=batch_chunk_budget,
                 allow_ingest_code_mismatch=allow_ingest_code_mismatch,
                 s3_region=s3_region,
             )
