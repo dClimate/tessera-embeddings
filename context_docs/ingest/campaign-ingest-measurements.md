@@ -575,7 +575,7 @@ snapshot.
 **An earlier reading of "1.14x, adopt it globally" is SUPERSEDED.** That figure is real but it is
 one point on a curve that is **not monotonic**: the same setting measured on four further regions
 *loses* on two of them. Batching is therefore not a global setting — it is sized per region from
-covered area, and every targeted update fuses four dates (§3.21).
+covered area, and every targeted update of chosen shards fuses four dates (§3.21).
 
 **Why it can lose.** Batching trades commit count for graph size and peak memory. Where the fleet
 has idle capacity the larger graph packs into it and the saved commits are free; where it does not,
@@ -799,10 +799,12 @@ an automatic decision rather than a setting. Stores are byte-identical either wa
 domain function `ingest_s2_roi_reflectance` keeps its `pipeline_dates` argument, so the ingest
 code identity does not move (`ingcode-67740a8483141eda`).
 
-**Decision 2: every update batches four dates.** `ingest_zone_year` passes
-`batch_dates=AUTO_BATCH_DATES` (4) to the S2 leg whenever it runs for an update. Campaign fills
-stay on the covered-area rule, which was calibrated on full zone-years, where covered area does
-track how much a date writes. Batched stores are byte-identical (batching parity test).
+**Decision 2: every update of chosen shards batches four dates.** `ingest_zone_year` passes
+`batch_dates=AUTO_BATCH_DATES` (4) to the S2 leg whenever it runs for an update that names its
+shards. Campaign fills stay on the covered-area rule, which was calibrated on full zone-years,
+where covered area does track how much a date writes, and so does an update planned over every
+shard of a cell: it covers the whole zone, and forcing four dates there would risk the
+mid-size loss §3.16 measured. Batched stores are byte-identical (batching parity test).
 
 **Not yet measured:** both changes together on an update. The confirmation is a small update of a
 sparse zone on dev, comparing its `Stage timings`, `Batch timings` and `Pipeline` lines against

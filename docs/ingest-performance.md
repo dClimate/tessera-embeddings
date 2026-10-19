@@ -559,12 +559,14 @@ batched. Recalibrate against real runs rather than an offline sweep, since a dif
 gives a different answer. Figures in
 `context_docs/ingest/campaign-ingest-measurements.md` §3.16.
 
-**Every targeted update batches four dates.** `ingest_zone_year` passes `batch_dates=4`
-(`AUTO_BATCH_DATES`) to the S2 leg of any run made for an update, and leaves campaign fills on
-the automatic rule. The rule measures covered area because, over a full zone-year, that tracks
-how much each date writes. An update's windows are scattered across the zone: together they can
-cover more than 500 chunks while each date touches only a handful, so the rule would write such
-an update one date at a time and pay the fixed per-date write overhead on every date. On those
+**Every targeted update of chosen shards batches four dates.** `ingest_zone_year` passes
+`batch_dates=4` (`AUTO_BATCH_DATES`) to the S2 leg of any run made for an update that names its
+shards, and leaves campaign fills on the automatic rule. The rule measures covered area because,
+over a full zone-year, that tracks how much each date writes. An update's shards are scattered
+across the zone: together they can cover more than 500 chunks while each date touches only a
+handful, so the rule would write such an update one date at a time and pay the fixed per-date
+write overhead on every date. An update of every shard in a zone-year covers the whole zone, as
+a fill does, so it keeps the automatic rule. On those
 small dates the overhead is most of the cost, and amortising it is exactly what batching does.
 Batched stores are byte-identical (parity test). Evidence in
 `context_docs/ingest/campaign-ingest-measurements.md` §3.21.

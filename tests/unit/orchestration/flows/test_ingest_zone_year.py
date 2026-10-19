@@ -189,6 +189,16 @@ def test_an_update_ingests_only_its_shards_under_its_own_prefix(wired, monkeypat
     assert all(kw["skip_coverage_check"] is True for _, kw in wired["coverage_checked"])
 
 
+def test_an_update_of_every_shard_keeps_the_automatic_batch_size(wired, monkeypatch):
+    """A whole-zone update writes what a campaign fill does, so the covered-area rule still applies."""
+    plan = UpdatePlan(name="u1", mode="shards", cells={"33N/2025": None})
+    monkeypatch.setattr(mod, "load_update", lambda paths, name, mask_name: plan)
+    monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+    monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
+    _run(s1_orbit="ascending", update="u1")
+    assert all("batch_dates" not in p for _, p in wired["arun"])
+
+
 def test_dispatches_and_marks_on_success(wired, monkeypatch):
     monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
     monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))  # nothing ingested yet
