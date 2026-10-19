@@ -715,6 +715,37 @@ def test_adapter_wait_polls_child_run_to_completion(monkeypatch):
     assert client.cancelled == []  # nothing in flight at shutdown
 
 
+def test_ingest_runs_are_created_inside_the_fills_run_context(monkeypatch):
+    """Worker threads inherit none of the flow's context, so without entering a copy of the fill's
+    run context around the dispatch, every ingest run is created unattached to the fill.
+    """
+    entered: list[str] = []
+
+    @contextmanager
+    def fill_context():
+        entered.append("in")
+        yield
+        entered.append("out")
+
+    monkeypatch.setattr(mod, "FlowRunContext", SimpleNamespace(get=lambda: SimpleNamespace(model_copy=fill_context)))
+    seen = []
+
+    def run_deployment(dep, parameters, timeout, tags=None):
+        seen.append((threading.current_thread().name.startswith("cell-ingest"), list(entered)))
+        return SimpleNamespace(id="fr-1", state=None)
+
+    monkeypatch.setattr(mod, "run_deployment", run_deployment)
+    monkeypatch.setattr(
+        mod, "get_client", lambda sync_client=True: _FakeClient([_state(StateType.COMPLETED, final=True)])
+    )
+    adapter = _adapter()
+    try:
+        adapter.wait("33N", 2025)
+    finally:
+        adapter.shutdown()
+    assert seen == [(True, ["in"])] and entered == ["in", "out"]
+
+
 def test_adapter_shutdown_cancels_in_flight_child_runs(monkeypatch):
     """The reviewer's orphan scenario: parent dies while a child ingest runs.
     shutdown() must request cancellation of the in-flight child flow run —
