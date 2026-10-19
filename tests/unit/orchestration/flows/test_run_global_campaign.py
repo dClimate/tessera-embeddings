@@ -230,6 +230,7 @@ class TestCampaignDefaults:
         ("kwargs", "match"),
         [
             ({"num_actors": 0}, "num_actors must be >= 1"),
+            ({"inference_start_delay_minutes": -1}, "inference_start_delay_minutes must be >= 0"),
             ({"fill_strategy": "cluster-per-zne"}, "fill_strategy must be"),
             # A card name is checked HERE and not only inside the child. The child's own
             # refusal arrives after it has primed its look-ahead mosaics and entered
@@ -899,6 +900,18 @@ def test_sequential_strategy_dispatches_one_run_per_year(wired):
     # Mosaic lifecycle belongs to the child in this mode.
     assert wired["deletes"] == []
     assert result["dispatched"] == 1
+
+
+@pytest.mark.parametrize(("strategy", "forwarded"), [("chained-clusters", 30.0), ("cluster-per-zone", None)])
+def test_the_inference_start_delay_reaches_chained_fills_only(wired, strategy, forwarded):
+    """A per-zone fill ingests its one cell before its cluster starts: there is no backlog to hold for."""
+    asyncio.run(
+        mod.run_global_campaign.fn(
+            paths=_PATHS, ami_ssm_name="ami", fill_strategy=strategy, inference_start_delay_minutes=30.0
+        )
+    )
+    fills = [p for d, p in wired["arun"] if d.startswith("fill-")]
+    assert fills and [p.get("inference_start_delay_minutes") for p in fills] == [forwarded] * len(fills)
 
 
 def test_sequential_strategy_forwards_ingest_false(wired):

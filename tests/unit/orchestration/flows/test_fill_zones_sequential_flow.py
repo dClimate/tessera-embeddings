@@ -20,6 +20,7 @@ from functools import partial
 from types import SimpleNamespace
 
 import pytest
+from prefect.exceptions import TerminationSignal
 from prefect.states import StateType
 
 import tessera_embeddings.orchestration.prefect.flows._child_runs as _child_runs
@@ -520,6 +521,9 @@ class _RecordingInputs:
         self._order.append("wait_first:" + ",".join(z for z, _ in cells))
         return cells[-1] if cells else None
 
+    def hold_for_backlog(self, cells, minutes):
+        self._order.append(f"hold:{minutes}")
+
     def shutdown(self):
         self._order.append("inputs_shutdown")
 
@@ -555,6 +559,17 @@ def test_gpus_wait_for_whichever_mosaic_lands_first(wired, monkeypatch):
     assert "wait_first:01N,02N,03N" in order
     assert not [e for e in order if e.startswith("wait:")]
     assert order.index("wait_first:01N,02N,03N") < order.index("ray_up")
+
+
+@pytest.mark.parametrize(("delay", "held"), [(0.0, []), (5.0, ["hold:5.0"])])
+def test_the_gpu_request_is_held_only_when_a_delay_is_asked_for(wired, monkeypatch, delay, held):
+    """The default goes straight from the first landing to `ray up`, exactly as before; a delay
+    holds between the two, and nowhere else.
+    """
+    monkeypatch.setattr(mod, "_DeploymentCellInputs", partial(_RecordingInputs, wired["order"]))
+    _run(zones=["01N", "02N"], ingest=True, inference_start_delay_minutes=delay)
+    order = wired["order"]
+    assert order[order.index("wait_first:01N,02N") + 1 : order.index("ray_up")] == held
 
 
 def test_cells_are_ordered_by_true_tile_count_not_the_clamped_fleet_request(wired, monkeypatch):
@@ -1022,12 +1037,14 @@ def test_the_flow_default_matches_the_runner_default(wired):
     )
 
 
-def test_negative_look_ahead_rejected_before_any_side_effect(wired):
-    """look_ahead < 0 is rejected before triage / priming / `ray up` — a
-    deadlock that only manifested after the GPU cluster was provisioned.
+@pytest.mark.parametrize("param", ["look_ahead", "inference_start_delay_minutes"])
+def test_a_negative_width_or_delay_is_rejected_before_any_side_effect(wired, param):
+    """Rejected before triage / priming / `ray up`. A negative look_ahead is a deadlock that
+    only manifested after the GPU cluster was provisioned.
     """
-    with pytest.raises(ValueError, match="look_ahead must be >= 0"):
-        _run(look_ahead=-2)
+    with pytest.raises(ValueError, match=f"{param} must be >= 0"):
+        _run(**{param: -2})
+    assert wired["preflights"] == []  # no triage
     assert wired["ray_kwargs"] is None  # no cluster provisioned
     assert wired["seq_kwargs"] is None  # runner never entered
 
@@ -1268,8 +1285,49 @@ def test_the_all_failed_report_names_cells_that_failed_in_earlier_waits():
         adapter.shutdown()
 
 
-def test_a_failure_while_priming_still_cancels_the_ingests_it_started(wired, monkeypatch):
-    """Priming lives inside the shutdown guard, so no child ingest is ever orphaned.
+@pytest.mark.parametrize(
+    ("settle", "reason"),
+    [
+        (None, "limit reached"),
+        (lambda fut: fut.set_result(None), "every ingest finished"),
+        # A failed ingest is finished too: nothing more will arrive from it.
+        (lambda fut: fut.set_exception(RuntimeError("bad credentials")), "every ingest finished"),
+    ],
+)
+def test_the_backlog_hold_ends_at_its_limit_or_once_nothing_more_can_land(caplog, settle, reason):
+    """The hold waits on the ingests themselves, so it ends the moment the last one settles
+    rather than sitting out the rest of a limit that can no longer buy a mosaic.
+    """
+    adapter = _adapter()
+    late: Future = Future()
+    adapter._futures = {("01N", 2024): _settled(None), ("02N", 2024): late}
+    if settle is not None:
+        threading.Timer(0.05, settle, args=(late,)).start()
+    limit_s = 0.3 if settle is None else 60.0
+    t0 = time.monotonic()
+    try:
+        with caplog.at_level(logging.INFO, logger="test-adapter"):
+            run_under_deadline(10.0, lambda: adapter.hold_for_backlog([("01N", 2024), ("02N", 2024)], limit_s / 60))
+    finally:
+        adapter.shutdown()
+    elapsed = time.monotonic() - t0
+    assert "1 of 2 mosaic(s) landed" in caplog.text  # the opening line counts the first landing
+    assert f"({reason})" in caplog.text
+    assert (limit_s * 0.9 <= elapsed) if settle is None else (elapsed < 5.0)
+
+
+@pytest.mark.parametrize(
+    ("step", "exc"),
+    [
+        ("wait_first", RuntimeError("prefect API unreachable")),
+        ("hold_for_backlog", RuntimeError("prefect API unreachable")),
+        # What Prefect raises in the flow process when the run is cancelled.
+        ("hold_for_backlog", TerminationSignal(signal=15)),
+    ],
+)
+def test_a_failure_while_priming_still_cancels_the_ingests_it_started(wired, monkeypatch, step, exc):
+    """Priming, the first-landing wait and the backlog hold all live inside the shutdown guard,
+    so no child ingest is ever orphaned.
 
     ``start`` submits the whole window at once, so from the first submission there are
     child runs that only ``shutdown()`` can cancel. With priming above the ``try``, a
@@ -1278,14 +1336,13 @@ def test_a_failure_while_priming_still_cancels_the_ingests_it_started(wired, mon
     writing mosaic prefixes server-side that a prompt retry would then race.
     """
 
-    class _FailingInputs(_RecordingInputs):
-        def wait_first(self, cells, timeout=None):
-            self._order.append("wait_first:raised")
-            raise RuntimeError("prefect API unreachable")
+    def _raise(self, *a, **k):
+        raise exc
 
-    monkeypatch.setattr(mod, "_DeploymentCellInputs", partial(_FailingInputs, wired["order"]))
-    with pytest.raises(RuntimeError, match="prefect API unreachable"):
-        _run(zones=["01N", "02N", "03N"], ingest=True, look_ahead=1)
+    failing = type("_FailingInputs", (_RecordingInputs,), {step: _raise})
+    monkeypatch.setattr(mod, "_DeploymentCellInputs", partial(failing, wired["order"]))
+    with pytest.raises(type(exc)):
+        _run(zones=["01N", "02N", "03N"], ingest=True, look_ahead=1, inference_start_delay_minutes=5.0)
 
     order = wired["order"]
     assert "start:01N" in order, "the window was primed, so its children must be cancelled"

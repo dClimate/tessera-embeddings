@@ -245,6 +245,17 @@ prefect deployment run 'fill-zones-sequential/<deployment>' -p update=amazon-thi
   `fill-zones-sequential`.
 - **It starts GPU machines in your cloud account,** so it costs money while it runs; see "How long
   it takes" below.
+- **For an update of many small zone-years, let the imagery pile up before the GPUs start.** By
+  default each GPU cluster starts its machines as soon as the imagery for its first zone-year is
+  downloaded. When each zone-year takes only minutes on the GPUs, the machines then sit idle, and
+  billed, between downloads. Add `-p inference_start_delay_minutes=30` to make each cluster wait up
+  to 30 more minutes for more imagery first; it starts sooner once all of its imagery is in. The
+  default, 0, does not wait. `fill-zones-sequential` takes the same setting:
+
+  ```bash
+  prefect deployment run 'run-global-campaign/<deployment>' -p update=amazon-thin-2024 -p allow_s2_only=true \
+      -p inference_start_delay_minutes=30
+  ```
 - **Follow it in the Prefect UI** or with `prefect flow-run ls`. It is done when the flow run ends
   `Completed` and the store has the tag `update-<name>-complete`.
 - **To resume after a failure, run the same command again.** Zone-years that are done are skipped.

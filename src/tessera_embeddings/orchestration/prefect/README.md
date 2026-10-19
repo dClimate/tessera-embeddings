@@ -258,11 +258,28 @@ enough to infer that the rest of the window lands behind it, and inference is sl
 than ingest in almost every case, so the stream does not run dry and the fleet does
 not idle.
 
+**A small job can hold the request for a backlog.** That argument fails for a small,
+scattered job, such as a targeted update whose zone-years ingest in minutes to hours
+and infer in minutes: the first small mosaic boots the fleet, which finishes it, winds
+down to one actor after the 120 s idle grace, and regrows at the next landing, over
+and over. `inference_start_delay_minutes`, set per dispatch on `run_global_campaign`
+(which forwards it to every chained fill) or on `fill_zones_sequential_flow`, keeps
+holding the request for that many minutes after the first landing, and ends the hold
+early once every ingest in the cluster has finished, landed or failed. The default, 0,
+requests GPUs at the first landing; on the full campaign a hold would buy the
+up-front ingest time the last bullet below rejects. The hold sits inside the same
+shutdown guard as the wait. The inference pause gate is no substitute, since a paused
+cluster still boots and keeps its full fleet while landed work waits
+([`the-fleet-and-the-work-source.md`](../../../../context_docs/inference/the-fleet-and-the-work-source.md)).
+
 ```text
-start window (1 + look_ahead zones), all ingesting in parallel
-   smallest lands ──►│                       (densest lands much later)
-                      ray up ──► stream, taking whichever zone has landed
-                                 (density order preserved, minus the barrier)
+every zone starts ingesting, 1 + look_ahead at a time
+   first lands ──►│ hold ─►│                     (densest lands much later)
+                            ray up ──► stream, taking whichever zone has landed
+                                       (density order preserved, minus the barrier)
+
+hold: up to inference_start_delay_minutes (0 by default), ending early once every
+      ingest has finished
 ```
 
 Two subtleties worth knowing:
