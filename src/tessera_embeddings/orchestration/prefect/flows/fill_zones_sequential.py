@@ -141,14 +141,14 @@ class _DeploymentCellInputs:
     it to a terminal state, so a cell's ``wait`` is a future join and the child run's id is
     known while it executes: ``shutdown`` can cancel every in-flight ingest instead of
     orphaning children that keep writing after the parent failed (a quick retry would then
-    race the orphan on the same mosaic prefix). ``max_parallel`` sizes the executor and the
-    flow passes its full cell count, so every UTM zone of a cluster is submitted at once and
-    they finish together — the cluster waits for all of them before requesting GPUs. What
-    limits how many actually RUN is ``ingest_limit_name``, a Prefect global concurrency limit
-    shared by every cluster; the clusters are separate flow runs, so only a server-side gate
-    can bound them together. ``cleanup`` deletes only mosaics THIS adapter produced (a cell
-    never started here is someone else's input), matching the parallel driver's
-    ``did_ingest and cleanup_mosaics`` rule.
+    race the orphan on the same mosaic prefix). The flow submits every cell of a cluster at
+    once; ``max_parallel`` (``1 + look_ahead``, this cluster's share of the fleet-wide ingest
+    cap) sizes the executor, so that many run at a time, and the cluster requests GPUs as soon
+    as any one mosaic lands (``wait_first``). The hard ceiling is ``ingest_limit_name``, a
+    Prefect global concurrency limit shared by every cluster; the clusters are separate flow
+    runs, so only a server-side gate can bound them together. ``cleanup`` deletes only mosaics
+    THIS adapter produced (a cell never started here is someone else's input), matching the
+    parallel driver's ``did_ingest and cleanup_mosaics`` rule.
 
     Threads don't inherit the flow's Prefect context, so ingest runs dispatch without a
     parent-run link — they are still tracked as ordinary runs of the ingest deployment.

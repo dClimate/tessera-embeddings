@@ -683,11 +683,9 @@ async def run_global_campaign(
             there is no per-zone teardown, actor churn or model reload. It amortizes ``ray
             up`` + per-worker bringup + model-load cold starts across the whole cluster;
             ingest look-ahead and trailing assembly cover the remaining seams (see the
-            runner's module docstring). Each cluster ingests EVERY one of its cells before
-            requesting GPUs, so a fleet is never billed against an unfinished ingest — which
-            makes the up-front ingest scale with cluster size, and
-            ``max_parallel_clusters=1`` degenerate to a whole year of ingest before any
-            inference. ``"cluster-per-zone"`` dispatches one ``fill-zone-year`` run per cell
+            runner's module docstring). Each cluster requests GPUs as soon as its first mosaic
+            lands — any of them — so a fleet is never booted speculatively nor held for the
+            slowest ingest. ``"cluster-per-zone"`` dispatches one ``fill-zone-year`` run per cell
             instead, each provisioning its own short-lived Ray cluster — simpler, and it pays
             a full cluster bringup and model load per zone.
         chained_fill_deployment: ``flow-name/deployment-name`` of the chained fill deployment
