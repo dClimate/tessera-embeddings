@@ -360,8 +360,9 @@ def ingest_s2_roi_reflectance(
             failure commits none of its dates and the retry re-ingests exactly those (per-date
             sessions are impossible — each date's append resizes the time axis, so sibling
             sessions conflict on array metadata). Identical stores either way. COMPOSES with
-            ``pipeline_dates``: the look-ahead is then sized to the batch, so the next batch's
-            whole preparation overlaps this batch's write instead of only one date's. ``None``
+            ``pipeline_dates``: the look-ahead then follows the batch the latest date implies, so
+            the next batch's whole preparation overlaps this batch's write, while a dense date
+            is prepared only one ahead. ``None``
             (the default) caps it at :data:`~tessera_embeddings.config.ingest.AUTO_BATCH_DATES`;
             1 forces the one-commit-per-date path.
         batch_chunk_budget: The most storage chunks one batch may write. Batching pays for
@@ -1131,8 +1132,12 @@ def ingest_s2_roi_reflectance(
             # consume, so a depth-1 buffer would hide one date's preparation out of k. Depth k has
             # the next batch ready as this one lands. Preparation stays single-threaded either way
             # (see ingest._pipeline).
+            # The look-ahead follows the batch the latest date implies: a full batch of sparse
+            # dates, but one dense date at a time, so a dense run holds no more prepared dates
+            # than writing one date per commit does.
+            expected = 1
             supply = (
-                pipelined(by_date.values(), prepare, depth=batch_dates)
+                pipelined(by_date.values(), prepare, depth=lambda: expected)
                 if pipeline_dates
                 # Unpipelined: prepare inline and report the whole preparation as stall,
                 # so the two modes stay comparable from one log line.
@@ -1166,13 +1171,16 @@ def ingest_s2_roi_reflectance(
                 # would push the batch past its budget starts a new one, so a dense date writes
                 # alone.
                 chunks = _covered_chunks(prepared.windows)
+                expected = max(1, min(batch_dates, batch_chunk_budget // max(chunks, 1)))
                 if batch and batch_chunks + chunks > batch_chunk_budget:
                     _write_batch_or_isolate(batch, batch_stall)
                     batch, batch_stall, batch_chunks = [], 0.0, 0
                 batch.append(prepared)
                 batch_stall += stall_s
                 batch_chunks += chunks
-                if len(batch) == batch_dates:
+                # Written as soon as it is full in either sense, so a dense date never waits
+                # for the next one to show it cannot share.
+                if len(batch) == batch_dates or batch_chunks >= batch_chunk_budget:
                     _write_batch_or_isolate(batch, batch_stall)
                     batch, batch_stall, batch_chunks = [], 0.0, 0
             if batch:

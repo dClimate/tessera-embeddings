@@ -531,6 +531,19 @@ def test_a_batch_failure_that_is_not_a_read_error_still_fails_the_leg(run_ingest
         run_ingest(dates, pipeline_dates=False, fail_on="2024-01-02", batch_dates=2)
 
 
+def test_dense_dates_are_written_at_once_and_prepared_one_ahead(run_ingest, monkeypatch):
+    """A date over the budget writes alone, and straight away, so a dense run holds no more
+    prepared dates than writing one date per commit: the next-but-one date is not loaded until
+    the first has been written.
+    """
+    one_chunk = SimpleNamespace(y0=0, y1=SIZE, x0=0, x1=SIZE)
+    monkeypatch.setattr(s2_roi, "windows_for_date", lambda *_a, **_k: [one_chunk] * 20)
+    dates = {f"2024-01-0{d}": True for d in range(1, 5)}
+    run = run_ingest(dates, pipeline_dates=True, batch_dates=None, write_s=0.2)
+    assert run.written == list(dates)
+    assert run.load_started["2024-01-03"] >= run.write_ended["2024-01-01"]
+
+
 @pytest.mark.parametrize(
     ("chunks", "budget", "sizes"),
     [

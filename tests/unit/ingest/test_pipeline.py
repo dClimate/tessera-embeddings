@@ -234,3 +234,18 @@ def test_depth_preserves_order_and_single_threading():
 def test_depth_rejects_zero():
     with pytest.raises(ValueError, match="depth must be >= 1"):
         next(pipelined(range(3), lambda i: i, depth=0))
+
+
+def test_a_callable_depth_is_reread_at_every_refill():
+    """A consumer whose batch size follows its items can widen or narrow the look-ahead as it goes."""
+    submitted: list[int] = []
+    depth = 1
+    gen = pipelined(range(10), lambda i: submitted.append(i) or i, depth=lambda: depth)
+    next(gen)
+    time.sleep(0.1)
+    assert len(submitted) == 2  # one primed, one refilled at depth 1
+    depth = 4
+    next(gen)
+    time.sleep(0.1)
+    assert len(submitted) == 6  # four in flight after the second was taken
+    gen.close()
