@@ -232,6 +232,9 @@ def _run_ingest(
             min_valid_coverage=min_valid_coverage,
             log=log,
             storage_options=storage_options,
+            # As the S2 flow decides for every local cluster: no fleet here is wide enough for
+            # the overlap to cost more than it hides.
+            pipeline_dates=True,
         )
         log.info("S2 ingestion: %s", s2_result)
 

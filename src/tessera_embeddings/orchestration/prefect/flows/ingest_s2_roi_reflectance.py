@@ -25,43 +25,40 @@ from tessera_embeddings.orchestration.prefect.flows._dask_lifecycle import (
 from tessera_embeddings.orchestration.prefect.tasks.ingest import process_roi_reflectance
 
 MAX_PIPELINE_DATES_WORKERS = 140
-"""Widest fleet on which date pipelining is allowed to run.
+"""Widest Fargate fleet on which the flow pipelines S2 dates.
 
-Overlapping the next date's preparation with the current date's write only pays while the
-write leaves the fleet room to absorb the coverage gate. That gate is worker-side work, so on
-a fleet the write already keeps busy it is additive however it is scheduled, and past some
-width the overlap costs more than the client-side graph build it saves. A measured
-calibration, not a property of the code: see `yield-embeddings/context_docs/measurements/`.
-
-Above the bound the flow declines to pipeline rather than obeying, because the flag arrives
-from many callers and the failure is silent — a slower run just looks like a slower run.
-Declining can only prevent harm; pipelining is off by default.
+Overlapping the next date's preparation with the current date's write pays while the write
+leaves the fleet room to absorb the coverage gate. That gate is worker-side work, so on a fleet
+the write already keeps busy it is additive however it is scheduled. The preparation left to
+hide grows as the fleet narrows (12.5 s a date at 120 workers, 18.5 s at 60, 20.6 s at 45), and
+every paired test, at 60 and 120 workers, gained. Past this width the overlap is estimated to
+cost more than the client-side graph build it saves. An estimate over an unmeasured region, not
+a property of the code: see `yield-embeddings/context_docs/measurements/`.
 """
 
 
-def _gated_pipeline_dates(
+def _pipelines_dates(
     *,
-    pipeline_dates: bool,
     use_local: bool,
     max_workers: int,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
 ) -> bool:
-    """Return the pipelining flag actually in force, declining above the width bound.
+    """Decide whether this run prepares each S2 date while the previous one is written.
 
-    Fargate-only: on ``use_local`` the ``max_workers`` parameter provisions nothing, so
-    gating on it would disable pipelining for a cluster whose width it does not describe.
-    The bound is inclusive.
+    Yes, unless the Fargate fleet is wider than ``MAX_PIPELINE_DATES_WORKERS`` (inclusive
+    bound). On ``use_local`` the ``max_workers`` parameter provisions nothing, so it decides
+    nothing there and the local cluster always pipelines.
     """
-    if pipeline_dates and not use_local and max_workers > MAX_PIPELINE_DATES_WORKERS:
-        log.warning(
-            "pipeline_dates requested with max_workers=%d, above the %d-worker bound where "
-            "overlapping preparation still pays; running WITHOUT pipelining. See "
-            "MAX_PIPELINE_DATES_WORKERS.",
-            max_workers,
-            MAX_PIPELINE_DATES_WORKERS,
-        )
-        return False
-    return pipeline_dates
+    if use_local or max_workers <= MAX_PIPELINE_DATES_WORKERS:
+        return True
+    log.info(
+        "Preparing S2 dates one at a time: this %d-worker fleet is wider than the %d workers up to "
+        "which preparing the next date during the current write is known to pay. See "
+        "MAX_PIPELINE_DATES_WORKERS.",
+        max_workers,
+        MAX_PIPELINE_DATES_WORKERS,
+    )
+    return False
 
 
 @flow(name="ingest_s2_roi_impl")
@@ -77,12 +74,16 @@ def _ingest_s2_roi_impl(
     storage_options: dict | None = None,
     stream_stac_monthly: bool = True,
     overlap_window_writes: bool = True,
-    pipeline_dates: bool = False,
+    pipeline_dates: bool,
     batch_dates: int | None = None,
     allow_ingest_code_mismatch: bool = False,
     s3_region: str | None = None,
 ) -> dict[str, Any]:
-    """Inner flow: submits the S2 ingestion task to the configured Dask runner."""
+    """Inner flow: submits the S2 ingestion task to the configured Dask runner.
+
+    ``pipeline_dates`` is the outer flow's decision (see :func:`_pipelines_dates`), never a
+    caller's.
+    """
     future = process_roi_reflectance.submit(
         roi_zarr_path=roi_zarr_path,
         start_date=start_date,
@@ -127,7 +128,6 @@ def ingest_s2_roi_reflectance(
     perf_report_uri: str | None = None,
     stream_stac_monthly: bool = True,
     overlap_window_writes: bool = True,
-    pipeline_dates: bool = False,
     batch_dates: int | None = None,
     worker_env_overrides: dict[str, str] | None = None,
     allow_ingest_code_mismatch: bool = False,
@@ -138,6 +138,12 @@ def ingest_s2_roi_reflectance(
     Reads the Zarr ROI store for a WGS84 bounding box, queries STAC for intersecting tiles,
     and writes a mosaicked ``reflectance.zarr`` under ``store_path`` at the ingestion
     pipeline's INGEST_CHUNKS (4000x4000).
+
+    Each date's preparation (load graph, coverage gate, footprint narrowing, masking) runs on a
+    background thread while the previous date is written, so it costs wall clock only where the
+    write cannot cover it. Automatic, with no setting: every fleet up to
+    ``MAX_PIPELINE_DATES_WORKERS`` pipelines, and a wider one prepares dates one at a time.
+    Identical stores either way.
 
     Args:
         roi_zarr_path: Any fsspec-compatible URI to the Zarr ROI store.
@@ -163,21 +169,17 @@ def ingest_s2_roi_reflectance(
             blocking compute per window, so their critical paths overlap across the fleet
             instead of summing. Identical stores either way; falls back to the sequential
             write when the overlapped machinery is unavailable.
-        pipeline_dates: Prepare the next date (load graph, coverage gate, footprint
-            narrowing, masking) on a background thread while the current date is written,
-            so preparation costs wall clock only where the write cannot cover it. The write
-            stays serial and in date order — one commit per date — and stores are identical
-            either way. Ignored with a warning above ``MAX_PIPELINE_DATES_WORKERS``; narrow
-            fleets benefit most.
         batch_dates: Compute up to this many consecutive passing dates as one dask graph and
             land them as ONE commit, so their work packs the fleet together and the per-date
             drain tail and commit gap are paid once per batch. The commit unit becomes the
             batch: a mid-batch failure commits none of its dates, and the retry re-ingests
-            exactly those. Identical stores either way. Composes with ``pipeline_dates`` —
-            the look-ahead becomes the batch, so a whole batch's preparation hides behind
-            the previous batch's write. Leave at ``None`` to size it from the ROI, which is
-            what the campaign wants: the benefit is not monotonic in ROI size, so one global
-            value regresses part of the range. Pin an int only for one arm of a comparison.
+            exactly those. Identical stores either way. When dates are pipelined the
+            look-ahead becomes the batch, so a whole batch's preparation hides behind the
+            previous batch's write. Leave at ``None`` to size it from the ROI, which is what a
+            campaign fill wants: the benefit is not monotonic in ROI size, so one global value
+            regresses part of the range. ``ingest_zone_year`` pins it for a targeted update,
+            whose scattered windows the size rule misreads; otherwise pin an int only for one
+            arm of a comparison.
         worker_env_overrides: Env vars merged into every Dask worker's environment for THIS
             run only, to A/B worker-side tuning (allocator, cache behaviour) one arm at a
             time. Not a configuration channel — anything meant to hold for every run belongs
@@ -196,9 +198,7 @@ def ingest_s2_roi_reflectance(
     log = get_run_logger()
     log.info("Starting ingest_s2_roi_reflectance for %s", roi_zarr_path)
 
-    pipeline_dates = _gated_pipeline_dates(
-        pipeline_dates=pipeline_dates, use_local=use_local, max_workers=max_workers, log=log
-    )
+    pipeline_dates = _pipelines_dates(use_local=use_local, max_workers=max_workers, log=log)
 
     if use_local:
         from tessera_embeddings.providers.local.dask import local_cluster

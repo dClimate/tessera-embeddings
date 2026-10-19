@@ -18,6 +18,7 @@ from pystac_client.exceptions import APIError
 from urllib3.exceptions import ResponseError
 
 import tessera_embeddings.orchestration.prefect.flows.ingest_zone_year as mod
+from tessera_embeddings.config.ingest import AUTO_BATCH_DATES
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.errors import ConfigMismatchError, InsufficientCoverageError, NonMonotonicDateError
 from tessera_embeddings.ingest import land_mask
@@ -183,7 +184,8 @@ def test_an_update_ingests_only_its_shards_under_its_own_prefix(wired, monkeypat
     assert (export["dest_path"], export["tiles"]) == (f"{root}/rois/2025/zone_33N.zarr", tiles)
     params = [p for _, p in wired["arun"]]
     assert all(p["store_path"] == f"{root}/mosaics/33N/2025" for p in params)
-    assert next(p for p in params if "min_valid_coverage" in p)["min_valid_coverage"] == plan.min_valid_coverage
+    s2_params = next(p for p in params if "min_valid_coverage" in p)
+    assert (s2_params["min_valid_coverage"], s2_params["batch_dates"]) == (plan.min_valid_coverage, AUTO_BATCH_DATES)
     assert all(kw["skip_coverage_check"] is True for _, kw in wired["coverage_checked"])
 
 
@@ -203,6 +205,7 @@ def test_dispatches_and_marks_on_success(wired, monkeypatch):
     assert all(p["start_date"] == "2025-01-01" and p["end_date"] == "2025-12-31" for p in params)
     s2_params = next(p for p in params if "min_valid_coverage" in p)
     assert s2_params["min_valid_coverage"] == 0.2
+    assert "batch_dates" not in s2_params, "a campaign fill sizes its batches from its covered area"
     s1_params = next(p for p in params if "orbit" in p)
     assert s1_params["orbit"] == "ascending"
     # Coverage verified, then a marker on each required store (reflectance + sar_asc).

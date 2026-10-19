@@ -574,8 +574,8 @@ snapshot.
 
 **An earlier reading of "1.14x, adopt it globally" is SUPERSEDED.** That figure is real but it is
 one point on a curve that is **not monotonic**: the same setting measured on four further regions
-*loses* on two of them. Batching is therefore not a global setting — it is sized per region, and
-the default is off.
+*loses* on two of them. Batching is therefore not a global setting — it is sized per region from
+covered area, and every targeted update fuses four dates (§3.21).
 
 **Why it can lose.** Batching trades commit count for graph size and peak memory. Where the fleet
 has idle capacity the larger graph packs into it and the saved commits are free; where it does not,
@@ -763,6 +763,50 @@ gained 15% from six; main's workers do not have that headroom. Six threads with
 24 GiB worker, and no arm spilled, paused or lost a worker. Dense zones carry most of the campaign's
 worker hours, so the saving there is real money at campaign scale, at most about $4,700 of the
 nine-year campaign's $187,441 container bill (`context_docs/campaign/campaign-cost-model.md`).
+
+### 3.21 Pipelining becomes automatic, and every update batches — the Latin America update (October 2026)
+
+**What the run showed.** The production Latin America update of 2026-10-19 ran its S2 legs on
+60-worker fleets with date pipelining off, as every campaign run until then had. All 659 S2
+`Stage timings` and `Batch timings` lines report `hidden=0.0`: no date's preparation overlapped a
+write. Each date paid fixed costs of about 1.7 s of graph build, 4.9 s of coverage gate and 10 s
+of write overhead, against about 2.3 s per window written, and an update's date touches a median
+of about six windows — so the fixed costs were most of every date. The fleets averaged between 110
+and 450 tasks in flight against 360 task slots (60 workers of six threads); the least loaded left
+most of their slots idle.
+
+Three zone-years (18S, 19S, 20N) also wrote one date at a time. Their scattered update windows
+covered more than 500 chunks in all, so `auto_batch_dates` (§3.16) read them as large regions,
+while each date touched only a handful of windows and paid the 10 s write overhead alone.
+
+**Decision 1: pipelining is automatic.** The S2 flow takes no `pipeline_dates` parameter. It
+pipelines on every Fargate fleet up to `MAX_PIPELINE_DATES_WORKERS` (140 workers) and on every
+local cluster, and prepares dates one at a time on a wider fleet. The paired tests recorded in the
+yield-embeddings test plan (F-22 to F-25) and its fleet scaling report (§8, correction of
+2026-07-26) support it:
+
+| Measure | 120 workers | 60 workers | 45 workers |
+|---|---|---|---|
+| hideable preparation (an unpipelined arm's build + gate, s/date) | 12.5 | 18.5 | 20.6 |
+| median per-date gain, first paired test at that width | +0.7 s (1.01×) | +21.8 s (1.14×) | not measured |
+
+The cycle saving was positive in all four paired tests (4.8, 22.1, 20.9 and 6.7 s a date), so no
+pipelined run has been slower end to end. The preparation there is to hide grows as a fleet
+narrows, so narrower fleets gain more. Nothing has been measured below 45 workers or above 120.
+The only estimated loss is above about 140 workers on a saturated fleet, where the gate the
+overlap adds to the write outweighs the preparation it hides, which is why that bound stays, as
+an automatic decision rather than a setting. Stores are byte-identical either way (parity test). The
+domain function `ingest_s2_roi_reflectance` keeps its `pipeline_dates` argument, so the ingest
+code identity does not move (`ingcode-67740a8483141eda`).
+
+**Decision 2: every update batches four dates.** `ingest_zone_year` passes
+`batch_dates=AUTO_BATCH_DATES` (4) to the S2 leg whenever it runs for an update. Campaign fills
+stay on the covered-area rule, which was calibrated on full zone-years, where covered area does
+track how much a date writes. Batched stores are byte-identical (batching parity test).
+
+**Not yet measured:** both changes together on an update. The confirmation is a small update of a
+sparse zone on dev, comparing its `Stage timings`, `Batch timings` and `Pipeline` lines against
+the figures above.
 
 ## 4. What did not work, and why
 
@@ -1739,6 +1783,7 @@ defect fix.
 | `F`, per-window blocking cost | 7.04 s | fitted by differencing two runs (constants cancel). **Do not use the linear model it belongs to** — `cost = n_windows x F + area x V` failed its first out-of-sample test and is superseded by §12's dispatch-floor model. `F` survives inside that model as the per-window floor, binding only when a window is small |
 | scheduler envelope | one core of 4 saturated, never >100%; RSS peak 1.79 / 8 GiB | 114 heartbeats |
 | per-date client graph build | 7.2 s (3.47 gate + 3.74 bands), one now removed | measured |
+| S2 fixed per-date costs on an update, unpipelined, 60 workers | build ~1.7 s + gate ~4.9 s + write overhead ~10 s, against ~2.3 s per window; `hidden=0.0` on all 659 timing lines | measured, production Latin America update, 2026-10-19 (§3.21) |
 | STAC query | 5.58 ms/item; 164 s/month; ~34 min/year; 368,248 items/year | measured, linear 3→14 days |
 | STAC page size ceiling | 250 (500 and 1000 both fail) | measured |
 | Earth Search page-1 refusal | 502 at `limit=250`; 200 at `limit=100`, same window | measured (§7c) |
