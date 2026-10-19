@@ -561,15 +561,20 @@ def test_gpus_wait_for_whichever_mosaic_lands_first(wired, monkeypatch):
     assert order.index("wait_first:01N,02N,03N") < order.index("ray_up")
 
 
-@pytest.mark.parametrize(("delay", "held"), [(0.0, []), (5.0, ["hold:5.0"])])
-def test_the_gpu_request_is_held_only_when_a_delay_is_asked_for(wired, monkeypatch, delay, held):
+@pytest.mark.parametrize(
+    ("delay", "held", "announced"),
+    [(0.0, [], "as soon as the first mosaic lands"), (5.0, ["hold:5.0"], "5 min after the first mosaic lands")],
+)
+def test_the_gpu_request_is_held_only_when_a_delay_is_asked_for(wired, monkeypatch, caplog, delay, held, announced):
     """The default goes straight from the first landing to `ray up`, exactly as before; a delay
-    holds between the two, and nowhere else.
+    holds between the two, and nowhere else. The opening log line says which.
     """
     monkeypatch.setattr(mod, "_DeploymentCellInputs", partial(_RecordingInputs, wired["order"]))
-    _run(zones=["01N", "02N"], ingest=True, inference_start_delay_minutes=delay)
+    with caplog.at_level(logging.INFO, logger="test-seq-flow"):
+        _run(zones=["01N", "02N"], ingest=True, inference_start_delay_minutes=delay)
     order = wired["order"]
     assert order[order.index("wait_first:01N,02N") + 1 : order.index("ray_up")] == held
+    assert f"GPUs are requested {announced}" in caplog.text
 
 
 def test_cells_are_ordered_by_true_tile_count_not_the_clamped_fleet_request(wired, monkeypatch):

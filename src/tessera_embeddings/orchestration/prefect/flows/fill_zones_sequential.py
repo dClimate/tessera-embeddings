@@ -1520,10 +1520,13 @@ def fill_zones_sequential_flow(
                 inputs.start(cell.zone, cell.year)
 
             log.info(
-                "Ingesting %d cell(s), %d at a time; GPUs are requested as soon as the first "
-                "mosaic lands (densest first: %s tiles)",
+                "Ingesting %d cell(s), %d at a time; GPUs are requested %s (densest first: %s tiles)",
                 len(ingest_window),
                 1 + look_ahead,
+                f"{inference_start_delay_minutes:g} min after the first mosaic lands, or once every "
+                "ingest has finished if sooner"
+                if inference_start_delay_minutes
+                else "as soon as the first mosaic lands",
                 ", ".join(f"{c.n_tiles:,}" for c in ingest_window[:6]),
             )
             t0 = time.monotonic()
