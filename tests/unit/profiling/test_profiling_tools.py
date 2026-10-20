@@ -11,15 +11,20 @@ work against any run:
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
+import pytest
+import xarray as xr
+
 from tessera_embeddings.inference.actors import _chunk_summary_line
 from tessera_embeddings.inference.resource_monitor import ResourceMonitor
-from tessera_embeddings.profiling.inference import compare_coarsened_stores, observe_cluster
+from tessera_embeddings.profiling.inference import compare_coarsened_stores, compare_outputs, observe_cluster
 
 
 def _load_phase_parser() -> str:
@@ -120,9 +125,8 @@ class TestPhaseParser:
             overhead_s=5.0,
             strips=2,
             strip_h=1024,
-            strategy="dense/prefetch",
             t_kept=50,
-            rung="starter",
+            rung="prefetched",
             x_crop_w=None,
         )
         skip = _chunk_summary_line(
@@ -135,7 +139,6 @@ class TestPhaseParser:
             overhead_s=2.0,
             strips=1,
             strip_h=2000,
-            strategy="single",
             t_kept=8,
             rung="serial",
             x_crop_w=120,
@@ -153,7 +156,7 @@ class TestPhaseParser:
             "chunk_0_0",
             "50",
             "2",
-            "starter",
+            "prefetched",
             "1000",
             "3.0",
             "15.0",
@@ -289,3 +292,57 @@ class TestCoarsenedCompare:
         assert np.isfinite(cmp.max_abs_diff) and abs(cmp.max_abs_diff - 0.5) < 1e-6
         assert np.isfinite(cmp.mean_abs_diff)
         assert cmp.n_finite_pairs == 2  # the two finite pairs only
+
+
+def _staged(path: Path, emb: np.ndarray) -> str:
+    """A minimal staged tile: embeddings, positive scales and the three observation-count layers."""
+    yx = ("northing", "easting")
+    counts = {
+        v: (yx, np.ones(emb.shape[:2], "uint16")) for v in ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count")
+    }
+    scales = np.full(emb.shape[:2], 0.01, "float32")
+    xr.Dataset({"embeddings": ((*yx, "band"), emb), "scales": (yx, scales), **counts}).to_zarr(path)
+    return str(path)
+
+
+# The worst full-Iowa-year tile measured across configs: 4 levels, 1.97% scale drift, cosine 0.999865.
+_WORST_SHIMMER = compare_outputs.ChunkComparison(
+    label="t",
+    n_values=4_194_304 * 128,
+    exact_frac=0.9995,
+    max_abs_delta=4,
+    within_one_frac=0.99999,
+    scale_max_rel_drift=0.0197,
+    nan_mask_mismatches=0,
+    cosine_min=0.999865,
+    cosine_mean=1.0,
+    n_pixels=4_194_304,
+    cross_config=True,
+)
+
+
+class TestCrossConfigEnvelope:
+    """The cross-config verdict passes rounding shimmer and refuses a defect."""
+
+    @pytest.mark.parametrize(
+        ("overrides", "passed"),
+        [
+            ({}, True),
+            ({"within_one_frac": 0.99, "n_pixels": 194}, True),  # a share over 194 pixels is not judged
+            ({"within_one_frac": 0.99}, False),
+            ({"scale_max_rel_drift": 0.05}, False),
+            ({"cosine_min": 0.998}, False),
+            ({"obs_count_mismatches": 1}, False),
+        ],
+    )
+    def test_verdict(self, overrides: dict, passed: bool) -> None:
+        assert dataclasses.replace(_WORST_SHIMMER, **overrides).passed is passed
+
+    @pytest.mark.parametrize("cross_config", [True, False])
+    def test_a_zeroed_artifact_fails(self, tmp_path: Path, cross_config: bool) -> None:
+        """All-zero embeddings with valid scales fail, even on a tile too small for the within-one share."""
+        emb = np.random.default_rng(0).integers(-127, 128, (8, 8, 16), dtype=np.int8)
+        ref, test = _staged(tmp_path / "ref.zarr", emb), _staged(tmp_path / "test.zarr", np.zeros_like(emb))
+        result = compare_outputs.compare_chunk(ref, test, "t", cross_config=cross_config)
+        assert result.cosine_min == 0.0
+        assert not result.passed

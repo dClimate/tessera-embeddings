@@ -19,6 +19,7 @@ from prefect.states import StateType
 
 import tessera_embeddings.orchestration.prefect.flows.run_global_campaign as mod
 from tessera_embeddings.config.paths import BucketPaths
+from tessera_embeddings.storage.update import UpdatePlan
 
 _PATHS = BucketPaths(inputs="s3://in", outputs="s3://out")
 
@@ -198,10 +199,8 @@ class TestCampaignDefaults:
         """Both gates live in CHILD flow runs, so a gate only binds if it reaches the
         Prefect limit they name. Writing them from this flow is what stops the server's
         numbers drifting from the ones chosen here — and, for the pause gate, what makes
-        pausing reachable without an operator creating anything first.
-
-        There were three. The commit gate is gone — nothing bounds committers any more, and
-        `test_no_committer_gate_is_published` pins that it stays gone.
+        pausing reachable without an operator creating anything first. Commits are ungated, so
+        there is no third.
         """
         asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
         assert dict(wired["limits"]) == {
@@ -231,6 +230,7 @@ class TestCampaignDefaults:
         ("kwargs", "match"),
         [
             ({"num_actors": 0}, "num_actors must be >= 1"),
+            ({"inference_start_delay_minutes": -1}, "inference_start_delay_minutes must be >= 0"),
             ({"fill_strategy": "cluster-per-zne"}, "fill_strategy must be"),
             # A card name is checked HERE and not only inside the child. The child's own
             # refusal arrives after it has primed its look-ahead mosaics and entered
@@ -285,31 +285,6 @@ class TestCampaignDefaults:
         """
         asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", ingest=False))
         assert dict(wired["limits"]) == {"tessera-global-inference": 1}
-
-    @pytest.mark.parametrize("clusters", [1, 4, 8, 16, 40])
-    def test_no_committer_gate_is_published_at_any_cluster_count(self, wired, clusters):
-        """Commits are ungated, and the cluster count no longer implies a committer cap.
-
-        The removed gate derived ``min(clusters, 8)`` from the run-1 contention curve. It was
-        removed because what it bounded is a SLOWDOWN, not a failure: all 120 zone groups do
-        share one repo and one branch tip, and run 1 measured that contention as 2.2 s commits
-        at 16 simultaneous committers and 15 s at 120, with ZERO unresolvable conflicts at every
-        N. The curve itself is kept in
-        ``context_docs/storage/writing-to-the-global-store.md`` together with the scale
-        (N>=16) at which it would matter again — this is parametrised past that scale on
-        purpose, so a reader sees the removal is unconditional rather than tuned.
-        """
-        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=clusters))
-        assert "tessera-global-commits" not in dict(wired["limits"])
-
-    def test_the_flow_takes_no_commit_limit_parameter(self):
-        """Structural: there is no knob left to re-enable a fleet-wide committer bound, so a
-        dispatch cannot reintroduce one without a code change.
-        """
-        import inspect
-
-        flow = getattr(mod.run_global_campaign, "fn", mod.run_global_campaign)
-        assert "commit_limit_name" not in inspect.signature(flow).parameters
 
     def test_nothing_bounds_mosaics_in_flight(self, wired, monkeypatch):
         """A whole year's mosaics may coexist: no backpressure from fill onto ingest.
@@ -927,6 +902,18 @@ def test_sequential_strategy_dispatches_one_run_per_year(wired):
     assert result["dispatched"] == 1
 
 
+@pytest.mark.parametrize(("strategy", "forwarded"), [("chained-clusters", 30.0), ("cluster-per-zone", None)])
+def test_the_inference_start_delay_reaches_chained_fills_only(wired, strategy, forwarded):
+    """A per-zone fill ingests its one cell before its cluster starts: there is no backlog to hold for."""
+    asyncio.run(
+        mod.run_global_campaign.fn(
+            paths=_PATHS, ami_ssm_name="ami", fill_strategy=strategy, inference_start_delay_minutes=30.0
+        )
+    )
+    fills = [p for d, p in wired["arun"] if d.startswith("fill-")]
+    assert fills and [p.get("inference_start_delay_minutes") for p in fills] == [forwarded] * len(fills)
+
+
 def test_sequential_strategy_forwards_ingest_false(wired):
     asyncio.run(
         mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters", ingest=False)
@@ -1050,6 +1037,85 @@ def test_every_cluster_opens_on_one_of_the_densest_zones(wired, monkeypatch):
     for zs in dispatched:
         tiles = [counts[z] for z in zs]
         assert tiles == sorted(tiles, reverse=True), zs
+
+
+class TestAnUpdateAcrossClusters:
+    """A targeted update: the plan is the work list, every chained child runs it, clusters balance on its shards."""
+
+    PLAN = UpdatePlan(
+        name="u1",
+        mode="holes",
+        mask_name="alt",
+        cells={"01N/2025": ["chunk_0_0", "chunk_0_1"], "02N/2025": ["chunk_3_3"], "03N/2024": None},
+    )
+
+    @pytest.fixture()
+    def update_wired(self, wired, monkeypatch):
+        monkeypatch.setattr(mod, "load_update", lambda paths, name, mask_name: self.PLAN)
+        # Every cell is complete — an update's cells always are — so the campaign's own list is empty.
+        status = SimpleNamespace(zones={"01N": (), "02N": (), "03N": ()}, has=lambda z, y: True)
+        monkeypatch.setattr(mod, "campaign_status", lambda *a, **k: status)
+        monkeypatch.setattr(mod, "campaign_work_list", lambda *a, **k: pytest.fail("an update has its own work list"))
+        monkeypatch.setattr(mod, "tag_year_complete", lambda *a, **k: pytest.fail("an update pins no campaign tag"))
+
+        def states(repo, name, cells):
+            return {
+                c: "not_complete" if c == ("03N", 2024) else "done" if c in wired["landed"] else "pending"
+                for c in cells
+            }
+
+        monkeypatch.setattr(mod, "update_states", states)
+        monkeypatch.setattr(mod, "zone_live_tile_count", lambda mask, zone, **k: len(k["tiles"] or ()))
+        wired["finished"] = []
+        monkeypatch.setattr(mod, "finish_update", lambda repo, plan: wired["finished"].append(plan.name) or "t")
+        return wired
+
+    def test_the_plan_is_the_work_list_and_every_child_runs_it(self, update_wired):
+        result = asyncio.run(
+            mod.run_global_campaign.fn(
+                paths=_PATHS, ami_ssm_name="ami", update="u1", max_parallel_clusters=2, allow_s2_only=True
+            )
+        )
+        assert result["never_filled"] == ["03N-2024"], "a planned cell the campaign never filled is reported"
+
+        dispatched = [p for _, p in update_wired["arun"] if "cells" in p]
+        assert {tuple(c) for p in dispatched for c in p["cells"]} == {("01N", 2025), ("02N", 2025)}
+        assert all(p["update"] == "u1" and p["mask_name"] == "alt" for p in dispatched)
+        assert update_wired["finished"] == ["u1"]
+
+    def test_the_orphan_sweep_reclaims_the_update_s_own_mosaics(self, update_wired):
+        """A recorded cell's leftover mosaic is under the update's root; the campaign's are not its to delete."""
+        update_wired["landed"].add(("01N", 2025))  # recorded by an earlier run whose cleanup failed
+        asyncio.run(
+            mod.run_global_campaign.fn(
+                paths=_PATHS, ami_ssm_name="ami", update="u1", sweep_orphan_mosaics=True, allow_s2_only=True
+            )
+        )
+        assert "s3://in/updates/u1/mosaics/01N/2025" in update_wired["deletes"]
+        assert all(d.startswith("s3://in/updates/u1/") for d in update_wired["deletes"]), update_wired["deletes"]
+        # 03N/2024 is out of the work list too, but the campaign has yet to fill it, so its mosaic may yet be used.
+        assert "s3://in/updates/u1/mosaics/03N/2024" not in update_wired["deletes"]
+
+    def test_an_update_whose_targets_are_dead_never_resolves_the_ami(self, update_wired, monkeypatch):
+        """Its child records the update without a cluster, so the parent must not need the AMI either."""
+        monkeypatch.setattr(mod, "zone_has_live_tiles", lambda mask, zone, **k: k["tiles"] is None)
+        monkeypatch.setattr(mod, "_resolve_ami_id", lambda *a, **k: pytest.fail("resolved an AMI for dead targets"))
+        asyncio.run(
+            mod.run_global_campaign.fn(
+                paths=_PATHS, ami_ssm_name="ami", update="u1", max_parallel_clusters=2, allow_s2_only=True
+            )
+        )
+        assert all(p["ami_id"] is None for _, p in update_wired["arun"] if "cells" in p)
+
+    def test_clusters_balance_on_the_update_shards_not_the_zone(self, monkeypatch):
+        monkeypatch.setattr(mod, "zone_work_weight", lambda *a, **k: pytest.fail("an update weighs its shards"))
+        monkeypatch.setattr(mod, "zone_live_tile_count", lambda mask, zone, **k: len(k["tiles"] or ()))
+        work = mod._update_work(self.PLAN, [("01N", 2025), ("02N", 2025)], "mask")
+        assert work == {"01N": 2.0, "02N": 1.0}
+        clusters = mod._partition_by_live_tiles(
+            ["02N", "01N", "03N"], 2, land_mask_path="mask", work=work | {"03N": 1.5}
+        )
+        assert clusters == [["01N"], ["03N", "02N"]]
 
 
 def test_sequential_single_shard_reads_no_tile_counts(wired, monkeypatch):
@@ -1627,6 +1693,9 @@ def test_the_staging_fingerprint_changes_with_the_stores_depth_rule(wired, monke
     at_none = mod._staging_run_id("33N", 2025, optical_min_obs=None, **common)
     assert len({at_25, at_30, at_none}) == 3, "each rule must own its staging prefix"
     assert at_25 == mod._staging_run_id("33N", 2025, optical_min_obs=25, **common), "and be stable"
+    # Registry parts are named by run id, so an update's run never shares one with another's or the campaign's.
+    updates = {mod._staging_run_id("33N", 2025, optical_min_obs=25, update=u, **common) for u in ("u1", "u2")}
+    assert len(updates | {at_25}) == 3
 
 
 def test_overlap_years_does_not_overcount_per_cell_runs(wired, monkeypatch):
@@ -2106,7 +2175,7 @@ class TestImmediateRefill:
     def test_a_round_that_is_already_over_is_not_even_planned_for(self, wired, monkeypatch):
         """The gate before planning is a COST filter, not the safety one.
 
-        The commit gate below it is what actually prevents a pointless replacement, and it
+        The dispatch gate below it is what actually prevents a pointless replacement, and it
         would decline this case on its own. This one exists so the driver does not pay for
         a store re-read and a full live-run scan per settled cluster once the round is
         over — which, at the fleet's cluster count, is a burst of orchestrator queries for

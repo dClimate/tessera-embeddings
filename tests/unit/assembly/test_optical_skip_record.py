@@ -113,7 +113,7 @@ class TestWhereItIsRecorded:
 
 
 class TestIdempotency:
-    """Re-recording a year replaces its entry; it never appends or accumulates."""
+    """Re-recording a year replaces its entry; only a different run is kept, in the year's history."""
 
     def test_re_recording_the_same_year_leaves_one_entry(self) -> None:
         summary = {"tiles_skipped": 2, "tiles_live": 5, "labels": ["chunk_0_1", "chunk_1_0"]}
@@ -132,3 +132,15 @@ class TestIdempotency:
         runs = run_provenance(runs, 2021, "b", optical_skips=summary)
         assert runs["2021"]["optical_skips"]["labels"] == ["chunk_0_1"]
         assert runs["2021"]["run_id"] == "b"
+
+    def test_a_retry_of_the_same_run_leaves_no_history_and_another_run_leaves_a_compact_one(self) -> None:
+        """A cell is retried under its own run id routinely, so only a different run may grow the history,
+        and by its identity alone: the replaced run's labels would grow it by a land mask per refill.
+        """
+        summary = {"tiles_skipped": 1, "tiles_live": 4, "labels": ["chunk_0_1"]}
+        runs = run_provenance(None, 2021, "a", optical_skips=summary, commit={"snapshot": "s", "committed_at": "t"})
+        runs = run_provenance(runs, 2021, "a", optical_skips=summary)
+        assert "previous" not in runs["2021"]
+        runs = run_provenance(runs, 2021, "b", optical_skips=summary)
+        (replaced,) = runs["2021"]["previous"]
+        assert set(replaced) == {"run_id", "assembled_at", "commit"} and replaced["run_id"] == "a"

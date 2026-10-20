@@ -74,7 +74,12 @@ scenes of a solar day overlap.
 Dask-backed array, corrected at load time where a producer's reflectance offset requires it,
 converted where radar amplitude needs decibels, and written one date at a time into the
 ROI's live windows. Writing per date rather than per year keeps the Dask graph small enough
-for a scheduler to hold.
+for a scheduler to hold. Each date is stored as `INGEST_CHUNKS` blocks, one object each, which is
+also the unit ingest writes. Each block is a shard of smaller inner chunks
+(`INGEST_INNER_CHUNKS`: 512 rows of one 2048-px inference tile), so a reader decompresses only the
+rows and tile it asks for rather than the whole block, and every inner chunk is compressed with
+Blosc-LZ4 (`INGEST_COMPRESSORS`), which decompresses 2.6× faster than zarr's default zstd while
+storing 6% less.
 
 **Where the length of this file comes from.** Those four stages are the whole pipeline.
 Everything else here exists because catalogues rate-limit and refuse, granules get reprocessed
@@ -104,7 +109,7 @@ sections up to [Authentication](#authentication-edl--opera-data) describe the ha
 | `catalogue_refusal.py` | Tells a catalogue that is BUSY apart from one that cannot serve this REQUEST, and names the request either way. [§ When the catalogue refuses](../../../docs/ingest-error-handling.md#when-the-catalogue-refuses-naming-the-request-and-telling-the-two-refusals-apart) |
 | `live_windows.py` | Derives the chunk-aligned live windows every ingest loads and writes, and narrows them per date to the land that date's imagery reaches. [§ Cropping to live windows](../../../docs/ingest-performance.md#cropping-to-live-windows-unconditional) |
 | `_http.py` | Shared HTTP helpers for catalogue and granule queries: retries that log each attempt, calls the caller can abandon, and a guard for replies that claim success but are not JSON. |
-| `_pipeline.py` | A prepare/consume pipeline with a look-ahead depth, so the next item is prepared while the current one is consumed. Buys buffering, never concurrency. [§ Pipelining a date's preparation](../../../docs/ingest-performance.md#pipelining-a-dates-preparation-pipeline_dates) |
+| `_pipeline.py` | A prepare/consume pipeline with a look-ahead depth, so the next item is prepared while the current one is consumed. Buys buffering, never concurrency. S2 dates go through it automatically on every fleet up to 140 workers. [§ Pipelining a date's preparation](../../../docs/ingest-performance.md#pipelining-a-dates-preparation-automatic) |
 
 ---
 

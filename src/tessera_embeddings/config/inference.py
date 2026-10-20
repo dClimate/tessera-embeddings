@@ -363,30 +363,24 @@ S1Orbit = Literal["ascending", "descending", "both", "none"]
 #: Minimum valid Sentinel-2 observations for a pixel to be EMBEDDED AT ALL, in the calendar
 #: year being filled. A pixel below it is written as fill, exactly as an out-of-ROI pixel is.
 #:
-#: **Not the counterpart of :data:`RADAR_THIN_MAX_OBS`.** That line LABELS; this one REFUSES,
-#: irreversibly — a refused pixel has no embedding, so recovering one re-runs its whole shard.
-#: Nor are the numbers comparable: radar sees through cloud, so one observation a month is a
-#: thin-but-usable year, while optical loses most passes to cloud. (Documents and commits
-#: predating 2026-08-13 use the old name ``OPTICAL_THIN_MAX_OBS``, when it was a label.)
+#: **One: any valid observation embeds** (Robert, 2026-10-12; ADR 028), because downstream users
+#: need wall-to-wall coverage. A pixel with NO valid observation is refused as ``no_optical`` by
+#: the dataset whatever the rule, so at 1 the thin counts — ``refused_thin``, ``s2_thin_px`` per
+#: chunk, ``s2_thin_below_obs`` in run provenance, the registry's ``refused_thin_px`` — are
+#: invariants: **each must be zero; a non-zero one means the gate leaked.**
 #:
-#: Two things bound how freely the value moves. It is stamped into the global store's root
-#: attrs as part of their write-once identity, so **a store cannot be re-stamped** — changing
-#: the line means a new store, not a migration, and a store seeded at another value keeps it.
-#: And the seeder takes it explicitly rather than defaulting to this constant, so nothing can
-#: stamp a store by inheriting whatever happens to be here.
+#: **Not the counterpart of :data:`RADAR_THIN_MAX_OBS`.** That line LABELS; this one REFUSES — a
+#: refused pixel has no embedding, so recovering one re-runs its shard.
 #:
-#: ``s2_thin_px`` per chunk and ``s2_thin_below_obs`` in run provenance count EMBEDDED pixels
-#: below this value — a preview of what a refusal removes while nothing refuses, and once the
-#: gate is enforced an invariant: **the count must be zero; a non-zero one means it leaked.**
-#: Each cell's provenance records the line its own numbers were produced under, so cells
-#: filled before and after a change stay comparable.
-#:
-#: **15 is a DECISION (Robert and colleague, 2026-08-17), not a placeholder.** Coverage over
-#: reproducibility: it keeps **94% of pixels rather than 79%**, at the knowingly accepted cost
-#: that two independent embeddings of the same ground agree less well. The trade, including
-#: what 15 admits that 20 would not, is in
-#: ``context_docs/inference/minimum-optical-depth.md`` (ADR-018).
-OPTICAL_MIN_OBS = 15
+#: The seeder takes the value explicitly rather than defaulting to this constant, so nothing can
+#: stamp a store by inheriting whatever happens to be here, and stamps it on the global store's
+#: root, where it never moves: a store seeded at 15 keeps 15. A targeted update may apply a looser
+#: line to its own cells (``UpdatePlan.optical_min_obs``), recorded in each cell's update record
+#: and never on the root or a zone group, so
+#: :func:`~tessera_embeddings.storage.update.cell_optical_min_obs` is the line a cell's pixels were
+#: judged against. The evidence on depth against agreement is
+#: ``context_docs/inference/minimum-optical-depth.md``.
+OPTICAL_MIN_OBS = 1
 
 #: Resolved value meaning "this ROI has no usable radar at all, and that is a finding".
 #:
@@ -495,16 +489,6 @@ MODEL_ENCODER_URLS: dict[str, str] = {
     "v2-large": "https://huggingface.co/geotessera/TESSERA-V-2.0-2B-L",
 }
 
-#: Planning-only inference throughput (px/s/worker). Strip and prefetch
-#: planning divides by this to ask "will the GPU stay busy long enough to hide
-#: this read?", so a faster model must not inherit a slower one's figure.
-#: Strategy only — never correctness, never a RAM bound. Calibration in
-#: context_docs.
-MODEL_EST_PX_PER_SEC: dict[str, float] = {
-    "v1.1": 16_000.0,
-    "v2-large": 22_000.0,
-}
-
 
 def encoder_url(model_version: ModelVersion = DEFAULT_MODEL_VERSION) -> str:
     """Public ``geoemb:model`` URL for *model_version*.
@@ -527,15 +511,6 @@ def encoder_url(model_version: ModelVersion = DEFAULT_MODEL_VERSION) -> str:
         raise ValueError(msg) from None
 
 
-def est_px_per_sec(model_version: str = DEFAULT_MODEL_VERSION) -> float:
-    """Planning-only inference-rate estimate; unknown versions fall back.
-
-    Falls back rather than raising because this is a speed hint — planning with
-    a stale number beats refusing to plan.
-    """
-    return MODEL_EST_PX_PER_SEC.get(model_version, MODEL_EST_PX_PER_SEC[DEFAULT_MODEL_VERSION])
-
-
 # v1.1 observation-count buckets. Every pixel with k valid observations is resampled
 # to the next bucket size; pixels sharing a bucket form rectangular batches for the
 # transformer. Multiples of 8 from 8 to 256 match tessera v1.1 defaults.
@@ -543,9 +518,7 @@ DEFAULT_NUM_OBS_CHECKPOINTS: tuple[int, ...] = tuple(range(8, 257, 8))
 
 # CPU batch-prep pipeline depth for the inference loop, and the number of prep workers.
 # Depth 1 starved the GPU whenever a forward ran shorter than one prep; depth 2 keeps a batch
-# ready across consecutive short forwards. Lives in this torch-free module because actors.py
-# sizes its background-load CPU reservation to match (one reserved core per prep worker) and
-# cannot import inference.py at module scope — the Fargate flow runner has no torch.
+# ready across consecutive short forwards.
 PREFETCH_DEPTH = 2
 
 # Spatial read-tile size for inference, on both paths: one tile is exactly one 2048-px output

@@ -153,6 +153,13 @@ For the optional EC2-scheduler mode (`ec2_scheduler=True` on
 | `EC2_SCHEDULER_CAPACITY_PROVIDER` | ECS capacity provider name backed by an EC2 ASG |
 | `EC2_SCHEDULER_SUBNET` | Single subnet for both scheduler and workers (avoids cross-AZ transfer) |
 
+**Worker shape.** Ingest workers are 4 vCPU, 24576 MiB and six task threads
+(`DEFAULT_INGEST_WORKER_CPU`, `_MEM` and `_NTHREADS` in `providers/aws/dask.py`; why each, in
+`context_docs/ingest/campaign-ingest-measurements.md` §8). The thread count and Dask's memory
+limit travel in each run's worker command. When `DASK_WORKER_TASK_DEFINITION_ARN` and
+`DASK_SCHEDULER_TASK_DEFINITION_ARN` pin the task definitions, the container's CPU and memory are
+whatever those definitions registered, so raise the definition whenever the memory constant rises.
+
 ## IAM you'll need
 
 The flow runner's task role needs:

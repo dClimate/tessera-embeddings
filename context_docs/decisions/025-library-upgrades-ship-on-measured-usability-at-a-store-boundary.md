@@ -1,4 +1,4 @@
-# 024 — A library upgrade ships on the cross-config envelope and measured usability, at a store boundary
+# 025 — A library upgrade ships on the cross-config envelope and measured usability, at a store boundary
 
 **Status:** Accepted (2026-10-03, repo owner)
 

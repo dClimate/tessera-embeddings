@@ -31,6 +31,7 @@ import xarray as xr
 from icechunk.xarray import to_icechunk
 
 from tessera_embeddings.config import S2_L2A_BANDS
+from tessera_embeddings.config.ingest import INGEST_INNER_CHUNKS
 from tessera_embeddings.storage.region_writes import _pad_region_to_chunks
 from tessera_embeddings.storage.time_axis import compute_doy
 from tessera_embeddings.storage.zarr_store import (
@@ -1016,6 +1017,34 @@ class TestWriteRegion:
             write_region(store_path, new, region=resolve_region(store_path, time=("2024-01-06", "2024-01-06")))
 
         np.testing.assert_array_equal(open_store(store_path)["blue"].values, original)
+
+
+class TestWriteRegionSharded(TestWriteRegion):
+    """Every region-write test again on sharded stores: 500-px shards of 250-px inner chunks.
+
+    A sharded array opens with its INNER chunks as the dask chunks, so a write widened to those
+    would write partial shards; region writes must widen to the shard instead.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _shard_the_mosaics(self, monkeypatch):
+        monkeypatch.setitem(INGEST_INNER_CHUNKS, "northing", 250)
+        monkeypatch.setitem(INGEST_INNER_CHUNKS, "easting", 250)
+
+    def test_an_unaligned_write_widens_to_whole_shards_not_inner_chunks(self, local_zarr_path, sample_reflectance_data):
+        # Rows 300:400 widen to 250:500 on the inner chunks but 0:500 on the shards; easting 600:700
+        # to 500:750 and 500:1000. Values alone cannot tell: a partial-shard write reads back right too.
+        store_path = self._store(local_zarr_path, sample_reflectance_data, ["2024-01-01"], name="rw_widen")
+        existing = open_store(store_path)
+        data = _single_date_block("2024-01-01", 9, height=100, width=100, n0=300, e0=600, chunks=ONE_BLOCK)
+        region = {"time": slice(0, 1), "northing": slice(300, 400), "easting": slice(600, 700)}
+        _padded, widened = _pad_region_to_chunks(existing, data, region, open_store_as_zarr_group(store_path))
+        assert widened["northing"] == slice(0, 500) and widened["easting"] == slice(500, 1000)
+
+    def test_the_store_is_sharded(self, local_zarr_path, sample_reflectance_data):
+        store_path = self._store(local_zarr_path, sample_reflectance_data, ["2024-01-01"], name="rw_shard")
+        blue = open_store_as_zarr_group(store_path)["blue"]
+        assert blue.chunks == (1, 250, 250) and blue.shards == (1, 500, 500)
 
 
 class TestDefaultRepoConfig:

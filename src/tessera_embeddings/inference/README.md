@@ -341,37 +341,37 @@ through the model, and written into the whole-tile output buffers by row range.
          └ each strip's read happens DURING the previous strip's forward passes
 ```
 
-**How the strips are chosen.** `_strip_plan` decides per tile, from the full-tile SCL mask
-it already loaded. Two quantities pull in different directions: the bytes to read scale with
-`T_kept × H × W` regardless of how many pixels are valid, while the GPU time scales with the
-**valid-pixel count**. A tile can be cheap to read and slow to infer, or the reverse, so the
-plan picks the strategy that fits — the same choice appears as Q2 and Q3 of the
-[decision tree](../../../docs/inference-performance.md#how-a-tiles-path-is-chosen):
+**How the strips are chosen.** `_strip_plan` sizes strips from the full-tile SCL mask it
+already loaded: the tallest strip whose bands plus the tile's mask fit one byte budget. A
+tile that fits one budget is a single strip.
 
 ```text
- per_set = T_kept·H·W·(10 bands × 2 B + 1 B mask)   budget = _S2_STRIP_BYTE_BUDGET (5.75 GiB)
+ per_set = T_kept·strip_h·W·(10 bands × 2 B) + T_kept·H·W·(1 B mask)
+ budget  = _S2_STRIP_BYTE_BUDGET (3.5 GiB)
 
- per_set ≤ budget ─────────────────────────────▶ ONE strip, no prefetch   (most tiles)
- else, and enough valid pixels to hide the ───▶ equal strips ≤ budget, prefetch ON
- reads behind inference (a dense tile)
-        └─ tall enough to be worth it? ───────▶   + a small "starter" strip, so the
-                                                   GPU begins one read sooner
- else (many bytes, few valid pixels, so ──────▶ strips ≤ the PAIR budget, prefetch OFF
- nothing to hide the reads behind)                (only one strip resident, so it may
-                                                   safely use twice the budget)
+ whole tile fits the budget ──▶ ONE strip
+ else                        ──▶ strips of the budget's height (the last one shorter), the
+                                 next always loading in the background (floor: 256 rows)
 ```
 
-**Peak host memory has the same ceiling in every branch.** With prefetching on, two band
-sets co-reside — the strip being inferred and the strip being read — each within the budget,
-so the pair is bounded at roughly twice it. With prefetching off the previous set is
-released before the next is read, so only one is resident and it may use the whole pair
-budget. Either way the ceiling is the same, and it holds peak memory under 60% of a 32 GB
-worker across the density variation of a whole UTM zone. The arithmetic behind the budget
-constant is in its own comment.
+**Strips run densest first, empty strips last.** Each strip's load hides behind the previous
+strip's inference, so an empty or sparse strip early in the order — the top rows of a tile on a
+footprint's edge — would leave the next load exposed with the card idle. The order does not change
+which pixels share a sub-batch, so the outputs are the same in any order.
 
-**Turning prefetching off is deliberate, not a fallback.** A background read only helps if
-there is inference to hide it behind. On a tile with many bytes and few valid pixels the
-read would sit exposed on the critical path *and* force a second resident set for nothing.
+**A `holes` update reads only where its holes are.** Given a tile's hole mask (`ChunkSpec.pixels`),
+`_chunk_read_plan` tiles only the rows between the first and last hole and drops every strip that
+holds none, since the update keeps the store's values outside its holes. The column crop covers
+the holes with an optical observation, the only ones it can embed. A strip whose holes cannot embed
+is still read, last, because the update rewrites every hole's observation counts, radar's included.
+A read still decompresses whole 512-row inner chunks (below), so a hole costs the rows of its
+chunk; the column crop saves the per-pixel work after the read.
+
+**Peak host memory has one ceiling.** The load pipeline is one strip deep, so at most two
+band sets co-reside — the strip being inferred and the strip being read — and the pair is
+bounded at twice the budget. A full year of Iowa peaked at 50% of a 32 GB worker, under the
+60% ceiling, and the margin is what absorbs the memory spikes a global run does hit. The
+arithmetic behind the budget is in its own comment.
 
 **Two reads are decoupled.** The SCL mask — one byte per pixel — is read **once** for the
 whole tile (`load_s2_mask_bundle`) and sliced per strip, never re-decompressed; it doubles
@@ -380,46 +380,52 @@ read per strip on the tiles that split, and that per-strip read is exactly the w
 the byte budget bounds. A tile that fits one budget is loaded whole, byte for byte the same
 as if striping did not exist.
 
+**A strip reads little more than its own rows, so strips are cheap.** The mosaics are sharded
+(see the ingest README): each 4096-px block is one stored object holding inner chunks of 512
+rows × one 2048-px tile, and a read decompresses only the inner chunks it touches. An extra
+strip therefore costs one more background read of its own rows, where whole-block storage
+charged every strip ~13 s to decompress the block; that is why one small budget costs no
+throughput, and why strip heights are not rounded to the inner chunk (a straddling strip
+decompresses one extra inner chunk, in the background). Each inner chunk is its own ranged
+request, so reads wait on S3 latency at zarr's default of 10 requests in flight; every actor
+raises that to 64 (`MOSAIC_READ_CONCURRENCY`) when it starts. Mosaics written before sharding
+still read correctly, but every strip decompresses whole blocks.
+
 #### 4.3 Starting the next tile early, and finishing the last one late
 
-Every tile pays a serial, GPU-idle **prologue** before its first forward pass: read the SCL
-mask, read the first band set, build the dataset. That is 24–36 seconds per tile in which
+Every tile pays a **prologue** before its first forward pass: read the SCL mask, read the
+first band set, build the dataset. Run serially, that is several seconds per tile in which
 an expensive card does nothing.
 
-The fix is to do it during the *previous* tile's work. The scheduler reserves each actor's
-next tile one ahead (`ActorPool.reserved`, passed to the actor as `prefetch_hint`), and
-during the current tile's **last strip** — by which point the co-residency has decayed to
-its low point — the actor preloads a **capped** payload for the tile it is about to get:
-its SCL mask and read plan, and where the budget allows, its first 256 rows.
+The fix is to run it during the *previous* tile's last strip. The scheduler reserves each
+actor's next tile one ahead (`ActorPool.reserved`, passed to the actor as `prefetch_hint`),
+and the strip pipeline simply runs across the tile boundary: on tile N's last strip with
+pixels, the "next strip" to load is tile N+1's first, together with its SCL mask. Any empty
+strips after it load alongside, for their observation counts.
 
 ```text
  actor timeline, tile N → N+1 (prefetch hit)
 
- [═════════ inference N ═══════════][═ N+1 starter ═][═══ N+1 body ═══]
-              [mask N+1][starter N+1]      [body N+1 loads]
-  GPU:  busy ─────────────────────── busy ── busy ─────── busy
-        └ prefetch runs during N's LAST strip (the memory trough) ┘
+ [═══ N strip k-1 ═══][═══ N last strip ═══][═══ N+1 strip 0 ═══][═══ N+1 strip 1 ═══]
+     [N last strip loads] [mask + strip 0 of N+1]  [N+1 strip 1 loads]
+  GPU:  busy ──────────── busy ──────────────── busy ──────────── busy
 ```
 
-**It deliberately does not prefetch the whole next tile.** That co-resides two full working
-sets, and at UTM-zone density variation it exhausts the machine's memory — measured at
-92–95% peak, which killed a worker. The cap is about 2 GiB
-(`_XCHUNK_PREFETCH_CAP_BYTES`), and the tiers that decide how much of it to use
-(`_xchunk_rung`) are conservative: a dense, already-striped tile gets its small starter
-free; a single-budget tile is converted into starter-plus-body only when a net-gain check
-says the extra fixed read will actually be hidden; everything else gets the mask alone.
+**It never holds more than the pair.** Tile N's last strip and tile N+1's first, each charged
+its own mask, are the same two sets the budget is sized for. Prefetching a whole next tile
+would co-reside two full working sets, which once exhausted a worker's memory at 92–95%.
 
-**Every way this can miss degrades to the serial prologue** — slower, never bigger. Hitting
-the cap, another actor stealing the reserved tile, a credential window expiring, a failed
-read, or the `TESSERA_DISABLE_XCHUNK_PREFETCH=1` escape hatch all simply mean the next tile
-loads the way it would have anyway.
+**Every way this can miss degrades to the serial prologue** — slower, never bigger. Another
+actor stealing the reserved tile, a credential window expiring, or a failed read all simply
+mean the next tile loads the way it would have anyway.
 
 **Two smaller overlaps ride on the same idea.** Bucketing rides the strip-prefetch thread:
 `_load_strip` returns the built dataset alongside the data, so choosing pixels and grouping
 them (about ten seconds) happens during the previous strip's GPU work rather than between
-load and inference. And background strip loads **reserve two cores** for the batch-prep
-workers feeding the GPU (`reserve_cpus`), so decompressing bands cannot starve inference on
-a four-vCPU machine.
+load and inference. Background loads do compete with the batch-prep workers for the four
+cores — zarr decompresses on its own pool across all of them — but preparing a batch takes
+about a quarter of the GPU's time per batch and the loop prepares two ahead, so the GPU still
+runs at its standalone rate.
 
 **The staging write is deferred too.** It goes to a single-slot writer thread and overlaps
 the next tile's prologue — both are I/O, and the GPU is idle for either. The tile's result
@@ -476,6 +482,12 @@ buckets.
    double peak memory — 14 GB of source arrays plus a 17 GB copy, which was an
    out-of-memory kill. Per-batch indexing costs about 7 ms per batch and removes the spike
    entirely.
+
+4. **A targeted update can narrow it further.** A tile whose `ChunkSpec.pixels` names a mask
+   embeds only the pixels it marks, beside the gates above
+   ([ADR 027](../../../context_docs/decisions/027-targeted-updates.md)). An update in `holes` mode
+   masks each tile to the pixels that are holes in the store, so pixels already embedded never
+   reach the GPU; the refusal counts still describe the whole strip.
 
 **When no pixel qualifies.** A tile inside the area of interest whose every pixel fails the
 filter takes the **skip path**: the actor writes a zero-byte `{chunk.label}.skipped` marker
@@ -636,9 +648,11 @@ things worse:
   where the model was trained with it before, and on real pixels that changes every stored
   value ([ADR 026](../../../context_docs/decisions/026-v1-1-runs-the-gru-it-was-trained-with.md)).
   v1.1 only: v2's pooling head is a single attention layer with no recurrence.
-- **Positional encoding writes into an uninitialised buffer.** The sine and cosine values
-  are written straight into it, instead of being scattered into a multi-gigabyte block of
-  FP32 zeros allocated on every forward pass. Same values, lower peak memory.
+- **Positional encoding is a per-day lookup table.** Day of year is an integer, so the
+  sine/cosine encoding of all 367 days is computed once per device and dtype, by the same
+  FP32 arithmetic, and each forward pass indexes into it — instead of computing sin and cos
+  over every pixel and timestep into two full-size FP32 tensors. Same values on the GPU, a
+  forward pass 5–8% faster.
 
 **What the logs report, and why it is not pixels per second.** A pixel with few
 observations costs about a tenth of a densely observed one, so a pixels-per-second figure
@@ -768,6 +782,8 @@ is recorded as its own signal, *after* the store is fully written:
                     ↓
                 ds.to_zarr(…, mode="w")           many objects, no atomic commit
                     ↓
+                coverage = {…}                    this shard's refusal reasons and depth
+                    ↓
                 staged_complete = True            in-store attribute
                     ↓
                 <label>.done  (zero bytes)        sibling object, written LAST
@@ -811,6 +827,32 @@ second gate to maintain.
 
 All of this guards the *staging* layer only. The final store is Icechunk, whose
 transactional commit already rolls back cleanly on a crash during assembly.
+
+#### The coverage record rides on the tile, not only on the result
+
+A shard's coverage record — its three refusal counts, its optical depth statistics and whether
+either radar orbit saw it — fills the published registry's measurement columns. Both kinds of
+shard persist it on object storage, so it outlives the process that measured it:
+
+```text
+  refused shard   ── record ──▶ <label>.skipped                 on S3, survives every resume
+  embedded shard  ── record ──▶ <label>.zarr  attrs["coverage"]  on S3, survives every resume
+                         └────▶ Ray result                       this leg only
+```
+
+A resumed run's finishing leg reports earlier legs' tiles as **synthetic successes** carrying no
+record. `assemble_global` therefore reads the record back from the staged tile for every label
+that arrived without one: `read_staged_coverage` is the embedded half of `read_skip_records` —
+concurrent, fail-soft, counting unreadable objects rather than swallowing them — and a run that
+staged everything itself reads nothing at all. `write_chunk` sets the attribute with
+`staged_complete`, so before `.done`, and the completion marker keeps vouching for a tile whose
+attributes are already set.
+
+A record that cannot be read publishes its row null, "not measured", with a warning naming the
+count. Every column is derivable from the store, so such rows are repairable:
+`scripts/maintenance/rebuild_registry_measurements.py`. That script also repaired the 1,519,045
+null rows of the v1.1 campaign, which ran before the embedded path persisted its record
+([`registry-backfill.md`](../../../context_docs/storage/registry-backfill.md)).
 
 ### 2. Assembling the staged tiles into the store
 
@@ -908,6 +950,13 @@ not pixels.) `years_complete` and the per-year run provenance advance in a **sec
 after the shards: a crash between the two leaves a year written but unmarked. The zone-fill runner
 ([`orchestration/runners/zone_fill.py`](../orchestration/runners/zone_fill.py)) drives the
 sequence: coverage mask → inference → `assemble_global` → `campaign.tag_zone_year`.
+
+**A targeted update** ([ADR 027](../../../context_docs/decisions/027-targeted-updates.md)) runs the
+same sequence over chosen shards of a year that is already filled, with three differences. A shard
+whose tile staged nothing is kept, not cleared; in `holes` mode each staged tile is **merged**,
+the worker reading the shard already in the store and replacing only its hole pixels, in every
+array; and the second commit appends the update's record to the group's `updates` attr instead of
+advancing `years_complete` and `runs`. No zone-year tag is created.
 
 **The campaign's land mask is not a pixel-resolution area of interest** but a per-zone
 *coverage bitmap* (`tile_live_2048`), built from the delivery registry by

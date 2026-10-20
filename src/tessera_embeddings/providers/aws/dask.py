@@ -81,8 +81,8 @@ from tornado.ioloop import PeriodicCallback
 # hundred MiB — undersizing costs a whole run, not a retry.
 #
 # Raising the limit is a WEAK lever: a worker settles at ~72% of whatever it is given (caches
-# and allocator arenas expand into the space) while Dask pauses at 80%, leaving ~8% margin at
-# ANY size. Demand scales with a date's window count — the overlapped write holds every
+# and allocator arenas expand into the space) while Dask pauses at 90% (set below), leaving ~18%
+# margin at ANY size. Demand scales with a date's window count — the overlapped write holds every
 # window of a date concurrently — and that count varies by year, so the size follows the
 # asymptote of a long run over the densest dates. Measured peaks and the margin chosen
 # against them: context_docs/ingest/campaign-ingest-measurements.md.
@@ -98,6 +98,14 @@ from tornado.ioloop import PeriodicCallback
 # the container's hard limit, replacing a pause with an OOM kill. The two change together.
 DEFAULT_INGEST_WORKER_CPU = 4096
 DEFAULT_INGEST_WORKER_MEM = 24576
+
+# Task threads per ingest worker: six on 4 vCPU, not dask-cloudprovider's one per vCPU. Each
+# band read waits on S3 for part of its run, so with four threads a worker leaves CPU idle even
+# when every thread is busy. Where a date's work fills the fleet (dense zones) six take up that
+# slack, about 3% faster and cheaper a date; where it does not, they change nothing. Peak worker
+# memory grows about 1.5x and stays near a quarter of the size above. Measured in
+# context_docs/ingest/campaign-ingest-measurements.md §3.20.
+DEFAULT_INGEST_WORKER_NTHREADS = 6
 
 # Schedulers don't need much memory but benefit from a few cores so
 # graph construction and dashboard responsiveness stay smooth.
@@ -585,6 +593,9 @@ class FargateConfig:
                 "DASK_DISTRIBUTED__ADMIN__TICK__LIMIT": "10s",
                 "DASK_DISTRIBUTED__COMM__TIMEOUTS__CONNECT": "60s",
                 "DASK_DISTRIBUTED__COMM__TIMEOUTS__TCP": "120s",
+                # Pause at 90%, not Dask's 80%: 2019 optical carries denser per-date metadata than
+                # other vintages and lifts the driver worker's peak toward the old threshold.
+                "DASK_DISTRIBUTED__WORKER__MEMORY__PAUSE": "0.90",
                 # Use unsigned requests for public S3 buckets (e.g. sentinel-s2-l1c)
                 "AWS_NO_SIGN_REQUEST": "YES",
                 # Task logs from Dask containers ship to the orchestrator API — Prefect's
@@ -722,7 +733,7 @@ def ecs_cluster(
     worker_mem: int | None = None,
     scheduler_cpu: int | None = None,
     scheduler_mem: int | None = None,
-    worker_nthreads: int | None = None,
+    worker_nthreads: int = DEFAULT_INGEST_WORKER_NTHREADS,
     worker_nprocs: int | None = None,
     extra_worker_env: dict[str, str] | None = None,
     extra_scheduler_env: dict[str, str] | None = None,
@@ -744,7 +755,8 @@ def ecs_cluster(
         worker_mem: Override worker memory in MiB.
         scheduler_cpu: Override scheduler CPU units.
         scheduler_mem: Override scheduler memory in MiB.
-        worker_nthreads: Threads per worker process.
+        worker_nthreads: Threads per worker process (see :data:`DEFAULT_INGEST_WORKER_NTHREADS`).
+            The default is measured for the default 4 vCPU; pass both when resizing a worker.
         worker_nprocs: Worker processes per Fargate task. Set ``> 1`` with
             ``worker_nthreads=1`` for GIL-bound workloads to use all vCPUs.
         extra_worker_env: Env vars set on every worker, merged after the defaults.
@@ -822,12 +834,11 @@ def ecs_cluster(
         cluster_kwargs["image"] = image
     if resource_tags:
         cluster_kwargs["tags"] = dict(resource_tags)
+    cluster_kwargs["worker_nthreads"] = worker_nthreads
 
     worker_extra_args = ["--death-timeout", "300"]
     if worker_nprocs is not None:
         worker_extra_args.extend(["--nworkers", str(worker_nprocs)])
-    if worker_nthreads is not None:
-        worker_extra_args.extend(["--nthreads", str(worker_nthreads)])
     cluster_kwargs["worker_extra_args"] = worker_extra_args
     log.info("Worker args: %s", worker_extra_args)
 

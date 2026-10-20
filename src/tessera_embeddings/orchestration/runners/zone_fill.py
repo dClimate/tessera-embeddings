@@ -35,17 +35,25 @@ crash landed the fill untagged. Zone-year tags are permanent — icechunk forbid
 even a deleted tag name — so a deliberate refill keeps the old tag on the old snapshot and
 must pin its new snapshot under a fresh, manually chosen name; campaign history is never
 silently rewritten.
+
+Once a cell with live tiles has committed and published its registry part, and before it is
+tagged, its parts are merged into the registry's ``master/`` file for the cell
+(:func:`_merge_registry_master`), best-effort, so the registry consumers read is current as each
+cell lands — including a deliberate refill, which fails at the tag step by design.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, cast
 
+import fsspec
 import icechunk
 import numpy as np
 import zarr
@@ -53,6 +61,7 @@ import zarr
 from tessera_embeddings.config.assembly import AssemblyConfig
 from tessera_embeddings.config.fault_injection import ArmedFault
 from tessera_embeddings.config.inference import InferenceConfig
+from tessera_embeddings.config.paths import store_key
 from tessera_embeddings.config.store_layout import GLOBAL, REQUIRED_VARS
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import (
@@ -65,11 +74,26 @@ from tessera_embeddings.inference.assembly import (
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, enumerate_chunks
 from tessera_embeddings.inference.data_loading import _active_orbits
 from tessera_embeddings.inference.runner import run_inference
-from tessera_embeddings.storage.campaign import mark_zone_year_empty, tag_zone_year, zone_year_tag
+from tessera_embeddings.ingest.land_mask import narrow_tile_live
+from tessera_embeddings.storage.campaign import mark_zone_year_empty, pin_tag, tag_zone_year, zone_year_tag
 from tessera_embeddings.storage.global_store import check_destination_types, open_global_repo
+from tessera_embeddings.storage.published_store import calendar_years, live_shards, shard_writes, store_year
+from tessera_embeddings.storage.registry_master import merge_cell
+from tessera_embeddings.storage.registry_rebuild import as_coverage_record, rebuild_tile
 from tessera_embeddings.storage.shard_writer import read_years_complete, shard_pitch
 from tessera_embeddings.storage.time_axis import time_index_of, year_timestamp
-from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group
+from tessera_embeddings.storage.update import (
+    UpdateTarget,
+    applied_optical_min_obs,
+    base_tag,
+    check_no_tightening,
+    check_radar_policy,
+    commit_update_record,
+    stage_hole_masks,
+    update_record,
+    update_state,
+)
+from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group, plain_zarr_storage_options
 from tessera_embeddings.storage.zone_grid import PIXEL_M, canonicalize_zone, tile_row_latitudes
 from tessera_embeddings.storage.zone_grid import zone as zone_spec
 
@@ -105,6 +129,7 @@ def zone_live_tile_count(
     *,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
+    tiles: Collection[str] | None = None,
 ) -> int:
     """Number of 2048-px tiles the coverage bitmap marks live for ``zone``.
 
@@ -113,10 +138,11 @@ def zone_live_tile_count(
     largest-first (so a shared cluster's fleet only ever shrinks) and clamping per-zone actor
     requests. This reads only the liveness bitmap; :func:`fill_zone_year` re-reads and
     attr-validates the coverage group as the authority, so a wrong-zone mask still fails
-    loudly there rather than being trusted here.
+    loudly there rather than being trusted here. ``tiles`` narrows the count to a targeted
+    update's shards (:func:`~tessera_embeddings.ingest.land_mask.narrow_tile_live`).
     """
     cov = open_store_as_zarr_group(land_mask_path, group=zone, get_credentials=get_credentials, region=s3_region)
-    return int(np.asarray(cast("zarr.Array", cov["tile_live_2048"]), dtype=bool).sum())
+    return int(narrow_tile_live(np.asarray(cast("zarr.Array", cov["tile_live_2048"]), dtype=bool), tiles).sum())
 
 
 #: Observations per pixel-year by 20-degree latitude band — the campaign census, from
@@ -195,6 +221,7 @@ def zone_has_live_tiles(
     *,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
+    tiles: Collection[str] | None = None,
 ) -> bool:
     """Whether the coverage bitmap marks ANY 2048-px tile live for ``zone``.
 
@@ -202,7 +229,10 @@ def zone_has_live_tiles(
     caller can skip provisioning a Ray cluster for it. See :func:`zone_live_tile_count` for
     the underlying read and its trust boundary.
     """
-    return zone_live_tile_count(land_mask_path, zone, get_credentials=get_credentials, s3_region=s3_region) > 0
+    return (
+        zone_live_tile_count(land_mask_path, zone, get_credentials=get_credentials, s3_region=s3_region, tiles=tiles)
+        > 0
+    )
 
 
 def zone_year_complete(
@@ -274,6 +304,8 @@ class ZoneFillHandoff:
     # Terminal result from the inference phase (already-complete cell, or all-ocean empty
     # fill). When set, assembly is a pass-through no-op.
     done: dict[str, Any] | None = None
+    # The targeted update this cell runs for, or None for a campaign fill (see `_assemble_update`).
+    update: UpdateTarget | None = None
 
 
 def _store_credentials(
@@ -316,6 +348,76 @@ def _check_assembly_workers(n: int | None) -> None:
         raise ValueError(f"n_assembly_workers must be >= 1 when set, got {n}")
 
 
+def _merge_registry_master(
+    registry_root: str | None,
+    store_path: str,
+    zone: str,
+    year: int,
+    run_id: str | None,
+    *,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None,
+    s3_region: str | None,
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+) -> None:
+    """Merge the part assembly just published into the cell's ``master/`` file. Never raises.
+
+    This is what keeps the master current: every fill merges its cell's parts into the cell's
+    existing master file, tile by tile
+    (:func:`~tessera_embeddings.storage.registry_master.merge_cell`), so a refill, a new year or
+    an update of some tiles reaches consumers as it lands. Called before the tag, because a deliberate refill
+    fails at the tag step once its data and part have landed. Best-effort for the reason
+    ``publish_registry_part`` is: the cell has committed, and a registry failure must not fail it
+    or keep it from being tagged. A failure —
+    including ``run_id``'s own part never having published, which would otherwise rewrite the master
+    from the older runs and report success — is logged loudly and leaves the cell stale.
+    ``rebuild_registry_measurements.py repair --zones`` rebuilds it once the part exists.
+
+    A retry of a cell that already landed, or of an update already recorded, runs it again with no
+    ``run_id`` (:func:`plan_zone_inference`): a process that died between the commit and this merge
+    would otherwise leave the master stale for good, since the retry skips the fill or update.
+
+    The store's live shards for the year are compared with the master's embedded tiles on the way,
+    from the manifests alone, and a disagreement is logged at ERROR: no run removes a tile it did
+    not write, so a shard cleared by hand would otherwise leave the master describing it. The
+    store's run record is checked against the cell's parts too (``store_disagreements``), which
+    refuses the update when a run that wrote the year has no part to describe its tiles.
+    """
+    if not registry_root:
+        return
+    try:
+        credentials = _store_credentials(store_path, get_credentials)
+        repo = open_global_repo(store_path, get_credentials=credentials, region=s3_region)
+        session = repo.readonly_session(branch="main")
+        node = cast(zarr.Group, zarr.open_group(session.store, mode="r")[zone])
+        live = live_shards(session, zone).get(calendar_years(node).index(year), frozenset())
+        # The registry sits beside the store, in its bucket, so the store's credential writes it.
+        fs, _ = fsspec.url_to_fs(
+            registry_root, **(plain_zarr_storage_options(registry_root, credentials, s3_region) or {})
+        )
+        disagreements = merge_cell(
+            fs,
+            registry_root,
+            zone,
+            year,
+            run_id=run_id,
+            live=live,
+            store=lambda: store_year(repo, node, zone, year, shard_writes(repo)),
+        )
+    except Exception:
+        log.exception(
+            "Zone %s year %d: registry master NOT merged. The cell is committed, but master/ — what "
+            "consumers read — still describes it as it was before this fill. Repair, once the cause "
+            "above is resolved: scripts/maintenance/rebuild_registry_measurements.py repair --zones %s --write",
+            zone,
+            year,
+            zone,
+        )
+        return
+    for disagreement in disagreements:
+        log.error("Zone %s year %d: registry master and store disagree — %s", zone, year, disagreement)
+    log.info("Zone %s year %d: registry master merged", zone, year)
+
+
 def fill_zone_year(
     *,
     store_path: str,
@@ -339,6 +441,7 @@ def fill_zone_year(
     on_fleet_demand: Callable[[int], None] | None = None,
     fault: ArmedFault | None = None,
     input_coverage: dict | None = None,
+    update: UpdateTarget | None = None,
 ) -> dict[str, Any]:
     """Fill one (zone, year): mask → inference → shard assembly → tag.
 
@@ -379,6 +482,8 @@ def fill_zone_year(
         fault: Supervised-drill hook, forwarded to the assembly phase. Inert unless the run
             was armed for a fault this path hosts and for this cell
             (:mod:`tessera_embeddings.config.fault_injection`).
+        update: Run a targeted update of this already-filled cell instead of filling it
+            (:func:`plan_zone_inference`, :func:`assemble_zone_year`).
 
     Returns:
         Summary dict: zone, year, run_id, snapshot_id, tag, tile counts,
@@ -400,6 +505,8 @@ def fill_zone_year(
         s3_region=s3_region,
         on_actor_retire=on_actor_retire,
         on_fleet_demand=on_fleet_demand,
+        update=update,
+        registry_root=registry_root,
     )
     return assemble_zone_year(
         handoff,
@@ -437,6 +544,8 @@ class ZonePlan:
     # committed and tagged during planning). When set, there is nothing to
     # infer or assemble.
     done: dict[str, Any] | None = None
+    # The targeted update this cell runs for, carried to assembly through the handoff.
+    update: UpdateTarget | None = None
 
 
 def preflight_destination(
@@ -496,6 +605,8 @@ def plan_zone_inference(
     run_id: str | None = None,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
+    update: UpdateTarget | None = None,
+    registry_root: str | None = None,
 ) -> ZonePlan:
     """Validate a (zone, year) cell and enumerate its live tiles — no GPU work.
 
@@ -503,6 +614,17 @@ def plan_zone_inference(
     validation, the coverage-mask read (with identity checks), the live-tile enumeration, and
     the mosaic grid asserts. Terminal cells — already complete (retagged here) or all-ocean
     (marked complete empty, committed and tagged here) — come back with ``ZonePlan.done`` set.
+
+    A cell that already landed, or an update already recorded there, also has its registry master
+    merged again (``registry_root``; :func:`_merge_registry_master`). Every retry of a landed cell is
+    planned, by every runner, so this is the one place a run that died between its commit and its
+    merge is caught up.
+
+    ``update`` plans a targeted update instead (:mod:`tessera_embeddings.storage.update`). The
+    cell must already be complete, and is done once the update has recorded itself there; its
+    live tiles are the mask's narrowed to the update's shards; the store is pinned under the
+    update's base tag before anything is written; and in ``holes`` mode each tile is given its
+    hole mask, a tile with no holes dropping out as kept. Nothing is ever marked or tagged.
     """
     t0 = time.monotonic()
     run_id = run_id or uuid.uuid4().hex[:12]
@@ -517,23 +639,25 @@ def plan_zone_inference(
     node = cast(zarr.Group, root[zone])
 
     # The store's minimum-depth rule is part of its write-once root identity, so the store —
-    # not this call's config — is the authority on what rule its zones were filled under. The
-    # Prefect adapter substitutes the store's value into the config before calling; this
-    # ASSERTS that rather than trusting it, so the domain API is safe to call directly. Free:
-    # `root` is already open above. A check and not a substitution, deliberately: silently
-    # replacing a caller's value would let a direct caller believe it had configured a line it
-    # had not, the same class of surprise as the gap it closes.
+    # not this call's config — is the authority on what rule its zones are filled under. A fill
+    # applies exactly that rule. An update may apply a looser one, which its flow takes from the
+    # plan and checks before any ingest; the runner sees only the config. The Prefect adapter
+    # substitutes the value into the config before calling; this ASSERTS it rather than trusting
+    # it, so the domain API is safe to call directly. Free: `root` is already open above. A check
+    # and not a substitution, deliberately: silently replacing a caller's value would let a direct
+    # caller believe it had configured a line it had not, the same class of surprise as the gap it
+    # closes.
     raw_rule = root.attrs.get("optical_min_obs")
     store_rule = int(cast("int", raw_rule)) if raw_rule is not None else None
-    if config.optical_min_obs != store_rule:
+    rule = store_rule if update is None else applied_optical_min_obs(store_rule, config.optical_min_obs)
+    if config.optical_min_obs != rule:
         raise ValueError(
-            f"This fill would apply optical_min_obs={config.optical_min_obs!r} to {zone}-{year}, but "
-            f"{store_path} advertises {store_rule!r}. The rule is part of the store's write-once root "
-            "identity: filling one zone under a different line than its neighbours is undetectable "
-            "afterwards, because a refused pixel is indistinguishable from one with no optical input. "
-            "Pass the store's value (None when it declares no rule), or seed a new store for a new rule."
+            f"This run would apply optical_min_obs={config.optical_min_obs!r} to {zone}-{year}, but "
+            f"{store_path} advertises {store_rule!r}. Filling one zone under a different line than the "
+            "store states is undetectable afterwards, because a refused pixel is indistinguishable from "
+            "one with no optical input. Pass the store's value, or plan an update with a looser line of "
+            "its own (plan_update.py --optical-min-obs)."
         )
-
     # Validate the year BEFORE any expensive work: assemble_global re-checks,
     # but hitting that check after hours of GPU inference would be brutal.
     if time_index_of(node, year_timestamp(year)) is None:
@@ -560,8 +684,34 @@ def plan_zone_inference(
     # retention holds; see mark_zone_year_empty's attribution note) instead of re-inferring.
     # Zone-year tags are write-once forever — icechunk forbids tag-name reuse even after
     # deletion — so deliberate refills need a fresh tag name.
+    if update is not None:
+        check_radar_policy(update, allow_s2_only=config.allow_s2_only)
+        state = update_state(node, year, update.name)
+        if state == "not_complete":
+            raise ValueError(
+                f"Update {update.name!r} targets {zone}-{year}, which has not been filled. An update "
+                "inserts into existing data; filling the year is the campaign's job."
+            )
+        if state == "done":
+            log.info("Zone %s year %d: update %s already recorded — nothing to do", zone, year, update.name)
+            _merge_registry_master(
+                registry_root,
+                store_path,
+                zone,
+                year,
+                None,
+                get_credentials=get_credentials,
+                s3_region=s3_region,
+                log=log,
+            )
+            result = {"zone": zone, "year": year, "run_id": run_id, "update": update.name, "already_recorded": True}
+            return ZonePlan(zone=zone, year=year, run_id=run_id, t0=t0, summary={}, live=[], done=result, update=update)
+        # Nor may a pending update tighten what an earlier, looser update embedded here. The flows
+        # check this before any ingest; asserted again so a direct caller cannot skip it. After the
+        # recorded branch, so rerunning an update that already landed still works.
+        check_no_tightening(repo, update.name, rule, [(zone, year)])
     tag = zone_year_tag(zone, year)
-    if year in read_years_complete(node):
+    if update is None and year in read_years_complete(node):
         if tag in repo.list_tags():
             snapshot = repo.lookup_tag(tag)
             log.info("Zone %s year %d already complete and tagged (%s) — nothing to do", zone, year, tag)
@@ -569,6 +719,9 @@ def plan_zone_inference(
             snapshot = repo.lookup_branch("main")
             tag_zone_year(repo, zone, year, snapshot_id=snapshot)
             log.info("Zone %s year %d landed but was untagged (crash before tag) — tagged %s", zone, year, tag)
+        _merge_registry_master(
+            registry_root, store_path, zone, year, None, get_credentials=get_credentials, s3_region=s3_region, log=log
+        )
         result = {
             "zone": zone,
             "year": year,
@@ -621,12 +774,23 @@ def plan_zone_inference(
             f"Coverage bitmap for {zone} has tile_live shape {tile_live.shape} but the zone's tile grid is "
             f"({n_tile_rows}, {n_tile_cols}) — the coverage build is inconsistent with the seeded grid."
         )
+    tile_live = narrow_tile_live(tile_live, None if update is None else update.tiles)
 
     # 1 inference tile == 1 shard == 1 coverage tile (ADR-008 D3), so a chunk's (row, col) ARE
     # its coverage-bitmap indices: liveness is a direct lookup, not the per-tile windowed read
     # the single-ROI pixel mask needs.
     chunks = enumerate_chunks(ny, nx, shard_px)
     live = [c for c in chunks if bool(tile_live[c.row, c.col])]
+    if update is not None and update.on_skip == "clear":
+        # Clearing only reaches tiles the mask calls land, so a listed dead tile would keep its old
+        # data while the update recorded the cell as done.
+        dead = sorted(set(update.tiles or ()) - {c.label for c in live})
+        if dead:
+            raise ValueError(
+                f"Update {update.name!r} would clear {dead} in {zone}/{year}, but its mask has no land "
+                "there, so they would never be written. Plan them under a mask where they are land, or "
+                "leave them out."
+            )
     log.info(
         "Zone %s year %d: %d/%d tiles are live in the campaign coverage mask (run %s)",
         zone,
@@ -643,6 +807,43 @@ def plan_zone_inference(
         "total_tiles": len(chunks),
         "live_tiles": len(live),
     }
+
+    if update is not None:
+        # BEFORE the first write of the whole update, which some cell's planning always precedes.
+        pin_tag(repo, base_tag(update.name))
+        if update.mode == "holes":
+            holes = stage_hole_masks(
+                node,
+                year_index=cast(int, time_index_of(node, year_timestamp(year))),
+                chunks=live,
+                # Per destination store: a mask describes one store's holes, and one plan may be run
+                # against more than one store sharing the inputs bucket.
+                prefix=f"{update.holes}/{store_key(store_path)}",
+            )
+            update = dataclasses.replace(update, kept=tuple(sorted(c.label for c in live if c.label not in holes)))
+            live = [dataclasses.replace(c, pixels=holes[c.label]) for c in live if c.label in holes]
+            log.info(
+                "Zone %s year %d: update %s infers the holes of %d tile(s); %d have none and are kept",
+                zone,
+                year,
+                update.name,
+                len(live),
+                len(update.kept),
+            )
+        summary |= {"update": update.name, "live_tiles": len(live)}
+        if not live:
+            # Nothing to infer is still an answer, and recording it is what stops the cell being
+            # dispatched again. Never marked empty: the cell keeps everything it held.
+            snapshot = commit_update_record(
+                repo,
+                zone,
+                year,
+                record=update_record(
+                    update, run_id=run_id, written=[], kept=update.kept, optical_min_obs=config.optical_min_obs
+                ),
+            )
+            result = {**summary, "snapshot_id": snapshot, "elapsed_sec": time.monotonic() - t0}
+            return ZonePlan(zone=zone, year=year, run_id=run_id, t0=t0, summary={}, live=[], done=result, update=update)
 
     if not live:
         # A no-data cell (all-ocean) still lands: years_complete + provenance in one commit,
@@ -739,7 +940,7 @@ def plan_zone_inference(
             read_store_spatial_coords(sar_path, get_credentials=get_credentials, s3_region=s3_region),
         )
 
-    return ZonePlan(zone=zone, year=year, run_id=run_id, t0=t0, summary=summary, live=live)
+    return ZonePlan(zone=zone, year=year, run_id=run_id, t0=t0, summary=summary, live=live, update=update)
 
 
 def infer_zone_year(
@@ -759,6 +960,8 @@ def infer_zone_year(
     on_actor_retire: Callable[[str], None] | None = None,
     on_fleet_demand: Callable[[int], None] | None = None,
     retire_idle_actors: bool = True,
+    update: UpdateTarget | None = None,
+    registry_root: str | None = None,
 ) -> ZoneFillHandoff:
     """Inference phase of a (zone, year) fill: plan → run_inference.
 
@@ -785,6 +988,8 @@ def infer_zone_year(
         run_id=run_id,
         get_credentials=get_credentials,
         s3_region=s3_region,
+        update=update,
+        registry_root=registry_root,
     )
     return (
         complete_zone_inference(plan, results=None)
@@ -857,6 +1062,7 @@ def complete_zone_inference(plan: ZonePlan, *, results: list[dict] | None) -> Zo
             live=[],
             results=[],
             done=plan.done,
+            update=plan.update,
         )
     assert results is not None
     failed = [r for r in results if r["status"] == "failed"]
@@ -872,6 +1078,7 @@ def complete_zone_inference(plan: ZonePlan, *, results: list[dict] | None) -> Zo
         summary=plan.summary,
         live=plan.live,
         results=results,
+        update=plan.update,
     )
 
 
@@ -908,7 +1115,7 @@ def assemble_zone_year(
     skipped), tags the landed commit, and cleans up staging. Opens its own repo/writer
     connections so the sequential multi-zone runner can run it on a trailing thread while the
     caller's thread starts the next cell's inference. A terminal handoff (``done`` set) passes
-    straight through.
+    straight through: :func:`plan_zone_inference` already caught up a landed cell's master.
 
     ``fault`` is the supervised-drill hook, forwarded to the assembly call on both the data
     and the all-skipped path so the drill does not depend on which one a cell takes. Inert
@@ -939,6 +1146,22 @@ def assemble_zone_year(
             _cleanup()
         else:
             defer_cleanup(_cleanup)
+
+    if handoff.update is not None:
+        return _assemble_update(
+            handoff,
+            writer=writer,
+            store_path=store_path,
+            registry_root=registry_root,
+            optical_min_obs=optical_min_obs,
+            log=log,
+            n_assembly_workers=n_assembly_workers,
+            get_credentials=get_credentials,
+            s3_region=s3_region,
+            fault=fault,
+            input_coverage=input_coverage,
+            cleanup=_run_cleanup,
+        )
 
     staged_labels = writer.verify_staged_completeness(run_id, live, log=log)
     if not staged_labels:
@@ -980,6 +1203,18 @@ def assemble_zone_year(
                 log=log,
                 fault=fault,
                 input_coverage=input_coverage,
+            )
+            # Before the tag, not after it: a deliberate refill FAILS at the tag step by design,
+            # once its data and part have landed, and the master must still learn of it.
+            _merge_registry_master(
+                registry_root,
+                store_path,
+                zone,
+                year,
+                run_id,
+                get_credentials=get_credentials,
+                s3_region=s3_region,
+                log=log,
             )
         else:
             # No live tiles at all: nothing was ever written here, so there is nothing to
@@ -1070,6 +1305,10 @@ def assemble_zone_year(
         fault=fault,
         input_coverage=input_coverage,
     )
+    # Before the tag, as on the all-refused branch: a deliberate refill fails at the tag step.
+    _merge_registry_master(
+        registry_root, store_path, zone, year, run_id, get_credentials=get_credentials, s3_region=s3_region, log=log
+    )
     repo = open_global_repo(
         store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
     )
@@ -1086,3 +1325,193 @@ def assemble_zone_year(
         "resumed": sum(bool(r.get("resumed")) for r in results),
         "elapsed_sec": time.monotonic() - t0,
     }
+
+
+def _assemble_update(
+    handoff: ZoneFillHandoff,
+    *,
+    writer: ZarrWriter,
+    store_path: str,
+    registry_root: str | None,
+    optical_min_obs: int | None,
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+    n_assembly_workers: int | None,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None,
+    s3_region: str | None,
+    fault: ArmedFault | None,
+    input_coverage: dict | None,
+    cleanup: Callable[[], None],
+) -> dict[str, Any]:
+    """The assembly phase of a targeted update: write its shards, record it, keep the rest.
+
+    Differs from a fill in four ways, each the reason updates are safe to run over landed data:
+
+    - **A tile this run skipped keeps what the store holds** (``on_skip="keep"``), rather than being
+      cleared to fill as a fill clears it. A ``shards`` update may clear it instead.
+    - **A ``holes`` tile is merged**, replacing only the pixels its mask marks, in every array.
+    - **The update records itself in ``updates[year]``** in place of the fill's year attrs, so
+      ``years_complete``, ``runs`` and the zone-year tag stay exactly as the fill left them.
+    - **Its registry rows describe each tile as it now stands**: a merged tile's are re-derived
+      from the store after the commit, since no single run's record describes a merged shard.
+    """
+    update = cast(UpdateTarget, handoff.update)
+    zone, year, run_id, live, results = handoff.zone, handoff.year, handoff.run_id, handoff.live, handoff.results
+    staged = writer.verify_staged_completeness(run_id, live, log=log)
+    skipped = sorted({c.label for c in live} - staged)
+    cleared = skipped if update.on_skip == "clear" else []
+    radar_coverage = summarise_radar_coverage(results)
+    record = update_record(
+        update,
+        run_id=run_id,
+        written=sorted(staged),
+        kept=sorted({*update.kept, *([] if cleared else skipped)}),
+        optical_min_obs=optical_min_obs,
+        cleared=cleared,
+        radar_coverage=radar_coverage,
+        input_coverage=input_coverage,
+    )
+    store_credentials = _store_credentials(store_path, get_credentials)
+    merged = update.mode == "holes"
+    committed: dict[str, str] = {}
+
+    def _record(repo: icechunk.Repository, group: str, year_label: int, commit: Mapping[str, str]) -> str:
+        committed.update(commit)  # the shard commit, which stamps the merged tiles' part
+        return commit_update_record(repo, group, year_label, commit, record=record)
+
+    if staged or cleared:
+        snapshot = writer.assemble_global(
+            store_path,
+            zone,
+            year=year,
+            run_id=run_id,
+            n_workers=n_assembly_workers or AssemblyConfig().compute_n_workers(len(staged) + len(cleared)),
+            staged_labels=staged,
+            # None, not empty, when keeping: assembly then writes the staged tiles alone and clears nothing.
+            skipped_labels=cleared or None,
+            radar_coverage=radar_coverage,
+            registry_root=None if merged else registry_root,
+            optical_min_obs=optical_min_obs,
+            embedded_records=None
+            if merged
+            else {
+                str(r["chunk"]): r["coverage"]
+                for r in results
+                if r.get("status") == "success" and isinstance(r.get("coverage"), dict) and r.get("chunk")
+            },
+            pixels={c.label: c.pixels for c in live if c.pixels is not None and c.label in staged} or None,
+            commit_attrs=_record,
+            update_name=update.name,
+            get_credentials=store_credentials,
+            s3_region=s3_region,
+            log=log,
+            fault=fault,
+            input_coverage=input_coverage,
+        )
+        if merged and registry_root:
+            _publish_merged_rows(
+                writer,
+                registry_root,
+                store_path,
+                zone,
+                year,
+                run_id,
+                committed_at=committed["committed_at"],
+                labels=sorted(staged),
+                optical_min_obs=optical_min_obs,
+                update_name=update.name,
+                get_credentials=store_credentials,
+                s3_region=s3_region,
+                log=log,
+            )
+        _merge_registry_master(
+            registry_root, store_path, zone, year, run_id, get_credentials=get_credentials, s3_region=s3_region, log=log
+        )
+    else:
+        snapshot = commit_update_record(
+            open_global_repo(store_path, get_credentials=store_credentials, region=s3_region), zone, year, record=record
+        )
+    cleanup()
+    log.info(
+        "Zone %s year %d: update %s wrote %d tile(s), kept %d, cleared %d (snapshot %s)",
+        zone,
+        year,
+        update.name,
+        len(record["written"]),
+        len(record["kept"]),
+        len(cleared),
+        snapshot,
+    )
+    return {
+        **handoff.summary,
+        "update": update.name,
+        "snapshot_id": snapshot,
+        "written": len(record["written"]),
+        "kept": len(record["kept"]),
+        "cleared": len(cleared),
+        "elapsed_sec": time.monotonic() - handoff.t0,
+    }
+
+
+def _publish_merged_rows(
+    writer: ZarrWriter,
+    registry_root: str,
+    store_path: str,
+    zone: str,
+    year: int,
+    run_id: str,
+    *,
+    committed_at: str,
+    labels: list[str],
+    optical_min_obs: int | None,
+    update_name: str,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None,
+    s3_region: str | None,
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+) -> None:
+    """Publish registry rows for merged tiles, re-derived from the shards as committed.
+
+    A merged shard holds two runs' pixels, so neither run's coverage record describes it, and the
+    master keeps only each tile's newest row. Re-deriving from the store is exact — the registry
+    repair proved it on every published row — and costs one read of each tile's observation counts.
+    The part is stamped with the update's shard commit, as every part is. Best-effort, like every
+    registry write after a commit: the cell has landed.
+    """
+    records: dict[str, dict] = {}
+    # A store with no depth rule refused no pixel as thin, so none may be counted below a line.
+    thin_below = optical_min_obs or 0
+    try:
+        session = open_global_repo(store_path, get_credentials=get_credentials, region=s3_region).readonly_session(
+            branch="main"
+        )
+        node = cast(zarr.Group, zarr.open_group(session.store, mode="r")[zone])
+        year_index = calendar_years(node).index(year)
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            rows = pool.map(
+                lambda tile: as_coverage_record(
+                    rebuild_tile(node, time_index=year_index, tile=tile, optical_min_obs=thin_below, with_radar=True)
+                ),
+                labels,
+            )
+            records = dict(zip(labels, rows, strict=True))
+    except Exception:
+        log.exception(
+            "Zone %s year %d: merged tiles' registry rows could not be re-derived; publishing them unmeasured. "
+            "Repair: scripts/maintenance/rebuild_registry_measurements.py repair --zones %s --write",
+            zone,
+            year,
+            zone,
+        )
+    writer.publish_registry_part(
+        registry_root,
+        zone,
+        year,
+        run_id,
+        committed_at=committed_at,
+        embedded=labels,
+        refused=[],
+        optical_min_obs=optical_min_obs,
+        embedded_records=records,
+        update_name=update_name,
+        get_credentials=get_credentials,
+        s3_region=s3_region,
+    )

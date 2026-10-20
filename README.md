@@ -122,7 +122,7 @@ A Python library for:
   at configurable resolution.
 
 Output stores are self-describing via GeoZarr conventions: every embedding
-store carries the [`proj:`](https://github.com/zarr-conventions/geo-proj) and
+store carries the [`proj:`](https://github.com/zarr-conventions/proj) and
 [`spatial:`](https://github.com/zarr-conventions/spatial) conventions for
 CRS/affine metadata, plus the
 [`geoemb:` geoembeddings convention](https://github.com/geo-embeddings/embeddings-zarr-convention)
@@ -485,6 +485,8 @@ context_docs/            why it is shaped this way, and what was measured
 examples/quickstart/     the bundled Denver, CO area of interest and its config
 scripts/                 scoping and analysis scripts, not part of the library
 tests/                   unit, architecture, integration, parity and GPU tiers
+.agents/skills/          step-by-step procedures for AI agents (Agent Skills format;
+                         .claude/skills links here)
 ```
 
 ## Documentation

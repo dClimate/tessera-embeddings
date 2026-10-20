@@ -213,8 +213,8 @@ def test_a_hold_announces_itself_once_and_then_periodically(monkeypatch, no_slee
 
 
 def test_the_gate_survives_having_no_logger(monkeypatch, no_sleeping) -> None:
-    """The commit gate is constructed before a run logger exists on some paths, and a hold must
-    not turn into an AttributeError inside a commit.
+    """A gate can be constructed before a run logger exists, and a hold must not turn into an
+    AttributeError.
     """
     cm = _Opens(_wrapped(_server_said(422, "Slots requested is greater than the limit")), fail_times=1)
     monkeypatch.setattr(mod, "concurrency", cm)
@@ -402,12 +402,6 @@ def test_the_gate_is_thread_safe(monkeypatch):
     """One FleetGate is shared across threads, and each exit must pair with the SAME
     thread's entered context — an instance slot let a concurrent enter overwrite the
     other thread's context and release the wrong Prefect concurrency slot.
-
-    These two tests moved here from ``test_fill_zone_year_flow.py`` when the commit gate
-    was removed. They were written against ``_PrefectCommitGate``, but everything they
-    exercise lives in :class:`FleetGate`, which the INGEST gate still uses as the
-    campaign's pause lever — so the coverage follows the mechanism rather than being
-    deleted with its former caller.
     """
     import threading
 

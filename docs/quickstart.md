@@ -193,6 +193,11 @@ Denver, CO — one inference chunk at 10 m resolution. To use your own AOI:
 3. Update `time_range` in `config.yaml` if you need a different
    season.
 
+## Updating part of an output
+
+To redo part of a window already in the store, after new imagery or a fix, add an `update` block to
+the config and run it again. [`updates.md`](updates.md) walks through it.
+
 ## Troubleshooting
 
 - **HTTP 401 on `datapool.asf.alaska.edu`** → either

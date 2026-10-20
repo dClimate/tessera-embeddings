@@ -13,7 +13,7 @@ change. Only a read that states the schema is safe; this reads both ways and rep
 
 **Agreement with the store.** Every column is derivable from the store, so the registry is a
 convenience layer and never a second source of truth — which is only true if it agrees.
-``--verify-zones`` compares, per cell, the registry's embedded tiles against the store's shards.
+``--verify-zones`` compares, per cell, the embedded tiles ``master/`` names against the store's shards.
 
 Run from the REPOSITORY ROOT::
 
@@ -43,6 +43,7 @@ if TYPE_CHECKING:
 from tessera_embeddings.storage import published_store, zone_grid
 from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.registry import dataset_schema, registry_schema
+from tessera_embeddings.storage.registry_master import audit, invariant_failures, master_schema, tile_years
 
 DEFAULT_STORE = "s3://tessera-embeddings/v1.1/dclimate.icechunk"
 DEFAULT_REGISTRY = "s3://tessera-embeddings/v1.1/dclimate.registry"
@@ -219,6 +220,76 @@ def _read_dataset(fs: pyarrow.fs.FileSystem, root: str, *, with_schema: bool) ->
     }
 
 
+def _master(fs: pyarrow.fs.FileSystem, root: str) -> str:
+    """The prefix consumers read, ``master/``. Its absence is a failure: there is nothing else to read."""
+    from pyarrow.fs import FileType
+
+    base = root.removeprefix("s3://").rstrip("/")
+    if fs.get_file_info(f"{base}/master").type != FileType.Directory:
+        raise SystemExit(f"{root.rstrip('/')}/master does not exist, so consumers have no registry to read")
+    return f"{base}/master"
+
+
+def _completeness(fs: pyarrow.fs.FileSystem, root: str) -> dict[str, Any]:
+    """How much of the registry actually carries measurements, per cell and in total.
+
+    **A registry can be perfectly well-formed and still say nothing.** Every other check here asks
+    whether the rows are shaped right; this asks whether they hold numbers. The published campaign
+    finished green with 1,519,045 of 3,247,410 rows (47%) null across every measurement column,
+    and no check noticed — a consumer reading ``embedded`` alone sees full coverage while the
+    refusal counts that qualify it are absent.
+
+    ``chunk_px`` stands in for all of them: a row's measurement columns are null together, and
+    this is the one a rebuild can always populate.
+
+    The split by ``embedded`` is diagnostic rather than decorative. v1.1's null rows were all on
+    the embedded side: an embedded tile's record then lived only in the actor's in-memory result,
+    which a resume loses, while a refused tile's was in its skip marker on object storage. Both are
+    persisted now, so unmeasured rows concentrated on the embedded side mean that path regressed.
+
+    Counted over ``master/``, since that is what consumers read and ``parts/`` keeps its null rows
+    forever by design. The master is also audited against the parts, cell by cell
+    (:func:`~tessera_embeddings.storage.registry_master.audit`): a fill whose master update failed
+    leaves its cell short or stale with no null rows to count, so every cell that fails is named,
+    for ``repair --zones``.
+    """
+    import pyarrow.compute as pc
+    import pyarrow.dataset as ds
+
+    prefix = _master(fs, root)
+    started = time.monotonic()
+    table = ds.dataset(prefix, filesystem=fs, partitioning="hive", schema=master_schema()).to_table()
+    parts_prefix = prefix.rsplit("/", 1)[0] + "/parts"
+    parts = ds.dataset(parts_prefix, filesystem=fs, partitioning="hive", schema=dataset_schema()).to_table()
+    problems = audit(table, parts)
+    invariants = invariant_failures(table, expected_rows=tile_years(parts))
+    unmeasured = pc.is_null(table.column("chunk_px")).to_pylist()
+    embedded = table.column("embedded").to_pylist()
+    zones, years = table.column("zone").to_pylist(), table.column("year").to_pylist()
+
+    per_cell: dict[str, dict[str, int]] = {}
+    for zone, year, is_unmeasured in zip(zones, years, unmeasured, strict=True):
+        cell = per_cell.setdefault(f"{zone}/{year}", {"rows": 0, "unmeasured": 0})
+        cell["rows"] += 1
+        cell["unmeasured"] += int(is_unmeasured)
+    total_unmeasured = sum(unmeasured)
+    return {
+        "wall_s": round(time.monotonic() - started, 2),
+        "prefix": prefix.rsplit("/", 1)[1],
+        "rows": table.num_rows,
+        "master_problems": problems,
+        "master_invariants": invariants,
+        "rows_without_measurements": total_unmeasured,
+        "fraction_without_measurements": round(total_unmeasured / table.num_rows, 6) if table.num_rows else 0.0,
+        "unmeasured_rows_that_are_embedded": sum(
+            1 for missing, was_embedded in zip(unmeasured, embedded, strict=True) if missing and was_embedded
+        ),
+        "cells_wholly_unmeasured": sorted(k for k, v in per_cell.items() if v["unmeasured"] == v["rows"]),
+        "cells_partly_unmeasured": sorted(k for k, v in per_cell.items() if 0 < v["unmeasured"] < v["rows"]),
+        "cells_fully_measured": sum(1 for v in per_cell.values() if v["unmeasured"] == 0),
+    }
+
+
 def _aoi_query(
     fs: pyarrow.fs.FileSystem, root: str, aoi: tuple[float, float, float, float], year: int
 ) -> dict[str, Any]:
@@ -232,8 +303,8 @@ def _aoi_query(
     import pyarrow.dataset as ds
 
     west, south, east, north = aoi
-    prefix = root.removeprefix("s3://").rstrip("/") + "/parts"
-    dataset = ds.dataset(prefix, filesystem=fs, partitioning="hive", schema=dataset_schema())
+    prefix = _master(fs, root)
+    dataset = ds.dataset(prefix, filesystem=fs, partitioning="hive", schema=master_schema())
     started = time.monotonic()
     table = dataset.to_table(
         filter=(pc.field("year") == year)
@@ -243,8 +314,7 @@ def _aoi_query(
         & (pc.field("bbox_north") >= south),
         columns=[
             # Everything read downstream, not only what the report prints: an unprojected column
-            # is simply absent from the returned rows, so the per-cell grouping and `_newest_run`
-            # raise on `year` and `run_id` rather than falling back to anything.
+            # is simply absent from the returned rows, and reading one raises.
             "zone",
             "year",
             "tile",
@@ -257,20 +327,11 @@ def _aoi_query(
             "assembled_at",
         ],
     )
-    raw = table.to_pylist()
-    # Per (zone, year), because an area of interest can span both, and within each the newest RUN:
-    # a refill leaves the original part in place, so a tile filled twice would be counted twice
-    # here and its refused pixels added together, inflating the answer a consumer came for.
-    by_cell: dict[tuple[str, int], list[dict[str, Any]]] = {}
-    for row in raw:
-        by_cell.setdefault((str(row["zone"]), int(row["year"] or year)), []).append(row)
-    rows = [r for cell_rows in by_cell.values() for r in _newest_run(cell_rows)]
+    # The master holds one row per tile-year, so a refilled tile is counted once with no run selection.
+    rows = table.to_pylist()
     embedded = [r["embedded"] for r in rows]
     refused = [r["refused_px"] for r in rows if r["refused_px"] is not None]
-    # Malformed timestamps have to reach the REPORT, not just the run selection: `_newest_run` can
-    # never select a run it cannot order, so an AOI-only run would otherwise print a plausible
-    # answer built on the older rows and exit 0.
-    bad_stamps = unparsable_stamps(raw)
+    bad_stamps = unparsable_stamps(rows)
     # A null bounding box makes every Arrow comparison in the filter above evaluate to null, so the
     # row is dropped from EVERY area query — silently undercounting the coverage this dataset exists
     # to report. The schema permits null, so it has to be checked rather than assumed.
@@ -282,7 +343,6 @@ def _aoi_query(
         "year": year,
         "wall_s": round(time.monotonic() - started, 2),
         "tiles_overlapping": len(rows),
-        "rows_before_dedup": table.num_rows,
         "zones_overlapping": sorted({str(r["zone"]) for r in rows}),
         "tiles_embedded": sum(1 for v in embedded if v),
         "tiles_not_embedded": sum(1 for v in embedded if not v),
@@ -348,27 +408,6 @@ def _optical_skip_labels(group: zarr.Group, year: int) -> list[str]:
     return [str(label) for label in labels] if isinstance(labels, list) else []
 
 
-def _newest_run(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Only the rows of the most recently assembled run among ``rows``.
-
-    A part is one complete run of one cell, so "latest wins" chooses between RUNS, not rows:
-    picking per tile would build a union no run produced, which the store cannot match.
-    ``assembled_at`` is the clock the registry provides for this; a run id is not one. A run whose
-    timestamps will not parse cannot be ordered, so it is never selected.
-    """
-    newest: tuple[datetime, str] | None = None
-    for row in rows:
-        stamp = _parse_stamp(row["assembled_at"])
-        if stamp is None:
-            continue
-        candidate = (stamp, str(row["run_id"]))
-        if newest is None or candidate > newest:
-            newest = candidate
-    if newest is None:
-        return list(rows)
-    return [r for r in rows if str(r["run_id"]) == newest[1]]
-
-
 def _verify_against_store(
     fs: pyarrow.fs.FileSystem,
     root: str,
@@ -378,12 +417,15 @@ def _verify_against_store(
     *,
     anonymous: bool = False,
 ) -> list[dict[str, Any]]:
-    """Per cell, compare the registry's embedded tiles with the store's live shards."""
+    """Per cell, compare the master's embedded tiles with the store's live shards.
+
+    The master and not ``parts/``, because it is what consumers read: a shard cleared by hand, which
+    no run's part records, leaves the master naming a tile the store no longer holds.
+    """
     import pyarrow.compute as pc
     import pyarrow.dataset as ds
 
-    prefix = root.removeprefix("s3://").rstrip("/") + "/parts"
-    dataset = ds.dataset(prefix, filesystem=fs, partitioning="hive", schema=dataset_schema())
+    dataset = ds.dataset(_master(fs, root), filesystem=fs, partitioning="hive", schema=master_schema())
     session = open_global_repo(store_uri, region=region, anonymous=anonymous).readonly_session(branch="main")
     root_group = zarr.open_group(session.store, mode="r")
 
@@ -415,16 +457,7 @@ def _verify_against_store(
         registry_years = {int(r["year"]) for r in rows if r["year"] is not None}
         for year in sorted(set(calendar) | registry_years):
             time_index = calendar.index(year) if year in calendar else None
-            all_rows = [r for r in rows if r["year"] == year]
-            # Duplicates WITHIN one run, before latest-wins hides them. Cross-run duplication is
-            # by design; the same `(run_id, tile)` twice doubles that tile's counts for anyone
-            # reading the Parquet directly.
-            within_run: dict[tuple[str, str], int] = {}
-            for row in all_rows:
-                key = (str(row["run_id"]), str(row["tile"]))
-                within_run[key] = within_run.get(key, 0) + 1
-            duplicated = sorted(f"{run}/{tile}" for (run, tile), n in within_run.items() if n > 1)
-            registry_rows = _newest_run(all_rows)
+            registry_rows = [r for r in rows if r["year"] == year]
             # The COORDINATES, not the count: one tile missing and one wrongly marked embedded
             # leaves the cardinalities equal while the registry points consumers at the wrong
             # ground and this audit says "agrees".
@@ -445,7 +478,7 @@ def _verify_against_store(
             must_be_refused = ((observed_tiles - store_tiles) | skipped) - store_tiles
             unrecorded_refusals = sorted(must_be_refused - refused_tiles)
             unparsed_tiles = sorted({r["tile"] for r in registry_rows if not _tile_coordinate(r["tile"])})
-            bad_stamps = unparsable_stamps(all_rows)
+            bad_stamps = unparsable_stamps(registry_rows)
             findings.append(
                 {
                     "zone": zone,
@@ -453,8 +486,7 @@ def _verify_against_store(
                     "in_store_time_axis": time_index is not None,
                     "marked_complete": year in years,
                     "registry_rows": len(registry_rows),
-                    "registry_rows_before_dedup": len(all_rows),
-                    "runs_present": sorted({r["run_id"] for r in all_rows}),
+                    "runs_present": sorted({r["run_id"] for r in registry_rows}),
                     "registry_embedded": sum(1 for r in registry_rows if r["embedded"]),
                     "registry_not_embedded": sum(1 for r in registry_rows if not r["embedded"]),
                     "store_live_shards": len(store_tiles),
@@ -464,7 +496,6 @@ def _verify_against_store(
                     "refused_tiles_the_registry_omits": unrecorded_refusals[:20],
                     "unparsable_tile_labels": unparsed_tiles[:10],
                     "unparsable_assembled_at": bad_stamps[:10],
-                    "duplicated_within_a_run": duplicated[:10],
                     "refusal_reasons_do_not_sum": [r["tile"] for r in registry_rows if not _refusals_add_up(r)][:10],
                 }
             )
@@ -481,6 +512,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--aoi", default="", help="west,south,east,north in WGS84 degrees, to time a coverage query")
     parser.add_argument("--aoi-year", type=int, default=2025)
     parser.add_argument("--skip-schema-audit", action="store_true", help="skip the per-part footer read")
+    parser.add_argument(
+        "--max-unmeasured",
+        type=float,
+        default=0.0,
+        help=(
+            "fraction of rows allowed to carry no measurements before this fails. Zero by default: "
+            "a null row is the registry saying nothing about that ground, and a campaign should not "
+            "be able to finish green having published half a coverage record"
+        ),
+    )
     parser.add_argument(
         "--anonymous",
         action="store_true",
@@ -510,7 +551,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"cells with more than one part (a refill): {len(refilled)} {list(refilled)[:8]}")
     print(f"parts whose path does not parse or names no real zone: {len(unparsed)} {unparsed[:4]}")
 
-    # A compacted master and a dataset-level `_common_metadata` are what a consumer WITHOUT this
+    # A master and a dataset-level `_common_metadata` are what a consumer WITHOUT this
     # package needs, so one schema covers the whole read and comes from the dataset rather than
     # from a part they must know is current. Absence is a finding about who can read this.
     siblings = _siblings(fs, args.registry)
@@ -551,6 +592,38 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  columns an inferring reader loses: {dropped or 'none'}")
     report["columns_lost_by_inference"] = dropped
 
+    report["completeness"] = _completeness(fs, args.registry)
+    complete = report["completeness"]
+    print(f"\nmeasurement completeness of {complete['prefix']}/ ({complete['wall_s']}s):")
+    print(
+        f"  rows with no measurements: {complete['rows_without_measurements']:,} of {complete['rows']:,} "
+        f"({complete['fraction_without_measurements']:.1%}), of which "
+        f"{complete['unmeasured_rows_that_are_embedded']:,} are embedded tiles"
+    )
+    print(
+        f"  cells wholly unmeasured {len(complete['cells_wholly_unmeasured'])}, "
+        f"partly {len(complete['cells_partly_unmeasured'])}, fully measured {complete['cells_fully_measured']}"
+    )
+    # Counts, not the rounded fraction: one null row in 3.2 M rounds to 0.0 and would pass a zero threshold.
+    above = complete["rows_without_measurements"] > args.max_unmeasured * complete["rows"]
+    problems = complete["master_problems"]
+    incomplete = above or bool(problems) or bool(complete["master_invariants"])
+    for failure in complete["master_invariants"]:
+        print(f"  MASTER INVARIANT: {failure}")
+    for cell, found in list(problems.items())[:20]:
+        print(f"  MASTER {cell}: {'; '.join(found)}")
+    if problems:
+        zones = ",".join(sorted({cell.split("/")[0] for cell in problems}))
+        print(
+            f"  master/ fails its audit in {len(problems)} cell(s). "
+            f"Repair: rebuild_registry_measurements.py repair --zones {zones} --write"
+        )
+    if above:
+        print(
+            f"  ABOVE THE THRESHOLD ({args.max_unmeasured:.1%}) — every column is derivable from the store, so "
+            "this is repairable: scripts/maintenance/rebuild_registry_measurements.py"
+        )
+
     if args.aoi:
         west, south, east, north = (float(v) for v in args.aoi.split(","))
         report["aoi_query"] = _aoi_query(fs, args.registry, (west, south, east, north), args.aoi_year)
@@ -581,7 +654,6 @@ def main(argv: list[str] | None = None) -> int:
                     finding["tiles_disagreeing"],
                     finding["unparsable_tile_labels"],
                     finding["unparsable_assembled_at"],
-                    finding["duplicated_within_a_run"],
                     finding["refusal_reasons_do_not_sum"],
                     finding["refused_tiles_the_registry_omits"],
                 )
@@ -619,7 +691,7 @@ def main(argv: list[str] | None = None) -> int:
     aoi_broken = any(aoi.get(key) for key in _AOI_FINDINGS)
     audit = report.get("schema_audit", {})
     broken = any(audit.get(key) for key in _SCHEMA_FINDINGS)
-    return 1 if (unparsed or broken or disagreements or aoi_broken) else 0
+    return 1 if (unparsed or broken or disagreements or aoi_broken or incomplete) else 0
 
 
 if __name__ == "__main__":

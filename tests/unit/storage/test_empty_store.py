@@ -94,6 +94,29 @@ def test_grid_identity_matches_real_write(tmp_path) -> None:
         assert empty[name].chunksizes == real[name].chunksizes
 
 
+def test_both_creation_paths_store_the_mosaic_codec(tmp_path) -> None:
+    """Seeded and directly written mosaics are both Blosc-LZ4, so every mosaic decodes alike."""
+    roi, times = _roi(), _times(1)
+    coords = roi.geobox.coordinates
+    shape = (len(times), roi.height, roi.width)
+    cs = (INGEST_CHUNKS["time"], INGEST_CHUNKS["northing"], INGEST_CHUNKS["easting"])
+    real_ds = xr.Dataset(
+        {
+            name: (("time", "northing", "easting"), da.zeros(shape, dtype=dtype, chunks=cs))
+            for name, dtype in _VARS.items()
+        },
+        coords={"time": times, "northing": coords["y"].values, "easting": coords["x"].values},
+    )
+    write_dataset(str(tmp_path / "real.zarr"), real_ds, tile_id="roi", baselines={}, chunks=INGEST_CHUNKS, crs=_CRS)
+    create_empty_store(str(tmp_path / "empty.zarr"), roi=roi, times=times, var_dtypes=_VARS, tile_id="roi", crs=_CRS)
+    for store in ("real.zarr", "empty.zarr"):
+        group = open_store_as_zarr_group(str(tmp_path / store))
+        for name in _VARS:
+            assert [(type(c).__name__, c.cname.value, c.shuffle.value) for c in group[name].compressors] == [
+                ("BloscCodec", "lz4", "shuffle")
+            ], (store, name)
+
+
 def test_coords_match_geobox(tmp_path) -> None:
     """Empty store coords are exactly the geobox pixel centers (the grid authority)."""
     roi = _roi()

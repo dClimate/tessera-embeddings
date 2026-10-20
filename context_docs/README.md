@@ -40,7 +40,11 @@ context_docs/
 │   ├── 021-correct-the-boa-offset-per-image.md
 │   ├── 022-resolve-the-roi-mask-credential-at-read-time.md
 │   ├── 023-the-single-path-end-to-end-is-the-quickstart-run.md
-│   └── 024-library-upgrades-ship-on-measured-usability-at-a-store-boundary.md
+│   ├── 024-spatial-transform-origin-is-the-pixel-corner.md
+│   ├── 025-library-upgrades-ship-on-measured-usability-at-a-store-boundary.md
+│   ├── 026-v1-1-runs-the-gru-it-was-trained-with.md
+│   ├── 027-targeted-updates.md
+│   └── 028-embed-every-pixel-with-an-optical-observation.md
 │
 ├── campaign/                      THE GLOBAL CAMPAIGN — start here
 │   ├── campaign-plan.md                        <- START HERE. What runs, with what settings, in
@@ -50,8 +54,12 @@ context_docs/
 │   │                                              how work balances across N clusters (§5b)
 │   ├── campaign-validation-and-monitoring.md   how each published cell is checked, and how a
 │   │                                              finding reaches a person
-│   └── radar-coverage-by-zone.md               which zones publish no usable radar, and why
-│                                                  three quarters of that is a polarisation choice
+│   ├── radar-coverage-by-zone.md               which zones publish no usable radar, and why
+│   │                                              three quarters of that is a polarisation choice
+│   ├── stack-dev-verification.md               #219, #221 and #223 checked together on dev, and
+│   │                                              what hole-aware reads save
+│   └── update-dev-verification.md              targeted updates checked end to end on dev: only
+│                                                  target shards change, holes match full inference
 │
 ├── ingest/                        BUILDING THE MOSAICS
 │   ├── campaign-ingest-measurements.md         what ingest costs, what made it faster, and what
@@ -63,6 +71,10 @@ context_docs/
 │                                                  answer was inverted for the life of the code
 │
 ├── inference/                     RUNNING THE ENCODER
+│   ├── simplifying-the-strip-loader.md         the October 2026 loading experiments: what was
+│   │                                              tried, measured and shipped — the simpler strip
+│   │                                              loader on sharded mosaics, densest-first strips,
+│   │                                              the forward-pass benchmark
 │   ├── inference-on-gpus.md                    throughput, which cards may be rented, why the
 │   │                                              batch is sized to the card, what the campaign
 │   │                                              path itself measured, and what the v2 Large
@@ -72,8 +84,8 @@ context_docs/
 │   │                                              same-model ceiling they were calibrated from
 │   ├── v1.1-against-the-published-store.md     what PR #98's precision fix did to v1.1: one
 │   │                                              published tile re-made at three commits
-│   ├── minimum-optical-depth.md                the one data-quality rule: refuse a pixel below
-│   │                                              15 observations. Four measurement campaigns
+│   ├── minimum-optical-depth.md                the one data-quality rule: embed any pixel with
+│   │                                              one observation. Four measurement campaigns
 │   ├── gpu-fleet-launch-throttling.md          why several clusters asking EC2 for GPUs at once
 │   │                                              throttle each other, and the two bounds
 │   └── the-fleet-and-the-work-source.md        a fleet lives for one `run_inference` call, so a
@@ -99,6 +111,14 @@ context_docs/
     │                                              conforms, measured speeds in two regions, and
     │                                              what would surprise a consumer
     ├── staging-identity-and-resume.md          what a run id identifies, and what resumes
+    ├── registry-master.md                      the one registry consumers read: merged in place
+    │                                              by every fill, tile by tile, never dropping an
+    │                                              untouched tile; its checks, repair, versioned
+    │                                              rollback, and the v1.1 equivalence check
+    ├── registry-backfill.md                    how the 47% of registry rows the campaign left
+    │                                              unmeasured were re-derived from the store, why
+    │                                              that is a re-derivation rather than an
+    │                                              estimate, and the v1.1 run
     └── icechunk-api-ledger.md                  signatures and gotchas the scale tests earned
 ```
 
