@@ -53,8 +53,8 @@ context_docs/
 │   │                                              how work balances across N clusters (§5b)
 │   ├── campaign-validation-and-monitoring.md   how each published cell is checked, and how a
 │   │                                              finding reaches a person
-│   ├── latin-america-update.md                 the first targeted update of the published store:
-│   │                                              what ran, what it cost, the checks, the lessons
+│   ├── latin-america-update.md                 filling Latin America's 2024–2025 gaps, the first
+│   │                                              targeted update: why, cost, checks, lessons
 │   ├── radar-coverage-by-zone.md               which zones publish no usable radar, and why
 │   │                                              three quarters of that is a polarisation choice
 │   ├── stack-dev-verification.md               #219, #221 and #223 checked together on dev, and

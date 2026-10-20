@@ -1,126 +1,202 @@
-# The Latin America update of v1.1, 2024–2025
+# Filling Latin America's gaps in the v1.1 store, 2024–2025
 
-The first targeted update of the published store ([ADR 027](../decisions/027-targeted-updates.md)), and
-the first with its own optical line ([ADR 028](../decisions/028-embed-every-pixel-with-an-optical-observation.md)).
-It embedded the pixels v1.1's line of 15 had refused in core Latin America, at a line of one, for 2024 and
-2025. **It landed on 2026-10-20 at 09:53 UTC** (tag `update-latam-infill-2024-2025-complete`), every planned
-tile written and every check passing, at about half the estimated cost and about twice the estimated time.
-How to run one is [`docs/updates.md`](../../docs/updates.md); this page is what this one measured.
+In October 2026 we filled most of the empty pixels that the published v1.1 embeddings store had left in Latin
+America for 2024 and 2025. Every one of the 13,029 tiles we planned to update was written, and every check
+afterwards passed. It finished on 20 October 2026 at 09:53 UTC, cost about $1,350 against an estimate of
+$2,500–3,700, and took about twice as long as planned. This page records why we did it, what it covered, how it
+ran, what it cost, how we checked the result, and what we learned. How to run an update like this one is in
+[`docs/updates.md`](../../docs/updates.md).
 
-## In short
+## Why it was needed
+
+The v1.1 store holds one embedding per 10 m pixel of land per year: 128 numbers summarising what the
+Sentinel-2 (optical) and Sentinel-1 (radar) satellites saw at that spot over the year. When the store was built,
+a pixel was left empty unless it had at least 15 usable optical observations that year, meaning 15 dates on
+which the pixel was not hidden by cloud, shadow or missing data.
+
+That rule left large gaps wherever the sky is often cloudy, and much of Latin America is. A gap breaks a map
+and shortens a time series, which matters more to users than the slightly lower quality of an embedding built
+from fewer observations. So we decided that one usable observation is enough
+([ADR 028](../decisions/028-embed-every-pixel-with-an-optical-observation.md)).
+
+Rebuilding the whole store to apply the new rule would have been very expensive. Instead we used a **targeted
+update** ([ADR 027](../decisions/027-targeted-updates.md)): it re-processes only chosen tiles, computes only
+their empty pixels, and leaves every pixel that already had an embedding exactly as it was. This was the first
+targeted update of the published store, and the first to apply the lower rule.
+
+## Terms used here
+
+| term | meaning |
+|---|---|
+| tile | a square of 2,048 × 2,048 pixels, about 20 km on a side, the unit the model processes |
+| zone-year | one UTM zone (a 6° band of longitude) in one calendar year; the store is filled one zone-year at a time |
+| observation | one date on which a pixel was clearly seen by Sentinel-2 |
+| thin pixel | a pixel with 1 to 14 observations in its year, left empty by the old rule of 15 |
+| gap | a pixel with no embedding in the store |
+| ingest | downloading a year of satellite imagery for an area and stacking it into a mosaic, on ordinary computers |
+| inference | running the model on that mosaic to produce embeddings, on GPU machines |
+| GPU-hour | one GPU machine running for one hour, the unit GPU cost is billed in |
+
+## What it covered
+
+The update covered core Latin America: every tile touching the World Bank's "Latin America and Caribbean" region,
+plus French Guiana and the French and Dutch Caribbean, widened by about 30 km so that coastal tiles counted.
+Remote oceanic islands such as the Galápagos, Easter Island and the Falklands were left out. The years were 2024
+and 2025.
+
+In each year we chose the fewest tiles that together held 99% of the region's thin pixels. That came to 13,029
+tiles in 40 zone-years, across 21 UTM zones (11N to 22N and 17S to 25S), holding 8.11 billion thin pixels. About
+82 million thin pixels, the 1% scattered across tiles with very few of them, were left as gaps by design.
+Pixels with no observation at all cannot be filled under any rule, so they remain gaps.
+
+## How it ran
+
+The update ran on AWS in two attempts, with the same plan both times and both years processed together. The
+tiles were split between four independent groups of GPU machines, with up to 30 machines per group, and up to 20
+ingests ran at once across all four.
+
+### The first attempt
+
+The first attempt ran for two hours on 19 October (17:57 to 20:00 UTC) and was stopped on purpose, because
+ingest was running 15–65% slower than planned. Each date of imagery carried about 17 seconds of fixed overhead,
+preparing the next date never overlapped with writing the current one, and the largest areas wrote one date at
+a time. We changed the ingest so that preparation overlaps writing and small dates share a single write, which
+spreads that overhead (PR #235), and started again.
+
+The first attempt had written nothing to the published store, and its downloads were kept: 12 zone-years were
+complete and 28 partly done. The second attempt picked them up where they had stopped. With the change, ingest
+ran about 1.2 times faster per date, though that compares later dates of the same areas rather than the same
+dates (details in [`campaign-ingest-measurements.md`](../ingest/campaign-ingest-measurements.md) §3.21).
+
+### The second attempt
+
+The second attempt ran on 20 October (times UTC):
+
+| time | event |
+|---|---|
+| 01:19 | started |
+| 01:22–01:24 | the 12 complete zone-years were recognised as done and went straight to waiting for GPUs |
+| 02:22–02:53 | each group requested its GPU machines, either when all its ingests had finished or after a 90-minute wait |
+| 04:14 | the last ingest finished |
+| 06:29–09:52 | the four groups finished inference, one after another |
+| 09:53 | the update was complete and the store was marked with its completion tag |
+
+### Why it took longer than planned
+
+AWS was short of GPU machines. From the first request, AWS refused to supply the GPU machine type we use in
+every part of the region. Machines arrived at about one every two minutes across all four groups, and the groups
+never had more than 42 between them, against the 120 requested. The same account had run over a thousand GPU
+machines in this region during August and September, and its limit had not changed, so the shortage was on AWS's
+side. Our setup names only that one machine type, so there was nothing else to fall back to. This slowed the run
+but barely changed its cost, because machines that never start are not paid for.
+
+2025 also took more GPU time per tile than 2024. The plan estimated each tile's GPU time from its share of thin
+pixels, using test timings mostly from 2024. At the same number of gaps per tile, 2025 pixels carried 20% more
+optical observations and 59% more radar observations, so their tiles took 22% longer to load and 47% longer to
+compute. 2025 zone-years took 1.2 to 1.8 times the estimate, 2024 ones 0.9 to 1.25 times, and the whole update
+1.23 times ([`inference-on-gpus.md`](../inference/inference-on-gpus.md) §6).
+
+### Waiting before requesting GPUs
+
+The 90-minute wait before a group requested its GPUs was deliberate. Without it, a group starts its machines on
+the first small mosaic, runs out of work, shuts most of them down, and starts them again for the next one,
+paying each start-up again. With it, 205–214 GPU-hours were paid for against 201 GPU-hours of actual work, an
+overhead of 2–6% against the 16% the plan expected.
+
+## Results against the plan
 
 | | planned | actual |
 |---|---|---|
-| zone-years / tiles | 40 / 13,029 | 40 / 13,029, none failed |
-| end to end | about 4.1 h | 8.6 h for the restart, after run 1's 2 h of ingest |
-| GPU work / billed | about 160 / 186 GPU-h | 201 / 205–214 GPU-h |
-| cost, list prices | $2,500–3,700 | about $1,350 |
-| blocking validation findings | none expected | none |
-
-## What ran
-
-- **Scope.** Every tile touching the World Bank's "Latin America & Caribbean" region in Natural Earth, plus
-  French Guiana and the French and Dutch Caribbean, widened by 0.3°; remote oceanic islands excluded. In each
-  year, the fewest tiles holding 99% of that area's thin pixels (1–14 valid optical observations), pooled
-  across the region: 13,029 tiles in 40 zone-years of 21 zones (11N–22N, 17S–25S), 8.11 B thin pixels.
-- **Plan.** `holes` mode, `optical_min_obs` 1, the campaign's `global` mask, `on_skip: keep`,
-  `min_valid_coverage` 1e-9, partial windows allowed.
-- **Run.** One `run-global-campaign` dispatch: `allow_s2_only=true` (a `holes` update refuses without it),
-  4 clusters, 20 concurrent ingests, 30 GPUs per cluster, both years in one batch, and a 90-minute GPU hold
-  after each cluster's first mosaic (`inference_start_delay_minutes`). Run 1's mosaics were resumed with
-  `allow_ingest_code_mismatch=true`. Code: TE `26136f5b`, YE `c3e561b`.
-
-## How it went
-
-**Run 1 was stopped after two hours** (2026-10-19, 17:57–20:00 UTC) because its optical ingest ran 15–65%
-slower than planned: each date paid about 17 s of fixed cost, none of it overlapped with the write, and the
-largest zone-years wrote one date at a time. PR #235 fixed both; the restart was the fix's first production
-run, and it ingested 1.20× faster per date, on later dates of the same zone-years rather than the same
-dates ([`campaign-ingest-measurements.md`](../ingest/campaign-ingest-measurements.md) §3.21). Run 1 wrote nothing to the store and left 12 complete mosaics and 28 part-built ones. The restart
-resumed them under `allow_ingest_code_mismatch`, and each resumed mosaic records both ingest identities in
-`mixed_ingest_code_identities`.
-
-**The restart** (2026-10-20, UTC):
-
-| time | |
-|---|---|
-| 01:19 | dispatched |
-| 01:22–01:24 | the 12 complete zone-years matched their markers at once; all four clusters began the hold |
-| 02:22, 02:44 | clusters B and A ended the hold early, every ingest finished; C and D at the 90-minute limit, 02:53 |
-| 04:14 | the last ingest (19S-2024) finished |
-| 06:29, 07:50, 08:51, 09:52 | clusters B, C, A and D completed |
-| 09:53 | campaign completed and tagged |
-
-**GPU supply set the pace.** From the first request, EC2 refused `g6e.xlarge` in every zone
-(`InsufficientInstanceCapacity`; Ray tries each subnet and logs only the last, so every refusal reads as
-us-west-2b). Fleets grew by about one machine every two minutes across the region and peaked at 42 against
-the 120 requested. Prod's `gpu-worker-ladder` names `g6e.xlarge` only, so there was nothing to fall back to.
-The same account ran up to about 8,600 on-demand G-class vCPUs in this region from 24 August to 9 September,
-against a quota of 10,000 that has not changed; the shortage was AWS's.
-
-**2025 cost more GPU than planned.** The plan priced a tile at 30 s plus 100 s × its thin share, from dev
-timings mostly on 2024. At the same hole pixels per tile, 2025 carried 20% more optical observations and 59%
-more radar, so its tiles took 22% longer to read and 47% longer to infer. 2025 zone-years ran 1.17–1.8× the
-model and 2024 ones 0.86–1.25×, 1.23× overall ([`inference-on-gpus.md`](../inference/inference-on-gpus.md) §6).
-
-**The hold worked as intended.** 205–214 GPU-hours were billed for 201 of tile work, 2–6% overhead against the
-16% the plan expected; the slow arrival of machines also left little idle time.
+| zone-years and tiles | 40 and 13,029 | 40 and 13,029, none failed |
+| time from start to finish | about 4.1 hours | 8.6 hours for the second attempt, after 2 hours of ingest in the first |
+| GPU-hours of work, and GPU-hours paid for | about 160 and 186 | 201 and 205–214 |
+| cost at AWS list prices | $2,500–3,700 | about $1,350 |
+| problems found by validation | none expected | none |
 
 ## Cost
 
-Usage measured, priced at us-west-2 on-demand list prices. Cost Explorer's cost metrics read as zero in this
-account (`scripts/scoping/campaign_cost_actuals.py`), so usage is the measurement: Container Insights for
-Fargate (it agreed with Cost Explorer's usage for 19 October to within 1%), each GPU machine's first and last
-log line, and Cost Explorer for S3 requests.
-
-| | run 1 | restart | |
+| | first attempt | second attempt | notes |
 |---|---|---|---|
-| Fargate, ARM: Dask workers, fills, ingest runners | $571 | $250 | 10,690 and 4,617 vCPU-h |
-| Fargate, x86: schedulers, optical flow runners | $35 | $14 | above the account's daily baseline |
-| GPU, `g6e.xlarge` at $1.861/h | — | $382–398 | 205–214 h |
-| Ray head nodes, EBS | — | $11 | |
-| S3 requests | $37 | $42+ | 20 October was still arriving |
+| ordinary machines: ingest workers, and the tasks that coordinate the run and write its results | $606 | $264 | about 16,200 processor-hours in all |
+| GPU machines at $1.861 an hour | — | $382–398 | 205–214 machine-hours |
+| GPU group coordinators and disks | — | $11 | |
+| storage requests | $37 | $42 or more | the second day's count was still arriving |
 | **total** | **$643** | **$700–715** | **about $1,350** |
 
-Ingest was about 70% of it and GPU about 30%; the estimate, built from the campaign's averages, had ingest
-at 80%. Run 1's two hours cost almost as much as the whole restart because twenty zone-years ingested at once
-on full-width fleets; the restart resumed its mosaics, so that work was not lost.
+These are AWS's published on-demand prices applied to measured usage. AWS's billing tool does not show dollar
+amounts for this account, so the figures were built from usage instead:
+- container usage from AWS's monitoring, which agreed with AWS's own usage records to within 1% for the day both
+  covered;
+- each GPU machine's lifetime from its first and last log line;
+- storage request counts from AWS's usage records.
 
-## Checks after landing
+The ordinary machines and storage requests came to about 70% of the cost and the GPUs about 30%. The estimate,
+built from the original campaign's averages, had put ingest alone at 80%. The first attempt's two hours cost
+almost as much as the whole second attempt, because it ran twenty full-size ingests at once. That work was not
+wasted: the second attempt reused its downloads.
 
-All read-only, against the published store and registry.
+## How the result was checked
 
-- **Validation:** 40 completed `validate-zone-year` runs, none blocking. 38 verdicts have exactly the
-  campaign's statuses; 17N-2024 and 17S-2024 add one expected disagreement, because the radar record covers
-  the tiles the campaign wrote and the year now also holds never-written Ecuador tiles the update filled.
-- **The store:** the diff from `update-latam-infill-2024-2025-base` to `-complete` touches exactly the 13,029
-  planned tiles in each of the eight arrays, and no group or array was created or deleted. The root keeps
-  `optical_min_obs` 15; each zone-year holds one record for the update at line 1, and `cell_optical_min_obs`
-  reads 1.
-- **One tile, 18N-2024 `chunk_412_10`:** its 2,947,924 existing pixels are bit-identical in `scales`,
-  `embeddings` and `s2_obs_count`; 1,246,336 holes were filled, exactly its earlier `refused_thin_px`; the 44
-  left are its pixels with no optical observation.
-- **The registry:** all 13,029 planned `master/` rows rewritten at line 1 with `refused_thin_px` 0; the other
-  182,825 rows in these zones untouched. `rebuild_registry_measurements.py verify` over the 21 zones: 881,343
-  rows against 881,343 tile-years in `parts/`.
+All of these were read-only checks against the published store and its registry, the public table summarising
+every tile and year.
 
-## What it taught
+- **Automated validation.** Each updated zone-year was checked by the same validator the original campaign
+  used. None of the 40 found a blocking problem. 38 gave exactly the same results as the original campaign. The
+  other 2, Ecuador in 2024 (zones 17N and 17S), each showed one expected difference: they now hold tiles the
+  original campaign never wrote, which the stored radar summary does not cover.
+- **Only the planned tiles changed.** The store keeps a tagged version from before the update
+  (`update-latam-infill-2024-2025-base`) and one from after it (`-complete`). Between the two, exactly the 13,029
+  planned tiles changed, in each of the 8 data layers, and nothing was created or deleted.
+- **Existing pixels were left untouched.** One tile (zone 18N, 2024, `chunk_412_10`) was compared pixel by pixel:
+  - its 2,947,924 pixels that already had embeddings are identical to the bit;
+  - 1,246,336 gaps were filled, exactly the number of thin pixels it had;
+  - 44 gaps remain, exactly its pixels with no observation at all.
+- **The rule is recorded where it applies.** The store-wide setting still says 15, because the rest of the store
+  was built under that rule. Each updated zone-year carries a record of the update stating that it used a rule of
+  one.
+- **The registry matches.** All 13,029 updated tiles have new registry rows showing the rule of one and no thin
+  pixels left. The other 182,825 rows for these zones are unchanged. The registry's own consistency audit passed
+  for all 21 zones.
 
-- **Price an update's GPU per year.** The thin-share model is right for 2024 and low for 2025, whose deeper
-  sequences cost more per hole pixel. Calibrate it per year before the next estimate.
-- **Sparse tiles are read-bound.** Tiles with under 250,000 hole pixels took 44% of the GPU-hours, at about
-  10% inference; the card waits on a year of imagery that a holes mask does not shrink, and hole-aware reads
-  skipped no strip here because every tile had holes in every strip.
-- **One instance type is a single point of failure for the fleet.** The ladder has no fallback.
-- **Three monitoring gaps.** The "appending under `allow_ingest_code_mismatch`" warning is logged on a module
-  logger Prefect does not capture, so the append is verified from the mosaic's `mixed_ingest_code_identities`
-  instead. `te-observe-cluster --report` stopped early on fleets without pollers (fixed in #236).
-  `campaign_cost_actuals.py` has no price for ARM Fargate, which the Dask workers have run on since the
-  Graviton change, so it reports their usage as excluded.
+## What we learned
 
-## Open
+- **Estimate GPU time separately for each year.** The per-tile estimate was right for 2024 and too low for 2025,
+  which has more observations per pixel, probably because Sentinel-2C and Sentinel-1C joined that year.
+  Calibrate it per year before the next update.
+- **Tiles with few gaps mostly wait on imagery.** Tiles with fewer than 250,000 gaps took 44% of the GPU time
+  but spent only about a tenth of it computing. The rest went to loading the tile's full year of imagery, which
+  costs the same however few pixels need filling.
+  - The obvious remedy, loading only the dates the gaps can use, was measured afterwards and saves only 2–3% of
+    GPU time, because the gaps in a tile are spread out and together use most dates.
+  - Loading time depends on how many separate pieces of imagery are read rather than how many bytes. The larger
+    gain would come from reading fewer, larger pieces.
+- **One GPU machine type is a single point of failure.** When AWS runs short of it, every group stalls.
+- **Three shortcomings in the monitoring tools.**
+  - The log message confirming that the second attempt correctly resumed the first attempt's downloads never
+    reached the orchestration logs, so we confirmed it from the downloaded data instead.
+  - The GPU profiling tool's live report stopped early unless its samplers had been started (fixed in PR #236).
+  - The cost script has no prices for the ARM-based machines ingest now runs on, so it leaves their usage out.
 
-- Expiring the base tag and collecting garbage both change the published store, so each needs its own decision.
-- Add ARM Fargate prices to `campaign_cost_actuals.py`.
-- Decide whether prod's ladder gets a fallback rung.
-- The batch budget: a paired dev test at 16 and 20 chunks per worker (§3.21).
+## Still open
+
+- **Cleaning up the "before" version of the store.** Removing the pre-update version frees storage but makes
+  rolling back impossible, so it needs its own decision.
+- **Adding ARM machine prices to the cost script** (`scripts/scoping/campaign_cost_actuals.py`).
+- **Whether to give the GPU setup a second machine type to fall back to.**
+- **Testing a larger batch size for ingest writes**, as set out in §3.21 of the ingest measurements.
+- **Imagery dropped by how the ingest chooses between catalogue copies.** While measuring a follow-up, we found
+  that when a satellite pass is split into two pieces over one tile, the ingest can keep only one piece and lose
+  part of that day's imagery. This affects this update as well as the original campaign, and is being
+  investigated separately.
+
+## For reproducing or auditing
+
+| item | value |
+|---|---|
+| update name | `latam-infill-2024-2025` (permanent: it names the tags, records and registry rows) |
+| plan | `s3://global-tessera-inputs/updates/latam-infill-2024-2025/plan.json` |
+| plan settings | mode `holes`, `optical_min_obs` 1, land mask `global`, `on_skip: keep`, `min_valid_coverage` 1e-9, partial windows allowed |
+| run settings | `run-global-campaign` with `allow_s2_only=true`, `max_parallel_clusters` 4, `max_parallel_ingest` 20, `num_actors` 30, `overlap_years` true, `inference_start_delay_minutes` 90; the second attempt added `allow_ingest_code_mismatch=true` to resume the first attempt's downloads |
+| code | tessera-embeddings `26136f5b`, deployed through yield-embeddings `c3e561b` |
+| store tags | `update-latam-infill-2024-2025-base` (before) and `update-latam-infill-2024-2025-complete` (after) |
+| registry check | `scripts/maintenance/rebuild_registry_measurements.py verify` over the 21 zones: 881,343 rows against 881,343 tile-years |
