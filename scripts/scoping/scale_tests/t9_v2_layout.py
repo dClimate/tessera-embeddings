@@ -119,10 +119,13 @@ def _side(cfg: harness.RunConfig) -> int:
 
 
 def phase_fetch(source: str, profile: str, tiles: Path, n_tiles: int) -> None:
-    """Copy the ``n_tiles`` fullest 2048-px tiles of a v2 store into ``tiles`` as ``.npy``.
+    """Copy ``n_tiles`` whole 2048-px tiles of a v2 store into ``tiles`` as ``.npy``.
 
-    Opens the store with static credentials from ``profile``: Icechunk's provider chain skips
-    environment credentials, so the library's own opener fails from a laptop.
+    The tiles are spread evenly, in grid order, over every tile holding any embedding, rather than
+    taken fullest-first: in a uniform area the fullest tiles cluster, and a coast's partial tiles
+    are what the elision and compression of a real zone depend on. Opens the store with static
+    credentials from ``profile``: Icechunk's provider chain skips environment credentials, so the
+    library's own opener fails from a laptop.
     """
     import boto3
     import icechunk
@@ -142,8 +145,10 @@ def phase_fetch(source: str, profile: str, tiles: Path, n_tiles: int) -> None:
     _, ny, nx = scales.shape
     windows = [(y, x) for y in range(0, ny - TILE + 1, TILE) for x in range(0, nx - TILE + 1, TILE)]
     valid = {(y, x): int(np.isfinite(scales[0, y : y + TILE : 64, x : x + TILE : 64]).sum()) for y, x in windows}
+    live = [w for w in windows if valid[w]]
+    picks = [live[int(i)] for i in np.linspace(0, len(live) - 1, min(n_tiles, len(live)))]
     tiles.mkdir(parents=True, exist_ok=True)
-    for i, (y, x) in enumerate(sorted(windows, key=valid.__getitem__, reverse=True)[:n_tiles]):
+    for i, (y, x) in enumerate(picks):
         np.save(tiles / f"emb_{i:03d}.npy", np.asarray(emb[0, y : y + TILE, x : x + TILE]))
         np.save(tiles / f"scales_{i:03d}.npy", np.asarray(scales[0, y : y + TILE, x : x + TILE]))
         logger.info("fetched tile %d at (%d, %d), %d%% valid", i, y, x, 100 * valid[(y, x)] // (TILE // 64) ** 2)
