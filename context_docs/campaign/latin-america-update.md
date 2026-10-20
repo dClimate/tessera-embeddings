@@ -25,17 +25,18 @@ How to run one is [`docs/updates.md`](../../docs/updates.md); this page is what 
   across the region: 13,029 tiles in 40 zone-years of 21 zones (11N–22N, 17S–25S), 8.11 B thin pixels.
 - **Plan.** `holes` mode, `optical_min_obs` 1, the campaign's `global` mask, `on_skip: keep`,
   `min_valid_coverage` 1e-9, partial windows allowed.
-- **Run.** One `run-global-campaign` dispatch: 4 clusters, 20 concurrent ingests, 30 GPUs per cluster, both
-  years in one batch, and a 90-minute GPU hold after each cluster's first mosaic (`inference_start_delay_minutes`).
-  Code: TE `26136f5b`, YE `c3e561b`.
+- **Run.** One `run-global-campaign` dispatch: `allow_s2_only=true` (a `holes` update refuses without it),
+  4 clusters, 20 concurrent ingests, 30 GPUs per cluster, both years in one batch, and a 90-minute GPU hold
+  after each cluster's first mosaic (`inference_start_delay_minutes`). Run 1's mosaics were resumed with
+  `allow_ingest_code_mismatch=true`. Code: TE `26136f5b`, YE `c3e561b`.
 
 ## How it went
 
 **Run 1 was stopped after two hours** (2026-10-19, 17:57–20:00 UTC) because its optical ingest ran 15–65%
 slower than planned: each date paid about 17 s of fixed cost, none of it overlapped with the write, and the
 largest zone-years wrote one date at a time. PR #235 fixed both; the restart was the fix's first production
-run, and it ingested 1.20× faster per date ([`campaign-ingest-measurements.md`](../ingest/campaign-ingest-measurements.md)
-§3.21). Run 1 wrote nothing to the store and left 12 complete mosaics and 28 part-built ones. The restart
+run, and it ingested 1.20× faster per date, on later dates of the same zone-years rather than the same
+dates ([`campaign-ingest-measurements.md`](../ingest/campaign-ingest-measurements.md) §3.21). Run 1 wrote nothing to the store and left 12 complete mosaics and 28 part-built ones. The restart
 resumed them under `allow_ingest_code_mismatch`, and each resumed mosaic records both ingest identities in
 `mixed_ingest_code_identities`.
 

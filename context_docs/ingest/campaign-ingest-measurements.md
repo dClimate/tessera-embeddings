@@ -824,9 +824,15 @@ after the July sweep, so the restarted production run was used to check it, belo
 resuming run 1's mosaics ([`../campaign/latin-america-update.md`](../campaign/latin-america-update.md)).
 On the 19 zone-years ingested in both runs, wall time per optical date fell from 23.2 s to 19.3 s,
 each zone-year weighted by its run-1 dates: **1.20×**, median zone-year 1.18×, range 1.03–1.46×, none
-slower. 85% of each date's preparation was hidden (none in run 1), the wait for it fell from 5.9 s to
-2.0 s a date, and writes holding a single date fell from 73% to 22%. 19S gained least (1.07–1.10×):
-each of its dates covers 510–590 chunks, so two never fit in 720.
+slower. This is an unmatched production comparison, not a paired test: each resumed leg started
+after run 1's newest committed date, so the two runs timed different dates of the same zone-years.
+Windows per date agreed within 10% in 18 of the 19 zone-years (the exception, 23S-2025, had 23%
+more in the restart and was still faster), which controls the largest driver of per-date cost but not
+cloudiness or date density; the paired tests cited above remain the controlled
+evidence for the overlap. The mechanisms themselves are measured directly: 85% of each date's
+preparation was hidden (none in run 1), the wait for it fell from 5.9 s to 2.0 s a date, and writes
+holding a single date fell from 73% to 22%. 19S gained least (1.07–1.10×): each of its dates covers
+510–590 chunks, so two never fit in 720.
 
 | on 60-worker fleets, both at six threads | run 1 | restart |
 |---|---|---|
