@@ -153,7 +153,25 @@ a reservation needs only an AZ, refusals are free) and with real launches:
 Spot placement scores say nothing here: the account's spot quota is 64 vCPU, so every target scores "unlikely".
 The Ray VPC has no subnet in us-west-2d. One day is one sample.
 
-## 7. Not measured
+## 7. Headroom past the fused layer, on the RTX PRO 6000
+
+With this branch, a v2 forward runs at roughly 80% of the card's sustained matmul rate at v2's layer
+widths. What is left was probed on the forward benchmark, against this branch:
+
+| change | forward vs this branch | int8 identical to today | |
+|---|---:|---:|---|
+| attention on the memory-efficient kernel | 0.932× | 94.2% | slower; FlashAttention stays |
+| attention on cuDNN | — | — | no kernel for head dim 160 on this card |
+| the layers compiled with `max-autotune-no-cudagraphs` | **1.059×** | 95.6% | searched GEMM kernels replace part of cuBLAS's sm_80 choices |
+
+The searched kernels are the one lever left inside the forward pass. They are untested on the other
+cards and in the pipeline, they lengthen the fresh-machine compile, and they reorder arithmetic again
+(ADR 030). Outside it, the card still waits on the host: in the pipeline the graphics engine is active
+0.96 of the inference loop and the SMs 0.94, in bursts, a fifth of one-second samples below 0.9. Gathering
+each batch on the GPU from strip arrays already resident there would remove that wait without changing
+any value.
+
+## 8. Not measured
 
 - The two changes together over a whole campaign cell, and the A10G beyond one tile.
 - A compiler cache baked into the worker image, which would remove the fresh-machine compile.
