@@ -109,7 +109,7 @@ sections up to [Authentication](#authentication-edl--opera-data) describe the ha
 | `catalogue_refusal.py` | Tells a catalogue that is BUSY apart from one that cannot serve this REQUEST, and names the request either way. [§ When the catalogue refuses](../../../docs/ingest-error-handling.md#when-the-catalogue-refuses-naming-the-request-and-telling-the-two-refusals-apart) |
 | `live_windows.py` | Derives the chunk-aligned live windows every ingest loads and writes, and narrows them per date to the land that date's imagery reaches. [§ Cropping to live windows](../../../docs/ingest-performance.md#cropping-to-live-windows-unconditional) |
 | `_http.py` | Shared HTTP helpers for catalogue and granule queries: retries that log each attempt, calls the caller can abandon, and a guard for replies that claim success but are not JSON. |
-| `_pipeline.py` | A prepare/consume pipeline with a look-ahead depth, so the next item is prepared while the current one is consumed. Buys buffering, never concurrency. [§ Pipelining a date's preparation](../../../docs/ingest-performance.md#pipelining-a-dates-preparation-pipeline_dates) |
+| `_pipeline.py` | A prepare/consume pipeline with a look-ahead depth, so the next item is prepared while the current one is consumed. Buys buffering, never concurrency. S2 dates go through it automatically on every fleet up to 140 workers. [§ Pipelining a date's preparation](../../../docs/ingest-performance.md#pipelining-a-dates-preparation-automatic) |
 
 ---
 
