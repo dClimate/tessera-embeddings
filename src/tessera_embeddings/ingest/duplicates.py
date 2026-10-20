@@ -3,6 +3,9 @@
 Element 84's Sentinel-2 catalogue holds **more than one item per tile-date** whenever a granule
 has been reprocessed: same tile, same acquisition, different processing baseline, distinguished by
 ``s2:sequence``. It is common — a single MGRS tile can have dozens of duplicated dates in a season.
+Not every second item is a copy: where a datastrip boundary crosses a tile the catalogue holds one
+granule per datastrip of the same pass, each covering part of the tile, and those are separate
+imagery to keep (:func:`acquisition_identity`).
 
 **The loader fuses them.** ``odc.stac.load`` groups by solar day and mosaics every item in the
 group, so both copies are read and one unreadable copy fails the whole date. Choosing one copy up
@@ -345,19 +348,34 @@ _SAME_ACQUISITION_S = 120.0
 #: reprocessings, so the head of it names the observation itself.
 _DATATAKE_RE = re.compile(r"(G[A-Z0-9]{2,}_[0-9]{8}T[0-9]{6}_[0-9]+)_N[0-9]{1,2}\.[0-9]{1,2}")
 
+#: ``s2:datastrip_id``, e.g. ``S2B_OPER_MSI_L2A_DS_2BPS_20250619T191325_S20250619T153625_N05.11``:
+#: mission, processing centre and time, the datastrip's SENSING START, then the baseline.
+#: Reprocessing changes the processing fields and keeps the sensing start.
+_DATASTRIP_RE = re.compile(
+    r"S2[A-Z]_OPER_MSI_L2A_DS_[A-Z0-9_]{4}_[0-9]{8}T[0-9]{6}_S([0-9]{8}T[0-9]{6})_N[0-9]{1,2}\.[0-9]{1,2}"
+)
+
 
 def acquisition_identity(item: Any) -> str | None:  # noqa: ANN401 — any STAC-like item
-    """A stable name for the OBSERVATION, shared by every reprocessing of it.
+    """A stable name for one DATASTRIP of one pass, shared by every reprocessing of it.
 
-    Preferred over :func:`acquisition_instant` for deciding whether two copies are the same
-    acquisition: the catalogue ``datetime`` is per-copy and reprocessings do not agree on it, so no
-    tolerance around it separates "two reprocessings" from "two passes" without getting one wrong.
-    Mission, sensing start and orbit are identical across a reprocessing pair and different across
-    passes, so no tolerance is needed at all.
+    The datatake names the pass: mission, sensing start and orbit are identical across a
+    reprocessing pair and different across passes, so no tolerance is needed at all. That is why it
+    is preferred over :func:`acquisition_instant`: the catalogue ``datetime`` is per-copy and
+    reprocessings do not agree on it.
 
-    ``None`` where the property is absent or not this shape, which sends the caller to the
-    instant. Matched as a whole rather than split on underscores, so a value that is not a
-    datatake id is rejected instead of yielding a plausible-looking wrong key.
+    The datastrip's sensing start is appended because a pass is not always one image of a tile.
+    Where a datastrip boundary crosses the tile, the catalogue publishes one granule per datastrip
+    at the same baseline, each covering part of the tile; named by the datatake alone they compete
+    and the loser's ground is lost for the day. Reprocessing keeps the sensing start, so copies of
+    one datastrip still compete and the newest baseline still wins. Where a reprocessing omits a
+    datastrip, the older copy of it survives beside the newer ones: coverage outranks one baseline
+    per pass (ADR 029). Empirical, see ``context_docs/ingest/split-datastrips.md``.
+
+    ``None`` where the datatake is absent or not this shape, which sends the caller to the instant;
+    an unreadable datastrip leaves the datatake alone as the name. Both are matched as a whole
+    rather than split on underscores, so a value of another shape is rejected instead of yielding a
+    plausible-looking wrong key.
     """
     raw = item.properties.get("s2:datatake_id")
     if not isinstance(raw, str):
@@ -366,7 +384,9 @@ def acquisition_identity(item: Any) -> str | None:  # noqa: ANN401 — any STAC-
     if match is None:
         logger.debug("Not a datatake id: %r on %s", raw, getattr(item, "id", "?"))
         return None
-    return match.group(1)
+    strip = item.properties.get("s2:datastrip_id")
+    start = _DATASTRIP_RE.fullmatch(strip.strip()) if isinstance(strip, str) else None
+    return match.group(1) if start is None else f"{match.group(1)}_S{start.group(1)}"
 
 
 def acquisition_instant(item: Any) -> datetime.datetime | None:  # noqa: ANN401 — any STAC-like item
@@ -508,7 +528,9 @@ def select_preferred_duplicates(
     over eight tiles and 2021: keying on (tile, solar day) alone dropped **493 of 2,733 items** as
     duplicates when they were distinct acquisitions — nothing at all in the mid-latitude tiles,
     196 of 500 at 33XVG and 297 of 500 at 22XER. So copies are split by acquisition first, and
-    only true reprocessings of one acquisition compete on ``s2:sequence``.
+    only true reprocessings of one acquisition compete on ``s2:sequence``. An acquisition is one
+    datastrip of one pass (:func:`acquisition_identity`), so a pass split across datastrips keeps
+    every granule of it.
 
     Returns:
         ``(kept, alternates)``. ``kept`` preserves the input order of the survivors, so a

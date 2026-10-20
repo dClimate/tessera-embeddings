@@ -676,6 +676,98 @@ class TestReprocessingsAreOneAcquisitionHoweverTheyAreTimestamped:
         assert len(kept) == 2, "the timestamp fallback stopped clustering"
 
 
+def _granule(ident: str, baseline: str, datatake: str, strip: str) -> _Item:
+    """A real catalogue item, reduced to what selection reads; ``strip`` is the datastrip id's tail."""
+    _, tile, _, sequence, _ = ident.split("_")
+    return _Item(
+        ident,
+        f"MGRS-{tile}",
+        sequence,
+        **{
+            "s2:processing_baseline": baseline,
+            "s2:datatake_id": f"{datatake}_N{baseline}",
+            "s2:datastrip_id": f"{ident[:3]}_OPER_MSI_L2A_DS_{strip}_N{baseline}",
+        },
+    )
+
+
+class TestADatastripSplitIsTwoAcquisitions:
+    """One pass crossing a datastrip boundary is published as one granule per datastrip.
+
+    Both share the datatake and baseline, so naming an acquisition by the datatake alone made them
+    compete and dropped the loser's ground. Values are as Earth Search publishes them; see
+    ``context_docs/ingest/split-datastrips.md``.
+    """
+
+    # 18NUN: `_0_` covers the whole tile, `_1_` a sliver at its south edge.
+    NUN = (
+        _granule(
+            "S2B_18NUN_20250619_0_L2A", "05.11", "GS2B_20250619T153629_043280", "2BPS_20250619T191325_S20250619T153625"
+        ),
+        _granule(
+            "S2B_18NUN_20250619_1_L2A", "05.11", "GS2B_20250619T153629_043280", "2BPS_20250619T204702_S20250619T154121"
+        ),
+    )
+    # 33UUP: the split survived reprocessing, two datastrips at 02.13 and the same two at 05.00.
+    UUP = tuple(
+        _granule(f"S2A_33UUP_20191021_{seq}_L2A", base, "GS2A_20191021T101041_022613", strip)
+        for seq, base, strip in (
+            ("0", "02.13", "MPS__20191021T105520_S20191021T101549"),
+            ("1", "02.13", "EPAE_20191021T115008_S20191021T101730"),
+            ("2", "05.00", "S2RP_20230527T013126_S20191021T101549"),
+            ("3", "05.00", "S2RP_20230705T190725_S20191021T101730"),
+        )
+    )
+    # 17QRE: the 05.00 reprocessing published only one of the two 00.01 datastrips.
+    QRE = tuple(
+        _granule(f"S2B_17QRE_20180622_{seq}_L2A", base, "GS2B_20180622T155529_006758", strip)
+        for seq, base, strip in (
+            ("0", "00.01", "SHIT_20200930T000431_S20180622T155524"),
+            ("1", "00.01", "SHIT_20200713T180011_S20180622T155654"),
+            ("2", "05.00", "S2RP_20230629T091808_S20180622T155524"),
+        )
+    )
+
+    @staticmethod
+    def _ids(items: list[_Item]) -> set[str]:
+        return {it.id for it in items}
+
+    def test_the_datastrip_start_joins_the_pass_and_survives_reprocessing(self) -> None:
+        old, _, new, _ = self.UUP
+        assert acquisition_identity(old) == acquisition_identity(new) == "GS2A_20191021T101041_022613_S20191021T101549"
+
+    def test_an_unreadable_datastrip_leaves_the_pass_as_the_name(self) -> None:
+        item = _granule("S2B_18NUN_20250619_0_L2A", "05.11", "GS2B_20250619T153629_043280", "2BPS_x")
+        assert acquisition_identity(item) == "GS2B_20250619T153629_043280"
+
+    def test_both_granules_of_a_split_pass_are_kept(self) -> None:
+        kept, alternates = select_preferred_duplicates(list(self.NUN))
+        assert self._ids(kept) == {it.id for it in self.NUN}, "half of the pass was dropped"
+        assert alternates == {}
+
+    def test_a_reprocessed_split_keeps_the_newest_copy_of_each_half(self) -> None:
+        kept, alternates = select_preferred_duplicates(list(self.UUP))
+        assert self._ids(kept) == {self.UUP[2].id, self.UUP[3].id}
+        assert self._ids(next(iter(alternates.values()))) == {self.UUP[0].id, self.UUP[1].id}
+
+    def test_a_datastrip_the_reprocessing_omits_is_kept_at_its_older_baseline(self) -> None:
+        kept, alternates = select_preferred_duplicates(list(self.QRE))
+        assert self._ids(kept) == {self.QRE[1].id, self.QRE[2].id}, "coverage was traded for one baseline"
+        assert self._ids(next(iter(alternates.values()))) == {self.QRE[0].id}
+
+    def test_a_granule_published_twice_is_still_one_copy(self) -> None:
+        first = self.NUN[0]
+        again = _Item("S2B_18NUN_20250619_2_L2A", "MGRS-18NUN", "2", **first.properties)
+        kept, _ = select_preferred_duplicates([first, again])
+        assert len(kept) == 1
+
+    def test_a_read_failure_steps_down_only_the_half_that_failed(self) -> None:
+        kept, alternates = select_preferred_duplicates(list(self.UUP))
+        stepped = step_down_copies(alternates, kept, implicated=[self.UUP[2]])
+        assert stepped is not None
+        assert self._ids(stepped[0]) == {self.UUP[0].id, self.UUP[3].id}, "the healthy half was stepped down"
+
+
 class TestASpareThatWillRefuseIsKeptOffTheLadderWithoutVisibleAssets:
     """The reported P2/MEDIUM. Two changes on this branch interlock to create it.
 

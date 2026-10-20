@@ -856,12 +856,14 @@ is owed separately — measured in
 ### Choosing between duplicate copies of a tile-date
 
 A catalogue indexes the same tile-date more than once whenever a granule is reprocessed, and
-sometimes from more than one region. An **acquisition** is one real pass of the satellite over
-the tile — a high-latitude tile can have two in a day, and each can be published several times as
-ESA reprocesses it — so the job is to reduce each tile-date to one copy per acquisition, keeping
-every distinct pass. `duplicates.py` does that before the loader sees it, because `odc.stac.load`
-fuses a solar-day group: two copies of one acquisition would be blended into one pixel stack at
-two different processing baselines, and the baseline recorded on the store would match neither.
+sometimes from more than one region. An **acquisition** is one datastrip of one real pass of the
+satellite over the tile — a high-latitude tile can have two passes in a day, a pass crossing a
+datastrip boundary reaches the tile as one granule per datastrip, and each can be published several
+times as ESA reprocesses it — so the job is to reduce each tile-date to one copy per acquisition,
+keeping every distinct pass and datastrip. `duplicates.py` does that before the loader sees it,
+because `odc.stac.load` fuses a solar-day group: two copies of one acquisition would be blended
+into one pixel stack at two different processing baselines, and the baseline recorded on the store
+would match neither.
 
 The copies it rejects are not discarded. They become the **fallback ladder**: if the chosen
 copy's object will not read, the recovery steps down to the next rung rather than losing the
@@ -950,6 +952,31 @@ from "two passes" without getting one wrong. The timestamp window survives only 
 for a copy naming no datatake. Splitting on a real acquisition protects genuine same-day
 coverage: successive orbits revisit a high-latitude tile the same day, and keying on `(tile,
 solar day)` alone dropped 493 of 2,733 distinct acquisitions as duplicates.
+
+**The datatake names the pass; the datastrip's sensing start, read from `s2:datastrip_id`, names
+the image.** Where a datastrip boundary crosses a tile, ESA publishes one granule per datastrip at
+the same baseline, each covering part of the tile. They share the datatake, and named by it alone
+they competed and the loser's ground was dropped for the day — on any given tile-date this is rare,
+but where a boundary crosses a tile on most passes it removes a large share of the year. Reprocessing
+keeps each datastrip's sensing start, so the two shapes separate cleanly:
+
+```text
+   a SPLIT pass: two images                     a REPROCESSING: one image twice
+   ┌──────────────────────────┐                 ┌──────────────────────────┐
+   │ datastrip S…T153625      │ granule _0_     │ datastrip S…T101549      │ _0_ at 02.13
+   │ most of the tile         │                 │                          │ _2_ at 05.00
+   ├──────────────────────────┤                 └──────────────────────────┘
+   │ datastrip S…T154121      │ granule _1_     same sensing start, same ground:
+   └──────────────────────────┘                 they compete and the newest baseline wins
+   same datatake and baseline, different
+   ground: both are kept
+```
+
+Where a reprocessing omits one of a pass's datastrips, the older copy of that datastrip is kept
+beside the newer ones, so the day mixes baselines across datastrips but never within one. Coverage
+outranks one baseline per pass because the offset is corrected per image (ADR 021). The census
+behind both choices is in
+[`context_docs/ingest/split-datastrips.md`](../../../context_docs/ingest/split-datastrips.md).
 
 A copy naming **no** datatake joins an identified acquisition its timestamp places it in, before
 it is allowed to start one, and it is matched against *any* member of that acquisition — members

@@ -43,7 +43,8 @@ context_docs/
 │   ├── 024-spatial-transform-origin-is-the-pixel-corner.md
 │   ├── 026-v1-1-runs-the-gru-it-was-trained-with.md
 │   ├── 027-targeted-updates.md
-│   └── 028-embed-every-pixel-with-an-optical-observation.md
+│   ├── 028-embed-every-pixel-with-an-optical-observation.md
+│   └── 029-an-acquisition-is-one-datastrip-of-one-pass.md
 │
 ├── campaign/                      THE GLOBAL CAMPAIGN — start here
 │   ├── campaign-plan.md                        <- START HERE. What runs, with what settings, in
@@ -66,8 +67,10 @@ context_docs/
 │   │                                              budget, live-tile cropping, region writes
 │   ├── source-read-failures.md                 twelve ways a source read fails, the guard each
 │   │                                              earned, and the retry budget they share
-│   └── solar-day-fusion-order.md               which scene wins a contested pixel, and why the
-│                                                  answer was inverted for the life of the code
+│   ├── solar-day-fusion-order.md               which scene wins a contested pixel, and why the
+│   │                                              answer was inverted for the life of the code
+│   └── split-datastrips.md                     why a pass split across datastrips keeps every
+│                                                  granule, and what dropping one cost
 │
 ├── inference/                     RUNNING THE ENCODER
 │   ├── simplifying-the-strip-loader.md         the October 2026 loading experiments: what was

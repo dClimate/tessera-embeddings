@@ -137,6 +137,10 @@ names its files differently, so inspecting individual files there finds nothing.
 
 ### Decision 4 — Two copies are the same photograph when they name the same datatake
 
+> **AMENDED by [ADR 029](029-an-acquisition-is-one-datastrip-of-one-pass.md).** A datatake is a
+> pass, and a pass crossing a datastrip boundary is two photographs of a tile. The name is now the
+> datatake plus the datastrip's sensing start. The reasoning below about timestamps still holds.
+
 The same photograph is often published more than once, reprocessed with a newer version. We must
 keep one, not blend both together. The obvious way to spot them — a shared timestamp — does not
 work:
