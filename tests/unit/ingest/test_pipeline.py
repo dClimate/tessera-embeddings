@@ -234,21 +234,3 @@ def test_depth_preserves_order_and_single_threading():
 def test_depth_rejects_zero():
     with pytest.raises(ValueError, match="depth must be >= 1"):
         next(pipelined(range(3), lambda i: i, depth=0))
-
-
-def test_a_weight_budget_buffers_many_light_items_but_one_heavy_one():
-    """With a budget, the buffer stops growing once queued weight would pass it, keeping at least one."""
-    weights = [1, 1, 1, 1, 9, 9, 9]
-    submitted: list[int] = []
-    gen = pipelined(range(7), lambda i: submitted.append(i) or i, depth=4, weigh=lambda i: weights[i], budget=5)
-    next(gen)  # took item 0; 1-3 queued, item 4 (weight 9) waits for room
-    time.sleep(0.1)
-    assert submitted == [0, 1, 2, 3]
-    for _ in range(3):
-        next(gen)  # took 1, 2, 3: the queue empties, so item 4 goes in alone
-    time.sleep(0.1)
-    assert submitted == [0, 1, 2, 3, 4]
-    next(gen)  # took 4: item 5 goes in alone, item 6 waits
-    time.sleep(0.1)
-    assert submitted == [0, 1, 2, 3, 4, 5]
-    gen.close()

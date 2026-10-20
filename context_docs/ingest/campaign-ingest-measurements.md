@@ -807,7 +807,10 @@ threshold misread the update's sparse large zone-years, and "every update batche
 a dense update. The S2 ingest now counts the storage chunks each date's footprint-narrowed windows
 cover, and fills a batch with up to four dates while their chunks stay within
 `BATCH_CHUNKS_PER_WORKER` (12) per worker; a date that would cross the budget starts a new batch,
-so a dense date writes alone. One rule for campaign fills, updates and single-area runs: the S2
+so a dense date writes alone. The batches are decided before any date is prepared, from that
+geometry, and the pipeline prepares one whole batch ahead; an earlier draft let the writer and the
+look-ahead each decide batch membership, and every review round found a new way for the two to
+disagree. One rule for campaign fills, updates and single-area runs: the S2
 flow passes the budget from its planned width, and any other caller gets it from the workers its
 Dask client reports.
 

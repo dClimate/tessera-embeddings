@@ -554,6 +554,7 @@ def test_dense_dates_are_written_at_once_and_prepared_one_ahead(run_ingest, monk
     [
         ([1, 1, 1, 1, 1], None, [4, 1]),  # no budget passed: sparse dates still fill to the cap
         ([20, 1, 1], None, [1, 2]),  # no budget passed: one worker's budget, so a dense date writes alone
+        ([1, 0, 1, 1, 1, 1], None, [4, 1]),  # a date reaching no live window rides along without a slot
         ([1, 1, 1, 1, 1], 10, [4, 1]),  # sparse dates fill a batch to the cap
         ([2, 2, 3, 1, 1], 5, [2, 3]),  # a date that would cross the budget closes the batch first
         ([1, 9, 1, 1], 5, [1, 1, 2]),  # a date over the budget on its own writes alone
@@ -569,7 +570,7 @@ def test_a_batch_holds_sparse_dates_up_to_its_chunk_budget(run_ingest, monkeypat
     with caplog.at_level(logging.INFO, logger=log.name):
         run = run_ingest(dates, pipeline_dates=True, batch_dates=None, batch_chunk_budget=budget, log=log)
     assert [int(n) for n in re.findall(r"Batch timings .* n=(\d+):", caplog.text)] == sizes
-    assert run.written == list(dates)
+    assert run.written == [d for d, c in zip(dates, chunks, strict=True) if c]  # a windowless date writes nothing
 
 
 # ---------------------------------------------------------------------------

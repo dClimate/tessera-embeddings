@@ -581,9 +581,9 @@ middle of a batch.
 
 Three practical details:
 
-- A date that fails the gate does not take up a slot, so batches stay full even in cloudy
-  stretches where most dates are rejected. Whatever is left over is written at each month
-  boundary.
+- Because batches are decided before preparation, a date that then fails the cloud check still
+  occupies its slot, so cloudy stretches write smaller batches. A date whose imagery reaches no
+  live window will write nothing, so it takes no slot. Each streamed month ends its own last batch.
 - Logging changes. Instead of one `Stage timings` line per date there is one `Batch timings` line
   per batch. Its build and gate figures are sums of the real per-date values; the write is a
   single shared computation and cannot be split per date.
@@ -591,19 +591,15 @@ Three practical details:
   date per commit.
 
 **Combining it with pipelining.** The two fix different idleness. Batching fills gaps
-*inside* a date's write; pipelining removes the serial preparation *between* writes. When both
-are on, the look-ahead is held to the same budget as a batch, weighing each date by the chunks it
-will write before preparing it (its footprint against the live windows, which needs no read): up to
-four sparse dates, so a whole batch's preparation hides behind the previous batch's write, but one
-dense date, so a dense run holds no more prepared dates than writing one date per commit, even
-straight after a run of sparse ones. A batch is
-written as soon as it holds four dates or reaches its budget, so a dense date never waits for the
-next one.
-
-Preparation still runs on one thread at any depth, so the rule that it must not touch anything
-beyond the dataset it returns is unchanged. The cost is memory — up to `k` prepared dates held
-while `k` more are written. `Batch timings` reports `prepare`, `hidden` and `stall` per batch,
-with the same caveat as the per-date line.
+*inside* a date's write; pipelining removes the serial preparation *between* writes. They meet in
+one place: **the batches are decided first, before any date is prepared.** What a date will write is
+known from geometry alone, its satellite footprint against the live windows, so each streamed month
+is split into batches up front, and the pipeline then prepares the next whole batch while the
+current one writes. That bounds what is held by construction: one batch writing and one prepared,
+each within the budget or a single dense date, which for a dense run is the same as writing one
+date per commit. Preparation still runs on one thread, so the rule that it must not touch anything
+beyond the dataset it returns is unchanged. `Batch timings` reports `prepare`, `hidden` and `stall`
+per batch, with the same caveat as the per-date line.
 
 ## has_new_stac_dates pre-check
 
