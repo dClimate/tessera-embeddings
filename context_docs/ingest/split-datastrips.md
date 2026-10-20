@@ -1,7 +1,7 @@
 # Split datastrips: one pass, two granules, one kept
 
-**Status: the selection rule is fixed in `ingest/split-datastrips`. Verification on dev, the effect on
-the published v1.1 store and the remediation decision are open (§7).**
+**Status: the selection rule is fixed in `ingest/split-datastrips`. The dev fills and the remediation
+decision are open (§8).**
 
 Sentinel-2 duplicate selection (`ingest/duplicates.py`) treated two granules of one pass as two copies
 of one image whenever a datastrip boundary crossed the tile, kept one, and dropped the other's ground
@@ -155,9 +155,43 @@ The OPERA path (`ingest/opera_query.py`, `ingest/s1_roi.py`) does not call the s
 item-level deduplication is by exact granule id across the two halves of an antimeridian query, so
 distinct bursts of a date are never collapsed.
 
-## 7. Open
+## 7. What it did to the published store
 
-- **Dev verification**: paired control and fix arms on one tile around 18NUN, mosaics and fill.
-- **The published store**: what the loss did to `s2_obs_count`, the month flags, pixels refused at
-  each cell's optical line, and the embeddings of pixels that kept a shorter sequence.
-- **Remediation**: fix forward only, a `holes` update, or a `shards` rewrite of the worst cells.
+Measured exactly at the 1,127 sample points rather than estimated. For every day the old rule lost at a
+point, the scene classification was read at the point from each granule the fix restores (12,959 reads
+of public SCL COGs, 14 unreadable); the published store's count and embedded state were read at the
+point's pixel, and the tile's own optical line from the published registry.
+
+| land-weighted, all nine years | |
+|---|---|
+| valid optical observations lost per pixel-year | 0.62 (the cloud-weighted estimate in §4 was 0.62) |
+| embedded pixel-years whose sequence is one or more observations short | 36% |
+| pixel-years refused only because of the loss (count below the tile's line, count plus the lost observations at or above it) | 6 of 10,121 sampled, about 0.03% |
+
+So the loss mostly changed embeddings, slightly, rather than coverage: almost every published tile ran
+at the line of 15, and a lost date pushes a pixel across it rarely. Three of the six refusals are in
+2017, the thinnest year. Six events bound the refusal figure only loosely.
+
+## 8. Dev verification
+
+Paired arms on global-tessera-dev, `dev/global-tessera-dupsel-control` (YE main, TE `26136f5b`) and
+`dev/global-tessera-dupsel-fix` (TE `24a9c92d`), through the campaign path on one tile: 18N
+`chunk_421_8`, 2025, chosen to straddle the edge of the 18NUN sliver so that its query returns both
+granules. Run locally before launch, the year's query for that tile drops three granules under the old
+rule and none under the fix. Each mosaic's ingest code identity matched its arm's code computed locally.
+
+**Mosaics.** The same 81 dates in both arms, and every band byte-identical on the dates without a
+split. On 2025-06-19 the control holds data on 19% of the tile and the fix on all of it: 3,388,172
+pixels gained, 1,314,548 of them clear, every one inside a dropped granule's footprint, none lost.
+
+**Where both granules cover the ground, the fix can take the pixel from the other one.** Fusion is
+clearest first (`solar-day-fusion-order.md`), so the restored granule wins wherever it sorts ahead. Two
+datastrips of one pass do not agree exactly, because atmospheric correction runs per datastrip: on
+clear ground the median red difference is 19 DN (0.19% reflectance), the 90th percentile 100. On
+2025-10-27 the differing pixels are all cloud or cirrus in the control; cirrus is valid for the model,
+so those reach it.
+
+**Fills: not yet run.** No g6e.xlarge capacity was available in us-west-2b for twenty minutes, and the
+arms were cancelled. Open: the fills' counts and embeddings against the mosaics, the size of the
+embedding change, and the remediation decision (fix forward only, a `holes` update, or a `shards`
+rewrite of the worst cells).
