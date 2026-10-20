@@ -135,9 +135,11 @@ class MosaicChunkInferenceDataset:
             if pixels.shape != s2_nonzero.shape:
                 raise ValueError(f"pixel mask shape {pixels.shape} does not match the strip's {s2_nonzero.shape}")
             # The loader reads only the dates some pixel in ``pixels`` is valid on (``restrict_to_pixels``), so outside
-            # the mask the reflectance test above saw part of the year. The SCL count stands in there, which is what
-            # that test equals on every measured registry row (``storage.registry_rebuild``). It reaches only the
-            # refusal counts: pixels outside the mask are never embedded.
+            # the mask the reflectance test above saw part of the year. The SCL count stands in there. The two differ
+            # only for a pixel with valid SCL and all-zero reflectance, which no measured registry row has ever held
+            # (``storage.registry_rebuild``, whose basis check would flag one); testing it exactly would mean reading
+            # the very bands the restriction skips. It reaches only the refusal counts: pixels outside the mask are
+            # never embedded, and an update's published rows are re-derived from its shards.
             s2_nonzero |= ~pixels & (s2_valid_count > 0)
 
         if chunk_data.s1_asc_obs_count is not None:
