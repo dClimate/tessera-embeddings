@@ -1,7 +1,7 @@
 # Split datastrips: one pass, two granules, one kept
 
-**Status: the selection rule is fixed in `ingest/split-datastrips`. The dev fills and the remediation
-decision are open (§8).**
+**Status: the selection rule is fixed in `ingest/split-datastrips`, for future runs only. The published
+v1.1 store is left as it is (§7).**
 
 Sentinel-2 duplicate selection (`ingest/duplicates.py`) treated two granules of one pass as two copies
 of one image whenever a datastrip boundary crossed the tile, kept one, and dropped the other's ground
@@ -172,6 +172,9 @@ So the loss mostly changed embeddings, slightly, rather than coverage: almost ev
 at the line of 15, and a lost date pushes a pixel across it rarely. Three of the six refusals are in
 2017, the thinnest year. Six events bound the refusal figure only loosely.
 
+**Decision: fix forward only.** No published tile is rewritten or updated for this; the fix applies to
+every run after it is deployed.
+
 ## 8. Dev verification
 
 Paired arms on global-tessera-dev, `dev/global-tessera-dupsel-control` (YE main, TE `26136f5b`) and
@@ -191,7 +194,5 @@ clear ground the median red difference is 19 DN (0.19% reflectance), the 90th pe
 2025-10-27 the differing pixels are all cloud or cirrus in the control; cirrus is valid for the model,
 so those reach it.
 
-**Fills: not yet run.** No g6e.xlarge capacity was available in us-west-2b for twenty minutes, and the
-arms were cancelled. Open: the fills' counts and embeddings against the mosaics, the size of the
-embedding change, and the remediation decision (fix forward only, a `holes` update, or a `shards`
-rewrite of the worst cells).
+**The fills were not run.** They would have measured how far the embeddings move when a lost date is
+restored, which matters only for rewriting published tiles, and none will be rewritten (§7).

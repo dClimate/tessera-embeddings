@@ -29,7 +29,8 @@ observations, and up to a fifth of a year where a boundary crosses a tile on mos
 
 - The ingest code identity moves, so a part-built mosaic needs `allow_ingest_code_mismatch` to
   resume, and no fill or update should straddle the deploy.
-- Every published v1.1 cell was ingested under the old rule. What to do about it is decided
-  separately, on the store measurement.
+- Every published v1.1 cell was ingested under the old rule, and stays as it is: the fix applies to
+  future runs only. The loss mostly shortened pixels' observation sequences rather than leaving them
+  empty ([`split-datastrips.md`](../ingest/split-datastrips.md) §7).
 - The result no longer depends on how large an area was queried: before, a query too small to
   return one granule of a split pass kept the other one, and a zone-wide query might not.
