@@ -279,12 +279,82 @@ def _t6_summary(rows: list[dict]) -> str:
     return f"{int(deleted[0]['value'])} objs @ {per_s}/s, {_fmt(bytes_r)}B reclaimed"
 
 
+#: T9 read columns: (label, workload, dims). Each cell is requests / MB for the embeddings array.
+_T9_READS = (
+    ("point 16", "point", 16),
+    ("point 128", "point", 128),
+    ("tile 16", "tile", 16),
+    ("shard 16", "shard", 16),
+    ("bulk 16", "bulk", 16),
+    ("bulk 64", "bulk", 64),
+    ("bulk 128", "bulk", 128),
+)
+
+
+def _t9_value(rows: list[dict], metric: str, variant: str, **params: Any) -> float | None:  # noqa: ANN401
+    """Median of one T9 metric for one arm, or ``None``."""
+    vals = [r["value"] for r in _sel(rows, test="t9", metric=metric, **params) if r.get("variant") == variant]
+    return statistics.median(vals) if vals else None
+
+
+def _t9_tables(rows: list[dict]) -> list[str]:
+    """Render T9's write table, one request-plan table per client, and the Dask table."""
+    arms = sorted({r["variant"] for r in _sel(rows, test="t9", phase="build", metric="encode_cpu_s")})
+    if not arms:
+        return []
+    out = ["## T9 — v2 layout arms", "", "| arm | embeddings MB | ratio | encode CPU s/shard |", "|---|---|---|---|"]
+    for a in arms:
+        stored = sum(
+            r["value"] for r in _sel(rows, test="t9", metric="bytes_written", array="embeddings") if r["variant"] == a
+        )
+        raw_arm = "_".join(a.split("_")[:2]) + "_raw"
+        raw = sum(
+            r["value"]
+            for r in _sel(rows, test="t9", metric="bytes_written", array="embeddings")
+            if r["variant"] == raw_arm
+        )
+        ratio = f"{raw / stored:.2f}" if stored and raw else "?"
+        out.append(f"| {a} | {stored / 1e6:.0f} | {ratio} | {_fmt(_t9_value(rows, 'encode_cpu_s', a) or 0)} |")
+    for client in sorted(
+        {r["params"]["client"] for r in _sel(rows, test="t9", metric="get_requests") if "client" in r["params"]}
+    ):
+        out += [
+            "",
+            f"### Requests / MB fetched, {client}",
+            "",
+            "| arm | " + " | ".join(c[0] for c in _T9_READS) + " |",
+            "|---|" + "---|" * len(_T9_READS),
+        ]
+        for a in arms:
+            cells = []
+            for _, workload, dims in _T9_READS:
+                kw = {"client": client, "workload": workload, "dims": dims, "array": "embeddings"}
+                n = _t9_value(rows, "get_requests", a, **kw)
+                b = _t9_value(rows, "bytes_fetched", a, **kw)
+                cells.append("—" if n is None or b is None else f"{n:.0f} / {b / 1e6:.1f}")
+            out.append(f"| {a} | " + " | ".join(cells) + " |")
+    dask_arms = sorted({r["variant"] for r in _sel(rows, test="t9", metric="dask_tasks")})
+    if dask_arms:
+        out += [
+            "",
+            "### Dask, bulk 16-d pull",
+            "",
+            "| arm | tasks default | tasks shard-aligned | requests default | requests shard-aligned |",
+            "|---|---|---|---|---|",
+        ]
+        for a in dask_arms:
+            t = [_t9_value(rows, "dask_tasks", a, chunks=c) for c in ("default", "shard_aligned")]
+            q = [_t9_value(rows, "get_requests", a, chunks=c) for c in ("default", "shard_aligned")]
+            out.append(f"| {a} | " + " | ".join("—" if v is None else f"{v:.0f}" for v in (*t, *q)) + " |")
+    return [*out, ""]
+
+
 def build_report(results_dir: Path, run_id: str) -> str:
     """Assemble the full markdown report string."""
     rows = _load_rows(results_dir)
     if not rows:
         return f"# Scale-test report — run `{run_id}`\n\nNo metrics found under {results_dir}.\n"
-    lines = _header(rows, run_id) + _decision_matrix(rows) + _per_test_tables(rows)
+    lines = _header(rows, run_id) + _decision_matrix(rows) + _t9_tables(rows) + _per_test_tables(rows)
     return "\n".join(lines)
 
 

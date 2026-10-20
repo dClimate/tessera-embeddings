@@ -57,6 +57,10 @@ METRICS = frozenset(
         "gc_wall_s",
         "slowdown_503_count",
         "puts_per_s",
+        "get_requests",
+        "encode_cpu_s",
+        "decode_cpu_s",
+        "dask_tasks",
     }
 )
 
