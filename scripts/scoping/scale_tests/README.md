@@ -18,7 +18,8 @@ These scripts write real data to real object stores and cost real money at
 ```
 scale_tests/
 ├── harness.py        config, metrics (JSONL), phase markers, timers, RSS, object stats, cold subprocess
-├── variants.py       the 5 store-layout variants (chunk/shard geometry) — stable metric join keys
+├── variants.py       the v1.1 layout variants and the v2 geometries, with v2 codec/order/scales arms
+│                     — stable metric join keys
 ├── zone_geometry.py  mock UTM-zone shapes + annual (2017–2025) time axis
 ├── synth.py          deterministic int8 embeddings + coherent land masks (+ optional --real-sample)
 ├── seeding.py        multi-group empty-store seeding (the primitive the library still lacks)
@@ -35,6 +36,8 @@ scale_tests/
 ├── t7_ramp.py        fresh-bucket PUT ramp (S3 only)       → campaign warm-up
 ├── t8_sharding.py    shard vs unshard: write-align, bytes, → ADR D3 (see
 │                     scattered reads, object count            ADR-008 D3)
+├── t9_v2_layout.py   v2 layout arms, local: stored bytes, encode CPU,  → v2 store layout
+│                     request plans on two zarr versions, Dask graph   (decision pending)
 ├── report.py         collate metrics → decision matrix markdown
 └── teardown.py       delete a run's stores; verify $0 residue
 ```
@@ -69,6 +72,13 @@ uv run python -m scripts.scoping.scale_tests.t7_ramp       --run-id run1 --backe
 # D3 settlement (separate run; see ADR-008 D3)
 uv run python -m scripts.scoping.scale_tests.t8_sharding   --run-id d3   --backend s3 --scale bench --bucket <bucket>/global-embeddings/
 
+# v2 layout (T9): local only. Build and read with the library's own environment, then read the
+# same stores again from an environment pinned to the old client (zarr 3.2.1 + icechunk 2.1.1)
+uv run python -m scripts.scoping.scale_tests.t9_v2_layout --run-id v2a --phase fetch --tiles <dir> \
+    --source s3://<bucket>/<v2 single-area store> --profile <aws profile> --n-tiles 4
+uv run python -m scripts.scoping.scale_tests.t9_v2_layout --run-id v2a --scale bench --tiles <dir>
+<old-venv>/bin/python -m scripts.scoping.scale_tests.t9_v2_layout --run-id v2a --scale bench --tiles <dir>
+
 # collate + tear down
 uv run python -m scripts.scoping.scale_tests.report   --run-id run1
 uv run python -m scripts.scoping.scale_tests.teardown --run-id run1 --backend s3 --bucket <bucket>/global-embeddings/
@@ -79,6 +89,26 @@ Install the extra deps once: `uv sync --group scale-tests`.
 **Bench environment runs the library's own lock** (`uv.lock`). Never go below
 `icechunk>=2.1.1` (ADR D9): 2.0.4 has a concurrent-manifest-fetch bug (#2158,
 ~25× slowdown) that poisons read benchmarks.
+
+### T9 — the v2 layout, measured without AWS
+
+v2's 128 dimensions are Matryoshka-ordered, so its store chunks the band axis at 16 inside the
+same 2048² shard. T9 builds every arm as a local store of 2×2 shards from real v2 tiles, and records:
+
+- what the writer pays: stored bytes, and encode CPU per shard
+- what every read asks for: requests and bytes for each workload at 16, 64 and 128 dims
+- the Dask graph a reader's default chunking builds
+
+**The arms** are the geometries in `variants.py`, each crossed with int8 codecs, a band-planar
+transpose, the inner-chunk order within a shard, and the `scales` geometry.
+
+**Requests are counted by a store wrapper** that also intercepts zarr ≥ 3.3's merged-range path.
+`WrapperStore` would otherwise forward it unseen, and so would zarr 3.4's sync path.
+
+**Request plans carry over to S3, but latency does not.** The requests depend only on zarr's
+sharding codec, so they hold on S3. Latency depends on the network, so T1 measures the finalists on
+S3. Run the `requests` phase under both the library's zarr and an old client: zarr 3.3 changed
+partial shard reads from one request per inner chunk to merged, concurrent ones.
 
 ### Common flags (every `tN` script)
 
