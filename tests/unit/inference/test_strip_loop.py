@@ -24,7 +24,7 @@ import zarr
 import tessera_embeddings.inference.actors as _actors_mod
 import tessera_embeddings.inference.data_loading as _dl_mod
 import tessera_embeddings.inference.read_plan as _read_plan_mod
-from tessera_embeddings.config.inference import S2_BAND_ORDER
+from tessera_embeddings.config.inference import S2_BAND_ORDER, SCL_VALID_CLASSES
 from tessera_embeddings.config.store_layout import (
     MONTH_COVERED_FOR_OBS,
     MONTHS_IN_YEAR,
@@ -234,8 +234,8 @@ def _open_store_side_effect(n_t_sar: int = 5):
     return store_opener(_CHUNK, n_t_s2=8, n_t_sar=n_t_sar)
 
 
-def _run_process_chunk(inference_config, test_model, n_t_sar: int = 5, chunk: ChunkSpec = _CHUNK):
-    """Run process_chunk capturing the single whole-chunk write."""
+def _run_process_chunk(inference_config, test_model, n_t_sar: int = 5, chunk: ChunkSpec = _CHUNK, opener=None):
+    """Run process_chunk capturing the single whole-chunk write; ``opener`` replaces the default synthetic stores."""
     inference_config.s1_orbit = "both"
     # Synthetic stores carry 2024 dates; align the window so the filter keeps them.
     inference_config.time_window = parse_time_window("December 2024")
@@ -245,7 +245,7 @@ def _run_process_chunk(inference_config, test_model, n_t_sar: int = 5, chunk: Ch
     _CapturingWriter.last_skip = None
 
     with (
-        patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_open_store_side_effect(n_t_sar)),
+        patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=opener or _open_store_side_effect(n_t_sar)),
         patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
     ):
         result = actor.process_chunk(chunk, "s3://b/m", "/tmp/staging", "run-1")
@@ -323,6 +323,63 @@ class TestProcessChunkStriping:
         assert result["valid_pixels"] == holes.sum()
         np.testing.assert_array_equal(part["embeddings"][holes], full["embeddings"][holes])
         np.testing.assert_allclose(part["scales"][holes], full["scales"][holes], rtol=1e-6)
+
+    @pytest.mark.parametrize("hole_dates", [(1, 3, 4, 6, 7), ()], ids=["some-dates", "no-date"])
+    def test_a_holes_tile_reads_only_the_dates_its_holes_use_and_is_unchanged_by_it(
+        self, inference_config, test_model, tmp_path, hole_dates
+    ):
+        """Dates valid only outside the holes are not read, and the tile comes out bit-identical to reading them."""
+        holes = np.zeros((_CHUNK.height, _CHUNK.width), dtype=bool)
+        holes[9:11, 2:5] = True
+        write_pixel_mask(str(tmp_path / "holes.npz"), holes)
+        opener = store_opener(_CHUNK, n_t_s2=8, n_t_sar=5)
+        s2 = opener("reflectance")
+        scl = s2["scl"][:]
+        scl[:, holes] = 8
+        scl[list(hole_dates), 9:11, 2:5] = 4
+        # A pixel outside the holes seen only on the dates the holes are not, so the restriction drops its whole year.
+        scl[:, 0, 0] = [8 if t in hole_dates else 4 for t in range(scl.shape[0])]
+        s2["scl"][:] = scl
+        valid = np.isin(scl, list(SCL_VALID_CLASSES))
+        for band in S2_BAND_ORDER:  # ingest zeroes the bands wherever SCL is invalid
+            s2[band][:] = np.where(valid, s2[band][:], 0)
+
+        reads: dict[str, list[int]] = {"restricted": [], "unrestricted": []}
+
+        def run(label: str):
+            real = _dl_mod._load_s2_bands
+
+            def _spy(root, time_indices, **kwargs):
+                reads[label].append(len(time_indices))
+                return real(root, time_indices=time_indices, **kwargs)
+
+            _CapturingWriter.last_skip_record = None
+            with patch.object(_dl_mod, "_load_s2_bands", side_effect=_spy):
+                result, write = _run_process_chunk(
+                    inference_config,
+                    test_model,
+                    chunk=dataclasses.replace(_CHUNK, pixels=str(tmp_path / "holes.npz")),
+                    opener=opener,
+                )
+            return result, write, _CapturingWriter.last_skip_record
+
+        with patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(4)):
+            restricted = run("restricted")
+            with patch.object(_actors_mod, "restrict_to_pixels", side_effect=lambda bundle, _pixels: bundle):
+                unrestricted = run("unrestricted")
+
+        assert reads["unrestricted"] == [8]
+        assert reads["restricted"] == ([len(hole_dates)] if hole_dates else [])
+        (res, write, skip), (res_u, write_u, skip_u) = restricted, unrestricted
+        assert res["valid_pixels"] == res_u["valid_pixels"] == (holes.sum() if hole_dates else 0)
+        assert skip == skip_u
+        if hole_dates:
+            for key in ("embeddings", "scales"):
+                np.testing.assert_array_equal(write[key], write_u[key], err_msg=key)
+            for key in ("obs_counts", "month_covered"):
+                for var, arr in write[key].items():
+                    np.testing.assert_array_equal(arr, write_u[key][var], err_msg=var)
+            assert write["coverage"] == write_u["coverage"]
 
     def test_month_coverage_is_populated_and_agrees_with_the_obs_count(self, inference_config, test_model):
         """The actor must pass month flags that describe its own observations.

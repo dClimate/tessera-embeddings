@@ -131,6 +131,14 @@ class MosaicChunkInferenceDataset:
         s2_nonzero = np.zeros((self.H, self.W), dtype=bool)
         for t in range(s2_bands.shape[0]):
             s2_nonzero |= np.any(s2_bands[t] != 0, axis=-1)
+        if pixels is not None:
+            if pixels.shape != s2_nonzero.shape:
+                raise ValueError(f"pixel mask shape {pixels.shape} does not match the strip's {s2_nonzero.shape}")
+            # The loader reads only the dates some pixel in ``pixels`` is valid on (``restrict_to_pixels``), so outside
+            # the mask the reflectance test above saw part of the year. The SCL count stands in there, which is what
+            # that test equals on every measured registry row (``storage.registry_rebuild``). It reaches only the
+            # refusal counts: pixels outside the mask are never embedded.
+            s2_nonzero |= ~pixels & (s2_valid_count > 0)
 
         if chunk_data.s1_asc_obs_count is not None:
             s1_asc_valid = chunk_data.s1_asc_obs_count.astype(np.int32)
@@ -163,8 +171,6 @@ class MosaicChunkInferenceDataset:
         # A targeted update's mask narrows WHAT is embedded, never the refusal counts below, which read
         # the gates rather than `valid_mask` and so still describe the whole strip.
         if pixels is not None:
-            if pixels.shape != valid_mask.shape:
-                raise ValueError(f"pixel mask shape {pixels.shape} does not match the strip's {valid_mask.shape}")
             valid_mask &= pixels
         # For the per-chunk record: eligible-but-refused, by reason. "Thin" counts only pixels that HAD optical and
         # lost on depth, so the two optical reasons partition rather than overlap and their sum is the optical refusal

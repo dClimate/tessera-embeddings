@@ -44,6 +44,7 @@ from tessera_embeddings.inference.data_loading import (
     load_chunk,
     load_s2_mask_bundle,
     make_store_opener,
+    restrict_to_pixels,
 )
 from tessera_embeddings.inference.progress import chunk_uid
 from tessera_embeddings.inference.read_plan import _chunk_read_plan
@@ -512,9 +513,11 @@ class InferenceActor:
         """
         store_opener = make_store_opener(region=self._s3_region)
         mask_bundle = load_s2_mask_bundle(mosaic_base, chunk, time_window, store_opener=store_opener)
-        x_sub, strips, live_strips = _chunk_read_plan(
-            chunk, mask_bundle, pixels=None if chunk.pixels is None else _pixel_mask(chunk.pixels)
-        )
+        pixels = None if chunk.pixels is None else _pixel_mask(chunk.pixels)
+        x_sub, strips, live_strips = _chunk_read_plan(chunk, mask_bundle, pixels=pixels)
+        if pixels is not None:
+            # After the plan, so the strips and crop stay an unrestricted load's: only the band reads shrink.
+            mask_bundle = restrict_to_pixels(mask_bundle, pixels)
         first_strip = self._load_strip_dataset(
             chunk,
             mosaic_base,

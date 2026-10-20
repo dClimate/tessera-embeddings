@@ -16,7 +16,7 @@ import datetime
 import logging
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 import icechunk
@@ -669,6 +669,24 @@ def load_s2_mask_bundle(
     )
 
 
+def restrict_to_pixels(bundle: S2MaskBundle, pixels: np.ndarray) -> S2MaskBundle:
+    """Keep only the timesteps on which at least one of ``pixels`` is valid.
+
+    A targeted update embeds only ``pixels`` (its holes), and each pixel's sequence is drawn from its own valid
+    timesteps alone, so a date valid only elsewhere in the tile is read for nothing. Ingest zeroes the bands wherever
+    SCL is invalid, so a dropped date holds nothing for any target pixel either. Observation counts and month flags
+    come from the pre-prune mask and are unchanged.
+
+    Apply it AFTER the read plan: the strips and the column crop must be the unrestricted bundle's, because they
+    decide which pixels share a sub-batch, and that is what keeps the outputs bit-identical.
+    """
+    keep = np.fromiter((plane[pixels].any() for plane in bundle.mask), dtype=bool, count=bundle.mask.shape[0])
+    if keep.all():
+        return bundle
+    logger.info("Pruned %d/%d S2 timesteps on which no target pixel is valid", int((~keep).sum()), keep.size)
+    return replace(bundle, mask=bundle.mask[keep], doys=bundle.doys[keep], abs_indices=bundle.abs_indices[keep])
+
+
 def _load_s2(
     mosaic_base: str,
     chunk: ChunkSpec,
@@ -717,16 +735,17 @@ def _load_s2(
         # obs_count > 0 ⟺ the pruned mask has a valid entry (pruning drops only all-False
         # planes), and the (H, W) scan avoids walking the strided (T_kept, H, W) mask view
         # (~100 ms/chunk on dense multi-strip chunks).
-        if not s2_obs_count.any():
+        if not s2_obs_count.any() or not abs_kept.size:
             # No valid S2 pixel anywhere in this strip: bucketing would select none, so the
             # 20 B/px band read is pure waste. Return a T=0 band stack — the dataset sees no
             # candidates and the strip short-circuits — while obs counts keep full fidelity
             # from the bundle. Common on sparse/edge chunks whose valid sliver lies in other
             # strips; the chunk-global timestep prune cannot help them (one sliver anywhere
-            # keeps the timestep).
+            # keeps the timestep). A bundle restricted to an update's holes reaches here with
+            # no timestep at all when no hole has an observation.
             h = y_slice.stop - y_slice.start
             w = x_slice.stop - x_slice.start
-            logger.info("Strip rows %s have no valid S2 pixels — skipping band read", rows)
+            logger.info("Strip rows %s have no S2 timestep to read — skipping band read", rows)
             empty = np.empty((0, h, w, len(S2_BAND_ORDER)), dtype=root[S2_BAND_ORDER[0]].dtype)
             return empty, s2_masks[:0], s2_doys[:0], s2_obs_count
 

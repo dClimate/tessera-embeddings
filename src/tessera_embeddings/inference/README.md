@@ -367,6 +367,16 @@ is still read, last, because the update rewrites every hole's observation counts
 A read still decompresses whole 512-row inner chunks (below), so a hole costs the rows of its
 chunk; the column crop saves the per-pixel work after the read.
 
+**It reads only the dates its holes can use.** Once the plan is made, `restrict_to_pixels` drops
+from the tile's mask bundle every date on which no hole is valid, so the reflectance bands are read
+for those dates alone. Every pixel's sequence comes from its own valid dates, and ingest zeroes the
+bands wherever SCL is invalid, so a dropped date carries nothing for any hole. The strips and the
+crop are planned from the unrestricted bundle first, which keeps the same pixels in each sub-batch
+and the outputs bit-identical. Observation counts still come from the full mask. Outside the holes
+the reflectance test then sees only part of the year, so the dataset counts a pixel there as having
+optical input by its SCL count, which is what that test equals on every measured registry row. Radar
+is read as before.
+
 **Peak host memory has one ceiling.** The load pipeline is one strip deep, so at most two
 band sets co-reside — the strip being inferred and the strip being read — and the pair is
 bounded at twice the budget. A full year of Iowa peaked at 50% of a 32 GB worker, under the
