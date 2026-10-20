@@ -177,11 +177,25 @@ graphics engine is active 0.96–0.97 of the inference loop; six workers made it
 busier. Gathering batches on the GPU, which avoids the CPU altogether, is the remaining idea and is
 untested; at most it recovers the last 3–5%, on this card only.
 
-**A compiler cache restores, but most of a fresh machine's compile lies outside it.** On an A10G whose
-cache was wiped, restoring an archived cache cut the autotuned layers' compile from 42 s to 1.4 s, while
-this branch's add + LayerNorm kernel took about 3 s either way. Its first call on a freshly booted machine
-took 104–120 s, so that cost is in work done once per machine outside the compiler's cache, such as first
-imports of the compiler stack. A warm-up during the worker image build is the likely remedy; untested.
+**A fresh worker's start-up is the disk, not the compiler.** Timed phase by phase on fresh `g5.2xlarge`
+boxes (`warm_probe.py`), the first v2 forward of a new machine's first process took 354 s: 104 s importing
+PyTorch, 52 s importing its compiler, 64 s building the model, 23 s in the first library calls and 109 s in
+the first forward. Run again with the disk's blocks already fetched but no bytecode and the compiler cache
+wiped, the same process took 15 s; bytecode saved a further 6 s and a warm compiler cache under 1 s. So 339
+of the 354 s are the new EBS volume loading the image's snapshot block by block on first read, and the
+kernel compile itself is about 3 s. Baking bytecode and a compiler cache into the image saves about 7 s.
+
+| fresh worker, first v2 forward | before it | first forward | total |
+|---|---:|---:|---:|
+| today's image | — | 354 s | 354 s |
+| read the 6.4 GB Python environment in parallel at boot | 202 s | 20 s | 222 s |
+| Fast Snapshot Restore on the image's snapshot | — | 36 s | 36 s |
+
+Fast Snapshot Restore removes nine-tenths of it, but AWS grants an 80 GiB snapshot 10 fast-restored
+volumes per AZ, refilling at 10 per hour, at $0.75 per snapshot per AZ-hour; later volumes load the slow
+way. That covers steady replacement, not a fleet of hundreds starting together. Two remedies that would
+scale are untested: EBS's provisioned volume-initialization rate, priced per GiB initialized, and
+installing the environment onto the instance's NVMe from an S3 archive at boot.
 
 ## 8. Where the rest of a paid GPU-hour goes
 
@@ -204,7 +218,7 @@ while `g6e.xlarge` spot sat at its on-demand price. Spot capacity and interrupti
 ## 9. Not measured
 
 - The two changes together over a whole campaign cell, and the A10G beyond one tile.
-- A warm-up in the worker image build, to remove the fresh-machine compile.
+- EBS's provisioned volume-initialization rate, and an environment installed onto NVMe from S3 at boot.
 - Gathering batches on the GPU.
 - v1.1 with the fused layer. Its encoder uses the same layers, but its published store keeps its
   arithmetic, so it was left alone.
