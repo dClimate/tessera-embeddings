@@ -175,13 +175,13 @@ every tile and year.
   - The log message confirming that the second attempt correctly resumed the first attempt's downloads never
     reached the orchestration logs, so we confirmed it from the downloaded data instead.
   - The GPU profiling tool's live report stopped early unless its samplers had been started (fixed in PR #236).
-  - The cost script has no prices for the ARM-based machines ingest now runs on, so it leaves their usage out.
+  - The cost script had no prices for the ARM-based machines ingest now runs on, so it left their usage out
+    (fixed in PR #239).
 
 ## Still open
 
 - **Cleaning up the "before" version of the store.** Removing the pre-update version frees storage but makes
   rolling back impossible, so it needs its own decision.
-- **Adding ARM machine prices to the cost script** (`scripts/scoping/campaign_cost_actuals.py`).
 - **Whether to give the GPU setup a second machine type to fall back to.**
 - **Testing a larger batch size for ingest writes**, as set out in §3.21 of the ingest measurements.
 - **Imagery dropped by how the ingest chooses between catalogue copies.** While measuring a follow-up, we found
