@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Literal, final
 
@@ -516,10 +517,23 @@ def encoder_url(model_version: ModelVersion = DEFAULT_MODEL_VERSION) -> str:
 # transformer. Multiples of 8 from 8 to 256 match tessera v1.1 defaults.
 DEFAULT_NUM_OBS_CHECKPOINTS: tuple[int, ...] = tuple(range(8, 257, 8))
 
-# CPU batch-prep pipeline depth for the inference loop, and the number of prep workers.
-# Depth 1 starved the GPU whenever a forward ran shorter than one prep; depth 2 keeps a batch
-# ready across consecutive short forwards.
-PREFETCH_DEPTH = 2
+# Bounds on the CPU batch-prep pipeline depth for the inference loop, which is also its number of prep
+# workers. Depth 1 starved the GPU whenever a forward ran shorter than one prep; depth 2 keeps a batch
+# ready across consecutive short forwards. The ceiling is the deepest depth measured
+# (context_docs/inference/v2-on-blackwell.md §4).
+MIN_PREFETCH_DEPTH, MAX_PREFETCH_DEPTH = 2, 4
+
+
+def prefetch_depth(cpus: int | None = None) -> int:
+    """Batch-prep workers for a host with *cpus* vCPUs (default: this one): one per two, from 2 to 4.
+
+    A faster card can outrun two workers and then waits on CPU prep between batches; a host with spare
+    vCPUs runs more of them. Extra workers change only scheduling, so outputs are bit-identical at any
+    depth. Empirical: context_docs/inference/v2-on-blackwell.md §4.
+    """
+    available = os.cpu_count() if cpus is None else cpus
+    return max(MIN_PREFETCH_DEPTH, min(MAX_PREFETCH_DEPTH, (available or 0) // 2))
+
 
 # Spatial read-tile size for inference, on both paths: one tile is exactly one 2048-px output
 # shard (ADR-008 D3), so assembly writes whole shards instead of read-modify-writing a partial

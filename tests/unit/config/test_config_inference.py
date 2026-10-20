@@ -16,6 +16,7 @@ from tessera_embeddings.config.inference import (
     band_stats,
     batch_size_for_gpu,
     checkpoint_filename,
+    prefetch_depth,
 )
 from tessera_embeddings.config.time_windows import parse_time_window
 
@@ -318,6 +319,12 @@ class TestActorRequestPolicy:
         assert bounded.initial_actor_request(250) == 25
         # A target smaller than either still wins, so a tiny run does not over-ask.
         assert bounded.initial_actor_request(10) == 10
+
+
+@pytest.mark.parametrize(("cpus", "depth"), [(1, 2), (4, 2), (8, 4), (64, 4)])
+def test_prefetch_depth_follows_vcpus_within_its_bounds(cpus: int, depth: int) -> None:
+    """Two workers on a 4-vCPU g6e.xlarge, four on an 8-vCPU host, never more than measured."""
+    assert prefetch_depth(cpus) == depth
 
 
 # ---------------------------------------------------------------------------

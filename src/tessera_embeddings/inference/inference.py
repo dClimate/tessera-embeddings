@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
-from tessera_embeddings.config.inference import EMBEDDING_DIM, PREFETCH_DEPTH, InferenceConfig
+from tessera_embeddings.config.inference import EMBEDDING_DIM, InferenceConfig, prefetch_depth
 from tessera_embeddings.inference.dataset import MosaicChunkInferenceDataset
 from tessera_embeddings.inference.models.ssl_model import MultimodalBTInferenceModel
 from tessera_embeddings.inference.profiling import (
@@ -611,19 +611,21 @@ def run_inference(
         on_batch=on_batch,
     )
 
-    # PREFETCH_DEPTH prep workers keep that many batches staged: depth 1 starved the GPU whenever a forward ran
-    # shorter than one CPU prep (partial sub-batches, short sequences). Quantization is not a CPU stage — it runs
-    # on-device — so the scatter-back is a cheap memcpy either way.
+    # `depth` prep workers keep that many batches staged: depth 1 starved the GPU whenever a forward ran
+    # shorter than one CPU prep (partial sub-batches, short sequences), and a host with more vCPUs runs more
+    # (prefetch_depth). Quantization is not a CPU stage — it runs on-device — so the scatter-back is a cheap
+    # memcpy either way.
     use_pipelined = device.type == "cuda" and not os.environ.get(_SERIAL_LOOP_ENV)
-    with torch.no_grad(), ThreadPoolExecutor(max_workers=PREFETCH_DEPTH, thread_name_prefix="prefetch") as pool:
+    depth = prefetch_depth()
+    with torch.no_grad(), ThreadPoolExecutor(max_workers=depth, thread_name_prefix="prefetch") as pool:
         prefetched: deque[Future[tuple[dict[str, np.ndarray], float]]] = deque()
-        for j in range(min(PREFETCH_DEPTH, len(sub_batches))):
+        for j in range(min(depth, len(sub_batches))):
             prefetched.append(pool.submit(_prepare_batch, dataset, *sub_batches[j]))
 
         def _batches() -> _BatchIter:
             for i, (bucket_key, start, end) in enumerate(sub_batches):
                 batch, get_batch_secs = prefetched.popleft().result()
-                nxt = i + PREFETCH_DEPTH
+                nxt = i + depth
                 if nxt < len(sub_batches):
                     prefetched.append(pool.submit(_prepare_batch, dataset, *sub_batches[nxt]))
                 yield i, bucket_key, start, end, batch, get_batch_secs

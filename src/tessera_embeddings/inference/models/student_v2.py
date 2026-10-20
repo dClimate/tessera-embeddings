@@ -41,6 +41,8 @@ BF16 model neither loses DOY precision nor silently upcasts the transformer.
 
 from __future__ import annotations
 
+import functools
+from collections.abc import Callable
 from typing import cast
 
 import torch
@@ -129,6 +131,51 @@ class QKNormEncoderLayer(nn.Module):
         return self.norm2(x + self.dropout2(self.linear2(self.dropout(F.relu(self.linear1(x))))))
 
 
+def _add_layer_norm(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float
+) -> torch.Tensor:
+    """``LayerNorm(x + residual)``: the step after each sub-layer of a post-norm encoder layer."""
+    return F.layer_norm(x + residual, (x.shape[-1],), weight, bias, eps)
+
+
+@functools.cache
+def _compiled_add_layer_norm() -> Callable[..., torch.Tensor]:
+    """``_add_layer_norm`` as one GPU kernel, compiled once per process.
+
+    Eager makes two passes over ``(B, T, D)``, the add and then the LayerNorm; one kernel reads both inputs
+    and writes the result once. ``emulate_precision_casts`` rounds the sum to the input dtype where eager
+    does, but the kernel's LayerNorm reduces in a different order from aten's, so outputs move slightly
+    (ADR 030). ``dynamic=True`` keeps one kernel across every bucket length.
+    """
+    compiled = torch.compile(_add_layer_norm, dynamic=True, options={"emulate_precision_casts": True})
+    return cast(Callable[..., torch.Tensor], compiled)
+
+
+def _encoder_layer_forward(
+    layer: nn.TransformerEncoderLayer, x: torch.Tensor, add_layer_norm: Callable[..., torch.Tensor]
+) -> torch.Tensor:
+    """Inference forward of a post-norm ReLU ``layer`` from its own weights, ending each sub-layer in *add_layer_norm*.
+
+    The kernels of PyTorch's fused encoder-layer fast path, called one by one: a single QKV projection,
+    ``scaled_dot_product_attention`` (FlashAttention on the GPU), the output projection, add + LayerNorm,
+    the first FFN projection with its bias and ReLU in the matmul's epilogue, the second, add + LayerNorm.
+    Given the plain :func:`_add_layer_norm` it computes ``layer(x)``; the fast path is one opaque operator,
+    so this is the only way to fuse its add and LayerNorm. No dropout: inference only.
+    """
+    b, t, e = x.shape
+    attn = layer.self_attn
+    qkv = F.linear(x, attn.in_proj_weight, attn.in_proj_bias).view(b, t, 3, attn.num_heads, e // attn.num_heads)
+    q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)  # each (B, heads, T, head_dim), head_dim contiguous
+    o = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(b, t, e)
+    x = add_layer_norm(
+        x, F.linear(o, attn.out_proj.weight, attn.out_proj.bias), layer.norm1.weight, layer.norm1.bias, layer.norm1.eps
+    )
+    h = torch._addmm_activation(layer.linear1.bias, x.reshape(-1, e), layer.linear1.weight.t()).view(b, t, -1)
+    return add_layer_norm(
+        x, F.linear(h, layer.linear2.weight, layer.linear2.bias), layer.norm2.weight, layer.norm2.bias, layer.norm2.eps
+    )
+
+
 class StudentTransformerEncoder(nn.Module):
     """Per-pixel band embedding + DOY positional encoding + transformer + attention pool.
 
@@ -138,7 +185,9 @@ class StudentTransformerEncoder(nn.Module):
 
     ``enable_qk_norm=False`` (default) uses the standard
     ``nn.TransformerEncoderLayer`` stack (ReLU, no QK-norm); ``True`` uses
-    :class:`QKNormEncoderLayer`.
+    :class:`QKNormEncoderLayer`. In inference on CUDA the standard stack runs through
+    :func:`_encoder_layer_forward` with each residual add and LayerNorm fused into one kernel; on
+    CPU, and in training, it runs the modules as written.
     """
 
     def __init__(
@@ -197,6 +246,10 @@ class StudentTransformerEncoder(nn.Module):
         if self.enable_qk_norm:
             for layer in cast("nn.ModuleList", self.transformer_encoder):
                 x = layer(x)
+        elif x.is_cuda and not self.training and x.shape[1] > 0:
+            add_layer_norm = _compiled_add_layer_norm()
+            for layer in cast("nn.TransformerEncoder", self.transformer_encoder).layers:
+                x = _encoder_layer_forward(cast("nn.TransformerEncoderLayer", layer), x, add_layer_norm)
         else:
             x = self.transformer_encoder(x)
         return self.attn_pool(x)

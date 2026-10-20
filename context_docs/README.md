@@ -44,7 +44,8 @@ context_docs/
 │   ├── 025-library-upgrades-ship-on-measured-usability-at-a-store-boundary.md
 │   ├── 026-v1-1-runs-the-gru-it-was-trained-with.md
 │   ├── 027-targeted-updates.md
-│   └── 028-embed-every-pixel-with-an-optical-observation.md
+│   ├── 028-embed-every-pixel-with-an-optical-observation.md
+│   └── 030-forward-pass-reorderings-ship-at-a-store-boundary.md
 │
 ├── campaign/                      THE GLOBAL CAMPAIGN — start here
 │   ├── campaign-plan.md                        <- START HERE. What runs, with what settings, in
@@ -88,6 +89,9 @@ context_docs/
 │   │                                              one observation. Four measurement campaigns
 │   ├── gpu-fleet-launch-throttling.md          why several clusters asking EC2 for GPUs at once
 │   │                                              throttle each other, and the two bounds
+│   ├── v2-on-blackwell.md                      the g7e (RTX PRO 6000) against the fleet's cards,
+│   │                                              v2's fused add + LayerNorm, prep workers by host
+│   │                                              size, outputs across cards, g7e capacity
 │   └── the-fleet-and-the-work-source.md        a fleet lives for one `run_inference` call, so a
 │                                                  retry through a second call rebuilt one; the
 │                                                  wind-down, and why the fleet is not held

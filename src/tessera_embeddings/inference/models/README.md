@@ -17,7 +17,7 @@ has to treat sampling as model-specific
 |---|---|---|
 | `modules.py` | `tessera_infer/src/models/modules.py` | Type hints, ruff formatting. Upstream's `TransformerEncoder` renamed `V11TransformerEncoder` (upstream v2 has a same-named class; see `student_v2.py`). `TemporalPositionalEncoder` caches `div_term` per device in FP32 (computed on the CPU for v1.1 and on the device for v2, as each upstream does) and takes an explicit output dtype, and the encoder casts bands (not DOY) to the weights' dtype — see "The input stays FP32" in `../README.md` §7. `TemporalAwarePooling` runs its GRU, LayerNorm and attention score as one compiled step per timestep. Layer shapes and forward-pass math are unchanged. |
 | `ssl_model.py` | `tessera_infer/src/models/ssl_model.py` | Type hints, ruff formatting. Backbone annotations widened to `nn.Module` so the wrapper hosts either version's backbones. |
-| `student_v2.py` | `geotessera/TESSERA-V-2.0-2B-L` (Hugging Face) `model.py`, = `ucam-eo/tessera` `tessera_infer_v2/student/model.py` | Type hints, ruff formatting; upstream's `TransformerEncoder` renamed `StudentTransformerEncoder`; upstream's inline positional encoder replaced by the shared `modules.TemporalPositionalEncoder` (bit-identical at fp32, plus an explicit output-dtype cast and a per-device FP32 `div_term` cache); the top-level `PixelStudent` assembly is not duplicated — see below. |
+| `student_v2.py` | `geotessera/TESSERA-V-2.0-2B-L` (Hugging Face) `model.py`, = `ucam-eo/tessera` `tessera_infer_v2/student/model.py` | Type hints, ruff formatting; upstream's `TransformerEncoder` renamed `StudentTransformerEncoder`; upstream's inline positional encoder replaced by the shared `modules.TemporalPositionalEncoder` (bit-identical at fp32, plus an explicit output-dtype cast and a per-device FP32 `div_term` cache); in inference on CUDA the encoder layers run through `_encoder_layer_forward` with each residual add + LayerNorm as one compiled kernel, which moves outputs slightly (ADR 030; `../README.md` §7); the top-level `PixelStudent` assembly is not duplicated — see below. |
 | `builder.py` | `tessera_infer/src/models/builder.py` | Type hints, ruff formatting. Added FSDP prefix stripping in `load_v11_checkpoint()`, plus the v2 build/load path (`_build_v2_inference_model`, `load_v2_checkpoint`, `_verify_v2_args`). |
 
 Both models are pinned to upstream by golden tests that run a **verbatim** copy of
@@ -30,6 +30,11 @@ upstream's code beside our port on the real checkpoint, in FP32 on CPU:
 
 Each skips unless its environment variable points at the checkpoint, and refuses a file whose digest
 differs. Re-fetch instructions are in the vendored files' headers.
+
+They run on CPU, where v2 runs its encoder modules as written. v2's CUDA path is held to them in two
+steps: `test_hand_written_encoder_layer_computes_the_module` pins `_encoder_layer_forward` to the
+modules, and the fused add + LayerNorm it adds on the GPU was measured against today's output on
+three cards ([ADR 030](../../../../context_docs/decisions/030-forward-pass-reorderings-ship-at-a-store-boundary.md)).
 
 ## v1.1 vs v2 Large
 
