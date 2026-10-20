@@ -183,7 +183,25 @@ this branch's add + LayerNorm kernel took about 3 s either way. Its first call o
 took 104–120 s, so that cost is in work done once per machine outside the compiler's cache, such as first
 imports of the compiler stack. A warm-up during the worker image build is the likely remedy; untested.
 
-## 8. Not measured
+## 8. Where the rest of a paid GPU-hour goes
+
+The October v2 full-stack run (eight `g6e.xlarge`, sharded mosaics, the current loader, 394 Iowa tiles;
+its `CHUNK_SUMMARY` lines in `/ec2/global-tessera-dev/ray`, its billing in
+`s3://global-tessera-inputs-dev/perf/_v2_fullstack/`) shows how little is left outside the forward pass:
+
+| layer | kept | lost to |
+|---|---:|---|
+| billed GPU-hours → processing tiles | 95% | boot, model load, idle grace, the tail |
+| tile time → inference loop | 95.6% | 15 cold first tiles; prefetched tiles median 0.0 s prologue, 0.3 s overhead |
+| inference loop → GPU busy | ~98% on an L40S, ~95% on the RTX PRO 6000 | waits on CPU batch prep |
+
+This branch's harness shows far more exposed prologue (11–19 s per tile) because its Iowa mosaic predates
+sharding and its runs are three tiles long; production mosaics do not. What remains is inside the
+forward pass (§3, §7) and in what a GPU-hour costs: on 2026-10-20 a `g7e.2xlarge` spot price was $1.91–1.94
+in two AZs and a `g5.2xlarge` $0.41–0.47, about half an on-demand `g6e.xlarge`'s cost per v2 token,
+while `g6e.xlarge` spot sat at its on-demand price. Spot capacity and interruptions were not measured.
+
+## 9. Not measured
 
 - The two changes together over a whole campaign cell, and the A10G beyond one tile.
 - A warm-up in the worker image build, to remove the fresh-machine compile.
