@@ -153,28 +153,41 @@ a reservation needs only an AZ, refusals are free) and with real launches:
 Spot placement scores say nothing here: the account's spot quota is 64 vCPU, so every target scores "unlikely".
 The Ray VPC has no subnet in us-west-2d. One day is one sample.
 
-## 7. Headroom past the fused layer, on the RTX PRO 6000
+## 7. Headroom past the fused layer
 
-With this branch, a v2 forward runs at roughly 80% of the card's sustained matmul rate at v2's layer
-widths. What is left was probed on the forward benchmark, against this branch:
+With this branch, a v2 forward on the RTX PRO 6000 runs at roughly 80% of the card's sustained matmul rate
+at v2's layer widths. What is left was probed against this branch, first on the forward benchmark and then,
+for what looked promising, in the real pipeline (steady state, same strips):
 
-| change | forward vs this branch | int8 identical to today | |
-|---|---:|---:|---|
-| attention on the memory-efficient kernel | 0.932× | 94.2% | slower; FlashAttention stays |
-| attention on cuDNN | — | — | no kernel for head dim 160 on this card |
-| the layers compiled with `max-autotune-no-cudagraphs` | **1.059×** | 95.6% | searched GEMM kernels replace part of cuBLAS's sm_80 choices |
+| change | forward, RTX PRO 6000 | pipeline: RTX PRO 6000 | L40S | A10G |
+|---|---:|---:|---:|---:|
+| attention on the memory-efficient kernel | 0.932× | — | — | — |
+| attention on cuDNN | no kernel for head dim 160 | — | — | — |
+| layers compiled with `max-autotune-no-cudagraphs` | 1.059× | **0.951×** | 0.997× | 1.036× |
+| six prep workers instead of four | — | 0.983× | — | — |
 
-The searched kernels are the one lever left inside the forward pass. They are untested on the other
-cards and in the pipeline, they lengthen the fresh-machine compile, and they reorder arithmetic again
-(ADR 030). Outside it, the card still waits on the host: in the pipeline the graphics engine is active
-0.96 of the inference loop and the SMs 0.94, in bursts, a fifth of one-second samples below 0.9. Gathering
-each batch on the GPU from strip arrays already resident there would remove that wait without changing
-any value.
+**Searched GEMM kernels do not ship.** The forward benchmark's gain does not survive the pipeline's bucket
+mix on the RTX PRO 6000, where it is slower, and it is level on the L40S. On the A10G it gains 3.6% but one
+of its kernels made an illegal memory access at the deepest bucket of the forward benchmark (256/104 at
+batch 3,593), a shape global runs reach. Outputs were in the same class as this branch's (98.1–98.4% of
+int8 values identical to today's).
+
+**More prep threads are not the remedy for the remaining host wait.** With four workers the RTX PRO 6000's
+graphics engine is active 0.96–0.97 of the inference loop; six workers made it slower and left the SMs no
+busier. Gathering batches on the GPU, which avoids the CPU altogether, is the remaining idea and is
+untested; at most it recovers the last 3–5%, on this card only.
+
+**A compiler cache restores, but most of a fresh machine's compile lies outside it.** On an A10G whose
+cache was wiped, restoring an archived cache cut the autotuned layers' compile from 42 s to 1.4 s, while
+this branch's add + LayerNorm kernel took about 3 s either way. Its first call on a freshly booted machine
+took 104–120 s, so that cost is in work done once per machine outside the compiler's cache, such as first
+imports of the compiler stack. A warm-up during the worker image build is the likely remedy; untested.
 
 ## 8. Not measured
 
 - The two changes together over a whole campaign cell, and the A10G beyond one tile.
-- A compiler cache baked into the worker image, which would remove the fresh-machine compile.
+- A warm-up in the worker image build, to remove the fresh-machine compile.
+- Gathering batches on the GPU.
 - v1.1 with the fused layer. Its encoder uses the same layers, but its published store keeps its
   arithmetic, so it was left alone.
 - `g7e` capacity on any other day.
