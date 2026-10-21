@@ -65,16 +65,18 @@ For fully reproducible GPU deploys, generate a pinned constraints file in
 your deployment repo:
 
 ```bash
+# Pin uv.lock's torch version; pyproject.toml asks for any torch, which would take the index's newest.
+echo "torch==2.14.1" > torch-pin.txt
 uv pip compile pyproject.toml \
     --extra inference --extra prefect --extra aws \
     --python-platform linux --python-version 3.12 \
     --extra-index-url https://download.pytorch.org/whl/cu130 \
-    --no-sources \
+    --no-sources --constraint torch-pin.txt \
     -o constraints-cu130.txt
 
-# Verify, every time. The filename is not a guarantee:
-grep -E '^(torch|nvidia-cuda-runtime)' constraints-cu130.txt
-# torch==2.14.1+cu130, and a CUDA 13.0 runtime package
+# Verify, every time. The filename is not a guarantee; each line fails if its pin is wrong:
+grep -x 'torch==2.14.1+cu130' constraints-cu130.txt
+grep -E '^nvidia-cuda-runtime==13\.' constraints-cu130.txt
 ```
 
 **No `--index-strategy unsafe-best-match` here, deliberately.** It searches every index and takes

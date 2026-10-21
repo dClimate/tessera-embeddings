@@ -882,8 +882,10 @@ it" safe.
 **Not guarded: the workers' library stack.** The code identity hashes our source, not PyTorch or
 CUDA, so nothing refuses an append made on a different stack. The rule is procedural
 ([ADR 025](../decisions/025-library-upgrades-ship-on-measured-usability-at-a-store-boundary.md)): a
-stack changes only between fills, and a store begun on one stack is finished on it, by naming that
-stack's worker image in the run's `ami_ssm_name`. Every published year, 2017–2025, was inferred on
+stack changes only between fills, and a store begun on one stack is finished on it, later years
+included, by naming that stack's worker image in the run's `ami_ssm_name`. A run on a different
+stack from the one that staged its tiles also passes a fresh `force_staging_restage` token, since
+the staging fingerprint cannot see the image. Every published year, 2017–2025, was inferred on
 **PyTorch 2.5.1 with CUDA 12.1**. Record each later switch here, with its date and worker image.
 
 ### When a re-run is free

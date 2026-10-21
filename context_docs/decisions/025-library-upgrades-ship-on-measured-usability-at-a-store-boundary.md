@@ -37,9 +37,12 @@ against itself across two runs.**
    production-path tiles from both models. Usability means top-20 neighbour agreement at or above the
    same-model ceiling of [`../inference/validating-a-model-change.md`](../inference/validating-a-model-change.md)
    (0.9940), measured on the same tiles. Footprint and observation-count layers stay exact.
-2. **An upgrade lands at a store boundary, never inside a store.** Areas and years started after the
-   switch use the new stack. A store begun on the old stack is finished on it: the worker image is a
-   per-run flow parameter (`ami_ssm_name`), so an append can name the old image.
+2. **An upgrade lands at a store boundary, never inside a store.** Stores started after the switch use
+   the new stack. A store begun on the old stack is finished on it, including every year, area or
+   update later appended to it, such as a new year in the global store: the worker image is a per-run
+   flow parameter (`ami_ssm_name`), so an append can name the old image. The staging fingerprint does
+   not include the image either, so a run on a different stack from the one that staged its tiles
+   passes a fresh `force_staging_restage` token rather than reusing them.
 3. **The workers run the lockfile's torch version,** as that version's CUDA build. Tests, the driver
    image and the workers then run one version, and moving it is a lockfile change.
 
