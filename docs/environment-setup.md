@@ -59,8 +59,11 @@ which must stay in step. Neither depends on CUDA — that job syncs without `--n
 `[tool.uv.sources]` holds torch to the CPU index.
 
 ```bash
-# 1. Install CUDA torch from the pytorch index (supported: Python 3.12-3.13)
+# 1. Install CUDA torch from the pytorch index for the model you run (supported: Python 3.12-3.13).
+#    v2:
 pip install "torch==2.14.1+cu130" --index-url https://download.pytorch.org/whl/cu130
+#    v1.1, the default model, on the stack its published store was inferred on:
+pip install "torch==2.5.1+cu121" --index-url https://download.pytorch.org/whl/cu121
 
 # 2. Install the package — pip sees torch already satisfied, keeps the CUDA wheel
 pip install "tessera_embeddings[inference]"
@@ -83,6 +86,9 @@ uv pip compile pyproject.toml \
 grep -x 'torch==2.14.1+cu130' constraints-cu130.txt
 grep -E '^nvidia-cuda-runtime==13\.' constraints-cu130.txt
 ```
+
+That is v2's stack. For v1.1's, pin `torch==2.5.1`, use the `cu121` index, and check for
+`torch==2.5.1+cu121` and `nvidia-cuda-runtime-cu12==12.1.`.
 
 **No `--index-strategy unsafe-best-match` here, deliberately.** It searches every index and takes
 the best *version* found anywhere, so PyPI's newest torch, built for whatever CUDA PyPI defaults
