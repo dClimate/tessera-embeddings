@@ -16,15 +16,18 @@ observations, and up to a fifth of a year where a boundary crosses a tile on mos
 ## Decision
 
 1. **An acquisition is named by the datatake plus the datastrip's sensing start**, read from
-   `s2:datastrip_id` (`ingest/duplicates._by_acquisition`). Every granule of a split pass is
-   kept. Reprocessing keeps the sensing start, so copies of one datastrip still compete and the
+   `s2:datatake_id` and `s2:datastrip_id` (`ingest/duplicates.image_identity`), and nothing else.
+   Every granule of a split pass is kept. Reprocessing keeps the sensing start, so copies of one datastrip still compete and the
    newest baseline still wins.
 2. **Coverage outranks one baseline per pass.** Where a reprocessing omits a datastrip, the older
    copy of it is kept beside the newer ones, so a day can mix baselines across datastrips, never
    within one. Before ADR 021 that mix could mis-correct pixels; with the offset corrected per image
    it costs only a less precise `baselines_applied` and two reads where one would do.
-3. A pass any copy of which names no readable datastrip is not split, so it reduces to one copy as
-   before: that copy could be a reprocessing of any of the pass's images.
+3. **Copies are merged only on proof.** A copy whose pass or datastrip cannot be read is kept as an
+   image of its own, with no spares, and the catalogue timestamp is not used to place it. Keeping a
+   copy that was in fact a duplicate costs a second read and a missing fallback rung; merging two
+   images loses ground. This retires the timestamp clustering and arbitrary attachment that ADR 020
+   decision 4 kept as fallbacks.
 
 ## Consequences
 

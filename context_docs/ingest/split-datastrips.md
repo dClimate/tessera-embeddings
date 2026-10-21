@@ -124,10 +124,20 @@ land below 15 clear observations. The store measurement (§7) replaces this.
 
 ## 5. The fix
 
-`_by_acquisition`, which groups a tile-date's copies into acquisitions, now splits each pass by the
-datastrip's sensing start (`datastrip_start`, read from `s2:datastrip_id`). Everything that asks
-whether two items are one acquisition goes through it — clustering, ranking within an acquisition,
-and the fallback ladder's attribution and placement — so nothing else changed.
+**Which image a copy is of is one function**, `image_identity`: the pass from `s2:datatake_id` and the
+datastrip's sensing start from `s2:datastrip_id`, or nothing if either cannot be read. Selection groups
+a tile-date's copies by it, keeps the best copy of each image, and offers the rest as that image's
+spares; a read failure steps a copy down to a spare of its own image and no other.
+
+**Copies are merged only on proof.** A copy whose image cannot be read is kept as an image of its own,
+with no spares. The code this replaces leaned the other way: where the datatake was missing it placed a
+copy by its catalogue timestamp (within 120 s), attached a copy with neither to an arbitrary acquisition,
+and ranked such copies below known ones so they could not win that acquisition. All of that existed to
+keep two copies of one image from being fused, which mis-corrected pixels before the offset was corrected
+per image (ADR 021). Since then, fusing a duplicate costs only a second read and a missing fallback
+rung, while merging two images loses ground. Splitting passes by datastrip on top of those rules
+produced a new edge case each time one was patched in review; reading identity from the two identifiers
+alone removes the whole class, and the timestamp is no longer read at all.
 
 - A split pass keeps every granule.
 - Copies of one datastrip still compete, and the newest baseline still wins (the stable row).
@@ -135,9 +145,8 @@ and the fallback ladder's attribution and placement — so nothing else changed.
 - Where a reprocessing omits a datastrip (the lacks row), the older copy of that datastrip is kept
   beside the newer ones. The day then mixes baselines across datastrips, never within one: coverage
   outranks one baseline per pass ([ADR 029](../decisions/029-an-acquisition-is-one-datastrip-of-one-pass.md)).
-- A pass any copy of which names no readable datastrip is not split, so it reduces to one copy as
-  before: that copy could be a reprocessing of any of the pass's images, and splitting around it would
-  keep and fuse two copies of one. No such copy was found in the corpus.
+- A copy naming no readable pass or datastrip is kept on its own, and the run logs how many. None was
+  found in the corpus.
 
 **Equivalence gate.** Over the whole corpus the fixed rule decides differently on 64,811 tile-dates,
 and every one of them holds a datatake with more than one datastrip. The branch's own code agrees with
@@ -148,11 +157,10 @@ sample points, almost all of it one datastrip at two baselines whose newer footp
 metres narrower at a swath edge (no-data differing by about 0.25 points). That comes from preferring
 the newest baseline and is unchanged by this fix.
 
-**Tests** (`tests/unit/ingest/test_duplicate_granules.py`, `TestADatastripSplitIsTwoAcquisitions`) use
-the catalogue's own values for 18NUN, a 33UUP split that survived reprocessing, and a 17QRE pass whose
-reprocessing omitted a datastrip, plus the two cases a copy's missing metadata raises: one naming no
-datastrip, and one with no datatake that is placed by its timestamp. Those that encode the fix fail on
-the old rule.
+**Tests** (`tests/unit/ingest/test_duplicate_granules.py`, `TestADatastripSplitIsTwoImages`) use the
+catalogue's own values for 18NUN, a 33UUP split that survived reprocessing, and a 17QRE pass whose
+reprocessing omitted a datastrip, plus a copy whose image cannot be read, which is kept on its own and
+given no spare. Those that encode the fix fail on the old rule.
 
 ## 6. Radar is not affected
 

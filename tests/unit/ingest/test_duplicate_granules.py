@@ -30,14 +30,11 @@ from tessera_embeddings.ingest.asset_locations import (
     read_set_is_complete,
 )
 from tessera_embeddings.ingest.duplicates import (
-    _first_for_failed_acquisition,
     _preference_key,
-    acquisition_identity,
-    acquisition_instant,
     alternates_for,
     cause_was_flattened,
     copies_label,
-    datastrip_start,
+    image_identity,
     is_provider_refusal,
     is_unreadable_source,
     item_processing_baseline,
@@ -50,15 +47,27 @@ from tessera_embeddings.ingest.duplicates import (
 from tessera_embeddings.ingest.solar_days import normalize_to_solar_day
 
 
+def _image(pass_no: int = 0, strip_no: int = 0) -> dict[str, str]:
+    """The identifiers of one image: doubles built from the same numbers are copies of one image."""
+    return {
+        "s2:datatake_id": f"GS2B_20210908T{100000 + pass_no:06d}_{pass_no:06d}_N05.00",
+        "s2:datastrip_id": f"S2B_OPER_MSI_L2A_DS_TEST_20210908T120000_S20210908T{110000 + strip_no:06d}_N05.00",
+    }
+
+
 class _Item:
-    """Stands in for a pystac Item, carrying only what the selector reads."""
+    """Stands in for a pystac Item, carrying only what the selector reads.
+
+    A copy of one image unless the test says otherwise (:func:`_image`), because selection only
+    compares copies of one image; pass ``None`` for an identifier to make a copy that names none.
+    """
 
     def __init__(self, ident: str, tile: str | None = None, sequence: str | None = None, **extra: object) -> None:
         self.id = ident
         # Every item reaching the selector has passed normalize_to_solar_day, whose canonical
         # stamp is noon UTC; solar_day_of RAISES on anything else, so the fixture must match.
         self.datetime = datetime(2021, 9, 8, 12, 0, 0, tzinfo=UTC)
-        self.properties: dict[str, object] = dict(extra)
+        self.properties: dict[str, object] = {**_image(), **extra}
         if tile is not None:
             self.properties["grid:code"] = tile
         if sequence is not None:
@@ -73,57 +82,26 @@ def _pair() -> tuple[_Item, _Item]:
 
 
 class TestAgainstRealPystacItems:
-    """The claim that `normalize_to_solar_day` destroys the acquisition instant, settled.
-
-    Reviewers have raised this four times: that assigning `pystac.Item.datetime` writes
-    through to `properties["datetime"]`, so `acquisition_instant` reads canonical noon for
-    every copy and distinct same-day passes collapse into one reprocessing group — real
-    imagery silently dropped at high latitudes, where successive orbits overlap.
-
-    It is a good failure to worry about and it is not what pystac does: `datetime` is a
-    plain instance attribute with no descriptor behind it, so the assignment leaves
-    `properties` untouched. Every other test in this file uses a double, which is exactly
-    the objection someone could raise next — so this one drives REAL `pystac.Item`s
-    through the real `normalize_to_solar_day` and asserts on the outcome, not the mechanism.
-    """
+    """Selection on real `pystac.Item`s after the real `normalize_to_solar_day`, not on doubles."""
 
     @staticmethod
-    def _real(ident: str, tile: str, sequence: str, acquired: str) -> pystac.Item:
+    def _real(ident: str, sequence: str, image: dict[str, str]) -> pystac.Item:
         return pystac.Item(
             id=ident,
             geometry=None,
             bbox=None,
-            datetime=datetime.fromisoformat(acquired.replace("Z", "+00:00")),
-            properties={"grid:code": tile, "s2:sequence": sequence, "datetime": acquired},
+            datetime=datetime(2021, 9, 8, 10, 20, 31, tzinfo=UTC),
+            properties={"grid:code": "MGRS-33XVG", "s2:sequence": sequence, **image},
         )
 
-    def test_normalising_leaves_the_acquisition_instant_in_properties(self) -> None:
-        item = self._real("S2A_33XVG_20210908_0_L2A", "MGRS-33XVG", "0", "2021-09-08T10:20:31.024000Z")
-        normalize_to_solar_day([item], mid_longitude=15.0)
+    def test_copies_of_one_image_reduce_and_another_image_survives(self) -> None:
+        old = self._real("S2B_33XVG_20210908_0_L2A", "0", _image(0))
+        new = self._real("S2B_33XVG_20210908_1_L2A", "1", _image(0))
+        other = self._real("S2A_33XVG_20210908_0_L2A", "0", _image(1))
+        normalize_to_solar_day([old, new, other], mid_longitude=15.0)
 
-        assert item.datetime.hour == 12, "the solar-day stamp must be applied to .datetime"
-        assert item.properties["datetime"] == "2021-09-08T10:20:31.024000Z", (
-            "pystac.Item.datetime is a plain attribute — assigning it must NOT write through"
-        )
-
-    def test_two_real_same_day_acquisitions_both_survive_the_whole_pipeline(self) -> None:
-        """End to end on real objects: normalise, then select. Neither may be dropped."""
-        first = self._real("S2A_33XVG_20210908_0_L2A", "MGRS-33XVG", "0", "2021-09-08T10:20:31.024000Z")
-        second = self._real("S2B_33XVG_20210908_0_L2A", "MGRS-33XVG", "0", "2021-09-08T11:10:14.512000Z")
-        normalize_to_solar_day([first, second], mid_longitude=15.0)
-
-        kept, alternates = select_preferred_duplicates([first, second])
-        assert kept == [first, second], "two distinct passes were collapsed into one"
-        assert alternates == {}
-
-    def test_real_reprocessings_of_one_acquisition_still_reduce(self) -> None:
-        """The other direction, so the test above cannot pass by never grouping anything."""
-        old = self._real("S2B_33XVG_20210908_0_L2A", "MGRS-33XVG", "0", "2021-09-08T10:20:31.024000Z")
-        new = self._real("S2B_33XVG_20210908_1_L2A", "MGRS-33XVG", "1", "2021-09-08T10:20:31.024000Z")
-        normalize_to_solar_day([old, new], mid_longitude=15.0)
-
-        kept, alternates = select_preferred_duplicates([old, new])
-        assert kept == [new]
+        kept, alternates = select_preferred_duplicates([old, new, other])
+        assert kept == [new, other]
         assert alternates == {("MGRS-33XVG", "2021-09-08"): [old]}
 
 
@@ -569,7 +547,7 @@ class TestWhenTheProviderRefused:
 
 
 class TestKeyingACopyAcrossProviders:
-    """The tile and the acquisition, read from fields each catalogue actually populates."""
+    """The tile and the image, read from fields each catalogue actually populates."""
 
     def test_the_planetary_computer_tile_property_is_read(self) -> None:
         """Its ids carry the tile as `_T33TWM_` in a later field, which the Element 84 pattern
@@ -594,87 +572,24 @@ class TestKeyingACopyAcrossProviders:
     def test_a_value_that_is_not_a_grid_square_is_not_accepted(self) -> None:
         assert item_tile(_Item("not-a-sentinel-id", **{"s2:mgrs_tile": "whatever"})) is None
 
-    def test_the_datatake_names_the_observation_without_its_baseline(self) -> None:
-        """The processing baseline is the only field a reprocessing changes, so the head of the
-        value is the observation itself.
-        """
-        item = _Item("x", **{"s2:datatake_id": "GS2B_20171219T095409_004109_N05.00"})
-        assert acquisition_identity(item) == "GS2B_20171219T095409_004109"
-
-    @pytest.mark.parametrize(
-        "raw", ["", "GS2B_20171219T095409_004109", "not a datatake", "GS2B_20171219T095409_004109_N05.00.1", 5.0]
-    )
-    def test_anything_that_is_not_a_datatake_id_is_refused(self, raw: object) -> None:
-        """Matched as a whole rather than split on underscores, so a value of another shape sends
-        the caller to the timestamp instead of yielding a plausible-looking wrong key.
-        """
-        assert acquisition_identity(_Item("x", **{"s2:datatake_id": raw})) is None
-
-    def test_an_item_without_the_property_falls_back(self) -> None:
-        assert acquisition_identity(_Item("x")) is None
-
-
-class TestReprocessingsAreOneAcquisitionHoweverTheyAreTimestamped:
-    """The reported MEDIUM, taken from the committed 2017-12-19 cassette.
-
-    Two copies of one granule — same sensing time, orbit and tile, baselines 02.06 and 05.00 —
-    carry catalogue timestamps 209 seconds apart. Clustering on those timestamps put them in
-    separate acquisitions, so both survived selection and were mosaicked together, and a
-    post-threshold version of the same shape would have refused the date as mixed-producer.
-    """
-
-    @staticmethod
-    def _reprocessing(sequence: str, baseline: str, acquired: str, host_root: str) -> _Item:
+    def test_an_image_is_its_pass_and_datastrip_without_the_baseline(self) -> None:
+        """A reprocessing changes the baseline and the processing fields and nothing else."""
         item = _Item(
-            f"S2B_33TWM_20171219_{sequence}_L2A",
-            "MGRS-33TWM",
-            sequence,
+            "x",
             **{
-                "s2:processing_baseline": baseline,
-                "s2:datatake_id": f"GS2B_20171219T095409_004109_N{baseline}",
-                "datetime": acquired,
+                "s2:datatake_id": "GS2B_20171219T095409_004109_N05.00",
+                "s2:datastrip_id": "S2B_OPER_MSI_L2A_DS_S2RP_20230527T013126_S20171219T095412_N05.00",
             },
         )
-        return _with_assets(item, _bands_at(host_root))
+        assert image_identity(item) == ("GS2B_20171219T095409_004109", "20171219T095412")
 
-    def _cassette_pair(self) -> tuple[_Item, _Item]:
-        old = self._reprocessing("0", "02.06", "2017-12-19T09:54:10.457000Z", _REMOTE)
-        new = self._reprocessing("1", "05.00", "2017-12-19T09:57:39.063000Z", _IN_REGION)
-        return old, new
-
-    def test_the_fixture_really_straddles_the_timestamp_window(self) -> None:
-        """Otherwise this would pass on the old timestamp clustering and prove nothing."""
-        old, new = self._cassette_pair()
-        skew = abs((acquisition_instant(new) - acquisition_instant(old)).total_seconds())
-        assert skew > 120, f"the copies are only {skew}s apart — the fixture no longer bites"
-
-    def test_they_reduce_to_one_copy(self) -> None:
-        old, new = self._cassette_pair()
-        kept, alternates = select_preferred_duplicates([old, new])
-        assert [i.id for i in kept] == [new.id], "two reprocessings of one granule were both loaded"
-        assert [i.id for i in next(iter(alternates.values()))] == [old.id]
-
-    def test_two_genuine_passes_are_still_kept_apart(self) -> None:
-        """The complement, and the reason this cannot simply collapse the tile-date: successive
-        orbits revisit a high-latitude tile the same day, and those are separate imagery.
+    @pytest.mark.parametrize("field", ["s2:datatake_id", "s2:datastrip_id"])
+    @pytest.mark.parametrize("raw", [None, "", "not an id", "GS2B_20171219T095409_004109", 5.0])
+    def test_an_unreadable_identifier_names_no_image(self, field: str, raw: object) -> None:
+        """Matched as a whole rather than split on underscores, so a value of another shape is
+        unknown instead of a plausible-looking wrong key.
         """
-        first = self._reprocessing("0", "05.00", "2017-12-19T09:54:10.457000Z", _IN_REGION)
-        first.properties["s2:datatake_id"] = "GS2B_20171219T095409_004109_N05.00"
-        second = self._reprocessing("0", "05.00", "2017-12-19T10:44:10.457000Z", _IN_REGION)
-        second.id = "S2B_33TWM_20171219_9_L2A"
-        second.properties["s2:datatake_id"] = "GS2B_20171219T104409_004110_N05.00"
-        kept, _ = select_preferred_duplicates([first, second])
-        assert len(kept) == 2, "two distinct passes were collapsed into one"
-
-    def test_a_copy_without_a_datatake_still_clusters_on_its_timestamp(self) -> None:
-        """The fallback has to keep working: an item naming no observation is placed by its
-        timestamp, exactly as before.
-        """
-        old, new = self._cassette_pair()
-        del old.properties["s2:datatake_id"]
-        del new.properties["s2:datatake_id"]
-        kept, _ = select_preferred_duplicates([old, new])
-        assert len(kept) == 2, "the timestamp fallback stopped clustering"
+        assert image_identity(_Item("x", **{field: raw})) is None
 
 
 def _granule(ident: str, baseline: str, datatake: str, strip: str) -> _Item:
@@ -692,10 +607,10 @@ def _granule(ident: str, baseline: str, datatake: str, strip: str) -> _Item:
     )
 
 
-class TestADatastripSplitIsTwoAcquisitions:
+class TestADatastripSplitIsTwoImages:
     """One pass crossing a datastrip boundary is published as one granule per datastrip.
 
-    Both share the datatake and baseline, so naming an acquisition by the datatake alone made them
+    Both share the datatake and baseline, so naming an image by the datatake alone made them
     compete and dropped the loser's ground. Values are as Earth Search publishes them; see
     ``context_docs/ingest/split-datastrips.md``.
     """
@@ -733,31 +648,28 @@ class TestADatastripSplitIsTwoAcquisitions:
     def _ids(items: list[_Item]) -> set[str]:
         return {it.id for it in items}
 
-    def test_reprocessing_keeps_the_datastrip_start(self) -> None:
+    def test_reprocessing_keeps_the_image(self) -> None:
         old, _, new, _ = self.UUP
-        assert datastrip_start(old) == datastrip_start(new) == "20191021T101549"
+        assert image_identity(old) == image_identity(new) == ("GS2A_20191021T101041_022613", "20191021T101549")
 
-    def test_a_copy_naming_no_datastrip_keeps_its_pass_whole(self) -> None:
-        """It could be a reprocessing of either image, so splitting around it would fuse two copies."""
-        old, _, new, _ = self.UUP
-        unread = _Item(new.id, "MGRS-33UUP", "2", **{**new.properties, "s2:datastrip_id": "unreadable"})
-        kept, alternates = select_preferred_duplicates([old, unread])
-        assert self._ids(kept) == {unread.id}, "two copies of one image were both kept"
-        assert self._ids(next(iter(alternates.values()))) == {old.id}
-
-    def test_a_copy_placed_by_its_timestamp_joins_the_image_its_datastrip_names(self) -> None:
-        """Both images of a split pass are seconds apart, so the time alone could put it in either."""
-        a_old, b_old, b_new = (
-            _Item(it.id, "MGRS-33UUP", it.properties["s2:sequence"], **{**it.properties, "datetime": when})
-            for it, when in zip(
-                (self.UUP[0], self.UUP[1], self.UUP[3]),
-                ("2019-10-21T10:17:27.820Z", "2019-10-21T10:17:35.210Z", "2019-10-21T10:17:35.212Z"),
-                strict=True,
-            )
+    def test_a_copy_whose_image_cannot_be_read_is_kept_on_its_own(self) -> None:
+        """Merged only on proof: it could be a copy of either half or of neither, and keeping a
+        duplicate costs a read where merging two images loses ground.
+        """
+        unread = _Item(
+            "S2B_18NUN_20250619_2_L2A", "MGRS-18NUN", "2", **{**self.NUN[0].properties, "s2:datastrip_id": None}
         )
-        del b_new.properties["s2:datatake_id"]
-        kept, _ = select_preferred_duplicates([a_old, b_old, b_new])
-        assert self._ids(kept) == {a_old.id, b_new.id}
+        kept, alternates = select_preferred_duplicates([*self.NUN, unread])
+        assert self._ids(kept) == {*self._ids(list(self.NUN)), unread.id}
+        assert alternates == {}
+
+    def test_a_copy_whose_image_cannot_be_read_has_no_spare(self) -> None:
+        """So its read failure steps nothing, rather than taking another image's spare."""
+        old, _, new, _ = self.UUP
+        unread = _Item("S2A_33UUP_20191021_4_L2A", "MGRS-33UUP", "4", **{**new.properties, "s2:datatake_id": None})
+        kept, alternates = select_preferred_duplicates([old, new, unread])
+        assert self._ids(kept) == {new.id, unread.id}
+        assert step_down_copies(alternates, kept, implicated=[unread]) is None
 
     def test_both_granules_of_a_split_pass_are_kept(self) -> None:
         kept, alternates = select_preferred_duplicates(list(self.NUN))
@@ -802,7 +714,7 @@ class TestASpareThatWillRefuseIsKeptOffTheLadderWithoutVisibleAssets:
     @staticmethod
     def _native_key_copy(ident: str, sequence: str, baseline: str | None) -> _Item:
         """A copy whose assets are keyed natively, so nothing can be looked up by band name."""
-        extra: dict[str, object] = {"datetime": "2022-01-07T10:20:31.024000Z"}
+        extra: dict[str, object] = {}
         if baseline is not None:
             extra["s2:processing_baseline"] = baseline
         item = _Item(ident, "MGRS-33TWM", sequence, **extra)
@@ -889,152 +801,72 @@ class TestASpareThatWillRefuseIsKeptOffTheLadderWithoutVisibleAssets:
         assert _known_harmonisation("earth-search", "sentinel-2-l1c") is None
 
 
-class TestATimestampOnlyCopyJoinsAnIdentifiedAcquisition:
-    """The reported MEDIUM. Identity clusters were built first and timestamp-only copies always
-    started their own, so one reprocessing declaring the datatake while its sibling omitted it were
-    never compared — and both survived to be fused, which is the defect identity was added to fix.
+class TestDistinctImagesOnOneDay:
+    """A tile-date can hold two IMAGES, not just two copies of one.
+
+    At high latitude successive orbits revisit a tile the same day. Those are separate imagery
+    that the loader mosaics together, so collapsing them to one copy discards coverage silently.
     """
 
     @staticmethod
-    def _copy_of_one_granule(sequence: str, baseline: str, acquired: str, *, datatake: bool) -> _Item:
-        extra: dict[str, object] = {"s2:processing_baseline": baseline, "datetime": acquired}
-        if datatake:
-            extra["s2:datatake_id"] = f"GS2B_20171219T095409_004109_N{baseline}"
-        item = _Item(f"S2B_33TWM_20171219_{sequence}_L2A", "MGRS-33TWM", sequence, **extra)
-        return _with_assets(item, _bands_at(_IN_REGION))
+    def _of(ident: str, pass_no: int, sequence: str = "0") -> _Item:
+        return _Item(ident, "MGRS-33XVG", sequence, **_image(pass_no))
 
-    def test_a_sibling_without_a_datatake_still_reduces(self) -> None:
-        identified = self._copy_of_one_granule("1", "05.00", "2017-12-19T09:54:10.457000Z", datatake=True)
-        anonymous = self._copy_of_one_granule("0", "02.06", "2017-12-19T09:54:41.000000Z", datatake=False)
-        kept, alternates = select_preferred_duplicates([anonymous, identified])
-        assert [i.id for i in kept] == [identified.id], "the copies were never compared"
-        assert [i.id for i in next(iter(alternates.values()))] == [anonymous.id]
-
-    def test_a_distant_timestamp_still_forms_its_own_acquisition(self) -> None:
-        """The complement: joining must be decided by the timestamp, not granted to anything
-        lacking a datatake, or a genuine second pass would be swallowed.
-        """
-        identified = self._copy_of_one_granule("1", "05.00", "2017-12-19T09:54:10.457000Z", datatake=True)
-        other_pass = self._copy_of_one_granule("0", "05.00", "2017-12-19T10:44:10.457000Z", datatake=False)
-        other_pass.id = "S2B_33TWM_20171219_9_L2A"
-        kept, _ = select_preferred_duplicates([identified, other_pass])
-        assert len(kept) == 2, "a distinct pass was absorbed into an identified acquisition"
-
-    def test_it_is_matched_against_any_member_of_the_acquisition(self) -> None:
-        """Members of one acquisition do NOT agree on the timestamp — that disagreement is why
-        identity is primary — so closeness to any member is the whole of the evidence.
-        """
-        early = self._copy_of_one_granule("0", "02.06", "2017-12-19T09:54:10.457000Z", datatake=True)
-        late = self._copy_of_one_granule("1", "05.00", "2017-12-19T09:57:39.063000Z", datatake=True)
-        # Close to `late` only, and 209s from `early`.
-        anonymous = self._copy_of_one_granule("2", "04.00", "2017-12-19T09:57:50.000000Z", datatake=False)
-        kept, _ = select_preferred_duplicates([early, late, anonymous])
-        assert [i.id for i in kept] == [late.id], "all three are one observation"
-
-
-class TestDistinctAcquisitionsOnOneDay:
-    """A tile-date can hold two ACQUISITIONS, not just two copies of one.
-
-    At high latitude successive orbits revisit a tile the same day. Those are separate
-    imagery that the loader mosaics together, so collapsing them to one copy discards
-    coverage silently. Measured on the live catalogue over eight tiles across 2021,
-    keying on (tile, solar day) alone discarded 493 of 2,733 items as duplicates when
-    they were distinct acquisitions — none in the mid-latitude tiles, 196 of 500 at
-    33XVG and 297 of 500 at 22XER.
-    """
-
-    @staticmethod
-    def _at(ident: str, acquired: str, sequence: str = "0") -> _Item:
-        """A copy carrying its ACQUISITION instant, as the catalogue supplies it.
-
-        ``properties["datetime"]`` and not ``item.datetime``: normalize_to_solar_day has
-        already overwritten the latter with the canonical noon stamp by this point, so the
-        property is the only surviving record of which acquisition a copy came from.
-        """
-        return _Item(ident, "MGRS-33XVG", sequence, **{"datetime": acquired})
-
-    def test_two_acquisitions_on_one_day_both_survive(self) -> None:
-        first = self._at("S2A_33XVG_20210908_0_L2A", "2021-09-08T10:20:31.024000Z")
-        second = self._at("S2B_33XVG_20210908_0_L2A", "2021-09-08T11:10:14.512000Z")
+    def test_two_passes_on_one_day_both_survive(self) -> None:
+        first = self._of("S2A_33XVG_20210908_0_L2A", 1)
+        second = self._of("S2B_33XVG_20210908_0_L2A", 2)
         kept, alternates = select_preferred_duplicates([first, second])
         assert kept == [first, second]
         assert alternates == {}
 
-    def test_reprocessings_of_one_acquisition_still_reduce_to_one(self) -> None:
-        """The behaviour the module exists for, unchanged: same instant, different
-        sequence, newest kept and the older offered as the fallback.
-        """
-        old = self._at("S2B_33XVG_20210908_0_L2A", "2021-09-08T10:20:31.024000Z", "0")
-        new = self._at("S2B_33XVG_20210908_1_L2A", "2021-09-08T10:20:31.024000Z", "1")
+    def test_copies_of_one_image_still_reduce_to_one(self) -> None:
+        old = self._of("S2B_33XVG_20210908_0_L2A", 1, "0")
+        new = self._of("S2B_33XVG_20210908_1_L2A", 1, "1")
         kept, alternates = select_preferred_duplicates([old, new])
         assert kept == [new]
         assert alternates == {("MGRS-33XVG", "2021-09-08"): [old]}
 
-    def test_each_acquisition_is_deduplicated_on_its_own(self) -> None:
-        """Both at once — two acquisitions, each reprocessed. One survivor per
-        acquisition, and both rejected copies reachable through the ladder.
-        """
-        a_old = self._at("S2A_33XVG_20210908_0_L2A", "2021-09-08T10:20:31.024000Z", "0")
-        a_new = self._at("S2A_33XVG_20210908_1_L2A", "2021-09-08T10:20:31.024000Z", "1")
-        b_old = self._at("S2B_33XVG_20210908_0_L2A", "2021-09-08T11:10:14.512000Z", "0")
-        b_new = self._at("S2B_33XVG_20210908_1_L2A", "2021-09-08T11:10:14.512000Z", "1")
+    def test_each_image_is_deduplicated_on_its_own(self) -> None:
+        a_old = self._of("S2A_33XVG_20210908_0_L2A", 1, "0")
+        a_new = self._of("S2A_33XVG_20210908_1_L2A", 1, "1")
+        b_old = self._of("S2B_33XVG_20210908_0_L2A", 2, "0")
+        b_new = self._of("S2B_33XVG_20210908_1_L2A", 2, "1")
         kept, alternates = select_preferred_duplicates([a_old, a_new, b_old, b_new])
         assert kept == [a_new, b_new]
         assert set(alternates[("MGRS-33XVG", "2021-09-08")]) == {a_old, b_old}
 
-    def test_sub_second_jitter_is_one_acquisition(self) -> None:
-        """Reprocessings differ in the microseconds of an otherwise identical instant.
-        Splitting on that would keep every reprocessing and defeat the module.
-        """
-        old = self._at("S2B_33XVG_20210908_0_L2A", "2021-09-08T10:20:31.024000Z", "0")
-        new = self._at("S2B_33XVG_20210908_1_L2A", "2021-09-08T10:20:31.026000Z", "1")
-        kept, _ = select_preferred_duplicates([old, new])
-        assert kept == [new]
 
-    def test_copies_without_an_instant_keep_the_old_behaviour(self) -> None:
-        """No instant is no evidence of distinctness, so they compete as before —
-        which is what keeps a catalogue that stops publishing the field from
-        silently retaining every reprocessing.
-        """
-        old, new = _pair()
-        kept, alternates = select_preferred_duplicates([old, new])
-        assert kept == [new]
-        assert alternates == {("MGRS-34WFA", "2021-09-08"): [old]}
-
-
-class TestTheLadderStepsOneAcquisitionAtATime:
-    """The fallback ladder must not swap an acquisition's sibling out from under it.
+class TestTheLadderStepsOneImageAtATime:
+    """The fallback ladder must not swap an image's sibling out from under it.
 
     `select_preferred_duplicates` keeps one copy per ACQUISITION, but `alternates` is keyed
     by tile-date because that is the granularity a read failure is attributed at. Swapping
-    on that key replaced every surviving acquisition with the same alternate — turning
-    `[a_new, b_new]` into `[a_old, a_old]`, which duplicates one acquisition and drops the
-    other. That is worse than the coverage loss the acquisition split fixed, because the
+    on that key replaced every surviving image with the same alternate — turning
+    `[a_new, b_new]` into `[a_old, a_old]`, which duplicates one image and drops the
+    other. That is worse than the coverage loss the image split fixed, because the
     loader is then handed the same granule twice.
     """
 
     @staticmethod
     def _four() -> tuple[_Item, _Item, _Item, _Item]:
-        """Two acquisitions on one tile-date, each with a reprocessing."""
-        at = "2021-09-08T10:20:31.024000Z"
-        bt = "2021-09-08T11:10:14.512000Z"
+        """Two images on one tile-date, each with a reprocessing."""
         return (
-            _Item("S2A_33XVG_20210908_0_L2A", "MGRS-33XVG", "0", **{"datetime": at}),
-            _Item("S2A_33XVG_20210908_1_L2A", "MGRS-33XVG", "1", **{"datetime": at}),
-            _Item("S2B_33XVG_20210908_0_L2A", "MGRS-33XVG", "0", **{"datetime": bt}),
-            _Item("S2B_33XVG_20210908_1_L2A", "MGRS-33XVG", "1", **{"datetime": bt}),
+            _Item("S2A_33XVG_20210908_0_L2A", "MGRS-33XVG", "0", **_image(1)),
+            _Item("S2A_33XVG_20210908_1_L2A", "MGRS-33XVG", "1", **_image(1)),
+            _Item("S2B_33XVG_20210908_0_L2A", "MGRS-33XVG", "0", **_image(2)),
+            _Item("S2B_33XVG_20210908_1_L2A", "MGRS-33XVG", "1", **_image(2)),
         )
 
-    def test_stepping_down_keeps_the_other_acquisition(self) -> None:
+    def test_stepping_down_keeps_the_other_image(self) -> None:
         a_old, a_new, b_old, b_new = self._four()
         kept, alternates = select_preferred_duplicates([a_old, a_new, b_old, b_new])
         assert kept == [a_new, b_new]
 
         stepped, _ = step_down_copies(alternates, kept, only=None)
-        assert stepped == [a_old, b_new], "one acquisition steps; its sibling is untouched"
-        assert len({id(i) for i in stepped}) == 2, "no acquisition may be duplicated"
+        assert stepped == [a_old, b_new], "one image steps; its sibling is untouched"
+        assert len({id(i) for i in stepped}) == 2, "no image may be duplicated"
 
-    def test_the_ladder_then_steps_the_second_acquisition(self) -> None:
+    def test_the_ladder_then_steps_the_second_image(self) -> None:
         a_old, a_new, b_old, b_new = self._four()
         kept, alternates = select_preferred_duplicates([a_old, a_new, b_old, b_new])
         first, _ = step_down_copies(alternates, kept, only=None)
@@ -1042,7 +874,7 @@ class TestTheLadderStepsOneAcquisitionAtATime:
         assert second == [a_old, b_old]
         assert step_down_copies(alternates, second, only=None) is None, "ladder exhausted"
 
-    def test_a_single_acquisition_steps_exactly_as_before(self) -> None:
+    def test_a_single_image_steps_exactly_as_before(self) -> None:
         """The behaviour the ladder was built for, unchanged."""
         old, new = _pair()
         kept, alternates = select_preferred_duplicates([old, new])
@@ -1051,44 +883,39 @@ class TestTheLadderStepsOneAcquisitionAtATime:
         assert keys == {("MGRS-34WFA", "2021-09-08")}
 
 
-def _two_acquisitions_each_with_a_spare() -> tuple[_Item, _Item, _Item, _Item]:
+def _two_images_each_with_a_spare() -> tuple[_Item, _Item, _Item, _Item]:
     """One high-latitude tile-date: two ORBITS, each reprocessed once.
 
     Successive orbits revisit the same tile the same day above ~60 degrees, so a tile-date
-    holds genuinely different imagery as well as reprocessings of it. The acquisition split
+    holds genuinely different imagery as well as reprocessings of it. The image split
     keeps one copy per orbit; the spares are the ladder.
     """
-    a_old = _Item("A_old", "MGRS-34WFA", "0")
-    a_new = _Item("A_new", "MGRS-34WFA", "9")  # ranks first across the whole tile-date
-    b_old = _Item("B_old", "MGRS-34WFA", "0")
-    b_new = _Item("B_new", "MGRS-34WFA", "1")
-    # Distinct acquisition instants, far enough apart to be separate orbits.
-    for it in (a_old, a_new):
-        it.properties["datetime"] = "2021-09-08T10:00:00Z"
-    for it in (b_old, b_new):
-        it.properties["datetime"] = "2021-09-08T11:00:00Z"
+    a_old = _Item("A_old", "MGRS-34WFA", "0", **_image(1))
+    a_new = _Item("A_new", "MGRS-34WFA", "9", **_image(1))  # ranks first across the whole tile-date
+    b_old = _Item("B_old", "MGRS-34WFA", "0", **_image(2))
+    b_new = _Item("B_new", "MGRS-34WFA", "1", **_image(2))
     return a_old, a_new, b_old, b_new
 
 
-def test_the_ladder_steps_the_acquisition_that_failed_not_the_best_ranked_spare():
-    """A tile-date with two acquisitions must downgrade only the one that could not be read.
+def test_the_ladder_steps_the_image_that_failed_not_the_best_ranked_spare():
+    """A tile-date with two images must downgrade only the one that could not be read.
 
     Ranking is per tile-date, so without attribution the rung taken is whichever spare sorts
-    first — which can belong to the acquisition that read perfectly well. That downgrades
+    first — which can belong to the image that read perfectly well. That downgrades
     healthy imagery to an older baseline, leaves the unreadable copy still selected, and
-    forces a second rung: two spent, one acquisition needlessly older.
+    forces a second rung: two spent, one image needlessly older.
 
     Here A's spare outranks B's, and B is the one that failed.
     """
-    a_old, a_new, b_old, b_new = _two_acquisitions_each_with_a_spare()
+    a_old, a_new, b_old, b_new = _two_images_each_with_a_spare()
     kept, alternates = select_preferred_duplicates([a_old, a_new, b_old, b_new])
-    assert set(kept) == {a_new, b_new}, "one survivor per acquisition"
+    assert set(kept) == {a_new, b_new}, "one survivor per image"
 
     stepped = step_down_copies(dict(alternates), kept, implicated=[b_new])
     assert stepped is not None
     items, _keys = stepped
-    assert a_new in items, "the acquisition that read fine must keep its newest copy"
-    assert b_old in items, "the acquisition that failed is the one that steps down"
+    assert a_new in items, "the image that read fine must keep its newest copy"
+    assert b_old in items, "the image that failed is the one that steps down"
     assert b_new not in items
 
 
@@ -1098,7 +925,7 @@ def test_without_attribution_the_ladder_still_steps_the_best_ranked_spare():
     Pinned so the new preference cannot quietly become the only path — a caller that cannot
     identify the failing object must still make progress.
     """
-    a_old, a_new, b_old, b_new = _two_acquisitions_each_with_a_spare()
+    a_old, a_new, b_old, b_new = _two_images_each_with_a_spare()
     kept, alternates = select_preferred_duplicates([a_old, a_new, b_old, b_new])
     stepped = step_down_copies(dict(alternates), kept)
     assert stepped is not None
@@ -1107,10 +934,10 @@ def test_without_attribution_the_ladder_still_steps_the_best_ranked_spare():
 
 
 def test_a_failure_in_one_tile_does_not_downgrade_a_neighbouring_tile():
-    """Acquisition matching is by INSTANT, and neighbouring MGRS tiles share one pass.
+    """An image identity names a pass and datastrip but not a tile, so neighbouring tiles share it.
 
     `implicated` carries the failed items from every tile in the date, so without filtering to
-    the tile-day being stepped, tile B's failure matches tile A's acquisition by time alone —
+    the tile-day being stepped, tile B's failure matches tile A's image —
     downgrading A while leaving B's own failed copy selected. That is the defect the attribution
     was added to remove, moved one level sideways.
     """
@@ -1118,9 +945,6 @@ def test_a_failure_in_one_tile_does_not_downgrade_a_neighbouring_tile():
     a_new = _Item("A_new", "MGRS-34WFA", "1")
     b_old = _Item("B_old", "MGRS-34WFB", "0")
     b_new = _Item("B_new", "MGRS-34WFB", "1")
-    for it in (a_old, a_new, b_old, b_new):  # one pass — the same instant on both tiles
-        it.properties["datetime"] = "2021-09-08T10:00:00Z"
-
     kept, alternates = select_preferred_duplicates([a_old, a_new, b_old, b_new])
     assert set(kept) == {a_new, b_new}
 
@@ -1167,13 +991,13 @@ class TestInRegionPreference:
     """Locality decides between copies the catalogue indexed from two regions.
 
     Written from the real pair measured on the live catalogue: tile 35QKC on 2017-01-20 is
-    indexed twice, both at baseline 00.01 and the SAME acquisition instant, with the remote
+    indexed twice, both at baseline 00.01 and the SAME image, with the remote
     copy carrying the HIGHER sequence. A sequence-first key therefore preferred the remote
     copy on every duplicated date.
     """
 
     def test_equal_baseline_prefers_the_in_region_copy(self) -> None:
-        """The measured case. Same baseline and instant, so the pixels are identical and the
+        """The measured case. Same baseline and image, so the pixels are identical and the
         only difference is whether the read egresses through NAT.
         """
         remote = _copy("S2A_33TWM_20170120_1_L2A", sequence="1", baseline="00.01", host_root=_REMOTE)
@@ -1474,7 +1298,7 @@ class TestTheDuplicateLogIsAnAuditTrail:
         local = _copy("a", sequence="0", baseline="00.01", host_root=_IN_REGION)
         remote = _copy("b", sequence="1", baseline="00.01", host_root=_REMOTE)
         msg = self._emit(caplog, [local], {("MGRS-33TWM", "2021-09-08"): [remote]})
-        assert "complete read set, then a decidable producer, then a known acquisition" in msg
+        assert "complete read set, then a decidable producer, then a readable baseline" in msg
         assert (
             "then a readable baseline, then newest baseline, then owing no offset correction, "
             "then in-region, then newest sequence"
@@ -1527,7 +1351,7 @@ class TestTheDuplicateLogIsAnAuditTrail:
         assert "1 in-region, 0 remote" in msg
 
     def test_it_states_one_ranking_because_there_is_only_one(self, caplog) -> None:
-        """This clause used to be conditional, naming a sequence-only fallback for acquisitions
+        """This clause used to be conditional, naming a sequence-only fallback for images
         where a copy declared no readable baseline. There is no fallback any more — such a copy
         simply ranks last — so the line states the ranking unconditionally, and it is the truth
         on an uncertain-metadata date as much as on any other.
@@ -1535,7 +1359,7 @@ class TestTheDuplicateLogIsAnAuditTrail:
         winner = _copy("a", sequence="1", baseline="00.01", host_root=_IN_REGION)
         unreadable = _with_assets(_Item("b", "MGRS-33TWM", "0"), _bands_at(_REMOTE))
         msg = self._emit(caplog, [winner], {("MGRS-33TWM", "2021-09-08"): [unreadable]})
-        assert "complete read set, then a decidable producer, then a known acquisition" in msg
+        assert "complete read set, then a decidable producer, then a readable baseline" in msg
         assert (
             "then a readable baseline, then newest baseline, then owing no offset correction, "
             "then in-region, then newest sequence"
@@ -1546,9 +1370,11 @@ class TestTheDuplicateLogIsAnAuditTrail:
         assert self._emit(caplog, [], {}) == ""
 
 
-def _copy_at(ident: str, *, acquired: str, sequence: str, baseline: str | None, host_root: str = _IN_REGION) -> _Item:
-    """A copy pinned to a given ACQUISITION instant, for cross-acquisition ordering tests."""
-    extra: dict[str, object] = {"datetime": acquired}
+def _copy_at(
+    ident: str, *, image: dict[str, str], sequence: str, baseline: str | None, host_root: str = _IN_REGION
+) -> _Item:
+    """A copy of a given IMAGE, for cross-image ordering tests."""
+    extra: dict[str, object] = {**image}
     if baseline is not None:
         extra["s2:processing_baseline"] = baseline
     return _with_assets(_Item(ident, "MGRS-33TWM", sequence, **extra), _bands_at(host_root))
@@ -1659,33 +1485,33 @@ class TestNonFiniteBaselinesAreUnknown:
         assert _run(["nan", "real"]) == _run(["real", "nan"]) == ["real"]
 
 
-class TestUnknownBaselineStaysScopedToItsAcquisition:
-    """One acquisition's unreadable baseline must not reorder another's. Review on PR #107.
+class TestUnknownBaselineStaysScopedToItsImage:
+    """One image's unreadable baseline must not reorder another's. Review on PR #107.
 
     `_rank_copies` reverts to sequence ordering when ANY baseline in the list it is given is
-    unknown — correct within an acquisition, where it stops locality promoting a copy over a
+    unknown — correct within an image, where it stops locality promoting a copy over a
     possibly-newer one. The alternates list was built by ranking a whole tile-date in one
-    call, so a single malformed item leaked that suspension across acquisition boundaries.
+    call, so a single malformed item leaked that suspension across image boundaries.
     """
 
-    _A = "2021-09-08T10:00:00Z"
-    _B = "2021-09-08T14:00:00Z"
+    _A = _image(1)
+    _B = _image(2)
 
     def test_a_neighbours_unknown_baseline_keeps_this_ladder_baseline_first(self) -> None:
         """The unknown copy must be a REJECTED one — that is what puts it in the shared list.
 
-        Acquisition A holds an unreadable baseline on its LOSING copy, so `rejected` spans
-        both acquisitions and contains an unknown. Ranking that whole list in one call
+        Image A holds an unreadable baseline on its LOSING copy, so `rejected` spans
+        both images and contains an unknown. Ranking that whole list in one call
         suspends the baseline term for B as well.
         """
         items = [
             # A: the unknown loses on sequence, so it lands in the shared rejected list.
-            _copy_at("a-keep", acquired=self._A, sequence="5", baseline="04.00"),
-            _copy_at("a-unknown", acquired=self._A, sequence="0", baseline=None),
+            _copy_at("a-keep", image=self._A, sequence="5", baseline="04.00"),
+            _copy_at("a-unknown", image=self._A, sequence="0", baseline=None),
             # B: readable throughout, so its ladder must stay in descending baseline order.
-            _copy_at("b-best", acquired=self._B, sequence="0", baseline="05.00"),
-            _copy_at("b-mid", acquired=self._B, sequence="1", baseline="04.00"),
-            _copy_at("b-newer-seq", acquired=self._B, sequence="9", baseline="03.00"),
+            _copy_at("b-best", image=self._B, sequence="0", baseline="05.00"),
+            _copy_at("b-mid", image=self._B, sequence="1", baseline="04.00"),
+            _copy_at("b-newer-seq", image=self._B, sequence="9", baseline="03.00"),
         ]
         kept, alternates = select_preferred_duplicates(items)
 
@@ -1699,35 +1525,35 @@ class TestUnknownBaselineStaysScopedToItsAcquisition:
         assert [i for i in ladder if i.startswith("b-")] == ["b-mid", "b-newer-seq"]
 
     def test_the_best_spare_overall_is_still_first(self) -> None:
-        """`_first_for_failed_acquisition` falls back to copies[0] when nothing is attributed."""
+        """`_spare_for_failed_image` falls back to copies[0] when nothing is attributed."""
         items = [
-            _copy_at("a-win", acquired=self._A, sequence="0", baseline="05.00"),
-            _copy_at("a-spare", acquired=self._A, sequence="0", baseline="03.00"),
-            _copy_at("b-win", acquired=self._B, sequence="0", baseline="05.00"),
-            _copy_at("b-spare", acquired=self._B, sequence="0", baseline="04.00"),
+            _copy_at("a-win", image=self._A, sequence="0", baseline="05.00"),
+            _copy_at("a-spare", image=self._A, sequence="0", baseline="03.00"),
+            _copy_at("b-win", image=self._B, sequence="0", baseline="05.00"),
+            _copy_at("b-spare", image=self._B, sequence="0", baseline="04.00"),
         ]
         _, alternates = select_preferred_duplicates(items)
         ladder = [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]]
-        # b-spare (04.00) outranks a-spare (03.00) despite belonging to the later acquisition.
+        # b-spare (04.00) outranks a-spare (03.00) despite belonging to the later image.
         assert ladder == ["b-spare", "a-spare"]
 
 
 class TestTheLadderKeepsGlobalPriorityPastItsHead:
     """`s2_roi`'s unattributed recovery consumes `copies[0]` on each retry, so EVERY position in
-    the ladder is a choice, not only the first. Raised on PR #107 against a per-acquisition
+    the ladder is a choice, not only the first. Raised on PR #107 against a per-image
     ranking that ordered the ladder heads and then flattened whole ladders behind them.
     """
 
-    _A = "2021-09-08T10:00:00Z"
-    _B = "2021-09-08T14:00:00Z"
+    _A = _image(1)
+    _B = _image(2)
 
-    def test_a_second_retry_does_not_skip_a_better_copy_in_another_acquisition(self) -> None:
+    def test_a_second_retry_does_not_skip_a_better_copy_in_another_image(self) -> None:
         items = [
-            _copy_at("a-win", acquired=self._A, sequence="9", baseline="05.10"),
-            _copy_at("a-05", acquired=self._A, sequence="2", baseline="05.00"),
-            _copy_at("a-01", acquired=self._A, sequence="1", baseline="01.00"),
-            _copy_at("b-win", acquired=self._B, sequence="9", baseline="05.10"),
-            _copy_at("b-04", acquired=self._B, sequence="2", baseline="04.00"),
+            _copy_at("a-win", image=self._A, sequence="9", baseline="05.10"),
+            _copy_at("a-05", image=self._A, sequence="2", baseline="05.00"),
+            _copy_at("a-01", image=self._A, sequence="1", baseline="01.00"),
+            _copy_at("b-win", image=self._B, sequence="9", baseline="05.10"),
+            _copy_at("b-04", image=self._B, sequence="2", baseline="04.00"),
         ]
         _, alternates = select_preferred_duplicates(items)
         ladder = [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]]
@@ -1736,15 +1562,15 @@ class TestTheLadderKeepsGlobalPriorityPastItsHead:
         assert ladder == ["a-05", "b-04", "a-01"]
 
     def test_every_position_is_in_descending_baseline_order(self) -> None:
-        """The general property, over three acquisitions interleaved at every rung."""
+        """The general property, over three images interleaved at every rung."""
         items = [
-            _copy_at(f"{tag}-win", acquired=acq, sequence="9", baseline="05.10")
+            _copy_at(f"{tag}-win", image=acq, sequence="9", baseline="05.10")
             for tag, acq in (("a", self._A), ("b", self._B))
         ] + [
-            _copy_at("a-hi", acquired=self._A, sequence="3", baseline="05.00"),
-            _copy_at("a-lo", acquired=self._A, sequence="1", baseline="02.00"),
-            _copy_at("b-mid", acquired=self._B, sequence="3", baseline="04.00"),
-            _copy_at("b-low", acquired=self._B, sequence="1", baseline="03.00"),
+            _copy_at("a-hi", image=self._A, sequence="3", baseline="05.00"),
+            _copy_at("a-lo", image=self._A, sequence="1", baseline="02.00"),
+            _copy_at("b-mid", image=self._B, sequence="3", baseline="04.00"),
+            _copy_at("b-low", image=self._B, sequence="1", baseline="03.00"),
         ]
         _, alternates = select_preferred_duplicates(items)
         ladder = alternates[("MGRS-33TWM", "2021-09-08")]
@@ -1753,16 +1579,16 @@ class TestTheLadderKeepsGlobalPriorityPastItsHead:
         assert [it.id for it in ladder] == ["a-hi", "b-mid", "b-low", "a-lo"]
 
     def test_an_unreadable_baseline_sorts_last_rather_than_suspending_the_order(self) -> None:
-        """The alternative — suspending the comparison — is what leaked one acquisition's
+        """The alternative — suspending the comparison — is what leaked one image's
         malformed metadata into another's ladder. A copy whose baseline cannot be read is also
         the one whose correction will silently be skipped, so it belongs at the end.
         """
         items = [
-            _copy_at("a-win", acquired=self._A, sequence="9", baseline="05.10"),
-            _copy_at("a-unknown", acquired=self._A, sequence="5", baseline=None),
-            _copy_at("a-04", acquired=self._A, sequence="1", baseline="04.00"),
-            _copy_at("b-win", acquired=self._B, sequence="9", baseline="05.10"),
-            _copy_at("b-03", acquired=self._B, sequence="1", baseline="03.00"),
+            _copy_at("a-win", image=self._A, sequence="9", baseline="05.10"),
+            _copy_at("a-unknown", image=self._A, sequence="5", baseline=None),
+            _copy_at("a-04", image=self._A, sequence="1", baseline="04.00"),
+            _copy_at("b-win", image=self._B, sequence="9", baseline="05.10"),
+            _copy_at("b-03", image=self._B, sequence="1", baseline="03.00"),
         ]
         _, alternates = select_preferred_duplicates(items)
         ladder = [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]]
@@ -1775,13 +1601,13 @@ class TestLocalityDoesNotDecideBetweenUnknownBaselines:
     buying cheaper egress with an older reprocessing. Raised on PR #107.
     """
 
-    _A = "2021-09-08T10:00:00Z"
+    _A = _image(1)
 
     def test_sequence_decides_between_two_unknown_baseline_spares(self) -> None:
         items = [
-            _copy_at("winner", acquired=self._A, sequence="3", baseline=None),
-            _copy_at("remote-seq2", acquired=self._A, sequence="2", baseline=None, host_root=_REMOTE),
-            _copy_at("local-seq1", acquired=self._A, sequence="1", baseline=None, host_root=_IN_REGION),
+            _copy_at("winner", image=self._A, sequence="3", baseline=None),
+            _copy_at("remote-seq2", image=self._A, sequence="2", baseline=None, host_root=_REMOTE),
+            _copy_at("local-seq1", image=self._A, sequence="1", baseline=None, host_root=_IN_REGION),
         ]
         kept, alternates = select_preferred_duplicates(items)
         # Sequence decides the winner among copies that all declare nothing readable.
@@ -1799,9 +1625,9 @@ class TestLocalityDoesNotDecideBetweenUnknownBaselines:
         ladder and prove nothing about locality.
         """
         items = [
-            _copy_at("winner", acquired=self._A, sequence="3", baseline="03.01"),
-            _copy_at("remote", acquired=self._A, sequence="1", baseline="02.06", host_root=_REMOTE),
-            _copy_at("local", acquired=self._A, sequence="1", baseline="02.06", host_root=_IN_REGION),
+            _copy_at("winner", image=self._A, sequence="3", baseline="03.01"),
+            _copy_at("remote", image=self._A, sequence="1", baseline="02.06", host_root=_REMOTE),
+            _copy_at("local", image=self._A, sequence="1", baseline="02.06", host_root=_IN_REGION),
         ]
         _, alternates = select_preferred_duplicates(items)
         ladder = [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]]
@@ -1825,7 +1651,7 @@ class TestAMalformedHrefDoesNotAbortTheSelection:
 
 
 class TestThePreferenceKeyHoldsItsInvariants:
-    """One key orders copies within an acquisition and across acquisitions, so the properties it
+    """One key orders copies within an image and across images, so the properties it
     must hold are worth asserting directly rather than only through the outcomes above.
 
     This class exists because there used to be TWO keys expressing the same preference, and every
@@ -2159,57 +1985,6 @@ class TestTheLadderOnlyOffersCopiesItCanRecoverWith:
         assert [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]] == ["usable"]
 
 
-class TestKnownAcquisitionsSurviveAnUndatedSibling:
-    """Two readable passes plus one undated copy must keep BOTH passes.
-
-    Raised four times in review, and I twice reported it fixed when it was not — a later edit had
-    reinstated the collapse while leaving the docstring describing the replacement. These assert
-    the outcome rather than the mechanism, so a revert fails here instead of in a fifth review.
-    """
-
-    _A = "2021-09-08T10:00:00Z"
-    _B = "2021-09-08T14:00:00Z"
-
-    def _at(self, ident: str, acquired: str | None, sequence: str) -> _Item:
-        extra: dict[str, object] = {"s2:processing_baseline": "05.00"}
-        if acquired is not None:
-            extra["datetime"] = acquired
-        return _with_assets(_Item(ident, "MGRS-33TWM", sequence, **extra), _bands_at(_IN_REGION))
-
-    def test_both_readable_passes_survive(self) -> None:
-        items = [
-            self._at("pass-a", self._A, "0"),
-            self._at("pass-b", self._B, "0"),
-            self._at("undated", None, "1"),
-        ]
-        kept, _ = select_preferred_duplicates(items)
-        assert sorted(it.id for it in kept) == ["pass-a", "pass-b"], "a readable pass was discarded"
-
-    def test_the_undated_copy_competes_rather_than_surviving_alongside(self) -> None:
-        """It must not add a third survivor — that is the fusion this module prevents."""
-        items = [self._at("pass-a", self._A, "0"), self._at("undated", None, "1")]
-        kept, alternates = select_preferred_duplicates(items)
-        assert len(kept) == 1, "the undated copy survived as its own acquisition"
-        assert alternates[("MGRS-33TWM", "2021-09-08")], "the loser must remain a fallback"
-
-    def test_three_passes_and_two_undated_keep_three_survivors(self) -> None:
-        items = [
-            self._at("pass-a", self._A, "0"),
-            self._at("pass-b", self._B, "0"),
-            self._at("pass-c", "2021-09-08T18:00:00Z", "0"),
-            self._at("undated-1", None, "1"),
-            self._at("undated-2", None, "2"),
-        ]
-        kept, _ = select_preferred_duplicates(items)
-        assert len(kept) == 3, f"expected one per readable pass, got {[i.id for i in kept]}"
-
-    def test_all_undated_still_reduces_to_one(self) -> None:
-        """With no readable instant anywhere there is no evidence of distinctness at all."""
-        items = [self._at("u1", None, "0"), self._at("u2", None, "1")]
-        kept, _ = select_preferred_duplicates(items)
-        assert len(kept) == 1
-
-
 class TestTheAuditReportsWhatSelectionDidNotWhatSurvivedTheFilter:
     """The ladder filter drops copies that would refuse, so the audit could not be derived from it.
 
@@ -2259,10 +2034,10 @@ class TestTheAuditReportsWhatSelectionDidNotWhatSurvivedTheFilter:
         """
         two_passes = [
             _with_assets(
-                _Item(f"pass-{tag}", "MGRS-33TWA", "0", **{"s2:processing_baseline": "05.00", "datetime": acq}),
+                _Item(f"pass-{tag}", "MGRS-33TWA", "0", **{"s2:processing_baseline": "05.00", **image}),
                 _bands_at(_IN_REGION),
             )
-            for tag, acq in (("a", "2021-09-08T10:00:00Z"), ("b", "2021-09-08T14:00:00Z"))
+            for tag, image in (("a", _image(1)), ("b", _image(2)))
         ]
         # ...and one real duplicate on a DIFFERENT tile, so the line is emitted at all.
         win = self._copy("win", baseline="05.10")
@@ -2279,34 +2054,34 @@ class TestTheAuditReportsWhatSelectionDidNotWhatSurvivedTheFilter:
         assert self._emit(caplog, [only], [only], {}) == ""
 
 
-class TestTheLadderStepsNothingWhenTheFailedAcquisitionHasNoSpare:
-    """Attribution named the failing objects and no copy belongs to their acquisition.
+class TestTheLadderStepsNothingWhenTheFailedImageHasNoSpare:
+    """Attribution named the failing objects and no copy belongs to their image.
 
-    Falling back to the best overall alternate there swapped a HEALTHY acquisition down to an older
+    Falling back to the best overall alternate there swapped a HEALTHY image down to an older
     copy while leaving the known-bad one selected, then rebuilt and re-read the whole date only to
     fail identically — once per unrelated spare before recording the loss. Raised on PR #107.
     """
 
-    _A = "2021-09-08T10:00:00Z"
-    _B = "2021-09-08T14:00:00Z"
+    _A = _image(1)
+    _B = _image(2)
 
-    def _at(self, ident: str, acquired: str, sequence: str, baseline: str = "05.00") -> _Item:
+    def _at(self, ident: str, image: dict[str, str], sequence: str, baseline: str = "05.00") -> _Item:
         return _with_assets(
-            _Item(ident, "MGRS-33TWM", sequence, **{"s2:processing_baseline": baseline, "datetime": acquired}),
+            _Item(ident, "MGRS-33TWM", sequence, **{"s2:processing_baseline": baseline, **image}),
             _bands_at(_IN_REGION),
         )
 
-    def test_nothing_is_stepped_when_only_a_healthy_acquisition_has_a_spare(self) -> None:
+    def test_nothing_is_stepped_when_only_a_healthy_image_has_a_spare(self) -> None:
         bad = self._at("bad-a", self._A, "1")  # the one that failed; no spare of its own
-        healthy = self._at("healthy-b", self._B, "1")  # a different acquisition...
+        healthy = self._at("healthy-b", self._B, "1")  # a different image...
         spare_b = self._at("spare-b", self._B, "0")  # ...which DOES have a spare
         kept, alternates = select_preferred_duplicates([bad, healthy, spare_b])
         assert sorted(i.id for i in kept) == ["bad-a", "healthy-b"]
 
         stepped = step_down_copies(alternates, kept, implicated=[bad])
-        assert stepped is None, "a healthy acquisition was downgraded for a failure it did not have"
+        assert stepped is None, "a healthy image was downgraded for a failure it did not have"
 
-    def test_the_failed_acquisition_is_stepped_when_it_does_have_a_spare(self) -> None:
+    def test_the_failed_image_is_stepped_when_it_does_have_a_spare(self) -> None:
         """The complement, or returning None unconditionally would pass the test above."""
         bad = self._at("bad-a", self._A, "1")
         spare_a = self._at("spare-a", self._A, "0")
@@ -2315,11 +2090,11 @@ class TestTheLadderStepsNothingWhenTheFailedAcquisitionHasNoSpare:
         stepped = step_down_copies(alternates, kept, implicated=[bad])
         assert stepped is not None
         swapped, _keys = stepped
-        assert "spare-a" in [i.id for i in swapped], "the failed acquisition was not stepped"
-        assert "healthy-b" in [i.id for i in swapped], "the healthy acquisition must be untouched"
+        assert "spare-a" in [i.id for i in swapped], "the failed image was not stepped"
+        assert "healthy-b" in [i.id for i in swapped], "the healthy image must be untouched"
 
     def test_unattributed_failure_still_steps_the_best_spare(self) -> None:
-        """With nothing attributed there is no acquisition to match, and the pre-existing
+        """With nothing attributed there is no image to match, and the pre-existing
         behaviour — take the best-ranked alternate — is still right.
         """
         first = self._at("first", self._A, "1")
@@ -2328,110 +2103,6 @@ class TestTheLadderStepsNothingWhenTheFailedAcquisitionHasNoSpare:
         stepped = step_down_copies(alternates, kept, implicated=[])
         assert stepped is not None
         assert "spare" in [i.id for i in stepped[0]]
-
-
-class TestAnUndatedCopyCannotDisplaceADatedPass:
-    """`_by_acquisition` attaches an undated copy to a cluster ARBITRARILY, so it must not win it.
-
-    The acquisition-instant term used to sit below baseline and locality, so an undated 05.10 copy
-    beat that cluster's dated 05.00 pass — representing a real pass with an item that may belong to
-    a different one, and potentially duplicating another pass while dropping this one's coverage.
-    Raised on PR #107.
-    """
-
-    _A = "2021-09-08T10:00:00Z"
-    _B = "2021-09-08T14:00:00Z"
-
-    def _at(self, ident: str, acquired: str | None, baseline: str, sequence: str = "0") -> _Item:
-        extra: dict[str, object] = {"s2:processing_baseline": baseline}
-        if acquired is not None:
-            extra["datetime"] = acquired
-        return _with_assets(_Item(ident, "MGRS-33TWM", sequence, **extra), _bands_at(_IN_REGION))
-
-    def test_a_dated_pass_beats_an_undated_copy_at_a_higher_baseline(self) -> None:
-        dated = self._at("dated-05.00", self._A, "05.00")
-        undated = self._at("undated-05.10", None, "05.10")
-        kept, _ = select_preferred_duplicates([dated, undated])
-        assert [i.id for i in kept] == ["dated-05.00"], "an arbitrary attachment displaced a real pass"
-
-    def test_a_dated_pass_beats_an_undated_copy_in_region(self) -> None:
-        """Locality sits below this too, so cheaper egress cannot buy an unknown pass either."""
-        dated = _with_assets(
-            _Item("dated-remote", "MGRS-33TWM", "0", **{"s2:processing_baseline": "05.00", "datetime": self._A}),
-            _bands_at(_REMOTE),
-        )
-        undated = self._at("undated-local", None, "05.00")
-        kept, _ = select_preferred_duplicates([dated, undated])
-        assert [i.id for i in kept] == ["dated-remote"]
-
-    def test_two_dated_copies_are_still_ranked_on_baseline(self) -> None:
-        """The complement: the new term must only separate dated from undated."""
-        newer = self._at("dated-05.10", self._A, "05.10")
-        older = self._at("dated-05.00", self._A, "05.00")
-        kept, _ = select_preferred_duplicates([newer, older])
-        assert [i.id for i in kept] == ["dated-05.10"]
-
-    def test_both_passes_still_survive_with_an_undated_copy_present(self) -> None:
-        """And the coverage guarantee still holds: one survivor per readable pass."""
-        items = [
-            self._at("pass-a", self._A, "05.00"),
-            self._at("pass-b", self._B, "05.00"),
-            self._at("undated", None, "05.10", sequence="9"),
-        ]
-        kept, _ = select_preferred_duplicates(items)
-        assert sorted(i.id for i in kept) == ["pass-a", "pass-b"]
-
-
-class TestAttributedRecoveryOnlyUsesCopiesItCanPlace:
-    """A spare with no readable instant has an arbitrary — and UNSTABLE — acquisition.
-
-    `_first_for_failed_acquisition` clusters a candidate against the implicated copies, while
-    `_alternate_for` clusters it against the survivors and lands on the earliest. So an undated
-    spare could be chosen for the acquisition that failed and then swapped onto a healthy one:
-    the spare is consumed, the failure stays selected, and the date is not recovered. Raised on
-    PR #107.
-    """
-
-    _A = "2021-09-08T10:00:00Z"
-    _B = "2021-09-08T14:00:00Z"
-
-    def _at(self, ident: str, acquired: str | None, sequence: str = "0") -> _Item:
-        extra: dict[str, object] = {"s2:processing_baseline": "05.00"}
-        if acquired is not None:
-            extra["datetime"] = acquired
-        return _with_assets(_Item(ident, "MGRS-33TWM", sequence, **extra), _bands_at(_IN_REGION))
-
-    def test_an_undated_spare_is_not_offered_for_an_attributed_failure(self) -> None:
-        undated = self._at("undated", None, "9")
-        failed = self._at("failed-b", self._B, "1")
-        assert _first_for_failed_acquisition([undated], [failed]) is None
-
-    def test_a_dated_spare_of_the_failed_acquisition_is_offered(self) -> None:
-        """The complement, or excluding everything would pass the test above."""
-        spare = self._at("spare-b", self._B, "0")
-        failed = self._at("failed-b", self._B, "1")
-        chosen = _first_for_failed_acquisition([spare], [failed])
-        assert chosen is not None and chosen.id == "spare-b"
-
-    def test_an_undated_spare_is_still_used_when_nothing_is_attributed(self) -> None:
-        """With no acquisition to match there is nothing to place it against, and the
-        pre-existing behaviour — take the best-ranked spare — remains right.
-        """
-        undated = self._at("undated", None, "9")
-        chosen = _first_for_failed_acquisition([undated], [])
-        assert chosen is not None and chosen.id == "undated"
-
-    def test_the_healthy_acquisition_is_not_swapped_end_to_end(self) -> None:
-        """The consequence the reviewer named, through the real entry point."""
-        pass_a = self._at("pass-a", self._A, "1")
-        pass_b = self._at("pass-b", self._B, "1")
-        undated = self._at("undated-spare", None, "9")
-        kept, alternates = select_preferred_duplicates([pass_a, pass_b, undated])
-        assert sorted(i.id for i in kept) == ["pass-a", "pass-b"]
-        stepped = step_down_copies(alternates, kept, implicated=[pass_b])
-        if stepped is not None:
-            swapped = [i.id for i in stepped[0]]
-            assert "pass-a" in swapped, "the healthy acquisition was replaced by an unplaceable spare"
 
 
 class TestASequenceIsMatchedNotCoerced:
@@ -2497,22 +2168,22 @@ class TestTheSteppedSetNamesOnlyWhatWasStepped:
     exactly the data-loss investigation that record exists for. Raised on PR #107.
     """
 
-    _A = "2021-09-08T10:00:00Z"
+    _A = _image(1)
 
-    def _at(self, ident: str, tile: str, acquired: str, sequence: str) -> _Item:
+    def _at(self, ident: str, tile: str, image: dict[str, str], sequence: str) -> _Item:
         return _with_assets(
-            _Item(ident, tile, sequence, **{"s2:processing_baseline": "05.00", "datetime": acquired}),
+            _Item(ident, tile, sequence, **{"s2:processing_baseline": "05.00", **image}),
             _bands_at(_IN_REGION),
         )
 
     def test_only_the_tile_date_with_a_usable_spare_is_reported(self) -> None:
-        # Tile A: the failure has a spare of its own acquisition, so it steps.
+        # Tile A: the failure has a spare of its own image, so it steps.
         a_bad = self._at("a-bad", "MGRS-33TWA", self._A, "1")
         a_spare = self._at("a-spare", "MGRS-33TWA", self._A, "0")
-        # Tile B: also failed, but its only spare belongs to a DIFFERENT acquisition.
+        # Tile B: also failed, but its only spare belongs to a DIFFERENT image.
         b_bad = self._at("b-bad", "MGRS-33TWB", self._A, "1")
-        b_other = self._at("b-other", "MGRS-33TWB", "2021-09-08T14:00:00Z", "1")
-        b_other_spare = self._at("b-other-spare", "MGRS-33TWB", "2021-09-08T14:00:00Z", "0")
+        b_other = self._at("b-other", "MGRS-33TWB", _image(2), "1")
+        b_other_spare = self._at("b-other-spare", "MGRS-33TWB", _image(2), "0")
 
         kept, alternates = select_preferred_duplicates([a_bad, a_spare, b_bad, b_other, b_other_spare])
         stepped = step_down_copies(alternates, kept, implicated=[a_bad, b_bad])
@@ -2523,8 +2194,8 @@ class TestTheSteppedSetNamesOnlyWhatWasStepped:
     def test_a_spare_is_not_consumed_from_a_tile_date_that_did_not_step(self) -> None:
         """Removing it from the ladder before knowing it would be used loses a copy for nothing."""
         b_bad = self._at("b-bad", "MGRS-33TWB", self._A, "1")
-        b_other = self._at("b-other", "MGRS-33TWB", "2021-09-08T14:00:00Z", "1")
-        b_other_spare = self._at("b-other-spare", "MGRS-33TWB", "2021-09-08T14:00:00Z", "0")
+        b_other = self._at("b-other", "MGRS-33TWB", _image(2), "1")
+        b_other_spare = self._at("b-other-spare", "MGRS-33TWB", _image(2), "0")
         a_bad = self._at("a-bad", "MGRS-33TWA", self._A, "1")
         a_spare = self._at("a-spare", "MGRS-33TWA", self._A, "0")
 
@@ -2547,7 +2218,6 @@ class TestTheProducerTermIsInertWithoutAReadSet:
 
     def _native(self, ident: str, baseline: str, sequence: str) -> _Item:
         item = _Item(ident, "MGRS-33TWM", sequence, **{"s2:processing_baseline": baseline})
-        item.properties["datetime"] = "2024-06-05T10:20:31.024000Z"
         # Native keys, as Planetary Computer serves them — none of the configured names resolve.
         return _with_assets(item, {k: {"href": f"https://x.blob.core.windows.net/{k}"} for k in ("B02", "B03")})
 
@@ -2575,7 +2245,6 @@ class TestTheProducerTermIsInertWithoutAReadSet:
         used to be posed on one of those and would now pass for the wrong reason.
         """
         unlisted = _Item("unlisted", "MGRS-33TWM", "0", **{"s2:processing_baseline": "05.00"})
-        unlisted.properties["datetime"] = "2024-06-05T10:20:31.024000Z"
         _with_assets(unlisted, _bands_at("s3://nobody-has-classified-this/33/T/WM"))
         assert refuses_its_date(unlisted, READ_ASSET_KEYS) is True
 

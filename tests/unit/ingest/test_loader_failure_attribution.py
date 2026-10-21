@@ -88,7 +88,13 @@ class _Item:
         self.id = ident
         # normalize_to_solar_day stamps noon UTC and solar_day_of raises on anything else.
         self.datetime = datetime(2021, 9, 8, 12, 0, 0, tzinfo=UTC)
-        self.properties: dict[str, object] = {"grid:code": tile, "s2:sequence": str(sequence)}
+        # Every copy here is of one image, as selection requires before it compares them.
+        self.properties: dict[str, object] = {
+            "grid:code": tile,
+            "s2:sequence": str(sequence),
+            "s2:datatake_id": "GS2B_20210908T100000_000001_N05.00",
+            "s2:datastrip_id": "S2B_OPER_MSI_L2A_DS_TEST_20210908T120000_S20210908T100000_N05.00",
+        }
         self.assets = {k: _Asset(v) for k, v in (assets or {}).items()}
 
 
