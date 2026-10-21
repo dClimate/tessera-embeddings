@@ -15,14 +15,15 @@ The upgrade was measured with the code, tiles, tiling and batch held fixed and o
 PyTorch differing ([`../inference/inference-on-gpus.md`](../inference/inference-on-gpus.md) §8),
 twice: first on code that still ran v1.1's `nn.GRU`, then on the code that ships, after #212 replaced
 that GRU with a compiled step ([ADR 026](026-v1-1-runs-the-gru-it-was-trained-with.md)). On the code
-that ships:
+that ships, v2 on each of the fleet's three cards (L40S, A10G, L4) and v1.1 on the A10G:
 
-- **The same-config gate fails on every tile, for both models.** v2 keeps 99.96–99.99% of int8
+- **The same-config gate fails on every tile, for both models.** v2 keeps 99.94–99.99% of int8
   values exactly equal and v1.1 88.7–90.0%; both reach a largest difference of 3 levels and per-pixel
-  scales up to 1.5% apart.
-- **The cross-config envelope passes** on every tile of both models.
-- **What a user of v2 consumes barely moves.** 99.99% of top-20 neighbours are kept, against the
-  0.9940 that two same-model stores agree on, and 99.999% of pixels stay in the same k-means group.
+  scales up to 1.6% apart.
+- **The cross-config envelope passes** on every tile, for both models and on every card.
+- **What a user of v2 consumes barely moves, on every card.** 99.99% of top-20 neighbours are kept
+  on the Iowa tiles and at least 99.93% on `m10`, against the 0.9940 that two same-model stores agree
+  on, and at least 99.99% of pixels stay in the same k-means group.
 - **v1.1 moves as far as a change of card.** It keeps 98.2% of top-20 neighbours on the Iowa tiles
   and 91.9% on the more uniform `m10` tile, below that ceiling; on the `nn.GRU` code it kept 99.48%.
   On the same Iowa tiles an A10G and an L40S running identical code differ by as much. The likely

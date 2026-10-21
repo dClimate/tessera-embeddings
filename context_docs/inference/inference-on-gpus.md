@@ -1227,16 +1227,18 @@ further than it did on `nn.GRU`, as far as a change of card, and misses that bar
 
 ### Method: hold everything but the library stack
 
-**Round 2, the code that ships.** One `g5.2xlarge` (A10G; there was no L40S capacity), booted from the
-2.5.1 worker image, ran `upgrade/pytorch-2-14` at `936291b5` (with #212) on the image's 2.5.1 and then
-on a copy of the same environment with only torch installed over it. The package diff between the two
-is torch, Triton and torch's own CUDA packages, nothing else. Both stacks processed the same tiles in
-the same order at the batch fitted to the card (3,593): three Iowa tiles of `mosaics/iowa_epsg5070`
-(`chunk_1_12`, `chunk_0_7`, `chunk_0_21`; calendar 2024, ascending radar) and the two-orbit
-`m10_parity_15S` tile, for both models. Controls, all bit-identical: v2's three tiles rerun on 2.5.1,
-and one v1.1 tile run twice on each stack, each run its own process so the compiled GRU step compiled
-afresh. Harness, results and the staged tiles: `s3://global-tessera-inputs-dev/perf/torch-upgrade/r2/`
-(`r2_box.sh`, `r2c_box.sh`).
+**Round 2, the code that ships.** One box per card, booted from the 2.5.1 worker image, ran
+`upgrade/pytorch-2-14` at `936291b5` (with #212) on the image's 2.5.1 and then on a copy of the same
+environment with only torch installed over it. The package diff between the two is torch, Triton and
+torch's own CUDA packages, nothing else. Both stacks processed the same tiles in the same order at the
+batch fitted to the card: three Iowa tiles of `mosaics/iowa_epsg5070` (`chunk_1_12`, `chunk_0_7`,
+`chunk_0_21`; calendar 2024, ascending radar) and the two-orbit `m10_parity_15S` tile. The A10G
+(`g5.2xlarge`) ran both models; the L40S (`g6e.xlarge`) and the L4 (`g6.2xlarge`), the fleet's other
+two cards, ran v2, the model that moves. Controls, all bit-identical: v2's three tiles rerun on 2.5.1
+on each card, and one v1.1 tile run twice on each stack on the A10G, each run its own process so the
+compiled GRU step compiled afresh. Harness, results and the staged tiles:
+`s3://global-tessera-inputs-dev/perf/torch-upgrade/r2/` (A10G; `r2_box.sh`, `r2c_box.sh`) and
+`r3/` (L40S, L4; `r3_box.sh`).
 
 **Round 1, one L40S, both stacks.** `InferenceActor` was driven without Ray on one `g6e.xlarge`, first on the
 image's 2.5.1 and then on a copy of the same environment with only torch replaced. Each stack
@@ -1273,8 +1275,19 @@ observation counts were exact on every tile.
 | top-20 neighbours kept | 98.2% | 91.9% | 99.99% | 99.94% |
 | same k-means group | 99.83% | 98.62% | 99.999% | 99.994% |
 
-**v2 clears ADR 025's usability bar (0.9940) on every tile; v1.1 does not.** On round 1's `nn.GRU`
-code v1.1 kept 99.48% of neighbours and moved 2.3e-6; on the shipped code it moves about ten times
+v2 on the fleet's other two cards, the same tiles and measures:
+
+| v2, 2.5.1 against 2.14.1 | L40S, Iowa | L40S, `m10` | L4, Iowa | L4, `m10` |
+|---|---:|---:|---:|---:|
+| int8 values exact | 99.94–99.99% | 99.98% | 99.94–99.99% | 99.98% |
+| largest scale drift | 1.59% | 0.96% | 1.06% | 0.99% |
+| cross-config envelope | 3 of 3 pass | pass | 3 of 3 pass | pass |
+| pixels bit-identical | 51% | 49% | 51% | 49% |
+| top-20 neighbours kept | 99.99% | 99.93% | 99.99% | 99.94% |
+| same k-means group | 99.999% | 99.994% | 99.999% | 99.992% |
+
+**v2 clears ADR 025's usability bar (0.9940) on every tile of every card; v1.1 does not.**
+On round 1's `nn.GRU` code v1.1 kept 99.48% of neighbours and moved 2.3e-6; on the shipped code it moves about ten times
 further. The likely reason, not separately tested, is that #212's GRU step is compiled with
 `torch.compile`, whose code generator changed between the stacks (Triton 3.1 to 3.8), and a recurrence
 carries each step's rounding into the next for up to 256 steps. The `m10` tile is the most uniform of
@@ -1329,13 +1342,16 @@ strip and a body, while the rerun processed it first as one strip. That tiling d
 
 ### Speed and memory
 
-Round 2 measured the shipped code on the A10G only; the other rows are round 1, on `nn.GRU`. ADR 026
-gives the fused step's speed against `nn.GRU` on both stacks and both cards.
+Round 2 measured the shipped code on all three cards for v2 and on the A10G for v1.1; the rows not
+marked round 2 are round 1, on `nn.GRU`. ADR 026 gives the fused step's speed against `nn.GRU` on both
+stacks and both cards. A rerun of the same stack moved inference-loop throughput by up to 1%.
 
 | | v1.1 | v2 |
 |---|---|---|
 | A10G, round 2, inference-loop tokens per second on the same tiles, steady state | **4.0% faster** | 0.5% slower |
-| A10G, round 2, peak card memory per tile | unchanged (2.3–4.2 GiB) | unchanged (1.7–3.1 GiB) |
+| L40S, round 2, the same | — | 1.2% faster |
+| L4, round 2, the same | — | 0.7% slower |
+| round 2, peak card memory per tile | unchanged on the A10G (2.3–4.2 GiB) | unchanged on all three (A10G and L4 1.7–3.1 GiB, L40S 3.4–6.2 GiB) |
 | L40S, single box (same tiles, serial) | **−3.5% wall per tile** | ±1% |
 | L40S, paired flow runs (25 tiles) | median tile 181 → 168 s; GPU-hours per tile 0.065 → 0.061 (−6%), on cards running 10% faster clocks (below) | not run |
 | A10G, deepest bucket (256 + 256) | 2,947 → 3,253 ms, **10% slower** | +1% |
