@@ -224,8 +224,7 @@ pip install tessera_embeddings[inference]
 pip install tessera_embeddings[inference,prefect,aws]
 
 # GPU, v2 (CUDA 13.0, NVIDIA driver 580+, Python 3.12-3.13) — install torch first so pip keeps
-# the CUDA wheel. On an older driver, the cu126 build of the same version runs pre-Blackwell
-# cards only; Blackwell (g7, g7e) needs driver 580+ and cu130.
+# the CUDA wheel. cu130 is the only measured build (ADR 025); see docs/environment-setup.md.
 pip install "torch==2.14.1+cu130" --index-url https://download.pytorch.org/whl/cu130
 pip install "tessera_embeddings[inference]"
 
