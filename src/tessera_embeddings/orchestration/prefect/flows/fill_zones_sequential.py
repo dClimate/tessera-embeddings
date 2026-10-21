@@ -51,7 +51,7 @@ from prefect.runtime import flow_run as flow_run_ctx
 from prefect.states import Cancelling
 
 from tessera_embeddings.config.fault_injection import WITHHOLD_WORK, FaultInjection, hard_exit_after_flush
-from tessera_embeddings.config.inference import checkpoint_filename
+from tessera_embeddings.config.inference import DEFAULT_MODEL_VERSION, ami_ssm_name_for_model, checkpoint_filename
 from tessera_embeddings.config.ingest import IngestSettings
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.store_layout import SHARD_PX
@@ -691,6 +691,7 @@ def fill_zones_sequential_flow(
     paths: BucketPaths,
     ami_ssm_name: str,
     ami_id: str | None = None,
+    ami_ssm_name_by_model: dict[str, str] | None = None,
     time_window_end: str | None = None,
     store_name: str = "tessera",
     mask_name: str = "global",
@@ -746,6 +747,8 @@ def fill_zones_sequential_flow(
         ami_id: Pre-resolved AMI ID the campaign pinned, used for BOTH the shared cluster's
             image AND this flow's own staging fingerprint, so a mid-campaign re-bake can't
             split them. ``None`` (direct calls) resolves ``ami_ssm_name``.
+        ami_ssm_name_by_model: Per-model overrides of ``ami_ssm_name``. This flow runs the
+            default model, so that model's entry, if any, replaces ``ami_ssm_name`` (ADR 025).
         time_window_end: End month of the inference window as ``"Month Year"``; defaults to
             ``"December {year}"`` per cell (the calendar-year window). Only valid for a
             SINGLE-year ``cells`` list — one literal override cannot describe several years,
@@ -904,6 +907,7 @@ def fill_zones_sequential_flow(
     """
     log = get_run_logger()
     t0_flow = time.monotonic()
+    ami_ssm_name = ami_ssm_name_for_model(ami_ssm_name, ami_ssm_name_by_model, DEFAULT_MODEL_VERSION)
 
     # Validate BEFORE any side effect (triage reads, primed ingests, `ray up`): look_ahead < 0
     # sizes the ingest driver's thread pool (1 + look_ahead) at zero width, so no cell would

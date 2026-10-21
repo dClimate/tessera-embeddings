@@ -59,7 +59,12 @@ from prefect.deployments import arun_deployment
 from prefect.runtime import flow_run as flow_run_ctx
 from prefect.states import StateType
 
-from tessera_embeddings.config.inference import checkpoint_filename, inference_code_identity
+from tessera_embeddings.config.inference import (
+    DEFAULT_MODEL_VERSION,
+    ami_ssm_name_for_model,
+    checkpoint_filename,
+    inference_code_identity,
+)
 from tessera_embeddings.config.ingest import IngestSettings
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.inference.data_loading import _active_orbits
@@ -549,6 +554,7 @@ async def run_global_campaign(
     *,
     paths: BucketPaths,
     ami_ssm_name: str,
+    ami_ssm_name_by_model: dict[str, str] | None = None,
     branch: str | None = None,
     fill_deployment: str | None = None,
     store_name: str = "tessera",
@@ -599,6 +605,9 @@ async def run_global_campaign(
     Args:
         paths: Deployment storage contract.
         ami_ssm_name: SSM parameter name for the Ray GPU AMI (forwarded to fills).
+        ami_ssm_name_by_model: Per-model overrides of ``ami_ssm_name``. The campaign runs the
+            default model, so that model's entry, if any, is the image it resolves, pins and
+            forwards (ADR 025).
         branch: Route child deployments to their branch-scoped variants. ``None``
             (production) leaves every ref at its unsuffixed default. A slug (e.g.
             ``"global-tessera"``) suffixes every *derived* child deployment name with
@@ -919,6 +928,7 @@ async def run_global_campaign(
         Summary: pending count at start, dispatched run ids per year, totals.
     """
     log = get_run_logger()
+    ami_ssm_name = ami_ssm_name_for_model(ami_ssm_name, ami_ssm_name_by_model, DEFAULT_MODEL_VERSION)
     # Stamped on every deployment this campaign dispatches so the terminal hooks can find
     # them from the flow-run id alone (see _child_tag). None outside a Prefect run — a direct
     # .fn() call in tests dispatches nothing worth sweeping.

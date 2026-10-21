@@ -455,6 +455,16 @@ def test_fill_run_id_ignores_the_build_and_keys_on_inference_code(wired, monkeyp
     assert changed.startswith("33N-2025-") and changed != base
 
 
+def test_the_campaign_forwards_the_default_models_own_image(wired):
+    """The campaign runs the default model, so that model's entry in ami_ssm_name_by_model is what its fills get."""
+    wired["arun"].clear()
+    wired["landed"].clear()
+    by_model = {mod.DEFAULT_MODEL_VERSION: "ami-own"}
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", ami_ssm_name_by_model=by_model))
+    params = next(p for d, p in wired["arun"] if "fill-zones-sequential" in d)
+    assert params["ami_ssm_name"] == "ami-own"
+
+
 def _chained_staging_identity(wired, **kwargs) -> str:
     """The staging identity the DEFAULT strategy hands its child."""
     wired["arun"].clear()

@@ -13,11 +13,26 @@ from tessera_embeddings.config.inference import (
     TUNED_GPU_GIB,
     InferenceConfig,
     _normalize_obs_checkpoints,
+    ami_ssm_name_for_model,
     band_stats,
     batch_size_for_gpu,
     checkpoint_filename,
 )
 from tessera_embeddings.config.time_windows import parse_time_window
+
+
+@pytest.mark.parametrize(
+    ("by_model", "model", "expected"),
+    [(None, "v1.1", "default"), ({"v1.1": "old"}, "v1.1", "old"), ({"v1.1": "old"}, "v2-large", "default")],
+)
+def test_a_listed_model_runs_on_its_own_worker_image(by_model, model, expected) -> None:
+    assert ami_ssm_name_for_model("default", by_model, model) == expected
+
+
+def test_a_misspelt_model_is_refused_rather_than_falling_back() -> None:
+    with pytest.raises(ValueError, match="unknown models"):
+        ami_ssm_name_for_model("default", {"v1_1": "old"}, "v1.1")
+
 
 # ---------------------------------------------------------------------------
 # checkpoint_filename

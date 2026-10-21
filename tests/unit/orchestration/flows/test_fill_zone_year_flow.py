@@ -221,6 +221,18 @@ def test_pinned_ami_id_reaches_ray_cluster(wired):
     assert captured["ami_id"] == "ami-pinned-01"
 
 
+def test_the_default_models_own_image_reaches_ray_cluster(wired):
+    """A fill runs the default model, so that model's entry in ami_ssm_name_by_model is its image (ADR 025)."""
+    wired.setattr("tessera_embeddings.providers.aws.ray.make_instance_terminator", lambda **k: object(), raising=False)
+    wired.setattr(mod, "fill_zone_year", lambda **kw: {"tag": "t"})
+    captured: dict = {}
+    wired.setattr("tessera_embeddings.providers.aws.ray.ray_cluster", _fake_ray_cluster(captured), raising=False)
+
+    by_model = {mod.DEFAULT_MODEL_VERSION: "ami-own"}
+    mod.fill_zone_year_flow.fn(zone="33N", year=2025, paths=_PATHS, ami_ssm_name="ami", ami_ssm_name_by_model=by_model)
+    assert captured["ami_ssm_name"] == "ami-own"
+
+
 def test_staging_base_scoped_to_zone_year(wired):
     """The runner is handed a (zone, year)-scoped staging_base so a reused run_id
     can't cross-contaminate another cell's staged tiles.

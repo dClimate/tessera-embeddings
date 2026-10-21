@@ -38,6 +38,7 @@ from tessera_embeddings.config.inference import (
     INFERENCE_CHUNK_SIZE,
     V2_RUN_PREFIX,
     ModelVersion,
+    ami_ssm_name_for_model,
     checkpoint_filename,
     run_id_prefix,
 )
@@ -229,6 +230,7 @@ def tessera_embeddings(
     num_actors: int = 20,
     s1_orbit: str = "both",
     model_version: ModelVersion = DEFAULT_MODEL_VERSION,
+    ami_ssm_name_by_model: dict[str, str] | None = None,
     require_s1: bool = True,
     s3_region: str | None = None,
     allow_s2_only: bool = False,
@@ -263,6 +265,9 @@ def tessera_embeddings(
         model_version: Which Tessera model to run — ``"v1.1"`` (default) or
             ``"v2-large"``. Also selects the checkpoint filename expected under
             ``{inputs}/models/``.
+        ami_ssm_name_by_model: Per-model overrides of ``ami_ssm_name``, such as
+            ``{"v1.1": "/<project>/ray/ami-id-torch-2-5-1"}``: a run of a listed model
+            provisions from that model's own worker image (ADR 025).
         require_s1: Demand radar rather than request it, and **True by default here**
             because this flow fills ONE cell: an operator naming a single zone-year over
             terrain that should be imaged wants to be told when its radar is missing, not to
@@ -298,6 +303,7 @@ def tessera_embeddings(
     # a GPU cluster has been paid for. Mirrors fill_zone_year.
     if not dev_params.assembly_only and num_actors < 1:
         raise ValueError(f"num_actors must be >= 1, got {num_actors} (no actor would ever run inference)")
+    ami_ssm_name = ami_ssm_name_for_model(ami_ssm_name, ami_ssm_name_by_model, model_version)
 
     # Refuse a contradicted resume before anything is opened. The run_id is minted much
     # later, from the config's EFFECTIVE flag, but this half needs only the request.

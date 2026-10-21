@@ -50,9 +50,11 @@ against itself across two runs.**
    not include the image either, so a run on a different stack from the one that staged its tiles
    passes a fresh `force_staging_restage` token rather than reusing them.
 3. **v2 moves to PyTorch 2.14.1; v1.1 stays on 2.5.1.** v2 clears the gate and v1.1 does not. Every
-   v1.1 run names the 2.5.1 worker image in its `ami_ssm_name`: the published store's updates and
-   any new v1.1 store alike. Nothing planned needs v1.1 on the new stack: its one store must finish on
-   2.5.1 under rule 2, and v1.1 is expected to give way to v2 (ADR 026).
+   v1.1 run provisions from the 2.5.1 worker image, the published store's updates and any new v1.1
+   store alike. The Ray flows take `ami_ssm_name_by_model`, deployments set it to that image for
+   v1.1, and each run picks its image from the model it actually runs, so no run lands on the new
+   stack by omitting an override. Nothing planned needs v1.1 on the new stack: its one store must
+   finish on 2.5.1 under rule 2, and v1.1 is expected to give way to v2 (ADR 026).
 4. **The workers run the lockfile's torch version,** as that version's CUDA build, with v1.1's runs
    as the one exception. Tests, the driver image and v2's workers then run one version, and moving it
    is a lockfile change.

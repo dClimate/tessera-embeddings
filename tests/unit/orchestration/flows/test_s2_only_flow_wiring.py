@@ -120,6 +120,14 @@ def _run_master_pipeline(monkeypatch, **kwargs) -> dict:
     return calls
 
 
+@pytest.mark.parametrize(("model", "image"), [("v1.1", "ami-v11"), ("v2-large", "ami")])
+def test_full_pipeline_hands_the_embeddings_stage_its_models_image(monkeypatch, model, image) -> None:
+    calls = _run_master_pipeline(
+        monkeypatch, model_version=model, ami_ssm_name="ami", ami_ssm_name_by_model={"v1.1": "ami-v11"}
+    )
+    assert calls[fp_mod.PipelineDeployments().tessera_embeddings]["ami_ssm_name"] == image
+
+
 def test_full_pipeline_forwards_allow_s2_only(monkeypatch) -> None:
     calls = _run_master_pipeline(monkeypatch, allow_s2_only=True)
     emb_params = calls[fp_mod.PipelineDeployments().tessera_embeddings]
