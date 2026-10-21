@@ -61,8 +61,9 @@ registry plus extra cells. A tile only that mask holds is processed whole, and t
 every such tile, because the validator reconciles a cell's written and skipped tiles against its
 mask's land. Anything that validates the store afterwards judges each year against the campaign's
 mask together with every mask the year's update records name (`mask_name`), resolved beside it as
-`{inputs}/masks/<name>.icechunk` (yield-embeddings #109), so such a mask is kept for as long as the
-store is validated. How to build one: [`docs/updates.md`](../../docs/updates.md).
+`{inputs}/masks/<name>.icechunk` (yield-embeddings #109). The record holds the name, not a snapshot,
+so a mask a record names is kept unchanged for as long as the store is validated, and a changed mask
+takes a new name. How to build one: [`docs/updates.md`](../../docs/updates.md).
 
 **Two tags per update, none per cell.** `update-<name>-base` pins the store before the update's first
 write, for comparison and rollback; `update-<name>-complete` pins it once every planned cell holds

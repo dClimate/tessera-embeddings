@@ -77,7 +77,7 @@ islands. Four island tiles above the cutoff fell outside the region for that rea
 
 ### The islands follow-up
 
-It took the Cambridge list whole, for 2024 and 2025 only. The list falls into two groups:
+It took the Cambridge list for 2024 and 2025, less the three entries below. The list falls into two groups:
 - **308 islands outside the land mask**, about 314 km² of missing land: the Bahamas banks, Cuba's cays, the
   Nicaraguan banks and San Andrés cays, Belize's atolls, Chile's fjord islands and others. They needed land
   added to the mask.
@@ -86,7 +86,8 @@ It took the Cambridge list whole, for 2024 and 2025 only. The list falls into tw
   La Orchila, Providencia, Cocos, Juan Fernández, Malpelo, Trindade, South Georgia and Bermuda. They needed an
   ordinary `holes` update.
 
-Two islands were left out. Rocas Alijos (Mexico) has no Sentinel-2 imagery in 2024. Salas y Gómez (Chile) is the
+Three entries of the first group were left out, so 305 of its islands and all 38 of the second were planned.
+Rocas Alijos (Mexico) has no Sentinel-2 imagery in 2024. Salas y Gómez (Chile) and the islet beside it are the
 only land in zone 13S, whose years the store publishes as empty, a path no update had exercised.
 
 The update ran under its own land mask, `latam-islands`: the partner's registry plus 273 cells covering the
@@ -255,6 +256,8 @@ every tile and year.
     whole mask, so a live tile left out of the plan reads as lost.
   - Whatever validates the store later must judge each year against every mask its updates ran under.
     yield-embeddings #109 made the validator and the campaign monitor read that from each update's record.
+    The record holds the mask's name, not a snapshot, so `latam-islands` must never be rebuilt under that
+    name; a changed mask takes a new one.
 - **Adding land must also cover the existing tiles the new land touches.** The islands plan took the thin
   pixels of the second group's islands and the new tiles of the first group, but not thin pixels in existing
   tiles that first-group islands reach into. About 70,000 such pixels remain, in 54 tile-years across 13

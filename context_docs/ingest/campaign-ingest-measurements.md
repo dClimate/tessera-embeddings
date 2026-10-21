@@ -831,8 +831,9 @@ more in the restart and was still faster), which controls the largest driver of 
 cloudiness or date density; the paired tests cited above remain the controlled
 evidence for the overlap. The mechanisms themselves are measured directly: 85% of each date's
 preparation was hidden (none in run 1), the wait for it fell from 5.9 s to 2.0 s a date, and writes
-holding a single date fell from 73% to 22%. 19S gained least (1.07–1.10×): each of its dates covers
-510–590 chunks, so two never fit in 720.
+holding a single date fell from 73% to 22%. Of the zone-years whose windows per date matched, 19S gained
+least (1.07–1.10×): each of its dates covers 510–590 chunks, so two never fit in 720. The range's 1.03× is
+23S-2025, the exception above, whose restart dates carried 23% more windows.
 
 | on 60-worker fleets, both at six threads | run 1 | restart |
 |---|---|---|
