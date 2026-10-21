@@ -45,7 +45,10 @@ because PyPI's CPU wheel stays in the candidate pool and can win.
 publishes `cu126`, `cu130` and `cu132`. Pick the one your driver supports: the CUDA 13 builds need
 an NVIDIA driver of 580 or later, `cu126` runs on older ones. CUDA 12.6 predates Blackwell, so
 `cu126` has no kernels for those cards (`g7`, `g7e`): they need a 580+ driver and a CUDA 13 build.
-Production runs `cu130`.
+Production runs v2 on `cu130`. v1.1's production runs stay on PyTorch 2.5.1 with CUDA 12.1, the
+stack the published v1.1 store was inferred on: on 2.14.1, v1.1's outputs differ from that store's by
+about as much as two GPU models' do (ADR 025; measurements in
+`context_docs/inference/inference-on-gpus.md` §8).
 
 **Supported Python is 3.12-3.13** — what CI tests, what the classifiers advertise, and what these
 instructions assume. `requires-python` is `>=3.12` with no upper bound, so 3.14 installs but is

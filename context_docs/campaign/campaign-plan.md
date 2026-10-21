@@ -886,7 +886,8 @@ stack changes only between fills, and a store begun on one stack is finished on 
 included, by naming that stack's worker image in the run's `ami_ssm_name`. A run on a different
 stack from the one that staged its tiles also passes a fresh `force_staging_restage` token, since
 the staging fingerprint cannot see the image. Every published year, 2017–2025, was inferred on
-**PyTorch 2.5.1 with CUDA 12.1**. Record each later switch here, with its date and worker image.
+**PyTorch 2.5.1 with CUDA 12.1**, and v1.1 stays on it: every v1.1 run names the 2.5.1 worker image,
+while v2 moves to 2.14.1. Record each later switch here, with its date and worker image.
 
 ### When a re-run is free
 
