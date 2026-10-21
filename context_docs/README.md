@@ -43,7 +43,8 @@ context_docs/
 │   ├── 024-spatial-transform-origin-is-the-pixel-corner.md
 │   ├── 026-v1-1-runs-the-gru-it-was-trained-with.md
 │   ├── 027-targeted-updates.md
-│   └── 028-embed-every-pixel-with-an-optical-observation.md
+│   ├── 028-embed-every-pixel-with-an-optical-observation.md
+│   └── 029-one-flow-per-ingest.md
 │
 ├── campaign/                      THE GLOBAL CAMPAIGN — start here
 │   ├── campaign-plan.md                        <- START HERE. What runs, with what settings, in
