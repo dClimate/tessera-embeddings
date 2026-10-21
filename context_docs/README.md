@@ -87,6 +87,9 @@ context_docs/
 │   │                                              one observation. Four measurement campaigns
 │   ├── gpu-fleet-launch-throttling.md          why several clusters asking EC2 for GPUs at once
 │   │                                              throttle each other, and the two bounds
+│   ├── fresh-worker-start.md                   a new worker's first minutes are its EBS volume
+│   │                                              loading the AMI, and the mounted venv image that
+│   │                                              removes them
 │   └── the-fleet-and-the-work-source.md        a fleet lives for one `run_inference` call, so a
 │                                                  retry through a second call rebuilt one; the
 │                                                  wind-down, and why the fleet is not held

@@ -233,7 +233,15 @@ setup_commands:
     - echo 'export PATH=/opt/tessera/venv/bin:$PATH' >> ~/.bashrc && echo 'export PYTHONPATH=$HOME/tessera-embeddings:$PYTHONPATH' >> ~/.bashrc
 
 head_setup_commands: []
-worker_setup_commands: []
+
+# A fresh EBS volume reads the AMI's snapshot block by block on first use, which holds a new
+# worker's first forward pass back by minutes; an ext4 image of the venv copied from S3 to the
+# instance store takes seconds (context_docs/inference/fresh-worker-start.md). An AMI that ships
+# one names it in /opt/tessera/env-image.uri, and the worker mounts it read-only over the venv
+# before `ray start`. No file, no instance store at /opt/dlami/nvme, a venv already mounted or a
+# failed copy all leave the AMI's own venv in place.
+worker_setup_commands:
+    - mountpoint -q /opt/tessera/venv || { u=$(cat /opt/tessera/env-image.uri 2>/dev/null) && mountpoint -q /opt/dlami/nvme && sudo aws configure set default.s3.max_concurrent_requests 32 && sudo aws s3 cp --only-show-errors "$u" /opt/dlami/nvme/venv.img && sudo mount -o loop,ro /opt/dlami/nvme/venv.img /opt/tessera/venv || true; }
 
 # Ray start commands activate the pre-installed venv at /opt/tessera/venv.
 # Adjust the venv path if your AMI puts it elsewhere.
