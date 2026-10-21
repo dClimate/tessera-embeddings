@@ -36,8 +36,10 @@ scale_tests/
 ├── t7_ramp.py        fresh-bucket PUT ramp (S3 only)       → campaign warm-up
 ├── t8_sharding.py    shard vs unshard: write-align, bytes, → ADR D3 (see
 │                     scattered reads, object count            ADR-008 D3)
-├── t9_v2_layout.py   v2 layout arms, local: stored bytes, encode CPU,  → v2 store layout
-│                     request plans on two zarr versions, Dask graph   (decision pending)
+├── t9_v2_layout.py   v2 layout arms, local: stored bytes, encode CPU,  → ADR 031
+│                     request plans on two zarr versions, Dask graph
+├── t10_v2_aws.py     v2 finalists on AWS: cold S3 reads on two        → ADR 031
+│                     clients, the assembly code's write cost
 ├── report.py         collate metrics → decision matrix markdown
 └── teardown.py       delete a run's stores; verify $0 residue
 ```
@@ -79,6 +81,12 @@ uv run python -m scripts.scoping.scale_tests.t9_v2_layout --run-id v2a --phase f
 uv run python -m scripts.scoping.scale_tests.t9_v2_layout --run-id v2a --scale bench --tiles <dir>
 <old-venv>/bin/python -m scripts.scoping.scale_tests.t9_v2_layout --run-id v2a --scale bench --tiles <dir>
 
+# v2 finalists (T10): in-region EC2 in the dev account. Reads on x86 (r7i), assembly on Graviton (m7g)
+T10="-m scripts.scoping.scale_tests.t10_v2_aws --run-id v2b --backend s3 --bucket <bucket>/<prefix> --scale bench"
+uv run python $T10 --tiles <dir> --phase build
+uv run python $T10 --tiles <dir> --phase read          # then again from the old-client environment
+uv run python $T10 --phase assemble --staging s3://<staged run dir> --extent <ny,nx> --n-tiles 64 --workers 16
+
 # collate + tear down
 uv run python -m scripts.scoping.scale_tests.report   --run-id run1
 uv run python -m scripts.scoping.scale_tests.teardown --run-id run1 --backend s3 --bucket <bucket>/global-embeddings/
@@ -106,9 +114,23 @@ transpose, the inner-chunk order within a shard, and the `scales` geometry.
 `WrapperStore` would otherwise forward it unseen, and so would zarr 3.4's sync path.
 
 **Request plans carry over to S3, but latency does not.** The requests depend only on zarr's
-sharding codec, so they hold on S3. Latency depends on the network, so T1 measures the finalists on
-S3. Run the `requests` phase under both the library's zarr and an old client: zarr 3.3 changed
+sharding codec, so they hold on S3. Latency depends on the network, so T10 measures the finalists
+there. Run the `requests` phase under both the library's zarr and an old client: zarr 3.3 changed
 partial shard reads from one request per inner chunk to merged, concurrent ones.
+
+### T10 — the v2 finalists on AWS
+
+Each phase runs on its own in-region EC2 box, writing throwaway repos under the run's store root.
+
+- **`build` then `read`** (x86, r7i.4xlarge). Each finalist is built as a repo of 10 × 10 shards
+  cycled from the real tiles T9 fetched, so no cache holds the working set. Every workload runs cold
+  in a fresh process, arms interleaved, in two passes of opposite order: points, an 8 × 8-tile pull
+  at 16, 64 and 128 dims, and Dask at default and shard-aligned chunks. `read` runs once per client.
+  `tune` repeats the full-vector pulls with wider fetch concurrency and band-aligned Dask chunks.
+- **`assemble`** (Graviton, like the assembly runner). Staged v2 tiles are written into each
+  band-last finalist by the library's own `shard_writer.write_year_shards` over a
+  `StagedShardSource`, every array included. Band-first arms are left out because the library
+  stages tiles band-last; their encode cost comes from `build` on a Graviton box instead.
 
 ### Common flags (every `tN` script)
 

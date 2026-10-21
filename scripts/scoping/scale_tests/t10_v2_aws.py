@@ -375,7 +375,9 @@ def phase_verify(cfg: harness.RunConfig, prefix: str, shards: list[tuple[int, in
                     mismatched[arm.name] += 1
                     logger.warning("verify %s: %s differs from C0 in shard (%d, %d)", arm.name, var, sy, sx)
     for name, n in mismatched.items():
-        harness.emit_metric(cfg, TEST, "verify", "mismatched_arrays", n, "count", variant=name, prefix=prefix, shards=len(shards))
+        harness.emit_metric(
+            cfg, TEST, "verify", "mismatched_arrays", n, "count", variant=name, prefix=prefix, shards=len(shards)
+        )
         logger.info("verify %s under %s: %d mismatched array-shards over %d shards", name, prefix, n, len(shards))
 
 
@@ -434,7 +436,10 @@ def main() -> int:
         else:  # a built set: two full cycles of the tiles, each tile in two places
             shards = [divmod(i, _side(cfg)) for i in range(min(16, _side(cfg) ** 2))]
         harness.run_phase(
-            cfg, TEST, f"verify_{args.prefix.replace('/', '_')}", lambda: phase_verify(cfg, args.prefix, shards, chosen or FINALISTS)
+            cfg,
+            TEST,
+            f"verify_{args.prefix.replace('/', '_')}",
+            lambda: phase_verify(cfg, args.prefix, shards, chosen or FINALISTS),
         )
     else:
         raise SystemExit("--phase must be build, read, points, tune, assemble or verify")

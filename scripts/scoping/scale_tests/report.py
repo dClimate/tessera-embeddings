@@ -445,7 +445,7 @@ def _t10_tables(rows: list[dict]) -> list[str]:
                     _t10_value(rows, m, a, phase=phase, dims=dims)
                     for m in ("read_p50_ms", "read_p50_lo_ms", "read_p50_hi_ms")
                 )
-                cells.append(f"{p50:.0f} [{lo:.0f}–{hi:.0f}]" if p50 and lo and hi else "—")
+                cells.append(f"{p50:.0f} [{lo:.0f}, {hi:.0f}]" if p50 and lo and hi else "—")
             open_s = _t10_value(rows, "open_wall_s", a, phase=phase)
             out.append(f"| {a} | {' | '.join(cells)} | {open_s or 0:.2f} |")
         out.append("")
