@@ -95,8 +95,8 @@ does:
 
 The kernel compiles once per process, in about 3 s. A fresh machine's first forward takes minutes for an
 unrelated reason, its EBS volume loading the AMI on first read, which is measured and fixed separately. On
-the RTX PRO 6000 the pipeline
-gains less than the forward pass because the faster forward leaves the card waiting on CPU prep (§4).
+the RTX PRO 6000 the pipeline gains less than the forward pass because the faster forward leaves the card
+waiting on CPU prep (§4).
 
 **This branch's code, run unpatched**, reproduced the measured arms bit for bit on the RTX PRO 6000 and the
 L40S (three tiles each, 100% of int8 values identical) and ran 11.2% and 7.7% faster than today, steady
@@ -118,6 +118,11 @@ two, on the same strips:
 Outputs are bit-identical at any depth on all three cards, since the workers change only scheduling.
 `config.inference.prefetch_depth` therefore runs one worker per two vCPUs, from two to four: four is the
 deepest measured, and a `g6e.xlarge` keeps its two.
+
+At campaign scale, the projected global v2 run spends about $363,000 on graphics cards
+([`campaign-cost-model.md`](../campaign/campaign-cost-model.md) §13). The fleet's L40S and A10G gain
+6.4–6.8% in the inference loop, which is about 91% of a billed GPU-hour (§8). That is roughly 5.5% fewer
+GPU-hours, about $20,000. This is an estimate, since neither change was measured over a whole campaign cell (§9).
 
 ## 5. Outputs across cards
 
