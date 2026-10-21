@@ -612,11 +612,11 @@ def run_inference(
     )
 
     # `depth` prep workers keep that many batches staged: depth 1 starved the GPU whenever a forward ran
-    # shorter than one CPU prep (partial sub-batches, short sequences), and a host with more vCPUs runs more
+    # shorter than one CPU prep (partial sub-batches, short sequences), and an actor with more vCPUs runs more
     # (prefetch_depth). Quantization is not a CPU stage — it runs on-device — so the scatter-back is a cheap
     # memcpy either way.
     use_pipelined = device.type == "cuda" and not os.environ.get(_SERIAL_LOOP_ENV)
-    depth = prefetch_depth()
+    depth = prefetch_depth(config.num_gpus)
     with torch.no_grad(), ThreadPoolExecutor(max_workers=depth, thread_name_prefix="prefetch") as pool:
         prefetched: deque[Future[tuple[dict[str, np.ndarray], float]]] = deque()
         for j in range(min(depth, len(sub_batches))):

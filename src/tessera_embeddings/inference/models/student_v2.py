@@ -185,9 +185,9 @@ class StudentTransformerEncoder(nn.Module):
 
     ``enable_qk_norm=False`` (default) uses the standard
     ``nn.TransformerEncoderLayer`` stack (ReLU, no QK-norm); ``True`` uses
-    :class:`QKNormEncoderLayer`. In inference on CUDA the standard stack runs through
+    :class:`QKNormEncoderLayer`. In inference on CUDA, with autograd off, the standard stack runs through
     :func:`_encoder_layer_forward` with each residual add and LayerNorm fused into one kernel; on
-    CPU, and in training, it runs the modules as written.
+    CPU, in training, and wherever gradients are recorded, it runs the modules as written.
     """
 
     def __init__(
@@ -246,7 +246,7 @@ class StudentTransformerEncoder(nn.Module):
         if self.enable_qk_norm:
             for layer in cast("nn.ModuleList", self.transformer_encoder):
                 x = layer(x)
-        elif x.is_cuda and not self.training and x.shape[1] > 0:
+        elif x.is_cuda and not self.training and not torch.is_grad_enabled() and x.shape[1] > 0:
             add_layer_norm = _compiled_add_layer_norm()
             for layer in cast("nn.TransformerEncoder", self.transformer_encoder).layers:
                 x = _encoder_layer_forward(cast("nn.TransformerEncoderLayer", layer), x, add_layer_norm)

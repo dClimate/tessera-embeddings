@@ -321,10 +321,12 @@ class TestActorRequestPolicy:
         assert bounded.initial_actor_request(10) == 10
 
 
-@pytest.mark.parametrize(("cpus", "depth"), [(1, 2), (4, 2), (8, 4), (64, 4)])
-def test_prefetch_depth_follows_vcpus_within_its_bounds(cpus: int, depth: int) -> None:
-    """Two workers on a 4-vCPU g6e.xlarge, four on an 8-vCPU host, never more than measured."""
-    assert prefetch_depth(cpus) == depth
+@pytest.mark.parametrize(
+    ("gpu_fraction", "cpus", "depth"), [(1, 1, 2), (1, 4, 2), (1, 8, 4), (1, 64, 4), (0.5, 8, 2), (0.1, 8, 2)]
+)
+def test_prefetch_depth_follows_vcpus_within_its_bounds(gpu_fraction: float, cpus: int, depth: int) -> None:
+    """Two on a 4-vCPU g6e.xlarge, four on 8 vCPUs, never more than measured; packed actors count their share."""
+    assert prefetch_depth(gpu_fraction, cpus) == depth
 
 
 # ---------------------------------------------------------------------------

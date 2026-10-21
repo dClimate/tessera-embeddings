@@ -1,6 +1,6 @@
 # 030 — A forward-pass reordering ships on the cross-config envelope and measured usability, at a store boundary
 
-**Status:** Proposed (2026-10-20)
+**Status:** Accepted by merging PR #241 (proposed 2026-10-20)
 
 ## Context
 

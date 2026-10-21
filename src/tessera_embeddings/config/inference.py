@@ -524,15 +524,17 @@ DEFAULT_NUM_OBS_CHECKPOINTS: tuple[int, ...] = tuple(range(8, 257, 8))
 MIN_PREFETCH_DEPTH, MAX_PREFETCH_DEPTH = 2, 4
 
 
-def prefetch_depth(cpus: int | None = None) -> int:
-    """Batch-prep workers for a host with *cpus* vCPUs (default: this one): one per two, from 2 to 4.
+def prefetch_depth(gpu_fraction: float = 1.0, cpus: int | None = None) -> int:
+    """Batch-prep workers for an actor holding *gpu_fraction* of a GPU on a host with *cpus* vCPUs (default:
+    this one): one per two vCPUs of the actor's share, from 2 to 4.
 
     A faster card can outrun two workers and then waits on CPU prep between batches; a host with spare
-    vCPUs runs more of them. Extra workers change only scheduling, so outputs are bit-identical at any
-    depth. Empirical: context_docs/inference/v2-on-blackwell.md §4.
+    vCPUs runs more of them. Actors packed onto one GPU split its host's vCPUs, so each counts only its
+    share. Extra workers change only scheduling, so outputs are bit-identical at any depth. Empirical:
+    context_docs/inference/v2-on-blackwell.md §4.
     """
-    available = os.cpu_count() if cpus is None else cpus
-    return max(MIN_PREFETCH_DEPTH, min(MAX_PREFETCH_DEPTH, (available or 0) // 2))
+    share = ((os.cpu_count() if cpus is None else cpus) or 0) * min(gpu_fraction, 1.0)
+    return max(MIN_PREFETCH_DEPTH, min(MAX_PREFETCH_DEPTH, int(share) // 2))
 
 
 # Spatial read-tile size for inference, on both paths: one tile is exactly one 2048-px output

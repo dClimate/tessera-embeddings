@@ -601,9 +601,9 @@ vectorised: a pixel's resample indices depend only on `(valid_count, target)`, s
 memoised, and a sub-batch costs a handful of `np.unique` lookups plus large gathers rather
 than one Python iteration per pixel. Before that, preparing a batch took *longer* than the
 forward pass it fed, which meant preparation — not the GPU — set the pipeline's speed. Prep
-workers keep that many batches ready: `config.inference.prefetch_depth` runs one per two host
-vCPUs, from two to four, because a fast card running v2 outruns two workers and waits between
-batches. More workers change only scheduling, so outputs are the same at any depth. The
+workers keep that many batches ready: `config.inference.prefetch_depth` runs one per two of the
+actor's vCPUs (its share of the host when actors share a GPU), from two to four, because a fast
+card running v2 outruns two workers and waits between batches. More workers change only scheduling, so outputs are the same at any depth. The
 vectorised path is bit-identical to the loop it replaced, and golden-reference tests enforce
 that.
 
