@@ -27,6 +27,13 @@ billed GPU-hours the October v2 full-stack run (eight `g6e.xlarge`, 394 tiles) s
 by its `CHUNK_SUMMARY` lines and billing in `s3://global-tessera-inputs-dev/perf/_v2_fullstack/`: roughly
 six minutes per new worker.
 
+At global scale it is hundreds of GPU-hours. The cost model counts 72 fleet builds per global run, one per
+cluster per year ([`campaign-cost-model.md`](../campaign/campaign-cost-model.md)). At 130 to 250 GPU workers
+per cluster (the v1.1 campaign's 1,307-card peak across its clusters, and the per-cluster ceiling), that is
+about 9,000 to 18,000 machine starts. Removing five minutes from each saves roughly 800 to 1,500 GPU-hours,
+about $1,000 to $2,800 at `g5.2xlarge` and `g6e.xlarge` on-demand prices, before any mid-run replacements.
+This is an estimate, not a measurement.
+
 ## 2. The remedies
 
 | fresh worker, first v2 forward | getting the venv | first forward | total | at fleet scale |
