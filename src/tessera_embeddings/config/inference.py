@@ -524,6 +524,11 @@ DEFAULT_NUM_OBS_CHECKPOINTS: tuple[int, ...] = tuple(range(8, 257, 8))
 MIN_PREFETCH_DEPTH, MAX_PREFETCH_DEPTH = 2, 4
 
 
+def actors_per_card(gpu_fraction: float) -> int:
+    """How many actors Ray packs onto one card at a *gpu_fraction* reservation: ``floor(1 / gpu_fraction)``."""
+    return math.floor(1.0 / gpu_fraction) if 0.0 < gpu_fraction < 1.0 else 1
+
+
 def prefetch_depth(gpu_fraction: float = 1.0, cpus: int | None = None) -> int:
     """Batch-prep workers for an actor holding *gpu_fraction* of a GPU on a host with *cpus* vCPUs (default:
     this one): one per two vCPUs of the actor's share, from 2 to 4.
@@ -533,8 +538,8 @@ def prefetch_depth(gpu_fraction: float = 1.0, cpus: int | None = None) -> int:
     share. Extra workers change only scheduling, so outputs are bit-identical at any depth. Empirical:
     context_docs/inference/v2-on-blackwell.md §4.
     """
-    share = ((os.cpu_count() if cpus is None else cpus) or 0) * min(gpu_fraction, 1.0)
-    return max(MIN_PREFETCH_DEPTH, min(MAX_PREFETCH_DEPTH, int(share) // 2))
+    share = ((os.cpu_count() if cpus is None else cpus) or 0) // actors_per_card(gpu_fraction)
+    return max(MIN_PREFETCH_DEPTH, min(MAX_PREFETCH_DEPTH, share // 2))
 
 
 # Spatial read-tile size for inference, on both paths: one tile is exactly one 2048-px output
@@ -618,8 +623,7 @@ def batch_size_for_gpu(
     """
     if total_gib is None:
         return configured
-    actors_per_card = math.floor(1.0 / gpu_fraction) if 0.0 < gpu_fraction < 1.0 else 1
-    share_gib = total_gib / actors_per_card
+    share_gib = total_gib / actors_per_card(gpu_fraction)
     deepest_tokens_per_pixel = 2 * max(num_obs_checkpoints)
     scale = (share_gib / TUNED_GPU_GIB) * (TUNED_TOKENS_PER_PIXEL / deepest_tokens_per_pixel)
     return max(1, min(configured, int(TUNED_BATCH_SIZE * scale)))

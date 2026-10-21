@@ -322,7 +322,8 @@ class TestActorRequestPolicy:
 
 
 @pytest.mark.parametrize(
-    ("gpu_fraction", "cpus", "depth"), [(1, 1, 2), (1, 4, 2), (1, 8, 4), (1, 64, 4), (0.5, 8, 2), (0.1, 8, 2)]
+    ("gpu_fraction", "cpus", "depth"),
+    [(1, 1, 2), (1, 4, 2), (1, 8, 4), (1, 64, 4), (0.6, 8, 4), (0.5, 8, 2), (0.1, 8, 2)],
 )
 def test_prefetch_depth_follows_vcpus_within_its_bounds(gpu_fraction: float, cpus: int, depth: int) -> None:
     """Two on a 4-vCPU g6e.xlarge, four on 8 vCPUs, never more than measured; packed actors count their share."""
