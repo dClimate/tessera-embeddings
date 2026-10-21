@@ -150,8 +150,9 @@ the newest baseline and is unchanged by this fix.
 
 **Tests** (`tests/unit/ingest/test_duplicate_granules.py`, `TestADatastripSplitIsTwoAcquisitions`) use
 the catalogue's own values for 18NUN, a 33UUP split that survived reprocessing, and a 17QRE pass whose
-reprocessing omitted a datastrip, plus a copy naming no datastrip. The four that encode the fix fail
-on the old rule.
+reprocessing omitted a datastrip, plus the two cases a copy's missing metadata raises: one naming no
+datastrip, and one with no datatake that is placed by its timestamp. Those that encode the fix fail on
+the old rule.
 
 ## 6. Radar is not affected
 

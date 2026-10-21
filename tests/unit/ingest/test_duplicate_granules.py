@@ -745,6 +745,20 @@ class TestADatastripSplitIsTwoAcquisitions:
         assert self._ids(kept) == {unread.id}, "two copies of one image were both kept"
         assert self._ids(next(iter(alternates.values()))) == {old.id}
 
+    def test_a_copy_placed_by_its_timestamp_joins_the_image_its_datastrip_names(self) -> None:
+        """Both images of a split pass are seconds apart, so the time alone could put it in either."""
+        a_old, b_old, b_new = (
+            _Item(it.id, "MGRS-33UUP", it.properties["s2:sequence"], **{**it.properties, "datetime": when})
+            for it, when in zip(
+                (self.UUP[0], self.UUP[1], self.UUP[3]),
+                ("2019-10-21T10:17:27.820Z", "2019-10-21T10:17:35.210Z", "2019-10-21T10:17:35.212Z"),
+                strict=True,
+            )
+        )
+        del b_new.properties["s2:datatake_id"]
+        kept, _ = select_preferred_duplicates([a_old, b_old, b_new])
+        assert self._ids(kept) == {a_old.id, b_new.id}
+
     def test_both_granules_of_a_split_pass_are_kept(self) -> None:
         kept, alternates = select_preferred_duplicates(list(self.NUN))
         assert self._ids(kept) == {it.id for it in self.NUN}, "half of the pass was dropped"

@@ -450,14 +450,16 @@ def _by_acquisition(copies: list[Any]) -> list[list[Any]]:
     grouping by timestamp fuses nothing and leaves both copies to be loaded and mosaicked together.
     The remainder falls back to the timestamps, clustered within :data:`_SAME_ACQUISITION_S`.
 
-    **A pass is then split by datastrip** (:func:`_by_datastrip`), so each image of a pass that
-    crossed a datastrip boundary is its own acquisition — unless some copy of the pass names no
-    datastrip, in which case it stays whole.
-
     **A copy without an identity JOINS an identified acquisition its timestamp places it in**,
     rather than always starting a cluster of its own. One reprocessing declaring the datatake while
     its sibling omits it would otherwise never be compared, however close their timestamps, so both
     would survive to be fused — the same defect identity exists to fix, by a different route.
+
+    **Each pass is then split by datastrip** (:func:`_by_datastrip`), so each image of a pass that
+    crossed a datastrip boundary is its own acquisition — unless some copy of the pass names no
+    datastrip, in which case it stays whole. Split AFTER the timestamp-only copies have joined:
+    the images of a split pass are seconds apart, so a copy matched by time alone cannot tell them
+    apart, while its own datastrip can.
 
     **A copy with neither JOINS a cluster rather than forming its own**, so it competes for one slot
     instead of adding one — that is what stops two copies of a pass being fused at two processing
@@ -485,10 +487,10 @@ def _by_acquisition(copies: list[Any]) -> list[list[Any]]:
         else:
             known.append((instant, item))
 
-    clusters: list[list[Any]] = [strip for _, group in sorted(identified.items()) for strip in _by_datastrip(group)]
+    passes: list[list[Any]] = [group for _, group in sorted(identified.items())]
 
-    # A timestamp-only copy joins an identified acquisition it is close to, before it is allowed to
-    # start one. Matched against ANY member: members of one acquisition do not agree on the
+    # A timestamp-only copy joins an identified pass it is close to, before it is allowed to start
+    # an acquisition. Matched against ANY member: members of one acquisition do not agree on the
     # timestamp (that disagreement is why identity is the primary key), so being close to any of
     # them is the whole of the available evidence.
     orphans: list[tuple[datetime.datetime, Any]] = []
@@ -496,7 +498,7 @@ def _by_acquisition(copies: list[Any]) -> list[list[Any]]:
         joined = next(
             (
                 cluster
-                for cluster in clusters
+                for cluster in passes
                 if any(
                     (sibling_instant := acquisition_instant(sibling)) is not None
                     and abs((instant - sibling_instant).total_seconds()) <= _SAME_ACQUISITION_S
@@ -510,6 +512,7 @@ def _by_acquisition(copies: list[Any]) -> list[list[Any]]:
         else:
             joined.append(item)
 
+    clusters = [strip for group in passes for strip in _by_datastrip(group)]
     if orphans:
         clusters.append([orphans[0][1]])
         for previous, current in itertools.pairwise(orphans):
