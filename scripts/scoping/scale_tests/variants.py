@@ -23,6 +23,8 @@ from tessera_embeddings.config.store_layout import clamp_chunks_and_shards, pcod
 DIMS: tuple[str, str, str, str] = ("time", "northing", "easting", "band")
 #: Embedding channel count.
 BAND: int = EMBEDDING_DIM
+#: Axis permutation from :data:`DIMS` to the band-first order (time, band, northing, easting).
+BAND_FIRST: tuple[int, int, int, int] = (0, 3, 1, 2)
 
 #: int8 ``embeddings`` compressor arms; the float arrays always use PCodec. ``"auto"`` is zarr's
 #: default zstd, which is what the library writes today.
@@ -43,7 +45,8 @@ class Variant:
     ``chunks`` and ``shards`` are in element units over :data:`DIMS`. ``shards``
     is ``None`` for the unsharded layouts; when set it must be a whole multiple
     of ``chunks`` on every axis (Zarr v3 requirement). ``scales_chunks`` of ``None``
-    co-chunks ``scales`` with the embeddings' spatial chunk.
+    co-chunks ``scales`` with the embeddings' spatial chunk. ``band_first`` stores the array as
+    (time, band, northing, easting); ``chunks`` and ``shards`` are still written over :data:`DIMS`.
     """
 
     name: str
@@ -53,6 +56,7 @@ class Variant:
     transpose: bool = False
     write_order: str = "morton"
     scales_chunks: tuple[int, int, int] | None = None
+    band_first: bool = False
 
     def __post_init__(self) -> None:
         """Validate shard/chunk alignment and arm names so a bad entry fails loudly."""
@@ -80,6 +84,10 @@ VARIANTS: dict[str, Variant] = {
         Variant("v2_c1", (1, 256, 256, 16), _V2_SHARD),
         Variant("v2_c2", (1, 512, 512, 16), _V2_SHARD),
         Variant("v2_b2", (1, 512, 512, 16), (1, 2048, 2048, 16)),
+        # Band-first storage (time, band, northing, easting): a full vector is stacked from contiguous
+        # band blocks rather than interleaved per pixel, and every chunk is band-planar by construction.
+        Variant("v2_c2f", (1, 512, 512, 16), _V2_SHARD, band_first=True),
+        Variant("v2_b2f", (1, 512, 512, 16), (1, 2048, 2048, 16), band_first=True),
     ]
 }
 
@@ -96,7 +104,8 @@ def selected(name: str | None) -> list[Variant]:
 def arm(base: Variant, **changes: object) -> Variant:
     """Derive a T9 arm from a registry geometry, naming it by every field that differs."""
     v = dataclasses.replace(base, **changes)  # type: ignore[arg-type]
-    parts = [base.name, v.codec, "T" if v.transpose else "", v.write_order if v.write_order != "morton" else ""]
+    parts = [base.name, "bandfirst" if v.band_first else "", v.codec, "T" if v.transpose else ""]
+    parts.append(v.write_order if v.write_order != "morton" else "")
     if v.scales_chunks is not None:
         parts.append(f"s{v.scales_chunks[1]}")
     return dataclasses.replace(v, name="_".join(p for p in parts if p))
@@ -113,19 +122,20 @@ def embeddings_array_kwargs(variant: Variant, shape: tuple[int, int, int, int]) 
     shape so a store smaller than one nominal chunk still creates cleanly.
     """
     chunks, shards = clamp_chunks_and_shards(shape, variant.chunks, variant.shards)
+    order = BAND_FIRST if variant.band_first else (0, 1, 2, 3)
     kwargs: dict = {
-        "shape": shape,
-        "chunks": chunks,
+        "shape": tuple(shape[i] for i in order),
+        "chunks": tuple(chunks[i] for i in order),
         "dtype": np.dtype("int8"),
         "fill_value": 0,
-        "dimension_names": DIMS,
+        "dimension_names": tuple(DIMS[i] for i in order),
         "serializer": "auto",
         "compressors": COMPRESSORS[variant.codec],
     }
     if variant.transpose:
         kwargs["filters"] = (TransposeCodec(order=(0, 3, 1, 2)),)
     if shards is not None:
-        kwargs["shards"] = shards
+        kwargs["shards"] = tuple(shards[i] for i in order)
     return kwargs
 
 
