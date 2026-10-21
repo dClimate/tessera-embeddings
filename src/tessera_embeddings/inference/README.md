@@ -600,9 +600,12 @@ so the computation is unchanged and the outputs are **identical bit for bit**. S
 vectorised: a pixel's resample indices depend only on `(valid_count, target)`, so they are
 memoised, and a sub-batch costs a handful of `np.unique` lookups plus large gathers rather
 than one Python iteration per pixel. Before that, preparing a batch took *longer* than the
-forward pass it fed, which meant preparation — not the GPU — set the pipeline's speed. Two
-prep workers keep `PREFETCH_DEPTH = 2` batches ready. The vectorised path is bit-identical
-to the loop it replaced, and golden-reference tests enforce that.
+forward pass it fed, which meant preparation — not the GPU — set the pipeline's speed. Prep
+workers keep that many batches ready: `config.inference.prefetch_depth` runs one per two of the
+actor's vCPUs (its share of the host when actors share a GPU), from two to four, because a fast
+card running v2 outruns two workers and waits between batches. More workers change only scheduling, so outputs are the same at any depth. The
+vectorised path is bit-identical to the loop it replaced, and golden-reference tests enforce
+that.
 
 **The output values are checked on the host, not on the card.** Each pixel's scale factor
 is validated for finiteness after it has been copied back
@@ -628,14 +631,15 @@ rather than a registered buffer, so `model.bfloat16()` cannot round them either.
 the v2 Large checkpoint, the mean per-channel deviation from the FP32 graph fell from 0.0075
 to 0.0027. The copy to the GPU was already FP32, so this costs no bandwidth.
 
-**Four things are deliberately off or replaced**, each because it was measured and made
+**Five things are deliberately off or replaced**, each because it was measured and made
 things worse:
 
 - **`torch.compile` is off for the model.** Capturing the model as a CUDA graph consumed
   11.6 GB of VRAM and roughly doubled the forward pass, because v1.1's recurrent layer
-  recompiled for every distinct sequence length it saw. Only the pooling head's single
-  timestep is compiled (below): its shapes do not depend on the sequence length, so it compiles
-  once per process.
+  recompiled for every distinct sequence length it saw. Two small pieces are compiled instead
+  (both below): v1.1's pooling-head timestep, whose shapes do not depend on the sequence
+  length, and v2's residual add + LayerNorm, compiled for dynamic shapes. Each compiles once
+  per process.
 - **cuDNN's autotuner (`benchmark` mode) is disabled.** It searches for the fastest kernel
   per input shape, and bucketing means the shapes change constantly, so it searches
   constantly — and inflates host memory doing it.
@@ -653,6 +657,17 @@ things worse:
   FP32 arithmetic, and each forward pass indexes into it — instead of computing sin and cos
   over every pixel and timestep into two full-size FP32 tensors. Same values on the GPU, a
   forward pass 5–8% faster.
+- **v2's encoder layers join each residual add to its LayerNorm.** PyTorch runs an
+  `nn.TransformerEncoderLayer` in inference as one fused operator, which the compiler cannot
+  open, so compiling the layers is slower than leaving them alone. On CUDA,
+  `student_v2._encoder_layer_forward` calls that operator's kernels one by one instead — one QKV
+  projection, FlashAttention, matmuls with bias and ReLU in their epilogues, which together give
+  the same output as the operator — and runs each residual add and LayerNorm as one compiled
+  kernel, saving a pass over the activations twice per layer. That kernel normalises in a
+  different order, so v2 outputs move slightly
+  ([ADR 030](../../../context_docs/decisions/030-forward-pass-reorderings-ship-at-a-store-boundary.md));
+  CPU and training run the modules as written. v2 only: v1.1's arithmetic is unchanged.
+  Measurements: [`v2-on-blackwell.md`](../../../context_docs/inference/v2-on-blackwell.md) §3.
 
 **What the logs report, and why it is not pixels per second.** A pixel with few
 observations costs about a tenth of a densely observed one, so a pixels-per-second figure

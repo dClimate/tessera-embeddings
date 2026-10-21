@@ -214,11 +214,12 @@ roughly bbox-proportional), negligible on interior tiles (which skip it).
 
 ## The model itself was also changed
 
-Everything above rearranges *when* work happens. Four changes alter *what runs on the card*, and
-they are the reason the scheduling work had a fast forward pass to schedule around. All four live
-in `models/builder.py` and `models/modules.py`. They were made on v1.1. The v2 Large student shares the positional
-encoder, so the two changes to it apply there too; it has no recurrent layer and its checkpoint
-carries no training-only heads, so the other two do not.
+Everything above rearranges *when* work happens. Five changes alter *what runs on the card*, and
+they are the reason the scheduling work had a fast forward pass to schedule around. Four live in
+`models/builder.py` and `models/modules.py` and were made on v1.1. The v2 Large student shares the
+positional encoder, so the two changes to it apply there too; it has no recurrent layer and its
+checkpoint carries no training-only heads, so the other two do not. The fifth is v2's own, in
+`models/student_v2.py`.
 
 **The pooling head runs one compiled step per timestep.** v1.1 pools each pixel's sequence with a
 GRU, a LayerNorm and an attention score. Written as `CustomGRU`, the GRU is several small GPU
@@ -246,6 +247,18 @@ and timestep allocated an FP32 angle tensor (about 2.6 GiB at B=7168, T=256) and
 (about 5.3 GiB) on every forward of each backbone; the table is under a megabyte. On the GPU the
 values are bit-identical and the forward pass is 5–8% faster
 ([`../context_docs/inference/inference-on-gpus.md`](../context_docs/inference/inference-on-gpus.md) §2).
+
+**v2's encoder layers join each residual add to its LayerNorm.** With no recurrence, most of a v2
+forward is the transformer's matmuls, and those already run near the card's matmul ceiling; what is
+left is attention, plus a residual add and a LayerNorm after each sub-layer that each make a full
+pass over the activations. PyTorch runs `nn.TransformerEncoderLayer` in inference as one fused
+operator the compiler cannot open, so compiling the layers is slower than leaving them alone. On
+CUDA, `student_v2._encoder_layer_forward` calls the operator's kernels one by one, which gives the
+same output, and runs each add and LayerNorm as one compiled kernel. That kernel normalises in a
+different order, so v2 outputs move slightly, within the cross-config envelope
+([ADR 030](../context_docs/decisions/030-forward-pass-reorderings-ship-at-a-store-boundary.md)). It
+pays on every card measured, most on the fastest
+([`v2-on-blackwell.md`](../context_docs/inference/v2-on-blackwell.md) §3).
 
 **Training-only parameters never reach the graph.** The checkpoint carries a BarlowTwins
 `projector` and a `segmented_matryoshka_projector` that served the variable-width training

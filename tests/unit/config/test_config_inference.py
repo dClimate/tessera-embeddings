@@ -16,6 +16,7 @@ from tessera_embeddings.config.inference import (
     band_stats,
     batch_size_for_gpu,
     checkpoint_filename,
+    prefetch_depth,
 )
 from tessera_embeddings.config.time_windows import parse_time_window
 
@@ -318,6 +319,15 @@ class TestActorRequestPolicy:
         assert bounded.initial_actor_request(250) == 25
         # A target smaller than either still wins, so a tiny run does not over-ask.
         assert bounded.initial_actor_request(10) == 10
+
+
+@pytest.mark.parametrize(
+    ("gpu_fraction", "cpus", "depth"),
+    [(1, 1, 2), (1, 4, 2), (1, 8, 4), (1, 64, 4), (0.6, 8, 4), (0.5, 8, 2), (0.1, 8, 2)],
+)
+def test_prefetch_depth_follows_vcpus_within_its_bounds(gpu_fraction: float, cpus: int, depth: int) -> None:
+    """Two on a 4-vCPU g6e.xlarge, four on 8 vCPUs, never more than measured; packed actors count their share."""
+    assert prefetch_depth(gpu_fraction, cpus) == depth
 
 
 # ---------------------------------------------------------------------------
