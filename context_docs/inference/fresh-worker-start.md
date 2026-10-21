@@ -59,5 +59,21 @@ then copies the image to the instance store and mounts it over `/opt/tessera/ven
 miss leaves the AMI's own venv in place: an AMI without the file, an instance without an instance store at
 `/opt/dlami/nvme`, a venv already mounted, or a copy that fails.
 
+## 4. End to end on a built AMI
+
+On 2026-10-21 the yield-embeddings AMI build with the packing step baked a `dev/global-tessera-env-image` AMI
+in global-tessera-dev. It has PyTorch 2.5.1 and ran TE main's code, which compiles no kernel. Two fresh
+`g5.2xlarge` boxes booted from it, under the Ray worker's instance profile:
+
+| fresh worker, first v2 forward | getting the venv | first forward | total |
+|---|---:|---:|---:|
+| the volume's venv (control) | — | 194 s | 194 s |
+| this template's `worker_setup_commands` entry, run as Ray's `ubuntu` user | 26 s | 14 s | **40 s** |
+
+The command found the AMI's URI file, downloaded the 7.6 GiB image and mounted it read-only. Run a second time,
+it returned at once and left one mount. The control is faster than §1's 354 s because PyTorch 2.5.1 without a
+compile reads fewer files on first use than PyTorch 2.14.1 with one.
+
 Harness and raw results: `s3://global-tessera-inputs-dev/perf/g7e/` (`warm_probe.py` for the phase timings,
-`warm.sh` for the decomposition, `image_build.sh` and `image_test.sh` for the mounted image).
+`warm.sh` for the decomposition, `image_build.sh` and `image_test.sh` for the mounted image, `env_e2e.sh` and
+`e2emount/`, `e2econtrol/` for §4).
