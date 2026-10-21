@@ -55,7 +55,11 @@ class _Item:
     def __init__(self, host_root: str | None, baseline: str | None, *, extra: dict | None = None) -> None:
         self.id = "S2A_33TWM_20220107_0_L2A"
         self.datetime = datetime(2022, 1, 7, 12, 0, 0, tzinfo=UTC)
-        self.properties: dict[str, object] = {}
+        # Every double is a copy of one image, as selection requires before it compares them.
+        self.properties: dict[str, object] = {
+            "s2:datatake_id": "GS2A_20220107T100411_039301_N05.00",
+            "s2:datastrip_id": "S2A_OPER_MSI_L2A_DS_TEST_20220107T120000_S20220107T100411_N05.00",
+        }
         if baseline is not None:
             self.properties["s2:processing_baseline"] = baseline
         self.assets: dict[str, dict[str, str]] = {}

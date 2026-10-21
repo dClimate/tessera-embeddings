@@ -171,10 +171,8 @@ def solar_grouping_longitude(roi: object) -> float | None:
 def _acquisition_instant(item: Any) -> datetime.datetime | None:  # noqa: ANN401 — any STAC-like item
     """The raw acquisition instant from ``properties["datetime"]``, or ``None``.
 
-    A local copy of :func:`~tessera_embeddings.ingest.duplicates.acquisition_instant`, which
-    cannot be imported here: that module imports :func:`solar_day_of` from this one, so the
-    dependency runs only one way. Both read the same field because it is the only record of the
-    acquisition that survives the canonical stamp.
+    Read from the properties because they are the only record of the acquisition that survives
+    the canonical stamp.
     """
     properties = getattr(item, "properties", None)
     raw = properties.get("datetime") if isinstance(properties, dict) else None
