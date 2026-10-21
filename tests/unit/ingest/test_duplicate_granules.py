@@ -37,6 +37,7 @@ from tessera_embeddings.ingest.duplicates import (
     alternates_for,
     cause_was_flattened,
     copies_label,
+    datastrip_start,
     is_provider_refusal,
     is_unreadable_source,
     item_processing_baseline,
@@ -732,13 +733,17 @@ class TestADatastripSplitIsTwoAcquisitions:
     def _ids(items: list[_Item]) -> set[str]:
         return {it.id for it in items}
 
-    def test_the_datastrip_start_joins_the_pass_and_survives_reprocessing(self) -> None:
+    def test_reprocessing_keeps_the_datastrip_start(self) -> None:
         old, _, new, _ = self.UUP
-        assert acquisition_identity(old) == acquisition_identity(new) == "GS2A_20191021T101041_022613_S20191021T101549"
+        assert datastrip_start(old) == datastrip_start(new) == "20191021T101549"
 
-    def test_an_unreadable_datastrip_leaves_the_pass_as_the_name(self) -> None:
-        item = _granule("S2B_18NUN_20250619_0_L2A", "05.11", "GS2B_20250619T153629_043280", "2BPS_x")
-        assert acquisition_identity(item) == "GS2B_20250619T153629_043280"
+    def test_a_copy_naming_no_datastrip_keeps_its_pass_whole(self) -> None:
+        """It could be a reprocessing of either image, so splitting around it would fuse two copies."""
+        old, _, new, _ = self.UUP
+        unread = _Item(new.id, "MGRS-33UUP", "2", **{**new.properties, "s2:datastrip_id": "unreadable"})
+        kept, alternates = select_preferred_duplicates([old, unread])
+        assert self._ids(kept) == {unread.id}, "two copies of one image were both kept"
+        assert self._ids(next(iter(alternates.values()))) == {old.id}
 
     def test_both_granules_of_a_split_pass_are_kept(self) -> None:
         kept, alternates = select_preferred_duplicates(list(self.NUN))

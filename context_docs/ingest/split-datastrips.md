@@ -124,9 +124,10 @@ land below 15 clear observations. The store measurement (§7) replaces this.
 
 ## 5. The fix
 
-`acquisition_identity` now appends the datastrip's sensing start to the datatake. Everything that
-asks whether two items are one acquisition goes through it — clustering, ranking within an
-acquisition, and the fallback ladder's attribution and placement — so nothing else changed.
+`_by_acquisition`, which groups a tile-date's copies into acquisitions, now splits each pass by the
+datastrip's sensing start (`datastrip_start`, read from `s2:datastrip_id`). Everything that asks
+whether two items are one acquisition goes through it — clustering, ranking within an acquisition,
+and the fallback ladder's attribution and placement — so nothing else changed.
 
 - A split pass keeps every granule.
 - Copies of one datastrip still compete, and the newest baseline still wins (the stable row).
@@ -134,7 +135,9 @@ acquisition, and the fallback ladder's attribution and placement — so nothing 
 - Where a reprocessing omits a datastrip (the lacks row), the older copy of that datastrip is kept
   beside the newer ones. The day then mixes baselines across datastrips, never within one: coverage
   outranks one baseline per pass ([ADR 029](../decisions/029-an-acquisition-is-one-datastrip-of-one-pass.md)).
-- An item whose datastrip cannot be read is named by its datatake alone, as before. None was found.
+- A pass any copy of which names no readable datastrip is not split, so it reduces to one copy as
+  before: that copy could be a reprocessing of any of the pass's images, and splitting around it would
+  keep and fuse two copies of one. No such copy was found in the corpus.
 
 **Equivalence gate.** Over the whole corpus the fixed rule decides differently on 64,811 tile-dates,
 and every one of them holds a datatake with more than one datastrip. The branch's own code agrees with
@@ -147,7 +150,8 @@ the newest baseline and is unchanged by this fix.
 
 **Tests** (`tests/unit/ingest/test_duplicate_granules.py`, `TestADatastripSplitIsTwoAcquisitions`) use
 the catalogue's own values for 18NUN, a 33UUP split that survived reprocessing, and a 17QRE pass whose
-reprocessing omitted a datastrip. Five of the seven fail on the old rule.
+reprocessing omitted a datastrip, plus a copy naming no datastrip. The four that encode the fix fail
+on the old rule.
 
 ## 6. Radar is not affected
 

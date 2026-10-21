@@ -974,8 +974,9 @@ keeps each datastrip's sensing start, so the two shapes separate cleanly:
 
 Where a reprocessing omits one of a pass's datastrips, the older copy of that datastrip is kept
 beside the newer ones, so the day mixes baselines across datastrips but never within one. Coverage
-outranks one baseline per pass because the offset is corrected per image (ADR 021). The census
-behind both choices is in
+outranks one baseline per pass because the offset is corrected per image (ADR 029). A pass with any
+copy naming no readable datastrip is not split, and reduces to one copy as before, since that copy
+could be a reprocessing of any of the pass's images. The census behind these choices is in
 [`context_docs/ingest/split-datastrips.md`](../../../context_docs/ingest/split-datastrips.md).
 
 A copy naming **no** datatake joins an identified acquisition its timestamp places it in, before
