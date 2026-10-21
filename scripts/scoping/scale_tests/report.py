@@ -373,7 +373,7 @@ def _t10_value(rows: list[dict], metric: str, variant: str, **params: Any) -> fl
 def _t10_tables(rows: list[dict]) -> list[str]:
     """Render T10's assembly table (ratios to the control) and one cold-read table per client."""
     out: list[str] = []
-    arms = sorted({r["variant"] for r in _sel(rows, test="t10", phase="assemble", metric="wall_s")})
+    arms = sorted({r["variant"] for r in _sel(rows, test="t10", phase="assemble", metric="wall_s") if r["variant"]})
     if arms:
         base = {k: _t10_value(rows, "encode_cpu_s", "v2_c0", kind=k) for k in ("worker", "write")}
         out += [
