@@ -50,8 +50,9 @@ FINALISTS: list[V.Variant] = [
     V.VARIANTS["v2_c0"],
     V.arm(V.VARIANTS["v2_c2"], codec="zstd1", scales_chunks=_S256),
     V.arm(V.VARIANTS["v2_c2"], codec="zstd1", transpose=True, scales_chunks=_S256),
-    V.arm(V.VARIANTS["v2_c2"], codec="zstd1", transpose=True, write_order="colexicographic", scales_chunks=_S256),
     V.arm(V.VARIANTS["v2_b2"], codec="zstd1", scales_chunks=_S256),
+    V.arm(V.VARIANTS["v2_c2f"], codec="zstd1", scales_chunks=_S256),
+    V.arm(V.VARIANTS["v2_b2f"], codec="zstd1", scales_chunks=_S256),
 ]
 POINTS = 300
 PASSES = 2
@@ -76,18 +77,31 @@ def _regions(side: int) -> dict[str, tuple[slice, slice]]:
 # ── build ────────────────────────────────────────────────────────────────────
 
 
-def _write_tiles(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — returns an icechunk ForkSession
-    """Spawned worker: write whole shards from the tile directory into the fork, in the arm's order."""
+def _write_tiles(payload: dict[str, Any]) -> tuple[Any, float, int]:
+    """Spawned worker: write whole shards into the fork in the arm's order; return (fork, write CPU, shards).
+
+    A band-first arm's tiles are put in band-first order BEFORE the timer: a band-first pipeline
+    stages them that way, so the write cost excludes any transpose.
+    """
     fork, arm, tiles = payload["fork"], V.Variant(**payload["arm"]), Path(payload["tiles"])
     grp = zarr.open_group(fork.store, mode="a")["zone"]
     emb, scl = grp["embeddings"], grp["scales"]
     V.apply_write_order(emb, arm.write_order)
     V.apply_write_order(scl, arm.write_order)
+    cpu = 0.0
     for sy, sx, n in payload["shards"]:
         ys, xs = slice(sy * TILE, (sy + 1) * TILE), slice(sx * TILE, (sx + 1) * TILE)
-        emb[0:1, ys, xs] = np.load(tiles / f"emb_{n:03d}.npy")[None]
-        scl[0:1, ys, xs] = np.load(tiles / f"scales_{n:03d}.npy")[None]
-    return fork
+        block, scales = np.load(tiles / f"emb_{n:03d}.npy"), np.load(tiles / f"scales_{n:03d}.npy")
+        if arm.band_first:
+            block = np.ascontiguousarray(block.transpose(2, 0, 1))
+        c0 = time.process_time()
+        if arm.band_first:
+            emb[0:1, :, ys, xs] = block[None]
+        else:
+            emb[0:1, ys, xs] = block[None]
+        scl[0:1, ys, xs] = scales[None]
+        cpu += time.process_time() - c0
+    return fork, cpu, len(payload["shards"])
 
 
 def phase_build(cfg: harness.RunConfig, tiles: Path, workers: int) -> None:
@@ -111,11 +125,13 @@ def phase_build(cfg: harness.RunConfig, tiles: Path, workers: int) -> None:
         ]
         t0 = time.monotonic()
         with ProcessPoolExecutor(len(payloads), mp_context=multiprocessing.get_context("spawn")) as ex:
-            forks = list(ex.map(_write_tiles, payloads))
-        session.merge(*forks)
+            results = list(ex.map(_write_tiles, payloads))
+        session.merge(*(fork for fork, _, _ in results))
         session.commit(f"build {arm.name}")
         n_obj, n_bytes = harness.object_stats(harness.store_uri(cfg, name) + "/chunks")
         harness.emit_metric(cfg, TEST, "build", "wall_s", time.monotonic() - t0, "s", variant=arm.name)
+        cpu_per_shard = sum(c for _, c, _ in results) / sum(n for _, _, n in results)
+        harness.emit_metric(cfg, TEST, "build", "encode_cpu_s", cpu_per_shard, "s", variant=arm.name, kind="write")
         harness.emit_metric(cfg, TEST, "build", "bytes_written", n_bytes, "bytes", variant=arm.name, objects=n_obj)
         logger.info("built %s: %d objects, %.1f GB", arm.name, n_obj, n_bytes / 1e9)
 
@@ -131,7 +147,12 @@ def cold_read(payload: dict[str, Any]) -> dict[str, Any]:
     store = CountingStore(_open_repo(payload["store_uri"]).readonly_session(branch="main").store)
     grp = zarr.open_group(store, mode="r")["zone"]
     emb, scl = grp["embeddings"], grp["scales"]
+    band_first = emb.metadata.dimension_names[1] == "band"
     workload, dims = payload["workload"], payload["dims"]
+
+    def window(ys: slice | int, xs: slice | int) -> tuple:
+        return (0, slice(0, dims), ys, xs) if band_first else (0, ys, xs, slice(0, dims))
+
     regions = {k: tuple(slice(*s) for s in v) for k, v in payload["regions"].items()}
     out: dict[str, Any] = {}
     net0, t0 = psutil.net_io_counters().bytes_recv, time.monotonic()
@@ -139,18 +160,19 @@ def cold_read(payload: dict[str, Any]) -> dict[str, Any]:
         lat = []
         for y, x in payload["points"]:
             p0 = time.monotonic()
-            emb[0, y, x, :dims] * scl[0, y, x]  # a dequantised prefix: two arrays, as a reader needs
+            emb[window(y, x)] * scl[0, y, x]  # a dequantised prefix: two arrays, as a reader needs
             lat.append(time.monotonic() - p0)
         out |= {"read_p50_ms": 1e3 * float(np.median(lat)), "read_p95_ms": 1e3 * float(np.percentile(lat, 95))}
     elif workload.startswith("dask"):
-        aligned = {"time": 1, "northing": TILE, "easting": TILE, "band": emb.chunks[-1]}  # one task per band chunk
+        band_chunk = dict(zip(emb.metadata.dimension_names, emb.chunks, strict=True))["band"]
+        aligned = {"time": 1, "northing": TILE, "easting": TILE, "band": band_chunk}  # one task per band chunk
         chunks = {} if workload == "dask_default" else aligned
         ds = xr.open_zarr(store, group="zone", consolidated=False, chunks=chunks)
         ys, xs = regions["pull8"]
         ds["embeddings"].isel(time=0, northing=ys, easting=xs, band=slice(0, dims)).data.compute()
     else:
         ys, xs = regions[workload]
-        emb[0, ys, xs, :dims]
+        emb[window(ys, xs)]
         scl[0, ys, xs]
     out |= {
         "wall_s": time.monotonic() - t0,
@@ -178,9 +200,10 @@ def _points(cfg: harness.RunConfig, tiles: Path) -> list[list[int]]:
 READ_WORKLOADS: list[tuple[str, int, dict]] = [
     ("point", 16, {}),
     ("point", 128, {}),
-    *((w, d, {}) for w in ("tile", "bulk", "pull8") for d in DIMS_READ),
+    ("bulk", 128, {}),
+    *(("pull8", d, {}) for d in DIMS_READ),
     ("dask_default", 16, {}),
-    ("dask_aligned", 16, {}),
+    ("dask_default", 128, {}),
 ]
 TUNE_WORKLOADS: list[tuple[str, int, dict]] = [
     ("pull8", 128, {}),
