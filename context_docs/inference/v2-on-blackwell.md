@@ -93,8 +93,9 @@ does:
 | L40S | 1.046× | 1.067× |
 | A10G, batch 3,593 | 1.063× | 1.068× (one tile) |
 
-The kernel compiles once per process: 120 s on a fresh machine, about 2 s once the compiler's on-disk cache
-is warm, the same order as v1.1's GRU step (150–200 s fresh). On the RTX PRO 6000 the pipeline
+The kernel compiles once per process, in about 3 s. A fresh machine's first forward takes minutes for an
+unrelated reason, its EBS volume loading the AMI on first read, which is measured and fixed separately. On
+the RTX PRO 6000 the pipeline
 gains less than the forward pass because the faster forward leaves the card waiting on CPU prep (§4).
 
 **This branch's code, run unpatched**, reproduced the measured arms bit for bit on the RTX PRO 6000 and the
@@ -177,32 +178,6 @@ graphics engine is active 0.96–0.97 of the inference loop; six workers made it
 busier. Gathering batches on the GPU, which avoids the CPU altogether, is the remaining idea and is
 untested; at most it recovers the last 3–5%, on this card only.
 
-**A fresh worker's start-up is the disk, not the compiler.** Timed phase by phase on fresh `g5.2xlarge`
-boxes (`warm_probe.py`), the first v2 forward of a new machine's first process took 354 s: 104 s importing
-PyTorch, 52 s importing its compiler, 64 s building the model, 23 s in the first library calls and 109 s in
-the first forward. Run again with the disk's blocks already fetched but no bytecode and the compiler cache
-wiped, the same process took 15 s; bytecode saved a further 6 s and a warm compiler cache under 1 s. So 339
-of the 354 s are the new EBS volume loading the image's snapshot block by block on first read, and the
-kernel compile itself is about 3 s. Baking bytecode and a compiler cache into the image saves about 7 s.
-
-| fresh worker, first v2 forward | getting the environment | first forward | total | scales to a fleet |
-|---|---:|---:|---:|---|
-| today's image | — | 354 s | 354 s | — |
-| read the 6.4 GB Python environment in parallel at boot | 202 s | 20 s | 222 s | yes |
-| EBS provisioned volume-initialization rate, 300 MiB/s | — | 179 s | 179 s | yes, charged per GiB initialized |
-| the environment as a tar on S3, unpacked onto NVMe | 11 s download + 43 s unpack | 31 s | 85 s | yes |
-| **the environment as an ext4 image with bytecode on S3, loop-mounted read-only from NVMe** | **24 s download, instant mount** | **25 s** | **~49 s** | **yes** |
-| Fast Snapshot Restore on the image's snapshot | — | 36 s | 36 s | no |
-
-Fast Snapshot Restore is fastest but rationed: AWS grants an 80 GiB snapshot 10 fast-restored volumes per AZ,
-refilling at 10 per hour, at $0.75 per snapshot per AZ-hour, and later volumes load the slow way. It suits
-dev testing, not a fleet. The provisioned initialization rate halves the wait but the volume is still
-loading while the first process runs. The mounted image scales with S3: an 8.5 GB image downloaded in 24 s,
-the mount is instant, and the bytecode compiled into it cannot go stale on a read-only mount. Most of its
-remaining first forward is the fused kernel's first compile (12.7 s, against 2.4 s warm), which a compiler
-cache shipped per card type would remove. The base interpreter and the driver libraries stay on EBS. Scripts:
-`image_build.sh` and `image_test.sh` beside the other harness files.
-
 ## 8. Where the rest of a paid GPU-hour goes
 
 The October v2 full-stack run (eight `g6e.xlarge`, sharded mosaics, the current loader, 394 Iowa tiles;
@@ -224,7 +199,6 @@ while `g6e.xlarge` spot sat at its on-demand price. Spot capacity and interrupti
 ## 9. Not measured
 
 - The two changes together over a whole campaign cell, and the A10G beyond one tile.
-- A worker fleet started from the mounted environment image, and a compiler cache shipped per card type.
 - Gathering batches on the GPU.
 - v1.1 with the fused layer. Its encoder uses the same layers, but its published store keeps its
   arithmetic, so it was left alone.
