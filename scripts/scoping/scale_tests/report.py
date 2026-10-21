@@ -349,12 +349,84 @@ def _t9_tables(rows: list[dict]) -> list[str]:
     return [*out, ""]
 
 
+#: T10 read columns: (label, workload, dims). Points report the p50 in ms; the rest, wall seconds.
+_T10_READS = (
+    ("point 16 p50", "point", 16),
+    ("point 128 p50", "point", 128),
+    ("tile 16", "tile", 16),
+    ("bulk 16", "bulk", 16),
+    ("bulk 128", "bulk", 128),
+    ("8x8 pull 16", "pull8", 16),
+    ("8x8 pull 64", "pull8", 64),
+    ("8x8 pull 128", "pull8", 128),
+    ("dask default", "dask_default", 16),
+    ("dask aligned", "dask_aligned", 16),
+)
+
+
+def _t10_value(rows: list[dict], metric: str, variant: str, **params: Any) -> float | None:  # noqa: ANN401
+    """Median over passes of one T10 metric for one arm, or ``None``."""
+    vals = [r["value"] for r in _sel(rows, test="t10", metric=metric, **params) if r.get("variant") == variant]
+    return statistics.median(vals) if vals else None
+
+
+def _t10_tables(rows: list[dict]) -> list[str]:
+    """Render T10's assembly table (ratios to the control) and one cold-read table per client."""
+    out: list[str] = []
+    arms = sorted({r["variant"] for r in _sel(rows, test="t10", phase="assemble", metric="wall_s")})
+    if arms:
+        base = {k: _t10_value(rows, "encode_cpu_s", "v2_c0", kind=k) for k in ("worker", "write")}
+        out += [
+            "## T10 — assembly code, per staged tile (median of passes)",
+            "",
+            "| arm | worker CPU s | vs C0 | write CPU s | vs C0 | wall s | stored GB |",
+            "|---|---|---|---|---|---|---|",
+        ]
+        for a in arms:
+            w, wr = (_t10_value(rows, "encode_cpu_s", a, kind=k) or 0 for k in ("worker", "write"))
+            wall = _t10_value(rows, "wall_s", a, phase="assemble") or 0
+            gb = (_t10_value(rows, "bytes_written", a) or 0) / 1e9
+            out.append(
+                f"| {a} | {w:.2f} | {w / (base['worker'] or 1):.2f} | {wr:.2f} | {wr / (base['write'] or 1):.2f} "
+                f"| {wall:.0f} | {gb:.1f} |"
+            )
+        out.append("")
+    clients = sorted({r["params"]["client"] for r in _sel(rows, test="t10", metric="get_requests")})
+    for client in clients:
+        read_arms = sorted({r["variant"] for r in _sel(rows, test="t10", metric="get_requests", client=client)})
+        out += [
+            f"## T10 — cold reads from S3, {client} (median of passes; wire MB in brackets)",
+            "",
+            "| arm | " + " | ".join(c[0] for c in _T10_READS) + " |",
+            "|---|" + "---|" * len(_T10_READS),
+        ]
+        for a in read_arms:
+            cells = []
+            for _, workload, dims in _T10_READS:
+                kw = {"client": client, "workload": workload, "dims": dims}
+                v = _t10_value(rows, "read_p50_ms" if workload == "point" else "wall_s", a, **kw)
+                wire = _t10_value(rows, "bytes_fetched", a, method="wire", **kw)
+                unit = "ms" if workload == "point" else "s"
+                cells.append(
+                    "—"
+                    if v is None
+                    else f"{v:.0f} {unit} ({(wire or 0) / 1e6:.0f})"
+                    if unit == "ms"
+                    else f"{v:.1f} s ({(wire or 0) / 1e6:.0f})"
+                )
+            out.append(f"| {a} | " + " | ".join(cells) + " |")
+        out.append("")
+    return out
+
+
 def build_report(results_dir: Path, run_id: str) -> str:
     """Assemble the full markdown report string."""
     rows = _load_rows(results_dir)
     if not rows:
         return f"# Scale-test report — run `{run_id}`\n\nNo metrics found under {results_dir}.\n"
-    lines = _header(rows, run_id) + _decision_matrix(rows) + _t9_tables(rows) + _per_test_tables(rows)
+    lines = (
+        _header(rows, run_id) + _decision_matrix(rows) + _t9_tables(rows) + _t10_tables(rows) + _per_test_tables(rows)
+    )
     return "\n".join(lines)
 
 
