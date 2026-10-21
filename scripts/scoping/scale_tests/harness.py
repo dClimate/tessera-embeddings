@@ -42,6 +42,8 @@ METRICS = frozenset(
         "peak_rss_bytes",
         "read_p50_ms",
         "read_p95_ms",
+        "read_p50_lo_ms",
+        "read_p50_hi_ms",
         "bytes_fetched",
         "throughput_mbps",
         "open_wall_s",
@@ -61,6 +63,7 @@ METRICS = frozenset(
         "encode_cpu_s",
         "decode_cpu_s",
         "dask_tasks",
+        "mismatched_arrays",
     }
 )
 
