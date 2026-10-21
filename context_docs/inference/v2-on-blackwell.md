@@ -185,17 +185,23 @@ wiped, the same process took 15 s; bytecode saved a further 6 s and a warm compi
 of the 354 s are the new EBS volume loading the image's snapshot block by block on first read, and the
 kernel compile itself is about 3 s. Baking bytecode and a compiler cache into the image saves about 7 s.
 
-| fresh worker, first v2 forward | before it | first forward | total |
-|---|---:|---:|---:|
-| today's image | — | 354 s | 354 s |
-| read the 6.4 GB Python environment in parallel at boot | 202 s | 20 s | 222 s |
-| Fast Snapshot Restore on the image's snapshot | — | 36 s | 36 s |
+| fresh worker, first v2 forward | getting the environment | first forward | total | scales to a fleet |
+|---|---:|---:|---:|---|
+| today's image | — | 354 s | 354 s | — |
+| read the 6.4 GB Python environment in parallel at boot | 202 s | 20 s | 222 s | yes |
+| EBS provisioned volume-initialization rate, 300 MiB/s | — | 179 s | 179 s | yes, charged per GiB initialized |
+| the environment as a tar on S3, unpacked onto NVMe | 11 s download + 43 s unpack | 31 s | 85 s | yes |
+| **the environment as an ext4 image with bytecode on S3, loop-mounted read-only from NVMe** | **24 s download, instant mount** | **25 s** | **~49 s** | **yes** |
+| Fast Snapshot Restore on the image's snapshot | — | 36 s | 36 s | no |
 
-Fast Snapshot Restore removes nine-tenths of it, but AWS grants an 80 GiB snapshot 10 fast-restored
-volumes per AZ, refilling at 10 per hour, at $0.75 per snapshot per AZ-hour; later volumes load the slow
-way. That covers steady replacement, not a fleet of hundreds starting together. Two remedies that would
-scale are untested: EBS's provisioned volume-initialization rate, priced per GiB initialized, and
-installing the environment onto the instance's NVMe from an S3 archive at boot.
+Fast Snapshot Restore is fastest but rationed: AWS grants an 80 GiB snapshot 10 fast-restored volumes per AZ,
+refilling at 10 per hour, at $0.75 per snapshot per AZ-hour, and later volumes load the slow way. It suits
+dev testing, not a fleet. The provisioned initialization rate halves the wait but the volume is still
+loading while the first process runs. The mounted image scales with S3: an 8.5 GB image downloaded in 24 s,
+the mount is instant, and the bytecode compiled into it cannot go stale on a read-only mount. Most of its
+remaining first forward is the fused kernel's first compile (12.7 s, against 2.4 s warm), which a compiler
+cache shipped per card type would remove. The base interpreter and the driver libraries stay on EBS. Scripts:
+`image_build.sh` and `image_test.sh` beside the other harness files.
 
 ## 8. Where the rest of a paid GPU-hour goes
 
@@ -218,7 +224,7 @@ while `g6e.xlarge` spot sat at its on-demand price. Spot capacity and interrupti
 ## 9. Not measured
 
 - The two changes together over a whole campaign cell, and the A10G beyond one tile.
-- EBS's provisioned volume-initialization rate, and an environment installed onto NVMe from S3 at boot.
+- A worker fleet started from the mounted environment image, and a compiler cache shipped per card type.
 - Gathering batches on the GPU.
 - v1.1 with the fused layer. Its encoder uses the same layers, but its published store keeps its
   arithmetic, so it was left alone.
