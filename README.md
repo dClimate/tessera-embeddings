@@ -223,10 +223,15 @@ pip install tessera_embeddings[inference]
 # Full production stack — inference + Prefect orchestration + AWS:
 pip install tessera_embeddings[inference,prefect,aws]
 
-# GPU (CUDA 13.0, NVIDIA driver 580+, Python 3.12-3.13) — install torch first so pip keeps
+# GPU, v2 (CUDA 13.0, NVIDIA driver 580+, Python 3.12-3.13) — install torch first so pip keeps
 # the CUDA wheel. On an older driver, the cu126 build of the same version runs pre-Blackwell
 # cards only; Blackwell (g7, g7e) needs driver 580+ and cu130.
 pip install "torch==2.14.1+cu130" --index-url https://download.pytorch.org/whl/cu130
+pip install "tessera_embeddings[inference]"
+
+# GPU, v1.1 (the default model) stays on PyTorch 2.5.1, the stack its published store was
+# inferred on; 2.14.1 moves its outputs as far as a change of card (ADR 025).
+pip install "torch==2.5.1+cu121" --index-url https://download.pytorch.org/whl/cu121
 pip install "tessera_embeddings[inference]"
 
 # 3.12-3.13 is the supported range: it is what CI tests. torch 2.14.1 publishes wheels up to
