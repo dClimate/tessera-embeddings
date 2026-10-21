@@ -43,7 +43,9 @@ because PyPI's CPU wheel stays in the candidate pool and can win.
 **Check the build exists before pinning it.**
 `https://download.pytorch.org/whl/<cuXXX>/torch/` lists what each index carries; `torch 2.14.1`
 publishes `cu126`, `cu130` and `cu132`. Pick the one your driver supports: the CUDA 13 builds need
-an NVIDIA driver of 580 or later, `cu126` runs on older ones. Production runs `cu130`.
+an NVIDIA driver of 580 or later, `cu126` runs on older ones. CUDA 12.6 predates Blackwell, so
+`cu126` has no kernels for those cards (`g7`, `g7e`): they need a 580+ driver and a CUDA 13 build.
+Production runs `cu130`.
 
 **Supported Python is 3.12-3.13** — what CI tests, what the classifiers advertise, and what these
 instructions assume. `requires-python` is `>=3.12` with no upper bound, so 3.14 installs but is
