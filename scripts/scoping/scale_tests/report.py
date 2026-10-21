@@ -393,7 +393,8 @@ def _t10_tables(rows: list[dict]) -> list[str]:
         out.append("")
     clients = sorted({r["params"]["client"] for r in _sel(rows, test="t10", metric="get_requests")})
     for client in clients:
-        read_arms = sorted({r["variant"] for r in _sel(rows, test="t10", metric="get_requests", client=client)})
+        phase = f"read_{client}"
+        read_arms = sorted({r["variant"] for r in _sel(rows, test="t10", phase=phase, metric="get_requests")})
         out += [
             f"## T10 — cold reads from S3, {client} (median of passes; wire MB in brackets)",
             "",
@@ -403,7 +404,7 @@ def _t10_tables(rows: list[dict]) -> list[str]:
         for a in read_arms:
             cells = []
             for _, workload, dims in _T10_READS:
-                kw = {"client": client, "workload": workload, "dims": dims}
+                kw = {"phase": phase, "workload": workload, "dims": dims}
                 v = _t10_value(rows, "read_p50_ms" if workload == "point" else "wall_s", a, **kw)
                 wire = _t10_value(rows, "bytes_fetched", a, method="wire", **kw)
                 unit = "ms" if workload == "point" else "s"
@@ -414,6 +415,33 @@ def _t10_tables(rows: list[dict]) -> list[str]:
                     if unit == "ms"
                     else f"{v:.1f} s ({(wire or 0) / 1e6:.0f})"
                 )
+            out.append(f"| {a} | " + " | ".join(cells) + " |")
+        out.append("")
+    tune = [
+        r
+        for r in rows
+        if r["test"] == "t10" and r["phase"].startswith("tune_") and r["metric"] == "wall_s" and r["variant"]
+    ]
+    if tune:
+        configs = sorted(
+            {(r["params"]["workload"], r["params"]["dims"], r["params"].get("zarr_config", "")) for r in tune}
+        )
+        out += [
+            "## T10 — full-vector reads, reader settings (wall s, median of passes)",
+            "",
+            "| arm | " + " | ".join(f"{w} {d} {c or 'default'}" for w, d, c in configs) + " |",
+            "|---|" + "---|" * len(configs),
+        ]
+        for a in sorted({r["variant"] for r in tune}):
+            cells = []
+            for w, d, c in configs:
+                vals = [
+                    r["value"]
+                    for r in tune
+                    if r["variant"] == a
+                    and (r["params"]["workload"], r["params"]["dims"], r["params"].get("zarr_config", "")) == (w, d, c)
+                ]
+                cells.append(f"{statistics.median(vals):.1f}" if vals else "—")
             out.append(f"| {a} | " + " | ".join(cells) + " |")
         out.append("")
     return out
