@@ -272,7 +272,9 @@ def phase_assemble(cfg: harness.RunConfig, staging: str, extent: tuple[int, int]
     dtypes = tuple((v, str(probe[v].dtype)) for v in variables)
     base, run_id = staging.rstrip("/").rsplit("/", 1)
     ny, nx = extent
-    arms = [a for a in FINALISTS if a.write_order == "morton"]  # the assembly code writes zarr's default order
+    # The assembly code writes zarr's default order and stages band-last tiles, so it can carry neither a
+    # non-default write order nor a band-first array; those arms' write cost comes from `build`.
+    arms = [a for a in FINALISTS if a.write_order == "morton" and not a.band_first]
     for p in range(PASSES):
         for arm in arms if p % 2 == 0 else arms[::-1]:
             name = f"t10asm/p{p}/{arm.name}"
