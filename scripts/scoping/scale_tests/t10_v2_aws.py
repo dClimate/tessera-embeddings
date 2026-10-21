@@ -127,6 +127,7 @@ def cold_read(payload: dict[str, Any]) -> dict[str, Any]:
     """One workload on one arm in a fresh process: wall, requests, store bytes, wire bytes."""
     import psutil
 
+    zarr.config.set(payload.get("zarr_config") or {})
     store = CountingStore(_open_repo(payload["store_uri"]).readonly_session(branch="main").store)
     grp = zarr.open_group(store, mode="r")["zone"]
     emb, scl = grp["embeddings"], grp["scales"]
@@ -142,7 +143,8 @@ def cold_read(payload: dict[str, Any]) -> dict[str, Any]:
             lat.append(time.monotonic() - p0)
         out |= {"read_p50_ms": 1e3 * float(np.median(lat)), "read_p95_ms": 1e3 * float(np.percentile(lat, 95))}
     elif workload.startswith("dask"):
-        chunks = {} if workload == "dask_default" else {"time": 1, "northing": TILE, "easting": TILE, "band": 16}
+        aligned = {"time": 1, "northing": TILE, "easting": TILE, "band": emb.chunks[-1]}  # one task per band chunk
+        chunks = {} if workload == "dask_default" else aligned
         ds = xr.open_zarr(store, group="zone", consolidated=False, chunks=chunks)
         ys, xs = regions["pull8"]
         ds["embeddings"].isel(time=0, northing=ys, easting=xs, band=slice(0, dims)).data.compute()
@@ -171,29 +173,43 @@ def _points(cfg: harness.RunConfig, tiles: Path) -> list[list[int]]:
     return pts
 
 
-def phase_read(cfg: harness.RunConfig, phase: str, tiles: Path) -> None:
+#: The read sweep: (workload, dims, zarr config). ``tune`` re-runs the full-vector pulls with a wider
+#: fetch concurrency and band-aligned Dask chunks, to see how much of their cost a reader can recover.
+READ_WORKLOADS: list[tuple[str, int, dict]] = [
+    ("point", 16, {}),
+    ("point", 128, {}),
+    *((w, d, {}) for w in ("tile", "bulk", "pull8") for d in DIMS_READ),
+    ("dask_default", 16, {}),
+    ("dask_aligned", 16, {}),
+]
+TUNE_WORKLOADS: list[tuple[str, int, dict]] = [
+    ("pull8", 128, {}),
+    ("pull8", 128, {"async.concurrency": 64}),
+    ("dask_aligned", 128, {}),
+    ("bulk", 128, {"async.concurrency": 64}),
+    ("pull8", 16, {"async.concurrency": 64}),
+]
+
+
+def phase_read(cfg: harness.RunConfig, phase: str, tiles: Path, workloads: list, arms: list[V.Variant]) -> None:
     """Every workload, cold, arms interleaved, PASSES passes with the arm order reversed each pass."""
     regions = {k: [(s.start, s.stop) for s in v] for k, v in _regions(_side(cfg)).items()}
-    workloads = [
-        ("point", 16),
-        ("point", 128),
-        *((w, d) for w in ("tile", "bulk", "pull8") for d in DIMS_READ),
-        ("dask_default", 16),
-        ("dask_aligned", 16),
-    ]
-    points = _points(cfg, tiles)
+    points = _points(cfg, tiles) if any(w == "point" for w, _, _ in workloads) else []
     for p in range(PASSES):
-        for workload, dims in workloads:
-            for arm in FINALISTS if p % 2 == 0 else FINALISTS[::-1]:
+        for workload, dims, zarr_config in workloads:
+            for arm in arms if p % 2 == 0 else arms[::-1]:
                 payload = {
                     "store_uri": harness.store_uri(cfg, f"t10/{arm.name}"),
                     "workload": workload,
                     "dims": dims,
                     "regions": regions,
                     "points": points if workload == "point" else [],
+                    "zarr_config": zarr_config,
                 }
                 r = harness.run_cold("scripts.scoping.scale_tests.t10_v2_aws.cold_read", payload)
                 tags = {"variant": arm.name, "client": CLIENT, "workload": workload, "dims": dims, "pass": p}
+                if zarr_config:
+                    tags["zarr_config"] = ",".join(f"{k}={v}" for k, v in zarr_config.items())
                 harness.emit_metric(cfg, TEST, phase, "wall_s", r["wall_s"], "s", **tags)
                 harness.emit_metric(cfg, TEST, phase, "get_requests", r["requests"], "count", **tags)
                 harness.emit_metric(cfg, TEST, phase, "bytes_fetched", r["bytes"], "bytes", method="store", **tags)
@@ -305,14 +321,24 @@ def main() -> int:
     if phase == "build":
         harness.run_phase(cfg, TEST, "build", lambda: phase_build(cfg, args.tiles, args.workers))
     elif phase == "read":
-        harness.run_phase(cfg, TEST, f"read_{CLIENT}", lambda: phase_read(cfg, f"read_{CLIENT}", args.tiles))
+        harness.run_phase(
+            cfg,
+            TEST,
+            f"read_{CLIENT}",
+            lambda: phase_read(cfg, f"read_{CLIENT}", args.tiles, READ_WORKLOADS, FINALISTS),
+        )
+    elif phase == "tune":
+        arms = [a for a in FINALISTS if a.write_order == "morton"]
+        harness.run_phase(
+            cfg, TEST, f"tune_{CLIENT}", lambda: phase_read(cfg, f"tune_{CLIENT}", args.tiles, TUNE_WORKLOADS, arms)
+        )
     elif phase == "assemble":
         extent = tuple(int(v) for v in args.extent.split(","))
         harness.run_phase(
             cfg, TEST, "assemble", lambda: phase_assemble(cfg, args.staging, extent, args.n_tiles, args.workers)
         )
     else:
-        raise SystemExit("--phase must be build, read or assemble")
+        raise SystemExit("--phase must be build, read, tune or assemble")
     return 0
 
 
