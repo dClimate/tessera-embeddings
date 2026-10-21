@@ -143,6 +143,18 @@ Each tile is computed whole on one card, so in a mixed store these differences f
 inside one. The A10G fallback rung, which already writes into stores whenever `g6e` is refused, moves
 outputs more than the RTX PRO 6000 does.
 
+**What one level is, for a user.** A level is one step of a pixel's int8 code, under 1% of its largest
+channel, and quantisation already rounds every channel by up to half a level. The fused layer moves about
+two of a pixel's 128 channels by one level and leaves 14% of pixels identical (5% for the card change).
+In direction, which is what similarity search and clustering use, a mean cosine distance of 7.2e-6 is a
+turn of about 0.22°, 0.66° at the 99.9th percentile and 0.86° at the worst pixel (card change: 0.27° mean).
+Horizontally adjacent 10 m pixels have a median cosine distance of 0.0031, or about 4.5°, so the fused
+layer's mean shift is 424 times smaller than that spatial variation in cosine distance (326 times for the card
+change) and about 20 times smaller in angle. The top-20 figure is 19.7 of 20 neighbours kept, against 19.6
+for the card change. From `usability.py` on the same tiles, in
+`s3://global-tessera-inputs-dev/perf/g7e/<card>/<card>-r4-usab.json`. A trained downstream model was not
+tested; the 12-cluster agreement is the nearest stand-in.
+
 ## 6. Capacity on the day
 
 Sampled from 15:20 to 17:00 UTC with capacity reservations created and cancelled at once (`odcr.py`:
