@@ -201,7 +201,9 @@ way to waste money on this pipeline.
 - **Workers:** g6e.xlarge (one L40S, 4 vCPU, 32 GB RAM), on demand, across several
   availability zones; Ray fails over between subnets when one refuses capacity.
 - Workers boot from a Packer-built AMI with every dependency already installed, and are
-  ready in about a minute.
+  ready in about a minute. Their first forward then waits on the new EBS volume loading the
+  AMI, unless the AMI ships its venv as a mountable image
+  ([`gotchas.md`](../providers/aws/gotchas.md)), which turns minutes into well under one.
 
 [`docs/providers/aws.md`](../../../docs/providers/aws.md) covers what to provision, the
 capacity-fallback rungs, and how the fleet mix is chosen.
