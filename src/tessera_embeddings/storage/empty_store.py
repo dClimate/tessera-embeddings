@@ -40,7 +40,7 @@ import numpy as np
 import zarr
 
 from tessera_embeddings.config.ingest import INGEST_CHUNKS, INGEST_COMPRESSORS, mosaic_chunk_layout
-from tessera_embeddings.config.store_layout import clamp_chunks_and_shards
+from tessera_embeddings.config.chunk_geometry import clamp_chunks_and_shards
 from tessera_embeddings.storage.time_axis import TIME_ENCODING, compute_doy
 from tessera_embeddings.storage.zarr_store import _create_repo, _delete_store
 from tessera_embeddings.utils import utcnow_iso

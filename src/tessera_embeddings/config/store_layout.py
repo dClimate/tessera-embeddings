@@ -34,6 +34,7 @@ import warnings
 import numpy as np
 from zarr.codecs.numcodecs import PCodec as _PCodecZarr3
 
+from tessera_embeddings.config.chunk_geometry import clamp_chunks_and_shards
 from tessera_embeddings.config.inference import EMBEDDING_DIM
 
 # PCodec is intentionally a Zarr v3 *serializer* (array->bytes), not a bytes->bytes compressor; silence the "not in
@@ -103,26 +104,6 @@ def pcodec_serializer() -> _PCodecZarr3:
     return _PCodecZarr3()
 
 
-def clamp_chunks_and_shards(
-    shape: tuple[int, ...],
-    chunks: tuple[int, ...],
-    shards: tuple[int, ...] | None,
-) -> tuple[tuple[int, ...], tuple[int, ...] | None]:
-    """Clamp nominal chunk/shard sizes to an array's ``shape``.
-
-    Chunks are clamped to the shape; shards are clamped to the shape and then floored to a whole
-    multiple of the clamped chunks (Zarr v3 requires shards to be exact chunk multiples), never
-    below one chunk, so a store smaller than one nominal chunk/shard still creates cleanly. The
-    single implementation of this geometry math: both :meth:`ArrayLayout.create_kwargs` and the
-    empty-store seeder call it.
-    """
-    # max(..., 1): a zero-extent axis is legal (a mosaic seeded with an EMPTY time axis, appended per date), but a
-    # zero chunk edge is not — keep the nominal chunk so the axis grows into it.
-    clamped = tuple(max(min(c, s), 1) for c, s in zip(chunks, shape, strict=True))
-    if shards is None:
-        return clamped, None
-    clamped_shards = tuple(max(c, (min(sh, s) // c) * c) for sh, s, c in zip(shards, shape, clamped, strict=True))
-    return clamped, clamped_shards
 
 
 @dataclasses.dataclass(frozen=True)
@@ -297,3 +278,22 @@ def trailing_extent(var: str, embedding_dim: int) -> int | None:
 
 #: The global campaign (ADR-008 D3). No ``embedding_std``, ever — see :func:`_sharded_arrays`.
 GLOBAL = StoreLayout(name="global", arrays=_sharded_arrays(include_std=False))
+
+
+
+#: PROTOTYPE (not for merge): the v2 store with embeddings band-first, (time, band, northing, easting).
+DIMS_4D_BAND_FIRST: tuple[str, str, str, str] = ("time", "band", "northing", "easting")
+GLOBAL_V2 = StoreLayout(
+    name="global-v2",
+    arrays={
+        **GLOBAL.arrays,
+        "embeddings": ArrayLayout(
+            dims=DIMS_4D_BAND_FIRST,
+            chunks=(1, 16, 512, 512),
+            shards=(1, 16, SHARD_PX, SHARD_PX),
+            dtype="int8",
+            fill_value=0,
+            codec="zstd",
+        ),
+    },
+)

@@ -18,6 +18,7 @@ Run from the REPOSITORY ROOT, with ``T10="-m scripts.scoping.scale_tests.t10_v2_
 
     python $T10 --tiles <dir> --phase build
     python $T10 --tiles <dir> --phase read        # once per client
+    python $T10 --tiles <dir> --phase tune        # full-vector pulls under reader settings
     python $T10 --phase assemble --staging s3://<staged run dir> --extent 34964,53383 --n-tiles 64 --workers 16
 """
 
@@ -30,7 +31,7 @@ import multiprocessing
 import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import xarray as xr
@@ -144,9 +145,11 @@ def cold_read(payload: dict[str, Any]) -> dict[str, Any]:
     import psutil
 
     zarr.config.set(payload.get("zarr_config") or {})
+    t_open = time.monotonic()
     store = CountingStore(_open_repo(payload["store_uri"]).readonly_session(branch="main").store)
     grp = zarr.open_group(store, mode="r")["zone"]
     emb, scl = grp["embeddings"], grp["scales"]
+    out: dict[str, Any] = {"open_wall_s": time.monotonic() - t_open}
     band_first = emb.metadata.dimension_names[1] == "band"
     workload, dims = payload["workload"], payload["dims"]
 
@@ -154,7 +157,6 @@ def cold_read(payload: dict[str, Any]) -> dict[str, Any]:
         return (0, slice(0, dims), ys, xs) if band_first else (0, ys, xs, slice(0, dims))
 
     regions = {k: tuple(slice(*s) for s in v) for k, v in payload["regions"].items()}
-    out: dict[str, Any] = {}
     net0, t0 = psutil.net_io_counters().bytes_recv, time.monotonic()
     if workload == "point":
         lat = []
@@ -162,7 +164,12 @@ def cold_read(payload: dict[str, Any]) -> dict[str, Any]:
             p0 = time.monotonic()
             emb[window(y, x)] * scl[0, y, x]  # a dequantised prefix: two arrays, as a reader needs
             lat.append(time.monotonic() - p0)
-        out |= {"read_p50_ms": 1e3 * float(np.median(lat)), "read_p95_ms": 1e3 * float(np.percentile(lat, 95))}
+        ms = 1e3 * np.asarray(lat)
+        # A 95% bootstrap interval on the median: a gate fails only if its interval clears the threshold.
+        boots = np.median(np.random.default_rng(0).choice(ms, (2000, ms.size)), axis=1)
+        lo, hi = np.percentile(boots, [2.5, 97.5])
+        out |= {"read_p50_ms": float(np.median(ms)), "read_p95_ms": float(np.percentile(ms, 95))}
+        out |= {"read_p50_lo_ms": float(lo), "read_p50_hi_ms": float(hi)}
     elif workload.startswith("dask"):
         band_chunk = dict(zip(emb.metadata.dimension_names, emb.chunks, strict=True))["band"]
         aligned = {"time": 1, "northing": TILE, "easting": TILE, "band": band_chunk}  # one task per band chunk
@@ -205,6 +212,7 @@ READ_WORKLOADS: list[tuple[str, int, dict]] = [
     ("dask_default", 16, {}),
     ("dask_default", 128, {}),
 ]
+POINT_WORKLOADS: list[tuple[str, int, dict]] = [("point", 16, {}), ("point", 128, {})]
 TUNE_WORKLOADS: list[tuple[str, int, dict]] = [
     ("pull8", 128, {}),
     ("pull8", 128, {"async.concurrency": 64}),
@@ -237,9 +245,10 @@ def phase_read(cfg: harness.RunConfig, phase: str, tiles: Path, workloads: list,
                 harness.emit_metric(cfg, TEST, phase, "get_requests", r["requests"], "count", **tags)
                 harness.emit_metric(cfg, TEST, phase, "bytes_fetched", r["bytes"], "bytes", method="store", **tags)
                 harness.emit_metric(cfg, TEST, phase, "bytes_fetched", r["wire_bytes"], "bytes", method="wire", **tags)
-                for k in ("read_p50_ms", "read_p95_ms"):
+                for k in ("read_p50_ms", "read_p95_ms", "read_p50_lo_ms", "read_p50_hi_ms"):
                     if k in r:
                         harness.emit_metric(cfg, TEST, phase, k, r[k], "ms", **tags)
+                harness.emit_metric(cfg, TEST, phase, "open_wall_s", r["open_wall_s"], "s", **tags)
                 logger.info(
                     "[%s] pass %d %s/%d %s: %.2fs %d req",
                     CLIENT,
@@ -255,26 +264,31 @@ def phase_read(cfg: harness.RunConfig, phase: str, tiles: Path, workloads: list,
 # ── assemble ─────────────────────────────────────────────────────────────────
 
 
-def phase_assemble(cfg: harness.RunConfig, staging: str, extent: tuple[int, int], n_tiles: int, workers: int) -> None:
-    """Write the same staged tiles into each finalist with the library's assembly code; time the workers."""
+def _picks(staging: str, n_tiles: int) -> list[str]:
+    """The staged tiles assembly writes: ``n_tiles`` labels spread evenly over the staged run."""
+    from tessera_embeddings.profiling.inference.compare_outputs import _staged_labels
+
+    labels = sorted(_staged_labels(staging)[0])
+    return [labels[int(i)] for i in np.linspace(0, len(labels) - 1, min(n_tiles, len(labels)))]
+
+
+def phase_assemble(
+    cfg: harness.RunConfig, staging: str, extent: tuple[int, int], n_tiles: int, workers: int, arms: list[V.Variant]
+) -> None:
+    """Write the same staged tiles into each arm with the library's assembly code; time the workers."""
     from tessera_embeddings.config.store_layout import CARRIED_VARS, GLOBAL, REQUIRED_VARS
     from tessera_embeddings.inference.assembly import StagedShardSource, _staged_storage_options
     from tessera_embeddings.inference.chunk_spec import parse_chunk_label
-    from tessera_embeddings.profiling.inference.compare_outputs import _staged_labels
     from tessera_embeddings.storage.shard_writer import write_year_shards
     from tessera_embeddings.storage.time_axis import TIME_ENCODING, calendar_year_times
 
-    labels = sorted(_staged_labels(staging)[0])
-    picks = [labels[int(i)] for i in np.linspace(0, len(labels) - 1, min(n_tiles, len(labels)))]
+    picks = _picks(staging, n_tiles)
     probe_path = f"{staging}/{picks[0]}.zarr"
     probe = zarr.open_group(probe_path, mode="r", storage_options=_staged_storage_options(probe_path))
     variables = tuple(v for v in (*REQUIRED_VARS, *CARRIED_VARS) if v in probe and v in GLOBAL.arrays)
     dtypes = tuple((v, str(probe[v].dtype)) for v in variables)
     base, run_id = staging.rstrip("/").rsplit("/", 1)
     ny, nx = extent
-    # The assembly code writes zarr's default order and stages band-last tiles, so it can carry neither a
-    # non-default write order nor a band-first array; those arms' write cost comes from `build`.
-    arms = [a for a in FINALISTS if a.write_order == "morton" and not a.band_first]
     for p in range(PASSES):
         for arm in arms if p % 2 == 0 else arms[::-1]:
             name = f"t10asm/p{p}/{arm.name}"
@@ -330,6 +344,41 @@ def phase_assemble(cfg: harness.RunConfig, staging: str, extent: tuple[int, int]
             )
 
 
+# ── verify ───────────────────────────────────────────────────────────────────
+
+
+def phase_verify(cfg: harness.RunConfig, prefix: str, shards: list[tuple[int, int]], arms: list[V.Variant]) -> None:
+    """Every arm under ``prefix`` holds exactly C0's values in every array of every listed shard.
+
+    Layouts must be lossless: a band-first array is read back and reordered before the comparison, and
+    floats compare with NaN equal to NaN.
+    """
+
+    def zone(arm: V.Variant) -> zarr.Group:
+        repo = _open_repo(harness.store_uri(cfg, f"{prefix}/{arm.name}"))
+        return cast(zarr.Group, zarr.open_group(repo.readonly_session(branch="main").store, mode="r")["zone"])
+
+    ref = zone(FINALISTS[0])
+    others = [(a, zone(a)) for a in arms if a.name != FINALISTS[0].name]
+    mismatched = dict.fromkeys((a.name for a, _ in others), 0)
+    for sy, sx in shards:
+        ys, xs = slice(sy * TILE, (sy + 1) * TILE), slice(sx * TILE, (sx + 1) * TILE)
+        for var, ref_arr in ref.arrays():
+            if ref_arr.ndim < 3:
+                continue
+            want = np.asarray(ref_arr[0, ys, xs])
+            for arm, grp in others:
+                arr = cast(zarr.Array, grp[var])
+                band_first = arr.metadata.dimension_names[1] == "band"
+                got = np.asarray(arr[0, :, ys, xs]).transpose(1, 2, 0) if band_first else np.asarray(arr[0, ys, xs])
+                if not np.array_equal(want, got, equal_nan=want.dtype.kind == "f"):
+                    mismatched[arm.name] += 1
+                    logger.warning("verify %s: %s differs from C0 in shard (%d, %d)", arm.name, var, sy, sx)
+    for name, n in mismatched.items():
+        harness.emit_metric(cfg, TEST, "verify", "mismatched_arrays", n, "count", variant=name, prefix=prefix, shards=len(shards))
+        logger.info("verify %s under %s: %d mismatched array-shards over %d shards", name, prefix, n, len(shards))
+
+
 def main() -> int:
     """Parse args and run the one phase asked for."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -339,10 +388,17 @@ def main() -> int:
     parser.add_argument("--staging", default=None, help="A staged run directory, for assemble.")
     parser.add_argument("--extent", default=None, help="The staged run's ROI extent 'ny,nx', for assemble.")
     parser.add_argument("--n-tiles", type=int, default=64)
+    parser.add_argument("--arms", default=None, help="Comma-separated finalist names, for assemble and verify.")
+    parser.add_argument("--prefix", default="t10", help="Store prefix to verify: t10 (build) or t10asm/p0.")
     args = parser.parse_args()
     cfg = harness.config_from_args(args)
     harness.configure_logging()
     phase, cfg = cfg.phase, dataclasses.replace(cfg, phase=None)  # run_phase filters on the name it is given
+    # The library's assembly code writes zarr's default order and stages band-last tiles, so by default it
+    # carries neither a non-default write order nor a band-first array; those arms' write cost comes from
+    # `build`, unless --arms names them for a library that can write them.
+    by_name = {a.name: a for a in FINALISTS}
+    chosen = [by_name[n] for n in args.arms.split(",")] if args.arms else None
     if phase == "build":
         harness.run_phase(cfg, TEST, "build", lambda: phase_build(cfg, args.tiles, args.workers))
     elif phase == "read":
@@ -357,13 +413,31 @@ def main() -> int:
         harness.run_phase(
             cfg, TEST, f"tune_{CLIENT}", lambda: phase_read(cfg, f"tune_{CLIENT}", args.tiles, TUNE_WORKLOADS, arms)
         )
+    elif phase == "points":
+        harness.run_phase(
+            cfg,
+            TEST,
+            f"points_{CLIENT}",
+            lambda: phase_read(cfg, f"points_{CLIENT}", args.tiles, POINT_WORKLOADS, FINALISTS),
+        )
     elif phase == "assemble":
         extent = tuple(int(v) for v in args.extent.split(","))
+        arms = chosen or [a for a in FINALISTS if a.write_order == "morton" and not a.band_first]
         harness.run_phase(
-            cfg, TEST, "assemble", lambda: phase_assemble(cfg, args.staging, extent, args.n_tiles, args.workers)
+            cfg, TEST, "assemble", lambda: phase_assemble(cfg, args.staging, extent, args.n_tiles, args.workers, arms)
+        )
+    elif phase == "verify":
+        from tessera_embeddings.inference.chunk_spec import parse_chunk_label
+
+        if args.staging:  # an assembled set: the tiles assembly wrote
+            shards = [parse_chunk_label(label) for label in _picks(args.staging, args.n_tiles)]
+        else:  # a built set: two full cycles of the tiles, each tile in two places
+            shards = [divmod(i, _side(cfg)) for i in range(min(16, _side(cfg) ** 2))]
+        harness.run_phase(
+            cfg, TEST, f"verify_{args.prefix.replace('/', '_')}", lambda: phase_verify(cfg, args.prefix, shards, chosen or FINALISTS)
         )
     else:
-        raise SystemExit("--phase must be build, read, tune or assemble")
+        raise SystemExit("--phase must be build, read, points, tune, assemble or verify")
     return 0
 
 

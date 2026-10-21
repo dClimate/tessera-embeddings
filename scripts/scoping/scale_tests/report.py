@@ -373,6 +373,20 @@ def _t10_value(rows: list[dict], metric: str, variant: str, **params: Any) -> fl
 def _t10_tables(rows: list[dict]) -> list[str]:
     """Render T10's assembly table (ratios to the control) and one cold-read table per client."""
     out: list[str] = []
+    built = sorted({r["variant"] for r in _sel(rows, test="t10", phase="build", metric="encode_cpu_s") if r["variant"]})
+    if built:
+        cpu0, gb0 = (_t10_value(rows, m, "v2_c0", phase="build") or 1 for m in ("encode_cpu_s", "bytes_written"))
+        out += [
+            "## T10 — bench store build, encode CPU per shard",
+            "",
+            "| arm | encode CPU s | vs C0 | stored GB | vs C0 |",
+            "|---|---|---|---|---|",
+        ]
+        for a in built:
+            cpu = _t10_value(rows, "encode_cpu_s", a, phase="build") or 0
+            gb = _t10_value(rows, "bytes_written", a, phase="build") or 0
+            out.append(f"| {a} | {cpu:.2f} | {cpu / cpu0:.2f} | {gb / 1e9:.1f} | {gb / gb0:.2f} |")
+        out.append("")
     arms = sorted({r["variant"] for r in _sel(rows, test="t10", phase="assemble", metric="wall_s") if r["variant"]})
     if arms:
         base = {k: _t10_value(rows, "encode_cpu_s", "v2_c0", kind=k) for k in ("worker", "write")}
@@ -385,7 +399,7 @@ def _t10_tables(rows: list[dict]) -> list[str]:
         for a in arms:
             w, wr = (_t10_value(rows, "encode_cpu_s", a, kind=k) or 0 for k in ("worker", "write"))
             wall = _t10_value(rows, "wall_s", a, phase="assemble") or 0
-            gb = (_t10_value(rows, "bytes_written", a) or 0) / 1e9
+            gb = (_t10_value(rows, "bytes_written", a, phase="assemble") or 0) / 1e9
             out.append(
                 f"| {a} | {w:.2f} | {w / (base['worker'] or 1):.2f} | {wr:.2f} | {wr / (base['write'] or 1):.2f} "
                 f"| {wall:.0f} | {gb:.1f} |"
@@ -416,6 +430,31 @@ def _t10_tables(rows: list[dict]) -> list[str]:
                     else f"{v:.1f} s ({(wire or 0) / 1e6:.0f})"
                 )
             out.append(f"| {a} | " + " | ".join(cells) + " |")
+        out.append("")
+    for phase in sorted({r["phase"] for r in rows if r["test"] == "t10" and r["phase"].startswith("points_")}):
+        out += [
+            f"## T10 — point reads with 95% intervals on the median, {phase.removeprefix('points_')}",
+            "",
+            "| arm | point 16 p50 ms | point 128 p50 ms | open s |",
+            "|---|---|---|---|",
+        ]
+        for a in sorted({r["variant"] for r in _sel(rows, test="t10", phase=phase, metric="read_p50_ms")}):
+            cells = []
+            for dims in (16, 128):
+                p50, lo, hi = (
+                    _t10_value(rows, m, a, phase=phase, dims=dims)
+                    for m in ("read_p50_ms", "read_p50_lo_ms", "read_p50_hi_ms")
+                )
+                cells.append(f"{p50:.0f} [{lo:.0f}–{hi:.0f}]" if p50 and lo and hi else "—")
+            open_s = _t10_value(rows, "open_wall_s", a, phase=phase)
+            out.append(f"| {a} | {' | '.join(cells)} | {open_s or 0:.2f} |")
+        out.append("")
+    verified = _sel(rows, test="t10", metric="mismatched_arrays")
+    if verified:
+        out += ["## T10 — lossless check against C0", "", "| arm | stores | shards | mismatched array-shards |"]
+        out.append("|---|---|---|---|")
+        for r in sorted(verified, key=lambda r: (r["params"]["prefix"], r["variant"])):
+            out.append(f"| {r['variant']} | {r['params']['prefix']} | {r['params']['shards']} | {r['value']:.0f} |")
         out.append("")
     tune = [
         r
@@ -452,10 +491,10 @@ def build_report(results_dir: Path, run_id: str) -> str:
     rows = _load_rows(results_dir)
     if not rows:
         return f"# Scale-test report — run `{run_id}`\n\nNo metrics found under {results_dir}.\n"
-    lines = (
-        _header(rows, run_id) + _decision_matrix(rows) + _t9_tables(rows) + _t10_tables(rows) + _per_test_tables(rows)
-    )
-    return "\n".join(lines)
+    # The ADR-008 matrix and the generic per-test stats describe T0-T8; a v2 layout run carries its own tables.
+    v1 = [r for r in rows if r["test"] not in ("t9", "t10")]
+    lines = _header(rows, run_id) + (_decision_matrix(v1) if v1 else []) + _t9_tables(rows) + _t10_tables(rows)
+    return "\n".join(lines + (_per_test_tables(v1) if v1 else []))
 
 
 def main() -> int:

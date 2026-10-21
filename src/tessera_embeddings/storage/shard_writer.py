@@ -828,6 +828,11 @@ def _write_shards_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 - retu
             # Trailing dims (band) not indexed are written in full, so one
             # assignment covers both the 3-D and 4-D arrays.
             region = (slice(year, year + 1), slice(y0, y0 + h), slice(x0, x0 + w))
+            # PROTOTYPE (band-first scoping): a (time, band, northing, easting) array takes its band-last
+            # staged block through a transposed view; zarr gathers each inner chunk from it.
+            if arr.ndim == 4 and arr.metadata.dimension_names[1] == "band":
+                region = (region[0], slice(None), *region[1:])
+                block = block.transpose(0, 3, 1, 2)
             if owned is not None:
                 # One variable at a time, so the extra memory is one shard of the widest array.
                 with timer.phase("pixel_merge"):
