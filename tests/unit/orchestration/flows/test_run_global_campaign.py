@@ -22,6 +22,7 @@ from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.storage.update import UpdatePlan
 
 _PATHS = BucketPaths(inputs="s3://in", outputs="s3://out")
+_AMI = {"ami_ssm_name": "ami", "ami_ssm_name_by_model": {"v1.1": "ami"}}  # v1.1 needs its own image (ADR 025)
 
 
 def _per_cell(**kwargs):
@@ -33,7 +34,7 @@ def _per_cell(**kwargs):
     the default itself is pinned by ``test_default_strategy_is_chained_clusters``.
     """
     kwargs.setdefault("fill_strategy", "cluster-per-zone")
-    return asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", **kwargs))
+    return asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI, **kwargs))
 
 
 def _completed_run(rid: str = "r") -> SimpleNamespace:
@@ -163,7 +164,7 @@ class TestCampaignDefaults:
 
     def test_the_default_strategy_is_chained_clusters(self, wired):
         """GPUs stream through a cluster instead of paying a cluster per zone."""
-        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI))
         assert [d for d, _ in wired["arun"]] == ["fill-zones-sequential/fill-zones-sequential"]
 
     def test_ten_clusters_share_sixty_ingest_slots(self):
@@ -202,7 +203,7 @@ class TestCampaignDefaults:
         pausing reachable without an operator creating anything first. Commits are ungated, so
         there is no third.
         """
-        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI))
         assert dict(wired["limits"]) == {
             "tessera-global-ingests": 60,
             "tessera-global-inference": 1,
@@ -215,14 +216,14 @@ class TestCampaignDefaults:
         larger number would imply a capacity it does not enforce — and zero, the value that
         pauses, must never be what a campaign start writes.
         """
-        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=8))
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI, max_parallel_clusters=8))
         assert dict(wired["limits"])["tessera-global-inference"] == 1
 
     def test_a_start_clears_a_pause_somebody_left_behind(self, wired):
         """The gate is upserted at every start, so a campaign cannot inherit a zero from a
         previous run's pause and sit there looking healthy while doing nothing.
         """
-        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI))
         writes = [v for k, v in wired["limits"] if k == "tessera-global-inference"]
         assert writes == [1]
 
@@ -249,7 +250,7 @@ class TestCampaignDefaults:
         before any upsert, and this asserts the absence rather than the ordering.
         """
         with pytest.raises(ValueError, match=match):
-            asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", **kwargs))
+            asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI, **kwargs))
         assert wired.get("limits", []) == [], "no cap, and above all no pause-gate reset"
 
     def test_a_rejected_invocation_never_touches_the_shared_gates(self, wired, monkeypatch):
@@ -265,7 +266,7 @@ class TestCampaignDefaults:
         monkeypatch.setattr(mod, "campaign_work_list", lambda *a, **k: [("99N", 2025)])
 
         with pytest.raises(ValueError, match="not seeded"):
-            asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+            asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI))
 
         assert wired.get("limits", []) == [], "a rejected run must leave every shared gate alone"
 
@@ -273,7 +274,7 @@ class TestCampaignDefaults:
         """The same hazard without an error: nothing to dispatch, so nothing to resume for."""
         monkeypatch.setattr(mod, "campaign_work_list", lambda *a, **k: [])
 
-        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI))
 
         assert wired.get("limits", []) == [], "a run with no work must not reset a live pause"
         assert wired["arun"] == [], "and must dispatch nothing"
@@ -283,7 +284,7 @@ class TestCampaignDefaults:
         because inference is exactly what this run still does and pausing it must stay
         available.
         """
-        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", ingest=False))
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI, ingest=False))
         assert dict(wired["limits"]) == {"tessera-global-inference": 1}
 
     def test_nothing_bounds_mosaics_in_flight(self, wired, monkeypatch):
@@ -463,13 +464,14 @@ def test_the_campaign_forwards_the_default_models_own_image(wired):
     asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", ami_ssm_name_by_model=by_model))
     params = next(p for d, p in wired["arun"] if "fill-zones-sequential" in d)
     assert params["ami_ssm_name"] == "ami-own"
+    assert params["ami_ssm_name_by_model"] == by_model, "the fill needs the map to resolve its own image"
 
 
 def _chained_staging_identity(wired, **kwargs) -> str:
     """The staging identity the DEFAULT strategy hands its child."""
     wired["arun"].clear()
     wired["landed"].clear()
-    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", **kwargs))
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI, **kwargs))
     params = next(p for d, p in wired["arun"] if "fill-zones-sequential" in d)
     return params["staging_code_identity"]
 
@@ -709,7 +711,7 @@ class TestValidationDeploymentForwarding:
     def test_the_chained_fill_receives_an_explicit_ref(self, wired):
         asyncio.run(
             mod.run_global_campaign.fn(
-                paths=_PATHS, ami_ssm_name="ami", validation_deployment="validate-zone-year/validate-zone-year-x"
+                paths=_PATHS, **_AMI, validation_deployment="validate-zone-year/validate-zone-year-x"
             )
         )
         params = next(p for d, p in wired["arun"] if "fill-zones-sequential" in d)
@@ -723,7 +725,7 @@ class TestValidationDeploymentForwarding:
         derive from the slug: there is no base name here to suffix, and the branch-scoped
         registration on the child already carries it.
         """
-        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", branch=branch))
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI, branch=branch))
         params = next(p for d, p in wired["arun"] if "fill-zones-sequential" in d)
         assert "validation_deployment" not in params
 
@@ -891,9 +893,7 @@ def test_sequential_strategy_dispatches_one_run_per_year(wired):
     # overlap_years is the DEFAULT now, and this test is about the per-year dispatch shape, so the
     # barrier is asked for explicitly rather than relied on.
     result = asyncio.run(
-        mod.run_global_campaign.fn(
-            paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters", overlap_years=False
-        )
+        mod.run_global_campaign.fn(paths=_PATHS, **_AMI, fill_strategy="chained-clusters", overlap_years=False)
     )
     deps = [d for d, _ in wired["arun"]]
     assert deps == ["fill-zones-sequential/fill-zones-sequential"]
@@ -916,24 +916,20 @@ def test_sequential_strategy_dispatches_one_run_per_year(wired):
 def test_the_inference_start_delay_reaches_chained_fills_only(wired, strategy, forwarded):
     """A per-zone fill ingests its one cell before its cluster starts: there is no backlog to hold for."""
     asyncio.run(
-        mod.run_global_campaign.fn(
-            paths=_PATHS, ami_ssm_name="ami", fill_strategy=strategy, inference_start_delay_minutes=30.0
-        )
+        mod.run_global_campaign.fn(paths=_PATHS, **_AMI, fill_strategy=strategy, inference_start_delay_minutes=30.0)
     )
     fills = [p for d, p in wired["arun"] if d.startswith("fill-")]
     assert fills and [p.get("inference_start_delay_minutes") for p in fills] == [forwarded] * len(fills)
 
 
 def test_sequential_strategy_forwards_ingest_false(wired):
-    asyncio.run(
-        mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters", ingest=False)
-    )
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI, fill_strategy="chained-clusters", ingest=False))
     assert wired["arun"][0][1]["ingest"] is False
 
 
 def test_invalid_fill_strategy_rejected(wired):
     with pytest.raises(ValueError, match="fill_strategy"):
-        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="both"))
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI, fill_strategy="both"))
     assert wired["arun"] == []
 
 
@@ -951,7 +947,7 @@ def test_sequential_strategy_shards_by_live_tiles(wired, monkeypatch):
     asyncio.run(
         mod.run_global_campaign.fn(
             paths=_PATHS,
-            ami_ssm_name="ami",
+            **_AMI,
             fill_strategy="chained-clusters",
             max_parallel_clusters=2,
             max_parallel_ingest=6,
@@ -989,7 +985,7 @@ class TestIngestBoundAcrossClusters:
         asyncio.run(
             mod.run_global_campaign.fn(
                 paths=_PATHS,
-                ami_ssm_name="ami",
+                **_AMI,
                 fill_strategy="chained-clusters",
                 max_parallel_clusters=clusters,
                 max_parallel_ingest=ingest_cap,
@@ -1037,9 +1033,7 @@ def test_every_cluster_opens_on_one_of_the_densest_zones(wired, monkeypatch):
     monkeypatch.setattr(mod, "zone_work_weight", lambda mask, zone, **k: float(counts[zone]))
 
     asyncio.run(
-        mod.run_global_campaign.fn(
-            paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters", max_parallel_clusters=3
-        )
+        mod.run_global_campaign.fn(paths=_PATHS, **_AMI, fill_strategy="chained-clusters", max_parallel_clusters=3)
     )
     dispatched = [_dispatched_zones(p) for _, p in wired["arun"]]
     assert {zs[0] for zs in dispatched} == {"01N", "02N", "03N"}, dispatched
@@ -1082,9 +1076,7 @@ class TestAnUpdateAcrossClusters:
 
     def test_the_plan_is_the_work_list_and_every_child_runs_it(self, update_wired):
         result = asyncio.run(
-            mod.run_global_campaign.fn(
-                paths=_PATHS, ami_ssm_name="ami", update="u1", max_parallel_clusters=2, allow_s2_only=True
-            )
+            mod.run_global_campaign.fn(paths=_PATHS, **_AMI, update="u1", max_parallel_clusters=2, allow_s2_only=True)
         )
         assert result["never_filled"] == ["03N-2024"], "a planned cell the campaign never filled is reported"
 
@@ -1097,9 +1089,7 @@ class TestAnUpdateAcrossClusters:
         """A recorded cell's leftover mosaic is under the update's root; the campaign's are not its to delete."""
         update_wired["landed"].add(("01N", 2025))  # recorded by an earlier run whose cleanup failed
         asyncio.run(
-            mod.run_global_campaign.fn(
-                paths=_PATHS, ami_ssm_name="ami", update="u1", sweep_orphan_mosaics=True, allow_s2_only=True
-            )
+            mod.run_global_campaign.fn(paths=_PATHS, **_AMI, update="u1", sweep_orphan_mosaics=True, allow_s2_only=True)
         )
         assert "s3://in/updates/u1/mosaics/01N/2025" in update_wired["deletes"]
         assert all(d.startswith("s3://in/updates/u1/") for d in update_wired["deletes"]), update_wired["deletes"]
@@ -1111,9 +1101,7 @@ class TestAnUpdateAcrossClusters:
         monkeypatch.setattr(mod, "zone_has_live_tiles", lambda mask, zone, **k: k["tiles"] is None)
         monkeypatch.setattr(mod, "_resolve_ami_id", lambda *a, **k: pytest.fail("resolved an AMI for dead targets"))
         asyncio.run(
-            mod.run_global_campaign.fn(
-                paths=_PATHS, ami_ssm_name="ami", update="u1", max_parallel_clusters=2, allow_s2_only=True
-            )
+            mod.run_global_campaign.fn(paths=_PATHS, **_AMI, update="u1", max_parallel_clusters=2, allow_s2_only=True)
         )
         assert all(p["ami_id"] is None for _, p in update_wired["arun"] if "cells" in p)
 
@@ -1135,7 +1123,7 @@ def test_sequential_single_shard_reads_no_tile_counts(wired, monkeypatch):
         raise AssertionError("zone weights must not be read for a single cluster")
 
     monkeypatch.setattr(mod, "zone_work_weight", boom)
-    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters"))
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI, fill_strategy="chained-clusters"))
     assert len(wired["arun"]) == 1
 
 
@@ -1259,7 +1247,7 @@ def test_both_strategies_pin_the_resolved_ami_id(wired):
 
     wired["arun"].clear()
     wired["landed"].clear()
-    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters"))
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI, fill_strategy="chained-clusters"))
     chained = next(p for d, p in wired["arun"] if "fill-zones-sequential" in d)
     assert chained["ami_id"] == "ami-test-id"
 
@@ -1275,9 +1263,7 @@ def test_both_strategies_forward_the_model_mismatch_override(wired, strategy: st
     re-checks it. Without forwarding, the child falls back to its default and rejects
     the same store — after the cell's ingest has already been paid for.
     """
-    asyncio.run(
-        mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy=strategy, allow_model_mismatch=True)
-    )
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI, fill_strategy=strategy, allow_model_mismatch=True))
     fill = next(p for d, p in wired["arun"] if dep in d)
     assert fill["allow_model_mismatch"] is True
 
@@ -1411,7 +1397,7 @@ class TestFailedZonesAreRetried:
     def test_a_failed_zone_is_re_dispatched(self, wired, monkeypatch):
         """Round one leaves 02N unfilled; round two lands it and the campaign passes."""
         rounds = self._wire(monkeypatch, wired, ["01N", "02N"], complete_after={1: {"01N"}, 2: {"01N", "02N"}})
-        result = asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=1))
+        result = asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI, max_parallel_clusters=1))
         assert rounds["n"] == 2, "the failed cell was never re-dispatched"
         assert result["dispatched"] >= 1
 
@@ -1425,7 +1411,7 @@ class TestFailedZonesAreRetried:
             ["01N", "02N", "03N"],
             complete_after={1: {"01N", "02N"}, 2: {"01N", "02N", "03N"}},
         )
-        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=1))
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI, max_parallel_clusters=1))
         dispatched = [_dispatched_zones(p) for d, p in wired["arun"] if "fill-zones-sequential" in d]
         assert dispatched[0] == ["01N", "02N", "03N"]
         assert dispatched[1] == ["03N"], f"second round re-dispatched landed zones: {dispatched[1]}"
@@ -1437,7 +1423,7 @@ class TestFailedZonesAreRetried:
         """
         rounds = self._wire(monkeypatch, wired, ["01N", "02N"], complete_after={1: {"01N"}})  # 02N never lands
         summary = asyncio.run(
-            mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=1, max_dispatch_rounds=5)
+            mod.run_global_campaign.fn(paths=_PATHS, **_AMI, max_parallel_clusters=1, max_dispatch_rounds=5)
         )
         assert summary["unfilled"] == {2025: ["02N"]}
         # One attempt, one retry that achieves nothing, then stop — the minimum
@@ -1454,7 +1440,7 @@ class TestFailedZonesAreRetried:
         """
         self._wire(monkeypatch, wired, ["01N", "02N"], complete_after={})
         with caplog.at_level(logging.WARNING):
-            summary = asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=1))
+            summary = asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI, max_parallel_clusters=1))
         # The list is DATA in the summary, not prose to be re-parsed out of a message.
         assert summary["unfilled"] == {2025: ["01N", "02N"]}
         # And it is loud: a banner, the whole list, and what a re-run would do.
@@ -1468,20 +1454,20 @@ class TestFailedZonesAreRetried:
         which of two shapes it gets.
         """
         self._wire(monkeypatch, wired, ["01N"], complete_after={1: {"01N"}})
-        summary = asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=1))
+        summary = asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI, max_parallel_clusters=1))
         assert summary["unfilled"] == {}
 
     def test_retries_are_disabled_at_one_attempt(self, wired, monkeypatch):
         rounds = self._wire(monkeypatch, wired, ["01N"], complete_after={})
         summary = asyncio.run(
-            mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=1, max_dispatch_rounds=1)
+            mod.run_global_campaign.fn(paths=_PATHS, **_AMI, max_parallel_clusters=1, max_dispatch_rounds=1)
         )
         assert rounds["n"] == 1
         assert summary["unfilled"] == {2025: ["01N"]}
 
     def test_zero_attempts_is_rejected(self, wired):
         with pytest.raises(ValueError, match="max_dispatch_rounds"):
-            asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_dispatch_rounds=0))
+            asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI, max_dispatch_rounds=0))
 
 
 # --- overlap_years: dropping the year barrier -------------------------------------------
@@ -1511,9 +1497,7 @@ def test_overlapping_years_is_now_the_default(wired, monkeypatch):
     """
     _multi_year(monkeypatch, ["01N", "02N"], [2025, 2024], wired)
     asyncio.run(
-        mod.run_global_campaign.fn(
-            paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters", max_parallel_clusters=1
-        )
+        mod.run_global_campaign.fn(paths=_PATHS, **_AMI, fill_strategy="chained-clusters", max_parallel_clusters=1)
     )
     # One dispatch carrying BOTH years, so year N+1's ingest overlaps year N's inference.
     years_per_dispatch = [{y for _z, y in p["cells"]} for _, p in wired["arun"]]
@@ -1529,7 +1513,7 @@ def test_the_year_barrier_is_still_reachable_when_asked_for(wired, monkeypatch):
     asyncio.run(
         mod.run_global_campaign.fn(
             paths=_PATHS,
-            ami_ssm_name="ami",
+            **_AMI,
             fill_strategy="chained-clusters",
             max_parallel_clusters=1,
             overlap_years=False,
@@ -1547,7 +1531,7 @@ def test_overlap_years_dispatches_every_year_in_one_batch(wired, monkeypatch):
     asyncio.run(
         mod.run_global_campaign.fn(
             paths=_PATHS,
-            ami_ssm_name="ami",
+            **_AMI,
             fill_strategy="chained-clusters",
             max_parallel_clusters=1,
             overlap_years=True,
@@ -1570,7 +1554,7 @@ def test_overlap_years_keeps_every_year_of_a_zone_in_one_cluster(wired, monkeypa
     asyncio.run(
         mod.run_global_campaign.fn(
             paths=_PATHS,
-            ami_ssm_name="ami",
+            **_AMI,
             fill_strategy="chained-clusters",
             max_parallel_clusters=4,
             overlap_years=True,
@@ -1605,7 +1589,7 @@ def test_a_resumed_cluster_is_credited_only_with_the_years_it_owns(wired, monkey
     summary = asyncio.run(
         mod.run_global_campaign.fn(
             paths=_PATHS,
-            ami_ssm_name="ami",
+            **_AMI,
             fill_strategy="chained-clusters",
             max_parallel_clusters=2,
             overlap_years=True,
@@ -1640,7 +1624,7 @@ def test_a_failing_year_does_not_block_its_zones_later_years(wired, monkeypatch)
     asyncio.run(
         mod.run_global_campaign.fn(
             paths=_PATHS,
-            ami_ssm_name="ami",
+            **_AMI,
             fill_strategy="cluster-per-zone",
             overlap_years=True,
             max_dispatch_rounds=1,
@@ -1670,7 +1654,7 @@ def test_overlap_years_still_reports_unfilled_cells_per_year(wired, monkeypatch)
     summary = asyncio.run(
         mod.run_global_campaign.fn(
             paths=_PATHS,
-            ami_ssm_name="ami",
+            **_AMI,
             fill_strategy="chained-clusters",
             max_parallel_clusters=1,
             overlap_years=True,
@@ -1722,7 +1706,7 @@ def test_overlap_years_does_not_overcount_per_cell_runs(wired, monkeypatch):
     result = asyncio.run(
         mod.run_global_campaign.fn(
             paths=_PATHS,
-            ami_ssm_name="ami",
+            **_AMI,
             fill_strategy="cluster-per-zone",
             max_parallel_clusters=2,
             overlap_years=True,
@@ -1842,7 +1826,7 @@ class _Round:
         rather than once, so a held cluster works in every round.
         """
         task = asyncio.ensure_future(
-            mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters", **kwargs)
+            mod.run_global_campaign.fn(paths=_PATHS, **_AMI, fill_strategy="chained-clusters", **kwargs)
         )
         for _ in range(50):  # rounds, generously; the assert below catches a real hang
             if task.done():
@@ -2289,7 +2273,7 @@ class TestTheDispatchDecisionIsAtomic:
             task = asyncio.ensure_future(
                 mod.run_global_campaign.fn(
                     paths=_PATHS,
-                    ami_ssm_name="ami",
+                    **_AMI,
                     fill_strategy="chained-clusters",
                     max_parallel_clusters=2,
                     immediate_refill=True,

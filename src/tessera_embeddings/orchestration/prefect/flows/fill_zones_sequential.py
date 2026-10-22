@@ -748,7 +748,8 @@ def fill_zones_sequential_flow(
             image AND this flow's own staging fingerprint, so a mid-campaign re-bake can't
             split them. ``None`` (direct calls) resolves ``ami_ssm_name``.
         ami_ssm_name_by_model: Per-model overrides of ``ami_ssm_name``. This flow runs the
-            default model, so that model's entry, if any, replaces ``ami_ssm_name`` (ADR 025).
+            default model, so that model's entry replaces ``ami_ssm_name``; a v1.1 run without one is
+            refused (ADR 025).
         time_window_end: End month of the inference window as ``"Month Year"``; defaults to
             ``"December {year}"`` per cell (the calendar-year window). Only valid for a
             SINGLE-year ``cells`` list — one literal override cannot describe several years,
