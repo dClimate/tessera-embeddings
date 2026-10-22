@@ -391,9 +391,9 @@ def _t10_tables(rows: list[dict]) -> list[str]:
     if arms:
         base = {k: _t10_value(rows, "encode_cpu_s", "v2_c0", kind=k) for k in ("worker", "write")}
         out += [
-            "## T10 — assembly code, per staged tile (median of passes)",
+            "## T10 — assembly code: CPU per staged tile, wall per run (median of passes)",
             "",
-            "| arm | worker CPU s | vs C0 | write CPU s | vs C0 | wall s | stored GB |",
+            "| arm | worker CPU s | vs C0 | write CPU s | vs C0 | wall s, whole run | stored GB |",
             "|---|---|---|---|---|---|---|",
         ]
         for a in arms:
