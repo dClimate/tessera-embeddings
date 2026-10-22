@@ -875,11 +875,15 @@ one manifest for each of its arrays, so it waits on that many serial round trips
 fetch them concurrently, and `_default_repo_config` (`storage/zarr_store.py`) now sets 16. In the
 controlled runs that cut commits from 0.79 s to 0.23 s. Batch writes fell to 0.92× the upgrade's.
 
-**End to end** (round 3, run beside the upgrade on the same granules):
+**End to end** (rounds 3 and 4, each run beside the upgrade on the same granules):
 
-- **Typical batch:** the median paired batch write was 0.975 [0.962, 0.997] of the upgrade's.
-- **Write total:** 0.4% lower. Two straggling batches hid most of the gain in the total.
-- **The whole run:** the commit saves about half a second a batch, about 2% of a run's wall clock.
+- **Typical batch:** the median paired batch write was 0.975 [0.962, 0.997] of the upgrade's in
+  round 3, and 1.000 [0.978, 1.024] in round 4. Pooled over 158 batch pairs it was 0.984
+  [0.973, 1.000].
+- **Totals:** straggling batches moved the totals far more than the setting did: write totals were
+  0.4% and 10% lower.
+- **What it is worth:** the saving is the controlled half-second a commit. That is about 2% of a
+  batch of 25 to 31 s, at the edge of what two paired rounds can detect.
 - **Outputs:** the mosaics are identical in every array of three dates at two sampled windows.
 
 **The global store keeps icechunk's default.** Its manifest config is saved inside the store at
