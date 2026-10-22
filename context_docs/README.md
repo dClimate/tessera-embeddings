@@ -44,7 +44,8 @@ context_docs/
 │   ├── 025-library-upgrades-ship-on-measured-usability-at-a-store-boundary.md
 │   ├── 026-v1-1-runs-the-gru-it-was-trained-with.md
 │   ├── 027-targeted-updates.md
-│   └── 028-embed-every-pixel-with-an-optical-observation.md
+│   ├── 028-embed-every-pixel-with-an-optical-observation.md
+│   └── 032-v2-stores-name-their-axes-y-and-x.md
 │
 ├── campaign/                      THE GLOBAL CAMPAIGN — start here
 │   ├── campaign-plan.md                        <- START HERE. What runs, with what settings, in

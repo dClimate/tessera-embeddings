@@ -2,8 +2,7 @@
 
 Implements the proj:, spatial:, and geoemb: Zarr conventions as purely additive
 metadata on the root (or zone) group, repeats ``spatial:dimensions`` on each spatial
-array, and adds CF axis attrs to the ``northing``/``easting`` coordinate arrays. No
-store layout changes.
+array, and adds CF axis attrs to the Y/X coordinate arrays. No store layout changes.
 
 The geoembeddings (``geoemb:``) convention supersedes the earlier ``tessera:`` one
 (still stripped from pre-existing stores by ``assembly``): it records encoder-model
@@ -267,12 +266,13 @@ def _crs_fields_from_epsg(epsg_code: str) -> dict[str, str | dict]:
     return result
 
 
-#: CF attributes for the projected coordinate arrays (CF Appendix A standard names), so CF-reading
-#: tools identify the X/Y axes and their units without knowing the ``spatial:`` convention.
-_CF_COORD_ATTRS: dict[str, dict[str, str]] = {
-    "northing": {"standard_name": "projection_y_coordinate", "units": "m", "axis": "Y"},
-    "easting": {"standard_name": "projection_x_coordinate", "units": "m", "axis": "X"},
-}
+#: CF attributes for the projected Y and X coordinate arrays, in that order (CF Appendix A
+#: standard names), so CF-reading tools identify the axes and their units without knowing the
+#: ``spatial:`` convention. Keyed by axis, not name: the names are the store's own.
+_CF_COORD_ATTRS: tuple[dict[str, str], dict[str, str]] = (
+    {"standard_name": "projection_y_coordinate", "units": "m", "axis": "Y"},
+    {"standard_name": "projection_x_coordinate", "units": "m", "axis": "X"},
+)
 
 
 def stamp_array_conventions(node: zarr.Group) -> None:
@@ -285,7 +285,7 @@ def stamp_array_conventions(node: zarr.Group) -> None:
       repeats them. The spec requires them on arrays when composed with ``proj``, and a reader
       that opens one variable (an xarray ``DataArray``) never sees the group's attrs. Any other
       registration on the array is kept; ours is matched by uuid.
-    * ``northing``/``easting`` get CF ``standard_name``/``units``/``axis``, which claim the values
+    * The Y and X coordinate arrays get CF ``standard_name``/``units``/``axis``, which claim the values
       are projected metres. So both halves must be declared: real coordinates (the group has
       ``spatial:dimensions``, which bare pixel indices never get) in a metre-based ``proj:code``
       (the ``geoemb:gsd`` rule). Anything else is left unlabelled rather than mislabelled.
@@ -294,7 +294,9 @@ def stamp_array_conventions(node: zarr.Group) -> None:
     """
     dims = cast("list[str]", node.attrs.get("spatial:dimensions") or [])
     epsg = cast("str | None", node.attrs.get("proj:code"))
-    wanted: dict[str, dict[str, Any]] = dict(_CF_COORD_ATTRS) if dims and _is_metre_crs(epsg) else {}
+    wanted: dict[str, dict[str, Any]] = (
+        dict(zip(dims, _CF_COORD_ATTRS, strict=True)) if dims and _is_metre_crs(epsg) else {}
+    )
     for name, arr in node.arrays() if dims else ():
         if set(dims) <= set(getattr(arr.metadata, "dimension_names", None) or ()):
             registered = cast("list[dict[str, Any]]", arr.attrs.get("zarr_conventions") or [])
@@ -472,6 +474,7 @@ def build_convention_attrs(
     total_y: int,
     total_x: int,
     embedding_dim: int,
+    spatial_dims: tuple[str, str],
     y_coords: np.ndarray | None = None,
     x_coords: np.ndarray | None = None,
     checkpoint_id: str | None = None,
@@ -488,7 +491,8 @@ def build_convention_attrs(
     ``proj:*``, ``spatial:*`` and ``geoemb:*`` metadata. *epsg_code* takes precedence over
     *tile_id*, so a caller that reprojects records the actual output CRS rather than the
     MGRS tile's original UTM zone; if neither resolves to a valid EPSG code the ``proj:``
-    convention is omitted.
+    convention is omitted. *spatial_dims* names the store's Y and X dimensions, as the store
+    has them: its model's on creation, its own on an append.
 
     The ``geoemb:`` fields record encoder-model provenance and quantization:
 
@@ -529,7 +533,7 @@ def build_convention_attrs(
     # --- spatial: convention ---
     if y_coords is not None and x_coords is not None and len(y_coords) > 1 and len(x_coords) > 1:
         conventions.append(_SPATIAL_CONVENTION)
-        attrs["spatial:dimensions"] = ["northing", "easting"]
+        attrs["spatial:dimensions"] = list(spatial_dims)
         attrs["spatial:transform_type"] = "affine"
         attrs["spatial:transform"] = _compute_affine_transform(y_coords, x_coords)
         attrs["spatial:shape"] = [total_y, total_x]

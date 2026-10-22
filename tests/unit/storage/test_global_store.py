@@ -8,9 +8,9 @@ import numpy as np
 import pytest
 import zarr
 
-from tessera_embeddings.config.inference import EMBEDDING_DIM
+from tessera_embeddings.config.inference import EMBEDDING_DIM, MODEL_FAMILIES
 from tessera_embeddings.config.store_layout import GLOBAL
-from tessera_embeddings.storage import global_store, zarr_store
+from tessera_embeddings.storage import global_store, published_store, zarr_store
 from tessera_embeddings.storage.zone_grid import ZoneSpec
 
 # Tiny stand-in zones (2048x4096 px = a couple shards) so coord arrays stay small.
@@ -23,6 +23,34 @@ def _seed(tmp_path):
     repo = global_store.create_global_repo(store)
     global_store.seed_zone_groups(repo, [_ZA, _ZB], years=(2023, 2024, 2025))
     return store
+
+
+@pytest.mark.parametrize(("model", "names"), [("v1.1", ("northing", "easting")), ("v2-large", ("y", "x"))])
+def test_each_model_seeds_its_own_spatial_names(tmp_path, model, names):
+    """v1.1 keeps northing/easting, v2 takes y/x, and the published-store audit accepts both."""
+    repo = global_store.create_global_repo(str(tmp_path / "global.icechunk"))
+    global_store.seed_zone_groups(repo, [_ZA], years=(2025,), model_version=model)
+    g = zarr_store.open_store_as_zarr_group(str(tmp_path / "global.icechunk"), group="01N")
+    y, x = names
+    assert (g[y].shape, g[x].shape) == ((4096,), (2048,))
+    assert g["embeddings"].metadata.dimension_names == ("time", y, x, "band")
+    assert g.attrs["spatial:dimensions"] == [y, x] and g[y].attrs["axis"] == "Y"
+    assert published_store.layout_departures(g) == []
+    assert published_store.coordinate_departures(g, _ZA) == []
+
+
+def test_extending_a_store_keeps_its_names(tmp_path, monkeypatch):
+    """A zone added to a store seeded with other names takes the store's, never mixing two."""
+    store = str(tmp_path / "global.icechunk")
+    repo = global_store.create_global_repo(store)
+    v2 = MODEL_FAMILIES["v2-large"]
+    monkeypatch.setitem(MODEL_FAMILIES, "v2-large", dataclasses.replace(v2, spatial_dims=("northing", "easting")))
+    global_store.seed_zone_groups(repo, [_ZA], years=(2025,), model_version="v2-large")
+    MODEL_FAMILIES["v2-large"] = v2
+    global_store.seed_zone_groups(repo, [_ZB], years=(2025,), model_version="v2-large")
+    g = zarr_store.open_store_as_zarr_group(store, group="01S")
+    assert g["scales"].metadata.dimension_names == ("time", "northing", "easting")
+    assert "y" not in g
 
 
 def test_sibling_groups_seeded_without_clobber(tmp_path):

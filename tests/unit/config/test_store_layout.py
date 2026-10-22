@@ -9,7 +9,7 @@ import zarr
 
 from tessera_embeddings.config.inference import EMBEDDING_DIM, INFERENCE_CHUNK_SIZE
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
-from tessera_embeddings.config.store_layout import GLOBAL, OBS_COUNT_VARS, SHARD_PX, SINGLE
+from tessera_embeddings.config.store_layout import GLOBAL, OBS_COUNT_VARS, SHARD_PX, SINGLE, spatial_dims_of
 
 
 def test_global_embeddings_geometry():
@@ -111,3 +111,22 @@ def test_sharded_roundtrip_and_fill(tmp_path):
     assert np.allclose(r["scales"][0, 0:256, 0:256], sdata[0])
     assert (r["embeddings"][0, 300:400, 300:400, :] == 0).all()  # unwritten -> fill
     assert np.isnan(r["scales"][0, 300:400, 300:400]).all()
+
+
+@pytest.mark.parametrize(("declared", "expected"), [(["y", "x"], ("y", "x")), (None, ("y", "x"))])
+def test_spatial_dims_of_reads_the_declaration_then_the_scales_array(declared, expected):
+    """A store with pixel-index coordinates declares no ``spatial:dimensions``; ``scales`` still names them."""
+    group = zarr.group(store=zarr.storage.MemoryStore())
+    group.create_array("scales", shape=(1, 2, 2), dtype="f4", dimension_names=("time", "y", "x"))
+    if declared:
+        group.attrs["spatial:dimensions"] = declared
+    assert spatial_dims_of(group) == expected
+
+
+def test_with_spatial_dims_renames_every_array_and_keeps_the_geometry():
+    renamed = GLOBAL.with_spatial_dims(("y", "x"))
+    assert renamed.spatial_dims == ("y", "x")
+    assert renamed.arrays["embeddings"].dims == ("time", "y", "x", "band")
+    assert renamed.arrays["s2_month_covered"].dims == ("time", "y", "x", "month")
+    geometry = [(a.chunks, a.shards, a.dtype, a.codec) for a in GLOBAL.arrays.values()]
+    assert [(a.chunks, a.shards, a.dtype, a.codec) for a in renamed.arrays.values()] == geometry

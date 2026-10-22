@@ -23,7 +23,7 @@ _V11_URL = encoder_url("v1.1")
 
 def _attrs(**kwargs: object) -> dict:
     """``build_convention_attrs`` for a v1.1 store, the model these layout tests don't vary."""
-    return build_convention_attrs(**{"model_version": "v1.1", **kwargs})  # type: ignore[arg-type]
+    return build_convention_attrs(**{"model_version": "v1.1", "spatial_dims": ("northing", "easting"), **kwargs})  # type: ignore[arg-type]
 
 
 class TestTileIdToEpsg:
@@ -203,7 +203,7 @@ class TestBuildConventionAttrs:
         assert explicit["geoemb:model"] == "https://example/x"
         # Provenance is never guessed: no model, or an unknown one, errors rather than defaulting.
         with pytest.raises(ValueError, match="needs a model_version"):
-            build_convention_attrs(total_y=10, total_x=10, embedding_dim=128)
+            build_convention_attrs(total_y=10, total_x=10, embedding_dim=128, spatial_dims=("y", "x"))
         with pytest.raises(ValueError, match="Invalid model_version"):
             _attrs(total_y=10, total_x=10, embedding_dim=128, model_version="v2_student_large")
 

@@ -128,9 +128,10 @@ CRS/affine metadata, plus the
 [`geoemb:` geoembeddings convention](https://github.com/geo-embeddings/embeddings-zarr-convention)
 for encoder-model provenance and quantization. Each registration is exactly the object its
 convention's schema requires. For tools that open one array at a time, every spatial array also
-repeats `spatial:dimensions`, and the `northing`/`easting` coordinate arrays carry CF
-`standard_name`, `units` and `axis` attributes whenever they hold real coordinates in a metre
-CRS. All of it is built in [`storage/conventions.py`](src/tessera_embeddings/storage/conventions.py);
+repeats `spatial:dimensions`, and the Y/X coordinate arrays carry CF `standard_name`, `units` and
+`axis` attributes whenever they hold real coordinates in a metre CRS. The model names those axes:
+`y`/`x` for v2 stores, `northing`/`easting` for v1.1, whose published store already uses them
+([ADR 032](context_docs/decisions/032-v2-stores-name-their-axes-y-and-x.md)). All of it is built in [`storage/conventions.py`](src/tessera_embeddings/storage/conventions.py);
 the versions followed and how conformance is checked are in
 [`context_docs/storage/conforming-to-the-zarr-conventions.md`](context_docs/storage/conforming-to-the-zarr-conventions.md).
 
@@ -437,7 +438,7 @@ if it did (UTM's usable range stops at 80°S). See
 
 ```
 one Icechunk repo (BucketPaths.global_store())
-├── 01N/    embeddings (time, northing, easting, band)  int8
+├── 01N/    embeddings (time, y, x, band)  int8      (v1.1: northing, easting)
 │           (1, 256, 256, 128) inner chunks in (1, 2048, 2048, 128) shards
 │           scales / obs counts sharded on the same 2048² spatial grid
 ├── 02N/    … one group per UTM zone, seeded metadata-only up front …
