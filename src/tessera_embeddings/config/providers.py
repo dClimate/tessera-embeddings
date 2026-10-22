@@ -1,6 +1,7 @@
 """Dataclasses and the provider registry for querying satellite data from STAC catalogs."""
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 from .satellites import (
     LANDSAT_C2_BANDS,
@@ -28,6 +29,9 @@ class CollectionConfig:
         tile_id_property: STAC property containing tile/grid ID
         tile_id_prefix: Prefix for tile ID in queries (e.g., "MGRS-")
         has_scl: whether this collection provides an SCL layer to use for cloudmask
+        fusion_order: the order the ingest hands a solar day's items to the loader in, which
+            decides who supplies a pixel two items cover, since the loader keeps the first valid
+            source. ``None`` imposes none and leaves odc's own ``(time, id)`` order
         harmonisation_varies_by_item: whether items here can disagree about whether the BOA
             offset was already subtracted, forcing a per-item decision from asset locations
         band_names_are_asset_keys: whether the names in ``bands`` are the item's asset keys
@@ -42,6 +46,9 @@ class CollectionConfig:
     tile_id_property: str | None = "grid:code"
     tile_id_prefix: str = ""
     has_scl: bool = False
+    #: Each name maps to one sort in ``ingest/stac.py`` (``_FUSION_SORT_KEYS``): the clearest scene
+    #: first, or the burst acquired most often over the window first.
+    fusion_order: Literal["clearest_scene", "most_acquired_burst"] | None = None
     #: Off by default: a collection served by one producer has one answer. On, the producer
     #: decision reads each item's asset LOCATIONS, which requires `band_names_are_asset_keys`.
     harmonisation_varies_by_item: bool = False
@@ -115,6 +122,7 @@ PROVIDERS: dict[str, STACProvider] = {
                 tile_id_property="grid:code",
                 tile_id_prefix="MGRS-",
                 has_scl=True,
+                fusion_order="clearest_scene",
                 harmonisation_varies_by_item=True,
                 band_names_are_asset_keys=True,
             ),
@@ -174,6 +182,8 @@ PROVIDERS: dict[str, STACProvider] = {
                 resolution=30,
                 tile_id_property=None,
                 tile_id_prefix="",
+                # ADR 033: where bursts of one solar day overlap, the most-acquired one wins.
+                fusion_order="most_acquired_burst",
             ),
         },
     ),

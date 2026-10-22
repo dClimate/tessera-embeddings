@@ -75,6 +75,9 @@ from odc.loader import RioDriver, RioReader  # noqa: E402
 # `odc-stac` is pinned rather than floating.
 from odc.stac._mdtools import StacMDParser  # noqa: E402
 
+# Below the GDAL configuration because it reaches rasterio, through `auth`'s odc reader session.
+from tessera_embeddings.ingest.opera_query import burst_fusion_sort_key  # noqa: E402
+
 # The project uses northing/easting everywhere; odc.stac.load works with y/x internally.
 _DIM_TO_ODC = {"northing": "y", "easting": "x"}
 
@@ -349,6 +352,16 @@ def solar_day_sort_key(item: Any) -> tuple[str, float, str]:  # noqa: ANN401 —
     )
 
 
+#: The sort that imposes each fusion order a collection can name in ``CollectionConfig.fusion_order``.
+#: One table, read by both the sort in :func:`query_stac_items` and the loader's
+#: ``preserve_original_order``, so a collection cannot be sorted without the loader keeping that
+#: order, or kept in an order nothing decided.
+_FUSION_SORT_KEYS: dict[str, Callable[[Any], tuple[Any, ...]]] = {
+    "clearest_scene": solar_day_sort_key,
+    "most_acquired_burst": burst_fusion_sort_key,
+}
+
+
 def extract_baselines(items: list[Any]) -> dict[str, int]:
     """The processing baseline to apply per date, over exactly ``items``.
 
@@ -571,18 +584,17 @@ def _load_from_stac(
         "resampling": effective_resampling,
         "chunks": load_chunks,
         "groupby": groupby,
-        # True only where THIS package decided the order. `query_stac_items` sorts a collection
-        # carrying an SCL band with `solar_day_sort_key`, and the fuser keeps the first valid
-        # source, so that order must survive into the loader. Nothing here sorts any other
-        # collection, and for those odc's own `(time, id)` default is what makes the fused result
-        # a function of the items rather than of the order the provider returned.
+        # True exactly where the collection names a fusion order, which `query_stac_items` imposes
+        # with the matching `_FUSION_SORT_KEYS` sort: the fuser keeps the first valid source, so
+        # that order must survive into the loader. A collection naming none is sorted by nothing
+        # here, and odc's own `(time, id)` default is then what makes the fused result a function
+        # of the items rather than of the order the provider returned.
         #
-        # TODO: Planetary Computer's `sentinel-2-l2a` config does not set `has_scl`, so this reads
-        # False there and odc reorders the group by `(time, id)` — and because normalisation gives a
-        # group one shared timestamp, `id` rather than cloud cover then decides an overlap, losing
-        # `s2_roi`'s clearest-first sort. OUT OF SCOPE: the campaign reads Earth Search only. The
-        # fix is to key this on whether the CALLER imposed an order, not on a collection capability.
-        "preserve_original_order": collection_config.has_scl,
+        # TODO: Planetary Computer's `sentinel-2-l2a` config names no fusion order, so odc reorders
+        # its groups by `(time, id)`, and `id` rather than cloud cover decides an overlap, losing
+        # `s2_roi`'s clearest-first sort. Naming `"clearest_scene"` there is the fix. Not made:
+        # the campaign reads Earth Search only, and nothing here exercises that provider's output.
+        "preserve_original_order": collection_config.fusion_order is not None,
     }
 
     if geobox is not None:
@@ -1477,7 +1489,7 @@ def query_stac_items(
 ) -> tuple[list[Any], dict[str, int]]:
     """Query STAC catalog, filter items, and extract baselines.
 
-    Combines the catalog query, optional item filtering, cloud-cover sorting, baseline extraction
+    Combines the catalog query, optional item filtering, the fusion-order sort, baseline extraction
     and existing-date filtering. The query half of ``ingest_tile``; pair with ``load_stac_items``
     to load data separately.
 
@@ -1527,7 +1539,7 @@ def query_stac_items(
             logger.info("No items remaining after item_filter_fn")
             return [], {}
 
-    # THE single solar-offset application for this path. Everything below — the cloud sort, the
+    # THE single solar-offset application for this path. Everything below — the fusion sort, the
     # baseline map, the existing-date dedup, and every consumer of the returned items — then reads
     # the solar day straight off `item.datetime` with no offset of its own. Keying the sort and
     # the baseline map on the UTC date instead left a day straddling UTC midnight unsorted as
@@ -1535,24 +1547,25 @@ def query_stac_items(
     # refuses rather than defaulting to UTC, for that reason.
     items = normalize_to_solar_day(items, mid_longitude=resolve_grouping_longitude(mid_longitude, bbox))
 
-    # `solar_day_sort_key` owns the order and the reasoning; `load_kwargs` below sets
-    # `preserve_original_order=True` so it is that order the loader fuses in. Pinned end to end by
-    # `tests/unit/ingest/test_solar_day_fusion.py`, which loads two real scenes of one solar day
-    # through this path and asserts which one survives. Keyed on the SOLAR day, matching
-    # `normalize_to_solar_day` above and the loader's own grouping — keying on the UTC date
-    # instead splits a group the loader treats as one, in the zones where the solar offset
+    # The collection's fusion order owns the order and the reasoning: clearest scene first for
+    # Sentinel-2 (`solar_day_sort_key`), most-acquired burst first for OPERA radar
+    # (`opera_query.burst_fusion_sort_key`). `load_kwargs` sets `preserve_original_order` from the
+    # same field, so it is that order the loader fuses in. Pinned end to end by
+    # `tests/unit/ingest/test_solar_day_fusion.py`, which loads real overlapping sources of one
+    # solar day through this path and asserts which one survives. Both keys read the SOLAR day,
+    # matching `normalize_to_solar_day` above and the loader's own grouping — keying on the UTC
+    # date instead splits a group the loader treats as one, in the zones where the solar offset
     # crosses midnight.
-    # TODO: this sort runs only for a collection WITH an SCL band, which today means
-    # `sentinel-2-l2a` alone. Every other collection keeps the assembly order, and that order
+    # TODO: a collection naming no fusion order keeps the assembly order, and that order
     # follows the window tree rather than a single catalogue walk — parent prefix first, then
-    # children oldest-first, against the catalogue's newest-first. So for a non-SCL collection
+    # children oldest-first, against the catalogue's newest-first. So for such a collection
     # the fused result would depend on how the query was partitioned. Not reachable today:
     # the only paged caller is `s2_roi`, which asks for `sentinel-2-l2a`, and the radar path
     # returns its items from a provider function before any window exists. Left alone because
     # imposing an order on Landsat, which currently has none, is a change to that collection's
-    # output that nothing here can verify. Fix it alongside the first paged non-SCL caller.
-    if collection_config.has_scl:
-        items.sort(key=solar_day_sort_key)
+    # output that nothing here can verify. Fix it alongside the first paged caller of one.
+    if collection_config.fusion_order is not None:
+        items.sort(key=_FUSION_SORT_KEYS[collection_config.fusion_order])
 
     baselines = extract_baselines(items)
 
