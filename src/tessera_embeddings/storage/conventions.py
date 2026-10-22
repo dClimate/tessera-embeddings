@@ -17,8 +17,10 @@ References:
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _dist_version
+from typing import cast
 
 import numpy as np
 from pyproj import CRS
@@ -149,6 +151,63 @@ def assert_encoder_matches(published: str | None, *, model_version: ModelVersion
             "family, or a fresh path. (A store carrying no geoemb:model at all is read as v1.1 — "
             "the attr predates v2, so its absence dates the store rather than leaving it open.)"
         )
+
+
+#: Root and staged-tile attr naming the library stack that computed the embeddings:
+#: ``{"torch": torch.__version__, "cuda": torch.version.cuda}``, CUDA ``None`` on a CPU build.
+STACK_ATTR = "inference_stack"
+
+
+def _describe_stack(stack: Mapping[str, object]) -> str:
+    cuda = stack.get("cuda")
+    return f"PyTorch {stack.get('torch')} " + (f"with CUDA {cuda}" if cuda else "on CPU")
+
+
+def staged_stack(
+    attrs: Mapping[str, object], where: str, *, expected: Mapping[str, str | None] | None = None
+) -> dict[str, str | None]:
+    """The library stack a staged tile was computed on, refusing a tile that differs from *expected*.
+
+    The inference actor records it as it stages the tile, never the driver: the flow runner runs the
+    lockfile's CPU build whatever the workers run. A tile without it predates the record, so the
+    stack that computed it is unknown and it is refused rather than guessed. *expected* is the
+    stack of the run's other tiles, since one run never mixes two.
+    """
+    stack = attrs.get(STACK_ATTR)
+    if not isinstance(stack, Mapping):
+        raise ValueError(
+            f"Staged tile {where} does not record the PyTorch that computed it: it was staged before "
+            "tiles recorded their stack. Re-infer it with a fresh force_staging_restage token, or by "
+            "deleting the staging prefix."
+        )
+    found = {"torch": stack.get("torch"), "cuda": stack.get("cuda")}
+    if expected is not None and found != dict(expected):
+        raise ValueError(
+            f"Staged tile {where} was computed on {_describe_stack(found)}, and this run's other tiles "
+            f"on {_describe_stack(expected)}. One run never mixes two stacks; re-infer it on one."
+        )
+    return found
+
+
+def assert_stack_matches(stored: object, staged: Mapping[str, str | None], *, allow_mismatch: bool, where: str) -> None:
+    """Refuse a write whose tiles were computed on a different library stack from the store's.
+
+    ADR 025 rule 2: a store is finished on the stack it began on, because another PyTorch or CUDA
+    shifts the embeddings slightly and nothing downstream would notice the mix. ``stored is None``
+    is a store written before the record, which the write stamps rather than refuses. One
+    implementation for the single-area and global write paths, as :func:`assert_encoder_matches`
+    is for the model.
+    """
+    if stored is None or allow_mismatch or dict(cast("Mapping[str, object]", stored)) == dict(staged):
+        return
+    raise ValueError(
+        f"Refusing to write into {where}: it was computed on "
+        f"{_describe_stack(cast('Mapping[str, object]', stored))}, and this run's tiles on "
+        f"{_describe_stack(staged)}. Another stack shifts the embeddings slightly, so one store never "
+        "mixes two (ADR 025). Run on the store's stack: the global flows pick its worker image through "
+        "ami_ssm_name_by_model, and a local run needs that PyTorch installed (docs/environment-setup.md). "
+        "allow_stack_mismatch=True accepts the mix, for a deliberate experiment only."
+    )
 
 
 def tile_id_to_epsg(tile_id: str) -> str | None:
