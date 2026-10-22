@@ -46,6 +46,12 @@ Why updates work the way they do is in
   lists the deployment names.
 - **Replace the example values** below (`s3://my-inputs`, `amazon-thin-2024`, `18S`, and so on) with
   your own.
+- **Update with the PyTorch the store was made with.** A store does not record which PyTorch
+  computed it, and another version shifts the embeddings slightly, so an update on a different
+  version quietly mixes two in one store. A v1.1 store needs PyTorch 2.5.1 with CUDA 12.1, on
+  Python 3.12 (see [`environment-setup.md`](environment-setup.md)), which a plain `uv sync` does not
+  install. `python -c "import torch; print(torch.__version__)"` shows what you have. The global
+  flows pick the right worker image for you.
 
 ## The update's name ties everything together
 
@@ -97,7 +103,8 @@ You need the config file of the run that made the store, and the store itself, a
    In `holes` mode, leave out `tiles`: only holes are inferred anyway. In `shards` mode, list the
    tiles to rewrite. Keep every other setting as it was; the store refuses settings that would
    change what its embeddings mean, such as the radar settings.
-3. **Run the same command as before,** with your config file:
+3. **Run the same command as before,** with your config file, on the store's PyTorch (see *Before
+   you start*):
 
    ```bash
    python -m tessera_embeddings.orchestration.runners.plain path/to/config.yaml
