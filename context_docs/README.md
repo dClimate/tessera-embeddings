@@ -47,7 +47,7 @@ context_docs/
 │   ├── 028-embed-every-pixel-with-an-optical-observation.md
 │   ├── 029-one-flow-per-ingest.md
 │   ├── 030-forward-pass-reorderings-ship-at-a-store-boundary.md
-│   ├── 031-the-v2-store-chunks-the-band-axis-at-16.md   (proposed)
+│   ├── 031-the-v2-store-chunks-the-band-axis-at-16.md
 │   └── 032-v2-stores-name-their-axes-y-and-x.md
 │
 ├── campaign/                      THE GLOBAL CAMPAIGN — start here

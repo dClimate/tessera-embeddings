@@ -1,9 +1,9 @@
-# 031 — The v2 store chunks the band axis at 16
+# 031 — The v2 store is band-first, chunked at 16 bands
 
-**Status:** Proposed. §4 recommends band-first with band-split shards. The dimension order (§3) is
-the repo owner's choice; everything else here is settled by the measurements in §2. For v2 stores
-only, this supersedes D2 of [ADR 008](008-global-store-architecture.md). The v1.1 store keeps D2,
-and targeted updates go on writing it that way.
+**Status:** Accepted 2026-10-22 (repo owner). The layout is band-first with band-split shards, and
+inference makes the reorder as it stages each tile (§4). For v2 stores only, this supersedes D2 of
+[ADR 008](008-global-store-architecture.md). The v1.1 store keeps D2, and targeted updates go on
+writing it that way.
 
 v2 emits 128 dimensions in Matryoshka order: the first 16, 32 and 64 are each usable on their own.
 D2 never splits the band axis, so a reader who wants 16 dimensions still fetches all 128. This
@@ -13,7 +13,7 @@ scale-test harness: T9 locally, T10 on AWS
 
 ---
 
-## 1. Settled, whichever order wins
+## 1. Settled in either band order
 
 **The 2,048² shard stays.** One inference tile is one shard, and the 4,096-px ingest chunk is set
 by Dask's scheduler, so nothing upstream of assembly moves. Only what sits inside the shard changes.
@@ -88,7 +88,7 @@ medians:
 | band-first, band-split shards | 385 [377, 397] ms | 372 [364, 379] ms |
 | band-first, in shard | 447 [439, 458] ms | **1,048 [1,021, 1,070] ms**, 2.43× C0 |
 
-## 3. The open choice: band-last or band-first
+## 3. Band-last against band-first
 
 Band-last is v1.1's order, `(time, northing, easting, band)`. Band-first is
 `(time, band, northing, easting)`. Within a band-first chunk, each band is a contiguous plane.
@@ -117,12 +117,22 @@ moves the ingest identity once. Moving the chunk-sizing function into its own mo
 The prototype's ingest identity was then the same with and without a preset.
 
 **The inference cost of band-first is about a second of background CPU per tile.** The model emits
-one row of 128 values per pixel, so a band-first tile has to be reordered once. The cheapest place
-is the staged write, which already runs on the actor's single-slot writer thread and overlaps the
-next tile's work. Writing the existing `(y, x, band)` buffer through a transposed view costs
-0.6–1.0 s of one laptop core per 2,048² tile against about 170 s of tile time. It needs no
+one row of 128 values per pixel, so a band-first tile has to be reordered once, after the model runs.
+Ingest cannot do it: its mosaics are already one array per spectral band, and the embeddings do not
+exist until inference. The cheapest place is the staged write, which already runs on the actor's
+single-slot writer thread and overlaps the next tile's work. Writing the existing `(y, x, band)`
+buffer through a transposed view costs 0.6–1.0 s of one laptop core per 2,048² tile. It needs no
 full-tile copy and no GPU time. Reordering on the GPU or on the main thread instead added 2.5–7.4 s
 per tile on an L4 host.
+
+**That writer has room, by the Iowa v2 runs' own logs (786 tiles).**
+
+- **Upload against tile:** the staged upload takes 16.6 s (median), against 164–166 s of tile time,
+  with the GPU at 100% (median).
+- **Where it already waits:** the next tile waits on the upload only on the 5.6% of tiles that
+  finish fast, adding 0.5 s per tile on average.
+- **What the reorder adds:** another 1–2 s on each upload lengthens only those waits. That is at most
+  about 0.1 s per tile, under 0.1% of inference time.
 
 **A reader who wants the other order pays a transpose either way.** Turning one 128-d tile from
 `(band, y, x)` into `(y, x, band)` takes 0.17 s with torch on 10 threads, or 1.2 s with numpy on one.
@@ -135,7 +145,7 @@ orders, because the v1.1 store stays band-last. Some failures would be silent. `
 example, labels a tile by chunk coordinates 1 and 2, which in band-first order are band and
 northing.
 
-## 4. Recommendation
+## 4. Decision
 
 **Band-first, with band-split shards.** `embeddings` is `(time, band, northing, easting)`, stored as
 shards of 1 × 16 × 2,048 × 2,048 holding inner chunks of 1 × 16 × 512 × 512, compressed with zstd at
@@ -161,10 +171,22 @@ inside one shard fails the old-client gate on a full-vector point.
 - **Objects:** eight embedding objects and PUTs per tile instead of one.
 - **Readers:** a transpose for per-pixel readers who want `(…, band)`.
 
+**The reorder is inference's, as it stages each tile.** Staged tiles, the shard writer, updates and
+readers all see band-first, so no stage after inference reorders anything. The cost is under 0.1% of
+inference time (§3).
+
+**Rejected: reordering in assembly instead.** It would leave inference's code untouched, at 1.17× C0's
+assembly CPU rather than 0.74×. It was turned down because band-first all the way through is the
+cleaner pipeline, and inference's part of it costs almost nothing.
+
 ## 5. Consequences
 
 - **A v2 preset** in `config/store_layout.py`, selected by model version for the global and
   single-area paths. `INNER_PX` stays 256, so the land mask's `chunk_live_256` stays valid.
+- **Inference stages v2 tiles band-first.** `ZarrWriter.write_chunk` writes the actor's
+  `(y, x, band)` buffer through a transposed view on the writer thread. Staging validation and
+  `StagedShardSource` read `(band, y, x)`, and the shard writer and the holes merge index band-first
+  arrays as `(time, band, northing, easting)`.
 - **The chunk-sizing function moves out of `store_layout.py` first**, as its own change at a store
   boundary. It moves the ingest identity once, and keeps later layout changes from moving it.
 - **`_layout_band` takes the band count from the shard**, not the chunk. Otherwise a v2 store is
