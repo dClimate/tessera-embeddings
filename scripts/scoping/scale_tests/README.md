@@ -126,9 +126,11 @@ Each phase runs on its own in-region EC2 box, writing throwaway repos under the 
 
 - **`build` then `read`** (x86, r7i.4xlarge). Each finalist is built as a repo of 10 × 10 shards
   cycled from the real tiles T9 fetched, so no cache holds the working set. Every workload runs cold
-  in a fresh process, arms interleaved, in two passes of opposite order: points, an 8 × 8-tile pull
-  at 16, 64 and 128 dims, and Dask at default and shard-aligned chunks. `read` runs once per client.
-  `tune` repeats the full-vector pulls with wider fetch concurrency and band-aligned Dask chunks.
+  in a fresh process, arms interleaved, in two passes of opposite order: points at 16 and 128 dims,
+  a 128-d read of 2 × 2 shards, an 8 × 8-tile pull at 16, 64 and 128 dims, and Dask at its default
+  chunks. `read` runs once per client. `points` repeats only the point reads, with bootstrap
+  intervals on their medians. `tune` repeats the full-vector pulls with wider fetch concurrency and
+  band-aligned Dask chunks.
 - **`assemble`** (Graviton, like the assembly runner). Staged v2 tiles are written into each
   band-last finalist by the library's own `shard_writer.write_year_shards` over a
   `StagedShardSource`, every array included. Band-first arms are left out because the library
