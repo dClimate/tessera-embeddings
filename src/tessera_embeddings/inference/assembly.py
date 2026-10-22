@@ -2586,6 +2586,10 @@ class ZarrWriter:
             embedded_records = self._top_up_embedded_records(run_id, registry_embedded, embedded_records)
         # Last before the write, so a run refused anywhere above never stamps a store it wrote nothing to.
         if stack is not None:
+            # A store's first stamp is permanent, so every tile is checked before it, not only as it is
+            # written. A stamped store needs no pass: a mixed run fails in the writer before it commits.
+            if STACK_ATTR not in zarr.open_group(repo.readonly_session(branch="main").store, mode="r").attrs:
+                check_staged_stacks(self.staging_base, run_id, labels, stack)
             claim_root_stack(repo, stack, allow_mismatch=allow_stack_mismatch, where=store_path)
         snapshot = write_year_shards(
             repo,
@@ -2811,6 +2815,27 @@ def read_staged_coverage(
             elif record is not None:
                 out[label] = record
     return out, unreadable
+
+
+def check_staged_stacks(
+    staging_base: str, run_id: str, labels: Iterable[str], expected: Mapping[str, str | None], *, workers: int = 32
+) -> None:
+    """Refuse unless every staged tile of the run was computed on the *expected* stack.
+
+    Run before a store's first write stamps its stack, because the stamp is permanent while the
+    shard writer checks each tile only as it writes it: a mixed run found there would already have
+    stamped the store with the probe tile's stack. Concurrent like :func:`read_staged_coverage`,
+    but strict, since a tile whose stack cannot be read cannot vouch for the stamp.
+    """
+    labels = list(labels)
+    base = f"{staging_base.rstrip('/')}/{run_id}"
+
+    def one(label: str) -> None:
+        path = f"{base}/{label}.zarr"
+        staged_stack(_open_staged_tile(path).attrs, path, expected=expected)
+
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(labels)))) as pool:
+        list(pool.map(one, labels))
 
 
 def summarise_optical_skips(
