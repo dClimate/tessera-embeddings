@@ -1556,14 +1556,10 @@ def query_stac_items(
     # matching `normalize_to_solar_day` above and the loader's own grouping — keying on the UTC
     # date instead splits a group the loader treats as one, in the zones where the solar offset
     # crosses midnight.
-    # TODO: a collection naming no fusion order keeps the assembly order, and that order
-    # follows the window tree rather than a single catalogue walk — parent prefix first, then
-    # children oldest-first, against the catalogue's newest-first. So for such a collection
-    # the fused result would depend on how the query was partitioned. Not reachable today:
-    # the only paged caller is `s2_roi`, which asks for `sentinel-2-l2a`, and the radar path
-    # returns its items from a provider function before any window exists. Left alone because
-    # imposing an order on Landsat, which currently has none, is a change to that collection's
-    # output that nothing here can verify. Fix it alongside the first paged caller of one.
+    # A collection naming no fusion order keeps the assembly order, which follows the window tree
+    # rather than a single catalogue walk. Its pixels cannot depend on that, since the loader then
+    # applies odc's own `(time, id)` order; only the provenance map below, which keeps a date's
+    # first item, still follows it.
     if collection_config.fusion_order is not None:
         items.sort(key=_FUSION_SORT_KEYS[collection_config.fusion_order])
 

@@ -67,8 +67,8 @@ catalogues refuse it.
 **Filtering.** Whole items are set aside first — when their date is already in the store, when a
 reprocessed granule duplicates one already chosen, or when an optional caller hook rejects them.
 A duplicate is kept rather than discarded: it becomes the next rung the read falls back to.
-What survives is then sorted clearest-first, and that sort decides which pixel wins where two
-scenes of a solar day overlap.
+What survives is then sorted — optical clearest scene first, radar most-acquired burst first — and
+that sort decides which source supplies a pixel where two of one solar day overlap.
 
 **Mosaic writing.** What survives is loaded lazily through `odc.stac.load` into a
 Dask-backed array, corrected at load time where a producer's reflectance offset requires it,
@@ -95,7 +95,7 @@ sections up to [Authentication](#authentication-edl--opera-data) describe the ha
 | Module | What it does |
 |---|---|
 | `stac.py` | STAC loading through `odc.stac.load` — providers, date filtering, and the load-time machinery that applies the Sentinel-2 reflectance offset. [§ Sentinel-2 baseline correction](#sentinel-2-baseline-correction-applied-during-the-read) |
-| `opera_query.py` | OPERA RTC-S1 queries: bounding boxes, items built from CMR's native Granule Search with orbit direction filtered server-side, UTM EPSG derivation, asset preparation. [§ OPERA-Specific Query Quirks](#opera-specific-query-quirks) |
+| `opera_query.py` | OPERA RTC-S1 queries: bounding boxes, items built from CMR's native Granule Search with orbit direction filtered server-side, UTM EPSG derivation, asset preparation, and the burst census and sort that decide which burst wins an overlap. [§ OPERA-Specific Query Quirks](#opera-specific-query-quirks) |
 | `boa_offset.py` | The one place the reflectance-offset question is answered. Asked per ASSET, so an item whose bands come from two producers is corrected band by band rather than refused. [§ Sentinel-2 baseline correction](#sentinel-2-baseline-correction-applied-during-the-read) |
 | `item_baselines.py` | The one reader of `s2:processing_baseline`. Reports integer hundredths (`04.00` -> `400`) and `None` for every kind of unreadable. |
 | `asset_locations.py` | Where an item's assets live, keeping two questions apart: whether the read is cheap (the bucket's REGION) and whether the offset is already removed (the PRODUCER). `AssetSources` reports the keys it could not resolve instead of dropping them. |
@@ -328,6 +328,12 @@ An item declaring no `eo:cloud_cover` sorts after every measured value, where it
 gaps. `solar_day_sort_key` gives it infinity rather than 100, since 100 is itself a real reading
 and the two would otherwise tie and be reordered by `id`, letting an unmeasured scene take ground
 from one known to be fully clouded.
+
+The sort is the collection's **fusion order** (`CollectionConfig.fusion_order`), and the same field
+sets the loader's `preserve_original_order`, so the loader keeps exactly the orders this package
+imposes. Radar has its own: the burst acquired most often over the window comes first
+([§ Which burst wins an overlap](#which-burst-wins-an-overlap)). A collection naming none, such as
+Landsat, keeps odc's own `(time, id)` order.
 
 #### Streaming the query month by month (S2)
 
@@ -572,10 +578,10 @@ how a refused window is re-cut, and how the windows are walked concurrently — 
 
 ### OPERA-specific query quirks
 
-OPERA RTC-S1 is queried through NASA's CMR rather than a STAC API, and three things about it have
+OPERA RTC-S1 is queried through NASA's CMR rather than a STAC API, and four things about it have
 no counterpart on the optical path: the query is built against CMR's native granule endpoint, one
-date arrives as ten separate burst granules, and the items carry no projection metadata for the
-loader to read.
+date arrives as ten separate burst granules, overlapping bursts are ranked by a census rather than
+by cloud cover, and the items carry no projection metadata for the loader to read.
 
 #### Native granule query (orbit filtering + item construction)
 
@@ -601,17 +607,20 @@ Orbit direction is filtered **server-side** via `attribute[]`, so the response h
 desired orbit — no separate STAC search and no local granule-ID intersection. Each granule's data
 links (`rel` ending `/data#`, href ending `_VV.tif` / `_VH.tif`) map onto the `S1_OPERA_BANDS`
 asset keys (`0_VV`, `0_VH`) to build `pystac.Item`s shape-compatible with the rest of the
-pipeline, with `title`, `time_start` and `polygons` supplying id, datetime and geometry.
+pipeline, with `title`, `time_start` and `polygons` supplying id, datetime and geometry. The title
+also names the burst (`opera:burst_id`, `sat:relative_orbit`, `opera:subswath` on the item), and
+`time_start` is kept in `properties["datetime"]` for solar-day normalisation to read.
 Pagination uses the `CMR-Search-After` header, which pages cleanly at 2000. See
 [ADR 009](../../../context_docs/decisions/009-native-cmr-granule-query.md).
 
 #### Polarisation filtered server-side
 
 A cost fix rather than a correctness one. Ingest needs dual-pol VV+VH, and the query carries
-`attribute[]=string,POLARIZATION,VV` alongside the orbit filter. It discards nothing reachable,
-since CMR matches a multi-valued attribute if ANY value matches, so VV admits every VV+VH granule.
-The client-side check remains as a safety net, and its warning means a catalogue inconsistency —
-metadata advertising VV without the bands published — rather than a regional fact.
+`attribute[]=string,POLARIZATION,VV` and `attribute[]=string,POLARIZATION,VH` alongside the orbit
+filter. CMR matches a multi-valued attribute if ANY value matches and ANDs repeated attributes, so
+naming both is exact: it admits no single-pol granule and drops no dual-pol one. The client-side
+check remains as a safety net, and its warning means a catalogue inconsistency — metadata
+advertising the pair without the bands published — rather than a regional fact.
 
 #### When a zone has no usable radar
 
@@ -635,6 +644,39 @@ cannot distinguish the two, so its warning names the mosaic and points at that c
 radar-free ROI necessarily means embedding S2-only pixels, and `InferenceConfig` derives
 `allow_s2_only` for that case rather than asking the caller, because the alternative is a fill
 that writes nothing and reports success.
+
+#### Which burst wins an overlap
+
+Bursts of one solar day overlap, and the loader keeps the first valid one, so their order decides
+which supplies a pixel. Inside one store (each orbit direction has its own) the overlaps are
+adjacent bursts and sub-swaths of one pass, which share a look geometry, and at high latitude two
+adjacent tracks on the same day, which do not:
+
+```text
+   ┌──────────────────┐
+   │ burst of T029    │                 on a day both tracks fly, the strip ▒ that both
+   │ (29 this year)   │                 cover goes to the burst acquired MORE OFTEN over
+   │          ┌───────┼──────────┐      the window — here T131, though its track number is
+   │          │▒▒▒▒▒▒▒│          │      higher — so the pixel's series keeps one look angle
+   └──────────┼───────┘          │      wherever the archive allows
+              │ burst of T131    │
+              │ (31 this year)   │
+              └──────────────────┘
+```
+
+`opera_query.burst_fusion_sort_key` orders each day's items by the burst's acquisitions over the
+whole ingest window, most first; ties go to the burst id (track, then burst number, then
+sub-swath), then the acquisition time and granule id, so a rerun builds the same pixels. A title
+that names no burst sorts last and is counted in the query log. Because a burst's footprint is
+fixed, this item order gives each pixel its most-acquired covering burst without reading a raster.
+
+The counts come from `burst_acquisitions`, one CMR query per orbit leg over the requested window
+(`BurstCensus`, built once in `s1_roi`). It asks for the reference format — titles only, about
+60 times smaller than the JSON the batch queries read — and counts distinct acquisitions, since
+a reprocessed acquisition is republished under a new production time. One orbit of a zone-year at
+35N took about 50 s; it starts alongside the first batch's query, so most of it overlaps.
+[ADR 033](../../../context_docs/decisions/033-radar-overlaps-go-to-the-most-acquired-burst.md) has
+the measurements and what was left out, such as per-pixel layover and shadow masks.
 
 #### UTM CRS derivation
 
@@ -674,7 +716,7 @@ These happen before `odc.stac.load` is called:
 | Transform | Where | What |
 |---|---|---|
 | **Date dedup** | `stac._filter_existing_dates` | Drops STAC items whose date is already written to the store. Keyed on the SOLAR day when the caller passes `mid_longitude`, matching how the store was written. |
-| **Item sort** | `stac.query_stac_items` | For S2: sorts by `(date, cloud_cover)` ascending, so the clearest tile comes FIRST and the loader's first-valid-source fuser keeps it. |
+| **Item sort** | `stac.query_stac_items` | Sorts by the collection's fusion order, so the loader's first-valid-source fuser keeps the right source. S2: `(date, cloud_cover)` ascending, clearest tile FIRST. Radar: most-acquired burst FIRST. |
 | **Item provider** | `opera_query.make_s1_item_provider` | Builds orbit-filtered OPERA items directly from the native CMR granule API (bypasses CMR-STAC search). |
 | **URL rewriting** | `auth.rewrite_assets_to_s3` | Rewrites HTTPS datapool/earthdatacloud URLs to `s3://` URIs. |
 | **Timestamp normalisation** | `solar_days.normalize_to_solar_day` | Stamps every item with noon UTC of its **solar day**. The single place the solar offset is applied; also what makes `odc.stac.load` mosaic OPERA's per-burst granules into one time slice. |
@@ -695,7 +737,7 @@ These happen before `odc.stac.load` is called:
 - **groupby** — `"solar_day"` merges items from adjacent MGRS tiles acquired on the same local
   calendar day into one mosaic, which is required for ROI queries crossing tile boundaries. Which
   scene wins a pixel is decided by the sort order; see *Cloud cover decides which scene wins a
-  pixel*.
+  pixel* and, for radar, *Which burst wins an overlap*.
 - **Dimension rename** — `normalize_odc_dims` maps `odc.stac.load`'s `y`/`x` output
   dimensions to the project-wide `northing`/`easting` convention and drops `spatial_ref`.
 - **The Sentinel-2 reflectance offset** is applied inside this read, per source — see

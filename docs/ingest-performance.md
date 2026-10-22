@@ -256,6 +256,11 @@ calendar days and the loop advances `batch_start` to the day *after* `batch_end`
 do overlap, because `fixed_day_ranges` pads each one a UTC day either side, so a boundary solar
 day comes back from two batches and `s1_roi.py` gives it up once rather than twice.
 
+One catalogue query is **not** per batch: the burst census that decides which of two overlapping
+bursts supplies a pixel covers the whole window, once per orbit leg, and runs alongside the first
+batch's query. So `batch_days` changes graph size and query count, never which burst wins — see
+[Which burst wins an overlap](../src/tessera_embeddings/ingest/README.md#which-burst-wins-an-overlap).
+
 ### Cropping to live windows (unconditional)
 
 Ingest cost scales with the **extent it computes, not the land it keeps**, and a mosaic load

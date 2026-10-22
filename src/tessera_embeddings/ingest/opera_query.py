@@ -42,8 +42,8 @@ logger = logging.getLogger(__name__)
 # host and honours ``attribute[]`` filtering, which CMR-STAC silently ignores — so orbit direction
 # is filtered server-side rather than by intersecting a separate STAC result.
 _CMR_GRANULE_URL = "https://cmr.earthdata.nasa.gov/search/granules.json"
-#: The same search in CMR's reference format: each granule's title and concept id, about 250 bytes
-#: against about 15 KB as JSON. All the burst census needs.
+#: The same search in CMR's reference format: each granule's title and concept id and nothing else,
+#: a small fraction of the JSON's bytes. All the burst census needs.
 _CMR_REFERENCE_URL = "https://cmr.earthdata.nasa.gov/search/granules.xml"
 _CMR_OPERA_SHORT_NAME = "OPERA_L2_RTC-S1_V1"
 _CMR_PROVIDER = "ASF"
@@ -503,11 +503,12 @@ def burst_acquisitions(
 ) -> dict[str, int]:
     """How many times each burst touching ``bbox`` was acquired in the window, by burst id.
 
-    Read from granule titles alone, through CMR's reference format, which is why a zone-year costs
-    tens of seconds rather than the minutes the full JSON takes. Counts distinct ACQUISITIONS, not
-    granules: a reprocessed acquisition is published again under the same burst and acquisition
+    Read from granule titles alone, through CMR's reference format, so a whole window costs a
+    small fraction of what the batch queries page through as JSON. Counts distinct ACQUISITIONS,
+    not granules: a reprocessed acquisition is published again under the same burst and acquisition
     time with a new production time, and counting granules would rank a burst by how often it was
-    reprocessed. A title that names no burst counts toward nothing.
+    reprocessed. A title that names no burst counts toward nothing. Cost and rationale:
+    ``context_docs/decisions/033-radar-overlaps-go-to-the-most-acquired-burst.md``.
 
     A burst's count does not depend on ``bbox`` beyond whether the burst touches it, so a query
     over a subset of an area ranks the bursts it shares with the whole the same way.
