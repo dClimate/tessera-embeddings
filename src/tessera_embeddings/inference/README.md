@@ -229,9 +229,10 @@ This is not ceremony. An actor lives for hours, and the default Rust credential 
 resolves the instance-profile credential once and may fail to refresh it. When it lapses,
 the tile in flight **and every tile that actor takes afterwards** fail with `no providers
 in chain provided credentials`. A botocore-backed, self-refreshing callback fixes that. One
-caveat carries over from `ingest/README.md`: `_resolve_iam_credentials` must stay
-`lru_cache`d, or the callback's re-invocation every fifteen minutes triggers a cold
-instance-metadata lookup each time and runs into throttling.
+caveat carries over from
+[ingest authentication](../../../docs/ingest-authentication.md#imds-throttling-why-_resolve_iam_credentials-is-cached):
+`_resolve_iam_credentials` must stay `lru_cache`d, or the callback's re-invocation every
+fifteen minutes triggers a cold instance-metadata lookup each time and runs into throttling.
 
 ### 4. Loading a tile's imagery
 
