@@ -550,6 +550,18 @@ class InferenceActor:
 
     # ------------------------------------------------------------------
     # Cross-chunk prefetch
+    @functools.cached_property
+    def _inference_stack(self) -> dict[str, str | None]:
+        """The PyTorch and CUDA this actor computes with, staged with every tile it writes (ADR 025).
+
+        Read here, where the model runs: the driver runs the lockfile's CPU build whatever the workers
+        run, so only this process knows which stack computed the embeddings. CUDA is ``None`` on a CPU
+        actor even when the build has it, since ``torch.version.cuda`` names the build, not the device.
+        """
+        import torch
+
+        return {"torch": torch.__version__, "cuda": torch.version.cuda if self.device.type == "cuda" else None}
+
     # ------------------------------------------------------------------
     # Stash keyed by chunk label; lazily initialised so test harnesses building bare actors via
     # object.__new__ keep working without __init__.
@@ -1176,6 +1188,7 @@ class InferenceActor:
                         # carry no measurements — a refused chunk's identical record survives
                         # because it goes into the skip marker.
                         coverage=coverage,
+                        inference_stack=self._inference_stack,
                     )
                     # One line per chunk: how long the backgrounded upload took. The phase table's write_s is ~0 by
                     # design, so this is the off-critical-path cost, for post-run upload health checks.

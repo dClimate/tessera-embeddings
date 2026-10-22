@@ -23,6 +23,7 @@ from tessera_embeddings.config.inference import (
     ModelVersion,
     _normalize_obs_checkpoints,
     band_stats,
+    model_family,
 )
 from tessera_embeddings.inference.data_loading import ChunkData
 from tessera_embeddings.inference.sampling import compute_bin_keys, resample_s1_bucket, resample_s2_bucket
@@ -197,10 +198,10 @@ class MosaicChunkInferenceDataset:
         pixel_s2_counts = s2_valid_count[rows, cols]
         pixel_s1_counts = s1_total_valid[rows, cols]
         keys = compute_bin_keys(pixel_s2_counts, pixel_s1_counts, self.num_obs_checkpoints)
-        if self.model_version != "v1.1":
-            # Each family's own missing-S1 input: v2 gives a radar-free pixel ONE zero step (upstream
-            # `s1_B = max(s1_bin, 1)`), where v1.1 keeps the smallest bucket. Seven fewer tokens per pixel.
-            keys["s1"][pixel_s1_counts == 0] = 1
+        # Each model's own missing-S1 input (ModelFamily.radar_free_s1_bin): v2 gives a radar-free
+        # pixel ONE zero step, where v1.1 keeps the smallest bucket. Seven fewer tokens per pixel.
+        if (radar_free_bin := model_family(self.model_version).radar_free_s1_bin) is not None:
+            keys["s1"][pixel_s1_counts == 0] = radar_free_bin
 
         # Group pixel indices by (s2, s1) bucket, packing structured (int32, int32) into one int64 for a stable
         # argsort.

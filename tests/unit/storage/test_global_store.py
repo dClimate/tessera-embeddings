@@ -137,7 +137,7 @@ def test_an_unstamped_store_keeps_its_identity_when_nothing_is_created(tmp_path)
     assert "geoemb:model" not in zarr_store.open_store_as_zarr_group(store).attrs, "the premise"
 
     # The same zone again — complete, so nothing is created — but now asking for an identity.
-    global_store.seed_zone_groups(repo, [_ZA], years=(2025,), model_version="v1", optical_min_obs=15)
+    global_store.seed_zone_groups(repo, [_ZA], years=(2025,), checkpoint_id="v1", optical_min_obs=15)
 
     root = zarr_store.open_store_as_zarr_group(store)
     assert "geoemb:model" in root.attrs, "the stamp must have been committed, not discarded"
@@ -165,20 +165,48 @@ def test_a_group_missing_a_later_schema_array_is_refused_not_skipped(tmp_path):
         global_store.seed_zone_groups(repo, [_ZA], years=(2025,))
 
 
-def test_reseed_with_different_model_rejected(tmp_path):
+@pytest.mark.parametrize(("model", "other"), [("v1.1", "v2-large"), ("v2-large", "v1.1")])
+def test_the_store_names_the_model_that_fills_it(tmp_path, model, other):
+    """Every fill takes its model from the store's root, so a request for another one is refused
+    unless the operator overrides it: one store never mixes two models.
+    """
+    store = str(tmp_path / "g.icechunk")
+    global_store.seed_zone_groups(global_store.create_global_repo(store), [_ZA], years=(2025,), model_version=model)
+    assert global_store.store_model_version(store) == model
+    assert global_store.store_model_version(store, model) == model
+    with pytest.raises(ValueError, match="would mix two models"):
+        global_store.store_model_version(store, other)
+    assert global_store.store_model_version(store, other, allow_mismatch=True) == other
+
+
+def test_a_store_naming_no_known_model_needs_the_fill_to_name_one(tmp_path):
+    """A campaign takes its model from the store, so an unknown URL is refused unless a fill names its model."""
+    store = str(tmp_path / "g.icechunk")
+    global_store.seed_zone_groups(global_store.create_global_repo(store), [_ZA], years=(2025,))
+    session = global_store.open_global_repo(store).writable_session("main")
+    zarr.open_group(session.store, mode="a").attrs["geoemb:model"] = "https://example.org/custom"
+    session.commit("a custom model URL")
+    with pytest.raises(ValueError, match=r"names no known model.*fill_zone_year"):
+        global_store.store_model_version(store, allow_mismatch=True)
+    assert global_store.store_model_version(store, "v2-large", allow_mismatch=True) == "v2-large"
+
+
+@pytest.mark.parametrize("change", [{"model_version": "v2-large"}, {"checkpoint_id": "other"}])
+def test_reseed_with_different_model_rejected(tmp_path, change):
     """Root encoder provenance is write-once: a matching reseed is a no-op, but a
-    partial reseed carrying a DIFFERENT encoder is rejected — otherwise the root
-    would advertise the new model and the fill-time model gate would permit mixing
+    partial reseed carrying a DIFFERENT model or checkpoint is rejected — otherwise the
+    root would advertise the new one and the fill-time model gate would permit mixing
     it with already-seeded zones.
     """
     store = str(tmp_path / "g.icechunk")
     repo = global_store.create_global_repo(store)
-    global_store.seed_zone_groups(repo, [_ZA], years=(2025,), model_version="v1")
+    same = {"model_version": "v1.1", "checkpoint_id": "v1"}
+    global_store.seed_zone_groups(repo, [_ZA], years=(2025,), **same)
     # Same model on a later incremental seed: fine (adds the group, provenance no-op).
-    global_store.seed_zone_groups(repo, [_ZB], years=(2025,), model_version="v1")
-    # A different model is rejected before any group work.
+    global_store.seed_zone_groups(repo, [_ZB], years=(2025,), **same)
+    # A different model or checkpoint is rejected before any group work.
     with pytest.raises(ValueError, match="write-once"):
-        global_store.seed_zone_groups(repo, [_ZB], years=(2025,), model_version="v2")
+        global_store.seed_zone_groups(repo, [_ZB], years=(2025,), **{**same, **change})
 
 
 def test_reseed_with_different_axis_rejected(tmp_path):

@@ -438,10 +438,12 @@ def test_pinned_ami_id_reaches_ray_cluster(wired):
     assert wired["ray_kwargs"]["ami_id"] == "ami-pinned-01"
 
 
-def test_the_default_models_own_image_reaches_ray_cluster(wired):
-    """The cells run the default model, so that model's entry in ami_ssm_name_by_model is the image (ADR 025)."""
-    _run(ami_ssm_name_by_model={mod.DEFAULT_MODEL_VERSION: "ami-own"})
-    assert wired["ray_kwargs"]["ami_ssm_name"] == "ami-own"
+@pytest.mark.parametrize("model", ["v1.1", "v2-large"])
+def test_the_stores_models_image_reaches_ray_cluster(wired, monkeypatch, model):
+    """The cells run the model their store holds, so that model's entry is the image (ADR 025)."""
+    monkeypatch.setattr(mod, "store_model_version", lambda *a, **k: model)
+    _run(ami_ssm_name_by_model={"v1.1": "ami-v11", "v2-large": "ami-v2"})
+    assert wired["ray_kwargs"]["ami_ssm_name"] == {"v1.1": "ami-v11", "v2-large": "ami-v2"}[model]
 
 
 def test_unpinned_ami_is_resolved_once_and_reused(wired, monkeypatch):
@@ -1606,6 +1608,15 @@ def test_the_chained_fill_applies_the_rule_its_store_advertises(wired, monkeypat
     _run(zones=["33N"])
     assert built, "no InferenceConfig was built"
     assert {c.get("optical_min_obs") for c in built} == {25}, "the store's rule must reach every cell's config"
+
+
+@pytest.mark.parametrize("flag", [False, True])
+def test_the_stack_override_reaches_every_cells_config(wired, monkeypatch, flag) -> None:
+    """Assembly reads it off the config, the only route from this flow to the stack check."""
+    built: list[dict] = []
+    monkeypatch.setattr(mod, "build_inference_config", lambda **k: built.append(k) or SimpleNamespace(**k))
+    _run(zones=["33N"], allow_stack_mismatch=flag)
+    assert built and {c["allow_stack_mismatch"] for c in built} == {flag}
 
 
 def test_a_store_declaring_no_rule_leaves_the_config_unconstrained(wired, monkeypatch) -> None:

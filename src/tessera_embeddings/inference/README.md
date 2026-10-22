@@ -19,8 +19,9 @@ Two encoders are selectable through `InferenceConfig.model_version`: Tessera v1.
 default, and the distilled v2 Large student (`"v2-large"`). They share every stage below
 except the model itself, its band statistics and the rule that fills each observation
 sequence; what differs, and why, is in [Model architecture constraint](#model-architecture-constraint).
-Both single-area entry points below take `model_version`; the global campaign's zone fill
-does not, and runs v1.1.
+Both single-area entry points below take `model_version`. The global campaign's zone fill
+does not choose: it runs the model its store was seeded for ([One record per
+model](models/README.md#one-record-per-model)).
 
 Two entry points run the same domain code:
 
@@ -784,6 +785,8 @@ is recorded as its own signal, *after* the store is fully written:
                     ↓
                 coverage = {…}                    this shard's refusal reasons and depth
                     ↓
+                inference_stack = {…}             the PyTorch and CUDA that computed it
+                    ↓
                 staged_complete = True            in-store attribute
                     ↓
                 <label>.done  (zero bytes)        sibling object, written LAST
@@ -918,7 +921,8 @@ icechunk sessions read their own writes, so the merged result is exact.
    extent. On an existing store: validate the `_manifest` and refuse a store published by the
    other encoder (`conventions.assert_encoder_matches`, which reads a store with no
    `geoemb:model` as v1.1; the pre-flight runs the same check before any GPU is
-   provisioned). Then either resize every time-dimensioned array by one step (an append
+   provisioned), or one computed on another library stack (see *One library stack per store*
+   below). Then either resize every time-dimensioned array by one step (an append
    *is* a resize plus a write at the new index) or, when the time value already exists,
    target that index for an in-place overwrite. That makes a resume **idempotent**: a
    crashed assembly re-run lands on the same index instead of appending a duplicate
@@ -928,7 +932,8 @@ icechunk sessions read their own writes, so the merged result is exact.
    index, so no stale slice describes the overwritten data.
 3. **Phase 2, data.** Fork the session; each worker writes its band's tile slices into every
    output array; the coordinator merges the forks, sets the root attributes (run metadata,
-   GeoZarr conventions, `_manifest`, merged `time_windows`) and commits once through
+   GeoZarr conventions, `_manifest`, merged `time_windows`, and `inference_stack` on the store's
+   first write) and commits once through
    `commit_with_rebase`.
 4. **Atomic publish.** Fast-forward `main` to the fully written work-branch tip, guarded by
    `from_snapshot_id` so a concurrent writer to the same store fails loudly, then drop the
@@ -957,6 +962,17 @@ whose tile staged nothing is kept, not cleared; in `holes` mode each staged tile
 the worker reading the shard already in the store and replacing only its hole pixels, in every
 array; and the second commit appends the update's record to the group's `updates` attr instead of
 advancing `years_complete` and `runs`. No zone-year tag is created.
+
+**One library stack per store** ([ADR 025](../../../context_docs/decisions/025-library-upgrades-ship-on-measured-usability-at-a-store-boundary.md)
+rule 2). The inference actor records the PyTorch and CUDA it runs on every tile it stages, as
+`inference_stack`. The driver cannot: it runs the lockfile's CPU build whatever the workers run.
+Both assembly paths read the stack off one probe tile, hold every other tile to it, and compare it
+with the store root's. The first write into a store stamps the root, for the global store in a
+small commit of its own before any shard (`shard_writer.claim_root_stack`), and only after every
+staged tile has been checked, since the stamp is permanent. A store written before the record is
+stamped, not refused. A tile staged on another stack, including one a resume would
+reuse, is refused with both stacks named. `allow_stack_mismatch` writes it anyway, for a deliberate
+experiment, and the store keeps its stack.
 
 **The campaign's land mask is not a pixel-resolution area of interest** but a per-zone
 *coverage bitmap* (`tile_live_2048`), built from the delivery registry by
@@ -1129,7 +1145,7 @@ the main loop; `ActorPool` encapsulates actor state and lifecycle operations
 | `max_gpu_workers` | 500 | Ray autoscaler ceiling |
 
 **Architecture params** (`nhead`, `num_encoder_layers`, `dim_feedforward`, etc.) **must match
-the checkpoint**. They are per-version defaults (`MODEL_ARCHS`): selecting `"v2-large"`
+the checkpoint**. They are per-model defaults (each record's `arch`): selecting `"v2-large"`
 replaces every field still at its v1.1 default with v2's value, and rejects a conflicting
 explicit one. See `models/README.md` before touching them.
 
@@ -1141,7 +1157,7 @@ explicit one. See `models/README.md` before touching them.
 **not** change layer dimensions, activations, or the forward pass unless you are also
 retraining.
 
-`models/builder.py` dispatches on `model_version`. The two architectures side by side, their
+`models/builder.py` dispatches on the model's `generation`. The two architectures side by side, their
 checkpoint loaders, and the porting rules are in [`models/README.md`](models/README.md); v2
 Large's throughput against v1.1 is §7 of
 [`inference-on-gpus.md`](../../../context_docs/inference/inference-on-gpus.md).
@@ -1153,6 +1169,10 @@ name. The plain runner can instead take its URL as `checkpoint_url`, as the quic
 v1.1. A store records the checkpoint's file name as its model identity (`checkpoint_id`), so append
 to a store from the same source that built it: the staged copy and the Hugging Face file have
 different names, and the append check refuses the mix.
+
+**Which model a run uses** is decided once, from a `ModelFamily` record per model; for a global
+store, it is the model the store was seeded for. See
+[One record per model](models/README.md#one-record-per-model).
 
 ---
 

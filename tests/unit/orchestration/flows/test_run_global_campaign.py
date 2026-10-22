@@ -456,14 +456,16 @@ def test_fill_run_id_ignores_the_build_and_keys_on_inference_code(wired, monkeyp
     assert changed.startswith("33N-2025-") and changed != base
 
 
-def test_the_campaign_forwards_the_default_models_own_image(wired):
-    """The campaign runs the default model, so that model's entry in ami_ssm_name_by_model is what its fills get."""
+@pytest.mark.parametrize("model", ["v1.1", "v2-large"])
+def test_the_campaign_forwards_the_stores_models_image(wired, monkeypatch, model):
+    """The campaign runs the model its store holds, so that model's entry is what its fills get."""
+    monkeypatch.setattr(mod, "store_model_version", lambda *a, **k: model)
     wired["arun"].clear()
     wired["landed"].clear()
-    by_model = {mod.DEFAULT_MODEL_VERSION: "ami-own"}
+    by_model = {"v1.1": "ami-v11", "v2-large": "ami-v2"}
     asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", ami_ssm_name_by_model=by_model))
     params = next(p for d, p in wired["arun"] if "fill-zones-sequential" in d)
-    assert params["ami_ssm_name"] == "ami-own"
+    assert params["ami_ssm_name"] == by_model[model]
     assert params["ami_ssm_name_by_model"] == by_model, "the fill needs the map to resolve its own image"
 
 
@@ -1252,20 +1254,21 @@ def test_both_strategies_pin_the_resolved_ami_id(wired):
     assert chained["ami_id"] == "ami-test-id"
 
 
+@pytest.mark.parametrize("override", ["allow_model_mismatch", "allow_stack_mismatch"])
 @pytest.mark.parametrize(
     ("strategy", "dep"),
     [("cluster-per-zone", "fill-zone-year"), ("chained-clusters", "fill-zones-sequential")],
 )
-def test_both_strategies_forward_the_model_mismatch_override(wired, strategy: str, dep: str):
-    """An operator override cleared in preflight must reach the gate that fires.
+def test_both_strategies_forward_the_mismatch_overrides(wired, strategy: str, dep: str, override: str):
+    """An operator override must reach the gate that fires, which is in the child.
 
-    The campaign checks the seeded model once before dispatching, but every child
-    re-checks it. Without forwarding, the child falls back to its default and rejects
-    the same store — after the cell's ingest has already been paid for.
+    The campaign checks the seeded model once before dispatching, but every child re-checks it,
+    and the stack is checked only at the child's assembly. Without forwarding, the child falls
+    back to its default and rejects the same store — after the cell's ingest has been paid for.
     """
-    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI, fill_strategy=strategy, allow_model_mismatch=True))
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI, fill_strategy=strategy, **{override: True}))
     fill = next(p for d, p in wired["arun"] if dep in d)
-    assert fill["allow_model_mismatch"] is True
+    assert fill[override] is True
 
 
 class TestAmiIsResolvedOnlyForCellsThatStartRay:
@@ -1680,9 +1683,13 @@ def test_the_staging_fingerprint_changes_with_the_stores_depth_rule(wired, monke
         "allow_partial_window": False,
         "allow_s2_only": False,
         "code_identity": "code=x",
+        "model_version": "v1.1",
     }
     monkeypatch.setattr(mod, "ingest_marker_identity", lambda *a, **k: "mosaic=1", raising=False)
     at_25 = mod._staging_run_id("33N", 2025, optical_min_obs=25, **common)
+    # v2's staging carries its generation's prefix, the only record a resume has; v1.1's ids are unchanged.
+    v2 = mod._staging_run_id("33N", 2025, optical_min_obs=25, **{**common, "model_version": "v2-large"})
+    assert at_25.startswith("33N-2025-") and v2.startswith("v2-33N-2025-") and v2 != "v2-" + at_25
     at_30 = mod._staging_run_id("33N", 2025, optical_min_obs=30, **common)
     at_none = mod._staging_run_id("33N", 2025, optical_min_obs=None, **common)
     assert len({at_25, at_30, at_none}) == 3, "each rule must own its staging prefix"

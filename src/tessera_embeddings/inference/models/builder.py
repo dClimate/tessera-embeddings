@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any
 import fsspec
 import torch
 
-from tessera_embeddings.config.inference import MODEL_ARCHS, V2_FUSION_METHOD
+from tessera_embeddings.config.inference import model_family
 
 from .modules import V11TransformerEncoder
 from .ssl_model import MultimodalBTInferenceModel, build_dim_reducer
@@ -96,7 +96,8 @@ def _build_v2_inference_model(config: InferenceConfig, device: torch.device) -> 
     (asc + desc concatenated) is 2.
     """
     max_seq_len = max(config.num_obs_checkpoints)
-    enable_qk_norm = MODEL_ARCHS[config.model_version].enable_qk_norm
+    family = model_family(config.model_version)
+    enable_qk_norm = family.arch.enable_qk_norm
 
     def make_encoder(band_num: int) -> StudentTransformerEncoder:
         return StudentTransformerEncoder(
@@ -116,9 +117,9 @@ def _build_v2_inference_model(config: InferenceConfig, device: torch.device) -> 
     # dataclass: a caller that reassigns `config.fusion_method` after construction bypasses the
     # first gate entirely, and the failure it would otherwise cause is a reducer sized for one
     # backbone loading a checkpoint shaped for two.
-    if config.fusion_method != V2_FUSION_METHOD:
+    if config.fusion_method != family.fusion_method:
         msg = (
-            f"v2 students are distilled with {V2_FUSION_METHOD!r} fusion; got "
+            f"{config.model_version} is distilled with {family.fusion_method!r} fusion; got "
             f"fusion_method={config.fusion_method!r} (set after InferenceConfig validation?)"
         )
         raise ValueError(msg)
@@ -218,7 +219,7 @@ def _verify_v2_args(config: InferenceConfig, args: dict[str, Any]) -> None:
         "nhead": config.nhead,
         "num_layers": config.num_encoder_layers,
         "dim_feedforward": config.dim_feedforward,
-        "enable_qk_norm": MODEL_ARCHS[config.model_version].enable_qk_norm,
+        "enable_qk_norm": model_family(config.model_version).arch.enable_qk_norm,
     }
     mismatched = {key: (args[key], value) for key, value in expected.items() if key in args and args[key] != value}
     if mismatched:
@@ -301,7 +302,9 @@ def build_inference_model(
 
     cpu = torch.device("cpu")
     t0 = time.monotonic()
-    is_v2 = config.model_version != "v1.1"
+    # The generation decides the graph and the checkpoint format; the rest of the model's
+    # differences are fields of its ModelFamily that the config already carries.
+    is_v2 = model_family(config.model_version).generation == "v2"
     model = _build_v2_inference_model(config, cpu) if is_v2 else _build_inference_model(config, cpu)
     logger.info("%s inference model built on CPU in %.1fs", config.model_version, time.monotonic() - t0)
 
