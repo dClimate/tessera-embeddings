@@ -412,7 +412,8 @@ def _t10_tables(rows: list[dict]) -> list[str]:
                 f"| {wall:.0f} | {gb:.1f} |"
             )
         out.append("")
-    clients = sorted({r["params"]["client"] for r in _sel(rows, test="t10", metric="get_requests")})
+    reads = [r for r in _sel(rows, test="t10", metric="get_requests") if r["phase"].startswith("read_")]
+    clients = sorted({r["params"]["client"] for r in reads})  # a points- or tune-only run has no read table
     for client in clients:
         phase = f"read_{client}"
         read_arms = sorted({r["variant"] for r in _sel(rows, test="t10", phase=phase, metric="get_requests")})

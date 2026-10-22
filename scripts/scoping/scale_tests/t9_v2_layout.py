@@ -148,6 +148,10 @@ def phase_fetch(source: str, profile: str, tiles: Path, n_tiles: int) -> None:
     live = [w for w in windows if valid[w]]
     picks = [live[int(i)] for i in np.linspace(0, len(live) - 1, min(n_tiles, len(live)))]
     tiles.mkdir(parents=True, exist_ok=True)
+    # Later phases read every emb_*/scales_* pair in the directory, so a re-fetch of fewer tiles
+    # must not leave an earlier fetch's higher-numbered pairs behind.
+    for stale in (*tiles.glob("emb_*.npy"), *tiles.glob("scales_*.npy")):
+        stale.unlink()
     for i, (y, x) in enumerate(picks):
         np.save(tiles / f"emb_{i:03d}.npy", np.asarray(emb[0, y : y + TILE, x : x + TILE]))
         np.save(tiles / f"scales_{i:03d}.npy", np.asarray(scales[0, y : y + TILE, x : x + TILE]))
