@@ -16,6 +16,7 @@ from tessera_embeddings.orchestration.runners import zone_fill
 from tessera_embeddings.storage import global_store
 from tessera_embeddings.storage.campaign import zone_year_tag
 from tessera_embeddings.storage.update import UpdateTarget, base_tag
+from tests.unit.inference_stack import OTHER_STACK, STACK
 from tests.unit.orchestration.runners.test_zone_fill import (
     _BAND,
     _TILE,
@@ -34,8 +35,8 @@ _S2_ONLY = InferenceConfig(time_window=_config().time_window, chunk_size=_TILE, 
 _YEAR_INDEX = 1  # 2025 on the (2024, 2025) axis
 
 
-def _stub(seed: int, *, skip: tuple[str, ...] = ()):
-    """A run_inference stand-in staging fresh values from ``seed``, and skip markers for ``skip``."""
+def _stub(seed: int, *, skip: tuple[str, ...] = (), stack: dict = STACK):
+    """A run_inference stand-in staging fresh values from ``seed`` on ``stack``, and skip markers for ``skip``."""
 
     def stub(num_actors, config, chunks, mosaic_base, staging_base, run_id, t0, log, **kwargs):
         rng = np.random.default_rng(seed)
@@ -47,7 +48,13 @@ def _stub(seed: int, *, skip: tuple[str, ...] = ()):
                 results.append({"chunk": chunk.label, "status": "skipped", "valid_pixels": 0, "elapsed_sec": 0.0})
                 continue
             emb = rng.integers(1, 100, size=(chunk.height, chunk.width, _BAND)).astype(np.int8)
-            writer.write_chunk(chunk, emb, run_id, scales=rng.random((chunk.height, chunk.width)).astype(np.float32))
+            writer.write_chunk(
+                chunk,
+                emb,
+                run_id,
+                scales=rng.random((chunk.height, chunk.width)).astype(np.float32),
+                inference_stack=stack,
+            )
             results.append({"chunk": chunk.label, "status": "success", "valid_pixels": 1, "elapsed_sec": 0.0})
         return results
 
@@ -83,8 +90,10 @@ def filled(tmp_path, monkeypatch):
     return {"store": store, "mosaic": mosaic, "mask": mask, "registry": registry, "tmp": tmp_path}
 
 
-def _update(filled, monkeypatch, target: UpdateTarget, *, seed: int = 11, skip: tuple[str, ...] = (), run_id="upd1"):
-    monkeypatch.setattr(zone_fill, "run_inference", _stub(seed, skip=skip))
+def _update(
+    filled, monkeypatch, target: UpdateTarget, *, seed: int = 11, skip: tuple[str, ...] = (), run_id="upd1", stack=STACK
+):
+    monkeypatch.setattr(zone_fill, "run_inference", _stub(seed, skip=skip, stack=stack))
     return _fill(
         filled["tmp"],
         filled["store"],
@@ -131,6 +140,16 @@ def test_a_shards_update_rewrites_its_target_and_nothing_else(filled, monkeypatc
     repo = global_store.open_global_repo(filled["store"])
     assert repo.lookup_tag(zone_year_tag(_ZONE, 2025)) == tag_before
     assert repo.lookup_tag(base_tag("u1")) == tip_before
+
+
+def test_an_update_on_another_stack_is_refused_and_writes_nothing(filled, monkeypatch):
+    """The campaign's fill stamped the store's stack; an update computed on another must not land."""
+    _, before = _year(filled["store"])
+    with pytest.raises(ValueError, match="Refusing to write"):
+        _update(filled, monkeypatch, _target(filled), stack=OTHER_STACK)
+    _, after = _year(filled["store"])
+    for var in after:
+        np.testing.assert_array_equal(after[var], before[var])
 
 
 def test_a_holes_update_fills_only_the_holes(filled, monkeypatch):

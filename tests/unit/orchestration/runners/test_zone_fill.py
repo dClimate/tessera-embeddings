@@ -18,6 +18,7 @@ from tessera_embeddings.storage.empty_store import VarSpec, create_empty_store_f
 from tessera_embeddings.storage.update import UpdateTarget, commit_update_record, update_record
 from tessera_embeddings.storage.zarr_store import open_or_create_repo
 from tessera_embeddings.storage.zone_grid import ZoneSpec, easting_coords, northing_coords
+from tests.unit.inference_stack import STACK
 
 log = logging.getLogger("test_zone_fill")
 
@@ -160,7 +161,7 @@ def _staging_inference_stub(staged: dict[str, np.ndarray]):
         for chunk in chunks:
             emb = rng.integers(-100, 100, size=(chunk.height, chunk.width, _BAND)).astype(np.int8)
             scales = rng.random((chunk.height, chunk.width)).astype(np.float32)
-            writer.write_chunk(chunk, emb, run_id, scales=scales)
+            writer.write_chunk(chunk, emb, run_id, scales=scales, inference_stack=STACK)
             staged[chunk.label] = emb
             results.append({"chunk": chunk.label, "status": "success", "valid_pixels": 1, "elapsed_sec": 0.0})
         return results
@@ -188,7 +189,13 @@ def _resuming_inference_stub(staged: dict[str, np.ndarray]):
         rng = np.random.default_rng(7)
         for chunk in (c for c in chunks if c.label not in already):
             emb = rng.integers(-100, 100, size=(chunk.height, chunk.width, _BAND)).astype(np.int8)
-            writer.write_chunk(chunk, emb, run_id, scales=rng.random((chunk.height, chunk.width)).astype(np.float32))
+            writer.write_chunk(
+                chunk,
+                emb,
+                run_id,
+                scales=rng.random((chunk.height, chunk.width)).astype(np.float32),
+                inference_stack=STACK,
+            )
             staged[chunk.label] = emb
             results.append({"chunk": chunk.label, "status": "success", "valid_pixels": 1, "elapsed_sec": 0.0})
         return results
@@ -744,6 +751,7 @@ def test_landed_but_untagged_cell_is_retagged_without_rerun(tmp_path, monkeypatc
         rng.integers(-100, 100, size=(_TILE, _TILE, _BAND)).astype(np.int8),
         "run1",
         scales=rng.random((_TILE, _TILE)).astype(np.float32),
+        inference_stack=STACK,
     )
     writer.assemble_global(store, _ZONE, year=2025, run_id="run1", n_workers=1)
     repo = global_store.open_global_repo(store)
@@ -1119,7 +1127,13 @@ def test_a_partly_refused_tile_publishes_what_the_gate_removed(tmp_path, monkeyp
         results = []
         for i, chunk in enumerate(chunks):
             emb = rng.integers(-100, 100, size=(chunk.height, chunk.width, _BAND)).astype(np.int8)
-            writer.write_chunk(chunk, emb, run_id, scales=rng.random((chunk.height, chunk.width)).astype(np.float32))
+            writer.write_chunk(
+                chunk,
+                emb,
+                run_id,
+                scales=rng.random((chunk.height, chunk.width)).astype(np.float32),
+                inference_stack=STACK,
+            )
             results.append(
                 {
                     "chunk": chunk.label,

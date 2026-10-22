@@ -105,19 +105,20 @@ def test_coverage_gate_fails_before_ray(wired, allow_partial):
     assert captured["creds"] is not None  # credential callback threaded through
 
 
+@pytest.mark.parametrize("name", ["allow_s2_only", "allow_stack_mismatch"])
 @pytest.mark.parametrize("flag", [False, True])
-def test_allow_s2_only_reaches_inference_config(wired, flag):
-    """The flow's allow_s2_only lands in build_inference_config — the single
-    chokepoint through which it reaches the dataset's per-pixel gate. The
-    zone-level gates are NOT relaxed by it (the coverage gate still raises here).
+def test_the_flags_reach_inference_config(wired, name, flag):
+    """Each flag lands in build_inference_config, the single chokepoint through which it reaches
+    the stage that reads it: the dataset's per-pixel gate, or assembly's stack check. The
+    zone-level gates are NOT relaxed by either (the coverage gate still raises here).
     """
     captured: dict = {}
     wired.setattr(mod, "build_inference_config", lambda **kw: captured.update(kw) or _FakeConfig())
     _stop_before_ray(wired)
 
     with pytest.raises(InsufficientCoverageError):
-        mod.fill_zone_year_flow.fn(zone="33N", year=2025, paths=_PATHS, **_AMI, allow_s2_only=flag)
-    assert captured["allow_s2_only"] is flag
+        mod.fill_zone_year_flow.fn(zone="33N", year=2025, paths=_PATHS, **_AMI, **{name: flag})
+    assert captured[name] is flag
 
 
 _AWS_CKPT = "tessera_v1_1_aws_encoder.pt"

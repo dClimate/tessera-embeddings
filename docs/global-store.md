@@ -28,8 +28,9 @@ has a `NaN` scale, which makes `scales` the array to ask about coverage.
 The store records all of this in its root attributes, so you can check it against the data:
 `geoemb:model` (`https://geotessera.org/model/1.1`), `checkpoint_id`, `geoemb:gsd`,
 `geoemb:dimensions`, `geoemb:source_data` listing the Sentinel-2 and OPERA archives it read,
-and `optical_min_obs`, the quality rule described below. Each zone group adds its own
-`crs`, `proj:*` and `spatial:*` metadata, plus `years_complete` and `runs`, the fill behind each
+`optical_min_obs`, the quality rule described below, and, where recorded, `inference_stack`, the
+PyTorch and CUDA versions that computed the embeddings (every published year: PyTorch 2.5.1 with
+CUDA 12.1). Each zone group adds its own `crs`, `proj:*` and `spatial:*` metadata, plus `years_complete` and `runs`, the fill behind each
 year. A year a targeted update has since rewritten in part also has `updates`, a list per year of
 which tiles each update rewrote: read `runs[year]`, then `updates[year]` in order
 ([`updates.md`](updates.md)).

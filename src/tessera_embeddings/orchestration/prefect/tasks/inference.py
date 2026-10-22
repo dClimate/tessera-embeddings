@@ -164,6 +164,7 @@ def assemble_embeddings_task(
         n_workers=n_workers,
         get_credentials=get_credentials,
         s3_region=s3_region,
+        allow_stack_mismatch=config.allow_stack_mismatch,
     )
 
     if cleanup_staging:
