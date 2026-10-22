@@ -120,12 +120,15 @@ def test_prepare_exceptions_surface_when_the_batch_is_consumed() -> None:
     assert consumed == [0], f"batch 0 should have been consumed before the failure: {consumed}"
 
 
-def _run_ingest(monkeypatch, catalogue: list[str], existing: set[str], **kwargs) -> list[str]:
+def _run_ingest(
+    monkeypatch, catalogue: list[str], existing: set[str], providers: list | None = None, **kwargs
+) -> list[str]:
     """Drive ``ingest_s1_roi_sar`` against a faked catalogue and store.
 
     ``catalogue`` is every solar date the catalogue holds; the fake returns the ones
     inside whatever range each batch asks for, which is what a real catalogue does.
-    Returns the dates actually written, in order.
+    Returns the dates actually written, in order. ``providers``, when given, collects the
+    keyword arguments each batch built its item provider with.
 
     That range is deliberately WIDER than the batch owns — ``fixed_day_ranges`` pads it a
     day either side so a solar day straddling a boundary is complete for whichever batch
@@ -172,7 +175,13 @@ def _run_ingest(monkeypatch, catalogue: list[str], existing: set[str], **kwargs)
     monkeypatch.setattr(
         s1_roi, "live_windows_for_mask", lambda *a, **k: [type("W", (), {"y0": 0, "y1": 1, "x0": 0, "x1": 1})()]
     )
-    monkeypatch.setattr(s1_roi, "make_s1_item_provider", lambda *a, **k: lambda: [])
+
+    def fake_provider(*_args, **kwargs):
+        if providers is not None:
+            providers.append(kwargs)
+        return lambda: []
+
+    monkeypatch.setattr(s1_roi, "make_s1_item_provider", fake_provider)
     # Reads the ROI store for provenance; irrelevant here and the only other S3 caller.
     monkeypatch.setattr(s1_roi.IngestManifest, "from_roi_store", classmethod(lambda _cls, _p, **_k: object()))
 
@@ -671,3 +680,31 @@ def test_a_bound_that_is_not_a_date_is_refused(monkeypatch, bad_end: str) -> Non
             end_date=bad_end,
             batch_days=31,
         )
+
+
+@pytest.mark.parametrize("pipe", _WRITE_PATHS)
+def test_one_burst_census_ranks_every_batch_over_the_requested_window(monkeypatch, pipe: bool) -> None:
+    """The radar fusion order ranks a burst by its acquisitions over the WHOLE window (ADR 033).
+
+    Built per batch, it would rank a burst by a month. Built over the resumed window — this store
+    already holds the first two days, so the search starts on the third — a resumed leg would rank
+    bursts differently from the run it resumes, and write different pixels for the same days.
+    """
+    from tessera_embeddings.ingest import s1_roi
+
+    built: list[tuple] = []
+    monkeypatch.setattr(s1_roi, "BurstCensus", lambda *args: built.append(args) or args)
+    providers: list[dict] = []
+    _run_ingest(
+        monkeypatch,
+        catalogue=["2024-01-03", "2024-01-05"],
+        existing={"2024-01-01", "2024-01-02"},
+        providers=providers,
+        start_date="2024-01-01",
+        end_date="2024-01-06",
+        pipeline_batches=pipe,
+    )
+
+    assert built == [((0, 0, 1, 1), "2024-01-01", "2024-01-06", "ascending")]
+    assert len(providers) > 1, "needs several batches to show they share one census"
+    assert all(k["burst_census"] is providers[0]["burst_census"] for k in providers)

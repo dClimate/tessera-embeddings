@@ -216,7 +216,7 @@ query. `StacApiIO`'s own default `max_retries=5` passes a bare int to urllib3, w
 
 **Why 502 sits outside it.** An Earth Search page refusal then arrives unretried, and the
 date-window re-cut described in
-[Appendix A](../src/tessera_embeddings/ingest/README.md#appendix-a--the-earth-search-response-cap-in-detail)
+[ingest-earth-search-response-cap.md](ingest-earth-search-response-cap.md#refusals-deep-in-a-walk-and-the-two-levers-against-them)
 starts immediately rather than after the ladder's backoff; a transient 502 is absorbed by the
 attempt budget owning the leg. The CMR Granule query keeps its own ladder
 (`opera_query._CMR_RETRY`), 502 included, because nothing has measured a response-size cap there.

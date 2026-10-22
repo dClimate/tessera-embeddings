@@ -215,8 +215,9 @@ Each single-date graph is small: `spatial_chunks × bands` tasks, with no date d
 multiply through, and the per-date overhead of one Python loop iteration and one Zarr append is
 negligible beside the Dask compute for a large spatial ROI.
 
-The grouping key must match the loader's, per [Timestamp handling](../src/tessera_embeddings/ingest/README.md#timestamp-handling-solar_dayspy). Grouping
-here by UTC calendar date lets the two disagree, and a group we believe is one day then loads as
+The grouping key must match the loader's, per
+[ingest-solar-days.md](ingest-solar-days.md#the-offset-arithmetic-must-match-the-loaders).
+Grouping here by UTC calendar date lets the two disagree, and a group we believe is one day then loads as
 TWO time slices against a cloud mask reduced to one:
 
 ```text
@@ -245,7 +246,7 @@ Batched approach (batch_days=30, ingest_s1_roi_sar only):
 A batch boundary is **not** a credential checkpoint, and treating it as one is unsafe: the STS
 credential's roughly one-hour life is unrelated to how long a batch takes, so a batch that outruns
 it cannot renew at its own boundary. Renewal is owned by a timer — see
-[Authentication](../src/tessera_embeddings/ingest/README.md#authentication-edl--opera-data).
+[Renewal runs on a timer](ingest-authentication.md#renewal-runs-on-a-timer-not-on-the-work-loop).
 
 `batch_days` is a parameter on `ingest_s1_roi_sar` and is absent from the S2 flow. The formula
 in the background section above estimates how many tasks a given window width produces; the
@@ -255,6 +256,11 @@ Batch *ownership* ranges are inclusive at both ends and do not overlap: each spa
 calendar days and the loop advances `batch_start` to the day *after* `batch_end`. The *queries*
 do overlap, because `fixed_day_ranges` pads each one a UTC day either side, so a boundary solar
 day comes back from two batches and `s1_roi.py` gives it up once rather than twice.
+
+One catalogue query is **not** per batch: the burst census that decides which of two overlapping
+bursts supplies a pixel covers the whole window, once per orbit leg, and runs alongside the first
+batch's query. So `batch_days` changes graph size and query count, never which burst wins — see
+[Which burst wins an overlap](ingest-radar.md#which-burst-wins-an-overlap).
 
 ### Cropping to live windows (unconditional)
 

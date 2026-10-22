@@ -581,6 +581,6 @@ each checked for the right shape, closes the same gap without the plumbing.
 
 ## 8. Related
 
-- [`ingest/README.md`](../../src/tessera_embeddings/ingest/README.md) — how the code implements all
+- [`docs/ingest-baseline-correction.md`](../../docs/ingest-baseline-correction.md) — how the code implements all
   of the above
 - [ADR 004](004-duck-typed-providers.md) — the per-provider configuration this relies on

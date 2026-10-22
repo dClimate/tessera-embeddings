@@ -1,8 +1,9 @@
 # Which scene wins a pixel: the solar-day fusion order
 
-**Status: the ordering was corrected in `fix/clearest-scene-wins-the-solar-day`. The blast-radius
-measurement is in progress and is the input to the restart decision. The radar path's ordering is
-identified as undisciplined and is not yet fixed.**
+**Status: the optical ordering was corrected in `fix/clearest-scene-wins-the-solar-day`. The
+blast-radius measurement is in progress and is the input to the restart decision. The radar path
+now has a fusion order of its own, the most-acquired burst first
+([ADR 033](../decisions/033-radar-overlaps-go-to-the-most-acquired-burst.md)).**
 
 This document exists because a belief about a third-party library sat unchecked in this codebase
 for its whole life, silently inverted a quality decision on every published optical pixel, and was
@@ -42,8 +43,8 @@ only fill the holes the earlier ones left.
 **First valid source wins. Later sources cannot overwrite.**
 
 Which source is "first" is the order the items are handed to the loader, because this package sets
-`preserve_original_order=True`. Without that flag `odc` sorts each group by `(time, id)`; with it,
-the caller's order decides.
+`preserve_original_order=True` for every collection that names a fusion order. Without that flag
+`odc` sorts each group by `(time, id)`; with it, the caller's order decides.
 
 ## What was believed instead
 
@@ -100,6 +101,10 @@ It asserts first-wins **in both directions**, which pins the mechanism rather th
 a future reversal of the sort cannot pass it. It also asserts a hole in the clearest scene falls
 through to the next-clearest, so the day keeps its coverage instead of trading coverage for clarity.
 
+The radar test in the same file does the same for bursts: two granules from adjacent tracks over
+the same ground, through `ingest_tile`, with the census favouring first one and then the other. The
+winner swaps with the census, whatever the supply order or the granule ids.
+
 ## Blast radius
 
 Being wrong on overlaps only matters where scenes actually contest ground, and a day carrying two
@@ -109,24 +114,35 @@ answers it computes the overlap area between different acquisitions in an equal-
 with the cloud gap across each contesting pair. No count of multi-acquisition days is a substitute,
 and none should be quoted as the impact.
 
-## Why the loader flag is now conditional
+## Radar: the most-acquired burst first
 
-The cloud sort runs only for collections carrying an SCL band, but `preserve_original_order` was
-set for every collection. Radar therefore had the flag's effect without the sort's benefit: odc's
-deterministic `(time, id)` ordering was switched off and nothing replaced it, leaving the winner of
-an overlap to whatever order the CMR granule query happened to return.
+Radar has no cloud cover, but it has an overlap whose winner matters. At high latitude two adjacent
+relative orbits image the same ground on one solar day, from different look angles, and backscatter
+depends on that angle. [ADR 033](../decisions/033-radar-overlaps-go-to-the-most-acquired-burst.md)
+gives such a pixel to the burst acquired most often over the ingest window, so the pixel's time
+series follows one geometry wherever the archive allows. Like the optical order it is an item sort,
+`opera_query.burst_fusion_sort_key`, ranked by a census of the window's bursts taken once per leg.
 
-Keying the flag on `has_scl` matches the condition that gates the sort, so the flag and the sort
-cannot disagree. **This is not the optical defect repeated.** Radar has no quality ordering, so
-neither of two overlapping bursts is the worse observation and nothing was being silently degraded;
-what this buys is reproducibility. And it *removes* an override rather than adding a mechanism —
-writing a radar sort to mirror the optical one would cost more and buy nothing the library does not
-already give.
+## The loader flag follows the fusion order
 
-It does change which burst supplies a contested pixel, which is why it belongs in a window where
-the store is being rebuilt. The radar footprint join is unaffected either way:
-`normalize_to_solar_day` gives every item in a group the same canonical noon timestamp and odc
-reads `item.datetime`, so that join key never depended on the order.
+`CollectionConfig.fusion_order` names the order a collection's items are handed to the loader in:
+`"clearest_scene"` for Sentinel-2 on Earth Search, `"most_acquired_burst"` for OPERA radar. One table
+in `stac.py` maps each name to its sort, and the same field sets `preserve_original_order`. So a
+collection is sorted exactly when the loader keeps the order, and a collection that names none
+(Landsat, Planetary Computer's Sentinel-2) keeps odc's deterministic `(time, id)`.
+
+**What this replaced.** The flag was first set for every collection, which gave radar the flag's
+effect with no sort behind it: the winner of an overlap was whatever order the CMR granule query
+returned. It was then keyed on `has_scl`, the condition gating the cloud sort, which restored odc's
+`(time, id)` for radar and made the result reproducible. The reasoning recorded with that change
+held that radar had no quality ordering, so neither of two overlapping bursts was the worse
+observation and a radar sort would buy nothing. It missed the two-track case above. With every
+item of a day on one noon timestamp, `(time, id)` resolves by granule title, which hands every
+contested day to the lowest track number, whatever track supplies most of the pixel's year.
+
+The radar footprint join is unaffected by any of this: `normalize_to_solar_day` gives every item
+in a group the same canonical noon timestamp and odc reads `item.datetime`, so that join key never
+depended on the order.
 
 ## Trade-offs accepted
 

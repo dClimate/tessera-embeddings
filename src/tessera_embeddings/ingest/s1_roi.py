@@ -14,7 +14,9 @@ and (where required) a credential callback.
      one-hour life is unrelated to the shape of the loop, and any unit that outlives the
      remaining margin cannot renew from inside itself. The loop also checks at a batch boundary
      and before every date's write, which costs nothing while the ticker keeps it fresh.
-   * Build an OPERA RTC item filter for the orbit / bounding box / batch window.
+   * Build an OPERA RTC item filter for the orbit / bounding box / batch window. Its items are
+     ranked by one census of the whole window's bursts, taken once per run, so where two bursts
+     of a day overlap the one acquired most often wins the pixel (ADR 033).
    * Call :func:`ingest_tile` to produce a per-batch ``xarray.Dataset``.
    * Apply the ROI mask, then write each date's live windows via
      :func:`tessera_embeddings.storage.zarr_store.write_day_windows` with a narrow tenacity retry
@@ -50,7 +52,7 @@ from tessera_embeddings.ingest.live_windows import (
     windows_for_date,
 )
 from tessera_embeddings.ingest.loader_failures import install_capture_everywhere, refusal_wait_out
-from tessera_embeddings.ingest.opera_query import make_s1_item_provider
+from tessera_embeddings.ingest.opera_query import BurstCensus, make_s1_item_provider
 from tessera_embeddings.ingest.roi import (
     read_roi_mask,
     read_roi_metadata,
@@ -533,6 +535,13 @@ def ingest_s1_roi_sar(
     start_date, end_date = _start.isoformat(), _end.isoformat()
     validated_batch_days(batch_days)
 
+    # ONE census for the leg, over the REQUESTED window, ranking every burst for the fusion order
+    # (`opera_query.burst_fusion_sort_key`). Not per batch, which would rank a burst by a month of
+    # acquisitions rather than its year, and not over the resumed window below, which would let a
+    # resumed leg rank bursts differently from the run it resumes and so build different pixels.
+    # Queries nothing until the first batch's provider starts it alongside its own query.
+    burst_census = BurstCensus(roi.bbox_wgs84, start_date, end_date, orbit)
+
     # Where the CATALOGUE is searched from. Everything at or below the newest held date is closed,
     # so searching back there cannot write anything — and searching is most of what a resumed run
     # does.
@@ -702,6 +711,7 @@ def ingest_s1_roi_sar(
             rng.query_start,
             rng.query_end,
             use_s3_direct=use_s3_direct,
+            burst_census=burst_census,
             mid_longitude=mid_longitude,
         )
         seen_items: list = []
