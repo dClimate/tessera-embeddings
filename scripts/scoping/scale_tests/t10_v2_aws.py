@@ -406,6 +406,7 @@ def main() -> int:
     # `build`, unless --arms names them for a library that can write them.
     by_name = {a.name: a for a in FINALISTS}
     chosen = [by_name[n] for n in args.arms.split(",")] if args.arms else None
+    assembled = chosen or [a for a in FINALISTS if a.write_order == "morton" and not a.band_first]
     if phase == "build":
         harness.run_phase(cfg, TEST, "build", lambda: phase_build(cfg, args.tiles, args.workers))
     elif phase == "read":
@@ -429,19 +430,21 @@ def main() -> int:
         )
     elif phase == "assemble":
         extent = tuple(int(v) for v in args.extent.split(","))
-        arms = chosen or [a for a in FINALISTS if a.write_order == "morton" and not a.band_first]
         harness.run_phase(
-            cfg, TEST, "assemble", lambda: phase_assemble(cfg, args.staging, extent, args.n_tiles, args.workers, arms)
+            cfg,
+            TEST,
+            "assemble",
+            lambda: phase_assemble(cfg, args.staging, extent, args.n_tiles, args.workers, assembled),
         )
     elif phase == "verify":
         from tessera_embeddings.inference.chunk_spec import parse_chunk_label
 
-        if args.staging:  # an assembled set: the tiles assembly wrote
-            shards = [parse_chunk_label(label) for label in _picks(args.staging, args.n_tiles)]
+        if args.staging:  # an assembled set: the tiles assembly wrote, in the arms it wrote them to
+            shards, arms = [parse_chunk_label(label) for label in _picks(args.staging, args.n_tiles)], assembled
         else:  # a built set: two full cycles of the tiles, each tile in two places
-            shards = [divmod(i, _side(cfg)) for i in range(min(16, _side(cfg) ** 2))]
+            shards, arms = [divmod(i, _side(cfg)) for i in range(min(16, _side(cfg) ** 2))], chosen or FINALISTS
         name = f"verify_{args.prefix.replace('/', '_')}"
-        harness.run_phase(cfg, TEST, name, lambda: phase_verify(cfg, name, args.prefix, shards, chosen or FINALISTS))
+        harness.run_phase(cfg, TEST, name, lambda: phase_verify(cfg, name, args.prefix, shards, arms))
     else:
         raise SystemExit("--phase must be build, read, points, tune, assemble or verify")
     return 0

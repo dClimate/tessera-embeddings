@@ -389,7 +389,7 @@ def _t10_tables(rows: list[dict]) -> list[str]:
         out.append("")
     arms = sorted({r["variant"] for r in _sel(rows, test="t10", phase="assemble", metric="wall_s") if r["variant"]})
     if arms:
-        base = {k: _t10_value(rows, "encode_cpu_s", "v2_c0", kind=k) for k in ("worker", "write")}
+        base = {k: _t10_value(rows, "encode_cpu_s", "v2_c0", phase="assemble", kind=k) for k in ("worker", "write")}
         out += [
             "## T10 — assembly code: CPU per staged tile, wall per run (median of passes)",
             "",
@@ -397,7 +397,7 @@ def _t10_tables(rows: list[dict]) -> list[str]:
             "|---|---|---|---|---|---|---|",
         ]
         for a in arms:
-            w, wr = (_t10_value(rows, "encode_cpu_s", a, kind=k) or 0 for k in ("worker", "write"))
+            w, wr = (_t10_value(rows, "encode_cpu_s", a, phase="assemble", kind=k) or 0 for k in ("worker", "write"))
             wall = _t10_value(rows, "wall_s", a, phase="assemble") or 0
             gb = (_t10_value(rows, "bytes_written", a, phase="assemble") or 0) / 1e9
             out.append(
@@ -409,15 +409,21 @@ def _t10_tables(rows: list[dict]) -> list[str]:
     for client in clients:
         phase = f"read_{client}"
         read_arms = sorted({r["variant"] for r in _sel(rows, test="t10", phase=phase, metric="get_requests")})
+        # Only the workloads this run's sweep scheduled: the sweep has been trimmed between runs.
+        ran = {
+            (r["params"].get("workload"), r["params"].get("dims"))
+            for r in _sel(rows, test="t10", phase=phase, metric="get_requests")
+        }
+        cols = [c for c in _T10_READS if (c[1], c[2]) in ran]
         out += [
             f"## T10 — cold reads from S3, {client} (median of passes; wire MB in brackets)",
             "",
-            "| arm | " + " | ".join(c[0] for c in _T10_READS) + " |",
-            "|---|" + "---|" * len(_T10_READS),
+            "| arm | " + " | ".join(c[0] for c in cols) + " |",
+            "|---|" + "---|" * len(cols),
         ]
         for a in read_arms:
             cells = []
-            for _, workload, dims in _T10_READS:
+            for _, workload, dims in cols:
                 kw = {"phase": phase, "workload": workload, "dims": dims}
                 v = _t10_value(rows, "read_p50_ms" if workload == "point" else "wall_s", a, **kw)
                 wire = _t10_value(rows, "bytes_fetched", a, method="wire", **kw)
