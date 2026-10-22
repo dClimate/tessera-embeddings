@@ -327,6 +327,46 @@ def test_export_zone_roi_idempotent(tmp_path) -> None:
     assert bool(np.asarray(z[10 * SHARD_PX : 11 * SHARD_PX, 5 * SHARD_PX : 6 * SHARD_PX]).all())
 
 
+def test_an_update_roi_covers_only_its_live_shards(tmp_path) -> None:
+    """A targeted update's ROI is the mask narrowed to its shards, stamped with that shard set."""
+    zone = "31N"
+    cov = make_coverage(tmp_path, zone, [(10, 5), (11, 5), (20, 8)])
+    dest = str(tmp_path / "roi.zarr")
+    # (20, 8) is live but not targeted; (12, 5) is targeted but dead in the mask.
+    tiles = frozenset({"chunk_10_5", "chunk_12_5"})
+    land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest, tiles=tiles)
+    z = zarr.open(dest, mode="r")
+    assert bool(np.asarray(z[10 * SHARD_PX : 11 * SHARD_PX, 5 * SHARD_PX : 6 * SHARD_PX]).all())
+    for row, col in [(11, 5), (12, 5), (20, 8)]:
+        assert not np.asarray(z[row * SHARD_PX : (row + 1) * SHARD_PX, col * SHARD_PX : (col + 1) * SHARD_PX]).any()
+    assert z.attrs["coverage_sha256"] == land_mask.coverage_identity("test-coverage-sha", tiles)
+    assert land_mask.live_chunk_count(zone, land_mask_path=cov, tiles=tiles) == 1
+
+
+@pytest.mark.parametrize(
+    ("tiles", "live"),
+    [(None, {(0, 0), (1, 1)}), (["chunk_1_1", "chunk_0_1"], {(1, 1)}), ([], set())],
+)
+def test_narrowing_the_live_tiles_to_a_shard_set(tiles, live) -> None:
+    tile_live = np.zeros((2, 2), dtype=bool)
+    tile_live[0, 0] = tile_live[1, 1] = True
+    narrowed = land_mask.narrow_tile_live(tile_live, tiles)
+    assert {tuple(int(i) for i in rc) for rc in np.argwhere(narrowed)} == live
+
+
+def test_a_shard_outside_the_grid_is_refused() -> None:
+    with pytest.raises(ValueError, match="outside the zone's"):
+        land_mask.narrow_tile_live(np.ones((2, 2), dtype=bool), ["chunk_2_0"])
+
+
+def test_the_coverage_identity_names_the_shard_set_not_its_order() -> None:
+    assert land_mask.coverage_identity("sha", None) == "sha"
+    assert land_mask.coverage_identity("sha", ["chunk_0_1", "chunk_0_0"]) == land_mask.coverage_identity(
+        "sha", ["chunk_0_0", "chunk_0_1"]
+    )
+    assert land_mask.coverage_identity("sha", ["chunk_0_0"]) != land_mask.coverage_identity("sha", ["chunk_0_1"])
+
+
 def test_export_zone_roi_rebuilds_after_partial_write(tmp_path) -> None:
     """The coverage-sha discriminator is stamped LAST, so an ROI missing it (a
     crash before the final attr write) is rebuilt rather than trusted: idempotency

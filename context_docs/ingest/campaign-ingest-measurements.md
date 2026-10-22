@@ -574,8 +574,8 @@ snapshot.
 
 **An earlier reading of "1.14x, adopt it globally" is SUPERSEDED.** That figure is real but it is
 one point on a curve that is **not monotonic**: the same setting measured on four further regions
-*loses* on two of them. Batching is therefore not a global setting — it is sized per region, and
-the default is off.
+*loses* on two of them. Batching is therefore not a global setting: it pays for sparse writes and
+loses on dense ones, and is now sized per date by the chunks each date writes (§3.21).
 
 **Why it can lose.** Batching trades commit count for graph size and peak memory. Where the fleet
 has idle capacity the larger graph packs into it and the saved commits are free; where it does not,
@@ -731,6 +731,104 @@ fails without it:
 **What this reopens.** §4.1 rejected a coarser store chunk because inference read whole chunks.
 With sharding the unit ingest writes and the unit inference reads are independent, so a larger
 block no longer costs readers anything. Not measured.
+
+### 3.20 Six task threads per worker — a few percent on dense zones, nothing elsewhere
+
+Ingest workers are 4 vCPU and ran dask-cloudprovider's default of one task thread per vCPU. A band
+read waits on S3 for part of each task, so a worker can have CPU to spare with every thread busy.
+`DEFAULT_INGEST_WORKER_NTHREADS = 6` (`providers/aws/dask.py`) now gives every ingest worker, S2
+and S1, six. It is outside the ingest code identity, so stores built at four threads resume
+unchanged.
+
+Each row is a pair of arms run at the same time, identical but for the threads, so the comparison
+is immune to the hours-scale latency drift (§11.6). Same-time pairs on main's Dask stack at
+4096-px chunks:
+
+| Arms | 4 threads | 6 threads | Worker CPU | Peak worker memory |
+|---|---|---|---|---|
+| 35N, 1–7 Jan 2024, S2, 60 workers, pipelined (yield dev, 2026-10-02) | 134 s/date median, $4.45 | **130 s, $4.34** | 85% → 92% while the threads are ≥ 90% busy | 3.7 → 5.7 GiB |
+| Iowa, 2 June – 5 July 2024, S2, 60 workers, 25 dates in auto-sized batches of 4 (global-tessera-dev, 2026-10-05) | 344.0 s of writes | 344.3 s | 53% → 59% | 3.3 → 3.7 GiB |
+| Iowa, June – August 2024, S1 ascending, 13 workers, all 21 dates | 6m44s, $0.36 | 6m56s, $0.36 | 42% → 52% | 2.3 → 2.8 GiB |
+
+**The gain tracks how fully the fleet's threads are used, not the thread count.** On 35N one
+date's work oversubscribes the fleet (§1), so the two extra threads per worker take up idle CPU:
+3% faster and 2.5% cheaper a date, with each band read about 1.5× slower (469 → 715 ms at 10 m)
+because six threads share four cores. Iowa's fleets are wider than their work, run at half their
+CPU, and never fill the four threads they have, so six change nothing in either direction. The
+Frisky engine at 2048-px chunks (draft PR #205) left its workers at 73% CPU with four threads and
+gained 15% from six; main's workers do not have that headroom. Six threads with
+`GDAL_NUM_THREADS=1` was also tried there and ran 6% slower than six with GDAL's default.
+
+**Adopted** because it costs nothing where it does not help: memory stays under a quarter of the
+24 GiB worker, and no arm spilled, paused or lost a worker. Dense zones carry most of the campaign's
+worker hours, so the saving there is real money at campaign scale, at most about $4,700 of the
+nine-year campaign's $187,441 container bill (`context_docs/campaign/campaign-cost-model.md`).
+
+### 3.21 Pipelining becomes automatic, and batching is sized by sparsity — the Latin America update (October 2026)
+
+**What the run showed.** The production Latin America update of 2026-10-19 ran its S2 legs on
+60-worker fleets with date pipelining off, as every campaign run until then had. All 659 S2
+`Stage timings` and `Batch timings` lines report `hidden=0.0`: no date's preparation overlapped a
+write. Each date paid fixed costs of about 1.7 s to build its read plan, 4.9 s for the cloud-mask
+check and 10 s of write overhead, against about 2.3 s per window written, and an update's date
+touches a median of about six windows, so the fixed costs were most of every date. The fleets
+averaged between 110 and 450 tasks in flight against 360 task slots (60 workers of six threads).
+
+Three zone-years (18S, 19S, 20N) also wrote one date at a time. Their scattered update windows
+covered more than 500 chunks in all, so `auto_batch_dates` (§3.16) read them as large regions,
+while each date touched only a handful of windows and paid the 10 s write overhead alone. The
+smaller zone-years, which did batch, paid about 5 s of write overhead a date on fleets of 10 to 53
+workers.
+
+**Decision 1: pipelining is automatic.** The S2 flow takes no `pipeline_dates` parameter. It
+pipelines on every Fargate fleet up to `MAX_PIPELINE_DATES_WORKERS` (140 workers) and on every
+local cluster. The paired tests recorded in the yield-embeddings test plan (F-22 to F-25) and its
+fleet scaling report (§8, correction of 2026-07-26) support it:
+
+| Measure | 120 workers | 60 workers | 45 workers |
+|---|---|---|---|
+| preparation an unpipelined arm paid (read plan + cloud-mask check, s/date) | 12.5 | 18.5 | 20.6 |
+| median per-date gain, first paired test at that width | +0.7 s (1.01×) | +21.8 s (1.14×) | not measured |
+
+The cycle saving was positive in all four paired tests (4.8, 22.1, 20.9 and 6.7 s a date), so no
+pipelined run has been slower end to end. The read plan, about 5.8 s of each figure above, is one
+thread in the ingest's driver and is always hidden; the cloud-mask check runs as fleet tasks and is
+hidden only into idle worker time. Why preparation shrank only 1.6× from 45 to 120 workers while
+the write shrank about 2.4× is not settled; the working suspicion is that the read plan cannot use
+more workers and that the check is a small graph bound by per-request read latency. Nothing has
+been measured below 45 workers or above 120, so the 140-worker bound is a precaution, not a
+measured loss. Stores are byte-identical either way (parity test). The domain function keeps its
+`pipeline_dates` argument for direct callers.
+
+**Decision 2: batching is sized by what each date writes.** Batching saves per-write overhead and
+nothing else, so it pays for sparse writes and loses on dense ones (§3.16: 1.61× on 26S and 1.12×
+on 59S, but 29% slower on 21N and 7% on 35N). Neither proxy measured that: the covered-area
+threshold misread the update's sparse large zone-years, and "every update batches" would misread
+a dense update. The S2 ingest now counts the storage chunks each date's footprint-narrowed windows
+cover, and fills a batch with up to four dates while their chunks stay within
+`BATCH_CHUNKS_PER_WORKER` (12) per worker; a date that would cross the budget starts a new batch,
+so a dense date writes alone. The batches are decided before any date is prepared, from that
+geometry, and the pipeline prepares one whole batch ahead; an earlier draft let the writer and the
+look-ahead each decide batch membership, and every review round found a new way for the two to
+disagree. One rule for campaign fills, updates and single-area runs: the S2
+flow passes the budget from its planned width, and any other caller gets it from the workers its
+Dask client reports.
+
+The budget is empirical and deliberately conservative: no theory sets it. The largest batch the
+sweep measured to gain was 59S's, about 750 chunks at four dates on fleets of 40 to 60 workers
+(the width was not recorded), so 12.5 to 19 chunks a worker; twelve, about 720 a batch on 60
+workers, sits at or below the low end of that. **To tune it from the restarted
+production run:** compare the `Batch timings` lines of 18S, 19S and 20N, which now carry
+`chunks=N`, against run 1's one-date writes of about 31 s at about six windows a date, and watch
+for writes on 60-worker fleets that lengthen as batches grow. The six-thread workers (§3.20, PR
+#214) arrived after the July sweep, so where batching starts to crowd the fleet may have moved.
+
+`config.ingest.auto_batch_dates` and its threshold are no longer called but stay defined:
+`config/ingest.py` is inside the inference code identity's closure, so removing them would move
+that identity. They go with the next change that moves it anyway. The ingest code identity moves
+away from `ingcode-67740a8483141eda` (`ingest/s2_roi.py` changed), so resuming
+mosaics built before this change needs `allow_ingest_code_mismatch=true`. The inference identity
+is unchanged (`infcode-44bbc47265fcb6a8`). Batched stores are byte-identical (batching parity test).
 
 ## 4. What did not work, and why
 
@@ -1707,6 +1805,7 @@ defect fix.
 | `F`, per-window blocking cost | 7.04 s | fitted by differencing two runs (constants cancel). **Do not use the linear model it belongs to** — `cost = n_windows x F + area x V` failed its first out-of-sample test and is superseded by §12's dispatch-floor model. `F` survives inside that model as the per-window floor, binding only when a window is small |
 | scheduler envelope | one core of 4 saturated, never >100%; RSS peak 1.79 / 8 GiB | 114 heartbeats |
 | per-date client graph build | 7.2 s (3.47 gate + 3.74 bands), one now removed | measured |
+| S2 fixed per-date costs on an update, unpipelined, 60 workers | build ~1.7 s + gate ~4.9 s + write overhead ~10 s, against ~2.3 s per window; `hidden=0.0` on all 659 timing lines | measured, production Latin America update, 2026-10-19 (§3.21) |
 | STAC query | 5.58 ms/item; 164 s/month; ~34 min/year; 368,248 items/year | measured, linear 3→14 days |
 | STAC page size ceiling | 250 (500 and 1000 both fail) | measured |
 | Earth Search page-1 refusal | 502 at `limit=250`; 200 at `limit=100`, same window | measured (§7c) |
@@ -1740,6 +1839,7 @@ defect fix.
 | hottest worker | 10.16 GiB of 16 at 8192 blocks; spill 0 throughout | run telemetry |
 | inference baseline (do not regress) | GPU util 99% in-phase, VRAM 97% peak, host RAM 46% of a 60% ceiling, GPU-idle ~6 s/chunk | 2,352 RESOURCES samples |
 | **ingest worker size (CURRENT)** | 4 vCPU / **24576 MiB** | Superseding, in order: 16384 → 30720 → 20480 → 24576 → 16384 → **24576**. **16384 is WITHDRAWN**, and with it §4.8's claim that pruning made the original size affordable: its 7.91 GiB peak over 91 dates was measured on 2017–18 optical at ~8 windows per date, and 2019 carries 14–16. The overlapped write (§3.11) holds a date's windows concurrently, so demand scales with that count — six workers on 2019 optical paused at **11.92 GiB**, 80% of the 14.90 GiB limit this size gives Dask, and never resumed, stalling four zone-years. 20480 was not chosen instead because §3.13 already records it as short: it was itself sized against a ~12.4 GiB short-run peak against a true ceiling of ~15. Whether 24576 holds at 60 concurrent cells on 2019-density data is **UNMEASURED**. With Dask task definitions PINNED the constant sets only Dask's `--memory-limit`, so the consumer's registered definition must be raised to match or the pause threshold lands above the container's hard limit. vCPU stays at 4 — the quota counts vCPU. |
+| **ingest worker task threads (CURRENT)** | **6** per 4 vCPU | 35N S2 paired: 134 → 130 s/date, $4.45 → $4.34, peak memory 3.7 → 5.7 GiB; Iowa S2 and S1 level (§3.20). Travels in the per-run worker command, so pinned task definitions need no change |
 | streaming retention cost | +1 month of items on the ingest worker; 1.25 GiB spill at 16 GiB | run telemetry |
 | items deferred across a month boundary | 1,084 of 31,507 (one day's worth) | live cluster |
 | write floor | graph ≈ store_chunks × bands; 2,992 covered vs 2,415 live (19% dead) | measured, all 7 windows |

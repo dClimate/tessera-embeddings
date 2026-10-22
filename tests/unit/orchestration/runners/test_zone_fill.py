@@ -15,6 +15,7 @@ from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.orchestration.runners import zone_fill
 from tessera_embeddings.storage import global_store, shard_writer
 from tessera_embeddings.storage.empty_store import VarSpec, create_empty_store_from_coords
+from tessera_embeddings.storage.update import UpdateTarget, commit_update_record, update_record
 from tessera_embeddings.storage.zarr_store import open_or_create_repo
 from tessera_embeddings.storage.zone_grid import ZoneSpec, easting_coords, northing_coords
 
@@ -323,37 +324,76 @@ def test_an_unusable_assembly_worker_override_is_refused_before_inference(tmp_pa
         _fill(tmp_path, store, n_assembly_workers=bad)
 
 
-def test_the_runner_refuses_a_rule_the_store_does_not_advertise(tmp_path):
-    """The store's minimum-depth rule is write-once root identity, so the STORE is the
-    authority on what rule its zones were filled under — not the caller's config.
+@pytest.mark.parametrize(
+    ("root_rule", "is_update", "config_rule", "refused"),
+    [
+        (None, False, 25, "advertises"),
+        (None, False, None, None),
+        (15, False, 1, "advertises"),
+        (15, True, 1, None),
+        (15, True, None, "advertises"),
+        (15, True, 20, "only loosen"),
+        (None, True, 1, "only loosen"),
+    ],
+)
+def test_the_runner_applies_only_the_stores_rule_or_an_updates_looser_one(
+    tmp_path, root_rule, is_update, config_rule, refused
+):
+    """The STORE is the authority on what rule a cell is filled under, not the caller's config: a
+    fill applies the root's rule exactly, and an update may apply a looser one but never a stricter.
 
-    The Prefect adapter reads the root and substitutes the value before calling. This runner
-    is the orchestrator-agnostic entry point and was trusting that: called directly, it would
-    run inference under any threshold, publish, and mark the year complete. Zones filled under
-    different lines would then sit under one root advertising a single rule, and no later check
-    could tell which pixels came from which — a refused pixel is indistinguishable from one
-    that had no optical input.
-
-    Asserted rather than substituted: silently replacing a caller's value would let a direct
-    caller believe it had configured a line it had not.
+    The Prefect adapter reads the store and substitutes the value before calling. This runner
+    is the orchestrator-agnostic entry point: trusting the config, a direct call would fill
+    under any threshold, and no later check could tell which pixels came from which — a refused
+    pixel is indistinguishable from one that had no optical input. Asserted rather than
+    substituted, so a direct caller never believes it configured a line it had not.
     """
-    store = _seed_global(tmp_path)  # seeded with no rule, so the store advertises None
-    config = InferenceConfig(time_window=_WINDOW, chunk_size=_TILE, num_gpus=0, optical_min_obs=25)
-    with pytest.raises(ValueError, match="write-once root identity"):
-        _fill(tmp_path, store, config=config)
-
-
-def test_the_runner_accepts_a_config_matching_the_store(tmp_path):
-    """The adapter's substitution must satisfy the check, not trip it — otherwise every
-    Prefect fill would fail on the guard meant to protect direct callers.
-    """
-    store = _seed_global(tmp_path)
-    config = InferenceConfig(time_window=_WINDOW, chunk_size=_TILE, num_gpus=0, optical_min_obs=None)
-    # This wiring points at an absent mask on purpose, so the fill still fails — just LATER,
-    # on the mask, which is what proves the rule check passed rather than short-circuited.
+    store = _seed_global_with_rule(tmp_path, root_rule)
+    update = UpdateTarget("u", "holes", "keep", "global", None, "h") if is_update else None
+    config = InferenceConfig(time_window=_WINDOW, chunk_size=_TILE, num_gpus=0, optical_min_obs=config_rule)
+    # A config that clears the check still fails LATER (the cell is unfilled, the mask absent),
+    # which proves the check passed rather than short-circuited.
     with pytest.raises(Exception) as exc:
-        _fill(tmp_path, store, config=config)
-    assert "write-once root identity" not in str(exc.value), "the matching config must clear the rule check"
+        _fill(tmp_path, store, config=config, update=update)
+    assert all((word in str(exc.value)) is (word == refused) for word in ("advertises", "only loosen"))
+
+
+def _record_updates(store: str, *lines: tuple[str, int]) -> None:
+    """Mark the test cell filled and record earlier updates of it, each at its own line."""
+    session = global_store.open_global_repo(store).writable_session("main")
+    zarr.open_group(session.store, mode="a")[_ZONE].attrs["years_complete"] = [2025]
+    session.commit("filled")
+    for name, line in lines:
+        target = UpdateTarget(name, "shards", "keep", "global", None, "h")
+        record = update_record(target, run_id=name, written=["chunk_0_0"], kept=[], optical_min_obs=line)
+        commit_update_record(global_store.open_global_repo(store), _ZONE, 2025, record=record)
+
+
+def _update_at(tmp_path, store: str, name: str, line: int | None):
+    config = InferenceConfig(time_window=_WINDOW, chunk_size=_TILE, num_gpus=0, optical_min_obs=line or 15)
+    update = UpdateTarget(name, "shards", "keep", "global", None, "h")
+    return _fill(tmp_path, store, config=config, update=update)
+
+
+@pytest.mark.parametrize(("line", "refused"), [(None, True), (5, True), (1, False)])
+def test_an_update_may_not_tighten_a_cell_an_earlier_update_loosened(tmp_path, line, refused):
+    """After an update at 1, a later one at the root's 15 or at 5 would drop (``shards``) or count as
+    thin (``holes``) the pixels the first one embedded, so the runner refuses it before inference.
+    """
+    store = _seed_global_with_rule(tmp_path, 15)
+    _record_updates(store, ("earlier", 1))
+    with pytest.raises(Exception) as exc:
+        _update_at(tmp_path, store, "later", line)
+    assert ("earlier update" in str(exc.value)) is refused
+
+
+def test_rerunning_a_recorded_update_is_not_a_tightening(tmp_path):
+    """Update a at 5, then b at 1: rerunning a (to catch up its registry master) does no inference and
+    writes no pixel, so it settles as already recorded rather than being refused.
+    """
+    store = _seed_global_with_rule(tmp_path, 15)
+    _record_updates(store, ("a", 5), ("b", 1))
+    assert _update_at(tmp_path, store, "a", 5)["already_recorded"]
 
 
 def test_chunk_size_shard_mismatch_raises(tmp_path):
@@ -861,8 +901,8 @@ def test_the_flow_actually_defers_both_deletes():
     )
 
 
-def _seed_global_with_rule(tmp_path, rule: int) -> str:
-    """A store whose write-once root declares a depth rule, so the fill's gate accepts one."""
+def _seed_global_with_rule(tmp_path, rule: int | None) -> str:
+    """A store whose root declares a depth rule (or none), so the fill's gate accepts that one."""
     store = str(tmp_path / "global.icechunk")
     repo = global_store.create_global_repo(store)
     global_store.seed_zone_groups(repo, [_SPEC], years=_YEARS, layout=SMALL, optical_min_obs=rule)
@@ -874,6 +914,12 @@ def _published_part(registry_root: str) -> dict:
     ds = pytest.importorskip("pyarrow.dataset")
     table = ds.dataset(f"{registry_root}/parts", partitioning="hive").to_table()
     return table.to_pydict()
+
+
+def _master_tiles(registry_root: str) -> list[str]:
+    """The tiles in the cell's ``master/`` file — present only if the fill brought it up to date."""
+    pq = pytest.importorskip("pyarrow.parquet")
+    return pq.read_table(f"{registry_root}/master/zone={_ZONE}/year=2025/part-0.parquet").column("tile").to_pylist()
 
 
 def test_the_registry_records_the_depth_rule_the_cell_was_filled_under(tmp_path, monkeypatch):
@@ -907,6 +953,96 @@ def test_the_registry_records_the_depth_rule_the_cell_was_filled_under(tmp_path,
     assert cols["tile"], "a part was published"
     assert set(cols["optical_min_obs"]) == {15}, "every row states the store's rule"
     assert set(cols["embedded"]) == {True}
+    assert _master_tiles(registry_root) == sorted(cols["tile"]), "and the cell's master is current"
+
+
+def _fill_one_tile(tmp_path, registry_root: str):
+    """A one-tile cell filled under a depth rule, with its registry beside it."""
+    return _fill(
+        tmp_path,
+        _seed_global_with_rule(tmp_path, 15),
+        land_mask_path=_make_mask(tmp_path, [(0, 0)]),
+        mosaic_base=_make_mosaic(tmp_path),
+        registry_root=registry_root,
+        config=InferenceConfig(time_window=_window(2025), chunk_size=_TILE, num_gpus=0, optical_min_obs=15),
+    )
+
+
+def test_a_failed_master_update_does_not_fail_a_landed_cell(tmp_path, monkeypatch, caplog):
+    """The cell has committed by then; the master is an index beside it, and repairable."""
+    monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub({}))
+
+    def unreachable(*_args: object, **_kwargs: object) -> list[str]:
+        raise OSError("S3 500")
+
+    monkeypatch.setattr(zone_fill, "merge_cell", unreachable)
+    with caplog.at_level(logging.ERROR):
+        summary = _fill_one_tile(tmp_path, str(tmp_path / "registry"))
+    assert summary["tag"], "the cell landed and was tagged"
+    assert "registry master NOT merged" in caplog.text
+
+
+def _all_skip_inference(num_actors, config, chunks, mosaic_base, staging_base, run_id, t0, log, **kwargs):
+    """Every tile refused, with nothing staged: the store holds nothing for them before or after."""
+    writer = ZarrWriter(staging_base, embedding_dim=_BAND)
+    for chunk in chunks:
+        writer.write_skip_marker(chunk, run_id, {"label": chunk.label, "refused": {"no_optical": 4}})
+    return [{"chunk": c.label, "status": "skipped", "valid_pixels": 0, "elapsed_sec": 0.0} for c in chunks]
+
+
+@pytest.mark.parametrize(
+    ("inference", "part_survives"),
+    [(_staging_inference_stub({}), True), (_all_skip_inference, False)],
+    ids=["its-part-published", "an-all-refused-run-whose-part-never-published"],
+)
+def test_a_retry_merges_the_master_a_fill_died_before_reaching(tmp_path, monkeypatch, caplog, inference, part_survives):
+    """The retry finds the cell complete and skips the fill, so planning merges the master or nothing does.
+
+    An all-refused run over a tile the store held nothing for still shows in its commit's diff, so
+    its retry refuses while its part is missing.
+    """
+    monkeypatch.setattr(zone_fill, "run_inference", inference)
+    store, registry_root = _seed_global_with_rule(tmp_path, 15), str(tmp_path / "registry")
+    cell = {
+        "land_mask_path": _make_mask(tmp_path, [(0, 0)]),
+        "mosaic_base": _make_mosaic(tmp_path),
+        "registry_root": registry_root,
+        "config": InferenceConfig(time_window=_window(2025), chunk_size=_TILE, num_gpus=0, optical_min_obs=15),
+    }
+    merge = zone_fill._merge_registry_master
+
+    def died(*_args: object, **_kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(zone_fill, "_merge_registry_master", died)
+    with pytest.raises(KeyboardInterrupt):
+        _fill(tmp_path, store, **cell)
+    if not part_survives:
+        for part in (tmp_path / "registry" / "parts").rglob("*.parquet"):
+            part.unlink()
+    monkeypatch.setattr(zone_fill, "_merge_registry_master", merge)
+    with caplog.at_level(logging.ERROR):
+        assert _fill(tmp_path, store, **cell)["already_complete"] is True
+    if part_survives:
+        assert _master_tiles(registry_root) == ["chunk_0_0"]
+    else:
+        assert "last wrote 1 tile(s) no part describes" in caplog.text
+
+
+def test_the_master_learns_of_a_refill_that_fails_at_the_tag_step(tmp_path, monkeypatch):
+    """A deliberate refill fails at tagging by design — zone-year tags are write-once — after its data
+    and part have landed. Updating the master after the tag would never reach it.
+    """
+    monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub({}))
+
+    def spent(*_args: object, **_kwargs: object) -> str:
+        raise ValueError("tag zone-01N-2025 already exists")
+
+    monkeypatch.setattr(zone_fill, "tag_zone_year", spent)
+    registry_root = str(tmp_path / "registry")
+    with pytest.raises(ValueError, match="already exists"):
+        _fill_one_tile(tmp_path, registry_root)
+    assert _master_tiles(registry_root) == ["chunk_0_0"]
 
 
 def test_an_all_refused_cell_still_records_the_depth_rule(tmp_path, monkeypatch):
@@ -944,6 +1080,7 @@ def test_an_all_refused_cell_still_records_the_depth_rule(tmp_path, monkeypatch)
     assert set(cols["embedded"]) == {False}, "every tile refused"
     assert set(cols["optical_min_obs"]) == {15}
     assert set(cols["refused_thin_px"]) == {4}, "and the reason survived alongside the rule"
+    assert _master_tiles(registry_root) == sorted(cols["tile"]), "this branch updates the master too"
 
 
 def test_a_store_with_no_depth_rule_publishes_null_not_zero(tmp_path, monkeypatch):

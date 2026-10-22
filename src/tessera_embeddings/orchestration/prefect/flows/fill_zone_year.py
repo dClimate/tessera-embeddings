@@ -42,6 +42,7 @@ from tessera_embeddings.orchestration.prefect.flows._ray_lifecycle import (
     ray_cleanup_on_cancellation,
 )
 from tessera_embeddings.orchestration.runners.zone_fill import (
+    _store_credentials,
     assert_calendar_year_window,
     fill_zone_year,
     preflight_destination,
@@ -73,7 +74,10 @@ def _optical_min_obs_from_store(
     ``None`` means the store declares no rule — every store seeded before 2026-08-13 — and the fill
     then embeds everything with any optical input, which is what those stores already contain.
     """
-    root = open_store_as_zarr_group(store_path, get_credentials=get_credentials, region=s3_region)
+    # The store's own credential, chosen from the path, so no caller can hand it the task role.
+    root = open_store_as_zarr_group(
+        store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
+    )
     value = root.attrs.get("optical_min_obs")
     if value is None:
         return None
@@ -106,7 +110,10 @@ def _assert_seeded_model_matches(
     the encoder URL is gated; seed with ``model_version=checkpoint_filename()`` to enable
     checkpoint-level gating.
     """
-    root = open_store_as_zarr_group(store_path, get_credentials=get_credentials, region=s3_region)
+    # The store's own credential, chosen from the path, so no caller can hand it the task role.
+    root = open_store_as_zarr_group(
+        store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
+    )
     seeded = cast("str | None", root.attrs.get("geoemb:model"))
     # EXPLICIT, not defaulted. The campaign fills with v1.1 today — `fill_zone_year` exposes no
     # model selector — but an unversioned call here silently compares any future v2 fill

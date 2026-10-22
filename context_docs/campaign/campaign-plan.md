@@ -278,8 +278,8 @@ Three records, in increasing detail:
    Tags are write-once, so a tag is a permanent, reproducible handle:
    `repo.readonly_session(snapshot_id=repo.lookup_tag("zone-33N-2025"))` reads that cell exactly
    as it was published, regardless of what landed afterwards.
-3. **`runs`** in the zone group `attrs`, one entry per year: the run id, when it was assembled, the
-   input window it was built over, which live tiles produced no data at all
+3. **`runs`** in the zone group `attrs`, one entry per year: the run id, when it was assembled, its
+   shard commit and the runs a refill replaced (for fills since v1.1), the input window it was built over, which live tiles produced no data at all
    (`optical_skips` — this is what separates ocean from a tile that yielded nothing), and the
    observation-depth summary (`s1_free_pct`, `s1_thin_pct`, `s2_thin_pct`).
 
@@ -342,7 +342,7 @@ is in this table because it is the most consequential value in it.
 | **`max_parallel_clusters`** | **10** ★ — **also run at 25** | 10 x 250 actors reaches the full 2,500-actor quota, and each cluster opens on one of the 10 densest zones; balance holds to ~16. **There is no single assembly ceiling — see the note above the table. 25 clusters is the other supported shape, chosen so a cluster that finishes early releases quota the survivors climb into; it costs the same to within about 0.2%, the difference being one Ray head node per cluster** |
 | **`max_parallel_ingest`** | **60** ★ | fleet-wide cap on simultaneous zone-ingests. With every year in one batch the ingest knee is gone, so this is set by quota and by what the GPU fleet can absorb (§6). **60 rather than 61, and the reason is division:** each cluster's share is this cap over the cluster count ROUNDED UP, so 61 over 10 aims every cluster at 7 and the fleet at 70 against its own gate of 61 — the gate holds the ceiling, so it oversubscribes rather than breaches, but the clusters queue on it and the log reports a width the fleet never runs at. 60 over 10 is exactly 6. Now the flow DEFAULT, so it needs no passing |
 | `max_dispatch_rounds` | 2 | **The outer recovery.** How many times the campaign re-dispatches whatever is still missing — rounds, not a per-zone budget. It is the only thing that recovers a child run that DIED, since a killed or cancelled run takes its own retry counter with it (§8) |
-| `immediate_refill` | `false` | **Off for the run in flight; turn it on at the next restart.** A dispatch round is a barrier — it collects every cluster's outcome before re-reading the store — so a cluster that dies early makes its whole roster wait for the round's slowest sibling. On, a settled cluster's still-missing cells go straight back out into the slot it vacated, inheriting its ingest and committer shares so fleet width and cost do not move. Admitted only when the predecessor's terminal state shows its own writers stopped AND a settling delay has passed, so the asynchronous cancellation of its descendants has had time to take effect; the delay is derived from the confirmation budget the fill's own teardown already spends. A crash or a cancellation waits, because neither carries that proof and re-dispatching them automatically is what §8's write-fencing note is about. It admits, it does not RESERVE: nothing locks a cell, so a writer dispatched from outside the campaign is not excluded — the same residual the round's own re-dispatch has always carried, bounded by mosaic commits refusing a second writer rather than merging. Off is byte-for-byte the old path, which is what makes it safe to merge mid-campaign (§8) |
+| `immediate_refill` | `false` | **Off for the run in flight; turn it on at the next restart.** A dispatch round is a barrier — it collects every cluster's outcome before re-reading the store — so a cluster that dies early makes its whole roster wait for the round's slowest sibling. On, a settled cluster's still-missing cells go straight back out into the slot it vacated, inheriting its ingest share so fleet width and cost do not move. Admitted only when the predecessor's terminal state shows its own writers stopped AND a settling delay has passed, so the asynchronous cancellation of its descendants has had time to take effect; the delay is derived from the confirmation budget the fill's own teardown already spends. A crash or a cancellation waits, because neither carries that proof and re-dispatching them automatically is what §8's write-fencing note is about. It admits, it does not RESERVE: nothing locks a cell, so a writer dispatched from outside the campaign is not excluded — the same residual the round's own re-dispatch has always carried, bounded by mosaic commits refusing a second writer rather than merging. Off is byte-for-byte the old path, which is what makes it safe to merge mid-campaign (§8) |
 | `ingest_settings.max_workers` | 60 | S2 fleet width. Shortens each cell, and so the tail of the cluster holding the densest zone (§6) |
 | `ingest_settings.s1_worker_fraction` | 0.22 | → 13 workers per S1 orbit at the recommended 60w, sized to finish inside S2 |
 | `ingest_settings.batch_days` | 30 | S1 batch length |
@@ -352,13 +352,12 @@ is in this table because it is the most consequential value in it.
 | `allow_partial_window` | `false` | a zone-year is a full calendar year or it fails |
 | **`allow_s2_only`** | **`true`** ★ | On for the global campaign. A fifth of the land has no radar for 2022–24 (§6); without this those pixels produce nothing. Cambridge validated radar-free embeddings, which cleared ADR 013's blocking follow-up. Registered on the campaign's own deployments, so a global run gets it without anyone passing it — see the note below |
 | `require_s1` | `false` | Also registered on the campaign's deployments. A global run never refuses a cell for having no radar; that option exists for an operator filling one named zone-year who wants to be told (§8) |
-| **`optical_min_obs`** | **15** | **The one data-quality line, and the only reason a pixel is refused.** Fewer than fifteen clear optical observations in the year and the pixel is left empty; exactly fifteen is kept. Stamped on the store when it is seeded, so every cell is measured against the same line and a consumer can read what it was. Nothing about radar enters this decision |
+| **`optical_min_obs`** | **1** | **The one data-quality line.** Any pixel with a clear optical observation in the year is embedded; only a pixel with none is left empty, as the dataset leaves it under any rule. Stamped on the store's root when it is seeded and never moved. v1.1 was filled at 15; a targeted update with a lower line of its own embeds the rest in place, and each updated cell's update records state that line ([ADR 028](../decisions/028-embed-every-pixel-with-an-optical-observation.md)). Nothing about radar enters this decision |
 | **`overlap_years`** | **`true`** ★ | every requested year dispatched as one batch, so a zone's later years overlap the inference of its earlier ones and the campaign boots 8 clusters rather than 72. Certified on six cells that each carry both radar orbits, including a same-zone year rollover inside one cluster |
 | `attempts_per_cell_in_cluster` | 2 | **The cheap retry.** One more go at a failed cell on the GPU fleet that is still standing — the cell re-enters the live work stream, reusing its kept mosaic and staged tiles. Covers "the work failed but the machine is fine"; a dead run is `max_dispatch_rounds`' job (§8). The retry happens inside the live work stream precisely so that a retried cell does not rebuild a GPU fleet — `context_docs/inference/the-fleet-and-the-work-source.md` |
 | `force_staging_reuse` | `false` | Escape hatch, and it cannot reach staging created without it: setting it changes the prefix, so it only preserves reuse between runs that both set it. To RESTART onto an earlier campaign's staged tiles, pass `staging_code_identity` (§8) |
 | `staging_code_identity` | `""` | The restart lever. States the fingerprint's code component outright instead of deriving it, which is the only form that reaches an existing prefix. Copy the value from the driver's log of the campaign being resumed. Mutually exclusive with both rows around it (§8) |
 | `force_staging_restage` | `""` | Any new token forces a fresh staging prefix, for a change the source hash cannot see (a dependency upgrade). Abandoning stale staged work is always safe, so unlike the row above this one is usable in production |
-| commit limit | derived, `min(clusters, 8)` = **8** | Never set by hand. It bounds commits in flight (~1 s each), not concurrent assemblies — so at 10 clusters two may briefly queue a commit, which is the intent: the gate is a bound, not an operating point, and seconds of queueing costs nothing against zones that run for hours |
 | leg retry wall-clock budget | **6 h** (`max_leg_wall_clock_s`) | **Ingest.** A zone-year's ingest is three legs (optical, plus one per radar orbit), and each retries on its own when a source misbehaves. This caps how long ONE leg may keep retrying, so a single stuck source cannot hold a whole zone (and the Dask fleet it is paying for) indefinitely. **Counted per leg**, from that leg's first try, so one slow leg cannot spend another's budget. Measured in time rather than tries because one try can itself take minutes. Nothing is lost when it fires: ingest commits date by date, so everything already fetched is kept, the cell goes back on the work list, and the next dispatch carries on from where it stopped — giving up early costs latency, not work. Six hours still clears three legs of the slowest dense zone |
 | pause between leg tries | **30 s, doubling to a 2-minute ceiling** (`leg_retry_backoff_s`) | Deliberately short. A retry picks up from the dates already committed, so it costs only the work actually lost, and the campaign's pace depends on legs landing — a long pause leaves a GPU fleet waiting on a mosaic. The pause exists only to tell a momentary refusal from a permanent one, which does not take minutes; a failure no retry can fix waits not at all (§8) |
 | Earth Search page size | 100 | Set per provider. This catalogue refuses some (area, window) pairs at 250 and answers the same query at 100 — see the note below |
@@ -366,10 +365,9 @@ is in this table because it is the most consequential value in it.
 The remaining gates are **Prefect global concurrency limits**, because clusters are separate flow
 runs on separate machines and only a server-side gate can bound them together.
 
-**There is no commits gate** — see
-[`../storage/writing-to-the-global-store.md`](../storage/writing-to-the-global-store.md) §5, which
-carries the measurement, the committer-count threshold that would open one, and the detector that
-would say so. Nothing bounds committers, and no pre-launch provisioning step is needed for one.
+**There is no commits gate**, and none is to be added — see
+[`../storage/writing-to-the-global-store.md`](../storage/writing-to-the-global-store.md) §5 for the
+measurement and the commit-latency detector.
 
 | gate | who creates it | if it is absent |
 |---|---|---|
@@ -693,7 +691,9 @@ rather than impossible. Our own buckets — mosaics, staging, figures, verdicts 
 * **Versioning stays OFF** With versioning on, deletes leave markers and prior
   versions, so mosaics deleted after consumption keep billing and the true footprint silently
   diverges from the intended one. The ~$3,000 storage figure depends on deletion actually
-  reclaiming space.
+  reclaiming space. The published bucket is not one of ours; the versioning its owner can enable
+  for the registry keeps the store prefix unversioned with a one-day lifecycle rule
+  ([`registry-master.md`](../storage/registry-master.md)).
 * **Verify a deletion by listing the prefix, never by an exit code.** One pass is not reliably
   complete: a run has reported a single error while leaving residue in three prefixes, two of them
   with no error at all.
@@ -896,9 +896,8 @@ are what that code produced.
 
 Two consequences of how recovery actually behaves, both of which remove work rather than add it. A
 fill's terminal hook tears down its GPU fleet even when the flow body is killed outright, skipping
-every `finally` — so a leaked Ray fleet is not an event to plan around. And a dead committer's gate
-slot returns on its own within about five minutes, so a whole cluster dying is a short stall on
-commits rather than a deadlock, and there is no manual release procedure.
+every `finally` — so a leaked Ray fleet is not an event to plan around. And nothing gates commits,
+so a whole cluster dying leaves no slot behind to release.
 
 > **Staged work is reused only when the run would produce the same tiles.** A run's staging prefix
 > is derived from the inputs, the parameters and the inference source, so a re-run reuses tiles only

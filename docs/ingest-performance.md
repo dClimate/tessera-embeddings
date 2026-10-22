@@ -463,80 +463,106 @@ by their own predictions — so rely on the measured range, do not model it, and
 far outside the widths measured. `context_docs/ingest/campaign-ingest-measurements.md` §3.11 and
 §4.9.
 
-### Pipelining a date's preparation (`pipeline_dates`)
+### Pipelining a date's preparation (automatic)
 
-A date's wall clock splits into **preparation** — building the load graph, running the coverage
-gate, narrowing the footprint, constructing the masks, and the **write**. Preparation is part
-client-side CPU, independent of fleet width, and part cluster compute, since the coverage gate
-reads SCL on the workers. Only the client-side part is serial residual a wider fleet cannot
-shrink.
+A date's wall clock splits into **preparation** and the **write**. Preparation has two parts, and
+they behave differently:
 
-**The overlap's payoff is therefore not symmetric.** Hiding the client-side part behind the write
-is free; hiding the gate is not, because it is fleet work and on a saturated fleet competes for the
-same slots regardless of scheduling order. The overlap pays in proportion to the spare capacity
-the write leaves, making it **more** valuable on narrow fleets than wide ones.
+- **Building the read plan** runs in the ingest's driver: one thread, in the task that drives the
+  ingest on one worker.
+- **The cloud-mask check** (the coverage gate) reads the date's cloud-mask data as tasks spread
+  across the fleet, on the same workers that run the write.
 
-`pipeline_dates` prepares date N+1 on one background thread while date N is written
-(`ingest/_pipeline.py`). The write stays serial: icechunk commits are sequential on a branch and
-one commit per date is the contract, so the store has exactly one writer either way. Preparation
-must be **side-effect-free**, touching nothing but the dataset it hands back, and that is what
-makes the two modes produce identical stores — pinned by a parity test including a date that fails
-the coverage gate mid-run.
+The S2 flow prepares date N+1 on one background thread of the driver while the fleet writes date N
+(`ingest/_pipeline.py`). Building the read plan then costs nothing, because the driver would
+otherwise wait on the write. The cloud-mask check costs nothing only where the write leaves
+workers idle: where the write keeps every worker busy, the check's tasks take turns with the
+write's and lengthen it. So the overlap saves at least the read-plan time, plus whatever part of
+the check fits into idle worker time.
+
+**Why preparation shrinks far less than the write as the fleet widens is not settled.** That it
+does is measured; the suspicion, not established, is that the read plan is one thread, so more
+workers cannot speed it, and that the check is a small graph, so once a fleet has more workers than
+its tasks, per-request read latency rather than worker count sets its time. The measurements are in
+`context_docs/ingest/campaign-ingest-measurements.md` §3.21.
+
+```text
+One date at a time — every date waits out its own preparation:
+ │ prep 1 │◄──── write 1 ────►│ prep 2 │◄──── write 2 ────►│ prep 3 │◄──── write 3 ────►│
+
+Pipelined — the next date is prepared during the current write:
+ │ prep 1 │◄──── write 1 ────►│◄──── write 2 ────►│◄──── write 3 ────►│
+          │ prep 2 │          │ prep 3 │          │ prep 4 │
+```
+
+The write stays serial: icechunk commits are sequential on a branch and one commit per date is the
+contract, so the store has exactly one writer either way. Preparation must be
+**side-effect-free**, touching nothing but the dataset it hands back, and that is what makes the
+two modes produce identical stores — pinned by a parity test including a date that fails the
+coverage gate mid-run.
+
+**It has no setting.** Every fleet up to `MAX_PIPELINE_DATES_WORKERS` (140 workers) pipelines,
+and so does every local cluster. In paired tests it was never slower, and it gained most on narrower
+fleets. No fleet wider than the bound has been measured, so a wider Fargate fleet prepares dates one
+at a time as a precaution, not because a loss was seen there, and logs one line saying so. The domain function keeps a `pipeline_dates` argument, off by default, for direct
+callers: the single-area runner passes it on, and the parity test compares both modes. Evidence,
+including what preparing dates one at a time cost a production update, is in
+`context_docs/ingest/campaign-ingest-measurements.md` §3.21.
 
 Depth is 1, intrinsically rather than by tuning: preparation is a small fraction of a write, so
 buffering more would hold graphs in memory to hide nothing. The pipeline lives inside one `_drive`
 call and drains at each streamed month boundary, leaving one unhidden preparation per month.
 
-Each written date logs `Pipeline date=…: prepare=… hidden=… stall=…` in both modes. `stall` is
-the preparation the write could not cover, and is the health metric: near zero when preparation
-hides fully, rising toward the whole preparation when the gate is starved behind the write's own
-tasks. Serially every date stalls for its full preparation, so the two modes compare from one
-line. **`hidden` is not a saving** — pipelined, `prepare` is background-thread wall time spanning
-the whole concurrent write, so it inflates with contention; take any A/B's expected saving from
-the control arm's `prepare` and treat `hidden` as a contention diagnostic.
+Each written date logs `Pipeline date=…: prepare=… hidden=… stall=…`, pipelined or not. `stall`
+is the preparation the write could not cover, and is the health metric: near zero when
+preparation hides fully, rising toward the whole preparation when the gate is starved behind the
+write's own tasks. Unpipelined, every date stalls for its full preparation and hides none, so a
+`hidden=0.0` on every line means the run prepared its dates one at a time. **`hidden` is not a
+saving** — pipelined, `prepare` is background-thread wall time spanning the whole concurrent
+write, so it inflates with contention; take any A/B's expected saving from an unpipelined arm's
+`prepare` and treat `hidden` as a contention diagnostic.
 
-Default **off**, and the flag threads from the outer flow through the task shell to the
-domain function. S1 has no coverage gate and a different batch loop; it is deliberately
-untouched.
+S1 has no coverage gate and a different batch loop; it is deliberately untouched.
 
 ### Batching dates into one compute (`batch_dates`)
 
 Normally each date is computed and written on its own. This fuses several consecutive dates into
 one computation and one write. The number fused is `k`.
 
-**It is not a free win, which is why the default sizes it per region.** With `batch_dates=None`
-the size comes from how much live land the region covers (`config.ingest.auto_batch_dates`).
-Passing an integer forces a fixed size, which is what an A/B comparison needs. Batching helps
-small regions, makes little difference on large ones, and **costs about 29% on mid-sized ones**,
-so no single value is right across the range.
-
-**Where the uneven shape comes from.** Two things happen at once while a date is written: the
-write itself, spread across the fleet, and the preparation for that date, running alongside it.
-Whichever is slower sets the pace. On top of that, each date pays for one **commit** — the single
-operation that makes it visible to readers.
+**It targets sparse writes.** Batching saves each write's fixed overhead (graph submission, the
+drain tail and the commit) and nothing else. It cannot make the write itself faster, so it pays where a date writes little compared with
+the fleet and loses where one date's write already fills it:
 
 ```
-per-date wall clock  ≈  max( W, P )  +  commit / k
+per-date wall clock  ≈  max( W, P )  +  overhead / k
 
-    W = the batch's write, per date          k = dates fused into one graph
+    W = the batch's write, per date          k = dates fused into one write
     P = the preparation running alongside it, per date
 ```
 
-Fusing `k` dates divides the commit cost by `k`, and that is the entire gain. It cannot make the
-write faster, because the machines are already fully occupied. And it can lose: a bigger write
-graph leaves less room for the preparation running beside it. On a mid-sized region the
-preparation already fitted inside the write with nothing left over, so there was no idle capacity
-to win back and only the crowding to pay for.
+On a dense date `W` already keeps every worker busy, so a bigger batch only queues, and it crowds
+out the preparation running beside it, whose cloud-mask check runs on the same workers. Measured
+gains on sparse regions and losses on dense ones are in `context_docs/ingest/campaign-ingest-measurements.md` §3.16.
 
-So batching pays only where the fleet has spare capacity to absorb a larger graph. The threshold
-is set at the largest region where that was actually measured to hold; raising it means measuring
-a region in between first.
+**Sparsity is measured per date, as the chunks the date writes.** Each date's preparation narrows
+its write to the live windows its satellite pass reaches, and the storage chunks those windows
+cover are what that date writes. The S2 ingest fills a batch with up to four dates
+(`AUTO_BATCH_DATES`) while their chunks stay within a budget of `BATCH_CHUNKS_PER_WORKER` (12)
+chunks per worker: 720 on 60 workers, 120 on 10. A date that would push the batch past the budget
+starts a new one, so a dense date writes alone. A caller that passes no budget, such as a local
+cluster or the single-area runner, gets the same 12 per worker, counted from the workers its Dask
+client reports. The same rule serves
+campaign fills, updates and single-area runs, because the payoff depends on what each date writes,
+not on whether the run is an update or how much area it covers in all: an update's scattered
+shards can cover a large area while each date touches a few of them, and an update can equally be
+dense. Passing an integer `batch_dates` changes the cap, which is what one arm of an A/B needs.
 
-One coupling to watch. Because the size is derived from covered area, the window merge above
-changes it: a finer merge covers less area, so more regions fall below the threshold and get
-batched. Recalibrate against real runs rather than an offline sweep, since a different merge cost
-gives a different answer. Figures in
-`context_docs/ingest/campaign-ingest-measurements.md` §3.16.
+**The budget is empirical and deliberately conservative.** No theory sets it: twelve chunks a
+worker sits at or below the smallest per-worker batch measured to gain. It is to be tuned from production runs: each `Batch timings` line ends with
+`chunks=N`, the batch's size in what the budget measures. The count depends on the window merge
+(`live_windows.WINDOW_COST_IN_CHUNKS*`), since a coarser merge covers more chunks a date, so retune
+the budget when that rate changes. Evidence and the tuning plan:
+`context_docs/ingest/campaign-ingest-measurements.md` §3.21.
 
 **What happens when it is on.** `k` consecutive dates that pass the quality gate are computed as
 one graph, and their work interleaves — while one date waits on slow reads, another's writes keep
@@ -555,25 +581,25 @@ middle of a batch.
 
 Three practical details:
 
-- A date that fails the gate does not take up a slot, so batches stay full even in cloudy
-  stretches where most dates are rejected. Whatever is left over is written at each month
-  boundary.
+- Because batches are decided before preparation, a date that then fails the cloud check still
+  occupies its slot, so cloudy stretches write smaller batches. A date whose imagery reaches no
+  live window will write nothing, so it takes no slot. Each streamed month ends its own last batch.
 - Logging changes. Instead of one `Stage timings` line per date there is one `Batch timings` line
   per batch. Its build and gate figures are sums of the real per-date values; the write is a
   single shared computation and cannot be split per date.
-- The default, `batch_dates=None`, is automatic rather than 1: `auto_batch_dates` fuses four
-  dates for a run covering at most 500 chunks and one above that.
+- The default, `batch_dates=None`, means up to four dates within the chunk budget; 1 forces one
+  date per commit.
 
-**Combining it with `pipeline_dates`.** The two fix different idleness. Batching fills gaps
-*inside* a date's write; pipelining removes the serial preparation *between* writes. Used
-together, the look-ahead is sized to the batch rather than to one date: a batch's write is one
-long operation, so a buffer holding a single prepared date would hide only one date's preparation
-out of `k`.
-
-Preparation still runs on one thread at any depth, so the rule that it must not touch anything
-beyond the dataset it returns is unchanged. The cost is memory — up to `k` prepared dates held
-while `k` more are written. `Batch timings` reports `prepare`, `hidden` and `stall` per batch,
-with the same caveat as the per-date line.
+**Combining it with pipelining.** The two fix different idleness. Batching fills gaps
+*inside* a date's write; pipelining removes the serial preparation *between* writes. They meet in
+one place: **the batches are decided first, before any date is prepared.** What a date will write is
+known from geometry alone, its satellite footprint against the live windows, so each streamed month
+is split into batches up front, and the pipeline then prepares the next whole batch while the
+current one writes. That bounds what is held by construction: one batch writing and one prepared,
+each within the budget or a single dense date, which for a dense run is the same as writing one
+date per commit. Preparation still runs on one thread, so the rule that it must not touch anything
+beyond the dataset it returns is unchanged. `Batch timings` reports `prepare`, `hidden` and `stall`
+per batch, with the same caveat as the per-date line.
 
 ## has_new_stac_dates pre-check
 

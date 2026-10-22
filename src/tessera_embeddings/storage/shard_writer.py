@@ -4,7 +4,8 @@ Fills one (zone, year) with whole shards in a single Icechunk commit. The
 d3v2-verified write path: each worker reads its assigned shard *sources* and
 writes each shard's region in one raw-zarr assignment - real data in land inner
 chunks, fill (elided by the sharding codec) elsewhere - so every shard object is
-emitted once, no read-modify-write, no dense nodata.
+emitted once, no dense nodata, and no read-modify-write except where a targeted
+update merges into the pixels a source owns (:meth:`ShardSource.pixels`).
 
 Cooperative fork/merge: the coordinator forks the session, workers write into
 their fork, the coordinator merges and makes **one commit per (zone, year)**,
@@ -43,7 +44,7 @@ import multiprocessing
 import threading
 import time
 from collections import Counter
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
@@ -174,12 +175,22 @@ class ShardSource(Protocol):
         """
         ...
 
+    def pixels(self, shard: tuple[int, int]) -> np.ndarray | None:
+        """Return the ``(h, w)`` pixels of ``shard`` this source owns, or ``None`` for all of them.
+
+        A mask makes the write a MERGE: the worker reads the shard already in the store and
+        replaces only the masked pixels, in every variable, so a targeted update can fill a
+        shard's holes without touching the pixels around them.
+        """
+        ...
+
 
 def commit_with_rebase(
     session: icechunk.Session,
     message: str,
     *,
     tries: int = 1000,
+    metadata: dict[str, Any] | None = None,
 ) -> str:
     """Commit, auto-rebasing on a moved branch tip; return the snapshot id.
 
@@ -200,7 +211,9 @@ def commit_with_rebase(
     completions. One line per commit, so the volume is one per zone-year.
     """
     started = time.monotonic()
-    snapshot = traced_commit(session, message, rebase_with=icechunk.ConflictDetector(), rebase_tries=tries)
+    snapshot = traced_commit(
+        session, message, rebase_with=icechunk.ConflictDetector(), rebase_tries=tries, metadata=metadata
+    )
     _log.info("COMMIT %.2fs: %s", time.monotonic() - started, message)
     return snapshot
 
@@ -543,6 +556,11 @@ def run_forked(
     return telemetry
 
 
+#: The snapshot-metadata key on every shard commit a run makes: ``{"run_id", "zone", "year"}``. Read
+#: back by :func:`~tessera_embeddings.storage.published_store.shard_writes`.
+SHARD_WRITE = "shard_write"
+
+
 def _group_node(store: Any, group: str) -> zarr.Group:  # noqa: ANN401 — icechunk store handle
     """Open a repo's zarr root and return the named group node (typed as Group)."""
     return cast(zarr.Group, zarr.open_group(store, mode="a")[group])
@@ -564,8 +582,17 @@ def run_provenance(
     optical_skips: dict | None = None,
     input_coverage: dict | None = None,
     code: dict | None = None,
+    commit: Mapping[str, str] | None = None,
 ) -> dict:
     """Merge a per-year run record into a group's ``runs`` attr (the schema's one owner).
+
+    ``commit`` is the run's shard commit, ``{"snapshot", "committed_at"}``, recorded as null for
+    a year marked without writing shards; a record with no ``commit`` key predates the field. The
+    commit itself is tagged with the run (``SHARD_WRITE``), and that tag, not this record, is the
+    store's authority on who wrote a year: this record lands in a second commit, which a dying
+    process can miss. **A refill keeps the runs before it** in ``previous``, as ``run_id``,
+    ``assembled_at``, ``commit`` and ``empty`` alone, which is all that is known of a run from
+    before tags.
 
     ``input_coverage`` answers the question the calendar-year guarantee below does NOT: not
     what window was *requested*, but **how much of it the input actually held** — per source
@@ -612,7 +639,7 @@ def run_provenance(
     the flag already states the whole live footprint is fill, and the label list would
     restate the land mask at zone size.
     """
-    record: dict = {"run_id": run_id, "assembled_at": datetime.now(UTC).isoformat()}
+    record: dict = {"run_id": run_id, "assembled_at": datetime.now(UTC).isoformat(), "commit": _or_none(commit)}
     if empty:
         record["empty"] = True
     if radar_coverage:
@@ -627,7 +654,25 @@ def run_provenance(
     resolved_code = code if code is not None else code_identity()
     if resolved_code:
         record["code"] = dict(resolved_code)
-    return {**(dict(existing) if isinstance(existing, dict) else {}), str(year): record}
+    runs = dict(existing) if isinstance(existing, dict) else {}
+    prior = runs.get(str(year))
+    if isinstance(prior, dict):
+        # A re-run under the same id replaces its own entry; any other run joins the history.
+        replaced = [] if prior.get("run_id") == run_id else [{k: prior[k] for k in _HISTORY if k in prior}]
+        previous = [p for p in [*prior.get("previous", []), *replaced] if p.get("run_id") != run_id]
+        if previous:
+            record["previous"] = previous
+    return {**runs, str(year): record}
+
+
+#: What ``previous`` keeps of a replaced run: enough to know it wrote the year, when, in which commit,
+#: and whether it left the year empty.
+_HISTORY = ("run_id", "assembled_at", "commit", "empty")
+
+
+def _or_none(value: Mapping[str, Any] | None) -> dict | None:
+    """``value`` as a plain dict, or ``None``."""
+    return dict(value) if value else None
 
 
 def commit_year_attrs(
@@ -640,6 +685,7 @@ def commit_year_attrs(
     radar_coverage: dict | None = None,
     optical_skips: dict | None = None,
     input_coverage: dict | None = None,
+    commit: Mapping[str, str] | None = None,
     tries: int = 8,
     skip_if_marked: bool = False,
 ) -> str:
@@ -661,7 +707,9 @@ def commit_year_attrs(
     a loser that re-reads the winner's value and re-applies its own key produces exactly
     the state both writers intended, in either order. That makes this a plain
     optimistic-concurrency loop rather than a lossy merge. Each attempt opens a FRESH
-    session, so it cannot re-apply onto a stale read.
+    session, so it cannot re-apply onto a stale read. Two runs of the SAME year both survive
+    too: the loser's re-applied record keeps the winner in ``previous``, and each carries its
+    shard ``commit``, so the order their pixels landed in is recorded whichever marks last.
 
     **The two callers want different idempotency, and the difference is deliberate.**
     ``skip_if_marked=True`` returns the branch tip untouched when the year is already in
@@ -690,6 +738,7 @@ def commit_year_attrs(
                 radar_coverage=radar_coverage,
                 optical_skips=optical_skips,
                 input_coverage=input_coverage,
+                commit=commit,
             )
         try:
             return commit_with_rebase(session, f"mark {group} year {year_label} complete")
@@ -768,6 +817,7 @@ def _write_shards_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 - retu
             last_report = time.monotonic()
         with timer.phase("read"):
             blocks = source.load((sy, sx))
+            owned = source.pixels((sy, sx))
         tiles += 1
         for var, block in blocks.items():
             arr = arrays.get(var)
@@ -777,8 +827,15 @@ def _write_shards_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 - retu
             h, w = block.shape[1], block.shape[2]
             # Trailing dims (band) not indexed are written in full, so one
             # assignment covers both the 3-D and 4-D arrays.
+            region = (slice(year, year + 1), slice(y0, y0 + h), slice(x0, x0 + w))
+            if owned is not None:
+                # One variable at a time, so the extra memory is one shard of the widest array.
+                with timer.phase("pixel_merge"):
+                    merged = np.asarray(arr[region])
+                    merged[:, owned] = block[:, owned]
+                    block = merged
             with timer.phase("write"):
-                arr[year : year + 1, y0 : y0 + h, x0 : x0 + w] = block
+                arr[region] = block
             writes += 1
             nbytes += block.nbytes
     # And the final count, which no timed checkpoint reaches: the loop exits without one, so a
@@ -805,6 +862,7 @@ def write_year_shards(
     telemetry: dict[str, Any] | None = None,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     fault: ArmedFault | None = None,
+    commit_attrs: Callable[[icechunk.Repository, str, int, Mapping[str, str]], str] | None = None,
 ) -> str:
     """Fill one (zone, year) with whole shards from ``source`` in one commit.
 
@@ -842,9 +900,10 @@ def write_year_shards(
     ``telemetry`` is an out-parameter: pass a dict to receive the fill's timing
     facts — the per-worker stats and ``wall_s``/``merge_s`` from
     :func:`run_forked`, its ``catch_ups`` tally, plus ``commit_s`` and
-    ``attrs_commit_s`` (each measured around its commit). An out-parameter
-    rather than a changed return, so the snapshot id the callers and tags key on
-    stays a plain string; the caller that wants a summary record owns emitting it.
+    ``attrs_commit_s`` (each measured around its commit) — and ``commit``, the shard
+    commit's ``snapshot`` and ``committed_at``, which the registry part is stamped with.
+    An out-parameter rather than a changed return, so the snapshot id the callers and
+    tags key on stays a plain string; the caller that wants a summary record owns emitting it.
 
     ``log`` is where the coordinator's progress lines go while the fill's forks
     are outstanding — the longest phase of a fill. A caller inside a flow passes
@@ -859,6 +918,11 @@ def write_year_shards(
     one state above that no operator can produce deliberately — bounded by two commits of
     one function, there is nothing outside the process to aim a kill at, and a state
     documented as benign but never observed is an assumption.
+
+    ``commit_attrs(repo, group, year, commit)`` replaces the second commit, given the shard commit
+    as ``commit_year_attrs`` is. A targeted update passes its own record writer here, so writing
+    shards into a year that is already complete records the update and leaves ``years_complete``
+    and ``runs`` exactly as the original fill left them.
 
     Returns the ATTR commit's snapshot id — a tag must point at a state where the
     year is both written and marked.
@@ -889,7 +953,20 @@ def write_year_shards(
 
     year_label = _year_label(_group_node(session.store, group), year_index)
     t_commit = time.monotonic()
-    commit_with_rebase(session, commit_msg or f"fill {group} year {year_label}")
+    # Tagged with the run on the commit itself, so the store's history names every run that wrote
+    # this year even when the process dies before the attrs commit below records it.
+    shard_snapshot = commit_with_rebase(
+        session,
+        commit_msg or f"fill {group} year {year_label}",
+        metadata={SHARD_WRITE: {"run_id": run_id, "zone": group, "year": year_label}} if run_id else None,
+    )
+    # The store's own clock for this write. Icechunk refuses a snapshot older than its parent, so
+    # along `main` these stamps are commit order, which is the order a tile's pixels were written
+    # in, whatever order the attrs commits below land in.
+    commit = {
+        "snapshot": shard_snapshot,
+        "committed_at": repo.lookup_snapshot(shard_snapshot).written_at.isoformat(),
+    }
     if fault is not None:
         # The drill's death lands HERE, between the two commits, and nowhere else can
         # produce this state on purpose. Inert for any other fault or any other cell.
@@ -899,18 +976,24 @@ def write_year_shards(
     # collision costs a sub-second retry instead of this whole assembly. Return that
     # snapshot rather than the shard one: a tag must point at a state where the year is
     # both written AND marked.
-    snapshot = commit_year_attrs(
-        repo,
-        group,
-        year_label,
-        run_id=run_id,
-        radar_coverage=radar_coverage,
-        optical_skips=optical_skips,
-        input_coverage=input_coverage,
-        empty=empty,
+    snapshot = (
+        commit_attrs(repo, group, year_label, commit)
+        if commit_attrs is not None
+        else commit_year_attrs(
+            repo,
+            group,
+            year_label,
+            run_id=run_id,
+            radar_coverage=radar_coverage,
+            optical_skips=optical_skips,
+            input_coverage=input_coverage,
+            empty=empty,
+            commit=commit,
+        )
     )
     if telemetry is not None:
         telemetry.update(
+            commit=commit,
             workers=fill["workers"],
             fill_wall_s=fill["wall_s"],
             merge_s=fill["merge_s"],

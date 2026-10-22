@@ -2,8 +2,9 @@
 
 A flow that dispatches work with ``run_deployment``/``arun_deployment`` gets an independently
 scheduled child run. Killing the parent does not touch it: the child keeps going, keeps writing,
-and keeps its Dask or Ray fleet billing. Prefect's subflow link does not help either — several of
-these dispatches happen from worker threads, so there is no parent-run relationship to walk.
+and keeps its Dask or Ray fleet billing. Prefect's subflow link does not cover it either: the server
+cancels a subflow only when its parent ends CANCELLED, never when the parent CRASHED, and the chained
+fill dispatches each cell's validation run from a worker thread, without the link.
 
 The mechanism is a deterministic TAG derived from the parent's flow-run id alone. Prefect runs
 terminal hooks in a FRESH import of the module after killing the flow process, so nothing in

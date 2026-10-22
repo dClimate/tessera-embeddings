@@ -38,12 +38,14 @@ import logging
 import threading
 import time
 from collections.abc import Callable, Iterable
-from concurrent.futures import FIRST_COMPLETED, CancelledError, Future, ThreadPoolExecutor, wait
+from concurrent.futures import ALL_COMPLETED, FIRST_COMPLETED, CancelledError, Future, ThreadPoolExecutor, wait
+from contextlib import AbstractContextManager, nullcontext
 from functools import cache, partial
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from prefect import flow, get_run_logger
 from prefect.client.orchestration import get_client
+from prefect.context import FlowRunContext
 from prefect.deployments import run_deployment
 from prefect.runtime import flow_run as flow_run_ctx
 from prefect.states import Cancelling
@@ -103,7 +105,16 @@ from tessera_embeddings.orchestration.runners.zone_fill import (
     zone_year_complete,
     zone_year_on_axis,
 )
+from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.object_store import delete_prefix
+from tessera_embeddings.storage.update import (
+    applied_optical_min_obs,
+    check_no_tightening,
+    check_radar_policy,
+    finish_update,
+    load_update,
+    update_states,
+)
 from tessera_embeddings.storage.zone_grid import canonicalize_zone
 
 if TYPE_CHECKING:
@@ -132,17 +143,19 @@ class _DeploymentCellInputs:
     it to a terminal state, so a cell's ``wait`` is a future join and the child run's id is
     known while it executes: ``shutdown`` can cancel every in-flight ingest instead of
     orphaning children that keep writing after the parent failed (a quick retry would then
-    race the orphan on the same mosaic prefix). ``max_parallel`` sizes the executor and the
-    flow passes its full cell count, so every UTM zone of a cluster is submitted at once and
-    they finish together — the cluster waits for all of them before requesting GPUs. What
-    limits how many actually RUN is ``ingest_limit_name``, a Prefect global concurrency limit
-    shared by every cluster; the clusters are separate flow runs, so only a server-side gate
-    can bound them together. ``cleanup`` deletes only mosaics THIS adapter produced (a cell
-    never started here is someone else's input), matching the parallel driver's
-    ``did_ingest and cleanup_mosaics`` rule.
+    race the orphan on the same mosaic prefix). The flow submits every cell of a cluster at
+    once; ``max_parallel`` (``1 + look_ahead``, this cluster's share of the fleet-wide ingest
+    cap) sizes the executor, so that many run at a time, and the cluster requests GPUs as soon
+    as any one mosaic lands (``wait_first``), or after an optional hold for a backlog
+    (``hold_for_backlog``). The hard ceiling is ``ingest_limit_name``, a
+    Prefect global concurrency limit shared by every cluster; the clusters are separate flow
+    runs, so only a server-side gate can bound them together. ``cleanup`` deletes only mosaics
+    THIS adapter produced (a cell never started here is someone else's input), matching the
+    parallel driver's ``did_ingest and cleanup_mosaics`` rule.
 
-    Threads don't inherit the flow's Prefect context, so ingest runs dispatch without a
-    parent-run link — they are still tracked as ordinary runs of the ingest deployment.
+    Each ingest run is created as a subflow of the fill (``_dispatch_and_wait``), so the UI lists
+    it under the fill. Cancellation does not rely on that link: a crashed fill gets no
+    server-side cascade, so the tag and ``shutdown`` stay the mechanism.
     """
 
     def __init__(
@@ -176,6 +189,8 @@ class _DeploymentCellInputs:
         self._lock = threading.Lock()
         self._inflight: dict[tuple[str, int], Any] = {}  # (zone, year) → flow-run id
         self._stopping = threading.Event()
+        # Captured here, on the flow's thread: worker threads inherit none of its context.
+        self._parent = FlowRunContext.get()
 
     def _run(self, zone: str, year: int) -> None:
         """Hold a fleet-wide ingest slot for this zone, then dispatch and poll it.
@@ -221,13 +236,21 @@ class _DeploymentCellInputs:
         # run_deployment() only yields the run AFTER it finishes, leaving shutdown nothing to
         # cancel. run_deployment is @sync_compatible (typed as a union with its coroutine
         # form); in these worker threads it always runs synchronously.
-        run: Any = run_deployment(
-            self._deployment,
-            parameters=self._params_for(zone, year),
-            timeout=0,
-            tags=[self._child_tag] if self._child_tag else None,
-        )
-        with self._lock:
+        # Entering a copy of the fill's run context makes the run a subflow of the fill. Only
+        # that context: copying the thread's whole context would share the flow's sync client
+        # across threads. Created and registered under the lock `shutdown` snapshots under, after
+        # a second stop check: a run then either makes the snapshot or is never created, so a
+        # thread that queued here while shutdown began cannot leave a child the sweep missed. The
+        # same lock serializes the copies, which share the fill's task-key counter.
+        with self._lock, self._as_subflow():
+            if self._stopping.is_set():
+                raise RuntimeError(f"ingest {zone}-{year} not dispatched: adapter shutting down")
+            run: Any = run_deployment(
+                self._deployment,
+                parameters=self._params_for(zone, year),
+                timeout=0,
+                tags=[self._child_tag] if self._child_tag else None,
+            )
             self._inflight[(zone, year)] = run.id
         run = self._poll_until_terminal(run.id, f"{zone}-{year}")
         # Deregister ONLY after a CONFIRMED terminal state. A transient poll error or a
@@ -236,6 +259,9 @@ class _DeploymentCellInputs:
         with self._lock:
             self._inflight.pop((zone, year), None)
         _check_completed(run, f"ingest {zone}-{year}")
+
+    def _as_subflow(self) -> AbstractContextManager[object]:
+        return self._parent.model_copy() if self._parent is not None else nullcontext()
 
     def _poll_until_terminal(self, flow_run_id: Any, label: str) -> Any:  # noqa: ANN401 — Prefect FlowRun
         errors = 0
@@ -387,6 +413,37 @@ class _DeploymentCellInputs:
             f"to infer, so no GPU fleet is requested. The first failure is chained below."
         ) from cause
 
+    def hold_for_backlog(self, cells: list[tuple[str, int]], minutes: float) -> None:
+        """After the first mosaic lands, hold the GPU request up to ``minutes`` for more to land.
+
+        Called straight after ``wait_first``, so the hold is measured from the first landing
+        and a slow first ingest is still followed by the whole hold. It ends early once every
+        one of ``cells`` has finished, landed or failed, since nothing more can arrive. It
+        blocks on the ingest futures rather than sleeping, so it returns the moment the last
+        one settles, and it raises nothing of its own: a failed ingest surfaces when the
+        runner reaches that cell, as it would without the hold.
+        """
+        futs = [self._futures[c] for c in cells if c in self._futures]
+
+        def landed() -> int:
+            return sum(1 for f in futs if f.done() and not f.cancelled() and f.exception() is None)
+
+        self._log.info(
+            "Holding the GPU request up to %.1f min for a backlog: %d of %d mosaic(s) landed",
+            minutes,
+            landed(),
+            len(futs),
+        )
+        t0 = time.monotonic()
+        _, pending = wait(futs, timeout=minutes * 60, return_when=ALL_COMPLETED)
+        self._log.info(
+            "GPU hold ended after %.1f min (%s): %d of %d mosaic(s) landed — requesting GPUs",
+            (time.monotonic() - t0) / 60,
+            "limit reached" if pending else "every ingest finished",
+            landed(),
+            len(futs),
+        )
+
     def cleanup(self, zone: str, year: int) -> None:
         """Delete the cell's mosaics, and RAISE if that did not happen.
 
@@ -516,11 +573,14 @@ class _DeploymentCellInputs:
         makes confirmation impossible rather than merely slow, and re-asking a server that is
         not answering delays a teardown whose whole job is to stop costing money.
         """
-        # Snapshot BEFORE waking the pollers: a woken worker deregisters its run id on the way
-        # out, and an id that leaves the map un-swept is an un-cancelled child still running.
+        # Stop FIRST, then snapshot under the lock. A dispatcher creates and registers its run
+        # under that lock after re-checking `_stopping`, so a creation already in progress
+        # registers before the snapshot, and every dispatcher still queued on the lock sees the
+        # flag and creates nothing; shutdown waits on at most that one creation. A woken poller
+        # deregisters only a run it has seen finish, so no live id leaves the map un-swept.
+        self._stopping.set()
         with self._lock:
             inflight = dict(self._inflight)
-        self._stopping.set()
         self._executor.shutdown(wait=False, cancel_futures=True)
         if not inflight:
             return
@@ -612,8 +672,8 @@ def _ingest_child_tag(flow_run_id: object) -> str | None:
 
 
 #: The in-process ``inputs.shutdown()`` covers normal failure paths; a cancelled or crashed
-#: flow is killed before its ``finally`` runs, and its child ingests — dispatched from threads,
-#: so carrying no parent-run link — keep writing the mosaic prefix a retry will race.
+#: flow is killed before its ``finally`` runs, and its child ingests keep writing the mosaic prefix
+#: a retry will race: their subflow link gets no server-side cancellation when the parent crashed.
 _cancel_child_ingests_on_cancellation = make_child_cancel_hook(_INGEST_TAG_PREFIX, "child ingest run")
 
 
@@ -627,7 +687,7 @@ _cancel_child_ingests_on_cancellation = make_child_cancel_hook(_INGEST_TAG_PREFI
 )
 def fill_zones_sequential_flow(
     *,
-    cells: list[tuple[str, int]],
+    cells: list[tuple[str, int]] | None = None,
     paths: BucketPaths,
     ami_ssm_name: str,
     ami_id: str | None = None,
@@ -659,6 +719,7 @@ def fill_zones_sequential_flow(
     ingest_deployment: str = "ingest-zone-year/ingest-zone-year",
     branch: str | None = None,
     look_ahead: int = 2,
+    inference_start_delay_minutes: float = 0.0,
     max_retained_failures: int = 100,
     attempts_per_cell_in_cluster: int = 2,
     inference_pause_gate: str | None = None,
@@ -667,6 +728,7 @@ def fill_zones_sequential_flow(
     ingest_settings: IngestSettings = IngestSettings(),  # noqa: B008
     fault_injection: FaultInjection | None = None,
     validation_deployment: str | None = None,
+    update: str | None = None,
 ) -> dict[str, Any]:
     """Fill many (zone, year) cells sequentially on a single shared Ray cluster.
 
@@ -777,6 +839,14 @@ def fill_zones_sequential_flow(
             a time, which also sets the priming abort quorum. It does not bound in-flight
             mosaics (peak storage is a cluster's mosaics by design, ADR-011) and does not set
             the retained-failure cap — see ``max_retained_failures``.
+        inference_start_delay_minutes: How much longer to hold the GPU request once the first
+            mosaic has landed, so more mosaics land and the fleet boots onto a backlog. The hold
+            ends early once every cell's ingest has finished, landed or failed, since nothing
+            more can arrive. ``0`` (the default) requests GPUs at the first landing. Worth
+            setting for a small, scattered job such as a targeted update, whose zone-years
+            ingest in minutes to hours and infer in minutes: without it the first small mosaic
+            boots the fleet, which then idles and regrows between landings. Has no effect with
+            ``ingest=False``, where the mosaics already exist.
         max_retained_failures: Failed cells holding mosaics off-budget before the feeder stops
             admitting and the run logs ``FAILURE CAP EXCEEDED``. A ceiling against a SYSTEMATIC
             fault, not a tripwire for a bad hour, so set it near the roster size: a value a bad
@@ -799,6 +869,34 @@ def fill_zones_sequential_flow(
             never waited on (:mod:`._cell_validation`), so cell N is validated while cell N+1 is
             still inferring. ``None`` (the default) validates nothing: the validator is a
             consumer's flow, so the library names none.
+        update: The NAME of a targeted update to run instead of a fill, e.g.
+            ``"amazon-thin-2024"``; ``None`` (the default) fills as usual. An update re-runs chosen
+            tiles of cells the campaign has already filled and writes nothing else.
+
+            The name is not a description of the work: it names a plan written beforehand with
+            ``scripts/update/plan_update.py --name <name> ... --write``, which this flow reads from
+            ``{paths.inputs}/updates/<name>/plan.json``. The plan fixes everything about the run:
+
+            - the cells and, per cell, the tiles to redo;
+            - the mode: ``holes`` infers only the pixels with no embedding and merges them into
+              the existing tiles, leaving every embedded pixel byte-identical; ``shards`` rewrites
+              each chosen tile whole;
+            - the land mask, which replaces ``mask_name`` (an explicit ``mask_name`` that differs is
+              refused);
+            - relaxed ingest settings, ``min_valid_coverage`` and ``allow_partial_window``, which
+              replace this flow's, since an update ingests only the area around its tiles.
+
+            ``cells`` defaults to the plan's cells and may name a subset, to split one update across
+            runs. A ``holes`` update needs ``allow_s2_only=True``. Before any work, each cell is
+            checked against the store: one already holding this update's record is skipped, so
+            rerunning the same call resumes, and one the campaign never filled is refused.
+
+            What the run leaves behind: each finished cell records the update in its zone's
+            ``updates[year]`` attr, while ``years_complete``, ``runs`` and the zone-year tags stay as
+            the fill left them; the store is tagged ``update-<name>-base`` before the first write
+            and ``update-<name>-complete`` once every planned cell is recorded; and the registry
+            rows of the tiles it rewrote carry ``update_name = <name>``. The full walk-through is
+            ``docs/updates.md``.
 
     Returns:
         Summary dict: triage counts (retag / empty / live), the sequential runner's outcome
@@ -812,6 +910,8 @@ def fill_zones_sequential_flow(
     # ever ingest — and it would only wedge AFTER priming and cluster bringup.
     if look_ahead < 0:
         raise ValueError(f"look_ahead must be >= 0, got {look_ahead}")
+    if inference_start_delay_minutes < 0:
+        raise ValueError(f"inference_start_delay_minutes must be >= 0, got {inference_start_delay_minutes}")
     if attempts_per_cell_in_cluster < 1:
         raise ValueError(
             f"attempts_per_cell_in_cluster must be >= 1, got {attempts_per_cell_in_cluster} "
@@ -843,7 +943,7 @@ def fill_zones_sequential_flow(
 
     # Lazily import the AWS providers so the flow file imports on machines without ray/boto
     # installed (arch tests, local inspection).
-    from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
+    from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials, icechunk_credentials_for
     from tessera_embeddings.providers.aws.ray import (
         cluster_name_for_flow_run,
         make_instance_terminator,
@@ -853,7 +953,25 @@ def fill_zones_sequential_flow(
     # Canonicalize + dedupe, preserving caller order until the size sort. Dedupe on the PAIR:
     # one zone may legitimately appear for several years, and only an exact repeat is a caller
     # mistake (it would dispatch one cell twice).
-    cells = list(dict.fromkeys((canonicalize_zone(z), int(y)) for z, y in cells))
+    plan = load_update(paths, update, mask_name=mask_name) if update is not None else None
+    if plan is None and cells is None:
+        raise ValueError("cells is required unless an update supplies them")
+    if plan is not None:
+        check_radar_policy(plan, allow_s2_only=allow_s2_only)
+        # The plan, not the parameters, decides what an update reads and how strictly.
+        mask_name, allow_partial_window = plan.mask_name, plan.allow_partial_window
+        ingest_settings = ingest_settings.model_copy(update={"min_valid_coverage": plan.min_valid_coverage})
+        cells = plan.cell_list() if cells is None else cells
+    cells = list(dict.fromkeys((canonicalize_zone(z), int(y)) for z, y in cast("list[tuple[str, int]]", cells)))
+    if plan is not None and (outside := [c for c in cells if c not in set(plan.cell_list())]):
+        raise ValueError(f"Cell(s) {outside} are not in update {plan.name!r}")
+    store_path = paths.global_store(store_name)
+    # Where this run's mosaics and staging live: the campaign's, or the update's own.
+    update_root = paths.update_root(update) if update is not None else None
+    mosaic_root = update_root or paths.inputs
+    staging_root = (
+        paths.update_staging(update, store_path) if update is not None else f"{paths.outputs.rstrip('/')}/staging"
+    )
     cell_years = sorted({y for _, y in cells})
     if time_window_end is not None and len(cell_years) > 1:
         raise ValueError(
@@ -861,7 +979,6 @@ def fill_zones_sequential_flow(
             "One literal window cannot describe several years; drop the override (each cell then "
             "takes its own calendar year) or dispatch one year per flow run."
         )
-    store_path = paths.global_store(store_name)
     land_mask_path = paths.land_mask_store(mask_name)
     checkpoint_path = f"{paths.inputs.rstrip('/')}/models/{checkpoint_filename()}"
 
@@ -895,10 +1012,15 @@ def fill_zones_sequential_flow(
         whose cells all settle in triage — a retag, an empty mark, an all-ocean zone — must not
         touch the store at all, and reading at flow start makes every such path need a live repo.
         """
-        value = _optical_min_obs_from_store(store_path, get_credentials=iam_icechunk_credentials, s3_region=s3_region)
+        store_rule = _optical_min_obs_from_store(
+            store_path, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+        )
+        # An update's plan may loosen it for the update's own cells (ADR 028).
+        value = applied_optical_min_obs(store_rule, plan.optical_min_obs if plan is not None else None)
         log.info(
-            "Optical depth rule for this fill, from the store root: %s",
+            "Optical depth rule for this fill: %s (the store root's: %s)",
             value if value is not None else "no rule",
+            store_rule if store_rule is not None else "no rule",
         )
         return value
 
@@ -929,6 +1051,40 @@ def fill_zones_sequential_flow(
     empty: list[dict[str, Any]] = []
     no_optical: list[dict[str, Any]] = []
     live: list[SequentialCell] = []
+    # An update's cells that need nothing: already recorded, or never filled (refused, as the runner
+    # would refuse them, but here before any ingest or cluster).
+    update_done: list[tuple[str, int]] = []
+    not_filled: list[tuple[str, int]] = []
+    # The STORE's credential: in production the store is the partner's published bucket, which the
+    # task role cannot read.
+    store_credentials = icechunk_credentials_for(store_path, iam_icechunk_credentials)
+    states = (
+        update_states(
+            open_global_repo(store_path, get_credentials=store_credentials, region=s3_region), plan.name, cells
+        )
+        if plan is not None
+        else {}
+    )
+    if plan is not None:
+        # Before any ingest or cluster: a line stricter than an earlier update used in a pending
+        # cell would otherwise fail in the runner only once both were paid for.
+        check_no_tightening(
+            open_global_repo(store_path, get_credentials=store_credentials, region=s3_region),
+            plan.name,
+            _store_optical_min_obs(),
+            [cell for cell, state in states.items() if state == "pending"],
+        )
+
+    def _finish(result: dict[str, Any]) -> dict[str, Any]:
+        """Pin the update's complete tag once every planned cell holds its record, whichever run lands last."""
+        if plan is not None and (
+            tag := finish_update(
+                open_global_repo(store_path, get_credentials=store_credentials, region=s3_region), plan
+            )
+        ):
+            log.info("Update %s has landed in every planned cell: tagged %s", plan.name, tag)
+            result["update_complete_tag"] = tag
+        return result
 
     # Resolved ONCE here, in the flow's own thread: the trailing assembly thread carries no
     # Prefect context, so reading the runtime id inside `_validate` would yield None for every
@@ -989,11 +1145,44 @@ def fill_zones_sequential_flow(
                 run_id=run_id,
                 get_credentials=iam_icechunk_credentials,
                 s3_region=s3_region,
+                # A retagged cell's master is caught up in planning, in case its fill died before that.
+                registry_root=paths.optical_registry(store_path),
             ),
         )
 
+    def _update_no_cluster(zone: str, year: int) -> dict[str, Any]:
+        # The runner's no-Ray update path: no shard of the update is live in its mask, so planning
+        # records that and returns before any inference; or the update is already recorded, and
+        # planning catches up the cell's master in case the run died before merging it.
+        assert plan is not None
+        return fill_zone_year(
+            store_path=store_path,
+            zone=zone,
+            year=year,
+            land_mask_path=land_mask_path,
+            mosaic_base=f"{mosaic_root.rstrip('/')}/mosaics/{zone}/{year}",
+            staging_base=f"{staging_root}/{zone}/{year}",
+            config=_config_for(s1_orbit, year),
+            num_actors=1,
+            log=log,
+            run_id=f"{zone}-{year}-{plan.name}-none",
+            get_credentials=iam_icechunk_credentials,
+            s3_region=s3_region,
+            update=plan.target(zone, year, root=cast(str, update_root)),
+            registry_root=paths.optical_registry(store_path),
+        )
+
     for zone, year in cells:
-        if zone_year_complete(store_path, zone, year, get_credentials=iam_icechunk_credentials, s3_region=s3_region):
+        if plan is not None and states[(zone, year)] == "done":
+            _update_no_cluster(zone, year)
+            update_done.append((zone, year))
+            continue
+        if plan is not None and states[(zone, year)] != "pending":
+            not_filled.append((zone, year))
+            continue
+        if plan is None and zone_year_complete(
+            store_path, zone, year, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+        ):
             retagged.append(_fill_no_cluster(zone, year, f"{zone}-{year}-retag"))
             continue
         if not zone_year_on_axis(store_path, zone, year, get_credentials=iam_icechunk_credentials, s3_region=s3_region):
@@ -1002,8 +1191,18 @@ def fill_zones_sequential_flow(
                 "reseed the store or drop the year."
             )
         n_tiles = zone_live_tile_count(
-            land_mask_path, zone, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+            land_mask_path,
+            zone,
+            get_credentials=iam_icechunk_credentials,
+            s3_region=s3_region,
+            # An update's work is its own shards, so the actors it asks for are too.
+            tiles=plan.target(zone, year, root=cast(str, update_root)).tiles if plan is not None else None,
         )
+        if n_tiles == 0 and plan is not None:
+            # None of the update's shards is live in its mask. The runner records that, with no
+            # cluster: an update never marks a cell empty, only itself done.
+            empty.append(_update_no_cluster(zone, year))
+            continue
         if n_tiles == 0:
             # No mosaic exists or is needed; run_id is provenance-only here (no staging to
             # fingerprint and no mosaic to read).
@@ -1054,6 +1253,14 @@ def fill_zones_sequential_flow(
         len(no_optical),
         [f"{c.zone}-{c.year}" for c in live],
     )
+    if plan is not None:
+        log.info(
+            "Update %s: %d cell(s) already recorded, %d never filled and refused: %s",
+            plan.name,
+            len(update_done),
+            len(not_filled),
+            [f"{z}-{y}" for z, y in not_filled],
+        )
 
     summary: dict[str, Any] = {
         "years": cell_years,
@@ -1062,10 +1269,15 @@ def fill_zones_sequential_flow(
         "empty": len(empty),
         "live": len(live),
         "no_optical": [[c["zone"], c["year"]] for c in no_optical],
+        **(
+            {"update": plan.name, "update_done": len(update_done), "not_filled": [list(c) for c in not_filled]}
+            if plan is not None
+            else {}
+        ),
     }
     if not live:
         log.info("No live cells — no Ray cluster needed")
-        return {**summary, "sequential": None}
+        return _finish({**summary, "sequential": None})
 
     # Fail loudly BEFORE provisioning Ray if the store was seeded for a
     # different encoder/checkpoint than this build embeds with.
@@ -1087,13 +1299,14 @@ def fill_zones_sequential_flow(
         allow_ingest_code_mismatch=allow_ingest_code_mismatch,
         s3_region=s3_region,
         branch=branch,
+        update=update,
     )
 
     inputs = (
         _DeploymentCellInputs(
             deployment=ingest_deployment,
             params_for=_ingest_params,
-            inputs_bucket=paths.inputs,
+            inputs_bucket=mosaic_root,
             cleanup_mosaics=cleanup_mosaics,
             # This cluster's SHARE of the fleet-wide ingest cap, so the clusters divide it
             # evenly by construction rather than racing for slots on the global gate
@@ -1137,7 +1350,7 @@ def fill_zones_sequential_flow(
         # any) has landed: orbit resolution probes the mosaic, the coverage gate reads its
         # months, and the run_id fingerprints its ingest marker (identical inputs → resume
         # staging; any change → fresh prefix).
-        mosaic_base = f"{paths.inputs.rstrip('/')}/mosaics/{cell.zone}/{cell.year}"
+        mosaic_base = f"{mosaic_root.rstrip('/')}/mosaics/{cell.zone}/{cell.year}"
         resolved = resolve_s1_orbit(
             mosaic_base,
             s1_orbit,
@@ -1159,11 +1372,11 @@ def fill_zones_sequential_flow(
         )
         return PreparedCell(
             mosaic_base=mosaic_base,
-            staging_base=f"{paths.outputs.rstrip('/')}/staging/{cell.zone}/{cell.year}",
+            staging_base=f"{staging_root}/{cell.zone}/{cell.year}",
             run_id=_staging_run_id(
                 cell.zone,
                 cell.year,
-                inputs_bucket=paths.inputs,
+                inputs_bucket=mosaic_root,
                 min_valid_coverage=ingest_settings.min_valid_coverage,
                 s1_orbit=s1_orbit,
                 allow_partial_window=allow_partial_window,
@@ -1172,6 +1385,7 @@ def fill_zones_sequential_flow(
                 code_identity=code_identity,
                 get_credentials=iam_icechunk_credentials,
                 s3_region=s3_region,
+                update=update,
             ),
             config=_config_for(resolved, cell.year),
             input_coverage=coverage,
@@ -1195,6 +1409,9 @@ def fill_zones_sequential_flow(
             run_id=prep.run_id,
             get_credentials=iam_icechunk_credentials,
             s3_region=s3_region,
+            update=plan.target(cell.zone, cell.year, root=cast(str, update_root)) if plan is not None else None,
+            # A cell this session finds already landed has its master caught up here, as triage's do.
+            registry_root=paths.optical_registry(store_path),
         )
 
     # The shared stream session: ONE set of actors for EVERY zone in the cluster, whatever orbit
@@ -1301,6 +1518,10 @@ def fill_zones_sequential_flow(
     # densest-first ORDER still sizes the session from the largest cell and puts the island tail
     # last; it is simply no longer a barrier.
     #
+    # `inference_start_delay_minutes` then holds the request a while longer, for a job too small
+    # for that to pay: when every cell infers in minutes, the first landing boots a fleet that
+    # finishes it and idles until the next one lands.
+    #
     # INSIDE the shutdown guard, deliberately. `start` submits every cell at once, so from the
     # first submission onward there are child ingest runs only `shutdown()` can cancel. Priming
     # above the `try` let any failure in between — a raising `start`, an unexpected error in the
@@ -1318,26 +1539,33 @@ def fill_zones_sequential_flow(
                 inputs.start(cell.zone, cell.year)
 
             log.info(
-                "Ingesting %d cell(s), %d at a time; GPUs are requested as soon as the first "
-                "mosaic lands (densest first: %s tiles)",
+                "Ingesting %d cell(s), %d at a time; GPUs are requested %s (densest first: %s tiles)",
                 len(ingest_window),
                 1 + look_ahead,
+                f"{inference_start_delay_minutes:g} min after the first mosaic lands, or once every "
+                "ingest has finished if sooner"
+                if inference_start_delay_minutes
+                else "as soon as the first mosaic lands",
                 ", ".join(f"{c.n_tiles:,}" for c in ingest_window[:6]),
             )
             t0 = time.monotonic()
-            first = inputs.wait_first([(c.zone, c.year) for c in ingest_window])
+            window_cells = [(c.zone, c.year) for c in ingest_window]
+            first = inputs.wait_first(window_cells)
             if first is None:  # nothing was started (no adapter cells) — nothing to wait for
                 log.warning("No ingest was started for this cluster; requesting GPUs without waiting")
             else:
                 landed = next(c for c in ingest_window if (c.zone, c.year) == first)
                 log.info(
-                    "Mosaic for %s-%d (%s tiles) ready after %.1fs — requesting GPUs; %d zone(s) still ingesting",
+                    "Mosaic for %s-%d (%s tiles) ready after %.1fs%s; %d zone(s) still ingesting",
                     landed.zone,
                     landed.year,
                     f"{landed.n_tiles:,}",
                     time.monotonic() - t0,
+                    "" if inference_start_delay_minutes else " — requesting GPUs",
                     len(ingest_window) - 1,
                 )
+                if inference_start_delay_minutes:
+                    inputs.hold_for_backlog(window_cells, inference_start_delay_minutes)
 
         # Pin a deterministic cluster name from the flow-run id so the cancellation hook can
         # re-derive it and terminate the fleet by tag even in a fresh module import (globals
@@ -1430,4 +1658,4 @@ def fill_zones_sequential_flow(
         len(retagged),
         len(empty),
     )
-    return {**summary, "sequential": seq}
+    return _finish({**summary, "sequential": seq})

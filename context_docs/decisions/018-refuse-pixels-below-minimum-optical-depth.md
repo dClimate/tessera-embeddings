@@ -1,6 +1,7 @@
 # 018 — Refuse pixels below 15 optical observations, and accept the deferral premium
 
-**Status:** Accepted (line decided 2026-08-17; recorded here 2026-08-18). Built.
+**Status:** Superseded by [ADR 028](028-embed-every-pixel-with-an-optical-observation.md) (2026-10-12).
+Accepted 2026-08-17.
 
 ## Context
 

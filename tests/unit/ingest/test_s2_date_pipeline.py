@@ -98,6 +98,11 @@ class _FakeClient:
         return SimpleNamespace(result=obj.compute)
 
     @staticmethod
+    def scheduler_info():
+        """One worker, so a run given no batch budget derives one worker's worth."""
+        return {"workers": {"inproc://fake": {}}}
+
+    @staticmethod
     def register_plugin(_plugin):
         """Accept the plugin. A worker's ``setup`` is what installs the rescues on a real
         cluster; here the in-process install has already run, which is what ``run`` reports.
@@ -524,6 +529,48 @@ def test_a_batch_failure_that_is_not_a_read_error_still_fails_the_leg(run_ingest
     dates = {"2024-01-01": True, "2024-01-02": True}
     with pytest.raises(RuntimeError, match="write of 2024-01-02 failed"):
         run_ingest(dates, pipeline_dates=False, fail_on="2024-01-02", batch_dates=2)
+
+
+@pytest.mark.parametrize("chunks", [[20, 20, 20, 20], [1, 1, 1, 1, 20, 20, 20]], ids=["dense", "sparse-then-dense"])
+def test_dense_dates_are_written_at_once_and_prepared_one_ahead(run_ingest, monkeypatch, chunks):
+    """A date over the budget writes alone, straight away, and the look-ahead weighs dates before
+    preparing them, so even after a run of sparse dates a dense run holds no more prepared dates
+    than writing one date per commit: the date after next is not loaded until the first dense date
+    has been written.
+    """
+    per_date = iter(chunks)
+    one_chunk = SimpleNamespace(y0=0, y1=SIZE, x0=0, x1=SIZE)
+    monkeypatch.setattr(s2_roi, "windows_for_date", lambda *_a, **_k: [one_chunk] * next(per_date))
+    dates = {f"2024-01-{d:02d}": True for d in range(1, len(chunks) + 1)}
+    run = run_ingest(dates, pipeline_dates=True, batch_dates=None, write_s=0.2)
+    assert run.written == list(dates)
+    first_dense = chunks.index(20)
+    order = list(dates)
+    assert run.load_started[order[first_dense + 2]] >= run.write_ended[order[first_dense]]
+
+
+@pytest.mark.parametrize(
+    ("chunks", "budget", "sizes"),
+    [
+        ([1, 1, 1, 1, 1], None, [4, 1]),  # no budget passed: sparse dates still fill to the cap
+        ([20, 1, 1], None, [1, 2]),  # no budget passed: one worker's budget, so a dense date writes alone
+        ([1, 0, 1, 1, 1, 1], None, [4, 1]),  # a date reaching no live window rides along without a slot
+        ([1, 1, 1, 1, 1], 10, [4, 1]),  # sparse dates fill a batch to the cap
+        ([2, 2, 3, 1, 1], 5, [2, 3]),  # a date that would cross the budget closes the batch first
+        ([1, 9, 1, 1], 5, [1, 1, 2]),  # a date over the budget on its own writes alone
+    ],
+)
+def test_a_batch_holds_sparse_dates_up_to_its_chunk_budget(run_ingest, monkeypatch, caplog, chunks, budget, sizes):
+    """Batching pays for sparse writes only, so a batch is sized by the chunks each date writes."""
+    per_date = iter(chunks)
+    one_chunk = SimpleNamespace(y0=0, y1=SIZE, x0=0, x1=SIZE)
+    monkeypatch.setattr(s2_roi, "windows_for_date", lambda *_a, **_k: [one_chunk] * next(per_date))
+    dates = {f"2024-01-{d:02d}": True for d in range(1, len(chunks) + 1)}
+    log = logging.getLogger("s2-batch-budget-test")
+    with caplog.at_level(logging.INFO, logger=log.name):
+        run = run_ingest(dates, pipeline_dates=True, batch_dates=None, batch_chunk_budget=budget, log=log)
+    assert [int(n) for n in re.findall(r"Batch timings .* n=(\d+):", caplog.text)] == sizes
+    assert run.written == [d for d, c in zip(dates, chunks, strict=True) if c]  # a windowless date writes nothing
 
 
 # ---------------------------------------------------------------------------

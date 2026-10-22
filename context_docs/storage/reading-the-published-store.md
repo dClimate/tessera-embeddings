@@ -61,8 +61,10 @@ authority**, and it distinguishes what nothing else can: a year deliberately lef
 with no qualifying land that year — *is* in the list, while a year that never landed is absent.
 
 Reading `zone.attrs` pulls the whole metadata document, including a `runs` entry per year carrying
-that fill's run id, its input coverage per source store and the commit it was built from. Useful
-provenance, and not small: a reader who only wants `years_complete` pays for all of it per zone.
+that fill's run id, its input coverage per source store and the commit it was built from. A fill
+since v1.1 also records its shard commit in the store and the runs it replaced, which the registry
+is checked against ([`registry-master.md`](registry-master.md)). Useful provenance, and not small: a
+reader who only wants `years_complete` pays for all of it per zone.
 
 ## 2. What is published
 
@@ -439,14 +441,26 @@ what a second traversal would cost.
 
 ## 5. The registry beside the store
 
-`s3://tessera-embeddings/v1.1/dclimate.registry` — 994 Parquet parts, 142 MB, at
-`parts/zone=<ZONE>/year=<YEAR>/<run_id>.parquet`. **3,247,410 rows**, one per tile per year, each
+`s3://tessera-embeddings/v1.1/dclimate.registry`: **3,247,410 rows**, one per tile per year, each
 with a WGS84 bounding box, whether the tile was embedded, how many of its pixels the depth rule
-refused and for which of three reasons, and how deep the imagery was where it fell short.
+refused and for which of three reasons, and how deep the imagery was where it fell short. It has
+two prefixes:
 
-**It is written as designed, on every check.** All 994 parts carry all 23 declared columns at the
-declared types; every part's key-value metadata agrees with the zone and year in its path; no path
-fails to parse; and no cell has more than one part, so nothing was filled twice.
+| prefix | contents | what it is |
+|---|---|---|
+| `master/` | 994 files at `master/zone=<ZONE>/year=<YEAR>/part-0.parquet` + `_common_metadata`, 151 MB | **what a consumer reads**: one row per tile-year, one schema, measurements on every row; its guide is [`docs/registry.md`](../../docs/registry.md), published beside it as `README.md` |
+| `parts/` | 994 files, 142 MB, at `parts/zone=<ZONE>/year=<YEAR>/<run_id>.parquet` | the fills' raw output, one part per cell per run, named by run id; internal |
+
+**`master/` describes what the store holds now.** Every run merges its rows into its zone-year's
+master file tile by tile as it lands: a tile's row comes from the newest run that wrote that tile,
+and a tile no later run touched keeps its row. A refill or a future update therefore reaches
+`master/` without anybody re-running anything, and a reader never has to choose between runs. See
+[`registry-master.md`](registry-master.md).
+
+**The campaign's parts are written as designed, on every check.** All 994 parts carry all 23
+declared columns at the declared types; every part's key-value metadata agrees with the zone and
+year in its path; no path fails to parse; and no cell has more than one part, so nothing was
+filled twice.
 
 **It agrees with the store, tile for tile.** A registry tile label is `chunk_<shard_y>_<shard_x>`,
 the same shard-grid coordinate Icechunk's chunk index returns, so the two compare as sets rather
@@ -464,38 +478,56 @@ record of it — and every tile in 33N/2017 with counts but no embeddings appear
 not-embedded row. Without that, deleting every `embedded=False` row would leave the embedded
 comparison untouched and the audit would still say the two agree.
 
+**Every row in `master/` carries measurements, and `measured_by` says whose.** In `parts/`,
+1,519,045 of the 3,247,410 rows (47%) are null across every measurement column: `refused_px`, the
+three reasons, the depth statistics, `px_with_any_radar`. The cause is an asymmetry in how the
+record reached the registry. A refused tile's went into its skip marker on object storage and
+survived a resume; an embedded tile's rode back in the actor's result and did not. So all 17,865
+wholly refused tiles were measured, and only 53% of embedded ones. Every column is derivable from
+the store, so those rows were re-derived from it and published in `master/` on 2026-10-12:
+1,728,365 rows are `measured_by = "fill"`, 1,519,045 are `"rebuild"`, and none are unmeasured.
+**Read `master/`, not `parts/`**: counting refusals over `parts/` counts the measured half only.
+One column differs by origin. Rebuilt rows leave `eligible_px` null and count over the whole tile,
+so divide refusals by `eligible_px` where it is present and by `chunk_px` otherwise; the two differ
+on 237 fill-measured tiles. See [`registry-backfill.md`](registry-backfill.md).
+
 **Row counts differ between the two, and both are right.** 3,247,410 registry rows against
 3,229,545 shards holding embeddings: the difference, 17,865, is tiles evaluated and refused
 outright. A consumer who reads `embedded` alone as coverage will overstate it, which is why the
 registry carries `refused_px` beside it — a tile can be embedded and still be largely holes.
 
-**Reading the whole dataset needs the schema stated**, or a column added mid-campaign is silently
-dropped: `pyarrow` infers a dataset's schema from the first file in sorted path order, so whether a
-newer column is visible depends on whether zone 01N was written before or after it was added.
+**Read the master with the schema it carries.** `master/` is written with one schema and a
+dataset-level `_common_metadata`, so a reader without this package takes the schema from the
+dataset itself:
 
 ```python
-import pyarrow.dataset as ds
-from tessera_embeddings.storage.registry import dataset_schema
-dataset = ds.dataset(f"{root}/parts", schema=dataset_schema(), partitioning="hive")
+import pyarrow.dataset as ds, pyarrow.parquet as pq
+from pyarrow.fs import S3FileSystem
+fs = S3FileSystem(region="us-west-2", anonymous=True)
+master = "tessera-embeddings/v1.1/dclimate.registry/master"
+schema = pq.read_schema(f"{master}/_common_metadata", filesystem=fs)
+dataset = ds.dataset(master, filesystem=fs, schema=schema, partitioning="hive")
 ```
 
-**On this dataset the hazard is latent, not live.** Both ways return the same 25 columns and the
-same 3,247,410 rows, because the whole campaign ran on one commit
-(`bbb9d836b3667f579c18a052e8d456d9a58c4e11`) and every part therefore has the same schema. It will
-bite the first time a column is added and only some zones are rewritten.
+**Reading `parts/` needs the schema stated**, or a column added mid-campaign is silently dropped:
+`pyarrow` infers a dataset's schema from the first file in sorted path order. Pass
+`schema=tessera_embeddings.storage.registry.dataset_schema()`. On v1.1 the hazard is latent rather
+than live: the campaign's parts span nine commits (their `code_commit`), but all of them wrote the
+same 23 columns, so every part has the same schema.
 
 ## 6. What is missing, and what would surprise a consumer
 
-**No compacted master and no `_common_metadata`.** Nothing sits beside `parts/`. The registry's
-design says a consumer without this package should read the compacted master, and that a
-dataset-level `_common_metadata` is where the compaction would put a schema they could take from the
-dataset rather than from a part they must know is current. Neither exists, so an outside consumer
-either states the schema from a part they chose themselves or accepts whatever `pyarrow` infers.
-Fine while every part agrees; a trap the first time they do not.
+**Nothing records the run's parameters.** The store's root carries `optical_min_obs`, the depth
+rule (15 for v1.1's campaign fill), but not `allow_s2_only` or `min_valid_coverage` — so exactly
+reproducing a cell needs the run's parameters from `context_docs/campaign/campaign-plan.md` rather
+than from the product.
 
-**Nothing records the run's parameters.** The store's root carries `optical_min_obs = 15`, the depth
-rule, but not `allow_s2_only` or `min_valid_coverage` — so exactly reproducing a cell needs the
-run's parameters from `context_docs/campaign/campaign-plan.md` rather than from the product.
+**The root's `optical_min_obs` understates a cell a targeted update reached.** An update may embed
+pixels below the store's line with a lower line of its own, and records that line only in the zone
+group's `updates[year]` records and the registry rows, never on the root or the zone group
+(ADR 028). Every pixel embedded in a cell meets `storage.update.cell_optical_min_obs(root, zone,
+year)`; a tile's own line is its registry row's `optical_min_obs`, and `s2_obs_count` gives each
+pixel's depth.
 
 **Point access is expensive, and the store is not built for it** (§4.1). That is the geometry
 working as intended: whole-chunk reads are what make block reads fast and object counts manageable.

@@ -542,8 +542,8 @@ def seed_zone_groups(
         # optical_min_obs is in the identity for the same reason the encoder is: a fill reads it to
         # decide which pixels it may embed, so re-stamping it would let zones filled under one rule
         # sit beside zones filled under another, under a root advertising only the second. The
-        # consequence to know is that it makes the rule UNCHANGEABLE for this store — moving the
-        # line means a new store, not a migration.
+        # consequence to know is that the root's rule never moves. A targeted update may apply a
+        # looser line to its own cells (ADR 028), and its update records, not the root, say so.
         root.attrs.update(_root_attrs(layout, model_version, optical_min_obs))
     # The time axis is fixed and UNIFORM across all zone groups (ADR-008 D1): campaign status and
     # fill code assume every group shares one axis. An incremental seed passing a different

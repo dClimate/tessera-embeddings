@@ -333,6 +333,26 @@ class TestTheMinimumDepthRuleComesFromTheStore:
         assert mod._optical_min_obs_from_store("s3://x", get_credentials=None) == 25
 
 
+@pytest.mark.parametrize(
+    ("reader", "kwargs"),
+    [
+        ("_optical_min_obs_from_store", {}),
+        ("_assert_seeded_model_matches", {"build_checkpoint": "c", "allow_model_mismatch": False}),
+    ],
+)
+def test_the_store_readers_take_the_store_s_credential_not_the_caller_s(monkeypatch, reader, kwargs):
+    """The task role cannot read the partner-owned published store, so the path picks the credential."""
+    opened = []
+    monkeypatch.setattr(mod, "_store_credentials", lambda path, given: ("store's own", path))
+    monkeypatch.setattr(
+        mod,
+        "open_store_as_zarr_group",
+        lambda path, **k: opened.append(k["get_credentials"]) or SimpleNamespace(attrs={}),
+    )
+    getattr(mod, reader)("s3://theirs/global.icechunk", get_credentials="task role", **kwargs)
+    assert opened == [("store's own", "s3://theirs/global.icechunk")]
+
+
 def test_the_depth_rule_is_resolved_even_when_no_cluster_is_needed(monkeypatch):
     """An all-ocean or already-complete cell never provisions Ray, and still reaches the runner.
 

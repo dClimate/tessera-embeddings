@@ -30,7 +30,7 @@ orchestration/prefect/
 │   ├── _child_runs.py               # child deployment runs: cancel sweeps, terminal-state check
 │   ├── _dask_lifecycle.py           # Dask/ECS teardown hook + the DaskTaskRunner factory
 │   ├── _ray_lifecycle.py            # Ray teardown hook (the Ray analogue of the above)
-│   ├── _fleet_gate.py               # hold dispatch while the GPU fleet is saturated
+│   ├── _fleet_gate.py               # ingest gate (zero = pause) + inference pause flag
 │   └── _overrides.py                # per-run flow option overrides
 └── tasks/                  Layer 2: thin @task wrappers (~20 LOC each, ADR-002)
     ├── ingest.py                    # process_roi_reflectance, process_roi_sar
@@ -122,7 +122,7 @@ the store. Since a cluster owns a roster of zones, one dying early costs that wh
 roster the wait for the round's slowest sibling. `immediate_refill` (default **off**,
 and off is byte-for-byte the behaviour above) re-dispatches a settled cluster's
 still-missing cells into the slot it just vacated — so the replacement inherits its
-ingest share, its committer share and its place under `max_parallel_clusters`, and the
+ingest share and its place under `max_parallel_clusters`, and the
 fleet's width and cost do not change.
 
 **Nothing locks a zone; the zone partition IS the guarantee that a zone's years never
@@ -258,11 +258,28 @@ enough to infer that the rest of the window lands behind it, and inference is sl
 than ingest in almost every case, so the stream does not run dry and the fleet does
 not idle.
 
+**A small job can hold the request for a backlog.** That argument fails for a small,
+scattered job, such as a targeted update whose zone-years ingest in minutes to hours
+and infer in minutes: the first small mosaic boots the fleet, which finishes it, winds
+down to one actor after the 120 s idle grace, and regrows at the next landing, over
+and over. `inference_start_delay_minutes`, set per dispatch on `run_global_campaign`
+(which forwards it to every chained fill) or on `fill_zones_sequential_flow`, keeps
+holding the request for that many minutes after the first landing, and ends the hold
+early once every ingest in the cluster has finished, landed or failed. The default, 0,
+requests GPUs at the first landing; on the full campaign a hold would buy the
+up-front ingest time the last bullet below rejects. The hold sits inside the same
+shutdown guard as the wait. The inference pause gate is no substitute, since a paused
+cluster still boots and keeps its full fleet while landed work waits
+([`the-fleet-and-the-work-source.md`](../../../../context_docs/inference/the-fleet-and-the-work-source.md)).
+
 ```text
-start window (1 + look_ahead zones), all ingesting in parallel
-   smallest lands ──►│                       (densest lands much later)
-                      ray up ──► stream, taking whichever zone has landed
-                                 (density order preserved, minus the barrier)
+every zone starts ingesting, 1 + look_ahead at a time
+   first lands ──►│ hold ─►│                     (densest lands much later)
+                            ray up ──► stream, taking whichever zone has landed
+                                       (density order preserved, minus the barrier)
+
+hold: up to inference_start_delay_minutes (0 by default), ending early once every
+      ingest has finished
 ```
 
 Two subtleties worth knowing:
@@ -306,6 +323,37 @@ unresolvable conflicts. See `context_docs/storage/writing-to-the-global-store.md
 cluster-less (they run on the flow runner like `generate_roi`); only
 `fill_zone_year` / `fill_zones_sequential` provision Ray.
 
+### Targeted updates of filled cells
+
+An **update** re-runs chosen tiles of cells the campaign has already filled and writes nothing
+else. How to plan, run, check and clean up an update is
+[`docs/updates.md`](../../../../docs/updates.md); the design is
+[ADR 027](../../../../context_docs/decisions/027-targeted-updates.md). Both fill flows take the
+update's name as `update=<name>`, and treat its cells differently from a fill's:
+
+| | campaign fill | update |
+|---|---|---|
+| work list | cells not yet in `years_complete` | plan cells without the update's record; a never-filled cell is refused |
+| inferred | every valid pixel of every live tile | `holes`: only the store's hole pixels; `shards`: the target shards |
+| a tile that embeds nothing | cleared to fill | kept (`on_skip: "clear"` for a `shards` defect fix) |
+| recorded in | `years_complete`, `runs[year]`, the zone-year tag | `updates[year]` alone |
+| ROI, mosaics, staging | the campaign's paths | `{inputs}/updates/<name>/`, `{outputs}/staging/updates/<name>/<store>/`; hole masks and staging per destination store |
+| `min_valid_coverage`, month check | 0.1, every month | `1e-9`, relaxed: a partial-zone ROI must never block |
+| radar policy | any | `holes` requires `allow_s2_only=True`, the campaign's, refused before ingest otherwise |
+
+Run one update per cell at a time: two updates of one cell conflict on its chunks.
+
+#### An update with a looser optical line
+
+The store's minimum optical depth rule sits on its root and never moves. An update can apply a
+looser line to its own cells: plan it with `--optical-min-obs`, and a `holes` update embeds exactly
+the pixels the looser line admits
+([ADR 028](../../../../context_docs/decisions/028-embed-every-pixel-with-an-optical-observation.md)).
+The root and zone groups keep the store's rule, so they understate an updated cell; its update
+records state the line, and `storage.update.cell_optical_min_obs` reads back the floor every
+embedded pixel meets. A line stricter than the store's is refused, as is one stricter than an
+earlier update applied to the same cell. The steps are in [`docs/updates.md`](../../../../docs/updates.md).
+
 ## Master pipeline
 
 `tessera_full_pipeline.py` is the recommended entry point for end-to-end
@@ -334,16 +382,16 @@ override.
 | `tessera_full_pipeline.py` | Async master flow chaining the four above via `arun_deployment`. |
 | `build_land_mask.py` | Global campaign: build per-zone coverage bitmaps from the partner delivery registry (ADR-010). Optional pre-build delivery verification + post-build validation. No cluster. |
 | `seed_global_store.py` | Global campaign: create the global-store repo and seed every unseeded UTM-zone group (metadata-only, ADR-008 D1). Idempotent. No cluster. |
-| `fill_zone_year.py` | Global campaign: fill one `(zone, year)` on a Ray cluster (coverage mask → inference → shard assembly → tag). Commits are ungated. |
-| `fill_zones_sequential.py` | Global campaign: fill one cluster's zones sequentially on a SINGLE shared Ray cluster (densest-first, ingest look-ahead, trailing assembly, idle-retirement gated until the final zone). Waits for its densest zone's mosaic before requesting GPUs. Pre-cluster triage settles retag/all-ocean cells. |
+| `fill_zone_year.py` | Global campaign: fill one `(zone, year)` on a Ray cluster (coverage mask → inference → shard assembly → tag → registry master). Commits are ungated. |
+| `fill_zones_sequential.py` | Global campaign: fill one cluster's zones sequentially on a SINGLE shared Ray cluster (densest-first, ingest look-ahead, trailing assembly, idle-retirement gated until the final zone). Requests GPUs as soon as its first mosaic lands. Pre-cluster triage settles retag/all-ocean cells. |
 | `ingest_zone_year.py` | Global campaign: build one cell's S1/S2 mosaics on the fixed zone grid by dispatching the ROI ingest deployments onto a synthesised zone-shaped ROI. Marker-gated and crash-safe: a stale or half-written mosaic is cleared and rebuilt, never appended onto. |
 | `run_global_campaign.py` | Global campaign driver: dispatch fills per pending `(zone, year)`, year-serial — per-cell `fill-zone-year` runs with bounded zone parallelism (`fill_strategy="cluster-per-zone"`), or size-balanced `fill-zones-sequential` runs on long-lived clusters (`"chained-clusters"`). |
 
 ### A landed cell is handed to a validator, and nothing waits for it
 
-Both fill flows take a `validation_deployment`. As each cell is tagged they create one run
-of it and return immediately (`flows/_cell_validation.py`), so cell N is checked while cell
-N+1 is still being filled — on the chained path the dispatch happens on the trailing
+Both fill flows take a `validation_deployment`. As each cell is tagged, or a targeted update
+writes or clears shards in it, they create one run of it and return immediately
+(`flows/_cell_validation.py`), so cell N is checked while cell N+1 is still being filled — on the chained path the dispatch happens on the trailing
 assembly thread, which already has that pipelining.
 
 Three properties are deliberate. The default is `None`, because the validator is a
@@ -358,6 +406,19 @@ consumer's monitoring reads published cells against the verdicts on file.
 The trace tag (`validates-cell-of:<id>`) is deliberately *not* the tag the cancellation
 hooks below sweep. A validation describes a cell that has already landed, holds no fleet,
 and is worth finishing even when its parent fill is cancelled.
+
+### A landed cell is merged into the registry master
+
+Once a cell with live tiles has committed and published its part, and before the tag, the
+runner merges its registry parts into the cell's file under the registry's `master/`
+(`runners/zone_fill.py`, `_merge_registry_master`), so consumers read every fill as soon as
+it lands, including a deliberate refill, which fails at the tag step by design. Like the
+validator dispatch, a failure there is logged and never fails the landed cell; the registry
+census names the cell and `scripts/maintenance/rebuild_registry_measurements.py repair`
+rebuilds it. Planning a retry of a cell that already landed, or of an update already recorded there, runs the merge again, on every runner
+and in triage, so a process that died before it still reaches the master. The merge refuses while a run the store records writing the
+year has no part for a tile it last wrote; refilling those tiles clears it. See
+[`registry-master.md`](../../../../context_docs/storage/registry-master.md).
 
 ### Cancelling reaches every level
 

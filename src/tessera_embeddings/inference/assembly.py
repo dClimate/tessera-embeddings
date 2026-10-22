@@ -72,7 +72,13 @@ from tessera_embeddings.config.store_layout import (
     StoreLayout,
     trailing_extent,
 )
-from tessera_embeddings.inference.chunk_spec import ChunkSpec, chunk_label, filter_chunks_by_roi_mask, parse_chunk_label
+from tessera_embeddings.inference.chunk_spec import (
+    ChunkSpec,
+    chunk_label,
+    filter_chunks_by_roi_mask,
+    parse_chunk_label,
+    read_pixel_mask,
+)
 from tessera_embeddings.storage import zone_grid
 from tessera_embeddings.storage.conventions import (
     assert_encoder_matches,
@@ -253,6 +259,9 @@ _WORKER_SUM_KEYS: tuple[str, ...] = (
     "read_cpu_s",
     "write_s",
     "write_cpu_s",
+    # A targeted update's read of the shard it merges into (`ShardSource.pixels`); absent otherwise.
+    "pixel_merge_s",
+    "pixel_merge_cpu_s",
     "wall_s",
     "cpu_s",
 )
@@ -565,6 +574,98 @@ class StagedResume:
     skipped: set[str]
 
 
+def assert_on_store_grid(
+    root: zarr.Group,
+    spatial: SpatialCoords | None,
+    *,
+    total_y: int,
+    total_x: int,
+    embedding_dim: int,
+    where: str,
+) -> None:
+    """Refuse mosaics whose grid is not the store's: a write into an existing store is positional.
+
+    Shared by an append to a single-area store and an update of one, which both write staged pixels
+    into the store's existing coordinate arrays.
+    """
+    # The store's own grid is authoritative: on a mismatched extent a raw region write
+    # would silently land in a corner, or be clamp-truncated.
+    emb = cast(zarr.Array, root["embeddings"])
+    if emb.shape[1] != total_y or emb.shape[2] != total_x or emb.shape[3] != embedding_dim:
+        raise ValueError(
+            f"Mosaic extent ({total_y} x {total_x} x {embedding_dim} bands) does not match "
+            f"existing store {where} ({emb.shape[1]} x {emb.shape[2]} x {emb.shape[3]} bands) "
+            "— wrong output path, ROI grid, or model width."
+        )
+    # Shape alone cannot catch a shifted or reversed mosaic on the same grid size (the
+    # manifest omits origin), which would append under the existing coordinates and be
+    # silently misgeoreferenced. So compare CRS and coordinate endpoints against the
+    # stored grid, at half-pixel absolute tolerance as in the zone-fill runner.
+    #
+    # CRS is checked only when present: atomic publish means `main` only ever exposes a
+    # COMPLETE store, so a normal re-append always sees one, and the None guard covers
+    # only a legacy store left partial by a pre-atomic-publish engine. The coordinate
+    # ARRAYS are the real check.
+    if spatial is not None:
+        stored_crs = root.attrs.get("crs")
+        if stored_crs is not None and spatial.crs != stored_crs:
+            raise ValueError(
+                f"Mosaic CRS {spatial.crs!r} does not match existing store {where} "
+                f"CRS {stored_crs!r} — appending would misgeoreference the timestep."
+            )
+        z_north = cast(zarr.Array, root["northing"])
+        z_east = cast(zarr.Array, root["easting"])
+        atol = PIXEL_M / 2
+        if not (
+            np.isclose(spatial.northing[0], z_north[0], rtol=0.0, atol=atol)
+            and np.isclose(spatial.northing[-1], z_north[-1], rtol=0.0, atol=atol)
+            and np.isclose(spatial.easting[0], z_east[0], rtol=0.0, atol=atol)
+            and np.isclose(spatial.easting[-1], z_east[-1], rtol=0.0, atol=atol)
+        ):
+            raise ValueError(
+                f"Mosaic coordinates do not lie on existing store {where}'s grid "
+                "(shifted or reversed axes) — appending would silently misgeoreference the timestep."
+            )
+        # Extent, CRS and endpoints still do not pin an axis: a reordered or non-affine
+        # interior satisfies all three, and this phase writes staged pixels POSITIONALLY
+        # against the store's existing coordinate arrays, so such an append publishes real
+        # pixels at the wrong coordinates with nothing to signal it. Hence the full-vector
+        # comparison the zone-fill runner also makes — two 1-D reads per append. A
+        # per-step spacing test cannot substitute: whatever slack it admits per step, an
+        # axis that wanders and returns accumulates it while still matching the length and
+        # both endpoints. Reachable on the supported hand-provided mosaic path.
+        for axis, values, stored in (
+            ("northing", spatial.northing, z_north),
+            ("easting", spatial.easting, z_east),
+        ):
+            got = np.asarray(values, dtype="float64")
+            want = np.asarray(stored[:], dtype="float64")
+            # A float round-trip allowance, not a geometric one: coordinates round-trip
+            # through float32 at ~1 m near a 9.3e6 m northing, while any real displacement
+            # is a whole pixel.
+            bad = ~np.isclose(got, want, rtol=0.0, atol=1.0)
+            if bad.any():
+                i = int(np.argmax(bad))
+                raise ValueError(
+                    f"Mosaic {axis} does not match existing store {where}'s axis: "
+                    f"index {i} is {got[i]} where the store says {want[i]} "
+                    f"({int(bad.sum())} of {got.size} coordinates differ). Extent, CRS and "
+                    "endpoints all match, so this is a reordered or non-affine interior — "
+                    "appending would write real pixels at the wrong coordinates."
+                )
+
+
+def tile_extent(shard: tuple[int, int], shard_px: int, extent: tuple[int, int] | None) -> tuple[int, int]:
+    """A tile's pixel size: one whole shard, cut short only where the destination's edge cuts it.
+
+    A zone is a whole number of shards; a single-area store is the area's size, so its last row and
+    column of tiles can be narrower.
+    """
+    if extent is None:
+        return shard_px, shard_px
+    return min(shard_px, extent[0] - shard[0] * shard_px), min(shard_px, extent[1] - shard[1] * shard_px)
+
+
 @dataclasses.dataclass(frozen=True)
 class StagedShardSource:
     """:class:`~tessera_embeddings.storage.shard_writer.ShardSource` over staged tiles.
@@ -594,6 +695,11 @@ class StagedShardSource:
     # Written as fill rather than left alone — see `live_shards`.
     cleared: tuple[tuple[int, int], ...] = ()
     fill_values: tuple[tuple[str, float], ...] = ()  # (var, fill) for the cleared tiles
+    # A targeted update's pixel masks, as `((row, col), uri)` pairs. A staged shard listed here is
+    # MERGED into the store, replacing only the pixels its mask marks (see `pixels`).
+    owned: tuple[tuple[tuple[int, int], str], ...] = ()
+    # The destination's (northing, easting) size, which cuts its last tiles short; None is whole tiles.
+    extent: tuple[int, int] | None = None
 
     def live_shards(self) -> list[tuple[int, int]]:
         """Every ``(row, col)`` this run is responsible for — staged AND skipped.
@@ -635,7 +741,7 @@ class StagedShardSource:
                     "write would silently C-cast (wraparound); mixed-version or corrupt staged run."
                 )
             h, w = block.shape[1:3]
-            if (h, w) != (self.shard_px, self.shard_px):
+            if (h, w) != tile_extent(shard, self.shard_px, self.extent):
                 raise ValueError(
                     f"Staged tile {path} has {var} extent {h} x {w} px but shards are {self.shard_px} px — "
                     "truncated or off-grid tile (ADR-008 D3 requires whole tiles)."
@@ -661,6 +767,11 @@ class StagedShardSource:
                 f"{list(self.variables)} — heterogeneous staged run; re-stage with one config before assembling."
             )
         return blocks
+
+    def pixels(self, shard: tuple[int, int]) -> np.ndarray | None:
+        """The pixels a targeted update owns in ``shard``, or ``None`` when the run owns it whole."""
+        uri = next((uri for position, uri in self.owned if position == shard), None)
+        return None if uri is None else read_pixel_mask(uri)
 
     def _fill_block(self, shard: tuple[int, int] | None = None) -> dict[str, np.ndarray]:
         """A whole tile of fill for a position this run skipped — with any coverage it DID measure.
@@ -956,6 +1067,46 @@ class ZarrWriter:
         logger.info("Staged coverage-only tile for refused chunk %s to %s", chunk.label, path)
         return path
 
+    def _top_up_embedded_records(
+        self, run_id: str, labels: list[str], records: Mapping[str, dict] | None
+    ) -> dict[str, dict]:
+        """``records``, plus the coverage attribute of every staged tile it has no entry for.
+
+        The registry's measurement columns are only as complete as this mapping, and a resumed run
+        arrives here with most of it missing: a leg that staged nothing for a tile an earlier leg
+        wrote reports it as a success carrying no record. The record is on the tile — the write
+        persists it (:meth:`write_chunk`) exactly as a refusal persists its own into a skip marker
+        — so the gap is a read rather than a re-inference.
+
+        Fail-soft, like every other provenance read on this path: losing the records must never
+        cost a cell whose inference is already paid for.
+        """
+        present = dict(records or {})
+        missing = [label for label in labels if label not in present]
+        if not missing:
+            return present
+        recovered, unreadable = read_staged_coverage(self.staging_base, run_id, missing)
+        if recovered or unreadable:
+            logger.info(
+                "Run %s: recovered %d of %d missing coverage record(s) from the staged tiles, %d unreadable",
+                run_id,
+                len(recovered),
+                len(missing),
+                unreadable,
+            )
+        still_missing = len(missing) - len(recovered)
+        if still_missing:
+            # LOUD, because this is exactly the state that published half a registry saying
+            # nothing, and it is invisible in every other signal a cell emits.
+            logger.warning(
+                "Run %s: %d embedded tile(s) will publish registry rows with NO measurements. Those "
+                "rows say nothing about the ground they name; every column is derivable from the "
+                "store, so they are repairable with scripts/maintenance/rebuild_registry_measurements.py",
+                run_id,
+                still_missing,
+            )
+        return present | recovered
+
     def publish_registry_part(
         self,
         registry_root: str,
@@ -963,10 +1114,12 @@ class ZarrWriter:
         year: int,
         run_id: str,
         *,
+        committed_at: str,
         embedded: list[str],
         refused: list[str],
         optical_min_obs: int | None = None,
         embedded_records: Mapping[str, dict] | None = None,
+        update_name: str | None = None,
         get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
         s3_region: str | None = None,
     ) -> str | None:
@@ -976,6 +1129,11 @@ class ZarrWriter:
         nothing reconciles the two — so a part written while assembly was still running advertises
         embedded and refused tiles for a zone-year that may never land, permanently. Publishing
         after the commit makes the part's existence mean the cell exists.
+
+        ``committed_at`` is the shard commit's own timestamp, stamped on every row as
+        ``assembled_at``. The master keeps each tile's newest row, so the stamp must order runs as
+        the store wrote their pixels; the clock at publication would not, when one run commits
+        first and publishes last.
 
         Returns the URI on success, ``None`` on failure. Best-effort in this direction only: losing
         a part costs a future infill campaign some precision, while raising would fail a cell that
@@ -1006,13 +1164,14 @@ class ZarrWriter:
                 uri,
                 registry_rows(
                     run_id,
-                    datetime.datetime.now(datetime.UTC).isoformat(),
+                    committed_at,
                     embedded=embedded,
                     refused=refused,
                     records=records,
                     optical_min_obs=optical_min_obs,
                     bboxes=boxes,
                     code=build,
+                    update_name=update_name,
                 ),
                 open_output=lambda target: fs.open(target, "wb"),
                 zone=zone,
@@ -1126,6 +1285,7 @@ class ZarrWriter:
         embeddings_std: np.ndarray | None = None,
         obs_counts: Mapping[str, np.ndarray | None] | None = None,
         month_covered: Mapping[str, np.ndarray | None] | None = None,
+        coverage: Mapping[str, Any] | None = None,
     ) -> str:
         """Write one chunk's embeddings to a staged intermediate (non-Icechunk) Zarr store.
 
@@ -1150,6 +1310,13 @@ class ZarrWriter:
                 its destination's axis order and assembly writes it without reordering.
             obs_counts: Optional dict of obs count variable names to (H, W) uint16 arrays. Keys
                 from ``OBS_COUNT_VARS``.
+            coverage: This chunk's coverage record (``actors._coverage_record``), persisted as a
+                tile attribute so it OUTLIVES THE PROCESS THAT MEASURED IT. A refused chunk writes
+                the same record into its skip marker, which is why every wholly-refused tile in the
+                published registry carries measurements while only half the embedded ones do: the
+                embedded path returned its record in the actor's result and a resumed leg never
+                sees it. Written with ``staged_complete`` and therefore before ``.done``, so the
+                marker keeps vouching for a tile whose attributes are already set.
 
         Returns:
             Path to the staged Zarr store.
@@ -1258,6 +1425,11 @@ class ZarrWriter:
         # implies `attribute set` implies `to_zarr returned`. A crash anywhere earlier leaves a tile
         # the listing reports as interrupted, which the resume scan re-infers (mode="w" overwrites).
         marker = zarr.open_group(path, mode="a", storage_options=_staged_storage_options(path))
+        if coverage is not None:
+            # BEFORE `staged_complete`, so the completeness flag keeps meaning "everything this
+            # tile carries is written". A reader gated on it can then take the record's absence as
+            # "this fill did not measure one" rather than "it may not have landed yet".
+            marker.attrs["coverage"] = dict(coverage)
         marker.attrs["staged_complete"] = True
         with done_fs.open(done_path, "wb") as f:
             f.write(b"")
@@ -1909,71 +2081,9 @@ class ZarrWriter:
                 where=output_path,
             )
 
-            # The store's own grid is authoritative: on a mismatched extent a raw region write
-            # would silently land in a corner, or be clamp-truncated.
-            emb = cast(zarr.Array, root["embeddings"])
-            if emb.shape[1] != total_y or emb.shape[2] != total_x or emb.shape[3] != self.embedding_dim:
-                raise ValueError(
-                    f"Mosaic extent ({total_y} x {total_x} x {self.embedding_dim} bands) does not match "
-                    f"existing store {output_path} ({emb.shape[1]} x {emb.shape[2]} x {emb.shape[3]} bands) "
-                    "— wrong output path, ROI grid, or model width."
-                )
-            # Shape alone cannot catch a shifted or reversed mosaic on the same grid size (the
-            # manifest omits origin), which would append under the existing coordinates and be
-            # silently misgeoreferenced. So compare CRS and coordinate endpoints against the
-            # stored grid, at half-pixel absolute tolerance as in the zone-fill runner.
-            #
-            # CRS is checked only when present: atomic publish means `main` only ever exposes a
-            # COMPLETE store, so a normal re-append always sees one, and the None guard covers
-            # only a legacy store left partial by a pre-atomic-publish engine. The coordinate
-            # ARRAYS are the real check.
-            if spatial is not None:
-                stored_crs = root.attrs.get("crs")
-                if stored_crs is not None and spatial.crs != stored_crs:
-                    raise ValueError(
-                        f"Mosaic CRS {spatial.crs!r} does not match existing store {output_path} "
-                        f"CRS {stored_crs!r} — appending would misgeoreference the timestep."
-                    )
-                z_north = cast(zarr.Array, root["northing"])
-                z_east = cast(zarr.Array, root["easting"])
-                atol = PIXEL_M / 2
-                if not (
-                    np.isclose(spatial.northing[0], z_north[0], rtol=0.0, atol=atol)
-                    and np.isclose(spatial.northing[-1], z_north[-1], rtol=0.0, atol=atol)
-                    and np.isclose(spatial.easting[0], z_east[0], rtol=0.0, atol=atol)
-                    and np.isclose(spatial.easting[-1], z_east[-1], rtol=0.0, atol=atol)
-                ):
-                    raise ValueError(
-                        f"Mosaic coordinates do not lie on existing store {output_path}'s grid "
-                        "(shifted or reversed axes) — appending would silently misgeoreference the timestep."
-                    )
-                # Extent, CRS and endpoints still do not pin an axis: a reordered or non-affine
-                # interior satisfies all three, and this phase writes staged pixels POSITIONALLY
-                # against the store's existing coordinate arrays, so such an append publishes real
-                # pixels at the wrong coordinates with nothing to signal it. Hence the full-vector
-                # comparison the zone-fill runner also makes — two 1-D reads per append. A
-                # per-step spacing test cannot substitute: whatever slack it admits per step, an
-                # axis that wanders and returns accumulates it while still matching the length and
-                # both endpoints. Reachable on the supported hand-provided mosaic path.
-                for axis, values, stored in (
-                    ("northing", spatial.northing, z_north),
-                    ("easting", spatial.easting, z_east),
-                ):
-                    got = np.asarray(values, dtype="float64")
-                    want = np.asarray(stored[:], dtype="float64")
-                    # A float round-trip allowance, not a geometric one: coordinates round-trip
-                    # through float32 at ~1 m near a 9.3e6 m northing, while any real displacement
-                    # is a whole pixel.
-                    bad = ~np.isclose(got, want, rtol=0.0, atol=1.0)
-                    if bad.any():
-                        i = int(np.argmax(bad))
-                        raise ValueError(
-                            f"Mosaic {axis} does not match existing store {output_path}'s axis: "
-                            f"index {i} is {got[i]} where the store says {want[i]} "
-                            f"({int(bad.sum())} of {got.size} coordinates differ). Extent, CRS and "
-                            "endpoints all match, so this is a reordered or non-affine interior — "
-                            "appending would write real pixels at the wrong coordinates."
-                        )
+            assert_on_store_grid(
+                root, spatial, total_y=total_y, total_x=total_x, embedding_dim=self.embedding_dim, where=output_path
+            )
             # Variables staged by this run but absent from the store (a store created before obs
             # counts, or compute_std newly on) are created schema-only at the current time extent;
             # prior timesteps read back as the layout fill.
@@ -2179,6 +2289,10 @@ class ZarrWriter:
         registry_root: str | None = None,
         optical_min_obs: int | None = None,
         embedded_records: Mapping[str, dict] | None = None,
+        pixels: Mapping[str, str] | None = None,
+        commit_attrs: Callable[[icechunk.Repository, str, int, Mapping[str, str]], str] | None = None,
+        update_name: str | None = None,
+        time_index: int | None = None,
     ) -> str:
         """Assemble a run's staged tiles into one (zone, year) of the global store.
 
@@ -2255,6 +2369,16 @@ class ZarrWriter:
                 the gap between its two commits. Inert unless the run was armed for
                 that fault and this cell
                 (:mod:`tessera_embeddings.config.fault_injection`).
+            pixels: A targeted update's pixel masks, label to URI. A staged tile listed here is
+                merged into the shard already in the store, replacing only the pixels its mask
+                marks; an unlisted one is written whole.
+            commit_attrs: Replaces the year-attrs commit
+                (:func:`~tessera_embeddings.storage.shard_writer.write_year_shards`). A targeted
+                update records itself this way and leaves ``years_complete`` and ``runs`` alone.
+            update_name: The targeted update writing this cell, stamped on its registry rows.
+            time_index: The time step to write, in place of ``year``'s calendar slot: an update of a
+                single-area store, whose arrays sit at its root (``zone=""``) on a time axis of
+                window ends.
 
         Returns:
             The commit snapshot id.
@@ -2299,7 +2423,7 @@ class ZarrWriter:
 
         # One readonly probe of the zone group: year index, shard pitch, variables.
         node = cast(zarr.Group, zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[zone])
-        year_index = time_index_of(node, year_timestamp(year))
+        year_index = time_index if time_index is not None else time_index_of(node, year_timestamp(year))
         if year_index is None:
             raise ValueError(
                 f"Year {year} is not on {zone}'s pre-allocated time axis "
@@ -2307,6 +2431,7 @@ class ZarrWriter:
                 "the axis is fixed at seeding (ADR-008 D1)."
             )
         shard_px = shard_pitch(cast(zarr.Array, node["embeddings"]))
+        extent = cast("tuple[int, int]", tuple(cast(zarr.Array, node["embeddings"]).shape[1:3]))
         # Destination band width is the authority for the staged-tile band check, NOT
         # ZarrWriter.embedding_dim, which defaults to 128 and need not match a zone seeded wider.
         dest_band = int(cast(zarr.Array, node["embeddings"]).shape[-1])
@@ -2342,7 +2467,7 @@ class ZarrWriter:
                         "a raw-zarr write would silently C-cast (wraparound); re-stage correctly."
                     )
             staged_shape = tuple(cast(zarr.Array, staged_group["embeddings"]).shape[:2])
-            if staged_shape != (shard_px, shard_px):
+            if staged_shape != tile_extent(parse_chunk_label(labels[0]), shard_px, extent):
                 raise ValueError(
                     f"Staged tiles are {staged_shape[0]} x {staged_shape[1]} px but {zone} shards are "
                     f"{shard_px} px — the global write path requires 1 inference tile == 1 shard (ADR-008 D3)."
@@ -2406,11 +2531,20 @@ class ZarrWriter:
             optional_present=dest_optional,
             cleared=cleared,
             fill_values=fill_values,
+            owned=tuple((parse_chunk_label(label), uri) for label, uri in sorted((pixels or {}).items())),
+            extent=extent,
         )
         telemetry: dict[str, Any] = {}
         # Captured before the write, so the registry part reports what THIS call published rather
         # than whatever a later listing happens to see.
         registry_embedded, registry_refused = list(labels), list(skipped)
+        # TOP UP FROM THE STAGED TILES, before the staging prefix goes anywhere. A resumed leg's
+        # `results` report earlier legs' tiles as synthetic successes with no coverage record, so
+        # without this their registry rows publish null — the asymmetry that left half the
+        # published registry saying nothing. Reading here rather than in the runner means every
+        # caller gets it, and a run that staged everything itself, or publishes no part, reads nothing at all.
+        if registry_root:
+            embedded_records = self._top_up_embedded_records(run_id, registry_embedded, embedded_records)
         snapshot = write_year_shards(
             repo,
             zone,
@@ -2434,6 +2568,7 @@ class ZarrWriter:
             log=_log,
             fault=fault,
             input_coverage=input_coverage,
+            commit_attrs=commit_attrs,
         )
         # THE CELL IS COMMITTED. Only now may the registry say so: nothing reconciles it against
         # the store, and consumers are told they need not open the store, so a part written any
@@ -2444,10 +2579,12 @@ class ZarrWriter:
                 zone,
                 year,
                 run_id,
+                committed_at=telemetry["commit"]["committed_at"],
                 embedded=registry_embedded,
                 refused=registry_refused,
                 optical_min_obs=optical_min_obs,
                 embedded_records=embedded_records,
+                update_name=update_name,
                 # The store's own callback: the registry is its sibling in the same bucket, so the
                 # credential that opened the store is the one that can write beside it.
                 get_credentials=get_credentials,
@@ -2586,6 +2723,50 @@ def read_skip_records(
             if bad:
                 unreadable += 1
             elif isinstance(record, dict):
+                out[label] = record
+    return out, unreadable
+
+
+def read_staged_coverage(
+    staging_base: str, run_id: str, labels: Iterable[str], *, workers: int = 32
+) -> tuple[dict[str, dict], int]:
+    """``({label: record}, n_unreadable)`` for every staged tile carrying a coverage attribute.
+
+    The embedded half of :func:`read_skip_records`, and it exists for the same reason: a record
+    that lives only in the process that measured it does not survive a resume. A resumed leg
+    reports earlier legs' tiles as synthetic successes with no ``coverage`` in their result, and
+    without this their registry rows publish null — which is how 1,519,045 of the published
+    registry's 3,247,410 rows came to say nothing about the ground they name.
+
+    Concurrent and fail-soft, like the skip-marker read: these are independent metadata GETs, and
+    losing a diagnostic must never cost a cell that has already been inferred. A tile with no
+    attribute is an ordinary outcome — a fill predating the attribute, which a resume across that
+    change must still assemble — while a read that FAILS is counted and reported, because "no
+    records" and "every read failed" are the same empty dict and mean opposite things.
+    """
+    labels = list(labels)
+    if not labels:
+        return {}, 0
+    base = f"{staging_base.rstrip('/')}/{run_id}"
+
+    def one(label: str) -> tuple[str, dict | None, bool]:
+        """``(label, record, unreadable)``. Absent is ordinary; a read error is not."""
+        try:
+            group = _open_staged_tile(f"{base}/{label}.zarr")
+        except (FileNotFoundError, IncompleteStageError):
+            return label, None, False
+        except Exception:
+            return label, None, True
+        record = group.attrs.get("coverage")
+        return label, (record if isinstance(record, dict) else None), False
+
+    out: dict[str, dict] = {}
+    unreadable = 0
+    with ThreadPoolExecutor(max_workers=min(workers, len(labels))) as pool:
+        for label, record, bad in pool.map(one, labels):
+            if bad:
+                unreadable += 1
+            elif record is not None:
                 out[label] = record
     return out, unreadable
 

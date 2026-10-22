@@ -12,6 +12,8 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
+import fsspec
+import numpy as np
 import xarray as xr
 import zarr
 
@@ -35,6 +37,10 @@ class ChunkSpec:
         y_stop: Stop index along y dimension (exclusive).
         x_start: Start index along x dimension (inclusive).
         x_stop: Stop index along x dimension (exclusive).
+        pixels: URI of a ``(height, width)`` boolean mask restricting inference to the pixels it
+            marks (:func:`write_pixel_mask`); ``None`` infers every valid pixel. Set by a targeted
+            update in ``holes`` mode, carried on the tile so the serial load, the cross-chunk
+            prefetch and the strip loop all see the same mask.
     """
 
     row: int
@@ -43,6 +49,7 @@ class ChunkSpec:
     y_stop: int
     x_start: int
     x_stop: int
+    pixels: str | None = None
 
     @property
     def height(self) -> int:
@@ -71,6 +78,25 @@ def parse_chunk_label(label: str) -> tuple[int, int]:
     if len(parts) != 3 or parts[0] != "chunk":
         raise ValueError(f"Label {label!r} is not of the form 'chunk_<row>_<col>'")
     return int(parts[1]), int(parts[2])
+
+
+def write_pixel_mask(uri: str, mask: np.ndarray) -> None:
+    """Write a tile's boolean pixel mask where :attr:`ChunkSpec.pixels` can point at it.
+
+    Compressed ``.npz``: a hole mask is spatially coherent, so deflate shrinks the 4 MiB of a
+    2048-px tile to kilobytes. Credentials come from fsspec's ambient chain, the one the actors and
+    the flow runner both read the inputs bucket with.
+    """
+    fs, path = fsspec.url_to_fs(uri)
+    fs.makedirs(path.rsplit("/", 1)[0], exist_ok=True)
+    with fs.open(path, "wb") as f:
+        np.savez_compressed(f, mask=np.asarray(mask, dtype=bool))
+
+
+def read_pixel_mask(uri: str) -> np.ndarray:
+    """Read a mask written by :func:`write_pixel_mask`."""
+    with fsspec.open(uri, "rb") as f, np.load(f) as npz:
+        return np.asarray(npz["mask"], dtype=bool)
 
 
 def enumerate_chunks(
