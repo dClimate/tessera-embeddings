@@ -171,12 +171,9 @@ def test_the_newest_field_is_the_last_field() -> None:
 
     Moving this assertion is the expected cost of adding a field, and it is worth paying: the
     tripwire fires on an insertion and on an append alike, so whoever moves it has to look at
-    where their field landed. It named allow_s2_only until 2026-08-13, then optical_min_obs, then
-    actor_request_headroom, and now model_version — which arrived on the v2-large branch INSERTED
-    second, before this rule existed on that branch, and was moved to the end during the merge
-    rather than left to rebind every positional argument after ``time_window``.
+    where their field landed.
     """
-    assert fields(InferenceConfig)[-1].name == "model_version"
+    assert fields(InferenceConfig)[-1].name == "allow_stack_mismatch"
 
 
 def test_the_minimum_depth_rule_defaults_to_no_rule() -> None:

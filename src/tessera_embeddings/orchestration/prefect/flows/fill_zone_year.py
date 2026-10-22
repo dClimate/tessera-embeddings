@@ -163,6 +163,7 @@ def fill_zone_year_flow(
     n_assembly_workers: int | None = None,
     allow_partial_window: bool = False,
     allow_model_mismatch: bool = False,
+    allow_stack_mismatch: bool = False,
     model_version: ModelVersion | None = None,
     allow_s2_only: bool = False,
     mosaic_base: str | None = None,
@@ -223,6 +224,9 @@ def fill_zone_year_flow(
             requires the mosaic's months to span the window).
         allow_model_mismatch: Fill even when the seeded store advertises a different encoder
             or checkpoint than this run (default rejects — it would mix encoders under one store).
+        allow_stack_mismatch: Write tiles computed on a different PyTorch or CUDA from the store's
+            recorded ``inference_stack`` (default rejects at assembly — ADR 025 rule 2). For a
+            deliberate experiment only.
         model_version: The model to fill with. ``None`` (the default) takes the model the store
             holds, its root's ``geoemb:model``, which is what keeps a fill or update from running
             a code default's checkpoint and worker image; a value must agree with the store
@@ -402,6 +406,7 @@ def fill_zone_year_flow(
         # stating it keeps a retune of the default from silently unaligning the campaign.
         chunk_size=SHARD_PX,
         allow_s2_only=allow_s2_only,
+        allow_stack_mismatch=allow_stack_mismatch,
         actor_request_headroom=actor_request_headroom,
         # Omitted when unset so the inference default stands — keyed on None, not on truthiness,
         # because 0 is a documented mode here rather than an absent value.

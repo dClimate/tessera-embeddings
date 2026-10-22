@@ -785,6 +785,8 @@ is recorded as its own signal, *after* the store is fully written:
                     ↓
                 coverage = {…}                    this shard's refusal reasons and depth
                     ↓
+                inference_stack = {…}             the PyTorch and CUDA that computed it
+                    ↓
                 staged_complete = True            in-store attribute
                     ↓
                 <label>.done  (zero bytes)        sibling object, written LAST
@@ -919,7 +921,8 @@ icechunk sessions read their own writes, so the merged result is exact.
    extent. On an existing store: validate the `_manifest` and refuse a store published by the
    other encoder (`conventions.assert_encoder_matches`, which reads a store with no
    `geoemb:model` as v1.1; the pre-flight runs the same check before any GPU is
-   provisioned). Then either resize every time-dimensioned array by one step (an append
+   provisioned), or one computed on another library stack (see *One library stack per store*
+   below). Then either resize every time-dimensioned array by one step (an append
    *is* a resize plus a write at the new index) or, when the time value already exists,
    target that index for an in-place overwrite. That makes a resume **idempotent**: a
    crashed assembly re-run lands on the same index instead of appending a duplicate
@@ -929,7 +932,8 @@ icechunk sessions read their own writes, so the merged result is exact.
    index, so no stale slice describes the overwritten data.
 3. **Phase 2, data.** Fork the session; each worker writes its band's tile slices into every
    output array; the coordinator merges the forks, sets the root attributes (run metadata,
-   GeoZarr conventions, `_manifest`, merged `time_windows`) and commits once through
+   GeoZarr conventions, `_manifest`, merged `time_windows`, and `inference_stack` on the store's
+   first write) and commits once through
    `commit_with_rebase`.
 4. **Atomic publish.** Fast-forward `main` to the fully written work-branch tip, guarded by
    `from_snapshot_id` so a concurrent writer to the same store fails loudly, then drop the
@@ -958,6 +962,16 @@ whose tile staged nothing is kept, not cleared; in `holes` mode each staged tile
 the worker reading the shard already in the store and replacing only its hole pixels, in every
 array; and the second commit appends the update's record to the group's `updates` attr instead of
 advancing `years_complete` and `runs`. No zone-year tag is created.
+
+**One library stack per store** ([ADR 025](../../../context_docs/decisions/025-library-upgrades-ship-on-measured-usability-at-a-store-boundary.md)
+rule 2). The inference actor records the PyTorch and CUDA it runs on every tile it stages, as
+`inference_stack`. The driver cannot: it runs the lockfile's CPU build whatever the workers run.
+Both assembly paths read the stack off one probe tile, hold every other tile to it, and compare it
+with the store root's. The first write into a store stamps the root, for the global store in a
+small commit of its own before any shard (`shard_writer.claim_root_stack`); a store written before
+the record is stamped, not refused. A tile staged on another stack, including one a resume would
+reuse, is refused with both stacks named. `allow_stack_mismatch` writes it anyway, for a deliberate
+experiment, and the store keeps its stack.
 
 **The campaign's land mask is not a pixel-resolution area of interest** but a per-zone
 *coverage bitmap* (`tile_live_2048`), built from the delivery registry by

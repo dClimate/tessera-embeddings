@@ -46,6 +46,7 @@ from tessera_embeddings.inference.assembly import (
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.storage.registry import REASONS, part_uri, registry_rows, write_registry_part
+from tests.unit.inference_stack import STACK
 
 #: A shard commit's timestamp, as `write_year_shards` reports it.
 COMMITTED = "2026-08-01T00:00:00.123456+00:00"
@@ -308,7 +309,9 @@ class TestCoverageOnlyStaging:
 
         cov = writer.write_coverage_only(chunk, "run1", obs, months)
         emb, scales = np.zeros((8, 8, 128), dtype=np.int8), np.zeros((8, 8), dtype=np.float32)
-        full = writer.write_chunk(chunk, emb, run_id="run2", scales=scales, obs_counts=obs, month_covered=months)
+        full = writer.write_chunk(
+            chunk, emb, run_id="run2", scales=scales, obs_counts=obs, month_covered=months, inference_stack=STACK
+        )
 
         cov_g, full_g = zarr.open_group(cov, mode="r"), zarr.open_group(full, mode="r")
         for var in (*OBS_COUNT_VARS, *MONTH_COVERED_VARS):
@@ -343,7 +346,7 @@ class TestCoverageOnlyStaging:
         assert Path(cov).exists()
 
         emb, scales = np.zeros((8, 8, 128), dtype=np.int8), np.zeros((8, 8), dtype=np.float32)
-        writer.write_chunk(chunk, emb, run_id="run1", scales=scales)
+        writer.write_chunk(chunk, emb, run_id="run1", scales=scales, inference_stack=STACK)
         assert not Path(cov).exists()
 
     def test_assembly_reads_the_real_counts_instead_of_fill(self, tmp_path: Path) -> None:
@@ -1273,6 +1276,7 @@ class TestTheEmbeddedHalfOfTheRecord:
             "run1",
             scales=np.ones((chunk.height, chunk.width), dtype=np.float32),
             coverage=coverage,
+            inference_stack=STACK,
         )
         return writer
 
@@ -1335,6 +1339,7 @@ class TestToppingUpTheRecords:
                 "run1",
                 scales=np.ones((8, 8), dtype=np.float32),
                 coverage=_record(label, thin=row + 1),
+                inference_stack=STACK,
             )
         return writer
 
