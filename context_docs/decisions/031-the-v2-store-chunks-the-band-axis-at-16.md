@@ -200,5 +200,9 @@ cleaner pipeline, and inference's part of it costs almost nothing.
   zone-year wrote 9,132 tiles, so a v2 zone-year holds at most about 140,000 references across all
   eight arrays. That is far below D4's 10⁶ split threshold, and about 56 MB of commit memory at
   400 bytes per reference.
-- **v2 is not yet wired through zone fill, seeding or provenance checks.** That work is separate
-  from this record.
+- **Band order is read from each array's dimension names**, never inferred from the model or the
+  store. Code that indexes `embeddings` asks where `band` sits in its `dimension_names`, so one path
+  reads both the band-last v1.1 store and a band-first v2 one.
+- **The preset follows the store's model**, chosen the way the checkpoint and the worker image
+  already are: from the model's `ModelFamily` record, and for a global store from the model it was
+  seeded for.
