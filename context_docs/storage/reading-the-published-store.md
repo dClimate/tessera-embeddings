@@ -157,7 +157,9 @@ the origin lands exactly on the far edges (`c + a Ã— width == bbox[2]`, `f + e Ã
 
 `zarr_conventions` registers `proj:`, `spatial:` and `geoemb:`. Match an entry on its `uuid`, which
 the conventions specification makes the identifier, not on its `name`: the proj and spatial
-schemas require the bare `"proj"` and `"spatial"`, while geoemb's requires `"geoemb:"`.
+schemas require the bare `"proj"` and `"spatial"`, while geoemb's requires `"geoemb:"`. Which
+versions the store follows, how that was checked, and where this store differs from what the code
+now writes are in [conforming to the Zarr conventions](conforming-to-the-zarr-conventions.md).
 
 **Reading it with rioxarray.** rioxarray does not find the spatial dimensions of this store on its
 own: it identifies the `spatial` convention by the name `"spatial:"` rather than by uuid, and the

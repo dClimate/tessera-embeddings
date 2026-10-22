@@ -114,10 +114,12 @@ class TestBuildConventionAttrs:
         assert attrs["geoemb:dimensions"] == 128
         assert attrs["geoemb:model"] == f"https://geotessera.org/model/{ENCODER_VERSION}"  # public encoder ref
         assert attrs["checkpoint_id"] == "1.1"  # supplied model_version -> provenance, not the public URL
-        assert attrs["geoemb:source_data"] == ["s3://sentinel-cogs", "https://datapool.asf.alaska.edu/RTC/OPERA-S1"]
+        assert attrs["geoemb:source_data"] == [
+            "https://earth-search.aws.element84.com/v1/collections/sentinel-2-l2a",
+            "https://doi.org/10.5067/SNWG/OPERA_L2_RTC-S1_V1",
+        ]
         assert attrs["geoemb:data_type"] == "int8"
         assert attrs["geoemb:gsd"] == 10.0  # derived from the 10 m (metre CRS) coordinate spacing
-        # spatial_layout is omitted by default (single-ROI store, no utmNN groups)
         assert "geoemb:spatial_layout" not in attrs
         assert attrs["geoemb:build_version"] == _PKG_VERSION  # software/package version, not the encoder
         quant = attrs["geoemb:quantization"]
@@ -197,14 +199,6 @@ class TestBuildConventionAttrs:
         # Provenance is never guessed: an unregistered family errors, not defaults.
         with pytest.raises(ValueError, match="No public encoder URL"):
             encoder_url("v3-imaginary")  # type: ignore[arg-type]
-
-    def test_spatial_layout_omitted_by_default_included_when_set(self) -> None:
-        """spatial_layout is optional: omitted for a root-only single-ROI store,
-        present when a multi-group caller (e.g. the campaign) sets it.
-        """
-        assert "geoemb:spatial_layout" not in build_convention_attrs(total_y=10, total_x=10, embedding_dim=128)
-        with_layout = build_convention_attrs(total_y=10, total_x=10, embedding_dim=128, spatial_layout="utm_zones")
-        assert with_layout["geoemb:spatial_layout"] == "utm_zones"
 
     def test_gsd_derived_from_coordinate_spacing(self) -> None:
         """Gsd reflects the actual pixel size, not the nominal default."""
@@ -429,13 +423,11 @@ class TestMultiGroupPlacement:
         """The root builder emits geoemb: (no proj:/spatial:) with an explicit gsd."""
         attrs = build_geoemb_root_attrs(
             embedding_dim=128,
-            spatial_layout="utm_zones",
             gsd=10.0,
             model_version="best_model_fsdp_20250608",
         )
         assert attrs["geoemb:type"] == "pixel"
         assert attrs["geoemb:dimensions"] == 128
-        assert attrs["geoemb:spatial_layout"] == "utm_zones"
         assert attrs["geoemb:gsd"] == 10.0
         assert attrs["geoemb:model"] == f"https://geotessera.org/model/{ENCODER_VERSION}"
         assert attrs["checkpoint_id"] == "best_model_fsdp_20250608"  # model_version is provenance, not the URL
@@ -452,10 +444,10 @@ def test_the_global_root_stamps_the_encoder_family_it_was_seeded_for() -> None:
     URL over a v2 seed — wrong provenance, and the cross-family gate then refuses the very append
     the store was seeded for, which is the failure being self-inflicted rather than caught.
     """
-    v2 = build_geoemb_root_attrs(embedding_dim=128, spatial_layout="utm_zones", encoder_version="v2-large")
+    v2 = build_geoemb_root_attrs(embedding_dim=128, encoder_version="v2-large")
     assert v2["geoemb:model"] == encoder_url("v2-large")
 
-    default = build_geoemb_root_attrs(embedding_dim=128, spatial_layout="utm_zones")
+    default = build_geoemb_root_attrs(embedding_dim=128)
     assert default["geoemb:model"] == encoder_url("v1.1"), "omitting it must stay v1.1"
     assert v2["geoemb:model"] != default["geoemb:model"], "the two families publish different URLs"
 

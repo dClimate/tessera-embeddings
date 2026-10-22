@@ -93,16 +93,9 @@ describe as permanently identifying the convention, and the only key that still 
 whose name is being migrated. The conventions specification says the same: a `name` "MUST NOT be
 used by tools to identify the Convention".
 
-**Follow-up in PR #218: geoemb's URLs, and why `"spatial:"` stays out.** A schema-validation audit
-of freshly seeded stores found the geoemb entry failing its own schema too. It pointed at a commit
-SHA, chosen in July because upstream has never cut the `v1` tag, and the geoemb schema pins
-`refs/tags/v1` as `const`. Unlike proj and spatial, `v1` *is* geoemb's version, so the entry now
-uses those URLs; they 404 until upstream tags the repository. rioxarray (0.22 and 0.23) still
-identifies the spatial and proj conventions by the pre-`v0.1` names `"spatial:"` and `"proj:"`, so
-it matched this store before the repair and has not since. We keep the schema's bare names, because
-switching back would fail validation to accommodate a reader that breaks the specification. Readers
-get the spatial axes from the CF `axis` attributes instead, added in the same PR (see
-[reading the published store](../storage/reading-the-published-store.md#2a-georeferencing-where-a-pixel-actually-is)).
+A later audit (PR #218) found the geoemb entry failing its own schema as well, and kept the bare
+names even though rioxarray still looks for `"spatial:"`; both are recorded in
+[conforming to the Zarr conventions](../storage/conforming-to-the-zarr-conventions.md).
 
 ## 4. Why the store is repaired rather than reissued or documented
 

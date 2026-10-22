@@ -130,7 +130,9 @@ for encoder-model provenance and quantization. Each registration is exactly the 
 convention's schema requires. For tools that open one array at a time, every spatial array also
 repeats `spatial:dimensions`, and the `northing`/`easting` coordinate arrays carry CF
 `standard_name`, `units` and `axis` attributes whenever the CRS is in metres. All of it is built
-in [`storage/conventions.py`](src/tessera_embeddings/storage/conventions.py).
+in [`storage/conventions.py`](src/tessera_embeddings/storage/conventions.py); the versions followed
+and how conformance is checked are in
+[`context_docs/storage/conforming-to-the-zarr-conventions.md`](context_docs/storage/conforming-to-the-zarr-conventions.md).
 
 The domain code — the scientific transformations, the inference
 engine, the Zarr I/O — is cloud-agnostic and orchestrator-agnostic.

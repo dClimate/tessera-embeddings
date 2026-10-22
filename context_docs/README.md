@@ -109,6 +109,9 @@ context_docs/
     ├── reading-the-published-store.md          the reader's side: no credentials needed, what
     │                                              conforms, measured speeds in two regions, and
     │                                              what would surprise a consumer
+    ├── conforming-to-the-zarr-conventions.md   which proj, spatial and geoemb versions the stores
+    │                                              follow, how that is validated (not draft-07),
+    │                                              and the fields deliberately left out
     ├── staging-identity-and-resume.md          what a run id identifies, and what resumes
     ├── registry-master.md                      the one registry consumers read: merged in place
     │                                              by every fill, tile by tile, never dropping an

@@ -110,11 +110,12 @@ _GEOEMB_CONVENTION = {
 #: family; this remains the v1.1 identifier. (``geoemb:build_version`` is the
 #: software/package version, not this.)
 ENCODER_VERSION = "1.1"
-#: Precise source datasets we pull from: Sentinel-2 L2A COGs (Earth Search AWS
-#: Open Data) and OPERA RTC-S1 (ASF datapool).
+#: The source datasets, as resolvable dataset references: the Earth Search Sentinel-2 L2A
+#: collection we query (it indexes both the `sentinel-cogs` and `sentinel-s2-l2a` buckets,
+#: ADR 021) and the OPERA RTC-S1 collection's DOI.
 DEFAULT_SOURCE_DATA: tuple[str, ...] = (
-    "s3://sentinel-cogs",
-    "https://datapool.asf.alaska.edu/RTC/OPERA-S1",
+    "https://earth-search.aws.element84.com/v1/collections/sentinel-2-l2a",
+    "https://doi.org/10.5067/SNWG/OPERA_L2_RTC-S1_V1",
 )
 #: Storage dtype of the quantized embeddings.
 QUANTIZED_DTYPE = "int8"
@@ -339,7 +340,6 @@ def _geoemb_fields(
     model_url: str | None,
     data_type: str,
     gsd: float | None,
-    spatial_layout: str | None,
     source_data: tuple[str, ...],
     encoder_version: ModelVersion | None = None,
 ) -> dict:
@@ -374,15 +374,12 @@ def _geoemb_fields(
         attrs["checkpoint_id"] = model_version
     if gsd is not None:
         attrs["geoemb:gsd"] = gsd
-    if spatial_layout is not None:
-        attrs["geoemb:spatial_layout"] = spatial_layout
     return attrs
 
 
 def build_geoemb_root_attrs(
     *,
     embedding_dim: int,
-    spatial_layout: str,
     gsd: float | None = None,
     model_version: str | None = None,
     encoder_version: ModelVersion | None = None,
@@ -390,10 +387,10 @@ def build_geoemb_root_attrs(
     data_type: str = QUANTIZED_DTYPE,
     source_data: tuple[str, ...] = DEFAULT_SOURCE_DATA,
 ) -> dict:
-    """``geoemb:`` attrs for the ROOT of a multi-group store (``utm_zones`` / ``global``).
+    """``geoemb:`` attrs for the ROOT of a multi-group (per-zone) store.
 
-    In the ``utm_zones`` layout the encoder/quantization provenance is stated ONCE at the
-    root, being identical across zones, while ``proj:``/``spatial:`` live on each per-zone
+    The encoder/quantization provenance is stated ONCE at the root, being identical across
+    zones, while ``proj:``/``spatial:`` live on each per-zone
     group whose CRS and grid differ — build those with :func:`build_convention_attrs` and
     ``include_geoemb=False``. *gsd* is explicit here because the root has no single
     coordinate grid to derive it from.
@@ -405,7 +402,6 @@ def build_geoemb_root_attrs(
         model_url=model_url,
         data_type=data_type,
         gsd=gsd,
-        spatial_layout=spatial_layout,
         source_data=source_data,
     )
     attrs["zarr_conventions"] = [_GEOEMB_CONVENTION]
@@ -426,7 +422,6 @@ def build_convention_attrs(
     model_url: str | None = None,
     data_type: str = QUANTIZED_DTYPE,
     gsd: float | None = None,
-    spatial_layout: str | None = None,
     source_data: tuple[str, ...] = DEFAULT_SOURCE_DATA,
     include_geoemb: bool = True,
 ) -> dict:
@@ -451,9 +446,11 @@ def build_convention_attrs(
     * ``geoemb:gsd`` — metres, and emitted only when trustworthy: from a metre-based CRS's
       coordinate spacing, or an explicit *gsd* the caller vouches for. OMITTED for a
       non-metre CRS (degrees, feet) or absent coords rather than given a false value.
-    * ``geoemb:spatial_layout`` — ``"utm_zones"``/``"global"``; OMITTED when ``None``, since
-      a single-ROI store has no utmNN/global groups.
     * ``geoemb:source_data`` — the source-dataset URLs.
+
+    ``geoemb:spatial_layout`` is never written. Its schema allows only ``"utm_zones"`` (60
+    groups named ``utm01`` to ``utm60``) and ``"global"`` (one array in a global CRS); our stores
+    are 120 hemisphere groups (``01N`` to ``60S``) or a single ROI, so either value would mislead.
 
     *include_geoemb* False emits only ``proj:``/``spatial:``: the multi-group campaign store
     carries geoemb: once at the root (:func:`build_geoemb_root_attrs`) and uses this builder
@@ -501,7 +498,6 @@ def build_convention_attrs(
                 model_url=model_url,
                 data_type=data_type,
                 gsd=gsd_val,
-                spatial_layout=spatial_layout,
                 source_data=source_data,
             )
         )
