@@ -60,7 +60,7 @@ import zarr
 
 from tessera_embeddings.config.assembly import AssemblyConfig
 from tessera_embeddings.config.fault_injection import ArmedFault
-from tessera_embeddings.config.inference import InferenceConfig
+from tessera_embeddings.config.inference import InferenceConfig, run_id_prefix
 from tessera_embeddings.config.paths import store_key
 from tessera_embeddings.config.store_layout import GLOBAL, REQUIRED_VARS
 from tessera_embeddings.config.time_windows import TimeWindow
@@ -627,7 +627,7 @@ def plan_zone_inference(
     hole mask, a tile with no holes dropping out as kept. Nothing is ever marked or tagged.
     """
     t0 = time.monotonic()
-    run_id = run_id or uuid.uuid4().hex[:12]
+    run_id = run_id or run_id_prefix(config.model_version) + uuid.uuid4().hex[:12]
 
     # The seeded zone group is the grid authority.
     repo = open_global_repo(

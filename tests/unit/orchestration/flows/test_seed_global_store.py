@@ -1,7 +1,7 @@
 """seed_global_store flow: the recorded checkpoint identity default.
 
 Exercised via ``.fn`` with the repo ops mocked, so no Icechunk store is created —
-the point is only which ``model_version`` (→ ``checkpoint_id``) is stamped.
+the point is only which model and ``checkpoint_id`` are stamped.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ _PATHS = BucketPaths(inputs="s3://in", outputs="s3://out")
 
 
 def _capture_seed(monkeypatch) -> dict:
-    """Force the create path and capture the model_version passed to seed_zone_groups."""
+    """Force the create path and capture the model and checkpoint passed to seed_zone_groups."""
     monkeypatch.setattr(mod, "get_run_logger", lambda: logging.getLogger("test-seed"))
     monkeypatch.setattr(mod, "create_global_repo", lambda *a, **k: object())
 
@@ -31,8 +31,9 @@ def _capture_seed(monkeypatch) -> dict:
     monkeypatch.setattr(mod, "open_global_repo", _raise_open)  # → create path, seeded=set()
     captured: dict = {}
 
-    def _fake_seed(repo, todo, *, years, model_version, optical_min_obs, commit_msg):
+    def _fake_seed(repo, todo, *, years, model_version, checkpoint_id, optical_min_obs, commit_msg):
         captured["model_version"] = model_version
+        captured["checkpoint_id"] = checkpoint_id
         captured["optical_min_obs"] = optical_min_obs
         return "snapshot"
 
@@ -40,20 +41,22 @@ def _capture_seed(monkeypatch) -> dict:
     return captured
 
 
-def test_seed_defaults_checkpoint_id_to_checkpoint_filename(monkeypatch):
-    """model_version defaults to checkpoint_filename() so the fill's checkpoint gate
-    is effective by default — geoemb:model alone can't distinguish aws vs mpc.
+@pytest.mark.parametrize("model", ["v1.1", "v2-large"])
+def test_seed_stamps_the_model_and_its_checkpoint(monkeypatch, model):
+    """The seed records the model every later fill follows, and that model's checkpoint by default
+    so the fill's checkpoint gate is effective — geoemb:model alone can't distinguish aws vs mpc.
     """
     captured = _capture_seed(monkeypatch)
-    mod.seed_global_store.fn(paths=_PATHS)
-    assert captured["model_version"] == checkpoint_filename()
+    mod.seed_global_store.fn(paths=_PATHS, model_version=model)
+    assert captured["model_version"] == model
+    assert captured["checkpoint_id"] == checkpoint_filename(model_version=model)
 
 
-def test_seed_preserves_explicit_model_version(monkeypatch):
-    """An explicit model_version overrides the checkpoint-filename default."""
+def test_seed_preserves_explicit_checkpoint_id(monkeypatch):
+    """An explicit checkpoint_id overrides the checkpoint-filename default."""
     captured = _capture_seed(monkeypatch)
-    mod.seed_global_store.fn(paths=_PATHS, model_version="custom-encoder-v2")
-    assert captured["model_version"] == "custom-encoder-v2"
+    mod.seed_global_store.fn(paths=_PATHS, checkpoint_id="custom-encoder-v2")
+    assert captured["checkpoint_id"] == "custom-encoder-v2"
 
 
 def test_seed_creates_on_missing_repo_icechunk_error(monkeypatch):
@@ -65,7 +68,7 @@ def test_seed_creates_on_missing_repo_icechunk_error(monkeypatch):
 
     monkeypatch.setattr(mod, "open_global_repo", _raise_missing)
     mod.seed_global_store.fn(paths=_PATHS)
-    assert captured["model_version"] == checkpoint_filename()  # seed_zone_groups ran → create path taken
+    assert captured["checkpoint_id"] == checkpoint_filename(model_version="v1.1")  # seed_zone_groups ran
 
 
 def test_seed_reraises_transient_icechunk_error(monkeypatch):
@@ -100,7 +103,7 @@ def test_seed_treats_rootless_existing_repo_as_unseeded(monkeypatch):
     monkeypatch.setattr(mod, "campaign_status", _rootless)
     mod.seed_global_store.fn(paths=_PATHS)
     # Reached seeding (seeded=set()) instead of propagating the read error.
-    assert captured["model_version"] == checkpoint_filename()
+    assert captured["checkpoint_id"] == checkpoint_filename(model_version="v1.1")
 
 
 def test_the_minimum_depth_rule_is_not_defaulted_from_the_config_constant(monkeypatch):
@@ -344,7 +347,7 @@ def test_a_fully_seeded_store_still_validates_the_requested_identity(monkeypatch
     monkeypatch.setattr(mod, "year_of", lambda t: t)
     seen: dict = {}
 
-    def _check(root_attrs, *, layout, model_version, optical_min_obs):
+    def _check(root_attrs, *, layout, model_version, checkpoint_id, optical_min_obs):
         seen["optical_min_obs"] = optical_min_obs
         if optical_min_obs != root_attrs["optical_min_obs"]:
             raise ValueError("Refusing to reseed: the store root's published identity is write-once")

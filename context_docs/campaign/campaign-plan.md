@@ -879,6 +879,19 @@ it" safe.
 | **staging fingerprint** | reusing staged tiles a different configuration or a different inference build produced | one cell assembled from two versions of the model's output |
 | **frozen land-mask `registry_sha256`** | a mask rebuilt mid-campaign | every completed cell's identity invalidated at once, and no way to tell which side of the rebuild a cell came from |
 
+**Not guarded: the workers' library stack.** The code identity hashes our source, not PyTorch or
+CUDA, so nothing refuses an append made on a different stack. The rule is procedural
+([ADR 025](../decisions/025-library-upgrades-ship-on-measured-usability-at-a-store-boundary.md)): a
+stack changes only between fills, and a store begun on one stack is finished on it, later years
+included, by naming that stack's worker image in the run's `ami_ssm_name`. A run on a different
+stack from the one that staged its tiles also passes a fresh `force_staging_restage` token, since
+the staging fingerprint cannot see the image. Every published year, 2017–2025, was inferred on
+**PyTorch 2.5.1 with CUDA 12.1**, and v1.1 stays on it while v2 moves to 2.14.1. The one guard is the
+image map: the Ray flows pick their worker image from the run's model through
+`ami_ssm_name_by_model`, which the deployments set to the 2.5.1 image for v1.1, and refuse a v1.1
+run without that entry. Record each later
+switch here, with its date and worker image.
+
 ### When a re-run is free
 
 A fresh campaign run recomputes nothing already done. Completed work is filtered at four
