@@ -328,7 +328,14 @@ def _t9_tables(rows: list[dict]) -> list[str]:
         for a in arms:
             cells = []
             for _, workload, dims in _T9_READS:
-                kw = {"client": client, "workload": workload, "dims": dims, "array": "embeddings"}
+                # The Dask phase records the same workload; the request plan is the requests phase's.
+                kw = {
+                    "phase": f"requests_{client}",
+                    "client": client,
+                    "workload": workload,
+                    "dims": dims,
+                    "array": "embeddings",
+                }
                 n = _t9_value(rows, "get_requests", a, **kw)
                 b = _t9_value(rows, "bytes_fetched", a, **kw)
                 cells.append("—" if n is None or b is None else f"{n:.0f} / {b / 1e6:.1f}")
@@ -438,20 +445,27 @@ def _t10_tables(rows: list[dict]) -> list[str]:
             out.append(f"| {a} | " + " | ".join(cells) + " |")
         out.append("")
     for phase in sorted({r["phase"] for r in rows if r["test"] == "t10" and r["phase"].startswith("points_")}):
+        # One interval per pass: each pass bootstraps its own probes, and the median of two passes'
+        # endpoints is not an interval for the passes combined.
+        passes = sorted({r["params"]["pass"] for r in _sel(rows, test="t10", phase=phase, metric="read_p50_ms")})
         out += [
-            f"## T10 — point reads with 95% intervals on the median, {phase.removeprefix('points_')}",
+            f"## T10 — point reads, p50 [95% interval] by pass ({', '.join(map(str, passes))}), "
+            f"{phase.removeprefix('points_')}",
             "",
-            "| arm | point 16 p50 ms | point 128 p50 ms | open s |",
+            "| arm | point 16 ms | point 128 ms | open s |",
             "|---|---|---|---|",
         ]
         for a in sorted({r["variant"] for r in _sel(rows, test="t10", phase=phase, metric="read_p50_ms")}):
             cells = []
             for dims in (16, 128):
-                p50, lo, hi = (
-                    _t10_value(rows, m, a, phase=phase, dims=dims)
-                    for m in ("read_p50_ms", "read_p50_lo_ms", "read_p50_hi_ms")
-                )
-                cells.append(f"{p50:.0f} [{lo:.0f}, {hi:.0f}]" if p50 and lo and hi else "—")
+                per_pass = []
+                for p in passes:
+                    kw: dict[str, Any] = {"phase": phase, "dims": dims, "pass": p}
+                    p50, lo, hi = (
+                        _t10_value(rows, m, a, **kw) for m in ("read_p50_ms", "read_p50_lo_ms", "read_p50_hi_ms")
+                    )
+                    per_pass.append(f"{p50:.0f} [{lo:.0f}, {hi:.0f}]" if p50 and lo and hi else "—")
+                cells.append(" / ".join(per_pass))
             open_s = _t10_value(rows, "open_wall_s", a, phase=phase)
             out.append(f"| {a} | {' | '.join(cells)} | {open_s or 0:.2f} |")
         out.append("")

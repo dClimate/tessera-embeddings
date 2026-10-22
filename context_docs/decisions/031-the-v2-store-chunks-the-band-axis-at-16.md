@@ -79,14 +79,17 @@ and 3.1× in band-last. Band-split shards pass, because even zarr 3.2 fetches se
 concurrently. On zarr 3.2, band-first band-split shards are faster than C0 on every workload.
 
 **Neither gate result is close to the noise.** The gates fail only if an interval clears the
-threshold, so a separate pass of 300 probes per arm put 95% bootstrap intervals on the point
-medians:
+threshold, so a separate run took 300 probes per arm in each of two passes, the arm order reversed
+between them. Each pass carries its own 95% bootstrap interval on the median, in ms:
 
-| full-vector point, p50 [95% CI] | zarr 3.4 | zarr 3.2 |
+| full-vector point, pass 1 / pass 2 | zarr 3.4 | zarr 3.2 |
 |---|---|---|
-| C0 | 432 [416, 444] ms | 431 [420, 442] ms |
-| band-first, band-split shards | 385 [377, 397] ms | 372 [364, 379] ms |
-| band-first, in shard | 447 [439, 458] ms | **1,048 [1,021, 1,070] ms**, 2.43× C0 |
+| C0 | 442 [425, 452] / 422 [406, 436] | 475 [464, 490] / 387 [376, 394] |
+| band-first, band-split shards | 370 [362, 384] / 400 [391, 409] | 387 [377, 393] / 357 [350, 364] |
+| band-first, in shard | 443 [438, 453] / 451 [439, 464] | **1,075 [1,045, 1,102] / 1,020 [997, 1,037]** |
+
+In-shard band-first on zarr 3.2 takes 2.3× and 2.6× its pass's C0, with every interval clear of 2×.
+Band-split band-first is faster than C0 in every pass on both clients.
 
 ## 3. Band-last against band-first
 

@@ -93,11 +93,17 @@ VARIANTS: dict[str, Variant] = {
 
 
 def selected(name: str | None) -> list[Variant]:
-    """Return the v1.1 variants, or just the one named (for ``--variant``)."""
+    """Return the v1.1 variants, or just the one named (for ``--variant``).
+
+    T1 to T8 index ``embeddings`` band-last, so a band-first variant is refused rather than read along
+    the wrong axis.
+    """
     if name is None:
         return [v for v in VARIANTS.values() if not v.name.startswith("v2_")]
     if name not in VARIANTS:
         raise SystemExit(f"unknown variant {name!r}; choices: {', '.join(VARIANTS)}")
+    if VARIANTS[name].band_first:
+        raise SystemExit(f"variant {name!r} is band-first, which only T9 and T10 read")
     return [VARIANTS[name]]
 
 
