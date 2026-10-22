@@ -506,6 +506,17 @@ pessimistic for the column scatter; the dataset's bucketed order cut it about 20
 | transpose on the GPU, then a column scatter into a band-first tile | 7.75 s |
 | today's path, then one CPU transpose of the finished tile | 2.92 s |
 
+**The staging writer's headroom, from the Iowa v2 inference runs' actor logs** (both arms of the
+#242 pair, 786 tiles, band-last staging; `Staging write … completed` and `Deferred write … blocked
+collection` lines in `/ec2/global-tessera-dev/ray`, each counted once):
+
+| | |
+|---|---|
+| tile time, median | 164–166 s (157–158 s of it inference), GPU 100% (median) |
+| staged upload on the writer thread, median / p95 / max | 16.6 / 21.8 / 24.8 s |
+| tiles whose next tile waited on the upload | 44 of 786 (5.6%), 408 s in all, median 8.4 s |
+| average wait per tile | 0.5 s, about 0.3% of tile time |
+
 **Writing the staged tile band-first instead** (laptop, zarr 3.4.1, memory store, no compression,
 one 2,048² × 128 tile): 0.05 s band-last; 0.63 s band-first at 128 × 256² chunks and 1.00 s at
 16 × 512² chunks, through a transposed view of the band-last buffer, with no full-tile copy.

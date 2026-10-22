@@ -44,7 +44,7 @@ context_docs/
 │   ├── 026-v1-1-runs-the-gru-it-was-trained-with.md
 │   ├── 027-targeted-updates.md
 │   ├── 028-embed-every-pixel-with-an-optical-observation.md
-│   └── 031-the-v2-store-chunks-the-band-axis-at-16.md   (proposed)
+│   └── 031-the-v2-store-chunks-the-band-axis-at-16.md
 │
 ├── campaign/                      THE GLOBAL CAMPAIGN — start here
 │   ├── campaign-plan.md                        <- START HERE. What runs, with what settings, in
