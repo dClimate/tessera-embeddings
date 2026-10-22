@@ -279,13 +279,243 @@ def _t6_summary(rows: list[dict]) -> str:
     return f"{int(deleted[0]['value'])} objs @ {per_s}/s, {_fmt(bytes_r)}B reclaimed"
 
 
+#: T9 read columns: (label, workload, dims). Each cell is requests / MB for the embeddings array.
+_T9_READS = (
+    ("point 16", "point", 16),
+    ("point 128", "point", 128),
+    ("tile 16", "tile", 16),
+    ("shard 16", "shard", 16),
+    ("bulk 16", "bulk", 16),
+    ("bulk 64", "bulk", 64),
+    ("bulk 128", "bulk", 128),
+)
+
+
+def _t9_value(rows: list[dict], metric: str, variant: str, **params: Any) -> float | None:  # noqa: ANN401
+    """Median of one T9 metric for one arm, or ``None``."""
+    vals = [r["value"] for r in _sel(rows, test="t9", metric=metric, **params) if r.get("variant") == variant]
+    return statistics.median(vals) if vals else None
+
+
+def _t9_tables(rows: list[dict]) -> list[str]:
+    """Render T9's write table, one request-plan table per client, and the Dask table."""
+    arms = sorted({r["variant"] for r in _sel(rows, test="t9", phase="build", metric="encode_cpu_s")})
+    if not arms:
+        return []
+    out = ["## T9 — v2 layout arms", "", "| arm | embeddings MB | ratio | encode CPU s/shard |", "|---|---|---|---|"]
+    for a in arms:
+        stored = sum(
+            r["value"] for r in _sel(rows, test="t9", metric="bytes_written", array="embeddings") if r["variant"] == a
+        )
+        raw_arm = "_".join(a.split("_")[:2]) + "_raw"
+        raw = sum(
+            r["value"]
+            for r in _sel(rows, test="t9", metric="bytes_written", array="embeddings")
+            if r["variant"] == raw_arm
+        )
+        ratio = f"{raw / stored:.2f}" if stored and raw else "?"
+        out.append(f"| {a} | {stored / 1e6:.0f} | {ratio} | {_fmt(_t9_value(rows, 'encode_cpu_s', a) or 0)} |")
+    for client in sorted(
+        {r["params"]["client"] for r in _sel(rows, test="t9", metric="get_requests") if "client" in r["params"]}
+    ):
+        out += [
+            "",
+            f"### Requests / MB fetched, {client}",
+            "",
+            "| arm | " + " | ".join(c[0] for c in _T9_READS) + " |",
+            "|---|" + "---|" * len(_T9_READS),
+        ]
+        for a in arms:
+            cells = []
+            for _, workload, dims in _T9_READS:
+                # The Dask phase records the same workload; the request plan is the requests phase's.
+                kw = {
+                    "phase": f"requests_{client}",
+                    "client": client,
+                    "workload": workload,
+                    "dims": dims,
+                    "array": "embeddings",
+                }
+                n = _t9_value(rows, "get_requests", a, **kw)
+                b = _t9_value(rows, "bytes_fetched", a, **kw)
+                cells.append("—" if n is None or b is None else f"{n:.0f} / {b / 1e6:.1f}")
+            out.append(f"| {a} | " + " | ".join(cells) + " |")
+    dask_arms = sorted({r["variant"] for r in _sel(rows, test="t9", metric="dask_tasks")})
+    if dask_arms:
+        out += [
+            "",
+            "### Dask, bulk 16-d pull",
+            "",
+            "| arm | tasks default | tasks shard-aligned | requests default | requests shard-aligned |",
+            "|---|---|---|---|---|",
+        ]
+        for a in dask_arms:
+            t = [_t9_value(rows, "dask_tasks", a, chunks=c) for c in ("default", "shard_aligned")]
+            q = [_t9_value(rows, "get_requests", a, chunks=c) for c in ("default", "shard_aligned")]
+            out.append(f"| {a} | " + " | ".join("—" if v is None else f"{v:.0f}" for v in (*t, *q)) + " |")
+    return [*out, ""]
+
+
+#: T10 read columns: (label, workload, dims). Points report the p50 in ms; the rest, wall seconds.
+_T10_READS = (
+    ("point 16 p50", "point", 16),
+    ("point 128 p50", "point", 128),
+    ("tile 16", "tile", 16),
+    ("bulk 16", "bulk", 16),
+    ("bulk 128", "bulk", 128),
+    ("8x8 pull 16", "pull8", 16),
+    ("8x8 pull 64", "pull8", 64),
+    ("8x8 pull 128", "pull8", 128),
+    ("dask default", "dask_default", 16),
+    ("dask aligned", "dask_aligned", 16),
+)
+
+
+def _t10_value(rows: list[dict], metric: str, variant: str, **params: Any) -> float | None:  # noqa: ANN401
+    """Median over passes of one T10 metric for one arm, or ``None``."""
+    vals = [r["value"] for r in _sel(rows, test="t10", metric=metric, **params) if r.get("variant") == variant]
+    return statistics.median(vals) if vals else None
+
+
+def _t10_tables(rows: list[dict]) -> list[str]:
+    """Render T10's assembly table (ratios to the control) and one cold-read table per client."""
+    out: list[str] = []
+    built = sorted({r["variant"] for r in _sel(rows, test="t10", phase="build", metric="encode_cpu_s") if r["variant"]})
+    if built:
+        cpu0, gb0 = (_t10_value(rows, m, "v2_c0", phase="build") or 1 for m in ("encode_cpu_s", "bytes_written"))
+        out += [
+            "## T10 — bench store build, encode CPU per shard",
+            "",
+            "| arm | encode CPU s | vs C0 | stored GB | vs C0 |",
+            "|---|---|---|---|---|",
+        ]
+        for a in built:
+            cpu = _t10_value(rows, "encode_cpu_s", a, phase="build") or 0
+            gb = _t10_value(rows, "bytes_written", a, phase="build") or 0
+            out.append(f"| {a} | {cpu:.2f} | {cpu / cpu0:.2f} | {gb / 1e9:.1f} | {gb / gb0:.2f} |")
+        out.append("")
+    arms = sorted({r["variant"] for r in _sel(rows, test="t10", phase="assemble", metric="wall_s") if r["variant"]})
+    if arms:
+        base = {k: _t10_value(rows, "encode_cpu_s", "v2_c0", phase="assemble", kind=k) for k in ("worker", "write")}
+        out += [
+            "## T10 — assembly code: CPU per staged tile, wall per run (median of passes)",
+            "",
+            "| arm | worker CPU s | vs C0 | write CPU s | vs C0 | wall s, whole run | stored GB |",
+            "|---|---|---|---|---|---|---|",
+        ]
+        for a in arms:
+            w, wr = (_t10_value(rows, "encode_cpu_s", a, phase="assemble", kind=k) or 0 for k in ("worker", "write"))
+            wall = _t10_value(rows, "wall_s", a, phase="assemble") or 0
+            gb = (_t10_value(rows, "bytes_written", a, phase="assemble") or 0) / 1e9
+            out.append(
+                f"| {a} | {w:.2f} | {w / (base['worker'] or 1):.2f} | {wr:.2f} | {wr / (base['write'] or 1):.2f} "
+                f"| {wall:.0f} | {gb:.1f} |"
+            )
+        out.append("")
+    reads = [r for r in _sel(rows, test="t10", metric="get_requests") if r["phase"].startswith("read_")]
+    clients = sorted({r["params"]["client"] for r in reads})  # a points- or tune-only run has no read table
+    for client in clients:
+        phase = f"read_{client}"
+        read_arms = sorted({r["variant"] for r in _sel(rows, test="t10", phase=phase, metric="get_requests")})
+        # Only the workloads this run's sweep scheduled: the sweep has been trimmed between runs.
+        ran = {
+            (r["params"].get("workload"), r["params"].get("dims"))
+            for r in _sel(rows, test="t10", phase=phase, metric="get_requests")
+        }
+        cols = [c for c in _T10_READS if (c[1], c[2]) in ran]
+        out += [
+            f"## T10 — cold reads from S3, {client} (median of passes; wire MB in brackets)",
+            "",
+            "| arm | " + " | ".join(c[0] for c in cols) + " |",
+            "|---|" + "---|" * len(cols),
+        ]
+        for a in read_arms:
+            cells = []
+            for _, workload, dims in cols:
+                kw = {"phase": phase, "workload": workload, "dims": dims}
+                v = _t10_value(rows, "read_p50_ms" if workload == "point" else "wall_s", a, **kw)
+                wire = _t10_value(rows, "bytes_fetched", a, method="wire", **kw)
+                unit = "ms" if workload == "point" else "s"
+                cells.append(
+                    "—"
+                    if v is None
+                    else f"{v:.0f} {unit} ({(wire or 0) / 1e6:.0f})"
+                    if unit == "ms"
+                    else f"{v:.1f} s ({(wire or 0) / 1e6:.0f})"
+                )
+            out.append(f"| {a} | " + " | ".join(cells) + " |")
+        out.append("")
+    for phase in sorted({r["phase"] for r in rows if r["test"] == "t10" and r["phase"].startswith("points_")}):
+        # One interval per pass: each pass bootstraps its own probes, and the median of two passes'
+        # endpoints is not an interval for the passes combined.
+        passes = sorted({r["params"]["pass"] for r in _sel(rows, test="t10", phase=phase, metric="read_p50_ms")})
+        out += [
+            f"## T10 — point reads, p50 [95% interval] by pass ({', '.join(map(str, passes))}), "
+            f"{phase.removeprefix('points_')}",
+            "",
+            "| arm | point 16 ms | point 128 ms | open s |",
+            "|---|---|---|---|",
+        ]
+        for a in sorted({r["variant"] for r in _sel(rows, test="t10", phase=phase, metric="read_p50_ms")}):
+            cells = []
+            for dims in (16, 128):
+                per_pass = []
+                for p in passes:
+                    kw: dict[str, Any] = {"phase": phase, "dims": dims, "pass": p}
+                    p50, lo, hi = (
+                        _t10_value(rows, m, a, **kw) for m in ("read_p50_ms", "read_p50_lo_ms", "read_p50_hi_ms")
+                    )
+                    per_pass.append(f"{p50:.0f} [{lo:.0f}, {hi:.0f}]" if p50 and lo and hi else "—")
+                cells.append(" / ".join(per_pass))
+            open_s = _t10_value(rows, "open_wall_s", a, phase=phase)
+            out.append(f"| {a} | {' | '.join(cells)} | {open_s or 0:.2f} |")
+        out.append("")
+    verified = _sel(rows, test="t10", metric="mismatched_arrays")
+    if verified:
+        out += ["## T10 — lossless check against C0", "", "| arm | stores | shards | mismatched array-shards |"]
+        out.append("|---|---|---|---|")
+        for r in sorted(verified, key=lambda r: (r["params"]["prefix"], r["variant"])):
+            out.append(f"| {r['variant']} | {r['params']['prefix']} | {r['params']['shards']} | {r['value']:.0f} |")
+        out.append("")
+    tune = [
+        r
+        for r in rows
+        if r["test"] == "t10" and r["phase"].startswith("tune_") and r["metric"] == "wall_s" and r["variant"]
+    ]
+    if tune:
+        configs = sorted(
+            {(r["params"]["workload"], r["params"]["dims"], r["params"].get("zarr_config", "")) for r in tune}
+        )
+        out += [
+            "## T10 — full-vector reads, reader settings (wall s, median of passes)",
+            "",
+            "| arm | " + " | ".join(f"{w} {d} {c or 'default'}" for w, d, c in configs) + " |",
+            "|---|" + "---|" * len(configs),
+        ]
+        for a in sorted({r["variant"] for r in tune}):
+            cells = []
+            for w, d, c in configs:
+                vals = [
+                    r["value"]
+                    for r in tune
+                    if r["variant"] == a
+                    and (r["params"]["workload"], r["params"]["dims"], r["params"].get("zarr_config", "")) == (w, d, c)
+                ]
+                cells.append(f"{statistics.median(vals):.1f}" if vals else "—")
+            out.append(f"| {a} | " + " | ".join(cells) + " |")
+        out.append("")
+    return out
+
+
 def build_report(results_dir: Path, run_id: str) -> str:
     """Assemble the full markdown report string."""
     rows = _load_rows(results_dir)
     if not rows:
         return f"# Scale-test report — run `{run_id}`\n\nNo metrics found under {results_dir}.\n"
-    lines = _header(rows, run_id) + _decision_matrix(rows) + _per_test_tables(rows)
-    return "\n".join(lines)
+    # The ADR-008 matrix and the generic per-test stats describe T0-T8; a v2 layout run carries its own tables.
+    v1 = [r for r in rows if r["test"] not in ("t9", "t10")]
+    lines = _header(rows, run_id) + (_decision_matrix(v1) if v1 else []) + _t9_tables(rows) + _t10_tables(rows)
+    return "\n".join(lines + (_per_test_tables(v1) if v1 else []))
 
 
 def main() -> int:
