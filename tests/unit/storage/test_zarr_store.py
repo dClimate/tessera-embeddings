@@ -41,11 +41,13 @@ from tessera_embeddings.storage.zarr_store import (
     _DEFAULT_STORAGE_INITIAL_BACKOFF_MS,
     _DEFAULT_STORAGE_MAX_BACKOFF_MS,
     _DEFAULT_STORAGE_MAX_TRIES,
+    _MANIFEST_FETCHES_DURING_COMMIT,
     S3Config,
     _default_repo_config,
     _open_writable_session,
     _write_new,
     get_existing_dates,
+    manifest_split,
     open_repo,
     open_store,
     open_store_as_zarr_group,
@@ -1086,6 +1088,15 @@ class TestDefaultRepoConfig:
         assert storage.retries.max_tries == _DEFAULT_STORAGE_MAX_TRIES
         assert storage.retries.initial_backoff_ms == _DEFAULT_STORAGE_INITIAL_BACKOFF_MS
         assert storage.retries.max_backoff_ms == _DEFAULT_STORAGE_MAX_BACKOFF_MS
+
+    @pytest.mark.parametrize("split", [None, {"time": 8}])
+    def test_commits_fetch_manifests_concurrently(self, split):
+        # With or without manifest splitting: the split must survive alongside the concurrency.
+        with manifest_split(split):
+            manifest = _default_repo_config().manifest
+        assert manifest is not None
+        assert manifest.max_concurrent_manifest_fetches_during_commit == _MANIFEST_FETCHES_DURING_COMMIT
+        assert (manifest.splitting is None) == (split is None)
 
 
 class TestEmptyChunkElision:
