@@ -124,10 +124,14 @@ def store_model_version(
     )
     try:
         stored = model_version_for_encoder(url)
-    except ValueError:
+    except ValueError as exc:
         if allow_mismatch and requested is not None:
             return requested
-        raise
+        # A campaign takes its model from the store, so it cannot fill one that names no known model.
+        raise ValueError(
+            f"{exc} Fill {store_path} zone by zone with fill_zone_year, naming model_version and "
+            "allow_model_mismatch=True."
+        ) from None
     if requested is not None and requested != stored and not allow_mismatch:
         raise ValueError(
             f"{store_path} holds {stored} embeddings (geoemb:model {url!r}), so filling it with "
