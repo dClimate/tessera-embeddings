@@ -1,8 +1,9 @@
 """GeoZarr convention attribute builders for embedding stores.
 
 Implements the proj:, spatial:, and geoemb: Zarr conventions as purely additive
-metadata on the root group, plus CF axis attrs on the ``northing``/``easting``
-coordinate arrays. No store layout changes.
+metadata on the root (or zone) group, repeats ``spatial:dimensions`` on each spatial
+array, and adds CF axis attrs to the ``northing``/``easting`` coordinate arrays. No
+store layout changes.
 
 The geoembeddings (``geoemb:``) convention supersedes the earlier ``tessera:`` one
 (still stripped from pre-existing stores by ``assembly``): it records encoder-model
@@ -20,7 +21,7 @@ from __future__ import annotations
 import logging
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _dist_version
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 from pyproj import CRS
@@ -91,13 +92,13 @@ _SPATIAL_CONVENTION = {
     "description": "Spatial coordinate information",
 }
 
-# The convention repo has not cut a `v1` tag, so `refs/tags/v1` 404s. We pin the
-# schema/spec URLs to an immutable commit SHA that DOES resolve, so the emitted
-# registration is dereferenceable. Switch to `refs/tags/v1` once upstream tags it.
-_GEOEMB_REF = "0655212938f36351245dbd3e5e8868f811d43663"
+# The geoemb schema pins `refs/tags/v1` as `const`, so this is the only registration that
+# validates — and v1 IS the convention's version, unlike proj/spatial above. Upstream has not
+# cut the tag yet, so the two URLs 404 until it does; a resolving commit-SHA URL was tried and
+# fails the schema it points at. The uuid identifies the convention either way.
 _GEOEMB_CONVENTION = {
-    "schema_url": f"https://raw.githubusercontent.com/geo-embeddings/embeddings-zarr-convention/{_GEOEMB_REF}/schema.json",
-    "spec_url": f"https://github.com/geo-embeddings/embeddings-zarr-convention/blob/{_GEOEMB_REF}/README.md",
+    "schema_url": "https://raw.githubusercontent.com/geo-embeddings/embeddings-zarr-convention/refs/tags/v1/schema.json",
+    "spec_url": "https://github.com/geo-embeddings/embeddings-zarr-convention/blob/v1/README.md",
     "uuid": "61c12cc5-0e28-4056-999a-480cf3fb7e4c",
     "name": "geoemb:",
     "description": "Geoembeddings convention for geospatial embedding arrays with model provenance",
@@ -222,15 +223,25 @@ _CF_COORD_ATTRS: dict[str, dict[str, str]] = {
 }
 
 
-def stamp_cf_coord_attrs(node: zarr.Group, epsg_code: str | None) -> None:
-    """Add CF ``standard_name``/``units``/``axis`` to *node*'s ``northing`` and ``easting`` arrays.
+def stamp_array_conventions(node: zarr.Group, epsg_code: str | None) -> None:
+    """Label *node*'s arrays for readers that open one array at a time; call after the group attrs.
 
-    Only for a metre-based CRS, the same rule as ``geoemb:gsd``: the attrs claim projected metres, so
-    a geographic or foot CRS, or a store whose coordinates are bare pixel indices, is left unlabelled
-    rather than mislabelled.
+    * Every array spanning both of the group's ``spatial:dimensions`` registers ``spatial`` and
+      repeats them. The spec requires them on arrays when composed with ``proj``, and a reader
+      that opens one variable (an xarray ``DataArray``) never sees the group's attrs.
+    * ``northing``/``easting`` get CF ``standard_name``/``units``/``axis``, only for a metre-based
+      CRS (the ``geoemb:gsd`` rule): a geographic or foot CRS, or bare pixel-index coordinates, is
+      left unlabelled rather than mislabelled.
+
+    Writes only arrays whose attrs differ, so re-stamping an unchanged store is a no-op.
     """
-    if _is_metre_crs(epsg_code):
-        for name, attrs in _CF_COORD_ATTRS.items():
+    dims = cast("list[str]", node.attrs.get("spatial:dimensions") or [])
+    wanted: dict[str, dict[str, Any]] = dict(_CF_COORD_ATTRS) if _is_metre_crs(epsg_code) else {}
+    for name, arr in node.arrays() if dims else ():
+        if set(dims) <= set(getattr(arr.metadata, "dimension_names", None) or ()):
+            wanted[name] = {"zarr_conventions": [_SPATIAL_CONVENTION], "spatial:dimensions": dims}
+    for name, attrs in wanted.items():
+        if any(node[name].attrs.get(k) != v for k, v in attrs.items()):
             node[name].attrs.update(attrs)
 
 

@@ -155,8 +155,22 @@ Two identities hold on every group, and are worth asserting if a reader is deriv
 than reading one: `c` equals `bbox[0]` and `f` equals `bbox[3]`, and walking `shape` pixels from
 the origin lands exactly on the far edges (`c + a × width == bbox[2]`, `f + e × height == bbox[1]`).
 
-`zarr_conventions` registers `proj:`, `spatial:` and `geoemb:` with a dereferenceable schema and
-spec URL each, pinned to the tag the upstream convention repository actually carries.
+`zarr_conventions` registers `proj:`, `spatial:` and `geoemb:`. Match an entry on its `uuid`, which
+the conventions specification makes the identifier, not on its `name`: the proj and spatial
+schemas require the bare `"proj"` and `"spatial"`, while geoemb's requires `"geoemb:"`.
+
+**Reading it with rioxarray.** rioxarray does not find the spatial dimensions of this store on its
+own: it identifies the `spatial` convention by the name `"spatial:"` rather than by uuid, and the
+coordinate arrays carry no CF `axis` attributes. Name them, and give a single variable the zone's
+CRS, which lives on the group rather than on the array:
+
+```python
+da = ds["scales"].rio.set_spatial_dims(x_dim="easting", y_dim="northing").rio.write_crs(ds.attrs["proj:code"])
+```
+
+The transform rioxarray then derives equals `spatial:transform` exactly. Stores written by the
+current code need only the `write_crs` step, because their coordinate arrays carry CF `axis`,
+`standard_name` and `units`, and each spatial array repeats `spatial:dimensions`.
 
 Stores published before 2026-09-14 place the transform origin at the pixel centre instead, so a
 consumer holding one is half a pixel south-east of where this describes; see

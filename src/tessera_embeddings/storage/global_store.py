@@ -41,7 +41,7 @@ from tessera_embeddings.config.store_layout import (
 from tessera_embeddings.storage.conventions import (
     build_convention_attrs,
     build_geoemb_root_attrs,
-    stamp_cf_coord_attrs,
+    stamp_array_conventions,
 )
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
 from tessera_embeddings.storage.time_axis import (
@@ -631,11 +631,11 @@ def seed_zone_groups(
                 "month": np.asarray(MONTH_COORD, dtype="int16"),
             },
         )
-        stamp_cf_coord_attrs(node, spec.crs)
         bnds = node.create_array("time_bnds", data=default_bnds, chunks=(nt, 2), dimension_names=("time", "bnds"))
         bnds.attrs.update(TIME_ENCODING)  # same int64-ns encoding as `time`
         node["time"].attrs["bounds"] = "time_bnds"  # CF: this coordinate represents an interval
         node.attrs.update(_zone_attrs(spec, north, east, layout))
+        stamp_array_conventions(node, spec.crs)
     if not created and not stamped_now:
         # Every requested zone was already complete AND the root already carried its identity, so
         # nothing was written — and icechunk refuses an empty commit unless asked. Committing
