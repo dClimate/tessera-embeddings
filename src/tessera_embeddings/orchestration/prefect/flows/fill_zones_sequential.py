@@ -709,6 +709,7 @@ def fill_zones_sequential_flow(
     allow_partial_window: bool = False,
     allow_s2_only: bool = False,
     allow_model_mismatch: bool = False,
+    allow_stack_mismatch: bool = False,
     allow_ingest_code_mismatch: bool = False,
     launch_pacing: bool = False,
     gpu_fallback_instance_types: list[str] | None = None,
@@ -787,6 +788,9 @@ def fill_zones_sequential_flow(
             unvalidated — see the optional-S1 ADR. Default False.
         allow_model_mismatch: Fill even when the seeded store advertises a different
             encoder/checkpoint than this build (default rejects).
+        allow_stack_mismatch: Write tiles computed on a different PyTorch or CUDA from the store's
+            recorded ``inference_stack`` (default rejects at assembly — ADR 025 rule 2).
+            Deliberate experiments only.
         allow_ingest_code_mismatch: Resume a store built by different ingest code (off by default).
         launch_pacing: Pace this cluster's EC2 launch requests against the account's shared
             RunInstances quota — a budget concurrent clusters share, except it is a request RATE
@@ -1047,6 +1051,7 @@ def fill_zones_sequential_flow(
             output_bucket=paths.outputs,
             chunk_size=SHARD_PX,  # 1 inference tile == 1 shard (D3)
             allow_s2_only=allow_s2_only,
+            allow_stack_mismatch=allow_stack_mismatch,
             optical_min_obs=_store_optical_min_obs(),
             actor_request_headroom=actor_request_headroom,
             # Omitted when unset so the inference default stands — keyed on None, not on

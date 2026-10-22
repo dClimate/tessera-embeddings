@@ -1610,6 +1610,15 @@ def test_the_chained_fill_applies_the_rule_its_store_advertises(wired, monkeypat
     assert {c.get("optical_min_obs") for c in built} == {25}, "the store's rule must reach every cell's config"
 
 
+@pytest.mark.parametrize("flag", [False, True])
+def test_the_stack_override_reaches_every_cells_config(wired, monkeypatch, flag) -> None:
+    """Assembly reads it off the config, the only route from this flow to the stack check."""
+    built: list[dict] = []
+    monkeypatch.setattr(mod, "build_inference_config", lambda **k: built.append(k) or SimpleNamespace(**k))
+    _run(zones=["33N"], allow_stack_mismatch=flag)
+    assert built and {c["allow_stack_mismatch"] for c in built} == {flag}
+
+
 def test_a_store_declaring_no_rule_leaves_the_config_unconstrained(wired, monkeypatch) -> None:
     """Stores seeded before the rule existed carry no attr, and must keep filling as before."""
     built: list[dict] = []
