@@ -30,6 +30,7 @@ from tessera_embeddings.storage.update import UpdatePlan
 from tests.unit.deadline import run_under_deadline
 
 _PATHS = BucketPaths(inputs="s3://in", outputs="s3://out")
+_AMI = {"ami_ssm_name": "ami", "ami_ssm_name_by_model": {"v1.1": "ami"}}  # v1.1 needs its own image (ADR 025)
 
 
 @pytest.fixture()
@@ -144,7 +145,7 @@ def _run(**overrides):
     does the conversion in one place; `cells=` is passed straight through for the tests
     that ARE about multi-year lists.
     """
-    kwargs = {"paths": _PATHS, "ami_ssm_name": "ami"}
+    kwargs = {"paths": _PATHS, **_AMI}
     if "cells" in overrides:
         kwargs["cells"] = overrides.pop("cells")
     else:
@@ -435,6 +436,12 @@ def test_pinned_ami_id_reaches_ray_cluster(wired):
     """
     _run(ami_id="ami-pinned-01")
     assert wired["ray_kwargs"]["ami_id"] == "ami-pinned-01"
+
+
+def test_the_default_models_own_image_reaches_ray_cluster(wired):
+    """The cells run the default model, so that model's entry in ami_ssm_name_by_model is the image (ADR 025)."""
+    _run(ami_ssm_name_by_model={mod.DEFAULT_MODEL_VERSION: "ami-own"})
+    assert wired["ray_kwargs"]["ami_ssm_name"] == "ami-own"
 
 
 def test_unpinned_ami_is_resolved_once_and_reused(wired, monkeypatch):
