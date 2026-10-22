@@ -41,6 +41,8 @@ scale_tests/
 ├── t10_v2_aws.py     v2 finalists on AWS: cold S3 reads on two        → ADR 031
 │                     clients, the assembly code's write cost
 ├── report.py         collate metrics → decision matrix markdown
+├── scale_testing_results.md   archived reports, v1.1 runs (ADR-008)
+├── v2_layout_results.md       archived reports, v2 layout runs (ADR 031)
 └── teardown.py       delete a run's stores; verify $0 residue
 ```
 
@@ -169,7 +171,9 @@ also builds its own stores so any single `tN` is independently runnable.
    same `--bucket` prefix as the stores, so a prefix-scoped bucket stays writable.
 2. Update the status of each affected decision in ADR-008 (`PENDING → FIRM`, or
    supersede with a new ADR — the decisions file is append-only for reversals).
-3. Archive the report alongside ADR-008.
+3. Archive the report beside the others: `scale_testing_results.md` holds the v1.1 runs behind
+   ADR-008, and `v2_layout_results.md` the T9/T10 runs behind ADR 031, each section under its
+   run's own provenance.
 
 ## Infrastructure a bench run needs
 
