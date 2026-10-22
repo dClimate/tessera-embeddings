@@ -232,15 +232,16 @@ def stamp_array_conventions(node: zarr.Group) -> None:
       repeats them. The spec requires them on arrays when composed with ``proj``, and a reader
       that opens one variable (an xarray ``DataArray``) never sees the group's attrs. Any other
       registration on the array is kept; ours is matched by uuid.
-    * ``northing``/``easting`` get CF ``standard_name``/``units``/``axis``, only when the group's
-      ``proj:code`` is a metre-based CRS (the ``geoemb:gsd`` rule): a geographic or foot CRS, or
-      no CRS at all, is left unlabelled rather than mislabelled.
+    * ``northing``/``easting`` get CF ``standard_name``/``units``/``axis``, which claim the values
+      are projected metres. So both halves must be declared: real coordinates (the group has
+      ``spatial:dimensions``, which bare pixel indices never get) in a metre-based ``proj:code``
+      (the ``geoemb:gsd`` rule). Anything else is left unlabelled rather than mislabelled.
 
     Writes only arrays whose attrs differ, so re-stamping an unchanged store is a no-op.
     """
     dims = cast("list[str]", node.attrs.get("spatial:dimensions") or [])
     epsg = cast("str | None", node.attrs.get("proj:code"))
-    wanted: dict[str, dict[str, Any]] = dict(_CF_COORD_ATTRS) if _is_metre_crs(epsg) else {}
+    wanted: dict[str, dict[str, Any]] = dict(_CF_COORD_ATTRS) if dims and _is_metre_crs(epsg) else {}
     for name, arr in node.arrays() if dims else ():
         if set(dims) <= set(getattr(arr.metadata, "dimension_names", None) or ()):
             registered = cast("list[dict[str, Any]]", arr.attrs.get("zarr_conventions") or [])

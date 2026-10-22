@@ -13,7 +13,7 @@ PR #218 (2026-10-22).
 | root (global store) | `geoemb` | encoder, source data, quantization, `gsd`; once for all 120 zones |
 | zone group, or root of a single-ROI store | `proj`, `spatial` (+ `geoemb` on a single-ROI root) | CRS as `proj:code`, `proj:wkt2` and `proj:projjson`; the grid as `spatial:dimensions`, `transform`, `shape`, `bbox`, `registration` |
 | every array spanning both spatial dimensions | `spatial` | `spatial:dimensions` repeated from the group |
-| `northing`, `easting` | none (CF attributes) | `standard_name`, `units: m`, `axis`, only for a CRS in metres |
+| `northing`, `easting` | none (CF attributes) | `standard_name`, `units: m`, `axis`, only for real coordinates in a metre CRS |
 
 | convention | version followed | latest upstream |
 |---|---|---|
@@ -70,9 +70,12 @@ sees its group's attributes. The group keeps its own copy, which the geoembeddin
 per-zone stores.
 
 **The coordinate arrays carry CF attributes, but CF is not registered.** `axis`, `standard_name` and
-`units` are what CF-reading tools use to find the spatial axes; they are written only when the
-group's own `proj:code` is in metres, the same rule as `geoemb:gsd`, so they follow the CRS the
-store declares however it was found. The [CF convention for Zarr](https://github.com/zarr-conventions/CF)
+`units` are what CF-reading tools use to find the spatial axes. They claim the values are
+projected metres, so they are written only when the group declares both halves of that claim:
+real coordinates (`spatial:dimensions`, which a store whose `northing`/`easting` are bare pixel
+indices never gets) and a metre CRS in its own `proj:code`, the same rule as `geoemb:gsd`. Reading
+the group's declarations, rather than the inputs, means the labels follow whatever the store
+declares, including a CRS derived from the MGRS tile. The [CF convention for Zarr](https://github.com/zarr-conventions/CF)
 is a proposal with no release, and its registration example adds a `version` field the conventions
 spec forbids, so registering it would not validate.
 

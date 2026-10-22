@@ -1757,6 +1757,9 @@ class TestAssemblyValidation:
 
         # proj:
         assert attrs["proj:code"] == "EPSG:32633"
+        # No mosaic, so northing/easting are pixel indices: the tile's CRS must not label them metres.
+        assert "spatial:dimensions" not in attrs
+        assert "axis" not in root["northing"].attrs
 
         # geoemb:
         assert attrs["geoemb:type"] == "pixel"

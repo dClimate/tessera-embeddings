@@ -463,12 +463,21 @@ def test_one_comparison_serves_every_reader_of_the_encoder_identity() -> None:
             assert_encoder_matches(published, model_version=wanted, where="s")
 
 
-@pytest.mark.parametrize(("epsg", "labelled"), [("EPSG:32633", True), ("EPSG:4326", False), (None, False)])
-def test_cf_coord_attrs_only_claim_metres_for_a_metre_crs(epsg: str | None, labelled: bool) -> None:
-    """The group's own ``proj:code`` decides: a degree CRS or no CRS is not labelled as metres."""
+@pytest.mark.parametrize(
+    ("epsg", "real_coords", "labelled"),
+    [("EPSG:32633", True, True), ("EPSG:32633", False, False), ("EPSG:4326", True, False), (None, True, False)],
+)
+def test_cf_coord_attrs_only_claim_metres_for_real_metre_coords(
+    epsg: str | None, real_coords: bool, labelled: bool
+) -> None:
+    """Labelled only when the group declares real coordinates (``spatial:dimensions``) in a metre
+    ``proj:code``: pixel indices under a tile-derived CRS, a degree CRS, or no CRS stay unlabelled.
+    """
     node = zarr.group(store=zarr.storage.MemoryStore())
     if epsg:
         node.attrs["proj:code"] = epsg
+    if real_coords:
+        node.attrs["spatial:dimensions"] = ["northing", "easting"]
     for name in ("northing", "easting"):
         node.create_array(name, data=np.arange(3.0), dimension_names=(name,))
     stamp_array_conventions(node)
