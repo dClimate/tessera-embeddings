@@ -87,6 +87,7 @@ from tessera_embeddings.storage.conventions import (
     assert_stack_matches,
     build_convention_attrs,
     staged_stack,
+    stamp_array_conventions,
 )
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
 from tessera_embeddings.storage.global_store import create_layout_arrays, open_global_repo
@@ -2270,6 +2271,8 @@ class ZarrWriter:
         for stale in [k for k in node.attrs if str(k).startswith("tessera:")]:
             del node.attrs[stale]
         node.attrs.update(attrs)
+        # Every assemble, not only at creation, so a store created before these attrs gains them.
+        stamp_array_conventions(node)
 
         t_commit = time.monotonic()
         commit_with_rebase(session, f"Run {run_id}: {len(chunks)} chunks assembled")
