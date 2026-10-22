@@ -527,6 +527,12 @@ _DEFAULT_STORAGE_MAX_TRIES = 10
 _DEFAULT_STORAGE_INITIAL_BACKOFF_MS = 200
 _DEFAULT_STORAGE_MAX_BACKOFF_MS = 30_000
 
+# Manifests a commit fetches and rewrites at once. Icechunk's default of 1 fetches every manifest
+# a commit touches one after another, so a mosaic commit, one or more manifests for each of its
+# arrays, waits on that many serial round trips. Empirical: see
+# context_docs/ingest/campaign-ingest-measurements.md.
+_MANIFEST_FETCHES_DURING_COMMIT = 16
+
 
 @contextmanager
 def manifest_split(split_sizes: "dict[str, int] | None" = DEFAULT_MANIFEST_SPLIT_SIZES) -> "Iterator[None]":
@@ -589,6 +595,10 @@ def _default_repo_config() -> icechunk.RepositoryConfig:
     default). When active it bounds a commit's manifest rewrite to the shards it touched, the
     dominant region-write cost on large continental stores.
 
+    **Manifest fetches during a commit run concurrently** (``_MANIFEST_FETCHES_DURING_COMMIT``)
+    rather than one at a time. The global store replaces this manifest config with its own
+    (:func:`global_store_config`), which is saved inside that store.
+
     **Request concurrency is icechunk's default (256) and is never overridden**, because at 1 —
     what assembly's old per-fork budget produced — icechunk deadlocks ``commit`` and
     ``rebase``/``diff``. ``context_docs/assembly/icechunk-max-concurrent-requests-1-deadlock.md``.
@@ -603,8 +613,10 @@ def _default_repo_config() -> icechunk.RepositoryConfig:
     immediately.
     """
     config = icechunk.RepositoryConfig.default()
-    if _manifest_split_sizes:
-        config.manifest = icechunk.ManifestConfig(splitting=_manifest_splitting_config(_manifest_split_sizes))
+    config.manifest = icechunk.ManifestConfig(
+        splitting=_manifest_splitting_config(_manifest_split_sizes) if _manifest_split_sizes else None,
+        max_concurrent_manifest_fetches_during_commit=_MANIFEST_FETCHES_DURING_COMMIT,
+    )
     # Mutate the existing StorageSettings in place (RepositoryConfig.default() may leave
     # storage=None) so any fields icechunk seeded survive.
     storage = config.storage or icechunk.StorageSettings()
