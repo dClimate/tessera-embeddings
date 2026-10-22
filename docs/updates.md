@@ -46,12 +46,13 @@ Why updates work the way they do is in
   lists the deployment names.
 - **Replace the example values** below (`s3://my-inputs`, `amazon-thin-2024`, `18S`, and so on) with
   your own.
-- **Update with the PyTorch the store was made with.** A store does not record which PyTorch
-  computed it, and another version shifts the embeddings slightly, so an update on a different
-  version quietly mixes two in one store. A v1.1 store needs PyTorch 2.5.1 with CUDA 12.1, on
-  Python 3.12 (see [`environment-setup.md`](environment-setup.md)), which a plain `uv sync` does not
-  install. `python -c "import torch; print(torch.__version__)"` shows what you have. The global
-  flows pick the right worker image for you.
+- **Update with the PyTorch the store was made with.** Another version shifts the embeddings
+  slightly, so the store refuses an update computed on a different one, and the error names both.
+  A v1.1 store needs PyTorch 2.5.1 with CUDA 12.1, on Python 3.12 (see
+  [`environment-setup.md`](environment-setup.md)), which a plain `uv sync` does not install.
+  `python -c "import torch; print(torch.__version__)"` shows what you have. The global flows pick the
+  right worker image for you. A store made before stores recorded their PyTorch takes the stack of
+  its first update, so check yours before that one.
 
 ## The update's name ties everything together
 
