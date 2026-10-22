@@ -25,7 +25,7 @@ import xarray as xr
 import zarr
 
 import tessera_embeddings.inference.assembly as _assembly_mod
-from tessera_embeddings.config.inference import EMBEDDING_DIM, INFERENCE_CHUNK_SIZE
+from tessera_embeddings.config.inference import EMBEDDING_DIM, INFERENCE_CHUNK_SIZE, encoder_url
 from tessera_embeddings.config.store_layout import (
     CARRIED_VARS,
     GLOBAL,
@@ -52,7 +52,6 @@ from tessera_embeddings.inference.assembly import (
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, enumerate_chunks, filter_chunks_by_roi_mask
 from tessera_embeddings.inference.quantization import quantize_embeddings
 from tessera_embeddings.storage import shard_writer
-from tessera_embeddings.storage.conventions import ENCODER_VERSION
 from tessera_embeddings.storage.global_store import create_global_repo, create_layout_arrays, open_global_repo
 from tessera_embeddings.storage.time_axis import TIME_ENCODING
 from tessera_embeddings.storage.zarr_store import open_or_create_repo, open_store, plain_zarr_storage_options
@@ -455,7 +454,7 @@ class TestAssembly:
                 output_path=output,
                 roi_zarr_path=roi,
                 run_started_at=datetime.datetime(2025, 6, 1, tzinfo=datetime.UTC),
-                encoder_version="v2-large",
+                model_version="v2-large",
                 n_workers=1,
             )
 
@@ -506,7 +505,7 @@ class TestAssembly:
                 output_path=output,
                 roi_zarr_path=roi,
                 run_started_at=datetime.datetime(2025, 6, 1, tzinfo=datetime.UTC),
-                encoder_version="v2-large",
+                model_version="v2-large",
                 n_workers=1,
             )
 
@@ -546,7 +545,7 @@ class TestAssembly:
                 output_path=output,
                 roi_zarr_path=roi,
                 run_started_at=datetime.datetime(day, 6, 1, tzinfo=datetime.UTC),
-                encoder_version="v1.1",
+                model_version="v1.1",
                 n_workers=1,
             )
 
@@ -1740,7 +1739,7 @@ class TestAssemblyValidation:
             output_path=output,
             roi_zarr_path=_make_full_roi_mask(tmp_path, 4, 4),
             tile_id="33UWP",
-            model_version="test_model_v1",
+            checkpoint_id="test_model_v1",
             n_workers=1,
         )
 
@@ -1762,8 +1761,8 @@ class TestAssemblyValidation:
         assert attrs["geoemb:type"] == "pixel"
         assert attrs["geoemb:dimensions"] == EMBEDDING_DIM
         # model is the PUBLIC encoder reference (not the checkpoint id); the supplied
-        # model_version ("test_model_v1") is recorded as checkpoint_id provenance.
-        assert attrs["geoemb:model"] == f"https://geotessera.org/model/{ENCODER_VERSION}"
+        # checkpoint id ("test_model_v1") is recorded as provenance.
+        assert attrs["geoemb:model"] == encoder_url("v1.1")
         assert attrs["checkpoint_id"] == "test_model_v1"
         # build_version is the software/package version, NOT the encoder/model version.
         assert attrs["geoemb:build_version"] == _dist_version("tessera_embeddings")

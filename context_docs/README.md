@@ -41,6 +41,7 @@ context_docs/
 │   ├── 022-resolve-the-roi-mask-credential-at-read-time.md
 │   ├── 023-the-single-path-end-to-end-is-the-quickstart-run.md
 │   ├── 024-spatial-transform-origin-is-the-pixel-corner.md
+│   ├── 025-library-upgrades-ship-on-measured-usability-at-a-store-boundary.md
 │   ├── 026-v1-1-runs-the-gru-it-was-trained-with.md
 │   ├── 027-targeted-updates.md
 │   └── 028-embed-every-pixel-with-an-optical-observation.md

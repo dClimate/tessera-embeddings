@@ -194,14 +194,14 @@ hide the one visible sign that the path is unverified.
 
 **`uv sync --all-extras --frozen` gives you CPU torch on a CUDA machine.** The lockfile pins torch
 to `download.pytorch.org/whl/cpu` for *every* platform, so a bare `--frozen` installs
-`torch==2.12.0+cpu`, `torch.cuda.is_available()` is False, and the test **skips** — reporting
+`torch==2.14.1+cpu`, `torch.cuda.is_available()` is False, and the test **skips** — reporting
 exactly what it reports in CI. An operator following that alone would believe they had verified the
 path.
 
 **Use the repository's own GPU install** — `docs/environment-setup.md` "GPU installs", which
 explains why `--extra-index-url` alone is not enough (PyPI's CPU wheel stays in the candidate pool
-and can win). **Check the index before pinning a build**: `torch==2.6.0` publishes `cu118`, `cu124`
-and `cu126`, and `https://download.pytorch.org/whl/<cuXXX>/torch/` is the list.
+and can win). **Check the index before pinning a build**: `torch==2.14.1` publishes `cu126`, `cu130`
+and `cu132`, and `https://download.pytorch.org/whl/<cuXXX>/torch/` is the list.
 
 **The `==` in that command is load-bearing, not decoration.** `uv pip install torch` — no version —
 is already satisfied by the CPU wheel `uv sync` just installed, so uv audits it and reports *"Would
@@ -211,7 +211,7 @@ for an unpinned `--force-reinstall` instead, which takes whatever that index top
 
 ```bash
 uv sync --all-extras --frozen
-uv pip install "torch==2.6.0+cu124" --index-url https://download.pytorch.org/whl/cu124
+uv pip install "torch==2.14.1+cu130" --index-url https://download.pytorch.org/whl/cu130
 
 # --no-sync on everything after this. `uv run` re-syncs from the lockfile by default, which
 # would put the CPU wheel straight back.
@@ -219,11 +219,9 @@ uv run --no-sync python -c "import torch; assert torch.cuda.is_available(), 'CPU
 uv run --no-sync pytest tests/unit/inference/test_inference_loop.py -k pipelined -v
 ```
 
-**One thing to know rather than to fix here.** That CUDA build is `2.6.0`, while the lockfile's CPU
-build is `2.12.0`, so the manual check does not run against the same torch version CI does. That
-mismatch is the repository's, not this test's — the GPU docs and the lock have drifted apart — and
-resolving it is a dependency question rather than a test one. **Say which version you ran against
-when you report a result.**
+**Keep that CUDA build at the lockfile's version.** Both are `2.14.1`, so the manual check runs
+the torch CI runs and production's GPU workers run. When the lock moves, move this command with it.
+**Say which version you ran against when you report a result.**
 
 **Read the outcome, not the exit code.** `pytest` exits 0 on a skip, so "the command succeeded" is
 not evidence. The only result that verifies anything here is a **passed**.

@@ -59,7 +59,13 @@ from prefect.deployments import arun_deployment
 from prefect.runtime import flow_run as flow_run_ctx
 from prefect.states import StateType
 
-from tessera_embeddings.config.inference import checkpoint_filename, inference_code_identity
+from tessera_embeddings.config.inference import (
+    ModelVersion,
+    ami_ssm_name_for_model,
+    checkpoint_filename,
+    inference_code_identity,
+    run_id_prefix,
+)
 from tessera_embeddings.config.ingest import IngestSettings
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.inference.data_loading import _active_orbits
@@ -88,7 +94,7 @@ from tessera_embeddings.storage.campaign import (
     tag_year_complete,
     zone_year_tag,
 )
-from tessera_embeddings.storage.global_store import open_global_repo, set_saved_manifest_preload
+from tessera_embeddings.storage.global_store import open_global_repo, set_saved_manifest_preload, store_model_version
 from tessera_embeddings.storage.object_store import delete_prefix
 from tessera_embeddings.storage.time_axis import CAMPAIGN_YEARS
 from tessera_embeddings.storage.update import (
@@ -302,6 +308,7 @@ def _staging_run_id(
     allow_s2_only: bool,
     optical_min_obs: int | None,
     code_identity: str,
+    model_version: ModelVersion,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
     update: str | None = None,
@@ -344,7 +351,7 @@ def _staging_run_id(
         # this fingerprint and is rejected by the seeded model gate (checkpoint_id /
         # geoemb:model). The checkpoint is fixed for a campaign and never overwritten
         # mid-run, so a same-filename byte-swap is a non-scenario. (Do not "fix" to an ETag.)
-        checkpoint_filename(),
+        checkpoint_filename(model_version=model_version),
         code_identity,
         _mosaic_identity(
             zone,
@@ -356,7 +363,9 @@ def _staging_run_id(
         ),
     )
     named = key if update is None else (*key, update)
-    return f"{zone}-{year}-{hashlib.sha256(repr(named).encode()).hexdigest()[:8]}"
+    # The model's prefix (empty for v1.1, so v1.1 ids are unchanged) is what the runner checks a
+    # resume against: the staged tiles themselves cannot say which model wrote them.
+    return run_id_prefix(model_version) + f"{zone}-{year}-{hashlib.sha256(repr(named).encode()).hexdigest()[:8]}"
 
 
 def _ingest_dispatch_params(
@@ -549,6 +558,7 @@ async def run_global_campaign(
     *,
     paths: BucketPaths,
     ami_ssm_name: str,
+    ami_ssm_name_by_model: dict[str, str] | None = None,
     branch: str | None = None,
     fill_deployment: str | None = None,
     store_name: str = "tessera",
@@ -599,6 +609,9 @@ async def run_global_campaign(
     Args:
         paths: Deployment storage contract.
         ami_ssm_name: SSM parameter name for the Ray GPU AMI (forwarded to fills).
+        ami_ssm_name_by_model: Per-model overrides of ``ami_ssm_name``. The entry for the model
+            the store holds is the image the campaign resolves, pins and forwards, and the map goes
+            to its fills too; a model on its own worker image (v1.1) without one is refused (ADR 025).
         branch: Route child deployments to their branch-scoped variants. ``None``
             (production) leaves every ref at its unsuffixed default. A slug (e.g.
             ``"global-tessera"``) suffixes every *derived* child deployment name with
@@ -1039,6 +1052,11 @@ async def run_global_campaign(
     # live-tile partition stay on the task role, the only credential that can read OUR buckets.
     store_credentials = icechunk_credentials_for(store_path, iam_icechunk_credentials)
     repo = open_global_repo(store_path, get_credentials=store_credentials, region=s3_region)
+    # The store decides the model for the whole campaign: the image it pins for every fill, the
+    # checkpoint its fingerprints name, and the staging prefix. Each fill re-reads the same attr.
+    model_version = store_model_version(store_path, get_credentials=store_credentials, region=s3_region)
+    ami_ssm_name = ami_ssm_name_for_model(ami_ssm_name, ami_ssm_name_by_model, model_version)
+    log.info("Campaign model: %s, from %s's geoemb:model", model_version, store_path)
     # ONCE, before any dispatch. Each fill re-checks this, but by then the campaign has paid
     # for that cell's ingest — and cells dispatch concurrently, so a store seeded for a
     # different encoder buys a multi-terabyte mosaic per in-flight zone before the first fill
@@ -1046,7 +1064,8 @@ async def run_global_campaign(
     # A metadata-only read.
     _assert_seeded_model_matches(
         store_path,
-        build_checkpoint=checkpoint_filename(),
+        model_version=model_version,
+        build_checkpoint=checkpoint_filename(model_version=model_version),
         allow_model_mismatch=allow_model_mismatch,
         get_credentials=store_credentials,
         s3_region=s3_region,
@@ -1313,6 +1332,7 @@ async def run_global_campaign(
             # must not inspect a possibly-cleaned-up mosaic.
             "run_id": run_id,
             "ami_ssm_name": ami_ssm_name,
+            "ami_ssm_name_by_model": ami_ssm_name_by_model,
             # Pin the exact image the staging fingerprint recorded (see _ami_id), so the fill
             # cannot re-resolve ami_ssm_name to a re-baked AMI mid-campaign.
             #
@@ -1420,9 +1440,9 @@ async def run_global_campaign(
         # so it gets a stable id that does NOT inspect the mosaic — fingerprinting would
         # raise before the tag repair.
         if retag_only:
-            run_id = f"{zone}-{year}-retag"
+            run_id = run_id_prefix(model_version) + f"{zone}-{year}-retag"
         elif empty_cell:
-            run_id = f"{zone}-{year}-empty"
+            run_id = run_id_prefix(model_version) + f"{zone}-{year}-empty"
         else:
             run_id = _staging_run_id(
                 zone,
@@ -1434,6 +1454,7 @@ async def run_global_campaign(
                 allow_s2_only=allow_s2_only,
                 optical_min_obs=_campaign_optical_min_obs(),
                 code_identity=_staging_code_identity(),
+                model_version=model_version,
                 get_credentials=iam_icechunk_credentials,
                 s3_region=s3_region,
             )
@@ -1599,6 +1620,7 @@ async def run_global_campaign(
                         "cells": cells,
                         "paths": paths.model_dump(),
                         "ami_ssm_name": ami_ssm_name,
+                        "ami_ssm_name_by_model": ami_ssm_name_by_model,
                         # Pin the fingerprinted image (see _ami_id / _fill_params), but ONLY
                         # for a cluster that will actually start Ray: one whose cells are all
                         # retag or all-ocean never provisions, and forcing an SSM read there

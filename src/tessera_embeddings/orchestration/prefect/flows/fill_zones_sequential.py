@@ -51,7 +51,7 @@ from prefect.runtime import flow_run as flow_run_ctx
 from prefect.states import Cancelling
 
 from tessera_embeddings.config.fault_injection import WITHHOLD_WORK, FaultInjection, hard_exit_after_flush
-from tessera_embeddings.config.inference import checkpoint_filename
+from tessera_embeddings.config.inference import ami_ssm_name_for_model, checkpoint_filename, run_id_prefix
 from tessera_embeddings.config.ingest import IngestSettings
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.store_layout import SHARD_PX
@@ -105,7 +105,7 @@ from tessera_embeddings.orchestration.runners.zone_fill import (
     zone_year_complete,
     zone_year_on_axis,
 )
-from tessera_embeddings.storage.global_store import open_global_repo
+from tessera_embeddings.storage.global_store import open_global_repo, store_model_version
 from tessera_embeddings.storage.object_store import delete_prefix
 from tessera_embeddings.storage.update import (
     applied_optical_min_obs,
@@ -691,6 +691,7 @@ def fill_zones_sequential_flow(
     paths: BucketPaths,
     ami_ssm_name: str,
     ami_id: str | None = None,
+    ami_ssm_name_by_model: dict[str, str] | None = None,
     time_window_end: str | None = None,
     store_name: str = "tessera",
     mask_name: str = "global",
@@ -746,6 +747,9 @@ def fill_zones_sequential_flow(
         ami_id: Pre-resolved AMI ID the campaign pinned, used for BOTH the shared cluster's
             image AND this flow's own staging fingerprint, so a mid-campaign re-bake can't
             split them. ``None`` (direct calls) resolves ``ami_ssm_name``.
+        ami_ssm_name_by_model: Per-model overrides of ``ami_ssm_name``. The entry for the model
+            the store holds replaces ``ami_ssm_name``; a model on its own worker image (v1.1) without
+            one is refused (ADR 025).
         time_window_end: End month of the inference window as ``"Month Year"``; defaults to
             ``"December {year}"`` per cell (the calendar-year window). Only valid for a
             SINGLE-year ``cells`` list — one literal override cannot describe several years,
@@ -966,6 +970,14 @@ def fill_zones_sequential_flow(
     if plan is not None and (outside := [c for c in cells if c not in set(plan.cell_list())]):
         raise ValueError(f"Cell(s) {outside} are not in update {plan.name!r}")
     store_path = paths.global_store(store_name)
+    # The store decides the model, and with it the checkpoint, worker image and staging prefix: an
+    # update of the v1.1 store runs v1.1 whatever any default says.
+    model_version = store_model_version(
+        store_path,
+        get_credentials=icechunk_credentials_for(store_path, iam_icechunk_credentials),
+        region=s3_region,
+    )
+    ami_ssm_name = ami_ssm_name_for_model(ami_ssm_name, ami_ssm_name_by_model, model_version)
     # Where this run's mosaics and staging live: the campaign's, or the update's own.
     update_root = paths.update_root(update) if update is not None else None
     mosaic_root = update_root or paths.inputs
@@ -980,7 +992,7 @@ def fill_zones_sequential_flow(
             "takes its own calendar year) or dispatch one year per flow run."
         )
     land_mask_path = paths.land_mask_store(mask_name)
-    checkpoint_path = f"{paths.inputs.rstrip('/')}/models/{checkpoint_filename()}"
+    checkpoint_path = f"{paths.inputs.rstrip('/')}/models/{checkpoint_filename(model_version=model_version)}"
 
     @cache
     def _window_for(cell_year: int) -> TimeWindow:
@@ -1030,6 +1042,7 @@ def fill_zones_sequential_flow(
             s1_orbit=resolved_orbit,
             time_window=_window_for(cell_year),
             checkpoint_path=checkpoint_path,
+            model_version=model_version,
             inputs_bucket=paths.inputs,
             output_bucket=paths.outputs,
             chunk_size=SHARD_PX,  # 1 inference tile == 1 shard (D3)
@@ -1165,7 +1178,7 @@ def fill_zones_sequential_flow(
             config=_config_for(s1_orbit, year),
             num_actors=1,
             log=log,
-            run_id=f"{zone}-{year}-{plan.name}-none",
+            run_id=run_id_prefix(model_version) + f"{zone}-{year}-{plan.name}-none",
             get_credentials=iam_icechunk_credentials,
             s3_region=s3_region,
             update=plan.target(zone, year, root=cast(str, update_root)),
@@ -1183,7 +1196,7 @@ def fill_zones_sequential_flow(
         if plan is None and zone_year_complete(
             store_path, zone, year, get_credentials=iam_icechunk_credentials, s3_region=s3_region
         ):
-            retagged.append(_fill_no_cluster(zone, year, f"{zone}-{year}-retag"))
+            retagged.append(_fill_no_cluster(zone, year, run_id_prefix(model_version) + f"{zone}-{year}-retag"))
             continue
         if not zone_year_on_axis(store_path, zone, year, get_credentials=iam_icechunk_credentials, s3_region=s3_region):
             raise ValueError(
@@ -1206,7 +1219,7 @@ def fill_zones_sequential_flow(
         if n_tiles == 0:
             # No mosaic exists or is needed; run_id is provenance-only here (no staging to
             # fingerprint and no mosaic to read).
-            empty.append(_fill_no_cluster(zone, year, f"{zone}-{year}-empty"))
+            empty.append(_fill_no_cluster(zone, year, run_id_prefix(model_version) + f"{zone}-{year}-empty"))
             continue
         # Optical preflight, only when THIS flow produces the mosaics: a cell whose source
         # confirmably publishes nothing for its live land would otherwise pay for its ingest
@@ -1283,7 +1296,8 @@ def fill_zones_sequential_flow(
     # different encoder/checkpoint than this build embeds with.
     _assert_seeded_model_matches(
         store_path,
-        build_checkpoint=checkpoint_filename(),
+        model_version=model_version,
+        build_checkpoint=checkpoint_filename(model_version=model_version),
         allow_model_mismatch=allow_model_mismatch,
         get_credentials=iam_icechunk_credentials,
         s3_region=s3_region,
@@ -1383,6 +1397,7 @@ def fill_zones_sequential_flow(
                 allow_s2_only=allow_s2_only,
                 optical_min_obs=_store_optical_min_obs(),
                 code_identity=code_identity,
+                model_version=model_version,
                 get_credentials=iam_icechunk_credentials,
                 s3_region=s3_region,
                 update=update,

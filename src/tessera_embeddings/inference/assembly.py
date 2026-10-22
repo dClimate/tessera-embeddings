@@ -54,6 +54,7 @@ import zarr
 from tessera_embeddings.config.environment import code_identity
 from tessera_embeddings.config.fault_injection import ArmedFault
 from tessera_embeddings.config.inference import (
+    DEFAULT_MODEL_VERSION,
     EMBEDDING_DIM,
     OPTICAL_MIN_OBS,
     RADAR_THIN_MAX_OBS,
@@ -1870,8 +1871,8 @@ class ZarrWriter:
         time_window: TimeWindow | None = None,
         tile_id: str | None = None,
         compute_std: bool = False,
-        model_version: str | None = None,
-        encoder_version: ModelVersion | None = None,
+        checkpoint_id: str | None = None,
+        model_version: ModelVersion = DEFAULT_MODEL_VERSION,
         manifest: EmbeddingManifest | None = None,
         n_workers: int,
         get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
@@ -1928,10 +1929,11 @@ class ZarrWriter:
                 metadata lands in dataset attributes.
             tile_id: Sentinel-2 MGRS tile ID for ``proj:`` convention attrs when the mosaic store
                 carries no ``crs`` attr.
-            model_version: Encoder checkpoint identifier, recorded as the ``checkpoint_id``
+            checkpoint_id: The checkpoint's filename stem, recorded as the ``checkpoint_id``
                 provenance attr (``geoemb:model`` is the public encoder URL, derived separately).
-            encoder_version: Model FAMILY (e.g. ``"v2-large"``) selecting the public
-                ``geoemb:model`` URL. Omitting it stamps the default model's URL.
+            model_version: The model that produced the staged tiles, selecting the public
+                ``geoemb:model`` URL and the cross-model append check. Production callers pass
+                the run config's.
             manifest: Typed manifest for append-safety validation. Written on create, validated
                 before extending an existing store.
             n_workers: Worker *process* count.
@@ -2073,7 +2075,7 @@ class ZarrWriter:
             # WHOLE store. Shared with the pre-flight so the two doors cannot disagree.
             assert_encoder_matches(
                 cast("str | None", root.attrs.get("geoemb:model")),
-                model_version=encoder_version,
+                model_version=model_version,
                 where=output_path,
             )
 
@@ -2206,8 +2208,8 @@ class ZarrWriter:
             embedding_dim=self.embedding_dim,
             y_coords=spatial.northing if spatial else None,
             x_coords=spatial.easting if spatial else None,
+            checkpoint_id=checkpoint_id,
             model_version=model_version,
-            encoder_version=encoder_version,
         )
         if conv_attrs:
             attrs.update(conv_attrs)

@@ -119,6 +119,14 @@ prefect deployment run 'tessera-full-pipeline/master' \
     --param ami_ssm_name='/tessera/ray/ami-id'
 ```
 
+Every Ray flow also takes `ami_ssm_name_by_model`, such as
+`{"v1.1": "/tessera/ray/ami-id-torch-2-5-1"}`. A run of a listed model provisions from
+that image and any other model from `ami_ssm_name`. **A v1.1 run requires an entry** and is
+refused without one, because v1.1 never runs on the default image. Set it on the deployment, so each
+run picks its worker image from the model it actually runs rather than from an
+override someone has to remember (ADR 025 keeps v1.1 on its own image). A fill's model is
+the one its store was seeded for.
+
 The plan was deliberately **caller-supplied deployment names**, not
 hardcoded — same flow can drive multiple environments (prod, dev,
 staging) without code changes.
