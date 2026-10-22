@@ -869,6 +869,75 @@ away from `ingcode-67740a8483141eda` (`ingest/s2_roi.py` changed), so resuming
 mosaics built before this change needs `allow_ingest_code_mismatch=true`. The inference identity
 is unchanged (`infcode-44bbc47265fcb6a8`). Batched stores are byte-identical (batching parity test).
 
+### 3.22 Commits fetch their manifests concurrently, and the zarr 3.4 / icechunk 2.3 upgrade costs ingest nothing (October 2026)
+
+**What prompted it.** The paired Iowa S2 dev runs that verified the zarr 3.4.1 / icechunk 2.3.0
+upgrade (PR #242) cost 4% and then 7% more on the upgrade. Both arms ran at the same time against
+the same granules, so the gap looked like a library cost.
+
+**It was not one.** A third round reversed the sign, and within each round the typical batch was
+level. The cloud-mask check moved as much as the write did, and that check reads imagery and writes
+nothing through zarr or icechunk.
+
+| round | Fargate cost, upgrade vs main | median paired batch write ratio [95% CI] | cloud-mask check total |
+|---|---|---|---|
+| 1 | +4% | 1.016 [1.000, 1.042] | +1% |
+| 2 | +7% | 0.993 [0.962, 1.014] | −6% |
+| 3 | −12% | 0.881 [0.868, 0.889] | −11% |
+
+The cost gaps came from two places. One was a few batches whose straggling reads moved by 100 to
+200 s, in both directions. The other was the tail after the last batch.
+
+**Controlled: the write path with source reads taken out.** `scripts/diagnostic/ingest_write_bench.py`
+sets up the write path like this:
+
+- **Driver:** the library's `write_days_windows`.
+- **Source:** three real Iowa dates of a 12,288² square, held in worker memory before timing starts.
+- **Cluster:** eight workers of six threads on one m7g.8xlarge.
+
+Five venvs differ only in zarr, icechunk and the fetch setting. Each run wrote 16 batches into a
+fresh store, and the arms ran in three interleaved rounds. Ratios are paired by round and batch,
+against zarr 3.2.1 with icechunk 2.1.1, with batch 0 dropped as warm-up:
+
+| arm | batch write | commit | worker write work |
+|---|---|---|---|
+| zarr 3.4.1 + icechunk 2.3.0 (the upgrade) | 0.954 [0.940, 0.967] | 0.981 | 0.953 |
+| zarr 3.4.1 + icechunk 2.1.1 | 0.993 [0.983, 1.008] | 1.009 | 0.973 |
+| zarr 3.2.1 + icechunk 2.3.0 | 0.961 [0.949, 0.970] | 0.976 | 0.989 |
+| the upgrade, manifest fetches at 16 | 0.874 [0.862, 0.896] | 0.271 | 0.961 |
+
+The upgrade makes the write path about 5% faster, and icechunk 2.3 carries most of that.
+
+**The change.** icechunk fetches and rewrites a commit's manifests one at a time: the default for
+`max_concurrent_manifest_fetches_during_commit` is 1. A batch commit into a mosaic touches at least
+one manifest for each of its arrays, so it waits on that many serial round trips. icechunk 2.3 can
+fetch them concurrently, and `_default_repo_config` (`storage/zarr_store.py`) now sets 16. In the
+controlled runs that cut commits from 0.79 s to 0.23 s. Batch writes fell to 0.92× the upgrade's.
+
+**End to end** (round 3, run beside the upgrade on the same granules):
+
+- **Typical batch:** the median paired batch write was 0.975 [0.962, 0.997] of the upgrade's.
+- **Write total:** 0.4% lower. Two straggling batches hid most of the gain in the total.
+- **The whole run:** the commit saves about half a second a batch, about 2% of a run's wall clock.
+- **Outputs:** the mosaics are identical in every array of three dates at two sampled windows.
+
+**The global store keeps icechunk's default.** Its manifest config is saved inside the store at
+create (`global_store_config` replaces this one). Changing it would mean rewriting the published
+store's saved config.
+
+**Identities.** `storage/zarr_store.py` lies in both closures:
+
+- **Ingest:** `ingcode-74b69535ab444c83` becomes `ingcode-bb0cfb728cdd9d89`. Resuming a mosaic built
+  before this change needs `allow_ingest_code_mismatch=true`.
+- **Inference:** `infcode-44bbc47265fcb6a8` becomes `infcode-3ea126f24effcb00`.
+
+So it deploys at a store boundary.
+
+**A method note: the Dask performance report costs two to three minutes a run.** Rounds 1 and 2
+wrote one, and their tails after the last batch were 178 to 239 s. Round 3 wrote none, and its
+tails were 67 to 69 s. Production never sets `perf_report_uri`. Leave it off in any cost
+comparison, or give both arms one.
+
 ## 4. What did not work, and why
 
 ### 4.1-4.8 What was tried and rejected — the table, so none of it is retried
