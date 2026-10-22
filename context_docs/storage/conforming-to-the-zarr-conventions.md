@@ -58,9 +58,11 @@ rioxarray (0.22 and 0.23) still looks for `"spatial:"` and `"proj:"`, but the co
 a `name` "MUST NOT be used by tools to identify the Convention", so we follow the schema rather than
 the reader. The published store matched rioxarray until ADR 024's repair corrected the names.
 
-**The geoemb registration uses the `refs/tags/v1` URLs.** Its schema pins them as `const`, and v1 is
-the convention's version. Upstream has not cut the tag, so the URLs 404 until it does. An earlier
-commit-SHA URL resolved but failed the schema it pointed at.
+**The geoemb registration carries its `uuid` and no URLs.** Its schema pins `schema_url` and
+`spec_url` to `refs/tags/v1` as `const`, a tag upstream has not cut, so those URLs 404, and the
+conventions spec defines both as URLs that resolve. An earlier commit-SHA URL resolved but failed
+the schema's `const`. The schema accepts a registration by `uuid` alone, which is how the geoemb
+README's own examples register it; the URLs return once the tag exists.
 
 **Every spatial array repeats `spatial:dimensions`.** The spatial spec requires it on arrays when
 composed with `proj`, and a reader that opens one variable, such as an xarray `DataArray`, never
@@ -68,8 +70,9 @@ sees its group's attributes. The group keeps its own copy, which the geoembeddin
 per-zone stores.
 
 **The coordinate arrays carry CF attributes, but CF is not registered.** `axis`, `standard_name` and
-`units` are what CF-reading tools use to find the spatial axes; they are written only for a CRS in
-metres, the same rule as `geoemb:gsd`. The [CF convention for Zarr](https://github.com/zarr-conventions/CF)
+`units` are what CF-reading tools use to find the spatial axes; they are written only when the
+group's own `proj:code` is in metres, the same rule as `geoemb:gsd`, so they follow the CRS the
+store declares however it was found. The [CF convention for Zarr](https://github.com/zarr-conventions/CF)
 is a proposal with no release, and its registration example adds a `version` field the conventions
 spec forbids, so registering it would not validate.
 
@@ -115,7 +118,7 @@ Repeating `proj:` on every array, or adding a CF `grid_mapping` variable, would 
   leave groups only `bbox`. Our group-level transform and shape would then move to the arrays.
 - **Versioning by `uuid`** ([zarr-conventions-spec#38](https://github.com/zarr-conventions/zarr-conventions-spec/issues/38)).
   Open. It may change how a registration names its version.
-- **The geoemb `v1` tag**, which would make the registration URLs resolve.
+- **The geoemb `v1` tag**, which would let the registration carry its `schema_url` and `spec_url`.
 
 ## 6. The published v1.1 store
 

@@ -631,7 +631,7 @@ def seed_zone_groups(
         bnds.attrs.update(TIME_ENCODING)  # same int64-ns encoding as `time`
         node["time"].attrs["bounds"] = "time_bnds"  # CF: this coordinate represents an interval
         node.attrs.update(_zone_attrs(spec, north, east, layout))
-        stamp_array_conventions(node, spec.crs)
+        stamp_array_conventions(node)
     if not created and not stamped_now:
         # Every requested zone was already complete AND the root already carried its identity, so
         # nothing was written — and icechunk refuses an empty commit unless asked. Committing

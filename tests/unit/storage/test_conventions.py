@@ -371,12 +371,12 @@ class TestTransformAndBboxAgree:
 class TestConventionRegistration:
     """The registration block a consumer follows to find the spec."""
 
-    def test_registered_urls_are_pinned_to_the_tag_each_schema_requires(self) -> None:
-        """Each schema pins its own URLs as ``const``: ``v0.1`` for proj/spatial, ``v1`` for geoemb.
+    def test_registered_urls_are_the_ones_each_schema_requires_and_resolve(self) -> None:
+        """proj/spatial pin ``v0.1``, the tag their schemas name; geoemb carries no URL at all.
 
-        Offline by design — this asserts the pin, not that GitHub is up. What it guards is an edit
-        to a URL that resolves but fails the schema (a commit SHA), or a version the convention
-        never had (``v1`` for proj/spatial).
+        Offline by design — this asserts the pin, not that GitHub is up. geoemb's schema names a
+        ``v1`` tag upstream has not cut, so any URL there either 404s or fails the schema's
+        ``const``; the uuid alone registers it until the tag exists.
         """
         attrs = build_convention_attrs(
             epsg_code="EPSG:32633",
@@ -387,14 +387,12 @@ class TestConventionRegistration:
             x_coords=np.arange(500000.0, 500100.0, 10.0),
         )
         registered = {c["name"]: c for c in attrs["zarr_conventions"]}
-        for name, repo, tag in (
-            ("proj", "zarr-conventions/proj/", "/v0.1/"),
-            ("spatial", "zarr-conventions/spatial/", "/v0.1/"),
-            ("geoemb:", "geo-embeddings/embeddings-zarr-convention/", "/v1/"),
-        ):
+        for name in ("proj", "spatial"):
             for url_field in ("schema_url", "spec_url"):
                 url = registered[name][url_field]
-                assert repo in url and tag in url, f"{name} {url_field} must be the URL its schema requires"
+                assert f"zarr-conventions/{name}/" in url and "/v0.1/" in url, f"{name} {url_field}"
+        assert {"schema_url", "spec_url"}.isdisjoint(registered["geoemb:"])
+        assert registered["geoemb:"]["uuid"] == "61c12cc5-0e28-4056-999a-480cf3fb7e4c"
 
 
 class TestMultiGroupPlacement:
@@ -467,11 +465,13 @@ def test_one_comparison_serves_every_reader_of_the_encoder_identity() -> None:
 
 @pytest.mark.parametrize(("epsg", "labelled"), [("EPSG:32633", True), ("EPSG:4326", False), (None, False)])
 def test_cf_coord_attrs_only_claim_metres_for_a_metre_crs(epsg: str | None, labelled: bool) -> None:
-    """A degree CRS or bare pixel indices must not be labelled as projected metres."""
+    """The group's own ``proj:code`` decides: a degree CRS or no CRS is not labelled as metres."""
     node = zarr.group(store=zarr.storage.MemoryStore())
+    if epsg:
+        node.attrs["proj:code"] = epsg
     for name in ("northing", "easting"):
         node.create_array(name, data=np.arange(3.0), dimension_names=(name,))
-    stamp_array_conventions(node, epsg)
+    stamp_array_conventions(node)
     assert dict(node["easting"].attrs) == (
         {"standard_name": "projection_x_coordinate", "units": "m", "axis": "X"} if labelled else {}
     )
@@ -479,12 +479,14 @@ def test_cf_coord_attrs_only_claim_metres_for_a_metre_crs(epsg: str | None, labe
 
 
 def test_spatial_arrays_repeat_the_group_spatial_dimensions() -> None:
-    """Arrays spanning both spatial dims register ``spatial`` themselves; others are left alone."""
+    """Arrays spanning both spatial dims register ``spatial`` beside any registration they hold."""
     node = zarr.group(store=zarr.storage.MemoryStore())
     node.attrs["spatial:dimensions"] = ["northing", "easting"]
-    node.create_array("scales", shape=(1, 2, 2), dtype="f4", dimension_names=("time", "northing", "easting"))
+    scales = node.create_array("scales", shape=(1, 2, 2), dtype="f4", dimension_names=("time", "northing", "easting"))
+    scales.attrs["zarr_conventions"] = [{"uuid": "other"}]
     node.create_array("time", data=np.arange(1.0), dimension_names=("time",))
-    stamp_array_conventions(node, None)
+    stamp_array_conventions(node)
+    stamp_array_conventions(node)  # idempotent: no duplicate registration
     assert node["scales"].attrs["spatial:dimensions"] == ["northing", "easting"]
-    assert [c["uuid"] for c in node["scales"].attrs["zarr_conventions"]] == [_SPATIAL_CONVENTION["uuid"]]
+    assert [c["uuid"] for c in node["scales"].attrs["zarr_conventions"]] == ["other", _SPATIAL_CONVENTION["uuid"]]
     assert dict(node["time"].attrs) == {}

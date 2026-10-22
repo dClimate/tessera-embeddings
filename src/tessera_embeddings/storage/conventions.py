@@ -92,13 +92,11 @@ _SPATIAL_CONVENTION = {
     "description": "Spatial coordinate information",
 }
 
-# The geoemb schema pins `refs/tags/v1` as `const`, so this is the only registration that
-# validates — and v1 IS the convention's version, unlike proj/spatial above. Upstream has not
-# cut the tag yet, so the two URLs 404 until it does; a resolving commit-SHA URL was tried and
-# fails the schema it points at. The uuid identifies the convention either way.
+# Registered by uuid alone, as the geoemb README's own examples do. Its schema pins the URLs to
+# `refs/tags/v1`, a tag upstream has not cut, so those 404 — and the conventions spec defines
+# `schema_url`/`spec_url` as URLs that resolve. A commit-SHA URL resolves but fails the schema's
+# `const`. Add the `v1` URLs once the tag exists.
 _GEOEMB_CONVENTION = {
-    "schema_url": "https://raw.githubusercontent.com/geo-embeddings/embeddings-zarr-convention/refs/tags/v1/schema.json",
-    "spec_url": "https://github.com/geo-embeddings/embeddings-zarr-convention/blob/v1/README.md",
     "uuid": "61c12cc5-0e28-4056-999a-480cf3fb7e4c",
     "name": "geoemb:",
     "description": "Geoembeddings convention for geospatial embedding arrays with model provenance",
@@ -224,23 +222,30 @@ _CF_COORD_ATTRS: dict[str, dict[str, str]] = {
 }
 
 
-def stamp_array_conventions(node: zarr.Group, epsg_code: str | None) -> None:
-    """Label *node*'s arrays for readers that open one array at a time; call after the group attrs.
+def stamp_array_conventions(node: zarr.Group) -> None:
+    """Label *node*'s arrays for readers that open one array at a time, from the group's own attrs.
+
+    Call after the group attrs are written. Both labels derive from what the group declares, so
+    they cannot disagree with it however its CRS was found (a mosaic attr or the MGRS tile).
 
     * Every array spanning both of the group's ``spatial:dimensions`` registers ``spatial`` and
       repeats them. The spec requires them on arrays when composed with ``proj``, and a reader
-      that opens one variable (an xarray ``DataArray``) never sees the group's attrs.
-    * ``northing``/``easting`` get CF ``standard_name``/``units``/``axis``, only for a metre-based
-      CRS (the ``geoemb:gsd`` rule): a geographic or foot CRS, or bare pixel-index coordinates, is
-      left unlabelled rather than mislabelled.
+      that opens one variable (an xarray ``DataArray``) never sees the group's attrs. Any other
+      registration on the array is kept; ours is matched by uuid.
+    * ``northing``/``easting`` get CF ``standard_name``/``units``/``axis``, only when the group's
+      ``proj:code`` is a metre-based CRS (the ``geoemb:gsd`` rule): a geographic or foot CRS, or
+      no CRS at all, is left unlabelled rather than mislabelled.
 
     Writes only arrays whose attrs differ, so re-stamping an unchanged store is a no-op.
     """
     dims = cast("list[str]", node.attrs.get("spatial:dimensions") or [])
-    wanted: dict[str, dict[str, Any]] = dict(_CF_COORD_ATTRS) if _is_metre_crs(epsg_code) else {}
+    epsg = cast("str | None", node.attrs.get("proj:code"))
+    wanted: dict[str, dict[str, Any]] = dict(_CF_COORD_ATTRS) if _is_metre_crs(epsg) else {}
     for name, arr in node.arrays() if dims else ():
         if set(dims) <= set(getattr(arr.metadata, "dimension_names", None) or ()):
-            wanted[name] = {"zarr_conventions": [_SPATIAL_CONVENTION], "spatial:dimensions": dims}
+            registered = cast("list[dict[str, Any]]", arr.attrs.get("zarr_conventions") or [])
+            others = [c for c in registered if c.get("uuid") != _SPATIAL_CONVENTION["uuid"]]
+            wanted[name] = {"zarr_conventions": [*others, _SPATIAL_CONVENTION], "spatial:dimensions": dims}
     for name, attrs in wanted.items():
         if any(node[name].attrs.get(k) != v for k, v in attrs.items()):
             node[name].attrs.update(attrs)

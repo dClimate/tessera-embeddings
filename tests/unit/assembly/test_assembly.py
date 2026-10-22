@@ -2787,13 +2787,16 @@ class TestAssembleGuards:
                 n_workers=1,
             )
 
-    def test_projected_coords_get_cf_axis_attrs(self, tmp_path, monkeypatch):
-        """A store assembled over a metre CRS labels northing/easting for CF-only readers."""
+    @pytest.mark.parametrize(("crs", "tile_id"), [("EPSG:32633", None), (None, "33UWP")])
+    def test_projected_coords_get_cf_axis_attrs(self, tmp_path, monkeypatch, crs, tile_id):
+        """A store over a metre CRS labels northing/easting, whether the CRS came from the mosaic
+        or from the MGRS tile fallback.
+        """
         writer = ZarrWriter(str(tmp_path / "staging"))
         output = str(tmp_path / "out.zarr")
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
         axis = np.arange(4, dtype="float64") * 10.0
-        spatial = SpatialCoords(northing=axis[::-1], easting=axis, crs="EPSG:32633")
+        spatial = SpatialCoords(northing=axis[::-1], easting=axis, crs=crs)
         monkeypatch.setattr(_assembly_mod, "read_spatial_coords", lambda *a, **k: spatial)
         self._stage_one(writer, chunk, "run1")
         writer.assemble(
@@ -2805,8 +2808,10 @@ class TestAssembleGuards:
             roi_zarr_path=_make_full_roi_mask(tmp_path, 4, 4),
             n_workers=1,
             mosaic_base=str(tmp_path / "mosaic"),
+            tile_id=tile_id,
         )
         root = zarr.open_group(open_or_create_repo(output)[0].readonly_session("main").store, mode="r")
+        assert root.attrs["proj:code"] == "EPSG:32633"
         assert root["northing"].attrs["axis"] == "Y"
         assert root["easting"].attrs["standard_name"] == "projection_x_coordinate"
 

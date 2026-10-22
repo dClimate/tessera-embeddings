@@ -2237,7 +2237,7 @@ class ZarrWriter:
             del node.attrs[stale]
         node.attrs.update(attrs)
         # Every assemble, not only at creation, so a store created before these attrs gains them.
-        stamp_array_conventions(node, spatial.crs if spatial else None)
+        stamp_array_conventions(node)
 
         t_commit = time.monotonic()
         commit_with_rebase(session, f"Run {run_id}: {len(chunks)} chunks assembled")
