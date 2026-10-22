@@ -1254,20 +1254,21 @@ def test_both_strategies_pin_the_resolved_ami_id(wired):
     assert chained["ami_id"] == "ami-test-id"
 
 
+@pytest.mark.parametrize("override", ["allow_model_mismatch", "allow_stack_mismatch"])
 @pytest.mark.parametrize(
     ("strategy", "dep"),
     [("cluster-per-zone", "fill-zone-year"), ("chained-clusters", "fill-zones-sequential")],
 )
-def test_both_strategies_forward_the_model_mismatch_override(wired, strategy: str, dep: str):
-    """An operator override cleared in preflight must reach the gate that fires.
+def test_both_strategies_forward_the_mismatch_overrides(wired, strategy: str, dep: str, override: str):
+    """An operator override must reach the gate that fires, which is in the child.
 
-    The campaign checks the seeded model once before dispatching, but every child
-    re-checks it. Without forwarding, the child falls back to its default and rejects
-    the same store — after the cell's ingest has already been paid for.
+    The campaign checks the seeded model once before dispatching, but every child re-checks it,
+    and the stack is checked only at the child's assembly. Without forwarding, the child falls
+    back to its default and rejects the same store — after the cell's ingest has been paid for.
     """
-    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI, fill_strategy=strategy, allow_model_mismatch=True))
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI, fill_strategy=strategy, **{override: True}))
     fill = next(p for d, p in wired["arun"] if dep in d)
-    assert fill["allow_model_mismatch"] is True
+    assert fill[override] is True
 
 
 class TestAmiIsResolvedOnlyForCellsThatStartRay:

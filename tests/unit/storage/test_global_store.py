@@ -179,6 +179,18 @@ def test_the_store_names_the_model_that_fills_it(tmp_path, model, other):
     assert global_store.store_model_version(store, other, allow_mismatch=True) == other
 
 
+def test_a_store_naming_no_known_model_needs_the_fill_to_name_one(tmp_path):
+    """A campaign takes its model from the store, so an unknown URL is refused unless a fill names its model."""
+    store = str(tmp_path / "g.icechunk")
+    global_store.seed_zone_groups(global_store.create_global_repo(store), [_ZA], years=(2025,))
+    session = global_store.open_global_repo(store).writable_session("main")
+    zarr.open_group(session.store, mode="a").attrs["geoemb:model"] = "https://example.org/custom"
+    session.commit("a custom model URL")
+    with pytest.raises(ValueError, match=r"names no known model.*fill_zone_year"):
+        global_store.store_model_version(store, allow_mismatch=True)
+    assert global_store.store_model_version(store, "v2-large", allow_mismatch=True) == "v2-large"
+
+
 @pytest.mark.parametrize("change", [{"model_version": "v2-large"}, {"checkpoint_id": "other"}])
 def test_reseed_with_different_model_rejected(tmp_path, change):
     """Root encoder provenance is write-once: a matching reseed is a no-op, but a
