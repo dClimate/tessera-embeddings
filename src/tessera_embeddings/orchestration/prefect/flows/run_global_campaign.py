@@ -599,6 +599,7 @@ async def run_global_campaign(
     allow_partial_window: bool = False,
     allow_s2_only: bool = False,
     allow_model_mismatch: bool = False,
+    allow_stack_mismatch: bool = False,
     allow_ingest_code_mismatch: bool = False,
     sweep_orphan_mosaics: bool = False,
     validation_deployment: str | None = None,
@@ -890,6 +891,9 @@ async def run_global_campaign(
             before any ingest is dispatched, so a mismatch costs a metadata read rather than
             a mosaic per in-flight zone. Deliberate override only — mixing encoders under one
             store is permanent.
+        allow_stack_mismatch: Write tiles computed on a different PyTorch or CUDA from the store's
+            recorded ``inference_stack`` (default rejects at assembly — ADR 025 rule 2). Forwarded
+            to every fill. Deliberate experiments only.
         allow_ingest_code_mismatch: Forwarded to every ingest: resume interrupted mosaics
             built by different ingest code, instead of demanding they be deleted.
         sweep_orphan_mosaics: Before the run, delete mosaics for cells already
@@ -1360,6 +1364,7 @@ async def run_global_campaign(
             # forwarding the override it rejects the same store after its ingest has been
             # paid for. The campaign-level flag has to reach the gate that fires.
             "allow_model_mismatch": allow_model_mismatch,
+            "allow_stack_mismatch": allow_stack_mismatch,
             # A fleet-wide rate the concurrent fills share: the account's RunInstances quota.
             # There is no share to divide — each autoscaler runs the limiter client-side — so the
             # campaign passes only whether to run it at all.
@@ -1643,6 +1648,7 @@ async def run_global_campaign(
                         "require_s1": False,
                         # As in _fill_params: the chained child gates on the seeded model too.
                         "allow_model_mismatch": allow_model_mismatch,
+                        "allow_stack_mismatch": allow_stack_mismatch,
                         "ssm_prefix": ssm_prefix,
                         "cloudwatch_log_group": cloudwatch_log_group,
                         "code_bucket": code_bucket,
