@@ -517,7 +517,6 @@ def _run_inference_and_assemble(
             writer, planned, output_path=output_path, run_id=run_id, results=results, log=log
         )
     else:
-        # Provenance id: the checkpoint filename stem, not the ModelVersion literal.
         checkpoint_id = checkpoint_to_version(config.checkpoint_path)
         manifest = EmbeddingManifest.from_upstream_stores(
             model_checkpoint=checkpoint_id,
@@ -536,8 +535,8 @@ def _run_inference_and_assemble(
             log=log,
             time_window=time_window,
             tile_id=roi_name,
-            model_version=checkpoint_id,
-            encoder_version=config.model_version,
+            checkpoint_id=checkpoint_id,
+            model_version=config.model_version,
             manifest=manifest,
             n_workers=AssemblyConfig().compute_n_workers(n_live),
         )

@@ -24,12 +24,7 @@ from prefect import flow, get_run_logger
 from prefect.runtime import flow_run as flow_run_ctx
 
 from tessera_embeddings.config.fault_injection import DIE_BETWEEN_COMMITS, FaultInjection
-from tessera_embeddings.config.inference import (
-    DEFAULT_MODEL_VERSION,
-    ModelVersion,
-    ami_ssm_name_for_model,
-    checkpoint_filename,
-)
+from tessera_embeddings.config.inference import ModelVersion, ami_ssm_name_for_model, checkpoint_filename
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.store_layout import SHARD_PX
 from tessera_embeddings.config.time_windows import parse_time_window
@@ -56,6 +51,7 @@ from tessera_embeddings.orchestration.runners.zone_fill import (
     zone_year_on_axis,
 )
 from tessera_embeddings.storage.conventions import expected_model_url
+from tessera_embeddings.storage.global_store import store_model_version
 from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group
 from tessera_embeddings.storage.zone_grid import canonicalize_zone
 
@@ -96,7 +92,7 @@ def _assert_seeded_model_matches(
     allow_model_mismatch: bool,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None,
     s3_region: str | None = None,
-    encoder_version: ModelVersion = DEFAULT_MODEL_VERSION,
+    model_version: ModelVersion,
 ) -> None:
     """Refuse to fill a store seeded for a different encoder/checkpoint than this build.
 
@@ -109,23 +105,18 @@ def _assert_seeded_model_matches(
 
     ``geoemb:model`` versions only the ENCODER (e.g. "1.1"); it does NOT distinguish the concrete
     checkpoint / norm source (the ``aws`` and ``mpc`` v1.1 checkpoints share one URL). So when the
-    store also recorded a ``checkpoint_id`` (the seed's ``model_version``), require it to match
-    this build's checkpoint (*build_checkpoint* = :func:`checkpoint_filename`) — otherwise two
-    same-URL-but-different checkpoints could be mixed. Absent ``checkpoint_id`` (the default), only
-    the encoder URL is gated; seed with ``model_version=checkpoint_filename()`` to enable
-    checkpoint-level gating.
+    store also recorded a ``checkpoint_id``, require it to match this run's checkpoint
+    (*build_checkpoint* = :func:`checkpoint_filename`) — otherwise two same-URL-but-different
+    checkpoints could be mixed. Absent ``checkpoint_id``, only the encoder URL is gated.
     """
     # The store's own credential, chosen from the path, so no caller can hand it the task role.
     root = open_store_as_zarr_group(
         store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
     )
     seeded = cast("str | None", root.attrs.get("geoemb:model"))
-    # EXPLICIT, not defaulted. The campaign fills with v1.1 today — `fill_zone_year` exposes no
-    # model selector — but an unversioned call here silently compares any future v2 fill
-    # against v1.1's URL, the failure `encoder_url`'s docstring describes:
-    # it rejects a correct run, or waves through a real mismatch when the seed carried the
-    # same stale default. Passing the version makes the seam visible and one-line to move.
-    expected = expected_model_url(model_version=encoder_version)
+    # The fill's model normally comes from this same attr (store_model_version), so this check
+    # bites when an explicit model_version overrode it, or on the checkpoint below.
+    expected = expected_model_url(model_version=model_version)
     if seeded is not None and seeded != expected and not allow_model_mismatch:
         raise ValueError(
             f"Global store {store_path} was seeded for encoder {seeded!r} but this build embeds with "
@@ -172,6 +163,7 @@ def fill_zone_year_flow(
     n_assembly_workers: int | None = None,
     allow_partial_window: bool = False,
     allow_model_mismatch: bool = False,
+    model_version: ModelVersion | None = None,
     allow_s2_only: bool = False,
     mosaic_base: str | None = None,
     launch_pacing: bool = False,
@@ -196,8 +188,8 @@ def fill_zone_year_flow(
             ``ami_ssm_name`` — so a mid-campaign re-bake can't run new code under a fingerprint
             that recorded the old image. ``None`` (direct calls) resolves ``ami_ssm_name`` at
             provisioning.
-        ami_ssm_name_by_model: Per-model overrides of ``ami_ssm_name``. This flow runs the
-            default model, so that model's entry, if any, replaces ``ami_ssm_name`` (ADR 025).
+        ami_ssm_name_by_model: Per-model overrides of ``ami_ssm_name``. The entry for the model
+            the store holds, if any, replaces ``ami_ssm_name`` (ADR 025).
         time_window_end: End month of the inference window as ``"Month Year"``; defaults to
             ``"December {year}"``. The runner REQUIRES the exact January-December window for
             ``year`` (the store guarantees calendar-year slots), so any other value fails loudly
@@ -229,8 +221,11 @@ def fill_zone_year_flow(
         allow_partial_window: Relax the pre-Ray temporal-coverage gate to "non-empty" (default
             requires the mosaic's months to span the window).
         allow_model_mismatch: Fill even when the seeded store advertises a different encoder
-            than this build (default rejects — a mid-campaign model upgrade would otherwise mix
-            encoders under one store).
+            or checkpoint than this run (default rejects — it would mix encoders under one store).
+        model_version: The model to fill with. ``None`` (the default) takes the model the store
+            holds, its root's ``geoemb:model``, which is what keeps a fill or update from running
+            a code default's checkpoint and worker image; a value must agree with the store
+            unless ``allow_model_mismatch``.
         allow_s2_only: Embed S2-valid pixels that have ZERO S1 observations (sub-zone SAR
             coverage gaps) using the upstream v1.1 missing-S1 convention (all-zeros normalized
             S1 input). Default False: such pixels are skipped. Only the PER-PIXEL gate is
@@ -281,7 +276,6 @@ def fill_zone_year_flow(
         ``empty`` flag, elapsed seconds).
     """
     log = get_run_logger()
-    ami_ssm_name = ami_ssm_name_for_model(ami_ssm_name, ami_ssm_name_by_model, DEFAULT_MODEL_VERSION)
 
     # Checked HERE, not left to run_inference: this deployment is invoked directly as well as by
     # the campaign, and on that path the value is only validated after preflight and
@@ -317,6 +311,17 @@ def fill_zone_year_flow(
     # only credential that can read OUR buckets. `icechunk_credentials_for` returns the caller's
     # own callback unchanged for our buckets, so nothing changes in dev.
     store_credentials = icechunk_credentials_for(store_path, iam_icechunk_credentials)
+    # The store decides the model, and with it the checkpoint, worker image and staging prefix: a
+    # fill or update of a v1.1 store runs v1.1 whatever any default says.
+    model_version = store_model_version(
+        store_path,
+        model_version,
+        allow_mismatch=allow_model_mismatch,
+        get_credentials=store_credentials,
+        region=s3_region,
+    )
+    ami_ssm_name = ami_ssm_name_for_model(ami_ssm_name, ami_ssm_name_by_model, model_version)
+    checkpoint = checkpoint_filename(model_version=model_version)
     land_mask_path = paths.land_mask_store(mask_name)
     # Campaign mosaics live per (zone, year); `mosaic_base` overrides for a hand-provided mosaic
     # (e.g. a shared multi-year store).
@@ -386,7 +391,8 @@ def fill_zone_year_flow(
     config = build_inference_config(
         s1_orbit=resolved_s1,
         time_window=window,
-        checkpoint_path=f"{paths.inputs.rstrip('/')}/models/{checkpoint_filename()}",
+        checkpoint_path=f"{paths.inputs.rstrip('/')}/models/{checkpoint}",
+        model_version=model_version,
         inputs_bucket=paths.inputs,
         output_bucket=paths.outputs,
         # 1 inference tile == 1 output shard == 2x2 tiles per 4096-px ingest chunk (D3), so
@@ -426,7 +432,8 @@ def fill_zone_year_flow(
         # under one store and tag it permanently. A cheap metadata-only read.
         _assert_seeded_model_matches(
             store_path,
-            build_checkpoint=checkpoint_filename(),
+            model_version=model_version,
+            build_checkpoint=checkpoint,
             allow_model_mismatch=allow_model_mismatch,
             get_credentials=store_credentials,
             s3_region=s3_region,

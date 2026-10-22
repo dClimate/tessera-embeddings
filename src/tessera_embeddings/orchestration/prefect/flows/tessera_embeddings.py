@@ -40,6 +40,7 @@ from tessera_embeddings.config.inference import (
     ModelVersion,
     ami_ssm_name_for_model,
     checkpoint_filename,
+    model_family,
     run_id_prefix,
 )
 from tessera_embeddings.config.paths import BucketPaths
@@ -141,8 +142,7 @@ def _resolve_run_id(
     """
     if previous_run_id:
         staged_v2, staged_s2_only = _run_modes(previous_run_id)
-        wants_v2 = model_version != "v1.1"
-        if staged_v2 != wants_v2:
+        if staged_v2 != (model_family(model_version).generation == "v2"):
             staged = "v2" if staged_v2 else "v1.1"
             raise ValueError(
                 f"Cannot resume run {previous_run_id!r} (staged by {staged}) with "
