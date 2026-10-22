@@ -1,6 +1,6 @@
 # 033 — Radar overlaps go to the most-acquired burst
 
-**Status:** Proposed 2026-10-22. Replaces the radar half of
+**Status:** Proposed 2026-10-22 in PR #250. Replaces the radar half of
 [`ingest/solar-day-fusion-order.md`](../ingest/solar-day-fusion-order.md), which recorded the radar
 order as undisciplined; that document holds the loader mechanism this rests on.
 
