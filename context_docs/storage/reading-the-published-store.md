@@ -44,7 +44,9 @@ print(zone.attrs["years_complete"])          # which years this zone holds
 vector = zone["embeddings"][8, 500_000, 30_000, :]   # one pixel, all 128 bands, 2025
 ```
 
-That is the whole of it. Two details carry the rest of the document.
+That is the whole of it. Read with zarr 3.3 or later: older versions fetch the pieces of a shard
+one at a time, which makes region reads about 5× slower (§4.1). Two details carry the rest of the
+document.
 
 **The store is Icechunk, not plain Zarr.** `xr.open_zarr("s3://.../dclimate.icechunk")` does not
 work and does not fail obviously — the URI is a repository, not a Zarr hierarchy. A reader has to
@@ -233,6 +235,22 @@ region-local, so no configuration makes a remote region's reads local.
 | tile, 1000×1000×128 | 315 MB/s (0.4 s) → 537 warm | 91 MB/s (1.4 s) → 102 warm | 3.5× |
 | band subset, 512×512×8 | 11 MB/s → 15 warm | 2 MB/s → 6 warm | 5.6× |
 | bulk, 4096×4096×128 | **767 MB/s (2.8 s)** | **219 MB/s (9.8 s)** | 3.5× |
+
+**Region reads depend on the zarr version; points and bulk reads do not.** zarr 3.2 fetches the
+inner chunks of a partial shard read one after another. zarr 3.3 and later merge nearby ranges and
+fetch them concurrently. On one in-region host, the two clients ran the benchmark back to back,
+once in each order:
+
+| sweep medians, cold, in-region | zarr 3.2.1 + icechunk 2.1.1 | zarr 3.4.1 + icechunk 2.3.0 |
+|---|---|---|
+| one pixel's 128-band vector, p50 | 282–313 ms | 277–341 ms |
+| tile, 1000×1000×128 | 57–62 MB/s | 283–337 MB/s |
+| band subset, 512×512×8 | 5 MB/s | 11 MB/s |
+| bulk, 4096×4096×128 | 741–751 MB/s | 756–773 MB/s |
+
+The in-region tile and band-subset figures in the table above match zarr 3.4.1, so a reader on
+zarr 3.2 should expect region reads about 5× slower. Whichever client ran first paid the higher
+point latency, so the point ranges overlap.
 
 **Cross-region costs between 1.5× and 5.6×, and where a read lands depends on its shape rather than
 its size.** Bulk pays 3.5× because it is bandwidth-bound and bandwidth is what distance takes away.
