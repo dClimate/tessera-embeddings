@@ -20,9 +20,9 @@ cloud-native, distributed architecture that runs on any major cloud —
 or on a laptop (slowly).
 
 **TESSERA v1.1 is the default model, and the published global store is v1.1.** The
-distilled **v2 Large student** can be selected on the single-area paths with
-`model_version="v2-large"`; the global campaign's zone fill runs v1.1 only. What differs
-between the two is in the
+distilled **v2 Large student** is selected with `model_version="v2-large"`: per run on the
+single-area paths, and once per global store, when it is seeded, because every zone fill follows
+the model its store was seeded for. What differs between the two is in the
 [inference README](src/tessera_embeddings/inference/README.md#model-architecture-constraint).
 
 ## Contents
