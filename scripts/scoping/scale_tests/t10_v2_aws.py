@@ -1,0 +1,451 @@
+"""T10 — the v2 layout finalists on AWS: cold read latency from S3, and the assembly code's write cost.
+
+T9 settled what does not depend on the network. This measures the two things that do, each on its
+own in-region EC2 box, in the dev account, into throwaway repos under the run's store root:
+
+* ``build`` then ``read_<client>`` (x86, the read benchmark's r7i.4xlarge). Every finalist is built as
+  an Icechunk repo of 10 x 10 shards cycled from real v2 tiles, so no cache holds the working set.
+  Each workload then runs cold in a fresh process, arms interleaved, in two passes of opposite arm
+  order. Records wall time, requests, store bytes and wire bytes (psutil). Run ``read`` once per
+  client: the library's environment, then one pinned to zarr 3.2.1 + icechunk 2.1.1.
+* ``assemble`` (Graviton, like the assembly runner). The same staged v2 tiles are written into each
+  finalist by the library's own assembly code, ``shard_writer.write_year_shards`` over a
+  ``StagedShardSource`` — every array a fill writes, not just the two that change — in two passes of
+  opposite order. Records worker CPU (total, read, compress-and-upload), wall time and stored bytes.
+
+Run from the REPOSITORY ROOT, with ``T10="-m scripts.scoping.scale_tests.t10_v2_aws --run-id v2b
+--backend s3 --bucket <bucket>/<prefix> --scale bench"``::
+
+    python $T10 --tiles <dir> --phase build
+    python $T10 --tiles <dir> --phase read        # once per client
+    python $T10 --tiles <dir> --phase tune        # full-vector pulls under reader settings
+    python $T10 --phase assemble --staging s3://<staged run dir> --extent 34964,53383 --n-tiles 64 --workers 16
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import logging
+import multiprocessing
+import time
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
+from typing import Any, cast
+
+import numpy as np
+import xarray as xr
+import zarr
+
+from scripts.scoping.scale_tests import harness
+from scripts.scoping.scale_tests import variants as V
+from scripts.scoping.scale_tests._workers import _open_repo
+from scripts.scoping.scale_tests.t9_v2_layout import CLIENT, DIMS_READ, TILE, CountingStore
+from tessera_embeddings.storage.shard_writer import partition_round_robin
+
+logger = logging.getLogger("scale_tests.t10")
+
+TEST = "t10"
+_S256 = (1, 256, 256)
+FINALISTS: list[V.Variant] = [
+    V.VARIANTS["v2_c0"],
+    V.arm(V.VARIANTS["v2_c2"], codec="zstd1", scales_chunks=_S256),
+    V.arm(V.VARIANTS["v2_c2"], codec="zstd1", transpose=True, scales_chunks=_S256),
+    V.arm(V.VARIANTS["v2_b2"], codec="zstd1", scales_chunks=_S256),
+    V.arm(V.VARIANTS["v2_c2f"], codec="zstd1", scales_chunks=_S256),
+    V.arm(V.VARIANTS["v2_b2f"], codec="zstd1", scales_chunks=_S256),
+]
+POINTS = 300
+PASSES = 2
+
+
+def _side(cfg: harness.RunConfig) -> int:
+    """Bench zone side in shards: 10 at bench, 1 for a tiny smoke."""
+    return 1 if cfg.is_tiny else 10
+
+
+def _regions(side: int) -> dict[str, tuple[slice, slice]]:
+    """The region workloads: a 1,000-px tile inside one shard, a 2x2-shard bulk, an 8x8-shard pull."""
+    k = min(side, 8)
+    off = TILE * min(3, side - 1)
+    return {
+        "tile": (slice(off + 500, off + 1500), slice(off + 700, off + 1700)),
+        "bulk": (slice(TILE * min(2, side - 1), TILE * min(4, side)),) * 2,
+        "pull8": (slice(0, TILE * k),) * 2,
+    }
+
+
+# ── build ────────────────────────────────────────────────────────────────────
+
+
+def _write_tiles(payload: dict[str, Any]) -> tuple[Any, float, int]:
+    """Spawned worker: write whole shards into the fork in the arm's order; return (fork, write CPU, shards).
+
+    A band-first arm's tiles are put in band-first order BEFORE the timer: a band-first pipeline
+    stages them that way, so the write cost excludes any transpose.
+    """
+    fork, arm, tiles = payload["fork"], V.Variant(**payload["arm"]), Path(payload["tiles"])
+    grp = zarr.open_group(fork.store, mode="a")["zone"]
+    emb, scl = grp["embeddings"], grp["scales"]
+    V.apply_write_order(emb, arm.write_order)
+    V.apply_write_order(scl, arm.write_order)
+    cpu = 0.0
+    for sy, sx, n in payload["shards"]:
+        ys, xs = slice(sy * TILE, (sy + 1) * TILE), slice(sx * TILE, (sx + 1) * TILE)
+        block, scales = np.load(tiles / f"emb_{n:03d}.npy"), np.load(tiles / f"scales_{n:03d}.npy")
+        if arm.band_first:
+            block = np.ascontiguousarray(block.transpose(2, 0, 1))
+        c0 = time.process_time()
+        if arm.band_first:
+            emb[0:1, :, ys, xs] = block[None]
+        else:
+            emb[0:1, ys, xs] = block[None]
+        scl[0:1, ys, xs] = scales[None]
+        cpu += time.process_time() - c0
+    return fork, cpu, len(payload["shards"])
+
+
+def phase_build(cfg: harness.RunConfig, tiles: Path, workers: int) -> None:
+    """Build every finalist as an Icechunk repo of side x side shards, tiles cycled over the grid."""
+    side, n_tiles = _side(cfg), len(list(tiles.glob("emb_*.npy")))
+    jobs = [(sy, sx, (sy * side + sx) % n_tiles) for sy in range(side) for sx in range(side)]
+    for arm in FINALISTS:
+        name = f"t10/{arm.name}"
+        harness.reset_store(cfg, name)
+        repo = harness.create_repo(cfg, name)
+        session = repo.writable_session("main")
+        grp = zarr.open_group(session.store, mode="a").require_group("zone")
+        grp.create_array("embeddings", **V.embeddings_array_kwargs(arm, (1, side * TILE, side * TILE, V.BAND)))
+        grp.create_array("scales", **V.scales_array_kwargs(arm, (1, side * TILE, side * TILE)))
+        session.commit("seed")
+        session = repo.writable_session("main")
+        fork = session.fork()
+        payloads = [
+            {"fork": fork, "arm": dataclasses.asdict(arm), "tiles": str(tiles), "shards": part}
+            for part in partition_round_robin(jobs, workers)
+        ]
+        t0 = time.monotonic()
+        with ProcessPoolExecutor(len(payloads), mp_context=multiprocessing.get_context("spawn")) as ex:
+            results = list(ex.map(_write_tiles, payloads))
+        session.merge(*(fork for fork, _, _ in results))
+        session.commit(f"build {arm.name}")
+        n_obj, n_bytes = harness.object_stats(harness.store_uri(cfg, name) + "/chunks")
+        harness.emit_metric(cfg, TEST, "build", "wall_s", time.monotonic() - t0, "s", variant=arm.name)
+        cpu_per_shard = sum(c for _, c, _ in results) / sum(n for _, _, n in results)
+        harness.emit_metric(cfg, TEST, "build", "encode_cpu_s", cpu_per_shard, "s", variant=arm.name, kind="write")
+        harness.emit_metric(cfg, TEST, "build", "bytes_written", n_bytes, "bytes", variant=arm.name, objects=n_obj)
+        logger.info("built %s: %d objects, %.1f GB", arm.name, n_obj, n_bytes / 1e9)
+
+
+# ── read ─────────────────────────────────────────────────────────────────────
+
+
+def cold_read(payload: dict[str, Any]) -> dict[str, Any]:
+    """One workload on one arm in a fresh process: wall, requests, store bytes, wire bytes."""
+    import psutil
+
+    zarr.config.set(payload.get("zarr_config") or {})
+    t_open = time.monotonic()
+    store = CountingStore(_open_repo(payload["store_uri"]).readonly_session(branch="main").store)
+    grp = zarr.open_group(store, mode="r")["zone"]
+    emb, scl = grp["embeddings"], grp["scales"]
+    out: dict[str, Any] = {"open_wall_s": time.monotonic() - t_open}
+    band_first = emb.metadata.dimension_names[1] == "band"
+    workload, dims = payload["workload"], payload["dims"]
+
+    def window(ys: slice | int, xs: slice | int) -> tuple:
+        return (0, slice(0, dims), ys, xs) if band_first else (0, ys, xs, slice(0, dims))
+
+    regions = {k: tuple(slice(*s) for s in v) for k, v in payload["regions"].items()}
+    net0, t0 = psutil.net_io_counters().bytes_recv, time.monotonic()
+    if workload == "point":
+        lat = []
+        for y, x in payload["points"]:
+            p0 = time.monotonic()
+            emb[window(y, x)] * scl[0, y, x]  # a dequantised prefix: two arrays, as a reader needs
+            lat.append(time.monotonic() - p0)
+        ms = 1e3 * np.asarray(lat)
+        # A 95% bootstrap interval on the median: a gate fails only if its interval clears the threshold.
+        boots = np.median(np.random.default_rng(0).choice(ms, (2000, ms.size)), axis=1)
+        lo, hi = np.percentile(boots, [2.5, 97.5])
+        out |= {"read_p50_ms": float(np.median(ms)), "read_p95_ms": float(np.percentile(ms, 95))}
+        out |= {"read_p50_lo_ms": float(lo), "read_p50_hi_ms": float(hi)}
+    elif workload.startswith("dask"):
+        band_chunk = dict(zip(emb.metadata.dimension_names, emb.chunks, strict=True))["band"]
+        aligned = {"time": 1, "northing": TILE, "easting": TILE, "band": band_chunk}  # one task per band chunk
+        chunks = {} if workload == "dask_default" else aligned
+        ds = xr.open_zarr(store, group="zone", consolidated=False, chunks=chunks)
+        ys, xs = regions["pull8"]
+        ds["embeddings"].isel(time=0, northing=ys, easting=xs, band=slice(0, dims)).data.compute()
+    else:
+        ys, xs = regions[workload]
+        emb[window(ys, xs)]
+        scl[0, ys, xs]
+    out |= {
+        "wall_s": time.monotonic() - t0,
+        "requests": len(store.requests),
+        "bytes": sum(store.requests),
+        "wire_bytes": psutil.net_io_counters().bytes_recv - net0,
+    }
+    return out
+
+
+def _points(cfg: harness.RunConfig, tiles: Path) -> list[list[int]]:
+    """POINTS pixels holding an embedding, spread over every shard of the zone."""
+    side, n_tiles = _side(cfg), len(list(tiles.glob("emb_*.npy")))
+    rng, pts = np.random.default_rng(7), []
+    valid = [np.argwhere(np.isfinite(np.load(tiles / f"scales_{n:03d}.npy"))) for n in range(n_tiles)]
+    for i in range(POINTS):
+        sy, sx = divmod(i % (side * side), side)
+        yx = valid[(sy * side + sx) % n_tiles][rng.integers(len(valid[(sy * side + sx) % n_tiles]))]
+        pts.append([int(sy * TILE + yx[0]), int(sx * TILE + yx[1])])
+    return pts
+
+
+#: The read sweep: (workload, dims, zarr config). ``tune`` re-runs the full-vector pulls with a wider
+#: fetch concurrency and band-aligned Dask chunks, to see how much of their cost a reader can recover.
+READ_WORKLOADS: list[tuple[str, int, dict]] = [
+    ("point", 16, {}),
+    ("point", 128, {}),
+    ("bulk", 128, {}),
+    *(("pull8", d, {}) for d in DIMS_READ),
+    ("dask_default", 16, {}),
+    ("dask_default", 128, {}),
+]
+POINT_WORKLOADS: list[tuple[str, int, dict]] = [("point", 16, {}), ("point", 128, {})]
+TUNE_WORKLOADS: list[tuple[str, int, dict]] = [
+    ("pull8", 128, {}),
+    ("pull8", 128, {"async.concurrency": 64}),
+    ("dask_aligned", 128, {}),
+    ("bulk", 128, {"async.concurrency": 64}),
+    ("pull8", 16, {"async.concurrency": 64}),
+]
+
+
+def phase_read(cfg: harness.RunConfig, phase: str, tiles: Path, workloads: list, arms: list[V.Variant]) -> None:
+    """Every workload, cold, arms interleaved, PASSES passes with the arm order reversed each pass."""
+    regions = {k: [(s.start, s.stop) for s in v] for k, v in _regions(_side(cfg)).items()}
+    points = _points(cfg, tiles) if any(w == "point" for w, _, _ in workloads) else []
+    for p in range(PASSES):
+        for workload, dims, zarr_config in workloads:
+            for arm in arms if p % 2 == 0 else arms[::-1]:
+                payload = {
+                    "store_uri": harness.store_uri(cfg, f"t10/{arm.name}"),
+                    "workload": workload,
+                    "dims": dims,
+                    "regions": regions,
+                    "points": points if workload == "point" else [],
+                    "zarr_config": zarr_config,
+                }
+                r = harness.run_cold("scripts.scoping.scale_tests.t10_v2_aws.cold_read", payload)
+                tags = {"variant": arm.name, "client": CLIENT, "workload": workload, "dims": dims, "pass": p}
+                if zarr_config:
+                    tags["zarr_config"] = ",".join(f"{k}={v}" for k, v in zarr_config.items())
+                harness.emit_metric(cfg, TEST, phase, "wall_s", r["wall_s"], "s", **tags)
+                harness.emit_metric(cfg, TEST, phase, "get_requests", r["requests"], "count", **tags)
+                harness.emit_metric(cfg, TEST, phase, "bytes_fetched", r["bytes"], "bytes", method="store", **tags)
+                harness.emit_metric(cfg, TEST, phase, "bytes_fetched", r["wire_bytes"], "bytes", method="wire", **tags)
+                for k in ("read_p50_ms", "read_p95_ms", "read_p50_lo_ms", "read_p50_hi_ms"):
+                    if k in r:
+                        harness.emit_metric(cfg, TEST, phase, k, r[k], "ms", **tags)
+                harness.emit_metric(cfg, TEST, phase, "open_wall_s", r["open_wall_s"], "s", **tags)
+                logger.info(
+                    "[%s] pass %d %s/%d %s: %.2fs %d req",
+                    CLIENT,
+                    p,
+                    workload,
+                    dims,
+                    arm.name,
+                    r["wall_s"],
+                    r["requests"],
+                )
+
+
+# ── assemble ─────────────────────────────────────────────────────────────────
+
+
+def _picks(staging: str, n_tiles: int) -> list[str]:
+    """The staged tiles assembly writes: ``n_tiles`` labels spread evenly over the staged run."""
+    from tessera_embeddings.profiling.inference.compare_outputs import _staged_labels
+
+    labels = sorted(_staged_labels(staging)[0])
+    return [labels[int(i)] for i in np.linspace(0, len(labels) - 1, min(n_tiles, len(labels)))]
+
+
+def phase_assemble(
+    cfg: harness.RunConfig, staging: str, extent: tuple[int, int], n_tiles: int, workers: int, arms: list[V.Variant]
+) -> None:
+    """Write the same staged tiles into each arm with the library's assembly code; time the workers."""
+    from tessera_embeddings.config.store_layout import CARRIED_VARS, GLOBAL, REQUIRED_VARS
+    from tessera_embeddings.inference.assembly import StagedShardSource, _staged_storage_options
+    from tessera_embeddings.inference.chunk_spec import parse_chunk_label
+    from tessera_embeddings.storage.shard_writer import write_year_shards
+    from tessera_embeddings.storage.time_axis import TIME_ENCODING, calendar_year_times
+
+    picks = _picks(staging, n_tiles)
+    probe_path = f"{staging}/{picks[0]}.zarr"
+    probe = zarr.open_group(probe_path, mode="r", storage_options=_staged_storage_options(probe_path))
+    variables = tuple(v for v in (*REQUIRED_VARS, *CARRIED_VARS) if v in probe and v in GLOBAL.arrays)
+    dtypes = tuple((v, str(probe[v].dtype)) for v in variables)
+    base, run_id = staging.rstrip("/").rsplit("/", 1)
+    ny, nx = extent
+    for p in range(PASSES):
+        for arm in arms if p % 2 == 0 else arms[::-1]:
+            name = f"t10asm/p{p}/{arm.name}"
+            harness.reset_store(cfg, name)
+            repo = harness.create_repo(cfg, name)
+            session = repo.writable_session("main")
+            grp = zarr.open_group(session.store, mode="a").require_group("zone")
+            for v in variables:
+                layout = GLOBAL.arrays[v]
+                shape = (1, ny, nx, *layout.chunks[3:])[: len(layout.dims)]
+                if v == "embeddings":
+                    kwargs = V.embeddings_array_kwargs(arm, (1, ny, nx, V.BAND))
+                elif v == "scales":
+                    kwargs = V.scales_array_kwargs(arm, (1, ny, nx))
+                else:
+                    kwargs = layout.create_kwargs(shape)
+                grp.create_array(v, **kwargs).attrs.update(dict(layout.attrs))
+            times = calendar_year_times((2025,)).astype("datetime64[ns]").astype("int64")
+            grp.create_array("time", data=times, chunks=(1,), dimension_names=("time",)).attrs.update(TIME_ENCODING)
+            session.commit("seed")
+            source = StagedShardSource(
+                staging_base=base,
+                run_id=run_id,
+                shards=tuple(parse_chunk_label(label) for label in picks),
+                variables=variables,
+                shard_px=TILE,
+                dtypes=dtypes,
+                embedding_dim=V.BAND,
+                extent=(ny, nx),
+            )
+            telemetry: dict[str, Any] = {}
+            t0 = time.monotonic()
+            write_year_shards(
+                repo,
+                "zone",
+                0,
+                source,
+                n_workers=workers,
+                telemetry=telemetry,
+                commit_attrs=lambda _repo, _group, _year, commit: commit["snapshot"],
+            )
+            wall = time.monotonic() - t0
+            stats = telemetry["workers"]
+            tags = {"variant": arm.name, "pass": p, "tiles": len(picks), "workers": workers}
+            for kind, key in (("worker", "cpu_s"), ("write", "write_cpu_s"), ("read", "read_cpu_s")):
+                total = sum(float(w.get(key, 0.0)) for w in stats)
+                harness.emit_metric(cfg, TEST, "assemble", "encode_cpu_s", total / len(picks), "s", kind=kind, **tags)
+            harness.emit_metric(cfg, TEST, "assemble", "wall_s", wall, "s", **tags)
+            _, n_bytes = harness.object_stats(harness.store_uri(cfg, name) + "/chunks")
+            harness.emit_metric(cfg, TEST, "assemble", "bytes_written", n_bytes, "bytes", **tags)
+            logger.info(
+                "assembled %s pass %d: %d tiles in %.0fs, %.1f GB", arm.name, p, len(picks), wall, n_bytes / 1e9
+            )
+
+
+# ── verify ───────────────────────────────────────────────────────────────────
+
+
+def phase_verify(
+    cfg: harness.RunConfig, phase: str, prefix: str, shards: list[tuple[int, int]], arms: list[V.Variant]
+) -> None:
+    """Every arm under ``prefix`` holds exactly C0's values in every array of every listed shard.
+
+    Layouts must be lossless: a band-first array is read back and reordered before the comparison, and
+    floats compare with NaN equal to NaN. Any mismatch raises after the counts are recorded, so the
+    phase is never marked done and a rerun checks again.
+    """
+
+    def zone(arm: V.Variant) -> zarr.Group:
+        repo = _open_repo(harness.store_uri(cfg, f"{prefix}/{arm.name}"))
+        return cast(zarr.Group, zarr.open_group(repo.readonly_session(branch="main").store, mode="r")["zone"])
+
+    ref = zone(FINALISTS[0])
+    others = [(a, zone(a)) for a in arms if a.name != FINALISTS[0].name]
+    mismatched = dict.fromkeys((a.name for a, _ in others), 0)
+    for sy, sx in shards:
+        ys, xs = slice(sy * TILE, (sy + 1) * TILE), slice(sx * TILE, (sx + 1) * TILE)
+        for var, ref_arr in ref.arrays():
+            if ref_arr.ndim < 3:
+                continue
+            want = np.asarray(ref_arr[0, ys, xs])
+            for arm, grp in others:
+                arr = cast(zarr.Array, grp[var])
+                band_first = arr.metadata.dimension_names[1] == "band"
+                got = np.asarray(arr[0, :, ys, xs]).transpose(1, 2, 0) if band_first else np.asarray(arr[0, ys, xs])
+                if not np.array_equal(want, got, equal_nan=want.dtype.kind == "f"):
+                    mismatched[arm.name] += 1
+                    logger.warning("verify %s: %s differs from C0 in shard (%d, %d)", arm.name, var, sy, sx)
+    for name, n in mismatched.items():
+        harness.emit_metric(
+            cfg, TEST, phase, "mismatched_arrays", n, "count", variant=name, prefix=prefix, shards=len(shards)
+        )
+        logger.info("verify %s under %s: %d mismatched array-shards over %d shards", name, prefix, n, len(shards))
+    if failed := {name: n for name, n in mismatched.items() if n}:
+        raise RuntimeError(f"layouts are not lossless under {prefix}: mismatched array-shards {failed}")
+
+
+def main() -> int:
+    """Parse args and run the one phase asked for."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    harness.add_common_args(parser)
+    parser.add_argument("--tiles", type=Path, default=None, help="Directory of real v2 tiles (.npy), for build/read.")
+    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--staging", default=None, help="A staged run directory, for assemble.")
+    parser.add_argument("--extent", default=None, help="The staged run's ROI extent 'ny,nx', for assemble.")
+    parser.add_argument("--n-tiles", type=int, default=64)
+    parser.add_argument("--arms", default=None, help="Comma-separated finalist names, for assemble and verify.")
+    parser.add_argument("--prefix", default="t10", help="Store prefix to verify: t10 (build) or t10asm/p0.")
+    args = parser.parse_args()
+    cfg = harness.config_from_args(args)
+    harness.configure_logging()
+    phase, cfg = cfg.phase, dataclasses.replace(cfg, phase=None)  # run_phase filters on the name it is given
+    # The library's assembly code writes zarr's default order and stages band-last tiles, so by default it
+    # carries neither a non-default write order nor a band-first array; those arms' write cost comes from
+    # `build`, unless --arms names them for a library that can write them.
+    by_name = {a.name: a for a in FINALISTS}
+    chosen = [by_name[n] for n in args.arms.split(",")] if args.arms else None
+    if phase == "build":
+        harness.run_phase(cfg, TEST, "build", lambda: phase_build(cfg, args.tiles, args.workers))
+    elif phase == "read":
+        harness.run_phase(
+            cfg,
+            TEST,
+            f"read_{CLIENT}",
+            lambda: phase_read(cfg, f"read_{CLIENT}", args.tiles, READ_WORKLOADS, FINALISTS),
+        )
+    elif phase == "tune":
+        arms = [a for a in FINALISTS if a.write_order == "morton"]
+        harness.run_phase(
+            cfg, TEST, f"tune_{CLIENT}", lambda: phase_read(cfg, f"tune_{CLIENT}", args.tiles, TUNE_WORKLOADS, arms)
+        )
+    elif phase == "points":
+        harness.run_phase(
+            cfg,
+            TEST,
+            f"points_{CLIENT}",
+            lambda: phase_read(cfg, f"points_{CLIENT}", args.tiles, POINT_WORKLOADS, FINALISTS),
+        )
+    elif phase == "assemble":
+        extent = tuple(int(v) for v in args.extent.split(","))
+        arms = chosen or [a for a in FINALISTS if a.write_order == "morton" and not a.band_first]
+        harness.run_phase(
+            cfg, TEST, "assemble", lambda: phase_assemble(cfg, args.staging, extent, args.n_tiles, args.workers, arms)
+        )
+    elif phase == "verify":
+        from tessera_embeddings.inference.chunk_spec import parse_chunk_label
+
+        if args.staging:  # an assembled set: the tiles assembly wrote
+            shards = [parse_chunk_label(label) for label in _picks(args.staging, args.n_tiles)]
+        else:  # a built set: two full cycles of the tiles, each tile in two places
+            shards = [divmod(i, _side(cfg)) for i in range(min(16, _side(cfg) ** 2))]
+        name = f"verify_{args.prefix.replace('/', '_')}"
+        harness.run_phase(cfg, TEST, name, lambda: phase_verify(cfg, name, args.prefix, shards, chosen or FINALISTS))
+    else:
+        raise SystemExit("--phase must be build, read, points, tune, assemble or verify")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
