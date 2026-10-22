@@ -5,13 +5,16 @@ from typing import ClassVar
 
 import numpy as np
 import pytest
+import zarr
 
 from tessera_embeddings.config.inference import encoder_url
 from tessera_embeddings.storage.conventions import (
+    _SPATIAL_CONVENTION,
     ENCODER_VERSION,
     assert_encoder_matches,
     build_convention_attrs,
     build_geoemb_root_attrs,
+    stamp_array_conventions,
     tile_id_to_epsg,
 )
 
@@ -111,10 +114,12 @@ class TestBuildConventionAttrs:
         assert attrs["geoemb:dimensions"] == 128
         assert attrs["geoemb:model"] == f"https://geotessera.org/model/{ENCODER_VERSION}"  # public encoder ref
         assert attrs["checkpoint_id"] == "1.1"  # supplied model_version -> provenance, not the public URL
-        assert attrs["geoemb:source_data"] == ["s3://sentinel-cogs", "https://datapool.asf.alaska.edu/RTC/OPERA-S1"]
+        assert attrs["geoemb:source_data"] == [
+            "https://earth-search.aws.element84.com/v1/collections/sentinel-2-l2a",
+            "https://doi.org/10.5067/SNWG/OPERA_L2_RTC-S1_V1",
+        ]
         assert attrs["geoemb:data_type"] == "int8"
         assert attrs["geoemb:gsd"] == 10.0  # derived from the 10 m (metre CRS) coordinate spacing
-        # spatial_layout is omitted by default (single-ROI store, no utmNN groups)
         assert "geoemb:spatial_layout" not in attrs
         assert attrs["geoemb:build_version"] == _PKG_VERSION  # software/package version, not the encoder
         quant = attrs["geoemb:quantization"]
@@ -194,14 +199,6 @@ class TestBuildConventionAttrs:
         # Provenance is never guessed: an unregistered family errors, not defaults.
         with pytest.raises(ValueError, match="No public encoder URL"):
             encoder_url("v3-imaginary")  # type: ignore[arg-type]
-
-    def test_spatial_layout_omitted_by_default_included_when_set(self) -> None:
-        """spatial_layout is optional: omitted for a root-only single-ROI store,
-        present when a multi-group caller (e.g. the campaign) sets it.
-        """
-        assert "geoemb:spatial_layout" not in build_convention_attrs(total_y=10, total_x=10, embedding_dim=128)
-        with_layout = build_convention_attrs(total_y=10, total_x=10, embedding_dim=128, spatial_layout="utm_zones")
-        assert with_layout["geoemb:spatial_layout"] == "utm_zones"
 
     def test_gsd_derived_from_coordinate_spacing(self) -> None:
         """Gsd reflects the actual pixel size, not the nominal default."""
@@ -374,12 +371,12 @@ class TestTransformAndBboxAgree:
 class TestConventionRegistration:
     """The registration block a consumer follows to find the spec."""
 
-    def test_registered_urls_are_pinned_to_an_existing_tag(self) -> None:
-        """No ``v1`` exists for either convention, so nothing may claim one.
+    def test_registered_urls_are_the_ones_each_schema_requires_and_resolve(self) -> None:
+        """proj/spatial pin ``v0.1``, the tag their schemas name; geoemb carries no URL at all.
 
-        Offline by design — this asserts the pin, not that GitHub is up. The URLs were verified
-        to resolve by hand when they were chosen; what this guards is a silent edit back to a
-        version tag that upstream has not cut, which 404s for every consumer who follows it.
+        Offline by design — this asserts the pin, not that GitHub is up. geoemb's schema names a
+        ``v1`` tag upstream has not cut, so any URL there either 404s or fails the schema's
+        ``const``; the uuid alone registers it until the tag exists.
         """
         attrs = build_convention_attrs(
             epsg_code="EPSG:32633",
@@ -393,8 +390,9 @@ class TestConventionRegistration:
         for name in ("proj", "spatial"):
             for url_field in ("schema_url", "spec_url"):
                 url = registered[name][url_field]
-                assert "/v0.1/" in url, f"{name} {url_field} must pin the tag upstream actually cut"
-                assert "zarr-conventions/" in url, f"{name} {url_field} must use the conventions org"
+                assert f"zarr-conventions/{name}/" in url and "/v0.1/" in url, f"{name} {url_field}"
+        assert {"schema_url", "spec_url"}.isdisjoint(registered["geoemb:"])
+        assert registered["geoemb:"]["uuid"] == "61c12cc5-0e28-4056-999a-480cf3fb7e4c"
 
 
 class TestMultiGroupPlacement:
@@ -423,13 +421,11 @@ class TestMultiGroupPlacement:
         """The root builder emits geoemb: (no proj:/spatial:) with an explicit gsd."""
         attrs = build_geoemb_root_attrs(
             embedding_dim=128,
-            spatial_layout="utm_zones",
             gsd=10.0,
             model_version="best_model_fsdp_20250608",
         )
         assert attrs["geoemb:type"] == "pixel"
         assert attrs["geoemb:dimensions"] == 128
-        assert attrs["geoemb:spatial_layout"] == "utm_zones"
         assert attrs["geoemb:gsd"] == 10.0
         assert attrs["geoemb:model"] == f"https://geotessera.org/model/{ENCODER_VERSION}"
         assert attrs["checkpoint_id"] == "best_model_fsdp_20250608"  # model_version is provenance, not the URL
@@ -446,10 +442,10 @@ def test_the_global_root_stamps_the_encoder_family_it_was_seeded_for() -> None:
     URL over a v2 seed — wrong provenance, and the cross-family gate then refuses the very append
     the store was seeded for, which is the failure being self-inflicted rather than caught.
     """
-    v2 = build_geoemb_root_attrs(embedding_dim=128, spatial_layout="utm_zones", encoder_version="v2-large")
+    v2 = build_geoemb_root_attrs(embedding_dim=128, encoder_version="v2-large")
     assert v2["geoemb:model"] == encoder_url("v2-large")
 
-    default = build_geoemb_root_attrs(embedding_dim=128, spatial_layout="utm_zones")
+    default = build_geoemb_root_attrs(embedding_dim=128)
     assert default["geoemb:model"] == encoder_url("v1.1"), "omitting it must stay v1.1"
     assert v2["geoemb:model"] != default["geoemb:model"], "the two families publish different URLs"
 
@@ -465,3 +461,41 @@ def test_one_comparison_serves_every_reader_of_the_encoder_identity() -> None:
     for published, wanted in ((encoder_url("v1.1"), "v2-large"), (None, "v2-large"), (encoder_url("v2-large"), "v1.1")):
         with pytest.raises(ValueError, match="Refusing to append"):
             assert_encoder_matches(published, model_version=wanted, where="s")
+
+
+@pytest.mark.parametrize(
+    ("epsg", "real_coords", "labelled"),
+    [("EPSG:32633", True, True), ("EPSG:32633", False, False), ("EPSG:4326", True, False), (None, True, False)],
+)
+def test_cf_coord_attrs_only_claim_metres_for_real_metre_coords(
+    epsg: str | None, real_coords: bool, labelled: bool
+) -> None:
+    """Labelled only when the group declares real coordinates (``spatial:dimensions``) in a metre
+    ``proj:code``: pixel indices under a tile-derived CRS, a degree CRS, or no CRS stay unlabelled.
+    """
+    node = zarr.group(store=zarr.storage.MemoryStore())
+    if epsg:
+        node.attrs["proj:code"] = epsg
+    if real_coords:
+        node.attrs["spatial:dimensions"] = ["northing", "easting"]
+    for name in ("northing", "easting"):
+        node.create_array(name, data=np.arange(3.0), dimension_names=(name,))
+    stamp_array_conventions(node)
+    assert dict(node["easting"].attrs) == (
+        {"standard_name": "projection_x_coordinate", "units": "m", "axis": "X"} if labelled else {}
+    )
+    assert dict(node["northing"].attrs).get("axis") == ("Y" if labelled else None)
+
+
+def test_spatial_arrays_repeat_the_group_spatial_dimensions() -> None:
+    """Arrays spanning both spatial dims register ``spatial`` beside any registration they hold."""
+    node = zarr.group(store=zarr.storage.MemoryStore())
+    node.attrs["spatial:dimensions"] = ["northing", "easting"]
+    scales = node.create_array("scales", shape=(1, 2, 2), dtype="f4", dimension_names=("time", "northing", "easting"))
+    scales.attrs["zarr_conventions"] = [{"uuid": "other"}]
+    node.create_array("time", data=np.arange(1.0), dimension_names=("time",))
+    stamp_array_conventions(node)
+    stamp_array_conventions(node)  # idempotent: no duplicate registration
+    assert node["scales"].attrs["spatial:dimensions"] == ["northing", "easting"]
+    assert [c["uuid"] for c in node["scales"].attrs["zarr_conventions"]] == ["other", _SPATIAL_CONVENTION["uuid"]]
+    assert dict(node["time"].attrs) == {}

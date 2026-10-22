@@ -56,6 +56,8 @@ def test_coords_and_attrs(tmp_path):
     assert g["northing"].shape == (4096,)
     assert g["time"].shape == (3,)
     assert g["band"].shape == (EMBEDDING_DIM,)  # band coord present for xarray consumers
+    assert g["northing"].attrs["standard_name"] == "projection_y_coordinate"  # CF axis attrs for CF-only readers
+    assert g["easting"].attrs["axis"] == "X"
     # CF time bounds: (time, 2), linked via time.attrs["bounds"], seeded once to each
     # slot's calendar year, half-open so consecutive years leave no gap.
     assert g["time_bnds"].shape == (3, 2)
@@ -80,14 +82,14 @@ def test_coords_and_attrs(tmp_path):
 
 
 def test_root_carries_geoemb_convention(tmp_path):
-    """Encoder/quantization provenance sits once on the root group (utm_zones layout);
+    """Encoder/quantization provenance sits once on the root group;
     zones carry only their own proj:/spatial:.
     """
     store = _seed(tmp_path)
     attrs = dict(zarr_store.open_store_as_zarr_group(store).attrs)
     assert attrs["geoemb:type"] == "pixel"
     assert attrs["geoemb:dimensions"] == EMBEDDING_DIM
-    assert attrs["geoemb:spatial_layout"] == "utm_zones"
+    assert "geoemb:spatial_layout" not in attrs  # both schema values misdescribe 120 hemisphere groups
     assert attrs["geoemb:gsd"] == 10.0  # fixed 10 m grid across all zones
     assert attrs["geoemb:data_type"] == "int8"
     assert "geoemb:build_version" in attrs

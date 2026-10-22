@@ -11,12 +11,11 @@ Lives above the low-level primitives on purpose: it pulls together
 (:mod:`~tessera_embeddings.config.store_layout`), the coord/schema writers in
 :mod:`~tessera_embeddings.storage.empty_store`, and GeoZarr convention attrs.
 
-Convention placement follows the geoembeddings ``utm_zones`` layout: the encoder
-and quantization provenance (``geoemb:``) is written ONCE on the root group
-(:func:`~tessera_embeddings.storage.conventions.build_geoemb_root_attrs`, with
-``spatial_layout="utm_zones"``), while each zone group carries only its own
-``proj:``/``spatial:`` (``build_convention_attrs(..., include_geoemb=False)``) —
-their CRS and grid differ by zone.
+Convention placement: the encoder and quantization provenance (``geoemb:``) is written
+ONCE on the root group
+(:func:`~tessera_embeddings.storage.conventions.build_geoemb_root_attrs`), while each zone
+group carries only its own ``proj:``/``spatial:``
+(``build_convention_attrs(..., include_geoemb=False)``) — their CRS and grid differ by zone.
 """
 
 from __future__ import annotations
@@ -38,7 +37,11 @@ from tessera_embeddings.config.store_layout import (
     REQUIRED_VARS,
     StoreLayout,
 )
-from tessera_embeddings.storage.conventions import build_convention_attrs, build_geoemb_root_attrs
+from tessera_embeddings.storage.conventions import (
+    build_convention_attrs,
+    build_geoemb_root_attrs,
+    stamp_array_conventions,
+)
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
 from tessera_embeddings.storage.time_axis import (
     CAMPAIGN_YEARS,
@@ -252,9 +255,8 @@ def _layout_band(layout: StoreLayout) -> int:
 def _zone_attrs(spec: ZoneSpec, north: np.ndarray, east: np.ndarray, layout: StoreLayout) -> dict:
     """Per-zone group attrs: campaign markers + per-zone ``proj:``/``spatial:``.
 
-    Encoder/quantization provenance (``geoemb:``) is NOT here — in the geoembeddings
-    ``utm_zones`` layout it lives once on the root group (see :func:`_root_attrs`);
-    each zone group carries only its own CRS/grid conventions.
+    Encoder/quantization provenance (``geoemb:``) is NOT here — it lives once on the root
+    group (see :func:`_root_attrs`); each zone group carries only its own CRS/grid conventions.
     """
     attrs: dict = {
         "crs": spec.crs,
@@ -293,8 +295,7 @@ def _root_attrs(
 ) -> dict:
     """Root-group attrs for the multi-zone campaign store: geoemb: stated once.
 
-    The geoembeddings ``utm_zones`` layout puts the encoder/quantization provenance
-    on the root (identical across all zones), with ``spatial_layout="utm_zones"``.
+    The encoder/quantization provenance is identical across all zones, so it lives on the root.
 
     ``optical_min_obs`` is the minimum valid optical observations a pixel needed to be
     embedded at all, or ``None`` for a store that embedded every pixel it had input for. On the
@@ -309,7 +310,6 @@ def _root_attrs(
     # append the store was seeded for.
     attrs = build_geoemb_root_attrs(
         embedding_dim=_layout_band(layout),
-        spatial_layout="utm_zones",
         gsd=float(PIXEL_M),  # every zone is the same fixed-metre grid; the root has none to derive from
         model_version=model_version,
         encoder_version=encoder_version,
@@ -524,7 +524,7 @@ def seed_zone_groups(
         )
     session = repo.writable_session("main")
     root = zarr.open_group(session.store, mode="a")
-    # geoemb: provenance is stated once on the root (utm_zones layout). It is WRITE-ONCE: a later
+    # geoemb: provenance is stated once on the root. It is WRITE-ONCE: a later
     # fill's model gate (fill_zone_year) trusts it to decide which encoder may write, so an
     # incremental seed must NOT silently re-stamp it with a different encoder — that would let
     # already-seeded/filled zones (encoder A) mix with a new one (encoder B) under a root now
@@ -631,6 +631,7 @@ def seed_zone_groups(
         bnds.attrs.update(TIME_ENCODING)  # same int64-ns encoding as `time`
         node["time"].attrs["bounds"] = "time_bnds"  # CF: this coordinate represents an interval
         node.attrs.update(_zone_attrs(spec, north, east, layout))
+        stamp_array_conventions(node)
     if not created and not stamped_now:
         # Every requested zone was already complete AND the root already carried its identity, so
         # nothing was written — and icechunk refuses an empty commit unless asked. Committing
