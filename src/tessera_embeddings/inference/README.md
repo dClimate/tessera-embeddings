@@ -968,8 +968,9 @@ rule 2). The inference actor records the PyTorch and CUDA it runs on every tile 
 `inference_stack`. The driver cannot: it runs the lockfile's CPU build whatever the workers run.
 Both assembly paths read the stack off one probe tile, hold every other tile to it, and compare it
 with the store root's. The first write into a store stamps the root, for the global store in a
-small commit of its own before any shard (`shard_writer.claim_root_stack`); a store written before
-the record is stamped, not refused. A tile staged on another stack, including one a resume would
+small commit of its own before any shard (`shard_writer.claim_root_stack`), and only after every
+staged tile has been checked, since the stamp is permanent. A store written before the record is
+stamped, not refused. A tile staged on another stack, including one a resume would
 reuse, is refused with both stacks named. `allow_stack_mismatch` writes it anyway, for a deliberate
 experiment, and the store keeps its stack.
 

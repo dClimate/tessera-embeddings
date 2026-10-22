@@ -2284,13 +2284,20 @@ class TestAssembleGlobal:
         assert root[self.ZONE].attrs["years_complete"] == [2025]
         assert root.attrs[STACK_ATTR] == OTHER_STACK, "write-once, override or not"
 
+    @pytest.mark.parametrize("root_stack", [None, STACK])
     @pytest.mark.parametrize(
         ("second", "match"), [(OTHER_STACK, "never mixes two stacks"), (None, "does not record the PyTorch")]
     )
-    def test_a_tile_off_the_runs_stack_is_refused(self, tmp_path, second, match):
-        """Every tile, not only the probe: a resumed run can hold tiles staged before a stack switch."""
+    def test_a_tile_off_the_runs_stack_is_refused_and_changes_no_stamp(self, tmp_path, second, match, root_stack):
+        """Every tile, not only the probe: a resumed run can hold tiles staged before a stack switch.
+
+        On an unstamped store every tile is checked BEFORE the stamp, which is permanent, so a mixed
+        run cannot leave the store claiming the probe tile's stack.
+        """
         with pytest.raises(ValueError, match=match):
-            self._fill_on_stacks(tmp_path, STACK, second)
+            self._fill_on_stacks(tmp_path, STACK, second, root_stack=root_stack)
+        repo = open_global_repo(str(tmp_path / "global.icechunk"))
+        assert zarr.open_group(repo.readonly_session(branch="main").store, mode="r").attrs.get(STACK_ATTR) == root_stack
 
     def test_a_matching_stack_is_checked_without_a_commit(self, tmp_path):
         """What a rerun or the next fill meets: the stamp is already there and nothing is written."""
