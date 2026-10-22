@@ -99,11 +99,6 @@ _GEOEMB_CONVENTION = {
 }
 
 # --- geoemb: field defaults (this pipeline's fixed provenance) --------------
-#: v1.1's public encoder version. The live ``geoemb:model`` lookup is
-#: :func:`~tessera_embeddings.config.inference.encoder_url`, keyed by model
-#: family; this remains the v1.1 identifier. (``geoemb:build_version`` is the
-#: software/package version, not this.)
-ENCODER_VERSION = "1.1"
 #: Precise source datasets we pull from: Sentinel-2 L2A COGs (Earth Search AWS
 #: Open Data) and OPERA RTC-S1 (ASF datapool).
 DEFAULT_SOURCE_DATA: tuple[str, ...] = (

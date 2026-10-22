@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 import tessera_embeddings.orchestration.prefect.flows.fill_zone_year as mod
+from tessera_embeddings.config.inference import checkpoint_filename
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.errors import InsufficientCoverageError
 from tessera_embeddings.storage.conventions import expected_model_url
@@ -128,6 +129,7 @@ def _guard(monkeypatch, attrs: dict, *, build_checkpoint: str = "ckpt.pt", allow
     monkeypatch.setattr(mod, "open_store_as_zarr_group", lambda *a, **k: SimpleNamespace(attrs=attrs))
     mod._assert_seeded_model_matches(
         "s3://in/store",
+        model_version="v1.1",
         build_checkpoint=build_checkpoint,
         allow_model_mismatch=allow_mismatch,
         get_credentials=None,
@@ -144,7 +146,7 @@ def _guard(monkeypatch, attrs: dict, *, build_checkpoint: str = "ckpt.pt", allow
         # the encoder, so the aws/mpc v1.1 checkpoints share a URL and would otherwise
         # be mixed silently; checkpoint_id is what tells them apart.
         pytest.param(
-            {"geoemb:model": expected_model_url(), "checkpoint_id": _MPC_CKPT},
+            {"geoemb:model": expected_model_url(model_version="v1.1"), "checkpoint_id": _MPC_CKPT},
             _AWS_CKPT,
             "seeded for checkpoint",
             id="checkpoint",
@@ -159,12 +161,17 @@ def test_model_guard_rejects_a_mismatched_store(monkeypatch, attrs, build_checkp
 @pytest.mark.parametrize(
     "attrs,build_checkpoint,allow_mismatch,why",
     [
-        ({"geoemb:model": expected_model_url()}, "ckpt.pt", False, "encoder matches"),
+        ({"geoemb:model": expected_model_url(model_version="v1.1")}, "ckpt.pt", False, "encoder matches"),
         ({}, "ckpt.pt", False, "store advertises no model (legacy/unseeded root)"),
-        ({"geoemb:model": expected_model_url(), "checkpoint_id": _MPC_CKPT}, _MPC_CKPT, False, "checkpoint matches"),
+        (
+            {"geoemb:model": expected_model_url(model_version="v1.1"), "checkpoint_id": _MPC_CKPT},
+            _MPC_CKPT,
+            False,
+            "checkpoint matches",
+        ),
         ({"geoemb:model": "https://x/OLD"}, "ckpt.pt", True, "encoder override"),
         (
-            {"geoemb:model": expected_model_url(), "checkpoint_id": _MPC_CKPT},
+            {"geoemb:model": expected_model_url(model_version="v1.1"), "checkpoint_id": _MPC_CKPT},
             _AWS_CKPT,
             True,
             "checkpoint override",
@@ -222,16 +229,23 @@ def test_pinned_ami_id_reaches_ray_cluster(wired):
     assert captured["ami_id"] == "ami-pinned-01"
 
 
-def test_the_default_models_own_image_reaches_ray_cluster(wired):
-    """A fill runs the default model, so that model's entry in ami_ssm_name_by_model is its image (ADR 025)."""
+@pytest.mark.parametrize("model", ["v1.1", "v2-large"])
+def test_the_store_decides_the_fills_model(wired, model):
+    """A fill runs the model its store holds: that model's image, checkpoint and config (ADR 025)."""
+    wired.setattr(mod, "store_model_version", lambda *a, **k: model)
     wired.setattr("tessera_embeddings.providers.aws.ray.make_instance_terminator", lambda **k: object(), raising=False)
+    fill: dict = {}
     wired.setattr(mod, "fill_zone_year", lambda **kw: {"tag": "t"})
+    config: dict = {}
+    wired.setattr(mod, "build_inference_config", lambda **kw: config.update(kw) or _FakeConfig())
     captured: dict = {}
     wired.setattr("tessera_embeddings.providers.aws.ray.ray_cluster", _fake_ray_cluster(captured), raising=False)
 
-    by_model = {mod.DEFAULT_MODEL_VERSION: "ami-own"}
+    by_model = {"v1.1": "ami-v11", "v2-large": "ami-v2"}
     mod.fill_zone_year_flow.fn(zone="33N", year=2025, paths=_PATHS, ami_ssm_name="ami", ami_ssm_name_by_model=by_model)
-    assert captured["ami_ssm_name"] == "ami-own"
+    assert captured["ami_ssm_name"] == by_model[model]
+    assert config["model_version"] == model
+    assert config["checkpoint_path"].endswith(checkpoint_filename(model_version=model))
 
 
 def test_a_v1_1_fill_without_its_image_is_refused_before_ray(wired):
@@ -359,7 +373,10 @@ class TestTheMinimumDepthRuleComesFromTheStore:
     ("reader", "kwargs"),
     [
         ("_optical_min_obs_from_store", {}),
-        ("_assert_seeded_model_matches", {"build_checkpoint": "c", "allow_model_mismatch": False}),
+        (
+            "_assert_seeded_model_matches",
+            {"model_version": "v1.1", "build_checkpoint": "c", "allow_model_mismatch": False},
+        ),
     ],
 )
 def test_the_store_readers_take_the_store_s_credential_not_the_caller_s(monkeypatch, reader, kwargs):
