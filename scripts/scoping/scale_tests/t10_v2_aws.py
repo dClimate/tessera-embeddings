@@ -347,11 +347,14 @@ def phase_assemble(
 # ── verify ───────────────────────────────────────────────────────────────────
 
 
-def phase_verify(cfg: harness.RunConfig, prefix: str, shards: list[tuple[int, int]], arms: list[V.Variant]) -> None:
+def phase_verify(
+    cfg: harness.RunConfig, phase: str, prefix: str, shards: list[tuple[int, int]], arms: list[V.Variant]
+) -> None:
     """Every arm under ``prefix`` holds exactly C0's values in every array of every listed shard.
 
     Layouts must be lossless: a band-first array is read back and reordered before the comparison, and
-    floats compare with NaN equal to NaN.
+    floats compare with NaN equal to NaN. Any mismatch raises after the counts are recorded, so the
+    phase is never marked done and a rerun checks again.
     """
 
     def zone(arm: V.Variant) -> zarr.Group:
@@ -376,9 +379,11 @@ def phase_verify(cfg: harness.RunConfig, prefix: str, shards: list[tuple[int, in
                     logger.warning("verify %s: %s differs from C0 in shard (%d, %d)", arm.name, var, sy, sx)
     for name, n in mismatched.items():
         harness.emit_metric(
-            cfg, TEST, "verify", "mismatched_arrays", n, "count", variant=name, prefix=prefix, shards=len(shards)
+            cfg, TEST, phase, "mismatched_arrays", n, "count", variant=name, prefix=prefix, shards=len(shards)
         )
         logger.info("verify %s under %s: %d mismatched array-shards over %d shards", name, prefix, n, len(shards))
+    if failed := {name: n for name, n in mismatched.items() if n}:
+        raise RuntimeError(f"layouts are not lossless under {prefix}: mismatched array-shards {failed}")
 
 
 def main() -> int:
@@ -435,12 +440,8 @@ def main() -> int:
             shards = [parse_chunk_label(label) for label in _picks(args.staging, args.n_tiles)]
         else:  # a built set: two full cycles of the tiles, each tile in two places
             shards = [divmod(i, _side(cfg)) for i in range(min(16, _side(cfg) ** 2))]
-        harness.run_phase(
-            cfg,
-            TEST,
-            f"verify_{args.prefix.replace('/', '_')}",
-            lambda: phase_verify(cfg, args.prefix, shards, chosen or FINALISTS),
-        )
+        name = f"verify_{args.prefix.replace('/', '_')}"
+        harness.run_phase(cfg, TEST, name, lambda: phase_verify(cfg, name, args.prefix, shards, chosen or FINALISTS))
     else:
         raise SystemExit("--phase must be build, read, points, tune, assemble or verify")
     return 0
