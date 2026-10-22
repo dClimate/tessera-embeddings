@@ -36,13 +36,19 @@ def ami_ssm_name_for_model(
 ) -> str:
     """The worker-image parameter for a run of *model_version*: its entry in the map, else *ami_ssm_name*.
 
-    A deployment keeps a model on its own worker image this way, as v1.1 stays on PyTorch 2.5.1
-    (ADR 025), and each run picks the image from the model it actually runs. An unknown model is
-    refused, because a misspelt key would otherwise fall back to the default image silently.
+    A deployment keeps a model on its own worker image this way, and each run picks the image from the
+    model it actually runs. A model whose record says ``own_worker_image`` is refused without an entry
+    rather than sent to the default image, and so is an unknown model, which would otherwise fall back
+    silently. Both refusals happen before anything is provisioned.
     """
     by_model = ami_ssm_name_by_model or {}
     if unknown := sorted(set(by_model) - set(MODEL_FAMILIES)):
         raise ValueError(f"ami_ssm_name_by_model names unknown models {unknown}; known: {list(MODEL_FAMILIES)}")
+    if model_family(model_version).own_worker_image and model_version not in by_model:
+        raise ValueError(
+            f"{model_version} runs on its own worker image (ADR 025), and ami_ssm_name_by_model has no "
+            f"{model_version!r} entry: pass the SSM parameter naming that image."
+        )
     return by_model.get(model_version, ami_ssm_name)
 
 
@@ -497,6 +503,9 @@ class ModelFamily:
     #: The S1 bin a pixel with no radar is given: ``None`` keeps the smallest bucket (v1.1), and
     #: v2 gives it one zero step (upstream ``s1_B = max(s1_bin, 1)``).
     radar_free_s1_bin: int | None
+    #: Whether it runs only on its own worker image, never the deployment default: v1.1 stays on
+    #: PyTorch 2.5.1 (ADR 025), so a run without its image entry is refused before provisioning.
+    own_worker_image: bool
 
     @property
     def takes_norm_source(self) -> bool:
@@ -533,6 +542,7 @@ MODEL_FAMILIES: dict[str, ModelFamily] = {
         fusion_method=None,
         generation="v1",
         radar_free_s1_bin=None,
+        own_worker_image=True,
     ),
     "v2-large": ModelFamily(
         arch=_V2_LARGE_ARCH,
@@ -544,6 +554,7 @@ MODEL_FAMILIES: dict[str, ModelFamily] = {
         fusion_method=V2_FUSION_METHOD,
         generation="v2",
         radar_free_s1_bin=1,
+        own_worker_image=False,
     ),
 }
 

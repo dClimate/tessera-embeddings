@@ -112,7 +112,8 @@ async def tessera_full_pipeline(
         skip_coverage_check: Skip the embeddings stage's time-window coverage validation.
         ami_ssm_name: SSM parameter name for the Ray GPU AMI ID.
         ami_ssm_name_by_model: Per-model overrides of ``ami_ssm_name``; the embeddings stage
-            is handed ``model_version``'s entry, if it has one (ADR 025).
+            is handed ``model_version``'s entry and the map; a v1.1 run without an entry is
+            refused (ADR 025).
         ssm_prefix: SSM Parameter Store prefix the deployment's infra publishes Ray
             cluster resource IDs under. Deployments publishing elsewhere must override
             the OSS ``/tessera/ray/``.
@@ -232,6 +233,7 @@ async def tessera_full_pipeline(
             "time_window_end": time_window_end,
             "paths": paths.model_dump(),
             "ami_ssm_name": ami_ssm_name,
+            "ami_ssm_name_by_model": ami_ssm_name_by_model,
             "ssm_prefix": ssm_prefix,
             "cloudwatch_log_group": cloudwatch_log_group,
             "code_bucket": code_bucket,

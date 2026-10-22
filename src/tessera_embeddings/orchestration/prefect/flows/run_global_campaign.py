@@ -610,8 +610,8 @@ async def run_global_campaign(
         paths: Deployment storage contract.
         ami_ssm_name: SSM parameter name for the Ray GPU AMI (forwarded to fills).
         ami_ssm_name_by_model: Per-model overrides of ``ami_ssm_name``. The entry for the model
-            the store holds, if any, is the image the campaign resolves, pins and forwards
-            (ADR 025).
+            the store holds is the image the campaign resolves, pins and forwards, and the map goes
+            to its fills too; a model on its own worker image (v1.1) without one is refused (ADR 025).
         branch: Route child deployments to their branch-scoped variants. ``None``
             (production) leaves every ref at its unsuffixed default. A slug (e.g.
             ``"global-tessera"``) suffixes every *derived* child deployment name with
@@ -1332,6 +1332,7 @@ async def run_global_campaign(
             # must not inspect a possibly-cleaned-up mosaic.
             "run_id": run_id,
             "ami_ssm_name": ami_ssm_name,
+            "ami_ssm_name_by_model": ami_ssm_name_by_model,
             # Pin the exact image the staging fingerprint recorded (see _ami_id), so the fill
             # cannot re-resolve ami_ssm_name to a re-baked AMI mid-campaign.
             #
@@ -1619,6 +1620,7 @@ async def run_global_campaign(
                         "cells": cells,
                         "paths": paths.model_dump(),
                         "ami_ssm_name": ami_ssm_name,
+                        "ami_ssm_name_by_model": ami_ssm_name_by_model,
                         # Pin the fingerprinted image (see _ami_id / _fill_params), but ONLY
                         # for a cluster that will actually start Ray: one whose cells are all
                         # retag or all-ocean never provisions, and forcing an SSM read there

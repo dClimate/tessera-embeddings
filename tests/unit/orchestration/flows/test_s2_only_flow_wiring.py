@@ -28,6 +28,7 @@ from tessera_embeddings.orchestration.prefect.flows.tessera_embeddings import (
 )
 
 _PATHS = BucketPaths(inputs="s3://in", outputs="s3://out")
+_AMI = {"ami_ssm_name": "ami", "ami_ssm_name_by_model": {"v1.1": "ami"}}  # v1.1 needs its own image (ADR 025)
 
 
 class _StopError(Exception):
@@ -90,7 +91,7 @@ def test_flow_refuses_resume_mode_flip_before_any_io(monkeypatch) -> None:
             roi_name="demo",
             time_window_end="June 2025",
             paths=_PATHS,
-            ami_ssm_name="ami",
+            **_AMI,
             allow_s2_only=True,
             dev_params=emb_mod.EmbeddingsDevParams(previous_run_id="plain-run-000"),
         )
@@ -116,16 +117,21 @@ def _run_master_pipeline(monkeypatch, **kwargs) -> dict:
     monkeypatch.setattr(fp_mod, "compute_pipeline_cluster_sizing", lambda *a, **k: (1, 2, 4))
     monkeypatch.setattr(fp_mod, "get_run_logger", lambda: logging.getLogger("test-fp"))
 
-    asyncio.run(fp_mod.tessera_full_pipeline.fn(paths=_PATHS, time_window_end="June 2025", roi_name="demo", **kwargs))
+    asyncio.run(
+        fp_mod.tessera_full_pipeline.fn(
+            paths=_PATHS, time_window_end="June 2025", roi_name="demo", **{**_AMI, **kwargs}
+        )
+    )
     return calls
 
 
 @pytest.mark.parametrize(("model", "image"), [("v1.1", "ami-v11"), ("v2-large", "ami")])
 def test_full_pipeline_hands_the_embeddings_stage_its_models_image(monkeypatch, model, image) -> None:
-    calls = _run_master_pipeline(
-        monkeypatch, model_version=model, ami_ssm_name="ami", ami_ssm_name_by_model={"v1.1": "ami-v11"}
-    )
-    assert calls[fp_mod.PipelineDeployments().tessera_embeddings]["ami_ssm_name"] == image
+    by_model = {"v1.1": "ami-v11"}
+    calls = _run_master_pipeline(monkeypatch, model_version=model, ami_ssm_name="ami", ami_ssm_name_by_model=by_model)
+    emb_params = calls[fp_mod.PipelineDeployments().tessera_embeddings]
+    assert emb_params["ami_ssm_name"] == image
+    assert emb_params["ami_ssm_name_by_model"] == by_model, "the stage needs the map to resolve v1.1 itself"
 
 
 def test_full_pipeline_forwards_allow_s2_only(monkeypatch) -> None:
@@ -171,7 +177,7 @@ def test_the_run_id_is_minted_from_the_effective_mode_not_the_requested_one(monk
             roi_name="demo",
             time_window_end="June 2025",
             paths=_PATHS,
-            ami_ssm_name="ami",
+            **_AMI,
             require_s1=False,
             allow_s2_only=False,  # requested off; the resolved orbit forces it on
         )
@@ -200,7 +206,7 @@ def test_a_forced_s2_only_resume_is_not_refused_by_the_early_guard(monkeypatch) 
             roi_name="demo",
             time_window_end="June 2025",
             paths=_PATHS,
-            ami_ssm_name="ami",
+            **_AMI,
             require_s1=False,
             allow_s2_only=False,
             dev_params=emb_mod.EmbeddingsDevParams(previous_run_id=f"{emb_mod.S2_ONLY_RUN_PREFIX}abc123def456"),

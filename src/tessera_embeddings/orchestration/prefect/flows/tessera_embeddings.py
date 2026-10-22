@@ -267,7 +267,8 @@ def tessera_embeddings(
             ``{inputs}/models/``.
         ami_ssm_name_by_model: Per-model overrides of ``ami_ssm_name``, such as
             ``{"v1.1": "/<project>/ray/ami-id-torch-2-5-1"}``: a run of a listed model
-            provisions from that model's own worker image (ADR 025).
+            provisions from that model's own worker image; a v1.1 run without an entry
+            is refused (ADR 025).
         require_s1: Demand radar rather than request it, and **True by default here**
             because this flow fills ONE cell: an operator naming a single zone-year over
             terrain that should be imaged wants to be told when its radar is missing, not to

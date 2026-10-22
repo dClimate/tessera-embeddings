@@ -228,10 +228,10 @@ pip install tessera_embeddings[inference,prefect,aws]
 pip install "torch==2.14.1+cu130" --index-url https://download.pytorch.org/whl/cu130
 pip install "tessera_embeddings[inference]"
 
-# GPU, v1.1 (the default model) stays on PyTorch 2.5.1, the stack its published store was
-# inferred on; 2.14.1 moves its outputs as far as a change of card (ADR 025).
-pip install "torch==2.5.1+cu121" --index-url https://download.pytorch.org/whl/cu121
-pip install "tessera_embeddings[inference]"
+# GPU, v1.1 (the default model) INSTEAD: it stays on PyTorch 2.5.1, the stack its published
+# store was inferred on (ADR 025), which needs Python 3.12. Run these in place of the two above:
+#   pip install "torch==2.5.1+cu121" --index-url https://download.pytorch.org/whl/cu121
+#   pip install "tessera_embeddings[inference]"
 
 # 3.12-3.13 is the supported range: it is what CI tests. torch 2.14.1 publishes wheels up to
 # Python 3.15, so 3.14 is untested rather than blocked -- see docs/environment-setup.md.

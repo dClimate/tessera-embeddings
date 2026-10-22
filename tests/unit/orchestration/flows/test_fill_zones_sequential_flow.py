@@ -30,6 +30,7 @@ from tessera_embeddings.storage.update import UpdatePlan
 from tests.unit.deadline import run_under_deadline
 
 _PATHS = BucketPaths(inputs="s3://in", outputs="s3://out")
+_AMI = {"ami_ssm_name": "ami", "ami_ssm_name_by_model": {"v1.1": "ami"}}  # v1.1 needs its own image (ADR 025)
 
 
 @pytest.fixture()
@@ -144,7 +145,7 @@ def _run(**overrides):
     does the conversion in one place; `cells=` is passed straight through for the tests
     that ARE about multi-year lists.
     """
-    kwargs = {"paths": _PATHS, "ami_ssm_name": "ami"}
+    kwargs = {"paths": _PATHS, **_AMI}
     if "cells" in overrides:
         kwargs["cells"] = overrides.pop("cells")
     else:

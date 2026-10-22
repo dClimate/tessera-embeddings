@@ -189,7 +189,8 @@ def fill_zone_year_flow(
             that recorded the old image. ``None`` (direct calls) resolves ``ami_ssm_name`` at
             provisioning.
         ami_ssm_name_by_model: Per-model overrides of ``ami_ssm_name``. The entry for the model
-            the store holds, if any, replaces ``ami_ssm_name`` (ADR 025).
+            the store holds replaces ``ami_ssm_name``; a model on its own worker image (v1.1) without
+            one is refused (ADR 025).
         time_window_end: End month of the inference window as ``"Month Year"``; defaults to
             ``"December {year}"``. The runner REQUIRES the exact January-December window for
             ``year`` (the store guarantees calendar-year slots), so any other value fails loudly

@@ -59,14 +59,19 @@ To support a new version: add it to the `unit.yml` matrix and the `pyproject.tom
 which must stay in step. Neither depends on CUDA — that job syncs without `--no-sources`, so
 `[tool.uv.sources]` holds torch to the CPU index.
 
-```bash
-# 1. Install CUDA torch from the pytorch index for the model you run (supported: Python 3.12-3.13).
-#    v2:
-pip install "torch==2.14.1+cu130" --index-url https://download.pytorch.org/whl/cu130
-#    v1.1, the default model, on the stack its published store was inferred on:
-pip install "torch==2.5.1+cu121" --index-url https://download.pytorch.org/whl/cu121
+Install CUDA torch first, then the package, so pip sees torch already satisfied and keeps the CUDA
+wheel. Run **one** of the two, for the model you run. For v2, on Python 3.12-3.13:
 
-# 2. Install the package — pip sees torch already satisfied, keeps the CUDA wheel
+```bash
+pip install "torch==2.14.1+cu130" --index-url https://download.pytorch.org/whl/cu130
+pip install "tessera_embeddings[inference]"
+```
+
+For v1.1, the default model, on the stack its published store was inferred on. **Python 3.12
+only**: v1.1's GRU step is compiled, and PyTorch 2.5.1's compiler does not support Python 3.13.
+
+```bash
+pip install "torch==2.5.1+cu121" --index-url https://download.pytorch.org/whl/cu121
 pip install "tessera_embeddings[inference]"
 ```
 

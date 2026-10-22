@@ -888,7 +888,8 @@ stack from the one that staged its tiles also passes a fresh `force_staging_rest
 the staging fingerprint cannot see the image. Every published year, 2017–2025, was inferred on
 **PyTorch 2.5.1 with CUDA 12.1**, and v1.1 stays on it while v2 moves to 2.14.1. The one guard is the
 image map: the Ray flows pick their worker image from the run's model through
-`ami_ssm_name_by_model`, which the deployments set to the 2.5.1 image for v1.1. Record each later
+`ami_ssm_name_by_model`, which the deployments set to the 2.5.1 image for v1.1, and refuse a v1.1
+run without that entry. Record each later
 switch here, with its date and worker image.
 
 ### When a re-run is free

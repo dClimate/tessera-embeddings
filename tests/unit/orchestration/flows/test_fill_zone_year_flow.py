@@ -21,6 +21,7 @@ from tessera_embeddings.errors import InsufficientCoverageError
 from tessera_embeddings.storage.conventions import expected_model_url
 
 _PATHS = BucketPaths(inputs="s3://in", outputs="s3://out")
+_AMI = {"ami_ssm_name": "ami", "ami_ssm_name_by_model": {"v1.1": "ami"}}  # v1.1 needs its own image (ADR 025)
 
 
 @pytest.fixture()
@@ -93,7 +94,7 @@ def test_coverage_gate_fails_before_ray(wired, allow_partial):
             zone="33n",  # canonicalized to 33N by the flow
             year=2025,
             paths=_PATHS,
-            ami_ssm_name="ami",
+            **_AMI,
             allow_partial_window=allow_partial,
         )
 
@@ -114,7 +115,7 @@ def test_allow_s2_only_reaches_inference_config(wired, flag):
     _stop_before_ray(wired)
 
     with pytest.raises(InsufficientCoverageError):
-        mod.fill_zone_year_flow.fn(zone="33N", year=2025, paths=_PATHS, ami_ssm_name="ami", allow_s2_only=flag)
+        mod.fill_zone_year_flow.fn(zone="33N", year=2025, paths=_PATHS, **_AMI, allow_s2_only=flag)
     assert captured["allow_s2_only"] is flag
 
 
@@ -203,7 +204,7 @@ def test_ray_path_wires_actor_terminator(wired):
     captured: dict = {}
     wired.setattr(mod, "fill_zone_year", lambda **kw: captured.update(kw) or {"tag": "t"})
 
-    mod.fill_zone_year_flow.fn(zone="33n", year=2025, paths=_PATHS, ami_ssm_name="ami")
+    mod.fill_zone_year_flow.fn(zone="33n", year=2025, paths=_PATHS, **_AMI)
     assert captured["on_actor_retire"] is sentinel
 
 
@@ -217,7 +218,7 @@ def test_pinned_ami_id_reaches_ray_cluster(wired):
     captured: dict = {}
     wired.setattr("tessera_embeddings.providers.aws.ray.ray_cluster", _fake_ray_cluster(captured), raising=False)
 
-    mod.fill_zone_year_flow.fn(zone="33N", year=2025, paths=_PATHS, ami_ssm_name="ami", ami_id="ami-pinned-01")
+    mod.fill_zone_year_flow.fn(zone="33N", year=2025, paths=_PATHS, **_AMI, ami_id="ami-pinned-01")
     assert captured["ami_id"] == "ami-pinned-01"
 
 
@@ -233,6 +234,17 @@ def test_the_default_models_own_image_reaches_ray_cluster(wired):
     assert captured["ami_ssm_name"] == "ami-own"
 
 
+def test_a_v1_1_fill_without_its_image_is_refused_before_ray(wired):
+    """No v1.1 entry means a stale registration or a direct call: refuse it rather than run the default image."""
+    ray_calls: list = []
+    wired.setattr(
+        "tessera_embeddings.providers.aws.ray.ray_cluster", lambda *a, **k: ray_calls.append(k), raising=False
+    )
+    with pytest.raises(ValueError, match="runs on its own worker image"):
+        mod.fill_zone_year_flow.fn(zone="33N", year=2025, paths=_PATHS, ami_ssm_name="ami")
+    assert not ray_calls
+
+
 def test_staging_base_scoped_to_zone_year(wired):
     """The runner is handed a (zone, year)-scoped staging_base so a reused run_id
     can't cross-contaminate another cell's staged tiles.
@@ -242,7 +254,7 @@ def test_staging_base_scoped_to_zone_year(wired):
     captured: dict = {}
     wired.setattr(mod, "fill_zone_year", lambda **kw: captured.update(kw) or {"tag": "t"})
 
-    mod.fill_zone_year_flow.fn(zone="33n", year=2025, paths=_PATHS, ami_ssm_name="ami")
+    mod.fill_zone_year_flow.fn(zone="33n", year=2025, paths=_PATHS, **_AMI)
     assert captured["staging_base"] == "s3://out/staging/33N/2025"
 
 
@@ -259,7 +271,7 @@ def test_the_registry_root_follows_the_store_this_run_writes(wired):
     captured: dict = {}
     wired.setattr(mod, "fill_zone_year", lambda **kw: captured.update(kw) or {"tag": "t"})
 
-    mod.fill_zone_year_flow.fn(zone="33n", year=2025, paths=_PATHS, ami_ssm_name="ami", store_name="tessera-radar")
+    mod.fill_zone_year_flow.fn(zone="33n", year=2025, paths=_PATHS, **_AMI, store_name="tessera-radar")
     assert captured["registry_root"] == "s3://out/global/tessera-radar.registry"
     assert captured["store_path"] == "s3://out/global/tessera-radar.icechunk"
     # The pair must agree by construction — same stem, sibling prefixes.
@@ -291,7 +303,7 @@ class TestPerCellValidation:
             "tessera_embeddings.providers.aws.ray.make_instance_terminator", lambda **k: object(), raising=False
         )
         wired.setattr("tessera_embeddings.providers.aws.ray.ray_cluster", _fake_ray_cluster(), raising=False)
-        mod.fill_zone_year_flow.fn(zone="33n", year=2025, paths=_PATHS, ami_ssm_name="ami", validation_deployment="v/v")
+        mod.fill_zone_year_flow.fn(zone="33n", year=2025, paths=_PATHS, **_AMI, validation_deployment="v/v")
         (call,) = dispatched
         assert call["deployment"] == "v/v"
         assert (call["zone"], call["year"]) == ("33N", 2025)
@@ -299,15 +311,13 @@ class TestPerCellValidation:
 
     def test_the_no_cluster_path_validates_a_retagged_cell(self, wired, dispatched):
         wired.setattr(mod, "zone_year_complete", lambda *a, **k: True)
-        mod.fill_zone_year_flow.fn(zone="33n", year=2025, paths=_PATHS, ami_ssm_name="ami", validation_deployment="v/v")
+        mod.fill_zone_year_flow.fn(zone="33n", year=2025, paths=_PATHS, **_AMI, validation_deployment="v/v")
         assert [(c["zone"], c["year"]) for c in dispatched] == [("33N", 2025)]
 
     def test_the_summary_reaches_the_caller_unchanged(self, wired, dispatched):
         """The dispatch is a side effect; the fill's own summary is the return value."""
         wired.setattr(mod, "zone_year_complete", lambda *a, **k: True)
-        summary = mod.fill_zone_year_flow.fn(
-            zone="33N", year=2025, paths=_PATHS, ami_ssm_name="ami", validation_deployment="v/v"
-        )
+        summary = mod.fill_zone_year_flow.fn(zone="33N", year=2025, paths=_PATHS, **_AMI, validation_deployment="v/v")
         assert summary == {"tag": "zone-33N-2025"}
 
 
@@ -402,7 +412,7 @@ def test_the_destination_schema_is_checked_before_ray(wired):
     wired.setattr(mod, "preflight_destination", _refuse)
 
     with pytest.raises(ValueError, match="expected int16"):
-        mod.fill_zone_year_flow.fn(zone="33N", year=2025, paths=_PATHS, ami_ssm_name="ami")
+        mod.fill_zone_year_flow.fn(zone="33N", year=2025, paths=_PATHS, **_AMI)
     assert ray_calls == [], "the GPU fleet must not be provisioned for a destination we cannot write"
 
 
@@ -416,5 +426,5 @@ def test_a_complete_cell_does_not_pay_for_the_schema_check(wired):
     calls: list = []
     wired.setattr(mod, "preflight_destination", lambda **k: calls.append(k))
 
-    mod.fill_zone_year_flow.fn(zone="33N", year=2025, paths=_PATHS, ami_ssm_name="ami")
+    mod.fill_zone_year_flow.fn(zone="33N", year=2025, paths=_PATHS, **_AMI)
     assert calls == []

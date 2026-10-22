@@ -53,8 +53,9 @@ against itself across two runs.**
 3. **v2 moves to PyTorch 2.14.1; v1.1 stays on 2.5.1.** v2 clears the gate and v1.1 does not. Every
    v1.1 run provisions from the 2.5.1 worker image, the published store's updates and any new v1.1
    store alike. The Ray flows take `ami_ssm_name_by_model`, deployments set it to that image for
-   v1.1, and each run picks its image from the model it actually runs, so no run lands on the new
-   stack by omitting an override. Nothing planned needs v1.1 on the new stack: its one store must
+   v1.1, and each run picks its image from the model it actually runs. A v1.1 run whose map has no
+   v1.1 entry, such as one from a deployment registered before the map existed, is refused before
+   anything is provisioned rather than sent to the default image. Nothing planned needs v1.1 on the new stack: its one store must
    finish on 2.5.1 under rule 2, and v1.1 is expected to give way to v2 (ADR 026).
 4. **The workers run the lockfile's torch version,** as that version's CUDA build, with v1.1's runs
    as the one exception. Tests, the driver image and v2's workers then run one version, and moving it
