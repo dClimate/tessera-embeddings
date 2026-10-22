@@ -30,6 +30,7 @@ from tessera_embeddings.storage.update import UpdatePlan
 from tests.unit.deadline import run_under_deadline
 
 _PATHS = BucketPaths(inputs="s3://in", outputs="s3://out")
+_AMI = {"ami_ssm_name": "ami", "ami_ssm_name_by_model": {"v1.1": "ami"}}  # v1.1 needs its own image (ADR 025)
 
 
 @pytest.fixture()
@@ -144,7 +145,7 @@ def _run(**overrides):
     does the conversion in one place; `cells=` is passed straight through for the tests
     that ARE about multi-year lists.
     """
-    kwargs = {"paths": _PATHS, "ami_ssm_name": "ami"}
+    kwargs = {"paths": _PATHS, **_AMI}
     if "cells" in overrides:
         kwargs["cells"] = overrides.pop("cells")
     else:
@@ -435,6 +436,14 @@ def test_pinned_ami_id_reaches_ray_cluster(wired):
     """
     _run(ami_id="ami-pinned-01")
     assert wired["ray_kwargs"]["ami_id"] == "ami-pinned-01"
+
+
+@pytest.mark.parametrize("model", ["v1.1", "v2-large"])
+def test_the_stores_models_image_reaches_ray_cluster(wired, monkeypatch, model):
+    """The cells run the model their store holds, so that model's entry is the image (ADR 025)."""
+    monkeypatch.setattr(mod, "store_model_version", lambda *a, **k: model)
+    _run(ami_ssm_name_by_model={"v1.1": "ami-v11", "v2-large": "ami-v2"})
+    assert wired["ray_kwargs"]["ami_ssm_name"] == {"v1.1": "ami-v11", "v2-large": "ami-v2"}[model]
 
 
 def test_unpinned_ami_is_resolved_once_and_reused(wired, monkeypatch):

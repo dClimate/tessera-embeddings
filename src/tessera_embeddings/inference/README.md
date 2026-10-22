@@ -19,8 +19,9 @@ Two encoders are selectable through `InferenceConfig.model_version`: Tessera v1.
 default, and the distilled v2 Large student (`"v2-large"`). They share every stage below
 except the model itself, its band statistics and the rule that fills each observation
 sequence; what differs, and why, is in [Model architecture constraint](#model-architecture-constraint).
-Both single-area entry points below take `model_version`; the global campaign's zone fill
-does not, and runs v1.1.
+Both single-area entry points below take `model_version`. The global campaign's zone fill
+does not choose: it runs the model its store was seeded for ([One record per
+model](models/README.md#one-record-per-model)).
 
 Two entry points run the same domain code:
 
@@ -1129,7 +1130,7 @@ the main loop; `ActorPool` encapsulates actor state and lifecycle operations
 | `max_gpu_workers` | 500 | Ray autoscaler ceiling |
 
 **Architecture params** (`nhead`, `num_encoder_layers`, `dim_feedforward`, etc.) **must match
-the checkpoint**. They are per-version defaults (`MODEL_ARCHS`): selecting `"v2-large"`
+the checkpoint**. They are per-model defaults (each record's `arch`): selecting `"v2-large"`
 replaces every field still at its v1.1 default with v2's value, and rejects a conflicting
 explicit one. See `models/README.md` before touching them.
 
@@ -1141,7 +1142,7 @@ explicit one. See `models/README.md` before touching them.
 **not** change layer dimensions, activations, or the forward pass unless you are also
 retraining.
 
-`models/builder.py` dispatches on `model_version`. The two architectures side by side, their
+`models/builder.py` dispatches on the model's `generation`. The two architectures side by side, their
 checkpoint loaders, and the porting rules are in [`models/README.md`](models/README.md); v2
 Large's throughput against v1.1 is §7 of
 [`inference-on-gpus.md`](../../../context_docs/inference/inference-on-gpus.md).
@@ -1153,6 +1154,10 @@ name. The plain runner can instead take its URL as `checkpoint_url`, as the quic
 v1.1. A store records the checkpoint's file name as its model identity (`checkpoint_id`), so append
 to a store from the same source that built it: the staged copy and the Hugging Face file have
 different names, and the append check refuses the mix.
+
+**Which model a run uses** is decided once, from a `ModelFamily` record per model; for a global
+store, it is the model the store was seeded for. See
+[One record per model](models/README.md#one-record-per-model).
 
 ---
 
