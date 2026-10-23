@@ -8,6 +8,7 @@ so TestCleanupStagingDispatch exercises the routing decision instead of error pr
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 import itertools
 import json
@@ -25,7 +26,7 @@ import xarray as xr
 import zarr
 
 import tessera_embeddings.inference.assembly as _assembly_mod
-from tessera_embeddings.config.inference import EMBEDDING_DIM, INFERENCE_CHUNK_SIZE, encoder_url
+from tessera_embeddings.config.inference import EMBEDDING_DIM, INFERENCE_CHUNK_SIZE, MODEL_FAMILIES, encoder_url
 from tessera_embeddings.config.store_layout import (
     CARRIED_VARS,
     GLOBAL,
@@ -1790,6 +1791,9 @@ class TestAssemblyValidation:
 
         # proj:
         assert attrs["proj:code"] == "EPSG:32633"
+        # No mosaic, so northing/easting are pixel indices: the tile's CRS must not label them metres.
+        assert "spatial:dimensions" not in attrs
+        assert "axis" not in root["northing"].attrs
 
         # geoemb:
         assert attrs["geoemb:type"] == "pixel"
@@ -2897,6 +2901,78 @@ class TestAssembleGuards:
                 run_started_at=datetime.datetime(2025, 6, 1, tzinfo=datetime.UTC),
                 n_workers=1,
             )
+
+    @pytest.mark.parametrize(("crs", "tile_id"), [("EPSG:32633", None), (None, "33UWP")])
+    def test_projected_coords_get_cf_axis_attrs(self, tmp_path, monkeypatch, crs, tile_id):
+        """A store over a metre CRS labels northing/easting, whether the CRS came from the mosaic
+        or from the MGRS tile fallback.
+        """
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        output = str(tmp_path / "out.zarr")
+        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
+        axis = np.arange(4, dtype="float64") * 10.0
+        spatial = SpatialCoords(northing=axis[::-1], easting=axis, crs=crs)
+        monkeypatch.setattr(_assembly_mod, "read_spatial_coords", lambda *a, **k: spatial)
+        self._stage_one(writer, chunk, "run1")
+        writer.assemble(
+            [chunk],
+            total_y=4,
+            total_x=4,
+            run_id="run1",
+            output_path=output,
+            roi_zarr_path=_make_full_roi_mask(tmp_path, 4, 4),
+            n_workers=1,
+            mosaic_base=str(tmp_path / "mosaic"),
+            tile_id=tile_id,
+        )
+        root = zarr.open_group(open_or_create_repo(output)[0].readonly_session("main").store, mode="r")
+        assert root.attrs["proj:code"] == "EPSG:32633"
+        assert root["northing"].attrs["axis"] == "Y"
+        assert root["easting"].attrs["standard_name"] == "projection_x_coordinate"
+
+    @pytest.mark.parametrize(
+        ("created_with", "kept"),
+        [(("y", "x"), ("y", "x")), (("northing", "easting"), ("northing", "easting"))],
+        ids=["new-v2-store", "v2-store-created-before-y-x"],
+    )
+    def test_a_store_takes_its_models_names_once_and_keeps_them(self, tmp_path, monkeypatch, created_with, kept):
+        """A new v2 store is created with y/x; an append keeps whatever names the store has."""
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        output = str(tmp_path / "out.zarr")
+        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
+        axis = np.arange(4, dtype="float64") * 10.0
+        spatial = SpatialCoords(northing=axis[::-1], easting=axis, crs="EPSG:32633")
+        monkeypatch.setattr(_assembly_mod, "read_spatial_coords", lambda *a, **k: spatial)
+        roi = _make_full_roi_mask(tmp_path, 4, 4)
+
+        def _run(run_id: str, month: int) -> None:
+            self._stage_one(writer, chunk, run_id)
+            writer.assemble(
+                [chunk],
+                total_y=4,
+                total_x=4,
+                run_id=run_id,
+                output_path=output,
+                roi_zarr_path=roi,
+                run_started_at=datetime.datetime(2024, month, 1, tzinfo=datetime.UTC),
+                n_workers=1,
+                mosaic_base=str(tmp_path / "mosaic"),
+                model_version="v2-large",
+            )
+
+        v2 = MODEL_FAMILIES["v2-large"]
+        monkeypatch.setitem(MODEL_FAMILIES, "v2-large", dataclasses.replace(v2, spatial_dims=created_with))
+        _run("run1", 6)
+        MODEL_FAMILIES["v2-large"] = v2  # the append runs under today's record
+        _run("run2", 7)
+
+        root = zarr.open_group(open_or_create_repo(output)[0].readonly_session("main").store, mode="r")
+        y, x = kept
+        assert root["time"].shape == (2,)
+        assert root["embeddings"].metadata.dimension_names == ("time", y, x, "band")
+        assert root.attrs["spatial:dimensions"] == [y, x]
+        assert root[y].attrs["axis"] == "Y" and root[x].attrs["axis"] == "X"
+        assert {"northing", "easting", "y", "x"} - set(root.array_keys()) == {"northing", "easting", "y", "x"} - {y, x}
 
     def test_append_refuses_a_reordered_interior_on_matching_endpoints(self, tmp_path, monkeypatch):
         """Extent, CRS and endpoints do not pin an axis, and this phase writes POSITIONALLY.

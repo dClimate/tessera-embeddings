@@ -141,8 +141,9 @@ Input mosaic stores (Icechunk/Zarr on S3):
             │
             ▼
   Output:  {roi_name}.zarr  (Icechunk; time axis extends on re-run)
-           embeddings    (time, northing, easting, 128)
-           obs counts    (time, northing, easting)  — s2 / s1_asc / s1_desc
+           embeddings    (time, y, x, 128)
+           obs counts    (time, y, x)  — s2 / s1_asc / s1_desc
+           (a v1.1 store names y and x northing and easting; ADR 032)
 
   Global-campaign variant: writer.assemble_global() writes the same staged
   tiles as whole 2048-px shards into a pre-seeded UTM zone group of the

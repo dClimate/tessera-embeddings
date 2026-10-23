@@ -125,8 +125,10 @@ wave the new encoder through onto already-published zones).
 mosaic paths, tags, flow params — with EPSG retained only as the CRS
 (`ZoneSpec.epsg` / `proj:code`). This is a **deliberate deviation from the
 geoembeddings `utm_zones` spec**, whose `utm{NN}` group name cannot express the
-hemisphere (33N vs 33S). A hemisphere amendment is a candidate to propose
-upstream. `canonicalize_zone` is the single parser.
+hemisphere (33N vs 33S). Stores written since PR #218 therefore declare no
+`geoemb:spatial_layout` at all; a hemisphere amendment upstream would let them
+declare one ([conforming to the Zarr conventions](../storage/conforming-to-the-zarr-conventions.md)).
+`canonicalize_zone` is the single parser.
 
 **Staging `run_id`** (fill, per cell): the campaign derives each cell's staging
 `run_id` as `{zone}-{year}-{hash}` over the acceptance config (threshold / orbit /
