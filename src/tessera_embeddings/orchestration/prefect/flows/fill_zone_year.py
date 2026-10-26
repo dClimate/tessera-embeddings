@@ -24,7 +24,12 @@ from prefect import flow, get_run_logger
 from prefect.runtime import flow_run as flow_run_ctx
 
 from tessera_embeddings.config.fault_injection import DIE_BETWEEN_COMMITS, FaultInjection
-from tessera_embeddings.config.inference import DEFAULT_MODEL_VERSION, ModelVersion, checkpoint_filename
+from tessera_embeddings.config.inference import (
+    DEFAULT_MODEL_VERSION,
+    ModelVersion,
+    ami_ssm_name_for_model,
+    checkpoint_filename,
+)
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.store_layout import SHARD_PX
 from tessera_embeddings.config.time_windows import parse_time_window
@@ -151,6 +156,7 @@ def fill_zone_year_flow(
     paths: BucketPaths,
     ami_ssm_name: str,
     ami_id: str | None = None,
+    ami_ssm_name_by_model: dict[str, str] | None = None,
     time_window_end: str | None = None,
     store_name: str = "tessera",
     mask_name: str = "global",
@@ -190,6 +196,9 @@ def fill_zone_year_flow(
             ``ami_ssm_name`` — so a mid-campaign re-bake can't run new code under a fingerprint
             that recorded the old image. ``None`` (direct calls) resolves ``ami_ssm_name`` at
             provisioning.
+        ami_ssm_name_by_model: Per-model overrides of ``ami_ssm_name``. This flow runs the
+            default model, so that model's entry replaces ``ami_ssm_name``; a v1.1 run without one is
+            refused (ADR 025).
         time_window_end: End month of the inference window as ``"Month Year"``; defaults to
             ``"December {year}"``. The runner REQUIRES the exact January-December window for
             ``year`` (the store guarantees calendar-year slots), so any other value fails loudly
@@ -273,6 +282,7 @@ def fill_zone_year_flow(
         ``empty`` flag, elapsed seconds).
     """
     log = get_run_logger()
+    ami_ssm_name = ami_ssm_name_for_model(ami_ssm_name, ami_ssm_name_by_model, DEFAULT_MODEL_VERSION)
 
     # Checked HERE, not left to run_inference: this deployment is invoked directly as well as by
     # the campaign, and on that path the value is only validated after preflight and

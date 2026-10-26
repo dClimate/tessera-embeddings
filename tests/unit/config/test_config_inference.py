@@ -13,12 +13,32 @@ from tessera_embeddings.config.inference import (
     TUNED_GPU_GIB,
     InferenceConfig,
     _normalize_obs_checkpoints,
+    ami_ssm_name_for_model,
     band_stats,
     batch_size_for_gpu,
     checkpoint_filename,
     prefetch_depth,
 )
 from tessera_embeddings.config.time_windows import parse_time_window
+
+
+@pytest.mark.parametrize(
+    ("by_model", "model", "expected"),
+    [(None, "v2-large", "default"), ({"v1.1": "old"}, "v1.1", "old"), ({"v1.1": "old"}, "v2-large", "default")],
+)
+def test_a_listed_model_runs_on_its_own_worker_image(by_model, model, expected) -> None:
+    assert ami_ssm_name_for_model("default", by_model, model) == expected
+
+
+@pytest.mark.parametrize(
+    ("by_model", "match"),
+    [(None, "no 'v1.1' entry"), ({"v2-large": "new"}, "no 'v1.1' entry"), ({"v1_1": "old"}, "unknown")],
+)
+def test_v1_1_never_falls_back_to_the_default_image(by_model, match) -> None:
+    """v1.1 stays on PyTorch 2.5.1 (ADR 025): no entry, or a misspelt one, is refused, never defaulted."""
+    with pytest.raises(ValueError, match=match):
+        ami_ssm_name_for_model("default", by_model, "v1.1")
+
 
 # ---------------------------------------------------------------------------
 # checkpoint_filename

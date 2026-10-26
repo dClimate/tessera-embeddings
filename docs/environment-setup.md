@@ -42,8 +42,14 @@ because PyPI's CPU wheel stays in the candidate pool and can win.
 
 **Check the build exists before pinning it.**
 `https://download.pytorch.org/whl/<cuXXX>/torch/` lists what each index carries; `torch 2.14.1`
-publishes `cu126`, `cu130` and `cu132`. Pick the one your driver supports: the CUDA 13 builds need
-an NVIDIA driver of 580 or later, `cu126` runs on older ones. Production runs `cu130`.
+publishes `cu126`, `cu130` and `cu132`. **Only `cu130` is supported for production stores**: it is
+the build ADR 025 measured, and the CUDA libraries are part of the stack that gate covers. It needs an
+NVIDIA driver of 580 or later. `cu126` and `cu132` install too but are unmeasured, and `cu126` has no
+kernels for Blackwell cards (`g7`, `g7e`) because CUDA 12.6 predates them.
+Production runs v2 on `cu130`. v1.1's production runs stay on PyTorch 2.5.1 with CUDA 12.1, the
+stack the published v1.1 store was inferred on: on 2.14.1, v1.1's outputs differ from that store's by
+about as much as two GPU models' do (ADR 025; measurements in
+`context_docs/inference/inference-on-gpus.md` §8).
 
 **Supported Python is 3.12-3.13** — what CI tests, what the classifiers advertise, and what these
 instructions assume. `requires-python` is `>=3.12` with no upper bound, so 3.14 installs but is
@@ -53,11 +59,19 @@ To support a new version: add it to the `unit.yml` matrix and the `pyproject.tom
 which must stay in step. Neither depends on CUDA — that job syncs without `--no-sources`, so
 `[tool.uv.sources]` holds torch to the CPU index.
 
-```bash
-# 1. Install CUDA torch from the pytorch index (supported: Python 3.12-3.13)
-pip install "torch==2.14.1+cu130" --index-url https://download.pytorch.org/whl/cu130
+Install CUDA torch first, then the package, so pip sees torch already satisfied and keeps the CUDA
+wheel. Run **one** of the two, for the model you run. For v2, on Python 3.12-3.13:
 
-# 2. Install the package — pip sees torch already satisfied, keeps the CUDA wheel
+```bash
+pip install "torch==2.14.1+cu130" --index-url https://download.pytorch.org/whl/cu130
+pip install "tessera_embeddings[inference]"
+```
+
+For v1.1, the default model, on the stack its published store was inferred on. **Python 3.12
+only**: v1.1's GRU step is compiled, and PyTorch 2.5.1's compiler does not support Python 3.13.
+
+```bash
+pip install "torch==2.5.1+cu121" --index-url https://download.pytorch.org/whl/cu121
 pip install "tessera_embeddings[inference]"
 ```
 
@@ -65,17 +79,22 @@ For fully reproducible GPU deploys, generate a pinned constraints file in
 your deployment repo:
 
 ```bash
+# Pin uv.lock's torch version; pyproject.toml asks for any torch, which would take the index's newest.
+echo "torch==2.14.1" > torch-pin.txt
 uv pip compile pyproject.toml \
     --extra inference --extra prefect --extra aws \
     --python-platform linux --python-version 3.12 \
     --extra-index-url https://download.pytorch.org/whl/cu130 \
-    --no-sources \
+    --no-sources --constraint torch-pin.txt \
     -o constraints-cu130.txt
 
-# Verify, every time. The filename is not a guarantee:
-grep -E '^(torch|nvidia-cuda-runtime)' constraints-cu130.txt
-# torch==2.14.1+cu130, and a CUDA 13.0 runtime package
+# Verify, every time. The filename is not a guarantee; each line fails if its pin is wrong:
+grep -x 'torch==2.14.1+cu130' constraints-cu130.txt
+grep -E '^nvidia-cuda-runtime==13\.' constraints-cu130.txt
 ```
+
+That is v2's stack. For v1.1's, pin `torch==2.5.1`, use the `cu121` index, and check for
+`torch==2.5.1+cu121` and `nvidia-cuda-runtime-cu12==12.1.`.
 
 **No `--index-strategy unsafe-best-match` here, deliberately.** It searches every index and takes
 the best *version* found anywhere, so PyPI's newest torch, built for whatever CUDA PyPI defaults

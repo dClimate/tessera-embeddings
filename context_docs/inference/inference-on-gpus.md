@@ -1224,28 +1224,95 @@ CUDA 12.1 build" and that index stopped at 2.5.1. Tests and the driver image ran
 This section measured moving the workers to 2.14.1 (CUDA 13.0, cuDNN 9.24) on the worker image's own
 driver (595.91.07, CUDA 13.2-capable). The rule it led to is
 [ADR 025](../decisions/025-library-upgrades-ship-on-measured-usability-at-a-store-boundary.md).
-Everything ran in `global-tessera-dev` on 2026-10-02 and 03.
+It was measured twice in `global-tessera-dev`: round 1 on 2026-10-02 and 03, on code that still ran
+v1.1's `nn.GRU`, and round 2 on 2026-10-21, on the code that ships, after #212 replaced that GRU with a
+compiled fused step ([ADR 026](../decisions/026-v1-1-runs-the-gru-it-was-trained-with.md)). Outcome:
+v2 moves very little and clears ADR 025's usability bar; v1.1 on the shipped code moves about ten times
+further than it did on `nn.GRU`, as far as a change of card, and misses that bar.
 
 ### Method: hold everything but the library stack
 
-**One L40S, both stacks.** `InferenceActor` was driven without Ray on one `g6e.xlarge`, first on the
+**Round 2, the code that ships.** One box per card, booted from the 2.5.1 worker image, ran
+`upgrade/pytorch-2-14` at `936291b5` (with #212) on the image's 2.5.1 and then on a copy of the same
+environment with only torch installed over it. The package diff between the two is torch, Triton and
+torch's own CUDA packages, nothing else. Both stacks processed the same tiles in the same order at the
+batch fitted to the card: three Iowa tiles of `mosaics/iowa_epsg5070` (`chunk_1_12`, `chunk_0_7`,
+`chunk_0_21`; calendar 2024, ascending radar) and the two-orbit `m10_parity_15S` tile. The A10G
+(`g5.2xlarge`) ran both models; the L40S (`g6e.xlarge`) and the L4 (`g6.2xlarge`), the fleet's other
+two cards, ran v2, the model that moves. Controls, all bit-identical: v2's three tiles rerun on 2.5.1
+on each card, and one v1.1 tile run twice on each stack on the A10G, each run its own process so the
+compiled GRU step compiled afresh. Harness, results and the staged tiles:
+`s3://global-tessera-inputs-dev/perf/torch-upgrade/r2/` (A10G; `r2_box.sh`, `r2c_box.sh`) and
+`r3/` (L40S, L4; `r3_box.sh`).
+
+**Round 1, one L40S, both stacks.** `InferenceActor` was driven without Ray on one `g6e.xlarge`, first on the
 image's 2.5.1 and then on a copy of the same environment with only torch replaced. Each stack
 processed the same tiles in the same order, with the same prefetch hints, so tiling and batch were
 identical. The tiles were six Iowa tiles (deep and shallow optical, light and heavy radar, two
 easting-cropped edges) and the two-orbit `m10_parity_15S` tile, for v1.1 and for v2 (three Iowa
 tiles plus `m10`). A second 2.5.1 pass is the determinism control.
 
-**The production path, paired.** Two `tessera-embeddings` flow runs on Iowa, 3 L40S workers each,
+**Round 1, the production path, paired.** Two `tessera-embeddings` flow runs on Iowa, 3 L40S workers each,
 started together and cancelled after 35 minutes of inference. One ran the 2.14.1 AMI and the other
 an AMI baked from `main` that differs from it only in torch. Each worker's start-up line confirms its
 version. The 25 tiles both runs wrote completely, all cut into identical strips, are the comparison
 set: 70.3M valid pixels.
 
-**The A10G.** One `g5.2xlarge` ran the forward pass at the batch `batch_size_for_gpu` fits to its
+**Round 1, the A10G.** One `g5.2xlarge` ran the forward pass at the batch `batch_size_for_gpu` fits to its
 22.06 GiB card (3,593), with the workers' allocator settings, on both stacks. This is how the
 deepest bucket (256 optical plus 256 radar steps) was checked.
 
-### Outputs
+### Outputs on the code that ships (round 2)
+
+ADR 012's harness both ways, then `usability.py`'s measures (2,000 queries among 20,000 candidates per
+tile, by cosine; k-means with k = 12 groups fitted on a sample of the 2.5.1 output). Footprint and
+observation counts were exact on every tile.
+
+| 2.5.1 against 2.14.1, one A10G | v1.1, Iowa (3 tiles) | v1.1, `m10` | v2, Iowa (3 tiles) | v2, `m10` |
+|---|---:|---:|---:|---:|
+| int8 values exact | 88.7–90.0% | 88.8% | 99.96–99.99% | 99.99% |
+| largest difference, levels | 3 | 2 | 3 | 2 |
+| largest scale drift | 1.45% | 1.54% | 1.25% | 0.97% |
+| cross-config envelope | 3 of 3 pass | pass | 3 of 3 pass | pass |
+| pixels bit-identical | 0.3% | 0.2% | 51% | 49% |
+| mean per-pixel cosine distance | 2.5e-5 (0.40°) | 2.3e-5 (0.39°) | 6.4e-8 (0.02°) | 6.1e-8 (0.02°) |
+| adjacent pixels' median distance, over that | 293× | 80× | 47,400× | 10,900× |
+| top-20 neighbours kept | 98.2% | 91.9% | 99.99% | 99.94% |
+| same k-means group | 99.83% | 98.62% | 99.999% | 99.994% |
+
+v2 on the fleet's other two cards, the same tiles and measures:
+
+| v2, 2.5.1 against 2.14.1 | L40S, Iowa | L40S, `m10` | L4, Iowa | L4, `m10` |
+|---|---:|---:|---:|---:|
+| int8 values exact | 99.94–99.99% | 99.98% | 99.94–99.99% | 99.98% |
+| largest scale drift | 1.59% | 0.96% | 1.06% | 0.99% |
+| cross-config envelope | 3 of 3 pass | pass | 3 of 3 pass | pass |
+| pixels bit-identical | 51% | 49% | 51% | 49% |
+| top-20 neighbours kept | 99.99% | 99.93% | 99.99% | 99.94% |
+| same k-means group | 99.999% | 99.994% | 99.999% | 99.992% |
+
+**v2 clears ADR 025's usability bar (0.9940) on every tile of every card; v1.1 does not.**
+On round 1's `nn.GRU` code v1.1 kept 99.48% of neighbours and moved 2.3e-6; on the shipped code it moves about ten times
+further. The likely reason, not separately tested, is that #212's GRU step is compiled with
+`torch.compile`, whose code generator changed between the stacks (Triton 3.1 to 3.8), and a recurrence
+carries each step's rounding into the next for up to 256 steps. The `m10` tile is the most uniform of
+the four, its adjacent pixels 1.9e-3 apart against Iowa's 7.3e-3, so its neighbours are nearest to
+ties and swap most.
+
+**The yardstick is a change of card.** On the same two Iowa tiles, v1.1 on identical code (2.14.1) on
+an A10G against an L40S, from the `g7e` evaluation (PR #241, `v2-on-blackwell.md` §5), against this
+stack change on one A10G:
+
+| | card change, `chunk_0_7` / `chunk_0_21` | stack change, same tiles |
+|---|---:|---:|
+| top-20 neighbours kept | 98.03% / 98.47% | 98.09% / 98.35% |
+| same k-means group | 99.79% / 99.85% | 99.79% / 99.90% |
+| mean turn of a pixel's embedding | 0.41° | 0.40° |
+
+The upgrade moves v1.1 as far as the A10G and L40S mix that every v1.1 store already holds. No card
+comparison exists on the `m10` tile.
+
+### Round 1 outputs, on `nn.GRU`
 
 ADR 012's harness on the 25 production-path pairs (v1.1):
 
@@ -1280,8 +1347,16 @@ strip and a body, while the rerun processed it first as one strip. That tiling d
 
 ### Speed and memory
 
+Round 2 measured the shipped code on all three cards for v2 and on the A10G for v1.1; the rows not
+marked round 2 are round 1, on `nn.GRU`. ADR 026 gives the fused step's speed against `nn.GRU` on both
+stacks and both cards. A rerun of the same stack moved inference-loop throughput by up to 1%.
+
 | | v1.1 | v2 |
 |---|---|---|
+| A10G, round 2, inference-loop tokens per second on the same tiles, steady state | **4.0% faster** | 0.5% slower |
+| L40S, round 2, the same | — | 1.2% faster |
+| L4, round 2, the same | — | 0.7% slower |
+| round 2, peak card memory per tile | unchanged on the A10G (2.3–4.2 GiB) | unchanged on all three (A10G and L4 1.7–3.1 GiB, L40S 3.4–6.2 GiB) |
 | L40S, single box (same tiles, serial) | **−3.5% wall per tile** | ±1% |
 | L40S, paired flow runs (25 tiles) | median tile 181 → 168 s; GPU-hours per tile 0.065 → 0.061 (−6%), on cards running 10% faster clocks (below) | not run |
 | A10G, deepest bucket (256 + 256) | 2,947 → 3,253 ms, **10% slower** | +1% |
@@ -1304,7 +1379,10 @@ Hold the tiles, the order and the batch fixed, and change only the library. That
 environment on one box, plus two flow runs whose only difference is `ami_ssm_name`. Confirm each
 stack's version from its own output; a pass that silently ran the old torch was caught here only that
 way. Run `te-compare-outputs` both ways, then the neighbour and cluster measures, on both models and on
-every card the fleet may rent.
+every card the fleet may rent. Measure the code that will ship, not the code of the day: round 1's
+`nn.GRU` was replaced before the upgrade merged, and the replacement moved ten times further. Keep the
+staged tiles, so a question asked later needs no GPU. Where a step is compiled, run each stack twice in
+separate processes as the determinism control.
 
 ---
 

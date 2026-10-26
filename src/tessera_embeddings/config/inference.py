@@ -5,8 +5,9 @@ from __future__ import annotations
 import logging
 import math
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Literal, final
+from typing import Literal, final, get_args
 
 from tessera_embeddings.config.code_identity import source_identity
 from tessera_embeddings.config.time_windows import TimeWindow
@@ -28,6 +29,31 @@ logger = logging.getLogger(__name__)
 ModelVersion = Literal["v1.1", "v2-large"]
 
 DEFAULT_MODEL_VERSION: ModelVersion = "v1.1"
+
+#: Models that never fall back to the default worker image: v1.1 stays on PyTorch 2.5.1 (ADR 025).
+MODELS_ON_THEIR_OWN_IMAGE: frozenset[ModelVersion] = frozenset({"v1.1"})
+
+
+def ami_ssm_name_for_model(
+    ami_ssm_name: str, ami_ssm_name_by_model: Mapping[str, str] | None, model_version: ModelVersion
+) -> str:
+    """The worker-image parameter for a run of *model_version*: its entry in the map, else *ami_ssm_name*.
+
+    A deployment keeps a model on its own worker image this way, and each run picks the image from the
+    model it actually runs. A model in :data:`MODELS_ON_THEIR_OWN_IMAGE` without an entry is refused
+    rather than sent to the default image, and so is an unknown model, which would otherwise fall back
+    silently. Both refusals happen before anything is provisioned.
+    """
+    by_model = ami_ssm_name_by_model or {}
+    if unknown := sorted(set(by_model) - set(get_args(ModelVersion))):
+        raise ValueError(f"ami_ssm_name_by_model names unknown models {unknown}; known: {list(get_args(ModelVersion))}")
+    if model_version in MODELS_ON_THEIR_OWN_IMAGE and model_version not in by_model:
+        raise ValueError(
+            f"{model_version} runs on its own worker image (ADR 025), and ami_ssm_name_by_model has no "
+            f"{model_version!r} entry: pass the SSM parameter naming that image."
+        )
+    return by_model.get(model_version, ami_ssm_name)
+
 
 #: Prefix marking a staging run_id whose chunks were produced by a v2 student.
 #:
