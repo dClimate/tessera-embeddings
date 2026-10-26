@@ -779,7 +779,7 @@ error**. The presence of the directory therefore proves nothing, which is why co
 is recorded as its own signal, *after* the store is fully written:
 
 ```text
-  write_chunk:  _stacks/<digest>.json            the run's stack, on its first write; another refuses
+  write_chunk:  _stack.json                      the run's stack: created once, read back, another refuses
                     ↓
                 rm <label>.done                   retract the old marker FIRST
                     ↓
@@ -932,8 +932,8 @@ icechunk sessions read their own writes, so the merged result is exact.
    index, so no stale slice describes the overwritten data.
 3. **Phase 2, data.** Fork the session; each worker writes its band's tile slices into every
    output array; the coordinator merges the forks, sets the root attributes (run metadata,
-   GeoZarr conventions, `_manifest`, merged `time_windows`, and `inference_stack` on the store's
-   first write) and commits once through
+   GeoZarr conventions, `_manifest`, merged `time_windows`, and `inference_stack`, PyTorch and
+   CUDA, on the store's first write) and commits once through
    `commit_with_rebase`.
 4. **Atomic publish.** Fast-forward `main` to the fully written work-branch tip, guarded by
    `from_snapshot_id` so a concurrent writer to the same store fails loudly, then drop the
@@ -968,19 +968,23 @@ rule 2). A run's *stack* is what computed it: model, checkpoint stem, PyTorch an
 workers know it, since the driver runs the lockfile's CPU build. Two checks hold it, and nothing
 else does:
 
-1. **Joining a run.** A worker's first write into a staging run records its stack as
-   `_stacks/<digest>.json` (`ZarrWriter._join_run`). A worker on another stack finds a second
-   digest there and stops before staging anything, so a run's tiles never mix stacks and carry no
-   record of their own. A resume on another checkpoint or PyTorch is refused the same way.
-2. **Writing a store.** Assembly reads the run's one record (`run_stack`) and compares it with the
+1. **Joining a run.** A run's first write creates `_stack.json` exclusively (a conditional PUT on
+   S3, `O_EXCL` on a local disk), and every later write reads it back (`ZarrWriter._join_run`). A
+   worker on another stack stops before staging anything and leaves nothing behind, so a run's
+   tiles never mix stacks and carry no record of their own. A resume on another checkpoint or
+   PyTorch is refused the same way.
+2. **Writing a store.** Assembly reads the run's record (`run_stack`) and compares it with the
    store root once (`conventions.assert_stack_matches`: the root's `geoemb:model`, read as v1.1
-   when absent, its `checkpoint_id` as a stem, and its `inference_stack`). Every write passes here:
-   the Prefect flows, a direct `runners.zone_fill` call and the plain runner's updates. The first
-   write stamps `inference_stack`, for the global store in a small commit before any shard
-   (`shard_writer.claim_root_stack`); a single-area store's model attrs come from the record too.
-   `allow_stack_mismatch` is the one deliberate override, and the store keeps its stamp.
+   when absent, its `checkpoint_id` as a stem, and its `inference_stack`, PyTorch and CUDA). Every
+   write passes here: the Prefect flows, a direct `runners.zone_fill` call and the plain runner's
+   updates. The first write stamps `inference_stack`, for the global store in a small commit before
+   any shard (`shard_writer.claim_root_stack`). A single-area assembly also refuses a record whose
+   model or checkpoint differs from its caller's, the ones it labels the store with; the run id
+   varies with the checkpoint, so only a reused id can disagree.
 
-The fill flows also compare the model before any GPU is provisioned, only to fail early.
+There is no override. Moving a store to another stack is a restamp after ADR 025's measurement.
+Each fill and campaign also reads the store's model and checkpoint through `store_model_version`
+before anything is provisioned, only to fail early.
 
 **The campaign's land mask is not a pixel-resolution area of interest** but a per-zone
 *coverage bitmap* (`tile_live_2048`), built from the delivery registry by

@@ -76,10 +76,7 @@ from tessera_embeddings.orchestration.prefect.flows._child_runs import (
     make_child_cancel_hook,
 )
 from tessera_embeddings.orchestration.prefect.flows._overrides import set_overrides
-from tessera_embeddings.orchestration.prefect.flows.fill_zone_year import (
-    _assert_seeded_model_matches,
-    _optical_min_obs_from_store,
-)
+from tessera_embeddings.orchestration.prefect.flows.fill_zone_year import _optical_min_obs_from_store
 from tessera_embeddings.orchestration.prefect.flows.ingest_zone_year import IngestDeployments
 from tessera_embeddings.orchestration.runners.zone_fill import (
     zone_has_live_tiles,
@@ -598,8 +595,6 @@ async def run_global_campaign(
     ingest_settings: IngestSettings = IngestSettings(),  # noqa: B008
     allow_partial_window: bool = False,
     allow_s2_only: bool = False,
-    allow_model_mismatch: bool = False,
-    allow_stack_mismatch: bool = False,
     allow_ingest_code_mismatch: bool = False,
     sweep_orphan_mosaics: bool = False,
     validation_deployment: str | None = None,
@@ -886,14 +881,6 @@ async def run_global_campaign(
             ingest bug. Folded into the staging run_id so a retry across a flipped flag never
             resumes mixed tiles. S2-only pixel quality is unvalidated (see the optional-S1
             ADR); affected pixels are identifiable via s1_*_obs_count == 0.
-        allow_model_mismatch: Proceed even though the store was seeded for a different
-            encoder/checkpoint than this build embeds with. The gate runs ONCE up front,
-            before any ingest is dispatched, so a mismatch costs a metadata read rather than
-            a mosaic per in-flight zone. Deliberate override only — mixing encoders under one
-            store is permanent.
-        allow_stack_mismatch: Write tiles computed on a different PyTorch or CUDA from the store's
-            recorded ``inference_stack`` (default rejects at assembly — ADR 025 rule 2). Forwarded
-            to every fill. Deliberate experiments only.
         allow_ingest_code_mismatch: Forwarded to every ingest: resume interrupted mosaics
             built by different ingest code, instead of demanding they be deleted.
         sweep_orphan_mosaics: Before the run, delete mosaics for cells already
@@ -1052,28 +1039,17 @@ async def run_global_campaign(
     store_path = paths.global_store(store_name)
     land_mask_path = paths.land_mask_store(mask_name)
     # THE STORE may be the partner-owned published bucket, which the task role cannot open.
-    # Only the four store reads take this; the land-mask reads, the mosaic fingerprint and the
+    # Only the store reads take this; the land-mask reads, the mosaic fingerprint and the
     # live-tile partition stay on the task role, the only credential that can read OUR buckets.
     store_credentials = icechunk_credentials_for(store_path, iam_icechunk_credentials)
     repo = open_global_repo(store_path, get_credentials=store_credentials, region=s3_region)
     # The store decides the model for the whole campaign: the image it pins for every fill, the
     # checkpoint its fingerprints name, and the staging prefix. Each fill re-reads the same attr.
+    # Resolved ONCE, before any dispatch, so a store this build cannot fill is refused for a
+    # metadata read rather than a multi-terabyte mosaic per in-flight zone.
     model_version = store_model_version(store_path, get_credentials=store_credentials, region=s3_region)
     ami_ssm_name = ami_ssm_name_for_model(ami_ssm_name, ami_ssm_name_by_model, model_version)
     log.info("Campaign model: %s, from %s's geoemb:model", model_version, store_path)
-    # ONCE, before any dispatch. Each fill re-checks this, but by then the campaign has paid
-    # for that cell's ingest — and cells dispatch concurrently, so a store seeded for a
-    # different encoder buys a multi-terabyte mosaic per in-flight zone before the first fill
-    # fails, and those mosaics are retained on failure (which is what makes a resume cheap).
-    # A metadata-only read.
-    _assert_seeded_model_matches(
-        store_path,
-        model_version=model_version,
-        build_checkpoint=checkpoint_filename(model_version=model_version),
-        allow_model_mismatch=allow_model_mismatch,
-        get_credentials=store_credentials,
-        s3_region=s3_region,
-    )
     status = campaign_status(repo, years=campaign_years)
     existing_tags = set(repo.list_tags())
 
@@ -1360,11 +1336,6 @@ async def run_global_campaign(
             # — parts of the globe have no dual-pol coverage at all, and refusing them fails
             # those cells on every retry forever.
             "require_s1": False,
-            # The child re-runs the model gate this flow cleared in preflight, so without
-            # forwarding the override it rejects the same store after its ingest has been
-            # paid for. The campaign-level flag has to reach the gate that fires.
-            "allow_model_mismatch": allow_model_mismatch,
-            "allow_stack_mismatch": allow_stack_mismatch,
             # A fleet-wide rate the concurrent fills share: the account's RunInstances quota.
             # There is no share to divide — each autoscaler runs the limiter client-side — so the
             # campaign passes only whether to run it at all.
@@ -1646,9 +1617,6 @@ async def run_global_campaign(
                         "allow_s2_only": allow_s2_only,
                         # As in _fill_params: the chained child must not demand radar either.
                         "require_s1": False,
-                        # As in _fill_params: the chained child gates on the seeded model too.
-                        "allow_model_mismatch": allow_model_mismatch,
-                        "allow_stack_mismatch": allow_stack_mismatch,
                         "ssm_prefix": ssm_prefix,
                         "cloudwatch_log_group": cloudwatch_log_group,
                         "code_bucket": code_bucket,

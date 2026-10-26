@@ -883,8 +883,9 @@ it" safe.
 PyTorch or CUDA, so the stack (model, checkpoint, PyTorch, CUDA) has its own record
 ([ADR 025](../decisions/025-library-upgrades-ship-on-measured-usability-at-a-store-boundary.md)
 rule 2). Each staging run records the stack its workers ran and refuses a worker on another, the
-store's first write stamps it on the root as `inference_stack`, and assembly refuses a run from any
-other, a resume after a switch included. A stack still changes only between fills, and a store begun on one is finished on
+store's first write stamps PyTorch and CUDA on the root as `inference_stack` beside its model and
+checkpoint, and assembly refuses a run from any other, a resume after a switch included. There is no
+override flag. A stack still changes only between fills, and a store begun on one is finished on
 it by naming that stack's worker image: the Ray flows pick it from the run's model through
 `ami_ssm_name_by_model`, which the deployments set to the 2.5.1 image for v1.1, and refuse a v1.1
 run without that entry. Every published year, 2017–2025, was inferred on **PyTorch 2.5.1 with CUDA

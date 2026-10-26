@@ -478,23 +478,24 @@ _V11 = {"model_version": "v1.1", "checkpoint_id": "tessera_v1_1_aws_encoder", "t
     ("root", "stack", "refused"),
     [
         ({"geoemb:model": _V11_URL, "checkpoint_id": "tessera_v1_1_aws_encoder.pt"}, _V11, None),
-        ({"inference_stack": _V11}, _V11, None),
+        ({"inference_stack": {"torch": "2.5.1+cu121", "cuda": "12.1"}}, _V11, None),
         ({}, {**_V11, "model_version": "v2-large", "checkpoint_id": "v2_student_large"}, "Refusing to append"),
         (
             {"checkpoint_id": "tessera_v1_1_aws_encoder.pt"},
             {**_V11, "checkpoint_id": "tessera_v1_1_mpc_encoder"},
             "checkpoint",
         ),
-        ({"inference_stack": {**_V11, "torch": "2.14.1+cu130"}}, _V11, "never mixes two stacks"),
+        ({"inference_stack": {"torch": "2.14.1+cu130", "cuda": "12.1"}}, _V11, "never mixes two stacks"),
     ],
 )
 def test_the_store_root_decides_the_stack_a_write_may_carry(root, stack, refused) -> None:
-    """Checkpoints compare as stems (a global root keeps the file name), and a root without
+    """The root records model and checkpoint once, and PyTorch and CUDA under ``inference_stack``.
+
+    Checkpoints compare as stems (a global root keeps the file name), and a root without
     ``geoemb:model`` reads as v1.1, so a v2 write into it is refused.
     """
     if refused is None:
-        assert_stack_matches(root, stack, allow_mismatch=False, where="s")
+        assert_stack_matches(root, stack, where="s")
         return
     with pytest.raises(ValueError, match=refused):
-        assert_stack_matches(root, stack, allow_mismatch=False, where="s")
-    assert_stack_matches(root, stack, allow_mismatch=True, where="s")
+        assert_stack_matches(root, stack, where="s")

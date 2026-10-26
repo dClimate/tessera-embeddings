@@ -57,7 +57,7 @@ import zarr
 from tessera_embeddings.config.environment import code_identity, configure_logging
 from tessera_embeddings.config.fault_injection import ArmedFault
 from tessera_embeddings.config.store_layout import SHARD_PX
-from tessera_embeddings.storage.conventions import STACK_ATTR, assert_stack_matches
+from tessera_embeddings.storage.conventions import STACK_ATTR, assert_stack_matches, library_stack
 from tessera_embeddings.storage.icechunk_logging import traced_commit
 from tessera_embeddings.storage.session_catch_up import (
     CATCH_UP_INTERVAL_S,
@@ -756,7 +756,6 @@ def claim_root_stack(
     repo: icechunk.Repository,
     stack: Mapping[str, str | None],
     *,
-    allow_mismatch: bool,
     where: str,
     tries: int = 8,
 ) -> None:
@@ -764,17 +763,17 @@ def claim_root_stack(
 
     Its own small commit, before any shard is written, so a write on another stack is refused
     before it touches data, and two first fills of different zones cannot collide in their shard
-    commits. Write-once: a stamped stack is never replaced, ``allow_mismatch`` included. Retried
+    commits. Write-once: a stamped stack is never replaced. Retried
     like :func:`commit_year_attrs`: a loser re-reads the winner's stamp, then matches it or is
     refused by it.
     """
     for attempt in range(1, tries + 1):
         session = repo.writable_session("main")
         root = zarr.open_group(session.store, mode="a")
-        assert_stack_matches(root.attrs, stack, allow_mismatch=allow_mismatch, where=where)
+        assert_stack_matches(root.attrs, stack, where=where)
         if STACK_ATTR in root.attrs:
             return
-        root.attrs[STACK_ATTR] = dict(stack)
+        root.attrs[STACK_ATTR] = library_stack(stack)
         try:
             commit_with_rebase(
                 session, f"record the store's inference stack: {stack.get('model_version')}, torch {stack.get('torch')}"

@@ -114,8 +114,8 @@ otherwise be mixed in and silently misgeoreference the fill.
 **Model gate** (fill, pre-Ray): the store root's seeded `geoemb:model` (encoder
 version) must match the running build's, else the fill refuses — a mid-campaign
 model upgrade would otherwise write new-encoder embeddings under a store still
-advertising the old one and tag them permanently. `allow_model_mismatch` is the
-deliberate-override escape hatch. This gate is only sound because the root
+advertising the old one and tag them permanently. There is no override: the fill takes its
+model from the store (ADR 025 rule 2 makes the same rule for the library stack). This gate is only sound because the root
 provenance is **write-once**: `seed_zone_groups` stamps the encoder identity on the
 first seed and rejects any incremental reseed that would change it (a partial
 reseed with a different encoder would otherwise re-stamp the root and let the gate

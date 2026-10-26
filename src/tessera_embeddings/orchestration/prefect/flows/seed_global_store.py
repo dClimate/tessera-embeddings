@@ -18,7 +18,7 @@ import icechunk
 import zarr
 from prefect import flow, get_run_logger
 
-from tessera_embeddings.config.inference import DEFAULT_MODEL_VERSION, ModelVersion, checkpoint_filename
+from tessera_embeddings.config.inference import DEFAULT_MODEL_VERSION, ModelVersion
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.store_layout import GLOBAL
 from tessera_embeddings.storage.campaign import campaign_status
@@ -43,7 +43,6 @@ def seed_global_store(
     name: str = "tessera",
     years: tuple[int, ...] = CAMPAIGN_YEARS,
     model_version: ModelVersion = DEFAULT_MODEL_VERSION,
-    checkpoint_id: str | None = None,
     optical_min_obs: int | None = None,
     s3_region: str | None = None,
 ) -> dict[str, Any]:
@@ -55,11 +54,9 @@ def seed_global_store(
         years: Campaign year axis to pre-allocate on each group (fixed at seeding).
         model_version: The model this store holds, stamped on the root as ``geoemb:model``.
             Every later fill and update reads it there and runs that model, so this is the
-            one place a global store's model is chosen.
-        checkpoint_id: The concrete checkpoint stamped as ``checkpoint_id`` on the root.
-            Defaults to *model_version*'s :func:`checkpoint_filename` so the fill's model
-            gate can distinguish it (the ``aws``/``mpc`` v1.1 checkpoints share one
-            ``geoemb:model`` URL); without it that gate is a no-op.
+            one place a global store's model is chosen. Its checkpoint, stamped as
+            ``checkpoint_id``, is the model's own (:func:`checkpoint_filename`), the one every
+            fill runs.
         optical_min_obs: Minimum valid optical observations for a pixel to be embedded,
             stamped on the root as part of its write-once identity. **Deliberately has no
             default and is not read from the config constant**: it decides what the product
@@ -87,10 +84,6 @@ def seed_global_store(
     # returns the task-role provider unchanged for our own buckets, so the substitution only
     # happens where it is required.
     store_credentials = icechunk_credentials_for(store_path, iam_icechunk_credentials)
-    # Default the recorded checkpoint identity to the model's checkpoint filename so the fill's
-    # checkpoint gate is effective by default (it only compares when the store carries a
-    # checkpoint_id). geoemb:model alone can't tell aws from mpc.
-    checkpoint_id = checkpoint_id or checkpoint_filename(model_version=model_version)
 
     # Open-or-create with the global config (manifest split + preload). A missing repo raises
     # on open; create_global_repo persists the config via save_config.
@@ -192,7 +185,7 @@ def seed_global_store(
     todo = [spec for zone_name, spec in ZONES.items() if zone_name not in seeded]
     if not todo:
         # seed_zone_groups is where the write-once root identity is checked, and it is not
-        # reached when there is nothing to create — so a rerun asking for a different checkpoint
+        # reached when there is nothing to create — so a rerun asking for a different model
         # or minimum-depth rule would report a clean seed, leave the old identity standing and
         # let the campaign follow the OLD rule. Checked here too, on the path that skips the seed.
         root_attrs = dict(zarr.open_group(repo.readonly_session(branch="main").store, mode="r").attrs)
@@ -202,13 +195,12 @@ def seed_global_store(
             root_attrs,
             layout=GLOBAL,
             model_version=model_version,
-            checkpoint_id=checkpoint_id,
             optical_min_obs=optical_min_obs,
         )
         if "geoemb:model" not in root_attrs:
             # UNSTAMPED, and no group is created here to stamp it as a side effect. Seeding a
             # store predating the root identity would otherwise report success having written
-            # neither the checkpoint nor the depth rule asked for — and the fill gates pass on
+            # neither the model nor the depth rule asked for — and the fill gates pass on
             # an ABSENT attr (`if seeded is not None`, `optical_min_obs` compared to None), so
             # the store would accept anything while the operator was told it was seeded.
             _refuse_stamping_over_landed_cells(root_attrs, f"all {len(ZONES)} zone groups")
@@ -216,7 +208,6 @@ def seed_global_store(
                 repo,
                 layout=GLOBAL,
                 model_version=model_version,
-                checkpoint_id=checkpoint_id,
                 optical_min_obs=optical_min_obs,
             )
             log.info(
@@ -242,7 +233,6 @@ def seed_global_store(
         todo,
         years=years,
         model_version=model_version,
-        checkpoint_id=checkpoint_id,
         optical_min_obs=optical_min_obs,
         commit_msg=f"seed {len(todo)} zone group(s)",
     )
