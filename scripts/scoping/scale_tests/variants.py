@@ -117,6 +117,17 @@ def arm(base: Variant, **changes: object) -> Variant:
     return dataclasses.replace(v, name="_".join(p for p in parts if p))
 
 
+def read_window(arr: zarr.Array, t: int, ys: slice | int, xs: slice | int, trailing: slice = slice(None)) -> np.ndarray:
+    """``arr[t]`` over a window as ``(y, x[, band])``, whatever the array's dimension order.
+
+    The order is read from the array's dimension names (ADR 031), so one reader serves band-last
+    and band-first stores alike, and arrays with no band axis.
+    """
+    if arr.metadata.dimension_names[1] != "band":
+        return np.asarray(arr[(t, ys, xs, trailing)[: arr.ndim]])
+    return np.moveaxis(np.asarray(arr[t, trailing, ys, xs]), 0, -1)
+
+
 def embeddings_array_kwargs(variant: Variant, shape: tuple[int, int, int, int]) -> dict:
     """Return ``create_array`` kwargs for the int8 ``embeddings`` array.
 

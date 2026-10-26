@@ -492,7 +492,8 @@ def run_phase(
     stores — phases must be resumable, so nothing is threaded through in memory.
     Honors ``--phase`` (run only the matching phase) and ``--variant``.
     """
-    if cfg.phase and cfg.phase != name:
+    # A phase recorded per client (`requests_zarr3.4`) also answers to its plain name, `requests`.
+    if cfg.phase and cfg.phase not in (name, re.sub(r"_zarr[\d.]+$", "", name)):
         return
     if phase_done(cfg, test, name):
         logger.info("[%s/%s] already done — skipping", test, name)
