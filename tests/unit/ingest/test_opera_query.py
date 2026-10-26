@@ -505,6 +505,23 @@ class TestBurstAcquisitions:
         assert mock_get.call_args.args[0].endswith("granules.xml"), "titles only: the light format"
         assert "1 unnamed" in caplog.text
 
+    def test_counts_the_solar_day_window_at_the_zone_longitude(self):
+        """The window is solar days: the catalogue is asked a UTC day either side and each
+        acquisition is placed on its solar day first. At +150° (a +10 h offset) a pass late on
+        UTC 31 December belongs to 1 January and counts; the same pass a year on does not.
+        """
+        titles = [
+            _title(_LOW, acquired="20231231T150000Z"),  # 2024-01-01 solar: in
+            _title(_LOW, acquired="20240601T000000Z"),  # in
+            _title(_LOW, acquired="20241231T150000Z"),  # 2025-01-01 solar: out
+        ]
+        patcher, mock_get = _patch_cmr_session(side_effect=[_reference_page(titles)])
+        with patcher:
+            counts = burst_acquisitions(self.BBOX, "2024-01-01", "2024-12-31", "ascending", mid_longitude=150.0)
+
+        assert counts == {_LOW: 2}
+        assert mock_get.call_args.kwargs["params"]["temporal"] == "2023-12-31T00:00:00Z,2025-01-01T23:59:59Z"
+
     def test_a_burst_returned_by_both_antimeridian_halves_counts_once(self):
         patcher, mock_get = _patch_cmr_session(side_effect=[_reference_page([_title(_LOW)]) for _ in range(2)])
         with patcher:
@@ -525,17 +542,24 @@ class TestBurstAcquisitions:
         """Constructing the census queries nothing; every later caller shares one answer."""
         calls: list[tuple] = []
 
-        def fake(*args):
-            calls.append(args)
+        def fake(*args, **kwargs):
+            calls.append((args, kwargs))
             return {_LOW: 3}
 
         with patch("tessera_embeddings.ingest.opera_query.burst_acquisitions", side_effect=fake):
-            census = BurstCensus(self.BBOX, "2024-01-01", "2024-12-31", "ascending")
+            census = BurstCensus(self.BBOX, "2024-01-01", "2024-12-31", "ascending", mid_longitude=27.0)
             assert calls == []
             census.start()
             assert census.counts() == census.counts() == {_LOW: 3}
 
-        assert calls == [(self.BBOX, "2024-01-01", "2024-12-31", "ascending")]
+        assert calls == [((self.BBOX, "2024-01-01", "2024-12-31", "ascending"), {"mid_longitude": 27.0})]
+
+    def test_recorded_counts_are_the_answer_and_nothing_is_queried(self):
+        """A resumed leg ranks by the census its store recorded, whatever the catalogue says now."""
+        with patch("tessera_embeddings.ingest.opera_query.burst_acquisitions") as query:
+            census = BurstCensus(self.BBOX, "2024-01-01", "2024-12-31", "ascending", counts={_HIGH: 31})
+            assert census.counts() == {_HIGH: 31}
+        query.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

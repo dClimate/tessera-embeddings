@@ -58,8 +58,15 @@ year, so a pixel's time series could switch angle on every day both tracks flew.
    - It counts acquisitions rather than granules, because a reprocessed acquisition is published
      again under a new production time, and counting granules would rank a burst by how often it
      was reprocessed.
-   - It uses the requested window, not the window a resumed leg searches, so a resumed leg ranks
-     bursts exactly as the run it resumes did.
+   - It counts the requested window as solar days at the zone's grouping longitude, exactly the
+     days the batches own: the catalogue is asked for a UTC day either side and each acquisition
+     is placed on its solar day before it is counted. Counted on UTC dates, an edge acquisition
+     would be in or out by the hour of the pass, and a count off by one flips a tie.
+   - It uses the requested window, not the window a resumed leg searches, and a store that holds
+     any date holds the census that ranked it (root attribute `burst_census`, written in the
+     first date's commit). A resumed leg ranks by that record rather than counting the catalogue
+     again, which may have gained an acquisition since and would rank a tied burst the other way,
+     fusing later days by a different geometry than the days already written.
    - A burst's count does not depend on the query box, as long as the burst touches it. So a run
      over a few tiles of a zone ranks the bursts it shares with the whole zone the same way.
 5. **A title that does not parse sorts after every named burst of its day**, so it can only fill

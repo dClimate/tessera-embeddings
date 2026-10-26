@@ -104,8 +104,16 @@ fixed, this item order gives each pixel its most-acquired covering burst without
 The counts come from `burst_acquisitions`, one CMR query per orbit leg over the requested window
 (`BurstCensus`, built once in `s1_roi`). It asks for the reference format — titles only, about
 60 times smaller than the JSON the batch queries read — and counts distinct acquisitions, since
-a reprocessed acquisition is republished under a new production time. One orbit of a zone-year at
-35N took about 50 s; it starts alongside the first batch's query, so most of it overlaps.
+a reprocessed acquisition is republished under a new production time. The window is the same
+solar days the batches own: the query reaches a UTC day either side and each acquisition is
+placed on its solar day before it is counted. One orbit of a zone-year at 35N took about 50 s; it
+starts alongside the first batch's query, so most of it overlaps.
+
+The census is written on the orbit's store as the root attribute `burst_census`, in the same
+commit as every date, and a leg resuming a store that holds any date ranks by the census it reads
+back rather than counting again. The catalogue keeps changing, counts commonly tie, and a leg
+that re-counted after a backfilled acquisition could fuse its remaining days by a different burst
+than the days already written.
 [ADR 033](../../context_docs/decisions/033-radar-overlaps-go-to-the-most-acquired-burst.md) has
 the measurements and what was left out, such as per-pixel layover and shadow masks.
 

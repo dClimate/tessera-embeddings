@@ -121,14 +121,21 @@ def test_prepare_exceptions_surface_when_the_batch_is_consumed() -> None:
 
 
 def _run_ingest(
-    monkeypatch, catalogue: list[str], existing: set[str], providers: list | None = None, **kwargs
+    monkeypatch,
+    catalogue: list[str],
+    existing: set[str],
+    providers: list | None = None,
+    writes: list | None = None,
+    recorded_census: dict[str, int] | None = None,
+    **kwargs,
 ) -> list[str]:
     """Drive ``ingest_s1_roi_sar`` against a faked catalogue and store.
 
     ``catalogue`` is every solar date the catalogue holds; the fake returns the ones
     inside whatever range each batch asks for, which is what a real catalogue does.
     Returns the dates actually written, in order. ``providers``, when given, collects the
-    keyword arguments each batch built its item provider with.
+    keyword arguments each batch built its item provider with; ``writes`` the keyword
+    arguments of each date's write. ``recorded_census`` is what the store's root attr holds.
 
     That range is deliberately WIDER than the batch owns — ``fixed_day_ranges`` pads it a
     day either side so a solar day straddling a boundary is complete for whichever batch
@@ -145,7 +152,7 @@ def _run_ingest(
     import numpy as np
     import xarray as xr
 
-    from tessera_embeddings.ingest import s1_roi
+    from tessera_embeddings.ingest import opera_query, s1_roi
 
     written: list[str] = []
 
@@ -159,12 +166,17 @@ def _run_ingest(
         )
         return ds, {}
 
-    def fake_write_day_windows(_store, data, *_args, **_kwargs):
+    def fake_write_day_windows(_store, data, *_args, **kwargs):
         written.append(str(data["time"].values[0])[:10])
+        if writes is not None:
+            writes.append(kwargs)
 
     monkeypatch.setattr(s1_roi, "ingest_tile", fake_ingest_tile)
     monkeypatch.setattr(s1_roi, "write_day_windows", fake_write_day_windows)
     monkeypatch.setattr(s1_roi, "get_existing_dates", lambda _store, **_kw: set(existing))
+    monkeypatch.setattr(s1_roi, "get_root_attr", lambda _store, _key, **_kw: recorded_census)
+    # The census answers at once, with the catalogue's counts, unless a test records one.
+    monkeypatch.setattr(opera_query, "burst_acquisitions", lambda *_a, **_k: {"T001-000001-IW1": 2})
     monkeypatch.setattr(s1_roi, "apply_roi_mask", lambda data, *a, **k: data)
     monkeypatch.setattr(s1_roi, "read_roi_mask", lambda *a, **k: object())
     monkeypatch.setattr(
@@ -693,7 +705,15 @@ def test_one_burst_census_ranks_every_batch_over_the_requested_window(monkeypatc
     from tessera_embeddings.ingest import s1_roi
 
     built: list[tuple] = []
-    monkeypatch.setattr(s1_roi, "BurstCensus", lambda *args: built.append(args) or args)
+
+    class _Census:
+        def __init__(self, *args, **kwargs) -> None:
+            built.append((args, kwargs))
+
+        def counts(self) -> dict[str, int]:
+            return {}
+
+    monkeypatch.setattr(s1_roi, "BurstCensus", _Census)
     providers: list[dict] = []
     _run_ingest(
         monkeypatch,
@@ -705,6 +725,35 @@ def test_one_burst_census_ranks_every_batch_over_the_requested_window(monkeypatc
         pipeline_batches=pipe,
     )
 
-    assert built == [((0, 0, 1, 1), "2024-01-01", "2024-01-06", "ascending")]
+    assert built == [(((0, 0, 1, 1), "2024-01-01", "2024-01-06", "ascending"), {"mid_longitude": 0.5, "counts": None})]
     assert len(providers) > 1, "needs several batches to show they share one census"
     assert all(k["burst_census"] is providers[0]["burst_census"] for k in providers)
+
+
+@pytest.mark.parametrize(
+    ("existing", "recorded", "expected"),
+    [
+        pytest.param(set(), None, {"T001-000001-IW1": 2}, id="first-leg-counts-and-records"),
+        pytest.param({"2024-01-01"}, {"T001-000001-IW1": 9}, {"T001-000001-IW1": 9}, id="resume-reuses-the-record"),
+    ],
+)
+def test_a_store_holds_the_census_that_ranked_its_dates(monkeypatch, existing, recorded, expected) -> None:
+    """Every date's write carries the census as a root attr, and a resumed leg ranks by the one
+    its store already holds rather than counting the catalogue again (ADR 033): a backfilled
+    acquisition could otherwise flip a tie and fuse later days by a different burst.
+    """
+    from tessera_embeddings.ingest.opera_query import BURST_CENSUS_ATTR
+
+    writes: list[dict] = []
+    _run_ingest(
+        monkeypatch,
+        catalogue=["2024-01-01", "2024-01-03"],
+        existing=existing,
+        writes=writes,
+        recorded_census=recorded,
+        start_date="2024-01-01",
+        end_date="2024-01-04",
+    )
+
+    assert writes, "the open date is written"
+    assert all(w["store_attrs"] == {BURST_CENSUS_ATTR: expected} for w in writes)

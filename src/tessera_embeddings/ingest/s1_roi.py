@@ -52,7 +52,7 @@ from tessera_embeddings.ingest.live_windows import (
     windows_for_date,
 )
 from tessera_embeddings.ingest.loader_failures import install_capture_everywhere, refusal_wait_out
-from tessera_embeddings.ingest.opera_query import BurstCensus, make_s1_item_provider
+from tessera_embeddings.ingest.opera_query import BURST_CENSUS_ATTR, BurstCensus, make_s1_item_provider
 from tessera_embeddings.ingest.roi import (
     read_roi_mask,
     read_roi_metadata,
@@ -74,6 +74,7 @@ from tessera_embeddings.storage.manifest import IngestManifest
 from tessera_embeddings.storage.zarr_store import (
     StorageOptions,
     get_existing_dates,
+    get_root_attr,
     record_assessed_window,
     resolve_storage_options,
     store_write_retrying,
@@ -539,8 +540,14 @@ def ingest_s1_roi_sar(
     # (`opera_query.burst_fusion_sort_key`). Not per batch, which would rank a burst by a month of
     # acquisitions rather than its year, and not over the resumed window below, which would let a
     # resumed leg rank bursts differently from the run it resumes and so build different pixels.
-    # Queries nothing until the first batch's provider starts it alongside its own query.
-    burst_census = BurstCensus(roi.bbox_wgs84, start_date, end_date, orbit)
+    # For the same reason a store that holds any date holds the census that ranked it, written
+    # in the first date's commit (`store_attrs` below) and read back here: the catalogue keeps
+    # changing, and a resumed leg that re-counted could rank a tied burst the other way. Queries
+    # nothing until the first batch's provider starts it alongside its own query.
+    recorded_census = get_root_attr(orbit_store, BURST_CENSUS_ATTR, s3_region=s3_region) if written_dates else None
+    burst_census = BurstCensus(
+        roi.bbox_wgs84, start_date, end_date, orbit, mid_longitude=mid_longitude, counts=recorded_census
+    )
 
     # Where the CATALOGUE is searched from. Everything at or below the newest held date is closed,
     # so searching back there cannot write anything — and searching is most of what a resumed run
@@ -924,6 +931,7 @@ def ingest_s1_roi_sar(
                                     chunks=INGEST_CHUNKS,
                                     parallel_windows=overlap_window_writes,
                                     s3_region=s3_region,
+                                    store_attrs={BURST_CENSUS_ATTR: burst_census.counts()},
                                 )
                 except Exception as exc:
                     # The retry is exhausted. Only a failure the source is answerable for is

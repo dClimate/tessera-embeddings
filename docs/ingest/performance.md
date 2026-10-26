@@ -152,7 +152,7 @@ per passing date (one writable session ── one commit)
    ├─ to_icechunk(region=window₁) ┐  pixels flow from the Dask workers that
    ├─ to_icechunk(region=window₂) │  computed them, never materialised on
    ├─ ...                         ┘  the flow runner
-   ├─ merge attrs                 (baselines ∪, doy ++, last_appended)
+   ├─ merge attrs                 (baselines ∪, doy ++, last_appended, the radar census)
    └─ commit                      (crash before here ⇒ nothing visible; retry is clean)
 ```
 

@@ -1249,6 +1249,32 @@ def get_existing_dates(
         raise
 
 
+def get_root_attr(
+    store_path: str,
+    key: str,
+    *,
+    get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
+    s3_region: str | None = None,
+) -> Any:  # noqa: ANN401 — whatever JSON the attr holds
+    """One root attribute of a store, or None if the store or the attribute is absent.
+
+    Fails closed like :func:`get_existing_dates`: only genuine absence answers None, and a
+    read that fails for any other reason propagates rather than being read as "not recorded".
+    """
+    try:
+        ds = _open_readonly(store_path, get_credentials=get_credentials, region=s3_region)
+    except FileNotFoundError:
+        return None
+    except icechunk.IcechunkError as exc:
+        if is_missing_repo(exc):
+            return None
+        raise
+    try:
+        return ds.attrs.get(key)
+    finally:
+        ds.close()
+
+
 def resolve_region(
     store_path: str,
     *,
@@ -1608,6 +1634,7 @@ def write_day_windows(
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     s3_region: str | None = None,
     parallel_windows: bool = False,
+    store_attrs: dict[str, Any] | None = None,
 ) -> None:
     """Write ONE date's live windows into a mosaic store, one commit for the date.
 
@@ -1632,6 +1659,7 @@ def write_day_windows(
         get_credentials=get_credentials,
         s3_region=s3_region,
         parallel_windows=parallel_windows,
+        store_attrs=store_attrs,
     )
 
 
@@ -1648,6 +1676,7 @@ def write_days_windows(
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     s3_region: str | None = None,
     parallel_windows: bool = False,
+    store_attrs: dict[str, Any] | None = None,
 ) -> None:
     """Write one or more dates' live windows into a mosaic store, ONE commit for the batch.
 
@@ -1679,6 +1708,10 @@ def write_days_windows(
     as the append path does (baselines union, doy concat, ``last_appended`` bump). The
     manifest is validated BEFORE anything is written — the per-append structural gate must
     not be lost to batching.
+
+    ``store_attrs`` are merged into the root attrs in the same commit as the dates, for a
+    record that must exist whenever any date does, such as the radar burst census that ranked
+    the dates' sources: a separate commit could be lost between the first date and itself.
     """
     from tessera_embeddings.storage.empty_store import create_empty_store  # local: storage-internal, avoids cycle
 
@@ -1789,6 +1822,8 @@ def write_days_windows(
         attrs["baselines_applied"] = merged
         attrs["doy"] = list(cast("list", attrs.get("doy", []))) + compute_doy(np.array(whens)).tolist()
         attrs["last_appended"] = utcnow_iso()
+        if store_attrs:
+            attrs.update(store_attrs)
         if mixed:
             # Same commit as the dates it describes; a union, since one resume writes many.
             prior = cast("list", attrs.get(MIXED_CODE_IDENTITIES_ATTR, []))

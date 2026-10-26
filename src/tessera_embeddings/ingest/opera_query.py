@@ -15,6 +15,7 @@ import time
 import warnings
 from collections import Counter
 from collections.abc import Callable, Iterator
+from datetime import UTC, datetime
 from typing import Any, cast
 from xml.etree import ElementTree
 
@@ -32,7 +33,7 @@ from tessera_embeddings.ingest._http import (
     spawn_abandonable,
 )
 from tessera_embeddings.ingest.auth import get_edl_session, resolve_item_assets, rewrite_assets_to_s3
-from tessera_embeddings.ingest.solar_days import normalize_to_solar_day
+from tessera_embeddings.ingest.solar_days import normalize_to_solar_day, solar_day_of_instant, whole_window_range
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,9 @@ SUBSWATH = "opera:subswath"
 #: The burst's acquisitions over the whole ingest window, stamped by the item provider from the
 #: :class:`BurstCensus`. What :func:`burst_fusion_sort_key` ranks bursts by.
 BURST_ACQUISITIONS = "tessera:burst_acquisitions"
+#: Root attribute of a radar mosaic store: the :class:`BurstCensus` counts that ranked every date it
+#: holds, written in the first date's commit and reused by every resumed leg.
+BURST_CENSUS_ATTR = "burst_census"
 
 
 # CMR intermittently times out or 5xxes under load. urllib3's Retry covers read timeouts (``read``
@@ -499,7 +503,12 @@ def _query_cmr_granules_one(
 
 
 def burst_acquisitions(
-    bbox: tuple[float, float, float, float], start_date: str, end_date: str, orbit_direction: str
+    bbox: tuple[float, float, float, float],
+    start_date: str,
+    end_date: str,
+    orbit_direction: str,
+    *,
+    mid_longitude: float | None = None,
 ) -> dict[str, int]:
     """How many times each burst touching ``bbox`` was acquired in the window, by burst id.
 
@@ -510,19 +519,30 @@ def burst_acquisitions(
     reprocessed. A title that names no burst counts toward nothing. Cost and rationale:
     ``context_docs/decisions/033-radar-overlaps-go-to-the-most-acquired-burst.md``.
 
+    ``start_date..end_date`` are SOLAR days at ``mid_longitude``, as the ingest window is: the
+    catalogue is asked for a UTC day either side (:func:`~.solar_days.whole_window_range`) and
+    each title's acquisition instant is placed on its solar day before it is counted, so an
+    acquisition the batches own is counted and one they do not is not. Counted on UTC dates, an
+    edge acquisition would be counted or missed by the hour of the pass, and a count off by one
+    flips the ties that are the common case. ``None`` counts on UTC dates, as the loader groups
+    without an offset.
+
     A burst's count does not depend on ``bbox`` beyond whether the burst touches it, so a query
     over a subset of an area ranks the bursts it shares with the whole the same way.
     """
+    window = whole_window_range(start_date, end_date)
     acquired: dict[str, set[str]] = {}
     titles = unnamed = 0
     t0 = time.monotonic()
     for box in _cmr_boxes(bbox):
-        params = _granule_params(box, start_date, end_date, orbit_direction)
+        params = _granule_params(box, window.query_start, window.query_end, orbit_direction)
         for page in _granule_pages(params, url=_CMR_REFERENCE_URL, parse=_reference_titles):
             titles += len(page)
             for title in page:
                 if burst := _TITLE_RE.match(title):
-                    acquired.setdefault(burst["burst"], set()).add(burst["acquired"])
+                    instant = datetime.strptime(burst["acquired"], "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
+                    if window.owns(solar_day_of_instant(instant, mid_longitude=mid_longitude).isoformat()):
+                        acquired.setdefault(burst["burst"], set()).add(burst["acquired"])
                 else:
                     unnamed += 1
     logger.info(
@@ -547,18 +567,34 @@ class BurstCensus:
     batch look-ahead cannot hide; :meth:`counts` waits for the answer, and every later call
     returns the same one. The batches that share it are prepared one at a time, so it takes no
     lock.
+
+    ``counts`` given up front, as read back from a store's :data:`BURST_CENSUS_ATTR`, are the
+    answer and nothing is queried: the catalogue keeps changing after a leg's first date commits,
+    a backfilled acquisition can flip a tied ranking, and a resumed leg that re-counted would fuse
+    its later days by a different burst than the days already written. The census that ranked a
+    store's first date ranks every date after it.
     """
 
     def __init__(
-        self, bbox: tuple[float, float, float, float], start_date: str, end_date: str, orbit_direction: str
+        self,
+        bbox: tuple[float, float, float, float],
+        start_date: str,
+        end_date: str,
+        orbit_direction: str,
+        *,
+        mid_longitude: float | None = None,
+        counts: dict[str, int] | None = None,
     ) -> None:
         self._args = (bbox, start_date, end_date, orbit_direction)
-        self._waiter: Callable[..., dict[str, int]] | None = None
+        self._mid_longitude = mid_longitude
+        self._waiter: Callable[..., dict[str, int]] | None = None if counts is None else lambda: counts
 
     def start(self) -> Callable[..., dict[str, int]]:
         """Send the query if nothing has yet, and return the waiter for its answer."""
         if self._waiter is None:
-            self._waiter = spawn_abandonable(lambda args: burst_acquisitions(*args), self._args)
+            self._waiter = spawn_abandonable(
+                lambda args: burst_acquisitions(*args, mid_longitude=self._mid_longitude), self._args
+            )
         return self._waiter
 
     def counts(self) -> dict[str, int]:
