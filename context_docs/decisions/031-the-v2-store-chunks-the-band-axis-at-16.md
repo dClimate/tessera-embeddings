@@ -57,8 +57,10 @@ staged Iowa tiles into each layout on Graviton.
 - **Band-last:** 0.90–0.91× C0's worker CPU per tile.
 - **Band-first:** 1.17× C0's worker CPU, at 0.94–1.00× its wall time. This was measured with a
   prototype writer that reorders each band-last staged tile as it writes it.
-- **What overstates band-first:** a band-first pipeline does that reorder earlier, in inference
-  (§3). Without it, assembly costs what encoding does, which is 0.74× C0.
+- **Why 1.17× is an upper bound:** a band-first pipeline does that reorder earlier, in inference
+  (§3), so assembly will not pay it. How far below 1.17× it lands is unmeasured: encoding alone costs
+  0.74× C0 in band-first order, but assembly also reads and checks the staged tiles and writes the
+  other arrays, none of which the reorder changes.
 
 **Every layout is lossless.** Read back, every array of all 64 assembled tiles is identical to C0's
 in every layout, band-first arrays after reordering.
@@ -103,7 +105,7 @@ Band-last is v1.1's order, `(time, northing, easting, band)`. Band-first is
 | **inference, outputs** | unchanged | reordered once per tile on the actor's background writer thread (below) |
 | **appending a year** | an end-append on the time axis (ADR 008 D1) | the same: time stays the leading axis, chunked at 1, so a new year's chunks are new keys and no existing chunk moves |
 | **encode CPU** | 0.81–0.83× C0 | 0.74–0.75× C0 |
-| **assembly worker CPU** | 0.90–0.91× C0 | 1.17× C0 when assembly reorders band-last staged tiles; encode cost (0.74×) when inference stages them band-first |
+| **assembly worker CPU** | 0.90–0.91× C0 | 1.17× C0 with assembly reordering band-last staged tiles: an upper bound once inference stages them band-first |
 | **storage** | −3% | −23%, band-planar compression for free |
 | **reads** | 16-d about 4× faster than C0; 128-d bulk 1.5–1.7× slower | 16-d about 4× faster; 64-d 1.4–1.6× faster; 128-d level with C0 |
 | **readers' tools** | per-pixel readers (scikit-learn) get `(…, band)` directly | rioxarray refuses `(y, x, band)`; PyTorch convolutions take channels first; AlphaEarth's Source Coop copy is `(time, band, y, x)` |
@@ -134,8 +136,9 @@ per tile on an L4 host.
   with the GPU at 100% (median).
 - **Where it already waits:** the next tile waits on the upload only on the 5.6% of tiles that
   finish fast, adding 0.5 s per tile on average.
-- **What the reorder adds:** another 1–2 s on each upload lengthens only those waits. That is at most
-  about 0.1 s per tile, under 0.1% of inference time.
+- **What the reorder adds:** another 1–2 s on each upload. The next tile can wait at most that much
+  longer, so the reorder costs at most 1–2 s per tile, about 1% of tile time. A tile waits only when
+  the next one finishes before its upload does, which today is the 5.6% above.
 
 **A reader who wants the other order pays a transpose either way.** Turning one 128-d tile from
 `(band, y, x)` into `(y, x, band)` takes 0.17 s with torch on 10 threads, or 1.2 s with numpy on one.
@@ -175,12 +178,13 @@ inside one shard fails the old-client gate on a full-vector point.
 - **Readers:** a transpose for per-pixel readers who want `(…, band)`.
 
 **The reorder is inference's, as it stages each tile.** Staged tiles, the shard writer, updates and
-readers all see band-first, so no stage after inference reorders anything. The cost is under 0.1% of
-inference time (§3).
+readers all see band-first, so no stage after inference reorders anything. The cost is at most about
+1% of inference time (§3).
 
 **Rejected: reordering in assembly instead.** It would leave inference's code untouched, at 1.17× C0's
-assembly CPU rather than 0.74×. It was turned down because band-first all the way through is the
-cleaner pipeline, and inference's part of it costs almost nothing.
+assembly CPU, above what assembling band-first staged tiles will cost. It was turned down because
+band-first all the way through is the cleaner pipeline, and inference's part of it costs at most about
+1% of tile time.
 
 ## 5. Consequences
 

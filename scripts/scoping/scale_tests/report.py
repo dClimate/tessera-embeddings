@@ -352,18 +352,17 @@ def _t9_tables(rows: list[dict]) -> list[str]:
                 b = _t9_value(rows, "bytes_fetched", a, **kw)
                 cells.append("—" if n is None or b is None else f"{n:.0f} / {b / 1e6:.1f}")
             out.append(f"| {a} | " + " | ".join(cells) + " |")
-    dask_arms = sorted({r["variant"] for r in _sel(rows, test="t9", metric="dask_tasks")})
-    if dask_arms:
+    for phase in sorted({r["phase"] for r in _sel(rows, test="t9", metric="dask_tasks")}):
         out += [
             "",
-            "### Dask, bulk 16-d pull",
+            f"### Dask, bulk 16-d pull, {phase.removeprefix('dask_')}",
             "",
             "| arm | tasks default | tasks shard-aligned | requests default | requests shard-aligned |",
             "|---|---|---|---|---|",
         ]
-        for a in dask_arms:
-            t = [_t9_value(rows, "dask_tasks", a, chunks=c) for c in ("default", "shard_aligned")]
-            q = [_t9_value(rows, "get_requests", a, chunks=c) for c in ("default", "shard_aligned")]
+        for a in sorted({r["variant"] for r in _sel(rows, test="t9", phase=phase, metric="dask_tasks")}):
+            t = [_t9_value(rows, "dask_tasks", a, phase=phase, chunks=c) for c in ("default", "shard_aligned")]
+            q = [_t9_value(rows, "get_requests", a, phase=phase, chunks=c) for c in ("default", "shard_aligned")]
             out.append(f"| {a} | " + " | ".join("—" if v is None else f"{v:.0f}" for v in (*t, *q)) + " |")
     return [*out, ""]
 

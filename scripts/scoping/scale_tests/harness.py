@@ -478,6 +478,11 @@ def _sync_results_from_s3(cfg: RunConfig, test: str) -> None:
         logger.warning("S3 results sync-down failed for %s: %s", test, exc)
 
 
+def phase_matches(requested: str, name: str) -> bool:
+    """Whether ``--phase requested`` selects ``name``; a phase recorded per client answers to its plain name."""
+    return requested in (name, re.sub(r"_zarr[\d.]+$", "", name))
+
+
 def run_phase(
     cfg: RunConfig,
     test: str,
@@ -492,8 +497,7 @@ def run_phase(
     stores — phases must be resumable, so nothing is threaded through in memory.
     Honors ``--phase`` (run only the matching phase) and ``--variant``.
     """
-    # A phase recorded per client (`requests_zarr3.4`) also answers to its plain name, `requests`.
-    if cfg.phase and cfg.phase not in (name, re.sub(r"_zarr[\d.]+$", "", name)):
+    if cfg.phase and not phase_matches(cfg.phase, name):
         return
     if phase_done(cfg, test, name):
         logger.info("[%s/%s] already done — skipping", test, name)
