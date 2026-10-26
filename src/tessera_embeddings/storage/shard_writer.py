@@ -760,7 +760,7 @@ def claim_root_stack(
     where: str,
     tries: int = 8,
 ) -> None:
-    """Check a write's library stack against the store root's, stamping it on the store's first write.
+    """Check a write's stack against the store root's, stamping it on the store's first write.
 
     Its own small commit, before any shard is written, so a write on another stack is refused
     before it touches data, and two first fills of different zones cannot collide in their shard
@@ -771,13 +771,14 @@ def claim_root_stack(
     for attempt in range(1, tries + 1):
         session = repo.writable_session("main")
         root = zarr.open_group(session.store, mode="a")
-        stored = root.attrs.get(STACK_ATTR)
-        assert_stack_matches(stored, stack, allow_mismatch=allow_mismatch, where=where)
-        if stored is not None:
+        assert_stack_matches(root.attrs, stack, allow_mismatch=allow_mismatch, where=where)
+        if STACK_ATTR in root.attrs:
             return
         root.attrs[STACK_ATTR] = dict(stack)
         try:
-            commit_with_rebase(session, f"record the store's inference stack: torch {stack.get('torch')}")
+            commit_with_rebase(
+                session, f"record the store's inference stack: {stack.get('model_version')}, torch {stack.get('torch')}"
+            )
             return
         except icechunk.RebaseFailedError:
             if attempt == tries:

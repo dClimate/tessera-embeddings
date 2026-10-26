@@ -37,6 +37,7 @@ import bisect
 import contextlib
 import dataclasses
 import datetime
+import hashlib
 import itertools
 import json
 import logging
@@ -82,14 +83,10 @@ from tessera_embeddings.inference.chunk_spec import (
 )
 from tessera_embeddings.storage import zone_grid
 from tessera_embeddings.storage.conventions import (
-    MODEL_ATTR,
     STACK_ATTR,
     assert_encoder_matches,
-    assert_model_matches,
     assert_stack_matches,
     build_convention_attrs,
-    staged_model,
-    staged_stack,
 )
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
 from tessera_embeddings.storage.global_store import create_layout_arrays, open_global_repo
@@ -127,6 +124,10 @@ logger = logging.getLogger(__name__)
 #: actual fix.
 STAGED_READ_CONFIG_KWARGS = {"retries": {"max_attempts": 10, "mode": "adaptive"}}
 _COVERAGE_SUFFIX = ".coverage.zarr"
+#: Where a staging run records the stack that computed it (:meth:`ZarrWriter._join_run`).
+_STACKS_DIR = "_stacks"
+#: ``(stacks_dir, digest)`` pairs this process has joined, so a run is joined once, not per tile.
+_JOINED: set[tuple[str, str]] = set()
 """Suffix of the coverage-only tile a refused chunk stages.
 
 Named once because two places must agree on it: the writer that creates such a tile, and the
@@ -483,7 +484,6 @@ def _fill_band_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — retur
         y0, y1 = max(tile.y_start, y0b), min(tile.y_stop, y1b)
         with timer.phase("read"):
             staged = _open_staged_tile(path)
-        staged_stack(staged.attrs, path, expected=payload["stack"])
         tiles += 1
         for var, arr in arrays.items():
             staged_arr = cast(zarr.Array, staged[var])
@@ -708,11 +708,6 @@ class StagedShardSource:
     owned: tuple[tuple[tuple[int, int], str], ...] = ()
     # The destination's (northing, easting) size, which cuts its last tiles short; None is whole tiles.
     extent: tuple[int, int] | None = None
-    # The probe tile's library stack, as `(key, value)` pairs; every tile must match it. Empty skips
-    # the check, for a run with nothing staged.
-    stack: tuple[tuple[str, str | None], ...] = ()
-    # The probe tile's model, held to every tile the same way.
-    model: tuple[tuple[str, str], ...] = ()
 
     def live_shards(self) -> list[tuple[int, int]]:
         """Every ``(row, col)`` this run is responsible for — staged AND skipped.
@@ -738,10 +733,6 @@ class StagedShardSource:
         sy, sx = shard
         path = f"{self.staging_base}/{self.run_id}/{chunk_label(sy, sx)}.zarr"
         group = _open_staged_tile(path)
-        if self.stack:
-            staged_stack(group.attrs, path, expected=dict(self.stack))
-        if self.model:
-            staged_model(group.attrs, path, expected=dict(self.model))
         expected_dtypes = dict(self.dtypes)
         blocks: dict[str, np.ndarray] = {}
         for var in self.variables:
@@ -1304,8 +1295,7 @@ class ZarrWriter:
         month_covered: Mapping[str, np.ndarray | None] | None = None,
         coverage: Mapping[str, Any] | None = None,
         *,
-        inference_stack: Mapping[str, str | None],
-        inference_model: Mapping[str, str],
+        stack: Mapping[str, str | None],
     ) -> str:
         """Write one chunk's embeddings to a staged intermediate (non-Icechunk) Zarr store.
 
@@ -1337,12 +1327,9 @@ class ZarrWriter:
                 embedded path returned its record in the actor's result and a resumed leg never
                 sees it. Written with ``staged_complete`` and therefore before ``.done``, so the
                 marker keeps vouching for a tile whose attributes are already set.
-            inference_stack: The PyTorch and CUDA versions that computed *embeddings*
-                (:data:`~tessera_embeddings.storage.conventions.STACK_ATTR`), from the process that
-                ran the model. Assembly refuses a tile whose stack differs from the store's.
-            inference_model: The model and checkpoint stem that computed *embeddings*
-                (:data:`~tessera_embeddings.storage.conventions.MODEL_ATTR`), from the same process.
-                Assembly refuses a tile whose model differs from the store root's.
+            stack: What computed *embeddings* (:data:`~tessera_embeddings.storage.conventions.STACK_ATTR`),
+                from the process that ran the model. A run's first write records it as the run's
+                (:meth:`_join_run`); a tile carries no record of its own.
 
         Returns:
             Path to the staged Zarr store.
@@ -1351,6 +1338,7 @@ class ZarrWriter:
         if embeddings.shape != expected_shape:
             msg = f"Expected shape {expected_shape}, got {embeddings.shape}"
             raise ValueError(msg)
+        self._join_run(run_id, stack)
 
         path = self._staging_path(run_id, chunk)
         # Sub-chunk staged files at inner-chunk size, full band (ADR-008 D2: the band axis is
@@ -1456,8 +1444,6 @@ class ZarrWriter:
             # tile carries is written". A reader gated on it can then take the record's absence as
             # "this fill did not measure one" rather than "it may not have landed yet".
             marker.attrs["coverage"] = dict(coverage)
-        marker.attrs[STACK_ATTR] = dict(inference_stack)
-        marker.attrs[MODEL_ATTR] = dict(inference_model)
         marker.attrs["staged_complete"] = True
         with done_fs.open(done_path, "wb") as f:
             f.write(b"")
@@ -1610,6 +1596,46 @@ class ZarrWriter:
         # Sorted: fs.ls order is backend-dependent (S3 lexicographic, local filesystems
         # arbitrary) and downstream probes take labels[0].
         return sorted(entry.rstrip("/").rsplit("/", 1)[-1] for entry in entries)
+
+    def _join_run(self, run_id: str, stack: Mapping[str, str | None]) -> None:
+        """Record *stack* as the run's, refusing a run that another stack has joined.
+
+        One run is computed by one stack, so a tile needs no record of its own: the run's stack is a
+        file in ``_stacks/``, named by its digest. A process on another stack finds a second name
+        there and stops before staging anything; two that start together both see both. Once per
+        process and run.
+        """
+        digest = hashlib.sha256(json.dumps(dict(stack), sort_keys=True).encode()).hexdigest()[:16]
+        stacks_dir = f"{self.staging_base}/{run_id}/{_STACKS_DIR}"
+        if (stacks_dir, digest) in _JOINED:
+            return
+        fs = _fs_for(stacks_dir)
+        fs.makedirs(stacks_dir, exist_ok=True)
+        with fs.open(f"{stacks_dir}/{digest}.json", "w") as f:
+            json.dump(dict(stack), f)
+        if others := [n for n in fs.ls(stacks_dir, detail=False, refresh=True) if not n.endswith(f"/{digest}.json")]:
+            raise ValueError(
+                f"Staging run {run_id} was already joined by another stack ({others}), and this process "
+                f"runs {dict(stack)}. One run is computed by one stack; run it on one."
+            )
+        _JOINED.add((stacks_dir, digest))
+
+    def run_stack(self, run_id: str) -> dict[str, str | None]:
+        """The one stack a staging run was computed by, refusing a run with none or with two."""
+        stacks_dir = f"{self.staging_base}/{run_id}/{_STACKS_DIR}"
+        fs = _fs_for(stacks_dir)
+        try:
+            names = fs.ls(stacks_dir, detail=False, refresh=True)
+        except FileNotFoundError:
+            names = []
+        if len(names) != 1:
+            raise ValueError(
+                f"Staging run {run_id} records {len(names)} stacks; assembly needs exactly one. None means "
+                "no worker staged it, and two mean two stacks computed it: re-infer it with a fresh "
+                "force_staging_restage token, or by deleting the staging prefix."
+            )
+        with fs.open(names[0]) as f:
+            return cast("dict[str, str | None]", json.load(f))
 
     def _list_staged(self, run_id: str) -> StagedListing:
         """Classify every artifact of a run from one staging LIST.
@@ -1998,11 +2024,12 @@ class ZarrWriter:
         )
         staged_labels = self.verify_staged_completeness(run_id, roi_live_chunks, log=_log)
         live_chunks = [c for c in roi_live_chunks if c.label in staged_labels]
-        # The run's library stack, from one tile; the band workers hold every other tile to it.
-        stack: dict[str, str | None] | None = None
-        if live_chunks:
-            probe_path = self._staging_path(run_id, live_chunks[0])
-            stack = staged_stack(_open_staged_tile(probe_path).attrs, probe_path)
+        # What computed the run, from its one record. With tiles staged, the store's model attrs come
+        # from it rather than from the caller, whose values only label an all-fill timestep.
+        stack = self.run_stack(run_id) if live_chunks else None
+        if stack is not None:
+            model_version = cast("ModelVersion", stack["model_version"])
+            checkpoint_id = stack["checkpoint_id"]
         # SKIP-MARKED CHUNKS ARE DROPPED HERE AND THEIR COVERAGE ARTIFACTS GO UNREAD — a DELIBERATE
         # asymmetry with the global path, recorded because it reads as an oversight otherwise.
         # Global assembly consumes each skipped chunk's `.coverage.zarr`, so its observation counts
@@ -2113,14 +2140,11 @@ class ZarrWriter:
             # families can share, and is skipped ENTIRELY for a legacy store with no `_manifest`.
             # Past both, the attrs write at the end of this method restamps `geoemb:model` for the
             # WHOLE store. Shared with the pre-flight so the two doors cannot disagree.
-            assert_encoder_matches(
-                cast("str | None", root.attrs.get("geoemb:model")),
-                model_version=model_version,
-                where=output_path,
-            )
             if stack is not None:
-                assert_stack_matches(
-                    root.attrs.get(STACK_ATTR), stack, allow_mismatch=allow_stack_mismatch, where=output_path
+                assert_stack_matches(root.attrs, stack, allow_mismatch=allow_stack_mismatch, where=output_path)
+            else:
+                assert_encoder_matches(
+                    cast("str | None", root.attrs.get("geoemb:model")), model_version=model_version, where=output_path
                 )
 
             assert_on_store_grid(
@@ -2217,7 +2241,6 @@ class ZarrWriter:
                         "variables": tuple(variables),
                         "tiles": tiles,
                         "clear": clear,
-                        "stack": stack,
                     }
                 )
         _log.info(
@@ -2338,7 +2361,6 @@ class ZarrWriter:
         update_name: str | None = None,
         time_index: int | None = None,
         allow_stack_mismatch: bool = False,
-        allow_model_mismatch: bool = False,
     ) -> str:
         """Assemble a run's staged tiles into one (zone, year) of the global store.
 
@@ -2428,9 +2450,6 @@ class ZarrWriter:
             allow_stack_mismatch: Write tiles computed on a different PyTorch or CUDA from the store's
                 (:func:`~tessera_embeddings.storage.shard_writer.claim_root_stack`). For a deliberate
                 experiment only: the store keeps its recorded stack.
-            allow_model_mismatch: Write tiles whose recorded model or checkpoint differs from the
-                store root's (:func:`~tessera_embeddings.storage.conventions.assert_model_matches`).
-                The deliberate override, for a store seeded with a custom ``model_url``.
 
         Returns:
             The commit snapshot id.
@@ -2541,8 +2560,7 @@ class ZarrWriter:
                         f"{dest_dt} — a raw-zarr write would silently C-cast; re-stage at the seeded dtype."
                     )
             probe_dtypes = tuple((v, str(cast(zarr.Array, staged_group[v]).dtype)) for v in variables)
-            stack: dict[str, str | None] | None = staged_stack(staged_group.attrs, probe_path)
-            model: dict[str, str] | None = staged_model(staged_group.attrs, probe_path)
+            stack: dict[str, str | None] | None = self.run_stack(run_id)
         else:
             # Nothing staged, so there is no tile to probe and the write is fill only. The
             # DESTINATION answers both questions the probe usually does: which variables to write
@@ -2550,7 +2568,7 @@ class ZarrWriter:
             # what dtype (the seeded one, which a fill cannot disagree with).
             variables = (*REQUIRED_VARS, *dest_optional)
             probe_dtypes = tuple((v, str(cast(zarr.Array, node[v]).dtype)) for v in variables)
-            stack = model = None
+            stack = None
 
         _log.info(
             "Assembling %d staged tiles into %s/%s year %d (index %d, vars %s, %d workers)",
@@ -2588,8 +2606,6 @@ class ZarrWriter:
             fill_values=fill_values,
             owned=tuple((parse_chunk_label(label), uri) for label, uri in sorted((pixels or {}).items())),
             extent=extent,
-            stack=tuple(sorted(stack.items())) if stack else (),
-            model=tuple(sorted(model.items())) if model else (),
         )
         telemetry: dict[str, Any] = {}
         # Captured before the write, so the registry part reports what THIS call published rather
@@ -2602,18 +2618,9 @@ class ZarrWriter:
         # caller gets it, and a run that staged everything itself, or publishes no part, reads nothing at all.
         if registry_root:
             embedded_records = self._top_up_embedded_records(run_id, registry_embedded, embedded_records)
-        # The store's model, from its root, against the model the tiles record. Every write into a
-        # store passes here, whoever called it, so this is the one guard; the shard source holds every
-        # other tile to the probe's model as it loads it.
-        if model is not None:
-            root_attrs = zarr.open_group(repo.readonly_session(branch="main").store, mode="r").attrs
-            assert_model_matches(root_attrs, model, allow_mismatch=allow_model_mismatch, where=store_path)
-        # Last before the write, so a run refused anywhere above never stamps a store it wrote nothing to.
+        # The run's one stack against the store root's, stamping it on the store's first write. Every
+        # write into a store passes here, whoever called it; nothing else checks what computed a tile.
         if stack is not None:
-            # A store's first stamp is permanent, so every tile is checked before it, not only as it is
-            # written. A stamped store needs no pass: a mixed run fails in the writer before it commits.
-            if STACK_ATTR not in zarr.open_group(repo.readonly_session(branch="main").store, mode="r").attrs:
-                check_staged_stacks(self.staging_base, run_id, labels, stack)
             claim_root_stack(repo, stack, allow_mismatch=allow_stack_mismatch, where=store_path)
         snapshot = write_year_shards(
             repo,
@@ -2839,27 +2846,6 @@ def read_staged_coverage(
             elif record is not None:
                 out[label] = record
     return out, unreadable
-
-
-def check_staged_stacks(
-    staging_base: str, run_id: str, labels: Iterable[str], expected: Mapping[str, str | None], *, workers: int = 32
-) -> None:
-    """Refuse unless every staged tile of the run was computed on the *expected* stack.
-
-    Run before a store's first write stamps its stack, because the stamp is permanent while the
-    shard writer checks each tile only as it writes it: a mixed run found there would already have
-    stamped the store with the probe tile's stack. Concurrent like :func:`read_staged_coverage`,
-    but strict, since a tile whose stack cannot be read cannot vouch for the stamp.
-    """
-    labels = list(labels)
-    base = f"{staging_base.rstrip('/')}/{run_id}"
-
-    def one(label: str) -> None:
-        path = f"{base}/{label}.zarr"
-        staged_stack(_open_staged_tile(path).attrs, path, expected=expected)
-
-    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(labels)))) as pool:
-        list(pool.map(one, labels))
 
 
 def summarise_optical_skips(

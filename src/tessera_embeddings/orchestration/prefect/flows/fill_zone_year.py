@@ -118,7 +118,8 @@ def _assert_seeded_model_matches(
     )
     assert_model_matches(
         root.attrs,
-        {"model_version": model_version, "checkpoint_id": build_checkpoint},
+        model_version,
+        build_checkpoint,
         allow_mismatch=allow_model_mismatch,
         where=f"global store {store_path}",
     )
@@ -398,8 +399,7 @@ def fill_zone_year_flow(
         # stating it keeps a retune of the default from silently unaligning the campaign.
         chunk_size=SHARD_PX,
         allow_s2_only=allow_s2_only,
-        allow_stack_mismatch=allow_stack_mismatch,
-        allow_model_mismatch=allow_model_mismatch,
+        allow_stack_mismatch=allow_stack_mismatch or allow_model_mismatch,
         actor_request_headroom=actor_request_headroom,
         # Omitted when unset so the inference default stands — keyed on None, not on truthiness,
         # because 0 is a documented mode here rather than an absent value.

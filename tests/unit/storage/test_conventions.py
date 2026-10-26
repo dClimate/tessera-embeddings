@@ -9,7 +9,7 @@ import pytest
 from tessera_embeddings.config.inference import encoder_url
 from tessera_embeddings.storage.conventions import (
     assert_encoder_matches,
-    assert_model_matches,
+    assert_stack_matches,
     build_convention_attrs,
     build_geoemb_root_attrs,
     tile_id_to_epsg,
@@ -471,29 +471,30 @@ def test_one_comparison_serves_every_reader_of_the_encoder_identity() -> None:
             assert_encoder_matches(published, model_version=wanted, where="s")
 
 
-_V11_TILE = {"model_version": "v1.1", "checkpoint_id": "tessera_v1_1_aws_encoder"}
+_V11 = {"model_version": "v1.1", "checkpoint_id": "tessera_v1_1_aws_encoder", "torch": "2.5.1+cu121", "cuda": "12.1"}
 
 
 @pytest.mark.parametrize(
-    ("root", "tile", "refused"),
+    ("root", "stack", "refused"),
     [
-        ({"geoemb:model": _V11_URL, "checkpoint_id": "tessera_v1_1_aws_encoder.pt"}, _V11_TILE, None),
-        ({"checkpoint_id": "tessera_v1_1_aws_encoder"}, _V11_TILE, None),
-        ({}, {"model_version": "v2-large", "checkpoint_id": "v2_student_large"}, "Refusing to append"),
+        ({"geoemb:model": _V11_URL, "checkpoint_id": "tessera_v1_1_aws_encoder.pt"}, _V11, None),
+        ({"inference_stack": _V11}, _V11, None),
+        ({}, {**_V11, "model_version": "v2-large", "checkpoint_id": "v2_student_large"}, "Refusing to append"),
         (
-            {"geoemb:model": _V11_URL, "checkpoint_id": "tessera_v1_1_aws_encoder.pt"},
-            {**_V11_TILE, "checkpoint_id": "tessera_v1_1_mpc_encoder"},
+            {"checkpoint_id": "tessera_v1_1_aws_encoder.pt"},
+            {**_V11, "checkpoint_id": "tessera_v1_1_mpc_encoder"},
             "checkpoint",
         ),
+        ({"inference_stack": {**_V11, "torch": "2.14.1+cu130"}}, _V11, "never mixes two stacks"),
     ],
 )
-def test_the_store_root_decides_the_model_a_write_may_carry(root, tile, refused) -> None:
+def test_the_store_root_decides_the_stack_a_write_may_carry(root, stack, refused) -> None:
     """Checkpoints compare as stems (a global root keeps the file name), and a root without
     ``geoemb:model`` reads as v1.1, so a v2 write into it is refused.
     """
     if refused is None:
-        assert_model_matches(root, tile, allow_mismatch=False, where="s")
+        assert_stack_matches(root, stack, allow_mismatch=False, where="s")
         return
     with pytest.raises(ValueError, match=refused):
-        assert_model_matches(root, tile, allow_mismatch=False, where="s")
-    assert_model_matches(root, tile, allow_mismatch=True, where="s")
+        assert_stack_matches(root, stack, allow_mismatch=False, where="s")
+    assert_stack_matches(root, stack, allow_mismatch=True, where="s")
