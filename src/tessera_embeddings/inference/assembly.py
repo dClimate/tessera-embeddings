@@ -82,10 +82,13 @@ from tessera_embeddings.inference.chunk_spec import (
 )
 from tessera_embeddings.storage import zone_grid
 from tessera_embeddings.storage.conventions import (
+    MODEL_ATTR,
     STACK_ATTR,
     assert_encoder_matches,
+    assert_model_matches,
     assert_stack_matches,
     build_convention_attrs,
+    staged_model,
     staged_stack,
 )
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
@@ -1298,6 +1301,7 @@ class ZarrWriter:
         coverage: Mapping[str, Any] | None = None,
         *,
         inference_stack: Mapping[str, str | None],
+        inference_model: Mapping[str, str],
     ) -> str:
         """Write one chunk's embeddings to a staged intermediate (non-Icechunk) Zarr store.
 
@@ -1332,6 +1336,9 @@ class ZarrWriter:
             inference_stack: The PyTorch and CUDA versions that computed *embeddings*
                 (:data:`~tessera_embeddings.storage.conventions.STACK_ATTR`), from the process that
                 ran the model. Assembly refuses a tile whose stack differs from the store's.
+            inference_model: The model and checkpoint stem that computed *embeddings*
+                (:data:`~tessera_embeddings.storage.conventions.MODEL_ATTR`), from the same process.
+                Assembly refuses a tile whose model differs from the store root's.
 
         Returns:
             Path to the staged Zarr store.
@@ -1446,6 +1453,7 @@ class ZarrWriter:
             # "this fill did not measure one" rather than "it may not have landed yet".
             marker.attrs["coverage"] = dict(coverage)
         marker.attrs[STACK_ATTR] = dict(inference_stack)
+        marker.attrs[MODEL_ATTR] = dict(inference_model)
         marker.attrs["staged_complete"] = True
         with done_fs.open(done_path, "wb") as f:
             f.write(b"")
@@ -2326,6 +2334,7 @@ class ZarrWriter:
         update_name: str | None = None,
         time_index: int | None = None,
         allow_stack_mismatch: bool = False,
+        allow_model_mismatch: bool = False,
     ) -> str:
         """Assemble a run's staged tiles into one (zone, year) of the global store.
 
@@ -2415,6 +2424,9 @@ class ZarrWriter:
             allow_stack_mismatch: Write tiles computed on a different PyTorch or CUDA from the store's
                 (:func:`~tessera_embeddings.storage.shard_writer.claim_root_stack`). For a deliberate
                 experiment only: the store keeps its recorded stack.
+            allow_model_mismatch: Write tiles whose recorded model or checkpoint differs from the
+                store root's (:func:`~tessera_embeddings.storage.conventions.assert_model_matches`).
+                The deliberate override, for a store seeded with a custom ``model_url``.
 
         Returns:
             The commit snapshot id.
@@ -2526,6 +2538,7 @@ class ZarrWriter:
                     )
             probe_dtypes = tuple((v, str(cast(zarr.Array, staged_group[v]).dtype)) for v in variables)
             stack: dict[str, str | None] | None = staged_stack(staged_group.attrs, probe_path)
+            model: dict[str, str] | None = staged_model(staged_group.attrs, probe_path)
         else:
             # Nothing staged, so there is no tile to probe and the write is fill only. The
             # DESTINATION answers both questions the probe usually does: which variables to write
@@ -2533,7 +2546,7 @@ class ZarrWriter:
             # what dtype (the seeded one, which a fill cannot disagree with).
             variables = (*REQUIRED_VARS, *dest_optional)
             probe_dtypes = tuple((v, str(cast(zarr.Array, node[v]).dtype)) for v in variables)
-            stack = None
+            stack = model = None
 
         _log.info(
             "Assembling %d staged tiles into %s/%s year %d (index %d, vars %s, %d workers)",
@@ -2584,6 +2597,12 @@ class ZarrWriter:
         # caller gets it, and a run that staged everything itself, or publishes no part, reads nothing at all.
         if registry_root:
             embedded_records = self._top_up_embedded_records(run_id, registry_embedded, embedded_records)
+        # The store's model, from its root, against the model the tiles record. Every write into a
+        # store passes here, whoever called it, so this is the one guard; one run never mixes two
+        # models, because the staging key holds the checkpoint.
+        if model is not None:
+            root_attrs = zarr.open_group(repo.readonly_session(branch="main").store, mode="r").attrs
+            assert_model_matches(root_attrs, model, allow_mismatch=allow_model_mismatch, where=store_path)
         # Last before the write, so a run refused anywhere above never stamps a store it wrote nothing to.
         if stack is not None:
             # A store's first stamp is permanent, so every tile is checked before it, not only as it is
