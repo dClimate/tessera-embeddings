@@ -146,7 +146,9 @@ def phase_fetch(source: str, profile: str, tiles: Path, n_tiles: int) -> None:
     scales, emb = root["scales"], root["embeddings"]
     _, ny, nx = scales.shape
     windows = [(y, x) for y in range(0, ny - TILE + 1, TILE) for x in range(0, nx - TILE + 1, TILE)]
-    valid = {(y, x): int(np.isfinite(scales[0, y : y + TILE : 64, x : x + TILE : 64]).sum()) for y, x in windows}
+    # Every pixel: a strided sample can miss a thin strip of valid pixels, and saves no reads, since the
+    # sample already touches every inner chunk of `scales`.
+    valid = {(y, x): int(np.isfinite(scales[0, y : y + TILE, x : x + TILE]).sum()) for y, x in windows}
     live = [w for w in windows if valid[w]]
     picks = [live[int(i)] for i in np.linspace(0, len(live) - 1, min(n_tiles, len(live)))]
     tiles.mkdir(parents=True, exist_ok=True)
@@ -157,7 +159,7 @@ def phase_fetch(source: str, profile: str, tiles: Path, n_tiles: int) -> None:
     for i, (y, x) in enumerate(picks):
         np.save(tiles / f"emb_{i:03d}.npy", V.read_window(emb, 0, slice(y, y + TILE), slice(x, x + TILE)))
         np.save(tiles / f"scales_{i:03d}.npy", np.asarray(scales[0, y : y + TILE, x : x + TILE]))
-        logger.info("fetched tile %d at (%d, %d), %d%% valid", i, y, x, 100 * valid[(y, x)] // (TILE // 64) ** 2)
+        logger.info("fetched tile %d at (%d, %d), %d%% valid", i, y, x, 100 * valid[(y, x)] // TILE**2)
 
 
 # ── build ────────────────────────────────────────────────────────────────────
