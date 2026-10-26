@@ -94,10 +94,10 @@ meaning each:
   `store_model_version`, and the checkpoint, worker image, staging run-id prefix and inference config
   all follow from it. The campaign flows take no model parameter. A single zone fill may name
   one, and is refused if it disagrees with the store unless it sets `allow_model_mismatch`.
-- **The guard is in the write, not the callers.** Each staged tile records its model and checkpoint,
-  and the global write path refuses tiles that disagree with the store root, whoever called it
-  (`conventions.assert_model_matches`). Reading the model at the flows only chooses the image and
-  checkpoint before Ray starts.
+- **The guard is in the write, not the callers.** A staging run records the stack that computed it,
+  model and checkpoint included, and every write into a store compares that record with the root
+  ([One stack per run, one stack per store](../README.md)). Reading the model at the flows only
+  chooses the image and checkpoint before Ray starts.
 - **Defaults** exist only at those entry points and on the workers that are handed a config: the
   dataset, the sampler, assembly and zone seeding. The functions that name a checkpoint or write
   provenance (`checkpoint_filename`, `band_stats`, `expected_model_url`) require the model.
