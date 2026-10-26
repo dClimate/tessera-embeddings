@@ -118,7 +118,7 @@ here than anywhere else in the archive.
 The page size is `STACProvider.max_page_size` (the `limit` per page request), defaulting to 250
 and set to 100 for Earth Search. It applies only to providers queried through `client.search()`,
 which in production means Earth Search; the OPERA `cmr-asf` path queries the native CMR Granule
-API instead — see [ADR 009](../context_docs/decisions/009-native-cmr-granule-query.md).
+API instead — see [ADR 009](../../context_docs/decisions/009-native-cmr-granule-query.md).
 
 **Why 100 for Earth Search, and what to watch.** Not throughput but the cap: 250 items of
 `sentinel-2-l2a` is always over it. A hundred averages 4.6 MB, yet the largest page ever served
@@ -189,7 +189,7 @@ It does change the order items are *walked* in — one walk returns the window n
 worklist returns window by window in date order — which is safe only because `query_stac_items`
 re-sorts with `solar_day_sort_key`, making the final sequence a function of the items rather than
 of the order the walk produced (see
-[the fusion order](../src/tessera_embeddings/ingest/README.md#the-fusion-order-decides-which-source-wins-a-pixel)
+[the fusion order](../../src/tessera_embeddings/ingest/README.md#the-fusion-order-decides-which-source-wins-a-pixel)
 for what that sort decides).
 
 The cap, the measured margins, the sampling behind the heavy band and the levers that are closed

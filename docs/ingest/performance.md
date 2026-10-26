@@ -116,7 +116,7 @@ decoupled.
 The two flows keep task count bounded via different mechanisms — per-date iteration for S2,
 time-windowed batching for S1 — described in the sections below. The same scheduler-RAM
 discipline reappears in inference assembly; see
-[`inference/README.md`](../src/tessera_embeddings/inference/README.md#1-deciding-which-tiles-to-run) for the
+[`inference/README.md`](../../src/tessera_embeddings/inference/README.md#1-deciding-which-tiles-to-run) for the
 ChunkSpec-vs-sub-chunk decoupling that makes assembly survive on the same budget.
 
 ### Chunk alignment
@@ -138,7 +138,7 @@ than each choosing a sensible one.
 
 Inference is the exception, and deliberately so: it reads 2048×2048 sub-tiles out of these
 4096×4096 chunks through `zarr.Array.oindex`, which needs no alignment — see
-[`inference/README.md`](../src/tessera_embeddings/inference/README.md).
+[`inference/README.md`](../../src/tessera_embeddings/inference/README.md).
 
 ### Writing a date: one session, one commit
 
@@ -216,7 +216,7 @@ multiply through, and the per-date overhead of one Python loop iteration and one
 negligible beside the Dask compute for a large spatial ROI.
 
 The grouping key must match the loader's, per
-[ingest-solar-days.md](ingest-solar-days.md#the-offset-arithmetic-must-match-the-loaders).
+[solar-days.md](solar-days.md#the-offset-arithmetic-must-match-the-loaders).
 Grouping here by UTC calendar date lets the two disagree, and a group we believe is one day then loads as
 TWO time slices against a cloud mask reduced to one:
 
@@ -246,7 +246,7 @@ Batched approach (batch_days=30, ingest_s1_roi_sar only):
 A batch boundary is **not** a credential checkpoint, and treating it as one is unsafe: the STS
 credential's roughly one-hour life is unrelated to how long a batch takes, so a batch that outruns
 it cannot renew at its own boundary. Renewal is owned by a timer — see
-[Renewal runs on a timer](ingest-authentication.md#renewal-runs-on-a-timer-not-on-the-work-loop).
+[Renewal runs on a timer](authentication.md#renewal-runs-on-a-timer-not-on-the-work-loop).
 
 `batch_days` is a parameter on `ingest_s1_roi_sar` and is absent from the S2 flow. The formula
 in the background section above estimates how many tasks a given window width produces; the
@@ -260,7 +260,7 @@ day comes back from two batches and `s1_roi.py` gives it up once rather than twi
 One catalogue query is **not** per batch: the burst census that decides which of two overlapping
 bursts supplies a pixel covers the whole window, once per orbit leg, and runs alongside the first
 batch's query. So `batch_days` changes graph size and query count, never which burst wins — see
-[Which burst wins an overlap](ingest-radar.md#which-burst-wins-an-overlap).
+[Which burst wins an overlap](radar.md#which-burst-wins-an-overlap).
 
 ### Cropping to live windows (unconditional)
 
@@ -359,7 +359,7 @@ the price, the per-zone table and the cap sweep are in
 - **Writes** go through `storage.write_day_windows`, one commit per date — see
   *Writing a date: one session, one commit* above.
 - **Reads retry, per date**, and a failed date says which date and which ROI. See
-  [ingest-error-handling.md](ingest-error-handling.md#where-the-retry-sits-and-how-a-failed-date-is-attributed).
+  [error-handling.md](error-handling.md#where-the-retry-sits-and-how-a-failed-date-is-attributed).
 - **Each date narrows further, to the land its own imagery reaches**, via `windows_for_date`.
   See *Narrowing a date's windows, and skipping dates that reach none*.
 
@@ -616,7 +616,7 @@ or starting Fargate tasks, so a flow could exit early when nothing is new.
 
 An overlapping date range is no longer a correctness problem:
 each ROI ingest begins the day after the newest date its store holds, and a window wholly below
-that line returns a skip without querying (see [Where a resumed run starts](ingest-error-handling.md#where-a-resumed-run-starts)). What the pre-check
+that line returns a skip without querying (see [Where a resumed run starts](error-handling.md#where-a-resumed-run-starts)). What the pre-check
 would still buy is avoiding the cluster, since the skip is decided inside the ingest and the
 caller reaches it only after provisioning one. Tracked in
 [issue #47](https://github.com/dClimate/tessera-embeddings/issues/47); when wiring it, do not

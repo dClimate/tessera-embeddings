@@ -10,7 +10,7 @@ It is for anyone setting up a radar ingest, or diagnosing an `AccessDenied`, `Ex
 instance-metadata (IMDS) error during one. It covers setup, the S3 direct access path the pipeline
 uses and the credential-lifetime rules around it, the identity used for the project's own bucket,
 how asset URLs are rewritten to S3, and the legacy signed-URL fallback. The rest of the radar
-path is in [ingest-radar.md](ingest-radar.md).
+path is in [radar.md](radar.md).
 
 ## Setup
 
@@ -113,7 +113,7 @@ fail with `ExpiredToken` on a bucket the role can always read — a lifetime pro
 permissions problem's error message. Two consequences: each block read pays its own store open
 and metadata round trip where a credential resolved once at graph build paid one for the whole
 array, and the returned array is cloudpickle-only because the closure is nested. Both are
-measured in [ADR 022](../context_docs/decisions/022-resolve-the-roi-mask-credential-at-read-time.md),
+measured in [ADR 022](../../context_docs/decisions/022-resolve-the-roi-mask-credential-at-read-time.md),
 and both argue against handing this array to a plain-pickle boundary or reading a zone grid you
 do not need.
 

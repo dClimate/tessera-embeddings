@@ -23,17 +23,9 @@ what was tried and abandoned — you want [`context_docs/`](../context_docs/) in
 | find out what the global dataset covers, and how well, without opening it | [`registry.md`](registry.md) |
 | see what other people have built with TESSERA embeddings | [`example-uses-of-tessera.md`](example-uses-of-tessera.md) |
 | choose between one area and the whole globe | [`single-vs-global.md`](single-vs-global.md) |
-| work out why an ingest failed, or what it does about a refused query or a corrupt file | [`ingest-error-handling.md`](ingest-error-handling.md) |
-| work out what is limiting an ingest, and which levers to reach for | [`ingest-performance.md`](ingest-performance.md) |
-| make or check the zone masks the global campaign ingests through | [`ingest-zone-rois.md`](ingest-zone-rois.md) |
-| work out which day an image is filed under, or why a day near the antimeridian came out short | [`ingest-solar-days.md`](ingest-solar-days.md) |
-| work out why Earth Search refuses a query, and how ingest sizes its requests around that | [`ingest-earth-search-response-cap.md`](ingest-earth-search-response-cap.md) |
-| know how radar is found and read, and which burst supplies a radar pixel | [`ingest-radar.md`](ingest-radar.md) |
-| know which copy of a reprocessed Sentinel-2 image an ingest reads | [`ingest-duplicate-copies.md`](ingest-duplicate-copies.md) |
-| know when and how the Sentinel-2 reflectance offset is removed | [`ingest-baseline-correction.md`](ingest-baseline-correction.md) |
-| set up Earthdata Login for radar, or work out a credential error during an ingest | [`ingest-authentication.md`](ingest-authentication.md) |
+| work out why an ingest failed or is slow, or how it handles solar days, radar, Sentinel-2 copies and offsets, credentials or zone masks | [`ingest/`](ingest/README.md) |
 | work out why the GPU is idle during inference, and which levers to reach for | [`inference-performance.md`](inference-performance.md) |
-| read how a pipeline stage works internally | its package README, e.g. [`ingest/README.md`](../src/tessera_embeddings/ingest/README.md) |
+| read how a pipeline stage works internally | its package README, e.g. [`src/tessera_embeddings/ingest/README.md`](../src/tessera_embeddings/ingest/README.md) |
 | understand *why* a design is the way it is | [`../context_docs/`](../context_docs/) |
 | understand what the code *is* | the [top-level README](../README.md) |
 
@@ -57,7 +49,7 @@ project before.
 Measurements do not belong in this directory. If you find a throughput figure, a cost, or a
 benchmark here, it is either a short summary with a link, or it has drifted from
 `context_docs/` and should be replaced by one.
-[`ingest-performance.md`](ingest-performance.md) is the exception that proves the rule: it
+[`ingest/performance.md`](ingest/performance.md) is the exception that proves the rule: it
 carries a lot of figures, because a lever is useless without its price, and every one of them
 cites the derivation in
 [`campaign-ingest-measurements.md`](../context_docs/ingest/campaign-ingest-measurements.md)

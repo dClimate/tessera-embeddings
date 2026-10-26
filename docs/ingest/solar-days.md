@@ -114,7 +114,7 @@ chunk's while the loader would have grouped it into this one, dropping it from t
 `solar_day_offset_seconds` is the single definition, and it is why `solar_grouping_longitude`
 prefers the geobox centroid over a bbox midpoint, why `group_items_by_date` takes a
 `mid_longitude`, and why the pre-sort uses the same key: the sort carries the
-[fusion order](../src/tessera_embeddings/ingest/README.md#the-fusion-order-decides-which-source-wins-a-pixel)
+[fusion order](../../src/tessera_embeddings/ingest/README.md#the-fusion-order-decides-which-source-wins-a-pixel)
 (clearest tile FIRST within a group), so sorting on a different notion of "day" than the grouping
 would silently let a cloudier pixel win. Central longitudes image far from UTC midnight and are
 unaffected, which kept it latent.

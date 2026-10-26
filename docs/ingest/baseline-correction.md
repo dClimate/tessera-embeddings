@@ -10,9 +10,9 @@ This document is for anyone changing `boa_offset.py`, `asset_locations.py`, `ite
 the loader in `stac.py`, or checking why a Sentinel-2 pixel has the value it does. It covers how
 the decision is made per source and applied inside the read, the arithmetic, and the limits that
 are recorded rather than fixed. Which of several copies of one image gets read is a neighbouring
-subject, in [ingest-duplicate-copies.md](ingest-duplicate-copies.md). The reasoning and
-measurements are in [ADR 020](../context_docs/decisions/020-boa-offset-applies-to-every-valid-dn.md)
-and [ADR 021](../context_docs/decisions/021-correct-the-boa-offset-per-image.md).
+subject, in [duplicate-copies.md](duplicate-copies.md). The reasoning and
+measurements are in [ADR 020](../../context_docs/decisions/020-boa-offset-applies-to-every-valid-dn.md)
+and [ADR 021](../../context_docs/decisions/021-correct-the-boa-offset-per-image.md).
 
 ## Who served the pixels decides
 
@@ -29,7 +29,7 @@ that asset lives (`boa_offset.source_decision`). Three properties of that decisi
   that is wholly harmonised where it matters. `scl` is excluded even though it *is* read: it is
   categorical and never corrected, so its producer cannot make the reflectance ambiguous. This
   is a different asset set from the one locality is judged over — see the
-  [duplicate selector](ingest-duplicate-copies.md#two-properties-held-by-tests), which uses the
+  [duplicate selector](duplicate-copies.md#two-properties-held-by-tests), which uses the
   full read set including `scl`.
 - **Decided per SOURCE, and applied as each image is read.** `odc.stac.load` fuses a solar day
   into one time slice, so a correction applied to its OUTPUT hits every tile at once, and a day
@@ -38,7 +38,7 @@ that asset lives (`boa_offset.source_decision`). Three properties of that decisi
   inside the read (`stac._BoaCorrectingReader`) before anything is resampled together, so no pixel
   is both corrected and uncorrected. It is purely additive, the amount being a constant: days the
   pipeline loaded before are bit-identical and only previously-refused days change. See
-  [ADR 021](../context_docs/decisions/021-correct-the-boa-offset-per-image.md) §3.
+  [ADR 021](../../context_docs/decisions/021-correct-the-boa-offset-per-image.md) §3.
 - **Thresholded on the item's own declared baseline, and an unreadable one refuses.** An absent
   or malformed `s2:processing_baseline` parses as nothing rather than 0: read as zero it falls
   under the threshold and exempts pixels that may carry the offset, while correcting it takes 1000
@@ -143,5 +143,5 @@ ten configured bands are natively 20 m on a 10 m grid. A pixel whose kernel span
 boundary is floored where Element 84, flooring each source first, would not have been. Fixing it
 means taking over the read-and-warp step and would rewrite pixels in every existing store, so it
 is owed separately — measured in
-[ADR 021](../context_docs/decisions/021-correct-the-boa-offset-per-image.md) §6, alongside
-[ADR 020](../context_docs/decisions/020-boa-offset-applies-to-every-valid-dn.md).
+[ADR 021](../../context_docs/decisions/021-correct-the-boa-offset-per-image.md) §6, alongside
+[ADR 020](../../context_docs/decisions/020-boa-offset-applies-to-every-valid-dn.md).

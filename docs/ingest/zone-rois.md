@@ -10,7 +10,7 @@ This document is for anyone running the global campaign, pre-generating zone mas
 or changing `land_mask.export_zone_roi` or `validate_zone_roi`. It covers how a zone's mask is
 made and where it sits in a zone-year's ingest, and the `export-zone-rois` flow that builds and
 checks many zones' masks ahead of time. How a single-area ROI is generated, read and applied is in
-the [ingest README](../src/tessera_embeddings/ingest/README.md#roi-workflow).
+the [ingest README](../../src/tessera_embeddings/ingest/README.md#roi-workflow).
 
 ## How a zone's mask is made, and where it is used
 
@@ -42,7 +42,7 @@ The S2 `min_valid_coverage` bar is lowered far below the ROI default (5 % → ~0
 solar-day's swath covers only a sliver of a whole 6° zone, so a high bar would drop nearly
 every date. Mosaics are per `(zone, year)` and deleted after the fill is tagged — they are
 re-derivable inputs at ~TB scale
-([ADR 011](../context_docs/decisions/011-campaign-zone-ingestion.md)). Zones are named by UTM common name (`33N`/`07S`),
+([ADR 011](../../context_docs/decisions/011-campaign-zone-ingestion.md)). Zones are named by UTM common name (`33N`/`07S`),
 not EPSG (see `storage/zone_grid.canonicalize_zone`).
 
 ## Pre-generating the zone masks: `export-zone-rois`

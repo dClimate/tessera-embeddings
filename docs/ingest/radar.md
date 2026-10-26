@@ -9,8 +9,8 @@ to read. And amplitude is converted to decibels before it is stored.
 This document is for anyone changing `opera_query.py`, `s1_roi.py` or `transforms.py`, or asking
 why a radar pixel came from the burst it did, or why a zone has no radar at all. Two neighbouring
 subjects have their own documents: the credentials for ASF's bucket are in
-[ingest-authentication.md](ingest-authentication.md), and how ten burst timestamps become one
-day's slice is in [ingest-solar-days.md](ingest-solar-days.md#fusing-operas-per-burst-timestamps).
+[authentication.md](authentication.md), and how ten burst timestamps become one
+day's slice is in [solar-days.md](solar-days.md#fusing-operas-per-burst-timestamps).
 
 ## Native granule query (orbit filtering + item construction)
 
@@ -40,7 +40,7 @@ pipeline, with `title`, `time_start` and `polygons` supplying id, datetime and g
 also names the burst (`opera:burst_id`, `sat:relative_orbit`, `opera:subswath` on the item), and
 `time_start` is kept in `properties["datetime"]` for solar-day normalisation to read.
 Pagination uses the `CMR-Search-After` header, which pages cleanly at 2000. See
-[ADR 009](../context_docs/decisions/009-native-cmr-granule-query.md).
+[ADR 009](../../context_docs/decisions/009-native-cmr-granule-query.md).
 
 ## Polarisation filtered server-side
 
@@ -78,7 +78,7 @@ that writes nothing and reports success.
 
 Bursts of one solar day overlap, and the loader keeps the first valid one, so their order decides
 which supplies a pixel — radar's half of
-[the fusion order](../src/tessera_embeddings/ingest/README.md#the-fusion-order-decides-which-source-wins-a-pixel).
+[the fusion order](../../src/tessera_embeddings/ingest/README.md#the-fusion-order-decides-which-source-wins-a-pixel).
 Inside one store (each orbit direction has its own) the overlaps are adjacent bursts and
 sub-swaths of one pass, which share a look geometry, and at high latitude two adjacent tracks on
 the same day, which do not:
@@ -106,7 +106,7 @@ The counts come from `burst_acquisitions`, one CMR query per orbit leg over the 
 60 times smaller than the JSON the batch queries read — and counts distinct acquisitions, since
 a reprocessed acquisition is republished under a new production time. One orbit of a zone-year at
 35N took about 50 s; it starts alongside the first batch's query, so most of it overlaps.
-[ADR 033](../context_docs/decisions/033-radar-overlaps-go-to-the-most-acquired-burst.md) has
+[ADR 033](../../context_docs/decisions/033-radar-overlaps-go-to-the-most-acquired-burst.md) has
 the measurements and what was left out, such as per-pixel layover and shadow masks.
 
 ## UTM CRS derivation

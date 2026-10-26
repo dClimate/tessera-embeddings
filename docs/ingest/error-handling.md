@@ -216,7 +216,7 @@ query. `StacApiIO`'s own default `max_retries=5` passes a bare int to urllib3, w
 
 **Why 502 sits outside it.** An Earth Search page refusal then arrives unretried, and the
 date-window re-cut described in
-[ingest-earth-search-response-cap.md](ingest-earth-search-response-cap.md#refusals-deep-in-a-walk-and-the-two-levers-against-them)
+[earth-search-response-cap.md](earth-search-response-cap.md#refusals-deep-in-a-walk-and-the-two-levers-against-them)
 starts immediately rather than after the ladder's backoff; a transient 502 is absorbed by the
 attempt budget owning the leg. The CMR Granule query keeps its own ladder
 (`opera_query._CMR_RETRY`), 502 included, because nothing has measured a response-size cap there.
@@ -327,7 +327,7 @@ path does differently because it has no second copy to fall back on.
 *[Provider system failure](#the-five-classes-of-failure): absorbs the transient ones before they
 reach a classifier.*
 
-`configure_gdal_environment()` (in [`config/environment.py`](../src/tessera_embeddings/config/environment.py)) must be
+`configure_gdal_environment()` (in [`config/environment.py`](../../src/tessera_embeddings/config/environment.py)) must be
 called before importing `rasterio` or `odc.stac`. It sets GDAL config options for network
 resilience (retry counts, timeouts, connection pooling) that affect all subsequent COG reads.
 
@@ -630,7 +630,7 @@ apart anyway.
 
 What the store does carry is `assessed_window`, the date range a leg examined in full, so an
 empty month inside it reads as "we looked and there was nothing" rather than "no run got here".
-See [Recording the window an ingest examined](../src/tessera_embeddings/ingest/README.md#recording-the-window-an-ingest-examined).
+See [Recording the window an ingest examined](../../src/tessera_embeddings/ingest/README.md#recording-the-window-an-ingest-examined).
 
 A lost day still produces a `DATA LOSS` line and an end-of-leg summary. What it does not produce
 is a record anything later reads.

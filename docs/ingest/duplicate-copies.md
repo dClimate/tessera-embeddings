@@ -11,7 +11,7 @@ would both be read, and one unreadable copy would fail the whole date with nothi
 This document is for anyone changing `duplicates.py`, or asking why a tile-date was read from the
 copy it was, or why a date survived a read failure. The offset correction that several of the
 ranking terms below protect is its own subject, in
-[ingest-baseline-correction.md](ingest-baseline-correction.md).
+[baseline-correction.md](baseline-correction.md).
 
 ## Which image a copy is of
 
@@ -39,17 +39,17 @@ A copy whose pass or datastrip cannot be read is kept as an
 image of its own, with no spares. The two possible mistakes are not alike. Keeping a copy that was in
 fact a duplicate costs a second read and a missing fallback rung, and its pixels are still right
 because the offset is corrected per image
-([ADR 021](../context_docs/decisions/021-correct-the-boa-offset-per-image.md)). Merging two
+([ADR 021](../../context_docs/decisions/021-correct-the-boa-offset-per-image.md)). Merging two
 different images loses ground for the day, silently. So under doubt the cheap mistake is made, and the run logs how many copies it kept
 that way. Where a reprocessing omits one of a pass's datastrips, the older copy of that datastrip is
 kept beside the newer ones for the same reason
-([ADR 029](../context_docs/decisions/029-an-acquisition-is-one-datastrip-of-one-pass.md)). The
+([ADR 029](../../context_docs/decisions/029-an-acquisition-is-one-datastrip-of-one-pass.md)). The
 census behind these choices is in
-[`context_docs/ingest/split-datastrips.md`](../context_docs/ingest/split-datastrips.md).
+[`context_docs/ingest/split-datastrips.md`](../../context_docs/ingest/split-datastrips.md).
 
 The copies it rejects are not discarded. They become the **fallback ladder**: if the chosen
 copy's object will not read, the
-[recovery](ingest-error-handling.md#when-a-source-object-will-not-read) steps down to the next
+[recovery](error-handling.md#when-a-source-object-will-not-read) steps down to the next
 rung rather than losing the date. That is why several terms below rank for "can this copy be
 processed at all" ahead of "is this copy the best", and it is described in full under
 [The fallback ladder](#the-fallback-ladder).
@@ -88,7 +88,7 @@ In full, in that order:
    each source is decided on its own bucket and corrected band by band. Inert below the threshold.
 3. **Whether the baseline is readable**, for producers whose correction depends on it, unknown
    sorting last. An unreadable baseline refuses the whole date, for the reason given under
-   [the baseline correction](ingest-baseline-correction.md#who-served-the-pixels-decides), so an older reprocessing that can be corrected beats a newer one
+   [the baseline correction](baseline-correction.md#who-served-the-pixels-decides), so an older reprocessing that can be corrected beats a newer one
    that cannot be processed — and it outranks every term below because the ladder recovers from a
    read error but not from a refusal. Already-harmonised copies are exempt.
 4. **Processing baseline, descending.** Ordered by value rather than "is it best", so every rung

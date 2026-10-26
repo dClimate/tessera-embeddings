@@ -21,26 +21,26 @@ into Icechunk/Zarr stores. Used by the Tessera ingestion flows (`ingest_s1_roi_s
 
 - [Overview](#overview)
 - [Module map](#module-map)
-- [ROI Workflow](#roi-workflow) · zone masks: [ingest-zone-rois.md](../../../docs/ingest-zone-rois.md)
+- [ROI Workflow](#roi-workflow) · zone masks: [docs/ingest/zone-rois.md](../../../docs/ingest/zone-rois.md)
 - [Basic Ingestion Process](#basic-ingestion-process)
 - [Detailed Ingestion Process](#detailed-ingestion-process)
   - [STAC query strategy](#stac-query-strategy) and [the fusion order](#the-fusion-order-decides-which-source-wins-a-pixel)
-  - [Radar: OPERA RTC-S1 through CMR](#radar-opera-rtc-s1-through-cmr) · [ingest-radar.md](../../../docs/ingest-radar.md)
-  - [Which day an image belongs to](#which-day-an-image-belongs-to-solar_dayspy) · [ingest-solar-days.md](../../../docs/ingest-solar-days.md)
-  - [Sizing requests to Earth Search's response cap](#sizing-requests-to-earth-searchs-response-cap) · [ingest-earth-search-response-cap.md](../../../docs/ingest-earth-search-response-cap.md)
+  - [Radar: OPERA RTC-S1 through CMR](#radar-opera-rtc-s1-through-cmr) · [docs/ingest/radar.md](../../../docs/ingest/radar.md)
+  - [Which day an image belongs to](#which-day-an-image-belongs-to-solar_dayspy) · [docs/ingest/solar-days.md](../../../docs/ingest/solar-days.md)
+  - [Sizing requests to Earth Search's response cap](#sizing-requests-to-earth-searchs-response-cap) · [docs/ingest/earth-search-response-cap.md](../../../docs/ingest/earth-search-response-cap.md)
   - [Date deduplication before loading](#date-deduplication-before-loading)
-  - [Choosing between duplicate copies of a tile-date](#choosing-between-duplicate-copies-of-a-tile-date) · [ingest-duplicate-copies.md](../../../docs/ingest-duplicate-copies.md)
+  - [Choosing between duplicate copies of a tile-date](#choosing-between-duplicate-copies-of-a-tile-date) · [docs/ingest/duplicate-copies.md](../../../docs/ingest/duplicate-copies.md)
   - [Data transformations](#data-transformations)
-  - [Sentinel-2 baseline correction](#sentinel-2-baseline-correction-applied-during-the-read) · [ingest-baseline-correction.md](../../../docs/ingest-baseline-correction.md)
+  - [Sentinel-2 baseline correction](#sentinel-2-baseline-correction-applied-during-the-read) · [docs/ingest/baseline-correction.md](../../../docs/ingest/baseline-correction.md)
   - [Recording the window an ingest examined](#recording-the-window-an-ingest-examined)
-- [Authentication (EDL / OPERA data)](#authentication-edl--opera-data) · [ingest-authentication.md](../../../docs/ingest-authentication.md)
-- [Error handling](#error-handling) · [ingest-error-handling.md](../../../docs/ingest-error-handling.md)
-- [Performance](#performance) · [ingest-performance.md](../../../docs/ingest-performance.md)
+- [Authentication (EDL / OPERA data)](#authentication-edl--opera-data) · [docs/ingest/authentication.md](../../../docs/ingest/authentication.md)
+- [Error handling](#error-handling) · [docs/ingest/error-handling.md](../../../docs/ingest/error-handling.md)
+- [Performance](#performance) · [docs/ingest/performance.md](../../../docs/ingest/performance.md)
 - [Accessing the Dask Dashboard](#accessing-the-dask-dashboard)
 
 Read the overview below; the rest of this file is a map. Every subject with machinery of its own
 is summarised here in a paragraph and explained in a standalone document under
-[`docs/`](../../../docs/README.md). The rationale behind these choices — what was measured, and
+[`docs/ingest/`](../../../docs/ingest/README.md). The rationale behind these choices — what was measured, and
 what was tried and abandoned — is in [`context_docs/ingest/`](../../../context_docs/ingest/).
 
 ---
@@ -95,8 +95,8 @@ else exists because catalogues rate-limit and refuse, granules get reprocessed a
 objects fail to read while reporting success, credentials expire mid-run, and a task graph over a
 whole zone-year exhausts a scheduler's memory before reading a byte. This README follows the
 happy path and links each of those subjects to its own document; the failure modes are
-[ingest-error-handling.md](../../../docs/ingest-error-handling.md) and the scheduler's limits
-[ingest-performance.md](../../../docs/ingest-performance.md).
+[docs/ingest/error-handling.md](../../../docs/ingest/error-handling.md) and the scheduler's limits
+[docs/ingest/performance.md](../../../docs/ingest/performance.md).
 
 ---
 ## Module map
@@ -105,24 +105,24 @@ happy path and links each of those subjects to its own document; the failure mod
 |---|---|
 | `s2_roi.py` | The Sentinel-2 ingest: queries month by month, keeps one copy of each image, then loads and writes one solar day at a time. |
 | `s1_roi.py` | The OPERA radar ingest: walks the window in `batch_days` batches, builds the burst census once per orbit leg, and renews ASF credentials on a timer. |
-| `stac.py` | STAC querying and loading through `odc.stac.load` — providers, the date-window worklist that keeps Earth Search queries under its response cap, date filtering, and the load-time machinery that applies the Sentinel-2 reflectance offset. [§ Earth Search's response cap](../../../docs/ingest-earth-search-response-cap.md), [§ Sentinel-2 baseline correction](../../../docs/ingest-baseline-correction.md) |
-| `opera_query.py` | OPERA RTC-S1 queries: bounding boxes, items built from CMR's native Granule Search with orbit direction filtered server-side, UTM EPSG derivation, asset preparation, and the burst census and sort that decide which burst wins an overlap. [§ Radar ingest](../../../docs/ingest-radar.md) |
-| `solar_days.py` | The one place the solar offset is applied: stamps each item with noon UTC of its solar day, and splits a window into chunks that own solar days and query UTC dates. [§ Solar days](../../../docs/ingest-solar-days.md) |
-| `boa_offset.py` | The one place the reflectance-offset question is answered. Asked per ASSET, so an item whose bands come from two producers is corrected band by band rather than refused. [§ Sentinel-2 baseline correction](../../../docs/ingest-baseline-correction.md) |
+| `stac.py` | STAC querying and loading through `odc.stac.load` — providers, the date-window worklist that keeps Earth Search queries under its response cap, date filtering, and the load-time machinery that applies the Sentinel-2 reflectance offset. [§ Earth Search's response cap](../../../docs/ingest/earth-search-response-cap.md), [§ Sentinel-2 baseline correction](../../../docs/ingest/baseline-correction.md) |
+| `opera_query.py` | OPERA RTC-S1 queries: bounding boxes, items built from CMR's native Granule Search with orbit direction filtered server-side, UTM EPSG derivation, asset preparation, and the burst census and sort that decide which burst wins an overlap. [§ Radar ingest](../../../docs/ingest/radar.md) |
+| `solar_days.py` | The one place the solar offset is applied: stamps each item with noon UTC of its solar day, and splits a window into chunks that own solar days and query UTC dates. [§ Solar days](../../../docs/ingest/solar-days.md) |
+| `boa_offset.py` | The one place the reflectance-offset question is answered. Asked per ASSET, so an item whose bands come from two producers is corrected band by band rather than refused. [§ Sentinel-2 baseline correction](../../../docs/ingest/baseline-correction.md) |
 | `item_baselines.py` | The one reader of `s2:processing_baseline`. Reports integer hundredths (`04.00` -> `400`) and `None` for every kind of unreadable. |
 | `asset_locations.py` | Where an item's assets live, keeping two questions apart: whether the read is cheap (the bucket's REGION) and whether the offset is already removed (the PRODUCER). `AssetSources` reports the keys it could not resolve instead of dropping them. |
-| `duplicates.py` | Keeps one copy of each image of a tile-date — the catalogue lists an image again whenever it is reprocessed — and every image. Rejected copies are kept as a fallback. [§ Duplicate copies](../../../docs/ingest-duplicate-copies.md) |
-| `loader_failures.py` | Keeps what a failed load knows — which object, and why — neither of which reaches the caller on its own. One `install_capture_everywhere` call covers every current and future worker. [§ When a source object will not read](../../../docs/ingest-error-handling.md#when-a-source-object-will-not-read) |
-| `auth.py` | Earthdata Login for ASF-hosted OPERA data: S3 direct access on roughly hourly credentials, plus legacy signed URLs. Renewal is timer-driven, because the credentials expire on their own clock. [§ Authentication](../../../docs/ingest-authentication.md) |
-| `transforms.py` | Post-load lazy Dask transforms. Currently `amplitude_to_db`. [§ Amplitude to decibels](../../../docs/ingest-radar.md#amplitude-to-decibels) |
+| `duplicates.py` | Keeps one copy of each image of a tile-date — the catalogue lists an image again whenever it is reprocessed — and every image. Rejected copies are kept as a fallback. [§ Duplicate copies](../../../docs/ingest/duplicate-copies.md) |
+| `loader_failures.py` | Keeps what a failed load knows — which object, and why — neither of which reaches the caller on its own. One `install_capture_everywhere` call covers every current and future worker. [§ When a source object will not read](../../../docs/ingest/error-handling.md#when-a-source-object-will-not-read) |
+| `auth.py` | Earthdata Login for ASF-hosted OPERA data: S3 direct access on roughly hourly credentials, plus legacy signed URLs. Renewal is timer-driven, because the credentials expire on their own clock. [§ Authentication](../../../docs/ingest/authentication.md) |
+| `transforms.py` | Post-load lazy Dask transforms. Currently `amplitude_to_db`. [§ Amplitude to decibels](../../../docs/ingest/radar.md#amplitude-to-decibels) |
 | `roi.py` | ROI utilities: read an existing Zarr ROI store, rasterise a GeoJSON polygon to a boolean mask on a UTM grid, load Sentinel-2 tile footprints. [§ Generating an ROI](#generating-an-roi) |
 | `roi_processing.py` | Higher-level ROI helpers used by the `generate_roi` flow. |
 | `land_mask.py` | Builds per-zone coverage bitmaps from the partner's land mask, and writes and validates zone ROIs (`export_zone_roi`, `validate_zone_roi`). [§ Zone ingestion](#zone-ingestion-the-global-campaign--adr-011) |
 | `source_coverage.py` | Optical preflight: does the catalogue publish anything reaching a zone's live land in this window, answered before any cluster is provisioned. Three-valued — only a positive finding of absence refuses. [§ Zone ingestion (the global campaign) — ADR-011](#zone-ingestion-the-global-campaign--adr-011) |
-| `catalogue_refusal.py` | Tells a catalogue that is BUSY apart from one that cannot serve this REQUEST, and names the request either way. [§ When the catalogue refuses](../../../docs/ingest-error-handling.md#when-the-catalogue-refuses-naming-the-request-and-telling-the-two-refusals-apart) |
-| `live_windows.py` | Derives the chunk-aligned live windows every ingest loads and writes, and narrows them per date to the land that date's imagery reaches. [§ Cropping to live windows](../../../docs/ingest-performance.md#cropping-to-live-windows-unconditional) |
+| `catalogue_refusal.py` | Tells a catalogue that is BUSY apart from one that cannot serve this REQUEST, and names the request either way. [§ When the catalogue refuses](../../../docs/ingest/error-handling.md#when-the-catalogue-refuses-naming-the-request-and-telling-the-two-refusals-apart) |
+| `live_windows.py` | Derives the chunk-aligned live windows every ingest loads and writes, and narrows them per date to the land that date's imagery reaches. [§ Cropping to live windows](../../../docs/ingest/performance.md#cropping-to-live-windows-unconditional) |
 | `_http.py` | Shared HTTP helpers for catalogue and granule queries: retries that log each attempt, calls the caller can abandon, and a guard for replies that claim success but are not JSON. |
-| `_pipeline.py` | A prepare/consume pipeline with a look-ahead depth, so the next item is prepared while the current one is consumed. Buys buffering, never concurrency. S2 dates go through it automatically on every fleet up to 140 workers. [§ Pipelining a date's preparation](../../../docs/ingest-performance.md#pipelining-a-dates-preparation-automatic) |
+| `_pipeline.py` | A prepare/consume pipeline with a look-ahead depth, so the next item is prepared while the current one is consumed. Buys buffering, never concurrency. S2 dates go through it automatically on every fleet up to 140 workers. [§ Pipelining a date's preparation](../../../docs/ingest/performance.md#pipelining-a-dates-preparation-automatic) |
 
 ---
 
@@ -184,7 +184,7 @@ coverage bitmap. The same S1/S2 flows then ingest it into per-(zone, year) mosai
 coverage bar lowered from 5% to about 0.1% because one solar day's swath covers only a sliver of
 a 6° zone. The `export-zone-rois` flow builds and validates many zones' masks ahead of the
 campaign. Where a zone's ingest sits in the campaign, and what validation proves, are in
-**[ingest-zone-rois.md](../../../docs/ingest-zone-rois.md)**.
+**[docs/ingest/zone-rois.md](../../../docs/ingest/zone-rois.md)**.
 
 ---
 
@@ -227,9 +227,9 @@ assets point straight at ESA's archive, and a query returns them mixed. The two 
 on one thing that matters — Element 84 has already subtracted the post-baseline-04.00 reflectance
 offset and ESA has not — so which producer served an asset is decided per asset from where that
 asset lives, never from the collection. That decision is the subject of
-[ingest-baseline-correction.md](../../../docs/ingest-baseline-correction.md), and choosing between
+[docs/ingest/baseline-correction.md](../../../docs/ingest/baseline-correction.md), and choosing between
 an ESA copy and an Element 84 copy of the same tile-date is the subject of
-[ingest-duplicate-copies.md](../../../docs/ingest-duplicate-copies.md).
+[docs/ingest/duplicate-copies.md](../../../docs/ingest/duplicate-copies.md).
 
 Each `CollectionConfig` records: collection ID, band list, native resolution, tile ID property
 (for S2/Landsat property-based queries), and correction parameters. For OPERA RTC-S1 on
@@ -244,7 +244,7 @@ was built instead. Treat it as unvalidated configuration.
 ## Detailed Ingestion Process
 
 The happy path, stage by stage. Failure modes live in
-[ingest-error-handling.md](../../../docs/ingest-error-handling.md) instead.
+[docs/ingest/error-handling.md](../../../docs/ingest/error-handling.md) instead.
 
 Six things happen between a region and a written mosaic, and they are the order of this section:
 
@@ -283,7 +283,7 @@ ground from one known to be fully clouded.
 
 **Radar: the most-acquired burst first.** Overlapping bursts of one day go to the burst acquired
 most often over the window, so a pixel's series keeps one look angle wherever the archive allows —
-see [Which burst wins an overlap](../../../docs/ingest-radar.md#which-burst-wins-an-overlap).
+see [Which burst wins an overlap](../../../docs/ingest/radar.md#which-burst-wins-an-overlap).
 
 #### Streaming the query month by month (S2)
 
@@ -321,7 +321,7 @@ metadata, and overlapping bursts are ranked by a once-per-leg census of how ofte
 acquired. A zone whose land is ice has granules but no usable dual-pol radar; it resolves to
 `S1_ORBIT_NONE` and is embedded from Sentinel-2 alone, unless the caller passes `require_s1`. All
 of it, with the decibel conversion applied after the load, is in
-**[ingest-radar.md](../../../docs/ingest-radar.md)**.
+**[docs/ingest/radar.md](../../../docs/ingest/radar.md)**.
 
 ### Which day an image belongs to (`solar_days.py`)
 
@@ -344,7 +344,7 @@ on each side, and items are filtered to their owner before the loader groups the
 
 The full table of date conventions, what enforces them, how OPERA's per-burst timestamps become
 one slice, and which day a slice is labelled with are in
-**[ingest-solar-days.md](../../../docs/ingest-solar-days.md)**.
+**[docs/ingest/solar-days.md](../../../docs/ingest/solar-days.md)**.
 
 ### Sizing requests to Earth Search's response cap
 
@@ -355,14 +355,14 @@ which regroups its scenes into pages that fit; a refusal no shorter window can r
 or a single day, is retried with a smaller page. Windows meet on a shared instant, so together they
 cover exactly the window asked for, and the results are re-sorted afterwards, so the order of the
 walk never reaches the mosaic. The mechanism in plain language, then in full, is in
-**[ingest-earth-search-response-cap.md](../../../docs/ingest-earth-search-response-cap.md)**.
+**[docs/ingest/earth-search-response-cap.md](../../../docs/ingest/earth-search-response-cap.md)**.
 
 ### Date deduplication before loading
 
 `_filter_existing_dates` removes items whose dates are already in the Zarr store before calling
 `odc.stac.load`, so no task graph is built and no COG read is issued for data that would be
 discarded. It is keyed by solar day, the way the store was written — see
-[Dates already in the store](../../../docs/ingest-solar-days.md#dates-already-in-the-store).
+[Dates already in the store](../../../docs/ingest/solar-days.md#dates-already-in-the-store).
 
 The filter is an optimisation, not the guarantee. On S1 the queries are built one batch ahead of
 the writes, so the set they filter against is frozen before the run began; the write loop tracks
@@ -378,7 +378,7 @@ every image and one copy of each, before the loader sees them, telling them apar
 copies of one image a single context-free sort key decides: first whether a copy can be processed
 at all, then the newest baseline, then cost. The copies it rejects are kept, in that order, as the
 fallback ladder a read failure steps down. The seven terms of the key and what each protects are
-in **[ingest-duplicate-copies.md](../../../docs/ingest-duplicate-copies.md)**.
+in **[docs/ingest/duplicate-copies.md](../../../docs/ingest/duplicate-copies.md)**.
 
 ### Data transformations
 
@@ -428,7 +428,7 @@ These happen before `odc.stac.load` is called:
 One transform runs after `odc.stac.load` returns: `transforms.amplitude_to_db` converts OPERA's
 linear float32 amplitude to scaled decibels stored as uint16. It is lazy, so nothing is
 materialised until the Zarr write. The formula and its constants are in
-[Amplitude to decibels](../../../docs/ingest-radar.md#amplitude-to-decibels).
+[Amplitude to decibels](../../../docs/ingest/radar.md#amplitude-to-decibels).
 
 ### Sentinel-2 baseline correction (applied during the read)
 
@@ -440,7 +440,7 @@ solar day's tiles are fused together. The amount is a constant, `-1000`, floored
 pixel never becomes nodata; only whether it applies is decided. A source at or above the threshold
 whose producer cannot be determined refuses rather than guess, because both wrong answers are
 silent. The rest, including the limits recorded rather than fixed, is in
-**[ingest-baseline-correction.md](../../../docs/ingest-baseline-correction.md)**.
+**[docs/ingest/baseline-correction.md](../../../docs/ingest/baseline-correction.md)**.
 
 ### Recording the window an ingest examined
 
@@ -487,21 +487,21 @@ and reads it directly over S3, renewing them on a timer and broadcasting them to
 Because those credentials occupy the `AWS_*` environment variables, every read and write on the
 project's own bucket resolves the deployment's IAM role instead. Renewal, the per-thread session
 patch, the IAM identity and why it is cached, URL rewriting and the signed-URL fallback are in
-**[ingest-authentication.md](../../../docs/ingest-authentication.md)**.
+**[docs/ingest/authentication.md](../../../docs/ingest/authentication.md)**.
 
 ---
 
 ## Error handling
 
 Everything that goes wrong between a catalogue request and a written pixel, and what the pipeline
-does about it, is in **[ingest-error-handling.md](../../../docs/ingest-error-handling.md)** — twelve diagnosed causes, the
+does about it, is in **[docs/ingest/error-handling.md](../../../docs/ingest/error-handling.md)** — twelve diagnosed causes, the
 evidence each one leaves, and the single classifier that tells them apart. The short version: a
 date given up is given up for good, so the pipeline spends time rather than dates.
 
 ## Performance
 
 What bounds an ingest and the levers against it are in
-**[ingest-performance.md](../../../docs/ingest-performance.md)**. The short version: the Dask scheduler is one
+**[docs/ingest/performance.md](../../../docs/ingest/performance.md)**. The short version: the Dask scheduler is one
 process holding the whole task graph, so every lever either keeps the graph small enough to fit
 or keeps the fleet busy once it does, and the two pull against each other.
 

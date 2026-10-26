@@ -44,7 +44,7 @@ CI verifies that the names listed here match `tessera_embeddings.__all__`.
   front, bounding how many STAC items are retained at once. Loads and
   writes are always restricted to the chunk-aligned windows where the ROI
   mask has land — that behaviour is unconditional and has **no flag** (see
-  [Cropping to live windows](ingest-performance.md#cropping-to-live-windows-unconditional)
+  [Cropping to live windows](ingest/performance.md#cropping-to-live-windows-unconditional)
   for why the former `crop_to_live_windows` parameter was removed rather
   than defaulted).
 - `ingest_s1_roi_sar(*, roi_zarr_path, start_date, end_date,
