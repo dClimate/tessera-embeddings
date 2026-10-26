@@ -65,6 +65,24 @@ def _ensure_tag(repo: icechunk.Repository, tag: str, sid: str, *, explicit: bool
     return tag
 
 
+def pin_tag(repo: icechunk.Repository, tag: str) -> str:
+    """Create ``tag`` at the ``main`` tip unless it already exists; return the tag.
+
+    Idempotent, so every cell of a targeted update can call it and only the first pins. A tag that
+    exists stays where it is, which is the point of a base tag: it holds the store as it was before
+    the update's first write.
+
+    Safe under concurrent callers: one that loses the race to create the tag finds it existing and
+    returns it, as a caller that came second would have.
+    """
+    try:
+        return _ensure_tag(repo, tag, repo.lookup_branch("main"), explicit=False)
+    except icechunk.IcechunkError:
+        if tag in repo.list_tags():
+            return tag
+        raise
+
+
 def tag_zone_year(
     repo: icechunk.Repository,
     zone: str,

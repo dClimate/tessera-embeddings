@@ -38,10 +38,11 @@ def process_roi_reflectance(
     stream_stac_monthly: bool = True,
     overlap_window_writes: bool = True,
     pipeline_dates: bool = False,
-    # ``int | None``, not ``int``: None is the value that means "derive from the ROI's size"
-    # (config.ingest.auto_batch_dates), so an ``int``-annotated shell defaulting to 1 cannot
+    # ``int | None``, not ``int``: None is the value that means "the default cap"
+    # (config.ingest.AUTO_BATCH_DATES), so an ``int``-annotated shell defaulting to 1 cannot
     # express it and pins any caller that omits the flag to never batching.
     batch_dates: int | None = None,
+    batch_chunk_budget: int | None = None,
     allow_ingest_code_mismatch: bool = False,
     s3_region: str | None = None,
 ) -> dict[str, Any]:
@@ -91,6 +92,7 @@ def process_roi_reflectance(
             pipeline_dates=pipeline_dates,
             s3_region=s3_region,
             batch_dates=batch_dates,
+            batch_chunk_budget=batch_chunk_budget,
             allow_ingest_code_mismatch=allow_ingest_code_mismatch,
         )
     return asdict(result)

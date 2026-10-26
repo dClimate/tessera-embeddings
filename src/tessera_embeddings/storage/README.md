@@ -36,10 +36,20 @@ writers on one dataset. `manifest.py` refuses a write whose settings do not matc
 dataset's.
 
 `empty_store.py` creates a dataset with the right shape but no values in it, and
-`global_store.py` does that for all 120 groups at once, so filling never resizes anything.
+`global_store.py` does that for all 120 groups at once, so filling never resizes anything. It also
+stamps the store's minimum optical depth rule on the root at seeding, where it never moves; a
+targeted update may apply a looser line to its own cells and records it there (`update.py`,
+[ADR 028](../../../context_docs/decisions/028-embed-every-pixel-with-an-optical-observation.md)).
 `shard_writer.py` then fills one group-year in parallel and `region_writes.py` works out where a
 block of data belongs. What stops two writers overwriting each other is the conflict check at
 commit time; `session_catch_up.py` only shortens the work that check has to do.
+
+**`update.py`** is how a group-year that is already filled gets some of its tiles redone: a named,
+write-once plan of which tiles, under which land mask, either filling only the store's holes or
+rewriting tiles whole. It records each update beside the original fill in the group's `updates`
+attr, never over it, and `shard_writer.py` merges a holes update into the tiles it touches
+([ADR 027](../../../context_docs/decisions/027-targeted-updates.md)). It sits outside both code
+identities, like `campaign.py`.
 
 `campaign.py` tracks what is finished and clears out old versions, `published_store.py`
 checks a finished dataset from outside, and `object_store.py` deletes what we no longer need.

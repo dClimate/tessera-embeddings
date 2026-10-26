@@ -61,6 +61,7 @@ def _inference_config(**over) -> MagicMock:
         time_window=parse_time_window("August 2024"),
         s1_orbit="ascending",
         checkpoint_path="/models/ckpt.pt",
+        model_version="v1.1",
         allow_s2_only=False,
         chunk_size=2048,
     )

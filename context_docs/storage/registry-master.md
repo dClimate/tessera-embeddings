@@ -81,7 +81,8 @@ second is refused and checks again. It runs before the tag because a deliberate 
 - **A retry of a cell that already landed runs it again.** A process that dies between the commit
   and the merge leaves no tag, and its retry finds the cell complete and skips the fill, so
   planning (`plan_zone_inference`) runs the merge on that path too, with no run id. Every runner
-  plans every retry, the campaign's triage included, so this is the one place it happens. The store check below then
+  plans every retry, the campaign's triage included, so this is the one place it happens. Rerunning
+  an update through `fill-zones-sequential` does the same for each cell it finds already recorded. The store check below then
   refuses the cell if the dead run's part never published. A cell with neither a part nor a master
   file, an all-ocean one, is left alone.
 - **It never fails a committed cell.** The cell is committed by then. Raising would undo nothing
@@ -120,8 +121,9 @@ same rows writes the same file.
 **A run's row must describe the whole tile as that run leaves it.** Per-tile latest-wins makes the
 newest run's row the tile's only row. An update that rewrites some of a tile's pixels must therefore
 publish measurements for the whole tile after the update, not for the rewritten pixels alone, or the
-master will describe a fraction of the tile as if it were all of it. This is a requirement on future
-updates, not something this code can check.
+master will describe a fraction of the tile as if it were all of it. An update that fills a tile's
+holes does this by re-deriving the tile's row from the shard it committed; its rows also name it in
+`update_name` ([ADR 027](../decisions/027-targeted-updates.md)).
 
 ## The store stands behind the parts
 
@@ -130,7 +132,8 @@ a part is best-effort, so a run can commit without one. Its tiles then keep the 
 and once any later run lands, nothing in the registry shows it. So the store keeps the account, and
 keeps it where no crash can separate it from the pixels: **every shard commit is tagged with its
 run.** `write_year_shards` puts `{"shard_write": {run_id, zone, year}}` in the commit's own Icechunk
-metadata, in the same commit as the shards.
+metadata, in the same commit as the shards. A targeted update's shard commit carries the same
+tag, under the update's run, so the check below treats it like any other run.
 
 ```
   main:  … ─ shard commit  metadata.shard_write = {run_id, zone, year}   ← the authority
@@ -152,11 +155,11 @@ metadata, in the same commit as the shards.
   shards, which wrote no tile.
 - **Snapshot expiry drops shard commits from the history** (`campaign.expire_and_gc` keeps tagged
   snapshots, and a zone-year's tag is on its attrs commit). A recorded run whose commit has gone is
-  then known from its `runs` entry, like a v1.1 run: its part still describes it, and without one
-  nothing bounds its tiles, so the zone-year blocks. A run a refill replaced is taken to hold no tile
-  instead, since the refill rewrote every tile it wrote: its part is still recognised, and a missing
-  one does not block. The store check confirms that only while the commit is there to diff, so run
-  `verify` before expiring.
+  then known from its `runs` entry, like a v1.1 run, or a targeted update's from its `updates`
+  entry: its part still describes it, and without one nothing bounds its tiles, so the zone-year
+  blocks. A run a refill replaced is taken to hold no tile instead, since the refill rewrote every
+  tile it wrote: its part is still recognised, and a missing one does not block. The store check
+  confirms that only while the commit is there to diff, so run `verify` before expiring.
 - **Which tiles a commit wrote** comes from Icechunk's diff of that commit against its parent, the
   store's own transaction log (`published_store.commit_tiles`), in every per-tile array rather
   than `scales` alone: a refused tile writes its observation counts and month coverage and no

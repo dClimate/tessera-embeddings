@@ -42,7 +42,7 @@ import hashlib
 import logging
 import math
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from functools import cache
 from typing import TYPE_CHECKING, cast
@@ -55,6 +55,7 @@ from pyproj import Transformer
 
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
 from tessera_embeddings.config.store_layout import INNER_PX, SHARD_PX
+from tessera_embeddings.inference.chunk_spec import parse_chunk_label
 from tessera_embeddings.ingest.live_windows import coarsen_live_grid, live_chunk_grid_from_keys
 from tessera_embeddings.storage import zone_grid
 from tessera_embeddings.storage.manifest import RoiManifest
@@ -718,6 +719,37 @@ def _remove_superseded_roi(dest_path: str, storage_options: dict | None) -> None
     logger.warning("Removed superseded ROI at %s — this delivery has no land in that zone", dest_path)
 
 
+def narrow_tile_live(tile_live: np.ndarray, tiles: Collection[str] | None) -> np.ndarray:
+    """``tile_live`` restricted to the shard labels in ``tiles``; ``None`` keeps it whole.
+
+    How a targeted update narrows the campaign's work to its own shards. A listed shard that is
+    dead in the mask stays dead: the mask decides where land is, the update only chooses among it.
+
+    Raises:
+        ValueError: If a label lies outside the zone's tile grid — a shard list for another grid.
+    """
+    if tiles is None:
+        return tile_live
+    narrowed = np.zeros_like(tile_live, dtype=bool)
+    for label in tiles:
+        row, col = parse_chunk_label(label)
+        if not (0 <= row < tile_live.shape[0] and 0 <= col < tile_live.shape[1]):
+            raise ValueError(f"Shard {label} lies outside the zone's {tile_live.shape} tile grid")
+        narrowed[row, col] = tile_live[row, col]
+    return narrowed
+
+
+def coverage_identity(registry_sha256: str | None, tiles: Collection[str] | None) -> str | None:
+    """The coverage digest an ROI is stamped with: the mask's own, or the mask's with a shard set.
+
+    The single derivation behind both the ROI's ``coverage_sha256`` and the ingest fingerprint, so a
+    narrowed ROI can never be mistaken for the whole-zone one, nor two shard sets for each other.
+    """
+    if tiles is None or registry_sha256 is None:
+        return registry_sha256
+    return hashlib.sha256(f"{registry_sha256}:{','.join(sorted(tiles))}".encode()).hexdigest()
+
+
 def _roi_is_current(
     dest_path: str,
     height: int,
@@ -756,6 +788,7 @@ def export_zone_roi(
     dest_path: str,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
+    tiles: Collection[str] | None = None,
 ) -> str | None:
     """Synthesize the ingest ROI mask for one zone from its coverage bitmap.
 
@@ -777,6 +810,8 @@ def export_zone_roi(
             the ROI is a plain zarr and does not travel on this callback by itself, so a
             callback-only deployment could otherwise not export a mask at all.
         s3_region: Region for the coverage-repo read, if not the default.
+        tiles: A targeted update's shard labels: the ROI covers only these (and what the mask
+            marks live among them), and is stamped with their :func:`coverage_identity`.
 
     Returns:
         ``dest_path`` on success, or ``None`` for an all-ocean zone (no ROI, so
@@ -784,8 +819,8 @@ def export_zone_roi(
     """
     spec = zone_grid.zone(zone)
     cov = open_store_as_zarr_group(land_mask_path, group=zone, get_credentials=get_credentials, region=s3_region)
-    tile_live = np.asarray(cast("zarr.Array", cov["tile_live_2048"]), dtype=bool)
-    coverage_sha = cast("str | None", cov.attrs.get("registry_sha256"))
+    tile_live = narrow_tile_live(np.asarray(cast("zarr.Array", cov["tile_live_2048"]), dtype=bool), tiles)
+    coverage_sha = coverage_identity(cast("str | None", cov.attrs.get("registry_sha256")), tiles)
     if not tile_live.any():
         # Clear any ROI an EARLIER delivery left here before reporting the zone all-ocean:
         # this delivery is the authority on where land is, and a stale mask at a name-derived
@@ -847,6 +882,7 @@ def expected_live_chunk_grid(
     land_mask_path: str,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
+    tiles: Collection[str] | None = None,
 ) -> np.ndarray:
     """Boolean grid of the live ingest chunks in ``zone`` (a KB read of the bitmap).
 
@@ -854,10 +890,10 @@ def expected_live_chunk_grid(
     blocking of ``tile_live_2048``, same skip-if-not-``any`` rule — so it is the authority
     on both HOW MANY chunks a correct mask stores and WHERE they sit.
     :func:`validate_zone_roi` compares positions against it; :func:`live_chunk_count` is its
-    sum.
+    sum. ``tiles`` narrows it to a targeted update's shards, as the export does.
     """
     cov = open_store_as_zarr_group(land_mask_path, group=zone, get_credentials=get_credentials, region=s3_region)
-    tile_live = np.asarray(cast("zarr.Array", cov["tile_live_2048"]), dtype=bool)
+    tile_live = narrow_tile_live(np.asarray(cast("zarr.Array", cov["tile_live_2048"]), dtype=bool), tiles)
     return coarsen_live_grid(tile_live, INGEST_CHUNK_SIZE // SHARD_PX)
 
 
@@ -867,6 +903,7 @@ def live_chunk_count(
     land_mask_path: str,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
+    tiles: Collection[str] | None = None,
 ) -> int:
     """Live ingest chunks in ``zone``, coarsened from the coverage bitmap (a KB read).
 
@@ -875,7 +912,7 @@ def live_chunk_count(
     """
     return int(
         expected_live_chunk_grid(
-            zone, land_mask_path=land_mask_path, get_credentials=get_credentials, s3_region=s3_region
+            zone, land_mask_path=land_mask_path, get_credentials=get_credentials, s3_region=s3_region, tiles=tiles
         ).sum()
     )
 

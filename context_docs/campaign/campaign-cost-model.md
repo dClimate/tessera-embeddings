@@ -1597,6 +1597,11 @@ rather than assuming it, and checks it as a share of the measured total rather t
 232 MB is 0.0000017% of what followed. [`scripts/diagnostic/campaign_volume_audit.py`](../../scripts/diagnostic/campaign_volume_audit.py)
 builds an Athena table over the 36 snapshots and counts each object once.
 
+**Only the 08-31 snapshot survives.** On 2026-10-16 inventory was switched off on all four
+global-tessera buckets and the report history deleted, except the inputs bucket's
+`2026-08-31T01-00Z` snapshot: the peak, and the one reconciled with CloudWatch below. The figures
+here stand as recorded, but the deduplicated total can no longer be re-derived.
+
 Three things make this a measurement rather than an estimate.
 
 - **Two methods agree to the byte.** Deduplicating on `(key, last_modified_date)` across every
@@ -1675,10 +1680,9 @@ a third less than §12's $828,364, and take about 10.5 days on §12's average fl
 Measured 2026-10-05 on the Iowa year on g6e.xlarge (L40S) cards; the factors are applied to the
 whole card line, A10G hours included.
 
-**One prerequisite: the global campaign cannot run v2 yet.** Zone fill (`fill_zone_year`) builds
-v1.1 only; v2 Large is selectable on the single-area paths. Wiring v2 through zone fill, its seed
-and its provenance checks comes first, and this section costs the campaign that wiring makes
-possible.
+**A v2 campaign fills its own store.** A global store is seeded for one model and every zone fill
+follows it, so v2 seeds a fresh store with `model_version="v2-large"`; this section costs that
+campaign.
 
 ### GPU time, measured on the Iowa year
 

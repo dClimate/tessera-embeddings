@@ -26,9 +26,8 @@ longer one.
   on an AWS DLAMI host). To use a checkpoint you already have on disk,
   set `checkpoint_url: null` and point `checkpoint_dir` at its parent
   directory instead — the expected filename comes from
-  `tessera_embeddings.checkpoint_filename()` (or
-  `checkpoint_filename(norm_source="aws")` for the AWS-normalised
-  encoder).
+  `tessera_embeddings.checkpoint_filename(model_version="v1.1")`, the
+  AWS-normalised encoder.
 
 ### Earthdata Login (EDL) setup
 
@@ -192,6 +191,11 @@ Denver, CO — one inference chunk at 10 m resolution. To use your own AOI:
 
 3. Update `time_range` in `config.yaml` if you need a different
    season.
+
+## Updating part of an output
+
+To redo part of a window already in the store, after new imagery or a fix, add an `update` block to
+the config and run it again. [`updates.md`](updates.md) walks through it.
 
 ## Troubleshooting
 

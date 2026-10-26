@@ -24,7 +24,7 @@ from prefect import flow, get_run_logger
 from prefect.runtime import flow_run as flow_run_ctx
 
 from tessera_embeddings.config.fault_injection import DIE_BETWEEN_COMMITS, FaultInjection
-from tessera_embeddings.config.inference import DEFAULT_MODEL_VERSION, ModelVersion, checkpoint_filename
+from tessera_embeddings.config.inference import ami_ssm_name_for_model, checkpoint_filename
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.store_layout import SHARD_PX
 from tessera_embeddings.config.time_windows import parse_time_window
@@ -42,6 +42,7 @@ from tessera_embeddings.orchestration.prefect.flows._ray_lifecycle import (
     ray_cleanup_on_cancellation,
 )
 from tessera_embeddings.orchestration.runners.zone_fill import (
+    _store_credentials,
     assert_calendar_year_window,
     fill_zone_year,
     preflight_destination,
@@ -49,7 +50,7 @@ from tessera_embeddings.orchestration.runners.zone_fill import (
     zone_year_complete,
     zone_year_on_axis,
 )
-from tessera_embeddings.storage.conventions import expected_model_url
+from tessera_embeddings.storage.global_store import store_model_version
 from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group
 from tessera_embeddings.storage.zone_grid import canonicalize_zone
 
@@ -73,60 +74,14 @@ def _optical_min_obs_from_store(
     ``None`` means the store declares no rule — every store seeded before 2026-08-13 — and the fill
     then embeds everything with any optical input, which is what those stores already contain.
     """
-    root = open_store_as_zarr_group(store_path, get_credentials=get_credentials, region=s3_region)
+    # The store's own credential, chosen from the path, so no caller can hand it the task role.
+    root = open_store_as_zarr_group(
+        store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
+    )
     value = root.attrs.get("optical_min_obs")
     if value is None:
         return None
     return int(cast("int", value))
-
-
-def _assert_seeded_model_matches(
-    store_path: str,
-    *,
-    build_checkpoint: str,
-    allow_model_mismatch: bool,
-    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None,
-    s3_region: str | None = None,
-    encoder_version: ModelVersion = DEFAULT_MODEL_VERSION,
-) -> None:
-    """Refuse to fill a store seeded for a different encoder/checkpoint than this build.
-
-    The seed stamps ``geoemb:model`` (the encoder-version URL) once at the store root; the fill
-    re-derives it from the running code. A model upgrade slipped in between seeding and filling
-    would write embeddings from a NEW encoder while the root still advertises the OLD one — mixing
-    encoders under a single store and permanently tagging the result. A metadata-only read catches
-    it before Ray. ``allow_model_mismatch`` is the deliberate-override escape hatch (e.g. a store
-    seeded with a custom ``model_url`` the code can't re-derive).
-
-    ``geoemb:model`` versions only the ENCODER (e.g. "1.1"); it does NOT distinguish the concrete
-    checkpoint / norm source (the ``aws`` and ``mpc`` v1.1 checkpoints share one URL). So when the
-    store also recorded a ``checkpoint_id`` (the seed's ``model_version``), require it to match
-    this build's checkpoint (*build_checkpoint* = :func:`checkpoint_filename`) — otherwise two
-    same-URL-but-different checkpoints could be mixed. Absent ``checkpoint_id`` (the default), only
-    the encoder URL is gated; seed with ``model_version=checkpoint_filename()`` to enable
-    checkpoint-level gating.
-    """
-    root = open_store_as_zarr_group(store_path, get_credentials=get_credentials, region=s3_region)
-    seeded = cast("str | None", root.attrs.get("geoemb:model"))
-    # EXPLICIT, not defaulted. The campaign fills with v1.1 today — `fill_zone_year` exposes no
-    # model selector — but an unversioned call here silently compares any future v2 fill
-    # against v1.1's URL, the failure `encoder_url`'s docstring describes:
-    # it rejects a correct run, or waves through a real mismatch when the seed carried the
-    # same stale default. Passing the version makes the seam visible and one-line to move.
-    expected = expected_model_url(model_version=encoder_version)
-    if seeded is not None and seeded != expected and not allow_model_mismatch:
-        raise ValueError(
-            f"Global store {store_path} was seeded for encoder {seeded!r} but this build embeds with "
-            f"{expected!r} — filling would mix encoders under one store (its root still advertises "
-            f"{seeded!r}). Reseed for the new model, or pass allow_model_mismatch=True to override."
-        )
-    seeded_ckpt = cast("str | None", root.attrs.get("checkpoint_id"))
-    if seeded_ckpt is not None and seeded_ckpt != build_checkpoint and not allow_model_mismatch:
-        raise ValueError(
-            f"Global store {store_path} was seeded for checkpoint {seeded_ckpt!r} but this build fills with "
-            f"{build_checkpoint!r} — the encoder URL matches but the concrete checkpoint (norm source) differs, "
-            "so the embeddings would be mixed. Reseed, or pass allow_model_mismatch=True to override."
-        )
 
 
 @flow(
@@ -144,6 +99,7 @@ def fill_zone_year_flow(
     paths: BucketPaths,
     ami_ssm_name: str,
     ami_id: str | None = None,
+    ami_ssm_name_by_model: dict[str, str] | None = None,
     time_window_end: str | None = None,
     store_name: str = "tessera",
     mask_name: str = "global",
@@ -158,7 +114,6 @@ def fill_zone_year_flow(
     cleanup_staging: bool = True,
     n_assembly_workers: int | None = None,
     allow_partial_window: bool = False,
-    allow_model_mismatch: bool = False,
     allow_s2_only: bool = False,
     mosaic_base: str | None = None,
     launch_pacing: bool = False,
@@ -183,6 +138,9 @@ def fill_zone_year_flow(
             ``ami_ssm_name`` — so a mid-campaign re-bake can't run new code under a fingerprint
             that recorded the old image. ``None`` (direct calls) resolves ``ami_ssm_name`` at
             provisioning.
+        ami_ssm_name_by_model: Per-model overrides of ``ami_ssm_name``. The entry for the model
+            the store holds replaces ``ami_ssm_name``; a model on its own worker image (v1.1) without
+            one is refused (ADR 025).
         time_window_end: End month of the inference window as ``"Month Year"``; defaults to
             ``"December {year}"``. The runner REQUIRES the exact January-December window for
             ``year`` (the store guarantees calendar-year slots), so any other value fails loudly
@@ -213,9 +171,6 @@ def fill_zone_year_flow(
             bounds assembly throughput, so it belongs to the run rather than to the deployment.
         allow_partial_window: Relax the pre-Ray temporal-coverage gate to "non-empty" (default
             requires the mosaic's months to span the window).
-        allow_model_mismatch: Fill even when the seeded store advertises a different encoder
-            than this build (default rejects — a mid-campaign model upgrade would otherwise mix
-            encoders under one store).
         allow_s2_only: Embed S2-valid pixels that have ZERO S1 observations (sub-zone SAR
             coverage gaps) using the upstream v1.1 missing-S1 convention (all-zeros normalized
             S1 input). Default False: such pixels are skipped. Only the PER-PIXEL gate is
@@ -301,6 +256,11 @@ def fill_zone_year_flow(
     # only credential that can read OUR buckets. `icechunk_credentials_for` returns the caller's
     # own callback unchanged for our buckets, so nothing changes in dev.
     store_credentials = icechunk_credentials_for(store_path, iam_icechunk_credentials)
+    # The store decides the model, and with it the checkpoint, worker image and staging prefix: a
+    # fill or update of a v1.1 store runs v1.1 whatever any default says.
+    model_version = store_model_version(store_path, get_credentials=store_credentials, region=s3_region)
+    ami_ssm_name = ami_ssm_name_for_model(ami_ssm_name, ami_ssm_name_by_model, model_version)
+    checkpoint = checkpoint_filename(model_version=model_version)
     land_mask_path = paths.land_mask_store(mask_name)
     # Campaign mosaics live per (zone, year); `mosaic_base` overrides for a hand-provided mosaic
     # (e.g. a shared multi-year store).
@@ -370,7 +330,8 @@ def fill_zone_year_flow(
     config = build_inference_config(
         s1_orbit=resolved_s1,
         time_window=window,
-        checkpoint_path=f"{paths.inputs.rstrip('/')}/models/{checkpoint_filename()}",
+        checkpoint_path=f"{paths.inputs.rstrip('/')}/models/{checkpoint}",
+        model_version=model_version,
         inputs_bucket=paths.inputs,
         output_bucket=paths.outputs,
         # 1 inference tile == 1 output shard == 2x2 tiles per 4096-px ingest chunk (D3), so
@@ -405,16 +366,6 @@ def fill_zone_year_flow(
     )
 
     if needs_cluster:
-        # Fail loudly BEFORE provisioning Ray if the store was seeded for a different encoder
-        # than this build embeds with — a mid-campaign model upgrade would otherwise mix encoders
-        # under one store and tag it permanently. A cheap metadata-only read.
-        _assert_seeded_model_matches(
-            store_path,
-            build_checkpoint=checkpoint_filename(),
-            allow_model_mismatch=allow_model_mismatch,
-            get_credentials=store_credentials,
-            s3_region=s3_region,
-        )
         # Fail loudly on a partial/absent mosaic BEFORE provisioning Ray: a zone-wide mosaic
         # missing months is an ingest failure, and the write-once zone-year tag would otherwise
         # make partial embeddings permanent (the zone-fill chain has no other temporal-coverage

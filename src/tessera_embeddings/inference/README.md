@@ -19,8 +19,9 @@ Two encoders are selectable through `InferenceConfig.model_version`: Tessera v1.
 default, and the distilled v2 Large student (`"v2-large"`). They share every stage below
 except the model itself, its band statistics and the rule that fills each observation
 sequence; what differs, and why, is in [Model architecture constraint](#model-architecture-constraint).
-Both single-area entry points below take `model_version`; the global campaign's zone fill
-does not, and runs v1.1.
+Both single-area entry points below take `model_version`. The global campaign's zone fill
+does not choose: it runs the model its store was seeded for ([One record per
+model](models/README.md#one-record-per-model)).
 
 Two entry points run the same domain code:
 
@@ -359,6 +360,14 @@ strip's inference, so an empty or sparse strip early in the order — the top ro
 footprint's edge — would leave the next load exposed with the card idle. The order does not change
 which pixels share a sub-batch, so the outputs are the same in any order.
 
+**A `holes` update reads only where its holes are.** Given a tile's hole mask (`ChunkSpec.pixels`),
+`_chunk_read_plan` tiles only the rows between the first and last hole and drops every strip that
+holds none, since the update keeps the store's values outside its holes. The column crop covers
+the holes with an optical observation, the only ones it can embed. A strip whose holes cannot embed
+is still read, last, because the update rewrites every hole's observation counts, radar's included.
+A read still decompresses whole 512-row inner chunks (below), so a hole costs the rows of its
+chunk; the column crop saves the per-pixel work after the read.
+
 **Peak host memory has one ceiling.** The load pipeline is one strip deep, so at most two
 band sets co-reside — the strip being inferred and the strip being read — and the pair is
 bounded at twice the budget. A full year of Iowa peaked at 50% of a 32 GB worker, under the
@@ -474,6 +483,12 @@ buckets.
    double peak memory — 14 GB of source arrays plus a 17 GB copy, which was an
    out-of-memory kill. Per-batch indexing costs about 7 ms per batch and removes the spike
    entirely.
+
+4. **A targeted update can narrow it further.** A tile whose `ChunkSpec.pixels` names a mask
+   embeds only the pixels it marks, beside the gates above
+   ([ADR 027](../../../context_docs/decisions/027-targeted-updates.md)). An update in `holes` mode
+   masks each tile to the pixels that are holes in the store, so pixels already embedded never
+   reach the GPU; the refusal counts still describe the whole strip.
 
 **When no pixel qualifies.** A tile inside the area of interest whose every pixel fails the
 filter takes the **skip path**: the actor writes a zero-byte `{chunk.label}.skipped` marker
@@ -764,7 +779,9 @@ error**. The presence of the directory therefore proves nothing, which is why co
 is recorded as its own signal, *after* the store is fully written:
 
 ```text
-  write_chunk:  rm <label>.done                   retract the old marker FIRST
+  write_chunk:  _stack.json                      the run's stack: created once, read back, another refuses
+                    ↓
+                rm <label>.done                   retract the old marker FIRST
                     ↓
                 ds.to_zarr(…, mode="w")           many objects, no atomic commit
                     ↓
@@ -904,7 +921,8 @@ icechunk sessions read their own writes, so the merged result is exact.
    extent. On an existing store: validate the `_manifest` and refuse a store published by the
    other encoder (`conventions.assert_encoder_matches`, which reads a store with no
    `geoemb:model` as v1.1; the pre-flight runs the same check before any GPU is
-   provisioned). Then either resize every time-dimensioned array by one step (an append
+   provisioned), or one computed on another library stack (see *One library stack per store*
+   below). Then either resize every time-dimensioned array by one step (an append
    *is* a resize plus a write at the new index) or, when the time value already exists,
    target that index for an in-place overwrite. That makes a resume **idempotent**: a
    crashed assembly re-run lands on the same index instead of appending a duplicate
@@ -914,7 +932,8 @@ icechunk sessions read their own writes, so the merged result is exact.
    index, so no stale slice describes the overwritten data.
 3. **Phase 2, data.** Fork the session; each worker writes its band's tile slices into every
    output array; the coordinator merges the forks, sets the root attributes (run metadata,
-   GeoZarr conventions, `_manifest`, merged `time_windows`) and commits once through
+   GeoZarr conventions, `_manifest`, merged `time_windows`, and `inference_stack`, PyTorch and
+   CUDA, on the store's first write) and commits once through
    `commit_with_rebase`.
 4. **Atomic publish.** Fast-forward `main` to the fully written work-branch tip, guarded by
    `from_snapshot_id` so a concurrent writer to the same store fails loudly, then drop the
@@ -936,6 +955,36 @@ not pixels.) `years_complete` and the per-year run provenance advance in a **sec
 after the shards: a crash between the two leaves a year written but unmarked. The zone-fill runner
 ([`orchestration/runners/zone_fill.py`](../orchestration/runners/zone_fill.py)) drives the
 sequence: coverage mask → inference → `assemble_global` → `campaign.tag_zone_year`.
+
+**A targeted update** ([ADR 027](../../../context_docs/decisions/027-targeted-updates.md)) runs the
+same sequence over chosen shards of a year that is already filled, with three differences. A shard
+whose tile staged nothing is kept, not cleared; in `holes` mode each staged tile is **merged**,
+the worker reading the shard already in the store and replacing only its hole pixels, in every
+array; and the second commit appends the update's record to the group's `updates` attr instead of
+advancing `years_complete` and `runs`. No zone-year tag is created.
+
+**One stack per run, one stack per store** ([ADR 025](../../../context_docs/decisions/025-library-upgrades-ship-on-measured-usability-at-a-store-boundary.md)
+rule 2). A run's *stack* is what computed it: model, checkpoint stem, PyTorch and CUDA. Only the
+workers know it, since the driver runs the lockfile's CPU build. Two checks hold it, and nothing
+else does:
+
+1. **Joining a run.** A run's first write creates `_stack.json` exclusively (a conditional PUT on
+   S3, `O_EXCL` on a local disk), and every later write reads it back (`ZarrWriter._join_run`). A
+   worker on another stack stops before staging anything and leaves nothing behind, so a run's
+   tiles never mix stacks and carry no record of their own. A resume on another checkpoint or
+   PyTorch is refused the same way.
+2. **Writing a store.** Assembly reads the run's record (`run_stack`) and compares it with the
+   store root once (`conventions.assert_stack_matches`: the root's `geoemb:model`, read as v1.1
+   when absent, its `checkpoint_id` as a stem, and its `inference_stack`, PyTorch and CUDA). Every
+   write passes here: the Prefect flows, a direct `runners.zone_fill` call and the plain runner's
+   updates. The first write stamps `inference_stack`, for the global store in a small commit before
+   any shard (`shard_writer.claim_root_stack`). A single-area assembly also refuses a record whose
+   model or checkpoint differs from its caller's, the ones it labels the store with; the run id
+   varies with the checkpoint, so only a reused id can disagree.
+
+There is no override. Moving a store to another stack is a restamp after ADR 025's measurement.
+Each fill and campaign also reads the store's model and checkpoint through `store_model_version`
+before anything is provisioned, only to fail early.
 
 **The campaign's land mask is not a pixel-resolution area of interest** but a per-zone
 *coverage bitmap* (`tile_live_2048`), built from the delivery registry by
@@ -1108,7 +1157,7 @@ the main loop; `ActorPool` encapsulates actor state and lifecycle operations
 | `max_gpu_workers` | 500 | Ray autoscaler ceiling |
 
 **Architecture params** (`nhead`, `num_encoder_layers`, `dim_feedforward`, etc.) **must match
-the checkpoint**. They are per-version defaults (`MODEL_ARCHS`): selecting `"v2-large"`
+the checkpoint**. They are per-model defaults (each record's `arch`): selecting `"v2-large"`
 replaces every field still at its v1.1 default with v2's value, and rejects a conflicting
 explicit one. See `models/README.md` before touching them.
 
@@ -1120,7 +1169,7 @@ explicit one. See `models/README.md` before touching them.
 **not** change layer dimensions, activations, or the forward pass unless you are also
 retraining.
 
-`models/builder.py` dispatches on `model_version`. The two architectures side by side, their
+`models/builder.py` dispatches on the model's `generation`. The two architectures side by side, their
 checkpoint loaders, and the porting rules are in [`models/README.md`](models/README.md); v2
 Large's throughput against v1.1 is §7 of
 [`inference-on-gpus.md`](../../../context_docs/inference/inference-on-gpus.md).
@@ -1132,6 +1181,10 @@ name. The plain runner can instead take its URL as `checkpoint_url`, as the quic
 v1.1. A store records the checkpoint's file name as its model identity (`checkpoint_id`), so append
 to a store from the same source that built it: the staged copy and the Hugging Face file have
 different names, and the append check refuses the mix.
+
+**Which model a run uses** is decided once, from a `ModelFamily` record per model; for a global
+store, it is the model the store was seeded for. See
+[One record per model](models/README.md#one-record-per-model).
 
 ---
 

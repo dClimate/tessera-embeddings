@@ -139,16 +139,22 @@ where `store_group` is the zone's group opened with xarray, as in the store's
 | `median_obs_where_any` | the median optical observation count over pixels with at least one |
 | `median_obs_where_thin` | the median over the refused thin pixels only, null when there are none |
 | `px_with_any_radar` | pixels with at least one radar observation |
-| `optical_min_obs` | the quality rule's line, 15 observations in v1.1 |
+| `optical_min_obs` | the quality rule's line this row was judged against: 15 for v1.1's campaign fill, the update's line for a tile an update rewrote |
 | `radar_rule_enforced` | whether pixels without radar were refused; false in v1.1 |
 | `measured_by` | `"fill"` if the fill measured this row's numbers, `"rebuild"` if they were re-derived from the store later |
 | `filled_at` | when the fill whose pixels the row describes landed |
 | `run_id`, `assembled_at` | the run the row came from, and when it was written: the fill, or for a re-derived row the re-derivation |
 | `code_version`, `code_commit` | the build of the tessera-embeddings repository that ran the fill |
+| `update_name` | the targeted update that last rewrote the tile ([ADR 027](../context_docs/decisions/027-targeted-updates.md)), null where the tile is still the campaign's fill |
 
-The quality rule is the store's: a pixel is embedded only if it had at least 15 usable optical
-observations in the year. Every count above comes from the store's own per-pixel observation-count
-arrays, so any row can be checked against the store.
+The quality rule is the store's: a pixel is embedded only if it had at least `optical_min_obs`
+usable optical observations in the year: the store root's value, or a lower one a targeted update
+used for its tiles, and each row's own `optical_min_obs` says which. The campaign's line is one, at
+which `refused_thin_px` is always 0; a v1.1 row still at 15 is a tile no update has yet reached at a
+lower line
+([ADR 028](../context_docs/decisions/028-embed-every-pixel-with-an-optical-observation.md)). Every
+count above comes from the store's own per-pixel observation-count arrays, so any row can be checked
+against the store.
 
 ## What catches people out
 
@@ -180,11 +186,15 @@ reaches the registry right after its pixels are committed to the store:
 ```
 
 - **A tile's row comes from the newest run that wrote that tile.** A full refill replaces every
-  row in its zone-year. An update of some tiles replaces only the tiles it rewrote, and
-  every other tile keeps its row. The master follows the store, which also keeps each tile as the
-  last run that wrote it left it.
+  row in its zone-year. An update of some tiles replaces only the tiles it rewrote, and every other
+  tile keeps its row. An update that filled a tile's holes merged two runs' pixels, so its row is
+  re-derived from the tile as committed rather than taken from either run. The master follows the
+  store, which also keeps each tile as the last run that wrote it left it.
 - **Each zone-year file is replaced in a single write**, so a reader sees the old file or the new
   one, never a mixture, and zone-years never wait on each other.
+- **`_common_metadata` follows the schema.** When a column is added, the next update rewrites it, so
+  a reader taking the dataset's schema from it sees the new column; cell files written before it
+  read it as null.
 - **`measured_by` records where the numbers came from.** Fills that resumed after an interruption
   published 1,519,045 of v1.1's rows without their measurements. Those were re-derived from the
   store's observation counts on 2026-10-12, by a method that matched the fill's own numbers

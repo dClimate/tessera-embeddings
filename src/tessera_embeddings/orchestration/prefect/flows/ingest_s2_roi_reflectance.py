@@ -1,11 +1,9 @@
 """Sentinel-2 L2A reflectance ingestion flow for ROI-based regions.
 
-The outer flow provisions a Dask cluster (AWS Fargate by default; ``LocalCluster`` when
-``use_local=True``) and invokes the inner flow via ``.with_options(task_runner=...)``, so
-Prefect binds the runner late, after the cluster context has produced a scheduler address.
-
-The two-flow split is load-bearing: ``task_runner=`` must be set at flow definition time or
-via ``.with_options()`` on a callable, which requires an inner ``@flow``. Do not collapse it.
+The flow provisions a Dask cluster (AWS Fargate by default; ``LocalCluster`` when
+``use_local=True``) and runs the ``process_roi_reflectance`` task shell on it with
+:func:`._dask_lifecycle.run_on_cluster`, as a task run of this flow run, so the ingest's progress
+logs land on this run.
 """
 
 from __future__ import annotations
@@ -17,89 +15,61 @@ from prefect import flow, get_run_logger
 from prefect.runtime import flow_run as flow_run_ctx
 
 from tessera_embeddings.ingest.roi_processing import DEFAULT_MIN_VALID_COVERAGE
+from tessera_embeddings.ingest.s2_roi import BATCH_CHUNKS_PER_WORKER
 from tessera_embeddings.orchestration.prefect.flows._dask_lifecycle import (
     dask_cleanup_on_cancellation,
     dask_resource_tags,
-    get_task_runner_for_cluster,
+    run_on_cluster,
 )
 from tessera_embeddings.orchestration.prefect.tasks.ingest import process_roi_reflectance
+from tessera_embeddings.providers.local.dask import local_cluster
 
 MAX_PIPELINE_DATES_WORKERS = 140
-"""Widest fleet on which date pipelining is allowed to run.
+"""Widest Fargate fleet on which the flow prepares the next S2 date during the current write.
 
-Overlapping the next date's preparation with the current date's write only pays while the
-write leaves the fleet room to absorb the coverage gate. That gate is worker-side work, so on
-a fleet the write already keeps busy it is additive however it is scheduled, and past some
-width the overlap costs more than the client-side graph build it saves. A measured
-calibration, not a property of the code: see `yield-embeddings/context_docs/measurements/`.
+Preparing a date has two parts. Building its read plan runs in the ingest's driver: one thread,
+in the task that drives the ingest on one worker. Checking its cloud mask reads the date's
+cloud-mask (SCL) data as tasks spread across the fleet, on the same workers that run the write.
+The overlap prepares the next date on a background thread of the driver while the fleet writes
+the current one. The read plan then costs nothing, because the driver would otherwise wait on
+the write. The cloud-mask check costs nothing only where the write leaves workers idle; where the
+write keeps every worker busy, the check's tasks take turns with the write's and lengthen it.
 
-Above the bound the flow declines to pipeline rather than obeying, because the flag arrives
-from many callers and the failure is silent — a slower run just looks like a slower run.
-Declining can only prevent harm; pipelining is off by default.
+Empirically, preparation shrinks far less than the write as the fleet widens, and why is not
+settled. The suspicion, not established: the read plan is one thread, so more workers cannot speed
+it; and the cloud-mask check is a small graph, so once a fleet has more workers than its tasks,
+per-request read latency rather than worker count sets its time.
+
+So the overlap saves at least the read-plan time, plus whatever part of the check fits into idle
+worker time. In paired tests it was never slower, and it gained most on narrower fleets. No fleet
+wider than this bound has been measured, so the overlap is off above it as a precaution, not
+because a loss was seen there. Evidence: ``context_docs/ingest/campaign-ingest-measurements.md``
+§3.21.
 """
 
 
-def _gated_pipeline_dates(
+def _pipelines_dates(
     *,
-    pipeline_dates: bool,
     use_local: bool,
     max_workers: int,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
 ) -> bool:
-    """Return the pipelining flag actually in force, declining above the width bound.
+    """Decide whether this run prepares each S2 date while the previous one is written.
 
-    Fargate-only: on ``use_local`` the ``max_workers`` parameter provisions nothing, so
-    gating on it would disable pipelining for a cluster whose width it does not describe.
-    The bound is inclusive.
+    Yes, unless the Fargate fleet is wider than ``MAX_PIPELINE_DATES_WORKERS`` (inclusive
+    bound). On ``use_local`` the ``max_workers`` parameter provisions nothing, so it decides
+    nothing there and the local cluster always pipelines.
     """
-    if pipeline_dates and not use_local and max_workers > MAX_PIPELINE_DATES_WORKERS:
-        log.warning(
-            "pipeline_dates requested with max_workers=%d, above the %d-worker bound where "
-            "overlapping preparation still pays; running WITHOUT pipelining. See "
-            "MAX_PIPELINE_DATES_WORKERS.",
-            max_workers,
-            MAX_PIPELINE_DATES_WORKERS,
-        )
-        return False
-    return pipeline_dates
-
-
-@flow(name="ingest_s2_roi_impl")
-def _ingest_s2_roi_impl(
-    *,
-    roi_zarr_path: str,
-    start_date: str,
-    end_date: str,
-    store_path: str,
-    min_valid_coverage: float = DEFAULT_MIN_VALID_COVERAGE,
-    provider: str = "earth-search",
-    collection: str = "sentinel-2-l2a",
-    storage_options: dict | None = None,
-    stream_stac_monthly: bool = True,
-    overlap_window_writes: bool = True,
-    pipeline_dates: bool = False,
-    batch_dates: int | None = None,
-    allow_ingest_code_mismatch: bool = False,
-    s3_region: str | None = None,
-) -> dict[str, Any]:
-    """Inner flow: submits the S2 ingestion task to the configured Dask runner."""
-    future = process_roi_reflectance.submit(
-        roi_zarr_path=roi_zarr_path,
-        start_date=start_date,
-        end_date=end_date,
-        store_path=store_path,
-        min_valid_coverage=min_valid_coverage,
-        provider=provider,
-        collection=collection,
-        storage_options=storage_options,
-        stream_stac_monthly=stream_stac_monthly,
-        overlap_window_writes=overlap_window_writes,
-        pipeline_dates=pipeline_dates,
-        batch_dates=batch_dates,
-        allow_ingest_code_mismatch=allow_ingest_code_mismatch,
-        s3_region=s3_region,
+    if use_local or max_workers <= MAX_PIPELINE_DATES_WORKERS:
+        return True
+    log.info(
+        "Preparing S2 dates one at a time: this %d-worker fleet is wider than the %d workers up to "
+        "which preparing the next date during the current write is known to pay. See "
+        "MAX_PIPELINE_DATES_WORKERS.",
+        max_workers,
+        MAX_PIPELINE_DATES_WORKERS,
     )
-    return future.result()
+    return False
 
 
 @flow(
@@ -127,7 +97,6 @@ def ingest_s2_roi_reflectance(
     perf_report_uri: str | None = None,
     stream_stac_monthly: bool = True,
     overlap_window_writes: bool = True,
-    pipeline_dates: bool = False,
     batch_dates: int | None = None,
     worker_env_overrides: dict[str, str] | None = None,
     allow_ingest_code_mismatch: bool = False,
@@ -138,6 +107,12 @@ def ingest_s2_roi_reflectance(
     Reads the Zarr ROI store for a WGS84 bounding box, queries STAC for intersecting tiles,
     and writes a mosaicked ``reflectance.zarr`` under ``store_path`` at the ingestion
     pipeline's INGEST_CHUNKS (4000x4000).
+
+    Each date's preparation (load graph, coverage gate, footprint narrowing, masking) runs on a
+    background thread while the previous date is written, so it costs wall clock only where the
+    write cannot cover it. Automatic, with no setting: every fleet up to
+    ``MAX_PIPELINE_DATES_WORKERS`` pipelines, and a wider one prepares dates one at a time.
+    Identical stores either way.
 
     Args:
         roi_zarr_path: Any fsspec-compatible URI to the Zarr ROI store.
@@ -163,21 +138,15 @@ def ingest_s2_roi_reflectance(
             blocking compute per window, so their critical paths overlap across the fleet
             instead of summing. Identical stores either way; falls back to the sequential
             write when the overlapped machinery is unavailable.
-        pipeline_dates: Prepare the next date (load graph, coverage gate, footprint
-            narrowing, masking) on a background thread while the current date is written,
-            so preparation costs wall clock only where the write cannot cover it. The write
-            stays serial and in date order — one commit per date — and stores are identical
-            either way. Ignored with a warning above ``MAX_PIPELINE_DATES_WORKERS``; narrow
-            fleets benefit most.
-        batch_dates: Compute up to this many consecutive passing dates as one dask graph and
-            land them as ONE commit, so their work packs the fleet together and the per-date
-            drain tail and commit gap are paid once per batch. The commit unit becomes the
-            batch: a mid-batch failure commits none of its dates, and the retry re-ingests
-            exactly those. Identical stores either way. Composes with ``pipeline_dates`` —
-            the look-ahead becomes the batch, so a whole batch's preparation hides behind
-            the previous batch's write. Leave at ``None`` to size it from the ROI, which is
-            what the campaign wants: the benefit is not monotonic in ROI size, so one global
-            value regresses part of the range. Pin an int only for one arm of a comparison.
+        batch_dates: The most consecutive passing dates computed as one dask graph and landed
+            as ONE commit, so the per-write overhead (graph submission, drain tail, commit) is
+            paid once per batch. The commit unit becomes the batch: a mid-batch failure commits
+            none of its dates, and the retry re-ingests exactly those. Identical stores either
+            way. When dates are pipelined the look-ahead becomes the batch. ``None`` caps it at
+            ``AUTO_BATCH_DATES`` (4). How many dates a batch actually holds is set per date by a
+            budget of ``BATCH_CHUNKS_PER_WORKER`` storage chunks per worker: batching pays only
+            for sparse writes, so sparse dates fill a batch and a date that would push it past
+            the budget starts a new one. Pin an int only for one arm of a comparison.
         worker_env_overrides: Env vars merged into every Dask worker's environment for THIS
             run only, to A/B worker-side tuning (allocator, cache behaviour) one arm at a
             time. Not a configuration channel — anything meant to hold for every run belongs
@@ -196,68 +165,55 @@ def ingest_s2_roi_reflectance(
     log = get_run_logger()
     log.info("Starting ingest_s2_roi_reflectance for %s", roi_zarr_path)
 
-    pipeline_dates = _gated_pipeline_dates(
-        pipeline_dates=pipeline_dates, use_local=use_local, max_workers=max_workers, log=log
-    )
+    pipeline_dates = _pipelines_dates(use_local=use_local, max_workers=max_workers, log=log)
+    # From the fleet's planned width, since a Fargate fleet may still be starting when the ingest
+    # counts its workers. A local cluster is up already, so the ingest counts it itself (None).
+    batch_chunk_budget = None if use_local else BATCH_CHUNKS_PER_WORKER * max_workers
+
+    task_parameters: dict[str, Any] = {
+        "roi_zarr_path": roi_zarr_path,
+        "start_date": start_date,
+        "end_date": end_date,
+        "store_path": store_path,
+        "min_valid_coverage": min_valid_coverage,
+        "provider": provider,
+        "collection": collection,
+        "storage_options": storage_options,
+        "stream_stac_monthly": stream_stac_monthly,
+        "overlap_window_writes": overlap_window_writes,
+        "pipeline_dates": pipeline_dates,
+        "batch_dates": batch_dates,
+        "batch_chunk_budget": batch_chunk_budget,
+        "allow_ingest_code_mismatch": allow_ingest_code_mismatch,
+        "s3_region": s3_region,
+    }
 
     if use_local:
-        from tessera_embeddings.providers.local.dask import local_cluster
-
         if perf_report_uri:
             # Say so rather than no-op: an operator finding nothing at the URI would
             # otherwise suspect the upload or their credentials.
             log.warning("perf_report_uri is ignored on the local-cluster path (use_local=True)")
         with local_cluster() as cluster:
             log.info("Local Dask cluster ready: scheduler=%s", cluster.scheduler_address)
-            task_runner = get_task_runner_for_cluster(cluster.scheduler_address)
-            return _ingest_s2_roi_impl.with_options(task_runner=task_runner)(  # type: ignore[arg-type]
-                roi_zarr_path=roi_zarr_path,
-                start_date=start_date,
-                end_date=end_date,
-                store_path=store_path,
-                min_valid_coverage=min_valid_coverage,
-                provider=provider,
-                collection=collection,
-                storage_options=storage_options,
-                stream_stac_monthly=stream_stac_monthly,
-                overlap_window_writes=overlap_window_writes,
-                pipeline_dates=pipeline_dates,
-                batch_dates=batch_dates,
-                allow_ingest_code_mismatch=allow_ingest_code_mismatch,
-                s3_region=s3_region,
-            )
+            return run_on_cluster(cluster.scheduler_address, process_roi_reflectance, task_parameters)
 
+    # Deferred: providers.aws.dask needs the `aws` extra, which a use_local run must not.
     from tessera_embeddings.providers.aws.dask import ecs_cluster, maybe_performance_report
 
-    with ecs_cluster(
-        log,
-        min_workers=min_workers,
-        max_workers=max_workers,
-        ec2_scheduler=ec2_scheduler,
-        # A capped task stream silently truncates the report to the run's last few dates;
-        # raise it only when a report is actually being captured.
-        diagnostic_task_stream=bool(perf_report_uri),
-        extra_worker_env=worker_env_overrides,
-        # Tag every cluster resource with this run's id so the cancellation/crash hook can
-        # sweep the tasks from a fresh process (see _dask_lifecycle).
-        resource_tags=dask_resource_tags(flow_run_ctx.id),
-    ) as cluster:
-        task_runner = get_task_runner_for_cluster(cluster.scheduler_address)
-        log.info("Task runner connected to scheduler at %s", cluster.scheduler_address)
-        with maybe_performance_report(cluster.scheduler_address, perf_report_uri, log):
-            return _ingest_s2_roi_impl.with_options(task_runner=task_runner)(  # type: ignore[arg-type]
-                roi_zarr_path=roi_zarr_path,
-                start_date=start_date,
-                end_date=end_date,
-                store_path=store_path,
-                min_valid_coverage=min_valid_coverage,
-                provider=provider,
-                collection=collection,
-                storage_options=storage_options,
-                stream_stac_monthly=stream_stac_monthly,
-                overlap_window_writes=overlap_window_writes,
-                pipeline_dates=pipeline_dates,
-                batch_dates=batch_dates,
-                allow_ingest_code_mismatch=allow_ingest_code_mismatch,
-                s3_region=s3_region,
-            )
+    with (
+        ecs_cluster(
+            log,
+            min_workers=min_workers,
+            max_workers=max_workers,
+            ec2_scheduler=ec2_scheduler,
+            # A capped task stream silently truncates the report to the run's last few dates;
+            # raise it only when a report is actually being captured.
+            diagnostic_task_stream=bool(perf_report_uri),
+            extra_worker_env=worker_env_overrides,
+            # Tag every cluster resource with this run's id so the cancellation/crash hook can
+            # sweep the tasks from a fresh process (see _dask_lifecycle).
+            resource_tags=dask_resource_tags(flow_run_ctx.id),
+        ) as cluster,
+        maybe_performance_report(cluster.scheduler_address, perf_report_uri, log),
+    ):
+        return run_on_cluster(cluster.scheduler_address, process_roi_reflectance, task_parameters)

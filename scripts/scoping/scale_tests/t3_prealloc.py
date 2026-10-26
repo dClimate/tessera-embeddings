@@ -22,12 +22,11 @@ import icechunk
 import numpy as np
 import zarr
 
-from scripts.scoping.scale_tests import synth
+from scripts.scoping.scale_tests import harness, synth
 from scripts.scoping.scale_tests import store_builder as SB
 from scripts.scoping.scale_tests import variants as V
 from scripts.scoping.scale_tests.seeding import embedding_group_spec, seed_groups
 from scripts.scoping.scale_tests.zone_geometry import YEARS, MockZone, zone_for
-from scripts.scoping.scale_tests import harness
 
 logger = logging.getLogger("scale_tests.t3")
 

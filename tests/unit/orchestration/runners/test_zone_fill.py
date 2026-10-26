@@ -15,8 +15,10 @@ from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.orchestration.runners import zone_fill
 from tessera_embeddings.storage import global_store, shard_writer
 from tessera_embeddings.storage.empty_store import VarSpec, create_empty_store_from_coords
+from tessera_embeddings.storage.update import UpdateTarget, commit_update_record, update_record
 from tessera_embeddings.storage.zarr_store import open_or_create_repo
 from tessera_embeddings.storage.zone_grid import ZoneSpec, easting_coords, northing_coords
+from tests.unit.inference_stack import STACK
 
 log = logging.getLogger("test_zone_fill")
 
@@ -159,7 +161,7 @@ def _staging_inference_stub(staged: dict[str, np.ndarray]):
         for chunk in chunks:
             emb = rng.integers(-100, 100, size=(chunk.height, chunk.width, _BAND)).astype(np.int8)
             scales = rng.random((chunk.height, chunk.width)).astype(np.float32)
-            writer.write_chunk(chunk, emb, run_id, scales=scales)
+            writer.write_chunk(chunk, emb, run_id, scales=scales, stack=STACK)
             staged[chunk.label] = emb
             results.append({"chunk": chunk.label, "status": "success", "valid_pixels": 1, "elapsed_sec": 0.0})
         return results
@@ -187,7 +189,13 @@ def _resuming_inference_stub(staged: dict[str, np.ndarray]):
         rng = np.random.default_rng(7)
         for chunk in (c for c in chunks if c.label not in already):
             emb = rng.integers(-100, 100, size=(chunk.height, chunk.width, _BAND)).astype(np.int8)
-            writer.write_chunk(chunk, emb, run_id, scales=rng.random((chunk.height, chunk.width)).astype(np.float32))
+            writer.write_chunk(
+                chunk,
+                emb,
+                run_id,
+                scales=rng.random((chunk.height, chunk.width)).astype(np.float32),
+                stack=STACK,
+            )
             staged[chunk.label] = emb
             results.append({"chunk": chunk.label, "status": "success", "valid_pixels": 1, "elapsed_sec": 0.0})
         return results
@@ -323,37 +331,76 @@ def test_an_unusable_assembly_worker_override_is_refused_before_inference(tmp_pa
         _fill(tmp_path, store, n_assembly_workers=bad)
 
 
-def test_the_runner_refuses_a_rule_the_store_does_not_advertise(tmp_path):
-    """The store's minimum-depth rule is write-once root identity, so the STORE is the
-    authority on what rule its zones were filled under — not the caller's config.
+@pytest.mark.parametrize(
+    ("root_rule", "is_update", "config_rule", "refused"),
+    [
+        (None, False, 25, "advertises"),
+        (None, False, None, None),
+        (15, False, 1, "advertises"),
+        (15, True, 1, None),
+        (15, True, None, "advertises"),
+        (15, True, 20, "only loosen"),
+        (None, True, 1, "only loosen"),
+    ],
+)
+def test_the_runner_applies_only_the_stores_rule_or_an_updates_looser_one(
+    tmp_path, root_rule, is_update, config_rule, refused
+):
+    """The STORE is the authority on what rule a cell is filled under, not the caller's config: a
+    fill applies the root's rule exactly, and an update may apply a looser one but never a stricter.
 
-    The Prefect adapter reads the root and substitutes the value before calling. This runner
-    is the orchestrator-agnostic entry point and was trusting that: called directly, it would
-    run inference under any threshold, publish, and mark the year complete. Zones filled under
-    different lines would then sit under one root advertising a single rule, and no later check
-    could tell which pixels came from which — a refused pixel is indistinguishable from one
-    that had no optical input.
-
-    Asserted rather than substituted: silently replacing a caller's value would let a direct
-    caller believe it had configured a line it had not.
+    The Prefect adapter reads the store and substitutes the value before calling. This runner
+    is the orchestrator-agnostic entry point: trusting the config, a direct call would fill
+    under any threshold, and no later check could tell which pixels came from which — a refused
+    pixel is indistinguishable from one that had no optical input. Asserted rather than
+    substituted, so a direct caller never believes it configured a line it had not.
     """
-    store = _seed_global(tmp_path)  # seeded with no rule, so the store advertises None
-    config = InferenceConfig(time_window=_WINDOW, chunk_size=_TILE, num_gpus=0, optical_min_obs=25)
-    with pytest.raises(ValueError, match="write-once root identity"):
-        _fill(tmp_path, store, config=config)
-
-
-def test_the_runner_accepts_a_config_matching_the_store(tmp_path):
-    """The adapter's substitution must satisfy the check, not trip it — otherwise every
-    Prefect fill would fail on the guard meant to protect direct callers.
-    """
-    store = _seed_global(tmp_path)
-    config = InferenceConfig(time_window=_WINDOW, chunk_size=_TILE, num_gpus=0, optical_min_obs=None)
-    # This wiring points at an absent mask on purpose, so the fill still fails — just LATER,
-    # on the mask, which is what proves the rule check passed rather than short-circuited.
+    store = _seed_global_with_rule(tmp_path, root_rule)
+    update = UpdateTarget("u", "holes", "keep", "global", None, "h") if is_update else None
+    config = InferenceConfig(time_window=_WINDOW, chunk_size=_TILE, num_gpus=0, optical_min_obs=config_rule)
+    # A config that clears the check still fails LATER (the cell is unfilled, the mask absent),
+    # which proves the check passed rather than short-circuited.
     with pytest.raises(Exception) as exc:
-        _fill(tmp_path, store, config=config)
-    assert "write-once root identity" not in str(exc.value), "the matching config must clear the rule check"
+        _fill(tmp_path, store, config=config, update=update)
+    assert all((word in str(exc.value)) is (word == refused) for word in ("advertises", "only loosen"))
+
+
+def _record_updates(store: str, *lines: tuple[str, int]) -> None:
+    """Mark the test cell filled and record earlier updates of it, each at its own line."""
+    session = global_store.open_global_repo(store).writable_session("main")
+    zarr.open_group(session.store, mode="a")[_ZONE].attrs["years_complete"] = [2025]
+    session.commit("filled")
+    for name, line in lines:
+        target = UpdateTarget(name, "shards", "keep", "global", None, "h")
+        record = update_record(target, run_id=name, written=["chunk_0_0"], kept=[], optical_min_obs=line)
+        commit_update_record(global_store.open_global_repo(store), _ZONE, 2025, record=record)
+
+
+def _update_at(tmp_path, store: str, name: str, line: int | None):
+    config = InferenceConfig(time_window=_WINDOW, chunk_size=_TILE, num_gpus=0, optical_min_obs=line or 15)
+    update = UpdateTarget(name, "shards", "keep", "global", None, "h")
+    return _fill(tmp_path, store, config=config, update=update)
+
+
+@pytest.mark.parametrize(("line", "refused"), [(None, True), (5, True), (1, False)])
+def test_an_update_may_not_tighten_a_cell_an_earlier_update_loosened(tmp_path, line, refused):
+    """After an update at 1, a later one at the root's 15 or at 5 would drop (``shards``) or count as
+    thin (``holes``) the pixels the first one embedded, so the runner refuses it before inference.
+    """
+    store = _seed_global_with_rule(tmp_path, 15)
+    _record_updates(store, ("earlier", 1))
+    with pytest.raises(Exception) as exc:
+        _update_at(tmp_path, store, "later", line)
+    assert ("earlier update" in str(exc.value)) is refused
+
+
+def test_rerunning_a_recorded_update_is_not_a_tightening(tmp_path):
+    """Update a at 5, then b at 1: rerunning a (to catch up its registry master) does no inference and
+    writes no pixel, so it settles as already recorded rather than being refused.
+    """
+    store = _seed_global_with_rule(tmp_path, 15)
+    _record_updates(store, ("a", 5), ("b", 1))
+    assert _update_at(tmp_path, store, "a", 5)["already_recorded"]
 
 
 def test_chunk_size_shard_mismatch_raises(tmp_path):
@@ -704,6 +751,7 @@ def test_landed_but_untagged_cell_is_retagged_without_rerun(tmp_path, monkeypatc
         rng.integers(-100, 100, size=(_TILE, _TILE, _BAND)).astype(np.int8),
         "run1",
         scales=rng.random((_TILE, _TILE)).astype(np.float32),
+        stack=STACK,
     )
     writer.assemble_global(store, _ZONE, year=2025, run_id="run1", n_workers=1)
     repo = global_store.open_global_repo(store)
@@ -861,8 +909,8 @@ def test_the_flow_actually_defers_both_deletes():
     )
 
 
-def _seed_global_with_rule(tmp_path, rule: int) -> str:
-    """A store whose write-once root declares a depth rule, so the fill's gate accepts one."""
+def _seed_global_with_rule(tmp_path, rule: int | None) -> str:
+    """A store whose root declares a depth rule (or none), so the fill's gate accepts that one."""
     store = str(tmp_path / "global.icechunk")
     repo = global_store.create_global_repo(store)
     global_store.seed_zone_groups(repo, [_SPEC], years=_YEARS, layout=SMALL, optical_min_obs=rule)
@@ -1079,7 +1127,13 @@ def test_a_partly_refused_tile_publishes_what_the_gate_removed(tmp_path, monkeyp
         results = []
         for i, chunk in enumerate(chunks):
             emb = rng.integers(-100, 100, size=(chunk.height, chunk.width, _BAND)).astype(np.int8)
-            writer.write_chunk(chunk, emb, run_id, scales=rng.random((chunk.height, chunk.width)).astype(np.float32))
+            writer.write_chunk(
+                chunk,
+                emb,
+                run_id,
+                scales=rng.random((chunk.height, chunk.width)).astype(np.float32),
+                stack=STACK,
+            )
             results.append(
                 {
                     "chunk": chunk.label,

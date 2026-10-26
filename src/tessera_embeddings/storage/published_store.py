@@ -259,10 +259,12 @@ def committed_runs(attrs: Mapping[str, Any], year: int, writes: Sequence[Commit]
     is a year marked without shards, which wrote nothing. A run a refill replaced whose commit has
     expired is marked ``empty``: its part, if it has one, is still the store's, but the refill rewrote
     every tile it wrote, which the store check confirms while the commit is still there to diff, and
-    nothing can afterwards.
+    nothing can afterwards. A targeted update records itself in the same shape beside the fill, in
+    ``updates[year]`` (``storage.update``), so its expired commits are found the same way.
     """
     head = (attrs.get("runs") or {}).get(str(year))
     current, replaced = ([head], head.get("previous", [])) if isinstance(head, dict) else ([], [])
+    current += (attrs.get("updates") or {}).get(str(year), [])
     tagged = {commit.snapshot for commit in writes}
     recorded = [c for entry in current if (c := _recorded(entry, tagged)) is not None]
     recorded += [c for entry in replaced if (c := _recorded(entry, tagged, replaced=True)) is not None]

@@ -11,6 +11,7 @@ but not torch. Ray serializes only the actor class reference; torch is needed on
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import logging
 import time
@@ -37,7 +38,7 @@ from tessera_embeddings.config.inference import (
 from tessera_embeddings.config.store_layout import MONTH_COVERED_VARS, MONTHS_IN_YEAR
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import OBS_COUNT_VARS, ZarrWriter
-from tessera_embeddings.inference.chunk_spec import ChunkSpec
+from tessera_embeddings.inference.chunk_spec import ChunkSpec, read_pixel_mask
 from tessera_embeddings.inference.data_loading import (
     configure_mosaic_reads,
     load_chunk,
@@ -47,6 +48,7 @@ from tessera_embeddings.inference.data_loading import (
 from tessera_embeddings.inference.progress import chunk_uid
 from tessera_embeddings.inference.read_plan import _chunk_read_plan
 from tessera_embeddings.inference.resource_monitor import ResourceMonitor
+from tessera_embeddings.storage.conventions import checkpoint_stem
 from tessera_embeddings.storage.zarr_store import credentials_provider
 
 if TYPE_CHECKING:
@@ -306,6 +308,17 @@ def _accelerator_index() -> str | None:
     return str(ids[0]) if ids else None
 
 
+@functools.lru_cache(maxsize=4)
+def _pixel_mask(uri: str) -> np.ndarray:
+    """A tile's update pixel mask, read once per tile rather than once per strip.
+
+    Read-only, because every strip of the tile slices the same cached array.
+    """
+    mask = read_pixel_mask(uri)
+    mask.setflags(write=False)
+    return mask
+
+
 # Memory env vars, all on runtime_env rather than the decorator process, so Ray exports them into the worker
 # environment BEFORE this module imports torch / instantiates the C allocator — each is read once at init and ignored
 # if set later. On the decorator so they cover every creation site: the initial pool, the ActorPool replacement path
@@ -480,6 +493,7 @@ class InferenceActor:
             optical_min_obs=self.config.optical_min_obs,
             model_version=self.config.model_version,
             norm_source=self.config.norm_source,
+            pixels=None if chunk.pixels is None else _pixel_mask(chunk.pixels)[y_sub, x_sub or slice(None)],
         )
         return data, dataset
 
@@ -499,7 +513,9 @@ class InferenceActor:
         """
         store_opener = make_store_opener(region=self._s3_region)
         mask_bundle = load_s2_mask_bundle(mosaic_base, chunk, time_window, store_opener=store_opener)
-        x_sub, strips, live_strips = _chunk_read_plan(chunk, mask_bundle)
+        x_sub, strips, live_strips = _chunk_read_plan(
+            chunk, mask_bundle, pixels=None if chunk.pixels is None else _pixel_mask(chunk.pixels)
+        )
         first_strip = self._load_strip_dataset(
             chunk,
             mosaic_base,
@@ -535,6 +551,24 @@ class InferenceActor:
 
     # ------------------------------------------------------------------
     # Cross-chunk prefetch
+    @functools.cached_property
+    def _inference_stack(self) -> dict[str, str | None]:
+        """What this actor computes with: model, checkpoint stem, PyTorch and CUDA (ADR 025).
+
+        Read here, where the model runs: the driver runs the lockfile's CPU build whatever the workers
+        run, so only this process knows. A staging run records it once (``ZarrWriter._join_run``) and
+        assembly holds the store to it. CUDA is ``None`` on a CPU actor even when the build has it,
+        since ``torch.version.cuda`` names the build, not the device.
+        """
+        import torch
+
+        return {
+            "model_version": self.config.model_version,
+            "checkpoint_id": checkpoint_stem(self.config.checkpoint_path),
+            "torch": torch.__version__,
+            "cuda": torch.version.cuda if self.device.type == "cuda" else None,
+        }
+
     # ------------------------------------------------------------------
     # Stash keyed by chunk label; lazily initialised so test harnesses building bare actors via
     # object.__new__ keep working without __init__.
@@ -1122,9 +1156,9 @@ class InferenceActor:
             # No optical-free count is needed — that case IS the skip, and a skipped chunk never reaches here.
             s2_at_embedded = obs_buffers["s2_obs_count"][embedded]
             # The rule this RUN applied, not the module default. The dataset gates on `config.optical_min_obs`, which
-            # comes from the store root, so counting against the constant would report a thin share measured by a line
-            # the fill never used — and would read as a non-zero count on a store whose rule already refuses every
-            # pixel it names.
+            # comes from the store root or an update's plan, so counting against the constant would report a thin
+            # share measured by a line the fill never used — and would read as a non-zero count on a store whose rule
+            # already refuses every pixel it names.
             thin_below = self.config.optical_min_obs or OPTICAL_MIN_OBS
             s2_thin_px = int((s2_at_embedded < thin_below).sum())
             del embedded, obs_at_embedded, s2_at_embedded
@@ -1161,6 +1195,7 @@ class InferenceActor:
                         # carry no measurements — a refused chunk's identical record survives
                         # because it goes into the skip marker.
                         coverage=coverage,
+                        stack=self._inference_stack,
                     )
                     # One line per chunk: how long the backgrounded upload took. The phase table's write_s is ~0 by
                     # design, so this is the off-critical-path cost, for post-run upload health checks.

@@ -21,6 +21,7 @@ from tessera_embeddings.config.inference import (
     _STAGED_OUTPUT_SOURCES,
     inference_code_identity,
 )
+from tessera_embeddings.config.ingest import _MOSAIC_CONTENT_SOURCES
 from tests._paths import SRC_ROOT
 
 _ROOT = SRC_ROOT
@@ -175,3 +176,17 @@ def test_the_real_ingest_fingerprint_covers_the_collection_settings() -> None:
     seed = [_ROOT / entry for entry in _MOSAIC_CONTENT_SOURCES]
     reached = {p.relative_to(_ROOT).as_posix() for p in first_party_import_closure(seed, _ROOT)}
     assert "config/providers.py" in reached
+
+
+@pytest.mark.parametrize("module", ["storage/update.py", "ingest/land_mask.py", "config/paths.py"])
+def test_targeted_updates_move_neither_fingerprint(module: str) -> None:
+    """An update's plan, paths and shard narrowing decide WHERE work runs, never what a pixel holds.
+
+    Inside either closure, a change to them would abandon staged tiles or refuse appends to
+    interrupted mosaics — so nothing in either closure may import them.
+    """
+    ingest = {
+        p.relative_to(_ROOT).as_posix()
+        for p in first_party_import_closure([_ROOT / e for e in _MOSAIC_CONTENT_SOURCES], _ROOT)
+    }
+    assert module not in _covered() and module not in ingest

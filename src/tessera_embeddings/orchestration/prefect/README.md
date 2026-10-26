@@ -28,7 +28,7 @@ orchestration/prefect/
 │   │  shared private helpers (underscore = not a public import surface)
 │   ├── _cell_validation.py          # hand a tagged cell to its validator, don't wait
 │   ├── _child_runs.py               # child deployment runs: cancel sweeps, terminal-state check
-│   ├── _dask_lifecycle.py           # Dask/ECS teardown hook + the DaskTaskRunner factory
+│   ├── _dask_lifecycle.py           # Dask/ECS teardown hook + run_on_cluster (task shell -> cluster)
 │   ├── _ray_lifecycle.py            # Ray teardown hook (the Ray analogue of the above)
 │   ├── _fleet_gate.py               # ingest gate (zero = pause) + inference pause flag
 │   └── _overrides.py                # per-run flow option overrides
@@ -44,7 +44,7 @@ orchestration/prefect/
 - [Master pipeline](#master-pipeline)
 - [Individual flows](#individual-flows)
 - [Deliberate fault injection (supervised drills only)](#deliberate-fault-injection-supervised-drills-only)
-- [The two-flow pattern](#the-two-flow-pattern)
+- [One flow per ingest](#one-flow-per-ingest)
 - [Task shells](#task-shells)
 - [Provider selection](#provider-selection)
 - [Running](#running)
@@ -257,11 +257,28 @@ enough to infer that the rest of the window lands behind it, and inference is sl
 than ingest in almost every case, so the stream does not run dry and the fleet does
 not idle.
 
+**A small job can hold the request for a backlog.** That argument fails for a small,
+scattered job, such as a targeted update whose zone-years ingest in minutes to hours
+and infer in minutes: the first small mosaic boots the fleet, which finishes it, winds
+down to one actor after the 120 s idle grace, and regrows at the next landing, over
+and over. `inference_start_delay_minutes`, set per dispatch on `run_global_campaign`
+(which forwards it to every chained fill) or on `fill_zones_sequential_flow`, keeps
+holding the request for that many minutes after the first landing, and ends the hold
+early once every ingest in the cluster has finished, landed or failed. The default, 0,
+requests GPUs at the first landing; on the full campaign a hold would buy the
+up-front ingest time the last bullet below rejects. The hold sits inside the same
+shutdown guard as the wait. The inference pause gate is no substitute, since a paused
+cluster still boots and keeps its full fleet while landed work waits
+([`the-fleet-and-the-work-source.md`](../../../../context_docs/inference/the-fleet-and-the-work-source.md)).
+
 ```text
-start window (1 + look_ahead zones), all ingesting in parallel
-   smallest lands ──►│                       (densest lands much later)
-                      ray up ──► stream, taking whichever zone has landed
-                                 (density order preserved, minus the barrier)
+every zone starts ingesting, 1 + look_ahead at a time
+   first lands ──►│ hold ─►│                     (densest lands much later)
+                            ray up ──► stream, taking whichever zone has landed
+                                       (density order preserved, minus the barrier)
+
+hold: up to inference_start_delay_minutes (0 by default), ending early once every
+      ingest has finished
 ```
 
 Two subtleties worth knowing:
@@ -305,6 +322,37 @@ unresolvable conflicts. See `context_docs/storage/writing-to-the-global-store.md
 cluster-less (they run on the flow runner like `generate_roi`); only
 `fill_zone_year` / `fill_zones_sequential` provision Ray.
 
+### Targeted updates of filled cells
+
+An **update** re-runs chosen tiles of cells the campaign has already filled and writes nothing
+else. How to plan, run, check and clean up an update is
+[`docs/updates.md`](../../../../docs/updates.md); the design is
+[ADR 027](../../../../context_docs/decisions/027-targeted-updates.md). Both fill flows take the
+update's name as `update=<name>`, and treat its cells differently from a fill's:
+
+| | campaign fill | update |
+|---|---|---|
+| work list | cells not yet in `years_complete` | plan cells without the update's record; a never-filled cell is refused |
+| inferred | every valid pixel of every live tile | `holes`: only the store's hole pixels; `shards`: the target shards |
+| a tile that embeds nothing | cleared to fill | kept (`on_skip: "clear"` for a `shards` defect fix) |
+| recorded in | `years_complete`, `runs[year]`, the zone-year tag | `updates[year]` alone |
+| ROI, mosaics, staging | the campaign's paths | `{inputs}/updates/<name>/`, `{outputs}/staging/updates/<name>/<store>/`; hole masks and staging per destination store |
+| `min_valid_coverage`, month check | 0.1, every month | `1e-9`, relaxed: a partial-zone ROI must never block |
+| radar policy | any | `holes` requires `allow_s2_only=True`, the campaign's, refused before ingest otherwise |
+
+Run one update per cell at a time: two updates of one cell conflict on its chunks.
+
+#### An update with a looser optical line
+
+The store's minimum optical depth rule sits on its root and never moves. An update can apply a
+looser line to its own cells: plan it with `--optical-min-obs`, and a `holes` update embeds exactly
+the pixels the looser line admits
+([ADR 028](../../../../context_docs/decisions/028-embed-every-pixel-with-an-optical-observation.md)).
+The root and zone groups keep the store's rule, so they understate an updated cell; its update
+records state the line, and `storage.update.cell_optical_min_obs` reads back the floor every
+embedded pixel meets. A line stricter than the store's is refused, as is one stricter than an
+earlier update applied to the same cell. The steps are in [`docs/updates.md`](../../../../docs/updates.md).
+
 ## Master pipeline
 
 `tessera_full_pipeline.py` is the recommended entry point for end-to-end
@@ -334,15 +382,15 @@ override.
 | `build_land_mask.py` | Global campaign: build per-zone coverage bitmaps from the partner delivery registry (ADR-010). Optional pre-build delivery verification + post-build validation. No cluster. |
 | `seed_global_store.py` | Global campaign: create the global-store repo and seed every unseeded UTM-zone group (metadata-only, ADR-008 D1). Idempotent. No cluster. |
 | `fill_zone_year.py` | Global campaign, single cell by hand: fill one `(zone, year)` on its own Ray cluster (coverage mask → inference → shard assembly → tag → registry master). Commits are ungated. Not dispatched by the campaign. |
-| `fill_zones_sequential.py` | Global campaign: fill one cluster's zones sequentially on a SINGLE shared Ray cluster (densest-first, ingest look-ahead, trailing assembly, idle-retirement gated until the final zone). Waits for its densest zone's mosaic before requesting GPUs. Pre-cluster triage settles retag/all-ocean cells. |
+| `fill_zones_sequential.py` | Global campaign: fill one cluster's zones sequentially on a SINGLE shared Ray cluster (densest-first, ingest look-ahead, trailing assembly, idle-retirement gated until the final zone). Requests GPUs as soon as its first mosaic lands. Pre-cluster triage settles retag/all-ocean cells. |
 | `ingest_zone_year.py` | Global campaign: build one cell's S1/S2 mosaics on the fixed zone grid by dispatching the ROI ingest deployments onto a synthesised zone-shaped ROI. Marker-gated and crash-safe: a stale or half-written mosaic is cleared and rebuilt, never appended onto. |
 | `run_global_campaign.py` | Global campaign driver: dispatch every pending `(zone, year)` as size-balanced `fill-zones-sequential` runs on long-lived clusters, with bounded re-dispatch rounds. |
 
 ### A landed cell is handed to a validator, and nothing waits for it
 
-Both fill flows take a `validation_deployment`. As each cell is tagged they create one run
-of it and return immediately (`flows/_cell_validation.py`), so cell N is checked while cell
-N+1 is still being filled — on the chained path the dispatch happens on the trailing
+Both fill flows take a `validation_deployment`. As each cell is tagged, or a targeted update
+writes or clears shards in it, they create one run of it and return immediately
+(`flows/_cell_validation.py`), so cell N is checked while cell N+1 is still being filled — on the chained path the dispatch happens on the trailing
 assembly thread, which already has that pipelining.
 
 Three properties are deliberate. The default is `None`, because the validator is a
@@ -366,7 +414,7 @@ runner merges its registry parts into the cell's file under the registry's `mast
 it lands, including a deliberate refill, which fails at the tag step by design. Like the
 validator dispatch, a failure there is logged and never fails the landed cell; the registry
 census names the cell and `scripts/maintenance/rebuild_registry_measurements.py repair`
-rebuilds it. Planning a retry of a cell that already landed runs the merge again, on every runner
+rebuilds it. Planning a retry of a cell that already landed, or of an update already recorded there, runs the merge again, on every runner
 and in triage, so a process that died before it still reaches the master. The merge refuses while a run the store records writing the
 year has no part for a tile it last wrote; refilling those tiles clears it. See
 [`registry-master.md`](../../../../context_docs/storage/registry-master.md).
@@ -394,8 +442,8 @@ fill_zones_sequential --"chained-ingest:<id>"-->    ingest-zone-year (look-ahead
 Each flow keeps its own teardown hook as well; the sweep stops the runs those
 hooks then clean up after.
 
-> **Why so many flow files?** The two-flow pattern below explains the inner/outer
-> split per file. The flows themselves are kept thin — task-graph discipline
+> **Why so many flow files?** One per deployment, and each ingest is a single flow
+> (see [One flow per ingest](#one-flow-per-ingest)). The flows are kept thin — task-graph discipline
 > (per-date iteration for S2, batched windows for S1, ChunkSpec-granularity
 > assembly) lives in the domain modules. See
 > [`docs/ingest-performance.md`](../../../../docs/ingest-performance.md#background-how-dask-task-graphs-consume-scheduler-ram)
@@ -434,24 +482,37 @@ every hop (`fill_zone_year` → `assemble_zone_year` → `assemble_global` →
 the commit path of the store that is the campaign's only output, and a reviewer of any
 one of those functions should be able to see that it can be asked to fail.
 
-## The two-flow pattern
+## One flow per ingest
 
-You'll notice each flow file has an outer `@flow` and an inner
-`@flow` invoked via `.with_options(task_runner=...)`. This is a
-deliberate Prefect idiom — `task_runner=` must be set at flow
-definition time or via `.with_options()` on a callable, which
-requires a separate inner `@flow`. Don't try to collapse it. The
-docstring at the top of each flow file states this explicitly.
+Each ingest deployment is one `@flow`. It provisions its Dask cluster, then runs its task shell
+on that cluster with `run_on_cluster` (`flows/_dask_lifecycle.py`):
 
 ```
-ingest_s2_roi_reflectance(...)            ← outer @flow: provisions the cluster
-  with ecs_cluster(...) as cluster:
-    runner = DaskTaskRunner(cluster.scheduler_address)
-    _ingest_s2_roi_impl.with_options(     ← inner @flow: runs against that runner
-        task_runner=runner,
-    )(...)
-      └── process_roi_reflectance.submit(...)   ← @task: pulls client + log from context
+ingest_s2_roi_reflectance(...)                  ← the deployment's @flow
+  with ecs_cluster(...) as cluster:             ← Fargate fleet (local_cluster() when use_local)
+    with maybe_performance_report(...):         ← no-op unless perf_report_uri is set
+      run_on_cluster(cluster.scheduler_address, ← PrefectDaskClient on that scheduler
+                     process_roi_reflectance, ...)
+        └── process_roi_reflectance             ← @task: a task run of the SAME flow run,
+                                                  executing on a Dask worker
 ```
+
+- **Why not `@flow(task_runner=DaskTaskRunner(...))`.** A task runner binds when the flow is
+  defined, and the scheduler address exists only once the flow body has provisioned the
+  cluster. Submitting through a `PrefectDaskClient` needs no task runner, so one flow can do both.
+- **The driver runs on a worker.** The task shell is the ingest's driver loop, and it executes
+  on one Dask worker: `get_client()` there returns that worker's client, and the worker sizing
+  in `providers/aws/dask.py` is set for it.
+- **Logs.** Prefect's task engine on that worker sends the shell's `get_run_logger()` lines to
+  the API under the flow run, so the per-date and per-batch progress lines sit on the
+  deployment's own run, beside the flow's lines.
+- **Failure and teardown.** A failing task fails the flow with the task's exception.
+  `ecs_cluster` tears the fleet down on exit, and the `on_cancellation` / `on_crashed` hook
+  sweeps it by the flow-run tag when a kill skips that exit.
+
+`export_zone_rois` is the one flow that calls an inner flow, because it sizes its
+`ThreadPoolTaskRunner` per run. The decision record is
+[ADR 029](../../../../context_docs/decisions/029-one-flow-per-ingest.md).
 
 ## Task shells
 

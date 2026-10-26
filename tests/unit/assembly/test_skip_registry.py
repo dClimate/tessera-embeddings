@@ -46,6 +46,7 @@ from tessera_embeddings.inference.assembly import (
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.storage.registry import REASONS, part_uri, registry_rows, write_registry_part
+from tests.unit.inference_stack import STACK
 
 #: A shard commit's timestamp, as `write_year_shards` reports it.
 COMMITTED = "2026-08-01T00:00:00.123456+00:00"
@@ -308,7 +309,15 @@ class TestCoverageOnlyStaging:
 
         cov = writer.write_coverage_only(chunk, "run1", obs, months)
         emb, scales = np.zeros((8, 8, 128), dtype=np.int8), np.zeros((8, 8), dtype=np.float32)
-        full = writer.write_chunk(chunk, emb, run_id="run2", scales=scales, obs_counts=obs, month_covered=months)
+        full = writer.write_chunk(
+            chunk,
+            emb,
+            run_id="run2",
+            scales=scales,
+            obs_counts=obs,
+            month_covered=months,
+            stack=STACK,
+        )
 
         cov_g, full_g = zarr.open_group(cov, mode="r"), zarr.open_group(full, mode="r")
         for var in (*OBS_COUNT_VARS, *MONTH_COVERED_VARS):
@@ -343,7 +352,7 @@ class TestCoverageOnlyStaging:
         assert Path(cov).exists()
 
         emb, scales = np.zeros((8, 8, 128), dtype=np.int8), np.zeros((8, 8), dtype=np.float32)
-        writer.write_chunk(chunk, emb, run_id="run1", scales=scales)
+        writer.write_chunk(chunk, emb, run_id="run1", scales=scales, stack=STACK)
         assert not Path(cov).exists()
 
     def test_assembly_reads_the_real_counts_instead_of_fill(self, tmp_path: Path) -> None:
@@ -652,6 +661,17 @@ class TestTheDatasetIsActuallyReadable:
         assert table.num_rows == 2
         assert set(table.column("zone").to_pylist()) == {"32S", "09S"}, "from the path, not a column"
         assert set(table.column("year").to_pylist()) == {2021, 2022}
+
+    def test_an_update_names_itself_on_its_rows_and_a_fill_leaves_it_null(self, tmp_path: Path) -> None:
+        """The master keeps each tile's newest row, so this is how a tile says which update its data came from."""
+        pq = pytest.importorskip("pyarrow.parquet")
+        root = str(tmp_path / "reg")
+        fill = self._write(root, "32S", 2021, "fill", registry_rows("fill", "t1", embedded=["chunk_0_0"], refused=[]))
+        update = self._write(
+            root, "32S", 2021, "upd", registry_rows("upd", "t2", embedded=["chunk_0_0"], refused=[], update_name="u1")
+        )
+        assert pq.read_table(fill).column("update_name").to_pylist() == [None]
+        assert pq.read_table(update).column("update_name").to_pylist() == ["u1"]
 
     def test_a_refill_adds_a_part_rather_than_replacing_one(self, tmp_path: Path) -> None:
         """Keyed by run so the registry holds both fills of a cell. A fixed name would silently
@@ -1262,6 +1282,7 @@ class TestTheEmbeddedHalfOfTheRecord:
             "run1",
             scales=np.ones((chunk.height, chunk.width), dtype=np.float32),
             coverage=coverage,
+            stack=STACK,
         )
         return writer
 
@@ -1324,6 +1345,7 @@ class TestToppingUpTheRecords:
                 "run1",
                 scales=np.ones((8, 8), dtype=np.float32),
                 coverage=_record(label, thin=row + 1),
+                stack=STACK,
             )
         return writer
 

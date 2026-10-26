@@ -10,6 +10,7 @@ provisioned once with the idle-timeout override.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import threading
 import time
@@ -19,14 +20,17 @@ from functools import partial
 from types import SimpleNamespace
 
 import pytest
+from prefect.exceptions import TerminationSignal
 from prefect.states import StateType
 
 import tessera_embeddings.orchestration.prefect.flows._child_runs as _child_runs
 import tessera_embeddings.orchestration.prefect.flows.fill_zones_sequential as mod
 from tessera_embeddings.config.paths import BucketPaths
+from tessera_embeddings.storage.update import UpdatePlan
 from tests.unit.deadline import run_under_deadline
 
 _PATHS = BucketPaths(inputs="s3://in", outputs="s3://out")
+_AMI = {"ami_ssm_name": "ami", "ami_ssm_name_by_model": {"v1.1": "ami"}}  # v1.1 needs its own image (ADR 025)
 
 
 @pytest.fixture()
@@ -72,7 +76,7 @@ def wired(monkeypatch):
         return {"zone": kwargs["zone"], "run_id": kwargs["run_id"]}
 
     monkeypatch.setattr(mod, "fill_zone_year", fake_no_cluster_fill)
-    monkeypatch.setattr(mod, "_assert_seeded_model_matches", lambda *a, **k: rec["order"].append("model_guard"))
+    monkeypatch.setattr(mod, "store_model_version", lambda *a, **k: rec["order"].append("model_guard") or "v1.1")
     # The chained path reads the depth rule off the store root, like the per-cell flow.
     monkeypatch.setattr(mod, "_optical_min_obs_from_store", lambda *a, **k: None)
     monkeypatch.setattr(mod, "build_inference_config", lambda **k: SimpleNamespace(**k))
@@ -141,7 +145,7 @@ def _run(**overrides):
     does the conversion in one place; `cells=` is passed straight through for the tests
     that ARE about multi-year lists.
     """
-    kwargs = {"paths": _PATHS, "ami_ssm_name": "ami"}
+    kwargs = {"paths": _PATHS, **_AMI}
     if "cells" in overrides:
         kwargs["cells"] = overrides.pop("cells")
     else:
@@ -174,6 +178,113 @@ def test_a_streamed_cell_is_planned_with_the_registry(wired, monkeypatch):
         SimpleNamespace(zone="33N", year=2025), SimpleNamespace(mosaic_base="m", config=None, run_id="r")
     )
     assert seen["registry_root"] == _PATHS.optical_registry(_PATHS.global_store())
+
+
+class TestAnUpdate:
+    """A targeted update triages by its own record and shards, and never retags or marks."""
+
+    PLAN = UpdatePlan(
+        name="u1",
+        mode="shards",
+        mask_name="alt",
+        cells={"01N/2025": ["chunk_0_0"], "02N/2025": None, "03N/2025": None, "04N/2025": ["chunk_5_5"]},
+    )
+
+    @pytest.fixture()
+    def update_wired(self, wired, monkeypatch):
+        monkeypatch.setattr(mod, "load_update", lambda paths, name, mask_name: self.PLAN)
+        monkeypatch.setattr(mod, "open_global_repo", lambda *a, **k: object())
+        states = {
+            ("01N", 2025): "pending",
+            ("02N", 2025): "done",
+            ("03N", 2025): "not_complete",
+            ("04N", 2025): "pending",
+        }
+        monkeypatch.setattr(mod, "update_states", lambda repo, name, cells: {c: states[c] for c in cells})
+        monkeypatch.setattr(mod, "zone_year_complete", lambda *a, **k: pytest.fail("an update must never retag"))
+        wired["tiles"], wired["ingests"], wired["finished"], wired["tightening"] = {}, [], [], []
+        monkeypatch.setattr(
+            mod,
+            "check_no_tightening",
+            lambda repo, name, rule, cells: wired["tightening"].append(
+                (name, rule, list(cells), len(wired["ingests"]))
+            ),
+        )
+        monkeypatch.setattr(mod, "finish_update", lambda repo, plan: wired["finished"].append(plan.name) or "t")
+
+        def count(mask, zone, **k):
+            wired["tiles"][zone] = (mask, k["tiles"])
+            return 0 if zone == "04N" else 3
+
+        monkeypatch.setattr(mod, "zone_live_tile_count", count)
+        real = mod.run_deployment
+
+        def record(dep, parameters, timeout, tags=None):
+            wired["ingests"].append(parameters)
+            return real(dep, parameters, timeout, tags)
+
+        monkeypatch.setattr(mod, "run_deployment", record)
+        return wired
+
+    def test_cells_come_from_the_plan_and_settle_by_its_record(self, update_wired):
+        result = _run(cells=None, update="u1")
+
+        root = _PATHS.update_root("u1")
+        assert (result["update"], result["update_done"], result["not_filled"]) == ("u1", 1, [["03N", 2025]])
+        assert result["live"] == 1 and result["empty"] == 1
+        assert update_wired["tiles"]["01N"] == (_PATHS.land_mask_store("alt"), frozenset({"chunk_0_0"}))
+        # The recorded cell goes through the runner too, so planning catches up its master; the
+        # dead-target cell records itself there. Both with no cluster, as the update.
+        recorded, dead = sorted(update_wired["no_cluster_fills"], key=lambda f: f["zone"])
+        assert recorded["zone"] == "02N" and recorded["update"].name == "u1"
+        assert recorded["registry_root"] == dead["registry_root"] == _PATHS.optical_registry(_PATHS.global_store())
+        assert dead["update"].tiles == frozenset({"chunk_5_5"})
+        assert dead["mosaic_base"] == f"{root}/mosaics/04N/2025"
+        assert dead["staging_base"] == f"{_PATHS.update_staging('u1', _PATHS.global_store())}/04N/2025"
+        # The live cell's ingest runs as the update, and its fill is planned as one.
+        assert [p["update"] for p in update_wired["ingests"]] == ["u1"]
+        assert update_wired["seq_kwargs"]["cells"][0].zone == "01N"
+        # A one-cluster update pins its complete tag too, once every planned cell holds the record.
+        assert update_wired["finished"] == ["u1"] and result["update_complete_tag"] == "t"
+
+    def test_staging_is_per_destination_store(self, update_wired):
+        # A holes update infers only its own store's holes, so a second store must never resume its tiles.
+        for store in ("tessera", "other"):
+            _run(cells=[("04N", 2025)], update="u1", store_name=store)
+        first, second = (f["staging_base"] for f in update_wired["no_cluster_fills"])
+        assert first != second
+        assert second == f"{_PATHS.update_staging('u1', _PATHS.global_store('other'))}/04N/2025"
+
+    def test_a_stricter_line_is_checked_before_any_ingest(self, update_wired, monkeypatch):
+        """Only the cells still pending, at the run's own rule, and before a single ingest is dispatched."""
+        monkeypatch.setattr(mod, "_optical_min_obs_from_store", lambda *a, **k: 15)
+        _run(cells=None, update="u1")
+        [(name, rule, cells, ingests_before)] = update_wired["tightening"]
+        assert (name, rule, cells, ingests_before) == ("u1", 15, [("01N", 2025), ("04N", 2025)], 0)
+
+    def test_a_cell_outside_the_plan_is_refused(self, update_wired):
+        with pytest.raises(ValueError, match="not in update 'u1'"):
+            _run(cells=[("09N", 2025)], update="u1")
+
+    @pytest.mark.parametrize(("line", "applied"), [(None, 15), (1, 1)])
+    def test_the_plans_own_line_reaches_the_config_and_the_fingerprint(self, update_wired, monkeypatch, line, applied):
+        """The store root stays at 15: an update planned at 1 fills its cells at 1, and stages them
+        apart from a run at 15; a plan without a line applies the store's.
+        """
+        plan = dataclasses.replace(self.PLAN, optical_min_obs=line)
+        monkeypatch.setattr(mod, "load_update", lambda paths, name, mask_name: plan)
+        monkeypatch.setattr(mod, "_optical_min_obs_from_store", lambda *a, **k: 15)
+        fingerprinted: list[int] = []
+
+        def fingerprint(zone, year, **k):
+            fingerprinted.append(k["optical_min_obs"])
+            return f"{zone}-{year}-fingerprint"
+
+        monkeypatch.setattr(mod, "_staging_run_id", fingerprint)
+        _run(cells=None, update="u1")
+        prepare = update_wired["seq_kwargs"]["prepare"]
+        assert prepare(SimpleNamespace(zone="01N", year=2025, num_actors=5)).config.optical_min_obs == applied
+        assert set(fingerprinted) == {applied}
 
 
 class TestPerCellValidation:
@@ -306,7 +417,7 @@ def test_model_mismatch_prevents_cluster(wired, monkeypatch):
     def guard(*a, **k):
         raise ValueError("seeded for a different encoder")
 
-    monkeypatch.setattr(mod, "_assert_seeded_model_matches", guard)
+    monkeypatch.setattr(mod, "store_model_version", guard)
     with pytest.raises(ValueError, match="different encoder"):
         _run()
     assert wired["ray_kwargs"] is None
@@ -325,6 +436,14 @@ def test_pinned_ami_id_reaches_ray_cluster(wired):
     """
     _run(ami_id="ami-pinned-01")
     assert wired["ray_kwargs"]["ami_id"] == "ami-pinned-01"
+
+
+@pytest.mark.parametrize("model", ["v1.1", "v2-large"])
+def test_the_stores_models_image_reaches_ray_cluster(wired, monkeypatch, model):
+    """The cells run the model their store holds, so that model's entry is the image (ADR 025)."""
+    monkeypatch.setattr(mod, "store_model_version", lambda *a, **k: model)
+    _run(ami_ssm_name_by_model={"v1.1": "ami-v11", "v2-large": "ami-v2"})
+    assert wired["ray_kwargs"]["ami_ssm_name"] == {"v1.1": "ami-v11", "v2-large": "ami-v2"}[model]
 
 
 def test_unpinned_ami_is_resolved_once_and_reused(wired, monkeypatch):
@@ -411,6 +530,9 @@ class _RecordingInputs:
         self._order.append("wait_first:" + ",".join(z for z, _ in cells))
         return cells[-1] if cells else None
 
+    def hold_for_backlog(self, cells, minutes):
+        self._order.append(f"hold:{minutes}")
+
     def shutdown(self):
         self._order.append("inputs_shutdown")
 
@@ -446,6 +568,22 @@ def test_gpus_wait_for_whichever_mosaic_lands_first(wired, monkeypatch):
     assert "wait_first:01N,02N,03N" in order
     assert not [e for e in order if e.startswith("wait:")]
     assert order.index("wait_first:01N,02N,03N") < order.index("ray_up")
+
+
+@pytest.mark.parametrize(
+    ("delay", "held", "announced"),
+    [(0.0, [], "as soon as the first mosaic lands"), (5.0, ["hold:5.0"], "5 min after the first mosaic lands")],
+)
+def test_the_gpu_request_is_held_only_when_a_delay_is_asked_for(wired, monkeypatch, caplog, delay, held, announced):
+    """The default goes straight from the first landing to `ray up`, exactly as before; a delay
+    holds between the two, and nowhere else. The opening log line says which.
+    """
+    monkeypatch.setattr(mod, "_DeploymentCellInputs", partial(_RecordingInputs, wired["order"]))
+    with caplog.at_level(logging.INFO, logger="test-seq-flow"):
+        _run(zones=["01N", "02N"], ingest=True, inference_start_delay_minutes=delay)
+    order = wired["order"]
+    assert order[order.index("wait_first:01N,02N") + 1 : order.index("ray_up")] == held
+    assert f"GPUs are requested {announced}" in caplog.text
 
 
 def test_cells_are_ordered_by_true_tile_count_not_the_clamped_fleet_request(wired, monkeypatch):
@@ -589,6 +727,68 @@ def test_adapter_wait_polls_child_run_to_completion(monkeypatch):
     finally:
         adapter.shutdown()
     assert client.cancelled == []  # nothing in flight at shutdown
+
+
+def test_ingest_runs_are_created_inside_the_fills_run_context(monkeypatch):
+    """Worker threads inherit none of the flow's context, so without entering a copy of the fill's
+    run context around the dispatch, every ingest run is created unattached to the fill.
+    """
+    entered: list[str] = []
+
+    @contextmanager
+    def fill_context():
+        entered.append("in")
+        yield
+        entered.append("out")
+
+    monkeypatch.setattr(mod, "FlowRunContext", SimpleNamespace(get=lambda: SimpleNamespace(model_copy=fill_context)))
+    seen = []
+
+    def run_deployment(dep, parameters, timeout, tags=None):
+        seen.append((threading.current_thread().name.startswith("cell-ingest"), list(entered)))
+        return SimpleNamespace(id="fr-1", state=None)
+
+    monkeypatch.setattr(mod, "run_deployment", run_deployment)
+    monkeypatch.setattr(
+        mod, "get_client", lambda sync_client=True: _FakeClient([_state(StateType.COMPLETED, final=True)])
+    )
+    adapter = _adapter()
+    try:
+        adapter.wait("33N", 2025)
+    finally:
+        adapter.shutdown()
+    assert seen == [(True, ["in"])] and entered == ["in", "out"]
+
+
+def test_a_dispatch_queued_while_shutdown_begins_creates_no_run(monkeypatch):
+    """A worker past the first stop check but still waiting for the lock must create nothing:
+    shutdown has already snapshotted the runs it will cancel, so a run made now is never swept.
+    """
+    created = []
+    monkeypatch.setattr(
+        mod, "run_deployment", lambda *a, **k: created.append(1) or SimpleNamespace(id="fr-late", state=None)
+    )
+    adapter = _adapter()
+    with adapter._lock:
+        adapter.start("33N", 2025)
+        time.sleep(0.2)  # the worker is now queued on the lock
+        adapter._stopping.set()
+    with pytest.raises(RuntimeError, match="not dispatched"):
+        adapter._futures[("33N", 2025)].result(timeout=5)
+    adapter.shutdown()
+    assert created == []
+
+
+def test_shutdown_raises_the_stop_flag_before_waiting_for_the_lock():
+    """Dispatchers queued on the lock must see the flag the moment they get it, so none of them
+    creates a run while shutdown is still waiting its turn behind an in-progress creation.
+    """
+    adapter = _adapter()
+    with adapter._lock:  # stands in for a creation in progress
+        stopper = threading.Thread(target=adapter.shutdown)
+        stopper.start()
+        assert adapter._stopping.wait(2), "the flag must rise before shutdown takes the lock"
+    stopper.join(5)
 
 
 def test_adapter_shutdown_cancels_in_flight_child_runs(monkeypatch):
@@ -913,12 +1113,14 @@ def test_the_flow_default_matches_the_runner_default(wired):
     )
 
 
-def test_negative_look_ahead_rejected_before_any_side_effect(wired):
-    """look_ahead < 0 is rejected before triage / priming / `ray up` — a
-    deadlock that only manifested after the GPU cluster was provisioned.
+@pytest.mark.parametrize("param", ["look_ahead", "inference_start_delay_minutes"])
+def test_a_negative_width_or_delay_is_rejected_before_any_side_effect(wired, param):
+    """Rejected before triage / priming / `ray up`. A negative look_ahead is a deadlock that
+    only manifested after the GPU cluster was provisioned.
     """
-    with pytest.raises(ValueError, match="look_ahead must be >= 0"):
-        _run(look_ahead=-2)
+    with pytest.raises(ValueError, match=f"{param} must be >= 0"):
+        _run(**{param: -2})
+    assert wired["preflights"] == []  # no triage
     assert wired["ray_kwargs"] is None  # no cluster provisioned
     assert wired["seq_kwargs"] is None  # runner never entered
 
@@ -1159,8 +1361,49 @@ def test_the_all_failed_report_names_cells_that_failed_in_earlier_waits():
         adapter.shutdown()
 
 
-def test_a_failure_while_priming_still_cancels_the_ingests_it_started(wired, monkeypatch):
-    """Priming lives inside the shutdown guard, so no child ingest is ever orphaned.
+@pytest.mark.parametrize(
+    ("settle", "reason"),
+    [
+        (None, "limit reached"),
+        (lambda fut: fut.set_result(None), "every ingest finished"),
+        # A failed ingest is finished too: nothing more will arrive from it.
+        (lambda fut: fut.set_exception(RuntimeError("bad credentials")), "every ingest finished"),
+    ],
+)
+def test_the_backlog_hold_ends_at_its_limit_or_once_nothing_more_can_land(caplog, settle, reason):
+    """The hold waits on the ingests themselves, so it ends the moment the last one settles
+    rather than sitting out the rest of a limit that can no longer buy a mosaic.
+    """
+    adapter = _adapter()
+    late: Future = Future()
+    adapter._futures = {("01N", 2024): _settled(None), ("02N", 2024): late}
+    if settle is not None:
+        threading.Timer(0.05, settle, args=(late,)).start()
+    limit_s = 0.3 if settle is None else 60.0
+    t0 = time.monotonic()
+    try:
+        with caplog.at_level(logging.INFO, logger="test-adapter"):
+            run_under_deadline(10.0, lambda: adapter.hold_for_backlog([("01N", 2024), ("02N", 2024)], limit_s / 60))
+    finally:
+        adapter.shutdown()
+    elapsed = time.monotonic() - t0
+    assert "1 of 2 mosaic(s) landed" in caplog.text  # the opening line counts the first landing
+    assert f"({reason})" in caplog.text
+    assert (limit_s * 0.9 <= elapsed) if settle is None else (elapsed < 5.0)
+
+
+@pytest.mark.parametrize(
+    ("step", "exc"),
+    [
+        ("wait_first", RuntimeError("prefect API unreachable")),
+        ("hold_for_backlog", RuntimeError("prefect API unreachable")),
+        # What Prefect raises in the flow process when the run is cancelled.
+        ("hold_for_backlog", TerminationSignal(signal=15)),
+    ],
+)
+def test_a_failure_while_priming_still_cancels_the_ingests_it_started(wired, monkeypatch, step, exc):
+    """Priming, the first-landing wait and the backlog hold all live inside the shutdown guard,
+    so no child ingest is ever orphaned.
 
     ``start`` submits the whole window at once, so from the first submission there are
     child runs that only ``shutdown()`` can cancel. With priming above the ``try``, a
@@ -1169,14 +1412,13 @@ def test_a_failure_while_priming_still_cancels_the_ingests_it_started(wired, mon
     writing mosaic prefixes server-side that a prompt retry would then race.
     """
 
-    class _FailingInputs(_RecordingInputs):
-        def wait_first(self, cells, timeout=None):
-            self._order.append("wait_first:raised")
-            raise RuntimeError("prefect API unreachable")
+    def _raise(self, *a, **k):
+        raise exc
 
-    monkeypatch.setattr(mod, "_DeploymentCellInputs", partial(_FailingInputs, wired["order"]))
-    with pytest.raises(RuntimeError, match="prefect API unreachable"):
-        _run(zones=["01N", "02N", "03N"], ingest=True, look_ahead=1)
+    failing = type("_FailingInputs", (_RecordingInputs,), {step: _raise})
+    monkeypatch.setattr(mod, "_DeploymentCellInputs", partial(failing, wired["order"]))
+    with pytest.raises(type(exc)):
+        _run(zones=["01N", "02N", "03N"], ingest=True, look_ahead=1, inference_start_delay_minutes=5.0)
 
     order = wired["order"]
     assert "start:01N" in order, "the window was primed, so its children must be cancelled"

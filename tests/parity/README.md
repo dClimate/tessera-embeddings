@@ -55,15 +55,16 @@ don't accidentally run the slow ones.
 ## A second kind of parity: performance flags
 
 Some parity tests compare two configurations of the *same* path rather than two
-orchestrators. A performance flag meant to change only *when* or *how
-concurrently* work happens — `pipeline_dates`, in
-`test_ingest_s2_roi_pipeline_parity.py` — is safe only if the store is identical
-with the flag on and off, which is what lets its default be flipped on evidence.
+orchestrators. A performance mode meant to change only *when* or *how
+concurrently* work happens — S2 date pipelining in
+`test_ingest_s2_roi_pipeline_parity.py`, date batching in
+`test_ingest_s2_roi_batching_parity.py` — is safe only if the store is identical
+in both modes, which is what lets the flows choose the mode on their own.
 
 Those tests take the same shape (two temp stores, one `assert_zarr_equivalent`)
 and carry the same weight, but a failure means a third thing beyond the two
 above: the optimisation is not semantics-preserving. That is a STOP rather than a
-fix-forward — the flag stays off until the stores match.
+fix-forward — no flow may choose the mode until the stores match.
 
 ## Adding a parity test
 

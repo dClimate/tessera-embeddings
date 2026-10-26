@@ -23,6 +23,7 @@ from tessera_embeddings.config.inference import (
     ModelVersion,
     _normalize_obs_checkpoints,
     band_stats,
+    model_family,
 )
 from tessera_embeddings.inference.data_loading import ChunkData
 from tessera_embeddings.inference.sampling import compute_bin_keys, resample_s1_bucket, resample_s2_bucket
@@ -62,6 +63,9 @@ class MosaicChunkInferenceDataset:
             Ignored by v2, which hard-codes one set. The band statistics are DERIVED from this and
             ``model_version`` rather than passed in, so normalisation and resampling cannot
             describe different students.
+        pixels: ``(H, W)`` mask of the only pixels this strip may embed, beside the depth and radar
+            gates rather than instead of them. A targeted update passes the store's holes here, so
+            pixels that already hold embeddings never reach the GPU. ``None`` gates nothing.
     """
 
     def __init__(
@@ -73,6 +77,7 @@ class MosaicChunkInferenceDataset:
         optical_min_obs: int | None = None,
         model_version: ModelVersion = DEFAULT_MODEL_VERSION,
         norm_source: str | None = None,
+        pixels: np.ndarray | None = None,
     ) -> None:
         if optical_min_obs is not None and optical_min_obs <= 0:
             # Zero refuses nothing while reading as a configured rule, making a caller that meant "no minimum"
@@ -107,9 +112,9 @@ class MosaicChunkInferenceDataset:
         self._cols = np.empty((0,), dtype=np.int64)
         self._global_idxs = np.empty((0,), dtype=np.int64)
 
-        self._find_and_bucket_pixels(chunk_data)
+        self._find_and_bucket_pixels(chunk_data, pixels)
 
-    def _find_and_bucket_pixels(self, chunk_data: ChunkData) -> None:
+    def _find_and_bucket_pixels(self, chunk_data: ChunkData, pixels: np.ndarray | None = None) -> None:
         """Identify valid pixels and assign each to a ``(s2_bin, s1_bin)`` bucket."""
         s2_bands = chunk_data.s2_bands
         s2_masks = chunk_data.s2_masks
@@ -156,6 +161,12 @@ class MosaicChunkInferenceDataset:
         valid_mask = has_optical & deep_enough
         if not self.allow_s2_only:
             valid_mask &= has_radar
+        # A targeted update's mask narrows WHAT is embedded, never the refusal counts below, which read
+        # the gates rather than `valid_mask` and so still describe the whole strip.
+        if pixels is not None:
+            if pixels.shape != valid_mask.shape:
+                raise ValueError(f"pixel mask shape {pixels.shape} does not match the strip's {valid_mask.shape}")
+            valid_mask &= pixels
         # For the per-chunk record: eligible-but-refused, by reason. "Thin" counts only pixels that HAD optical and
         # lost on depth, so the two optical reasons partition rather than overlap and their sum is the optical refusal
         # total.
@@ -187,10 +198,10 @@ class MosaicChunkInferenceDataset:
         pixel_s2_counts = s2_valid_count[rows, cols]
         pixel_s1_counts = s1_total_valid[rows, cols]
         keys = compute_bin_keys(pixel_s2_counts, pixel_s1_counts, self.num_obs_checkpoints)
-        if self.model_version != "v1.1":
-            # Each family's own missing-S1 input: v2 gives a radar-free pixel ONE zero step (upstream
-            # `s1_B = max(s1_bin, 1)`), where v1.1 keeps the smallest bucket. Seven fewer tokens per pixel.
-            keys["s1"][pixel_s1_counts == 0] = 1
+        # Each model's own missing-S1 input (ModelFamily.radar_free_s1_bin): v2 gives a radar-free
+        # pixel ONE zero step, where v1.1 keeps the smallest bucket. Seven fewer tokens per pixel.
+        if (radar_free_bin := model_family(self.model_version).radar_free_s1_bin) is not None:
+            keys["s1"][pixel_s1_counts == 0] = radar_free_bin
 
         # Group pixel indices by (s2, s1) bucket, packing structured (int32, int32) into one int64 for a stable
         # argsort.

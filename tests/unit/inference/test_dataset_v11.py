@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from tessera_embeddings.config.inference import OPTICAL_MIN_OBS
 from tessera_embeddings.inference.data_loading import ChunkData
 from tessera_embeddings.inference.dataset import MosaicChunkInferenceDataset
 
@@ -225,18 +226,16 @@ class TestTheMinimumOpticalDepthGate:
         assert len(ds) == 1
         assert ds.refused_thin == 1
 
-    def test_the_campaigns_own_line_is_fifteen_and_fifteen_is_kept(self):
+    def test_the_campaigns_own_line_embeds_any_valid_observation(self):
         """Pinned at the value the campaign actually runs, not a stand-in.
 
-        The rule is STRICTLY FEWER than fifteen: 14 is refused, 15 is embedded. Stated here because
-        an off-by-one at the boundary changes what a petabyte contains and would be invisible in
-        aggregate — 15 is the modal depth in exactly the thin band this line was chosen to keep.
+        One observation embeds; zero is refused as no optical input, never as thin — so at the
+        campaign's line the thin count is an invariant at zero.
         """
         ds = MosaicChunkInferenceDataset(
-            self._chunk(np.array([[13, 14, 15, 16]])), allow_s2_only=True, optical_min_obs=15
+            self._chunk(np.array([[0, 1, 2]])), allow_s2_only=True, optical_min_obs=OPTICAL_MIN_OBS
         )
-        assert len(ds) == 2, "15 and 16 are embedded"
-        assert ds.refused_thin == 2, "13 and 14 are refused"
+        assert (len(ds), ds.refused_no_optical, ds.refused_thin) == (2, 1, 0)
 
     def test_a_deep_pixel_with_no_radar_is_embedded_under_the_campaigns_policy(self):
         """The case that cost 40S three-quarters of its land.
@@ -287,6 +286,21 @@ class TestTheMinimumOpticalDepthGate:
         chunk.s2_bands[:, 0, 0:2, :] = 0  # no reflectance where the count is zero
         ds = MosaicChunkInferenceDataset(chunk, allow_s2_only=True, optical_min_obs=30)
         assert (ds.refused_no_optical, ds.refused_thin, len(ds)) == (2, 1, 1)
+
+    def test_an_update_mask_narrows_what_is_embedded_but_not_the_refusals(self):
+        """A targeted update's holes are the only pixels the GPU sees; the refusal reasons still
+        describe the whole strip, because the update's registry rows are re-derived from it.
+        """
+        chunk = self._chunk(np.array([[5, 20, 30, 40]]))
+        ds = MosaicChunkInferenceDataset(
+            chunk, allow_s2_only=True, optical_min_obs=15, pixels=np.array([[True, True, False, True]])
+        )
+        assert sorted(ds._global_idxs.tolist()) == [1, 3]
+        assert ds.refused_thin == 1
+
+    def test_an_update_mask_of_the_wrong_shape_is_refused(self):
+        with pytest.raises(ValueError, match="pixel mask shape"):
+            MosaicChunkInferenceDataset(self._chunk(np.array([[20, 30]])), pixels=np.ones((2, 2), dtype=bool))
 
     def test_a_radar_refusal_counts_only_pixels_that_passed_the_optical_test(self):
         """Otherwise a thin pixel with no radar lands in two counters at once."""

@@ -678,8 +678,9 @@ So the two cases land differently:
   excused, stays in `missing`, and the cell fails with `InsufficientCoverageError` before
   publishing anything.
 - **some dates lost from a month that keeps others** — nothing per-month sees it. The only rule
-  that does is per pixel: `config.inference.OPTICAL_MIN_OBS` refuses a pixel with too few valid
-  optical observations in the year rather than publishing it thin.
+  that does is per pixel, and at the campaign's line of one (`config.inference.OPTICAL_MIN_OBS`)
+  it refuses a pixel only when no valid observation is left; otherwise the pixel publishes thin,
+  its depth recorded in `s2_obs_count`.
 
 A vanished bucket reaches neither case, because `NoSuchBucket` is deliberately NOT matched: a
 bucket or prefix that has gone is systemic by construction and every remaining date fails

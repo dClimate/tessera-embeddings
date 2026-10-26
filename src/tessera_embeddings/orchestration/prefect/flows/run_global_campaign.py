@@ -21,10 +21,12 @@ racing for slots.
 
 GPUs are the resource that must not wait, and DENSITY ORDERING keeps them fed. Zones are
 dealt to clusters densest-first, so each opens on one of the year's biggest zones and tapers
-towards sparse ones: a cluster waits for that opening zone alone before requesting a fleet,
-never booting GPUs speculatively or paying for a whole cluster's ingest up front, and the
-opening zone is dense enough that the rest of the window lands behind it. Inference is slower
-than ingest in almost every case, so the stream does not run dry.
+towards sparse ones: a cluster waits only for its first mosaic to land, any of them, before
+requesting a fleet, never booting GPUs speculatively or paying for a whole cluster's ingest up
+front, and its dense zones take long enough to infer that the rest land behind them. Inference
+is slower than ingest in almost every case, so the stream does not run dry. A small job, where
+every zone-year infers in minutes, can hold the request for a backlog with
+``inference_start_delay_minutes``.
 
 **Scheduling (ADR-008 D6 + the runner contract).** Inference is parallel across zones; only
 commits contend, and only *same-zone* fills conflict (shared ``years_complete``/``runs``
@@ -44,7 +46,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from logging import LoggerAdapter
 from typing import Any
 
@@ -56,7 +58,13 @@ from prefect.deployments import arun_deployment
 from prefect.runtime import flow_run as flow_run_ctx
 from prefect.states import StateType
 
-from tessera_embeddings.config.inference import checkpoint_filename, inference_code_identity
+from tessera_embeddings.config.inference import (
+    ModelVersion,
+    ami_ssm_name_for_model,
+    checkpoint_filename,
+    inference_code_identity,
+    run_id_prefix,
+)
 from tessera_embeddings.config.ingest import IngestSettings
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.inference.data_loading import _active_orbits
@@ -67,10 +75,10 @@ from tessera_embeddings.orchestration.prefect.flows._child_runs import (
     make_child_cancel_hook,
 )
 from tessera_embeddings.orchestration.prefect.flows._overrides import set_overrides
-from tessera_embeddings.orchestration.prefect.flows.fill_zone_year import _assert_seeded_model_matches
 from tessera_embeddings.orchestration.prefect.flows.ingest_zone_year import IngestDeployments
 from tessera_embeddings.orchestration.runners.zone_fill import (
     zone_has_live_tiles,
+    zone_live_tile_count,
     zone_work_weight,
     zone_year_on_axis,
 )
@@ -81,9 +89,16 @@ from tessera_embeddings.storage.campaign import (
     tag_year_complete,
     zone_year_tag,
 )
-from tessera_embeddings.storage.global_store import open_global_repo, set_saved_manifest_preload
+from tessera_embeddings.storage.global_store import open_global_repo, set_saved_manifest_preload, store_model_version
 from tessera_embeddings.storage.object_store import delete_prefix
 from tessera_embeddings.storage.time_axis import CAMPAIGN_YEARS
+from tessera_embeddings.storage.update import (
+    UpdatePlan,
+    check_radar_policy,
+    finish_update,
+    load_update,
+    update_states,
+)
 from tessera_embeddings.storage.zarr_store import is_missing_repo, open_store_group_and_tip
 from tessera_embeddings.storage.zone_grid import canonicalize_zone
 
@@ -286,8 +301,10 @@ def _staging_run_id(
     allow_s2_only: bool,
     optical_min_obs: int | None,
     code_identity: str,
+    model_version: ModelVersion,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
+    update: str | None = None,
 ) -> str:
     """Deterministic staging run_id fingerprinting everything that determines the embeddings.
 
@@ -302,6 +319,11 @@ def _staging_run_id(
     still resolved and pinned into every fill's provisioning, it just no longer decides
     staging reuse. Mechanism and failure modes:
     ``context_docs/storage/staging-identity-and-resume.md``.
+
+    ``update`` names a targeted update, whose run must never share an id with another update's or
+    the campaign's: registry parts are named by run id, and the mosaic identity is content, so two
+    runs on identical mosaics would otherwise publish over each other. ``None`` adds nothing, so
+    campaign ids are unchanged.
     """
     key = (
         year,
@@ -322,7 +344,7 @@ def _staging_run_id(
         # this fingerprint and is rejected by the seeded model gate (checkpoint_id /
         # geoemb:model). The checkpoint is fixed for a campaign and never overwritten
         # mid-run, so a same-filename byte-swap is a non-scenario. (Do not "fix" to an ETag.)
-        checkpoint_filename(),
+        checkpoint_filename(model_version=model_version),
         code_identity,
         _mosaic_identity(
             zone,
@@ -333,7 +355,10 @@ def _staging_run_id(
             s3_region=s3_region,
         ),
     )
-    return f"{zone}-{year}-{hashlib.sha256(repr(key).encode()).hexdigest()[:8]}"
+    named = key if update is None else (*key, update)
+    # The model's prefix (empty for v1.1, so v1.1 ids are unchanged) is what the runner checks a
+    # resume against: the staged tiles themselves cannot say which model wrote them.
+    return run_id_prefix(model_version) + f"{zone}-{year}-{hashlib.sha256(repr(named).encode()).hexdigest()[:8]}"
 
 
 def _ingest_dispatch_params(
@@ -348,6 +373,7 @@ def _ingest_dispatch_params(
     allow_ingest_code_mismatch: bool = False,
     s3_region: str | None = None,
     branch: str | None = None,
+    update: str | None = None,
 ) -> dict[str, Any]:
     """Parameter dict for one ``ingest-zone-year`` deployment run.
 
@@ -357,6 +383,7 @@ def _ingest_dispatch_params(
     gate) hit the same stores rather than defaulting to us-west-2 on a non-default-region
     deployment. ``branch`` routes the S1/S2 grandchildren to their branch-scoped deployments
     (see :func:`_dpl`); without it a branch campaign 404s one level down on the prod refs.
+    ``update`` names a targeted update, sent only when set so a campaign's dispatch is unchanged.
     """
     return {
         "zone": zone,
@@ -375,6 +402,7 @@ def _ingest_dispatch_params(
             "ingest_s1_roi_sar": _dpl(_INGEST_DEPLOYMENT_DEFAULTS.ingest_s1_roi_sar, branch),
             "ingest_s2_roi_reflectance": _dpl(_INGEST_DEPLOYMENT_DEFAULTS.ingest_s2_roi_reflectance, branch),
         },
+        **({"update": update} if update is not None else {}),
     }
 
 
@@ -386,6 +414,7 @@ def _partition_by_live_tiles(
     pending_years: Mapping[str, int] | None = None,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
+    work: Mapping[str, float] | None = None,
 ) -> list[list[str]]:
     """Split ``zones`` into ``n_clusters`` lists of ~equal total inference WORK.
 
@@ -429,12 +458,16 @@ def _partition_by_live_tiles(
         return [zones]
     years = pending_years or {}
     n_years = {z: years.get(z, 1) if pending_years is not None else 1 for z in zones}
-    weight = {
-        z: 0.0
-        if n_years[z] <= 0
-        else n_years[z] * zone_work_weight(land_mask_path, z, get_credentials=get_credentials, s3_region=s3_region)
-        for z in zones
-    }
+    weight = (
+        {z: float(work.get(z, 0.0)) for z in zones}
+        if work is not None
+        else {
+            z: 0.0
+            if n_years[z] <= 0
+            else n_years[z] * zone_work_weight(land_mask_path, z, get_credentials=get_credentials, s3_region=s3_region)
+            for z in zones
+        }
+    )
     clusters: list[list[str]] = [[] for _ in range(n_clusters)]
     totals = [0.0] * n_clusters
     for z in sorted(zones, key=lambda z: weight[z], reverse=True):
@@ -442,6 +475,29 @@ def _partition_by_live_tiles(
         clusters[i].append(z)
         totals[i] += weight[z]
     return [cl for cl in clusters if cl]
+
+
+def _update_work(
+    plan: UpdatePlan,
+    cells: Iterable[tuple[str, int]],
+    land_mask_path: str,
+    *,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+    s3_region: str | None = None,
+) -> dict[str, float]:
+    """Each zone's share of an update's work: its cells' live target shards, summed.
+
+    What balances an update's clusters, since its cells are all complete and the campaign's own
+    weighting counts only unfilled ones. Shards rather than tokens: an update's shards are
+    scattered, so the latitude weighting of a whole zone does not describe them.
+    """
+    work: dict[str, float] = {}
+    for zone, year in cells:
+        tiles = plan.cells[f"{zone}/{year}"]
+        work[zone] = work.get(zone, 0.0) + zone_live_tile_count(
+            land_mask_path, zone, get_credentials=get_credentials, s3_region=s3_region, tiles=tiles
+        )
+    return work
 
 
 def _resolve_code_identity(
@@ -496,6 +552,7 @@ async def run_global_campaign(
     *,
     paths: BucketPaths,
     ami_ssm_name: str,
+    ami_ssm_name_by_model: dict[str, str] | None = None,
     branch: str | None = None,
     store_name: str = "tessera",
     years: tuple[int, ...] | None = None,
@@ -521,6 +578,7 @@ async def run_global_campaign(
     max_parallel_ingest: int = 60,
     max_dispatch_rounds: int = 2,
     immediate_refill: bool = False,
+    inference_start_delay_minutes: float = 0.0,
     # Staging-reuse escape hatches. All THREE default off; see `_staging_code_identity`.
     force_staging_reuse: bool = False,
     force_staging_restage: str = "",
@@ -532,16 +590,19 @@ async def run_global_campaign(
     ingest_settings: IngestSettings = IngestSettings(),  # noqa: B008
     allow_partial_window: bool = False,
     allow_s2_only: bool = False,
-    allow_model_mismatch: bool = False,
     allow_ingest_code_mismatch: bool = False,
     sweep_orphan_mosaics: bool = False,
     validation_deployment: str | None = None,
+    update: str | None = None,
 ) -> dict[str, Any]:
     """Fill every pending (zone, year) — all years in one batch, bounded zone parallelism.
 
     Args:
         paths: Deployment storage contract.
         ami_ssm_name: SSM parameter name for the Ray GPU AMI (forwarded to fills).
+        ami_ssm_name_by_model: Per-model overrides of ``ami_ssm_name``. The entry for the model
+            the store holds is the image the campaign resolves, pins and forwards, and the map goes
+            to its fills too; a model on its own worker image (v1.1) without one is refused (ADR 025).
         branch: Route child deployments to their branch-scoped variants. ``None``
             (production) leaves every ref at its unsuffixed default. A slug (e.g.
             ``"global-tessera"``) suffixes every *derived* child deployment name with
@@ -744,6 +805,14 @@ async def run_global_campaign(
             Not part of the staging fingerprint: it changes WHEN work is dispatched, not what
             is computed. Design record:
             ``context_docs/campaign/campaign-plan.md`` (§3, ``immediate_refill``).
+        inference_start_delay_minutes: Forwarded to every chained fill: once a cluster's first
+            mosaic lands, hold its GPU request up to this many more minutes so a backlog lands
+            first, ending early once all of the cluster's ingests have finished. ``0`` (the
+            default) requests GPUs at the first landing, which suits the full campaign, where
+            dense zones take hours to infer. Set it per dispatch for a small, scattered job such
+            as a targeted update, whose zone-years infer in minutes, so a fleet does not boot on
+            the first small mosaic and idle between the rest
+            (``-p inference_start_delay_minutes=30``).
         ingest_limit_name: Prefect global concurrency limit backing ``max_parallel_ingest``.
             The campaign upserts it to that value at start, so
             the parameter is the single place the number is written and cannot drift from
@@ -779,11 +848,6 @@ async def run_global_campaign(
             ingest bug. Folded into the staging run_id so a retry across a flipped flag never
             resumes mixed tiles. S2-only pixel quality is unvalidated (see the optional-S1
             ADR); affected pixels are identifiable via s1_*_obs_count == 0.
-        allow_model_mismatch: Proceed even though the store was seeded for a different
-            encoder/checkpoint than this build embeds with. The gate runs ONCE up front,
-            before any ingest is dispatched, so a mismatch costs a metadata read rather than
-            a mosaic per in-flight zone. Deliberate override only — mixing encoders under one
-            store is permanent.
         allow_ingest_code_mismatch: Forwarded to every ingest: resume interrupted mosaics
             built by different ingest code, instead of demanding they be deleted.
         sweep_orphan_mosaics: Before the run, delete mosaics for cells already
@@ -803,6 +867,24 @@ async def run_global_campaign(
             is where a consumer names its validator and where a branch-scoped registration
             already carries the suffix. Forwarding None would override that with nothing and
             switch validation off for every cell of the run.
+        update: The NAME of a targeted update to run across clusters instead of a fill, e.g.
+            ``"amazon-thin-2024"``; ``None`` (the default) runs the campaign as usual. An update
+            re-runs chosen tiles of cells the campaign has already filled and writes nothing else.
+
+            The name is not a description of the work: it names a plan written beforehand with
+            ``scripts/update/plan_update.py --name <name> ... --write``, read from
+            ``{paths.inputs}/updates/<name>/plan.json``. The plan fixes the cells and tiles, the
+            mode (``holes`` fills only pixels with no embedding; ``shards`` rewrites whole tiles),
+            the land mask and relaxed ingest settings; see ``fill_zones_sequential_flow``'s
+            ``update`` for what each means.
+
+            The work list is the plan's cells, narrowed by ``zones`` and ``years``, that do not yet
+            hold this update's record, so rerunning the same call resumes; cells the campaign never
+            filled are skipped with a warning. Clusters are balanced on the plan's tile counts, and
+            each runs its cells through ``fill-zones-sequential`` with the same ``update``. A
+            ``holes`` update needs ``allow_s2_only=True``. Once every planned cell holds the record,
+            the store is tagged ``update-<name>-complete``. The full walk-through is
+            ``docs/updates.md``.
 
     Returns:
         Summary: pending count at start, dispatched run ids per year, totals.
@@ -836,6 +918,8 @@ async def run_global_campaign(
     # — see there.
     if num_actors < 1:
         raise ValueError(f"num_actors must be >= 1, got {num_actors} (no actor would ever run inference)")
+    if inference_start_delay_minutes < 0:
+        raise ValueError(f"inference_start_delay_minutes must be >= 0, got {inference_start_delay_minutes}")
     # HERE, before any dispatch. `_apply_gpu_fallback` refuses the same values, but it runs
     # inside the child, AFTER that child has upserted shared limits and primed its look-ahead
     # mosaics — so a deterministic configuration error would spend real ingest work per
@@ -896,7 +980,18 @@ async def run_global_campaign(
             f"force_staging_reuse={force_staging_reuse!r}, force_staging_restage={force_staging_restage!r})."
         )
 
-    campaign_years = tuple(years) if years is not None else CAMPAIGN_YEARS
+    # An update's plan decides its mask and, unless narrowed, its years.
+    plan: UpdatePlan | None = load_update(paths, update, mask_name=mask_name) if update is not None else None
+    if plan is not None:
+        mask_name = plan.mask_name
+        check_radar_policy(plan, allow_s2_only=allow_s2_only)
+    campaign_years = (
+        tuple(years)
+        if years is not None
+        else tuple(sorted({y for _, y in plan.cell_list()}))
+        if plan is not None
+        else CAMPAIGN_YEARS
+    )
 
     # Lazy AWS import so the flow file imports on non-AWS machines (arch tests). The driver
     # reads the global store directly (status, tags, on-axis probe) BEFORE any child flow is
@@ -907,22 +1002,17 @@ async def run_global_campaign(
     store_path = paths.global_store(store_name)
     land_mask_path = paths.land_mask_store(mask_name)
     # THE STORE may be the partner-owned published bucket, which the task role cannot open.
-    # Only the four store reads take this; the land-mask reads, the mosaic fingerprint and the
+    # Only the store reads take this; the land-mask reads, the mosaic fingerprint and the
     # live-tile partition stay on the task role, the only credential that can read OUR buckets.
     store_credentials = icechunk_credentials_for(store_path, iam_icechunk_credentials)
     repo = open_global_repo(store_path, get_credentials=store_credentials, region=s3_region)
-    # ONCE, before any dispatch. Each fill re-checks this, but by then the campaign has paid
-    # for that cell's ingest — and cells dispatch concurrently, so a store seeded for a
-    # different encoder buys a multi-terabyte mosaic per in-flight zone before the first fill
-    # fails, and those mosaics are retained on failure (which is what makes a resume cheap).
-    # A metadata-only read.
-    _assert_seeded_model_matches(
-        store_path,
-        build_checkpoint=checkpoint_filename(),
-        allow_model_mismatch=allow_model_mismatch,
-        get_credentials=store_credentials,
-        s3_region=s3_region,
-    )
+    # The store decides the model for the whole campaign: the image it pins for every fill, the
+    # checkpoint its fingerprints name, and the staging prefix. Each fill re-reads the same attr.
+    # Resolved ONCE, before any dispatch, so a store this build cannot fill is refused for a
+    # metadata read rather than a multi-terabyte mosaic per in-flight zone.
+    model_version = store_model_version(store_path, get_credentials=store_credentials, region=s3_region)
+    ami_ssm_name = ami_ssm_name_for_model(ami_ssm_name, ami_ssm_name_by_model, model_version)
+    log.info("Campaign model: %s, from %s's geoemb:model", model_version, store_path)
     status = campaign_status(repo, years=campaign_years)
     existing_tags = set(repo.list_tags())
 
@@ -960,7 +1050,33 @@ async def run_global_campaign(
     # campaign_work_list is tag-aware: it skips landed-and-tagged cells and INCLUDES
     # complete-but-untagged ones (crash between fill and tag → the runner's idempotent retag
     # path runs). See its docstring for the two use cases.
-    work = campaign_work_list(status, existing_tags, expected_zones=expected_zones, years=campaign_years)
+    def _work(
+        snapshot: CampaignStatus, *, zones_: Iterable[str] | None, years_: Iterable[int]
+    ) -> list[tuple[str, int]]:
+        """The cells still to do, from the store: unfilled cells, or an update's unrecorded ones.
+
+        An update cell the campaign never filled is not work — the runner would refuse it — so it
+        is left out, and named once at the start.
+        """
+        if plan is None:
+            return campaign_work_list(snapshot, set(repo.list_tags()), expected_zones=zones_, years=years_)
+        states = update_states(repo, plan.name, plan.cell_list(zones=zones_, years=years_))
+        return [cell for cell, state in states.items() if state == "pending"]
+
+    work = _work(status, zones_=expected_zones, years_=campaign_years)
+    never_filled: list[str] = []
+    if plan is not None:
+        never_filled = [
+            f"{z}-{y}"
+            for (z, y), state in update_states(
+                repo, plan.name, plan.cell_list(zones=expected_zones, years=campaign_years)
+            ).items()
+            if state == "not_complete"
+        ]
+        if never_filled:
+            log.warning(
+                "Update %s skips %d cell(s) the campaign never filled: %s", plan.name, len(never_filled), never_filled
+            )
 
     # Every work cell must be seeded before we dispatch. The guard above covers a requested
     # subset, but the default `zones=None` expands to all 120 in campaign_work_list, so a
@@ -995,26 +1111,35 @@ async def run_global_campaign(
 
     # Orphan-mosaic recovery: a per-cell cleanup that failed after tagging leaves the mosaic
     # behind, and that cell has left `work`, so it is never retried. Best-effort sweep of
-    # complete-and-tagged cells in scope. Opt-in; the zero-cost backstop is an S3 lifecycle
-    # rule.
+    # complete-and-tagged cells in scope, or of an update's finished cells under its own root.
+    # Opt-in; the zero-cost backstop is an S3 lifecycle rule.
     if sweep_orphan_mosaics and ingest and cleanup_mosaics:
-        work_set = set(work)
-        sweep_zones = expected_zones if expected_zones is not None else sorted(status.zones)
-        swept = 0
-        for y in set(campaign_years):
-            for z in sweep_zones:
-                if (z, y) not in work_set and status.has(z, y) and zone_year_tag(z, y) in existing_tags:
-                    delete_prefix(
-                        f"{paths.inputs.rstrip('/')}/mosaics/{z}/{y}",
-                        log=log,
-                        # Campaign buckets have versioning OFF (measured; the CDK creates them
-                        # that way, Icechunk carrying its own history), so all-versions buys
-                        # nothing here and costs a heavier request pattern and a wider
-                        # permission. Asserted at the call site rather than assumed by default.
-                        all_versions=False,
-                    )
-                    swept += 1
-        log.info("Orphan-mosaic sweep: reclaimed %d completed-cell mosaic prefix(es)", swept)
+        if plan is not None:
+            # Recorded cells only: one the campaign has yet to fill is out of the work list too.
+            mosaic_root = paths.update_root(plan.name)
+            in_scope = plan.cell_list(zones=expected_zones, years=campaign_years)
+            finished = [c for c, state in update_states(repo, plan.name, in_scope).items() if state == "done"]
+        else:
+            mosaic_root = paths.inputs
+            work_set = set(work)
+            sweep_zones = expected_zones if expected_zones is not None else sorted(status.zones)
+            finished = [
+                (z, y)
+                for y in set(campaign_years)
+                for z in sweep_zones
+                if (z, y) not in work_set and status.has(z, y) and zone_year_tag(z, y) in existing_tags
+            ]
+        for z, y in finished:
+            delete_prefix(
+                f"{mosaic_root.rstrip('/')}/mosaics/{z}/{y}",
+                log=log,
+                # Campaign buckets have versioning OFF (measured; the CDK creates them
+                # that way, Icechunk carrying its own history), so all-versions buys
+                # nothing here and costs a heavier request pattern and a wider
+                # permission. Asserted at the call site rather than assumed by default.
+                all_versions=False,
+            )
+        log.info("Orphan-mosaic sweep: reclaimed %d completed-cell mosaic prefix(es)", len(finished))
 
     log.info(
         "Campaign: %d (zone, year) cell(s) need work across %d year(s); <=%d Ray cluster(s) per batch",
@@ -1163,6 +1288,18 @@ async def run_global_campaign(
                     pending_years={
                         z: sum(1 for zz, y in batch_cells if zz == z and not status.has(z, y)) for z in batch_zones
                     },
+                    # An update's cells are all complete, so its work is its shards instead.
+                    work=(
+                        _update_work(
+                            plan,
+                            batch_cells,
+                            land_mask_path,
+                            get_credentials=iam_icechunk_credentials,
+                            s3_region=s3_region,
+                        )
+                        if plan is not None
+                        else None
+                    ),
                     get_credentials=iam_icechunk_credentials,
                     s3_region=s3_region,
                 )
@@ -1214,9 +1351,14 @@ async def run_global_campaign(
                 def _needs_ray(cells: list[list[Any]], snapshot: CampaignStatus = status) -> bool:
                     """True if any UTM zone in this cluster will actually provision Ray."""
                     return any(
-                        not snapshot.has(z, y)
+                        (plan is not None or not snapshot.has(z, y))
                         and zone_has_live_tiles(
-                            land_mask_path, z, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+                            land_mask_path,
+                            z,
+                            get_credentials=iam_icechunk_credentials,
+                            s3_region=s3_region,
+                            # An update provisions Ray only for its own live shards.
+                            tiles=plan.cells.get(f"{z}/{y}") if plan is not None else None,
                         )
                         for z, y in cells
                     )
@@ -1236,6 +1378,7 @@ async def run_global_campaign(
                         "cells": cells,
                         "paths": paths.model_dump(),
                         "ami_ssm_name": ami_ssm_name,
+                        "ami_ssm_name_by_model": ami_ssm_name_by_model,
                         # Pin the campaign's image (see _ami_id), but ONLY for a cluster that
                         # will actually start Ray: one whose cells are all retag or all-ocean
                         # never provisions, and forcing an SSM read there breaks the cheap
@@ -1257,10 +1400,6 @@ async def run_global_campaign(
                         # dual-pol coverage at all, and demanding radar fails those cells on
                         # every retry forever.
                         "require_s1": False,
-                        # The child re-runs the model gate this flow cleared in preflight, so
-                        # without the override it rejects the same store after its ingest has
-                        # been paid for.
-                        "allow_model_mismatch": allow_model_mismatch,
                         "ssm_prefix": ssm_prefix,
                         "cloudwatch_log_group": cloudwatch_log_group,
                         "code_bucket": code_bucket,
@@ -1277,6 +1416,7 @@ async def run_global_campaign(
                         # This cluster's OWN zone count, so its admission gates never limit
                         # fleet fill (see the dispatch comment above).
                         "look_ahead": cell_look_ahead,
+                        "inference_start_delay_minutes": inference_start_delay_minutes,
                         # This deployment runs on the 244 GiB `assembly_large` family; every
                         # other caller keeps the library default.
                         "n_assembly_workers": ASSEMBLY_WORKERS_ON_THE_LARGE_RUNNER,
@@ -1308,6 +1448,7 @@ async def run_global_campaign(
                         # validation off for every cell. The child dispatches each cell's
                         # validation off its trailing assembly thread as that cell is tagged.
                         **({"validation_deployment": validation_deployment} if validation_deployment else {}),
+                        **({"update": update} if update is not None else {}),
                     }
 
                 async def _settle(parameters: dict[str, Any]) -> Any:  # noqa: ANN401 — Prefect FlowRun
@@ -1395,9 +1536,7 @@ async def run_global_campaign(
                             """
                             return [
                                 (z, y)
-                                for z, y in campaign_work_list(
-                                    snapshot, set(repo.list_tags()), expected_zones=zones, years=years
-                                )
+                                for z, y in _work(snapshot, zones_=zones, years_=years)
                                 if z in roster and (z, y) not in refilled_cells
                             ]
 
@@ -1673,11 +1812,7 @@ async def run_global_campaign(
             # the campaign.
             before = set(remaining)
             status = campaign_status(repo, years=campaign_years)
-            remaining = list(
-                campaign_work_list(
-                    status, set(repo.list_tags()), expected_zones=expected_zones, years=tuple(batch_years)
-                )
-            )
+            remaining = _work(status, zones_=expected_zones, years_=tuple(batch_years))
             if not round_failures and remaining:
                 log.warning(
                     "Year(s) %s attempt %d/%d: the fill(s) reported no failures, but %d cell(s) are still "
@@ -1725,8 +1860,9 @@ async def run_global_campaign(
         # cannot stamp the global tag prematurely, which matters because tags are write-once
         # forever. Attempted for EVERY year in the batch: an unfinished year raises
         # ValueError and is free, which is what lets the overlapping path use the same code
-        # as the year-serial one instead of detecting "was that the year's last cell".
-        for y in batch_years:
+        # as the year-serial one instead of detecting "was that the year's last cell". Never
+        # in an update, which must not pin a campaign tag at a snapshot holding its writes.
+        for y in batch_years if plan is None else ():
             try:
                 year_tag = tag_year_complete(repo, y)
                 log.info("Year %d tagged complete (all 120 zones): %s", y, year_tag)
@@ -1772,6 +1908,9 @@ async def run_global_campaign(
     except Exception as exc:
         log.warning("Could not switch manifest preloading off (%s); run the maintenance script", exc)
 
+    if plan is not None and (tag := finish_update(repo, plan)):
+        log.info("Update %s has landed in every planned cell: tagged %s", plan.name, tag)
+
     return {
         "work_at_start": len(work),
         "dispatched": dispatched,
@@ -1779,4 +1918,7 @@ async def run_global_campaign(
         # Always present, empty when everything landed: a caller testing for the KEY rather
         # than for its truthiness must not have to know which shape it gets.
         "unfilled": {year: sorted(zones) for year, zones in sorted(unfilled.items())},
+        # An update's planned cells the campaign has yet to fill: never dispatched, and until they
+        # are filled and updated the update has no complete tag.
+        "never_filled": never_filled,
     }

@@ -52,9 +52,10 @@ and is vastly more cost-effective for small area analysis.
 
 **The same inference code runs in both.** The single-area flow and the global campaign both call
 the same `run_inference` function, producing the same 128-dimensional embedding per pixel. There is
-no "global model" and no "small model" — by default they run the same checkpoint too, though the
-single-area path can select the v2 Large encoder with `model_version` or point at another checkpoint
-with `checkpoint_url`, in which case the outputs are of course no longer comparable.
+no "global model" and no "small model" — by default they run the same checkpoint too. Either can
+run the v2 Large encoder instead: the single-area path per run with `model_version`, a global store
+when it is seeded. The single-area path can also point at another checkpoint with `checkpoint_url`.
+Outputs from different models are of course not comparable.
 
 **The same ingest code runs in both, and it sees the same kind of input.** This is the part that
 surprises people. The global campaign holds its coverage information in one format and the
@@ -72,21 +73,21 @@ tiles and cost accordingly. If your area is sparse, its cost is set by how many 
 
 ### But it is not configured the same, and that part does change the answer
 
-The shared code is run with **different default settings**, and three of them change what comes out.
+The shared code is run with **different default settings**, and two of them change what comes out.
 The same area and the same year can therefore differ depending on which path produced it:
 
 | setting | single area | the global campaign |
 |---|---|---|
 | `allow_s2_only` | `false` — a pixel with no radar observation produces nothing | **`true`** — optical-only pixels are embedded |
-| `optical_min_obs` | unset — no minimum | **15** — a pixel with fewer than fifteen clear optical observations in the year is left empty |
+| `optical_min_obs` | unset — no minimum | **1** — every pixel with a clear optical observation in the year is embedded; the same pixels as unset |
 | `min_valid_coverage` | **5%** of the area's pixels must be cloud-free for a date to be kept | **0.1%** |
 
-The first two are the only quality rules applied per pixel, and both were deliberate choices for a
-global run: about a fifth of the land has no radar for 2022–24, so without `allow_s2_only` those
-pixels would be holes, and fifteen observations is the line below which an embedding was judged
-untrustworthy.
+`allow_s2_only` is the one per-pixel rule that differs: about a fifth of the land has no radar for
+2022–24, so without it those pixels would be holes. The optical line differs in name only — a pixel
+with no valid optical observation is never embedded under any rule — and the campaign states it as
+`1` so the store records that a rule was applied ([ADR 028](../context_docs/decisions/028-embed-every-pixel-with-an-optical-observation.md)).
 
-**The third is easy to miss and matters as much**, because it throws away whole dates before
+**The second is easy to miss and matters as much**, because it throws away whole dates before
 inference ever sees them. A zone-sized area is mostly ocean and edge, so the single-area default of
 5% would discard nearly every date over a zone — hence 0.1% for the campaign. Run a small, compact
 area at 0.1% and you keep dates the 5% default would have dropped, and the embeddings differ
@@ -97,18 +98,18 @@ reading one of them tells you nothing about which applies to your run.
 **What this means in practice.** If you compare your own single-area output against the published
 global store and the pixels disagree, check these settings before looking for a bug.
 
-**Exact parity is not reachable from the single-area entry points today, and you should know that
-before trying.** `allow_s2_only` is a parameter you can pass. `optical_min_obs` is **not exposed**
-on either documented single-area path — neither the plain runner nor the Prefect flow reads it — so
-a single-area run applies no optical-depth floor and there is currently no way to ask it for the
-campaign's fifteen. Wiring it through would be a small change to the library and is on the roadmap.
+**For parity, pass `allow_s2_only=True` and match the coverage threshold.** `optical_min_obs` is
+not exposed on either single-area path and needs no exposing: unset embeds the same pixels as the
+campaign's line of one. A published cell filled under an earlier, stricter line is the exception —
+the store says which line each zone-year and tile was held to (below).
 
 **What the published store lets you check, and what it does not.** Only one of the three is
-recorded, and it is on the store's ROOT attributes rather than on a zone:
+recorded: the optical line, on the ROOT attributes, with a lower one in a zone-year's `updates`
+records wherever a targeted update used one (`storage.update.cell_optical_min_obs` reads both):
 
 ```python
 ds_root = xr.open_zarr(session.store, consolidated=False)   # no group=
-ds_root.attrs["optical_min_obs"]     # 15 — the line every cell was measured against
+ds_root.attrs["optical_min_obs"]     # the store's line; an update may have used a lower one
 ds_root.attrs["checkpoint_id"]       # which model produced it, plus the geoemb: provenance
 ```
 
@@ -128,6 +129,7 @@ most often: which optical-depth line a cell was held to, and which model wrote i
 | output | one store per area, one entry per window | one store for the world, one entry per zone per year |
 | scale | one machine, one GPU or a few | **up to a 1,307-card daily average** (964 across the campaign), plus a large container fleet; **16 days** end to end |
 | you run it | yourself, when you want | as a campaign, with restart and recovery machinery |
+| redoing part of it | an `update` block in the run's config ([`updates.md`](updates.md)) | a named update plan, run by the campaign flows ([`updates.md`](updates.md)) |
 
 \* A **UTM zone** is a common convention in geography. The UTM system divides the world into 
 60 northern and southern strips for mapping, each six degrees of longitude wide. 

@@ -574,8 +574,8 @@ snapshot.
 
 **An earlier reading of "1.14x, adopt it globally" is SUPERSEDED.** That figure is real but it is
 one point on a curve that is **not monotonic**: the same setting measured on four further regions
-*loses* on two of them. Batching is therefore not a global setting — it is sized per region, and
-the default is off.
+*loses* on two of them. Batching is therefore not a global setting: it pays for sparse writes and
+loses on dense ones, and is now sized per date by the chunks each date writes (§3.21).
 
 **Why it can lose.** Batching trades commit count for graph size and peak memory. Where the fleet
 has idle capacity the larger graph packs into it and the saved commits are free; where it does not,
@@ -763,6 +763,111 @@ gained 15% from six; main's workers do not have that headroom. Six threads with
 24 GiB worker, and no arm spilled, paused or lost a worker. Dense zones carry most of the campaign's
 worker hours, so the saving there is real money at campaign scale, at most about $4,700 of the
 nine-year campaign's $187,441 container bill (`context_docs/campaign/campaign-cost-model.md`).
+
+### 3.21 Pipelining becomes automatic, and batching is sized by sparsity — the Latin America update (October 2026)
+
+**What the run showed.** The production Latin America update of 2026-10-19 ran its S2 legs on
+60-worker fleets with date pipelining off, as every campaign run until then had. All 659 S2
+`Stage timings` and `Batch timings` lines report `hidden=0.0`: no date's preparation overlapped a
+write. Each date paid fixed costs of about 1.7 s to build its read plan, 4.9 s for the cloud-mask
+check and 10 s of write overhead, against about 2.3 s per window written, and an update's date
+touches a median of about six windows, so the fixed costs were most of every date. The fleets
+averaged between 110 and 450 tasks in flight against 360 task slots (60 workers of six threads).
+
+Three zone-years (18S, 19S, 20N) also wrote one date at a time. Their scattered update windows
+covered more than 500 chunks in all, so `auto_batch_dates` (§3.16) read them as large regions,
+while each date touched only a handful of windows and paid the 10 s write overhead alone. The
+smaller zone-years, which did batch, paid about 5 s of write overhead a date on fleets of 10 to 53
+workers.
+
+**Decision 1: pipelining is automatic.** The S2 flow takes no `pipeline_dates` parameter. It
+pipelines on every Fargate fleet up to `MAX_PIPELINE_DATES_WORKERS` (140 workers) and on every
+local cluster. The paired tests recorded in the yield-embeddings test plan (F-22 to F-25) and its
+fleet scaling report (§8, correction of 2026-07-26) support it:
+
+| Measure | 120 workers | 60 workers | 45 workers |
+|---|---|---|---|
+| preparation an unpipelined arm paid (read plan + cloud-mask check, s/date) | 12.5 | 18.5 | 20.6 |
+| median per-date gain, first paired test at that width | +0.7 s (1.01×) | +21.8 s (1.14×) | not measured |
+
+The cycle saving was positive in all four paired tests (4.8, 22.1, 20.9 and 6.7 s a date), so no
+pipelined run has been slower end to end. The read plan, about 5.8 s of each figure above, is one
+thread in the ingest's driver and is always hidden; the cloud-mask check runs as fleet tasks and is
+hidden only into idle worker time. Why preparation shrank only 1.6× from 45 to 120 workers while
+the write shrank about 2.4× is not settled; the working suspicion is that the read plan cannot use
+more workers and that the check is a small graph bound by per-request read latency. Nothing has
+been measured below 45 workers or above 120, so the 140-worker bound is a precaution, not a
+measured loss. Stores are byte-identical either way (parity test). The domain function keeps its
+`pipeline_dates` argument for direct callers.
+
+**Decision 2: batching is sized by what each date writes.** Batching saves per-write overhead and
+nothing else, so it pays for sparse writes and loses on dense ones (§3.16: 1.61× on 26S and 1.12×
+on 59S, but 29% slower on 21N and 7% on 35N). Neither proxy measured that: the covered-area
+threshold misread the update's sparse large zone-years, and "every update batches" would misread
+a dense update. The S2 ingest now counts the storage chunks each date's footprint-narrowed windows
+cover, and fills a batch with up to four dates while their chunks stay within
+`BATCH_CHUNKS_PER_WORKER` (12) per worker; a date that would cross the budget starts a new batch,
+so a dense date writes alone. The batches are decided before any date is prepared, from that
+geometry, and the pipeline prepares one whole batch ahead; an earlier draft let the writer and the
+look-ahead each decide batch membership, and every review round found a new way for the two to
+disagree. One rule for campaign fills, updates and single-area runs: the S2
+flow passes the budget from its planned width, and any other caller gets it from the workers its
+Dask client reports.
+
+The budget is empirical and deliberately conservative: no theory sets it. The largest batch the
+sweep measured to gain was 59S's, about 750 chunks at four dates on fleets of 40 to 60 workers
+(the width was not recorded), so 12.5 to 19 chunks a worker; twelve, about 720 a batch on 60
+workers, sits at or below the low end of that. The six-thread workers (§3.20, PR #214) arrived
+after the July sweep, so the restarted production run was used to check it, below.
+
+**What the restart measured (2026-10-20).** The update's restart ran this code on the same plan,
+resuming run 1's mosaics ([`../campaign/latin-america-update.md`](../campaign/latin-america-update.md)).
+On the 19 zone-years ingested in both runs, wall time per optical date fell from 23.2 s to 19.3 s,
+each zone-year weighted by its run-1 dates: **1.20×**, median zone-year 1.18×, range 1.03–1.46×, none
+slower. This is an unmatched production comparison, not a paired test: each resumed leg started
+after run 1's newest committed date, so the two runs timed different dates of the same zone-years.
+Windows per date agreed within 10% in 18 of the 19 zone-years (the exception, 23S-2025, had 23%
+more in the restart and was still faster), which controls the largest driver of per-date cost but not
+cloudiness or date density; the paired tests cited above remain the controlled
+evidence for the overlap. The mechanisms themselves are measured directly: 85% of each date's
+preparation was hidden (none in run 1), the wait for it fell from 5.9 s to 2.0 s a date, and writes
+holding a single date fell from 73% to 22%. Of the zone-years whose windows per date matched, 19S gained
+least (1.07–1.10×): each of its dates covers 510–590 chunks, so two never fit in 720. The range's 1.03× is
+23S-2025, the exception above, whose restart dates carried 23% more windows.
+
+| on 60-worker fleets, both at six threads | run 1 | restart |
+|---|---|---|
+| tasks in flight, average (360 slots) / tasks the scheduler tracks | 256 / 9,500 | 410 / 16,900 |
+| scheduler CPU at or above 90% / 99% of a core, share of 30 s samples | 6% / 1% | 17% / 7% |
+| event-loop lag at or above 1 s / 3 s; 99th percentile | 7.2% / 2.7%; 4.7 s | 7.9% / 2.0%; 3.5 s |
+| busiest worker's memory, of 24 GiB | 9.6 GiB | 5.1 GiB |
+
+Neither run spilled, paused or lost a worker; worker CPU was 38–39% of reserved across all ingest
+workers. On the budget itself:
+
+- Within each leg, write time per chunk falls until about 6 chunks per worker and is flat from 6 to 12
+  (0.96–1.03 of the leg's median). Run 1, which batched four dates whatever their size, reached 12–20
+  per worker on a few legs with no clear penalty (1.02–1.08, its chunk counts estimated from each
+  zone-year's chunks per window).
+- A write costs about 9 s fixed + 57 ms per chunk + 3.4 s per date on 60-worker legs, and 11 s +
+  63 ms + 5.3 s on narrower ones (least squares). Batching saves only the fixed term.
+- Regrouping the restart's dates under other rules and pricing the writes saved at that fixed cost:
+  16 per worker would have saved about 6% of the 60-worker legs' optical time and 20 about 8%. On
+  narrower legs the 4-date cap binds before the budget, and a cap of 6 with 16 per worker would have
+  saved about 7%.
+
+**So the budget stays at 12 for now.** 16 is the most this evidence supports on 60-worker fleets; above
+12 nothing has been measured on a fleet that also overlaps preparation, whose scheduler already reaches
+a full core 7% of the time, and a bigger batch is a bigger graph. A paired dev test at 16 and 20, and
+at a 6-date cap on narrow fleets, would settle it; watch scheduler CPU and lag first, then worker
+memory.
+
+`config.ingest.auto_batch_dates` and its threshold are no longer called but stay defined:
+`config/ingest.py` is inside the inference code identity's closure, so removing them would move
+that identity. They go with the next change that moves it anyway. The ingest code identity moves
+away from `ingcode-67740a8483141eda` (`ingest/s2_roi.py` changed), so resuming
+mosaics built before this change needs `allow_ingest_code_mismatch=true`. The inference identity
+is unchanged (`infcode-44bbc47265fcb6a8`). Batched stores are byte-identical (batching parity test).
 
 ## 4. What did not work, and why
 
@@ -1739,6 +1844,7 @@ defect fix.
 | `F`, per-window blocking cost | 7.04 s | fitted by differencing two runs (constants cancel). **Do not use the linear model it belongs to** — `cost = n_windows x F + area x V` failed its first out-of-sample test and is superseded by §12's dispatch-floor model. `F` survives inside that model as the per-window floor, binding only when a window is small |
 | scheduler envelope | one core of 4 saturated, never >100%; RSS peak 1.79 / 8 GiB | 114 heartbeats |
 | per-date client graph build | 7.2 s (3.47 gate + 3.74 bands), one now removed | measured |
+| S2 fixed per-date costs on an update, unpipelined, 60 workers | build ~1.7 s + gate ~4.9 s + write overhead ~10 s, against ~2.3 s per window; `hidden=0.0` on all 659 timing lines | measured, production Latin America update, 2026-10-19 (§3.21) |
 | STAC query | 5.58 ms/item; 164 s/month; ~34 min/year; 368,248 items/year | measured, linear 3→14 days |
 | STAC page size ceiling | 250 (500 and 1000 both fail) | measured |
 | Earth Search page-1 refusal | 502 at `limit=250`; 200 at `limit=100`, same window | measured (§7c) |
