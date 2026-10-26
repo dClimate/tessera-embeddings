@@ -142,14 +142,14 @@ def _guard(monkeypatch, attrs: dict, *, build_checkpoint: str = "ckpt.pt", allow
     [
         # A store seeded for a different ENCODER than this build embeds with. Filling
         # it would mix encoders under one store and tag the result permanently.
-        pytest.param({"geoemb:model": "https://x/OLD"}, "ckpt.pt", "was seeded for encoder", id="encoder"),
+        pytest.param({"geoemb:model": "https://x/OLD"}, "ckpt.pt", "Refusing to append", id="encoder"),
         # Same encoder URL, different concrete CHECKPOINT. geoemb:model versions only
         # the encoder, so the aws/mpc v1.1 checkpoints share a URL and would otherwise
         # be mixed silently; checkpoint_id is what tells them apart.
         pytest.param(
             {"geoemb:model": expected_model_url(model_version="v1.1"), "checkpoint_id": _MPC_CKPT},
             _AWS_CKPT,
-            "seeded for checkpoint",
+            "checkpoint",
             id="checkpoint",
         ),
     ],

@@ -18,7 +18,7 @@ from tessera_embeddings.storage.empty_store import VarSpec, create_empty_store_f
 from tessera_embeddings.storage.update import UpdateTarget, commit_update_record, update_record
 from tessera_embeddings.storage.zarr_store import open_or_create_repo
 from tessera_embeddings.storage.zone_grid import ZoneSpec, easting_coords, northing_coords
-from tests.unit.inference_stack import STACK
+from tests.unit.inference_stack import MODEL, STACK
 
 log = logging.getLogger("test_zone_fill")
 
@@ -161,7 +161,7 @@ def _staging_inference_stub(staged: dict[str, np.ndarray]):
         for chunk in chunks:
             emb = rng.integers(-100, 100, size=(chunk.height, chunk.width, _BAND)).astype(np.int8)
             scales = rng.random((chunk.height, chunk.width)).astype(np.float32)
-            writer.write_chunk(chunk, emb, run_id, scales=scales, inference_stack=STACK)
+            writer.write_chunk(chunk, emb, run_id, scales=scales, inference_stack=STACK, inference_model=MODEL)
             staged[chunk.label] = emb
             results.append({"chunk": chunk.label, "status": "success", "valid_pixels": 1, "elapsed_sec": 0.0})
         return results
@@ -195,6 +195,7 @@ def _resuming_inference_stub(staged: dict[str, np.ndarray]):
                 run_id,
                 scales=rng.random((chunk.height, chunk.width)).astype(np.float32),
                 inference_stack=STACK,
+                inference_model=MODEL,
             )
             staged[chunk.label] = emb
             results.append({"chunk": chunk.label, "status": "success", "valid_pixels": 1, "elapsed_sec": 0.0})
@@ -752,6 +753,7 @@ def test_landed_but_untagged_cell_is_retagged_without_rerun(tmp_path, monkeypatc
         "run1",
         scales=rng.random((_TILE, _TILE)).astype(np.float32),
         inference_stack=STACK,
+        inference_model=MODEL,
     )
     writer.assemble_global(store, _ZONE, year=2025, run_id="run1", n_workers=1)
     repo = global_store.open_global_repo(store)
@@ -1133,6 +1135,7 @@ def test_a_partly_refused_tile_publishes_what_the_gate_removed(tmp_path, monkeyp
                 run_id,
                 scales=rng.random((chunk.height, chunk.width)).astype(np.float32),
                 inference_stack=STACK,
+                inference_model=MODEL,
             )
             results.append(
                 {

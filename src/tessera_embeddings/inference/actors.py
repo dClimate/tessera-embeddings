@@ -48,6 +48,7 @@ from tessera_embeddings.inference.data_loading import (
 from tessera_embeddings.inference.progress import chunk_uid
 from tessera_embeddings.inference.read_plan import _chunk_read_plan
 from tessera_embeddings.inference.resource_monitor import ResourceMonitor
+from tessera_embeddings.storage.conventions import checkpoint_stem
 from tessera_embeddings.storage.zarr_store import credentials_provider
 
 if TYPE_CHECKING:
@@ -561,6 +562,18 @@ class InferenceActor:
         import torch
 
         return {"torch": torch.__version__, "cuda": torch.version.cuda if self.device.type == "cuda" else None}
+
+    @functools.cached_property
+    def _inference_model(self) -> dict[str, str]:
+        """The model and checkpoint this actor computes with, staged with every tile it writes.
+
+        Assembly holds the store to what the tiles record, not to what a caller passes, so every
+        write path is checked the same way (``conventions.assert_model_matches``).
+        """
+        return {
+            "model_version": self.config.model_version,
+            "checkpoint_id": checkpoint_stem(self.config.checkpoint_path),
+        }
 
     # ------------------------------------------------------------------
     # Stash keyed by chunk label; lazily initialised so test harnesses building bare actors via
@@ -1189,6 +1202,7 @@ class InferenceActor:
                         # because it goes into the skip marker.
                         coverage=coverage,
                         inference_stack=self._inference_stack,
+                        inference_model=self._inference_model,
                     )
                     # One line per chunk: how long the backgrounded upload took. The phase table's write_s is ~0 by
                     # design, so this is the off-critical-path cost, for post-run upload health checks.

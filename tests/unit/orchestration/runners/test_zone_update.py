@@ -16,7 +16,7 @@ from tessera_embeddings.orchestration.runners import zone_fill
 from tessera_embeddings.storage import global_store
 from tessera_embeddings.storage.campaign import zone_year_tag
 from tessera_embeddings.storage.update import UpdateTarget, base_tag
-from tests.unit.inference_stack import OTHER_STACK, STACK
+from tests.unit.inference_stack import MODEL, OTHER_STACK, STACK
 from tests.unit.orchestration.runners.test_zone_fill import (
     _BAND,
     _TILE,
@@ -54,6 +54,7 @@ def _stub(seed: int, *, skip: tuple[str, ...] = (), stack: dict = STACK):
                 run_id,
                 scales=rng.random((chunk.height, chunk.width)).astype(np.float32),
                 inference_stack=stack,
+                inference_model=MODEL,
             )
             results.append({"chunk": chunk.label, "status": "success", "valid_pixels": 1, "elapsed_sec": 0.0})
         return results
