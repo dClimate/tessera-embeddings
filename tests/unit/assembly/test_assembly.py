@@ -2295,8 +2295,8 @@ class TestAssembleGlobal:
 
         A ``None`` stack stages a tile with no record, as one staged before tiles carried it.
         *root_stack* stamps the store first, as an earlier write would have. *tile_model* is the
-        model every tile records; ``None`` stages them without the record. *root_attrs* are stamped on
-        the store's root first, as a seed would.
+        model every tile records, or a list of one per tile; ``None`` stages them without the record.
+        *root_attrs* are stamped on the store's root first, as a seed would.
         """
         dim = 8
         store_path = self._seed_zone_repo(tmp_path, self.TILE, self.TILE * len(stacks), dim)
@@ -2316,7 +2316,7 @@ class TestAssembleGlobal:
                 "runK",
                 scales=np.ones((self.TILE, self.TILE), dtype=np.float32),
                 inference_stack=stack or STACK,
-                inference_model=tile_model or MODEL,
+                inference_model=(tile_model[col] if isinstance(tile_model, list) else tile_model) or MODEL,
             )
             if stack is None:
                 del zarr.open_group(path, mode="a").attrs[STACK_ATTR]
@@ -2346,6 +2346,12 @@ class TestAssembleGlobal:
             open_global_repo(str(tmp_path / "global.icechunk")).readonly_session(branch="main").store, mode="r"
         )
         assert STACK_ATTR not in root.attrs and not root[self.ZONE].attrs.get("years_complete")
+
+    def test_a_tile_whose_model_differs_from_the_probe_is_refused(self, tmp_path):
+        """A resumed direct run can hold tiles from both v1.1 checkpoints; each is held to the probe."""
+        mpc = {**MODEL, "checkpoint_id": "tessera_v1_1_mpc_encoder"}
+        with pytest.raises(ValueError, match="never mixes two models"):
+            self._fill_on_stacks(tmp_path, STACK, STACK, tile_model=[MODEL, mpc])
 
     def test_the_model_override_writes_tiles_of_another_model(self, tmp_path):
         root = self._fill_on_stacks(tmp_path, STACK, tile_model=OTHER_MODEL, allow_model_mismatch=True)
