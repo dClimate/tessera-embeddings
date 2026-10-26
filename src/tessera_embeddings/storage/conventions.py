@@ -201,11 +201,11 @@ def assert_stack_matches(root_attrs: Mapping[str, object], stack: Mapping[str, s
     Changing a store's stack is a deliberate restamp after measuring equivalence (ADR 025), never a flag.
     """
     assert_model_matches(root_attrs, str(stack["model_version"]), str(stack["checkpoint_id"]), where=where)
-    stored = root_attrs.get(STACK_ATTR)
-    if isinstance(stored, Mapping) and dict(stored) != library_stack(stack):
+    # Present means compared, whatever its type: a malformed stamp is refused, never read as absent.
+    if STACK_ATTR in root_attrs and (stored := root_attrs[STACK_ATTR]) != library_stack(stack):
         cuda = stack.get("cuda")
         raise ValueError(
-            f"Refusing to write into {where}: it was computed on {dict(stored)}, and this run on PyTorch "
+            f"Refusing to write into {where}: it was computed on {stored!r}, and this run on PyTorch "
             f"{stack.get('torch')} with {f'CUDA {cuda}' if cuda else 'CPU'}. One store never mixes two "
             "stacks (ADR 025). Run on the store's stack: the global flows pick its worker image through "
             "ami_ssm_name_by_model, and a local run needs that PyTorch installed (docs/environment-setup.md). "
