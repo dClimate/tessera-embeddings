@@ -63,8 +63,9 @@ cache (12.7 s, against 2.4 s warm). The base interpreter and the driver librarie
 The AMI build packs the venv into an image, uploads it under a unique name and writes that URI into the AMI
 at `/opt/tessera/env-image.uri`, so every AMI names exactly the venv it was built with. `cluster.yaml.template`
 then copies the image to the instance store and mounts it over `/opt/tessera/venv` before `ray start`. Any
-miss leaves the AMI's own venv in place: an AMI without the file, an instance without an instance store at
-`/opt/dlami/nvme`, a venv already mounted, or a copy that fails.
+miss leaves the AMI's own venv in place: an AMI without the file, an instance whose instance store is not
+mounted at `/opt/dlami/nvme` within 60 s (the DLAMI's boot service mounts it, and can finish after Ray's setup
+begins), a venv already mounted, or a copy that fails.
 
 ## 4. End to end on a built AMI
 
