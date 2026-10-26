@@ -17,6 +17,8 @@ from collections.abc import Callable
 
 import numpy as np
 
+from tessera_embeddings.config.inference import DEFAULT_MODEL_VERSION, ModelVersion
+
 
 def build_resample_indices(valid_len: int, target_size: int) -> np.ndarray:
     """Deterministic index vector resampling ``valid_len`` rows to ``target_size``.
@@ -89,7 +91,7 @@ _RESAMPLERS: dict[str, Callable[[int, int], np.ndarray]] = {
 }
 
 
-def resampler_for(model_version: str) -> Callable[[int, int], np.ndarray]:
+def resampler_for(model_version: ModelVersion) -> Callable[[int, int], np.ndarray]:
     """The padding/subsampling rule *model_version* was trained under.
 
     Raises on an unknown version rather than defaulting to v1.1: silently resampling a new
@@ -116,7 +118,9 @@ _CACHED_RESAMPLERS: dict[str, Callable[[int, int], np.ndarray]] = {
 }
 
 
-def _local_resample_matrix(counts: np.ndarray, target: int, model_version: str = "v1.1") -> np.ndarray:
+def _local_resample_matrix(
+    counts: np.ndarray, target: int, model_version: ModelVersion = DEFAULT_MODEL_VERSION
+) -> np.ndarray:
     """Stack per-pixel local resample indices into a ``(B, target)`` matrix.
 
     ``counts[i]`` is pixel *i*'s valid-observation count; row *i* of the result is
@@ -187,7 +191,7 @@ def resample_s2_bucket(
     target: int,
     s2_mean: np.ndarray,
     s2_std: np.ndarray,
-    model_version: str = "v1.1",
+    model_version: ModelVersion = DEFAULT_MODEL_VERSION,
 ) -> np.ndarray:
     """Resample a batch of pixels' S2 observations to a uniform length.
 
@@ -239,7 +243,7 @@ def resample_s1_bucket(
     s1a_std: np.ndarray,
     s1d_mean: np.ndarray,
     s1d_std: np.ndarray,
-    model_version: str = "v1.1",
+    model_version: ModelVersion = DEFAULT_MODEL_VERSION,
 ) -> np.ndarray:
     """Resample a batch of pixels' merged S1 observations to a uniform length.
 

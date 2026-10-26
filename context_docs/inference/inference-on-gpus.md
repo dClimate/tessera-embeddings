@@ -9,7 +9,7 @@ reference region.
 pipeline.** Every term is defined where it first appears, and the code locations are collected in an
 appendix so the explanation does not depend on them.
 
-Five measurement campaigns are folded together here, in the order a reader needs them:
+Six measurement campaigns are folded together here, in the order a reader needs them:
 
 | § | what it answers | when |
 |---|---|---|
@@ -19,6 +19,7 @@ Five measurement campaigns are folded together here, in the order a reader needs
 | 5 | why the batch is computed from the card rather than fixed | 2026-08-29 |
 | 6 | what the campaign path itself measured, which is what the cost model divides by | 2026-08 |
 | 7 | what the v2 Large student measured against that baseline | 2026-07 |
+| 8 | what moving the workers from PyTorch 2.5.1 to 2.14.1 changed, in outputs, speed and memory | 2026-10-03 |
 
 Cost figures are results here, with pointers. [`../campaign/campaign-cost-model.md`](../campaign/campaign-cost-model.md)
 is the source of truth for every rate, fleet size and dollar figure; where the two disagree, the
@@ -1098,6 +1099,36 @@ evidence yet that the inference line is sound.
 - **The first cell pays a warm-up premium** in per-chunk overhead, amortised across a chained shard
   rather than paid per zone. Quantifying it per cell needs the zone field named above.
 
+### A holes update on the campaign path (October 2026)
+
+The Latin America update ([`../campaign/latin-america-update.md`](../campaign/latin-america-update.md))
+inferred 13,029 tiles in `holes` mode on 73 `g6e.xlarge` workers, v1.1 with every change since the
+campaign (the faithful GRU step, the day-of-year table, sharded mosaics, the simpler loader).
+`CHUNK_SUMMARY` now carries `run`, the zone-year's run id, so these figures are per zone-year; the
+attribution warning above applies to lines from before that field.
+
+**Against the campaign, on tiles inferred whole.** Tiles with at least 3.5 M hole pixels are the same work
+as a campaign tile. Optical tokens per busy second per worker:
+
+| | tiles | this update | the campaign path, above |
+|---|---|---|---|
+| both orbits | 321 | 1.59 M | 1.26–1.62 M |
+| one orbit | 43 | 2.63 M | 1.60 M |
+
+Both-orbit tiles land at the top of the campaign's range, about what the changes since were expected to
+buy together; the one-orbit sample is small.
+
+**Where an update's GPU time goes.** 55% of tile time was outside inference, 33% of it reading imagery before
+the first forward pass. Tiles with under 250,000 hole pixels took 41 s each, 4 s of it inference, and 44% of
+all GPU-hours; denser tiles took 69 s, 48 s of it inference. A holes mask shrinks the forward pass but not the
+year of imagery behind it, and hole-aware reads skipped no strip, because every tile had holes in every
+strip. On one cluster's 1 s polls over 3.4 hours the card was busy 45–52% of seconds at about 200 W, against
+92–98% at 335 W on dense tiles.
+
+**Depth by year.** At the same hole pixels per tile, 2025 tiles kept 96 optical and 78 radar observations
+against 80 and 49 for 2024, and took 22% longer to read and 47% longer to infer. Host memory peaked at 63%,
+above 60% for at most 3 s on any worker, with no out-of-memory event.
+
 ---
 
 ## 7. The v2 Large student, measured against the v1.1 baseline
@@ -1211,7 +1242,176 @@ anywhere else, so raising the cap would not help.
 
 ---
 
-## 8. Gotchas, and remaining headroom
+## 8. The PyTorch 2.14.1 upgrade, measured
+
+The GPU workers ran PyTorch 2.5.1 (CUDA 12.1, cuDNN 9.1) because the Ray AMI installed "the newest
+CUDA 12.1 build" and that index stopped at 2.5.1. Tests and the driver image ran the lockfile's 2.12.
+This section measured moving the workers to 2.14.1 (CUDA 13.0, cuDNN 9.24) on the worker image's own
+driver (595.91.07, CUDA 13.2-capable). The rule it led to is
+[ADR 025](../decisions/025-library-upgrades-ship-on-measured-usability-at-a-store-boundary.md).
+It was measured twice in `global-tessera-dev`: round 1 on 2026-10-02 and 03, on code that still ran
+v1.1's `nn.GRU`, and round 2 on 2026-10-21, on the code that ships, after #212 replaced that GRU with a
+compiled fused step ([ADR 026](../decisions/026-v1-1-runs-the-gru-it-was-trained-with.md)). Outcome:
+v2 moves very little and clears ADR 025's usability bar; v1.1 on the shipped code moves about ten times
+further than it did on `nn.GRU`, as far as a change of card, and misses that bar.
+
+### Method: hold everything but the library stack
+
+**Round 2, the code that ships.** One box per card, booted from the 2.5.1 worker image, ran
+`upgrade/pytorch-2-14` at `936291b5` (with #212) on the image's 2.5.1 and then on a copy of the same
+environment with only torch installed over it. The package diff between the two is torch, Triton and
+torch's own CUDA packages, nothing else. Both stacks processed the same tiles in the same order at the
+batch fitted to the card: three Iowa tiles of `mosaics/iowa_epsg5070` (`chunk_1_12`, `chunk_0_7`,
+`chunk_0_21`; calendar 2024, ascending radar) and the two-orbit `m10_parity_15S` tile. The A10G
+(`g5.2xlarge`) ran both models; the L40S (`g6e.xlarge`) and the L4 (`g6.2xlarge`), the fleet's other
+two cards, ran v2, the model that moves. Controls, all bit-identical: v2's three tiles rerun on 2.5.1
+on each card, and one v1.1 tile run twice on each stack on the A10G, each run its own process so the
+compiled GRU step compiled afresh. Harness, results and the staged tiles:
+`s3://global-tessera-inputs-dev/perf/torch-upgrade/r2/` (A10G; `r2_box.sh`, `r2c_box.sh`) and
+`r3/` (L40S, L4; `r3_box.sh`).
+
+**Round 1, one L40S, both stacks.** `InferenceActor` was driven without Ray on one `g6e.xlarge`, first on the
+image's 2.5.1 and then on a copy of the same environment with only torch replaced. Each stack
+processed the same tiles in the same order, with the same prefetch hints, so tiling and batch were
+identical. The tiles were six Iowa tiles (deep and shallow optical, light and heavy radar, two
+easting-cropped edges) and the two-orbit `m10_parity_15S` tile, for v1.1 and for v2 (three Iowa
+tiles plus `m10`). A second 2.5.1 pass is the determinism control.
+
+**Round 1, the production path, paired.** Two `tessera-embeddings` flow runs on Iowa, 3 L40S workers each,
+started together and cancelled after 35 minutes of inference. One ran the 2.14.1 AMI and the other
+an AMI baked from `main` that differs from it only in torch. Each worker's start-up line confirms its
+version. The 25 tiles both runs wrote completely, all cut into identical strips, are the comparison
+set: 70.3M valid pixels.
+
+**Round 1, the A10G.** One `g5.2xlarge` ran the forward pass at the batch `batch_size_for_gpu` fits to its
+22.06 GiB card (3,593), with the workers' allocator settings, on both stacks. This is how the
+deepest bucket (256 optical plus 256 radar steps) was checked.
+
+### Outputs on the code that ships (round 2)
+
+ADR 012's harness both ways, then `usability.py`'s measures (2,000 queries among 20,000 candidates per
+tile, by cosine; k-means with k = 12 groups fitted on a sample of the 2.5.1 output). Footprint and
+observation counts were exact on every tile.
+
+| 2.5.1 against 2.14.1, one A10G | v1.1, Iowa (3 tiles) | v1.1, `m10` | v2, Iowa (3 tiles) | v2, `m10` |
+|---|---:|---:|---:|---:|
+| int8 values exact | 88.7–90.0% | 88.8% | 99.96–99.99% | 99.99% |
+| largest difference, levels | 3 | 2 | 3 | 2 |
+| largest scale drift | 1.45% | 1.54% | 1.25% | 0.97% |
+| cross-config envelope | 3 of 3 pass | pass | 3 of 3 pass | pass |
+| pixels bit-identical | 0.3% | 0.2% | 51% | 49% |
+| mean per-pixel cosine distance | 2.5e-5 (0.40°) | 2.3e-5 (0.39°) | 6.4e-8 (0.02°) | 6.1e-8 (0.02°) |
+| adjacent pixels' median distance, over that | 293× | 80× | 47,400× | 10,900× |
+| top-20 neighbours kept | 98.2% | 91.9% | 99.99% | 99.94% |
+| same k-means group | 99.83% | 98.62% | 99.999% | 99.994% |
+
+v2 on the fleet's other two cards, the same tiles and measures:
+
+| v2, 2.5.1 against 2.14.1 | L40S, Iowa | L40S, `m10` | L4, Iowa | L4, `m10` |
+|---|---:|---:|---:|---:|
+| int8 values exact | 99.94–99.99% | 99.98% | 99.94–99.99% | 99.98% |
+| largest scale drift | 1.59% | 0.96% | 1.06% | 0.99% |
+| cross-config envelope | 3 of 3 pass | pass | 3 of 3 pass | pass |
+| pixels bit-identical | 51% | 49% | 51% | 49% |
+| top-20 neighbours kept | 99.99% | 99.93% | 99.99% | 99.94% |
+| same k-means group | 99.999% | 99.994% | 99.999% | 99.992% |
+
+**v2 clears ADR 025's usability bar (0.9940) on every tile of every card; v1.1 does not.**
+On round 1's `nn.GRU` code v1.1 kept 99.48% of neighbours and moved 2.3e-6; on the shipped code it moves about ten times
+further. The likely reason, not separately tested, is that #212's GRU step is compiled with
+`torch.compile`, whose code generator changed between the stacks (Triton 3.1 to 3.8), and a recurrence
+carries each step's rounding into the next for up to 256 steps. The `m10` tile is the most uniform of
+the four, its adjacent pixels 1.9e-3 apart against Iowa's 7.3e-3, so its neighbours are nearest to
+ties and swap most.
+
+**The yardstick is a change of card.** On the same two Iowa tiles, v1.1 on identical code (2.14.1) on
+an A10G against an L40S, from the `g7e` evaluation (PR #241, `v2-on-blackwell.md` §5), against this
+stack change on one A10G:
+
+| | card change, `chunk_0_7` / `chunk_0_21` | stack change, same tiles |
+|---|---:|---:|
+| top-20 neighbours kept | 98.03% / 98.47% | 98.09% / 98.35% |
+| same k-means group | 99.79% / 99.85% | 99.79% / 99.90% |
+| mean turn of a pixel's embedding | 0.41° | 0.40° |
+
+The upgrade moves v1.1 as far as the A10G and L40S mix that every v1.1 store already holds. No card
+comparison exists on the `m10` tile.
+
+### Round 1 outputs, on `nn.GRU`
+
+ADR 012's harness on the 25 production-path pairs (v1.1):
+
+| | result |
+|---|---|
+| same-config gate | **0 of 25 pass** — exact 98.5–99.4%, max ±3, scale drift ≤ 1.53%, worst-pixel cosine ≥ 0.99990 |
+| cross-config envelope | **25 of 25 pass** |
+| footprint and observation counts | exact on every tile |
+
+On the single box, v2 sat about ten times closer than v1.1. It had 99.986–99.99998% of int8 values
+exact, but still a maximum of ±3 and up to 1.36% scale drift, so it fails the same-config gate on
+those two metrics and passes the cross-config envelope (3 of 3 Iowa tiles). The likely reason is that
+v1.1 pools through a cuDNN GRU, and cuDNN changed between the stacks. v2 has no recurrence.
+
+What a user consumes, on the same 25 pairs. The neighbour method follows
+[`validating-a-model-change.md`](validating-a-model-change.md): 2,000 queries among 20,000 candidates
+per tile, by cosine.
+
+| measure | 2.5.1 against 2.14.1 | for scale |
+|---|---|---|
+| pixels whose embedding is bit-identical | 36% | — |
+| mean per-pixel cosine distance | 2.3e-6 | adjacent pixels: 4.7e-3 (median), about 2,000× larger |
+| largest per-pixel cosine distance | 9.3e-5 | — |
+| top-10 neighbours kept | 99.42% | the 2026-09 day-of-year fix kept 95.5% |
+| top-20 neighbours kept | 99.48% | two same-model stores agree on 0.9940 |
+| same k-means cluster (k = 12) | 99.97% | — |
+
+**The current stack does not meet the same-config gate against itself.** In the 2.5.1 rerun, a
+single-strip tile that had been prefetched behind its predecessor was split into a 256-row starter
+strip and a body, while the rerun processed it first as one strip. That tiling difference alone gave
+99.95% exact, ±3, and 1.52% scale drift. Same stack and same tiling were bit-identical every time.
+
+### Speed and memory
+
+Round 2 measured the shipped code on all three cards for v2 and on the A10G for v1.1; the rows not
+marked round 2 are round 1, on `nn.GRU`. ADR 026 gives the fused step's speed against `nn.GRU` on both
+stacks and both cards. A rerun of the same stack moved inference-loop throughput by up to 1%.
+
+| | v1.1 | v2 |
+|---|---|---|
+| A10G, round 2, inference-loop tokens per second on the same tiles, steady state | **4.0% faster** | 0.5% slower |
+| L40S, round 2, the same | — | 1.2% faster |
+| L4, round 2, the same | — | 0.7% slower |
+| round 2, peak card memory per tile | unchanged on the A10G (2.3–4.2 GiB) | unchanged on all three (A10G and L4 1.7–3.1 GiB, L40S 3.4–6.2 GiB) |
+| L40S, single box (same tiles, serial) | **−3.5% wall per tile** | ±1% |
+| L40S, paired flow runs (25 tiles) | median tile 181 → 168 s; GPU-hours per tile 0.065 → 0.061 (−6%), on cards running 10% faster clocks (below) | not run |
+| A10G, deepest bucket (256 + 256) | 2,947 → 3,253 ms, **10% slower** | +1% |
+| A10G, shallower buckets | 1% faster | ±1% |
+| card memory, peak allocated | L40S 8.3 → 9.3 GiB; A10G deepest 12.0 → 13.4 GiB (fits; no OOM at the fitted batch) | unchanged |
+| host RAM, peak per actor (paired runs) | 16.1 → 15.0 GB | — |
+
+**The single box is the speed figure to use.** The paired runs give each stack its own cards, and
+cards differ: under the shared 350 W cap a card's clock falls about 11 MHz per degree it runs hotter.
+The 2.14.1 run's three cards averaged 1,842 MHz against the control's 1,680, and across 56 cards a 10%
+higher clock makes a forward pass about 2% faster, so part of the paired −6% is the cards. The single
+box ran both stacks on one card.
+
+Unit suites passed on 2.14.1 in both repositories (3,894 and 1,290 tests), as did v2's golden tests
+on the real checkpoint and a complete `m10_parity_15S` flow run, assembly included, in 8m24s.
+
+### Repeating this for the next upgrade
+
+Hold the tiles, the order and the batch fixed, and change only the library. That means a copied
+environment on one box, plus two flow runs whose only difference is `ami_ssm_name`. Confirm each
+stack's version from its own output; a pass that silently ran the old torch was caught here only that
+way. Run `te-compare-outputs` both ways, then the neighbour and cluster measures, on both models and on
+every card the fleet may rent. Measure the code that will ship, not the code of the day: round 1's
+`nn.GRU` was replaced before the upgrade merged, and the replacement moved ten times further. Keep the
+staged tiles, so a question asked later needs no GPU. Where a step is compiled, run each stack twice in
+separate processes as the determinism control.
+
+---
+
+## 9. Gotchas, and remaining headroom
 
 **RAM budget is load-bearing.** Do NOT raise `_S2_STRIP_BYTE_BUDGET` or reintroduce whole-chunk
 cross-chunk prefetch without re-deriving the arithmetic at the constant. The load pipeline is one
@@ -1264,6 +1464,7 @@ gap exists. See [`../../tests/README.md`](../../tests/README.md).
 | where an actor applies it | `inference/actors.py`, `InferenceActor.__init__` |
 | reading the card's size | `inference/actors.py`, `_gpu_total_gib` |
 | the allocator flag | `inference/actors.py`, the `@ray.remote(runtime_env=...)` decorator |
+| the workers' PyTorch version | yield-embeddings `infra/packer/scripts/provision.sh`: the lockfile's version, as its CUDA 13.0 build |
 | the checkpoint ladder and its clipping | `inference/sampling.py`, `compute_bin_keys` |
 | deepest bucket first | `inference/dataset.py`, `iter_buckets(largest_first=True)` |
 | the strip plan and its RAM budget | `inference/read_plan.py`, `_strip_plan`, `_S2_STRIP_BYTE_BUDGET` |

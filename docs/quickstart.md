@@ -26,9 +26,8 @@ longer one.
   on an AWS DLAMI host). To use a checkpoint you already have on disk,
   set `checkpoint_url: null` and point `checkpoint_dir` at its parent
   directory instead — the expected filename comes from
-  `tessera_embeddings.checkpoint_filename()` (or
-  `checkpoint_filename(norm_source="aws")` for the AWS-normalised
-  encoder).
+  `tessera_embeddings.checkpoint_filename(model_version="v1.1")`, the
+  AWS-normalised encoder.
 
 ### Earthdata Login (EDL) setup
 

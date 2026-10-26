@@ -172,7 +172,7 @@ fixed, shard-snapped `zone_grid.ZoneSpec` extent the fill validates against — 
 `tile_live_2048` coverage bitmap upsampled ×2048; WGS84 bbox tight to the live tiles).
 
 ```text
-run_global_campaign  (per pending (zone, year), zone-parallel within a year)
+run_global_campaign ──► fill-zones-sequential  (one per Ray cluster; per (zone, year) it owns:)
    │
    ├─ ingest-zone-year ──► export_zone_roi(zone)         {inputs}/rois/zarrs/zone_33N.zarr
    │      │                  (ZoneSpec grid + tile_live mask; ocean-tile skip)
@@ -183,7 +183,7 @@ run_global_campaign  (per pending (zone, year), zone-parallel within a year)
    │      ├─ check_time_window_coverage (strict span; allow_partial_window escape)
    │      └─ write ingest_marker  (last — crash before this ⇒ clean rebuild on re-run)
    │
-   ├─ fill-zone-year  ──► coverage + SAR-grid + model gates (pre-Ray) ──► inference ──► assemble ──► tag
+   ├─ fill (shared cluster) ──► coverage + SAR-grid + model gates ──► inference ──► trailing assembly ──► tag
    │
    └─ delete mosaics/33N/2025  (s5cmd --all-versions; transient input)
 ```
@@ -198,7 +198,7 @@ not EPSG (see `storage/zone_grid.canonicalize_zone`).
 
 `ingest-zone-year` exports the mask it needs on the fly, so the campaign is self-sufficient.
 The `export-zone-rois` flow does the same work for many zones **ahead of the campaign**, and
-adds the check the per-cell path has no reason to run:
+adds the check the campaign has no reason to run per cell:
 
 ```text
 export-zone-rois  (one task per zone, max_parallel_zones in flight, no barrier)
