@@ -486,6 +486,7 @@ _V11 = {"model_version": "v1.1", "checkpoint_id": "tessera_v1_1_aws_encoder", "t
             "checkpoint",
         ),
         ({"inference_stack": {"torch": "2.14.1+cu130", "cuda": "12.1"}}, _V11, "never mixes two stacks"),
+        ({"inference_stack": None}, _V11, "never mixes two stacks"),  # malformed is refused, not "unstamped"
     ],
 )
 def test_the_store_root_decides_the_stack_a_write_may_carry(root, stack, refused) -> None:
