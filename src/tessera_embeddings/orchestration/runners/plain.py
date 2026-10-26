@@ -160,6 +160,9 @@ def _staging_run_id(
     Staging is removed after a successful assemble, so in practice a prefix only survives a run
     that failed — which is exactly the run worth resuming.
 
+    ``stack-record`` is a fixed term: it moved every id once, so a prefix staged before a run
+    recorded its stack (``ZarrWriter._join_run``) is never found, and so never resumed.
+
     An ``update`` is a term too, when there is one: its tiles are inferred against the store's holes
     rather than whole, so they must never resume a full run's, nor another update's.
     """
@@ -178,6 +181,7 @@ def _staging_run_id(
             f"s2_only={config.allow_s2_only}",
             json.dumps(content, sort_keys=True, default=str),
             *([json.dumps(dict(update), sort_keys=True)] if update else []),
+            "stack-record",  # staging from before runs recorded their stack is never resumed
         ]
     )
     return hashlib.sha256(terms.encode()).hexdigest()[:12]
