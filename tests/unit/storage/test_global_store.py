@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import zarr
 
-from tessera_embeddings.config.inference import EMBEDDING_DIM
+from tessera_embeddings.config.inference import EMBEDDING_DIM, checkpoint_filename
 from tessera_embeddings.config.store_layout import GLOBAL
 from tessera_embeddings.storage import global_store, zarr_store
 from tessera_embeddings.storage.zone_grid import ZoneSpec
@@ -139,11 +139,11 @@ def test_an_unstamped_store_keeps_its_identity_when_nothing_is_created(tmp_path)
     assert "geoemb:model" not in zarr_store.open_store_as_zarr_group(store).attrs, "the premise"
 
     # The same zone again — complete, so nothing is created — but now asking for an identity.
-    global_store.seed_zone_groups(repo, [_ZA], years=(2025,), model_version="v1", optical_min_obs=15)
+    global_store.seed_zone_groups(repo, [_ZA], years=(2025,), optical_min_obs=15)
 
     root = zarr_store.open_store_as_zarr_group(store)
     assert "geoemb:model" in root.attrs, "the stamp must have been committed, not discarded"
-    assert root.attrs["checkpoint_id"] == "v1", "and it must carry the identity that was asked for"
+    assert root.attrs["checkpoint_id"] == checkpoint_filename(model_version="v1.1"), "the model's own checkpoint"
     assert root.attrs["optical_min_obs"] == 15
 
 
@@ -167,20 +167,42 @@ def test_a_group_missing_a_later_schema_array_is_refused_not_skipped(tmp_path):
         global_store.seed_zone_groups(repo, [_ZA], years=(2025,))
 
 
+@pytest.mark.parametrize("model", ["v1.1", "v2-large"])
+def test_the_store_names_the_model_that_fills_it(tmp_path, model):
+    """Every fill takes its model from the store's root, and runs that model's checkpoint."""
+    store = str(tmp_path / "g.icechunk")
+    global_store.seed_zone_groups(global_store.create_global_repo(store), [_ZA], years=(2025,), model_version=model)
+    assert global_store.store_model_version(store) == model
+
+
+@pytest.mark.parametrize(
+    ("attr", "value", "match"),
+    [
+        ("geoemb:model", "https://example.org/custom", "names no known model"),
+        ("checkpoint_id", "tessera_v1_1_mpc_encoder.pt", "checkpoint"),
+    ],
+)
+def test_a_store_no_fill_can_run_is_refused_before_anything_is_provisioned(tmp_path, attr, value, match):
+    """A root naming an unknown model, or a checkpoint other than its model's, is one no fill runs."""
+    store = str(tmp_path / "g.icechunk")
+    global_store.seed_zone_groups(global_store.create_global_repo(store), [_ZA], years=(2025,))
+    session = global_store.open_global_repo(store).writable_session("main")
+    zarr.open_group(session.store, mode="a").attrs[attr] = value
+    session.commit("a root no fill can run")
+    with pytest.raises(ValueError, match=match):
+        global_store.store_model_version(store)
+
+
 def test_reseed_with_different_model_rejected(tmp_path):
-    """Root encoder provenance is write-once: a matching reseed is a no-op, but a
-    partial reseed carrying a DIFFERENT encoder is rejected — otherwise the root
-    would advertise the new model and the fill-time model gate would permit mixing
-    it with already-seeded zones.
+    """Root encoder provenance is write-once: a matching reseed is a no-op, but a partial reseed
+    for a DIFFERENT model is rejected, or the root would advertise it over already-seeded zones.
     """
     store = str(tmp_path / "g.icechunk")
     repo = global_store.create_global_repo(store)
-    global_store.seed_zone_groups(repo, [_ZA], years=(2025,), model_version="v1")
-    # Same model on a later incremental seed: fine (adds the group, provenance no-op).
-    global_store.seed_zone_groups(repo, [_ZB], years=(2025,), model_version="v1")
-    # A different model is rejected before any group work.
+    global_store.seed_zone_groups(repo, [_ZA], years=(2025,), model_version="v1.1")
+    global_store.seed_zone_groups(repo, [_ZB], years=(2025,), model_version="v1.1")  # adds the group
     with pytest.raises(ValueError, match="write-once"):
-        global_store.seed_zone_groups(repo, [_ZB], years=(2025,), model_version="v2")
+        global_store.seed_zone_groups(repo, [_ZB], years=(2025,), model_version="v2-large")
 
 
 def test_reseed_with_different_axis_rejected(tmp_path):

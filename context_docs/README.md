@@ -41,9 +41,11 @@ context_docs/
 │   ├── 022-resolve-the-roi-mask-credential-at-read-time.md
 │   ├── 023-the-single-path-end-to-end-is-the-quickstart-run.md
 │   ├── 024-spatial-transform-origin-is-the-pixel-corner.md
+│   ├── 025-library-upgrades-ship-on-measured-usability-at-a-store-boundary.md
 │   ├── 026-v1-1-runs-the-gru-it-was-trained-with.md
 │   ├── 027-targeted-updates.md
-│   └── 028-embed-every-pixel-with-an-optical-observation.md
+│   ├── 028-embed-every-pixel-with-an-optical-observation.md
+│   └── 029-one-flow-per-ingest.md
 │
 ├── campaign/                      THE GLOBAL CAMPAIGN — start here
 │   ├── campaign-plan.md                        <- START HERE. What runs, with what settings, in
@@ -53,6 +55,9 @@ context_docs/
 │   │                                              how work balances across N clusters (§5b)
 │   ├── campaign-validation-and-monitoring.md   how each published cell is checked, and how a
 │   │                                              finding reaches a person
+│   ├── latin-america-update.md                 filling Latin America's 2024–2025 gaps and small
+│   │                                              islands, the first targeted updates: why, cost,
+│   │                                              checks, lessons
 │   ├── radar-coverage-by-zone.md               which zones publish no usable radar, and why
 │   │                                              three quarters of that is a polarisation choice
 │   ├── stack-dev-verification.md               #219, #221 and #223 checked together on dev, and
@@ -87,6 +92,9 @@ context_docs/
 │   │                                              one observation. Four measurement campaigns
 │   ├── gpu-fleet-launch-throttling.md          why several clusters asking EC2 for GPUs at once
 │   │                                              throttle each other, and the two bounds
+│   ├── fresh-worker-start.md                   a new worker's first minutes are its EBS volume
+│   │                                              loading the AMI, and the mounted venv image that
+│   │                                              removes them
 │   └── the-fleet-and-the-work-source.md        a fleet lives for one `run_inference` call, so a
 │                                                  retry through a second call rebuilt one; the
 │                                                  wind-down, and why the fleet is not held

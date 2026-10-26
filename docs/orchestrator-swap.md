@@ -39,32 +39,22 @@ The S2 ingest flow looks like:
 ```python
 # src/tessera_embeddings/orchestration/prefect/flows/ingest_s2_roi_reflectance.py
 from prefect import flow, get_run_logger
-from prefect_dask import DaskTaskRunner
 
 from tessera_embeddings.providers.aws.dask import ecs_cluster
+from tessera_embeddings.orchestration.prefect.flows._dask_lifecycle import run_on_cluster
 from tessera_embeddings.orchestration.prefect.tasks.ingest import (
     process_roi_reflectance,
 )
 
 
-@flow(name="ingest_s2_roi_impl")
-def _impl(*, roi_zarr_path, start_date, end_date, store_path, ...):
-    future = process_roi_reflectance.submit(
-        roi_zarr_path=roi_zarr_path,
-        start_date=start_date,
-        end_date=end_date,
-        store_path=store_path,
-        ...
-    )
-    return future.result()
-
-
 @flow(name="ingest_s2_roi_reflectance")
-def ingest_s2_roi_reflectance(...):
+def ingest_s2_roi_reflectance(*, roi_zarr_path, start_date, end_date, store_path, ...):
     log = get_run_logger()
+    task_parameters = {"roi_zarr_path": roi_zarr_path, "start_date": start_date, ...}
     with ecs_cluster(log, min_workers=1, max_workers=50) as cluster:
-        runner = DaskTaskRunner(address=cluster.scheduler_address)
-        return _impl.with_options(task_runner=runner)(...)
+        # PrefectDaskClient on the new scheduler: the task shell runs on a Dask
+        # worker, as a task run of this flow run.
+        return run_on_cluster(cluster.scheduler_address, process_roi_reflectance, task_parameters)
 ```
 
 And the @task shell it submits:
@@ -165,8 +155,8 @@ context fetching:
   logger                      get_run_logger()     context.log
 cluster lifecycle:
   ctx manager                 inside @flow body    @resource (also a ctx manager)
-task runner binding:
-  Dask                        prefect_dask.DaskTaskRunner   resource_defs={"dask_client": ...}
+task submission:
+  Dask                        prefect_dask.PrefectDaskClient resource_defs={"dask_client": ...}
 parameter passing             function args        op inputs / config
 result conversion             dataclass→dict       dataclass→dict
 ```

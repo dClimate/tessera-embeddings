@@ -3,7 +3,8 @@
 The end-to-end check of [ADR 027](../decisions/027-targeted-updates.md) on global-tessera-dev,
 before the update code reached a store anyone reads. **Both modes did exactly what the ADR says, on
 both drivers, and found one defect**, in the registry rows of merged shards, fixed in the same PR.
-A paired run on 2026-10-14 measured hole-aware reads, added afterwards.
+A paired run on 2026-10-14 measured hole-aware reads, added afterwards, and a short rehearsal on
+2026-10-21 checked a land mask that adds land, before the islands update used one.
 
 ## Setup
 
@@ -126,6 +127,31 @@ read.
   (ADR 012 fact 2): observation counts and month coverage are exact, and the embeddings are inside
   the cross-config envelope, with at most 3 levels of difference, scale drift at most 1.2%, and a
   worst-pixel cosine of 0.99993.
+
+## A mask that adds land (2026-10-21)
+
+Before the islands update ([`latin-america-update.md`](latin-america-update.md)) ran under its own mask,
+`latam-islands`, the exact production files were rehearsed in dev. It took 15 minutes, with no GPU and no
+ingest, under a throwaway `_islands-test/` prefix.
+
+- **Built:** `global` from the partner's registry and `latam-islands` from that registry plus 273 island
+  cells, each with `land_mask.build_all` and `validate_coverage`, the code the `build-land-mask` flow runs
+  with `verify=false`. That took about 80 seconds each. `global` came out at 360,953 live tiles, the campaign's
+  per-year roster exactly, and `latam-islands` at 361,198.
+- **Checked against the plan:** `latam-islands` kept every live tile and 256-px chunk of `global`, added
+  exactly the 245 planned tiles a year, and recorded the file's sha256. Under `narrow_tile_live`, every one of
+  the plan's 743 tile-years was live in it, and the 490 new ones dead in `global`.
+- **The validator's reader on real S3** (yield-embeddings #109): with `latam-islands` as its mask, it read the
+  published store's 17N 2024, whose update record names `global`. It resolved that name to the mask beside
+  its own, read it at a cost of three requests, and judged the year against the union: 5,414 live tiles
+  (5,322 plus the 92 new), none written outside the land.
+
+**Not covered: the GPU path.** Every update ingests a full year, about 20 minutes even for one tile, before a
+GPU cluster boots. Its parts were already proven: the alternative-mask `shards` run above wrote tiles dead
+in the baseline's mask, and the Latin America update filled never-written tiles in `holes` mode in
+production. The production run's first verdict was the remaining check, and it passed.
+
+The `_islands-test/` prefix (659 objects) was deleted the same hour.
 
 ## The defect, and the fix
 

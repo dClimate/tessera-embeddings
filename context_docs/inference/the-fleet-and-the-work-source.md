@@ -280,8 +280,8 @@ priming, it would already be spent in exactly the case where no backlog has had 
 ends early once every ingest in the cluster has finished, landed or failed, since nothing more can
 arrive, and it waits on the ingest futures with that timeout rather than sleeping. It runs inside
 the flow's shutdown guard like the priming, so a cancellation during the hold still cancels the
-child ingests. The default is 0, the behaviour above; `cluster-per-zone` ingests each cell before
-its own cluster, so the parameter does not apply there.
+child ingests. The default is 0, the behaviour above. A lone `fill-zone-year` run ingests its
+one cell before its own cluster, so the parameter does not apply there.
 
 **The inference pause gate cannot do this job.** It is read by the runner's dispatch loop, which
 starts only after `ray up`, so a paused cluster still boots its fleet and requests the first actor
