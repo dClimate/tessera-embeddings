@@ -220,11 +220,14 @@ def checkpoint_stem(checkpoint: str) -> str:
     return checkpoint.rsplit("/", 1)[-1].removesuffix(".pt")
 
 
-def staged_model(attrs: Mapping[str, object], where: str) -> dict[str, str]:
-    """The model and checkpoint a staged tile was computed with, recorded by the actor that ran it.
+def staged_model(
+    attrs: Mapping[str, object], where: str, *, expected: Mapping[str, str] | None = None
+) -> dict[str, str]:
+    """The model and checkpoint a staged tile was computed with, refusing one that differs from *expected*.
 
     A tile without the record predates it, so the model that computed it is unknown and it is
     refused rather than guessed, as :func:`staged_stack` refuses a tile without its stack.
+    *expected* is the probe tile's model: a resumed run can hold tiles from two checkpoints.
     """
     model = attrs.get(MODEL_ATTR)
     if not isinstance(model, Mapping):
@@ -233,7 +236,13 @@ def staged_model(attrs: Mapping[str, object], where: str) -> dict[str, str]:
             "tiles recorded their model. Re-infer it with a fresh force_staging_restage token, or by "
             "deleting the staging prefix."
         )
-    return {"model_version": str(model.get("model_version")), "checkpoint_id": str(model.get("checkpoint_id"))}
+    found = {"model_version": str(model.get("model_version")), "checkpoint_id": str(model.get("checkpoint_id"))}
+    if expected is not None and found != dict(expected):
+        raise ValueError(
+            f"Staged tile {where} was computed with {found}, and this run's other tiles with "
+            f"{dict(expected)}. One run never mixes two models; re-infer it with one."
+        )
+    return found
 
 
 def assert_model_matches(

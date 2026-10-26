@@ -711,6 +711,8 @@ class StagedShardSource:
     # The probe tile's library stack, as `(key, value)` pairs; every tile must match it. Empty skips
     # the check, for a run with nothing staged.
     stack: tuple[tuple[str, str | None], ...] = ()
+    # The probe tile's model, held to every tile the same way.
+    model: tuple[tuple[str, str], ...] = ()
 
     def live_shards(self) -> list[tuple[int, int]]:
         """Every ``(row, col)`` this run is responsible for — staged AND skipped.
@@ -738,6 +740,8 @@ class StagedShardSource:
         group = _open_staged_tile(path)
         if self.stack:
             staged_stack(group.attrs, path, expected=dict(self.stack))
+        if self.model:
+            staged_model(group.attrs, path, expected=dict(self.model))
         expected_dtypes = dict(self.dtypes)
         blocks: dict[str, np.ndarray] = {}
         for var in self.variables:
@@ -2585,6 +2589,7 @@ class ZarrWriter:
             owned=tuple((parse_chunk_label(label), uri) for label, uri in sorted((pixels or {}).items())),
             extent=extent,
             stack=tuple(sorted(stack.items())) if stack else (),
+            model=tuple(sorted(model.items())) if model else (),
         )
         telemetry: dict[str, Any] = {}
         # Captured before the write, so the registry part reports what THIS call published rather
@@ -2598,8 +2603,8 @@ class ZarrWriter:
         if registry_root:
             embedded_records = self._top_up_embedded_records(run_id, registry_embedded, embedded_records)
         # The store's model, from its root, against the model the tiles record. Every write into a
-        # store passes here, whoever called it, so this is the one guard; one run never mixes two
-        # models, because the staging key holds the checkpoint.
+        # store passes here, whoever called it, so this is the one guard; the shard source holds every
+        # other tile to the probe's model as it loads it.
         if model is not None:
             root_attrs = zarr.open_group(repo.readonly_session(branch="main").store, mode="r").attrs
             assert_model_matches(root_attrs, model, allow_mismatch=allow_model_mismatch, where=store_path)
