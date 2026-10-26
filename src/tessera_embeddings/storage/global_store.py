@@ -29,7 +29,12 @@ import icechunk
 import numpy as np
 import zarr
 
-from tessera_embeddings.config.inference import DEFAULT_MODEL_VERSION, ModelVersion, model_version_for_encoder
+from tessera_embeddings.config.inference import (
+    DEFAULT_MODEL_VERSION,
+    ModelVersion,
+    checkpoint_filename,
+    model_version_for_encoder,
+)
 from tessera_embeddings.config.store_layout import (
     CARRIED_VARS,
     GLOBAL,
@@ -38,7 +43,7 @@ from tessera_embeddings.config.store_layout import (
     REQUIRED_VARS,
     StoreLayout,
 )
-from tessera_embeddings.storage.conventions import build_convention_attrs, build_geoemb_root_attrs
+from tessera_embeddings.storage.conventions import assert_model_matches, build_convention_attrs, build_geoemb_root_attrs
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
 from tessera_embeddings.storage.time_axis import (
     CAMPAIGN_YEARS,
@@ -103,42 +108,25 @@ def open_global_repo(
 
 def store_model_version(
     store_path: str,
-    requested: ModelVersion | None = None,
     *,
-    allow_mismatch: bool = False,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     region: str | None = None,
 ) -> ModelVersion:
     """The model a global store holds, from its root's ``geoemb:model``, and so the model that fills it.
 
-    Resolved once per fill, campaign or update, and everything model-specific follows from it: the
-    checkpoint, the worker image, the staging run-id prefix and the inference config. A store is
-    seeded for one model and never mixes two, so the store, not a code default, is the authority.
-
-    *requested* is an explicit choice that must agree with the store. *allow_mismatch* lets it win,
-    for a store seeded with a custom ``model_url`` that names no known model.
+    Resolved once per fill, campaign or update, before anything is provisioned, and everything
+    model-specific follows from it: the checkpoint, the worker image, the staging run-id prefix and
+    the inference config. A store is seeded for one model and its checkpoint and never mixes two, so
+    the store, not a code default, is the authority. A root naming no known model, or another
+    checkpoint than its model's, is refused here rather than after the ingest has been paid for.
     """
     repo = open_global_repo(store_path, get_credentials=get_credentials, region=region)
-    url = cast(
-        "str | None", zarr.open_group(repo.readonly_session(branch="main").store, mode="r").attrs.get("geoemb:model")
+    attrs = zarr.open_group(repo.readonly_session(branch="main").store, mode="r").attrs
+    model_version = model_version_for_encoder(cast("str | None", attrs.get("geoemb:model")))
+    assert_model_matches(
+        attrs, model_version, checkpoint_filename(model_version=model_version), where=f"global store {store_path}"
     )
-    try:
-        stored = model_version_for_encoder(url)
-    except ValueError as exc:
-        if allow_mismatch and requested is not None:
-            return requested
-        # A campaign takes its model from the store, so it cannot fill one that names no known model.
-        raise ValueError(
-            f"{exc} Fill {store_path} zone by zone with fill_zone_year, naming model_version and "
-            "allow_model_mismatch=True."
-        ) from None
-    if requested is not None and requested != stored and not allow_mismatch:
-        raise ValueError(
-            f"{store_path} holds {stored} embeddings (geoemb:model {url!r}), so filling it with "
-            f"model_version={requested!r} would mix two models in one store. Leave model_version unset "
-            "to fill with the store's model, or pass allow_model_mismatch=True to override."
-        )
-    return requested or stored
+    return model_version
 
 
 def set_saved_manifest_preload(
@@ -329,7 +317,6 @@ def _root_attrs(
     layout: StoreLayout,
     *,
     model_version: ModelVersion,
-    checkpoint_id: str | None,
     optical_min_obs: int | None,
 ) -> dict:
     """Root-group attrs for the multi-zone campaign store: geoemb: stated once.
@@ -345,14 +332,14 @@ def _root_attrs(
     store advertises. Absent rather than zero when there was no rule — zero is a threshold that
     refuses nothing, a different statement from never having had one.
     """
-    # The model, separate from the checkpoint stem: geoemb:model is what every later fill reads
-    # to decide which model fills this store, so a v2 store stamped with v1.1's URL would be
-    # filled by v1.1.
+    # geoemb:model is what every later fill reads to decide which model fills this store, so a v2
+    # store stamped with v1.1's URL would be filled by v1.1. The checkpoint is the model's own: every
+    # fill runs it, so a store recording any other could never be filled.
     attrs = build_geoemb_root_attrs(
         embedding_dim=_layout_band(layout),
         spatial_layout="utm_zones",
         gsd=float(PIXEL_M),  # every zone is the same fixed-metre grid; the root has none to derive from
-        checkpoint_id=checkpoint_id,
+        checkpoint_id=checkpoint_filename(model_version=model_version),
         model_version=model_version,
     )
     if optical_min_obs is not None:
@@ -471,7 +458,6 @@ def check_root_identity(
     *,
     layout: StoreLayout,
     model_version: ModelVersion,
-    checkpoint_id: str | None = None,
     optical_min_obs: int | None = None,
 ) -> None:
     """Raise unless *root_attrs* already publishes the identity this seed requests.
@@ -479,7 +465,7 @@ def check_root_identity(
     Split out of :func:`seed_zone_groups` so the two callers that must not disagree share one
     implementation. The seed itself runs it before creating groups; the ``seed_global_store``
     flow runs it on the path where every zone already exists and no groups are created — without
-    it, a rerun requesting a different checkpoint or minimum-depth rule reports a clean seed and
+    it, a rerun requesting a different model or minimum-depth rule reports a clean seed and
     leaves the old identity in place for the campaign to follow.
 
     A store with no identity stamped yet passes: the first seed is what stamps it.
@@ -491,9 +477,7 @@ def check_root_identity(
         )
     if "geoemb:model" not in root_attrs:
         return
-    new_root = _root_attrs(
-        layout, model_version=model_version, checkpoint_id=checkpoint_id, optical_min_obs=optical_min_obs
-    )
+    new_root = _root_attrs(layout, model_version=model_version, optical_min_obs=optical_min_obs)
     identity = ("geoemb:model", "geoemb:dimensions", "geoemb:data_type", "checkpoint_id", "optical_min_obs")
     mismatched = {k: (root_attrs.get(k), new_root.get(k)) for k in identity if root_attrs.get(k) != new_root.get(k)}
     if mismatched:
@@ -509,7 +493,6 @@ def stamp_root_identity(
     *,
     layout: StoreLayout = GLOBAL,
     model_version: ModelVersion,
-    checkpoint_id: str | None = None,
     optical_min_obs: int | None = None,
     commit_msg: str | None = None,
 ) -> str | None:
@@ -522,7 +505,7 @@ def stamp_root_identity(
     Exists because "already stamped" and "seeding created no groups" are different questions and
     a store seeded before the root carried an identity answers no to both. :func:`seed_zone_groups`
     stamps as a side effect of creating groups, so a store with all 120 already present never
-    reaches that line: the flow would report a clean seed having recorded neither the checkpoint
+    reaches that line: the flow would report a clean seed having recorded neither the model
     nor the depth rule the operator asked for, after which the fill-side gates — which pass on an
     ABSENT attr — let anything write.
 
@@ -534,9 +517,7 @@ def stamp_root_identity(
     root = zarr.open_group(session.store, mode="a")
     if "geoemb:model" in root.attrs:
         return None
-    root.attrs.update(
-        _root_attrs(layout, model_version=model_version, checkpoint_id=checkpoint_id, optical_min_obs=optical_min_obs)
-    )
+    root.attrs.update(_root_attrs(layout, model_version=model_version, optical_min_obs=optical_min_obs))
     return session.commit(commit_msg or "stamp root identity on an already-seeded store")
 
 
@@ -547,7 +528,6 @@ def seed_zone_groups(
     years: tuple[int, ...] = CAMPAIGN_YEARS,
     layout: StoreLayout = GLOBAL,
     model_version: ModelVersion = DEFAULT_MODEL_VERSION,
-    checkpoint_id: str | None = None,
     optical_min_obs: int | None = None,
     commit_msg: str | None = None,
 ) -> str:
@@ -584,7 +564,6 @@ def seed_zone_groups(
         root.attrs,
         layout=layout,
         model_version=model_version,
-        checkpoint_id=checkpoint_id,
         optical_min_obs=optical_min_obs,
     )
     stamped_now = "geoemb:model" not in root.attrs
@@ -594,11 +573,7 @@ def seed_zone_groups(
         # sit beside zones filled under another, under a root advertising only the second. The
         # consequence to know is that the root's rule never moves. A targeted update may apply a
         # looser line to its own cells (ADR 028), and its update records, not the root, say so.
-        root.attrs.update(
-            _root_attrs(
-                layout, model_version=model_version, checkpoint_id=checkpoint_id, optical_min_obs=optical_min_obs
-            )
-        )
+        root.attrs.update(_root_attrs(layout, model_version=model_version, optical_min_obs=optical_min_obs))
     # The time axis is fixed and UNIFORM across all zone groups (ADR-008 D1): campaign status and
     # fill code assume every group shares one axis. An incremental seed passing a different
     # `years` than the groups already present would silently leave a mixed-axis store, so validate

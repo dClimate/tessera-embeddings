@@ -37,7 +37,6 @@ import bisect
 import contextlib
 import dataclasses
 import datetime
-import hashlib
 import itertools
 import json
 import logging
@@ -55,7 +54,6 @@ import zarr
 from tessera_embeddings.config.environment import code_identity
 from tessera_embeddings.config.fault_injection import ArmedFault
 from tessera_embeddings.config.inference import (
-    DEFAULT_MODEL_VERSION,
     EMBEDDING_DIM,
     OPTICAL_MIN_OBS,
     RADAR_THIN_MAX_OBS,
@@ -84,9 +82,11 @@ from tessera_embeddings.inference.chunk_spec import (
 from tessera_embeddings.storage import zone_grid
 from tessera_embeddings.storage.conventions import (
     STACK_ATTR,
-    assert_encoder_matches,
+    assert_model_matches,
     assert_stack_matches,
     build_convention_attrs,
+    checkpoint_stem,
+    library_stack,
 )
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
 from tessera_embeddings.storage.global_store import create_layout_arrays, open_global_repo
@@ -125,9 +125,7 @@ logger = logging.getLogger(__name__)
 STAGED_READ_CONFIG_KWARGS = {"retries": {"max_attempts": 10, "mode": "adaptive"}}
 _COVERAGE_SUFFIX = ".coverage.zarr"
 #: Where a staging run records the stack that computed it (:meth:`ZarrWriter._join_run`).
-_STACKS_DIR = "_stacks"
-#: ``(stacks_dir, digest)`` pairs this process has joined, so a run is joined once, not per tile.
-_JOINED: set[tuple[str, str]] = set()
+_STACK_FILE = "_stack.json"
 """Suffix of the coverage-only tile a refused chunk stages.
 
 Named once because two places must agree on it: the writer that creates such a tile, and the
@@ -1598,44 +1596,48 @@ class ZarrWriter:
         return sorted(entry.rstrip("/").rsplit("/", 1)[-1] for entry in entries)
 
     def _join_run(self, run_id: str, stack: Mapping[str, str | None]) -> None:
-        """Record *stack* as the run's, refusing a run that another stack has joined.
+        """Record *stack* as the run's, refusing a run that another stack already holds.
 
-        One run is computed by one stack, so a tile needs no record of its own: the run's stack is a
-        file in ``_stacks/``, named by its digest. A process on another stack finds a second name
-        there and stops before staging anything; two that start together both see both. Once per
-        process and run.
+        One run is computed by one stack, so a tile carries no record of its own. The run's first
+        write creates ``_stack.json`` exclusively (a conditional PUT on S3, ``O_EXCL`` on a local
+        disk) and every later write reads it back, so a worker on another stack stops before staging
+        anything and leaves nothing behind.
         """
-        digest = hashlib.sha256(json.dumps(dict(stack), sort_keys=True).encode()).hexdigest()[:16]
-        stacks_dir = f"{self.staging_base}/{run_id}/{_STACKS_DIR}"
-        if (stacks_dir, digest) in _JOINED:
+        path = f"{self.staging_base}/{run_id}/{_STACK_FILE}"
+        fs = _fs_for(path)
+        fs.makedirs(path.rsplit("/", 1)[0], exist_ok=True)
+        try:
+            with fs.open(path, "xb") as f:
+                f.write(json.dumps(dict(stack), sort_keys=True).encode())
             return
-        fs = _fs_for(stacks_dir)
-        fs.makedirs(stacks_dir, exist_ok=True)
-        with fs.open(f"{stacks_dir}/{digest}.json", "w") as f:
-            json.dump(dict(stack), f)
-        if others := [n for n in fs.ls(stacks_dir, detail=False, refresh=True) if not n.endswith(f"/{digest}.json")]:
+        except FileExistsError:
+            recorded = self._read_stack(path)
+        if recorded != dict(stack):
             raise ValueError(
-                f"Staging run {run_id} was already joined by another stack ({others}), and this process "
-                f"runs {dict(stack)}. One run is computed by one stack; run it on one."
+                f"Staging run {run_id} was computed by {recorded}, and this process runs {dict(stack)}. "
+                "One run is computed by one stack; run it on one."
             )
-        _JOINED.add((stacks_dir, digest))
+
+    @staticmethod
+    def _read_stack(path: str) -> dict[str, str | None]:
+        """Read a run's stack record, waiting out a local writer that created it but has not written it."""
+        fs = _fs_for(path)
+        for _ in range(50):
+            with contextlib.suppress(ValueError):
+                return cast("dict[str, str | None]", json.loads(fs.cat_file(path)))
+            time.sleep(0.02)
+        raise ValueError(f"{path} holds no stack record")
 
     def run_stack(self, run_id: str) -> dict[str, str | None]:
-        """The one stack a staging run was computed by, refusing a run with none or with two."""
-        stacks_dir = f"{self.staging_base}/{run_id}/{_STACKS_DIR}"
-        fs = _fs_for(stacks_dir)
+        """The one stack a staging run was computed by, refusing a run that records none."""
+        path = f"{self.staging_base}/{run_id}/{_STACK_FILE}"
         try:
-            names = fs.ls(stacks_dir, detail=False, refresh=True)
+            return self._read_stack(path)
         except FileNotFoundError:
-            names = []
-        if len(names) != 1:
             raise ValueError(
-                f"Staging run {run_id} records {len(names)} stacks; assembly needs exactly one. None means "
-                "no worker staged it, and two mean two stacks computed it: re-infer it with a fresh "
-                "force_staging_restage token, or by deleting the staging prefix."
-            )
-        with fs.open(names[0]) as f:
-            return cast("dict[str, str | None]", json.load(f))
+                f"Staging run {run_id} records no stack, so no worker staged it: re-infer it with a "
+                "fresh force_staging_restage token, or by deleting the staging prefix."
+            ) from None
 
     def _list_staged(self, run_id: str) -> StagedListing:
         """Classify every artifact of a run from one staging LIST.
@@ -1928,14 +1930,13 @@ class ZarrWriter:
         time_window: TimeWindow | None = None,
         tile_id: str | None = None,
         compute_std: bool = False,
-        checkpoint_id: str | None = None,
-        model_version: ModelVersion = DEFAULT_MODEL_VERSION,
+        checkpoint_id: str,
+        model_version: ModelVersion,
         manifest: EmbeddingManifest | None = None,
         n_workers: int,
         get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
         s3_region: str | None = None,
         layout: StoreLayout = SINGLE,
-        allow_stack_mismatch: bool = False,
     ) -> str:
         """Assemble staged chunk Zarrs into a standalone Icechunk store.
 
@@ -2000,9 +2001,6 @@ class ZarrWriter:
             s3_region: Optional S3 region override for the output store.
             layout: Output geometry preset. ``SINGLE`` (default) reproduces today's single-ROI
                 stores exactly; only new stores consult it.
-            allow_stack_mismatch: Append tiles computed on a different PyTorch or CUDA from the
-                store's (``inference_stack``). For a deliberate experiment only: the store keeps its
-                recorded stack.
 
         Returns:
             Path to the assembled output store.
@@ -2024,12 +2022,18 @@ class ZarrWriter:
         )
         staged_labels = self.verify_staged_completeness(run_id, roi_live_chunks, log=_log)
         live_chunks = [c for c in roi_live_chunks if c.label in staged_labels]
-        # What computed the run, from its one record. With tiles staged, the store's model attrs come
-        # from it rather than from the caller, whose values only label an all-fill timestep.
+        # What computed the run, from its one record, which must be what the caller labels the store
+        # with: the run id already varies with the checkpoint, so only a reused id can disagree.
         stack = self.run_stack(run_id) if live_chunks else None
-        if stack is not None:
-            model_version = cast("ModelVersion", stack["model_version"])
-            checkpoint_id = stack["checkpoint_id"]
+        if stack is not None and (stack["model_version"], stack["checkpoint_id"]) != (
+            model_version,
+            checkpoint_stem(checkpoint_id),
+        ):
+            raise ValueError(
+                f"Staging run {run_id} was computed by {stack['model_version']} ({stack['checkpoint_id']}), "
+                f"and this assembly writes {model_version} ({checkpoint_id}). Assemble it with the config "
+                "that staged it."
+            )
         # SKIP-MARKED CHUNKS ARE DROPPED HERE AND THEIR COVERAGE ARTIFACTS GO UNREAD — a DELIBERATE
         # asymmetry with the global path, recorded because it reads as an oversight otherwise.
         # Global assembly consumes each skipped chunk's `.coverage.zarr`, so its observation counts
@@ -2141,11 +2145,9 @@ class ZarrWriter:
             # Past both, the attrs write at the end of this method restamps `geoemb:model` for the
             # WHOLE store. Shared with the pre-flight so the two doors cannot disagree.
             if stack is not None:
-                assert_stack_matches(root.attrs, stack, allow_mismatch=allow_stack_mismatch, where=output_path)
+                assert_stack_matches(root.attrs, stack, where=output_path)
             else:
-                assert_encoder_matches(
-                    cast("str | None", root.attrs.get("geoemb:model")), model_version=model_version, where=output_path
-                )
+                assert_model_matches(root.attrs, model_version, checkpoint_id, where=output_path)
 
             assert_on_store_grid(
                 root, spatial, total_y=total_y, total_x=total_x, embedding_dim=self.embedding_dim, where=output_path
@@ -2286,7 +2288,7 @@ class ZarrWriter:
             _log.info("Wrote _manifest to %s", output_path)
         # Write-once: a store's first write records its stack, and no later one replaces it.
         if stack is not None and STACK_ATTR not in node.attrs:
-            attrs[STACK_ATTR] = stack
+            attrs[STACK_ATTR] = library_stack(stack)
         if time_window:
             # Raw writes never clobber attrs, so prior windows are read straight off the store
             # and merged.
@@ -2360,7 +2362,6 @@ class ZarrWriter:
         commit_attrs: Callable[[icechunk.Repository, str, int, Mapping[str, str]], str] | None = None,
         update_name: str | None = None,
         time_index: int | None = None,
-        allow_stack_mismatch: bool = False,
     ) -> str:
         """Assemble a run's staged tiles into one (zone, year) of the global store.
 
@@ -2447,9 +2448,6 @@ class ZarrWriter:
             time_index: The time step to write, in place of ``year``'s calendar slot: an update of a
                 single-area store, whose arrays sit at its root (``zone=""``) on a time axis of
                 window ends.
-            allow_stack_mismatch: Write tiles computed on a different PyTorch or CUDA from the store's
-                (:func:`~tessera_embeddings.storage.shard_writer.claim_root_stack`). For a deliberate
-                experiment only: the store keeps its recorded stack.
 
         Returns:
             The commit snapshot id.
@@ -2621,7 +2619,7 @@ class ZarrWriter:
         # The run's one stack against the store root's, stamping it on the store's first write. Every
         # write into a store passes here, whoever called it; nothing else checks what computed a tile.
         if stack is not None:
-            claim_root_stack(repo, stack, allow_mismatch=allow_stack_mismatch, where=store_path)
+            claim_root_stack(repo, stack, where=store_path)
         snapshot = write_year_shards(
             repo,
             zone,

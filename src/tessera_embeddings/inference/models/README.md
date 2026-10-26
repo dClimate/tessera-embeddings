@@ -90,10 +90,10 @@ meaning each:
 
 - **Single-area runs** take it from `InferenceConfig.model_version`, v1.1 by default.
 - **A global store** is seeded for one model (`seed_global_store(model_version=...)`), which stamps
-  its `geoemb:model`. Every fill, campaign and targeted update reads it back through
-  `store_model_version`, and the checkpoint, worker image, staging run-id prefix and inference config
-  all follow from it. The campaign flows take no model parameter. A single zone fill may name
-  one, and is refused if it disagrees with the store unless it sets `allow_model_mismatch`.
+  its `geoemb:model` and that model's own checkpoint as `checkpoint_id`. Every fill, campaign and
+  targeted update reads them back through `store_model_version`, before anything is provisioned, and
+  the checkpoint, worker image, staging run-id prefix and inference config all follow. No fill flow
+  takes a model parameter, and there is no override.
 - **The guard is in the write, not the callers.** A staging run records the stack that computed it,
   model and checkpoint included, and every write into a store compares that record with the root
   ([One stack per run, one stack per store](../README.md)). Reading the model at the flows only
