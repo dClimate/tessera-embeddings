@@ -847,10 +847,6 @@ class InferenceConfig:
     # Which upstream model family to run (see ModelVersion).
     model_version: ModelVersion = DEFAULT_MODEL_VERSION
 
-    # Let assembly write tiles computed on a different PyTorch or CUDA from the store's recorded
-    # `inference_stack` (ADR 025 rule 2). For a deliberate experiment only; the store keeps its stack.
-    allow_stack_mismatch: bool = False
-
     def initial_actor_request(self, num_actors: int) -> int:
         """How many actors to create before the scheduling loop takes over.
 

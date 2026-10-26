@@ -203,7 +203,9 @@ way to waste money on this pipeline.
 - **Workers:** g6e.xlarge (one L40S, 4 vCPU, 32 GB RAM), on demand, across several
   availability zones; Ray fails over between subnets when one refuses capacity.
 - Workers boot from a Packer-built AMI with every dependency already installed, and are
-  ready in about a minute.
+  ready in about a minute. Their first forward then waits on the new EBS volume loading the
+  AMI, unless the AMI ships its venv as a mountable image
+  ([`gotchas.md`](../providers/aws/gotchas.md)), which turns minutes into well under one.
 
 [`docs/providers/aws.md`](../../../docs/providers/aws.md) covers what to provision, the
 capacity-fallback rungs, and how the fleet mix is chosen.
@@ -780,13 +782,13 @@ error**. The presence of the directory therefore proves nothing, which is why co
 is recorded as its own signal, *after* the store is fully written:
 
 ```text
-  write_chunk:  rm <label>.done                   retract the old marker FIRST
+  write_chunk:  _stack.json                      the run's stack: created once, read back, another refuses
+                    ↓
+                rm <label>.done                   retract the old marker FIRST
                     ↓
                 ds.to_zarr(…, mode="w")           many objects, no atomic commit
                     ↓
                 coverage = {…}                    this shard's refusal reasons and depth
-                    ↓
-                inference_stack = {…}             the PyTorch and CUDA that computed it
                     ↓
                 staged_complete = True            in-store attribute
                     ↓
@@ -933,8 +935,8 @@ icechunk sessions read their own writes, so the merged result is exact.
    index, so no stale slice describes the overwritten data.
 3. **Phase 2, data.** Fork the session; each worker writes its band's tile slices into every
    output array; the coordinator merges the forks, sets the root attributes (run metadata,
-   GeoZarr conventions, `_manifest`, merged `time_windows`, and `inference_stack` on the store's
-   first write) and commits once through
+   GeoZarr conventions, `_manifest`, merged `time_windows`, and `inference_stack`, PyTorch and
+   CUDA, on the store's first write) and commits once through
    `commit_with_rebase`.
 4. **Atomic publish.** Fast-forward `main` to the fully written work-branch tip, guarded by
    `from_snapshot_id` so a concurrent writer to the same store fails loudly, then drop the
@@ -964,15 +966,28 @@ the worker reading the shard already in the store and replacing only its hole pi
 array; and the second commit appends the update's record to the group's `updates` attr instead of
 advancing `years_complete` and `runs`. No zone-year tag is created.
 
-**One library stack per store** ([ADR 025](../../../context_docs/decisions/025-library-upgrades-ship-on-measured-usability-at-a-store-boundary.md)
-rule 2). The inference actor records the PyTorch and CUDA it runs on every tile it stages, as
-`inference_stack`. The driver cannot: it runs the lockfile's CPU build whatever the workers run.
-Both assembly paths read the stack off one probe tile, hold every other tile to it, and compare it
-with the store root's. The first write into a store stamps the root, for the global store in a
-small commit of its own before any shard (`shard_writer.claim_root_stack`); a store written before
-the record is stamped, not refused. A tile staged on another stack, including one a resume would
-reuse, is refused with both stacks named. `allow_stack_mismatch` writes it anyway, for a deliberate
-experiment, and the store keeps its stack.
+**One stack per run, one stack per store** ([ADR 025](../../../context_docs/decisions/025-library-upgrades-ship-on-measured-usability-at-a-store-boundary.md)
+rule 2). A run's *stack* is what computed it: model, checkpoint stem, PyTorch and CUDA. Only the
+workers know it, since the driver runs the lockfile's CPU build. Two checks hold it, and nothing
+else does:
+
+1. **Joining a run.** A run's first write creates `_stack.json` exclusively (a conditional PUT on
+   S3, `O_EXCL` on a local disk), and every later write reads it back (`ZarrWriter._join_run`). A
+   worker on another stack stops before staging anything and leaves nothing behind, so a run's
+   tiles never mix stacks and carry no record of their own. A resume on another checkpoint or
+   PyTorch is refused the same way.
+2. **Writing a store.** Assembly reads the run's record (`run_stack`) and compares it with the
+   store root once (`conventions.assert_stack_matches`: the root's `geoemb:model`, read as v1.1
+   when absent, its `checkpoint_id` as a stem, and its `inference_stack`, PyTorch and CUDA). Every
+   write passes here: the Prefect flows, a direct `runners.zone_fill` call and the plain runner's
+   updates. The first write stamps `inference_stack`, for the global store in a small commit before
+   any shard (`shard_writer.claim_root_stack`). A single-area assembly also refuses a record whose
+   model or checkpoint differs from its caller's, the ones it labels the store with; the run id
+   varies with the checkpoint, so only a reused id can disagree.
+
+There is no override. Moving a store to another stack is a restamp after ADR 025's measurement.
+Each fill and campaign also reads the store's model and checkpoint through `store_model_version`
+before anything is provisioned, only to fail early.
 
 **The campaign's land mask is not a pixel-resolution area of interest** but a per-zone
 *coverage bitmap* (`tile_live_2048`), built from the delivery registry by

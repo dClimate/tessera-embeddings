@@ -1099,6 +1099,36 @@ evidence yet that the inference line is sound.
 - **The first cell pays a warm-up premium** in per-chunk overhead, amortised across a chained shard
   rather than paid per zone. Quantifying it per cell needs the zone field named above.
 
+### A holes update on the campaign path (October 2026)
+
+The Latin America update ([`../campaign/latin-america-update.md`](../campaign/latin-america-update.md))
+inferred 13,029 tiles in `holes` mode on 73 `g6e.xlarge` workers, v1.1 with every change since the
+campaign (the faithful GRU step, the day-of-year table, sharded mosaics, the simpler loader).
+`CHUNK_SUMMARY` now carries `run`, the zone-year's run id, so these figures are per zone-year; the
+attribution warning above applies to lines from before that field.
+
+**Against the campaign, on tiles inferred whole.** Tiles with at least 3.5 M hole pixels are the same work
+as a campaign tile. Optical tokens per busy second per worker:
+
+| | tiles | this update | the campaign path, above |
+|---|---|---|---|
+| both orbits | 321 | 1.59 M | 1.26–1.62 M |
+| one orbit | 43 | 2.63 M | 1.60 M |
+
+Both-orbit tiles land at the top of the campaign's range, about what the changes since were expected to
+buy together; the one-orbit sample is small.
+
+**Where an update's GPU time goes.** 55% of tile time was outside inference, 33% of it reading imagery before
+the first forward pass. Tiles with under 250,000 hole pixels took 41 s each, 4 s of it inference, and 44% of
+all GPU-hours; denser tiles took 69 s, 48 s of it inference. A holes mask shrinks the forward pass but not the
+year of imagery behind it, and hole-aware reads skipped no strip, because every tile had holes in every
+strip. On one cluster's 1 s polls over 3.4 hours the card was busy 45–52% of seconds at about 200 W, against
+92–98% at 335 W on dense tiles.
+
+**Depth by year.** At the same hole pixels per tile, 2025 tiles kept 96 optical and 78 radar observations
+against 80 and 49 for 2024, and took 22% longer to read and 47% longer to infer. Host memory peaked at 63%,
+above 60% for at most 3 s on any worker, with no out-of-memory event.
+
 ---
 
 ## 7. The v2 Large student, measured against the v1.1 baseline

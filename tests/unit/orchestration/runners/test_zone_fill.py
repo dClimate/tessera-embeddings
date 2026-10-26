@@ -161,7 +161,7 @@ def _staging_inference_stub(staged: dict[str, np.ndarray]):
         for chunk in chunks:
             emb = rng.integers(-100, 100, size=(chunk.height, chunk.width, _BAND)).astype(np.int8)
             scales = rng.random((chunk.height, chunk.width)).astype(np.float32)
-            writer.write_chunk(chunk, emb, run_id, scales=scales, inference_stack=STACK)
+            writer.write_chunk(chunk, emb, run_id, scales=scales, stack=STACK)
             staged[chunk.label] = emb
             results.append({"chunk": chunk.label, "status": "success", "valid_pixels": 1, "elapsed_sec": 0.0})
         return results
@@ -194,7 +194,7 @@ def _resuming_inference_stub(staged: dict[str, np.ndarray]):
                 emb,
                 run_id,
                 scales=rng.random((chunk.height, chunk.width)).astype(np.float32),
-                inference_stack=STACK,
+                stack=STACK,
             )
             staged[chunk.label] = emb
             results.append({"chunk": chunk.label, "status": "success", "valid_pixels": 1, "elapsed_sec": 0.0})
@@ -751,7 +751,7 @@ def test_landed_but_untagged_cell_is_retagged_without_rerun(tmp_path, monkeypatc
         rng.integers(-100, 100, size=(_TILE, _TILE, _BAND)).astype(np.int8),
         "run1",
         scales=rng.random((_TILE, _TILE)).astype(np.float32),
-        inference_stack=STACK,
+        stack=STACK,
     )
     writer.assemble_global(store, _ZONE, year=2025, run_id="run1", n_workers=1)
     repo = global_store.open_global_repo(store)
@@ -1132,7 +1132,7 @@ def test_a_partly_refused_tile_publishes_what_the_gate_removed(tmp_path, monkeyp
                 emb,
                 run_id,
                 scales=rng.random((chunk.height, chunk.width)).astype(np.float32),
-                inference_stack=STACK,
+                stack=STACK,
             )
             results.append(
                 {

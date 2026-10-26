@@ -306,8 +306,6 @@ class ZoneFillHandoff:
     done: dict[str, Any] | None = None
     # The targeted update this cell runs for, or None for a campaign fill (see `_assemble_update`).
     update: UpdateTarget | None = None
-    # `InferenceConfig.allow_stack_mismatch`, carried to assembly, the only stage that reads it.
-    allow_stack_mismatch: bool = False
 
 
 def _store_credentials(
@@ -548,7 +546,6 @@ class ZonePlan:
     done: dict[str, Any] | None = None
     # The targeted update this cell runs for, carried to assembly through the handoff.
     update: UpdateTarget | None = None
-    allow_stack_mismatch: bool = False
 
 
 def preflight_destination(
@@ -952,7 +949,6 @@ def plan_zone_inference(
         summary=summary,
         live=live,
         update=update,
-        allow_stack_mismatch=config.allow_stack_mismatch,
     )
 
 
@@ -1060,7 +1056,7 @@ def _infer_planned(
 def complete_zone_inference(plan: ZonePlan, *, results: list[dict] | None) -> ZoneFillHandoff:
     """Fold per-tile results back into the handoff the assembly phase consumes.
 
-    Shared by the per-cell path and the chained runner, which collects a zone's results from
+    Shared by the single-cell flow and the chained runner, which collects a zone's results from
     the streamed session instead of a dedicated ``run_inference`` call. Raises if any tile
     failed: the zone must not assemble partial output, and its cell stays pending in the
     campaign ledger.
@@ -1092,7 +1088,6 @@ def complete_zone_inference(plan: ZonePlan, *, results: list[dict] | None) -> Zo
         live=plan.live,
         results=results,
         update=plan.update,
-        allow_stack_mismatch=plan.allow_stack_mismatch,
     )
 
 
@@ -1318,7 +1313,6 @@ def assemble_zone_year(
         log=log,
         fault=fault,
         input_coverage=input_coverage,
-        allow_stack_mismatch=handoff.allow_stack_mismatch,
     )
     # Before the tag, as on the all-refused branch: a deliberate refill fails at the tag step.
     _merge_registry_master(
@@ -1421,7 +1415,6 @@ def _assemble_update(
             log=log,
             fault=fault,
             input_coverage=input_coverage,
-            allow_stack_mismatch=handoff.allow_stack_mismatch,
         )
         if merged and registry_root:
             _publish_merged_rows(

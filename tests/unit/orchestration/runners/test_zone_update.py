@@ -53,7 +53,7 @@ def _stub(seed: int, *, skip: tuple[str, ...] = (), stack: dict = STACK):
                 emb,
                 run_id,
                 scales=rng.random((chunk.height, chunk.width)).astype(np.float32),
-                inference_stack=stack,
+                stack=stack,
             )
             results.append({"chunk": chunk.label, "status": "success", "valid_pixels": 1, "elapsed_sec": 0.0})
         return results

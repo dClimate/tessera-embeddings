@@ -1,8 +1,8 @@
 # 032 — v2 stores name their spatial axes `y` and `x`
 
 **Status:** Proposed 2026-10-22. Built on [PR #247](https://github.com/dClimate/tessera-embeddings/pull/247)'s
-one record per model, with [PR #218](https://github.com/dClimate/tessera-embeddings/pull/218)'s
-convention work merged in.
+one record per model, and on [PR #218](https://github.com/dClimate/tessera-embeddings/pull/218)'s
+convention work.
 
 Every output store so far names its spatial dimensions `northing` and `easting`. No standard asks
 for that, and the tools downstream users reach for look for `y` and `x`. This makes the names a

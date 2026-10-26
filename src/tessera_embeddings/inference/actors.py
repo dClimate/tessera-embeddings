@@ -48,6 +48,7 @@ from tessera_embeddings.inference.data_loading import (
 from tessera_embeddings.inference.progress import chunk_uid
 from tessera_embeddings.inference.read_plan import _chunk_read_plan
 from tessera_embeddings.inference.resource_monitor import ResourceMonitor
+from tessera_embeddings.storage.conventions import checkpoint_stem
 from tessera_embeddings.storage.zarr_store import credentials_provider
 
 if TYPE_CHECKING:
@@ -552,14 +553,21 @@ class InferenceActor:
     # Cross-chunk prefetch
     @functools.cached_property
     def _inference_stack(self) -> dict[str, str | None]:
-        """The PyTorch and CUDA this actor runs, staged with every tile it writes (ADR 025).
+        """What this actor computes with: model, checkpoint stem, PyTorch and CUDA (ADR 025).
 
         Read here, where the model runs: the driver runs the lockfile's CPU build whatever the workers
-        run, so only this process knows which stack computed the embeddings.
+        run, so only this process knows. A staging run records it once (``ZarrWriter._join_run``) and
+        assembly holds the store to it. CUDA is ``None`` on a CPU actor even when the build has it,
+        since ``torch.version.cuda`` names the build, not the device.
         """
         import torch
 
-        return {"torch": torch.__version__, "cuda": torch.version.cuda}
+        return {
+            "model_version": self.config.model_version,
+            "checkpoint_id": checkpoint_stem(self.config.checkpoint_path),
+            "torch": torch.__version__,
+            "cuda": torch.version.cuda if self.device.type == "cuda" else None,
+        }
 
     # ------------------------------------------------------------------
     # Stash keyed by chunk label; lazily initialised so test harnesses building bare actors via
@@ -1187,7 +1195,7 @@ class InferenceActor:
                         # carry no measurements — a refused chunk's identical record survives
                         # because it goes into the skip marker.
                         coverage=coverage,
-                        inference_stack=self._inference_stack,
+                        stack=self._inference_stack,
                     )
                     # One line per chunk: how long the backgrounded upload took. The phase table's write_s is ~0 by
                     # design, so this is the off-critical-path cost, for post-run upload health checks.

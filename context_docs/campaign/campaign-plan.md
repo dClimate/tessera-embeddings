@@ -338,7 +338,6 @@ is in this table because it is the most consequential value in it.
 | parameter | value | why |
 |---|---|---|
 | **published store** | **`s3://tessera-embeddings/v1.1/dclimate.icechunk`** | the AWS Open Data bucket, not ours — it carries the storage cost and serves the dataset publicly. Set as `BucketPaths.global_store_uri` on the PROD account's paths, so it is a property of the account rather than a parameter an operator can get wrong. Every producer and consumer of the store reads it from that one method, and no dev or branch deployment carries it, so nothing but production can reach the public bucket |
-| `fill_strategy` | `"chained-clusters"` | one cluster per zone-set, not per zone-year |
 | **`max_parallel_clusters`** | **10** ★ — **also run at 25** | 10 x 250 actors reaches the full 2,500-actor quota, and each cluster opens on one of the 10 densest zones; balance holds to ~16. **There is no single assembly ceiling — see the note above the table. 25 clusters is the other supported shape, chosen so a cluster that finishes early releases quota the survivors climb into; it costs the same to within about 0.2%, the difference being one Ray head node per cluster** |
 | **`max_parallel_ingest`** | **60** ★ | fleet-wide cap on simultaneous zone-ingests. With every year in one batch the ingest knee is gone, so this is set by quota and by what the GPU fleet can absorb (§6). **60 rather than 61, and the reason is division:** each cluster's share is this cap over the cluster count ROUNDED UP, so 61 over 10 aims every cluster at 7 and the fleet at 70 against its own gate of 61 — the gate holds the ceiling, so it oversubscribes rather than breaches, but the clusters queue on it and the log reports a width the fleet never runs at. 60 over 10 is exactly 6. Now the flow DEFAULT, so it needs no passing |
 | `max_dispatch_rounds` | 2 | **The outer recovery.** How many times the campaign re-dispatches whatever is still missing — rounds, not a per-zone budget. It is the only thing that recovers a child run that DIED, since a killed or cancelled run takes its own retry counter with it (§8) |
@@ -880,11 +879,12 @@ it" safe.
 | **frozen land-mask `registry_sha256`** | a mask rebuilt mid-campaign | every completed cell's identity invalidated at once, and no way to tell which side of the rebuild a cell came from |
 
 **Guarded at assembly: the workers' library stack.** The code identity hashes our source, not
-PyTorch or CUDA, so the stack has its own record
+PyTorch or CUDA, so the stack (model, checkpoint, PyTorch, CUDA) has its own record
 ([ADR 025](../decisions/025-library-upgrades-ship-on-measured-usability-at-a-store-boundary.md)
-rule 2). Each staged tile carries the stack its worker ran, the store's first write stamps it on
-the root as `inference_stack`, and assembly refuses a tile from any other, a tile staged before a
-switch included. A stack still changes only between fills, and a store begun on one is finished on
+rule 2). Each staging run records the stack its workers ran and refuses a worker on another, the
+store's first write stamps PyTorch and CUDA on the root as `inference_stack` beside its model and
+checkpoint, and assembly refuses a run from any other, a resume after a switch included. There is no
+override flag. A stack still changes only between fills, and a store begun on one is finished on
 it by naming that stack's worker image: the Ray flows pick it from the run's model through
 `ami_ssm_name_by_model`, which the deployments set to the 2.5.1 image for v1.1, and refuse a v1.1
 run without that entry. Every published year, 2017–2025, was inferred on **PyTorch 2.5.1 with CUDA

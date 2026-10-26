@@ -15,7 +15,7 @@ from tessera_embeddings.inference.chunk_spec import enumerate_chunks
 from tessera_embeddings.orchestration.runners.plain import _plan_update, _write_update
 from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.update import base_tag, read_updates
-from tests.unit.inference_stack import OTHER_STACK, STACK
+from tests.unit.inference_stack import IDENTITY, OTHER_STACK, STACK
 
 log = logging.getLogger("test_plain_update")
 
@@ -42,7 +42,7 @@ def _stage(writer: ZarrWriter, run_id: str, value: int, *, holes: bool, stack: d
         if holes and chunk.label == "chunk_1_1":
             refused[:] = True
         emb[refused], scales[refused] = 0, np.nan
-        writer.write_chunk(chunk, emb, run_id, scales=scales, inference_stack=stack)
+        writer.write_chunk(chunk, emb, run_id, scales=scales, stack=stack)
 
 
 @pytest.fixture()
@@ -53,7 +53,9 @@ def area(tmp_path):
     writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=_BAND)
     _stage(writer, "fill", 1, holes=True)
     output = str(tmp_path / "out.zarr")
-    writer.assemble(CHUNKS, _NY, _NX, "fill", output, roi_zarr_path=roi, time_window=WINDOW, n_workers=1, layout=SMALL)
+    writer.assemble(
+        CHUNKS, _NY, _NX, "fill", output, roi_zarr_path=roi, time_window=WINDOW, n_workers=1, layout=SMALL, **IDENTITY
+    )
     return {"writer": writer, "output": output, "holes": str(tmp_path / "holes")}
 
 
@@ -83,7 +85,6 @@ def _update(area, *, stack: dict = STACK, **update):
         run_id="upd",
         results=results,
         log=log,
-        allow_stack_mismatch=False,
     )
     return zarr.open_group(open_global_repo(area["output"]).readonly_session(branch="main").store, mode="r")
 

@@ -166,8 +166,8 @@ Symptom: parity test fails with
 `RuntimeError: Failed to reach API at https://your-staging.../api/`.
 
 Cause: a developer's shell exports `PREFECT_API_URL` and the test
-inherits it. Even with `flow.fn(...)` to bypass the outer flow, the
-inner `@flow` body still calls a real Prefect runtime.
+inherits it. Even with `flow.fn(...)` to bypass the flow engine, an
+ingest flow's task shell still runs as a real Prefect task run.
 
 Fix: the `tests/parity/` suite wraps everything in
 `prefect.testing.utilities.prefect_test_harness`, which spins up an
@@ -192,22 +192,23 @@ tail rather than a clean failure. Don't reach for
 `INFERENCE_CHUNK_SIZE` here: it drives GPU read-tiling, not Dask, and
 must stay equal to the 2048-px shard pitch for the global store (D3).
 
-### Why two `@flow`s per flow file?
+### How an ingest flow reaches its Dask cluster
 
 ```
-@flow ingest_s2_roi_reflectance(...)         ← outer: provisions cluster
-  with ecs_cluster(...) as cluster:
-    runner = DaskTaskRunner(cluster.scheduler_address)
-    _ingest_s2_roi_impl.with_options(        ← inner: runs against runner
-        task_runner=runner,
-    )(...)
+@flow ingest_s2_roi_reflectance(...)          ← one flow: the deployment's
+  with ecs_cluster(...) as cluster:           ← provisions the fleet
+    run_on_cluster(cluster.scheduler_address, ← PrefectDaskClient on that scheduler
+                   process_roi_reflectance, ...)
+      └── @task process_roi_reflectance       ← runs on a Dask worker, as a task
+                                                run of the same flow run
 ```
 
-Prefect requires `task_runner=` to be set at flow-definition time or
-via `.with_options()` on a callable, which requires an inner
-`@flow`. Trying to collapse this into one decorator results in
-"task runner not bound" errors. Don't refactor it. The docstring at
-the top of each flow file states this explicitly.
+The cluster's address exists only once the flow body has provisioned it,
+so a `DaskTaskRunner` set on `@flow(task_runner=...)` has nothing to point
+at. The flow instead submits its task shell through a `PrefectDaskClient`
+(`flows/_dask_lifecycle.run_on_cluster`). The task's logs land on the
+deployment's own flow run. See
+[ADR 029](../context_docs/decisions/029-one-flow-per-ingest.md).
 
 ## Cancellation
 
