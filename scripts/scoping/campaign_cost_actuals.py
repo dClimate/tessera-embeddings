@@ -38,8 +38,9 @@ FOUR ASSUMPTIONS THAT WOULD SILENTLY CORRUPT THE ANSWER, each guarded below:
   instance-hours are called out separately, since those are the ones that are large money at
   small quantity.
 
-Re-run this at the end of a campaign, and widen ``EC2_TYPES`` if the fleet gains an instance type;
-an unpriced type shows up in the excluded list rather than vanishing.
+Re-run this at the end of a campaign, and widen ``EC2_TYPES`` if the fleet gains an instance type,
+or ``FLAT_TYPES`` if Fargate gains a billing type; an unpriced type shows up in the excluded list
+rather than vanishing.
 """
 
 from __future__ import annotations
@@ -65,9 +66,14 @@ EC2_TYPES = {
     "USW2-BoxUsage:c8gn.48xlarge": "c8gn.48xlarge",
 }
 #: Everything else, with the price fetched by usage type rather than by instance type.
+#:
+#: Fargate bills ARM (Graviton) tasks under usage types of their own, at a lower rate than x86, so
+#: each architecture needs its own entries: an ARM task would otherwise land in the excluded list.
 FLAT_TYPES = {
     "USW2-Fargate-vCPU-Hours:perCPU": ("AmazonECS", "hours"),
     "USW2-Fargate-GB-Hours": ("AmazonECS", "hours"),
+    "USW2-Fargate-ARM-vCPU-Hours:perCPU": ("AmazonECS", "hours"),
+    "USW2-Fargate-ARM-GB-Hours": ("AmazonECS", "hours"),
     "USW2-Requests-Tier1": ("AmazonS3", "Requests"),
     "USW2-Requests-Tier2": ("AmazonS3", "Requests"),
     "USW2-Inventory-ObjectsListed": ("AmazonS3", "Objects"),
@@ -87,6 +93,7 @@ STORAGE_TYPE = "USW2-TimedStorage-ByteHrs"
 GROUPS = (
     ("graphics cards", ("USW2-BoxUsage:g5.2xlarge", "USW2-BoxUsage:g6e.xlarge"), True),
     ("Fargate containers", ("USW2-Fargate-vCPU-Hours:perCPU", "USW2-Fargate-GB-Hours"), True),
+    ("Fargate containers, ARM", ("USW2-Fargate-ARM-vCPU-Hours:perCPU", "USW2-Fargate-ARM-GB-Hours"), True),
     ("S3 storage", (STORAGE_TYPE,), True),
     ("S3 requests", ("USW2-Requests-Tier1", "USW2-Requests-Tier2", "USW2-Inventory-ObjectsListed"), True),
     ("EBS volumes", ("USW2-EBS:VolumeUsage.gp3",), True),
