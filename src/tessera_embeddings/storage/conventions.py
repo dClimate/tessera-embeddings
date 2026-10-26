@@ -178,9 +178,8 @@ def assert_model_matches(
     A root without ``geoemb:model`` reads as v1.1 (:func:`assert_encoder_matches`); checkpoints
     compare as stems, because a global root records the file name and a single-area root its stem.
     """
-    published = root_attrs.get("geoemb:model")
     assert_encoder_matches(
-        published if isinstance(published, str) else None,
+        cast("str | None", root_attrs.get("geoemb:model")),
         model_version=cast("ModelVersion", model_version),
         where=where,
     )
