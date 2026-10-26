@@ -194,8 +194,7 @@ class _CapturingWriter:
         month_covered=None,
         coverage=None,
         *,
-        inference_stack,
-        inference_model,
+        stack,
     ):
         _CapturingWriter.last_write = {
             "embeddings": embeddings.copy(),
@@ -206,8 +205,7 @@ class _CapturingWriter:
             "month_covered": month_covered.copy() if month_covered is not None else None,
             # The record the real writer persists onto the tile so it outlives this process.
             "coverage": dict(coverage) if coverage is not None else None,
-            "inference_stack": dict(inference_stack),
-            "inference_model": dict(inference_model),
+            "stack": dict(stack),
         }
 
     def discard_coverage(self, chunk, run_id):
@@ -539,10 +537,11 @@ class TestDeferredStagingWrites:
         """
         with patch.object(torch.version, "cuda", "12.1"):
             self._run_two_chunks(inference_config, test_model, _CapturingWriter)
-        assert _CapturingWriter.last_write["inference_stack"] == {"torch": torch.__version__, "cuda": None}
-        assert _CapturingWriter.last_write["inference_model"] == {
+        assert _CapturingWriter.last_write["stack"] == {
             "model_version": inference_config.model_version,
             "checkpoint_id": inference_config.checkpoint_path.rsplit("/", 1)[-1].removesuffix(".pt"),
+            "torch": torch.__version__,
+            "cuda": None,
         }
 
     def test_the_coverage_record_goes_onto_the_tile_not_only_into_the_result(self, inference_config, test_model):
@@ -573,8 +572,7 @@ class TestDeferredStagingWrites:
                 month_covered=None,
                 coverage=None,
                 *,
-                inference_stack,
-                inference_model,
+                stack,
             ):
                 raise OSError("S3 500")
 

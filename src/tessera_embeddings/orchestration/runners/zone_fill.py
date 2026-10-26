@@ -306,10 +306,8 @@ class ZoneFillHandoff:
     done: dict[str, Any] | None = None
     # The targeted update this cell runs for, or None for a campaign fill (see `_assemble_update`).
     update: UpdateTarget | None = None
-    # `InferenceConfig.allow_stack_mismatch` and `allow_model_mismatch`, carried to assembly, the only
-    # stage that reads them.
+    # `InferenceConfig.allow_stack_mismatch`, carried to assembly, the only stage that reads it.
     allow_stack_mismatch: bool = False
-    allow_model_mismatch: bool = False
 
 
 def _store_credentials(
@@ -551,7 +549,6 @@ class ZonePlan:
     # The targeted update this cell runs for, carried to assembly through the handoff.
     update: UpdateTarget | None = None
     allow_stack_mismatch: bool = False
-    allow_model_mismatch: bool = False
 
 
 def preflight_destination(
@@ -955,7 +952,6 @@ def plan_zone_inference(
         live=live,
         update=update,
         allow_stack_mismatch=config.allow_stack_mismatch,
-        allow_model_mismatch=config.allow_model_mismatch,
     )
 
 
@@ -1096,7 +1092,6 @@ def complete_zone_inference(plan: ZonePlan, *, results: list[dict] | None) -> Zo
         results=results,
         update=plan.update,
         allow_stack_mismatch=plan.allow_stack_mismatch,
-        allow_model_mismatch=plan.allow_model_mismatch,
     )
 
 
@@ -1323,7 +1318,6 @@ def assemble_zone_year(
         fault=fault,
         input_coverage=input_coverage,
         allow_stack_mismatch=handoff.allow_stack_mismatch,
-        allow_model_mismatch=handoff.allow_model_mismatch,
     )
     # Before the tag, as on the all-refused branch: a deliberate refill fails at the tag step.
     _merge_registry_master(
@@ -1427,7 +1421,6 @@ def _assemble_update(
             fault=fault,
             input_coverage=input_coverage,
             allow_stack_mismatch=handoff.allow_stack_mismatch,
-            allow_model_mismatch=handoff.allow_model_mismatch,
         )
         if merged and registry_root:
             _publish_merged_rows(

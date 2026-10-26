@@ -52,11 +52,11 @@ from tessera_embeddings.inference.assembly import (
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, enumerate_chunks, filter_chunks_by_roi_mask
 from tessera_embeddings.inference.quantization import quantize_embeddings
 from tessera_embeddings.storage import shard_writer
-from tessera_embeddings.storage.conventions import MODEL_ATTR, STACK_ATTR
+from tessera_embeddings.storage.conventions import STACK_ATTR
 from tessera_embeddings.storage.global_store import create_global_repo, create_layout_arrays, open_global_repo
 from tessera_embeddings.storage.time_axis import TIME_ENCODING
 from tessera_embeddings.storage.zarr_store import open_or_create_repo, open_store, plain_zarr_storage_options
-from tests.unit.inference_stack import MODEL, OTHER_MODEL, OTHER_STACK, STACK
+from tests.unit.inference_stack import OTHER_STACK, STACK
 
 
 def _dummy_scales(h: int, w: int) -> np.ndarray:
@@ -114,7 +114,7 @@ def _stage_chunks(writer, chunks, run_id, rng, shape) -> np.ndarray:
     expected = np.zeros((*shape, EMBEDDING_DIM), dtype=np.int8)
     for chunk in chunks:
         emb, scales = _quantized_embeddings(rng, chunk.height, chunk.width)
-        writer.write_chunk(chunk, emb, run_id, scales=scales, inference_stack=STACK, inference_model=MODEL)
+        writer.write_chunk(chunk, emb, run_id, scales=scales, stack=STACK)
         expected[chunk.y_start : chunk.y_stop, chunk.x_start : chunk.x_stop, :] = emb
     return expected
 
@@ -178,8 +178,7 @@ class TestWriteChunk:
             embeddings,
             run_id="test123",
             scales=_dummy_scales(10, 10),
-            inference_stack=STACK,
-            inference_model=MODEL,
+            stack=STACK,
         )
 
         # Read back (staging uses plain Zarr, not Icechunk)
@@ -199,9 +198,7 @@ class TestWriteChunk:
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=10, x_start=0, x_stop=10)
         embeddings = np.random.default_rng(0).random((10, 10, EMBEDDING_DIM)).astype(np.float32)
 
-        path = writer.write_chunk(
-            chunk, embeddings, run_id="run1", scales=_dummy_scales(10, 10), inference_stack=STACK, inference_model=MODEL
-        )
+        path = writer.write_chunk(chunk, embeddings, run_id="run1", scales=_dummy_scales(10, 10), stack=STACK)
 
         assert zarr.open_group(path, mode="r").attrs["staged_complete"] is True
         assert Path(writer._done_marker_path("run1", chunk)).exists()
@@ -231,7 +228,7 @@ class TestWriteChunk:
         emb, scales = _quantized_embeddings(np.random.default_rng(0), 4, 4)
         if rewrite:
             # The case the retraction exists for: a marker is already there.
-            writer.write_chunk(chunk, emb, run_id="run1", scales=scales, inference_stack=STACK, inference_model=MODEL)
+            writer.write_chunk(chunk, emb, run_id="run1", scales=scales, stack=STACK)
             assert Path(writer._done_marker_path("run1", chunk)).exists()
 
         seen: list[str] = []
@@ -255,7 +252,7 @@ class TestWriteChunk:
             patch.object(xr.Dataset, "to_zarr", spy_to_zarr),
             patch.object(_assembly_mod, "_fs_for", spy_fs_for),
         ):
-            writer.write_chunk(chunk, emb, run_id="run1", scales=scales, inference_stack=STACK, inference_model=MODEL)
+            writer.write_chunk(chunk, emb, run_id="run1", scales=scales, stack=STACK)
 
         assert seen == ["retract:done", "retract:skipped", "retract:zarr", "tile", "attribute", "done"]
 
@@ -271,8 +268,7 @@ class TestWriteChunk:
                 bad_embeddings,
                 run_id="test",
                 scales=_dummy_scales(5, 5),
-                inference_stack=STACK,
-                inference_model=MODEL,
+                stack=STACK,
             )
 
     def test_coordinates_in_output(self, tmp_path):
@@ -287,8 +283,7 @@ class TestWriteChunk:
             embeddings,
             run_id="coord_test",
             scales=_dummy_scales(1500, 1500),
-            inference_stack=STACK,
-            inference_model=MODEL,
+            stack=STACK,
         )
 
         ds = xr.open_zarr(path)
@@ -318,8 +313,7 @@ class TestWriteChunk:
                 "s1_asc_obs_count": s1_asc_obs,
                 "s1_desc_obs_count": s1_desc_obs,
             },
-            inference_stack=STACK,
-            inference_model=MODEL,
+            stack=STACK,
         )
 
         ds = xr.open_zarr(path)
@@ -346,8 +340,7 @@ class TestWriteChunk:
             embeddings,
             run_id="no_obs",
             scales=_dummy_scales(10, 10),
-            inference_stack=STACK,
-            inference_model=MODEL,
+            stack=STACK,
         )
 
         ds = xr.open_zarr(path)
@@ -392,7 +385,7 @@ class TestAssembly:
         writer, output = ZarrWriter(str(tmp_path / "staging")), str(tmp_path / "output.zarr")
         for chunk in _GRID_1X2:
             emb, scales = _quantized_embeddings(np.random.default_rng(0), chunk.height, chunk.width)
-            writer.write_chunk(chunk, emb, run_id, scales=scales, inference_stack=stack, inference_model=MODEL)
+            writer.write_chunk(chunk, emb, run_id, scales=scales, stack=stack)
         roi = _make_full_roi_mask(tmp_path, 5, 10)
         writer.assemble(_GRID_1X2, 5, 10, run_id, output, roi_zarr_path=roi, n_workers=1, **kwargs)
         return dict(zarr.open_group(open_global_repo(output).readonly_session(branch="main").store, mode="r").attrs)
@@ -455,9 +448,7 @@ class TestAssembly:
 
         emb, scales = _quantized_embeddings(rng, 4, 4)
         std = rng.random((4, 4, EMBEDDING_DIM)).astype(np.float32)
-        writer.write_chunk(
-            chunk, emb, run_id="run1", scales=scales, embeddings_std=std, inference_stack=STACK, inference_model=MODEL
-        )
+        writer.write_chunk(chunk, emb, run_id="run1", scales=scales, embeddings_std=std, stack=STACK)
         writer.assemble(
             [chunk],
             total_y=4,
@@ -492,7 +483,7 @@ class TestAssembly:
         roi = _make_full_roi_mask(tmp_path, 5, 5)
 
         emb, scales = _quantized_embeddings(rng, 5, 5)
-        writer.write_chunk(chunk, emb, run_id="run1", scales=scales, inference_stack=STACK, inference_model=MODEL)
+        writer.write_chunk(chunk, emb, run_id="run1", scales=scales, stack=STACK)
         writer.assemble(
             [chunk],
             total_y=5,
@@ -505,7 +496,13 @@ class TestAssembly:
         )
 
         emb2, scales2 = _quantized_embeddings(rng, 5, 5)
-        writer.write_chunk(chunk, emb2, run_id="run2", scales=scales2, inference_stack=STACK, inference_model=MODEL)
+        writer.write_chunk(
+            chunk,
+            emb2,
+            run_id="run2",
+            scales=scales2,
+            stack={**STACK, "model_version": "v2-large", "checkpoint_id": "v2_student_large"},
+        )
         with pytest.raises(ValueError, match="Refusing to append"):
             writer.assemble(
                 [chunk],
@@ -515,7 +512,6 @@ class TestAssembly:
                 output_path=output,
                 roi_zarr_path=roi,
                 run_started_at=datetime.datetime(2025, 6, 1, tzinfo=datetime.UTC),
-                model_version="v2-large",
                 n_workers=1,
             )
 
@@ -536,7 +532,7 @@ class TestAssembly:
         roi = _make_full_roi_mask(tmp_path, 5, 5)
 
         emb, scales = _quantized_embeddings(rng, 5, 5)
-        writer.write_chunk(chunk, emb, run_id="legacy", scales=scales, inference_stack=STACK, inference_model=MODEL)
+        writer.write_chunk(chunk, emb, run_id="legacy", scales=scales, stack=STACK)
         writer.assemble(
             [chunk],
             total_y=5,
@@ -556,7 +552,13 @@ class TestAssembly:
         sess.commit("drop encoder identity (simulate a legacy store)")
 
         emb2, scales2 = _quantized_embeddings(rng, 5, 5)
-        writer.write_chunk(chunk, emb2, run_id="v2run", scales=scales2, inference_stack=STACK, inference_model=MODEL)
+        writer.write_chunk(
+            chunk,
+            emb2,
+            run_id="v2run",
+            scales=scales2,
+            stack={**STACK, "model_version": "v2-large", "checkpoint_id": "v2_student_large"},
+        )
         with pytest.raises(ValueError, match="Refusing to append"):
             writer.assemble(
                 [chunk],
@@ -566,13 +568,12 @@ class TestAssembly:
                 output_path=output,
                 roi_zarr_path=roi,
                 run_started_at=datetime.datetime(2025, 6, 1, tzinfo=datetime.UTC),
-                model_version="v2-large",
                 n_workers=1,
             )
 
         # And the case that must KEEP working: v1.1 still appends to that same legacy store.
         emb3, scales3 = _quantized_embeddings(rng, 5, 5)
-        writer.write_chunk(chunk, emb3, run_id="v11run", scales=scales3, inference_stack=STACK, inference_model=MODEL)
+        writer.write_chunk(chunk, emb3, run_id="v11run", scales=scales3, stack=STACK)
         writer.assemble(
             [chunk],
             total_y=5,
@@ -597,7 +598,7 @@ class TestAssembly:
 
         for run, day in (("runA", 2024), ("runB", 2025)):
             e, sc = _quantized_embeddings(rng, 5, 5)
-            writer.write_chunk(chunk, e, run_id=run, scales=sc, inference_stack=STACK, inference_model=MODEL)
+            writer.write_chunk(chunk, e, run_id=run, scales=sc, stack=STACK)
             writer.assemble(
                 [chunk],
                 total_y=5,
@@ -606,7 +607,6 @@ class TestAssembly:
                 output_path=output,
                 roi_zarr_path=roi,
                 run_started_at=datetime.datetime(day, 6, 1, tzinfo=datetime.UTC),
-                model_version="v1.1",
                 n_workers=1,
             )
 
@@ -629,7 +629,7 @@ class TestAssembly:
 
         # Run 1
         emb1, scales1 = _quantized_embeddings(rng, 5, 5)
-        writer.write_chunk(chunk, emb1, run_id="run1", scales=scales1, inference_stack=STACK, inference_model=MODEL)
+        writer.write_chunk(chunk, emb1, run_id="run1", scales=scales1, stack=STACK)
         writer.assemble(
             [chunk],
             total_y=5,
@@ -647,7 +647,7 @@ class TestAssembly:
 
         # Run 2 at a later date — should append
         emb2, scales2 = _quantized_embeddings(rng, 5, 5)
-        writer.write_chunk(chunk, emb2, run_id="run2", scales=scales2, inference_stack=STACK, inference_model=MODEL)
+        writer.write_chunk(chunk, emb2, run_id="run2", scales=scales2, stack=STACK)
         writer.assemble(
             [chunk],
             total_y=5,
@@ -680,7 +680,7 @@ class TestAssembly:
         day = datetime.datetime(2024, 6, 1, tzinfo=datetime.UTC)
 
         emb1, scales1 = _quantized_embeddings(rng, 5, 5)
-        writer.write_chunk(chunk, emb1, run_id="run1", scales=scales1, inference_stack=STACK, inference_model=MODEL)
+        writer.write_chunk(chunk, emb1, run_id="run1", scales=scales1, stack=STACK)
         writer.assemble(
             [chunk],
             total_y=5,
@@ -693,7 +693,7 @@ class TestAssembly:
         )
 
         emb2, scales2 = _quantized_embeddings(rng, 5, 5)
-        writer.write_chunk(chunk, emb2, run_id="run2", scales=scales2, inference_stack=STACK, inference_model=MODEL)
+        writer.write_chunk(chunk, emb2, run_id="run2", scales=scales2, stack=STACK)
         writer.assemble(
             [chunk],
             total_y=5,
@@ -724,7 +724,7 @@ class TestAssembly:
         # Run 1: both chunks carry real data.
         for chunk in chunks:
             emb, scales = _quantized_embeddings(rng, chunk.height, chunk.width)
-            writer.write_chunk(chunk, emb, "run1", scales=scales, inference_stack=STACK, inference_model=MODEL)
+            writer.write_chunk(chunk, emb, "run1", scales=scales, stack=STACK)
         writer.assemble(
             chunks,
             total_y=5,
@@ -738,7 +738,7 @@ class TestAssembly:
 
         # Run 2, same date: chunk_0_1 now has zero valid pixels (skip marker).
         emb2, scales2 = _quantized_embeddings(rng, 5, 5)
-        writer.write_chunk(chunks[0], emb2, "run2", scales=scales2, inference_stack=STACK, inference_model=MODEL)
+        writer.write_chunk(chunks[0], emb2, "run2", scales=scales2, stack=STACK)
         writer.write_skip_marker(chunks[1], "run2")
         writer.assemble(
             chunks,
@@ -773,7 +773,7 @@ class TestAssembly:
         # Run 1: FULL ROI — both chunks carry real data.
         for chunk in chunks:
             emb, scales = _quantized_embeddings(rng, chunk.height, chunk.width)
-            writer.write_chunk(chunk, emb, "run1", scales=scales, inference_stack=STACK, inference_model=MODEL)
+            writer.write_chunk(chunk, emb, "run1", scales=scales, stack=STACK)
         writer.assemble(
             chunks,
             total_y=5,
@@ -788,7 +788,7 @@ class TestAssembly:
         # Run 2, same date: SHRUNKEN ROI (only cols 0-5). Only chunk_0_0 is staged;
         # chunk_0_1 is now OUTSIDE the ROI (not merely skip-marked).
         emb2, scales2 = _quantized_embeddings(rng, 5, 5)
-        writer.write_chunk(chunks[0], emb2, "run2", scales=scales2, inference_stack=STACK, inference_model=MODEL)
+        writer.write_chunk(chunks[0], emb2, "run2", scales=scales2, stack=STACK)
         writer.assemble(
             chunks,
             total_y=5,
@@ -834,9 +834,7 @@ class TestAssembly:
             writer = ZarrWriter(str(tmp_path / f"staging_{name}"))
             for chunk in chunks:
                 emb, scales = staged[chunk.label]
-                writer.write_chunk(
-                    chunk, emb, run_id="run1", scales=scales, inference_stack=STACK, inference_model=MODEL
-                )
+                writer.write_chunk(chunk, emb, run_id="run1", scales=scales, stack=STACK)
             output = str(tmp_path / f"output_{name}.zarr")
             writer.assemble(
                 chunks,
@@ -904,8 +902,7 @@ class TestAssembly:
             run_id="run1",
             scales=scales1,
             embeddings_std=std1,
-            inference_stack=STACK,
-            inference_model=MODEL,
+            stack=STACK,
         )
         writer.assemble(
             [chunk],
@@ -928,8 +925,7 @@ class TestAssembly:
             run_id="run2",
             scales=scales2,
             embeddings_std=std2,
-            inference_stack=STACK,
-            inference_model=MODEL,
+            stack=STACK,
         )
         writer.assemble(
             [chunk],
@@ -970,8 +966,7 @@ class TestAssembly:
             run_id="run1",
             scales=scales1,
             embeddings_std=std1,
-            inference_stack=STACK,
-            inference_model=MODEL,
+            stack=STACK,
         )
         writer.assemble(
             [chunk],
@@ -987,7 +982,7 @@ class TestAssembly:
 
         # Run 2: SAME date, WITHOUT std — embedding_std is now untouched and stale.
         emb2, scales2 = _quantized_embeddings(rng, 4, 4)
-        writer.write_chunk(chunk, emb2, run_id="run2", scales=scales2, inference_stack=STACK, inference_model=MODEL)
+        writer.write_chunk(chunk, emb2, run_id="run2", scales=scales2, stack=STACK)
         writer.assemble(
             [chunk],
             total_y=4,
@@ -1026,7 +1021,7 @@ class TestAssembly:
         roi = _make_full_roi_mask(tmp_path, 5, 5)
 
         emb1, scales1 = _quantized_embeddings(rng, 5, 5)
-        writer.write_chunk(chunk, emb1, run_id="run1", scales=scales1, inference_stack=STACK, inference_model=MODEL)
+        writer.write_chunk(chunk, emb1, run_id="run1", scales=scales1, stack=STACK)
         writer.assemble(
             [chunk],
             total_y=5,
@@ -1052,7 +1047,7 @@ class TestAssembly:
             window_end_label="2025-01-01",
         )
         emb2, scales2 = _quantized_embeddings(rng, 5, 5)
-        writer.write_chunk(chunk, emb2, run_id="run2", scales=scales2, inference_stack=STACK, inference_model=MODEL)
+        writer.write_chunk(chunk, emb2, run_id="run2", scales=scales2, stack=STACK)
         writer.assemble(
             [chunk],
             total_y=5,
@@ -1089,9 +1084,7 @@ class TestAssembly:
             obs = {
                 var: rng.integers(0, 200, size=(chunk.height, chunk.width)).astype(np.uint16) for var in OBS_COUNT_VARS
             }
-            writer.write_chunk(
-                chunk, emb, run_id, scales=scales, obs_counts=obs, inference_stack=STACK, inference_model=MODEL
-            )
+            writer.write_chunk(chunk, emb, run_id, scales=scales, obs_counts=obs, stack=STACK)
             for var in OBS_COUNT_VARS:
                 expected_obs[var][chunk.y_start : chunk.y_stop, chunk.x_start : chunk.x_stop] = obs[var]
 
@@ -1136,7 +1129,7 @@ class TestAssembly:
                 writer.write_skip_marker(chunk, run_id)
                 continue
             emb, scales = _quantized_embeddings(rng, chunk.height, chunk.width)
-            writer.write_chunk(chunk, emb, run_id, scales=scales, inference_stack=STACK, inference_model=MODEL)
+            writer.write_chunk(chunk, emb, run_id, scales=scales, stack=STACK)
             expected[chunk.y_start : chunk.y_stop, chunk.x_start : chunk.x_stop, :] = emb
 
         writer.assemble(
@@ -1217,7 +1210,7 @@ class TestAssembly:
             if chunk is non_live:
                 continue  # no staged data for this chunk
             emb, scales = _quantized_embeddings(rng, chunk.height, chunk.width)
-            writer.write_chunk(chunk, emb, run_id, scales=scales, inference_stack=STACK, inference_model=MODEL)
+            writer.write_chunk(chunk, emb, run_id, scales=scales, stack=STACK)
             expected[chunk.y_start : chunk.y_stop, chunk.x_start : chunk.x_stop, :] = emb
 
         writer.assemble(
@@ -1260,7 +1253,7 @@ class TestAssembly:
             if chunk is non_live:
                 continue
             emb, scales = _quantized_embeddings(rng, chunk.height, chunk.width)
-            writer.write_chunk(chunk, emb, run_id, scales=scales, inference_stack=STACK, inference_model=MODEL)
+            writer.write_chunk(chunk, emb, run_id, scales=scales, stack=STACK)
 
         writer.assemble(
             chunks,
@@ -1342,7 +1335,7 @@ class TestDetectStagedChunkSize:
         chunk = ChunkSpec(row=3, col=5, y_start=600, y_stop=800, x_start=1000, x_stop=1200)
         rng = np.random.default_rng(0)
         emb, scales = _quantized_embeddings(rng, chunk.height, chunk.width)
-        writer.write_chunk(chunk, emb, "run1", scales=scales, inference_stack=STACK, inference_model=MODEL)
+        writer.write_chunk(chunk, emb, "run1", scales=scales, stack=STACK)
 
         result = writer.detect_staged_chunk_size("run1")
         assert result == 200
@@ -1354,7 +1347,7 @@ class TestDetectStagedChunkSize:
         chunk = ChunkSpec(row=0, col=1, y_start=0, y_stop=50, x_start=200, x_stop=400)
         rng = np.random.default_rng(1)
         emb, scales = _quantized_embeddings(rng, chunk.height, chunk.width)
-        writer.write_chunk(chunk, emb, "run1", scales=scales, inference_stack=STACK, inference_model=MODEL)
+        writer.write_chunk(chunk, emb, "run1", scales=scales, stack=STACK)
 
         result = writer.detect_staged_chunk_size("run1")
         assert result == 200
@@ -1382,7 +1375,7 @@ class _RecordingMarkerFS:
 
 
 def _mark_staged_complete(path: str) -> None:
-    """Record a hand-built staged tile as a COMPLETED write, as ``write_chunk`` does: stack and model, then completion.
+    """Record a hand-built staged tile as a COMPLETED write, as ``write_chunk`` does: its run's stack, then completion.
 
     ``write_chunk`` records completion twice — the in-store ``staged_complete``
     attribute (checked by readers that already have the group open) and the
@@ -1390,7 +1383,9 @@ def _mark_staged_complete(path: str) -> None:
     hand-rolls a tile and sets only one of them is not simulating a completed
     write; it is simulating a crash between the two.
     """
-    zarr.open_group(path, mode="a").attrs.update({STACK_ATTR: STACK, MODEL_ATTR: MODEL, "staged_complete": True})
+    run = Path(path).parent
+    ZarrWriter(str(run.parent))._join_run(run.name, STACK)
+    zarr.open_group(path, mode="a").attrs["staged_complete"] = True
     Path(path.removesuffix(".zarr") + ".done").write_bytes(b"")
 
 
@@ -1441,7 +1436,7 @@ class TestStagedLayout:
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=600, x_start=0, x_stop=600)
         rng = np.random.default_rng(42)
         emb, scales = _quantized_embeddings(rng, 600, 600)
-        path = writer.write_chunk(chunk, emb, "run1", scales=scales, inference_stack=STACK, inference_model=MODEL)
+        path = writer.write_chunk(chunk, emb, "run1", scales=scales, stack=STACK)
 
         g = zarr.open_group(path, mode="r")
         assert g["embeddings"].metadata.chunk_grid.chunk_shape == (INNER_PX, INNER_PX, EMBEDDING_DIM)
@@ -1599,7 +1594,7 @@ class TestSingleRoiChainIsAligned:
         staged = {}
         for chunk in filter_chunks_by_roi_mask(chunks, roi_mask):
             emb, scales = _quantized_embeddings(rng, chunk.height, chunk.width, dim=self.BAND)
-            writer.write_chunk(chunk, emb, "run1", scales=scales, inference_stack=STACK, inference_model=MODEL)
+            writer.write_chunk(chunk, emb, "run1", scales=scales, stack=STACK)
             staged[chunk.label] = emb
         output = str(tmp_path / "out.zarr")
         writer.assemble(
@@ -1763,7 +1758,7 @@ class TestAssemblyValidation:
 
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=5, x_start=0, x_stop=5)
         emb, scales = _quantized_embeddings(np.random.default_rng(42), 5, 5)
-        writer.write_chunk(chunk, emb, run_id, scales=scales, inference_stack=STACK, inference_model=MODEL)
+        writer.write_chunk(chunk, emb, run_id, scales=scales, stack=STACK)
 
         with pytest.raises(ValueError, match="doesn't match chunk grid extent"):
             writer.assemble(
@@ -1785,7 +1780,7 @@ class TestAssemblyValidation:
 
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
         emb, scales = _quantized_embeddings(np.random.default_rng(42), 4, 4)
-        writer.write_chunk(chunk, emb, run_id, scales=scales, inference_stack=STACK, inference_model=MODEL)
+        writer.write_chunk(chunk, emb, run_id, scales=scales, stack=STACK)
         writer.assemble(
             [chunk],
             total_y=4,
@@ -1818,7 +1813,7 @@ class TestAssemblyValidation:
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
         emb = np.random.default_rng(42).standard_normal((4, 4, EMBEDDING_DIM)).astype(np.float32)
         quantized, scales = quantize_embeddings(emb)
-        writer.write_chunk(chunk, quantized, run_id, scales=scales, inference_stack=STACK, inference_model=MODEL)
+        writer.write_chunk(chunk, quantized, run_id, scales=scales, stack={**STACK, "checkpoint_id": "test_model_v1"})
 
         writer.assemble(
             [chunk],
@@ -1828,7 +1823,6 @@ class TestAssemblyValidation:
             output_path=output,
             roi_zarr_path=_make_full_roi_mask(tmp_path, 4, 4),
             tile_id="33UWP",
-            checkpoint_id="test_model_v1",
             n_workers=1,
         )
 
@@ -1872,7 +1866,7 @@ class TestScanExistingStagedChunks:
     @staticmethod
     def _stage_chunk(writer: ZarrWriter, chunk: ChunkSpec, run_id: str) -> None:
         emb, scales = _quantized_embeddings(np.random.default_rng(42), chunk.height, chunk.width)
-        writer.write_chunk(chunk, emb, run_id, scales=scales, inference_stack=STACK, inference_model=MODEL)
+        writer.write_chunk(chunk, emb, run_id, scales=scales, stack=STACK)
 
     def test_no_staging_dir(self, tmp_path):
         """Returns empty set when staging directory doesn't exist."""
@@ -2053,7 +2047,7 @@ class TestVerifyStagedCompleteness:
     @staticmethod
     def _stage_chunk(writer: ZarrWriter, chunk: ChunkSpec, run_id: str) -> None:
         emb, scales = _quantized_embeddings(np.random.default_rng(42), chunk.height, chunk.width)
-        writer.write_chunk(chunk, emb, run_id, scales=scales, inference_stack=STACK, inference_model=MODEL)
+        writer.write_chunk(chunk, emb, run_id, scales=scales, stack=STACK)
 
     def test_all_present_passes(self, tmp_path):
         """No error when all expected chunks are staged."""
@@ -2290,107 +2284,83 @@ class TestAssembleGlobal:
             g.create_array(name, data=arr)
         _mark_staged_complete(path)  # assembly requires both completion signals
 
-    def _fill_on_stacks(self, tmp_path, *stacks, root_stack=None, tile_model=MODEL, root_attrs=None, **assemble_kwargs):
-        """Fill one zone-year whose tiles were staged on *stacks*, one tile each; return the zone group.
+    def _fill_on_stack(self, tmp_path, stack=STACK, *, root_attrs=None, **assemble_kwargs):
+        """Fill one zone-year from a run staged on *stack*; return the store's root group.
 
-        A ``None`` stack stages a tile with no record, as one staged before tiles carried it.
-        *root_stack* stamps the store first, as an earlier write would have. *tile_model* is the
-        model every tile records, or a list of one per tile; ``None`` stages them without the record.
-        *root_attrs* are stamped on the store's root first, as a seed would.
+        *root_attrs* are stamped on the root first, as a seed or an earlier write would have.
         """
         dim = 8
-        store_path = self._seed_zone_repo(tmp_path, self.TILE, self.TILE * len(stacks), dim)
-        if root_stack is not None or root_attrs:
+        store_path = self._seed_zone_repo(tmp_path, self.TILE, self.TILE, dim)
+        if root_attrs:
             session = open_global_repo(store_path).writable_session("main")
-            attrs = zarr.open_group(session.store, mode="a").attrs
-            attrs.update({**(root_attrs or {}), **({STACK_ATTR: root_stack} if root_stack is not None else {})})
-            session.commit("an earlier write's stack")
+            zarr.open_group(session.store, mode="a").attrs.update(root_attrs)
+            session.commit("an earlier write")
         writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=dim)
-        for col, stack in enumerate(stacks):
-            chunk = ChunkSpec(
-                row=0, col=col, y_start=0, y_stop=self.TILE, x_start=col * self.TILE, x_stop=(col + 1) * self.TILE
-            )
-            path = writer.write_chunk(
-                chunk,
-                np.ones((self.TILE, self.TILE, dim), dtype=np.int8),
-                "runK",
-                scales=np.ones((self.TILE, self.TILE), dtype=np.float32),
-                inference_stack=stack or STACK,
-                inference_model=(tile_model[col] if isinstance(tile_model, list) else tile_model) or MODEL,
-            )
-            if stack is None:
-                del zarr.open_group(path, mode="a").attrs[STACK_ATTR]
-            if tile_model is None:
-                del zarr.open_group(path, mode="a").attrs[MODEL_ATTR]
+        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=self.TILE, x_start=0, x_stop=self.TILE)
+        tile = np.ones((self.TILE, self.TILE, dim), dtype=np.int8)
+        writer.write_chunk(chunk, tile, "runK", scales=np.ones((self.TILE, self.TILE), dtype=np.float32), stack=stack)
         writer.assemble_global(store_path, self.ZONE, year=2025, run_id="runK", n_workers=1, **assemble_kwargs)
         return zarr.open_group(open_global_repo(store_path).readonly_session(branch="main").store, mode="r")
 
-    @pytest.mark.parametrize(
-        ("tile_model", "match"),
-        [
-            (OTHER_MODEL, "Refusing to append"),
-            ({**MODEL, "checkpoint_id": "tessera_v1_1_mpc_encoder"}, "checkpoint"),
-            (None, "does not record the model"),
-        ],
-    )
-    def test_a_tile_of_another_model_is_refused_before_anything_is_written(self, tmp_path, tile_model, match):
-        """Every write into a store passes here, so a direct runner call is held to the store's model too.
-
-        The root records its checkpoint as a global seed does, by file name; tiles record the stem.
-        """
-        with pytest.raises(ValueError, match=match):
-            self._fill_on_stacks(
-                tmp_path, STACK, tile_model=tile_model, root_attrs={"checkpoint_id": "tessera_v1_1_aws_encoder.pt"}
-            )
-        root = zarr.open_group(
-            open_global_repo(str(tmp_path / "global.icechunk")).readonly_session(branch="main").store, mode="r"
-        )
-        assert STACK_ATTR not in root.attrs and not root[self.ZONE].attrs.get("years_complete")
-
-    def test_a_tile_whose_model_differs_from_the_probe_is_refused(self, tmp_path):
-        """A resumed direct run can hold tiles from both v1.1 checkpoints; each is held to the probe."""
-        mpc = {**MODEL, "checkpoint_id": "tessera_v1_1_mpc_encoder"}
-        with pytest.raises(ValueError, match="never mixes two models"):
-            self._fill_on_stacks(tmp_path, STACK, STACK, tile_model=[MODEL, mpc])
-
-    def test_the_model_override_writes_tiles_of_another_model(self, tmp_path):
-        root = self._fill_on_stacks(tmp_path, STACK, tile_model=OTHER_MODEL, allow_model_mismatch=True)
-        assert root[self.ZONE].attrs["years_complete"] == [2025]
-
-    def test_the_first_write_stamps_the_stack_its_tiles_were_computed_on(self, tmp_path):
-        """From the tiles, not from this process: the driver runs the lockfile's CPU build."""
-        assert STACK["torch"] != _dist_version("torch"), "the premise: the tiles' stack is not this process's"
-        root = self._fill_on_stacks(tmp_path, STACK)
+    def test_the_first_write_stamps_the_runs_stack(self, tmp_path):
+        """From the run's record, not from this process: the driver runs the lockfile's CPU build."""
+        assert STACK["torch"] != _dist_version("torch"), "the premise: the run's stack is not this process's"
+        root = self._fill_on_stack(tmp_path)
         assert root.attrs[STACK_ATTR] == STACK
         assert root[self.ZONE].attrs["years_complete"] == [2025]
 
-    def test_a_store_on_another_stack_refuses_the_write_before_any_shard(self, tmp_path):
-        with pytest.raises(ValueError, match=r"Refusing to write.*PyTorch 2\.14\.1"):
-            self._fill_on_stacks(tmp_path, STACK, root_stack=OTHER_STACK)
+    @pytest.mark.parametrize(
+        ("stack", "root_attrs", "match"),
+        [
+            (STACK, {STACK_ATTR: OTHER_STACK}, r"Refusing to write.*PyTorch 2\.14\.1"),
+            ({**STACK, "model_version": "v2-large", "checkpoint_id": "v2_student_large"}, None, "Refusing to append"),
+            # A global seed records the checkpoint by file name; the run records its stem.
+            (
+                {**STACK, "checkpoint_id": "tessera_v1_1_mpc_encoder"},
+                {"checkpoint_id": "tessera_v1_1_aws_encoder.pt"},
+                "checkpoint",
+            ),
+        ],
+    )
+    def test_a_run_off_the_stores_stack_is_refused_before_anything_lands(self, tmp_path, stack, root_attrs, match):
+        """Every write into a store passes here, whoever called it: a direct runner call included."""
+        with pytest.raises(ValueError, match=match):
+            self._fill_on_stack(tmp_path, stack, root_attrs=root_attrs)
         root = zarr.open_group(
             open_global_repo(str(tmp_path / "global.icechunk")).readonly_session(branch="main").store, mode="r"
         )
+        assert root.attrs.get(STACK_ATTR) == (root_attrs or {}).get(STACK_ATTR), "the stamp is untouched"
         assert not np.any(np.asarray(root[self.ZONE]["embeddings"][1])), "no shard may land"
 
     def test_the_override_writes_and_the_store_keeps_its_stack(self, tmp_path):
-        root = self._fill_on_stacks(tmp_path, STACK, root_stack=OTHER_STACK, allow_stack_mismatch=True)
+        root = self._fill_on_stack(tmp_path, root_attrs={STACK_ATTR: OTHER_STACK}, allow_stack_mismatch=True)
         assert root[self.ZONE].attrs["years_complete"] == [2025]
         assert root.attrs[STACK_ATTR] == OTHER_STACK, "write-once, override or not"
 
-    @pytest.mark.parametrize("root_stack", [None, STACK])
-    @pytest.mark.parametrize(
-        ("second", "match"), [(OTHER_STACK, "never mixes two stacks"), (None, "does not record the PyTorch")]
-    )
-    def test_a_tile_off_the_runs_stack_is_refused_and_changes_no_stamp(self, tmp_path, second, match, root_stack):
-        """Every tile, not only the probe: a resumed run can hold tiles staged before a stack switch.
+    def test_a_second_stack_cannot_join_a_run(self, tmp_path):
+        """A resume on another checkpoint or PyTorch stops before staging anything into the run."""
+        writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=8)
+        tile, scales = np.ones((self.TILE, self.TILE, 8), dtype=np.int8), np.ones((self.TILE, self.TILE), np.float32)
+        for col, stack in enumerate((STACK, {**STACK, "checkpoint_id": "tessera_v1_1_mpc_encoder"})):
+            chunk = ChunkSpec(row=0, col=col, y_start=0, y_stop=self.TILE, x_start=0, x_stop=self.TILE)
+            if col:
+                with pytest.raises(ValueError, match="already joined by another stack"):
+                    writer.write_chunk(chunk, tile, "runJ", scales=scales, stack=stack)
+            else:
+                writer.write_chunk(chunk, tile, "runJ", scales=scales, stack=stack)
+        assert not (tmp_path / "staging" / "runJ" / "chunk_0_1.zarr").exists()
 
-        On an unstamped store every tile is checked BEFORE the stamp, which is permanent, so a mixed
-        run cannot leave the store claiming the probe tile's stack.
-        """
-        with pytest.raises(ValueError, match=match):
-            self._fill_on_stacks(tmp_path, STACK, second, root_stack=root_stack)
-        repo = open_global_repo(str(tmp_path / "global.icechunk"))
-        assert zarr.open_group(repo.readonly_session(branch="main").store, mode="r").attrs.get(STACK_ATTR) == root_stack
+    @pytest.mark.parametrize("records", [0, 2])
+    def test_assembly_needs_the_runs_one_record(self, tmp_path, records):
+        writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=8)
+        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=self.TILE, x_start=0, x_stop=self.TILE)
+        tile, scales = np.ones((self.TILE, self.TILE, 8), dtype=np.int8), np.ones((self.TILE, self.TILE), np.float32)
+        writer.write_chunk(chunk, tile, "runR", scales=scales, stack=STACK)
+        stacks = tmp_path / "staging" / "runR" / "_stacks"
+        for record in stacks.iterdir():
+            record.unlink() if records == 0 else (stacks / "another.json").write_text(record.read_text())
+        with pytest.raises(ValueError, match=f"records {records} stacks"):
+            writer.run_stack("runR")
 
     def test_a_matching_stack_is_checked_without_a_commit(self, tmp_path):
         """What a rerun or the next fill meets: the stamp is already there and nothing is written."""
@@ -2419,8 +2389,7 @@ class TestAssembleGlobal:
             np.ones((self.TILE, self.TILE, dim), dtype=np.int8),
             "runS",
             scales=np.ones((self.TILE, self.TILE), dtype=np.float32),
-            inference_stack=STACK,
-            inference_model=MODEL,
+            stack=STACK,
         )
 
         requested: list[bool] = []
@@ -2467,7 +2436,7 @@ class TestAssembleGlobal:
             )
             emb = rng.integers(-100, 100, size=(self.TILE, self.TILE, dim)).astype(np.int8)
             scales = rng.random((self.TILE, self.TILE)).astype(np.float32)
-            writer.write_chunk(chunk, emb, "runG", scales=scales, inference_stack=STACK, inference_model=MODEL)
+            writer.write_chunk(chunk, emb, "runG", scales=scales, stack=STACK)
             expected[chunk.y_start : chunk.y_stop, chunk.x_start : chunk.x_stop] = emb
             expected_scales[chunk.y_start : chunk.y_stop, chunk.x_start : chunk.x_stop] = scales
 
@@ -2498,8 +2467,7 @@ class TestAssembleGlobal:
             emb,
             run_id,
             scales=rng.random((self.TILE, self.TILE)).astype(np.float32),
-            inference_stack=STACK,
-            inference_model=MODEL,
+            stack=STACK,
         )
         return emb
 
@@ -2785,8 +2753,7 @@ class TestAssembleGlobal:
             emb,
             "runG",
             scales=np.ones((self.TILE, self.TILE), dtype=np.float32),
-            inference_stack=STACK,
-            inference_model=MODEL,
+            stack=STACK,
         )
 
         with pytest.raises(ValueError, match="not on 01N's pre-allocated time axis"):
@@ -2805,8 +2772,7 @@ class TestAssembleGlobal:
             emb,
             "runG",
             scales=np.ones((half, half), dtype=np.float32),
-            inference_stack=STACK,
-            inference_model=MODEL,
+            stack=STACK,
         )
 
         with pytest.raises(ValueError, match="1 inference tile == 1 shard"):
@@ -2861,8 +2827,7 @@ class TestAssembleGlobal:
             "runM",
             scales=rng.random((self.TILE, self.TILE)).astype(np.float32),
             month_covered={var: covered},
-            inference_stack=STACK,
-            inference_model=MODEL,
+            stack=STACK,
         )
         assert writer.assemble_global(store_path, self.ZONE, year=2025, run_id="runM", n_workers=1)
 
@@ -2975,9 +2940,7 @@ class TestAssembleGuards:
             if with_obs
             else None
         )
-        writer.write_chunk(
-            chunk, emb, run_id, scales=scales, obs_counts=obs, inference_stack=STACK, inference_model=MODEL
-        )
+        writer.write_chunk(chunk, emb, run_id, scales=scales, obs_counts=obs, stack=STACK)
         return emb
 
     def test_append_extent_mismatch_raises(self, tmp_path):
@@ -3124,8 +3087,7 @@ class TestAssembleGlobalGuards:
                 emb,
                 "runT",
                 scales=np.ones((chunk.height, chunk.width), dtype=np.float32),
-                inference_stack=STACK,
-                inference_model=MODEL,
+                stack=STACK,
             )
 
         with pytest.raises(ValueError, match=r"chunk_1_0\.zarr has embeddings extent 8 x 64 px"):
@@ -3144,8 +3106,7 @@ class TestAssembleGlobalGuards:
             emb,
             "runF",
             scales=np.ones((self.TILE, self.TILE), dtype=np.float32),
-            inference_stack=STACK,
-            inference_model=MODEL,
+            stack=STACK,
         )
 
         with pytest.raises(IncompleteStageError, match="dtype float32, expected int8"):

@@ -153,66 +153,10 @@ def assert_encoder_matches(published: str | None, *, model_version: ModelVersion
         )
 
 
-#: Root and staged-tile attr naming the library stack that computed the embeddings:
-#: ``{"torch": torch.__version__, "cuda": torch.version.cuda}``, CUDA ``None`` on a CPU build.
+#: Store-root attr, and each staging run's record, naming what computed the embeddings:
+#: ``{"model_version", "checkpoint_id", "torch", "cuda"}``. The checkpoint is its file's stem, and
+#: CUDA is ``None`` on a CPU run. One run is computed by one stack and one store holds one.
 STACK_ATTR = "inference_stack"
-
-
-def _describe_stack(stack: Mapping[str, object]) -> str:
-    cuda = stack.get("cuda")
-    return f"PyTorch {stack.get('torch')} " + (f"with CUDA {cuda}" if cuda else "on CPU")
-
-
-def staged_stack(
-    attrs: Mapping[str, object], where: str, *, expected: Mapping[str, str | None] | None = None
-) -> dict[str, str | None]:
-    """The library stack a staged tile was computed on, refusing a tile that differs from *expected*.
-
-    The inference actor records it as it stages the tile, never the driver: the flow runner runs the
-    lockfile's CPU build whatever the workers run. A tile without it predates the record, so the
-    stack that computed it is unknown and it is refused rather than guessed. *expected* is the
-    stack of the run's other tiles, since one run never mixes two.
-    """
-    stack = attrs.get(STACK_ATTR)
-    if not isinstance(stack, Mapping):
-        raise ValueError(
-            f"Staged tile {where} does not record the PyTorch that computed it: it was staged before "
-            "tiles recorded their stack. Re-infer it with a fresh force_staging_restage token, or by "
-            "deleting the staging prefix."
-        )
-    found = {"torch": stack.get("torch"), "cuda": stack.get("cuda")}
-    if expected is not None and found != dict(expected):
-        raise ValueError(
-            f"Staged tile {where} was computed on {_describe_stack(found)}, and this run's other tiles "
-            f"on {_describe_stack(expected)}. One run never mixes two stacks; re-infer it on one."
-        )
-    return found
-
-
-def assert_stack_matches(stored: object, staged: Mapping[str, str | None], *, allow_mismatch: bool, where: str) -> None:
-    """Refuse a write whose tiles were computed on a different library stack from the store's.
-
-    ADR 025 rule 2: a store is finished on the stack it began on, because another PyTorch or CUDA
-    shifts the embeddings slightly and nothing downstream would notice the mix. ``stored is None``
-    is a store written before the record, which the write stamps rather than refuses. One
-    implementation for the single-area and global write paths, as :func:`assert_encoder_matches`
-    is for the model.
-    """
-    if stored is None or allow_mismatch or dict(cast("Mapping[str, object]", stored)) == dict(staged):
-        return
-    raise ValueError(
-        f"Refusing to write into {where}: it was computed on "
-        f"{_describe_stack(cast('Mapping[str, object]', stored))}, and this run's tiles on "
-        f"{_describe_stack(staged)}. Another stack shifts the embeddings slightly, so one store never "
-        "mixes two (ADR 025). Run on the store's stack: the global flows pick its worker image through "
-        "ami_ssm_name_by_model, and a local run needs that PyTorch installed (docs/environment-setup.md). "
-        "allow_stack_mismatch=True accepts the mix, for a deliberate experiment only."
-    )
-
-
-#: Staged-tile attr naming the model that computed the embeddings:
-#: ``{"model_version": <ModelVersion>, "checkpoint_id": <checkpoint file stem>}``.
-MODEL_ATTR = "inference_model"
 
 
 def checkpoint_stem(checkpoint: str) -> str:
@@ -220,59 +164,61 @@ def checkpoint_stem(checkpoint: str) -> str:
     return checkpoint.rsplit("/", 1)[-1].removesuffix(".pt")
 
 
-def staged_model(
-    attrs: Mapping[str, object], where: str, *, expected: Mapping[str, str] | None = None
-) -> dict[str, str]:
-    """The model and checkpoint a staged tile was computed with, refusing one that differs from *expected*.
-
-    A tile without the record predates it, so the model that computed it is unknown and it is
-    refused rather than guessed, as :func:`staged_stack` refuses a tile without its stack.
-    *expected* is the probe tile's model: a resumed run can hold tiles from two checkpoints.
-    """
-    model = attrs.get(MODEL_ATTR)
-    if not isinstance(model, Mapping):
-        raise ValueError(
-            f"Staged tile {where} does not record the model that computed it: it was staged before "
-            "tiles recorded their model. Re-infer it with a fresh force_staging_restage token, or by "
-            "deleting the staging prefix."
-        )
-    found = {"model_version": str(model.get("model_version")), "checkpoint_id": str(model.get("checkpoint_id"))}
-    if expected is not None and found != dict(expected):
-        raise ValueError(
-            f"Staged tile {where} was computed with {found}, and this run's other tiles with "
-            f"{dict(expected)}. One run never mixes two models; re-infer it with one."
-        )
-    return found
+def _describe_stack(stack: Mapping[str, object]) -> str:
+    cuda = stack.get("cuda")
+    device = f"CUDA {cuda}" if cuda else "CPU"
+    return f"{stack.get('model_version')} ({stack.get('checkpoint_id')}) on PyTorch {stack.get('torch')} with {device}"
 
 
 def assert_model_matches(
-    root_attrs: Mapping[str, object], model: Mapping[str, str], *, allow_mismatch: bool, where: str
+    root_attrs: Mapping[str, object], model_version: str, checkpoint_id: str, *, allow_mismatch: bool, where: str
 ) -> None:
     """Refuse a write whose model or checkpoint disagrees with the store root's.
 
-    **One implementation for every reader:** the fills' pre-flight, which answers before any GPU
-    is provisioned, and the global write path, which every write into a store passes through (the
-    Prefect flows, a direct runner call, the plain runner's updates). The encoder is compared as
-    :func:`assert_encoder_matches` compares it, a root without ``geoemb:model`` reading as v1.1.
-    The checkpoint is compared only when the root records a ``checkpoint_id``, as stems, because a
-    global root records the file name and a single-area root its stem. ``allow_mismatch`` is the
-    deliberate override, for a store seeded with a custom ``model_url``.
+    The model half of :func:`assert_stack_matches`, on its own for the fill flows' pre-flight, which
+    runs before any worker exists and so knows the model but not the PyTorch. A root without
+    ``geoemb:model`` reads as v1.1 (:func:`assert_encoder_matches`); checkpoints compare as stems,
+    because a global root records the file name and a single-area root its stem.
     """
     if allow_mismatch:
         return
     published = root_attrs.get("geoemb:model")
     assert_encoder_matches(
         published if isinstance(published, str) else None,
-        model_version=cast("ModelVersion", model["model_version"]),
+        model_version=cast("ModelVersion", model_version),
         where=where,
     )
     stored = root_attrs.get("checkpoint_id")
-    if stored is not None and checkpoint_stem(str(stored)) != checkpoint_stem(model["checkpoint_id"]):
+    if stored is not None and checkpoint_stem(str(stored)) != checkpoint_stem(checkpoint_id):
         raise ValueError(
-            f"Refusing to write into {where}: it holds checkpoint {stored!r} and this run's tiles come "
-            f"from {model['checkpoint_id']!r}. The encoder matches but the checkpoint (norm source) "
-            "differs, so the embeddings would be mixed. Reseed, or pass allow_model_mismatch=True to "
-            "override deliberately."
+            f"Refusing to write into {where}: it holds checkpoint {stored!r} and this run uses "
+            f"{checkpoint_id!r}. The encoder matches but the checkpoint (norm source) differs, so the "
+            "embeddings would be mixed. Reseed, or pass allow_stack_mismatch=True to override deliberately."
+        )
+
+
+def assert_stack_matches(
+    root_attrs: Mapping[str, object], stack: Mapping[str, str | None], *, allow_mismatch: bool, where: str
+) -> None:
+    """Refuse a write whose stack disagrees with the store root's: the one check every write makes.
+
+    ADR 025: another model, checkpoint, PyTorch or CUDA shifts the embeddings, and nothing downstream
+    would notice the mix. A root without ``inference_stack`` was written before the record, and the
+    write stamps it rather than refuses. ``allow_mismatch`` is the deliberate override.
+    """
+    if allow_mismatch:
+        return
+    assert_model_matches(
+        root_attrs, str(stack["model_version"]), str(stack["checkpoint_id"]), allow_mismatch=False, where=where
+    )
+    stored = root_attrs.get(STACK_ATTR)
+    if isinstance(stored, Mapping) and dict(stored) != dict(stack):
+        raise ValueError(
+            f"Refusing to write into {where}: it was computed by {_describe_stack(stored)}, and this run "
+            f"by {_describe_stack(stack)}. One store never mixes two stacks (ADR 025). Run on the store's "
+            "stack: the global flows pick its worker image through ami_ssm_name_by_model, and a local run "
+            "needs that PyTorch installed (docs/environment-setup.md). allow_stack_mismatch=True accepts "
+            "the mix, for a deliberate experiment only."
         )
 
 

@@ -1051,8 +1051,7 @@ def fill_zones_sequential_flow(
             output_bucket=paths.outputs,
             chunk_size=SHARD_PX,  # 1 inference tile == 1 shard (D3)
             allow_s2_only=allow_s2_only,
-            allow_stack_mismatch=allow_stack_mismatch,
-            allow_model_mismatch=allow_model_mismatch,
+            allow_stack_mismatch=allow_stack_mismatch or allow_model_mismatch,
             optical_min_obs=_store_optical_min_obs(),
             actor_request_headroom=actor_request_headroom,
             # Omitted when unset so the inference default stands — keyed on None, not on
