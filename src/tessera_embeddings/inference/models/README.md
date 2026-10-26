@@ -65,6 +65,43 @@ multiply. PyTorch's `nn.GRU` applies it after and cannot stand in for it
 ([ADR 026](../../../../context_docs/decisions/026-v1-1-runs-the-gru-it-was-trained-with.md)).
 v2 has no GRU.
 
+## One record per model
+
+Everything that differs between models is a field of its `ModelFamily` record in
+`../../config/inference.py`:
+
+- the architecture, checkpoint file names and band statistics
+- the public encoder URL a store advertises as `geoemb:model`
+- the fusion its checkpoint loads with
+- the student generation, which picks the checkpoint loader and the staging run-id prefix
+- the S1 bin given to a pixel with no radar
+- whether it runs only on its own worker image
+
+Code asks `model_family(version)` for the field it needs rather than comparing version strings, so
+a new model is a new record, and a record missing a field cannot be built. Two names carry one
+meaning each:
+
+| name | means | example |
+|---|---|---|
+| `model_version` | the model | `"v1.1"`, `"v2-large"` |
+| `checkpoint_id` | the stem of the checkpoint file, recorded at a store's root | `tessera_v1_1_aws_encoder` |
+
+**Each run decides its model once:**
+
+- **Single-area runs** take it from `InferenceConfig.model_version`, v1.1 by default.
+- **A global store** is seeded for one model (`seed_global_store(model_version=...)`), which stamps
+  its `geoemb:model` and that model's own checkpoint as `checkpoint_id`. Every fill, campaign and
+  targeted update reads them back through `store_model_version`, before anything is provisioned, and
+  the checkpoint, worker image, staging run-id prefix and inference config all follow. No fill flow
+  takes a model parameter, and there is no override.
+- **The guard is in the write, not the callers.** A staging run records the stack that computed it,
+  model and checkpoint included, and every write into a store compares that record with the root
+  ([One stack per run, one stack per store](../README.md)). Reading the model at the flows only
+  chooses the image and checkpoint before Ray starts.
+- **Defaults** exist only at those entry points and on the workers that are handed a config: the
+  dataset, the sampler, assembly and zone seeding. The functions that name a checkpoint or write
+  provenance (`checkpoint_filename`, `band_stats`, `expected_model_url`) require the model.
+
 ## What not to touch
 
 - **`modules.py`**: `V11TransformerEncoder`, `TemporalPositionalEncoder`,
@@ -97,7 +134,8 @@ v2 has no GRU.
   A payload storing `args` as an `argparse.Namespace` is rejected rather than
   allowlisted — convert it to a dict and re-save.
 
-- **`InferenceConfig`** (in `../../config/inference.py`): per-version architecture
-  defaults live in `MODEL_ARCHS`; fields left at their v1.1 defaults adopt the
-  selected version's spec, and a conflicting explicit value is rejected. If you
-  train a new model with different hyperparameters, add/update its `ModelArch`.
+- **`InferenceConfig`** (in `../../config/inference.py`): per-model architecture
+  defaults live in each `ModelFamily` record's `arch`; fields left at their v1.1
+  defaults adopt the selected model's spec, and a conflicting explicit value is
+  rejected. A new model with different hyperparameters gets its own record
+  ([One record per model](#one-record-per-model)).

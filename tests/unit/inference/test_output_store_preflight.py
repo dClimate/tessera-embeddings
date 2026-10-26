@@ -198,3 +198,22 @@ def test_the_matching_family_still_passes_the_gate(tmp_path) -> None:
         config=config,
         mosaic_base=None,
     )
+
+
+def test_a_checkpoint_change_is_refused_before_compute_even_without_a_manifest(tmp_path) -> None:
+    """The gate makes the same model check as `assemble`, so a legacy store's `checkpoint_id` is enough."""
+    path = _existing_store(tmp_path, _config(tmp_path, checkpoint="tessera_v1_aws.pt"))
+    repo, _ = open_or_create_repo(path)
+    session = repo.writable_session("main")
+    root = zarr.open_group(session.store, mode="a")
+    del root.attrs["_manifest"]
+    root.attrs["checkpoint_id"] = "tessera_v1_aws"
+    session.commit("a store from before the manifest")
+    with pytest.raises(ValueError, match="checkpoint"):
+        assert_output_store_accepts(
+            output_bucket=str(tmp_path / "outputs"),
+            roi_name=_ROI,
+            output_name_suffix="",
+            config=_config(tmp_path, checkpoint="tessera_v1_mpc.pt"),
+            mosaic_base=None,
+        )

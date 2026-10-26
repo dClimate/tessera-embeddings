@@ -44,12 +44,17 @@ against itself across two runs.**
    production-path tiles from both models. Usability means top-20 neighbour agreement at or above the
    same-model ceiling of [`../inference/validating-a-model-change.md`](../inference/validating-a-model-change.md)
    (0.9940), measured on the same tiles. Footprint and observation-count layers stay exact.
-2. **An upgrade lands at a store boundary, never inside a store.** Stores started after the switch use
-   the new stack. A store begun on the old stack is finished on it, including every year, area or
-   update later appended to it, such as a new year in the global store: the worker image is a per-run
-   flow parameter (`ami_ssm_name`), so an append can name the old image. The staging fingerprint does
-   not include the image either, so a run on a different stack from the one that staged its tiles
-   passes a fresh `force_staging_restage` token rather than reusing them.
+2. **An upgrade lands at a store boundary, never inside a store, and assembly enforces it.** Stores
+   started after the switch use the new stack. A store begun on the old stack is finished on it,
+   including every year, area or update later appended to it, such as a new year in the global store:
+   the worker image is a per-run flow parameter (`ami_ssm_name`), so an append can name the old image.
+   Each staging run records the stack that computed it (model, checkpoint, PyTorch, CUDA) and
+   refuses a worker on another, so a resume after a switch cannot reuse the run; a fresh
+   `force_staging_restage` token re-infers it. The store's first write stamps PyTorch and CUDA on its
+   root as `inference_stack`, beside the `geoemb:model` and `checkpoint_id` it already carries, and
+   assembly refuses a run that differs from any of them. There is no override. Moving a store to
+   another stack means measuring it against this ADR's gate and then restamping the root's
+   `inference_stack` deliberately, a commit that stays in the store's history.
 3. **v2 moves to PyTorch 2.14.1; v1.1 stays on 2.5.1.** v2 clears the gate and v1.1 does not. Every
    v1.1 run provisions from the 2.5.1 worker image, the published store's updates and any new v1.1
    store alike. The Ray flows take `ami_ssm_name_by_model`, deployments set it to that image for
@@ -75,11 +80,16 @@ against itself across two runs.**
 
 ## Consequences
 
-- A store's output is consistent within one library stack. **The stack is not recorded in store
-  metadata,** because the code identity hashes our source and not our dependencies. The campaign
-  record carries each switch's date and worker image instead.
+- A store's output is consistent within one library stack, **and the store records it.** The
+  root's `inference_stack` holds PyTorch and CUDA, read on the workers because the driver runs the
+  lockfile's CPU build, and the root's `geoemb:model` and `checkpoint_id` name the model; the code
+  identity still hashes only our source. The GPU model, cuDNN and the driver are not recorded: rule 1
+  measures them inside the envelope. A store
+  written before the record carries none and takes the stack of its next write. Every published v1.1
+  year was computed on PyTorch 2.5.1 with CUDA 12.1, and the campaign record carries each switch's
+  date and worker image.
 - A switch must be scheduled between fills. Merging the AMI change while a fill or an append is
-  running would put two stacks into one store.
+  running fails that run, because a worker on the new image cannot join it.
 - **Two worker images stay in service.** The 2.5.1 image must stay addressable for as long as v1.1
   runs, and v1.1 cannot use Blackwell cards (`g7`, `g7e`), for which 2.5.1 has no kernels.
 - Every future upgrade repeats the measurement in `inference-on-gpus.md` §8, on the code that will

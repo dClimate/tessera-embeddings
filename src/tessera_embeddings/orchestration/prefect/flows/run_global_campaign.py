@@ -60,10 +60,11 @@ from prefect.runtime import flow_run as flow_run_ctx
 from prefect.states import StateType
 
 from tessera_embeddings.config.inference import (
-    DEFAULT_MODEL_VERSION,
+    ModelVersion,
     ami_ssm_name_for_model,
     checkpoint_filename,
     inference_code_identity,
+    run_id_prefix,
 )
 from tessera_embeddings.config.ingest import IngestSettings
 from tessera_embeddings.config.paths import BucketPaths
@@ -75,10 +76,7 @@ from tessera_embeddings.orchestration.prefect.flows._child_runs import (
     make_child_cancel_hook,
 )
 from tessera_embeddings.orchestration.prefect.flows._overrides import set_overrides
-from tessera_embeddings.orchestration.prefect.flows.fill_zone_year import (
-    _assert_seeded_model_matches,
-    _optical_min_obs_from_store,
-)
+from tessera_embeddings.orchestration.prefect.flows.fill_zone_year import _optical_min_obs_from_store
 from tessera_embeddings.orchestration.prefect.flows.ingest_zone_year import IngestDeployments
 from tessera_embeddings.orchestration.runners.zone_fill import (
     zone_has_live_tiles,
@@ -93,7 +91,7 @@ from tessera_embeddings.storage.campaign import (
     tag_year_complete,
     zone_year_tag,
 )
-from tessera_embeddings.storage.global_store import open_global_repo, set_saved_manifest_preload
+from tessera_embeddings.storage.global_store import open_global_repo, set_saved_manifest_preload, store_model_version
 from tessera_embeddings.storage.object_store import delete_prefix
 from tessera_embeddings.storage.time_axis import CAMPAIGN_YEARS
 from tessera_embeddings.storage.update import (
@@ -307,6 +305,7 @@ def _staging_run_id(
     allow_s2_only: bool,
     optical_min_obs: int | None,
     code_identity: str,
+    model_version: ModelVersion,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
     update: str | None = None,
@@ -349,7 +348,7 @@ def _staging_run_id(
         # this fingerprint and is rejected by the seeded model gate (checkpoint_id /
         # geoemb:model). The checkpoint is fixed for a campaign and never overwritten
         # mid-run, so a same-filename byte-swap is a non-scenario. (Do not "fix" to an ETag.)
-        checkpoint_filename(),
+        checkpoint_filename(model_version=model_version),
         code_identity,
         _mosaic_identity(
             zone,
@@ -361,7 +360,9 @@ def _staging_run_id(
         ),
     )
     named = key if update is None else (*key, update)
-    return f"{zone}-{year}-{hashlib.sha256(repr(named).encode()).hexdigest()[:8]}"
+    # The model's prefix (empty for v1.1, so v1.1 ids are unchanged) is what the runner checks a
+    # resume against: the staged tiles themselves cannot say which model wrote them.
+    return run_id_prefix(model_version) + f"{zone}-{year}-{hashlib.sha256(repr(named).encode()).hexdigest()[:8]}"
 
 
 def _ingest_dispatch_params(
@@ -594,7 +595,6 @@ async def run_global_campaign(
     ingest_settings: IngestSettings = IngestSettings(),  # noqa: B008
     allow_partial_window: bool = False,
     allow_s2_only: bool = False,
-    allow_model_mismatch: bool = False,
     allow_ingest_code_mismatch: bool = False,
     sweep_orphan_mosaics: bool = False,
     validation_deployment: str | None = None,
@@ -605,9 +605,9 @@ async def run_global_campaign(
     Args:
         paths: Deployment storage contract.
         ami_ssm_name: SSM parameter name for the Ray GPU AMI (forwarded to fills).
-        ami_ssm_name_by_model: Per-model overrides of ``ami_ssm_name``. The campaign runs the
-            default model, so that model's entry is the image it resolves, pins and forwards, and
-            the map goes to its fills too; a v1.1 run without an entry is refused (ADR 025).
+        ami_ssm_name_by_model: Per-model overrides of ``ami_ssm_name``. The entry for the model
+            the store holds is the image the campaign resolves, pins and forwards, and the map goes
+            to its fills too; a model on its own worker image (v1.1) without one is refused (ADR 025).
         branch: Route child deployments to their branch-scoped variants. ``None``
             (production) leaves every ref at its unsuffixed default. A slug (e.g.
             ``"global-tessera"``) suffixes every *derived* child deployment name with
@@ -881,11 +881,6 @@ async def run_global_campaign(
             ingest bug. Folded into the staging run_id so a retry across a flipped flag never
             resumes mixed tiles. S2-only pixel quality is unvalidated (see the optional-S1
             ADR); affected pixels are identifiable via s1_*_obs_count == 0.
-        allow_model_mismatch: Proceed even though the store was seeded for a different
-            encoder/checkpoint than this build embeds with. The gate runs ONCE up front,
-            before any ingest is dispatched, so a mismatch costs a metadata read rather than
-            a mosaic per in-flight zone. Deliberate override only — mixing encoders under one
-            store is permanent.
         allow_ingest_code_mismatch: Forwarded to every ingest: resume interrupted mosaics
             built by different ingest code, instead of demanding they be deleted.
         sweep_orphan_mosaics: Before the run, delete mosaics for cells already
@@ -928,7 +923,6 @@ async def run_global_campaign(
         Summary: pending count at start, dispatched run ids per year, totals.
     """
     log = get_run_logger()
-    ami_ssm_name = ami_ssm_name_for_model(ami_ssm_name, ami_ssm_name_by_model, DEFAULT_MODEL_VERSION)
     # Stamped on every deployment this campaign dispatches so the terminal hooks can find
     # them from the flow-run id alone (see _child_tag). None outside a Prefect run — a direct
     # .fn() call in tests dispatches nothing worth sweeping.
@@ -1045,22 +1039,17 @@ async def run_global_campaign(
     store_path = paths.global_store(store_name)
     land_mask_path = paths.land_mask_store(mask_name)
     # THE STORE may be the partner-owned published bucket, which the task role cannot open.
-    # Only the four store reads take this; the land-mask reads, the mosaic fingerprint and the
+    # Only the store reads take this; the land-mask reads, the mosaic fingerprint and the
     # live-tile partition stay on the task role, the only credential that can read OUR buckets.
     store_credentials = icechunk_credentials_for(store_path, iam_icechunk_credentials)
     repo = open_global_repo(store_path, get_credentials=store_credentials, region=s3_region)
-    # ONCE, before any dispatch. Each fill re-checks this, but by then the campaign has paid
-    # for that cell's ingest — and cells dispatch concurrently, so a store seeded for a
-    # different encoder buys a multi-terabyte mosaic per in-flight zone before the first fill
-    # fails, and those mosaics are retained on failure (which is what makes a resume cheap).
-    # A metadata-only read.
-    _assert_seeded_model_matches(
-        store_path,
-        build_checkpoint=checkpoint_filename(),
-        allow_model_mismatch=allow_model_mismatch,
-        get_credentials=store_credentials,
-        s3_region=s3_region,
-    )
+    # The store decides the model for the whole campaign: the image it pins for every fill, the
+    # checkpoint its fingerprints name, and the staging prefix. Each fill re-reads the same attr.
+    # Resolved ONCE, before any dispatch, so a store this build cannot fill is refused for a
+    # metadata read rather than a multi-terabyte mosaic per in-flight zone.
+    model_version = store_model_version(store_path, get_credentials=store_credentials, region=s3_region)
+    ami_ssm_name = ami_ssm_name_for_model(ami_ssm_name, ami_ssm_name_by_model, model_version)
+    log.info("Campaign model: %s, from %s's geoemb:model", model_version, store_path)
     status = campaign_status(repo, years=campaign_years)
     existing_tags = set(repo.list_tags())
 
@@ -1347,10 +1336,6 @@ async def run_global_campaign(
             # — parts of the globe have no dual-pol coverage at all, and refusing them fails
             # those cells on every retry forever.
             "require_s1": False,
-            # The child re-runs the model gate this flow cleared in preflight, so without
-            # forwarding the override it rejects the same store after its ingest has been
-            # paid for. The campaign-level flag has to reach the gate that fires.
-            "allow_model_mismatch": allow_model_mismatch,
             # A fleet-wide rate the concurrent fills share: the account's RunInstances quota.
             # There is no share to divide — each autoscaler runs the limiter client-side — so the
             # campaign passes only whether to run it at all.
@@ -1431,9 +1416,9 @@ async def run_global_campaign(
         # so it gets a stable id that does NOT inspect the mosaic — fingerprinting would
         # raise before the tag repair.
         if retag_only:
-            run_id = f"{zone}-{year}-retag"
+            run_id = run_id_prefix(model_version) + f"{zone}-{year}-retag"
         elif empty_cell:
-            run_id = f"{zone}-{year}-empty"
+            run_id = run_id_prefix(model_version) + f"{zone}-{year}-empty"
         else:
             run_id = _staging_run_id(
                 zone,
@@ -1445,6 +1430,7 @@ async def run_global_campaign(
                 allow_s2_only=allow_s2_only,
                 optical_min_obs=_campaign_optical_min_obs(),
                 code_identity=_staging_code_identity(),
+                model_version=model_version,
                 get_credentials=iam_icechunk_credentials,
                 s3_region=s3_region,
             )
@@ -1631,8 +1617,6 @@ async def run_global_campaign(
                         "allow_s2_only": allow_s2_only,
                         # As in _fill_params: the chained child must not demand radar either.
                         "require_s1": False,
-                        # As in _fill_params: the chained child gates on the seeded model too.
-                        "allow_model_mismatch": allow_model_mismatch,
                         "ssm_prefix": ssm_prefix,
                         "cloudwatch_log_group": cloudwatch_log_group,
                         "code_bucket": code_bucket,

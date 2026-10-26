@@ -76,7 +76,7 @@ def wired(monkeypatch):
         return {"zone": kwargs["zone"], "run_id": kwargs["run_id"]}
 
     monkeypatch.setattr(mod, "fill_zone_year", fake_no_cluster_fill)
-    monkeypatch.setattr(mod, "_assert_seeded_model_matches", lambda *a, **k: rec["order"].append("model_guard"))
+    monkeypatch.setattr(mod, "store_model_version", lambda *a, **k: rec["order"].append("model_guard") or "v1.1")
     # The chained path reads the depth rule off the store root, like the per-cell flow.
     monkeypatch.setattr(mod, "_optical_min_obs_from_store", lambda *a, **k: None)
     monkeypatch.setattr(mod, "build_inference_config", lambda **k: SimpleNamespace(**k))
@@ -417,7 +417,7 @@ def test_model_mismatch_prevents_cluster(wired, monkeypatch):
     def guard(*a, **k):
         raise ValueError("seeded for a different encoder")
 
-    monkeypatch.setattr(mod, "_assert_seeded_model_matches", guard)
+    monkeypatch.setattr(mod, "store_model_version", guard)
     with pytest.raises(ValueError, match="different encoder"):
         _run()
     assert wired["ray_kwargs"] is None
@@ -438,10 +438,12 @@ def test_pinned_ami_id_reaches_ray_cluster(wired):
     assert wired["ray_kwargs"]["ami_id"] == "ami-pinned-01"
 
 
-def test_the_default_models_own_image_reaches_ray_cluster(wired):
-    """The cells run the default model, so that model's entry in ami_ssm_name_by_model is the image (ADR 025)."""
-    _run(ami_ssm_name_by_model={mod.DEFAULT_MODEL_VERSION: "ami-own"})
-    assert wired["ray_kwargs"]["ami_ssm_name"] == "ami-own"
+@pytest.mark.parametrize("model", ["v1.1", "v2-large"])
+def test_the_stores_models_image_reaches_ray_cluster(wired, monkeypatch, model):
+    """The cells run the model their store holds, so that model's entry is the image (ADR 025)."""
+    monkeypatch.setattr(mod, "store_model_version", lambda *a, **k: model)
+    _run(ami_ssm_name_by_model={"v1.1": "ami-v11", "v2-large": "ami-v2"})
+    assert wired["ray_kwargs"]["ami_ssm_name"] == {"v1.1": "ami-v11", "v2-large": "ami-v2"}[model]
 
 
 def test_unpinned_ami_is_resolved_once_and_reused(wired, monkeypatch):
