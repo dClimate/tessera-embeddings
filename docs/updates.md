@@ -214,6 +214,25 @@ Two more options: `--mask` names a land mask other than the campaign's `global`,
 `--on-skip clear` makes a `shards` update blank a chosen tile where nothing embeds any more, instead
 of keeping it.
 
+**To add land the campaign's mask leaves out**, such as small islands its source registry omits, run
+the update under a mask of your own. A mask lives at `{paths.inputs}/masks/<name>.icechunk`.
+
+1. **Write a registry file:** the campaign's `registry.txt`, unchanged, with one line added for each
+   0.1° cell to cover. Name a cell `grid_<lon>_<lat>.tiff` from its centre, which sits 0.05° from
+   the cell's edges, for example `grid_-77.15_25.05.tiff`.
+2. **Build the mask** with the `build-land-mask-coverage` flow: a `name`, the file as
+   `registry_uri`, and `verify=false`. Verification checks that every cell in the registry exists in
+   the partner's delivery, which the new cells do not, and samples the contents of a few hundred.
+3. **Compare it with `global`.** It must keep every land tile and add only the tiles you meant. A
+   cell is about 11 km across, so it can make up to four tiles live, sea included.
+4. **Plan with `--mask <name>`, listing every tile the new mask makes live** in each zone-year. A new
+   tile is processed whole, and a live tile left out of the plan reads as missing to the validator.
+   Also list the existing tiles the new land reaches into, if their pixels were left thin.
+5. **Keep the mask and its registry file unchanged** for as long as the store is validated. Each
+   updated year records the name of the mask it ran under, and the validator judges the year against
+   that mask, as it stands then, as well as the campaign's. So never rebuild a mask under a name an
+   update has used: build a changed mask under a new name.
+
 **To embed pixels the depth rule left empty**, give the update a lower rule of its own. A global
 store has a depth rule, `optical_min_obs`: the minimum number of valid optical (Sentinel-2)
 observations a pixel needs in its year to be embedded. Pixels below it were left as holes, and the

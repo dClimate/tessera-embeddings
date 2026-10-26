@@ -15,8 +15,7 @@ interface declares":
 
 ```
 with ecs_cluster(log, min_workers=..., max_workers=...) as cluster:
-    runner = DaskTaskRunner(cluster.scheduler_address)
-    inner_flow.with_options(task_runner=runner)(...)
+    run_on_cluster(cluster.scheduler_address, task_shell, parameters)
 
 with ray_cluster(log, ami_ssm_name=...) as resolved_yaml:
     # `ray.init()` already called by the context manager

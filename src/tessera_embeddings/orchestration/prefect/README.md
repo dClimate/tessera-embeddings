@@ -28,7 +28,7 @@ orchestration/prefect/
 │   │  shared private helpers (underscore = not a public import surface)
 │   ├── _cell_validation.py          # hand a tagged cell to its validator, don't wait
 │   ├── _child_runs.py               # child deployment runs: cancel sweeps, terminal-state check
-│   ├── _dask_lifecycle.py           # Dask/ECS teardown hook + the DaskTaskRunner factory
+│   ├── _dask_lifecycle.py           # Dask/ECS teardown hook + run_on_cluster (task shell -> cluster)
 │   ├── _ray_lifecycle.py            # Ray teardown hook (the Ray analogue of the above)
 │   ├── _fleet_gate.py               # ingest gate (zero = pause) + inference pause flag
 │   └── _overrides.py                # per-run flow option overrides
@@ -44,7 +44,7 @@ orchestration/prefect/
 - [Master pipeline](#master-pipeline)
 - [Individual flows](#individual-flows)
 - [Deliberate fault injection (supervised drills only)](#deliberate-fault-injection-supervised-drills-only)
-- [The two-flow pattern](#the-two-flow-pattern)
+- [One flow per ingest](#one-flow-per-ingest)
 - [Task shells](#task-shells)
 - [Provider selection](#provider-selection)
 - [Running](#running)
@@ -444,8 +444,8 @@ fill_zones_sequential --"chained-ingest:<id>"-->    ingest-zone-year (look-ahead
 Each flow keeps its own teardown hook as well; the sweep stops the runs those
 hooks then clean up after.
 
-> **Why so many flow files?** The two-flow pattern below explains the inner/outer
-> split per file. The flows themselves are kept thin — task-graph discipline
+> **Why so many flow files?** One per deployment, and each ingest is a single flow
+> (see [One flow per ingest](#one-flow-per-ingest)). The flows are kept thin — task-graph discipline
 > (per-date iteration for S2, batched windows for S1, ChunkSpec-granularity
 > assembly) lives in the domain modules. See
 > [`docs/ingest-performance.md`](../../../../docs/ingest-performance.md#background-how-dask-task-graphs-consume-scheduler-ram)
@@ -484,24 +484,37 @@ every hop (`fill_zone_year` → `assemble_zone_year` → `assemble_global` →
 the commit path of the store that is the campaign's only output, and a reviewer of any
 one of those functions should be able to see that it can be asked to fail.
 
-## The two-flow pattern
+## One flow per ingest
 
-You'll notice each flow file has an outer `@flow` and an inner
-`@flow` invoked via `.with_options(task_runner=...)`. This is a
-deliberate Prefect idiom — `task_runner=` must be set at flow
-definition time or via `.with_options()` on a callable, which
-requires a separate inner `@flow`. Don't try to collapse it. The
-docstring at the top of each flow file states this explicitly.
+Each ingest deployment is one `@flow`. It provisions its Dask cluster, then runs its task shell
+on that cluster with `run_on_cluster` (`flows/_dask_lifecycle.py`):
 
 ```
-ingest_s2_roi_reflectance(...)            ← outer @flow: provisions the cluster
-  with ecs_cluster(...) as cluster:
-    runner = DaskTaskRunner(cluster.scheduler_address)
-    _ingest_s2_roi_impl.with_options(     ← inner @flow: runs against that runner
-        task_runner=runner,
-    )(...)
-      └── process_roi_reflectance.submit(...)   ← @task: pulls client + log from context
+ingest_s2_roi_reflectance(...)                  ← the deployment's @flow
+  with ecs_cluster(...) as cluster:             ← Fargate fleet (local_cluster() when use_local)
+    with maybe_performance_report(...):         ← no-op unless perf_report_uri is set
+      run_on_cluster(cluster.scheduler_address, ← PrefectDaskClient on that scheduler
+                     process_roi_reflectance, ...)
+        └── process_roi_reflectance             ← @task: a task run of the SAME flow run,
+                                                  executing on a Dask worker
 ```
+
+- **Why not `@flow(task_runner=DaskTaskRunner(...))`.** A task runner binds when the flow is
+  defined, and the scheduler address exists only once the flow body has provisioned the
+  cluster. Submitting through a `PrefectDaskClient` needs no task runner, so one flow can do both.
+- **The driver runs on a worker.** The task shell is the ingest's driver loop, and it executes
+  on one Dask worker: `get_client()` there returns that worker's client, and the worker sizing
+  in `providers/aws/dask.py` is set for it.
+- **Logs.** Prefect's task engine on that worker sends the shell's `get_run_logger()` lines to
+  the API under the flow run, so the per-date and per-batch progress lines sit on the
+  deployment's own run, beside the flow's lines.
+- **Failure and teardown.** A failing task fails the flow with the task's exception.
+  `ecs_cluster` tears the fleet down on exit, and the `on_cancellation` / `on_crashed` hook
+  sweeps it by the flow-run tag when a kill skips that exit.
+
+`export_zone_rois` is the one flow that calls an inner flow, because it sizes its
+`ThreadPoolTaskRunner` per run. The decision record is
+[ADR 029](../../../../context_docs/decisions/029-one-flow-per-ingest.md).
 
 ## Task shells
 

@@ -9,7 +9,7 @@ architecture tests in ``tests/architecture/`` enforce that.
 * ``flows/`` — ``@flow`` files that provision substrate (Ray / Dask) via the
   ``providers/`` package and submit one or more task shells.
 
-The two-flow pattern (outer ``@flow`` enters the cluster context manager, inner
-``@flow`` invoked via ``.with_options(task_runner=...)``) is load-bearing — see each
-flow's docstring.
+An ingest flow enters its cluster context manager and runs its task shell on that cluster
+through ``flows._dask_lifecycle.run_on_cluster``, as a task run of the same flow run (see the
+"One flow per ingest" section of this package's README).
 """
