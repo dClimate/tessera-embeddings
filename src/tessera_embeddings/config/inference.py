@@ -845,6 +845,11 @@ class InferenceConfig:
     # `inference_stack` (ADR 025 rule 2). For a deliberate experiment only; the store keeps its stack.
     allow_stack_mismatch: bool = False
 
+    # Let assembly write tiles whose model or checkpoint differs from the store root's
+    # (`conventions.assert_model_matches`). The deliberate override, for a store seeded with a custom
+    # `model_url`; the flows set it from their `allow_model_mismatch`.
+    allow_model_mismatch: bool = False
+
     def initial_actor_request(self, num_actors: int) -> int:
         """How many actors to create before the scheduling loop takes over.
 

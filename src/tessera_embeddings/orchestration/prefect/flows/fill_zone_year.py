@@ -50,7 +50,7 @@ from tessera_embeddings.orchestration.runners.zone_fill import (
     zone_year_complete,
     zone_year_on_axis,
 )
-from tessera_embeddings.storage.conventions import expected_model_url
+from tessera_embeddings.storage.conventions import assert_model_matches
 from tessera_embeddings.storage.global_store import store_model_version
 from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group
 from tessera_embeddings.storage.zone_grid import canonicalize_zone
@@ -108,28 +108,20 @@ def _assert_seeded_model_matches(
     store also recorded a ``checkpoint_id``, require it to match this run's checkpoint
     (*build_checkpoint* = :func:`checkpoint_filename`) — otherwise two same-URL-but-different
     checkpoints could be mixed. Absent ``checkpoint_id``, only the encoder URL is gated.
+
+    The same :func:`~tessera_embeddings.storage.conventions.assert_model_matches` guards the write
+    itself, in ``assemble_global``; this early call only spares a mismatched run its GPU time.
     """
     # The store's own credential, chosen from the path, so no caller can hand it the task role.
     root = open_store_as_zarr_group(
         store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
     )
-    seeded = cast("str | None", root.attrs.get("geoemb:model"))
-    # The fill's model normally comes from this same attr (store_model_version), so this check
-    # bites when an explicit model_version overrode it, or on the checkpoint below.
-    expected = expected_model_url(model_version=model_version)
-    if seeded is not None and seeded != expected and not allow_model_mismatch:
-        raise ValueError(
-            f"Global store {store_path} was seeded for encoder {seeded!r} but this build embeds with "
-            f"{expected!r} — filling would mix encoders under one store (its root still advertises "
-            f"{seeded!r}). Reseed for the new model, or pass allow_model_mismatch=True to override."
-        )
-    seeded_ckpt = cast("str | None", root.attrs.get("checkpoint_id"))
-    if seeded_ckpt is not None and seeded_ckpt != build_checkpoint and not allow_model_mismatch:
-        raise ValueError(
-            f"Global store {store_path} was seeded for checkpoint {seeded_ckpt!r} but this build fills with "
-            f"{build_checkpoint!r} — the encoder URL matches but the concrete checkpoint (norm source) differs, "
-            "so the embeddings would be mixed. Reseed, or pass allow_model_mismatch=True to override."
-        )
+    assert_model_matches(
+        root.attrs,
+        {"model_version": model_version, "checkpoint_id": build_checkpoint},
+        allow_mismatch=allow_model_mismatch,
+        where=f"global store {store_path}",
+    )
 
 
 @flow(
@@ -407,6 +399,7 @@ def fill_zone_year_flow(
         chunk_size=SHARD_PX,
         allow_s2_only=allow_s2_only,
         allow_stack_mismatch=allow_stack_mismatch,
+        allow_model_mismatch=allow_model_mismatch,
         actor_request_headroom=actor_request_headroom,
         # Omitted when unset so the inference default stands — keyed on None, not on truthiness,
         # because 0 is a documented mode here rather than an absent value.

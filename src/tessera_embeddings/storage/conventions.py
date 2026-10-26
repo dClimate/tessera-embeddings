@@ -210,6 +210,63 @@ def assert_stack_matches(stored: object, staged: Mapping[str, str | None], *, al
     )
 
 
+#: Staged-tile attr naming the model that computed the embeddings:
+#: ``{"model_version": <ModelVersion>, "checkpoint_id": <checkpoint file stem>}``.
+MODEL_ATTR = "inference_model"
+
+
+def checkpoint_stem(checkpoint: str) -> str:
+    """A checkpoint path or file name reduced to its stem, the form ``checkpoint_id`` compares in."""
+    return checkpoint.rsplit("/", 1)[-1].removesuffix(".pt")
+
+
+def staged_model(attrs: Mapping[str, object], where: str) -> dict[str, str]:
+    """The model and checkpoint a staged tile was computed with, recorded by the actor that ran it.
+
+    A tile without the record predates it, so the model that computed it is unknown and it is
+    refused rather than guessed, as :func:`staged_stack` refuses a tile without its stack.
+    """
+    model = attrs.get(MODEL_ATTR)
+    if not isinstance(model, Mapping):
+        raise ValueError(
+            f"Staged tile {where} does not record the model that computed it: it was staged before "
+            "tiles recorded their model. Re-infer it with a fresh force_staging_restage token, or by "
+            "deleting the staging prefix."
+        )
+    return {"model_version": str(model.get("model_version")), "checkpoint_id": str(model.get("checkpoint_id"))}
+
+
+def assert_model_matches(
+    root_attrs: Mapping[str, object], model: Mapping[str, str], *, allow_mismatch: bool, where: str
+) -> None:
+    """Refuse a write whose model or checkpoint disagrees with the store root's.
+
+    **One implementation for every reader:** the fills' pre-flight, which answers before any GPU
+    is provisioned, and the global write path, which every write into a store passes through (the
+    Prefect flows, a direct runner call, the plain runner's updates). The encoder is compared as
+    :func:`assert_encoder_matches` compares it, a root without ``geoemb:model`` reading as v1.1.
+    The checkpoint is compared only when the root records a ``checkpoint_id``, as stems, because a
+    global root records the file name and a single-area root its stem. ``allow_mismatch`` is the
+    deliberate override, for a store seeded with a custom ``model_url``.
+    """
+    if allow_mismatch:
+        return
+    published = root_attrs.get("geoemb:model")
+    assert_encoder_matches(
+        published if isinstance(published, str) else None,
+        model_version=cast("ModelVersion", model["model_version"]),
+        where=where,
+    )
+    stored = root_attrs.get("checkpoint_id")
+    if stored is not None and checkpoint_stem(str(stored)) != checkpoint_stem(model["checkpoint_id"]):
+        raise ValueError(
+            f"Refusing to write into {where}: it holds checkpoint {stored!r} and this run's tiles come "
+            f"from {model['checkpoint_id']!r}. The encoder matches but the checkpoint (norm source) "
+            "differs, so the embeddings would be mixed. Reseed, or pass allow_model_mismatch=True to "
+            "override deliberately."
+        )
+
+
 def tile_id_to_epsg(tile_id: str) -> str | None:
     """Derive EPSG code from a Sentinel-2 MGRS tile ID.
 

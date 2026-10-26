@@ -15,7 +15,7 @@ from tessera_embeddings.inference.chunk_spec import enumerate_chunks
 from tessera_embeddings.orchestration.runners.plain import _plan_update, _write_update
 from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.update import base_tag, read_updates
-from tests.unit.inference_stack import OTHER_STACK, STACK
+from tests.unit.inference_stack import MODEL, OTHER_STACK, STACK
 
 log = logging.getLogger("test_plain_update")
 
@@ -42,7 +42,7 @@ def _stage(writer: ZarrWriter, run_id: str, value: int, *, holes: bool, stack: d
         if holes and chunk.label == "chunk_1_1":
             refused[:] = True
         emb[refused], scales[refused] = 0, np.nan
-        writer.write_chunk(chunk, emb, run_id, scales=scales, inference_stack=stack)
+        writer.write_chunk(chunk, emb, run_id, scales=scales, inference_stack=stack, inference_model=MODEL)
 
 
 @pytest.fixture()
