@@ -1055,7 +1055,7 @@ def _infer_planned(
 def complete_zone_inference(plan: ZonePlan, *, results: list[dict] | None) -> ZoneFillHandoff:
     """Fold per-tile results back into the handoff the assembly phase consumes.
 
-    Shared by the per-cell path and the chained runner, which collects a zone's results from
+    Shared by the single-cell flow and the chained runner, which collects a zone's results from
     the streamed session instead of a dedicated ``run_inference`` call. Raises if any tile
     failed: the zone must not assemble partial output, and its cell stays pending in the
     campaign ledger.
