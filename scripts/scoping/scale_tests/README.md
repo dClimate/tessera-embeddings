@@ -88,6 +88,7 @@ T10="-m scripts.scoping.scale_tests.t10_v2_aws --run-id v2b --backend s3 --bucke
 uv run python $T10 --tiles <dir> --phase build
 uv run python $T10 --tiles <dir> --phase read          # then again from the old-client environment
 uv run python $T10 --phase assemble --staging s3://<staged run dir> --extent <ny,nx> --n-tiles 64 --workers 16
+uv run python $T10 --phase verify                      # then with the assemble line's --staging and --n-tiles
 
 # collate + tear down
 uv run python -m scripts.scoping.scale_tests.report   --run-id run1
@@ -141,6 +142,9 @@ Each phase runs on its own in-region EC2 box, writing throwaway repos under the 
   band-last finalist by the library's own `shard_writer.write_year_shards` over a
   `StagedShardSource`, every array included. Band-first arms are left out because the library
   stages tiles band-last; their encode cost comes from `build` on a Graviton box instead.
+- **`verify`**. Every arm holds exactly C0's values in every array, band-first ones reordered first.
+  It checks the built stores; given `--staging`, it checks the assembled ones, over the tiles
+  assembly wrote. The set chooses its own stores and arms, so there is no prefix to pass.
 
 ### Common flags (every `tN` script)
 
