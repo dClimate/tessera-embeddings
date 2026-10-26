@@ -167,9 +167,7 @@ def cold_read(payload: dict[str, Any]) -> dict[str, Any]:
         out |= {"read_p50_ms": float(np.median(ms)), "read_p95_ms": float(np.percentile(ms, 95))}
         out |= {"read_p50_lo_ms": float(lo), "read_p50_hi_ms": float(hi)}
     elif workload.startswith("dask"):
-        band_chunk = dict(zip(emb.metadata.dimension_names, emb.chunks, strict=True))["band"]
-        aligned = {"time": 1, "northing": TILE, "easting": TILE, "band": band_chunk}  # one task per band chunk
-        chunks = {} if workload == "dask_default" else aligned
+        chunks = {} if workload == "dask_default" else V.dask_chunks(emb)
         ds = xr.open_zarr(store, group="zone", consolidated=False, chunks=chunks)
         ys, xs = regions["pull8"]
         ds["embeddings"].isel(time=0, northing=ys, easting=xs, band=slice(0, dims)).data.compute()

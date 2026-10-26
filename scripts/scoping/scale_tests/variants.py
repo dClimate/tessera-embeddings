@@ -128,6 +128,18 @@ def read_window(arr: zarr.Array, t: int, ys: slice | int, xs: slice | int, trail
     return np.moveaxis(np.asarray(arr[t, trailing, ys, xs]), 0, -1)
 
 
+def dask_chunks(arr: zarr.Array) -> dict[str, int]:
+    """Dask chunks of one task per shard footprint and band chunk, keyed by the array's dimension names.
+
+    Read from the array, as :func:`read_window` reads its order, so each arm is chunked to its own
+    geometry: the control's 128-band chunk stays whole and a band-16 arm gets one task per band chunk.
+    """
+    names = arr.metadata.dimension_names
+    return dict(zip(names, arr.shards or arr.chunks, strict=True)) | {
+        "band": dict(zip(names, arr.chunks, strict=True))["band"]
+    }
+
+
 def embeddings_array_kwargs(variant: Variant, shape: tuple[int, int, int, int]) -> dict:
     """Return ``create_array`` kwargs for the int8 ``embeddings`` array.
 

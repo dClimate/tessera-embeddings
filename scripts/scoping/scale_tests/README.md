@@ -107,7 +107,7 @@ same 2048² shard. T9 builds every arm as a local store of 2×2 shards from real
 
 - what the writer pays: stored bytes, and encode CPU per shard
 - what every read asks for: requests and bytes for each workload at 16, 64 and 128 dims
-- the Dask graph a reader's default chunking builds
+- the Dask tasks and requests of a 16-d pull, at Dask's default chunks and at shard-aligned ones
 
 **The arms** are the geometries in `variants.py`, each crossed with int8 codecs, a band-planar
 transpose, the inner-chunk order within a shard, and the `scales` geometry.
@@ -115,9 +115,11 @@ transpose, the inner-chunk order within a shard, and the `scales` geometry.
 **Requests are counted by a store wrapper** that also intercepts zarr ≥ 3.3's merged-range path.
 `WrapperStore` would otherwise forward it unseen, and so would zarr 3.4's sync path.
 
-**Two rules hold for T9 and T10 alike.** Every read quantity is recorded per read: a point workload
-is many reads, one per probe. And readers take an array's band order from its dimension names
-(`variants.read_window`), so one reader serves band-last and band-first stores.
+**Three rules hold for T9 and T10 alike.** Every read quantity is recorded per read: a point
+workload is many reads, one per probe. Readers take an array's band order from its dimension names
+(`variants.read_window`), so one reader serves band-last and band-first stores. And aligned Dask
+chunks are read from the array too (`variants.dask_chunks`): one task per shard and band chunk, so
+the control's 128-band chunk is never split.
 
 **Request plans carry over to S3, but latency does not.** The requests depend only on zarr's
 sharding codec, so they hold on S3. Latency depends on the network, so T10 measures the finalists

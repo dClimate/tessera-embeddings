@@ -267,10 +267,9 @@ def phase_dask(cfg: harness.RunConfig, phase: str) -> None:
     """Task count and requests for the bulk 16-d pull through xarray, default vs shard-aligned chunks."""
     import dask
 
-    side = _side(cfg)
-    aligned = {"time": 1, "northing": min(TILE, side), "easting": min(TILE, side), "band": 16}
     for arm in (a for a in ARMS if a.codec == "zstd" and a.write_order == "morton" and a.scales_chunks is None):
         store = CountingStore(LocalStore(_store_dir(cfg, arm), read_only=True))
+        aligned = V.dask_chunks(zarr.open_array(store, path="embeddings", mode="r"))
         for label, chunks in (("default", {}), ("shard_aligned", aligned)):
             ds = xr.open_zarr(store, consolidated=False, chunks=chunks)
             lazy = ds["embeddings"].isel(time=0, band=slice(0, 16)).data

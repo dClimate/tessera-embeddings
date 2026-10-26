@@ -151,12 +151,16 @@ chunk, and `bandfirst` the `(time, band, northing, easting)` dimension order.
 |---|---|---|---|---|
 | v2_b2 | 577 | 37 | 119 | 4 |
 | v2_b2_zstd_T | 577 | 37 | 119 | 4 |
-| v2_c0 | 513 | 37 | 456 | 4 |
-| v2_c0_zstd_T | 513 | 37 | 456 | 4 |
+| v2_c0 | 513 | 9 | 456 | 4 |
+| v2_c0_zstd_T | 513 | 9 | 456 | 4 |
 | v2_c1 | 2305 | 37 | 456 | 54 |
 | v2_c1_zstd_T | 2305 | 37 | 456 | 54 |
 | v2_c2 | 577 | 37 | 119 | 18 |
 | v2_c2_zstd_T | 577 | 37 | 119 | 17 |
+
+> Shard-aligned is one Dask task per shard and band chunk of the arm (`variants.dask_chunks`). C0's
+> count of 9 is re-derived at this shape: the `f1242f88` run split its 128-band chunks into 8 tasks
+> each, which changed neither its requests nor its bytes.
 
 ## T9 — Puget Sound (`t9puget`)
 
@@ -278,12 +282,16 @@ chunk, and `bandfirst` the `(time, band, northing, easting)` dimension order.
 |---|---|---|---|---|
 | v2_b2 | 577 | 37 | 128 | 4 |
 | v2_b2_zstd_T | 577 | 37 | 128 | 4 |
-| v2_c0 | 513 | 37 | 512 | 4 |
-| v2_c0_zstd_T | 513 | 37 | 512 | 4 |
+| v2_c0 | 513 | 9 | 512 | 4 |
+| v2_c0_zstd_T | 513 | 9 | 512 | 4 |
 | v2_c1 | 2305 | 37 | 512 | 68 |
 | v2_c1_zstd_T | 2305 | 37 | 512 | 68 |
 | v2_c2 | 577 | 37 | 128 | 20 |
 | v2_c2_zstd_T | 577 | 37 | 128 | 20 |
+
+> Shard-aligned is one Dask task per shard and band chunk of the arm (`variants.dask_chunks`). C0's
+> count of 9 is re-derived at this shape: the `f1242f88` run split its 128-band chunks into 8 tasks
+> each, which changed neither its requests nor its bytes.
 
 ## T10 — band-last finalists (`v2b`)
 
