@@ -41,8 +41,14 @@ vocabularies. `spatial_dims_of` reads a store's names from its `spatial:dimensio
 required `scales` array, `(time, Y, X)`, when a store with pixel-index coordinates declares none.
 
 **Code that reads an output store asks the store.** The append grid check, the zone-fill grid
-check, the seed flow's completeness check and the published-store audit all take the names from
-`spatial_dims_of`, never from a constant. The CF attributes (PR #218) are keyed by axis, not by name.
+check, the seed flow's completeness check, the published-store audit and `resolve_region` all take
+the names from `spatial_dims_of`, never from a constant; `resolve_region` keeps its `northing` and
+`easting` range arguments and returns slices under the store's names. The CF attributes (PR #218)
+are keyed by axis, not by name.
+
+**A store without projected coordinates names no CRS.** Without a mosaic, single-area assembly
+writes pixel indices. rioxarray finds `y`/`x` by name, so a CRS beside those indices would place
+the raster at that CRS's origin; such a store gets no `proj:` attributes.
 
 **Output stores only.** Mosaics, staged tiles, `ZoneSpec`'s extents and `SpatialCoords` keep
 `northing`/`easting`. Both models share them, nothing outside the pipeline reads them, and

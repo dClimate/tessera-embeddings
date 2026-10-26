@@ -2267,8 +2267,10 @@ class ZarrWriter:
             "run_started_at": started.isoformat(),
             "run_completed_at": datetime.datetime.now(datetime.UTC).isoformat(),
         }
+        # No CRS without projected coordinates: a reader pairing it with pixel indices would place
+        # the raster at the CRS origin.
         conv_attrs = build_convention_attrs(
-            tile_id=tile_id,
+            tile_id=tile_id if spatial else None,
             epsg_code=spatial.crs if spatial else None,
             total_y=total_y,
             total_x=total_x,

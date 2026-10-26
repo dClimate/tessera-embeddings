@@ -56,7 +56,12 @@ from tessera_embeddings.storage import shard_writer
 from tessera_embeddings.storage.conventions import STACK_ATTR, library_stack
 from tessera_embeddings.storage.global_store import create_global_repo, create_layout_arrays, open_global_repo
 from tessera_embeddings.storage.time_axis import TIME_ENCODING
-from tessera_embeddings.storage.zarr_store import open_or_create_repo, open_store, plain_zarr_storage_options
+from tessera_embeddings.storage.zarr_store import (
+    open_or_create_repo,
+    open_store,
+    plain_zarr_storage_options,
+    resolve_region,
+)
 from tests.unit.inference_stack import IDENTITY, OTHER_STACK, STACK, identity
 
 _V2_STACK = {**STACK, "model_version": "v2-large", "checkpoint_id": "v2_student_large"}
@@ -1852,7 +1857,7 @@ class TestAssemblyValidation:
         assert "run_completed_at" in attrs
 
     def test_assemble_sets_geozarr_convention_attrs(self, tmp_path):
-        """Convention attrs (proj:, spatial:, geoemb:) are set on the root group."""
+        """Convention attrs are set on the root group; with no mosaic, only geoemb:."""
         staging = str(tmp_path / "staging")
         output = str(tmp_path / "output.zarr")
         writer = ZarrWriter(staging)
@@ -1884,12 +1889,11 @@ class TestAssemblyValidation:
         # Convention registration
         assert "zarr_conventions" in attrs
         names = [c["name"] for c in attrs["zarr_conventions"]]
-        assert "proj" in names
         assert "geoemb:" in names
 
-        # proj:
-        assert attrs["proj:code"] == "EPSG:32633"
-        # No mosaic, so northing/easting are pixel indices: the tile's CRS must not label them metres.
+        # No mosaic, so northing/easting are pixel indices. The tile's CRS would place them at its
+        # origin, so the store advertises none.
+        assert "proj" not in names and "proj:code" not in attrs
         assert "spatial:dimensions" not in attrs
         assert "axis" not in root["northing"].attrs
 
@@ -3095,6 +3099,7 @@ class TestAssembleGuards:
         assert root.attrs["spatial:dimensions"] == [y, x]
         assert root[y].attrs["axis"] == "Y" and root[x].attrs["axis"] == "X"
         assert {"northing", "easting", "y", "x"} - set(root.array_keys()) == {"northing", "easting", "y", "x"} - {y, x}
+        assert resolve_region(output, northing=(0, 10)) == {y: slice(2, 4)}  # descending Y axis
 
     def test_append_refuses_a_reordered_interior_on_matching_endpoints(self, tmp_path, monkeypatch):
         """Extent, CRS and endpoints do not pin an axis, and this phase writes POSITIONALLY.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import icechunk
 import numpy as np
 import pytest
+import xarray as xr
 import zarr
 
 from tessera_embeddings.config.inference import EMBEDDING_DIM, INFERENCE_CHUNK_SIZE
@@ -113,14 +114,21 @@ def test_sharded_roundtrip_and_fill(tmp_path):
     assert np.isnan(r["scales"][0, 300:400, 300:400]).all()
 
 
-@pytest.mark.parametrize(("declared", "expected"), [(["y", "x"], ("y", "x")), (None, ("y", "x"))])
-def test_spatial_dims_of_reads_the_declaration_then_the_scales_array(declared, expected):
-    """A store with pixel-index coordinates declares no ``spatial:dimensions``; ``scales`` still names them."""
+@pytest.mark.parametrize(
+    ("declared", "scales_dims", "expected"),
+    [
+        (["y", "x"], ("time", "y", "x"), ("y", "x")),
+        (None, ("time", "y", "x"), ("y", "x")),  # pixel-index coordinates declare nothing
+        (None, ("y", "x"), ("northing", "easting")),  # malformed: the audit reports, not raises
+    ],
+)
+def test_spatial_dims_of_reads_the_declaration_then_the_scales_array(declared, scales_dims, expected):
     group = zarr.group(store=zarr.storage.MemoryStore())
-    group.create_array("scales", shape=(1, 2, 2), dtype="f4", dimension_names=("time", "y", "x"))
+    group.create_array("scales", shape=(1,) * len(scales_dims), dtype="f4", dimension_names=scales_dims)
     if declared:
         group.attrs["spatial:dimensions"] = declared
     assert spatial_dims_of(group) == expected
+    assert spatial_dims_of(xr.open_zarr(group.store, consolidated=False)) == expected
 
 
 def test_with_spatial_dims_renames_every_array_and_keeps_the_geometry():

@@ -79,7 +79,8 @@ projected metres, so they are written only when the group declares both halves o
 real coordinates (`spatial:dimensions`, which a store whose Y/X coordinates are bare pixel
 indices never gets) and a metre CRS in its own `proj:code`, the same rule as `geoemb:gsd`. Reading
 the group's declarations, rather than the inputs, means the labels follow whatever the store
-declares, including a CRS derived from the MGRS tile. The [CF convention for Zarr](https://github.com/zarr-conventions/CF)
+declares, including a CRS derived from the MGRS tile. A store with pixel-index coordinates gets no `proj:`
+either: a reader pairing a CRS with indices would place the raster at that CRS's origin. The [CF convention for Zarr](https://github.com/zarr-conventions/CF)
 is a proposal with no release, and its registration example adds a `version` field the conventions
 spec forbids, so registering it would not validate.
 

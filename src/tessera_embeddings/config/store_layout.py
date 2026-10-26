@@ -38,6 +38,7 @@ from zarr.codecs.numcodecs import PCodec as _PCodecZarr3
 from tessera_embeddings.config.inference import EMBEDDING_DIM
 
 if TYPE_CHECKING:
+    import xarray as xr
     import zarr
 
 # PCodec is intentionally a Zarr v3 *serializer* (array->bytes), not a bytes->bytes compressor; silence the "not in
@@ -215,19 +216,21 @@ class StoreLayout:
         return dataclasses.replace(self, arrays=arrays)
 
 
-def spatial_dims_of(group: zarr.Group) -> tuple[str, str]:
+def spatial_dims_of(group: zarr.Group | xr.Dataset) -> tuple[str, str]:
     """The Y and X dimension names an existing output store uses.
 
     Its ``spatial:dimensions`` when it declares them, as every georeferenced store does; otherwise
     its required ``scales`` array, ``(time, Y, X)``, which a store with pixel-index coordinates
-    still has; the presets' names for a group with neither, so an audit reports it, not raises.
+    still has; the presets' names for anything else (a mosaic, a malformed group), so an audit
+    reports it rather than raises. Takes a zarr group or the xarray dataset opened from one.
     """
     declared = cast("list[str] | None", group.attrs.get("spatial:dimensions"))
-    if declared:
+    if declared and len(declared) == 2:
         return declared[0], declared[1]
     scales = group.get("scales")
-    dims = cast("tuple[str, ...]", getattr(getattr(scales, "metadata", None), "dimension_names", None) or DIMS_3D)
-    return dims[1], dims[2]
+    # xarray names a variable's dims on the variable; zarr in the array's metadata.
+    dims = getattr(scales, "dims", None) or getattr(getattr(scales, "metadata", None), "dimension_names", None)
+    return (dims[1], dims[2]) if dims and len(dims) == 3 else (DIMS_3D[1], DIMS_3D[2])
 
 
 def _obs(chunks: tuple[int, ...], shards: tuple[int, ...] | None, codec: str) -> dict[str, ArrayLayout]:
