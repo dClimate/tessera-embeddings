@@ -76,7 +76,7 @@ def wired(monkeypatch):
         return {"zone": kwargs["zone"], "run_id": kwargs["run_id"]}
 
     monkeypatch.setattr(mod, "fill_zone_year", fake_no_cluster_fill)
-    monkeypatch.setattr(mod, "_assert_seeded_model_matches", lambda *a, **k: rec["order"].append("model_guard"))
+    monkeypatch.setattr(mod, "store_model_version", lambda *a, **k: rec["order"].append("model_guard") or "v1.1")
     # The chained path reads the depth rule off the store root, like the per-cell flow.
     monkeypatch.setattr(mod, "_optical_min_obs_from_store", lambda *a, **k: None)
     monkeypatch.setattr(mod, "build_inference_config", lambda **k: SimpleNamespace(**k))
@@ -417,7 +417,7 @@ def test_model_mismatch_prevents_cluster(wired, monkeypatch):
     def guard(*a, **k):
         raise ValueError("seeded for a different encoder")
 
-    monkeypatch.setattr(mod, "_assert_seeded_model_matches", guard)
+    monkeypatch.setattr(mod, "store_model_version", guard)
     with pytest.raises(ValueError, match="different encoder"):
         _run()
     assert wired["ray_kwargs"] is None
@@ -1608,15 +1608,6 @@ def test_the_chained_fill_applies_the_rule_its_store_advertises(wired, monkeypat
     _run(zones=["33N"])
     assert built, "no InferenceConfig was built"
     assert {c.get("optical_min_obs") for c in built} == {25}, "the store's rule must reach every cell's config"
-
-
-@pytest.mark.parametrize("flag", [False, True])
-def test_the_stack_override_reaches_every_cells_config(wired, monkeypatch, flag) -> None:
-    """Assembly reads it off the config, the only route from this flow to the stack check."""
-    built: list[dict] = []
-    monkeypatch.setattr(mod, "build_inference_config", lambda **k: built.append(k) or SimpleNamespace(**k))
-    _run(zones=["33N"], allow_stack_mismatch=flag)
-    assert built and {c["allow_stack_mismatch"] for c in built} == {flag}
 
 
 def test_a_store_declaring_no_rule_leaves_the_config_unconstrained(wired, monkeypatch) -> None:

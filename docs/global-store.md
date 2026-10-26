@@ -29,8 +29,9 @@ The store records all of this in its root attributes, so you can check it agains
 `geoemb:model` (`https://geotessera.org/model/1.1`), `checkpoint_id`, `geoemb:gsd`,
 `geoemb:dimensions`, `geoemb:source_data` listing the Sentinel-2 and OPERA archives it read,
 `optical_min_obs`, the quality rule described below, and, where recorded, `inference_stack`, the
-model, checkpoint, PyTorch and CUDA that computed the embeddings (every published year: PyTorch 2.5.1 with
-CUDA 12.1). Each zone group adds its own `crs`, `proj:*` and `spatial:*` metadata, plus `years_complete` and `runs`, the fill behind each
+PyTorch and CUDA that computed the embeddings (every published year: PyTorch 2.5.1 with CUDA 12.1).
+Every write into the store must match all of these; moving the store to another PyTorch is a
+deliberate restamp after an equivalence check, not a flag. Each zone group adds its own `crs`, `proj:*` and `spatial:*` metadata, plus `years_complete` and `runs`, the fill behind each
 year. A year a targeted update has since rewritten in part also has `updates`, a list per year of
 which tiles each update rewrote: read `runs[year]`, then `updates[year]` in order
 ([`updates.md`](updates.md)).

@@ -52,11 +52,13 @@ from tessera_embeddings.inference.assembly import (
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, enumerate_chunks, filter_chunks_by_roi_mask
 from tessera_embeddings.inference.quantization import quantize_embeddings
 from tessera_embeddings.storage import shard_writer
-from tessera_embeddings.storage.conventions import STACK_ATTR
+from tessera_embeddings.storage.conventions import STACK_ATTR, library_stack
 from tessera_embeddings.storage.global_store import create_global_repo, create_layout_arrays, open_global_repo
 from tessera_embeddings.storage.time_axis import TIME_ENCODING
 from tessera_embeddings.storage.zarr_store import open_or_create_repo, open_store, plain_zarr_storage_options
-from tests.unit.inference_stack import OTHER_STACK, STACK
+from tests.unit.inference_stack import IDENTITY, OTHER_STACK, STACK, identity
+
+_V2_STACK = {**STACK, "model_version": "v2-large", "checkpoint_id": "v2_student_large"}
 
 
 def _dummy_scales(h: int, w: int) -> np.ndarray:
@@ -371,6 +373,7 @@ class TestAssembly:
             output_path=output,
             roi_zarr_path=_make_full_roi_mask(tmp_path, 8, 10),
             n_workers=1,
+            **IDENTITY,
         )
 
         # Read back assembled output (Icechunk store)
@@ -380,22 +383,21 @@ class TestAssembly:
         assert ds["embeddings"].shape == (1, 8, 10, EMBEDDING_DIM)
         assert "time" in ds.coords
 
-    def _assemble_on(self, tmp_path, stack, run_id, **kwargs) -> dict:
+    def _assemble_on(self, tmp_path, stack, run_id) -> dict:
         """Stage the 1x2 grid on *stack*, assemble it into the test's one store, and return its root attrs."""
         writer, output = ZarrWriter(str(tmp_path / "staging")), str(tmp_path / "output.zarr")
         for chunk in _GRID_1X2:
             emb, scales = _quantized_embeddings(np.random.default_rng(0), chunk.height, chunk.width)
             writer.write_chunk(chunk, emb, run_id, scales=scales, stack=stack)
         roi = _make_full_roi_mask(tmp_path, 5, 10)
-        writer.assemble(_GRID_1X2, 5, 10, run_id, output, roi_zarr_path=roi, n_workers=1, **kwargs)
+        writer.assemble(_GRID_1X2, 5, 10, run_id, output, roi_zarr_path=roi, n_workers=1, **identity(stack))
         return dict(zarr.open_group(open_global_repo(output).readonly_session(branch="main").store, mode="r").attrs)
 
     def test_the_store_keeps_its_first_writes_stack_and_refuses_another(self, tmp_path):
-        assert self._assemble_on(tmp_path, STACK, "first")[STACK_ATTR] == STACK
+        """The root records PyTorch and CUDA only: model and checkpoint are its geoemb:model and checkpoint_id."""
+        assert self._assemble_on(tmp_path, STACK, "first")[STACK_ATTR] == library_stack(STACK)
         with pytest.raises(ValueError, match="Refusing to write"):
             self._assemble_on(tmp_path, OTHER_STACK, "second")
-        overridden = self._assemble_on(tmp_path, OTHER_STACK, "third", allow_stack_mismatch=True)
-        assert overridden[STACK_ATTR] == STACK, "write-once, override or not"
 
     def test_a_store_without_the_record_takes_the_next_writes_stack(self, tmp_path):
         """A store written before stacks were recorded is stamped, not refused."""
@@ -403,7 +405,18 @@ class TestAssembly:
         session = open_global_repo(str(tmp_path / "output.zarr")).writable_session("main")
         del zarr.open_group(session.store, mode="a").attrs[STACK_ATTR]
         session.commit("a store from before the record")
-        assert self._assemble_on(tmp_path, OTHER_STACK, "second")[STACK_ATTR] == OTHER_STACK
+        assert self._assemble_on(tmp_path, OTHER_STACK, "second")[STACK_ATTR] == library_stack(OTHER_STACK)
+
+    def test_a_run_is_assembled_only_under_the_identity_it_was_staged_with(self, tmp_path):
+        """The run id varies with the checkpoint, so only a reused one can disagree; it is refused, never relabelled."""
+        writer, output = ZarrWriter(str(tmp_path / "staging")), str(tmp_path / "output.zarr")
+        for chunk in _GRID_1X2:
+            emb, scales = _quantized_embeddings(np.random.default_rng(0), chunk.height, chunk.width)
+            writer.write_chunk(chunk, emb, "run", scales=scales, stack=STACK)
+        roi = _make_full_roi_mask(tmp_path, 5, 10)
+        mpc = {**IDENTITY, "checkpoint_id": "tessera_v1_1_mpc_encoder"}
+        with pytest.raises(ValueError, match="Assemble it with the config that staged it"):
+            writer.assemble(_GRID_1X2, 5, 10, "run", output, roi_zarr_path=roi, n_workers=1, **mpc)
 
     def test_assemble_xarray_readable(self, tmp_path):
         """Assembled output must be readable with correct dims and coords."""
@@ -425,6 +438,7 @@ class TestAssembly:
             output_path=output,
             roi_zarr_path=_make_full_roi_mask(tmp_path, 5, 10),
             n_workers=1,
+            **IDENTITY,
         )
 
         ds = open_store(output)
@@ -458,6 +472,7 @@ class TestAssembly:
             compute_std=True,
             roi_zarr_path=_make_full_roi_mask(tmp_path, 4, 4),
             n_workers=1,
+            **IDENTITY,
         )
 
         ds = open_store(output)
@@ -493,6 +508,7 @@ class TestAssembly:
             roi_zarr_path=roi,
             run_started_at=datetime.datetime(2024, 6, 1, tzinfo=datetime.UTC),
             n_workers=1,
+            **IDENTITY,
         )
 
         emb2, scales2 = _quantized_embeddings(rng, 5, 5)
@@ -501,7 +517,7 @@ class TestAssembly:
             emb2,
             run_id="run2",
             scales=scales2,
-            stack={**STACK, "model_version": "v2-large", "checkpoint_id": "v2_student_large"},
+            stack=_V2_STACK,
         )
         with pytest.raises(ValueError, match="Refusing to append"):
             writer.assemble(
@@ -513,6 +529,7 @@ class TestAssembly:
                 roi_zarr_path=roi,
                 run_started_at=datetime.datetime(2025, 6, 1, tzinfo=datetime.UTC),
                 n_workers=1,
+                **identity(_V2_STACK),
             )
 
     def test_a_store_with_no_recorded_encoder_is_read_as_v11_not_waved_through(self, tmp_path):
@@ -542,6 +559,7 @@ class TestAssembly:
             roi_zarr_path=roi,
             run_started_at=datetime.datetime(2024, 6, 1, tzinfo=datetime.UTC),
             n_workers=1,
+            **IDENTITY,
         )
 
         # Strip the encoder identity to reproduce a store written before the attr existed.
@@ -557,7 +575,7 @@ class TestAssembly:
             emb2,
             run_id="v2run",
             scales=scales2,
-            stack={**STACK, "model_version": "v2-large", "checkpoint_id": "v2_student_large"},
+            stack=_V2_STACK,
         )
         with pytest.raises(ValueError, match="Refusing to append"):
             writer.assemble(
@@ -569,6 +587,7 @@ class TestAssembly:
                 roi_zarr_path=roi,
                 run_started_at=datetime.datetime(2025, 6, 1, tzinfo=datetime.UTC),
                 n_workers=1,
+                **identity(_V2_STACK),
             )
 
         # And the case that must KEEP working: v1.1 still appends to that same legacy store.
@@ -583,6 +602,7 @@ class TestAssembly:
             roi_zarr_path=roi,
             run_started_at=datetime.datetime(2026, 6, 1, tzinfo=datetime.UTC),
             n_workers=1,
+            **IDENTITY,
         )
 
     def test_the_same_encoder_appends_normally(self, tmp_path):
@@ -608,6 +628,7 @@ class TestAssembly:
                 roi_zarr_path=roi,
                 run_started_at=datetime.datetime(day, 6, 1, tzinfo=datetime.UTC),
                 n_workers=1,
+                **IDENTITY,
             )
 
         ds = open_store(output)
@@ -639,6 +660,7 @@ class TestAssembly:
             roi_zarr_path=roi,
             run_started_at=day1,
             n_workers=1,
+            **IDENTITY,
         )
 
         ds = open_store(output)
@@ -657,6 +679,7 @@ class TestAssembly:
             roi_zarr_path=roi,
             run_started_at=day2,
             n_workers=1,
+            **IDENTITY,
         )
 
         ds = open_store(output)
@@ -690,6 +713,7 @@ class TestAssembly:
             roi_zarr_path=roi,
             run_started_at=day,
             n_workers=1,
+            **IDENTITY,
         )
 
         emb2, scales2 = _quantized_embeddings(rng, 5, 5)
@@ -703,6 +727,7 @@ class TestAssembly:
             roi_zarr_path=roi,
             run_started_at=day,
             n_workers=1,
+            **IDENTITY,
         )
 
         ds = open_store(output)
@@ -734,6 +759,7 @@ class TestAssembly:
             roi_zarr_path=roi,
             run_started_at=day,
             n_workers=1,
+            **IDENTITY,
         )
 
         # Run 2, same date: chunk_0_1 now has zero valid pixels (skip marker).
@@ -749,6 +775,7 @@ class TestAssembly:
             roi_zarr_path=roi,
             run_started_at=day,
             n_workers=1,
+            **IDENTITY,
         )
 
         ds = open_store(output)
@@ -783,6 +810,7 @@ class TestAssembly:
             roi_zarr_path=_make_full_roi_mask(tmp_path, 5, 10),
             run_started_at=day,
             n_workers=1,
+            **IDENTITY,
         )
 
         # Run 2, same date: SHRUNKEN ROI (only cols 0-5). Only chunk_0_0 is staged;
@@ -798,6 +826,7 @@ class TestAssembly:
             roi_zarr_path=_make_partial_roi_mask(tmp_path, 5, 10, x_true_stop=5),
             run_started_at=day,
             n_workers=1,
+            **IDENTITY,
         )
 
         ds = open_store(output)
@@ -844,6 +873,7 @@ class TestAssembly:
                 output_path=output,
                 roi_zarr_path=roi,
                 n_workers=n_workers,
+                **IDENTITY,
             )
             outputs[name] = output
 
@@ -868,6 +898,7 @@ class TestAssembly:
                 output_path=str(tmp_path / "out.zarr"),
                 roi_zarr_path=roi,
                 n_workers=1,
+                **IDENTITY,
             )
         (rec,) = _assembly_summary_records(caplog)
         assert rec["run"] == "run1"
@@ -914,6 +945,7 @@ class TestAssembly:
             roi_zarr_path=roi,
             run_started_at=datetime.datetime(2024, 6, 1, tzinfo=datetime.UTC),
             n_workers=1,
+            **IDENTITY,
         )
 
         # Run 2 with std, at a later date
@@ -937,6 +969,7 @@ class TestAssembly:
             roi_zarr_path=roi,
             run_started_at=datetime.datetime(2025, 6, 1, tzinfo=datetime.UTC),
             n_workers=1,
+            **IDENTITY,
         )
 
         ds = open_store(output)
@@ -978,6 +1011,7 @@ class TestAssembly:
             roi_zarr_path=roi,
             run_started_at=started,
             n_workers=1,
+            **IDENTITY,
         )
 
         # Run 2: SAME date, WITHOUT std — embedding_std is now untouched and stale.
@@ -993,6 +1027,7 @@ class TestAssembly:
             roi_zarr_path=roi,
             run_started_at=started,
             n_workers=1,
+            **IDENTITY,
         )
 
         ds = open_store(output)
@@ -1031,6 +1066,7 @@ class TestAssembly:
             roi_zarr_path=roi,
             time_window=tw1,
             n_workers=1,
+            **IDENTITY,
         )
 
         ds1 = open_store(output)
@@ -1057,6 +1093,7 @@ class TestAssembly:
             roi_zarr_path=roi,
             time_window=tw2,
             n_workers=1,
+            **IDENTITY,
         )
 
         ds2 = open_store(output)
@@ -1096,6 +1133,7 @@ class TestAssembly:
             output_path=output,
             roi_zarr_path=_make_full_roi_mask(tmp_path, 8, 10),
             n_workers=1,
+            **IDENTITY,
         )
 
         ds = open_store(output)
@@ -1140,6 +1178,7 @@ class TestAssembly:
             output_path=output,
             roi_zarr_path=_make_full_roi_mask(tmp_path, 8, 10),
             n_workers=1,
+            **IDENTITY,
         )
 
         result = _assembled(output)
@@ -1171,6 +1210,7 @@ class TestAssembly:
             output_path=output,
             roi_zarr_path=_make_full_roi_mask(tmp_path, 5, 10),
             n_workers=1,
+            **IDENTITY,
         )
 
         ds = open_store(output)
@@ -1221,6 +1261,7 @@ class TestAssembly:
             output_path=output,
             roi_zarr_path=roi_path,
             n_workers=1,
+            **IDENTITY,
         )
 
         result = _assembled(output)
@@ -1263,6 +1304,7 @@ class TestAssembly:
             output_path=output,
             roi_zarr_path=roi_path,
             n_workers=1,
+            **IDENTITY,
         )
 
         ds = open_store(output)
@@ -1474,6 +1516,7 @@ class TestStagedLayout:
             output_path=output,
             roi_zarr_path=_make_full_roi_mask(tmp_path, 14, 16),
             n_workers=1,
+            **IDENTITY,
         )
 
         ds = open_store(output)
@@ -1490,6 +1533,7 @@ class TestStagedLayout:
             output_path=str(tmp_path / "output.zarr"),
             roi_zarr_path=_make_full_roi_mask(tmp_path, 8, 8),
             n_workers=1,
+            **IDENTITY,
         )
 
     def test_assemble_verifies_staged_completeness_itself(self, tmp_path):
@@ -1605,6 +1649,7 @@ class TestSingleRoiChainIsAligned:
             output_path=output,
             roi_zarr_path=roi_mask,
             n_workers=1,
+            **IDENTITY,
         )
         return staged, open_store(output)
 
@@ -1769,6 +1814,7 @@ class TestAssemblyValidation:
                 output_path=output,
                 roi_zarr_path=_make_full_roi_mask(tmp_path, 10, 10),
                 n_workers=1,
+                **IDENTITY,
             )
 
     def test_assemble_root_attrs(self, tmp_path):
@@ -1789,6 +1835,7 @@ class TestAssemblyValidation:
             output_path=output,
             roi_zarr_path=_make_full_roi_mask(tmp_path, 4, 4),
             n_workers=1,
+            **IDENTITY,
         )
 
         repo, _ = open_or_create_repo(output)
@@ -1813,7 +1860,8 @@ class TestAssemblyValidation:
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
         emb = np.random.default_rng(42).standard_normal((4, 4, EMBEDDING_DIM)).astype(np.float32)
         quantized, scales = quantize_embeddings(emb)
-        writer.write_chunk(chunk, quantized, run_id, scales=scales, stack={**STACK, "checkpoint_id": "test_model_v1"})
+        custom = {**STACK, "checkpoint_id": "test_model_v1"}
+        writer.write_chunk(chunk, quantized, run_id, scales=scales, stack=custom)
 
         writer.assemble(
             [chunk],
@@ -1824,6 +1872,7 @@ class TestAssemblyValidation:
             roi_zarr_path=_make_full_roi_mask(tmp_path, 4, 4),
             tile_id="33UWP",
             n_workers=1,
+            **identity(custom),
         )
 
         repo, _ = open_or_create_repo(output)
@@ -2284,7 +2333,7 @@ class TestAssembleGlobal:
             g.create_array(name, data=arr)
         _mark_staged_complete(path)  # assembly requires both completion signals
 
-    def _fill_on_stack(self, tmp_path, stack=STACK, *, root_attrs=None, **assemble_kwargs):
+    def _fill_on_stack(self, tmp_path, stack=STACK, *, root_attrs=None):
         """Fill one zone-year from a run staged on *stack*; return the store's root group.
 
         *root_attrs* are stamped on the root first, as a seed or an earlier write would have.
@@ -2299,21 +2348,21 @@ class TestAssembleGlobal:
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=self.TILE, x_start=0, x_stop=self.TILE)
         tile = np.ones((self.TILE, self.TILE, dim), dtype=np.int8)
         writer.write_chunk(chunk, tile, "runK", scales=np.ones((self.TILE, self.TILE), dtype=np.float32), stack=stack)
-        writer.assemble_global(store_path, self.ZONE, year=2025, run_id="runK", n_workers=1, **assemble_kwargs)
+        writer.assemble_global(store_path, self.ZONE, year=2025, run_id="runK", n_workers=1)
         return zarr.open_group(open_global_repo(store_path).readonly_session(branch="main").store, mode="r")
 
     def test_the_first_write_stamps_the_runs_stack(self, tmp_path):
         """From the run's record, not from this process: the driver runs the lockfile's CPU build."""
         assert STACK["torch"] != _dist_version("torch"), "the premise: the run's stack is not this process's"
         root = self._fill_on_stack(tmp_path)
-        assert root.attrs[STACK_ATTR] == STACK
+        assert root.attrs[STACK_ATTR] == library_stack(STACK)
         assert root[self.ZONE].attrs["years_complete"] == [2025]
 
     @pytest.mark.parametrize(
         ("stack", "root_attrs", "match"),
         [
-            (STACK, {STACK_ATTR: OTHER_STACK}, r"Refusing to write.*PyTorch 2\.14\.1"),
-            ({**STACK, "model_version": "v2-large", "checkpoint_id": "v2_student_large"}, None, "Refusing to append"),
+            (STACK, {STACK_ATTR: library_stack(OTHER_STACK)}, r"Refusing to write.*2\.14\.1"),
+            (_V2_STACK, None, "Refusing to append"),
             # A global seed records the checkpoint by file name; the run records its stem.
             (
                 {**STACK, "checkpoint_id": "tessera_v1_1_mpc_encoder"},
@@ -2332,42 +2381,35 @@ class TestAssembleGlobal:
         assert root.attrs.get(STACK_ATTR) == (root_attrs or {}).get(STACK_ATTR), "the stamp is untouched"
         assert not np.any(np.asarray(root[self.ZONE]["embeddings"][1])), "no shard may land"
 
-    def test_the_override_writes_and_the_store_keeps_its_stack(self, tmp_path):
-        root = self._fill_on_stack(tmp_path, root_attrs={STACK_ATTR: OTHER_STACK}, allow_stack_mismatch=True)
-        assert root[self.ZONE].attrs["years_complete"] == [2025]
-        assert root.attrs[STACK_ATTR] == OTHER_STACK, "write-once, override or not"
-
-    def test_a_second_stack_cannot_join_a_run(self, tmp_path):
-        """A resume on another checkpoint or PyTorch stops before staging anything into the run."""
+    def test_a_second_stack_cannot_join_a_run_and_leaves_no_trace(self, tmp_path):
+        """A resume on another checkpoint or PyTorch stops before staging anything, and the run keeps its record."""
         writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=8)
         tile, scales = np.ones((self.TILE, self.TILE, 8), dtype=np.int8), np.ones((self.TILE, self.TILE), np.float32)
         for col, stack in enumerate((STACK, {**STACK, "checkpoint_id": "tessera_v1_1_mpc_encoder"})):
             chunk = ChunkSpec(row=0, col=col, y_start=0, y_stop=self.TILE, x_start=0, x_stop=self.TILE)
             if col:
-                with pytest.raises(ValueError, match="already joined by another stack"):
+                with pytest.raises(ValueError, match="One run is computed by one stack"):
                     writer.write_chunk(chunk, tile, "runJ", scales=scales, stack=stack)
             else:
                 writer.write_chunk(chunk, tile, "runJ", scales=scales, stack=stack)
         assert not (tmp_path / "staging" / "runJ" / "chunk_0_1.zarr").exists()
+        assert writer.run_stack("runJ") == STACK
 
-    @pytest.mark.parametrize("records", [0, 2])
-    def test_assembly_needs_the_runs_one_record(self, tmp_path, records):
+    def test_assembly_refuses_a_run_with_no_record(self, tmp_path):
         writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=8)
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=self.TILE, x_start=0, x_stop=self.TILE)
         tile, scales = np.ones((self.TILE, self.TILE, 8), dtype=np.int8), np.ones((self.TILE, self.TILE), np.float32)
         writer.write_chunk(chunk, tile, "runR", scales=scales, stack=STACK)
-        stacks = tmp_path / "staging" / "runR" / "_stacks"
-        for record in stacks.iterdir():
-            record.unlink() if records == 0 else (stacks / "another.json").write_text(record.read_text())
-        with pytest.raises(ValueError, match=f"records {records} stacks"):
+        (tmp_path / "staging" / "runR" / "_stack.json").unlink()
+        with pytest.raises(ValueError, match="records no stack"):
             writer.run_stack("runR")
 
     def test_a_matching_stack_is_checked_without_a_commit(self, tmp_path):
         """What a rerun or the next fill meets: the stamp is already there and nothing is written."""
         repo = open_global_repo(self._seed_zone_repo(tmp_path, self.TILE, self.TILE, 8))
-        shard_writer.claim_root_stack(repo, STACK, allow_mismatch=False, where="s")
+        shard_writer.claim_root_stack(repo, STACK, where="s")
         stamped = repo.lookup_branch("main")
-        shard_writer.claim_root_stack(repo, STACK, allow_mismatch=False, where="s")
+        shard_writer.claim_root_stack(repo, STACK, where="s")
         assert repo.lookup_branch("main") == stamped
 
     @pytest.mark.parametrize("credentialled", [True, False])
@@ -2959,6 +3001,7 @@ class TestAssembleGuards:
             roi_zarr_path=_make_full_roi_mask(tmp_path, 8, 8),
             run_started_at=day,
             n_workers=1,
+            **IDENTITY,
         )
 
         small = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
@@ -2973,6 +3016,7 @@ class TestAssembleGuards:
                 roi_zarr_path=_make_full_roi_mask(tmp_path / "roi2", 4, 4),
                 run_started_at=datetime.datetime(2025, 6, 1, tzinfo=datetime.UTC),
                 n_workers=1,
+                **IDENTITY,
             )
 
     def test_append_refuses_a_reordered_interior_on_matching_endpoints(self, tmp_path, monkeypatch):
@@ -3007,6 +3051,7 @@ class TestAssembleGuards:
                 run_started_at=when,
                 n_workers=1,
                 mosaic_base=str(tmp_path / "mosaic"),
+                **IDENTITY,
             )
 
         _run("run1", datetime.datetime(2024, 6, 1, tzinfo=datetime.UTC), _make_full_roi_mask(tmp_path, 8, 8))
@@ -3042,6 +3087,7 @@ class TestAssembleGuards:
             roi_zarr_path=roi,
             run_started_at=datetime.datetime(2024, 6, 1, tzinfo=datetime.UTC),
             n_workers=1,
+            **IDENTITY,
         )
         ds = open_store(output)
         assert "s2_obs_count" not in ds
@@ -3058,6 +3104,7 @@ class TestAssembleGuards:
             roi_zarr_path=roi,
             run_started_at=datetime.datetime(2025, 6, 1, tzinfo=datetime.UTC),
             n_workers=1,
+            **IDENTITY,
         )
         ds = open_store(output)
         assert ds["s2_obs_count"].shape == (2, 6, 6)

@@ -334,7 +334,6 @@ def _write_update(
     run_id: str,
     results: list[dict[str, Any]],
     log: logging.Logger,
-    allow_stack_mismatch: bool,
 ) -> str:
     """Write an update's staged tiles into the store and record it there; return the snapshot.
 
@@ -362,7 +361,6 @@ def _write_update(
         pixels={c.label: c.pixels for c in chunks if c.pixels is not None and c.label in staged} or None,
         commit_attrs=partial(commit_update_record, record=record),
         log=log,
-        allow_stack_mismatch=allow_stack_mismatch,
     )
 
 
@@ -378,7 +376,6 @@ def _run_inference_and_assemble(
     model_version: ModelVersion,
     num_gpus: int,
     allow_s2_only: bool = False,
-    allow_stack_mismatch: bool = False,
     update: Mapping[str, Any] | None = None,
     log: logging.Logger,
 ) -> dict[str, Any]:
@@ -425,7 +422,6 @@ def _run_inference_and_assemble(
         num_gpus=num_gpus,
         model_version=model_version,
         allow_s2_only=allow_s2_only,
-        allow_stack_mismatch=allow_stack_mismatch,
     )
 
     chunks, total_y, total_x = enumerate_mosaic_chunks(mosaic_base, config.chunk_size or INFERENCE_CHUNK_SIZE, log)
@@ -524,7 +520,6 @@ def _run_inference_and_assemble(
             run_id=run_id,
             results=results,
             log=log,
-            allow_stack_mismatch=config.allow_stack_mismatch,
         )
     else:
         checkpoint_id = checkpoint_to_version(config.checkpoint_path)
@@ -549,7 +544,6 @@ def _run_inference_and_assemble(
             model_version=config.model_version,
             manifest=manifest,
             n_workers=AssemblyConfig().compute_n_workers(n_live),
-            allow_stack_mismatch=config.allow_stack_mismatch,
         )
 
     # Only after assemble RETURNS. A failed run keeps its staged tiles so the next attempt
@@ -606,7 +600,6 @@ def run_plain(
             min_valid_coverage: 20.0 # minimum SCL valid-pixel % to keep an S2 date; the CLI's
                                     # --min-valid-coverage overrides it
             allow_s2_only: false   # embed S2-valid pixels with zero S1 observations
-            allow_stack_mismatch: false # write into a store made on another PyTorch; experiments only
             n_workers: 2
             checkpoint_dir: null    # override model directory; null → {inputs}/models/
             checkpoint_url: null    # full checkpoint URI (s3://, https://, …); overrides checkpoint_dir
@@ -697,7 +690,6 @@ def run_plain(
         model_version=cfg.get("model_version", DEFAULT_MODEL_VERSION),
         num_gpus=num_gpus,
         allow_s2_only=cfg.get("allow_s2_only", False),
-        allow_stack_mismatch=cfg.get("allow_stack_mismatch", False),
         update=cfg.get("update"),
         log=log,
     )

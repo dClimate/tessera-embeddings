@@ -173,7 +173,7 @@ def test_the_newest_field_is_the_last_field() -> None:
     tripwire fires on an insertion and on an append alike, so whoever moves it has to look at
     where their field landed.
     """
-    assert fields(InferenceConfig)[-1].name == "allow_stack_mismatch"
+    assert fields(InferenceConfig)[-1].name == "model_version"
 
 
 def test_the_minimum_depth_rule_defaults_to_no_rule() -> None:
