@@ -69,16 +69,24 @@ def _fmt(x: float) -> str:
 
 
 def _header(rows: list[dict], run_id: str) -> list[str]:
-    """Render the run provenance header."""
+    """Render the run provenance header: one line per environment, naming its phases when there are several.
+
+    A run can be repeated from another client's environment under the same run id, so the
+    provenance is each row's, never the first row's for all.
+    """
     stamp = rows[0] if rows else {}
-    ic = stamp.get("icechunk", "?")
-    zr = stamp.get("zarr", "?")
-    sha = stamp.get("git_sha", "?")
+    envs: dict[tuple[str, str, str], set[str]] = {}
+    for r in rows:
+        envs.setdefault((r.get("icechunk", "?"), r.get("zarr", "?"), r.get("git_sha", "?")), set()).add(r["phase"])
+    lines = [
+        f"- icechunk **{ic}**, zarr **{zr}**, git `{sha}`" + (f": {', '.join(sorted(ph))}" if len(envs) > 1 else "")
+        for (ic, zr, sha), ph in sorted(envs.items())
+    ]
     return [
         f"# Scale-test report - run `{run_id}`",
         "",
         f"- backend: **{stamp.get('backend', '?')}**, scale: **{stamp.get('scale', '?')}**",
-        f"- icechunk **{ic}**, zarr **{zr}**, git `{sha}`",
+        *lines,
         f"- rows: {len(rows)}",
         "",
         "> Contention/latency numbers are only load-bearing on `--backend s3`.",
@@ -298,11 +306,13 @@ def _t9_value(rows: list[dict], metric: str, variant: str, **params: Any) -> flo
 
 
 def _t9_tables(rows: list[dict]) -> list[str]:
-    """Render T9's write table, one request-plan table per client, and the Dask table."""
-    arms = sorted({r["variant"] for r in _sel(rows, test="t9", phase="build", metric="encode_cpu_s")})
-    if not arms:
+    """Render T9's write table, one request-plan table per client, and the Dask table, each from its phase's rows."""
+    if not _sel(rows, test="t9"):
         return []
-    out = ["## T9 — v2 layout arms", "", "| arm | embeddings MB | ratio | encode CPU s/shard |", "|---|---|---|---|"]
+    arms = sorted({r["variant"] for r in _sel(rows, test="t9", phase="build", metric="encode_cpu_s")})
+    out = ["## T9 — v2 layout arms"]
+    if arms:
+        out += ["", "| arm | embeddings MB | ratio | encode CPU s/shard |", "|---|---|---|---|"]
     for a in arms:
         stored = sum(
             r["value"] for r in _sel(rows, test="t9", metric="bytes_written", array="embeddings") if r["variant"] == a
@@ -325,7 +335,9 @@ def _t9_tables(rows: list[dict]) -> list[str]:
             "| arm | " + " | ".join(c[0] for c in _T9_READS) + " |",
             "|---|" + "---|" * len(_T9_READS),
         ]
-        for a in arms:
+        for a in sorted(
+            {r["variant"] for r in _sel(rows, test="t9", phase=f"requests_{client}", metric="get_requests")}
+        ):
             cells = []
             for _, workload, dims in _T9_READS:
                 # The Dask phase records the same workload; the request plan is the requests phase's.

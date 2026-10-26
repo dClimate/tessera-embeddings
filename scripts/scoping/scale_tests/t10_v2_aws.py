@@ -150,11 +150,7 @@ def cold_read(payload: dict[str, Any]) -> dict[str, Any]:
     grp = zarr.open_group(store, mode="r")["zone"]
     emb, scl = grp["embeddings"], grp["scales"]
     out: dict[str, Any] = {"open_wall_s": time.monotonic() - t_open}
-    band_first = emb.metadata.dimension_names[1] == "band"
     workload, dims = payload["workload"], payload["dims"]
-
-    def window(ys: slice | int, xs: slice | int) -> tuple:
-        return (0, slice(0, dims), ys, xs) if band_first else (0, ys, xs, slice(0, dims))
 
     regions = {k: tuple(slice(*s) for s in v) for k, v in payload["regions"].items()}
     net0, t0 = psutil.net_io_counters().bytes_recv, time.monotonic()
@@ -162,7 +158,7 @@ def cold_read(payload: dict[str, Any]) -> dict[str, Any]:
         lat = []
         for y, x in payload["points"]:
             p0 = time.monotonic()
-            emb[window(y, x)] * scl[0, y, x]  # a dequantised prefix: two arrays, as a reader needs
+            V.read_window(emb, 0, y, x, slice(0, dims)) * scl[0, y, x]  # a dequantised prefix, as a reader reads
             lat.append(time.monotonic() - p0)
         ms = 1e3 * np.asarray(lat)
         # A 95% bootstrap interval on the median: a gate fails only if its interval clears the threshold.
@@ -179,13 +175,15 @@ def cold_read(payload: dict[str, Any]) -> dict[str, Any]:
         ds["embeddings"].isel(time=0, northing=ys, easting=xs, band=slice(0, dims)).data.compute()
     else:
         ys, xs = regions[workload]
-        emb[window(ys, xs)]
+        V.read_window(emb, 0, ys, xs, slice(0, dims))
         scl[0, ys, xs]
+    # Per read, as T9 records it: a point workload is many reads, one per probe.
+    reads = len(payload["points"]) if workload == "point" else 1
     out |= {
-        "wall_s": time.monotonic() - t0,
-        "requests": len(store.requests),
-        "bytes": sum(store.requests),
-        "wire_bytes": psutil.net_io_counters().bytes_recv - net0,
+        "wall_s": (time.monotonic() - t0) / reads,
+        "requests": len(store.requests) / reads,
+        "bytes": sum(store.requests) / reads,
+        "wire_bytes": (psutil.net_io_counters().bytes_recv - net0) / reads,
     }
     return out
 
@@ -369,11 +367,9 @@ def phase_verify(
         for var, ref_arr in ref.arrays():
             if ref_arr.ndim < 3:
                 continue
-            want = np.asarray(ref_arr[0, ys, xs])
+            want = V.read_window(ref_arr, 0, ys, xs)
             for arm, grp in others:
-                arr = cast(zarr.Array, grp[var])
-                band_first = arr.metadata.dimension_names[1] == "band"
-                got = np.asarray(arr[0, :, ys, xs]).transpose(1, 2, 0) if band_first else np.asarray(arr[0, ys, xs])
+                got = V.read_window(cast(zarr.Array, grp[var]), 0, ys, xs)
                 if not np.array_equal(want, got, equal_nan=want.dtype.kind == "f"):
                     mismatched[arm.name] += 1
                     logger.warning("verify %s: %s differs from C0 in shard (%d, %d)", arm.name, var, sy, sx)
@@ -395,26 +391,15 @@ def main() -> int:
     parser.add_argument("--staging", default=None, help="A staged run directory, for assemble.")
     parser.add_argument("--extent", default=None, help="The staged run's ROI extent 'ny,nx', for assemble.")
     parser.add_argument("--n-tiles", type=int, default=64)
-    parser.add_argument(
-        "--arms", default=None, help="Comma-separated finalist names, for assemble and verify; v2_c0 is always added."
-    )
     parser.add_argument("--prefix", default="t10", help="Store prefix to verify: t10 (build) or t10asm/p0.")
     args = parser.parse_args()
     cfg = harness.config_from_args(args)
     harness.configure_logging()
     phase, cfg = cfg.phase, dataclasses.replace(cfg, phase=None)  # run_phase filters on the name it is given
-    # The control comes with any custom selection: verification reads it as the reference, and every
-    # "vs C0" ratio divides by it. The library's assembly writes zarr's default order and stages band-last
-    # tiles, so by default it carries neither a non-default write order nor a band-first array; those arms'
+    # Each phase runs the arms it can. The library's assembly writes zarr's default order and stages
+    # band-last tiles, so it carries neither a non-default write order nor a band-first array; those arms'
     # write cost comes from `build`.
-    by_name, control = {a.name: a for a in FINALISTS}, FINALISTS[0]
-    chosen = [control, *(by_name[n] for n in args.arms.split(",") if n != control.name)] if args.arms else None
-    assembled = chosen or [a for a in FINALISTS if a.write_order == "morton" and not a.band_first]
-    if phase == "assemble" and (band_first := [a.name for a in assembled if a.band_first]):
-        raise SystemExit(
-            f"--arms names band-first arms {band_first}, but the library's assembly writes band-last arrays "
-            "only until ADR 031's implementation lands; leave them out"
-        )
+    assembled = [a for a in FINALISTS if a.write_order == "morton" and not a.band_first]
     if phase == "build":
         harness.run_phase(cfg, TEST, "build", lambda: phase_build(cfg, args.tiles, args.workers))
     elif phase == "read":
@@ -450,7 +435,7 @@ def main() -> int:
         if args.staging:  # an assembled set: the tiles assembly wrote, in the arms it wrote them to
             shards, arms = [parse_chunk_label(label) for label in _picks(args.staging, args.n_tiles)], assembled
         else:  # a built set: two full cycles of the tiles, each tile in two places
-            shards, arms = [divmod(i, _side(cfg)) for i in range(min(16, _side(cfg) ** 2))], chosen or FINALISTS
+            shards, arms = [divmod(i, _side(cfg)) for i in range(min(16, _side(cfg) ** 2))], FINALISTS
         name = f"verify_{args.prefix.replace('/', '_')}"
         harness.run_phase(cfg, TEST, name, lambda: phase_verify(cfg, name, args.prefix, shards, arms))
     else:

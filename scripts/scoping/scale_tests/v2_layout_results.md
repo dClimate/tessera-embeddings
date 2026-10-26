@@ -1,9 +1,10 @@
 # Scale-test report — the v2 store layout (T9, T10)
 
 The records behind [ADR 031](../../../context_docs/decisions/031-the-v2-store-chunks-the-band-axis-at-16.md).
-Each run's section is `report.py` output for that run, under its own provenance. The hand-written
-sections at the end cover a run whose records exist only in its log, and the microbenchmarks behind
-the ADR's inference and reader figures.
+Each run's section is `report.py` output for that run, under its own provenance. Point reads are per
+probe: these runs recorded each 300-probe batch's total, divided by 300 here, as T10 now records it.
+The hand-written sections at the end cover a run whose records exist only in its log, and the
+microbenchmarks behind the ADR's inference and reader figures.
 
 | run | test | host | clients | code |
 |---|---|---|---|---|
@@ -33,7 +34,8 @@ chunk, and `bandfirst` the `(time, band, northing, easting)` dimension order.
 ## T9 — Iowa (`t9iowa`)
 
 - backend: **local**, scale: **bench**
-- icechunk **2.3.0**, zarr **3.4.1**, git `f1242f88`
+- icechunk **2.1.1**, zarr **3.2.1**, git `f1242f88`: requests_zarr3.2
+- icechunk **2.3.0**, zarr **3.4.1**, git `f1242f88`: build, dask_zarr3.4, requests_zarr3.4
 - rows: 5184
 
 > Contention/latency numbers are only load-bearing on `--backend s3`.
@@ -159,7 +161,8 @@ chunk, and `bandfirst` the `(time, band, northing, easting)` dimension order.
 ## T9 — Puget Sound (`t9puget`)
 
 - backend: **local**, scale: **bench**
-- icechunk **2.3.0**, zarr **3.4.1**, git `f1242f88`
+- icechunk **2.1.1**, zarr **3.2.1**, git `f1242f88`: requests_zarr3.2
+- icechunk **2.3.0**, zarr **3.4.1**, git `f1242f88`: build, dask_zarr3.4, requests_zarr3.4
 - rows: 5184
 
 > Contention/latency numbers are only load-bearing on `--backend s3`.
@@ -285,7 +288,8 @@ chunk, and `bandfirst` the `(time, band, northing, easting)` dimension order.
 ## T10 — band-last finalists (`v2b`)
 
 - backend: **s3**, scale: **bench**
-- icechunk **2.3.0**, zarr **3.4.1**, git `unknown`
+- icechunk **2.1.1**, zarr **3.2.1**, git `unknown`: read_zarr3.2
+- icechunk **2.3.0**, zarr **3.4.1**, git `unknown`: assemble, build, read_zarr3.4
 - rows: 1174
 
 > Contention/latency numbers are only load-bearing on `--backend s3`.
@@ -303,21 +307,21 @@ chunk, and `bandfirst` the `(time, band, northing, easting)` dimension order.
 
 | arm | point 16 p50 | point 128 p50 | tile 16 | bulk 16 | bulk 128 | 8x8 pull 16 | 8x8 pull 64 | 8x8 pull 128 | dask default | dask aligned |
 |---|---|---|---|---|---|---|---|---|---|---|
-| v2_b2_zstd1_s256 | 335 ms (1209) | 426 ms (8222) | 1.8 s (39) | 0.7 s (233) | 3.4 s (1560) | 5.1 s (3788) | 17.4 s (12695) | 45.3 s (25075) | 9.1 s (3583) | 4.8 s (3611) |
-| v2_c0 | 460 ms (2146) | 451 ms (2146) | 4.5 s (189) | 2.0 s (1603) | 2.5 s (1592) | 19.9 s (25786) | 22.5 s (25894) | 25.7 s (25939) | 41.7 s (25668) | 19.6 s (25526) |
-| v2_c2_zstd1_T_colexicographic_s256 | 369 ms (993) | 1464 ms (6592) | 2.1 s (31) | 1.8 s (195) | 3.6 s (1252) | 11.7 s (3096) | 37.9 s (10662) | 43.6 s (20038) | 9.6 s (2932) | 7.7 s (2944) |
-| v2_c2_zstd1_T_s256 | 372 ms (996) | 1304 ms (6585) | 2.1 s (32) | 2.8 s (197) | 3.4 s (1253) | 13.2 s (3080) | 37.6 s (10660) | 43.9 s (19936) | 10.4 s (2909) | 8.7 s (2938) |
-| v2_c2_zstd1_s256 | 390 ms (1207) | 1434 ms (8224) | 2.3 s (38) | 2.3 s (236) | 3.6 s (1550) | 13.4 s (3765) | 40.2 s (12601) | 44.2 s (25112) | 11.0 s (3595) | 8.0 s (3618) |
+| v2_b2_zstd1_s256 | 335 ms (4) | 426 ms (27) | 1.8 s (39) | 0.7 s (233) | 3.4 s (1560) | 5.1 s (3788) | 17.4 s (12695) | 45.3 s (25075) | 9.1 s (3583) | 4.8 s (3611) |
+| v2_c0 | 460 ms (7) | 451 ms (7) | 4.5 s (189) | 2.0 s (1603) | 2.5 s (1592) | 19.9 s (25786) | 22.5 s (25894) | 25.7 s (25939) | 41.7 s (25668) | 19.6 s (25526) |
+| v2_c2_zstd1_T_colexicographic_s256 | 369 ms (3) | 1464 ms (22) | 2.1 s (31) | 1.8 s (195) | 3.6 s (1252) | 11.7 s (3096) | 37.9 s (10662) | 43.6 s (20038) | 9.6 s (2932) | 7.7 s (2944) |
+| v2_c2_zstd1_T_s256 | 372 ms (3) | 1304 ms (22) | 2.1 s (32) | 2.8 s (197) | 3.4 s (1253) | 13.2 s (3080) | 37.6 s (10660) | 43.9 s (19936) | 10.4 s (2909) | 8.7 s (2938) |
+| v2_c2_zstd1_s256 | 390 ms (4) | 1434 ms (27) | 2.3 s (38) | 2.3 s (236) | 3.6 s (1550) | 13.4 s (3765) | 40.2 s (12601) | 44.2 s (25112) | 11.0 s (3595) | 8.0 s (3618) |
 
 ### T10 — cold reads from S3, zarr3.4 (median of passes; wire MB in brackets)
 
 | arm | point 16 p50 | point 128 p50 | tile 16 | bulk 16 | bulk 128 | 8x8 pull 16 | 8x8 pull 64 | 8x8 pull 128 | dask default | dask aligned |
 |---|---|---|---|---|---|---|---|---|---|---|
-| v2_b2_zstd1_s256 | 380 ms (1215) | 453 ms (8202) | 0.8 s (39) | 0.7 s (234) | 3.2 s (1546) | 5.0 s (3784) | 16.3 s (12588) | 44.4 s (24923) | 9.1 s (3612) | 4.8 s (3601) |
-| v2_c0 | 460 ms (2156) | 467 ms (2135) | 0.8 s (187) | 2.2 s (1601) | 2.4 s (1597) | 19.5 s (25969) | 22.6 s (25779) | 28.0 s (25858) | 46.5 s (25614) | 19.7 s (25593) |
-| v2_c2_zstd1_T_colexicographic_s256 | 433 ms (999) | 502 ms (6576) | 0.7 s (31) | 0.8 s (198) | 3.3 s (1255) | 5.7 s (3097) | 19.0 s (10670) | 42.1 s (19982) | 10.6 s (2944) | 5.9 s (2950) |
-| v2_c2_zstd1_T_s256 | 427 ms (992) | 500 ms (6602) | 0.8 s (32) | 0.8 s (199) | 3.4 s (1251) | 6.0 s (3127) | 19.0 s (10581) | 42.5 s (19985) | 11.1 s (2944) | 5.5 s (2954) |
-| v2_c2_zstd1_s256 | 423 ms (1200) | 531 ms (8223) | 0.6 s (39) | 0.7 s (236) | 3.5 s (1538) | 5.6 s (3767) | 19.1 s (12666) | 42.4 s (24997) | 11.4 s (3611) | 5.2 s (3628) |
+| v2_b2_zstd1_s256 | 380 ms (4) | 453 ms (27) | 0.8 s (39) | 0.7 s (234) | 3.2 s (1546) | 5.0 s (3784) | 16.3 s (12588) | 44.4 s (24923) | 9.1 s (3612) | 4.8 s (3601) |
+| v2_c0 | 460 ms (7) | 467 ms (7) | 0.8 s (187) | 2.2 s (1601) | 2.4 s (1597) | 19.5 s (25969) | 22.6 s (25779) | 28.0 s (25858) | 46.5 s (25614) | 19.7 s (25593) |
+| v2_c2_zstd1_T_colexicographic_s256 | 433 ms (3) | 502 ms (22) | 0.7 s (31) | 0.8 s (198) | 3.3 s (1255) | 5.7 s (3097) | 19.0 s (10670) | 42.1 s (19982) | 10.6 s (2944) | 5.9 s (2950) |
+| v2_c2_zstd1_T_s256 | 427 ms (3) | 500 ms (22) | 0.8 s (32) | 0.8 s (199) | 3.4 s (1251) | 6.0 s (3127) | 19.0 s (10581) | 42.5 s (19985) | 11.1 s (2944) | 5.5 s (2954) |
+| v2_c2_zstd1_s256 | 423 ms (4) | 531 ms (27) | 0.6 s (39) | 0.7 s (236) | 3.5 s (1538) | 5.6 s (3767) | 19.1 s (12666) | 42.4 s (24997) | 11.4 s (3611) | 5.2 s (3628) |
 
 ## T10 — reader settings (`tune`, from the run log)
 
@@ -353,7 +357,8 @@ Wall seconds; two values are passes 0 and 1.
 ## T10 — band-first and band-last finalists, one session (`v2c`)
 
 - backend: **s3**, scale: **bench**
-- icechunk **2.3.0**, zarr **3.4.1**, git `unknown`
+- icechunk **2.1.1**, zarr **3.2.1**, git `unknown`: points_zarr3.2, read_zarr3.2
+- icechunk **2.3.0**, zarr **3.4.1**, git `unknown`: build, points_zarr3.4, read_zarr3.4, verify, verify_t10
 - rows: 1325
 
 > Contention/latency numbers are only load-bearing on `--backend s3`.
@@ -373,23 +378,23 @@ Wall seconds; two values are passes 0 and 1.
 
 | arm | point 16 p50 | point 128 p50 | bulk 128 | 8x8 pull 16 | 8x8 pull 64 | 8x8 pull 128 | dask default |
 |---|---|---|---|---|---|---|---|
-| v2_b2_zstd1_s256 | 331 ms (1207) | 414 ms (8217) | 3.5 s (1541) | 5.0 s (3733) | 18.2 s (12651) | 47.0 s (24927) | 9.1 s (3630) |
-| v2_b2f_bandfirst_zstd1_s256 | 305 ms (994) | 420 ms (6580) | 2.2 s (1252) | 5.2 s (3122) | 15.1 s (10689) | 27.8 s (20058) | 8.4 s (2937) |
-| v2_c0 | 405 ms (2159) | 472 ms (2141) | 2.6 s (1601) | 19.9 s (25718) | 23.8 s (25923) | 30.0 s (25701) | 40.9 s (25653) |
-| v2_c2_zstd1_T_s256 | 359 ms (993) | 1237 ms (6599) | 3.8 s (1250) | 12.3 s (3102) | 37.8 s (10654) | 46.3 s (19865) | 10.5 s (2949) |
-| v2_c2_zstd1_s256 | 382 ms (1209) | 1474 ms (8218) | 3.9 s (1538) | 13.3 s (3767) | 39.9 s (12578) | 47.3 s (25095) | 10.6 s (3593) |
-| v2_c2f_bandfirst_zstd1_s256 | 332 ms (994) | 1132 ms (6577) | 2.6 s (1244) | 14.1 s (3090) | 36.8 s (10622) | 29.0 s (19765) | 11.3 s (2913) |
+| v2_b2_zstd1_s256 | 331 ms (4) | 414 ms (27) | 3.5 s (1541) | 5.0 s (3733) | 18.2 s (12651) | 47.0 s (24927) | 9.1 s (3630) |
+| v2_b2f_bandfirst_zstd1_s256 | 305 ms (3) | 420 ms (22) | 2.2 s (1252) | 5.2 s (3122) | 15.1 s (10689) | 27.8 s (20058) | 8.4 s (2937) |
+| v2_c0 | 405 ms (7) | 472 ms (7) | 2.6 s (1601) | 19.9 s (25718) | 23.8 s (25923) | 30.0 s (25701) | 40.9 s (25653) |
+| v2_c2_zstd1_T_s256 | 359 ms (3) | 1237 ms (22) | 3.8 s (1250) | 12.3 s (3102) | 37.8 s (10654) | 46.3 s (19865) | 10.5 s (2949) |
+| v2_c2_zstd1_s256 | 382 ms (4) | 1474 ms (27) | 3.9 s (1538) | 13.3 s (3767) | 39.9 s (12578) | 47.3 s (25095) | 10.6 s (3593) |
+| v2_c2f_bandfirst_zstd1_s256 | 332 ms (3) | 1132 ms (22) | 2.6 s (1244) | 14.1 s (3090) | 36.8 s (10622) | 29.0 s (19765) | 11.3 s (2913) |
 
 ### T10 — cold reads from S3, zarr3.4 (median of passes; wire MB in brackets)
 
 | arm | point 16 p50 | point 128 p50 | bulk 128 | 8x8 pull 16 | 8x8 pull 64 | 8x8 pull 128 | dask default |
 |---|---|---|---|---|---|---|---|
-| v2_b2_zstd1_s256 | 348 ms (1205) | 424 ms (8213) | 3.5 s (1545) | 5.0 s (3763) | 18.0 s (12577) | 48.5 s (24960) | 9.0 s (3584) |
-| v2_b2f_bandfirst_zstd1_s256 | 324 ms (993) | 391 ms (6574) | 2.2 s (1255) | 4.9 s (3092) | 14.7 s (10707) | 27.7 s (19921) | 8.6 s (2952) |
-| v2_c0 | 442 ms (2138) | 419 ms (2151) | 2.8 s (1597) | 20.2 s (25873) | 24.2 s (25651) | 27.9 s (25772) | 43.4 s (25539) |
-| v2_c2_zstd1_T_s256 | 367 ms (991) | 443 ms (6568) | 3.8 s (1249) | 6.2 s (3127) | 20.5 s (10655) | 47.2 s (19995) | 11.2 s (2926) |
-| v2_c2_zstd1_s256 | 382 ms (1205) | 457 ms (8226) | 3.9 s (1551) | 5.4 s (3795) | 20.1 s (12657) | 48.1 s (25162) | 11.5 s (3593) |
-| v2_c2f_bandfirst_zstd1_s256 | 366 ms (994) | 460 ms (6544) | 2.8 s (1248) | 5.5 s (3115) | 16.7 s (10677) | 29.4 s (19931) | 11.7 s (2945) |
+| v2_b2_zstd1_s256 | 348 ms (4) | 424 ms (27) | 3.5 s (1545) | 5.0 s (3763) | 18.0 s (12577) | 48.5 s (24960) | 9.0 s (3584) |
+| v2_b2f_bandfirst_zstd1_s256 | 324 ms (3) | 391 ms (22) | 2.2 s (1255) | 4.9 s (3092) | 14.7 s (10707) | 27.7 s (19921) | 8.6 s (2952) |
+| v2_c0 | 442 ms (7) | 419 ms (7) | 2.8 s (1597) | 20.2 s (25873) | 24.2 s (25651) | 27.9 s (25772) | 43.4 s (25539) |
+| v2_c2_zstd1_T_s256 | 367 ms (3) | 443 ms (22) | 3.8 s (1249) | 6.2 s (3127) | 20.5 s (10655) | 47.2 s (19995) | 11.2 s (2926) |
+| v2_c2_zstd1_s256 | 382 ms (4) | 457 ms (27) | 3.9 s (1551) | 5.4 s (3795) | 20.1 s (12657) | 48.1 s (25162) | 11.5 s (3593) |
+| v2_c2f_bandfirst_zstd1_s256 | 366 ms (3) | 460 ms (22) | 2.8 s (1248) | 5.5 s (3115) | 16.7 s (10677) | 29.4 s (19931) | 11.7 s (2945) |
 
 ### T10 — point reads, p50 [95% interval] by pass (0, 1), zarr3.2
 

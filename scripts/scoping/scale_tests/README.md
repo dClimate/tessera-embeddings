@@ -115,6 +115,10 @@ transpose, the inner-chunk order within a shard, and the `scales` geometry.
 **Requests are counted by a store wrapper** that also intercepts zarr ≥ 3.3's merged-range path.
 `WrapperStore` would otherwise forward it unseen, and so would zarr 3.4's sync path.
 
+**Two rules hold for T9 and T10 alike.** Every read quantity is recorded per read: a point workload
+is many reads, one per probe. And readers take an array's band order from its dimension names
+(`variants.read_window`), so one reader serves band-last and band-first stores.
+
 **Request plans carry over to S3, but latency does not.** The requests depend only on zarr's
 sharding codec, so they hold on S3. Latency depends on the network, so T10 measures the finalists
 there. Run the `requests` phase under both the library's zarr and an old client: zarr 3.3 changed
@@ -134,9 +138,7 @@ Each phase runs on its own in-region EC2 box, writing throwaway repos under the 
 - **`assemble`** (Graviton, like the assembly runner). Staged v2 tiles are written into each
   band-last finalist by the library's own `shard_writer.write_year_shards` over a
   `StagedShardSource`, every array included. Band-first arms are left out because the library
-  stages tiles band-last; their encode cost comes from `build` on a Graviton box instead. `--arms`
-  picks finalists for `assemble` and `verify`; the control, `v2_c0`, is always added, and band-first
-  arms are refused.
+  stages tiles band-last; their encode cost comes from `build` on a Graviton box instead.
 
 ### Common flags (every `tN` script)
 
@@ -147,7 +149,7 @@ Each phase runs on its own in-region EC2 box, writing throwaway repos under the 
 | `--scale` | `tiny` (default, laptop) or `bench` (real numbers) |
 | `--bucket` | S3 bucket, required with `--backend s3`. Accepts a bare name, `bucket/prefix`, or `s3://bucket/prefix`; a prefix becomes the default `--store-root`, and both the stores and the S3 results mirror are scoped under it (T7 uses the bare bucket name). |
 | `--variant` | restrict to one variant (T1) |
-| `--phase` | run a single phase by name |
+| `--phase` | run a single phase by name; a phase recorded per client (`requests_zarr3.4`) also answers to its plain name |
 | `--results-dir` / `--store-root` | override output/store locations |
 
 Every phase is idempotent: a completed phase writes a `<phase>.done` marker and
