@@ -786,6 +786,7 @@ is recorded as its own signal, *after* the store is fully written:
                 coverage = {…}                    this shard's refusal reasons and depth
                     ↓
                 inference_stack = {…}             the PyTorch and CUDA that computed it
+                inference_model = {…}             the model and checkpoint that computed it
                     ↓
                 staged_complete = True            in-store attribute
                     ↓
@@ -962,6 +963,15 @@ whose tile staged nothing is kept, not cleared; in `holes` mode each staged tile
 the worker reading the shard already in the store and replacing only its hole pixels, in every
 array; and the second commit appends the update's record to the group's `updates` attr instead of
 advancing `years_complete` and `runs`. No zone-year tag is created.
+
+**One model per store.** The actor also records the model and checkpoint stem it ran on every
+tile, as `inference_model`. The global write path reads it off the probe tile and holds it to the
+root's `geoemb:model` and `checkpoint_id` before anything is written
+(`conventions.assert_model_matches`; a root without `geoemb:model` reads as v1.1, and checkpoints
+compare as stems). Every write into a store passes there, so the check holds for the Prefect
+flows, a direct `runners.zone_fill` call and the plain runner's updates alike, and is held to what
+the tiles contain rather than to what a caller passed. The fill flows run the same function before
+any GPU is provisioned, only to fail early. `allow_model_mismatch` is the deliberate override.
 
 **One library stack per store** ([ADR 025](../../../context_docs/decisions/025-library-upgrades-ship-on-measured-usability-at-a-store-boundary.md)
 rule 2). The inference actor records the PyTorch and CUDA it runs on every tile it stages, as
