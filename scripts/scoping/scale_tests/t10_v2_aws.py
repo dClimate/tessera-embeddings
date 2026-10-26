@@ -395,18 +395,26 @@ def main() -> int:
     parser.add_argument("--staging", default=None, help="A staged run directory, for assemble.")
     parser.add_argument("--extent", default=None, help="The staged run's ROI extent 'ny,nx', for assemble.")
     parser.add_argument("--n-tiles", type=int, default=64)
-    parser.add_argument("--arms", default=None, help="Comma-separated finalist names, for assemble and verify.")
+    parser.add_argument(
+        "--arms", default=None, help="Comma-separated finalist names, for assemble and verify; v2_c0 is always added."
+    )
     parser.add_argument("--prefix", default="t10", help="Store prefix to verify: t10 (build) or t10asm/p0.")
     args = parser.parse_args()
     cfg = harness.config_from_args(args)
     harness.configure_logging()
     phase, cfg = cfg.phase, dataclasses.replace(cfg, phase=None)  # run_phase filters on the name it is given
-    # The library's assembly code writes zarr's default order and stages band-last tiles, so by default it
-    # carries neither a non-default write order nor a band-first array; those arms' write cost comes from
-    # `build`, unless --arms names them for a library that can write them.
-    by_name = {a.name: a for a in FINALISTS}
-    chosen = [by_name[n] for n in args.arms.split(",")] if args.arms else None
+    # The control comes with any custom selection: verification reads it as the reference, and every
+    # "vs C0" ratio divides by it. The library's assembly writes zarr's default order and stages band-last
+    # tiles, so by default it carries neither a non-default write order nor a band-first array; those arms'
+    # write cost comes from `build`.
+    by_name, control = {a.name: a for a in FINALISTS}, FINALISTS[0]
+    chosen = [control, *(by_name[n] for n in args.arms.split(",") if n != control.name)] if args.arms else None
     assembled = chosen or [a for a in FINALISTS if a.write_order == "morton" and not a.band_first]
+    if phase == "assemble" and (band_first := [a.name for a in assembled if a.band_first]):
+        raise SystemExit(
+            f"--arms names band-first arms {band_first}, but the library's assembly writes band-last arrays "
+            "only until ADR 031's implementation lands; leave them out"
+        )
     if phase == "build":
         harness.run_phase(cfg, TEST, "build", lambda: phase_build(cfg, args.tiles, args.workers))
     elif phase == "read":

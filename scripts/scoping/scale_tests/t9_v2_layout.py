@@ -10,9 +10,10 @@ the layout decision needs that does not depend on the network:
   on zarr's sharding codec; latency does not, which is what T1 measures;
 * **decode CPU** per workload, and the **Dask graph** a reader's default chunking builds.
 
-Stores are written by the library's own environment. The ``requests`` phase is named for the
+Stores are written by the library's own environment. The ``requests`` phase is recorded under the
 zarr version that runs it, so the same run can be repeated by an old client (zarr 3.2.1 +
-icechunk 2.1.1) against the same stores. Run from the REPOSITORY ROOT::
+icechunk 2.1.1) against the same stores; ``--phase requests`` or ``--phase dask`` selects the
+running client's. Run from the REPOSITORY ROOT::
 
     python -m scripts.scoping.scale_tests.t9_v2_layout --run-id v2a --tiles <dir>
     <old-venv>/bin/python -m scripts.scoping.scale_tests.t9_v2_layout --run-id v2a --tiles <dir>
@@ -25,6 +26,7 @@ tiny scale smokes on synthetic data.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import logging
 import time
 from collections.abc import AsyncIterator, Callable
@@ -123,7 +125,8 @@ def phase_fetch(source: str, profile: str, tiles: Path, n_tiles: int) -> None:
 
     The tiles are spread evenly, in grid order, over every tile holding any embedding, rather than
     taken fullest-first: in a uniform area the fullest tiles cluster, and a coast's partial tiles
-    are what the elision and compression of a real zone depend on. Opens the store with static
+    are what the elision and compression of a real zone depend on. A band-first store's tiles are
+    transposed to the ``(y, x, band)`` every later phase reads. Opens the store with static
     credentials from ``profile``: Icechunk's provider chain skips environment credentials, so the
     library's own opener fails from a laptop.
     """
@@ -142,6 +145,7 @@ def phase_fetch(source: str, profile: str, tiles: Path, n_tiles: int) -> None:
     )
     root = zarr.open_group(icechunk.Repository.open(storage).readonly_session(branch="main").store, mode="r")
     scales, emb = root["scales"], root["embeddings"]
+    band_first = emb.metadata.dimension_names[1] == "band"  # as T10's reader decides it
     _, ny, nx = scales.shape
     windows = [(y, x) for y in range(0, ny - TILE + 1, TILE) for x in range(0, nx - TILE + 1, TILE)]
     valid = {(y, x): int(np.isfinite(scales[0, y : y + TILE : 64, x : x + TILE : 64]).sum()) for y, x in windows}
@@ -153,7 +157,11 @@ def phase_fetch(source: str, profile: str, tiles: Path, n_tiles: int) -> None:
     for stale in (*tiles.glob("emb_*.npy"), *tiles.glob("scales_*.npy")):
         stale.unlink()
     for i, (y, x) in enumerate(picks):
-        np.save(tiles / f"emb_{i:03d}.npy", np.asarray(emb[0, y : y + TILE, x : x + TILE]))
+        if band_first:
+            block = np.asarray(emb[0, :, y : y + TILE, x : x + TILE]).transpose(1, 2, 0)
+        else:
+            block = np.asarray(emb[0, y : y + TILE, x : x + TILE])
+        np.save(tiles / f"emb_{i:03d}.npy", block)
         np.save(tiles / f"scales_{i:03d}.npy", np.asarray(scales[0, y : y + TILE, x : x + TILE]))
         logger.info("fetched tile %d at (%d, %d), %d%% valid", i, y, x, 100 * valid[(y, x)] // (TILE // 64) ** 2)
 
@@ -305,10 +313,23 @@ def main() -> int:
     if cfg.phase == "fetch":
         phase_fetch(args.source, args.profile, args.tiles, args.n_tiles)
         return 0
-    if tuple(int(p) for p in zarr.__version__.split(".")[:2]) >= (3, 4):
+    # Phases are recorded per client (`requests_zarr3.4`), and --phase takes the plain name for the
+    # running client's. Anything else would match no phase and exit having measured nothing.
+    wanted = cfg.phase.removesuffix(f"_{CLIENT}") if cfg.phase else None
+    new_zarr = tuple(int(p) for p in zarr.__version__.split(".")[:2]) >= (3, 4)
+    if wanted not in (None, "build", "dask", "requests"):
+        raise SystemExit(f"--phase must be fetch, build, dask or requests, not {cfg.phase!r}")
+    if wanted in ("build", "dask") and not new_zarr:
+        raise SystemExit(f"--phase {wanted} runs on the library's own zarr (3.4 or later), not {CLIENT}")
+    cfg = dataclasses.replace(cfg, phase=None)  # run_phase filters on the name it is given
+    if new_zarr and wanted in (None, "build"):
         harness.run_phase(cfg, TEST, "build", lambda: phase_build(cfg, args.tiles))
+    if new_zarr and wanted in (None, "dask"):
         harness.run_phase(cfg, TEST, f"dask_{CLIENT}", lambda: phase_dask(cfg, f"dask_{CLIENT}"))
-    harness.run_phase(cfg, TEST, f"requests_{CLIENT}", lambda: phase_requests(cfg, f"requests_{CLIENT}", args.points))
+    if wanted in (None, "requests"):
+        harness.run_phase(
+            cfg, TEST, f"requests_{CLIENT}", lambda: phase_requests(cfg, f"requests_{CLIENT}", args.points)
+        )
     logger.info("T9 complete under %s.", CLIENT)
     return 0
 
