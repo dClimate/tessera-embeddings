@@ -127,8 +127,8 @@ store carries the [`proj:`](https://github.com/zarr-conventions/proj) and
 CRS/affine metadata, plus the
 [`geoemb:` geoembeddings convention](https://github.com/geo-embeddings/embeddings-zarr-convention)
 for encoder-model provenance and quantization. Each registration is exactly the object its
-convention's schema requires. For tools that open one array at a time, every spatial array also
-repeats `spatial:dimensions`, and the `northing`/`easting` coordinate arrays carry CF
+convention's schema requires. Every spatial array also repeats `spatial:dimensions`, as the
+spatial spec requires (the transform and CRS stay on the group), and the `northing`/`easting` coordinate arrays carry CF
 `standard_name`, `units` and `axis` attributes whenever they hold real coordinates in a metre
 CRS. All of it is built in [`storage/conventions.py`](src/tessera_embeddings/storage/conventions.py);
 the versions followed and how conformance is checked are in

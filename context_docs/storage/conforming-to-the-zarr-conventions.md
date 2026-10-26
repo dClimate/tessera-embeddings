@@ -64,10 +64,12 @@ conventions spec defines both as URLs that resolve. An earlier commit-SHA URL re
 the schema's `const`. The schema accepts a registration by `uuid` alone, which is how the geoemb
 README's own examples register it; the URLs return once the tag exists.
 
-**Every spatial array repeats `spatial:dimensions`.** The spatial spec requires it on arrays when
-composed with `proj`, and a reader that opens one variable, such as an xarray `DataArray`, never
-sees its group's attributes. The group keeps its own copy, which the geoembeddings spec asks of
-per-zone stores.
+**Every spatial array repeats `spatial:dimensions`.** The spatial spec requires it on every array
+and makes it optional on groups. The group keeps its own copy, which the geoembeddings spec asks of
+per-zone stores. The transform, bbox and CRS stay on the group only: the spatial spec lets child
+arrays inherit group properties, and the v0.1 schema requires nothing else on arrays. So a variable
+opened alone, such as an xarray `DataArray`, knows which of its dims are spatial but not where they
+lie; repeating the transform and `proj:code` per array is a v2 question (§5).
 
 **The coordinate arrays carry CF attributes, but CF is not registered.** `axis`, `standard_name` and
 `units` are what CF-reading tools use to find the spatial axes. They claim the values are
@@ -118,7 +120,9 @@ Repeating `proj:` on every array, or adding a CF `grid_mapping` variable, would 
 - **A single-source rule for `spatial:`** ([spatial#32](https://github.com/zarr-conventions/spatial/issues/32),
   [#23](https://github.com/zarr-conventions/spatial/issues/23)). Open, not released. It would put
   `dimensions`, `transform` and `shape` on arrays only, forbid `bbox` beside an affine transform, and
-  leave groups only `bbox`. Our group-level transform and shape would then move to the arrays.
+  leave groups only `bbox`. Our group-level transform and shape would then move to the arrays;
+  v2 should decide then whether `proj:code` moves with them, so one variable read alone is
+  georeferenced.
 - **Versioning by `uuid`** ([zarr-conventions-spec#38](https://github.com/zarr-conventions/zarr-conventions-spec/issues/38)).
   Open. It may change how a registration names its version.
 - **The geoemb `v1` tag**, which would let the registration carry its `schema_url` and `spec_url`.
