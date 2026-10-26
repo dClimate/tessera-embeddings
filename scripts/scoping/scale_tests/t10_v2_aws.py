@@ -20,6 +20,8 @@ Run from the REPOSITORY ROOT, with ``T10="-m scripts.scoping.scale_tests.t10_v2_
     python $T10 --tiles <dir> --phase read        # once per client
     python $T10 --tiles <dir> --phase tune        # full-vector pulls under reader settings
     python $T10 --phase assemble --staging s3://<staged run dir> --extent 34964,53383 --n-tiles 64 --workers 16
+    python $T10 --phase verify                    # the built stores hold C0's values
+    python $T10 --phase verify --staging s3://<staged run dir> --n-tiles 64   # the assembled stores do
 """
 
 from __future__ import annotations
@@ -46,6 +48,8 @@ from tessera_embeddings.storage.shard_writer import partition_round_robin
 logger = logging.getLogger("scale_tests.t10")
 
 TEST = "t10"
+#: Store prefixes: ``build`` writes one repo per arm under BUILT, ``assemble`` one per arm and pass under ASSEMBLED.
+BUILT, ASSEMBLED = "t10", "t10asm"
 _S256 = (1, 256, 256)
 FINALISTS: list[V.Variant] = [
     V.VARIANTS["v2_c0"],
@@ -110,7 +114,7 @@ def phase_build(cfg: harness.RunConfig, tiles: Path, workers: int) -> None:
     side, n_tiles = _side(cfg), len(list(tiles.glob("emb_*.npy")))
     jobs = [(sy, sx, (sy * side + sx) % n_tiles) for sy in range(side) for sx in range(side)]
     for arm in FINALISTS:
-        name = f"t10/{arm.name}"
+        name = f"{BUILT}/{arm.name}"
         harness.reset_store(cfg, name)
         repo = harness.create_repo(cfg, name)
         session = repo.writable_session("main")
@@ -226,7 +230,7 @@ def phase_read(cfg: harness.RunConfig, phase: str, tiles: Path, workloads: list,
         for workload, dims, zarr_config in workloads:
             for arm in arms if p % 2 == 0 else arms[::-1]:
                 payload = {
-                    "store_uri": harness.store_uri(cfg, f"t10/{arm.name}"),
+                    "store_uri": harness.store_uri(cfg, f"{BUILT}/{arm.name}"),
                     "workload": workload,
                     "dims": dims,
                     "regions": regions,
@@ -287,7 +291,7 @@ def phase_assemble(
     ny, nx = extent
     for p in range(PASSES):
         for arm in arms if p % 2 == 0 else arms[::-1]:
-            name = f"t10asm/p{p}/{arm.name}"
+            name = f"{ASSEMBLED}/p{p}/{arm.name}"
             harness.reset_store(cfg, name)
             repo = harness.create_repo(cfg, name)
             session = repo.writable_session("main")
@@ -386,10 +390,9 @@ def main() -> int:
     harness.add_common_args(parser)
     parser.add_argument("--tiles", type=Path, default=None, help="Directory of real v2 tiles (.npy), for build/read.")
     parser.add_argument("--workers", type=int, default=8)
-    parser.add_argument("--staging", default=None, help="A staged run directory, for assemble.")
+    parser.add_argument("--staging", default=None, help="A staged run directory, for assemble and its verify.")
     parser.add_argument("--extent", default=None, help="The staged run's ROI extent 'ny,nx', for assemble.")
     parser.add_argument("--n-tiles", type=int, default=64)
-    parser.add_argument("--prefix", default="t10", help="Store prefix to verify: t10 (build) or t10asm/p0.")
     args = parser.parse_args()
     cfg = harness.config_from_args(args)
     harness.configure_logging()
@@ -430,12 +433,15 @@ def main() -> int:
     elif phase == "verify":
         from tessera_embeddings.inference.chunk_spec import parse_chunk_label
 
-        if args.staging:  # an assembled set: the tiles assembly wrote, in the arms it wrote them to
-            shards, arms = [parse_chunk_label(label) for label in _picks(args.staging, args.n_tiles)], assembled
-        else:  # a built set: two full cycles of the tiles, each tile in two places
-            shards, arms = [divmod(i, _side(cfg)) for i in range(min(16, _side(cfg) ** 2))], FINALISTS
-        name = f"verify_{args.prefix.replace('/', '_')}"
-        harness.run_phase(cfg, TEST, name, lambda: phase_verify(cfg, name, args.prefix, shards, arms))
+        # Each set names its own stores, shards and arms, so a check can never open the other set's stores.
+        if args.staging:  # the assembled set's first pass: the tiles assembly wrote, in the arms it wrote them to
+            prefix, arms = f"{ASSEMBLED}/p0", assembled
+            shards = [parse_chunk_label(label) for label in _picks(args.staging, args.n_tiles)]
+        else:  # the built set: two full cycles of the tiles, each tile in two places
+            prefix, arms = BUILT, FINALISTS
+            shards = [divmod(i, _side(cfg)) for i in range(min(16, _side(cfg) ** 2))]
+        name = f"verify_{prefix.replace('/', '_')}"
+        harness.run_phase(cfg, TEST, name, lambda: phase_verify(cfg, name, prefix, shards, arms))
     else:
         raise SystemExit("--phase must be build, read, points, tune, assemble or verify")
     return 0
