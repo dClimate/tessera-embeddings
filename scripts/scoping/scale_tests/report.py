@@ -377,12 +377,17 @@ def _t10_value(rows: list[dict], metric: str, variant: str, **params: Any) -> fl
     return statistics.median(vals) if vals else None
 
 
+def _vs(value: float, base: float | None) -> str:
+    """``value / base`` to two places, or a dash when the control did not run, never a ratio to 1."""
+    return f"{value / base:.2f}" if base else "—"
+
+
 def _t10_tables(rows: list[dict]) -> list[str]:
     """Render T10's assembly table (ratios to the control) and one cold-read table per client."""
     out: list[str] = []
     built = sorted({r["variant"] for r in _sel(rows, test="t10", phase="build", metric="encode_cpu_s") if r["variant"]})
     if built:
-        cpu0, gb0 = (_t10_value(rows, m, "v2_c0", phase="build") or 1 for m in ("encode_cpu_s", "bytes_written"))
+        cpu0, gb0 = (_t10_value(rows, m, "v2_c0", phase="build") for m in ("encode_cpu_s", "bytes_written"))
         out += [
             "## T10 — bench store build, encode CPU per shard",
             "",
@@ -392,7 +397,7 @@ def _t10_tables(rows: list[dict]) -> list[str]:
         for a in built:
             cpu = _t10_value(rows, "encode_cpu_s", a, phase="build") or 0
             gb = _t10_value(rows, "bytes_written", a, phase="build") or 0
-            out.append(f"| {a} | {cpu:.2f} | {cpu / cpu0:.2f} | {gb / 1e9:.1f} | {gb / gb0:.2f} |")
+            out.append(f"| {a} | {cpu:.2f} | {_vs(cpu, cpu0)} | {gb / 1e9:.1f} | {_vs(gb, gb0)} |")
         out.append("")
     arms = sorted({r["variant"] for r in _sel(rows, test="t10", phase="assemble", metric="wall_s") if r["variant"]})
     if arms:
@@ -408,7 +413,7 @@ def _t10_tables(rows: list[dict]) -> list[str]:
             wall = _t10_value(rows, "wall_s", a, phase="assemble") or 0
             gb = (_t10_value(rows, "bytes_written", a, phase="assemble") or 0) / 1e9
             out.append(
-                f"| {a} | {w:.2f} | {w / (base['worker'] or 1):.2f} | {wr:.2f} | {wr / (base['write'] or 1):.2f} "
+                f"| {a} | {w:.2f} | {_vs(w, base['worker'])} | {wr:.2f} | {_vs(wr, base['write'])} "
                 f"| {wall:.0f} | {gb:.1f} |"
             )
         out.append("")
@@ -477,30 +482,24 @@ def _t10_tables(rows: list[dict]) -> list[str]:
         for r in sorted(verified, key=lambda r: (r["params"]["prefix"], r["variant"])):
             out.append(f"| {r['variant']} | {r['params']['prefix']} | {r['params']['shards']} | {r['value']:.0f} |")
         out.append("")
-    tune = [
-        r
-        for r in rows
-        if r["test"] == "t10" and r["phase"].startswith("tune_") and r["metric"] == "wall_s" and r["variant"]
-    ]
-    if tune:
-        configs = sorted(
-            {(r["params"]["workload"], r["params"]["dims"], r["params"].get("zarr_config", "")) for r in tune}
-        )
+
+    def setting(r: dict) -> tuple:
+        return r["params"]["workload"], r["params"]["dims"], r["params"].get("zarr_config", "")
+
+    # One table per client, as for reads and points: the zarr versions read shards differently.
+    for phase in sorted({r["phase"] for r in rows if r["test"] == "t10" and r["phase"].startswith("tune_")}):
+        tune = [r for r in _sel(rows, test="t10", phase=phase, metric="wall_s") if r["variant"]]
+        configs = sorted({setting(r) for r in tune})
         out += [
-            "## T10 — full-vector reads, reader settings (wall s, median of passes)",
+            f"## T10 — full-vector reads, reader settings, {phase.removeprefix('tune_')} (wall s, median of passes)",
             "",
             "| arm | " + " | ".join(f"{w} {d} {c or 'default'}" for w, d, c in configs) + " |",
             "|---|" + "---|" * len(configs),
         ]
         for a in sorted({r["variant"] for r in tune}):
             cells = []
-            for w, d, c in configs:
-                vals = [
-                    r["value"]
-                    for r in tune
-                    if r["variant"] == a
-                    and (r["params"]["workload"], r["params"]["dims"], r["params"].get("zarr_config", "")) == (w, d, c)
-                ]
+            for config in configs:
+                vals = [r["value"] for r in tune if r["variant"] == a and setting(r) == config]
                 cells.append(f"{statistics.median(vals):.1f}" if vals else "—")
             out.append(f"| {a} | " + " | ".join(cells) + " |")
         out.append("")
