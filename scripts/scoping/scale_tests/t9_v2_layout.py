@@ -309,10 +309,20 @@ def main() -> int:
     if cfg.phase == "fetch":
         phase_fetch(args.source, args.profile, args.tiles, args.n_tiles)
         return 0
-    if tuple(int(p) for p in zarr.__version__.split(".")[:2]) >= (3, 4):
-        harness.run_phase(cfg, TEST, "build", lambda: phase_build(cfg, args.tiles))
-        harness.run_phase(cfg, TEST, f"dask_{CLIENT}", lambda: phase_dask(cfg, f"dask_{CLIENT}"))
-    harness.run_phase(cfg, TEST, f"requests_{CLIENT}", lambda: phase_requests(cfg, f"requests_{CLIENT}", args.points))
+    phases: dict[str, Callable[[], None]] = {
+        f"requests_{CLIENT}": lambda: phase_requests(cfg, f"requests_{CLIENT}", args.points)
+    }
+    if tuple(int(p) for p in zarr.__version__.split(".")[:2]) >= (3, 4):  # build and dask: the library's own zarr
+        phases = {
+            "build": lambda: phase_build(cfg, args.tiles),
+            f"dask_{CLIENT}": lambda: phase_dask(cfg, f"dask_{CLIENT}"),
+            **phases,
+        }
+    # Refused rather than run as nothing: a phase this client cannot run would otherwise exit cleanly, measured.
+    if cfg.phase and not any(harness.phase_matches(cfg.phase, name) for name in phases):
+        raise SystemExit(f"--phase {cfg.phase!r} is not one {CLIENT} can run: fetch, {', '.join(phases)}")
+    for name, run in phases.items():
+        harness.run_phase(cfg, TEST, name, run)
     logger.info("T9 complete under %s.", CLIENT)
     return 0
 
