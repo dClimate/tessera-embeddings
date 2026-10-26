@@ -130,11 +130,13 @@ Each phase runs on its own in-region EC2 box, writing throwaway repos under the 
   a 128-d read of 2 × 2 shards, an 8 × 8-tile pull at 16, 64 and 128 dims, and Dask at its default
   chunks. `read` runs once per client. `points` repeats only the point reads, with bootstrap
   intervals on their medians. `tune` repeats the full-vector pulls with wider fetch concurrency and
-  band-aligned Dask chunks.
+  band-aligned Dask chunks; like `read`, it is reported per client.
 - **`assemble`** (Graviton, like the assembly runner). Staged v2 tiles are written into each
   band-last finalist by the library's own `shard_writer.write_year_shards` over a
   `StagedShardSource`, every array included. Band-first arms are left out because the library
-  stages tiles band-last; their encode cost comes from `build` on a Graviton box instead.
+  stages tiles band-last; their encode cost comes from `build` on a Graviton box instead. `--arms`
+  picks finalists for `assemble` and `verify`; the control, `v2_c0`, is always added, and band-first
+  arms are refused.
 
 ### Common flags (every `tN` script)
 
