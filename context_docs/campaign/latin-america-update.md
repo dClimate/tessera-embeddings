@@ -174,7 +174,8 @@ whole update 1.23 times ([`inference-on-gpus.md`](../inference/inference-on-gpus
 | problems found by validation | none expected | none | none expected | none |
 
 The islands' plan was the main update's cost method, scaled by how far that method had overestimated the main
-update (1.9–2.8 times).
+update: 1.9–2.8 times against the provisional cost of about $1,350 known when the islands were planned. Against the
+settled $1,430 the overestimate is 1.75–2.6 times.
 
 ## Cost
 
