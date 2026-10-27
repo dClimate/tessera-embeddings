@@ -1260,6 +1260,8 @@ async def run_global_campaign(
         # nodes' Python and every dependency live in it rather than in the AMI, so a
         # dependency change merged mid-campaign repoints the deployment's pointer, and without
         # this pin later fills would run a different environment under the same fingerprint.
+        # Switching is still a deliberate act: restart the campaign, which reads the pointer
+        # afresh, and its staged tiles resume (or pass force_staging_restage to redo them).
         if not env_image_cache:
             env_image_cache.append(_resolve_env_image_uri(code_bucket, code_suffix, None))
         return env_image_cache[0]
