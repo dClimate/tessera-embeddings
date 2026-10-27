@@ -79,6 +79,7 @@ from tessera_embeddings.inference.chunk_spec import (
     parse_chunk_label,
     read_pixel_mask,
 )
+from tessera_embeddings.inference.provenance import PROVENANCE_ATTR, SourcePlanes, stage_planes
 from tessera_embeddings.storage import zone_grid
 from tessera_embeddings.storage.conventions import assert_encoder_matches, build_convention_attrs
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
@@ -1018,6 +1019,9 @@ class ZarrWriter:
         run_id: str,
         obs_counts: Mapping[str, np.ndarray | None],
         month_covered: Mapping[str, np.ndarray | None] | None,
+        *,
+        planes: SourcePlanes | None = None,
+        pixels: np.ndarray | None = None,
     ) -> str:
         """Stage the coverage arrays of a chunk that embedded nothing. Call BEFORE the marker.
 
@@ -1029,6 +1033,10 @@ class ZarrWriter:
         No embeddings and no scales, which is the point: those are what the chunk failed to
         produce, and this avoids staging a 128-band fill array per refused tile. Assembly fills
         them and copies these — see :meth:`StagedShardSource._fill_block`.
+
+        ``planes`` are the shard's provenance planes (``inference/provenance.py``), staged here,
+        with their ``shard_dates`` summary as the ``provenance`` attribute, because a refused
+        shard's imagery was still seen.
         """
         path = self._coverage_path(run_id, chunk)
         staged_chunks_2d = (min(INNER_PX, chunk.height), min(INNER_PX, chunk.width))
@@ -1059,6 +1067,8 @@ class ZarrWriter:
         # leaves a tile that reads back as FILL rather than as an error, which here would publish
         # zeroed counts looking like measured ones.
         marker = zarr.open_group(path, mode="a", storage_options=_staged_storage_options(path))
+        if planes:
+            marker.attrs[PROVENANCE_ATTR] = stage_planes(marker, planes, pixels)
         marker.attrs["staged_complete"] = True
         logger.info("Staged coverage-only tile for refused chunk %s to %s", chunk.label, path)
         return path
@@ -1282,6 +1292,8 @@ class ZarrWriter:
         obs_counts: Mapping[str, np.ndarray | None] | None = None,
         month_covered: Mapping[str, np.ndarray | None] | None = None,
         coverage: Mapping[str, Any] | None = None,
+        planes: SourcePlanes | None = None,
+        pixels: np.ndarray | None = None,
     ) -> str:
         """Write one chunk's embeddings to a staged intermediate (non-Icechunk) Zarr store.
 
@@ -1313,6 +1325,11 @@ class ZarrWriter:
                 embedded path returned its record in the actor's result and a resumed leg never
                 sees it. Written with ``staged_complete`` and therefore before ``.done``, so the
                 marker keeps vouching for a tile whose attributes are already set.
+            planes: The shard's provenance planes (``inference/provenance.py``), ranked and staged
+                beside the embeddings, with their ``shard_dates`` summary as the ``provenance``
+                attribute, written before ``staged_complete`` like ``coverage``.
+            pixels: The pixels this run was asked to embed, for a holes update; the planes are cut
+                to them.
 
         Returns:
             Path to the staged Zarr store.
@@ -1421,6 +1438,8 @@ class ZarrWriter:
         # implies `attribute set` implies `to_zarr returned`. A crash anywhere earlier leaves a tile
         # the listing reports as interrupted, which the resume scan re-infers (mode="w" overwrites).
         marker = zarr.open_group(path, mode="a", storage_options=_staged_storage_options(path))
+        if planes:
+            marker.attrs[PROVENANCE_ATTR] = stage_planes(marker, planes, pixels)
         if coverage is not None:
             # BEFORE `staged_complete`, so the completeness flag keeps meaning "everything this
             # tile carries is written". A reader gated on it can then take the record's absence as

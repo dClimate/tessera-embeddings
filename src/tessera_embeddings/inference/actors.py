@@ -46,6 +46,7 @@ from tessera_embeddings.inference.data_loading import (
     make_store_opener,
 )
 from tessera_embeddings.inference.progress import chunk_uid
+from tessera_embeddings.inference.provenance import SourcePlanes
 from tessera_embeddings.inference.read_plan import _chunk_read_plan
 from tessera_embeddings.inference.resource_monitor import ResourceMonitor
 from tessera_embeddings.storage.zarr_store import credentials_provider
@@ -503,6 +504,7 @@ class InferenceActor:
         time_window: TimeWindow,
         s1_orbit: S1Orbit,
         *,
+        snapshots: Mapping[str, str] | None = None,
         prefetched: bool = False,
     ) -> _ChunkPrologue:
         """Open stores, load the SCL bundle, plan the strips and load the first one.
@@ -510,7 +512,7 @@ class InferenceActor:
         The one loader behind both the serial prologue and the cross-chunk prefetch, so a
         prefetched chunk is opened, cropped and tiled exactly as it would have been serially.
         """
-        store_opener = make_store_opener(region=self._s3_region)
+        store_opener = make_store_opener(region=self._s3_region, snapshots=snapshots)
         mask_bundle = load_s2_mask_bundle(mosaic_base, chunk, time_window, store_opener=store_opener)
         x_sub, strips, live_strips = _chunk_read_plan(
             chunk, mask_bundle, pixels=None if chunk.pixels is None else _pixel_mask(chunk.pixels)
@@ -528,7 +530,12 @@ class InferenceActor:
         return _ChunkPrologue(store_opener, mask_bundle, strips, live_strips, x_sub, first_strip, prefetched=prefetched)
 
     def _load_chunk_prologue(
-        self, chunk: ChunkSpec, mosaic_base: str, time_window: TimeWindow, s1_orbit: S1Orbit
+        self,
+        chunk: ChunkSpec,
+        mosaic_base: str,
+        time_window: TimeWindow,
+        s1_orbit: S1Orbit,
+        snapshots: Mapping[str, str] | None = None,
     ) -> _ChunkPrologue:
         """Load everything _process_chunk needs before its first forward pass.
 
@@ -537,7 +544,7 @@ class InferenceActor:
         """
         prologue = self._take_prefetched(chunk.label)
         if prologue is None:
-            return self._load_prologue(chunk, mosaic_base, time_window, s1_orbit)
+            return self._load_prologue(chunk, mosaic_base, time_window, s1_orbit, snapshots=snapshots)
         logger.info("xchunk prefetch: hit for %s", chunk.label)
         # The stash's opener was created on the prefetch thread; if that thread's store opens outlived the PRIOR
         # chunk's credential scope (the icechunk provider is a process-wide global, not thread-local) its repo
@@ -545,7 +552,7 @@ class InferenceActor:
         # mask and strip are already-materialised numpy and safe to keep, but the LIVE opener is rebuilt inside THIS
         # call's credential scope so body-strip reads never inherit stale credentials. Worst case: one repo re-open,
         # matching the serial path.
-        prologue.store_opener = make_store_opener(region=self._s3_region)
+        prologue.store_opener = make_store_opener(region=self._s3_region, snapshots=snapshots)
         return prologue
 
     # ------------------------------------------------------------------
@@ -563,7 +570,12 @@ class InferenceActor:
         return self._xchunk_prefetch_pool, self._xchunk_prefetched
 
     def _start_chunk_prefetch(
-        self, chunk: ChunkSpec, mosaic_base: str, time_window: TimeWindow, s1_orbit: S1Orbit
+        self,
+        chunk: ChunkSpec,
+        mosaic_base: str,
+        time_window: TimeWindow,
+        s1_orbit: S1Orbit,
+        snapshots: Mapping[str, str] | None = None,
     ) -> None:
         """Kick off the next chunk's prologue load on the prefetch thread.
 
@@ -584,6 +596,7 @@ class InferenceActor:
             mosaic_base,
             time_window,
             s1_orbit,
+            snapshots=snapshots,
             prefetched=True,
         )
 
@@ -719,6 +732,7 @@ class InferenceActor:
         prefetch_hint: ChunkSpec | None = None,
         time_window: TimeWindow | None = None,
         s1_orbit: S1Orbit | None = None,
+        mosaic_snapshots: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
         """Process a single spatial chunk: load data, run inference, write output.
 
@@ -753,6 +767,9 @@ class InferenceActor:
                 different year read the wrong months — and the session's only mismatch check is
                 on ``s1_orbit``, so nothing would catch it. ``None`` uses the actor's config,
                 which is what the single-ROI path does.
+            mosaic_snapshots: Mosaic store path to the snapshot this cell's fill sampled when it
+                planned the cell. Every mosaic read opens that version, so the model reads exactly
+                what the provenance export later describes. ``None`` opens each store's tip.
 
         Returns:
             Result dict with chunk label, status, pixel count, and timing.
@@ -764,7 +781,7 @@ class InferenceActor:
         )
         with cred_scope:
             return self._process_chunk(
-                chunk, mosaic_base, staging_base, run_id, tracker, prefetch_hint, time_window, s1_orbit
+                chunk, mosaic_base, staging_base, run_id, tracker, prefetch_hint, time_window, s1_orbit, mosaic_snapshots
             )
 
     def _process_chunk(
@@ -777,6 +794,7 @@ class InferenceActor:
         prefetch_hint: ChunkSpec | None = None,
         time_window: TimeWindow | None = None,
         s1_orbit: S1Orbit | None = None,
+        mosaic_snapshots: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
         """Run the load → inference → write pipeline for one chunk.
 
@@ -810,7 +828,7 @@ class InferenceActor:
             # The prologue — repo handles, full-chunk SCL mask (which sizes the density-based strips), and the first
             # strip's bands + dataset — loads serially here (GPU idle) unless the cross-chunk prefetch loaded it during
             # the PREVIOUS chunk's last strip; see _load_chunk_prologue.
-            prologue = self._load_chunk_prologue(chunk, mosaic_base, window, orbit)
+            prologue = self._load_chunk_prologue(chunk, mosaic_base, window, orbit, mosaic_snapshots)
             store_opener = prologue.store_opener
             mask_bundle = prologue.mask_bundle
             strips = prologue.strips
@@ -837,6 +855,14 @@ class InferenceActor:
             t_s1_desc = 0
             rung = "prefetched" if prologue.prefetched else "serial"
             prologue_s = time.monotonic() - t0
+            # Which granule supplied each pixel the input carried, per sensor and date: optical from
+            # the whole-shard mask bundle now, radar from each strip as it loads. Empty unless the
+            # mosaics carry a source index (``inference/provenance.py``).
+            planes = SourcePlanes(chunk.height, chunk.width)
+            planes.add("s2", mask_bundle.source_pieces)
+            # Passed to the writer only when there is something to stage, so a run whose mosaics carry
+            # no index writes exactly what it always has.
+            staged_planes: dict[str, Any] = {}
             logger.info("Chunk %s: T_kept=%d -> strip_h=%d -> %d strip(s)", chunk.label, t_kept, strip_h, len(strips))
             del prologue
 
@@ -949,7 +975,7 @@ class InferenceActor:
                     # The NEXT chunk's mask and first strip load from the last strip with pixels, so they hide behind
                     # real inference: any strips after it are empty and load little more than their radar counts.
                     if i + 1 == max(live_strips, 1) and prefetch_hint is not None:
-                        self._start_chunk_prefetch(prefetch_hint, mosaic_base, window, orbit)
+                        self._start_chunk_prefetch(prefetch_hint, mosaic_base, window, orbit, mosaic_snapshots)
 
                     # The chunk's radar sequence lengths. Every strip sees the same ones — SAR is read full-width
                     # regardless of the crop — so any strip's value is the chunk's and the last assignment wins. A
@@ -957,6 +983,8 @@ class InferenceActor:
                     # so a length is always defined.
                     t_s1_asc = len(chunk_data.s1_asc_doys)
                     t_s1_desc = len(chunk_data.s1_desc_doys)
+                    for sensor, pieces in chunk_data.source_pieces.items():
+                        planes.add(sensor, pieces)
 
                     # SAR month masks: the strip's own when the grid is uncropped, the full-width side channel when it
                     # is — the same choice the SAR obs counts make, so the saved provenance layers keep full extent
@@ -1022,6 +1050,9 @@ class InferenceActor:
             finally:
                 pool.shutdown(wait=False, cancel_futures=True)
 
+            if planes:
+                staged_planes = {"planes": planes, "pixels": None if chunk.pixels is None else _pixel_mask(chunk.pixels)}
+
             # All strips done: the last strip's inputs and the full-chunk SCL mask are no longer needed (obs counts
             # and embeddings already live in the whole-chunk output buffers). Freed before the S3 write so peak RAM
             # does not carry a dead strip + mask through it.
@@ -1062,7 +1093,7 @@ class InferenceActor:
                 # losing the MARKER turns a benign skip into a failed chunk and wedges the cell on every retry under
                 # the stable run id.
                 try:
-                    writer.write_coverage_only(chunk, run_id, obs_buffers, month_buffers)
+                    writer.write_coverage_only(chunk, run_id, obs_buffers, month_buffers, **staged_planes)
                 except Exception:
                     logger.exception(
                         "Chunk %s: coverage-only tile could not be staged; its counts will publish as "
@@ -1156,7 +1187,7 @@ class InferenceActor:
                 obs_buffers=obs_buffers,
                 x_sub=x_sub,
                 optical_min_obs=thin_below,
-            )
+            ) | {"embedded_px": total_valid}
 
             def _timed_write() -> str:
                 # "write" is a separate context slot: the upload overlaps the NEXT chunk's prologue on the main
@@ -1176,6 +1207,9 @@ class InferenceActor:
                         # carry no measurements — a refused chunk's identical record survives
                         # because it goes into the skip marker.
                         coverage=coverage,
+                        # Ranked and staged on this writer thread, so the work overlaps the next
+                        # chunk's prologue.
+                        **staged_planes,
                     )
                     # One line per chunk: how long the backgrounded upload took. The phase table's write_s is ~0 by
                     # design, so this is the off-critical-path cost, for post-run upload health checks.

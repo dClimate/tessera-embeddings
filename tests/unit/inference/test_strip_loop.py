@@ -24,7 +24,8 @@ import zarr
 import tessera_embeddings.inference.actors as _actors_mod
 import tessera_embeddings.inference.data_loading as _dl_mod
 import tessera_embeddings.inference.read_plan as _read_plan_mod
-from tessera_embeddings.config.inference import S2_BAND_ORDER
+from tessera_embeddings.config.inference import S2_BAND_ORDER, SCL_VALID_CLASSES
+from tessera_embeddings.config.ingest import SOURCE_INDEX_VAR
 from tessera_embeddings.config.store_layout import (
     MONTH_COVERED_FOR_OBS,
     MONTHS_IN_YEAR,
@@ -41,7 +42,7 @@ from tessera_embeddings.inference.read_plan import (
     _strip_slices,
 )
 from tessera_embeddings.inference.resource_monitor import ResourceMonitor
-from tests.unit.mosaic_stores import S2_SEED, make_s2_group, make_sar_group, store_opener
+from tests.unit.mosaic_stores import ASC_SEED, DESC_SEED, S2_SEED, make_s2_group, make_sar_group, store_opener
 
 
 class TestStripSlices:
@@ -172,19 +173,40 @@ class TestStripPlan:
 _CHUNK = ChunkSpec(row=0, col=0, y_start=0, y_stop=12, x_start=0, x_stop=10)
 
 
+def _ranked(planes, pixels):
+    """``{sensor: [(time, plane, sources, valid_px)]}``, what the writer would stage, or None."""
+    if not planes:
+        return None
+    return {
+        sensor: [(d.time, d.plane, d.sources, d.valid_px) for d in planes.dates(sensor, pixels)]
+        for sensor in planes.sensors()
+    }
+
+
 class _CapturingWriter:
     """Stand-in for ZarrWriter that records the single whole-chunk write."""
 
     last_write: dict | None = None
     last_skip: str | None = None
     last_skip_record: dict | None = None
+    last_coverage_planes: dict | None = None
     discarded: str | None = None
 
     def __init__(self, staging_base, embedding_dim=128):
         self.embedding_dim = embedding_dim
 
     def write_chunk(
-        self, chunk, embeddings, run_id, scales, embeddings_std=None, obs_counts=None, month_covered=None, coverage=None
+        self,
+        chunk,
+        embeddings,
+        run_id,
+        scales,
+        embeddings_std=None,
+        obs_counts=None,
+        month_covered=None,
+        coverage=None,
+        planes=None,
+        pixels=None,
     ):
         _CapturingWriter.last_write = {
             "embeddings": embeddings.copy(),
@@ -195,7 +217,12 @@ class _CapturingWriter:
             "month_covered": month_covered.copy() if month_covered is not None else None,
             # The record the real writer persists onto the tile so it outlives this process.
             "coverage": dict(coverage) if coverage is not None else None,
+            # Ranked here, as the real writer ranks them, so a test compares what would be staged.
+            "planes": _ranked(planes, pixels),
         }
+
+    def write_coverage_only(self, chunk, run_id, obs_counts, month_covered, *, planes=None, pixels=None):
+        _CapturingWriter.last_coverage_planes = _ranked(planes, pixels)
 
     def discard_coverage(self, chunk, run_id):
         """The real writer removes a partial coverage tile here; the fake records the intent."""
@@ -230,11 +257,13 @@ def _make_actor(inference_config, test_model):
 _N_T_SAR_SPANNING_MARCH = 8
 
 
-def _open_store_side_effect(n_t_sar: int = 5):
-    return store_opener(_CHUNK, n_t_s2=8, n_t_sar=n_t_sar)
+def _open_store_side_effect(n_t_sar: int = 5, source_index: bool = False):
+    return store_opener(_CHUNK, n_t_s2=8, n_t_sar=n_t_sar, source_index=source_index)
 
 
-def _run_process_chunk(inference_config, test_model, n_t_sar: int = 5, chunk: ChunkSpec = _CHUNK):
+def _run_process_chunk(
+    inference_config, test_model, n_t_sar: int = 5, chunk: ChunkSpec = _CHUNK, *, source_index: bool = False
+):
     """Run process_chunk capturing the single whole-chunk write."""
     inference_config.s1_orbit = "both"
     # Synthetic stores carry 2024 dates; align the window so the filter keeps them.
@@ -245,7 +274,7 @@ def _run_process_chunk(inference_config, test_model, n_t_sar: int = 5, chunk: Ch
     _CapturingWriter.last_skip = None
 
     with (
-        patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_open_store_side_effect(n_t_sar)),
+        patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_open_store_side_effect(n_t_sar, source_index)),
         patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
     ):
         result = actor.process_chunk(chunk, "s3://b/m", "/tmp/staging", "run-1")
@@ -1203,3 +1232,59 @@ class TestTheRecordCountsOnlyTheEvaluatedColumns:
         assert record["eligible_px"] == _CHUNK.height * _CHUNK.width
         assert record["s2_obs"]["px_with_any"] == _CHUNK.height * _CHUNK.width
         assert record["px_with_any_radar"] == _CHUNK.height * _CHUNK.width
+
+
+def _expected_planes(n_t_sar: int = 5) -> dict[str, list[tuple[int, list[int], int]]]:
+    """``{sensor: [(time, sources, valid_px)]}`` for the synthetic mosaics, computed by hand.
+
+    The model's validity tests: SCL in the valid classes for optical, a non-zero VV or VH for radar.
+    """
+    h, w = _CHUNK.height, _CHUNK.width
+    stores = {
+        "s2": make_s2_group(8, h, w, seed=S2_SEED, source_index=True),
+        "s1_asc": make_sar_group(n_t_sar, h, w, seed=ASC_SEED, source_index=True),
+        "s1_desc": make_sar_group(n_t_sar, h, w, seed=DESC_SEED, source_index=True),
+    }
+    out: dict[str, list[tuple[int, list[int], int]]] = {}
+    for sensor, root in stores.items():
+        if sensor == "s2":
+            valid = np.isin(root["scl"][:], list(SCL_VALID_CLASSES))
+        else:
+            valid = (root["0_VV"][:] != 0) | (root["0_VH"][:] != 0)
+        positions = np.where(valid, root[SOURCE_INDEX_VAR][:], 0)
+        out[sensor] = [
+            (t, sorted(int(v) - 1 for v in np.unique(plane) if v), int(np.count_nonzero(plane)))
+            for t, plane in enumerate(positions)
+            if valid[t].any()
+        ]
+    return out
+
+
+class TestProvenancePlanes:
+    """The actor's half of the provenance record: per sensor and date, which granule supplied each pixel."""
+
+    def test_mosaics_without_a_source_index_stage_no_planes(self, inference_config, test_model):
+        _, write = _run_process_chunk(inference_config, test_model)
+        assert write["planes"] is None
+
+    def test_each_plane_ranks_the_granules_the_input_was_valid_for(self, inference_config, test_model):
+        """Ranks point into the shard-date's sources, and the counts are the model's own validity."""
+        _, write = _run_process_chunk(inference_config, test_model, source_index=True)
+        expected = _expected_planes()
+        assert set(write["planes"]) == {"s2", "s1_asc", "s1_desc"}
+        for sensor, dates in write["planes"].items():
+            assert [(t, sources, valid) for t, _, sources, valid in dates] == expected[sensor], sensor
+            for _, plane, sources, valid in dates:
+                assert plane.dtype == np.uint8 and int(np.count_nonzero(plane)) == valid
+                assert sorted(np.unique(plane[plane > 0]).tolist()) == list(range(1, len(sources) + 1))
+
+    def test_the_planes_do_not_depend_on_how_the_shard_was_striped(self, inference_config, test_model):
+        """Radar arrives strip by strip and optical whole-shard; stitched, they must agree."""
+        with patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(10**6)):
+            _, one = _run_process_chunk(inference_config, test_model, source_index=True)
+        with patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(4)):
+            _, many = _run_process_chunk(inference_config, test_model, source_index=True)
+        for sensor in one["planes"]:
+            for (t1, p1, s1, v1), (t2, p2, s2, v2) in zip(one["planes"][sensor], many["planes"][sensor], strict=True):
+                assert (t1, s1, v1) == (t2, s2, v2)
+                np.testing.assert_array_equal(p1, p2)

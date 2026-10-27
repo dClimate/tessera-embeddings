@@ -14,9 +14,9 @@ from __future__ import annotations
 
 import datetime
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 import icechunk
@@ -28,6 +28,7 @@ from tessera_embeddings.config.store_layout import MONTHS_IN_YEAR
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.errors import InsufficientCoverageError
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
+from tessera_embeddings.inference.provenance import SourcePiece, read_source_pieces
 from tessera_embeddings.storage.time_axis import compute_doy
 from tessera_embeddings.storage.zarr_store import ASSESSED_WINDOW_ATTR, is_missing_repo, open_store_as_zarr_group
 
@@ -67,7 +68,7 @@ _BAND_READERS = 2
 StoreOpener = Callable[[str], zarr.Group]
 
 
-def make_store_opener(region: str | None = None) -> StoreOpener:
+def make_store_opener(region: str | None = None, snapshots: Mapping[str, str] | None = None) -> StoreOpener:
     """Return a store opener that opens each distinct path once and reuses it.
 
     Intended to live for one chunk's strip loop: each strip of a split chunk would otherwise
@@ -78,13 +79,19 @@ def make_store_opener(region: str | None = None) -> StoreOpener:
     ``region`` is the S3 region for the mosaic repos (credentials are injected separately, via
     the actor's :func:`credentials_provider` context); a non-default-region fill must thread it
     so the actor's reads open the store in the same region as the preflight/assembly paths.
+
+    ``snapshots`` pins each mosaic store to the snapshot the fill sampled when it planned the cell,
+    so the model reads exactly the version the provenance export later describes. A store it does
+    not name opens at its branch tip, as before.
     """
     cache: dict[str, zarr.Group] = {}
+    pins = dict(snapshots or {})
 
     def _open(store_path: str) -> zarr.Group:
         group = cache.get(store_path)
         if group is None:
-            group = open_store_as_zarr_group(store_path, region=region)
+            pin = pins.get(store_path)
+            group = open_store_as_zarr_group(store_path, region=region, **({"snapshot_id": pin} if pin else {}))
             cache[store_path] = group
         return group
 
@@ -123,6 +130,9 @@ class S2MaskBundle:
     abs_indices: np.ndarray
     obs_count: np.ndarray
     month_covered: np.ndarray
+    #: The shard's optical source index at the kept timesteps, zeroed where the mask is False and
+    #: compressed per date (``inference/provenance.py``). Empty when the mosaic carries none.
+    source_pieces: list[SourcePiece] = field(default_factory=list)
 
 
 @dataclass
@@ -171,6 +181,9 @@ class ChunkData:
     s1_desc_month_covered: np.ndarray | None = None
     s1_asc_month_covered_full: np.ndarray | None = None  # (MONTHS_IN_YEAR, H, full W), bool
     s1_desc_month_covered_full: np.ndarray | None = None
+    # The strip's radar source index per orbit (``s1_asc``, ``s1_desc``), zeroed where the strip's
+    # own validity test fails, compressed per date. Optical's rides on the mask bundle instead.
+    source_pieces: dict[str, list[SourcePiece]] = field(default_factory=dict)
 
 
 def _load_sar_bands_from_zarr(
@@ -659,13 +672,25 @@ def load_s2_mask_bundle(
     kept = np.where(nonempty_t)[0]
     if len(kept) < t_full:
         logger.info("Pruned %d/%d empty S2 timesteps (chunk-level)", t_full - len(kept), t_full)
+    mask = mask_full[kept]
+    del mask_full
 
     return S2MaskBundle(
-        mask=mask_full[kept],
+        mask=mask,
         doys=doys_full[kept],
         abs_indices=window_indices[kept],
         obs_count=obs_count,
         month_covered=month_covered,
+        # Read here because this is where optical validity is decided, for the whole shard at once.
+        source_pieces=read_source_pieces(
+            root,
+            window_indices[kept],
+            y_slice,
+            x_slice,
+            mask,
+            rows=slice(0, chunk.height),
+            cols=slice(0, chunk.width),
+        ),
     )
 
 
@@ -816,15 +841,16 @@ def _load_sar_orbit(
     time_window: TimeWindow,
     y_sub: slice | None = None,
     store_opener: StoreOpener | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Load SAR bands, DOYs and calendar months for a single orbit direction.
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[SourcePiece]]:
+    """Load SAR bands, DOYs, calendar months and source-index pieces for a single orbit direction.
 
     ``y_sub`` is an optional chunk-relative northing slice (full easting width); ``None`` reads
     the full chunk. The months come free from ``_filter_times_from_zarr`` alongside the DOYs, and
     returning them is what lets radar say WHEN a pixel was observed and not only how often.
 
     Returns:
-        Tuple of (bands, doys, months) with shapes (T, H, W, 2) uint16, (T,) int32 and (T,) int16.
+        Tuple of (bands, doys, months, source pieces) with shapes (T, H, W, 2) uint16, (T,) int32
+        and (T,) int16; the pieces use the same validity test as the obs counts.
     """
     if store_opener is None:
         store_opener = open_store_as_zarr_group
@@ -833,7 +859,16 @@ def _load_sar_orbit(
     y_slice = _resolve_y_slice(chunk, y_sub)
     x_slice = slice(chunk.x_start, chunk.x_stop)
     bands, kept = _load_sar_bands_from_zarr(root, window_indices, y_slice, x_slice)
-    return bands, doys_full[kept], months_full[kept]
+    pieces = read_source_pieces(
+        root,
+        window_indices[kept],
+        y_slice,
+        x_slice,
+        np.any(bands != 0, axis=-1),
+        rows=y_sub if y_sub is not None else slice(0, chunk.height),
+        cols=slice(0, chunk.width),
+    )
+    return bands, doys_full[kept], months_full[kept], pieces
 
 
 def load_chunk(
@@ -907,19 +942,19 @@ def load_chunk(
     # Skipped orbits get FULL-width placeholders: every SAR array must be
     # full-width here because the x_sub block below crops them all uniformly
     # (after capturing the full-width obs-count side channel).
-    s1_asc_bands, s1_asc_doys, s1_asc_months = (
+    s1_asc_bands, s1_asc_doys, s1_asc_months, asc_pieces = (
         _load_sar_orbit(
             mosaic_base, chunk, "ascending", time_window=time_window, y_sub=y_sub, store_opener=store_opener
         )
         if "ascending" in active
-        else _empty_sar_arrays(height, chunk.width)
+        else (*_empty_sar_arrays(height, chunk.width), [])
     )
-    s1_desc_bands, s1_desc_doys, s1_desc_months = (
+    s1_desc_bands, s1_desc_doys, s1_desc_months, desc_pieces = (
         _load_sar_orbit(
             mosaic_base, chunk, "descending", time_window=time_window, y_sub=y_sub, store_opener=store_opener
         )
         if "descending" in active
-        else _empty_sar_arrays(height, chunk.width)
+        else (*_empty_sar_arrays(height, chunk.width), [])
     )
 
     # A non-zero sample in either polarisation is the radar validity test; passing that one
@@ -979,4 +1014,5 @@ def load_chunk(
         s1_desc_month_covered=s1_desc_month_covered,
         s1_asc_month_covered_full=s1_asc_month_covered_full,
         s1_desc_month_covered_full=s1_desc_month_covered_full,
+        source_pieces={"s1_asc": asc_pieces, "s1_desc": desc_pieces},
     )

@@ -1094,6 +1094,7 @@ def open_store_as_zarr_group(
     *,
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     region: str | None = None,
+    snapshot_id: str | None = None,
 ) -> zarr.Group:
     """Open an Icechunk store for reading as a raw zarr Group.
 
@@ -1105,13 +1106,15 @@ def open_store_as_zarr_group(
     ``group`` selects one Zarr group (the global store's per-zone layout); ``None``
     returns the root. ``get_credentials``/``region`` are forwarded so a store outside the
     default S3 region, or reachable only via an explicit credential callback, can be read
-    with the same options as the writer used.
+    with the same options as the writer used. ``snapshot_id`` opens that version instead of the
+    branch tip.
     """
     return open_store_group_and_tip(
         store_path,
         group=group,
         get_credentials=get_credentials,
         region=region,
+        snapshot_id=snapshot_id,
     )[0]
 
 
@@ -1122,8 +1125,9 @@ def open_store_group_and_tip(
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     region: str | None = None,
     branch: str = "main",
+    snapshot_id: str | None = None,
 ) -> tuple[zarr.Group, str]:
-    """Open a store for reading and also return ``branch``'s tip snapshot ID.
+    """Open a store for reading and also return ``branch``'s tip snapshot ID, or ``snapshot_id``'s view.
 
     Same as :func:`open_store_as_zarr_group`, plus the commit the returned group is a view
     of. The snapshot ID is the store's canonical CONTENT identity — it moves on every commit
@@ -1137,7 +1141,7 @@ def open_store_group_and_tip(
     confusion the snapshot is here to prevent.
     """
     repo = open_repo(store_path, get_credentials=get_credentials, region=region)
-    tip = repo.lookup_branch(branch)
+    tip = snapshot_id or repo.lookup_branch(branch)
     session = repo.readonly_session(snapshot_id=tip)
     root = zarr.open_group(session.store, mode="r")
     if group is None:

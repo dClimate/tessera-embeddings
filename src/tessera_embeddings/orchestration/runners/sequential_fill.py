@@ -1136,6 +1136,7 @@ def fill_zones_sequential(
                     # exhausted counts of the one that failed.
                     attempt,
                     cell=f"{cell.zone}-{cell.year}",
+                    mosaic_snapshots=tuple(sorted(zplan.mosaic_snapshots.items())) if zplan.mosaic_snapshots else None,
                 )
                 with lock:
                     tallies[prep.run_id] = tally

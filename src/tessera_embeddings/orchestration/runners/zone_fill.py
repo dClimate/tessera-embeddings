@@ -93,7 +93,12 @@ from tessera_embeddings.storage.update import (
     update_record,
     update_state,
 )
-from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group, plain_zarr_storage_options
+from tessera_embeddings.storage.zarr_store import (
+    is_missing_repo,
+    open_repo,
+    open_store_as_zarr_group,
+    plain_zarr_storage_options,
+)
 from tessera_embeddings.storage.zone_grid import PIXEL_M, canonicalize_zone, tile_row_latitudes
 from tessera_embeddings.storage.zone_grid import zone as zone_spec
 
@@ -306,6 +311,9 @@ class ZoneFillHandoff:
     done: dict[str, Any] | None = None
     # The targeted update this cell runs for, or None for a campaign fill (see `_assemble_update`).
     update: UpdateTarget | None = None
+    # Each mosaic store's snapshot as the plan sampled it: what the actors read, and what the
+    # provenance export describes (`mosaic_snapshots`).
+    mosaic_snapshots: dict[str, str] | None = None
 
 
 def _store_credentials(
@@ -546,6 +554,32 @@ class ZonePlan:
     done: dict[str, Any] | None = None
     # The targeted update this cell runs for, carried to assembly through the handoff.
     update: UpdateTarget | None = None
+    # Each active mosaic store's snapshot, sampled once here (`mosaic_snapshots`).
+    mosaic_snapshots: dict[str, str] | None = None
+
+
+def mosaic_snapshots(
+    mosaic_base: str,
+    s1_orbit: str,
+    *,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+    s3_region: str | None = None,
+) -> dict[str, str]:
+    """Each active mosaic store's current snapshot, by store path. Sampled once per cell.
+
+    Every actor opens its mosaics at these snapshots and the provenance export reads them, so the
+    model and the record describe one version even if something commits to a mosaic mid-fill. Free
+    at read time: opening a branch resolves to a snapshot anyway. An orbit with no store is absent.
+    """
+    pins: dict[str, str] = {}
+    for store in ["reflectance", *(f"sar_{orbit}" for orbit in _active_orbits(s1_orbit))]:
+        path = f"{mosaic_base}/{store}.zarr"
+        try:
+            pins[path] = open_repo(path, get_credentials=get_credentials, region=s3_region).lookup_branch("main")
+        except icechunk.IcechunkError as exc:
+            if not is_missing_repo(exc):
+                raise
+    return pins
 
 
 def preflight_destination(
@@ -940,7 +974,18 @@ def plan_zone_inference(
             read_store_spatial_coords(sar_path, get_credentials=get_credentials, s3_region=s3_region),
         )
 
-    return ZonePlan(zone=zone, year=year, run_id=run_id, t0=t0, summary=summary, live=live, update=update)
+    return ZonePlan(
+        zone=zone,
+        year=year,
+        run_id=run_id,
+        t0=t0,
+        summary=summary,
+        live=live,
+        update=update,
+        mosaic_snapshots=mosaic_snapshots(
+            mosaic_base, config.s1_orbit, get_credentials=get_credentials, s3_region=s3_region
+        ),
+    )
 
 
 def infer_zone_year(
@@ -1040,6 +1085,7 @@ def _infer_planned(
         s3_region=s3_region,
         retire_idle_actors=retire_idle_actors,
         cell=f"{plan.zone}-{plan.year}",
+        mosaic_snapshots=plan.mosaic_snapshots,
     )
     return complete_zone_inference(plan, results=results)
 
@@ -1079,6 +1125,7 @@ def complete_zone_inference(plan: ZonePlan, *, results: list[dict] | None) -> Zo
         live=plan.live,
         results=results,
         update=plan.update,
+        mosaic_snapshots=plan.mosaic_snapshots,
     )
 
 

@@ -142,7 +142,7 @@ class TestLoadSarOrbit:
         n_t, h, w = 6, _CHUNK.height, _CHUNK.width
         root = make_sar_group(n_t, h, w)
         with patch.object(_dl_mod, "open_store_as_zarr_group", return_value=root):
-            bands, doys, months = _load_sar_orbit("s3://bucket/mosaic", _CHUNK, "ascending", _TIME_WINDOW)
+            bands, doys, months, _ = _load_sar_orbit("s3://bucket/mosaic", _CHUNK, "ascending", _TIME_WINDOW)
 
         assert bands.shape == (n_t, h, w, 2)
         assert bands.dtype == np.uint16
@@ -159,7 +159,7 @@ class TestLoadSarOrbit:
         """
         root = make_sar_group(6, _CHUNK.height, _CHUNK.width)
         with patch.object(_dl_mod, "open_store_as_zarr_group", return_value=root):
-            _, doys, months = _load_sar_orbit("s3://bucket/mosaic", _CHUNK, "ascending", _TIME_WINDOW)
+            _, doys, months, _ = _load_sar_orbit("s3://bucket/mosaic", _CHUNK, "ascending", _TIME_WINDOW)
         assert doys.shape == months.shape
 
     def test_store_path_uses_orbit_name(self):
@@ -172,7 +172,7 @@ class TestLoadSarOrbit:
         n_t, h, w = 4, _CHUNK.height, _CHUNK.width
         root = make_sar_group(n_t, h, w)
         with patch.object(_dl_mod, "open_store_as_zarr_group", return_value=root):
-            bands, _, _ = _load_sar_orbit("s3://bucket/mosaic", _CHUNK, "ascending", _TIME_WINDOW)
+            bands, _, _, _ = _load_sar_orbit("s3://bucket/mosaic", _CHUNK, "ascending", _TIME_WINDOW)
 
         np.testing.assert_array_equal(bands[:, :, :, 0], root["0_VV"][:])
         np.testing.assert_array_equal(bands[:, :, :, 1], root["0_VH"][:])
