@@ -471,6 +471,19 @@ def phase_assemble(
 # ── verify ───────────────────────────────────────────────────────────────────
 
 
+def _margin_is_fill(arr: zarr.Array, sy: int, sx: int, ny: int, nx: int) -> bool:
+    """Whether shard ``(sy, sx)``'s part beyond the zone's ``ny x nx``, which only a rounded-up array has, is fill."""
+    extent = dict(zip(arr.metadata.dimension_names, arr.shape, strict=True))
+    y0, x0 = sy * TILE, sx * TILE
+    y1, x1 = min(y0 + TILE, extent["northing"]), min(x0 + TILE, extent["easting"])
+    strips = [(slice(max(y0, ny), y1), slice(x0, x1)), (slice(y0, y1), slice(max(x0, nx), x1))]
+    return all(
+        bool(np.all(V.read_window(arr, 0, a, b) == arr.fill_value))
+        for a, b in strips
+        if a.start < a.stop and b.start < b.stop
+    )
+
+
 def phase_verify(
     cfg: harness.RunConfig, phase: str, prefix: str, shards: list[tuple[int, int]], arms: list[V.Variant]
 ) -> None:
@@ -488,15 +501,20 @@ def phase_verify(
     ref = zone(FINALISTS[0])
     others = [(a, zone(a)) for a in arms if a.name != FINALISTS[0].name]
     mismatched = dict.fromkeys((a.name for a, _ in others), 0)
+    # Compared over the zone's own extent: a variable-width grid rounds its array up to whole inner chunks, and
+    # that margin must read as fill instead.
+    _, ny, nx = ref["scales"].shape
     for sy, sx in shards:
-        ys, xs = slice(sy * TILE, (sy + 1) * TILE), slice(sx * TILE, (sx + 1) * TILE)
+        ys, xs = slice(sy * TILE, min((sy + 1) * TILE, ny)), slice(sx * TILE, min((sx + 1) * TILE, nx))
         for var, ref_arr in ref.arrays():
             if ref_arr.ndim < 3:
                 continue
             want = V.read_window(ref_arr, 0, ys, xs)
             for arm, grp in others:
-                got = V.read_window(cast(zarr.Array, grp[var]), 0, ys, xs)
-                if not np.array_equal(want, got, equal_nan=want.dtype.kind == "f"):
+                arr = cast(zarr.Array, grp[var])
+                got = V.read_window(arr, 0, ys, xs)
+                same = np.array_equal(want, got, equal_nan=want.dtype.kind == "f")
+                if not same or not _margin_is_fill(arr, sy, sx, ny, nx):
                     mismatched[arm.name] += 1
                     logger.warning("verify %s: %s differs from C0 in shard (%d, %d)", arm.name, var, sy, sx)
     for name, n in mismatched.items():
