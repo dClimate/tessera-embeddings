@@ -67,6 +67,7 @@ METRICS = frozenset(
         "first_read_s",
         "probe_rtt_ms",
         "probe_mbps",
+        "unreadable",
     }
 )
 

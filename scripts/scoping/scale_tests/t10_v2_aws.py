@@ -208,7 +208,10 @@ def cold_read(payload: dict[str, Any]) -> dict[str, Any]:
         out |= {"read_p50_lo_ms": float(lo), "read_p50_hi_ms": float(hi)}
     elif workload.startswith("dask"):
         chunks = {} if workload == "dask_default" else V.dask_chunks(emb)
-        ds = xr.open_zarr(store, group="zone", consolidated=False, chunks=chunks)
+        try:
+            ds = xr.open_zarr(store, group="zone", consolidated=False, chunks=chunks)
+        except NotImplementedError as exc:  # xarray before 2026.9 cannot open a variable-width shard grid
+            return out | {"unreadable": f"xarray {xr.__version__}: {exc}"}
         ys, xs = regions["pull8"]
         ds["embeddings"].isel(time=0, northing=ys, easting=xs, band=slice(0, dims)).data.compute()
     else:
@@ -286,6 +289,10 @@ def phase_read(
                 tags = {"variant": arm.name, "client": CLIENT, "workload": workload, "dims": dims, "pass": p}
                 if zarr_config:
                     tags["zarr_config"] = ",".join(f"{k}={v}" for k, v in zarr_config.items())
+                if "unreadable" in r:  # recorded as a finding, not a time: this client cannot open the arm
+                    harness.emit_metric(cfg, TEST, phase, "unreadable", 1, "count", reason=r["unreadable"], **tags)
+                    logger.info("[%s] %s/%d %s: unreadable (%s)", phase, workload, dims, arm.name, r["unreadable"])
+                    continue
                 harness.emit_metric(cfg, TEST, phase, "wall_s", r["wall_s"], "s", **tags)
                 harness.emit_metric(cfg, TEST, phase, "get_requests", r["requests"], "count", **tags)
                 harness.emit_metric(cfg, TEST, phase, "bytes_fetched", r["bytes"], "bytes", method="store", **tags)
@@ -320,15 +327,16 @@ class Study(NamedTuple):
 
 #: The mobile reads (ADR 031 §6), at the prefixes a preview or an on-device comparison takes.
 MOBILE_WORKLOADS: list[tuple[str, int, dict]] = [(w, d, {}) for w in SCALE_FREE for d in (4, 8)]
-#: The narrow finalists, fixed before T9 ran: the control, the accepted layout, band-split 8 and 4, 16-band shards
-#: with 4-band inner chunks, and two variable-width grids.
+#: The narrow finalists: the control, the accepted layout, band-split 8 and 4, 16-band shards with 4-band inner
+#: chunks, and the variable-width grids, the Matryoshka one also with each pixel's pieces side by side in a shard.
 NARROW_FINALISTS: list[V.Variant] = [
     V.VARIANTS["v2_c0"],
     V.ACCEPTED,
     *(
         V.arm(V.VARIANTS[g], codec="zstd1", scales_chunks=_S256)
-        for g in ("v2_b2f8", "v2_b2f4", "v2_b2f_i4", "v2_m2f", "v2_m2f_x4")
+        for g in ("v2_b2f8", "v2_b2f4", "v2_b2f_i4", "v2_m2f", "v2_m2f_x4", "v2_m2f_x3")
     ),
+    V.arm(V.VARIANTS["v2_m2f"], codec="zstd1", scales_chunks=_S256, write_order="colexicographic"),
 ]
 STUDIES: dict[str, Study] = {
     "band16": Study(FINALISTS, READ_WORKLOADS, POINT_WORKLOADS, TUNE_WORKLOADS, mobile=[]),
@@ -366,10 +374,15 @@ def _probe_network(cfg: harness.RunConfig, phase: str, arm: V.Variant, network: 
 
 
 def phase_mobile(cfg: harness.RunConfig, phase: str, study: Study, tiles: Path, network: str) -> None:
-    """The mobile reads through the browser-like client, on the shaped link (a local smoke skips the probe)."""
+    """The mobile reads through the browser-like client, on the shaped link (a local smoke skips the probe).
+
+    Compared with the accepted layout, not the control: C0's 220 MB viewport would take some 18 minutes a
+    read on the poor link, and no phone reads v1.1's geometry this way.
+    """
     if cfg.is_s3:
         _probe_network(cfg, phase, study.arms[0], network)
-    phase_read(cfg, phase, tiles, study.mobile, study.arms, client=MOBILE_CLIENT)
+    arms = [a for a in study.arms if a.name != "v2_c0"]
+    phase_read(cfg, phase, tiles, study.mobile, arms, client=MOBILE_CLIENT)
 
 
 # ── assemble ─────────────────────────────────────────────────────────────────
