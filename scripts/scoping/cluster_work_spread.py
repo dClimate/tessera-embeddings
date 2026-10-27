@@ -36,7 +36,10 @@ import argparse
 from tessera_embeddings.orchestration.prefect.flows import run_global_campaign as campaign
 from tessera_embeddings.orchestration.runners.zone_fill import zone_live_tile_count, zone_work_weight
 from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
-from tessera_embeddings.storage.zone_grid import ZONES
+from tessera_embeddings.storage.zone_grid import zones
+
+#: The mask this reads is on the v1.1 campaign's grid (ADR 034).
+ZONES = zones("hemispheres")
 
 
 def _read(mask: str, region: str | None) -> tuple[dict[str, float], dict[str, float]]:

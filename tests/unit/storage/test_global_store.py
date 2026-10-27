@@ -126,6 +126,19 @@ def test_root_carries_geoemb_convention(tmp_path):
     assert "proj:code" not in attrs
 
 
+def test_a_utm_zones_store_declares_its_layout_and_refuses_the_other(tmp_path):
+    """Columns are named utm01..utm60 in the northern CRS, and only that store claims utm_zones."""
+    store = str(tmp_path / "global.icechunk")
+    repo = global_store.create_global_repo(store)
+    column = ZoneSpec("32601", None, 1, (0.0, 20_480.0), (-20_480.0, 20_480.0))
+    global_store.seed_zone_groups(repo, [column], years=(2025,), model_version="v2-large")
+    root = zarr_store.open_store_as_zarr_group(store)
+    assert root.attrs["geoemb:spatial_layout"] == "utm_zones"
+    assert list(root.group_keys()) == ["utm01"] and root["utm01"].attrs["proj:code"] == "EPSG:32601"
+    with pytest.raises(ValueError, match="one store holds one layout"):
+        global_store.seed_zone_groups(repo, [_ZA], years=(2025,), model_version="v2-large")
+
+
 def test_group_aware_open_store_reads_one_zone(tmp_path):
     store = _seed(tmp_path)
     ds = zarr_store.open_store(store, chunks=None, group="01S")

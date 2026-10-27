@@ -46,7 +46,8 @@ context_docs/
 │   ├── 027-targeted-updates.md
 │   ├── 028-embed-every-pixel-with-an-optical-observation.md
 │   ├── 029-one-flow-per-ingest.md
-│   └── 032-v2-stores-name-their-axes-y-and-x.md
+│   ├── 032-v2-stores-name-their-axes-y-and-x.md
+│   └── 034-v2-stores-use-the-utm-zones-layout.md
 │
 ├── campaign/                      THE GLOBAL CAMPAIGN — start here
 │   ├── campaign-plan.md                        <- START HERE. What runs, with what settings, in

@@ -22,6 +22,7 @@ from typing import Any
 
 from prefect import flow, get_run_logger
 
+from tessera_embeddings.config.inference import ZoneLayout
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.ingest.land_mask import DEFAULT_DELIVERY_URI
 from tessera_embeddings.orchestration.prefect.tasks.land_mask import (
@@ -39,6 +40,7 @@ def build_land_mask(
     registry_uri: str | None = None,
     delivery_uri: str = DEFAULT_DELIVERY_URI,
     zones: list[str] | None = None,
+    zone_layout: ZoneLayout = "hemispheres",
     verify: bool = True,
     spot_check: int = 500,
     reconcile: bool = True,
@@ -53,9 +55,12 @@ def build_land_mask(
         name: Coverage repo basename (default ``"global"``).
         registry_uri: Registry file URI; defaults to ``{delivery_uri}/registry.txt``.
         delivery_uri: Partner delivery prefix.
-        zones: Restrict to these UTM common names, e.g. ``["33N", "07S"]`` (default: all
-            120). NOT EPSG codes — ``zone_grid.zone()`` keys on the common name, so an
-            ``"EPSG:32633"`` here raises ``KeyError``.
+        zones: Restrict to these zone names, e.g. ``["33N", "07S"]`` or ``["utm33"]``
+            (default: every zone of ``zone_layout``). NOT EPSG codes — ``zone_grid.zone()``
+            keys on the name, so an ``"EPSG:32633"`` here raises ``KeyError``.
+        zone_layout: Which zone grid to build when ``zones`` is not given (ADR 034):
+            ``"hemispheres"`` (the v1.1 stores) or ``"utm_zones"`` (v2 onward). A mask is
+            keyed to one grid, so a ``utm_zones`` store needs a mask built this way.
         verify: Reconcile the registry against the bucket and spot-check delivery tiles
             *before* building (guards the all-1s assumption the design rests on).
         spot_check: Number of delivery TIFFs to sample when verifying (0 = skip).
@@ -92,13 +97,14 @@ def build_land_mask(
         registry_uri=resolved_registry,
         delivery_uri=delivery_uri,
         zones=zones,
+        zone_layout=zone_layout,
         s3_region=s3_region,
     )
     summary.update(result)
 
     if run_validation:
         log.info("Validating coverage store %s", dest)
-        validate_land_mask_coverage(dest=dest, zones=zones, s3_region=s3_region)
+        validate_land_mask_coverage(dest=dest, zones=zones, zone_layout=zone_layout, s3_region=s3_region)
 
     log.info("Land-mask coverage ready at %s (%s)", dest, result["snapshot_id"])
     return summary

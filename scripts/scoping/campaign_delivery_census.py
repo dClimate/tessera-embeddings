@@ -51,7 +51,10 @@ from pathlib import Path
 
 from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
 from tessera_embeddings.storage.zarr_store import open_store_group_and_tip
-from tessera_embeddings.storage.zone_grid import ZONES
+from tessera_embeddings.storage.zone_grid import zones
+
+#: The mask this reads is on the v1.1 campaign's grid (ADR 034).
+ZONES = zones("hemispheres")
 
 MASK_URI = "s3://global-tessera-inputs/masks/global.icechunk"
 STORE_URI = "s3://tessera-embeddings/v1.1/dclimate.icechunk"

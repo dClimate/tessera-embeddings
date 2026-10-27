@@ -19,7 +19,7 @@ orchestration/prefect/
 │   │  global campaign (ADR-008)
 │   ├── build_land_mask.py           # registry -> per-zone coverage bitmaps (no cluster)
 │   ├── export_zone_rois.py          # per-zone ROI Zarrs from the coverage bitmaps
-│   ├── seed_global_store.py         # seed the 120 UTM-zone groups (metadata only, no cluster)
+│   ├── seed_global_store.py         # seed the UTM-zone groups (metadata only, no cluster)
 │   ├── ingest_zone_year.py          # one (zone, year) mosaic build
 │   ├── fill_zone_year.py            # one (zone, year) via Ray -> assembly -> tag
 │   ├── fill_zones_sequential.py     # many cells on one long-lived Ray cluster
@@ -40,7 +40,7 @@ orchestration/prefect/
 
 ## Contents
 
-- [Global campaign (120 UTM zones)](#global-campaign-120-utm-zones)
+- [Global campaign (UTM zones)](#global-campaign-utm-zones)
 - [Master pipeline](#master-pipeline)
 - [Individual flows](#individual-flows)
 - [Deliberate fault injection (supervised drills only)](#deliberate-fault-injection-supervised-drills-only)
@@ -50,10 +50,13 @@ orchestration/prefect/
 - [Running](#running)
 
 ---
-## Global campaign (120 UTM zones)
+## Global campaign (UTM zones)
 
 The global 10 m embeddings campaign (ADR-008) has its own four flows, distinct
-from the single-ROI path above:
+from the single-ROI path above. A store's zones are 60 `utm01`…`utm60` columns
+from v2 on, or 120 `01N`…`60S` hemisphere zones for v1.1 (ADR 034): the seed
+takes the model's layout, and `build_land_mask` and `export_zone_rois` take it
+as `zone_layout`.
 
 ```text
 build_land_mask   →   seed_global_store   →   run_global_campaign

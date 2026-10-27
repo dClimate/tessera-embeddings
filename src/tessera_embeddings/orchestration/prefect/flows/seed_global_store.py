@@ -1,4 +1,4 @@
-"""Seed the 120 UTM-zone groups of the global embeddings store (ADR-008 D1).
+"""Seed the UTM-zone groups of the global embeddings store (ADR-008 D1, ADR-034).
 
 Metadata-only and cluster-less: it runs entirely on the flow runner, because a zone
 group is a handful of schema arrays with no chunk data and so costs the same at any
@@ -18,7 +18,7 @@ import icechunk
 import zarr
 from prefect import flow, get_run_logger
 
-from tessera_embeddings.config.inference import DEFAULT_MODEL_VERSION, ModelVersion
+from tessera_embeddings.config.inference import DEFAULT_MODEL_VERSION, ModelVersion, model_family
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.store_layout import GLOBAL, spatial_dims_of
 from tessera_embeddings.storage.campaign import campaign_status
@@ -33,7 +33,7 @@ from tessera_embeddings.storage.global_store import (
 )
 from tessera_embeddings.storage.time_axis import CAMPAIGN_YEARS, read_time_values, year_of
 from tessera_embeddings.storage.zarr_store import is_missing_repo
-from tessera_embeddings.storage.zone_grid import ZONES
+from tessera_embeddings.storage.zone_grid import zone_layout_of, zones
 
 
 @flow(name="seed-global-store")
@@ -56,7 +56,8 @@ def seed_global_store(
             Every later fill and update reads it there and runs that model, so this is the
             one place a global store's model is chosen. Its checkpoint, stamped as
             ``checkpoint_id``, is the model's own (:func:`checkpoint_filename`), the one every
-            fill runs.
+            fill runs. A new store also takes the model's zone layout — ``utm01``…``utm60``
+            for v2 onward, ``01N``…``60S`` for v1.1 (ADR 034); an existing store keeps its own.
         optical_min_obs: Minimum valid optical observations for a pixel to be embedded,
             stamped on the root as part of its write-once identity. **Deliberately has no
             default and is not read from the config constant**: it decides what the product
@@ -143,7 +144,7 @@ def seed_global_store(
             )
         # And the LAYOUT, alongside the axis it belongs with. `seed_zone_groups` runs this
         # check too, but only while it is CREATING something — so a rerun against a store whose
-        # 120 groups all exist reported "seeded successfully" without ever applying it, and an
+        # groups all exist reported "seeded successfully" without ever applying it, and an
         # older-schema store passed a seed the helper itself would have refused, failing later
         # at fill or read against a store an operator was told was fine. One group suffices:
         # every group shares one axis and one layout, the same invariant the helper's own
@@ -184,7 +185,10 @@ def seed_global_store(
             f"freshly seeded store."
         )
 
-    todo = [spec for zone_name, spec in ZONES.items() if zone_name not in seeded]
+    # A new store takes its model's zone layout; one already seeded keeps its own (ADR 034), the
+    # same rule as its Y/X names, so extending a store never mixes the two grids.
+    all_zones = zones(zone_layout_of(seeded) or model_family(model_version).zone_layout)
+    todo = [spec for zone_name, spec in all_zones.items() if zone_name not in seeded]
     if not todo:
         # seed_zone_groups is where the write-once root identity is checked, and it is not
         # reached when there is nothing to create — so a rerun asking for a different model
@@ -205,7 +209,7 @@ def seed_global_store(
             # neither the model nor the depth rule asked for — and the fill gates pass on
             # an ABSENT attr (`if seeded is not None`, `optical_min_obs` compared to None), so
             # the store would accept anything while the operator was told it was seeded.
-            _refuse_stamping_over_landed_cells(root_attrs, f"all {len(ZONES)} zone groups")
+            _refuse_stamping_over_landed_cells(root_attrs, f"all {len(all_zones)} zone groups")
             snapshot = stamp_root_identity(
                 repo,
                 layout=GLOBAL,
@@ -219,8 +223,8 @@ def seed_global_store(
                 snapshot,
                 optical_min_obs if optical_min_obs is not None else "no rule",
             )
-        log.info("All %d zone groups already seeded in %s", len(ZONES), store_path)
-        return {"store_path": store_path, "seeded_now": 0, "already_seeded": len(seeded), "total": len(ZONES)}
+        log.info("All %d zone groups already seeded in %s", len(all_zones), store_path)
+        return {"store_path": store_path, "seeded_now": 0, "already_seeded": len(seeded), "total": len(all_zones)}
 
     # BEFORE the incremental seed, because that seed stamps the root identity as a side effect
     # of adding groups: a partially seeded store predating the identity and holding cells would
@@ -228,7 +232,7 @@ def seed_global_store(
     if seeded:
         _refuse_stamping_over_landed_cells(
             dict(zarr.open_group(repo.readonly_session(branch="main").store, mode="r").attrs),
-            f"{len(seeded)} of {len(ZONES)} zone groups",
+            f"{len(seeded)} of {len(all_zones)} zone groups",
         )
     snapshot = seed_zone_groups(
         repo,
@@ -249,6 +253,6 @@ def seed_global_store(
         "store_path": store_path,
         "seeded_now": len(todo),
         "already_seeded": len(seeded),
-        "total": len(ZONES),
+        "total": len(all_zones),
         "snapshot_id": snapshot,
     }

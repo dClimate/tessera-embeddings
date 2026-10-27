@@ -10,6 +10,7 @@ import rasterio
 import zarr
 from rasterio.transform import from_bounds
 
+from tessera_embeddings.config.inference import ZoneLayout
 from tessera_embeddings.config.store_layout import INNER_PX, SHARD_PX
 from tessera_embeddings.ingest import land_mask
 from tessera_embeddings.ingest.live_windows import live_chunk_grid_from_keys
@@ -58,6 +59,10 @@ def test_zone_for_cell_matches_delivery_samples() -> None:
     assert land_mask.zone_for_cell(179.95, 0.05) == "60N"
     assert land_mask.zone_for_cell(0.05, 0.05) == "31N"
     assert land_mask.zone_for_cell(0.05, -0.05) == "31S"
+    # A utm_zones column spans both hemispheres.
+    assert (
+        land_mask.zone_for_cell(0.05, -0.05, "utm_zones") == land_mask.zone_for_cell(0.05, 0.05, "utm_zones") == "utm31"
+    )
 
 
 def test_project_cells_to_pixel_boxes_is_on_grid() -> None:
@@ -103,24 +108,26 @@ def _write_registry(tmp_path, names: list[str]) -> str:
     return str(reg)
 
 
-def _geo_zones() -> list[str]:
-    return sorted({land_mask.zone_for_cell(lon, lat) for lon, lat, *_ in land_mask._GEO_CHECKS})
+def _geo_zones(layout: ZoneLayout = "hemispheres") -> list[str]:
+    return sorted({land_mask.zone_for_cell(lon, lat, layout) for lon, lat, *_ in land_mask._GEO_CHECKS})
 
 
 def _land_cell_names() -> list[str]:
     return [f"grid_{lon}_{lat}.tiff" for lon, lat, live, _ in land_mask._GEO_CHECKS if live]
 
 
-def test_build_all_and_validate(tmp_path) -> None:
+@pytest.mark.parametrize("layout", ["hemispheres", "utm_zones"])
+def test_build_all_and_validate(tmp_path, layout: ZoneLayout) -> None:
     """Build the geo-check zones from a synthetic registry; validate end-to-end.
 
     Restricting to the geo-check zones means validation's known land points are
     live (their cells are in the registry) and the ocean point is dead (its zone
-    has no cells) — exercising the geographic self-check for real.
+    has no cells) — exercising the geographic self-check for real, in each layout's
+    grid (Brasília sits in a southern half, which a utm column holds at negative northings).
     """
     names = _land_cell_names()
     registry = _write_registry(tmp_path, names)
-    zones = _geo_zones()
+    zones = _geo_zones(layout)
     dest = str(tmp_path / "coverage.icechunk")
 
     result = land_mask.build_all(dest, registry_uri=registry, delivery_uri="s3://x/y/", zones=zones)

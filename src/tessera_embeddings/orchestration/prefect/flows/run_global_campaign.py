@@ -614,10 +614,11 @@ async def run_global_campaign(
             rather than deployment names.
         store_name: Global-store repo basename.
         years: Campaign years to drive (default: all campaign years).
-        zones: Restrict the fill chain (inference + assembly) to these UTM zones in the
-            ergonomic ``"<1-60><N|S>"`` form, e.g. ``["33N", "15S"]``; ``None`` (default)
-            drives all 120. Either way only cells still needing work are dispatched, so a
-            re-run of a partially-complete year fills only the unfinished zones (see
+        zones: Restrict the fill chain (inference + assembly) to these UTM zones, named as
+            the store's groups are (``"utm33"``, or ``"33N"`` in a hemisphere store; any case,
+            leading zero optional); ``None`` (default) drives every zone of the store's layout.
+            Either way only cells still needing work are dispatched, so a re-run of a
+            partially-complete year fills only the unfinished zones (see
             :func:`campaign_work_list`).
         max_parallel_clusters: The number of Ray clusters — ``fill-zones-sequential`` runs —
             dispatched per batch (a cost knob). **Defaults to 10**, the campaign's planned
@@ -1034,19 +1035,19 @@ async def run_global_campaign(
                 f"(fixed at seeding, ADR-008 D1) — reseed the store or drop them from `years`."
             )
 
-    # Canonical common names ("33N", "07S"), so a bad id fails loudly here and the rest match
+    # Canonical zone names ("utm33", "07S"), so a bad id fails loudly here and the rest match
     # the store's group names exactly.
     expected_zones = [canonicalize_zone(z) for z in zones] if zones is not None else None
     # An explicit zones subset must be seeded: a typo that canonicalizes to a valid but
     # unseeded zone would otherwise count as pending and be ingested + filled only for the
-    # fill to reject an unseeded group. (The default None spans all 120; a not-fully-seeded
+    # fill to reject an unseeded group. (The default None spans every zone; a not-fully-seeded
     # store surfaces at the fill.)
     if expected_zones is not None:
         unseeded = [z for z in expected_zones if z not in status.zones]
         if unseeded:
             raise ValueError(f"Requested zone(s) {unseeded} are not seeded in {store_path} — run the seed flow first.")
 
-    # Cells still needing a fill, restricted to `zones` (default: all 120).
+    # Cells still needing a fill, restricted to `zones` (default: every zone of the store's layout).
     # campaign_work_list is tag-aware: it skips landed-and-tagged cells and INCLUDES
     # complete-but-untagged ones (crash between fill and tag → the runner's idempotent retag
     # path runs). See its docstring for the two use cases.
@@ -1079,7 +1080,7 @@ async def run_global_campaign(
             )
 
     # Every work cell must be seeded before we dispatch. The guard above covers a requested
-    # subset, but the default `zones=None` expands to all 120 in campaign_work_list, so a
+    # subset, but the default `zones=None` expands to every zone in campaign_work_list, so a
     # partially-seeded store would ingest each unseeded cell (expensive) only for the fill to
     # reject the missing group.
     unseeded_work = sorted({z for z, _ in work if z not in status.zones})
@@ -1855,7 +1856,7 @@ async def run_global_campaign(
 
         # Backfill the year-complete milestone/retention tag even when NO fills ran this pass
         # — a prior run may have completed every zone for the year but crashed before
-        # tagging. The milestone is defined over ALL 120 zones and `tag_year_complete` takes
+        # tagging. The milestone is defined over EVERY zone of the store's layout and `tag_year_complete` takes
         # no scope argument, so this run's `zones` subset cannot narrow it and a repair run
         # cannot stamp the global tag prematurely, which matters because tags are write-once
         # forever. Attempted for EVERY year in the batch: an unfinished year raises
@@ -1865,9 +1866,9 @@ async def run_global_campaign(
         for y in batch_years if plan is None else ():
             try:
                 year_tag = tag_year_complete(repo, y)
-                log.info("Year %d tagged complete (all 120 zones): %s", y, year_tag)
+                log.info("Year %d tagged complete (every zone): %s", y, year_tag)
             except ValueError as exc:
-                log.debug("Year %d not yet complete across all 120 zones (%s) — milestone tag deferred", y, exc)
+                log.debug("Year %d not yet complete across every zone (%s) — milestone tag deferred", y, exc)
 
     dispatched = sum(len(v) for v in runs_by_year.values())
     log.info("Campaign dispatch complete: %d fill run(s) across %d year(s)", dispatched, len(runs_by_year))

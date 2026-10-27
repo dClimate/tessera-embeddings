@@ -92,9 +92,9 @@ DRILL_EXIT_STATUS = 93
 #: rather than a way to study it.
 MAX_HOLD_MINUTES = 45.0
 
-#: The canonical UTM common name, i.e. exactly what ``zone_grid.canonicalize_zone``
-#: emits: zero-padded zone number 01-60 followed by the hemisphere.
-_CANONICAL_ZONE = re.compile(r"(0[1-9]|[1-5][0-9]|60)[NS]")
+#: The canonical zone name, i.e. exactly what ``zone_grid.canonicalize_zone`` emits:
+#: zero-padded zone number 01-60, prefixed ``utm`` or followed by the hemisphere.
+_CANONICAL_ZONE = re.compile(r"utm(0[1-9]|[1-5][0-9]|60)|(0[1-9]|[1-5][0-9]|60)[NS]")
 
 #: How long the announcement gets before the armed timer ends the process without it. A healthy
 #: flush is milliseconds, so this is three orders of magnitude of headroom; and it is small
@@ -230,11 +230,11 @@ class FaultInjection(BaseModel):
             # The FULL form, not merely uppercase: ``"7N"``, ``"99N"`` and ``"33N "`` are all
             # uppercase and none equals the writer's ``"07N"``. A literal pattern rather than
             # ``zone_grid.canonicalize_zone`` because ``storage`` imports ``config`` and the
-            # reverse would cycle; the pattern IS that function's output format (zero-padded
-            # 01-60 plus hemisphere), and a unit test pins the two together.
+            # reverse would cycle; the pattern IS that function's output format, and a unit
+            # test pins the two together.
             if _CANONICAL_ZONE.fullmatch(self.zone) is None:
                 raise ValueError(
-                    f"zone must be the canonical UTM common name (e.g. '33N', '07S'); got {self.zone!r}. "
+                    f"zone must be the canonical zone name (e.g. 'utm33', '33N', '07S'); got {self.zone!r}. "
                     f"The writer compares against the canonicalized zone, so a request in any other form "
                     f"would arm, log, and never fire — a drill that silently passes."
                 )

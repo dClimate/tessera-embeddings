@@ -1,7 +1,8 @@
-"""Global embeddings store: seed the 120 zone groups; open/create the repo.
+"""Global embeddings store: seed the zone groups; open/create the repo.
 
 The composition layer for the global campaign (ADR-008). One Icechunk repo holds
-120 Zarr groups (one per UTM zone); this module seeds them as pre-allocated,
+one Zarr group per UTM zone — 60 ``utm`` columns or 120 hemisphere zones (ADR-034,
+:mod:`~tessera_embeddings.storage.zone_grid`); this module seeds them as pre-allocated,
 metadata-only empty stores — full 2017-2025 time axis, per-zone coordinates and
 CRS, ``GLOBAL`` sharded array schemas — so the campaign can then fill years as
 region/shard writes without ever resizing (D1).
@@ -16,6 +17,7 @@ ONCE on the root group
 (:func:`~tessera_embeddings.storage.conventions.build_geoemb_root_attrs`), while each zone
 group carries only its own ``proj:``/``spatial:``
 (``build_convention_attrs(..., include_geoemb=False)``) — their CRS and grid differ by zone.
+A ``utm_zones`` store's root also declares ``geoemb:spatial_layout: "utm_zones"``.
 """
 
 from __future__ import annotations
@@ -59,7 +61,14 @@ from tessera_embeddings.storage.time_axis import (
     year_of,
 )
 from tessera_embeddings.storage.zarr_store import _create_storage, global_store_config
-from tessera_embeddings.storage.zone_grid import PIXEL_M, ZONE_SCHEME, ZoneSpec, easting_coords, northing_coords
+from tessera_embeddings.storage.zone_grid import (
+    PIXEL_M,
+    ZONE_SCHEME,
+    ZoneSpec,
+    easting_coords,
+    northing_coords,
+    zone_layout_of,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -508,7 +517,7 @@ def stamp_root_identity(
 
     Exists because "already stamped" and "seeding created no groups" are different questions and
     a store seeded before the root carried an identity answers no to both. :func:`seed_zone_groups`
-    stamps as a side effect of creating groups, so a store with all 120 already present never
+    stamps as a side effect of creating groups, so a store with every group already present never
     reaches that line: the flow would report a clean seed having recorded neither the model
     nor the depth rule the operator asked for, after which the fill-side gates — which pass on an
     ABSENT attr — let anything write.
@@ -570,6 +579,8 @@ def seed_zone_groups(
         model_version=model_version,
         optical_min_obs=optical_min_obs,
     )
+    # One store holds one zone layout (ADR 034): the groups it has and the ones requested must agree.
+    zone_layout = zone_layout_of([*root.group_keys(), *(spec.group_name for spec in specs)])
     stamped_now = "geoemb:model" not in root.attrs
     if stamped_now:
         # optical_min_obs is in the identity for the same reason the encoder is: a fill reads it to
@@ -578,6 +589,9 @@ def seed_zone_groups(
         # consequence to know is that the root's rule never moves. A targeted update may apply a
         # looser line to its own cells (ADR 028), and its update records, not the root, say so.
         root.attrs.update(_root_attrs(layout, model_version=model_version, optical_min_obs=optical_min_obs))
+        if zone_layout == "utm_zones":
+            # True only of this layout: the hemisphere groups are not the 60 the value names.
+            root.attrs["geoemb:spatial_layout"] = "utm_zones"
     # The time axis is fixed and UNIFORM across all zone groups (ADR-008 D1): campaign status and
     # fill code assume every group shares one axis. An incremental seed passing a different
     # `years` than the groups already present would silently leave a mixed-axis store, so validate

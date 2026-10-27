@@ -478,6 +478,12 @@ _V2_LARGE_ARCH = ModelArch(
 # comparison written while there were two models silently routes a third one to the wrong side;
 # a record without a field cannot be constructed.
 
+#: How a global store divides the world into zone groups (ADR 034). ``"hemispheres"``: 120 groups
+#: ``01N``..``60S``, each in its hemisphere's own EPSG code. ``"utm_zones"``: the geoembeddings
+#: layout, 60 groups ``utm01``..``utm60``, each in its northern EPSG code with the south as
+#: negative northings.
+ZoneLayout = Literal["hemispheres", "utm_zones"]
+
 
 @final
 @dataclass(frozen=True)
@@ -510,6 +516,10 @@ class ModelFamily:
     #: v1.1 keeps ``northing``/``easting``, which its published store already uses; later models
     #: take the conventional ``y``/``x``. An existing store keeps its own names whatever the model.
     spatial_dims: tuple[str, str]
+    #: How a global store it creates divides the world into zone groups. v1.1 keeps the
+    #: hemisphere groups its published store already has; later models take the geoembeddings
+    #: ``utm_zones`` layout. An existing store keeps its own layout whatever the model.
+    zone_layout: ZoneLayout
 
     @property
     def takes_norm_source(self) -> bool:
@@ -548,6 +558,7 @@ MODEL_FAMILIES: dict[str, ModelFamily] = {
         radar_free_s1_bin=None,
         own_worker_image=True,
         spatial_dims=("northing", "easting"),
+        zone_layout="hemispheres",
     ),
     "v2-large": ModelFamily(
         arch=_V2_LARGE_ARCH,
@@ -561,6 +572,7 @@ MODEL_FAMILIES: dict[str, ModelFamily] = {
         radar_free_s1_bin=1,
         own_worker_image=False,
         spatial_dims=("y", "x"),
+        zone_layout="utm_zones",
     ),
 }
 

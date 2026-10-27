@@ -2391,7 +2391,7 @@ class ZarrWriter:
 
         Args:
             store_path: URI of the global Icechunk repo (``BucketPaths.global_store()``).
-            zone: Zone group name — UTM common name, e.g. ``"01N"``/``"60S"``.
+            zone: Zone group name, e.g. ``"utm33"`` or ``"01N"`` (ADR 034).
             year: Campaign calendar year to fill; must be on the group's pre-allocated time axis.
             run_id: Run identifier (locates staged files).
             registry_root: Root of the published registry dataset

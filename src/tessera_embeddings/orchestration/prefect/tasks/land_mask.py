@@ -16,6 +16,7 @@ from typing import Any
 
 from prefect import get_run_logger, task
 
+from tessera_embeddings.config.inference import ZoneLayout
 from tessera_embeddings.ingest.land_mask import (
     DEFAULT_DELIVERY_URI,
     build_all,
@@ -33,6 +34,7 @@ def build_land_mask_coverage(
     registry_uri: str | None = None,
     delivery_uri: str = DEFAULT_DELIVERY_URI,
     zones: list[str] | None = None,
+    zone_layout: ZoneLayout = "hemispheres",
     s3_region: str | None = None,
 ) -> dict[str, Any]:
     """Prefect task: build per-zone coverage bitmaps into ``dest`` (one commit)."""
@@ -41,6 +43,7 @@ def build_land_mask_coverage(
         registry_uri=registry_uri,
         delivery_uri=delivery_uri,
         zones=zones,
+        zone_layout=zone_layout,
         s3_region=s3_region,
         log=get_run_logger(),
     )
@@ -72,6 +75,8 @@ def verify_land_mask_delivery(
 
 
 @task(name="validate-land-mask-coverage")
-def validate_land_mask_coverage(*, dest: str, zones: list[str] | None = None, s3_region: str | None = None) -> None:
+def validate_land_mask_coverage(
+    *, dest: str, zones: list[str] | None = None, zone_layout: ZoneLayout = "hemispheres", s3_region: str | None = None
+) -> None:
     """Prefect task: structural + geographic self-checks on a built coverage repo."""
-    validate_coverage(dest, zones=zones, s3_region=s3_region, log=get_run_logger())
+    validate_coverage(dest, zones=zones, zone_layout=zone_layout, s3_region=s3_region, log=get_run_logger())
