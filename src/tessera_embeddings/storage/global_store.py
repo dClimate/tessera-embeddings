@@ -32,6 +32,7 @@ from tessera_embeddings.config.inference import (
     DEFAULT_MODEL_VERSION,
     ModelVersion,
     checkpoint_filename,
+    model_family,
     model_version_for_encoder,
 )
 from tessera_embeddings.config.store_layout import (
@@ -41,6 +42,7 @@ from tessera_embeddings.config.store_layout import (
     MONTHS_IN_YEAR,
     REQUIRED_VARS,
     StoreLayout,
+    spatial_dims_of,
 )
 from tessera_embeddings.storage.conventions import (
     assert_model_matches,
@@ -204,7 +206,7 @@ def create_layout_arrays(
     zone-group seeder here and the single-ROI schema creator in
     :mod:`tessera_embeddings.inference.assembly`, so the two write paths cannot
     diverge in how a layout becomes on-disk arrays. ``sizes`` maps dim name →
-    extent (``{"time": ..., "northing": ..., "easting": ..., "band": ...}``).
+    extent, keyed by the layout's own dimension names (``{"time": ..., y: ..., x: ..., "band": ...}``).
     """
     for var in variables:
         array_layout = layout.for_var(var)
@@ -308,6 +310,7 @@ def _zone_attrs(spec: ZoneSpec, north: np.ndarray, east: np.ndarray, layout: Sto
             total_y=spec.height,
             total_x=spec.width,
             embedding_dim=_layout_band(layout),
+            spatial_dims=layout.spatial_dims,
             y_coords=north,
             x_coords=east,
             include_geoemb=False,  # geoemb: is stated once on the root, not per zone
@@ -385,7 +388,7 @@ def missing_seeded_arrays(node: zarr.Group, layout: StoreLayout) -> set[str]:
     per spec while creating, and `seed_global_store` asks it on the path where nothing is created
     at all, which otherwise applies no completeness check.
     """
-    expected = set(layout.arrays) | {"time", "northing", "easting", "band", "month", "time_bnds"}
+    expected = set(layout.arrays) | {"time", *layout.spatial_dims, "band", "month", "time_bnds"}
     return expected - set(node.array_keys())
 
 
@@ -580,10 +583,15 @@ def seed_zone_groups(
     # `years` than the groups already present would silently leave a mixed-axis store, so validate
     # against any seeded group HERE — not only in the seed_global_store flow's retry guard, which
     # a lower-level caller bypasses.
+    #
+    # A new store takes its model's Y/X names; one already seeded keeps its own, so extending it
+    # never leaves two vocabularies in one store.
+    layout = layout.with_spatial_dims(model_family(model_version).spatial_dims)
     for gname in root.group_keys():
         grp = cast("zarr.Group", root[gname])
         if "time" not in grp:
             continue
+        layout = layout.with_spatial_dims(spatial_dims_of(grp))
         existing_years = tuple(year_of(t) for t in read_time_values(grp))
         if existing_years != tuple(years):
             raise ValueError(
@@ -641,20 +649,15 @@ def seed_zone_groups(
         created += 1
         north = northing_coords(spec)
         east = easting_coords(spec)
-        sizes = {
-            "time": nt,
-            "northing": spec.height,
-            "easting": spec.width,
-            "band": band,
-            "month": MONTHS_IN_YEAR,
-        }
+        y, x = layout.spatial_dims
+        sizes = {"time": nt, y: spec.height, x: spec.width, "band": band, "month": MONTHS_IN_YEAR}
         create_layout_arrays(node, layout, layout.arrays, sizes)
         _write_coord_arrays(
             node,
             {
                 "time": times,
-                "northing": north,
-                "easting": east,
+                y: north,
+                x: east,
                 "band": np.arange(band),
                 # 1..12, not 0..11, so ``cov.sel(month=7)`` means July. A 0-based axis would put
                 # every reader's selection one off from the calendar they are thinking in.

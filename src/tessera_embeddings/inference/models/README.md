@@ -76,6 +76,9 @@ Everything that differs between models is a field of its `ModelFamily` record in
 - the student generation, which picks the checkpoint loader and the staging run-id prefix
 - the S1 bin given to a pixel with no radar
 - whether it runs only on its own worker image
+- the names of an output store's Y and X dimensions: `northing`/`easting` for v1.1, `y`/`x` for v2.
+  A new store takes them once; an existing store keeps its own
+  ([ADR 032](../../../../context_docs/decisions/032-v2-stores-name-their-axes-y-and-x.md))
 
 Code asks `model_family(version)` for the field it needs rather than comparing version strings, so
 a new model is a new record, and a record missing a field cannot be built. Two names carry one

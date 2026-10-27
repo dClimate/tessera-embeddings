@@ -13,7 +13,11 @@ PR #218 (2026-10-22).
 | root (global store) | `geoemb` | encoder, source data, quantization, `gsd`; once for all 120 zones |
 | zone group, or root of a single-ROI store | `proj`, `spatial` (+ `geoemb` on a single-ROI root) | CRS as `proj:code`, `proj:wkt2` and `proj:projjson`; the grid as `spatial:dimensions`, `transform`, `shape`, `bbox`, `registration` |
 | every array spanning both spatial dimensions | `spatial` | `spatial:dimensions` repeated from the group |
-| `northing`, `easting` | none (CF attributes) | `standard_name`, `units: m`, `axis`, only for real coordinates in a metre CRS |
+| the Y and X coordinate arrays | none (CF attributes) | `standard_name`, `units: m`, `axis`, only for real coordinates in a metre CRS |
+
+The Y and X dimensions are `northing`/`easting` in a v1.1 store and `y`/`x` from v2 on
+([ADR 032](../decisions/032-v2-stores-name-their-axes-y-and-x.md)); every attribute above names
+whichever the store has.
 
 | convention | version followed | latest upstream |
 |---|---|---|
@@ -74,10 +78,11 @@ lie; repeating the transform and `proj:code` per array is a v2 question (§5).
 **The coordinate arrays carry CF attributes, but CF is not registered.** `axis`, `standard_name` and
 `units` are what CF-reading tools use to find the spatial axes. They claim the values are
 projected metres, so they are written only when the group declares both halves of that claim:
-real coordinates (`spatial:dimensions`, which a store whose `northing`/`easting` are bare pixel
+real coordinates (`spatial:dimensions`, which a store whose Y/X coordinates are bare pixel
 indices never gets) and a metre CRS in its own `proj:code`, the same rule as `geoemb:gsd`. Reading
 the group's declarations, rather than the inputs, means the labels follow whatever the store
-declares, including a CRS derived from the MGRS tile. The [CF convention for Zarr](https://github.com/zarr-conventions/CF)
+declares, including a CRS derived from the MGRS tile. A store with pixel-index coordinates gets no `proj:`
+either: a reader pairing a CRS with indices would place the raster at that CRS's origin. The [CF convention for Zarr](https://github.com/zarr-conventions/CF)
 is a proposal with no release, and its registration example adds a `version` field the conventions
 spec forbids, so registering it would not validate.
 

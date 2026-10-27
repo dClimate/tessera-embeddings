@@ -16,7 +16,13 @@ from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import numpy as np
 
-from tessera_embeddings.config.store_layout import GLOBAL, SHARD_PX, StoreLayout, clamp_chunks_and_shards
+from tessera_embeddings.config.store_layout import (
+    GLOBAL,
+    SHARD_PX,
+    StoreLayout,
+    clamp_chunks_and_shards,
+    spatial_dims_of,
+)
 from tessera_embeddings.storage.global_store import _codec_id, missing_seeded_arrays
 from tessera_embeddings.storage.shard_writer import SHARD_WRITE
 
@@ -41,9 +47,11 @@ def layout_departures(group: zarr.Group, layout: StoreLayout = GLOBAL) -> list[s
     :func:`~tessera_embeddings.config.store_layout.clamp_chunks_and_shards`, or every zone narrower
     than one nominal shard reports a false departure.
     """
+    # Against the Y/X names the group declares: v1.1 stores use northing/easting, later models y/x.
+    layout = layout.with_spatial_dims(spatial_dims_of(group))
     present = dict(group.arrays())
     out: list[str] = []
-    # The COORDINATE arrays too: losing `northing`, `month` or `time_bnds` would otherwise only
+    # The COORDINATE arrays too: losing a spatial axis, `month` or `time_bnds` would otherwise only
     # skip that dimension's extent check, so the audit reports nothing while a labelled read of the
     # zone is incomplete.
     for name in sorted(missing_seeded_arrays(group, layout)):
@@ -58,7 +66,7 @@ def layout_departures(group: zarr.Group, layout: StoreLayout = GLOBAL) -> list[s
             # Everything below indexes by dimension, so the rest would compare unrelated axes.
             out.append(f"{var}: has {array.ndim} dimensions, the layout declares {len(expected.dims)} {expected.dims}")
             continue
-        # The NAMES: an array labelled `easting, northing` has the right rank, dtype and — both
+        # The NAMES: an array labelled (X, Y) has the right rank, dtype and — both
         # spatial chunks being 256 — chunk geometry, so every other check passes while every
         # labelled read comes back transposed. `getattr` because Zarr v2 metadata has no names at
         # all, and reporting that beats raising on it.
@@ -127,7 +135,7 @@ def coordinate_departures(group: zarr.Group, spec: ZoneSpec) -> list[str]:
     """Every way the group's spatial coordinates depart from the grid its zone spec defines.
 
     A zone can pass :func:`layout_departures` completely and still be geolocated wrongly —
-    `northing` reversed, shifted by a pixel, or at the wrong spacing — with no attribute to recover
+    the Y axis reversed, shifted by a pixel, or at the wrong spacing — with no attribute to recover
     the true positions from.
 
     Origin, step and far end only: those three pin a shift, a reversal and a wrong spacing, and
@@ -147,7 +155,8 @@ def coordinate_departures(group: zarr.Group, spec: ZoneSpec) -> list[str]:
         months = [int(v) for v in np.asarray(month[:])]
         if months != list(MONTH_COORD):
             out.append(f"month: holds {months}, the writer seeds {list(MONTH_COORD)}")
-    for name, expected in (("northing", northing_coords(spec)), ("easting", easting_coords(spec))):
+    y, x = spatial_dims_of(group)
+    for name, expected in ((y, northing_coords(spec)), (x, easting_coords(spec))):
         array = present.get(name)
         if array is None:
             out.append(f"{name}: absent, so its grid cannot be checked")
