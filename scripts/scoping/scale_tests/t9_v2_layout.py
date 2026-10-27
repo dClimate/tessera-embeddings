@@ -1,7 +1,7 @@
-"""T9 — v2 store layout: band-16 inner chunks, int8 codecs, shard orders, measured without AWS.
+"""T9 — v2 store layout: band chunks, int8 codecs, shard orders, measured without AWS.
 
-Builds each arm as a plain local Zarr store of 2x2 shards from real v2 tiles, then records what
-the layout decision needs that does not depend on the network:
+Builds each arm of a study as a plain local Zarr store of 2x2 shards from real v2 tiles, then
+records what the layout decision needs that does not depend on the network:
 
 * **write cost** — stored bytes and encode CPU per shard, through the same whole-shard assignment
   the assembly writer makes;
@@ -10,13 +10,18 @@ the layout decision needs that does not depend on the network:
   on zarr's sharding codec; latency does not, which is what T1 measures;
 * **decode CPU** per workload, and the **Dask graph** a reader's default chunking builds.
 
+``--study`` picks the arms. ``band16`` (the default) is the scoping behind ADR 031's band-16
+chunks; ``narrow`` measures 4-, 8- and variable-width band chunks for mobile readers against the
+control and the accepted layout, adds the mobile windows and prefix widths of 4 and 8, and records
+a third request plan, the direct-read client's (:data:`DIRECT_READ`).
+
 Stores are written by the library's own environment. The ``requests`` phase is recorded under the
 zarr version that runs it, so the same run can be repeated by an old client (zarr 3.2.1 +
 icechunk 2.1.1) against the same stores; ``--phase requests`` or ``--phase dask`` selects the
 running client's. Run from the REPOSITORY ROOT::
 
-    python -m scripts.scoping.scale_tests.t9_v2_layout --run-id v2a --tiles <dir>
-    <old-venv>/bin/python -m scripts.scoping.scale_tests.t9_v2_layout --run-id v2a --tiles <dir>
+    python -m scripts.scoping.scale_tests.t9_v2_layout --run-id v2a --tiles <dir> [--study narrow]
+    <old-venv>/bin/python -m scripts.scoping.scale_tests.t9_v2_layout --run-id v2a --tiles <dir> [--study narrow]
 
 ``--tiles`` holds ``emb_<n>.npy`` (2048, 2048, 128) int8 and ``scales_<n>.npy`` (2048, 2048)
 float32, written by ``--phase fetch --source <store> --profile <aws profile>``. Without it the
@@ -26,11 +31,12 @@ tiny scale smokes on synthetic data.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import time
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import xarray as xr
@@ -47,6 +53,8 @@ TEST = "t9"
 TILE = 2048
 DIMS_READ = (16, 64, 128)
 CLIENT = f"zarr{'.'.join(zarr.__version__.split('.')[:2])}"
+#: The direct-read client of a browser or app (zarrita.js): one request per inner chunk, never merged. zarr >= 3.3.
+DIRECT_READ = {"array.sharding_coalesce_max_gap_bytes": -1, "array.sharding_coalesce_max_bytes": 0}
 
 _GEOMETRIES = [V.VARIANTS[n] for n in ("v2_c0", "v2_c1", "v2_c2", "v2_b2")]
 _CODEC_ARMS = (("zstd1", False), ("raw", False), ("blosc_bitshuffle", False), ("zstd", True), ("zstd1", True))
@@ -57,8 +65,62 @@ ARMS: list[V.Variant] = [
     *(V.arm(V.VARIANTS[g], transpose=True, scales_chunks=(1, 512, 512)) for g in ("v2_c1", "v2_c2")),
 ]
 
-# (label, y0, x0, extent): non-aligned windows inside shard (0, 0), then aligned whole shards.
-REGIONS = (("patch", 700, 900, 100), ("tile", 500, 700, 1000), ("shard", 0, 0, TILE), ("bulk", 0, 0, 2 * TILE))
+Region = tuple[str, int, int, int, int]
+# (label, y0, x0, height, width): non-aligned windows inside shard (0, 0), then aligned whole shards.
+REGIONS: tuple[Region, ...] = (
+    ("patch", 700, 900, 100, 100),
+    ("tile", 500, 700, 1000, 1000),
+    ("shard", 0, 0, TILE, TILE),
+    ("bulk", 0, 0, 2 * TILE, 2 * TILE),
+)
+#: The mobile reads (ADR 031 §6): one 256² web-map tile on the 256 grid, and a phone viewport across a shard corner.
+MOBILE_REGIONS: tuple[Region, ...] = (
+    ("maptile", 512, 768, 256, 256),
+    ("viewport", TILE - 512, TILE - 1024, 1024, 2048),
+)
+
+
+class Study(NamedTuple):
+    """A fixed set of arms, control first, with the prefix widths and windows its reads cover."""
+
+    arms: list[V.Variant]
+    dims: tuple[int, ...]
+    regions: tuple[Region, ...]
+    dask_arms: list[V.Variant]
+    direct_read: bool  # also record the direct-read client's request plan
+
+
+_S256 = (1, 256, 256)
+_NARROW_GEOMETRIES = ("v2_b2f8", "v2_b2f4", "v2_b1f8", "v2_b1f4", "v2_b2f_i8", "v2_b2f_i4")
+_VARIABLE = ("v2_m2f", "v2_m1f", "v2_m2f_x4", "v2_m2f_x3")
+NARROW_ARMS: list[V.Variant] = [
+    V.VARIANTS["v2_c0"],
+    V.ACCEPTED,
+    *(V.arm(V.VARIANTS[g], codec="zstd1", scales_chunks=_S256) for g in (*_NARROW_GEOMETRIES, *_VARIABLE)),
+    # Where several inner chunks share a shard, the order within it decides which pieces sit side by side.
+    *(
+        V.arm(V.VARIANTS[g], codec="zstd1", scales_chunks=_S256, write_order=o)
+        for g in ("v2_b2f_i8", "v2_b2f_i4", "v2_m2f")
+        for o in V.WRITE_ORDERS[1:]
+    ),
+]
+STUDIES: dict[str, Study] = {
+    "band16": Study(
+        ARMS,
+        DIMS_READ,
+        REGIONS,
+        [a for a in ARMS if a.codec == "zstd" and a.write_order == "morton" and a.scales_chunks is None],
+        direct_read=False,
+    ),
+    "narrow": Study(
+        NARROW_ARMS,
+        (4, 8, *DIMS_READ),
+        REGIONS + MOBILE_REGIONS,
+        [a for a in NARROW_ARMS if a.write_order == "morton"],
+        direct_read=True,
+    ),
+}
+assert all(study.arms[0].name == "v2_c0" for study in STUDIES.values()), "every study runs the control first"
 
 
 class CountingStore(WrapperStore):
@@ -71,10 +133,16 @@ class CountingStore(WrapperStore):
     ``get``. Metadata reads are not counted.
     """
 
-    def __init__(self, store: Store) -> None:
-        """Wrap ``store`` with an empty request log."""
+    def __init__(self, store: Store, max_in_flight: int | None = None) -> None:
+        """Wrap ``store`` with an empty request log, optionally capping requests in flight.
+
+        zarr's ``async.concurrency`` limits shards in flight, not requests, so a browser's connection
+        limit is imposed here, on every request the read makes.
+        """
         super().__init__(store)
         self.requests: list[int] = []
+        self._max_in_flight = max_in_flight
+        self._gate: asyncio.Semaphore | None = None  # made on first use, inside zarr's event loop
 
     @property
     def _supports_sync_io(self) -> bool:
@@ -83,7 +151,12 @@ class CountingStore(WrapperStore):
 
     async def get(self, key: str, prototype: Any, byte_range: Any = None) -> Any:  # noqa: ANN401
         """Fetch through the wrapped store and log the returned length."""
-        buf = await self._store.get(key, prototype, byte_range)
+        if self._max_in_flight is None:
+            buf = await self._store.get(key, prototype, byte_range)
+        else:
+            self._gate = self._gate or asyncio.Semaphore(self._max_in_flight)
+            async with self._gate:
+                buf = await self._store.get(key, prototype, byte_range)
         if not key.endswith("zarr.json"):
             self.requests.append(len(buf) if buf is not None else 0)
         return buf
@@ -175,10 +248,10 @@ def _dir_bytes(path: Path) -> int:
     return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
 
 
-def phase_build(cfg: harness.RunConfig, tiles: Path | None) -> None:
+def phase_build(cfg: harness.RunConfig, study: Study, tiles: Path | None) -> None:
     """Write every arm from the same tiles, one whole-shard assignment per shard, timing each."""
     side = _side(cfg)
-    for arm in ARMS:
+    for arm in study.arms:
         path = _store_dir(cfg, arm)
         harness.reset_store(cfg, f"t9/{arm.name}")
         group = zarr.open_group(LocalStore(path), mode="w")
@@ -189,8 +262,10 @@ def phase_build(cfg: harness.RunConfig, tiles: Path | None) -> None:
         step = min(TILE, side)
         for n, (y0, x0) in enumerate((y, x) for y in range(0, side, step) for x in range(0, side, step)):
             block, scales = _tile(cfg, tiles, n, step, step)
+            block = V.to_storage_order(emb, block)
+            key = V.window_key(emb, slice(0, 1), slice(y0, y0 + step), slice(x0, x0 + step))
             cpu0, wall0 = time.process_time(), time.monotonic()
-            emb[0:1, y0 : y0 + step, x0 : x0 + step] = block[None]
+            emb[key] = block[None]
             cpu = time.process_time() - cpu0
             harness.emit_metric(cfg, TEST, "build", "encode_cpu_s", cpu, "s", variant=arm.name, shard=n)
             harness.emit_metric(cfg, TEST, "build", "wall_s", time.monotonic() - wall0, "s", variant=arm.name, shard=n)
@@ -223,51 +298,62 @@ def _emit_read(cfg: harness.RunConfig, phase: str, arm: str, result: Measured, *
         harness.emit_metric(cfg, TEST, phase, metric, value, unit, variant=arm, client=CLIENT, **tags)
 
 
-def _windows(side: int) -> list[tuple[str, tuple[slice, slice]]]:
-    """Each REGIONS window as (label, (northing slice, easting slice)), clamped to the store."""
+def _windows(side: int, regions: tuple[Region, ...]) -> list[tuple[str, tuple[slice, slice]]]:
+    """Each region as (label, (northing slice, easting slice)), clamped to the store.
+
+    A square region stays square; a region that starts outside a tiny store is skipped.
+    """
     out = []
-    for label, y0, x0, ext in REGIONS:
-        ext = min(ext, side - y0, side - x0)
-        out.append((label, (slice(y0, y0 + ext), slice(x0, x0 + ext))))
+    for label, y0, x0, h, w in regions:
+        if y0 >= side or x0 >= side:
+            continue
+        h, w = (min(h, side - y0, side - x0),) * 2 if h == w else (min(h, side - y0), min(w, side - x0))
+        out.append((label, (slice(y0, y0 + h), slice(x0, x0 + w))))
     return out
 
 
-def phase_requests(cfg: harness.RunConfig, phase: str, n_points: int) -> None:
-    """Every workload at every prefix width, on every arm, through the counting store."""
+def phase_requests(
+    cfg: harness.RunConfig, phase: str, study: Study, n_points: int, zarr_config: dict | None = None
+) -> None:
+    """Every workload at every prefix width, on every arm, through the counting store.
+
+    ``zarr_config`` is set before any array opens, which is when zarr reads its sharding settings.
+    """
     side = _side(cfg)
     points = [(int(y), int(x)) for y, x in np.random.default_rng(1).integers(0, side, size=(n_points, 2))]
-    for arm in ARMS:
-        store = CountingStore(LocalStore(_store_dir(cfg, arm), read_only=True))
-        group = zarr.open_group(store, mode="r")
-        emb, scl = group["embeddings"], group["scales"]
-        for dims in DIMS_READ:
-            per_point = [_measure(store, emb.__getitem__, (0, y, x, slice(0, dims))) for y, x in points]
-            n, nbytes, _, cpu = (float(np.mean(col)) for col in zip(*per_point, strict=True))
-            wall = float(np.median([p[2] for p in per_point]))
-            _emit_read(cfg, phase, arm.name, (n, nbytes, wall, cpu), workload="point", dims=dims, array="embeddings")
-            for label, (ys, xs) in _windows(side):
-                result = _measure(store, emb.__getitem__, (0, ys, xs, slice(0, dims)))
-                _emit_read(cfg, phase, arm.name, result, workload=label, dims=dims, array="embeddings")
-        result = _measure(store, scl.__getitem__, (0, *points[0]))
-        _emit_read(cfg, phase, arm.name, result, workload="point", dims=0, array="scales")
-        for label, (ys, xs) in _windows(side):
-            _emit_read(
-                cfg,
-                phase,
-                arm.name,
-                _measure(store, scl.__getitem__, (0, ys, xs)),
-                workload=label,
-                dims=0,
-                array="scales",
-            )
-        logger.info("[%s] read %s", CLIENT, arm.name)
+    with zarr.config.set(zarr_config or {}):
+        for arm in study.arms:
+            _arm_requests(cfg, phase, study, arm, side, points)
 
 
-def phase_dask(cfg: harness.RunConfig, phase: str) -> None:
+def _arm_requests(
+    cfg: harness.RunConfig, phase: str, study: Study, arm: V.Variant, side: int, points: list[tuple[int, int]]
+) -> None:
+    """One arm's request plans: points and every window, at every prefix width, then ``scales``."""
+    store = CountingStore(LocalStore(_store_dir(cfg, arm), read_only=True))
+    group = zarr.open_group(store, mode="r")
+    emb, scl = group["embeddings"], group["scales"]
+    for dims in study.dims:
+        per_point = [_measure(store, V.read_window, emb, 0, y, x, slice(0, dims)) for y, x in points]
+        n, nbytes, _, cpu = (float(np.mean(col)) for col in zip(*per_point, strict=True))
+        wall = float(np.median([p[2] for p in per_point]))
+        _emit_read(cfg, phase, arm.name, (n, nbytes, wall, cpu), workload="point", dims=dims, array="embeddings")
+        for label, (ys, xs) in _windows(side, study.regions):
+            result = _measure(store, V.read_window, emb, 0, ys, xs, slice(0, dims))
+            _emit_read(cfg, phase, arm.name, result, workload=label, dims=dims, array="embeddings")
+    result = _measure(store, scl.__getitem__, (0, *points[0]))
+    _emit_read(cfg, phase, arm.name, result, workload="point", dims=0, array="scales")
+    for label, (ys, xs) in _windows(side, study.regions):
+        result = _measure(store, scl.__getitem__, (0, ys, xs))
+        _emit_read(cfg, phase, arm.name, result, workload=label, dims=0, array="scales")
+    logger.info("[%s] read %s", phase, arm.name)
+
+
+def phase_dask(cfg: harness.RunConfig, phase: str, study: Study) -> None:
     """Task count and requests for the bulk 16-d pull through xarray, default vs shard-aligned chunks."""
     import dask
 
-    for arm in (a for a in ARMS if a.codec == "zstd" and a.write_order == "morton" and a.scales_chunks is None):
+    for arm in study.dask_arms:
         store = CountingStore(LocalStore(_store_dir(cfg, arm), read_only=True))
         aligned = V.dask_chunks(zarr.open_array(store, path="embeddings", mode="r"))
         for label, chunks in (("default", {}), ("shard_aligned", aligned)):
@@ -299,6 +385,7 @@ def main() -> int:
     parser.add_argument("--profile", default=None, help="AWS profile for --source.")
     parser.add_argument("--n-tiles", type=int, default=4)
     parser.add_argument("--points", type=int, default=100)
+    parser.add_argument("--study", choices=STUDIES, default="band16", help="Which arms and workloads to run.")
     args = parser.parse_args()
     cfg = harness.config_from_args(args)
     harness.configure_logging()
@@ -308,15 +395,19 @@ def main() -> int:
     if cfg.phase == "fetch":
         phase_fetch(args.source, args.profile, args.tiles, args.n_tiles)
         return 0
+    study = STUDIES[args.study]
     phases: dict[str, Callable[[], None]] = {
-        f"requests_{CLIENT}": lambda: phase_requests(cfg, f"requests_{CLIENT}", args.points)
+        f"requests_{CLIENT}": lambda: phase_requests(cfg, f"requests_{CLIENT}", study, args.points)
     }
     if tuple(int(p) for p in zarr.__version__.split(".")[:2]) >= (3, 4):  # build and dask: the library's own zarr
         phases = {
-            "build": lambda: phase_build(cfg, args.tiles),
-            f"dask_{CLIENT}": lambda: phase_dask(cfg, f"dask_{CLIENT}"),
+            "build": lambda: phase_build(cfg, study, args.tiles),
+            f"dask_{CLIENT}": lambda: phase_dask(cfg, f"dask_{CLIENT}", study),
             **phases,
         }
+        if study.direct_read:
+            name = f"requests_direct_{CLIENT}"
+            phases[name] = lambda: phase_requests(cfg, name, study, args.points, DIRECT_READ)
     # Refused rather than run as nothing: a phase this client cannot run would otherwise exit cleanly, measured.
     if cfg.phase and not any(harness.phase_matches(cfg.phase, name) for name in phases):
         raise SystemExit(f"--phase {cfg.phase!r} is not one {CLIENT} can run: fetch, {', '.join(phases)}")

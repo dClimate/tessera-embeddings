@@ -37,9 +37,11 @@ scale_tests/
 ├── t8_sharding.py    shard vs unshard: write-align, bytes, → ADR D3 (see
 │                     scattered reads, object count            ADR-008 D3)
 ├── t9_v2_layout.py   v2 layout arms, local: stored bytes, encode CPU,  → ADR 031
-│                     request plans on two zarr versions, Dask graph
+│                     request plans on two zarr versions and a
+│                     browser client, Dask graph
 ├── t10_v2_aws.py     v2 finalists on AWS: cold S3 reads on two        → ADR 031
-│                     clients, the assembly code's write cost
+│                     clients, mobile reads on a shaped link, the
+│                     assembly code's write cost
 ├── report.py         collate metrics → decision matrix markdown
 ├── scale_testing_results.md   archived reports, v1.1 runs (ADR-008)
 ├── v2_layout_results.md       archived reports, v2 layout runs (ADR 031)
@@ -82,6 +84,9 @@ uv run python -m scripts.scoping.scale_tests.t9_v2_layout --run-id v2a --phase f
     --source s3://<bucket>/<v2 single-area store> --profile <aws profile> --n-tiles 4
 uv run python -m scripts.scoping.scale_tests.t9_v2_layout --run-id v2a --scale bench --tiles <dir>
 <old-venv>/bin/python -m scripts.scoping.scale_tests.t9_v2_layout --run-id v2a --scale bench --tiles <dir>
+# the narrow study: the same, with --study narrow (and results kept outside the system temp dir)
+uv run python -m scripts.scoping.scale_tests.t9_v2_layout --run-id n9 --study narrow --scale bench --tiles <dir> \
+    --results-dir temp/v2-layout/results
 
 # v2 finalists (T10): in-region EC2 in the dev account. Reads on x86 (r7i), assembly on Graviton (m7g)
 T10="-m scripts.scoping.scale_tests.t10_v2_aws --run-id v2b --backend s3 --bucket <bucket>/<prefix> --scale bench"
@@ -89,6 +94,7 @@ uv run python $T10 --tiles <dir> --phase build
 uv run python $T10 --tiles <dir> --phase read          # then again from the old-client environment
 uv run python $T10 --phase assemble --staging s3://<staged run dir> --extent <ny,nx> --n-tiles 64 --workers 16
 uv run python $T10 --phase verify                      # then with the assemble line's --staging and --n-tiles
+uv run python $T10 --study narrow --tiles <dir> --phase mobile --network poor   # once tc shapes the link
 
 # collate + tear down
 uv run python -m scripts.scoping.scale_tests.report   --run-id run1
@@ -103,24 +109,44 @@ Install the extra deps once: `uv sync --group scale-tests`.
 
 ### T9 — the v2 layout, measured without AWS
 
-v2's 128 dimensions are Matryoshka-ordered, so its store chunks the band axis at 16 inside the
-same 2048² shard. T9 builds every arm as a local store of 2×2 shards from real v2 tiles, and records:
+v2's 128 dimensions are Matryoshka-ordered, so its store chunks the band axis inside the same 2048²
+shard. T9 builds every arm as a local store of 2×2 shards from real v2 tiles, and records:
 
 - what the writer pays: stored bytes, and encode CPU per shard
-- what every read asks for: requests and bytes for each workload at 16, 64 and 128 dims
+- what every read asks for: requests and bytes for each workload at each prefix width
 - the Dask tasks and requests of a 16-d pull, at Dask's default chunks and at shard-aligned ones
 
-**The arms** are the geometries in `variants.py`, each crossed with int8 codecs, a band-planar
-transpose, the inner-chunk order within a shard, and the `scales` geometry.
+**Two studies, chosen with `--study`.** Each is a fixed arm list with the control (C0, v1.1's
+geometry on v2 data) first, so T9 and T10 compare like with like.
+
+- **`band16`**, the default, is the scoping behind ADR 031: the band-16 geometries in `variants.py`,
+  each crossed with int8 codecs, a band-planar transpose, the inner-chunk order within a shard and
+  the `scales` geometry, read at 16, 64 and 128 dims. Every archived command reruns as it ran.
+- **`narrow`** measures narrower band chunks for mobile readers (ADR 031 §6), all band-first, against
+  C0 and the accepted layout: band-split shards of 8 or 4 bands at 512² or 256² inner chunks,
+  16-band shards holding 8- or 4-band inner chunks, and variable-width band shards (4, 4, 8, 16, 32, 64
+  and two coarser sets). It adds prefix widths of 4 and 8, a 256² map tile and a 1,024 × 2,048
+  viewport, and a third request plan: the direct-read client of a browser or app, which merges no
+  requests (`t9_v2_layout.DIRECT_READ`).
+
+**Variable-width band shards** are a rectilinear chunk grid. Reading one needs zarr's
+`array.rectilinear_chunks` setting on (`variants.py` sets it for every script; zarr 3.2.1 and 3.4.1
+both read the grid then), and xarray ≥ 2026.9 for xarray readers. icechunk
+accepts the grid only with every axis listed edge by edge, and zarr then requires every edge to be a
+whole number of inner chunks, so such an array's extent is rounded up to whole inner chunks.
 
 **Requests are counted by a store wrapper** that also intercepts zarr ≥ 3.3's merged-range path.
 `WrapperStore` would otherwise forward it unseen, and so would zarr 3.4's sync path.
 
 **Three rules hold for T9 and T10 alike.** Every read quantity is recorded per read: a point
-workload is many reads, one per probe. Readers take an array's band order from its dimension names
-(`variants.read_window`), so one reader serves band-last and band-first stores. And aligned Dask
-chunks are read from the array too (`variants.dask_chunks`): one task per shard and band chunk, so
-the control's 128-band chunk is never split.
+workload is many reads, one per probe. Readers and writers take an array's band order from its
+dimension names (`variants.window_key`, with `read_window` and `to_storage_order`), so one path serves
+band-last and band-first stores. And aligned Dask chunks are read from the array too
+(`variants.dask_chunks`): one task per shard and band chunk, so the control's 128-band chunk is never
+split.
+
+**Keep T9's results outside the system temp dir** (`--results-dir`), and copy them to the dev bucket
+beside T10's: macOS clears its temp dir, and the band-16 study's raw T9 rows were lost that way.
 
 **Request plans carry over to S3, but latency does not.** The requests depend only on zarr's
 sharding codec, so they hold on S3. Latency depends on the network, so T10 measures the finalists
@@ -130,6 +156,7 @@ partial shard reads from one request per inner chunk to merged, concurrent ones.
 ### T10 — the v2 finalists on AWS
 
 Each phase runs on its own in-region EC2 box, writing throwaway repos under the run's store root.
+`--study` picks the finalists and workloads, as in T9.
 
 - **`build` then `read`** (x86, r7i.4xlarge). Each finalist is built as a repo of 10 × 10 shards
   cycled from the real tiles T9 fetched, so no cache holds the working set. Every workload runs cold
@@ -137,11 +164,20 @@ Each phase runs on its own in-region EC2 box, writing throwaway repos under the 
   a 128-d read of 2 × 2 shards, an 8 × 8-tile pull at 16, 64 and 128 dims, and Dask at its default
   chunks. `read` runs once per client. `points` repeats only the point reads, with bootstrap
   intervals on their medians. `tune` repeats the full-vector pulls with wider fetch concurrency and
-  band-aligned Dask chunks; like `read`, it is reported per client.
+  band-aligned Dask chunks; like `read`, it is reported per client. `build` also records the
+  manifest bytes per object, which a direct reader downloads before its first chunk.
+- **`mobile`** (the read box, narrow study). The mobile reads, a 256² map tile and a 1,024 × 2,048
+  viewport at 4 and 8 dims, without `scales`, through a browser-like client: no merged requests, at
+  most 6 in flight, each object in one GET. It runs on a phone link that `tc netem` and an `ifb`
+  device shape first. `--network good|poor` names the profile (`t10_v2_aws.NETWORKS`); the phase
+  measures the round trip and downlink, and refuses to run if the shaping is not in effect. Each
+  cold read fetches one distant pixel first, timed apart as the first read, since that is where the
+  manifest download lands.
 - **`assemble`** (Graviton, like the assembly runner). Staged v2 tiles are written into each
-  band-last finalist by the library's own `shard_writer.write_year_shards` over a
-  `StagedShardSource`, every array included. Band-first arms are left out because the library
-  stages tiles band-last; their encode cost comes from `build` on a Graviton box instead.
+  finalist by the library's own `shard_writer.write_year_shards` over a `StagedShardSource`, every
+  array included. Band-first arms are written only where the shard writer says it can
+  (`WRITES_BAND_FIRST`, set by ADR 031's band-first prototype); otherwise their encode cost comes from
+  `build` on a Graviton box instead.
 - **`verify`**. Every arm holds exactly C0's values in every array, band-first ones reordered first.
   It checks the built stores; given `--staging`, it checks the assembled ones, over the tiles
   assembly wrote. The set chooses its own stores and arms, so there is no prefix to pass.

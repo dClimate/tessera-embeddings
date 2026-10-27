@@ -64,6 +64,9 @@ METRICS = frozenset(
         "decode_cpu_s",
         "dask_tasks",
         "mismatched_arrays",
+        "first_read_s",
+        "probe_rtt_ms",
+        "probe_mbps",
     }
 )
 

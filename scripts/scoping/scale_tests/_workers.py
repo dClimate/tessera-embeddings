@@ -21,15 +21,24 @@ from scripts.scoping.scale_tests import synth
 from tessera_embeddings.storage import zarr_store
 
 
-def _open_repo(store_uri: str, max_concurrent_requests: int | None = None) -> icechunk.Repository:
+def _open_repo(
+    store_uri: str, max_concurrent_requests: int | None = None, split_large_gets: bool = True
+) -> icechunk.Repository:
     """Open a repo directly from a URI (workers have no ``RunConfig``).
 
     ``max_concurrent_requests`` is applied here rather than by the library, which always takes
-    icechunk's default — see :func:`harness.layered_config`.
+    icechunk's default — see :func:`harness.layered_config`. ``split_large_gets=False`` fetches each
+    object in one GET, as a browser does, where icechunk would otherwise split a large one into
+    parallel ranges. Both change the library's storage settings in place, so its timeouts and
+    retries survive.
     """
     config = zarr_store._default_repo_config()
     if max_concurrent_requests is not None:
         config.max_concurrent_requests = max_concurrent_requests
+    if not split_large_gets:
+        storage = config.storage or icechunk.StorageSettings()
+        storage.concurrency = icechunk.StorageConcurrencySettings(max_concurrent_requests_for_object=1)
+        config.storage = storage
     return icechunk.Repository.open(zarr_store._create_storage(store_uri), config=config)
 
 
