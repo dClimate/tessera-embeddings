@@ -137,7 +137,7 @@ names its files differently, so inspecting individual files there finds nothing.
 
 ### Decision 4 — Two copies are the same photograph when they name the same datatake
 
-> **AMENDED by [ADR 029](029-an-acquisition-is-one-datastrip-of-one-pass.md).** A datatake is a
+> **AMENDED by [ADR 034](034-an-acquisition-is-one-datastrip-of-one-pass.md).** A datatake is a
 > pass, and a pass crossing a datastrip boundary is two photographs of a tile. The name is now the
 > datatake plus the datastrip's sensing start, and a file naming neither is kept on its own rather
 > than placed by its timestamp. The reasoning below, that a timestamp cannot tell two copies from two
