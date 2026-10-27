@@ -14,9 +14,8 @@ and (where required) a credential callback.
      one-hour life is unrelated to the shape of the loop, and any unit that outlives the
      remaining margin cannot renew from inside itself. The loop also checks at a batch boundary
      and before every date's write, which costs nothing while the ticker keeps it fresh.
-   * Build an OPERA RTC item filter for the orbit / bounding box / batch window. Its items are
-     ranked by one census of the whole window's bursts, taken once per run, so where two bursts
-     of a day overlap the one acquired most often wins the pixel (ADR 033).
+   * Build an OPERA RTC item filter for the orbit / bounding box / batch window, ranking its
+     items by one census of the window's bursts (ADR 033).
    * Call :func:`ingest_tile` to produce a per-batch ``xarray.Dataset``.
    * Apply the ROI mask, then write each date's live windows via
      :func:`tessera_embeddings.storage.zarr_store.write_day_windows` with a narrow tenacity retry
@@ -536,14 +535,9 @@ def ingest_s1_roi_sar(
     start_date, end_date = _start.isoformat(), _end.isoformat()
     validated_batch_days(batch_days)
 
-    # ONE census for the leg, over the REQUESTED window, ranking every burst for the fusion order
-    # (`opera_query.burst_fusion_sort_key`). Not per batch, which would rank a burst by a month of
-    # acquisitions rather than its year, and not over the resumed window below, which would let a
-    # resumed leg rank bursts differently from the run it resumes and so build different pixels.
-    # For the same reason a store that holds any date holds the census that ranked it, written
-    # in the first date's commit (`store_attrs` below) and read back here: the catalogue keeps
-    # changing, and a resumed leg that re-counted could rank a tied burst the other way. Queries
-    # nothing until the first batch's provider starts it alongside its own query.
+    # ONE census for the leg, over the REQUESTED window (not per batch, not the resumed window), and
+    # the one a store already holds when resuming it, so every date of a store is ranked alike
+    # (ADR 033). Written with every date's commit (`store_attrs` below).
     recorded_census = get_root_attr(orbit_store, BURST_CENSUS_ATTR, s3_region=s3_region) if written_dates else None
     burst_census = BurstCensus(
         roi.bbox_wgs84, start_date, end_date, orbit, mid_longitude=mid_longitude, recorded=recorded_census

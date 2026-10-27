@@ -1257,11 +1257,7 @@ def get_root_attr(
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     s3_region: str | None = None,
 ) -> Any:  # noqa: ANN401 — whatever JSON the attr holds
-    """One root attribute of a store, or None if the store or the attribute is absent.
-
-    Fails closed like :func:`get_existing_dates`: only genuine absence answers None, and a
-    read that fails for any other reason propagates rather than being read as "not recorded".
-    """
+    """One root attribute of a store, or None if the store or attribute is absent; other errors raise."""
     try:
         ds = _open_readonly(store_path, get_credentials=get_credentials, region=s3_region)
     except FileNotFoundError:
@@ -1713,9 +1709,8 @@ def write_days_windows(
     manifest is validated BEFORE anything is written — the per-append structural gate must
     not be lost to batching.
 
-    ``store_attrs`` are merged into the root attrs in the same commit as the dates, for a
-    record that must exist whenever any date does, such as the radar burst census that ranked
-    the dates' sources: a separate commit could be lost between the first date and itself.
+    ``store_attrs`` merge into the root attrs in the dates' own commit, for a record that must
+    exist whenever any date does, such as the radar burst census.
     """
     from tessera_embeddings.storage.empty_store import create_empty_store  # local: storage-internal, avoids cycle
 

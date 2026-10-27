@@ -96,29 +96,15 @@ the same day, which do not:
 ```
 
 `opera_query.burst_fusion_sort_key` orders each day's items by the burst's acquisitions over the
-whole ingest window, most first; ties go to the burst id (track, then burst number, then
-sub-swath), then the acquisition time and granule id, so a rerun builds the same pixels. A title
-that names no burst sorts last and is counted in the query log. Because a burst's footprint is
-fixed, this item order gives each pixel its most-acquired covering burst without reading a raster.
-
-The counts come from `burst_acquisitions`, one CMR query per orbit leg over the requested window
-(`BurstCensus`, built once in `s1_roi`). It asks for the reference format — titles only, about
-60 times smaller than the JSON the batch queries read — and counts distinct acquisitions, since
-a reprocessed acquisition is republished under a new production time. The window is the same
-solar days the batches own: the query reaches a UTC day either side and each acquisition is
-placed on its solar day before it is counted. One orbit of a zone-year at 35N took about 50 s; it
-starts alongside the first batch's query, so most of it overlaps.
-
-The census is written on the orbit's store as the root attribute `burst_census`, in the same
-commit as every date, with the window and grouping longitude it was counted over. A leg resuming a
-store that holds any date ranks by the census it reads back rather than counting again. The
-catalogue keeps changing, counts commonly tie, and a leg that re-counted after a backfilled
-acquisition could fuse its remaining days by a different burst than the days already written. A
-leg asking for a different window is refused: ranked by the stored census, a burst first seen in
-its new days would count as never acquired, and recounted, its days would be ranked differently
-from those already written. A different window goes into its own store.
+whole ingest window, most first, with ties broken by burst id so a rerun builds the same pixels; a
+title naming no burst sorts last. The counts come from one census per orbit leg
+(`opera_query.BurstCensus`), read from granule titles in CMR's light reference format over the
+same solar days the batches own. It is recorded on the orbit's store as the root attribute
+`burst_census`, with the window and longitude it covers, in every date's commit. A resumed leg
+ranks by that record instead of counting again, and a leg asking for a different window is
+refused; a different window goes into its own store.
 [ADR 033](../../context_docs/decisions/033-radar-overlaps-go-to-the-most-acquired-burst.md) has
-the measurements and what was left out, such as per-pixel layover and shadow masks.
+the reasoning, the measured cost, and what was left out, such as layover and shadow masks.
 
 ## UTM CRS derivation
 

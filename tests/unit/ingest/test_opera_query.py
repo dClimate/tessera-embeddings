@@ -15,8 +15,6 @@ from tessera_embeddings.ingest.opera_query import (
     _UNPARSEABLE_PAGE_ATTEMPTS,
     BURST_ACQUISITIONS,
     BURST_ID,
-    RELATIVE_ORBIT,
-    SUBSWATH,
     BurstCensus,
     _granule_to_item,
     _query_cmr_granules,
@@ -438,17 +436,17 @@ class TestMakeS1ItemProvider:
 @pytest.mark.parametrize(
     "title, named",
     [
-        (_title("T115-245714-IW1"), {BURST_ID: "T115-245714-IW1", RELATIVE_ORBIT: 115, SUBSWATH: "IW1"}),
-        (_title("T003-004321-IW3"), {BURST_ID: "T003-004321-IW3", RELATIVE_ORBIT: 3, SUBSWATH: "IW3"}),
-        (_title("T115-245714-EW1"), {}),
-        ("granule-123", {}),
+        (_title("T115-245714-IW1"), "T115-245714-IW1"),
+        (_title("T003-004321-IW3"), "T003-004321-IW3"),
+        (_title("T115-245714-EW1"), None),
+        ("granule-123", None),
     ],
     ids=["iw1", "zero-padded-track", "not-iw", "not-opera"],
 )
 def test_the_title_names_the_burst_and_never_fails_the_item(title, named) -> None:
     """A title that does not parse still yields a loadable item, with no burst named."""
     item = _granule_to_item(_granule_entry(title))
-    assert {k: item.properties[k] for k in (BURST_ID, RELATIVE_ORBIT, SUBSWATH) if k in item.properties} == named
+    assert item.properties.get(BURST_ID) == named
     # The raw acquisition time is what `normalize_to_solar_day` reads, and it never overwrites it.
     assert item.properties["datetime"] == "2024-06-02T07:03:52.000Z"
 

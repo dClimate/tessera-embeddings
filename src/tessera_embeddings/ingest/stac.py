@@ -352,10 +352,8 @@ def solar_day_sort_key(item: Any) -> tuple[str, float, str]:  # noqa: ANN401 —
     )
 
 
-#: The sort that imposes each fusion order a collection can name in ``CollectionConfig.fusion_order``.
-#: One table, read by both the sort in :func:`query_stac_items` and the loader's
-#: ``preserve_original_order``, so a collection cannot be sorted without the loader keeping that
-#: order, or kept in an order nothing decided.
+#: The sort for each ``CollectionConfig.fusion_order``. The loader keeps the input order exactly
+#: where a collection names one, so a sort and the order the loader fuses in cannot disagree.
 _FUSION_SORT_KEYS: dict[str, Callable[[Any], tuple[Any, ...]]] = {
     "clearest_scene": solar_day_sort_key,
     "most_acquired_burst": burst_fusion_sort_key,
@@ -584,16 +582,11 @@ def _load_from_stac(
         "resampling": effective_resampling,
         "chunks": load_chunks,
         "groupby": groupby,
-        # True exactly where the collection names a fusion order, which `query_stac_items` imposes
-        # with the matching `_FUSION_SORT_KEYS` sort: the fuser keeps the first valid source, so
-        # that order must survive into the loader. A collection naming none is sorted by nothing
-        # here, and odc's own `(time, id)` default is then what makes the fused result a function
-        # of the items rather than of the order the provider returned.
-        #
-        # TODO: Planetary Computer's `sentinel-2-l2a` config names no fusion order, so odc reorders
-        # its groups by `(time, id)`, and `id` rather than cloud cover decides an overlap, losing
-        # `s2_roi`'s clearest-first sort. Naming `"clearest_scene"` there is the fix. Not made:
-        # the campaign reads Earth Search only, and nothing here exercises that provider's output.
+        # Kept exactly where the collection names a fusion order (`_FUSION_SORT_KEYS`), since the
+        # fuser keeps the first valid source; elsewhere odc's `(time, id)` order makes the result a
+        # function of the items, not of the provider's order.
+        # TODO: Planetary Computer's `sentinel-2-l2a` names none, so `id` rather than cloud cover
+        # decides its overlaps. Naming `"clearest_scene"` there fixes it; unexercised, so not made.
         "preserve_original_order": collection_config.fusion_order is not None,
     }
 
@@ -1547,19 +1540,10 @@ def query_stac_items(
     # refuses rather than defaulting to UTC, for that reason.
     items = normalize_to_solar_day(items, mid_longitude=resolve_grouping_longitude(mid_longitude, bbox))
 
-    # The collection's fusion order owns the order and the reasoning: clearest scene first for
-    # Sentinel-2 (`solar_day_sort_key`), most-acquired burst first for OPERA radar
-    # (`opera_query.burst_fusion_sort_key`). `load_kwargs` sets `preserve_original_order` from the
-    # same field, so it is that order the loader fuses in. Pinned end to end by
-    # `tests/unit/ingest/test_solar_day_fusion.py`, which loads real overlapping sources of one
-    # solar day through this path and asserts which one survives. Both keys read the SOLAR day,
-    # matching `normalize_to_solar_day` above and the loader's own grouping — keying on the UTC
-    # date instead splits a group the loader treats as one, in the zones where the solar offset
-    # crosses midnight.
-    # A collection naming no fusion order keeps the assembly order, which follows the window tree
-    # rather than a single catalogue walk. Its pixels cannot depend on that, since the loader then
-    # applies odc's own `(time, id)` order; only the provenance map below, which keeps a date's
-    # first item, still follows it.
+    # The collection's fusion order: clearest scene first for Sentinel-2, most-acquired burst first
+    # for OPERA radar, both keyed on the SOLAR day the loader groups by. Pinned end to end by
+    # `test_solar_day_fusion.py`. A collection naming none keeps the assembly order, which its
+    # pixels cannot depend on (the loader applies odc's own order); only the baseline map does.
     if collection_config.fusion_order is not None:
         items.sort(key=_FUSION_SORT_KEYS[collection_config.fusion_order])
 
