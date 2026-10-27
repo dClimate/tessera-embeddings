@@ -517,7 +517,8 @@ def _resolve_code_identity(
     the region the fills' ``ray_cluster`` PROVISIONS from, where the AMI SSM parameter and
     source tarball live; NOT the storage ``s3_region``, which may differ. ``ami_id`` pins the
     AMI component to a pre-resolved id so the fingerprint matches the image the fill will
-    boot, and ``env_image_uri`` the environment image likewise. See :func:`tessera_embeddings.providers.aws.ray.resolve_code_artifact_identity`.
+    boot, and ``env_image_uri`` the environment image likewise. See
+    :func:`tessera_embeddings.providers.aws.ray.resolve_code_artifact_identity`.
     """
     from tessera_embeddings.providers.aws.ray import resolve_code_artifact_identity
 

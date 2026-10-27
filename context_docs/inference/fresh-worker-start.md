@@ -63,7 +63,10 @@ cache (12.7 s, against 2.4 s warm). The base interpreter and the driver librarie
 **Since 2026-10-27 the environment is not in the AMI at all.** The image holds Python 3.12 (uv's build) and the
 venv, laid out as they are mounted at `/opt/tessera`. The deployment uploads it under a content-addressed name
 and writes its URI to `s3://{CODE_BUCKET}/code/env-image{CODE_SUFFIX}.uri`, beside the source tarball.
-`cluster.yaml.template`'s first `setup_commands` entry copies it on every node, head included, onto the
+The provider reads that pointer once per cluster and writes the URI into the setup command, and a campaign
+resolves it once and pins it into every fill as it pins the AMI ID, so neither a growing fleet nor a running
+campaign can straddle two environments. `cluster.yaml.template`'s first `setup_commands` entry copies the image
+on every node, head included, onto the
 instance store where there is one and the root volume otherwise, and mounts it read-only at `/opt/tessera`.
 A node that cannot mount it fails its setup: with no venv on the AMI there is nothing to fall back to. An AMI
 that still carries a venv at `/opt/tessera/venv` skips the entry. Section 5 measures this path.

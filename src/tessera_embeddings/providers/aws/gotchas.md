@@ -137,10 +137,11 @@ runs Ray from `/opt/tessera/venv` and expects two artifacts:
   every inference dependency (`torch`, `ray`, ...), laid out as it will be
   mounted at `/opt/tessera` (`python/` and `venv/`). Upload it to S3 and
   write its URI to `s3://{code_bucket}/code/env-image{code_suffix}.uri`,
-  beside the source tarball. Every node, head included, copies it and
-  mounts it read-only before Ray starts: onto the instance store where
-  there is one (`/opt/dlami/nvme`), else the root volume. A node that
-  cannot mount it fails its setup. The node's instance profile must be
+  beside the source tarball. The provider reads that pointer once per
+  cluster, and a campaign pins it like the AMI ID. Every node, head
+  included, copies the image and mounts it read-only before Ray starts:
+  onto the instance store where there is one (`/opt/dlami/nvme`), else
+  the root volume. A node that cannot mount it fails its setup. The node's instance profile must be
   able to read the image.
 
 **Build rather than install on boot:** at 100–500 workers, `pip install`

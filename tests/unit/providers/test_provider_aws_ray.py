@@ -150,7 +150,8 @@ def test_resolve_ray_config_writes_a_complete_yaml(tmp_path: Path) -> None:
 def test_resolve_ray_config_substitutes_the_code_bucket_when_given(pinned: str | None) -> None:
     """With a bucket, the tarball fetch survives fully substituted, and the environment image's
     URI is written into the setup command: the pinned one when given, else the pointer's,
-    read here once so no node reads the pointer itself."""
+    read here once so no node reads the pointer itself.
+    """
     ami_param, _, _ = _seed_ssm_and_vpc()
     s3 = boto3.client("s3", region_name=REGION)
     s3.create_bucket(Bucket="my-code-bucket", CreateBucketConfiguration={"LocationConstraint": REGION})
