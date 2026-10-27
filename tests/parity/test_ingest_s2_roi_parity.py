@@ -72,9 +72,9 @@ def test_s2_roi_parity(
     )
 
     # Flow path. We bypass the @flow wrapper via .fn so tests don't
-    # need a running Prefect server; the wrapper around our domain
-    # function is one concrete provider-selection branch (use_local)
-    # plus a dispatch to .with_options(task_runner=...). Both paths
+    # need a flow run; the body around our domain function is one
+    # concrete provider-selection branch (use_local) plus the task
+    # shell's submission to that cluster (run_on_cluster). Both paths
     # eventually land in ingest_s2_roi_reflectance, so .fn-bypass is
     # faithful to the production code path.
     flow_module.ingest_s2_roi_reflectance.fn(  # type: ignore[attr-defined]

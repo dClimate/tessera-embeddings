@@ -9,13 +9,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
+from tessera_embeddings.errors import ConfigMismatchError
 from tessera_embeddings.ingest._http import NonJsonResponseError
 from tessera_embeddings.ingest.opera_query import (
     _UNPARSEABLE_PAGE_ATTEMPTS,
     BURST_ACQUISITIONS,
     BURST_ID,
-    RELATIVE_ORBIT,
-    SUBSWATH,
     BurstCensus,
     _granule_to_item,
     _query_cmr_granules,
@@ -437,17 +436,17 @@ class TestMakeS1ItemProvider:
 @pytest.mark.parametrize(
     "title, named",
     [
-        (_title("T115-245714-IW1"), {BURST_ID: "T115-245714-IW1", RELATIVE_ORBIT: 115, SUBSWATH: "IW1"}),
-        (_title("T003-004321-IW3"), {BURST_ID: "T003-004321-IW3", RELATIVE_ORBIT: 3, SUBSWATH: "IW3"}),
-        (_title("T115-245714-EW1"), {}),
-        ("granule-123", {}),
+        (_title("T115-245714-IW1"), "T115-245714-IW1"),
+        (_title("T003-004321-IW3"), "T003-004321-IW3"),
+        (_title("T115-245714-EW1"), None),
+        ("granule-123", None),
     ],
     ids=["iw1", "zero-padded-track", "not-iw", "not-opera"],
 )
 def test_the_title_names_the_burst_and_never_fails_the_item(title, named) -> None:
     """A title that does not parse still yields a loadable item, with no burst named."""
     item = _granule_to_item(_granule_entry(title))
-    assert {k: item.properties[k] for k in (BURST_ID, RELATIVE_ORBIT, SUBSWATH) if k in item.properties} == named
+    assert item.properties.get(BURST_ID) == named
     # The raw acquisition time is what `normalize_to_solar_day` reads, and it never overwrites it.
     assert item.properties["datetime"] == "2024-06-02T07:03:52.000Z"
 
@@ -481,6 +480,10 @@ def _reference_page(titles, search_after=None):
     refs = "".join(f"<reference><name>{t}</name><id>G{i}-ASF</id></reference>" for i, t in enumerate(titles))
     body = f'<?xml version="1.0"?><results><hits>{len(titles)}</hits><references>{refs}</references></results>'
     return _raw_response(body.encode(), content_type="application/xml", search_after=search_after)
+
+
+#: A census as a store records it: the window and grouping longitude it was counted over, and the counts.
+_RECORD = {"window": ["2024-01-01", "2024-12-31"], "mid_longitude": 27.0, "counts": {_HIGH: 31}}
 
 
 class TestBurstAcquisitions:
@@ -557,9 +560,22 @@ class TestBurstAcquisitions:
     def test_recorded_counts_are_the_answer_and_nothing_is_queried(self):
         """A resumed leg ranks by the census its store recorded, whatever the catalogue says now."""
         with patch("tessera_embeddings.ingest.opera_query.burst_acquisitions") as query:
-            census = BurstCensus(self.BBOX, "2024-01-01", "2024-12-31", "ascending", counts={_HIGH: 31})
+            census = BurstCensus(
+                self.BBOX, "2024-01-01", "2024-12-31", "ascending", mid_longitude=27.0, recorded=_RECORD
+            )
             assert census.counts() == {_HIGH: 31}
+            assert census.record() == _RECORD
         query.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("end", "longitude"), [("2025-02-28", 27.0), ("2024-12-31", 33.0)], ids=["another-window", "another-longitude"]
+    )
+    def test_a_record_counted_over_anything_else_is_refused(self, end, longitude):
+        """A burst first seen in the new days would rank as never acquired, and recounting would rank the
+        new days differently from those already written.
+        """
+        with pytest.raises(ConfigMismatchError, match="Ingest this window into its own store"):
+            BurstCensus(self.BBOX, "2024-01-01", end, "ascending", mid_longitude=longitude, recorded=_RECORD)
 
 
 # ---------------------------------------------------------------------------

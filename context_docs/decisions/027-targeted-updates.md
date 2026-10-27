@@ -55,6 +55,16 @@ the update, its mode and run, its code, its mask, its shard `commit`, and which 
 `written`, `kept` and `cleared`. A cell is therefore `runs[year]` with `updates[year]` applied on top, in order, and an
 update is done on a cell exactly when that cell holds its record — which is what makes a rerun free.
 
+**An update may add land, so a year is judged against every mask that wrote it.** A plan's mask may
+hold land the campaign's lacks, such as small islands the coverage registry omits: the campaign's
+registry plus extra cells. A tile only that mask holds is processed whole, and the plan must list
+every such tile, because the validator reconciles a cell's written and skipped tiles against its
+mask's land. Anything that validates the store afterwards judges each year against the campaign's
+mask together with every mask the year's update records name (`mask_name`), resolved beside it as
+`{inputs}/masks/<name>.icechunk` (yield-embeddings #109). The record holds the name, not a snapshot,
+so a mask a record names is kept unchanged for as long as the store is validated, and a changed mask
+takes a new name. How to build one: [`docs/updates.md`](../../docs/updates.md).
+
 **Two tags per update, none per cell.** `update-<name>-base` pins the store before the update's first
 write, for comparison and rollback; `update-<name>-complete` pins it once every planned cell holds
 the record. A cell the campaign never filled is refused: an update inserts into existing data.
@@ -138,8 +148,9 @@ in new imagery means deleting the mosaics first.
   full fill of the same tiles. Skipping empty strips mostly helps the sparsest tiles; narrowing a
   strip to its holes' rows and columns saves nothing measurable, because the mosaics' inner chunks
   span the tile's width ([`update-dev-verification.md`](../campaign/update-dev-verification.md)).
-- **The base tag retains the replaced shards** against any future garbage collection. Deleting it
-  once an update is verified releases them.
+- **The base tag retains the replaced shards** against any future garbage collection. Deleting the
+  tag only makes them collectable: freeing the storage needs snapshot expiry and garbage collection,
+  which can also remove every older untagged version of the store, so it is a separate decision.
 - **One update per cell at a time.** Two updates of the same cell conflict on its chunks; the
   `updates` record itself retries like any attr commit.
 - **`runs[year]` no longer describes every pixel of an updated cell.** Its `optical_skips` and

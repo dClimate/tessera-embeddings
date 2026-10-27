@@ -1,11 +1,9 @@
 """Sentinel-2 L2A reflectance ingestion flow for ROI-based regions.
 
-The outer flow provisions a Dask cluster (AWS Fargate by default; ``LocalCluster`` when
-``use_local=True``) and invokes the inner flow via ``.with_options(task_runner=...)``, so
-Prefect binds the runner late, after the cluster context has produced a scheduler address.
-
-The two-flow split is load-bearing: ``task_runner=`` must be set at flow definition time or
-via ``.with_options()`` on a callable, which requires an inner ``@flow``. Do not collapse it.
+The flow provisions a Dask cluster (AWS Fargate by default; ``LocalCluster`` when
+``use_local=True``) and runs the ``process_roi_reflectance`` task shell on it with
+:func:`._dask_lifecycle.run_on_cluster`, as a task run of this flow run, so the ingest's progress
+logs land on this run.
 """
 
 from __future__ import annotations
@@ -21,9 +19,10 @@ from tessera_embeddings.ingest.s2_roi import BATCH_CHUNKS_PER_WORKER
 from tessera_embeddings.orchestration.prefect.flows._dask_lifecycle import (
     dask_cleanup_on_cancellation,
     dask_resource_tags,
-    get_task_runner_for_cluster,
+    run_on_cluster,
 )
 from tessera_embeddings.orchestration.prefect.tasks.ingest import process_roi_reflectance
+from tessera_embeddings.providers.local.dask import local_cluster
 
 MAX_PIPELINE_DATES_WORKERS = 140
 """Widest Fargate fleet on which the flow prepares the next S2 date during the current write.
@@ -71,52 +70,6 @@ def _pipelines_dates(
         MAX_PIPELINE_DATES_WORKERS,
     )
     return False
-
-
-@flow(name="ingest_s2_roi_impl")
-def _ingest_s2_roi_impl(
-    *,
-    roi_zarr_path: str,
-    start_date: str,
-    end_date: str,
-    store_path: str,
-    min_valid_coverage: float = DEFAULT_MIN_VALID_COVERAGE,
-    provider: str = "earth-search",
-    collection: str = "sentinel-2-l2a",
-    storage_options: dict | None = None,
-    stream_stac_monthly: bool = True,
-    overlap_window_writes: bool = True,
-    pipeline_dates: bool,
-    batch_dates: int | None = None,
-    batch_chunk_budget: int | None,
-    allow_ingest_code_mismatch: bool = False,
-    provenance: bool = False,
-    s3_region: str | None = None,
-) -> dict[str, Any]:
-    """Inner flow: submits the S2 ingestion task to the configured Dask runner.
-
-    ``pipeline_dates`` and ``batch_chunk_budget`` are the outer flow's decisions, never a
-    caller's.
-    """
-    future = process_roi_reflectance.submit(
-        roi_zarr_path=roi_zarr_path,
-        start_date=start_date,
-        end_date=end_date,
-        store_path=store_path,
-        min_valid_coverage=min_valid_coverage,
-        provider=provider,
-        collection=collection,
-        storage_options=storage_options,
-        stream_stac_monthly=stream_stac_monthly,
-        overlap_window_writes=overlap_window_writes,
-        pipeline_dates=pipeline_dates,
-        batch_dates=batch_dates,
-        batch_chunk_budget=batch_chunk_budget,
-        allow_ingest_code_mismatch=allow_ingest_code_mismatch,
-        provenance=provenance,
-        s3_region=s3_region,
-    )
-    return future.result()
 
 
 @flow(
@@ -220,68 +173,51 @@ def ingest_s2_roi_reflectance(
     # counts its workers. A local cluster is up already, so the ingest counts it itself (None).
     batch_chunk_budget = None if use_local else BATCH_CHUNKS_PER_WORKER * max_workers
 
-    if use_local:
-        from tessera_embeddings.providers.local.dask import local_cluster
+    task_parameters: dict[str, Any] = {
+        "roi_zarr_path": roi_zarr_path,
+        "start_date": start_date,
+        "end_date": end_date,
+        "store_path": store_path,
+        "min_valid_coverage": min_valid_coverage,
+        "provider": provider,
+        "collection": collection,
+        "storage_options": storage_options,
+        "stream_stac_monthly": stream_stac_monthly,
+        "overlap_window_writes": overlap_window_writes,
+        "pipeline_dates": pipeline_dates,
+        "batch_dates": batch_dates,
+        "batch_chunk_budget": batch_chunk_budget,
+        "allow_ingest_code_mismatch": allow_ingest_code_mismatch,
+        "provenance": provenance,
+        "s3_region": s3_region,
+    }
 
+    if use_local:
         if perf_report_uri:
             # Say so rather than no-op: an operator finding nothing at the URI would
             # otherwise suspect the upload or their credentials.
             log.warning("perf_report_uri is ignored on the local-cluster path (use_local=True)")
         with local_cluster() as cluster:
             log.info("Local Dask cluster ready: scheduler=%s", cluster.scheduler_address)
-            task_runner = get_task_runner_for_cluster(cluster.scheduler_address)
-            return _ingest_s2_roi_impl.with_options(task_runner=task_runner)(  # type: ignore[arg-type]
-                roi_zarr_path=roi_zarr_path,
-                start_date=start_date,
-                end_date=end_date,
-                store_path=store_path,
-                min_valid_coverage=min_valid_coverage,
-                provider=provider,
-                collection=collection,
-                storage_options=storage_options,
-                stream_stac_monthly=stream_stac_monthly,
-                overlap_window_writes=overlap_window_writes,
-                pipeline_dates=pipeline_dates,
-                batch_dates=batch_dates,
-                batch_chunk_budget=batch_chunk_budget,
-                allow_ingest_code_mismatch=allow_ingest_code_mismatch,
-                provenance=provenance,
-                s3_region=s3_region,
-            )
+            return run_on_cluster(cluster.scheduler_address, process_roi_reflectance, task_parameters)
 
+    # Deferred: providers.aws.dask needs the `aws` extra, which a use_local run must not.
     from tessera_embeddings.providers.aws.dask import ecs_cluster, maybe_performance_report
 
-    with ecs_cluster(
-        log,
-        min_workers=min_workers,
-        max_workers=max_workers,
-        ec2_scheduler=ec2_scheduler,
-        # A capped task stream silently truncates the report to the run's last few dates;
-        # raise it only when a report is actually being captured.
-        diagnostic_task_stream=bool(perf_report_uri),
-        extra_worker_env=worker_env_overrides,
-        # Tag every cluster resource with this run's id so the cancellation/crash hook can
-        # sweep the tasks from a fresh process (see _dask_lifecycle).
-        resource_tags=dask_resource_tags(flow_run_ctx.id),
-    ) as cluster:
-        task_runner = get_task_runner_for_cluster(cluster.scheduler_address)
-        log.info("Task runner connected to scheduler at %s", cluster.scheduler_address)
-        with maybe_performance_report(cluster.scheduler_address, perf_report_uri, log):
-            return _ingest_s2_roi_impl.with_options(task_runner=task_runner)(  # type: ignore[arg-type]
-                roi_zarr_path=roi_zarr_path,
-                start_date=start_date,
-                end_date=end_date,
-                store_path=store_path,
-                min_valid_coverage=min_valid_coverage,
-                provider=provider,
-                collection=collection,
-                storage_options=storage_options,
-                stream_stac_monthly=stream_stac_monthly,
-                overlap_window_writes=overlap_window_writes,
-                pipeline_dates=pipeline_dates,
-                batch_dates=batch_dates,
-                batch_chunk_budget=batch_chunk_budget,
-                allow_ingest_code_mismatch=allow_ingest_code_mismatch,
-                provenance=provenance,
-                s3_region=s3_region,
-            )
+    with (
+        ecs_cluster(
+            log,
+            min_workers=min_workers,
+            max_workers=max_workers,
+            ec2_scheduler=ec2_scheduler,
+            # A capped task stream silently truncates the report to the run's last few dates;
+            # raise it only when a report is actually being captured.
+            diagnostic_task_stream=bool(perf_report_uri),
+            extra_worker_env=worker_env_overrides,
+            # Tag every cluster resource with this run's id so the cancellation/crash hook can
+            # sweep the tasks from a fresh process (see _dask_lifecycle).
+            resource_tags=dask_resource_tags(flow_run_ctx.id),
+        ) as cluster,
+        maybe_performance_report(cluster.scheduler_address, perf_report_uri, log),
+    ):
+        return run_on_cluster(cluster.scheduler_address, process_roi_reflectance, task_parameters)

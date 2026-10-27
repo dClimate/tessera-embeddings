@@ -205,6 +205,8 @@ class _CapturingWriter:
         obs_counts=None,
         month_covered=None,
         coverage=None,
+        *,
+        stack,
         planes=None,
         pixels=None,
     ):
@@ -217,6 +219,7 @@ class _CapturingWriter:
             "month_covered": month_covered.copy() if month_covered is not None else None,
             # The record the real writer persists onto the tile so it outlives this process.
             "coverage": dict(coverage) if coverage is not None else None,
+            "stack": dict(stack),
             # Ranked here, as the real writer ranks them, so a test compares what would be staged.
             "planes": _ranked(planes, pixels),
         }
@@ -549,6 +552,19 @@ class TestDeferredStagingWrites:
         # And the write actually happened (the capturing writer recorded it).
         assert _CapturingWriter.last_write is not None
 
+    def test_each_tile_carries_the_stack_its_actor_computed_with(self, inference_config, test_model):
+        """From the process that ran the model, since the driver runs the lockfile's CPU build. A CPU
+        actor records no CUDA even on a CUDA build, whose ``torch.version.cuda`` names the build.
+        """
+        with patch.object(torch.version, "cuda", "12.1"):
+            self._run_two_chunks(inference_config, test_model, _CapturingWriter)
+        assert _CapturingWriter.last_write["stack"] == {
+            "model_version": inference_config.model_version,
+            "checkpoint_id": inference_config.checkpoint_path.rsplit("/", 1)[-1].removesuffix(".pt"),
+            "torch": torch.__version__,
+            "cuda": None,
+        }
+
     def test_the_coverage_record_goes_onto_the_tile_not_only_into_the_result(self, inference_config, test_model):
         """An embedded shard's record must survive the process that measured it.
 
@@ -576,6 +592,8 @@ class TestDeferredStagingWrites:
                 obs_counts=None,
                 month_covered=None,
                 coverage=None,
+                *,
+                stack,
             ):
                 raise OSError("S3 500")
 

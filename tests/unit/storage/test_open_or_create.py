@@ -1,10 +1,8 @@
 """``open_or_create_repo`` must create only on PROVEN absence.
 
-Icechunk reports everything through one exception class — in 2.1.1 the exported types are
-``IcechunkError``, ``ConflictError`` and ``RebaseFailedError``, nothing narrower — so absence,
-an expired credential, a throttle, an IO error and real corruption are indistinguishable by
-type. Catching the class wholesale on the open leg therefore reads every failure as "not
-there" and creates.
+Every Icechunk error derives from ``IcechunkError``, so absence, an expired credential, a
+throttle, an IO error and real corruption all share that one class. Catching it wholesale on
+the open leg therefore reads every failure as "not there" and creates.
 
 Creating in response to a transient failure is not merely imprecise, it is destructive, and
 the reason is worth stating once here because it is the whole point of this module:

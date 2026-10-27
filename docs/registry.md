@@ -263,6 +263,7 @@ a fixed subset of these dates, chosen by a deterministic rule from the dates alo
 - The registry audited against the store tile for tile:
   [`reading-the-published-store.md`, section 5][audit].
 - How the provenance record is made, sized and checked: [`registry-provenance-plan.md`][provenance].
+- Why the provenance record is shaped as it is: [ADR 035][provenance-adr].
 
 [self]: https://github.com/dClimate/tessera-embeddings/blob/main/docs/registry.md
 [store]: https://github.com/dClimate/tessera-embeddings/blob/main/docs/global-store.md
@@ -270,3 +271,4 @@ a fixed subset of these dates, chosen by a deterministic rule from the dates alo
 [backfill]: https://github.com/dClimate/tessera-embeddings/blob/main/context_docs/storage/registry-backfill.md
 [audit]: https://github.com/dClimate/tessera-embeddings/blob/main/context_docs/storage/reading-the-published-store.md#5-the-registry-beside-the-store
 [provenance]: https://github.com/dClimate/tessera-embeddings/blob/main/context_docs/storage/registry-provenance-plan.md
+[provenance-adr]: https://github.com/dClimate/tessera-embeddings/blob/main/context_docs/decisions/035-a-provenance-record-for-the-published-store.md

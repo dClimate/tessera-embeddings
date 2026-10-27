@@ -245,7 +245,7 @@ Where the code changes:
 - Dead code: `inference/shard_record.py` is test-only and is deleted.
 - Docs: a Provenance section in `docs/registry.md`; the ingest and inference READMEs say where
   their half is produced; `registry-master.md` gains the publication step;
-  `staging-identity-and-resume.md` gains the snapshot pinning; an ADR records §8 and §13.
+  `staging-identity-and-resume.md` gains the snapshot pinning; [ADR 035](../decisions/035-a-provenance-record-for-the-published-store.md) records §8 and §13.
 
 ## 5. The pieces in detail
 

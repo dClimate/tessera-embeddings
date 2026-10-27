@@ -1680,10 +1680,9 @@ a third less than §12's $828,364, and take about 10.5 days on §12's average fl
 Measured 2026-10-05 on the Iowa year on g6e.xlarge (L40S) cards; the factors are applied to the
 whole card line, A10G hours included.
 
-**One prerequisite: the global campaign cannot run v2 yet.** Zone fill (`fill_zone_year`) builds
-v1.1 only; v2 Large is selectable on the single-area paths. Wiring v2 through zone fill, its seed
-and its provenance checks comes first, and this section costs the campaign that wiring makes
-possible.
+**A v2 campaign fills its own store.** A global store is seeded for one model and every zone fill
+follows it, so v2 seeds a fresh store with `model_version="v2-large"`; this section costs that
+campaign.
 
 ### GPU time, measured on the Iowa year
 
