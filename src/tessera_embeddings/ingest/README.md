@@ -478,8 +478,10 @@ the slot's own commit, and every pixel carries a `source_index`: the position pl
 granule that supplied it. The index costs no extra read and no extra fuser. The mask band (SCL,
 or VV) is read through a reader that packs each granule's position above its pixels, so odc's own
 first-wins fuse carries the winner through and a split afterwards returns the band unchanged. The
-mosaic's manifest records the switch, and a resume under the other setting is refused.
-[docs/ingest/provenance.md](../../../docs/ingest/provenance.md) has the fields and the mechanism.
+mosaic's manifest records the switch, and a resume under the other setting is refused. At zone
+scale the record adds about 6–20% to ingest worker time.
+[docs/ingest/provenance.md](../../../docs/ingest/provenance.md) has the fields, the mechanism and
+what it costs.
 
 ---
 ## Authentication (EDL / OPERA data)

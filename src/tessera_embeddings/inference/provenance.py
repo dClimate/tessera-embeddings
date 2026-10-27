@@ -3,7 +3,7 @@
 A mosaic built with the provenance switch on carries a ``source_index`` band beside its imagery
 (``ingest/provenance.py``): per pixel and slot, the fusion position plus one of the granule the
 fuser took the pixel from. The actor turns that into the per-shard record the registry publishes
-(``context_docs/storage/registry-provenance-plan.md`` §4, §5.2, §5.3):
+(``context_docs/storage/registry-provenance-plan.md`` §3, §4):
 
 * **Pieces, read where the mask is read.** Wherever a loader reads a sensor's validity — the
   whole-shard SCL mask for optical, each strip's VV and VH for radar — it also reads the source
@@ -41,8 +41,8 @@ from tessera_embeddings.config.ingest import SOURCE_INDEX_VAR
 #: The three sensors the record covers, named as the published planes are.
 SENSORS = ("s2", "s1_asc", "s1_desc")
 
-#: The staged and published planes' codec: §9 measured Blosc zstd 3 with bit shuffle at 1.17 MB a
-#: shard-year, where plain zstd took 2.83 MB.
+#: The staged and published planes' codec: Blosc zstd 3 with bit shuffle, measured at 1.17 MB a
+#: shard-year where plain zstd took 2.83 MB (the plan's Appendix A).
 PLANE_COMPRESSORS = (BloscCodec(cname="zstd", clevel=3, shuffle="bitshuffle"),)
 
 #: The same codec for the in-memory pieces, which are 16-bit positions rather than 8-bit ranks.

@@ -140,6 +140,10 @@ context_docs/
     │                                              unmeasured were re-derived from the store, why
     │                                              that is a re-derivation rather than an
     │                                              estimate, and the v1.1 run
+    ├── registry-provenance-plan.md             the provenance record: which granule supplied
+    │                                              every pixel on every date, for reviewers new to
+    │                                              the pipeline
+    ├── provenance-dev-verification.md          its end-to-end dev test, and what it costs
     └── icechunk-api-ledger.md                  signatures and gotchas the scale tests earned
 ```
 

@@ -76,8 +76,9 @@ bits of every pixel it returns:
 
 The packed value is zero exactly where the fuser's own nodata test says the granule has no data,
 so the packed fuse keeps the same granule the plain fuse would, and the band comes back
-bit-identical. The band is still read once, in its native dtype and resampling. SCL packs into
-`uint32` and VV into `uint64` while it is in flight; nothing extra is added to the task graph.
+bit-identical. The band is still read once, in its native dtype and resampling, and no fuse is
+added. SCL packs into `uint32` and VV into `uint64` while it is in flight, and the index is one
+more array for every window to write.
 
 The parser stamps each mask-band source with its granule's position and native metadata
 (`stac.SourceParser`), and the reader packs as it reads (`stac._SourceReader`) — the same
@@ -97,5 +98,12 @@ granule for a pixel the model did not see.
 ## What it costs
 
 The granule list is under 100 MB a zone-year. The index band adds two bytes a pixel per slot
-before compression, for as long as the mosaic exists. The dev test compares the ingest's time
-per day with the record on against #250's, which should be level.
+before compression; compressed, it is about 0.1% of an optical mosaic and 0.3% of a radar one, for
+as long as the mosaic exists.
+
+The record costs ingest time. Across a whole UTM zone, each date takes about 5–17% longer for
+optical and 10–30% longer for radar than with the switch off, roughly 6–20% more ingest worker time
+in all. The cost is CPU: the wider mask band is packed and fused on every worker, and the index is
+written as a third array. It hides on a small area, whose workers have time to spare. The paired
+measurements and the performance reports are in
+[`provenance-dev-verification.md`](../../context_docs/storage/provenance-dev-verification.md).

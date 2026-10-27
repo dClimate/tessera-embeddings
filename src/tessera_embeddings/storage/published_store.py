@@ -325,7 +325,7 @@ def source_runs(attrs: Mapping[str, Any], year: int, tile: str) -> list[str] | N
 
     ``None`` unless every run in the list carries one, so a reader can tell a tile with no complete
     record — all of v1.1, and anything filled with the switch off — from one that has it
-    (``context_docs/storage/registry-provenance-plan.md`` §6).
+    (``context_docs/storage/registry-provenance-plan.md`` §5).
     """
     head = (attrs.get("runs") or {}).get(str(year))
     lineage: list[Mapping[str, Any]] = [head] if isinstance(head, Mapping) else []
