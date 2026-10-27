@@ -141,8 +141,9 @@ Input mosaic stores (Icechunk/Zarr on S3):
             │
             ▼
   Output:  {roi_name}.zarr  (Icechunk; time axis extends on re-run)
-           embeddings    (time, northing, easting, 128)
-           obs counts    (time, northing, easting)  — s2 / s1_asc / s1_desc
+           embeddings    (time, y, x, 128)
+           obs counts    (time, y, x)  — s2 / s1_asc / s1_desc
+           (a v1.1 store names y and x northing and easting; ADR 032)
 
   Global-campaign variant: writer.assemble_global() writes the same staged
   tiles as whole 2048-px shards into a pre-seeded UTM zone group of the
@@ -202,7 +203,9 @@ way to waste money on this pipeline.
 - **Workers:** g6e.xlarge (one L40S, 4 vCPU, 32 GB RAM), on demand, across several
   availability zones; Ray fails over between subnets when one refuses capacity.
 - Workers boot from a Packer-built AMI with every dependency already installed, and are
-  ready in about a minute.
+  ready in about a minute. Their first forward then waits on the new EBS volume loading the
+  AMI, unless the AMI ships its venv as a mountable image
+  ([`gotchas.md`](../providers/aws/gotchas.md)), which turns minutes into well under one.
 
 [`docs/providers/aws.md`](../../../docs/providers/aws.md) covers what to provision, the
 capacity-fallback rungs, and how the fleet mix is chosen.

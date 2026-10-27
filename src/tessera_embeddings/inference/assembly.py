@@ -59,6 +59,7 @@ from tessera_embeddings.config.inference import (
     RADAR_THIN_MAX_OBS,
     ModelVersion,
     TimeWindow,
+    model_family,
 )
 from tessera_embeddings.config.store_layout import (
     CARRIED_VARS,
@@ -70,6 +71,7 @@ from tessera_embeddings.config.store_layout import (
     REQUIRED_VARS,
     SINGLE,
     StoreLayout,
+    spatial_dims_of,
     trailing_extent,
 )
 from tessera_embeddings.inference.chunk_spec import (
@@ -87,6 +89,7 @@ from tessera_embeddings.storage.conventions import (
     build_convention_attrs,
     checkpoint_stem,
     library_stack,
+    stamp_array_conventions,
 )
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
 from tessera_embeddings.storage.global_store import create_layout_arrays, open_global_repo
@@ -619,8 +622,9 @@ def assert_on_store_grid(
                 f"Mosaic CRS {spatial.crs!r} does not match existing store {where} "
                 f"CRS {stored_crs!r} — appending would misgeoreference the timestep."
             )
-        z_north = cast(zarr.Array, root["northing"])
-        z_east = cast(zarr.Array, root["easting"])
+        y_name, x_name = spatial_dims_of(root)
+        z_north = cast(zarr.Array, root[y_name])
+        z_east = cast(zarr.Array, root[x_name])
         atol = PIXEL_M / 2
         if not (
             np.isclose(spatial.northing[0], z_north[0], rtol=0.0, atol=atol)
@@ -641,8 +645,8 @@ def assert_on_store_grid(
         # axis that wanders and returns accumulates it while still matching the length and
         # both endpoints. Reachable on the supported hand-provided mosaic path.
         for axis, values, stored in (
-            ("northing", spatial.northing, z_north),
-            ("easting", spatial.easting, z_east),
+            (y_name, spatial.northing, z_north),
+            (x_name, spatial.easting, z_east),
         ):
             got = np.asarray(values, dtype="float64")
             want = np.asarray(stored[:], dtype="float64")
@@ -1893,18 +1897,13 @@ class ZarrWriter:
         pixels are written.
         """
         variables = list(variables)
-        sizes = {
-            "time": 1,
-            "northing": total_y,
-            "easting": total_x,
-            "band": self.embedding_dim,
-            "month": MONTHS_IN_YEAR,
-        }
+        y, x = layout.spatial_dims
+        sizes = {"time": 1, y: total_y, x: total_x, "band": self.embedding_dim, "month": MONTHS_IN_YEAR}
         create_layout_arrays(root, layout, variables, sizes)
         coords: dict[str, np.ndarray] = {
             "time": np.asarray([time_date], dtype="datetime64[ns]"),
-            "northing": spatial.northing if spatial else np.arange(total_y),
-            "easting": spatial.easting if spatial else np.arange(total_x),
+            y: spatial.northing if spatial else np.arange(total_y),
+            x: spatial.easting if spatial else np.arange(total_x),
             "band": np.arange(self.embedding_dim),
         }
         if any(var in variables for var in MONTH_COVERED_VARS):
@@ -2131,7 +2130,10 @@ class ZarrWriter:
         overwrite = False
         # "time" absent means a created-but-never-seeded repo (a crash between repo creation and
         # the schema commit) — treat as fresh.
-        if is_new or "time" not in root:
+        fresh = is_new or "time" not in root
+        # A new store takes its model's Y/X names; an existing one keeps its own, whatever the model.
+        layout = layout.with_spatial_dims(model_family(model_version).spatial_dims if fresh else spatial_dims_of(root))
+        if fresh:
             self._create_schema(root, layout, variables, total_y, total_x, time_date, spatial)
             traced_commit(session, f"Run {run_id}: create schema ({layout.name})")
             time_index = 0
@@ -2158,13 +2160,8 @@ class ZarrWriter:
             missing = [v for v in variables if v not in root]
             if missing:
                 nt = cast(zarr.Array, root["time"]).shape[0]
-                sizes = {
-                    "time": nt,
-                    "northing": total_y,
-                    "easting": total_x,
-                    "band": self.embedding_dim,
-                    "month": MONTHS_IN_YEAR,
-                }
+                y, x = layout.spatial_dims
+                sizes = {"time": nt, y: total_y, x: total_x, "band": self.embedding_dim, "month": MONTHS_IN_YEAR}
                 create_layout_arrays(root, _layout_matching_store(root, layout, missing), missing, sizes)
                 if any(var in missing for var in MONTH_COVERED_VARS) and "month" not in root:
                     # The axis this array introduces to a store that predates it; without the
@@ -2270,12 +2267,15 @@ class ZarrWriter:
             "run_started_at": started.isoformat(),
             "run_completed_at": datetime.datetime.now(datetime.UTC).isoformat(),
         }
+        # No CRS without projected coordinates: a reader pairing it with pixel indices would place
+        # the raster at the CRS origin.
         conv_attrs = build_convention_attrs(
-            tile_id=tile_id,
+            tile_id=tile_id if spatial else None,
             epsg_code=spatial.crs if spatial else None,
             total_y=total_y,
             total_x=total_x,
             embedding_dim=self.embedding_dim,
+            spatial_dims=layout.spatial_dims,
             y_coords=spatial.northing if spatial else None,
             x_coords=spatial.easting if spatial else None,
             checkpoint_id=checkpoint_id,
@@ -2307,6 +2307,8 @@ class ZarrWriter:
         for stale in [k for k in node.attrs if str(k).startswith("tessera:")]:
             del node.attrs[stale]
         node.attrs.update(attrs)
+        # Every assemble, not only at creation, so a store created before these attrs gains them.
+        stamp_array_conventions(node)
 
         t_commit = time.monotonic()
         commit_with_rebase(session, f"Run {run_id}: {len(chunks)} chunks assembled")
