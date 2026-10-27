@@ -89,8 +89,8 @@ MONTH_COORD = tuple(range(1, MONTHS_IN_YEAR + 1))
 #: for an unwritten pixel, exactly as a count of 0.
 #:
 #: Stored as ``int8`` carrying the attribute ``dtype="bool"``, xarray's own representation of a boolean array, so a
-#: reader gets booleans back while the on-disk type is the one the staging writer can produce (``Dataset.to_zarr``
-#: stores bool as int8 whatever the encoding says, and assembly reads staged tiles with raw zarr).
+#: reader gets booleans back while the on-disk type is the one the staging writer produces (it stages the masks as
+#: int8 explicitly, ``ZarrWriter._stage_month_masks``, and assembly reads staged tiles with raw zarr).
 MONTH_COVERED_VARS: tuple[str, ...] = tuple(f"{sensor}_month_covered" for sensor in SENSORS)
 
 #: The month mask paired with each obs-count array, so a caller holding one can name the other without slicing a name
@@ -280,12 +280,12 @@ def _sharded_arrays(*, include_std: bool) -> dict[str, ArrayLayout]:
         # coverage is spatially smooth and a plane compresses ~400x while packed bits look like noise to the
         # compressor. The 6x uncompressed never reaches disk, and a plane per month needs no helper library to read.
         #
-        # int8 + attrs dtype="bool" is xarray's OWN representation of a boolean array, forced here by the write path:
-        # staged tiles are written with `Dataset.to_zarr`, which stores bool as int8 whatever the encoding asks, while
-        # assembly reads those tiles with RAW zarr and sees int8 — so a bool destination refused every staged month
-        # tile on the dtype guard. Matching the destination to what the writer can express keeps the guard intact, and
-        # the attribute is what makes an xarray reader see booleans rather than 0/1, so `cov.sel(month=7)` is still a
-        # boolean mask. Size is unchanged: numpy bool is 1 byte.
+        # int8 + attrs dtype="bool" is xarray's OWN representation of a boolean array, and what the staging writer
+        # stages (explicitly: from xarray 2026.9, `to_zarr` would store bool natively). Assembly reads staged tiles
+        # with RAW zarr and compares dtypes, so destination and staged tile must agree — a bool destination refused
+        # every staged month tile on the dtype guard. Matching the destination to what the writer stages keeps the
+        # guard intact, and the attribute is what makes an xarray reader see booleans rather than 0/1, so
+        # `cov.sel(month=7)` is still a boolean mask. Size is unchanged: numpy bool is 1 byte.
         **{
             var: ArrayLayout(
                 DIMS_4D_MONTH,
