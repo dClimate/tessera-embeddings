@@ -56,7 +56,9 @@ ingest skips dates already on the axis, so a list is written once and never touc
 The mosaic also gains a `source_index` band, `uint16`, one value per pixel per slot: the
 granule's position in the day's fusion order plus one, or zero where no granule had data. It is
 16 bits because a day's fusion order is zone-wide, and a long land zone can hold more than 255
-scenes or bursts in one day. Inference reads bands by name and never sees it.
+scenes or bursts in one day. The model never reads it as a band; the inference actor reads it
+beside each sensor's mask to stage its shard's share of the record
+([inference README](../../src/tessera_embeddings/inference/README.md)).
 
 odc's fuser keeps the first granule with data at each pixel and reports nothing about which one
 that was. So one band per sensor — SCL for optical, VV for radar, the band each sensor's

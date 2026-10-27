@@ -1412,6 +1412,8 @@ def fill_zones_sequential_flow(
             update=plan.target(cell.zone, cell.year, root=cast(str, update_root)) if plan is not None else None,
             # A cell this session finds already landed has its master caught up here, as triage's do.
             registry_root=paths.optical_registry(store_path),
+            # And its provenance republished, should the earlier attempt have failed before its tag.
+            staging_base=prep.staging_base,
         )
 
     # The shared stream session: ONE set of actors for EVERY zone in the cluster, whatever orbit

@@ -43,6 +43,10 @@ shows it rather than downloading it. Nothing reads it, and it sits outside both 
   assemble_global ── commit the shards, tagged with the run ──▶ record the run in the zone's runs attr
         │         ──▶ publish parts/…/<run_id>.parquet, stamped with that commit's timestamp
         │
+  zone_fill ──▶ _publish_provenance    (mosaics ingested with the record only; RAISES on failure,
+        │                              so the cell stays untagged with its staging, and its retry
+        │                              republishes from planning before it tags)
+        │
   zone_fill ──▶ _merge_registry_master
                   │  read the master file's version, then the file and all of the cell's parts
                   │  then the store's record of the year's runs, and check the parts against it
@@ -54,8 +58,14 @@ shows it rather than downloading it. Nothing reads it, and it sits outside both 
                   ▼
               tag the zone-year
 
-  a retry of a cell that already landed ──▶ plan_zone_inference ──▶ _merge_registry_master, with no run id
+  a retry of a cell that already landed ──▶ plan_zone_inference ──▶ (_republish_provenance, if untagged)
+                                                              ──▶ _merge_registry_master, with no run id
 ```
+
+The provenance record is the one step on this path that fails the cell rather than logging: unlike a
+part, it cannot be re-derived from the store once the mosaics are gone, so a cell is not tagged, and
+its staging and mosaics not deleted, until it has published
+([`registry-provenance-plan.md`](registry-provenance-plan.md) §4 rule 3).
 
 `registry_master.merge_cell` does the work, called from both assembled branches of
 `orchestration/runners/zone_fill.py`, the ordinary one and the all-refused `empty=True` one, and from

@@ -1,7 +1,8 @@
 # Registry provenance: which satellite images went into every embedding
 
 Status: plan, revision 5 (2026-10-27). It has been through two adversarial reviews and has no open
-questions. The ingest half is built (§11); revision 5 records what building it changed (§13). It is aimed at the v2 campaign and assumes two pull requests
+questions. The ingest half and the model and assembly half are built; `source_runs` follows (§11).
+Revision 5 records what building them changed (§13). It is aimed at the v2 campaign and assumes two pull requests
 that are in review: [PR #240](https://github.com/dClimate/tessera-embeddings/pull/240), which
 teaches the ingest which catalogue entries are copies of the same image, and
 [PR #250](https://github.com/dClimate/tessera-embeddings/pull/250), which decides which radar
@@ -92,12 +93,15 @@ oldest first. For most shards it is one run. After a holes update it is two.
       ├── update_pixels/ zone=<Z>/year=<Y>/<run_id>.zarr    holes updates only: the pixels the run embedded
       └── pixel_sources.icechunk/                           one Icechunk repository with a group per run
           └── <Z>/<Y>/<run_id>/{s2,s1_asc,s1_desc}         (date, northing, easting) uint8: per pixel and
-                                                           date, the granule that supplied it
+                                                           date, the granule that supplied it, with
+                                                           each sensor's dates as <sensor>_date
 ```
 
-Every provenance row carries `zone`, `year` and `run_id` as ordinary columns, as well as in the
-folder names, so any Parquet reader can join across zones and runs without parsing paths. A run's
-files are written once and never changed; a later run adds its own files beside them.
+Every provenance row carries `run_id` as an ordinary column, so files from several runs join
+without parsing paths. `zone` and `year` are the hive partition keys, as in the registry, and any
+reader using hive partitioning gets them as columns; carrying them as columns too makes pyarrow
+refuse the dataset (`storage/registry.py`). A run's files are written once and never changed; a
+later run adds its own files beside them.
 
 ## 3. What a reader can ask
 
@@ -167,18 +171,21 @@ bit-identical to an unpacked load, and the index. The band is still read once, t
 mask share one definition, and nothing is added to the task graph. The other bands are fused by
 odc as today.
 
-**The actor** already records, for each shard, how many observations each pixel had. It will also
-keep the list of dates it used per sensor, with the count of valid pixels on each, and the count
-of pixels it embedded. For `pixel_sources`, it reads its shard's `source_index` at those dates,
-sets it to zero wherever its own validity test fails (so the published value means "the model saw
-this"), and for a holes update also zeroes everything outside the pixels it was asked to embed.
-All of this is staged with the shard, about a megabyte per shard, in the same place the shard's
-existing coverage record goes, so every resume path that reads coverage back carries it too.
+**The actor** reads the shard's `source_index` wherever it reads a sensor's validity: with the
+whole-shard SCL mask for optical, and with each strip's VV and VH for radar. It zeroes the index
+wherever its own validity test fails, so a non-zero value means the observation was valid for the
+model, and keeps each date compressed. At the staging write, on the actor's background writer,
+each date's pieces become one plane of ranks into that date's `sources`, cut to the pixels a holes
+update was asked to embed. The planes are staged as arrays on the shard's tile, with the summary
+(per sensor: dates, `sources`, valid pixels) as the tile's `provenance` attribute and, for a holes
+update, the pixel mask beside them; a refused shard stages them on its coverage-only tile. About a
+megabyte per shard. The coverage record gains `embedded_px`.
 
-**Assembly** gains a publication step after the registry part is published: write `shard_dates`
-and `update_pixels` from the staged records, write the run's `pixel_sources` group shard by shard
-as the shards are committed, export `granules` from the three mosaic stores, and run the checks in
-§7. The step is idempotent, so running it twice rewrites the same files.
+**Assembly** gains a publication step after the shards commit and the registry part publishes:
+export `granules` from the mosaics at the pinned snapshots, write the run's `pixel_sources` group
+and `shard_dates` from the staged tiles, `update_pixels` from the staged masks, and run the checks
+in §7 (`inference/provenance_publish.py`). The step is idempotent, so running it twice rewrites
+the same files.
 
 Three rules govern this.
 
@@ -188,19 +195,21 @@ Three rules govern this.
    has the list its own write carried. A retry, a batch broken up and written one day at a time,
    or a day skipped on its second attempt leaves nothing behind. A resumed ingest skips days
    already on the time axis, so a list is written once and never touched again.
-2. **The model and the export read the same mosaic version.** When a fill resumes, the campaign
-   already samples each mosaic's latest snapshot id and hashes it into the run id. It does not yet
-   pin what the actors read, which open the moving `main` branch. The snapshot ids will be
-   threaded into every actor store open and into the export, so a commit to a mosaic during its
-   own fill, which nothing in the pipeline makes but an out-of-band repair could, can change
-   neither what the model read nor what the record says. This costs nothing at read time: a
-   branch open resolves to a snapshot id anyway, and the chunks fetched are the same.
+2. **The model and the export read the same mosaic version.** The campaign samples each mosaic's
+   snapshot id and hashes it into the run id, which says whether inputs changed between attempts.
+   The zone runner samples them again when it plans the cell (`zone_fill.mosaic_snapshots`), and
+   every actor store open (`ZoneContext.mosaic_snapshots`) and the export use those, so a commit to
+   a mosaic during its own fill, which nothing in the pipeline makes but an out-of-band repair
+   could, can change neither what the model read nor what the record says. This costs nothing at
+   read time: a branch open resolves to a snapshot id anyway, and the chunks fetched are the same.
 3. **If publication fails, the zone-year fails before anything is deleted.** Publication runs
    under the same retry policy as the store writes. If it still fails, the zone-year is not tagged
    and no cleanup runs, exactly as any other post-commit step fails today. The staging and mosaics
-   the next attempt needs are still there, and that attempt republishes. There is deliberately no
-   separate marker, gate or held state. The step is three Parquet writes, a small zarr and one
-   store group written the way the embeddings are, and the ordinary retry is enough.
+   the next attempt needs are still there, and that attempt republishes. The next attempt finds the
+   cell landed but untagged (or the update recorded), and planning republishes from the staging
+   before it tags. There is deliberately no separate marker, gate or held state. The step is three
+   Parquet writes, a small zarr and one store group, and the ordinary retry is enough. A failed
+   check is not retried within the attempt, since it would fail the same way.
 
 Where the code changes:
 
@@ -220,13 +229,13 @@ Where the code changes:
 - Sentinel-1 ingest: #250 keeps track, burst, sub-swath and acquisition time on each item and
   sorts each day. Each batch lists its days from the items its load stamped, and each date's write
   carries its own list.
-- Actor: `_coverage_record` (`actors.py:215`) gains the per-sensor date lists; the planes are
-  written as arrays on the staged shard beside the embeddings; both travel with the `coverage`
-  attribute (`assembly.py:1424`) that `read_staged_coverage`, the resumed-shard top-up, the
-  coverage-only records for refused shards and the skip records already read. The actors open the
-  mosaics through `readonly_session(snapshot_id=…)`, which the code already uses elsewhere.
-- Assembly: `publish_provenance` runs after `publish_registry_part` on both the fill and update
-  paths. The already-landed retry path needs nothing, since a tagged zone-year has published.
+- Actor (`inference/provenance.py`, `data_loading.py`, `actors.py`): the mask bundle and each
+  radar strip carry compressed source pieces; the actor collects them per shard in a
+  `SourcePlanes`; `ZarrWriter.write_chunk` and `write_coverage_only` stage the ranked planes and
+  their summary. Every mosaic open uses `make_store_opener(snapshots=…)`.
+- Assembly (`inference/provenance_publish.py`, `zone_fill.py`): `_publish_provenance` runs after
+  `assemble_global` on the fill, all-refused and update paths, and `_republish_provenance` on the
+  two retry branches of `plan_zone_inference` that land nothing new, before the tag.
 - Switch: a `provenance` field on `IngestSettings` for the campaign flows and a flat parameter
   on the base ingest flows, forwarded beside `allow_ingest_code_mismatch` through
   `tasks/ingest.py` to `s2_roi` and `s1_roi`. `ingest-zone-year` passes it to every leg, to the
@@ -244,7 +253,7 @@ Where the code changes:
 
 | column | type | meaning | source |
 |---|---|---|---|
-| `zone`, `year`, `run_id` | string, int32, string | the zone-year and the run that read the mosaic | assembly |
+| `run_id` | string | the run that read the mosaic; `zone` and `year` come from the partition keys | assembly |
 | `sensor` | string | `s2`, `s1_asc` or `s1_desc`, the mosaic store the row describes | the store |
 | `solar_day` | date | the day, as on the mosaic's time axis | the slot |
 | `fusion_order` | int16 | the granule's position in the day's fusion order, 0 first | the write's item list |
@@ -275,7 +284,7 @@ without filtering: every slot has a list, and a slot without one fails the check
 
 | column | type | meaning | source |
 |---|---|---|---|
-| `zone`, `year`, `run_id` | | as in `granules` | assembly |
+| `run_id` | | as in `granules` | assembly |
 | `tile` | string | the shard, `chunk_<row>_<col>` | `ChunkSpec.label` |
 | `sensor` | string | `s2`, `s1_asc`, `s1_desc` | |
 | `solar_day` | date | a date on that store's time axis the shard kept | the actor's kept indices (`S2MaskBundle.abs_indices`; the SAR `kept` indices) |
@@ -291,9 +300,10 @@ positions in `sources`, so the table and the array cannot disagree.
 
 One Icechunk repository with a group per run, `<zone>/<year>/<run_id>`, holding one array per
 sensor of shape `(date, northing, easting)`, dtype uint8, chunked one date by one shard
-`(1, 2048, 2048)`, compressed with Blosc zstd and bit shuffle (§9 explains the codec). The `date`
-coordinate is the mosaic's time axis at the pinned snapshot; `northing` and `easting` are the
-zone group's.
+`(1, 2048, 2048)`, compressed with Blosc zstd and bit shuffle (§9 explains the codec). Each
+sensor's dates are a `<sensor>_date` array beside it, the mosaic's time axis at the pinned snapshot
+in CF time encoding. `northing` and `easting` are the zone group's indices, and the group's
+attributes give the grid's shape and shard pitch.
 
 A value k greater than zero means the model received this pixel on this date and the granule with
 `fusion_order = sources[k − 1]`, from the shard-date's `shard_dates` row, supplied it. Zero means
@@ -356,11 +366,11 @@ pixels the fill wrote, the update's dates for the holes. The record keeps both s
 - The update publishes its own `shard_dates` file and its own `pixel_sources` group, counted and
   written over the holes it filled. Today the holes path (`zone_fill._assemble_update` and
   `_publish_merged_rows`) publishes no per-shard records, so this is wired explicitly.
-- `update_pixels/<run_id>.zarr` holds one boolean array per shard the update wrote, its embed
-  mask at the time it ran. An Icechunk diff would name the chunks an update changed but not the
-  pixels within them, so the mask is the only exact record. At one bit per pixel it compresses to
-  a few kilobytes per shard. Fills publish none, because they wrote every pixel their
-  `shard_dates` rows describe.
+- `update_pixels/<run_id>.zarr` holds one boolean array per shard the update evaluated, the mask
+  of pixels it was asked to embed, staged by the actor beside the planes. An Icechunk diff would
+  name the chunks an update changed but not the pixels within them, so the mask is the only exact
+  record. At one bit per pixel it compresses to a few kilobytes per shard. Fills publish none,
+  because they wrote every pixel their `shard_dates` rows describe.
 - `source_runs` is derived from the store by every registry merge and every rebuild, never copied
   from an older row. The rule: the fill's run id from the zone group's `runs[year]` attribute,
   then each entry of `updates[year]` whose `written` list names the shard, in order. A `shards`
@@ -389,12 +399,15 @@ census, where a failure names the zone-year for repair.
 
 - Every slot on each mosaic's time axis has a non-empty granule list.
 - Every sensor and solar day in `shard_dates` is a slot.
-- Every shard in the registry part has `shard_dates` rows for every sensor present, or a stated
-  reason such as coverage-only or skipped.
+- Every embedded shard staged a record for every sensor whose mosaic carries one. A refused shard
+  whose coverage-only tile failed to write has none; it is named in the `shard_dates` file's
+  `unrecorded_tiles` metadata rather than failing the zone-year, as its registry row is already
+  published without measurements.
 - Every `shard_dates` row's `valid_px` equals the non-zero count of its `pixel_sources` plane,
   the plane's distinct non-zero values are exactly 1 to the length of its `sources` list, and every
   `sources` entry is a position within the day's granule list.
-- Every holes-update shard has an `update_pixels` array whose count equals `embedded_px`.
+- Every holes-update shard's `update_pixels` mask covers at least its `embedded_px` pixels, since
+  some holes may be refused, and no plane names a pixel outside it.
 - Every embedded master row's `source_runs` names only runs with published files and groups.
 - A zone-year written with the switch off (§5.4) has no files and null `source_runs`; the census
   passes it over.
@@ -507,10 +520,12 @@ zones, years and an update run before the registry README publishes them.
    `provenance_version` and the fingerprint note, for both sensors. Built: real-raster tests pin
    that the fused band is bit-identical with the index on, for an integer band, for Sentinel-2
    through the BOA-correcting parser, and for radar through the dB transform.
-3. The model and assembly half ships as a second stack: the actor's date lists, snapshot pinning,
-   the embed mask and the masked planes; then publication, `pixel_sources`, the checks,
-   `source_runs` on parts and master, and the docs. The registry schema changes and the
-   `_common_metadata` rewrite go with it.
+3. The model and assembly half ships as a second PR on the first: the actor's planes, snapshot
+   pinning, the staged holes mask, publication with its checks, the retry republish and the docs.
+   Built: tests on local stores reconstruct each mosaic's source index from the published planes,
+   `shard_dates` and `granules`, and check that a failed publication leaves the cell untagged until
+   its retry republishes. `source_runs` on parts and master, with the registry schema change and
+   the `_common_metadata` rewrite, ships as a third PR on the second.
 4. A dev test on the standard chain (tiny, then Iowa, then 35N) asserts: every slot has a granule
    list; every recorded asset URL returns 200 in-region; `valid_px` equals the mask-valid count in
    the mosaic for a sampled shard-date; a resumed zone-year publishes tables identical to an
@@ -547,7 +562,7 @@ the `pixel_sources` store.
 | stores from before the change would fail to resume indefinitely | unaddressed | a `provenance` switch, off by default; the mosaic records it as `provenance_version`, and resume refuses a mismatch with a reason (§5.4) |
 | the snapshot id is sampled at resume but not pinned at read | "pinned" | snapshot ids threaded into the actors and the export (§4 rule 2) |
 | footprint order does not identify the winner, and the fallback ladder leaves the order unsorted | "exact except near edges" | fusion order is the loader's input after step-down, and the winner is named per pixel (§5.3) |
-| `run_id` was only a filename and file metadata, so the documented joins could not run, and the queries lacked zone and year | | `zone`, `year` and `run_id` columns on every row; queries rewritten (§2, §10) |
+| `run_id` was only a filename and file metadata, so the documented joins could not run, and the queries lacked zone and year | | a `run_id` column on every row, `zone` and `year` from the partition keys; queries rewritten (§2, §10) |
 | sizes were extrapolated | 368k rows, a 20–45 TB bitmask | measured (§9); the per-pixel record taken up (§13) |
 
 ## 13. Decisions since the reviews
@@ -584,5 +599,17 @@ the `pixel_sources` store.
   a handful of contributing granules on a date, and §9's measurement was taken on per-shard ranks,
   so ranking within `sources` keeps the measured size and the `uint8` plane, at the cost of one
   more join for a pixel query (§10).
+- **The model half reads the index where it reads the mask, and ranks at the staging write**
+  (2026-10-27). Reading it per date for the whole shard after inference would hold every date's
+  plane at once, gigabytes for a dense shard; pieces read beside the mask are kilobytes, and the
+  ranking runs on the background writer, off the GPU's critical path.
+- **`zone` and `year` are partition keys, not columns** (2026-10-27). The plan had them as both;
+  the registry's own module records why that breaks a pyarrow dataset read, so the provenance
+  tables follow the registry.
+- **A retry of a landed but untagged cell republishes from planning** (2026-10-27). Publication
+  fails a cell before its tag, but the cell's shards and completion mark have landed, so its retry
+  takes the landed branch and would otherwise tag it without a record.
+- **`source_runs` is its own PR** (2026-10-27). It changes the published registry's schema and
+  merge, independently of how the record is made.
 - **Vocabulary:** shard, never tile, for the 2048-pixel unit; `granules`, never `scenes`, for the
   table.

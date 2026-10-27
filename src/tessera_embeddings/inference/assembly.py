@@ -160,7 +160,7 @@ class IncompleteStageError(RuntimeError):
     """Raised when assembly is attempted before all chunks have been staged."""
 
 
-def _open_staged_tile(path: str) -> zarr.Group:
+def _open_staged_tile(path: str, *, use_consolidated: bool | None = None) -> zarr.Group:
     """Open a staged tile, refusing one whose write never finished.
 
     The single in-store completeness check. ``write_chunk`` sets ``staged_complete`` only after
@@ -181,8 +181,13 @@ def _open_staged_tile(path: str) -> zarr.Group:
         FileNotFoundError: If there is no tile at *path* (zarr's ``GroupNotFoundError`` is a
             subclass). Any other open error — auth, throttling, transient network — propagates
             untouched, so a bad moment on S3 never makes a valid tile look partial.
+
+    ``use_consolidated=False`` lists the tile's arrays from storage rather than from the listing
+    consolidated when its embeddings were written, which a reader of arrays added later needs.
     """
-    group = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
+    group = zarr.open_group(
+        path, mode="r", storage_options=_staged_storage_options(path), use_consolidated=use_consolidated
+    )
     if not group.attrs.get("staged_complete"):
         raise IncompleteStageError(
             f"Staged tile {path} lacks the staged_complete marker — a crashed write_chunk left partial "

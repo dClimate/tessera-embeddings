@@ -168,15 +168,20 @@ def test_retag_and_ocean_cells_never_touch_the_cluster(wired, monkeypatch):
     assert result["retagged"] == 1 and result["empty"] == 1 and result["live"] == 0
 
 
-def test_a_streamed_cell_is_planned_with_the_registry(wired, monkeypatch):
-    """A cell the session finds already landed has its master caught up in planning, which needs the registry."""
+def test_a_streamed_cell_is_planned_with_the_registry_and_its_staging(wired, monkeypatch):
+    """A cell found already landed has its master merged and its provenance republished in planning.
+
+    Both need paths the plan is handed: the registry, and the cell's staging.
+    """
     seen: dict = {}
     monkeypatch.setattr(mod, "plan_zone_inference", lambda **k: seen.update(k))
     _run(zones=["33N"])
     wired["seq_kwargs"]["plan"](
-        SimpleNamespace(zone="33N", year=2025), SimpleNamespace(mosaic_base="m", config=None, run_id="r")
+        SimpleNamespace(zone="33N", year=2025),
+        SimpleNamespace(mosaic_base="m", config=None, run_id="r", staging_base="s"),
     )
     assert seen["registry_root"] == _PATHS.optical_registry(_PATHS.global_store())
+    assert seen["staging_base"] == "s"
 
 
 class TestAnUpdate:

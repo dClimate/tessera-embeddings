@@ -206,6 +206,53 @@ reaches the registry right after its pixels are committed to the store:
   store. Every column can be derived from the store, so the registry is a convenience, never a
   second source of truth.
 
+## Which imagery is behind an embedding (v2 onward)
+
+From v2, stores filled for publication also carry a provenance record under `provenance/`,
+beside `master/` and `parts/`. It names the satellite images behind every embedding, down to the
+one image that supplied each pixel on each date. v1.1 has none: its imagery was deleted before
+the record existed. A zone-year filled without the record has no files under `provenance/`.
+
+```
+  provenance/
+  ├── granules/      zone=<ZONE>/year=<YEAR>/<run_id>.parquet   every image fused into each day's mosaic
+  ├── shard_dates/   zone=<ZONE>/year=<YEAR>/<run_id>.parquet   per tile, sensor and date: what the run used
+  ├── update_pixels/ zone=<ZONE>/year=<YEAR>/<run_id>.zarr      holes updates only: the pixels they wrote
+  └── pixel_sources.icechunk/                                  per run, per pixel and date: which image
+```
+
+A tile here is the same 2048-pixel unit as a registry row, and the `tile` column names it the same
+way. The sensors are `s2` (optical), `s1_asc` and `s1_desc` (radar by orbit direction).
+
+- **`granules`**: one row per image per day per sensor, in the order the day's mosaic was built
+  (`fusion_order`, 0 first; the first image with data at a pixel supplies it). Each row carries
+  the image's catalogue ID and link, acquisition time, cloud cover, footprint (GeoParquet) and the
+  exact object URLs that were read. A URL that no longer resolves is itself information: the
+  catalogue entry has moved since.
+- **`shard_dates`**: one row per tile, sensor and date a run used, with `valid_px`, the tile's
+  pixels valid that day, and `sources`, the `fusion_order` of every image that supplied at least
+  one of them.
+- **`pixel_sources`**: one Icechunk repository with a group `<ZONE>/<YEAR>/<run_id>`, holding a
+  `(date, northing, easting)` array per sensor on the zone group's grid, and its dates as
+  `<sensor>_date`. A value `k > 0` means the pixel had a valid observation that date and the image
+  at `fusion_order = sources[k - 1]` of the tile's `shard_dates` row supplied it; `0` means none did.
+
+To trace one pixel, open the run's group, read the pixel's column of values, and join each
+non-zero value through the tile's `shard_dates` row to `granules`:
+
+```python
+k = run["s2"][:, row, col]                                 # one value per date of the optical axis
+dates = run["s2_date"][:]                                  # int64 nanoseconds, CF time encoding
+picks = [(d, v - 1) for d, v in zip(dates, k) if v]        # (date, rank in that date's `sources`)
+```
+
+Open the group of the run that wrote the tile's pixels: the run whose `parts/` file holds the
+tile's row with the master row's `filled_at`, as described under "Runs" above. After a holes
+update, the update's group covers the pixels in its `update_pixels` mask and the earlier run's
+group the rest. The record says what went in, not how much each image mattered: the model has no
+attribution. For a pixel observed more often than the model's longest sequence, the model reads
+a fixed subset of these dates, chosen by a deterministic rule from the dates alone.
+
 ## Going deeper
 
 - Reading the embeddings themselves: [`global-store.md`][store].
@@ -214,9 +261,11 @@ reaches the registry right after its pixels are committed to the store:
   [`registry-backfill.md`][backfill].
 - The registry audited against the store tile for tile:
   [`reading-the-published-store.md`, section 5][audit].
+- How the provenance record is made, sized and checked: [`registry-provenance-plan.md`][provenance].
 
 [self]: https://github.com/dClimate/tessera-embeddings/blob/main/docs/registry.md
 [store]: https://github.com/dClimate/tessera-embeddings/blob/main/docs/global-store.md
 [master]: https://github.com/dClimate/tessera-embeddings/blob/main/context_docs/storage/registry-master.md
 [backfill]: https://github.com/dClimate/tessera-embeddings/blob/main/context_docs/storage/registry-backfill.md
 [audit]: https://github.com/dClimate/tessera-embeddings/blob/main/context_docs/storage/reading-the-published-store.md#5-the-registry-beside-the-store
+[provenance]: https://github.com/dClimate/tessera-embeddings/blob/main/context_docs/storage/registry-provenance-plan.md

@@ -59,6 +59,10 @@ STAGED_TIMES = "pixel_sources_{sensor}_time"
 #: The staged shard's attribute holding its ``shard_dates`` summary, beside the planes it describes.
 PROVENANCE_ATTR = "provenance"
 
+#: A holes update's staged pixel mask: the pixels the run was asked to embed, which the planes are
+#: cut to and which publication copies to ``update_pixels``.
+STAGED_UPDATE_PIXELS = "update_pixels"
+
 
 @dataclass(frozen=True)
 class SourcePiece:
@@ -72,6 +76,13 @@ class SourcePiece:
     rows: slice
     cols: slice
     data: bytes
+
+
+def read_array(group: zarr.Group, name: str) -> np.ndarray:
+    """``group[name]`` read whole, as numpy."""
+    arr = group[name]
+    assert isinstance(arr, zarr.Array)
+    return np.asarray(arr[...])
 
 
 def read_source_pieces(
@@ -97,7 +108,7 @@ def read_source_pieces(
     pieces: list[SourcePiece] = []
     for start in range(0, len(times), _READ_BATCH):
         batch = np.asarray(times[start : start + _READ_BATCH])
-        positions = index.oindex[batch, y_slice, x_slice]
+        positions = np.asarray(index.oindex[batch, y_slice, x_slice])
         positions[~valid[start : start + len(batch)]] = 0
         pieces.extend(
             SourcePiece(int(t), rows, cols, _PIECE_CODEC.encode(np.ascontiguousarray(plane)))
@@ -178,8 +189,13 @@ def stage_planes(group: zarr.Group, planes: SourcePlanes, pixels: np.ndarray | N
     their mosaic time indices beside them. The summary is ``{sensor: {"time", "sources",
     "valid_px"}}``; the caller stores it as the shard's ``provenance`` attribute. A sensor whose
     mosaic had no index is absent from both, so the record follows the mosaics sensor by sensor.
+    ``pixels``, a holes update's mask, is staged too, as the record of which pixels this run wrote.
     """
     summary: dict[str, Any] = {}
+    if pixels is not None:
+        group.create_array(STAGED_UPDATE_PIXELS, shape=pixels.shape, chunks=pixels.shape, dtype=bool, overwrite=True)[
+            :
+        ] = pixels
     for sensor in planes.sensors():
         dates = list(planes.dates(sensor, pixels))
         arr = group.create_array(
@@ -196,7 +212,11 @@ def stage_planes(group: zarr.Group, planes: SourcePlanes, pixels: np.ndarray | N
             arr[i] = date.plane
         times = np.array([d.time for d in dates], dtype=np.int32)
         group.create_array(
-            STAGED_TIMES.format(sensor=sensor), shape=times.shape, chunks=(max(len(times), 1),), dtype=np.int32, overwrite=True
+            STAGED_TIMES.format(sensor=sensor),
+            shape=times.shape,
+            chunks=(max(len(times), 1),),
+            dtype=np.int32,
+            overwrite=True,
         )[:] = times
         summary[sensor] = {
             "time": times.tolist(),
@@ -207,13 +227,17 @@ def stage_planes(group: zarr.Group, planes: SourcePlanes, pixels: np.ndarray | N
 
 
 def staged_planes(group: zarr.Group, sensor: str) -> tuple[np.ndarray, zarr.Array] | None:
-    """A staged shard's ``(time indices, planes)`` for ``sensor``, or ``None`` if it staged none."""
+    """A staged shard's ``(time indices, planes)`` for ``sensor``, or ``None`` if it staged none.
+
+    ``group`` must be opened without consolidated metadata: the tile's listing was consolidated when
+    its embeddings were written, before these arrays existed.
+    """
     name = STAGED_PLANES.format(sensor=sensor)
     if name not in group:
         return None
     arr = group[name]
     assert isinstance(arr, zarr.Array)
-    return np.asarray(group[STAGED_TIMES.format(sensor=sensor)][:]), arr
+    return read_array(group, STAGED_TIMES.format(sensor=sensor)), arr
 
 
 def provenance_summary(attrs: Mapping[str, Any]) -> dict[str, Any] | None:

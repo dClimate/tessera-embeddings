@@ -781,7 +781,15 @@ class InferenceActor:
         )
         with cred_scope:
             return self._process_chunk(
-                chunk, mosaic_base, staging_base, run_id, tracker, prefetch_hint, time_window, s1_orbit, mosaic_snapshots
+                chunk,
+                mosaic_base,
+                staging_base,
+                run_id,
+                tracker,
+                prefetch_hint,
+                time_window,
+                s1_orbit,
+                mosaic_snapshots,
             )
 
     def _process_chunk(
@@ -1051,7 +1059,10 @@ class InferenceActor:
                 pool.shutdown(wait=False, cancel_futures=True)
 
             if planes:
-                staged_planes = {"planes": planes, "pixels": None if chunk.pixels is None else _pixel_mask(chunk.pixels)}
+                staged_planes = {
+                    "planes": planes,
+                    "pixels": None if chunk.pixels is None else _pixel_mask(chunk.pixels),
+                }
 
             # All strips done: the last strip's inputs and the full-chunk SCL mask are no longer needed (obs counts
             # and embeddings already live in the whole-chunk output buffers). Freed before the S3 write so peak RAM
