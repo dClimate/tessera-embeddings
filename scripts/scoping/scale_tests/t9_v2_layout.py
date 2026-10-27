@@ -396,6 +396,7 @@ def main() -> int:
         phase_fetch(args.source, args.profile, args.tiles, args.n_tiles)
         return 0
     study = STUDIES[args.study]
+    harness.bind_study(cfg, TEST, args.study)
     phases: dict[str, Callable[[], None]] = {
         f"requests_{CLIENT}": lambda: phase_requests(cfg, f"requests_{CLIENT}", study, args.points)
     }

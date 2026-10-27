@@ -94,7 +94,10 @@ uv run python $T10 --tiles <dir> --phase build
 uv run python $T10 --tiles <dir> --phase read          # then again from the old-client environment
 uv run python $T10 --phase assemble --staging s3://<staged run dir> --extent <ny,nx> --n-tiles 64 --workers 16
 uv run python $T10 --phase verify                      # then with the assemble line's --staging and --n-tiles
-uv run python $T10 --study narrow --tiles <dir> --phase mobile --network poor   # once tc shapes the link
+# the narrow study, under a run id of its own: a run holds one study
+T10N="-m scripts.scoping.scale_tests.t10_v2_aws --run-id v2n --study narrow --backend s3 --bucket <bucket>/<prefix> --scale bench"
+uv run python $T10N --tiles <dir> --phase build        # then read, points, tune and verify, as above
+uv run python $T10N --tiles <dir> --phase mobile --network poor   # once tc shapes the link
 
 # collate + tear down
 uv run python -m scripts.scoping.scale_tests.report   --run-id run1
@@ -117,7 +120,8 @@ shard. T9 builds every arm as a local store of 2×2 shards from real v2 tiles, a
 - the Dask tasks and requests of a 16-d pull, at Dask's default chunks and at shard-aligned ones
 
 **Two studies, chosen with `--study`.** Each is a fixed arm list with the control (C0, v1.1's
-geometry on v2 data) first, so T9 and T10 compare like with like.
+geometry on v2 data) first, so T9 and T10 compare like with like. A run holds one study: phase
+markers belong to a run, so `harness.bind_study` refuses a second study under the same run id.
 
 - **`band16`**, the default, is the scoping behind ADR 031: the band-16 geometries in `variants.py`,
   each crossed with int8 codecs, a band-planar transpose, the inner-chunk order within a shard and
@@ -170,7 +174,8 @@ Each phase runs on its own in-region EC2 box, writing throwaway repos under the 
   viewport at 4 and 8 dims, without `scales`, through a browser-like client: no merged requests, at
   most 6 in flight, each object in one GET. It runs on a phone link that `tc netem` and an `ifb`
   device shape first. `--network good|poor` names the profile (`t10_v2_aws.NETWORKS`); the phase
-  measures the round trip and downlink, and refuses to run if the shaping is not in effect. Each
+  measures the round trip and downlink, and refuses to run unless both are within a factor of two
+  of the profile's. Each
   cold read fetches one distant pixel first, timed apart as the first read, since that is where the
   manifest download lands.
 - **`assemble`** (Graviton, like the assembly runner). Staged v2 tiles are written into each
