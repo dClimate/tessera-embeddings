@@ -44,6 +44,7 @@ def process_roi_reflectance(
     batch_dates: int | None = None,
     batch_chunk_budget: int | None = None,
     allow_ingest_code_mismatch: bool = False,
+    provenance: bool = False,
     s3_region: str | None = None,
 ) -> dict[str, Any]:
     """Prefect task: ingest S2 reflectance for one ROI.
@@ -94,6 +95,7 @@ def process_roi_reflectance(
             batch_dates=batch_dates,
             batch_chunk_budget=batch_chunk_budget,
             allow_ingest_code_mismatch=allow_ingest_code_mismatch,
+            provenance=provenance,
         )
     return asdict(result)
 
@@ -118,6 +120,7 @@ def process_roi_sar(
     pipeline_batches: bool = True,
     narrow_windows_per_date: bool = True,
     allow_ingest_code_mismatch: bool = False,
+    provenance: bool = False,
     s3_region: str | None = None,
 ) -> dict[str, Any]:
     """Prefect task: ingest S1 OPERA SAR for one ROI.
@@ -180,6 +183,7 @@ def process_roi_sar(
             pipeline_batches=pipeline_batches,
             narrow_windows_per_date=narrow_windows_per_date,
             allow_ingest_code_mismatch=allow_ingest_code_mismatch,
+            provenance=provenance,
             s3_region=s3_region,
         )
     return asdict(result)

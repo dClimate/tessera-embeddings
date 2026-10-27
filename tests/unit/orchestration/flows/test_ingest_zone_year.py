@@ -1784,3 +1784,26 @@ class TestALegStillCommittingDatesEarnsWallClock:
             )
 
         assert dispatched.count("s2") == 1, "the optical leg's own store never grew"
+
+
+def test_the_provenance_switch_reaches_every_leg_and_the_fingerprint(wired, monkeypatch):
+    monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+    monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
+    result = _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(provenance=True))
+    assert [p["provenance"] for _, p in wired["arun"]] == [True, True]
+    assert result["fingerprint"]["provenance"] is True
+
+
+def test_a_mosaic_marked_without_the_record_does_not_satisfy_a_run_that_wants_it(wired, monkeypatch):
+    """Otherwise the campaign would embed it and publish no record for the zone-year."""
+    monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+    marked_off = {
+        "window": ["2025-01-01", "2025-12-31"],
+        "min_valid_coverage": 0.1,
+        "s1_orbit": "ascending",
+        "allow_partial_window": False,
+        "coverage_sha256": "cov-sha-1",
+    }
+    monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (True, marked_off))
+    with pytest.raises(ConfigMismatchError, match="different"):
+        _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(provenance=True))

@@ -44,7 +44,7 @@ import dask.distributed
 import numpy as np
 import xarray as xr
 
-from tessera_embeddings.config.ingest import AUTO_BATCH_DATES, INGEST_CHUNK_SIZE, INGEST_CHUNKS
+from tessera_embeddings.config.ingest import AUTO_BATCH_DATES, INGEST_CHUNK_SIZE, INGEST_CHUNKS, SOURCE_INDEX_VAR
 from tessera_embeddings.config.providers import PROVIDERS
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
 from tessera_embeddings.ingest._pipeline import pipelined
@@ -70,6 +70,7 @@ from tessera_embeddings.ingest.loader_failures import (
     install_capture_everywhere,
     label_objects,
 )
+from tessera_embeddings.ingest.provenance import STEPPED_DOWN, day_granules
 from tessera_embeddings.ingest.roi import (
     read_roi_mask,
     read_roi_metadata,
@@ -314,6 +315,8 @@ class _PreparedDate:
     straddle the threshold is corrected image by image while this map still names one baseline
     for the date.
     """
+    granules: str | None = None
+    """The provenance granule list for the slot, as written to the store; ``None`` with it off."""
     read_error: BaseException | None = None
     """Set when PREPARATION hit a source that would not read, instead of raising.
 
@@ -345,6 +348,7 @@ def ingest_s2_roi_reflectance(
     batch_chunk_budget: int | None = None,
     allow_ingest_code_mismatch: bool = False,
     s3_region: str | None = None,
+    provenance: bool = False,
 ) -> IngestResult:
     """Ingest S2 L2A reflectance for an ROI defined by a Zarr mask.
 
@@ -403,6 +407,9 @@ def ingest_s2_roi_reflectance(
         s3_region: S3 region for the mosaic Icechunk store. ``None`` uses the storage layer's
             default; set it when the bucket lives elsewhere, or every write below signs against
             the wrong region.
+        provenance: Write the provenance record with every date: the day's granule list and a
+            per-pixel ``source_index`` band (:mod:`~tessera_embeddings.ingest.provenance`). Off by
+            default; the store records the setting and a resume must match it.
 
     Returns:
         :class:`IngestResult`. ``status="skipped"`` if zero STAC items were returned or zero
@@ -433,7 +440,9 @@ def ingest_s2_roi_reflectance(
         min_valid_coverage=min_valid_coverage,
         storage_options=resolve_storage_options(storage_options),
         allow_ingest_code_mismatch=allow_ingest_code_mismatch,
+        provenance=provenance,
     )
+    catalogue = PROVIDERS[provider]
 
     mid_longitude = solar_grouping_longitude(roi)
 
@@ -606,6 +615,7 @@ def ingest_s2_roi_reflectance(
                 resampling="bilinear",
                 groupby="solar_day",
                 geobox=roi.geobox,
+                source_index=provenance,
             )
         except HeterogeneousProducerError as exc:
             # The day has no correct offset decision, so it is SKIPPED — loudly, and alone.
@@ -747,14 +757,31 @@ def ingest_s2_roi_reflectance(
         # ROI both fill with 0, so `x.where(A, 0).where(B, 0)` is `x.where(A & B, 0)`
         # — and each `where` is a graph task per (chunk, band), which is the budget
         # that limits ingest. SCL keeps only the ROI mask: it is categorical, and
-        # zeroing it by its own validity would rewrite the class codes it carries.
+        # zeroing it by its own validity would rewrite the class codes it carries. The source
+        # index keeps it too: it names the granule behind every pixel, cloudy or not, and the
+        # model's own validity test decides later which of them it saw.
         roi_2d = date_mask
         keep = roi_2d if any_valid is None else (any_valid & roi_2d)
         for var in day_ds.data_vars:
-            mask_for_var = roi_2d if str(var) == "scl" else keep
+            mask_for_var = roi_2d if str(var) in ("scl", SOURCE_INDEX_VAR) else keep
             day_ds[str(var)] = day_ds[str(var)].where(mask_for_var, other=0)
 
-        return _PreparedDate(date, day_ds, date_windows, build_s, gate_s, items=day_items, baselines=baselines)
+        # Listed now, from the positions THIS load stamped: a fallback copy re-prepares the date
+        # and re-stamps, and its list must describe its own fuse.
+        granules = (
+            day_granules(
+                day_items,
+                provider=provider,
+                collection=collection,
+                catalog_url=catalogue.catalog_url,
+                collection_id=catalogue.collections[collection].collection_id,
+            )[date]
+            if provenance
+            else None
+        )
+        return _PreparedDate(
+            date, day_ds, date_windows, build_s, gate_s, items=day_items, baselines=baselines, granules=granules
+        )
 
     def _write_date(prepared: _PreparedDate, stall_s: float) -> None:
         """Write one prepared date's pixels: the store's only writer.
@@ -791,6 +818,7 @@ def ingest_s2_roi_reflectance(
                         chunks=INGEST_CHUNKS,
                         parallel_windows=overlap_window_writes,
                         s3_region=s3_region,
+                        granules=prepared.granules,
                     )
         # One line per kept date, partitioning its wall clock into the graph build in the driver,
         # the coverage-gate compute and the write (windows + commit). Stable format: CloudWatch
@@ -861,6 +889,7 @@ def ingest_s2_roi_reflectance(
                         chunks=INGEST_CHUNKS,
                         parallel_windows=overlap_window_writes,
                         s3_region=s3_region,
+                        granules=[p.granules for p in batch if p.granules is not None] if provenance else None,
                     )
         # The batch's write is ONE compute, so a per-date write time does not exist as a
         # measurement: this line is the batched counterpart of `Stage timings` and analysis
@@ -1055,6 +1084,11 @@ def ingest_s2_roi_reflectance(
                     total_filtered += 1
                     return
                 stepped_items, swapped = stepped
+                # Marked on the copy for the granule list: it stands in for one that would not read.
+                previous = {id(item) for item in attempt.items}
+                for item in stepped_items:
+                    if id(item) not in previous:
+                        item.properties[STEPPED_DOWN] = True
                 before = copies_label(attempt.items, only=swapped)
                 after = copies_label(stepped_items, only=swapped)
                 if not tried:

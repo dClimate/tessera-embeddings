@@ -12,7 +12,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import count
 from typing import Any, final
 
@@ -30,7 +30,7 @@ from tessera_embeddings.config import (
     STACProvider,
 )
 from tessera_embeddings.config.environment import configure_gdal_environment
-from tessera_embeddings.config.ingest import INGEST_CHUNKS
+from tessera_embeddings.config.ingest import INGEST_CHUNKS, SOURCE_INDEX_VAR
 from tessera_embeddings.ingest._http import make_logging_retry, spawn_abandonable
 from tessera_embeddings.ingest.asset_locations import (
     Harmonisation,
@@ -67,16 +67,29 @@ from tessera_embeddings.ingest.solar_days import (
 configure_gdal_environment()
 
 import odc.stac  # noqa: E402
-from odc.loader import RioDriver, RioReader  # noqa: E402
+from odc.loader import RasterBandMetadata, RasterLoadParams, RioDriver, RioReader, resolve_src_nodata  # noqa: E402
 
-# Private, and the only private odc import here. `_resolve_driver` uses a driver's own `md_parser`
+# Private, and the only private odc imports here. `_resolve_driver` uses a driver's own `md_parser`
 # when it supplies one, so stamping the per-source offset at parse time means subclassing odc's
 # STAC parser. Worth 158 bytes against a measured 14.6 MB (see `BoaOffsetParser`), and the reason
-# `odc-stac` is pinned rather than floating.
+# `odc-stac` is pinned rather than floating. The two `_reader` helpers are the fuser's own nodata
+# test, which the source index must reproduce exactly (see `_SourceReader`).
+from odc.loader._reader import nodata_mask, resolve_dst_fill_value  # noqa: E402
 from odc.stac._mdtools import StacMDParser  # noqa: E402
 
 # Below the GDAL configuration because it reaches rasterio, through `auth`'s odc reader session.
 from tessera_embeddings.ingest.opera_query import burst_fusion_sort_key  # noqa: E402
+
+#: The dtype odc loads a band in when its metadata names none (``odc.loader.resolve_load_cfg``).
+_ODC_FALLBACK_DTYPE = "float32"
+
+from tessera_embeddings.ingest.provenance import (  # noqa: E402
+    FUSION_POSITION,
+    pack,
+    packed_dtype,
+    stamp_fusion_positions,
+    unpack,
+)
 
 # The project uses northing/easting everywhere; odc.stac.load works with y/x internally.
 _DIM_TO_ODC = {"northing": "y", "easting": "x"}
@@ -545,7 +558,7 @@ def _load_from_stac(
         geobox: Exact output grid (CRS, transform, shape). Overrides bbox, crs and resolution.
         driver: Optional odc reader driver, used to remove the Sentinel-2 BOA offset from each
               image AS IT IS READ, before resampled sources are fused into one solar-day mosaic —
-              see :class:`_BoaCorrectingDriver`. ``None`` leaves odc's default rio driver in
+              see :class:`_SourceDriver`. ``None`` leaves odc's default rio driver in
               place, which is every collection owed no offset.
 
     Returns:
@@ -720,8 +733,64 @@ def _reflectance_asset_keys(items: list[Any], collection_config: CollectionConfi
 #: correctly inert and one that silently never fired.
 _OFFSET_KEY = "boa_offset"
 
+#: Driver data on a source-index band's sources: the granule's fusion position, and the band's
+#: native dtype and nodata, which the reader reads in before packing the position above them.
+_POSITION_KEY = "fusion_position"
+_NATIVE_KEY = "native"
 
-class BoaOffsetParser(StacMDParser):
+
+def _native_fill(native: RasterBandMetadata, cfg: RasterLoadParams | None = None) -> float:
+    """The fill odc's fuser uses for the band as published: its nodata test and its empty value."""
+    dtype = np.dtype(native.data_type or _ODC_FALLBACK_DTYPE)
+    cfg = replace(cfg or RasterLoadParams(), dtype=str(dtype), fill_value=native.nodata)
+    return resolve_dst_fill_value(dtype, cfg, resolve_src_nodata(cfg.fill_value, cfg))
+
+
+class SourceParser(StacMDParser):
+    """Stamps each source with what its reader must do to it as it is read.
+
+    Here, the source-index band (``index_asset``). Its metadata is reported in the packed dtype with
+    nodata 0, so odc allocates and fuses the packed pixels; each of its sources carries the band's
+    native metadata, read from the item as odc would have, and its granule's fusion position, read
+    where :func:`~tessera_embeddings.ingest.provenance.stamp_fusion_positions` put it, so
+    :class:`_SourceReader` reads natively and packs. Rides on ``RasterSource.driver_data`` for the
+    reason :class:`BoaOffsetParser` gives: a table on the driver is copied into every task.
+    """
+
+    def __init__(self, cfg: Any, index_asset: str | None = None) -> None:  # noqa: ANN401 — odc's ConversionConfig
+        """Build a parser; ``index_asset`` names the source-index band, or ``None`` for no index."""
+        super().__init__(cfg)
+        self._index_asset = index_asset
+        #: The index band's native metadata as last parsed, for splitting the fused result.
+        self.native: RasterBandMetadata | None = None
+
+    def _native(self, md: Any) -> RasterBandMetadata:  # noqa: ANN401 — pystac Item
+        assert self._index_asset is not None
+        name = self._index_asset
+        native = self._extract_bands(name, md.assets[name], self._config(md.collection_id))[(name, 1)]
+        self.native = native
+        return native
+
+    def extract(self, md: Any) -> Any:  # noqa: ANN401 — pystac Item; odc's RasterGroupMetadata
+        """The item's bands, with the source-index band reported packed."""
+        meta = super().extract(md)
+        if self._index_asset is None or (key := (self._index_asset, 1)) not in meta.bands:
+            return meta
+        native = self._native(md)
+        packed = replace(
+            native, data_type=str(packed_dtype(np.dtype(native.data_type or _ODC_FALLBACK_DTYPE))), nodata=0
+        )
+        return replace(meta, bands={**meta.bands, key: packed})
+
+    def driver_data(self, md: Any, band_key: tuple[str, int]) -> Any:  # noqa: ANN401 — pystac Item
+        """The fusion position and native metadata for a source-index source; else the inherited value."""
+        if self._index_asset is None or band_key[0] != self._index_asset:
+            return super().driver_data(md, band_key)
+        # KeyError, at parse time and before any graph exists, for an item nothing stamped.
+        return {_POSITION_KEY: md.properties[FUSION_POSITION], _NATIVE_KEY: self._native(md)}
+
+
+class BoaOffsetParser(SourceParser):
     """Stamps every reflectance source with the offset it is owed, at parse time.
 
     **Why the metadata parser and not a lookup table on the driver.** The driver is embedded in
@@ -748,6 +817,7 @@ class BoaOffsetParser(StacMDParser):
         threshold: int,
         offset: int,
         known_harmonisation: SettledProducer | None,
+        index_asset: str | None = None,
     ) -> None:
         """Build a parser that decides the offset for ``reflectance_assets``.
 
@@ -760,8 +830,9 @@ class BoaOffsetParser(StacMDParser):
             threshold: baselines at or above this carry the offset.
             offset: the value to add, negative for a correction.
             known_harmonisation: the producer for every source, where the collection settles it.
+            index_asset: see :class:`SourceParser`.
         """
-        super().__init__(cfg)
+        super().__init__(cfg, index_asset)
         #: The asset keys this parser will decide for. Public because it is the thing that goes
         #: wrong when a correction silently reaches nothing, so it is what a test asserts on.
         self.reflectance_assets = reflectance_assets
@@ -813,13 +884,14 @@ class BoaOffsetParser(StacMDParser):
         return {_OFFSET_KEY: self._offset if decision is OffsetDecision.OWED else 0}
 
 
-class _BoaCorrectingReader(RioReader):
-    """One source's reader, with the BOA offset removed from what it returns.
+class _SourceReader(RioReader):
+    """One source's reader, doing to its pixels what the parser stamped on the source.
 
-    Subclasses odc's rio reader and overrides ``read`` alone, so the read itself — the GDAL
-    environment, the credential session :mod:`tessera_embeddings.ingest.auth` injects per thread,
-    and the log records :mod:`tessera_embeddings.ingest.loader_failures` attributes back to an
-    object — is exactly the one odc would have performed.
+    A reflectance source loses the BOA offset; a source-index source comes back packed with its
+    granule's fusion position. Subclasses odc's rio reader and overrides ``read`` alone, so the read
+    itself — the GDAL environment, the credential session :mod:`tessera_embeddings.ingest.auth`
+    injects per thread, and the log records :mod:`tessera_embeddings.ingest.loader_failures`
+    attributes back to an object — is exactly the one odc would have performed.
     """
 
     def read(
@@ -830,10 +902,12 @@ class _BoaCorrectingReader(RioReader):
         dst: np.ndarray | None = None,
         selection: Any = None,  # noqa: ANN401 — odc's ReaderSubsetSelection
     ) -> tuple[tuple[slice, slice], np.ndarray]:
-        """Read this source and correct it, before anything fuses it with another."""
+        """Read this source, then correct or pack it, before anything fuses it with another."""
+        driver_data = self._src.driver_data if isinstance(self._src.driver_data, dict) else {}
+        if (position := driver_data.get(_POSITION_KEY)) is not None:
+            return self._read_packed(cfg, dst_geobox, selection, position, driver_data[_NATIVE_KEY])
         roi, pixels = super().read(cfg, dst_geobox, dst=dst, selection=selection)
-        driver_data = self._src.driver_data
-        offset = driver_data.get(_OFFSET_KEY) if isinstance(driver_data, dict) else None
+        offset = driver_data.get(_OFFSET_KEY)
         if offset:
             # In place, which is safe because odc never hands a reader a shared destination: the
             # only caller passes no `dst`, so this buffer belongs to this source alone until the
@@ -845,15 +919,35 @@ class _BoaCorrectingReader(RioReader):
             np.copyto(pixels, correct_boa_dn(pixels, offset), where=pixels > _NODATA)
         return roi, pixels
 
+    def _read_packed(
+        self,
+        cfg: Any,  # noqa: ANN401 — odc's RasterLoadParams
+        dst_geobox: Any,  # noqa: ANN401 — odc.geo GeoBox
+        selection: Any,  # noqa: ANN401 — odc's ReaderSubsetSelection
+        position: int,
+        native: RasterBandMetadata,
+    ) -> tuple[tuple[slice, slice], np.ndarray]:
+        """Read with the band's native dtype and nodata, then pack ``position`` above every pixel with data.
 
-class _BoaCorrectingDriver(RioDriver):
-    """The rio reader driver, correcting each image before the mosaic rather than after it.
+        "With data" is the fuser's own test with the fill the native load would have used, so the
+        packed fuse, which fills only where the destination is still zero, keeps the granule the
+        native fuse would have kept. Reading natively rather than in the packed dtype is what keeps
+        the resampling, and so every pixel value, identical.
+        """
+        native_cfg = replace(cfg, dtype=native.data_type or _ODC_FALLBACK_DTYPE, fill_value=native.nodata)
+        roi, pixels = super().read(native_cfg, dst_geobox, selection=selection)
+        return roi, pack(pixels, position, nodata_mask(pixels, _native_fill(native, native_cfg)))
+
+
+class _SourceDriver(RioDriver):
+    """The rio reader driver, with each source corrected or packed as it is read, before fusion.
 
     ``odc.stac.load`` fuses a solar day's tiles into one time slice, so a correction applied to
     its output is applied to every tile at once, and a day whose imagery disagrees then has no
     correct single answer — such days were refused, at a measured cost of 347 days of one
     region-year. Applied here, each image answers for itself and no pixel is both corrected and
-    uncorrected.
+    uncorrected. The source index needs the same per-source hook for the same reason: after the
+    fuse, nothing says which source a pixel came from.
 
     Overrides ``open`` and nothing else. ``restore_env`` and ``capture_env`` are inherited
     deliberately: they put the read inside the GDAL environment and the per-thread credential
@@ -861,13 +955,13 @@ class _BoaCorrectingDriver(RioDriver):
     silently take long-lived workers off credential refresh.
     """
 
-    def __init__(self, parser: BoaOffsetParser) -> None:
+    def __init__(self, parser: SourceParser) -> None:
         """Build a driver whose sources were stamped by ``parser``."""
         super().__init__(md_parser=parser)
 
     def open(self, src: Any, ctx: Any) -> RioReader:  # noqa: ANN401 — odc's RasterSource/LocalContext
-        """Open ``src`` as a rio reader that corrects its own pixels."""
-        return _BoaCorrectingReader(src, ctx)
+        """Open ``src`` as a rio reader that corrects or packs its own pixels."""
+        return _SourceReader(src, ctx)
 
 
 # =============================================================================
@@ -1586,6 +1680,7 @@ def load_stac_items(
     groupby: str = "solar_day",
     geobox: GeoBox | None = None,
     selection_label: str | None = None,
+    source_index: bool = False,
 ) -> xr.Dataset:
     """Load STAC items into an xarray Dataset with corrections applied.
 
@@ -1611,6 +1706,10 @@ def load_stac_items(
               caller that queried by TILE must pass one, since the tile id never reaches this
               function and concurrent same-collection tile ingests otherwise log identical lines.
               Defaults to the bbox, which is per region of interest.
+        source_index: Also return the per-pixel source index as a ``source_index`` variable, built
+              from the collection's ``source_index_band`` as it is read
+              (:mod:`~tessera_embeddings.ingest.provenance`). Every item loaded is stamped with
+              its fusion position, which is how a caller lists the granules behind each slot.
 
     Returns:
         The corrected xarray Dataset.
@@ -1667,13 +1766,27 @@ def load_stac_items(
             # dict and there is no return value to carry it.
             if baselines is not None:
                 baselines.update(extract_baselines(pruned))
-        items = pruned
+        supplied, items = items, pruned
+    else:
+        supplied = items
+
+    index_asset = collection_config.source_index_band if source_index else None
+    if source_index and (index_asset is None or collection_config.fusion_order is None):
+        # Without a fusion order odc re-sorts each day by `(time, id)`, so a stamped position
+        # would not be the granule's place in the fuse.
+        raise ValueError(
+            f"{provider}/{collection} cannot record a source index: it needs a source-index band and a fusion order"
+        )
+    if index_asset is not None:
+        # The order given is the fusion order the loader keeps (`preserve_original_order`), so a
+        # position here is the granule's position in its day's fuse.
+        stamp_fusion_positions(supplied, items)
 
     # Built BEFORE the load, because the correction happens inside it — per image, as each source
     # is read and before anything fuses it with another. Different tiles occupy different ground,
     # so no pixel is both corrected and uncorrected and a day mixing producers need not be
     # refused.
-    parser: BoaOffsetParser | None = None
+    parser: SourceParser | None = None if index_asset is None else SourceParser({}, index_asset)
     reflectance_assets: frozenset[str] = frozenset()
     if collection_config.requires_baseline_correction:
         reflectance_assets = _reflectance_asset_keys(items, collection_config)
@@ -1704,6 +1817,7 @@ def load_stac_items(
             collection_config.baseline_threshold,  # type: ignore[arg-type]
             collection_config.baseline_offset,
             collection_harmonisation(collection_config),
+            index_asset,
         )
 
     data = _load_from_stac(
@@ -1717,10 +1831,10 @@ def load_stac_items(
         groupby=groupby,
         resolution=resolution,
         geobox=geobox,
-        driver=None if parser is None else _BoaCorrectingDriver(parser),
+        driver=None if parser is None else _SourceDriver(parser),
     )
 
-    if parser is not None and not parser.stamped:
+    if isinstance(parser, BoaOffsetParser) and not parser.stamped:
         # The no-silent-no-op check: a correction that reaches no source corrects nothing and
         # produces plausible pixels 1000 too high. A warning rather than an error, because a
         # caller that replaces the loader also reports zero and must not be failed for it — and
@@ -1736,7 +1850,7 @@ def load_stac_items(
             abs(collection_config.baseline_offset),
             sorted(reflectance_assets),
         )
-    elif parser is not None:
+    elif isinstance(parser, BoaOffsetParser):
         logger.info(
             "BOA offset decided per source for %s: %d of %d reflectance source(s) owed the %d offset.",
             collection,
@@ -1745,8 +1859,18 @@ def load_stac_items(
             collection_config.baseline_offset,
         )
 
+    index: xr.DataArray | None = None
+    if index_asset is not None and parser is not None and parser.native is not None:
+        native = parser.native
+        data[index_asset], index = unpack(
+            data[index_asset], np.dtype(native.data_type or _ODC_FALLBACK_DTYPE), _native_fill(native)
+        )
+
     if post_load_fn is not None:
         data = post_load_fn(data)
+    if index is not None:
+        # Added after the transform, which applies to every band and would rescale the index.
+        data[SOURCE_INDEX_VAR] = index
 
     return data
 
@@ -1794,6 +1918,7 @@ def ingest_tile(
     groupby: str = "solar_day",
     geobox: GeoBox | None = None,
     mid_longitude: float | None = None,
+    source_index: bool = False,
 ) -> tuple[xr.Dataset | None, dict[str, int]]:
     """Query STAC, filter existing dates, load data, and apply corrections.
 
@@ -1830,6 +1955,7 @@ def ingest_tile(
         mid_longitude: ROI centroid longitude. Supply it with ``groupby="solar_day"``:
               ``existing_dates`` then holds solar days, which an item's UTC date does not match
               wherever the offset crosses midnight, so half a committed group survives the filter.
+        source_index: See :func:`load_stac_items`.
 
     Returns:
         ``(dataset, baselines)``: the corrected Dataset, or None if every date already exists,
@@ -1882,6 +2008,7 @@ def ingest_tile(
         # The tile is this function's alone — `load_stac_items` never sees `tile_id` — and is what
         # distinguishes concurrent same-collection tile ingests in the selection audit log.
         selection_label=f"tile {tile_id}" if tile_id else None,
+        source_index=source_index,
     )
 
     return data, baselines

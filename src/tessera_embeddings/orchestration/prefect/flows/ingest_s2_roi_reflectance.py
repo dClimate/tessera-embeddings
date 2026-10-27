@@ -90,6 +90,7 @@ def _ingest_s2_roi_impl(
     batch_dates: int | None = None,
     batch_chunk_budget: int | None,
     allow_ingest_code_mismatch: bool = False,
+    provenance: bool = False,
     s3_region: str | None = None,
 ) -> dict[str, Any]:
     """Inner flow: submits the S2 ingestion task to the configured Dask runner.
@@ -112,6 +113,7 @@ def _ingest_s2_roi_impl(
         batch_dates=batch_dates,
         batch_chunk_budget=batch_chunk_budget,
         allow_ingest_code_mismatch=allow_ingest_code_mismatch,
+        provenance=provenance,
         s3_region=s3_region,
     )
     return future.result()
@@ -145,6 +147,7 @@ def ingest_s2_roi_reflectance(
     batch_dates: int | None = None,
     worker_env_overrides: dict[str, str] | None = None,
     allow_ingest_code_mismatch: bool = False,
+    provenance: bool = False,
     s3_region: str | None = None,
 ) -> dict[str, Any]:
     """Ingest S2 L2A reflectance for an ROI using Dask workers.
@@ -197,6 +200,8 @@ def ingest_s2_roi_reflectance(
             time. Not a configuration channel — anything meant to hold for every run belongs
             in ``FargateConfig``. Ignored on the ``use_local`` path.
         allow_ingest_code_mismatch: Resume a store built by different ingest code (off by default).
+        provenance: Write the provenance record — each date's granule list and a per-pixel source
+            index — into the mosaic (off by default; the global store's campaign turns it on).
 
         s3_region: S3 region for the mosaic Icechunk store. ``None`` uses the storage
             layer's default (us-west-2); set it when the input bucket lives elsewhere, or
@@ -240,6 +245,7 @@ def ingest_s2_roi_reflectance(
                 batch_dates=batch_dates,
                 batch_chunk_budget=batch_chunk_budget,
                 allow_ingest_code_mismatch=allow_ingest_code_mismatch,
+                provenance=provenance,
                 s3_region=s3_region,
             )
 
@@ -276,5 +282,6 @@ def ingest_s2_roi_reflectance(
                 batch_dates=batch_dates,
                 batch_chunk_budget=batch_chunk_budget,
                 allow_ingest_code_mismatch=allow_ingest_code_mismatch,
+                provenance=provenance,
                 s3_region=s3_region,
             )

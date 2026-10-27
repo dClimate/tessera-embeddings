@@ -36,6 +36,8 @@ class CollectionConfig:
             offset was already subtracted, forcing a per-item decision from asset locations
         band_names_are_asset_keys: whether the names in ``bands`` are the item's asset keys
             rather than common names the loader resolves through an alias table
+        source_index_band: the asset key of the band whose per-granule pixels decide the
+            provenance source index, or ``None`` where this collection records none
     """
 
     collection_id: str
@@ -57,6 +59,9 @@ class CollectionConfig:
     #: producer classification, read-set completeness, locality — is uninformative where this is
     #: False, and reports every copy as incomplete and remote.
     band_names_are_asset_keys: bool = False
+    #: The band the source index is read from: the one each sensor's validity is judged on, so the
+    #: index and the mask share one definition (``ingest/provenance.py``). Needs ``fusion_order``.
+    source_index_band: str | None = None
 
     @property
     def requires_baseline_correction(self) -> bool:
@@ -125,6 +130,7 @@ PROVIDERS: dict[str, STACProvider] = {
                 fusion_order="clearest_scene",
                 harmonisation_varies_by_item=True,
                 band_names_are_asset_keys=True,
+                source_index_band="scl",
             ),
             "sentinel-2-l1c": CollectionConfig(
                 collection_id="sentinel-2-l1c",
@@ -184,6 +190,7 @@ PROVIDERS: dict[str, STACProvider] = {
                 tile_id_prefix="",
                 # ADR 033: where bursts of one solar day overlap, the most-acquired one wins.
                 fusion_order="most_acquired_burst",
+                source_index_band="0_VV",
             ),
         },
     ),

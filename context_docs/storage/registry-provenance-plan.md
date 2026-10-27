@@ -1,7 +1,7 @@
 # Registry provenance: which satellite images went into every embedding
 
-Status: plan, revision 4 (2026-10-26). It has been through two adversarial reviews and has no open
-questions. None of it is built yet. It is aimed at the v2 campaign and assumes two pull requests
+Status: plan, revision 5 (2026-10-27). It has been through two adversarial reviews and has no open
+questions. The ingest half is built (§11); revision 5 records what building it changed (§13). It is aimed at the v2 campaign and assumes two pull requests
 that are in review: [PR #240](https://github.com/dClimate/tessera-embeddings/pull/240), which
 teaches the ingest which catalogue entries are copies of the same image, and
 [PR #250](https://github.com/dClimate/tessera-embeddings/pull/250), which decides which radar
@@ -70,9 +70,10 @@ granule whose footprint touches the shard.
 
 **`pixel_sources`: which image supplied each pixel on each date.** For each pixel and each date,
 one small integer. Zero means the model did not see the pixel that day. A positive number k means
-it did, and the k-th granule in that day's fusion order supplied it. This is what makes the
-pixel-level answer exact: a reader looks up a pixel's column of numbers and joins each one to
-`granules`. It is stored as a zarr array per sensor per run, in an Icechunk store of its own.
+it did, and the k-th granule in the shard-date's `sources` list supplied it. This is what makes the
+pixel-level answer exact: a reader looks up a pixel's column of numbers and joins each one, through
+`shard_dates`, to `granules`. It is stored as a zarr array per sensor per run, in an Icechunk store
+of its own.
 
 **`update_pixels`: which pixels a holes update wrote.** A holes update rewrites only some pixels
 of a shard. Its mask is kept so a reader knows which run's imagery applies to which pixel.
@@ -112,9 +113,9 @@ opens the registry master row for that shard and year and reads its `source_runs
 `33N-2025-1a2b3c4d`, the campaign fill. They open that run's `pixel_sources` group, take the
 optical array, and read the one column of numbers at the pixel's position. It has 130 entries, one
 per solar day on the mosaic's time axis; 48 of them are non-zero. Each non-zero entry is a date
-the model actually saw this pixel, and its value points at a row of `granules`: for 19 June the
-value is 2, so the second granule in that day's fusion order supplied the pixel, and that row
-gives its scene id, its 3% cloud cover, its footprint, its catalogue link and the exact object
+the model actually saw this pixel, and its value points, through the shard's `shard_dates` row
+for that date, at a row of `granules`: for 19 June the value is 2, so the second granule in that
+row's `sources` list supplied the pixel, and its `granules` row gives its scene id, its 3% cloud cover, its footprint, its catalogue link and the exact object
 URLs the ingest read. If the reader only wanted the shard-level picture, `shard_dates` for the
 same run lists the same 130 days with the count of valid pixels and the granules that supplied
 any part of the shard, with no need to touch the array.
@@ -153,17 +154,18 @@ Three stages already exist. Each gains a small job.
       what the model saw                                  ─▶ merge the master, tag, delete staging and mosaics
 ```
 
-**The ingest** already builds each day's granule list in memory before fusing. It will write that
+**The ingest** already builds each day's granule list in memory before fusing. It writes that
 list, as JSON, into a `granules` array in the mosaic store, one entry per day, in the same
-Icechunk commit as the day's pixels. It will also write a `source_index` band: for each pixel, the
-position in fusion order of the granule the fuser took the pixel from, plus one, or zero where no
-granule had data. The mosaic builder (odc's fuser) cannot report which source it used, so one
-band, SCL for optical and VV for radar, is taken out of the fuser's hands: it is loaded once per
-granule rather than fused, and from those per-granule slices the ingest computes both the index,
-as the position of the first granule with data at each pixel, and the fused band itself, as that
-granule's value. That is the fuser's own rule applied by us, so the fused band is the same as
-before, the band is still read once, and the index and the mask share one definition. The other
-bands are fused by odc as today.
+Icechunk commit as the day's pixels. It also writes a `source_index` band, `uint16`: for each
+pixel, the position in the day's fusion order of the granule the fuser took the pixel from, plus
+one, or zero where no granule had data. The mosaic builder (odc's fuser) cannot report which
+source it used, so one band, SCL for optical and VV for radar, is read through a reader that packs
+each granule's position into the high bits of the pixels it returns, zero where the granule has
+no data. odc's unchanged fuser fills only where the destination is still zero, so it keeps the
+first granule with data as it always has, and splitting the fused result gives back the band,
+bit-identical to an unpacked load, and the index. The band is still read once, the index and the
+mask share one definition, and nothing is added to the task graph. The other bands are fused by
+odc as today.
 
 **The actor** already records, for each shard, how many observations each pixel had. It will also
 keep the list of dates it used per sensor, with the count of valid pixels on each, and the count
@@ -202,20 +204,22 @@ Three rules govern this.
 
 Where the code changes:
 
-- Sentinel-2 ingest: `_write_batch` holds each date's items and passes `write_days_windows` only
-  the baselines; it will pass the items too. `append_time_slot` appends the list in the
-  `batched_region_writes` session. SCL leaves the fused `odc.stac.load` graph and is loaded per
-  item (`groupby="id"`) with the same geobox and nearest resampling; the index is the first slice
-  with data along the item axis, the fused SCL is `take_along_axis` by it, and the coverage gate,
-  which today reads SCL from the fused graph, reads this fused SCL instead so it is still built
-  once. `duplicates.step_down_copies` swaps a copy in place without
-  re-sorting, so fusion order is the loader's input after any step-down, and a `stepped_down` flag
-  marks the swap. The item's catalogue link is kept at query time (today `stac.py:923` prunes it)
-  or rebuilt from catalogue URL, collection and id. `baselines_applied` becomes derivable from the
-  list and stays until the gate that reads it is repointed.
+- Loader (`stac.py`, `ingest/provenance.py`): each collection names its source-index band
+  (`source_index_band`: `scl`, `0_VV`). `load_stac_items(source_index=True)` stamps every item it
+  loads with its position in its day's fusion order, which is the loader's input order after any
+  step-down. `SourceParser` reports that band to odc in a packed dtype with nodata 0 and hands
+  each of its sources the position and the band's native dtype and nodata; `_SourceReader` reads
+  natively and packs, and a split after the load restores the band and yields `source_index`. The
+  BOA offset parser and reader are the same classes, so the offset and the index ride one hook.
+  The coverage gate reads the unpacked SCL, so it is still built once.
+- Sentinel-2 ingest: each prepared date carries its granule list, built from the positions its
+  own load stamped, and both write paths pass it to `write_days_windows`, which writes it in the
+  slot's commit. A fallback copy re-prepares the date and so re-lists it; `stepped_down` marks the
+  swapped-in copy. The item's catalogue link, pruned at query time, is rebuilt from catalogue URL,
+  collection and id. `baselines_applied` stays.
 - Sentinel-1 ingest: #250 keeps track, burst, sub-swath and acquisition time on each item and
-  sorts each day. The per-date lists `_prepare_batch` builds are carried to the write and recorded
-  the same way. VV is loaded per item and fused by the index in the same way; VH is fused by odc.
+  sorts each day. Each batch lists its days from the items its load stamped, and each date's write
+  carries its own list.
 - Actor: `_coverage_record` (`actors.py:215`) gains the per-sensor date lists; the planes are
   written as arrays on the staged shard beside the embeddings; both travel with the `coverage`
   attribute (`assembly.py:1424`) that `read_staged_coverage`, the resumed-shard top-up, the
@@ -224,10 +228,11 @@ Where the code changes:
 - Assembly: `publish_provenance` runs after `publish_registry_part` on both the fill and update
   paths. The already-landed retry path needs nothing, since a tagged zone-year has published.
 - Switch: a `provenance` field on `IngestSettings` for the campaign flows and a flat parameter
-  on the single-ROI ingest flows, forwarded beside `allow_ingest_code_mismatch` through
-  `tasks/ingest.py` to `s2_roi` and `s1_roi`. The global campaign's deployment in
-  `yield-embeddings` sets it on. The model and assembly half has no switch; it follows the
-  mosaics (§5.4).
+  on the base ingest flows, forwarded beside `allow_ingest_code_mismatch` through
+  `tasks/ingest.py` to `s2_roi` and `s1_roi`. `ingest-zone-year` passes it to every leg, to the
+  manifest check before marking, and into the completion fingerprint when on. The global
+  campaign's deployment in `yield-embeddings` sets it on. The model and assembly half has no
+  switch; it follows the mosaics (§5.4).
 - Dead code: `inference/shard_record.py` is test-only and is deleted.
 - Docs: a Provenance section in `docs/registry.md`; the ingest and inference READMEs say where
   their half is produced; `registry-master.md` gains the publication step;
@@ -244,14 +249,14 @@ Where the code changes:
 | `solar_day` | date | the day, as on the mosaic's time axis | the slot |
 | `fusion_order` | int16 | the granule's position in the day's fusion order, 0 first | the write's item list |
 | `granule_id` | string | the catalogue id of the copy read | `item.id` |
-| `image_key` | string | which image this is a copy of: S2 `"<datatake>/<datastrip sensing start>"` (#240), S1 `"<track>/<burst>/<subswath>"` (#250) | item properties |
+| `image_key` | string | which image this is a copy of: S2 `"<datatake>/<datastrip sensing start>"` (#240), S1 the burst id `T<track>-<burst>-<subswath>` (#250) | item properties |
 | `platform` | string | `S2A`, `S1C` and so on | `properties["platform"]`; the title for S1 |
 | `acquired_at` | timestamp (UTC) | the real acquisition instant | `properties["datetime"]`, which solar-day grouping never overwrites (#250 fixes this for S1) |
 | `cloud_cover` | float64 | scene-level cloud percentage; null for radar | `eo:cloud_cover` |
 | `processing_baseline` | string | S2 only, for example `05.11` | `item_baselines` |
 | `product_uri` | string | ESA SAFE product name; S2 only | `s2:product_uri` |
 | `provider`, `collection` | string | `earth-search`/`sentinel-2-l2a`; `cmr-asf`/`OPERA_L2_RTC-S1_V1` | provider config |
-| `stac_item_url` | string | the item's public catalogue URL | kept at query time |
+| `stac_item_url` | string | the item's public catalogue URL | rebuilt from catalogue URL, collection and id |
 | `assets` | map<string,string> | band to the exact URL read, after any bucket rewrite | the item's read set |
 | `stepped_down` | bool | this copy replaced one that would not read | the fallback ladder |
 | `geometry`, `bbox` | GeoParquet, WGS84 | the footprint as published, split at ±180° | `item.geometry` |
@@ -276,11 +281,11 @@ without filtering: every slot has a list, and a slot without one fails the check
 | `solar_day` | date | a date on that store's time axis the shard kept | the actor's kept indices (`S2MaskBundle.abs_indices`; the SAR `kept` indices) |
 | `valid_px` | int32 | pixels of the shard valid on that date, counted over the pixels this run was asked to embed | the actor's mask |
 | `embedded_px` | int32 | pixels this run embedded in the shard: the whole live shard for a fill, the holes it filled for a holes update | the actor's refusal accounting |
-| `sources` | list<int16> | the `fusion_order` values that supplied at least one pixel of the shard on that date, ascending | the distinct non-zero values of the shard's `pixel_sources` plane, less one |
+| `sources` | list<int16> | the `fusion_order` values that supplied at least one pixel of the shard on that date, ascending | the distinct non-zero values of the shard's mosaic `source_index`, less one, over the pixels the model saw |
 
 A refused shard still gets rows, because imagery was seen even though no embedding came of it.
-`valid_px` is the non-zero count of the matching `pixel_sources` plane and `sources` its distinct
-values, so the table and the array cannot disagree.
+`valid_px` is the non-zero count of the matching `pixel_sources` plane, and the plane's values are
+positions in `sources`, so the table and the array cannot disagree.
 
 ### 5.3 `pixel_sources`
 
@@ -291,14 +296,18 @@ coordinate is the mosaic's time axis at the pinned snapshot; `northing` and `eas
 zone group's.
 
 A value k greater than zero means the model received this pixel on this date and the granule with
-`fusion_order = k − 1` supplied it. Zero means the model did not receive it, either because no
-granule had data there or because the cloud mask removed it; the footprints in `granules` tell
-those two apart. Only the shards a run evaluated are written, only at the dates they kept, and a
+`fusion_order = sources[k − 1]`, from the shard-date's `shard_dates` row, supplied it. Zero means
+the model did not receive it, either because no granule had data there or because the cloud mask
+removed it; the footprints in `granules` tell those two apart. The value is a rank within the
+shard-date rather than the zone-wide fusion order because a day's fusion order is zone-wide and
+can exceed 255, while a shard rarely has more than a handful of contributing granules on one
+date; the rank keeps the plane `uint8` and its values small, which is what §9 measured. Only the shards a run evaluated are written, only at the dates they kept, and a
 holes update writes only the pixels it was asked to embed, so the store is as sparse as the
 embeddings.
 
 Why an integer rather than a bit per pixel: it costs 4% more bytes (§9) and names the winning
 granule wherever two footprints overlap, where a bit would leave the reader a list of candidates.
+The actor refuses a shard-date with more than 255 contributing granules rather than wrap.
 Why a store of its own rather than arrays in the published zone groups: each run has its own list
 of dates, whose length differs by zone-year and by run, whereas the published store's groups share
 one fixed grid. Keeping it separate also leaves the published store, its metadata conventions and
@@ -318,14 +327,17 @@ parameter on the single-ROI ingest flows, forwarded to `s2_roi` and `s1_roi` bes
 With it off the ingest writes no `granules` array and no `source_index` band, and the mosaic is
 exactly today's.
 
-The mosaic records the choice. Its root gains `provenance_version` (1) when it is seeded with the
-switch on, and nothing when off, and the ingest manifest validates it on resume like its other
-terms. A run with the switch on refuses a store without the version, with a `granules` array
-shorter than its time axis, or without `source_index`; such a store, seeded with the switch off
-or half-written by a crashed upgrade, is re-seeded rather than patched. A run with the switch off
-refuses a store that has the version, so it can never leave a granule list short. A store from
-before the field resumes under off, the allowance the manifest already makes for
-`min_valid_coverage`.
+The mosaic records the choice. Its ingest manifest gains `provenance_version` (1) when it is seeded
+with the switch on, and nothing when off, and the manifest validates it on every write like its
+other terms. The term is one whose absence means off (`ABSENT_MEANS_OFF`, the rule the embedding
+manifest already applies to `allow_s2_only`). A run with the switch on refuses a store without the
+version; such a store, seeded with the switch off or before the field existed, is re-seeded
+rather than patched. A run with the switch off refuses a store that has the version, so it can
+never leave a granule list short. A store from before the field resumes under off. The seed
+creates the `granules` array and the `source_index` band in the same commit as the manifest, and
+every date writes both, so a store with the version always has both and no separate check is
+needed. The zone-year completion fingerprint carries `provenance: true` when the switch is on, so
+a finished mosaic marked without the record is refused by a run that wants it.
 
 The model and assembly half has no switch of its own; it follows the mosaics. The actor stages
 planes when its mosaic has `source_index`. Assembly publishes when all three of the zone-year's
@@ -380,8 +392,8 @@ census, where a failure names the zone-year for repair.
 - Every shard in the registry part has `shard_dates` rows for every sensor present, or a stated
   reason such as coverage-only or skipped.
 - Every `shard_dates` row's `valid_px` equals the non-zero count of its `pixel_sources` plane,
-  its `sources` list equals the plane's distinct non-zero values less one, and no plane holds a
-  value larger than the day's granule count.
+  the plane's distinct non-zero values are exactly 1 to the length of its `sources` list, and every
+  `sources` entry is a position within the day's granule list.
 - Every holes-update shard has an `update_pixels` array whose count equals `embedded_px`.
 - Every embedded master row's `source_runs` names only runs with published files and groups.
 - A zone-year written with the switch off (§5.4) has no files and null `source_runs`; the census
@@ -439,8 +451,9 @@ plane, which is why the chunking is one date by one shard.
 
 `shard_dates` is about 3,000 shards by around 130 dates by 3 sensors for a dense zone-year,
 roughly a million rows and 10 MB, so around 10 GB campaign-wide. `update_pixels` is a few
-kilobytes per updated shard. The mosaic's `source_index` band adds one byte per pixel per date
-before compression, under 5% of a mosaic's raw bytes, for as long as the mosaic exists.
+kilobytes per updated shard. The mosaic's `source_index` band adds two bytes per pixel per date
+before compression, about a tenth of a Sentinel-2 mosaic's raw bytes, and compresses to far less
+because it is constant over each granule's ground; it exists only as long as the mosaic.
 
 ## 10. Example queries
 
@@ -475,9 +488,12 @@ each non-zero number is a row of `granules`.
 run = pixel_sources[f"{zone}/{year}/{run_id}"]          # the run's group, opened read-only
 k = run["s2"][:, northing_index, easting_index]         # one uint8 per date
 seen = k > 0
-sources = pl.DataFrame({"solar_day": run["date"][:][seen], "fusion_order": k[seen] - 1})
-sources.join(granules.filter(zone=zone, year=year, run_id=run_id, sensor="s2"),
-             on=["solar_day", "fusion_order"])           # one granule per date the model saw
+picks = pl.DataFrame({"solar_day": run["date"][:][seen], "rank": k[seen] - 1})
+rows = shard_dates.filter(zone=zone, year=year, run_id=run_id, tile=shard, sensor="s2")
+picks = picks.join(rows, on="solar_day").with_columns(
+    fusion_order=pl.col("sources").list.get(pl.col("rank")))
+picks.join(granules.filter(zone=zone, year=year, run_id=run_id, sensor="s2"),
+           on=["solar_day", "fusion_order"])             # one granule per date the model saw
 ```
 
 A shard with several `source_runs` is read once per run, and `update_pixels` says which run's
@@ -488,7 +504,9 @@ zones, years and an update run before the registry README publishes them.
 
 1. #240 and #250 land.
 2. The ingest half ships as one stack on #250: the switch, the granule list, the source index,
-   `provenance_version` and the fingerprint note, for both sensors.
+   `provenance_version` and the fingerprint note, for both sensors. Built: real-raster tests pin
+   that the fused band is bit-identical with the index on, for an integer band, for Sentinel-2
+   through the BOA-correcting parser, and for radar through the dB transform.
 3. The model and assembly half ships as a second stack: the actor's date lists, snapshot pinning,
    the embed mask and the masked planes; then publication, `pixel_sources`, the checks,
    `source_runs` on parts and master, and the docs. The registry schema changes and the
@@ -502,12 +520,12 @@ zones, years and an update run before the registry README publishes them.
    or the export records; a holes update on a filled zone-year adds a second `shard_dates` file and
    an `update_pixels` array, `source_runs` recomputes to both runs after a second master merge and
    after a rebuild, and a `shards` update resets it; and for a sampled shard-date, the plane's
-   non-zero count equals `valid_px`, its distinct values equal `sources` plus one, every pixel
-   with value k lies inside the footprint of the granule at fusion order k − 1, and the mosaic's
-   reflectance at a sample of those pixels equals that granule's own. The same run measures the
-   retained `granules` rows for a full zone-year per sensor, the `pixel_sources` planes for all
-   three sensors, and the ingest's time per day against #250, which should be level since no band
-   is read twice. The chain runs with the switch on. A tiny leg then runs with it off and asserts
+   non-zero count equals `valid_px`, its distinct values are 1 to the length of `sources`, every
+   pixel with value k lies inside the footprint of the granule at fusion order `sources[k − 1]`,
+   and the mosaic's reflectance at a sample of those pixels equals that granule's own. The same
+   run measures the retained `granules` rows for a full zone-year per sensor, the `pixel_sources`
+   planes for all three sensors, and the ingest's time per day against #250, which should be level
+   since no band is read twice. The chain runs with the switch on. A tiny leg then runs with it off and asserts
    that the mosaics, staging and registry are today's, that a store seeded before the change
    resumes under it, and that a run with the switch on refuses that store with a reason.
 5. It ships with the first v2 zone-year, and `yield-embeddings` refreshes its lock after each
@@ -553,5 +571,18 @@ the `pixel_sources` store.
   have stranded the dev stores that `allow_ingest_code_mismatch` keeps usable today. The ingest
   owns the switch, the mosaics carry it, and the model and assembly half follows the mosaics
   (§5.4).
+- **The index rides on the reader, not on a per-granule load** (2026-10-27, building the ingest
+  half). Loading the mask band per granule (`groupby="id"`) makes one load task per granule per
+  chunk: tens of granules a day for optical, hundreds of bursts for radar, each a full chunk of
+  memory, where today there is one task per chunk. Packing the position into the pixels on the
+  read keeps one task per chunk and lets odc's own fuser pick the winner. odc mishandles a
+  per-band dtype override when chunks are given, so the packed dtype is declared through the
+  parser's band metadata instead.
+- **The mosaic's index is `uint16`; the published plane stays `uint8` as a rank into the
+  shard-date's `sources`** (2026-10-27). A day's fusion order is zone-wide, and a long land zone
+  can have more than 255 scenes or bursts in a day, so the mosaic needs sixteen bits. A shard has
+  a handful of contributing granules on a date, and §9's measurement was taken on per-shard ranks,
+  so ranking within `sources` keeps the measured size and the `uint8` plane, at the cost of one
+  more join for a pixel query (§10).
 - **Vocabulary:** shard, never tile, for the 2048-pixel unit; `granules`, never `scenes`, for the
   table.

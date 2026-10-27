@@ -45,6 +45,7 @@ def _ingest_s1_roi_impl(
     pipeline_batches: bool,
     narrow_windows_per_date: bool,
     allow_ingest_code_mismatch: bool,
+    provenance: bool,
     s3_region: str | None = None,
 ) -> dict[str, Any]:
     """Inner flow: submits the S1 ingestion task to the configured Dask runner."""
@@ -63,6 +64,7 @@ def _ingest_s1_roi_impl(
         pipeline_batches=pipeline_batches,
         narrow_windows_per_date=narrow_windows_per_date,
         allow_ingest_code_mismatch=allow_ingest_code_mismatch,
+        provenance=provenance,
         s3_region=s3_region,
     )
     return future.result()
@@ -109,6 +111,7 @@ def ingest_s1_roi_sar(
     pipeline_batches: bool = True,
     narrow_windows_per_date: bool = True,
     allow_ingest_code_mismatch: bool = False,
+    provenance: bool = False,
     s3_region: str | None = None,
 ) -> dict[str, Any]:
     """Ingest OPERA RTC-S1 SAR for an ROI using Dask workers.
@@ -149,6 +152,8 @@ def ingest_s1_roi_sar(
             driver. Set False for a strictly serial query-then-write loop.
         allow_ingest_code_mismatch: Resume a store built by different ingest code (off by
             default).
+        provenance: Write the provenance record — each date's granule list and a per-pixel source
+            index — into the mosaic (off by default; the global store's campaign turns it on).
 
         s3_region: S3 region for the mosaic Icechunk store. ``None`` uses the storage
             layer's default (us-west-2); set it when the input bucket lives elsewhere, or
@@ -198,6 +203,7 @@ def ingest_s1_roi_sar(
                 pipeline_batches=pipeline_batches,
                 narrow_windows_per_date=narrow_windows_per_date,
                 allow_ingest_code_mismatch=allow_ingest_code_mismatch,
+                provenance=provenance,
                 s3_region=s3_region,
             )
 
@@ -235,5 +241,6 @@ def ingest_s1_roi_sar(
                 pipeline_batches=pipeline_batches,
                 narrow_windows_per_date=narrow_windows_per_date,
                 allow_ingest_code_mismatch=allow_ingest_code_mismatch,
+                provenance=provenance,
                 s3_region=s3_region,
             )

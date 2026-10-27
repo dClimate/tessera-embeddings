@@ -34,7 +34,7 @@ Sentinel-2 reflectance and cloud masks. Five write paths, all committing atomica
 import itertools
 import logging
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
@@ -56,7 +56,7 @@ from tenacity import (
     wait_random,
 )
 
-from tessera_embeddings.config.ingest import INGEST_COMPRESSORS, mosaic_chunk_layout
+from tessera_embeddings.config.ingest import GRANULES_ARRAY, INGEST_COMPRESSORS, mosaic_chunk_layout
 from tessera_embeddings.errors import CorruptedStoreError, NonMonotonicDateError
 from tessera_embeddings.storage.manifest import MIXED_CODE_IDENTITIES_ATTR, IngestManifest, extract_manifest
 from tessera_embeddings.storage.region_writes import (
@@ -1635,6 +1635,7 @@ def write_day_windows(
     s3_region: str | None = None,
     parallel_windows: bool = False,
     store_attrs: dict[str, Any] | None = None,
+    granules: str | None = None,
 ) -> None:
     """Write ONE date's live windows into a mosaic store, one commit for the date.
 
@@ -1660,6 +1661,7 @@ def write_day_windows(
         s3_region=s3_region,
         parallel_windows=parallel_windows,
         store_attrs=store_attrs,
+        granules=None if granules is None else [granules],
     )
 
 
@@ -1677,6 +1679,7 @@ def write_days_windows(
     s3_region: str | None = None,
     parallel_windows: bool = False,
     store_attrs: dict[str, Any] | None = None,
+    granules: Sequence[str] | None = None,
 ) -> None:
     """Write one or more dates' live windows into a mosaic store, ONE commit for the batch.
 
@@ -1712,11 +1715,19 @@ def write_days_windows(
     ``store_attrs`` are merged into the root attrs in the same commit as the dates, for a
     record that must exist whenever any date does, such as the radar burst census that ranked
     the dates' sources: a separate commit could be lost between the first date and itself.
+
+    ``granules`` is the provenance granule list, one JSON string per date in ``days``, written
+    into the store's ``granules`` array at the date's own slot in the same commit, so a committed
+    slot always has its list and an uncommitted one has neither. A store seeded with it has the
+    array; whether a resume may write to that store either way is the manifest's
+    ``provenance_version`` term, validated before anything is written.
     """
     from tessera_embeddings.storage.empty_store import create_empty_store  # local: storage-internal, avoids cycle
 
     if not days:
         return  # nothing to write; a commit recording nothing would be noise
+    if granules is not None and len(granules) != len(days):
+        raise ValueError(f"one granule list per date: {len(granules)} for {len(days)} date(s)")
 
     whens: list[np.datetime64] = []
     _cy, _cx = chunks["northing"], chunks["easting"]
@@ -1778,6 +1789,7 @@ def write_days_windows(
             chunks=chunks,
             baselines={},  # merged per date below, exactly like the append path
             manifest=manifest,
+            granule_list=granules is not None,
             # Seed through a repo opened with THIS call's credentials/region. Letting
             # create_empty_store open its own would use the default storage config, so the
             # probe above and every write below would honour a callback or a non-default
@@ -1812,8 +1824,10 @@ def write_days_windows(
         # in the ONE commit together, preserving the no-date-before-its-pixels invariant at
         # batch granularity.
         writes: list[tuple[xr.Dataset, list[tuple[int, int, int, int]], int, list[str]]] = []
-        for (one_ds, one_windows), when in zip(days, whens, strict=True):
+        for i, ((one_ds, one_windows), when) in enumerate(zip(days, whens, strict=True)):
             t = batch.append_time_slot(when)
+            if granules is not None:
+                batch.group[GRANULES_ARRAY][t] = granules[i]  # type: ignore[index]
             drop = [c for c in ("time", "northing", "easting") if c in one_ds.coords]
             writes.append((one_ds, one_windows, t, drop))
         attrs = batch.group.attrs

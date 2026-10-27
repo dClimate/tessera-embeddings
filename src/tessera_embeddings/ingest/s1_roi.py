@@ -42,6 +42,7 @@ import numpy as np
 import xarray as xr
 
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE, INGEST_CHUNKS
+from tessera_embeddings.config.providers import PROVIDERS
 from tessera_embeddings.errors import ProviderRefusedReadsError
 from tessera_embeddings.ingest._pipeline import pipelined
 from tessera_embeddings.ingest.duplicates import is_provider_refusal, is_unreadable_source
@@ -53,6 +54,7 @@ from tessera_embeddings.ingest.live_windows import (
 )
 from tessera_embeddings.ingest.loader_failures import install_capture_everywhere, refusal_wait_out
 from tessera_embeddings.ingest.opera_query import BURST_CENSUS_ATTR, BurstCensus, make_s1_item_provider
+from tessera_embeddings.ingest.provenance import day_granules
 from tessera_embeddings.ingest.roi import (
     read_roi_mask,
     read_roi_metadata,
@@ -82,6 +84,9 @@ from tessera_embeddings.storage.zarr_store import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: The catalogue the radar leg reads: OPERA RTC-S1 bursts through CMR.
+_RADAR_PROVIDER, _RADAR_COLLECTION = "cmr-asf", "opera-rtc-s1"
 
 DEFAULT_CRED_REFRESH_INTERVAL_SEC = 30 * 60
 """Fallback refresh cadence, used only when the credential advertises no expiry."""
@@ -237,6 +242,8 @@ class _PreparedBatch:
     #: crosses UTC midnight. Empty window list = reaches nothing, so skip; missing key = unknown,
     #: so write everything; empty dict = the whole batch falls back.
     date_windows: dict[str, tuple[str, list[tuple[int, int, int, int]]]]
+    #: Solar day -> the provenance granule list for that day's slot. Empty with provenance off.
+    granules: dict[str, str] = field(default_factory=dict)
 
 
 def _baselines_for(baselines: dict[str, int], dates: Iterable[str]) -> dict[str, int]:
@@ -272,6 +279,7 @@ def ingest_s1_roi_sar(
     narrow_windows_per_date: bool = True,
     allow_ingest_code_mismatch: bool = False,
     s3_region: str | None = None,
+    provenance: bool = False,
 ) -> SarIngestResult:
     """Ingest OPERA RTC-S1 SAR for an ROI using batched time windows.
 
@@ -330,6 +338,9 @@ def ingest_s1_roi_sar(
         s3_region: S3 region for the mosaic Icechunk store. ``None`` uses the
             storage layer's default; set it when the bucket lives elsewhere, or
             every write below signs against the wrong region.
+        provenance: Write the provenance record with every date: the day's burst list and a
+            per-pixel ``source_index`` band (:mod:`~tessera_embeddings.ingest.provenance`). Off by
+            default; the store records the setting and a resume must match it.
 
     Returns:
         :class:`SarIngestResult`. ``status="skipped"`` if zero dates
@@ -354,6 +365,7 @@ def ingest_s1_roi_sar(
         roi_zarr_path,
         storage_options=resolve_storage_options(storage_options),
         allow_ingest_code_mismatch=allow_ingest_code_mismatch,
+        provenance=provenance,
     )
 
     # Load blocks match the store's chunks: one read task per (chunk, band), and the
@@ -737,8 +749,8 @@ def ingest_s1_roi_sar(
 
         query_started = time.monotonic()
         data, baselines = ingest_tile(
-            provider="cmr-asf",
-            collection="opera-rtc-s1",
+            provider=_RADAR_PROVIDER,
+            collection=_RADAR_COLLECTION,
             tile_id=None,
             start_date=rng.query_start,
             end_date=rng.query_end,
@@ -757,6 +769,7 @@ def ingest_s1_roi_sar(
             # only saves loading a group that is already committed — but filtering on UTC
             # dates would let half of one through, which is the case that costs a write.
             mid_longitude=mid_longitude,
+            source_index=provenance,
         )
         query_s = time.monotonic() - query_started
         # THE most diagnostic line in this flow: without the item count there is no telling a
@@ -784,6 +797,16 @@ def ingest_s1_roi_sar(
             query_s,
             len(seen_items),
             _date_footprints(seen_items),
+            # The items the load stamped are the ones it fused, in each day's burst order.
+            day_granules(
+                seen_items,
+                provider=_RADAR_PROVIDER,
+                collection=_RADAR_COLLECTION,
+                catalog_url=PROVIDERS[_RADAR_PROVIDER].catalog_url,
+                collection_id=PROVIDERS[_RADAR_PROVIDER].collections[_RADAR_COLLECTION].collection_id,
+            )
+            if provenance and data is not None
+            else {},
         )
 
     # depth=1: one batch prepared ahead. A batch's write is one long consume, so a single
@@ -932,6 +955,9 @@ def ingest_s1_roi_sar(
                                     parallel_windows=overlap_window_writes,
                                     s3_region=s3_region,
                                     store_attrs={BURST_CENSUS_ATTR: burst_census.counts()},
+                                    # KeyError for a written date the load did not list: with
+                                    # the record on, no slot may commit without its list.
+                                    granules=prepared.granules[date_str] if provenance else None,
                                 )
                 except Exception as exc:
                     # The retry is exhausted. Only a failure the source is answerable for is

@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import zarr
 
-from tessera_embeddings.config.ingest import INGEST_CHUNKS, INGEST_COMPRESSORS, mosaic_chunk_layout
+from tessera_embeddings.config.ingest import GRANULES_ARRAY, INGEST_CHUNKS, INGEST_COMPRESSORS, mosaic_chunk_layout
 from tessera_embeddings.config.store_layout import clamp_chunks_and_shards
 from tessera_embeddings.storage.time_axis import TIME_ENCODING, compute_doy
 from tessera_embeddings.storage.zarr_store import _create_repo, _delete_store
@@ -229,6 +229,7 @@ def create_empty_store(
     baselines: dict[str, int] | None = None,
     manifest: IngestManifest | None = None,
     repo: Repository | None = None,
+    granule_list: bool = False,
 ) -> None:
     """Create a 100%-empty store over the ROI extent and given dates.
 
@@ -255,6 +256,8 @@ def create_empty_store(
         manifest: Optional ingest manifest for provenance / append-safety.
         repo: Pre-opened repository to create the store in. Pass one when the caller's credentials
             or region differ from the defaults; otherwise this opens its own.
+        granule_list: Also create the provenance ``granules`` array, one string per time slot,
+            in the same commit as the schema, so a seeded store either has it or never will.
     """
     chunks = chunks if chunks is not None else INGEST_CHUNKS
     times = np.asarray(times, dtype="datetime64[ns]")
@@ -304,14 +307,21 @@ def create_empty_store(
         repo=repo,
         coords={"time": times, "northing": northing, "easting": easting},
         var_specs={
-            name: VarSpec(
-                dims=("time", "northing", "easting"),
-                dtype=dtype,
-                chunks=inner,
-                compressors=INGEST_COMPRESSORS,
-                shards=shards,
-            )
-            for name, dtype in var_dtypes.items()
+            **{
+                name: VarSpec(
+                    dims=("time", "northing", "easting"),
+                    dtype=dtype,
+                    chunks=inner,
+                    compressors=INGEST_COMPRESSORS,
+                    shards=shards,
+                )
+                for name, dtype in var_dtypes.items()
+            },
+            **(
+                {GRANULES_ARRAY: VarSpec(dims=("time",), dtype=np.dtypes.StringDType(), chunks=(1,), fill_value="")}
+                if granule_list
+                else {}
+            ),
         },
         commit_msg=f"Create empty store with {nt} dates",
         attrs=store_attrs,

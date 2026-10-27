@@ -23,12 +23,17 @@ were checked to fail when the skip is removed, so they are not passing vacuously
 
 from __future__ import annotations
 
+import json
 import threading
 import time
+from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
 
 from tessera_embeddings.ingest._pipeline import pipelined
+from tessera_embeddings.ingest.opera_query import BURST_ID
+from tessera_embeddings.ingest.provenance import stamp_fusion_positions
 
 
 def _fake_client():
@@ -120,6 +125,18 @@ def test_prepare_exceptions_surface_when_the_batch_is_consumed() -> None:
     assert consumed == [0], f"batch 0 should have been consumed before the failure: {consumed}"
 
 
+def _burst(date: str) -> SimpleNamespace:
+    """One radar granule acquired mid-morning UTC on ``date``, as the provider would hand it over."""
+    return SimpleNamespace(
+        id=f"OPERA_L2_RTC-S1_T001-000001-IW1_{date.replace('-', '')}T100000Z_X_S1A_30_v1.0",
+        datetime=datetime.fromisoformat(f"{date}T10:00:00+00:00"),
+        properties={"datetime": f"{date}T10:00:00Z", BURST_ID: "T001-000001-IW1"},
+        assets={},
+        geometry=None,
+        bbox=None,
+    )
+
+
 def _run_ingest(
     monkeypatch,
     catalogue: list[str],
@@ -156,7 +173,13 @@ def _run_ingest(
 
     written: list[str] = []
 
-    def fake_ingest_tile(*, start_date: str, end_date: str, existing_dates=None, **_):
+    def fake_ingest_tile(
+        *, start_date: str, end_date: str, existing_dates=None, item_provider_fn=None, source_index=False, **_
+    ):
+        if source_index:
+            # What the real loader does with the record on: fuse the provider's items, stamped.
+            fused = item_provider_fn()
+            stamp_fusion_positions(fused, fused)
         dates = [d for d in catalogue if start_date <= d <= end_date]
         if not dates:
             return None, {}
@@ -188,10 +211,10 @@ def _run_ingest(
         s1_roi, "live_windows_for_mask", lambda *a, **k: [type("W", (), {"y0": 0, "y1": 1, "x0": 0, "x1": 1})()]
     )
 
-    def fake_provider(*_args, **kwargs):
+    def fake_provider(_orbit, _bbox, query_start, query_end, **kwargs):
         if providers is not None:
             providers.append(kwargs)
-        return lambda: []
+        return lambda: [_burst(d) for d in catalogue if query_start <= d <= query_end]
 
     monkeypatch.setattr(s1_roi, "make_s1_item_provider", fake_provider)
     # Reads the ROI store for provenance; irrelevant here and the only other S3 caller.
@@ -757,3 +780,28 @@ def test_a_store_holds_the_census_that_ranked_its_dates(monkeypatch, existing, r
 
     assert writes, "the open date is written"
     assert all(w["store_attrs"] == {BURST_CENSUS_ATTR: expected} for w in writes)
+
+
+@pytest.mark.parametrize("pipe", _WRITE_PATHS)
+def test_each_written_date_carries_its_own_burst_list(monkeypatch, pipe: bool) -> None:
+    """With the record on, a date's write carries the list of the bursts its load fused."""
+    writes: list = []
+    written = _run_ingest(
+        monkeypatch,
+        catalogue=["2024-01-01", "2024-01-02", "2024-01-04"],
+        existing=set(),
+        writes=writes,
+        pipeline_batches=pipe,
+        provenance=True,
+    )
+    assert written == ["2024-01-01", "2024-01-02", "2024-01-04"]
+    for date, kwargs in zip(written, writes, strict=True):
+        (granule,) = json.loads(kwargs["granules"])
+        assert granule["granule_id"] == _burst(date).id
+        assert (granule["image_key"], granule["platform"]) == ("T001-000001-IW1", "S1A")
+
+
+def test_with_the_record_off_no_radar_write_carries_a_list(monkeypatch) -> None:
+    writes: list = []
+    _run_ingest(monkeypatch, catalogue=["2024-01-01"], existing=set(), writes=writes)
+    assert [kwargs["granules"] for kwargs in writes] == [None]

@@ -33,6 +33,7 @@ into Icechunk/Zarr stores. Used by the Tessera ingestion flows (`ingest_s1_roi_s
   - [Data transformations](#data-transformations)
   - [Sentinel-2 baseline correction](#sentinel-2-baseline-correction-applied-during-the-read) · [docs/ingest/baseline-correction.md](../../../docs/ingest/baseline-correction.md)
   - [Recording the window an ingest examined](#recording-the-window-an-ingest-examined)
+  - [Recording which granules supplied each slot](#recording-which-granules-supplied-each-slot) · [docs/ingest/provenance.md](../../../docs/ingest/provenance.md)
 - [Authentication (EDL / OPERA data)](#authentication-edl--opera-data) · [docs/ingest/authentication.md](../../../docs/ingest/authentication.md)
 - [Error handling](#error-handling) · [docs/ingest/error-handling.md](../../../docs/ingest/error-handling.md)
 - [Performance](#performance) · [docs/ingest/performance.md](../../../docs/ingest/performance.md)
@@ -120,6 +121,7 @@ happy path and links each of those subjects to its own document; the failure mod
 | `land_mask.py` | Builds per-zone coverage bitmaps from the partner's land mask, and writes and validates zone ROIs (`export_zone_roi`, `validate_zone_roi`). [§ Zone ingestion](#zone-ingestion-the-global-campaign--adr-011) |
 | `source_coverage.py` | Optical preflight: does the catalogue publish anything reaching a zone's live land in this window, answered before any cluster is provisioned. Three-valued — only a positive finding of absence refuses. [§ Zone ingestion (the global campaign) — ADR-011](#zone-ingestion-the-global-campaign--adr-011) |
 | `catalogue_refusal.py` | Tells a catalogue that is BUSY apart from one that cannot serve this REQUEST, and names the request either way. [§ When the catalogue refuses](../../../docs/ingest/error-handling.md#when-the-catalogue-refuses-naming-the-request-and-telling-the-two-refusals-apart) |
+| `provenance.py` | The ingest half of the provenance record: stamps each item with its fusion position, packs and splits the per-pixel source index, and builds each slot's granule list. Off unless the `provenance` switch is on. [§ Provenance](../../../docs/ingest/provenance.md) |
 | `live_windows.py` | Derives the chunk-aligned live windows every ingest loads and writes, and narrows them per date to the land that date's imagery reaches. [§ Cropping to live windows](../../../docs/ingest/performance.md#cropping-to-live-windows-unconditional) |
 | `_http.py` | Shared HTTP helpers for catalogue and granule queries: retries that log each attempt, calls the caller can abandon, and a guard for replies that claim success but are not JSON. |
 | `_pipeline.py` | A prepare/consume pipeline with a look-ahead depth, so the next item is prepared while the current one is consumed. Buys buffering, never concurrency. S2 dates go through it automatically on every fleet up to 140 workers. [§ Pipelining a date's preparation](../../../docs/ingest/performance.md#pipelining-a-dates-preparation-automatic) |
@@ -467,6 +469,17 @@ and a partially-covered month stays an error because it could hide unexamined da
 write the attribute is logged, never raised — the gate simply falls back to requiring every
 month. `assessed_empty_dates` is recorded alongside for observability, separating "sparse region"
 from "the footprints are wrong".
+
+### Recording which granules supplied each slot
+
+With the `provenance` switch on (off by default; the global store's campaign turns it on), every
+slot carries the list of granules fused into it, in fusion order, in a `granules` array written in
+the slot's own commit, and every pixel carries a `source_index`: the position plus one of the
+granule that supplied it. The index costs no extra read and no extra fuser. The mask band (SCL,
+or VV) is read through a reader that packs each granule's position above its pixels, so odc's own
+first-wins fuse carries the winner through and a split afterwards returns the band unchanged. The
+mosaic's manifest records the switch, and a resume under the other setting is refused.
+[docs/ingest/provenance.md](../../../docs/ingest/provenance.md) has the fields and the mechanism.
 
 ---
 ## Authentication (EDL / OPERA data)

@@ -14,6 +14,7 @@ both modes the same way still fails.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -26,8 +27,10 @@ import numpy as np
 import pytest
 import xarray as xr
 
+from tessera_embeddings.config.ingest import SOURCE_INDEX_VAR
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
 from tessera_embeddings.ingest import s2_roi
+from tessera_embeddings.ingest.provenance import stamp_fusion_positions
 from tessera_embeddings.ingest.stac import HeterogeneousProducerError
 from tessera_embeddings.storage.zarr_store import store_write_retrying
 
@@ -127,6 +130,9 @@ def _item(date: str, item_id: str | None = None):
         id=item_id or f"S2A_T13TDE_{date.replace('-', '')}_0_L2A",
         datetime=datetime.fromisoformat(f"{date}T10:00:00"),
         properties={"eo:cloud_cover": 0.0},
+        assets={},
+        geometry=None,
+        bbox=None,
     )
 
 
@@ -153,6 +159,8 @@ class _Run:
         self.load_started: dict[str, float] = {}
         self.write_ended: dict[str, float] = {}
         self.attempts: list[str] = []
+        #: Date -> the provenance granule list its write carried.
+        self.granules: dict[str, str | None] = {}
 
 
 @pytest.fixture
@@ -205,13 +213,18 @@ def run_ingest(monkeypatch):
         run = _Run()
         runs.append(run)  # so a test can inspect a run whose write raised
 
-        def load_stac_items(day_items, **_kwargs):
+        def load_stac_items(day_items, **kwargs):
             if load_raises is not None:
                 raise load_raises
             date = day_items[0].datetime.strftime("%Y-%m-%d")
             run.load_started[date] = time.monotonic()
             run.loaded.append(date)
-            return _day_ds(date, valid=dates[date])
+            ds = _day_ds(date, valid=dates[date])
+            if kwargs.get("source_index"):
+                # What the real loader does with the record on: stamp what it fused, add the band.
+                stamp_fusion_positions(day_items, day_items)
+                ds[SOURCE_INDEX_VAR] = xr.ones_like(ds["blue"])
+            return ds
 
         def _record_write(day_ds) -> None:
             """The write stub's whole behaviour, shared by every writer it stands in for.
@@ -228,14 +241,17 @@ def run_ingest(monkeypatch):
             run.written.append(date)
             run.write_ended[date] = time.monotonic()
 
-        def write_day_windows(_store, day_ds, _windows, **_kwargs):
+        def write_day_windows(_store, day_ds, _windows, **kwargs):
             _record_write(day_ds)
+            run.granules[str(day_ds.time.dt.date.values[0])] = kwargs.get("granules")
 
-        def write_days_windows(_store, days, **_kwargs):
+        def write_days_windows(_store, days, **kwargs):
             # The batched writer takes (day_ds, windows) pairs; each still counts as its
             # own write, which is what the one-commit-per-date accounting assumes.
-            for day_ds, _windows in days:
+            lists = kwargs.get("granules") or [None] * len(days)
+            for (day_ds, _windows), granules in zip(days, lists, strict=True):
                 _record_write(day_ds)
+                run.granules[str(day_ds.time.dt.date.values[0])] = granules
 
         monkeypatch.setattr(s2_roi, "query_stac_items", lambda **_kwargs: ([_item(d) for d in dates], {}))
         monkeypatch.setattr(s2_roi, "load_stac_items", load_stac_items)
@@ -887,3 +903,19 @@ def test_a_bound_that_is_not_a_date_is_refused(run_ingest, pipeline_dates, bad_e
             start_date="2018-01-01",
             end_date=bad_end,
         )
+
+
+@BOTH_MODES
+@pytest.mark.parametrize("batch_dates", [1, 4], ids=["per-date", "batched"])
+def test_each_written_date_carries_its_own_granule_list(run_ingest, pipeline_dates, batch_dates):
+    """With the record on, every write carries the list of the granules its load fused, and only its own."""
+    run = run_ingest(SKIP_CHAIN, pipeline_dates=pipeline_dates, batch_dates=batch_dates, provenance=True)
+    assert sorted(run.granules) == ["2024-01-01", "2024-01-05"]
+    for date, granules in run.granules.items():
+        assert granules is not None
+        assert [g["granule_id"] for g in json.loads(granules)] == [f"S2A_T13TDE_{date.replace('-', '')}_0_L2A"]
+
+
+def test_with_the_record_off_no_write_carries_a_list(run_ingest):
+    run = run_ingest(SKIP_CHAIN, pipeline_dates=False)
+    assert run.granules == {"2024-01-01": None, "2024-01-05": None}
