@@ -22,7 +22,7 @@ from prefect.deployments import arun_deployment
 from pydantic import BaseModel
 
 from tessera_embeddings.config.dask import compute_pipeline_cluster_sizing
-from tessera_embeddings.config.inference import DEFAULT_MODEL_VERSION, ModelVersion
+from tessera_embeddings.config.inference import DEFAULT_MODEL_VERSION, ModelVersion, ami_ssm_name_for_model
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.data_loading import _active_orbits
@@ -75,6 +75,7 @@ async def tessera_full_pipeline(
     allow_s2_only: bool = False,
     skip_coverage_check: bool = False,
     ami_ssm_name: str = "/tessera/ray/ami-id",
+    ami_ssm_name_by_model: dict[str, str] | None = None,
     ssm_prefix: str = "/tessera/ray/",
     cloudwatch_log_group: str = "/ec2/tessera/ray",
     code_bucket: str | None = None,
@@ -110,6 +111,9 @@ async def tessera_full_pipeline(
             this S1-trained checkpoint — see the optional-S1 ADR.
         skip_coverage_check: Skip the embeddings stage's time-window coverage validation.
         ami_ssm_name: SSM parameter name for the Ray GPU AMI ID.
+        ami_ssm_name_by_model: Per-model overrides of ``ami_ssm_name``; the embeddings stage
+            is handed ``model_version``'s entry and the map; a v1.1 run without an entry is
+            refused (ADR 025).
         ssm_prefix: SSM Parameter Store prefix the deployment's infra publishes Ray
             cluster resource IDs under. Deployments publishing elsewhere must override
             the OSS ``/tessera/ray/``.
@@ -130,6 +134,7 @@ async def tessera_full_pipeline(
     log = get_run_logger()
 
     _active_orbits(s1_orbit)  # validates
+    ami_ssm_name = ami_ssm_name_for_model(ami_ssm_name, ami_ssm_name_by_model, model_version)
 
     inputs_bucket = paths.inputs
 
@@ -228,6 +233,7 @@ async def tessera_full_pipeline(
             "time_window_end": time_window_end,
             "paths": paths.model_dump(),
             "ami_ssm_name": ami_ssm_name,
+            "ami_ssm_name_by_model": ami_ssm_name_by_model,
             "ssm_prefix": ssm_prefix,
             "cloudwatch_log_group": cloudwatch_log_group,
             "code_bucket": code_bucket,

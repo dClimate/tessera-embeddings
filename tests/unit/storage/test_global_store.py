@@ -8,9 +8,9 @@ import numpy as np
 import pytest
 import zarr
 
-from tessera_embeddings.config.inference import EMBEDDING_DIM
+from tessera_embeddings.config.inference import EMBEDDING_DIM, MODEL_FAMILIES, checkpoint_filename
 from tessera_embeddings.config.store_layout import GLOBAL
-from tessera_embeddings.storage import global_store, zarr_store
+from tessera_embeddings.storage import global_store, published_store, zarr_store
 from tessera_embeddings.storage.zone_grid import ZoneSpec
 
 # Tiny stand-in zones (2048x4096 px = a couple shards) so coord arrays stay small.
@@ -23,6 +23,34 @@ def _seed(tmp_path):
     repo = global_store.create_global_repo(store)
     global_store.seed_zone_groups(repo, [_ZA, _ZB], years=(2023, 2024, 2025))
     return store
+
+
+@pytest.mark.parametrize(("model", "names"), [("v1.1", ("northing", "easting")), ("v2-large", ("y", "x"))])
+def test_each_model_seeds_its_own_spatial_names(tmp_path, model, names):
+    """v1.1 keeps northing/easting, v2 takes y/x, and the published-store audit accepts both."""
+    repo = global_store.create_global_repo(str(tmp_path / "global.icechunk"))
+    global_store.seed_zone_groups(repo, [_ZA], years=(2025,), model_version=model)
+    g = zarr_store.open_store_as_zarr_group(str(tmp_path / "global.icechunk"), group="01N")
+    y, x = names
+    assert (g[y].shape, g[x].shape) == ((4096,), (2048,))
+    assert g["embeddings"].metadata.dimension_names == ("time", y, x, "band")
+    assert g.attrs["spatial:dimensions"] == [y, x] and g[y].attrs["axis"] == "Y"
+    assert published_store.layout_departures(g) == []
+    assert published_store.coordinate_departures(g, _ZA) == []
+
+
+def test_extending_a_store_keeps_its_names(tmp_path, monkeypatch):
+    """A zone added to a store seeded with other names takes the store's, never mixing two."""
+    store = str(tmp_path / "global.icechunk")
+    repo = global_store.create_global_repo(store)
+    v2 = MODEL_FAMILIES["v2-large"]
+    monkeypatch.setitem(MODEL_FAMILIES, "v2-large", dataclasses.replace(v2, spatial_dims=("northing", "easting")))
+    global_store.seed_zone_groups(repo, [_ZA], years=(2025,), model_version="v2-large")
+    MODEL_FAMILIES["v2-large"] = v2
+    global_store.seed_zone_groups(repo, [_ZB], years=(2025,), model_version="v2-large")
+    g = zarr_store.open_store_as_zarr_group(store, group="01S")
+    assert g["scales"].metadata.dimension_names == ("time", "northing", "easting")
+    assert "y" not in g
 
 
 def test_sibling_groups_seeded_without_clobber(tmp_path):
@@ -56,6 +84,8 @@ def test_coords_and_attrs(tmp_path):
     assert g["northing"].shape == (4096,)
     assert g["time"].shape == (3,)
     assert g["band"].shape == (EMBEDDING_DIM,)  # band coord present for xarray consumers
+    assert g["northing"].attrs["standard_name"] == "projection_y_coordinate"  # CF axis attrs for CF-only readers
+    assert g["easting"].attrs["axis"] == "X"
     # CF time bounds: (time, 2), linked via time.attrs["bounds"], seeded once to each
     # slot's calendar year, half-open so consecutive years leave no gap.
     assert g["time_bnds"].shape == (3, 2)
@@ -80,14 +110,14 @@ def test_coords_and_attrs(tmp_path):
 
 
 def test_root_carries_geoemb_convention(tmp_path):
-    """Encoder/quantization provenance sits once on the root group (utm_zones layout);
+    """Encoder/quantization provenance sits once on the root group;
     zones carry only their own proj:/spatial:.
     """
     store = _seed(tmp_path)
     attrs = dict(zarr_store.open_store_as_zarr_group(store).attrs)
     assert attrs["geoemb:type"] == "pixel"
     assert attrs["geoemb:dimensions"] == EMBEDDING_DIM
-    assert attrs["geoemb:spatial_layout"] == "utm_zones"
+    assert "geoemb:spatial_layout" not in attrs  # both schema values misdescribe 120 hemisphere groups
     assert attrs["geoemb:gsd"] == 10.0  # fixed 10 m grid across all zones
     assert attrs["geoemb:data_type"] == "int8"
     assert "geoemb:build_version" in attrs
@@ -137,11 +167,11 @@ def test_an_unstamped_store_keeps_its_identity_when_nothing_is_created(tmp_path)
     assert "geoemb:model" not in zarr_store.open_store_as_zarr_group(store).attrs, "the premise"
 
     # The same zone again — complete, so nothing is created — but now asking for an identity.
-    global_store.seed_zone_groups(repo, [_ZA], years=(2025,), model_version="v1", optical_min_obs=15)
+    global_store.seed_zone_groups(repo, [_ZA], years=(2025,), optical_min_obs=15)
 
     root = zarr_store.open_store_as_zarr_group(store)
     assert "geoemb:model" in root.attrs, "the stamp must have been committed, not discarded"
-    assert root.attrs["checkpoint_id"] == "v1", "and it must carry the identity that was asked for"
+    assert root.attrs["checkpoint_id"] == checkpoint_filename(model_version="v1.1"), "the model's own checkpoint"
     assert root.attrs["optical_min_obs"] == 15
 
 
@@ -165,20 +195,42 @@ def test_a_group_missing_a_later_schema_array_is_refused_not_skipped(tmp_path):
         global_store.seed_zone_groups(repo, [_ZA], years=(2025,))
 
 
+@pytest.mark.parametrize("model", ["v1.1", "v2-large"])
+def test_the_store_names_the_model_that_fills_it(tmp_path, model):
+    """Every fill takes its model from the store's root, and runs that model's checkpoint."""
+    store = str(tmp_path / "g.icechunk")
+    global_store.seed_zone_groups(global_store.create_global_repo(store), [_ZA], years=(2025,), model_version=model)
+    assert global_store.store_model_version(store) == model
+
+
+@pytest.mark.parametrize(
+    ("attr", "value", "match"),
+    [
+        ("geoemb:model", "https://example.org/custom", "names no known model"),
+        ("checkpoint_id", "tessera_v1_1_mpc_encoder.pt", "checkpoint"),
+    ],
+)
+def test_a_store_no_fill_can_run_is_refused_before_anything_is_provisioned(tmp_path, attr, value, match):
+    """A root naming an unknown model, or a checkpoint other than its model's, is one no fill runs."""
+    store = str(tmp_path / "g.icechunk")
+    global_store.seed_zone_groups(global_store.create_global_repo(store), [_ZA], years=(2025,))
+    session = global_store.open_global_repo(store).writable_session("main")
+    zarr.open_group(session.store, mode="a").attrs[attr] = value
+    session.commit("a root no fill can run")
+    with pytest.raises(ValueError, match=match):
+        global_store.store_model_version(store)
+
+
 def test_reseed_with_different_model_rejected(tmp_path):
-    """Root encoder provenance is write-once: a matching reseed is a no-op, but a
-    partial reseed carrying a DIFFERENT encoder is rejected — otherwise the root
-    would advertise the new model and the fill-time model gate would permit mixing
-    it with already-seeded zones.
+    """Root encoder provenance is write-once: a matching reseed is a no-op, but a partial reseed
+    for a DIFFERENT model is rejected, or the root would advertise it over already-seeded zones.
     """
     store = str(tmp_path / "g.icechunk")
     repo = global_store.create_global_repo(store)
-    global_store.seed_zone_groups(repo, [_ZA], years=(2025,), model_version="v1")
-    # Same model on a later incremental seed: fine (adds the group, provenance no-op).
-    global_store.seed_zone_groups(repo, [_ZB], years=(2025,), model_version="v1")
-    # A different model is rejected before any group work.
+    global_store.seed_zone_groups(repo, [_ZA], years=(2025,), model_version="v1.1")
+    global_store.seed_zone_groups(repo, [_ZB], years=(2025,), model_version="v1.1")  # adds the group
     with pytest.raises(ValueError, match="write-once"):
-        global_store.seed_zone_groups(repo, [_ZB], years=(2025,), model_version="v2")
+        global_store.seed_zone_groups(repo, [_ZB], years=(2025,), model_version="v2-large")
 
 
 def test_reseed_with_different_axis_rejected(tmp_path):

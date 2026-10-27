@@ -1,8 +1,9 @@
 """Sentinel-1 OPERA RTC SAR ingestion flow for ROI-based regions.
 
-The outer flow provisions a Dask cluster (AWS Fargate by default) and threads EDL
-credentials into worker env via ``extra_worker_env``; the inner flow runs the per-batch task
-on that cluster.
+The flow provisions a Dask cluster (AWS Fargate by default; ``LocalCluster`` when
+``use_local=True``), threads EDL credentials into worker env via ``extra_worker_env``, and runs
+the ``process_roi_sar`` task shell on that cluster with :func:`._dask_lifecycle.run_on_cluster`,
+as a task run of this flow run, so the ingest's progress logs land on this run.
 
 EDL credentials enter at the **flow boundary** (``EARTHDATA_USERNAME`` /
 ``EARTHDATA_PASSWORD`` env vars, or a Prefect ``Secret`` block) — never inside a domain
@@ -12,7 +13,6 @@ function. Hard rule #5.
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
 from typing import Any
 
 from prefect import flow, get_run_logger
@@ -23,51 +23,10 @@ from tessera_embeddings.ingest.s1_roi import S1Orbit
 from tessera_embeddings.orchestration.prefect.flows._dask_lifecycle import (
     dask_cleanup_on_cancellation,
     dask_resource_tags,
-    get_task_runner_for_cluster,
+    run_on_cluster,
 )
 from tessera_embeddings.orchestration.prefect.tasks.ingest import process_roi_sar
-
-
-@flow(name="ingest_s1_roi_impl")
-def _ingest_s1_roi_impl(
-    *,
-    roi_zarr_path: str,
-    start_date: str,
-    end_date: str,
-    store_path: str,
-    orbit: S1Orbit,
-    batch_days: int,
-    edl_credentials_fn: Callable[[], dict[str, str]] | None,
-    apply_credentials_fn: Callable[[dict[str, str]], None] | None,
-    use_s3_direct: bool,
-    storage_options: dict | None,
-    overlap_window_writes: bool,
-    pipeline_batches: bool,
-    narrow_windows_per_date: bool,
-    allow_ingest_code_mismatch: bool,
-    provenance: bool,
-    s3_region: str | None = None,
-) -> dict[str, Any]:
-    """Inner flow: submits the S1 ingestion task to the configured Dask runner."""
-    future = process_roi_sar.submit(
-        roi_zarr_path=roi_zarr_path,
-        start_date=start_date,
-        end_date=end_date,
-        store_path=store_path,
-        orbit=orbit,
-        batch_days=batch_days,
-        edl_credentials_fn=edl_credentials_fn,
-        apply_credentials_fn=apply_credentials_fn,
-        use_s3_direct=use_s3_direct,
-        storage_options=storage_options,
-        overlap_window_writes=overlap_window_writes,
-        pipeline_batches=pipeline_batches,
-        narrow_windows_per_date=narrow_windows_per_date,
-        allow_ingest_code_mismatch=allow_ingest_code_mismatch,
-        provenance=provenance,
-        s3_region=s3_region,
-    )
-    return future.result()
+from tessera_embeddings.providers.local.dask import local_cluster
 
 
 def _default_edl_env() -> dict[str, str]:
@@ -166,81 +125,58 @@ def ingest_s1_roi_sar(
     log = get_run_logger()
     log.info("Starting ingest_s1_roi_sar for %s (orbit=%s)", roi_zarr_path, orbit)
 
-    # STS credential callbacks for the domain function, gated on use_s3_direct. Workers get
-    # EARTHDATA_USERNAME/PASSWORD via extra_worker_env but cannot reach
-    # s3://asf-cumulus-prod-opera-products with IAM task-role credentials — they need
-    # short-lived STS tokens from ASF's cumulus endpoint. The plain runner wires these the
-    # same way; without them every batch fails with AccessDenied on the first S3 read.
-    edl_credentials_fn = get_s3_credentials if use_s3_direct else None
-    apply_credentials_fn = set_s3_credentials if use_s3_direct else None
-
-    # IAM storage_options for the ROI-mask reads are resolved on the worker in
-    # process_roi_sar, not here: they carry a live access key / secret / STS token, and a
-    # flow parameter is persisted in Prefect's DB and shown in the UI as plaintext.
+    task_parameters: dict[str, Any] = {
+        "roi_zarr_path": roi_zarr_path,
+        "start_date": start_date,
+        "end_date": end_date,
+        "store_path": store_path,
+        "orbit": orbit,
+        "batch_days": batch_days,
+        # STS credential callbacks for the domain function, gated on use_s3_direct. Workers get
+        # EARTHDATA_USERNAME/PASSWORD via extra_worker_env but cannot reach
+        # s3://asf-cumulus-prod-opera-products with IAM task-role credentials — they need
+        # short-lived STS tokens from ASF's cumulus endpoint. The plain runner wires these the
+        # same way; without them every batch fails with AccessDenied on the first S3 read.
+        "edl_credentials_fn": get_s3_credentials if use_s3_direct else None,
+        "apply_credentials_fn": set_s3_credentials if use_s3_direct else None,
+        "use_s3_direct": use_s3_direct,
+        # IAM storage_options for the ROI-mask reads are resolved on the worker in
+        # process_roi_sar, not here: they carry a live access key / secret / STS token, which
+        # stays in the worker process that holds the IAM role (hard rule #5).
+        "storage_options": storage_options,
+        "overlap_window_writes": overlap_window_writes,
+        "pipeline_batches": pipeline_batches,
+        "narrow_windows_per_date": narrow_windows_per_date,
+        "allow_ingest_code_mismatch": allow_ingest_code_mismatch,
+        "provenance": provenance,
+        "s3_region": s3_region,
+    }
 
     if use_local:
-        from tessera_embeddings.providers.local.dask import local_cluster
-
         if perf_report_uri:
             # Say so rather than no-op: an operator who set this and finds nothing at the
             # URI would otherwise suspect the upload or their credentials.
             log.warning("perf_report_uri is ignored on the local-cluster path (use_local=True)")
         with local_cluster() as cluster:
             log.info("Local Dask cluster ready: scheduler=%s", cluster.scheduler_address)
-            task_runner = get_task_runner_for_cluster(cluster.scheduler_address)
-            return _ingest_s1_roi_impl.with_options(task_runner=task_runner)(  # type: ignore[arg-type]
-                roi_zarr_path=roi_zarr_path,
-                start_date=start_date,
-                end_date=end_date,
-                store_path=store_path,
-                orbit=orbit,
-                batch_days=batch_days,
-                edl_credentials_fn=edl_credentials_fn,
-                apply_credentials_fn=apply_credentials_fn,
-                use_s3_direct=use_s3_direct,
-                storage_options=storage_options,
-                overlap_window_writes=overlap_window_writes,
-                pipeline_batches=pipeline_batches,
-                narrow_windows_per_date=narrow_windows_per_date,
-                allow_ingest_code_mismatch=allow_ingest_code_mismatch,
-                provenance=provenance,
-                s3_region=s3_region,
-            )
+            return run_on_cluster(cluster.scheduler_address, process_roi_sar, task_parameters)
 
+    # Deferred: providers.aws.dask needs the `aws` extra, which a use_local run must not.
     from tessera_embeddings.providers.aws.dask import ecs_cluster, maybe_performance_report
 
-    edl_env = _default_edl_env()
-
-    with ecs_cluster(
-        log,
-        min_workers=min_workers,
-        max_workers=max_workers,
-        extra_worker_env=edl_env,
-        # A capped task stream silently truncates the report to the run's last few dates;
-        # raise it only when a report is actually being captured.
-        diagnostic_task_stream=bool(perf_report_uri),
-        # Tag every cluster resource with this run's id so the cancellation/crash hook can
-        # sweep the tasks from a fresh process (see _dask_lifecycle).
-        resource_tags=dask_resource_tags(flow_run_ctx.id),
-    ) as cluster:
-        task_runner = get_task_runner_for_cluster(cluster.scheduler_address)
-        log.info("Task runner connected to scheduler at %s", cluster.scheduler_address)
-        with maybe_performance_report(cluster.scheduler_address, perf_report_uri, log):
-            return _ingest_s1_roi_impl.with_options(task_runner=task_runner)(  # type: ignore[arg-type]
-                roi_zarr_path=roi_zarr_path,
-                start_date=start_date,
-                end_date=end_date,
-                store_path=store_path,
-                orbit=orbit,
-                batch_days=batch_days,
-                edl_credentials_fn=edl_credentials_fn,
-                apply_credentials_fn=apply_credentials_fn,
-                use_s3_direct=use_s3_direct,
-                storage_options=storage_options,
-                overlap_window_writes=overlap_window_writes,
-                pipeline_batches=pipeline_batches,
-                narrow_windows_per_date=narrow_windows_per_date,
-                allow_ingest_code_mismatch=allow_ingest_code_mismatch,
-                provenance=provenance,
-                s3_region=s3_region,
-            )
+    with (
+        ecs_cluster(
+            log,
+            min_workers=min_workers,
+            max_workers=max_workers,
+            extra_worker_env=_default_edl_env(),
+            # A capped task stream silently truncates the report to the run's last few dates;
+            # raise it only when a report is actually being captured.
+            diagnostic_task_stream=bool(perf_report_uri),
+            # Tag every cluster resource with this run's id so the cancellation/crash hook can
+            # sweep the tasks from a fresh process (see _dask_lifecycle).
+            resource_tags=dask_resource_tags(flow_run_ctx.id),
+        ) as cluster,
+        maybe_performance_report(cluster.scheduler_address, perf_report_uri, log),
+    ):
+        return run_on_cluster(cluster.scheduler_address, process_roi_sar, task_parameters)

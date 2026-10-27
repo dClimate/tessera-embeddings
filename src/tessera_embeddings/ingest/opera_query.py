@@ -2,9 +2,8 @@
 
 OPERA RTC-S1 items on CMR-STAC carry no MGRS tile ID, orbit direction or projection metadata, so
 these helpers query by spatial extent, filter orbit via the native CMR Granule Search API, derive
-the CRS, and prepare items for loading. They also rank each burst by how often it was acquired over
-the ingest window, which decides which burst supplies a pixel two bursts of one solar day cover
-(``context_docs/decisions/033-radar-overlaps-go-to-the-most-acquired-burst.md``).
+the CRS, and prepare items for loading. They also rank each burst by its acquisitions over the
+window, the radar fusion order (``context_docs/decisions/033-radar-overlaps-go-to-the-most-acquired-burst.md``).
 """
 
 from __future__ import annotations
@@ -14,7 +13,7 @@ import re
 import time
 import warnings
 from collections import Counter
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime
 from typing import Any, cast
 from xml.etree import ElementTree
@@ -26,6 +25,7 @@ from pystac.utils import str_to_datetime
 from requests.adapters import HTTPAdapter
 
 from tessera_embeddings.config import S1_OPERA_BANDS
+from tessera_embeddings.errors import ConfigMismatchError
 from tessera_embeddings.ingest._http import (
     NonJsonResponseError,
     json_or_raise,
@@ -68,23 +68,14 @@ _BAND_HREF_RE = re.compile(r"_(VV|VH|HH|HV|mask)\.tif$")
 
 #: An OPERA RTC-S1 granule title, e.g.
 #: ``OPERA_L2_RTC-S1_T115-245714-IW1_20240101T015432Z_20240102T091011Z_S1A_30_v1.0``: the burst id
-#: (relative orbit, ESA burst number, sub-swath), the acquisition start, then the production time.
-#: The burst id's fields are fixed-width, so its string order is relative orbit, then burst number,
-#: then sub-swath.
-_TITLE_RE = re.compile(
-    r"^OPERA_L2_RTC-S1_(?P<burst>T(?P<track>\d{3})-\d{6}-(?P<subswath>IW[123]))_(?P<acquired>\d{8}T\d{6}Z)_"
-)
+#: (fixed-width relative orbit, burst number, sub-swath), the acquisition start, the production time.
+_TITLE_RE = re.compile(r"^OPERA_L2_RTC-S1_(?P<burst>T\d{3}-\d{6}-IW[123])_(?P<acquired>\d{8}T\d{6}Z)_")
 
-#: Item properties naming the burst a granule images, parsed from its title. Absent where the title
-#: does not parse.
+#: Item property: the burst id the title names; absent where it does not parse.
 BURST_ID = "opera:burst_id"
-RELATIVE_ORBIT = "sat:relative_orbit"
-SUBSWATH = "opera:subswath"
-#: The burst's acquisitions over the whole ingest window, stamped by the item provider from the
-#: :class:`BurstCensus`. What :func:`burst_fusion_sort_key` ranks bursts by.
+#: Item property: the burst's acquisitions over the ingest window, from the :class:`BurstCensus`.
 BURST_ACQUISITIONS = "tessera:burst_acquisitions"
-#: Root attribute of a radar mosaic store: the :class:`BurstCensus` counts that ranked every date it
-#: holds, written in the first date's commit and reused by every resumed leg.
+#: Root attribute of a radar mosaic store: the census that ranked its dates (:meth:`BurstCensus.record`).
 BURST_CENSUS_ATTR = "burst_census"
 
 
@@ -191,12 +182,8 @@ def _granule_to_item(entry: dict[str, Any], skip_counts: Counter[str] | None = N
     ``0_VH``) so the item is shape-compatible with the CMR-STAC items the rest of the pipeline
     expects. odc.stac.load reads dtype, nodata and CRS from the COGs themselves (we pass an
     explicit geobox), so only band hrefs, id, datetime, geometry and bbox matter to the load.
-
-    Two things are kept for the steps before it. ``properties["datetime"]`` holds the raw
-    acquisition time, which ``normalize_to_solar_day`` reads and never overwrites. The burst the
-    title names (:data:`BURST_ID`, :data:`RELATIVE_ORBIT`, :data:`SUBSWATH`) is what the fusion
-    order ranks; a title that does not parse leaves them absent rather than failing, and the item
-    sorts after every named burst.
+    ``properties["datetime"]`` keeps the raw acquisition time for ``normalize_to_solar_day``, and
+    :data:`BURST_ID` the burst the fusion order ranks, absent where the title does not parse.
 
     Only dual-pol VV+VH granules are accepted: a partial-pol granule would ingest a fabricated
     all-nodata band that the encoder reads as a confident physical signal (see the optional-S1
@@ -266,7 +253,7 @@ def _granule_to_item(entry: dict[str, Any], skip_counts: Counter[str] | None = N
 
     properties: dict[str, Any] = {"datetime": entry["time_start"]}
     if burst := _TITLE_RE.match(entry["title"]):
-        properties |= {BURST_ID: burst["burst"], RELATIVE_ORBIT: int(burst["track"]), SUBSWATH: burst["subswath"]}
+        properties[BURST_ID] = burst["burst"]
 
     return Item(
         id=entry["title"],
@@ -317,9 +304,8 @@ def _query_cmr_granules(
 ) -> list[Item]:
     """Query the CMR Granule Search API for OPERA items in a bbox/date/orbit.
 
-    A box crossing ±180° is queried as two halves (:func:`_cmr_boxes`) and merged, deduped by
-    granule id, since a granule straddling the line comes back from both. A normal box queries
-    once.
+    A box crossing ±180° is queried as two halves (:func:`_cmr_boxes`), deduped by granule id,
+    since a granule straddling the line comes back from both.
 
     Args:
         bbox: (west, south, east, north) in WGS84 degrees; west>east = crosses ±180°.
@@ -330,21 +316,12 @@ def _query_cmr_granules(
     Returns:
         List of pystac ``Item`` objects matching the orbit direction.
     """
-    boxes = _cmr_boxes(bbox)
-    if len(boxes) == 1:
-        return _query_cmr_granules_one(bbox, start_date, end_date, orbit_direction)
-    left, right = (_query_cmr_granules_one(box, start_date, end_date, orbit_direction) for box in boxes)
-    merged: list[Item] = []
-    seen: set[str] = set()
-    for item in (*left, *right):
-        if item.id not in seen:
-            seen.add(item.id)
-            merged.append(item)
-    logger.info(
-        f"CMR granule query ({orbit_direction}): antimeridian bbox split into 2 → "
-        f"{len(merged)} unique items ({len(left)}+{len(right)} pre-dedup)"
-    )
-    return merged
+    found = {
+        item.id: item
+        for box in _cmr_boxes(bbox)
+        for item in _query_cmr_granules_one(box, start_date, end_date, orbit_direction)
+    }
+    return list(found.values())
 
 
 def _granule_params(
@@ -492,13 +469,6 @@ def _query_cmr_granules_one(
             "+".join(_REQUIRED_POLARIZATIONS),
             dict(sorted(skip_counts.items())),
         )
-    if unnamed := sum(BURST_ID not in item.properties for item in items):
-        logger.warning(
-            "CMR granule query (%s): %d granule title(s) name no burst; they sort after every named "
-            "burst of their day, so they only fill gaps",
-            orbit_direction,
-            unnamed,
-        )
     return items
 
 
@@ -512,23 +482,10 @@ def burst_acquisitions(
 ) -> dict[str, int]:
     """How many times each burst touching ``bbox`` was acquired in the window, by burst id.
 
-    Read from granule titles alone, through CMR's reference format, so a whole window costs a
-    small fraction of what the batch queries page through as JSON. Counts distinct ACQUISITIONS,
-    not granules: a reprocessed acquisition is published again under the same burst and acquisition
-    time with a new production time, and counting granules would rank a burst by how often it was
-    reprocessed. A title that names no burst counts toward nothing. Cost and rationale:
-    ``context_docs/decisions/033-radar-overlaps-go-to-the-most-acquired-burst.md``.
-
-    ``start_date..end_date`` are SOLAR days at ``mid_longitude``, as the ingest window is: the
-    catalogue is asked for a UTC day either side (:func:`~.solar_days.whole_window_range`) and
-    each title's acquisition instant is placed on its solar day before it is counted, so an
-    acquisition the batches own is counted and one they do not is not. Counted on UTC dates, an
-    edge acquisition would be counted or missed by the hour of the pass, and a count off by one
-    flips the ties that are the common case. ``None`` counts on UTC dates, as the loader groups
-    without an offset.
-
-    A burst's count does not depend on ``bbox`` beyond whether the burst touches it, so a query
-    over a subset of an area ranks the bursts it shares with the whole the same way.
+    From titles alone, through CMR's light reference format. Counts distinct ACQUISITIONS, so a
+    reprocessed one counts once. ``start_date..end_date`` are solar days at ``mid_longitude``, as
+    the batches own them: the query reaches a UTC day either side and each acquisition is placed on
+    its solar day before it counts. Rationale and cost: ADR 033.
     """
     window = whole_window_range(start_date, end_date)
     acquired: dict[str, set[str]] = {}
@@ -562,17 +519,13 @@ def burst_acquisitions(
 class BurstCensus:
     """One window's :func:`burst_acquisitions`, queried once in the background and shared.
 
-    Constructing one queries nothing. The first :meth:`start` sends the query on a daemon thread,
-    so the radar ingest can run it alongside its first batch's granule query, the one query its
-    batch look-ahead cannot hide; :meth:`counts` waits for the answer, and every later call
-    returns the same one. The batches that share it are prepared one at a time, so it takes no
-    lock.
+    :meth:`start` sends the query on a daemon thread, alongside the first batch's own query, and
+    :meth:`counts` waits for it. ``recorded``, a store's :data:`BURST_CENSUS_ATTR`, is the answer
+    instead and nothing is queried, so a resumed leg ranks as the run it resumes did (ADR 033).
 
-    ``counts`` given up front, as read back from a store's :data:`BURST_CENSUS_ATTR`, are the
-    answer and nothing is queried: the catalogue keeps changing after a leg's first date commits,
-    a backfilled acquisition can flip a tied ranking, and a resumed leg that re-counted would fuse
-    its later days by a different burst than the days already written. The census that ranked a
-    store's first date ranks every date after it.
+    Raises:
+        ConfigMismatchError: ``recorded`` was counted over another window or longitude, so neither
+            it nor a recount would rank the new dates as the stored ones were.
     """
 
     def __init__(
@@ -583,11 +536,31 @@ class BurstCensus:
         orbit_direction: str,
         *,
         mid_longitude: float | None = None,
-        counts: dict[str, int] | None = None,
+        recorded: Mapping[str, Any] | None = None,
     ) -> None:
         self._args = (bbox, start_date, end_date, orbit_direction)
         self._mid_longitude = mid_longitude
-        self._waiter: Callable[..., dict[str, int]] | None = None if counts is None else lambda: counts
+        self._waiter: Callable[..., dict[str, int]] | None = None
+        if recorded is not None:
+            counted_over = {key: recorded.get(key) for key in self._scope()}
+            if counted_over != self._scope():
+                raise ConfigMismatchError(
+                    f"This {orbit_direction} store's dates were ranked by a burst census counted over "
+                    f"{counted_over}, and this ingest asks for {self._scope()}. Ranking new dates by "
+                    "another window's census, or recounting, would fuse them differently from the dates "
+                    "already written. Ingest this window into its own store, or delete this one and "
+                    "re-ingest the window whole."
+                )
+            counts = dict(recorded["counts"])
+            self._waiter = lambda: counts
+
+    def _scope(self) -> dict[str, Any]:
+        """What the counts depend on beyond the zone: the window and the solar-day longitude."""
+        return {"window": [self._args[1], self._args[2]], "mid_longitude": self._mid_longitude}
+
+    def record(self) -> dict[str, Any]:
+        """The census as a store records it: its counts and the window and longitude they cover."""
+        return {**self._scope(), "counts": self.counts()}
 
     def start(self) -> Callable[..., dict[str, int]]:
         """Send the query if nothing has yet, and return the waiter for its answer."""
@@ -603,20 +576,12 @@ class BurstCensus:
 
 
 def burst_fusion_sort_key(item: Any) -> tuple[str, bool, int, str, str, str]:  # noqa: ANN401 — any STAC-like item
-    """The order a solar day's radar items must be handed to the loader in.
+    """The order a solar day's radar items go to the loader in, which keeps the first valid source.
 
-    The loader keeps the FIRST valid source of a solar day and later sources only fill the gaps it
-    left, so this order decides which burst supplies a pixel that two bursts cover. The burst
-    acquired most often over the whole window comes first. A burst's footprint is fixed, so among
-    the bursts covering a pixel, the most-acquired one is the look geometry most of that pixel's
-    time series comes from, and putting it first makes contested days agree with it.
-
-    Ties go to the burst id, whose fixed-width fields order it by relative orbit, burst number and
-    sub-swath, then to the raw acquisition time and the item id, so the order is total and a rerun
-    builds the same mosaic. A title that names no burst sorts after every named one and can only
-    fill gaps. Keyed on the SOLAR day, like
-    :func:`~tessera_embeddings.ingest.stac.solar_day_sort_key`, which is the optical counterpart.
-    See ``context_docs/decisions/033-radar-overlaps-go-to-the-most-acquired-burst.md``.
+    Most-acquired burst first, so a contested pixel keeps the look geometry most of its series has;
+    ties by burst id, acquisition time and item id, so a rerun builds the same mosaic. A title
+    naming no burst sorts last and only fills gaps. Keyed on the solar day, like the optical
+    :func:`~tessera_embeddings.ingest.stac.solar_day_sort_key`. See ADR 033.
     """
     properties = item.properties
     burst = properties.get(BURST_ID)
@@ -652,9 +617,8 @@ def make_s1_item_provider(
        access, or through ASF's OAuth redirect chain to CloudFront signed URLs otherwise.
     3. **Normalizes timestamps** so same-day bursts share one, and odc.stac.load groups them into
        a single time slice for mosaicking.
-    4. **Ranks each item's burst**, stamping :data:`BURST_ACQUISITIONS` from ``burst_census`` for
-       the fusion sort. The census is started before this query and waited for after it, so the
-       two overlap.
+    4. **Ranks each item's burst**, stamping :data:`BURST_ACQUISITIONS` from ``burst_census``,
+       started before this query so the two overlap.
 
     Args:
         orbit_direction: "ascending" or "descending".
@@ -665,8 +629,7 @@ def make_s1_item_provider(
             URIs for direct in-region bucket access. When False, resolve each
             asset through ASF's OAuth redirect chain to obtain a CloudFront
             signed URL.
-        burst_census: The acquisitions per burst over the WHOLE ingest window, shared by every
-            provider of one run. A burst missing from it ranks as never acquired.
+        burst_census: The run's one census of the whole window; a burst missing from it counts as never acquired.
         mid_longitude: ROI geobox centroid longitude, used to stamp each granule with
             the SOLAR day it belongs to. Supply it whenever the loader groups by solar
             day — which the campaign always does. Omitting it groups by UTC date.

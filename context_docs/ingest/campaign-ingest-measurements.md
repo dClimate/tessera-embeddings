@@ -817,11 +817,50 @@ Dask client reports.
 The budget is empirical and deliberately conservative: no theory sets it. The largest batch the
 sweep measured to gain was 59S's, about 750 chunks at four dates on fleets of 40 to 60 workers
 (the width was not recorded), so 12.5 to 19 chunks a worker; twelve, about 720 a batch on 60
-workers, sits at or below the low end of that. **To tune it from the restarted
-production run:** compare the `Batch timings` lines of 18S, 19S and 20N, which now carry
-`chunks=N`, against run 1's one-date writes of about 31 s at about six windows a date, and watch
-for writes on 60-worker fleets that lengthen as batches grow. The six-thread workers (§3.20, PR
-#214) arrived after the July sweep, so where batching starts to crowd the fleet may have moved.
+workers, sits at or below the low end of that. The six-thread workers (§3.20, PR #214) arrived
+after the July sweep, so the restarted production run was used to check it, below.
+
+**What the restart measured (2026-10-20).** The update's restart ran this code on the same plan,
+resuming run 1's mosaics ([`../campaign/latin-america-update.md`](../campaign/latin-america-update.md)).
+On the 19 zone-years ingested in both runs, wall time per optical date fell from 23.2 s to 19.3 s,
+each zone-year weighted by its run-1 dates: **1.20×**, median zone-year 1.18×, range 1.03–1.46×, none
+slower. This is an unmatched production comparison, not a paired test: each resumed leg started
+after run 1's newest committed date, so the two runs timed different dates of the same zone-years.
+Windows per date agreed within 10% in 18 of the 19 zone-years (the exception, 23S-2025, had 23%
+more in the restart and was still faster), which controls the largest driver of per-date cost but not
+cloudiness or date density; the paired tests cited above remain the controlled
+evidence for the overlap. The mechanisms themselves are measured directly: 85% of each date's
+preparation was hidden (none in run 1), the wait for it fell from 5.9 s to 2.0 s a date, and writes
+holding a single date fell from 73% to 22%. Of the zone-years whose windows per date matched, 19S gained
+least (1.07–1.10×): each of its dates covers 510–590 chunks, so two never fit in 720. The range's 1.03× is
+23S-2025, the exception above, whose restart dates carried 23% more windows.
+
+| on 60-worker fleets, both at six threads | run 1 | restart |
+|---|---|---|
+| tasks in flight, average (360 slots) / tasks the scheduler tracks | 256 / 9,500 | 410 / 16,900 |
+| scheduler CPU at or above 90% / 99% of a core, share of 30 s samples | 6% / 1% | 17% / 7% |
+| event-loop lag at or above 1 s / 3 s; 99th percentile | 7.2% / 2.7%; 4.7 s | 7.9% / 2.0%; 3.5 s |
+| busiest worker's memory, of 24 GiB | 9.6 GiB | 5.1 GiB |
+
+Neither run spilled, paused or lost a worker; worker CPU was 38–39% of reserved across all ingest
+workers. On the budget itself:
+
+- Within each leg, write time per chunk falls until about 6 chunks per worker and is flat from 6 to 12
+  (0.96–1.03 of the leg's median). Run 1, which batched four dates whatever their size, reached 12–20
+  per worker on a few legs with no clear penalty (1.02–1.08, its chunk counts estimated from each
+  zone-year's chunks per window).
+- A write costs about 9 s fixed + 57 ms per chunk + 3.4 s per date on 60-worker legs, and 11 s +
+  63 ms + 5.3 s on narrower ones (least squares). Batching saves only the fixed term.
+- Regrouping the restart's dates under other rules and pricing the writes saved at that fixed cost:
+  16 per worker would have saved about 6% of the 60-worker legs' optical time and 20 about 8%. On
+  narrower legs the 4-date cap binds before the budget, and a cap of 6 with 16 per worker would have
+  saved about 7%.
+
+**So the budget stays at 12 for now.** 16 is the most this evidence supports on 60-worker fleets; above
+12 nothing has been measured on a fleet that also overlaps preparation, whose scheduler already reaches
+a full core 7% of the time, and a bigger batch is a bigger graph. A paired dev test at 16 and 20, and
+at a 6-date cap on narrow fleets, would settle it; watch scheduler CPU and lag first, then worker
+memory.
 
 `config.ingest.auto_batch_dates` and its threshold are no longer called but stay defined:
 `config/ingest.py` is inside the inference code identity's closure, so removing them would move

@@ -16,7 +16,7 @@ with the run that confirmed it. The harness itself is code, under `scripts/scopi
 > ledger on 2026-08-17 and deleted.
 
 Every signature below was verified against **icechunk 2.0.4 / zarr 3.2.1 on 2026-07-13**; the bench
-environment ran **icechunk ≥ 2.1.1** (ADR-008 D9), and production runs 2.1.1. **Re-verify with
+environment ran **icechunk ≥ 2.1.1** (ADR-008 D9), and production runs whatever `uv.lock` pins. **Re-verify with
 `inspect.signature` before relying on one** — several of these are Rust-bound and do not introspect
 usefully.
 

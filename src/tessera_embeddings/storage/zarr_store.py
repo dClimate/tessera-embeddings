@@ -57,6 +57,7 @@ from tenacity import (
 )
 
 from tessera_embeddings.config.ingest import GRANULES_ARRAY, INGEST_COMPRESSORS, mosaic_chunk_layout
+from tessera_embeddings.config.store_layout import spatial_dims_of
 from tessera_embeddings.errors import CorruptedStoreError, NonMonotonicDateError
 from tessera_embeddings.storage.manifest import MIXED_CODE_IDENTITIES_ATTR, IngestManifest, extract_manifest
 from tessera_embeddings.storage.region_writes import (
@@ -1256,11 +1257,7 @@ def get_root_attr(
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     s3_region: str | None = None,
 ) -> Any:  # noqa: ANN401 — whatever JSON the attr holds
-    """One root attribute of a store, or None if the store or the attribute is absent.
-
-    Fails closed like :func:`get_existing_dates`: only genuine absence answers None, and a
-    read that fails for any other reason propagates rather than being read as "not recorded".
-    """
+    """One root attribute of a store, or None if the store or attribute is absent; other errors raise."""
     try:
         ds = _open_readonly(store_path, get_credentials=get_credentials, region=s3_region)
     except FileNotFoundError:
@@ -1288,7 +1285,9 @@ def resolve_region(
     """Map coordinate-value ranges to half-open integer slices for an existing store.
 
     Each argument is a fully-inclusive ``(low, high)`` coordinate range or ``None`` (= the
-    full axis, omitted from the result). Both ends are matched (``coord >= low & coord <=
+    full axis, omitted from the result). *northing* and *easting* address the store's Y and X
+    axes whatever it names them (:func:`spatial_dims_of`), and the slices come back under
+    those names. Both ends are matched (``coord >= low & coord <=
     high``) and the returned slices are half-open ``[start, stop)``. The bounds may be given
     in either order — they are sorted before matching — so a descending axis (northing
     typically) can be addressed either way. ``time`` accepts anything ``np.datetime64``
@@ -1305,12 +1304,13 @@ def resolve_region(
     The matched coordinates must also be contiguous; a range straddling a gap (an
     out-of-order time axis) raises rather than silently widening the slice over it.
     """
-    # chunks=None: only the 1-D northing/easting/time coords are read here, never pixels, so
+    # chunks=None: only the 1-D spatial and time coords are read here, never pixels, so
     # skip building a per-chunk dask graph — it matters when this is called repeatedly, e.g.
     # resolving many features against a continental master.
     ds = _open_readonly(store_path, get_credentials=get_credentials, region=s3_region, chunks=None, group=group)
     try:
-        ranges = {"time": time, "northing": northing, "easting": easting}
+        y, x = spatial_dims_of(ds)
+        ranges = {"time": time, y: northing, x: easting}
         region: dict[str, slice] = {}
         for dim, rng in ranges.items():
             if rng is None:
@@ -1353,7 +1353,7 @@ def write_region(
 ) -> None:
     """Overwrite a region of an existing store in place, in one atomic commit.
 
-    ``region`` maps dimension names (``time``/``northing``/``easting``) to integer slices,
+    ``region`` maps dimension names (``time`` and the store's Y and X names) to integer slices,
     typically from :func:`resolve_region`; dimensions absent from it are written in full.
     ``data`` must cover exactly the cells the region selects (same shape along each region
     dim), and its own coordinate values are dropped before writing since the store's coords
@@ -1712,9 +1712,8 @@ def write_days_windows(
     manifest is validated BEFORE anything is written — the per-append structural gate must
     not be lost to batching.
 
-    ``store_attrs`` are merged into the root attrs in the same commit as the dates, for a
-    record that must exist whenever any date does, such as the radar burst census that ranked
-    the dates' sources: a separate commit could be lost between the first date and itself.
+    ``store_attrs`` merge into the root attrs in the dates' own commit, for a record that must
+    exist whenever any date does, such as the radar burst census.
 
     ``granules`` is the provenance granule list, one JSON string per date in ``days``, written
     into the store's ``granules`` array at the date's own slot in the same commit, so a committed

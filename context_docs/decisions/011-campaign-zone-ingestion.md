@@ -114,8 +114,8 @@ otherwise be mixed in and silently misgeoreference the fill.
 **Model gate** (fill, pre-Ray): the store root's seeded `geoemb:model` (encoder
 version) must match the running build's, else the fill refuses — a mid-campaign
 model upgrade would otherwise write new-encoder embeddings under a store still
-advertising the old one and tag them permanently. `allow_model_mismatch` is the
-deliberate-override escape hatch. This gate is only sound because the root
+advertising the old one and tag them permanently. There is no override: the fill takes its
+model from the store (ADR 025 rule 2 makes the same rule for the library stack). This gate is only sound because the root
 provenance is **write-once**: `seed_zone_groups` stamps the encoder identity on the
 first seed and rejects any incremental reseed that would change it (a partial
 reseed with a different encoder would otherwise re-stamp the root and let the gate
@@ -125,8 +125,10 @@ wave the new encoder through onto already-published zones).
 mosaic paths, tags, flow params — with EPSG retained only as the CRS
 (`ZoneSpec.epsg` / `proj:code`). This is a **deliberate deviation from the
 geoembeddings `utm_zones` spec**, whose `utm{NN}` group name cannot express the
-hemisphere (33N vs 33S). A hemisphere amendment is a candidate to propose
-upstream. `canonicalize_zone` is the single parser.
+hemisphere (33N vs 33S). Stores written since PR #218 therefore declare no
+`geoemb:spatial_layout` at all; a hemisphere amendment upstream would let them
+declare one ([conforming to the Zarr conventions](../storage/conforming-to-the-zarr-conventions.md)).
+`canonicalize_zone` is the single parser.
 
 **Staging `run_id`** (fill, per cell): the campaign derives each cell's staging
 `run_id` as `{zone}-{year}-{hash}` over the acceptance config (threshold / orbit /

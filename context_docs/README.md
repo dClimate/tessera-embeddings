@@ -41,11 +41,15 @@ context_docs/
 │   ├── 022-resolve-the-roi-mask-credential-at-read-time.md
 │   ├── 023-the-single-path-end-to-end-is-the-quickstart-run.md
 │   ├── 024-spatial-transform-origin-is-the-pixel-corner.md
+│   ├── 025-library-upgrades-ship-on-measured-usability-at-a-store-boundary.md
 │   ├── 026-v1-1-runs-the-gru-it-was-trained-with.md
 │   ├── 027-targeted-updates.md
 │   ├── 028-embed-every-pixel-with-an-optical-observation.md
-│   ├── 029-an-acquisition-is-one-datastrip-of-one-pass.md
-│   └── 033-radar-overlaps-go-to-the-most-acquired-burst.md
+│   ├── 029-one-flow-per-ingest.md
+│   ├── 030-forward-pass-reorderings-ship-at-a-store-boundary.md
+│   ├── 032-v2-stores-name-their-axes-y-and-x.md
+│   ├── 033-radar-overlaps-go-to-the-most-acquired-burst.md
+│   └── 034-an-acquisition-is-one-datastrip-of-one-pass.md
 │
 ├── campaign/                      THE GLOBAL CAMPAIGN — start here
 │   ├── campaign-plan.md                        <- START HERE. What runs, with what settings, in
@@ -55,6 +59,9 @@ context_docs/
 │   │                                              how work balances across N clusters (§5b)
 │   ├── campaign-validation-and-monitoring.md   how each published cell is checked, and how a
 │   │                                              finding reaches a person
+│   ├── latin-america-update.md                 filling Latin America's 2024–2025 gaps and small
+│   │                                              islands, the first targeted updates: why, cost,
+│   │                                              checks, lessons
 │   ├── radar-coverage-by-zone.md               which zones publish no usable radar, and why
 │   │                                              three quarters of that is a polarisation choice
 │   ├── stack-dev-verification.md               #219, #221 and #223 checked together on dev, and
@@ -92,6 +99,12 @@ context_docs/
 │   │                                              one observation. Four measurement campaigns
 │   ├── gpu-fleet-launch-throttling.md          why several clusters asking EC2 for GPUs at once
 │   │                                              throttle each other, and the two bounds
+│   ├── v2-on-blackwell.md                      the g7e (RTX PRO 6000) against the fleet's cards,
+│   │                                              v2's fused add + LayerNorm, prep workers by host
+│   │                                              size, outputs across cards, g7e capacity
+│   ├── fresh-worker-start.md                   a new worker's first minutes are its EBS volume
+│   │                                              loading the AMI, and the mounted venv image that
+│   │                                              removes them
 │   └── the-fleet-and-the-work-source.md        a fleet lives for one `run_inference` call, so a
 │                                                  retry through a second call rebuilt one; the
 │                                                  wind-down, and why the fleet is not held
@@ -114,6 +127,9 @@ context_docs/
     ├── reading-the-published-store.md          the reader's side: no credentials needed, what
     │                                              conforms, measured speeds in two regions, and
     │                                              what would surprise a consumer
+    ├── conforming-to-the-zarr-conventions.md   which proj, spatial and geoemb versions the stores
+    │                                              follow, how that is validated (not draft-07),
+    │                                              and the fields deliberately left out
     ├── staging-identity-and-resume.md          what a run id identifies, and what resumes
     ├── registry-master.md                      the one registry consumers read: merged in place
     │                                              by every fill, tile by tile, never dropping an

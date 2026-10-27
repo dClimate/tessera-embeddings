@@ -146,6 +146,20 @@ For a different layout (venv path, install location), edit
 `head_start_ray_commands` / `worker_start_ray_commands` and
 `setup_commands`.
 
+**Optionally, ship the venv as a mountable image too.** A fresh EBS
+volume reads the AMI's snapshot block by block on first use, which holds
+a new worker's first forward back by minutes. If the AMI writes the S3
+URI of an ext4 image of its venv to `/opt/tessera/env-image.uri`,
+`worker_setup_commands` copies the image to the instance store
+(`/opt/dlami/nvme`) and mounts it read-only over the venv before
+`ray start`; without the file, nothing changes. The file is read per
+AMI, so each worker image a run can pick (`ami_ssm_name` and every
+`ami_ssm_name_by_model` entry, such as v1.1's PyTorch 2.5.1 image)
+carries its own venv image or none. The worker's instance profile must
+be able to read the image. The reference repo's Packer build produces
+both. Measurements:
+[`fresh-worker-start.md`](../../../../context_docs/inference/fresh-worker-start.md).
+
 ---
 
 ## Code sync (`sync_source_path`)

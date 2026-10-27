@@ -30,11 +30,16 @@ from __future__ import annotations
 
 import dataclasses
 import warnings
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 from zarr.codecs.numcodecs import PCodec as _PCodecZarr3
 
 from tessera_embeddings.config.inference import EMBEDDING_DIM
+
+if TYPE_CHECKING:
+    import xarray as xr
+    import zarr
 
 # PCodec is intentionally a Zarr v3 *serializer* (array->bytes), not a bytes->bytes compressor; silence the "not in
 # the Zarr v3 spec" warning it emits on construction. This module is the codec's canonical home (inference.assembly
@@ -190,6 +195,42 @@ class StoreLayout:
             return self.arrays[var]
         except KeyError as exc:
             raise KeyError(f"{self.name} has no layout for variable {var!r} (known: {sorted(self.arrays)})") from exc
+
+    @property
+    def spatial_dims(self) -> tuple[str, str]:
+        """This layout's Y and X dimension names, read off the required ``scales`` array."""
+        _, y, x = self.for_var("scales").dims
+        return y, x
+
+    def with_spatial_dims(self, spatial_dims: tuple[str, str]) -> StoreLayout:
+        """This layout with its Y and X dimensions named *spatial_dims*; geometry unchanged.
+
+        The presets spell them ``northing``/``easting``. A new store takes its model's names
+        (``ModelFamily.spatial_dims``) and an existing one keeps its own (:func:`spatial_dims_of`).
+        """
+        rename = dict(zip(self.spatial_dims, spatial_dims, strict=True))
+        arrays = {
+            var: dataclasses.replace(array, dims=tuple(rename.get(d, d) for d in array.dims))
+            for var, array in self.arrays.items()
+        }
+        return dataclasses.replace(self, arrays=arrays)
+
+
+def spatial_dims_of(group: zarr.Group | xr.Dataset) -> tuple[str, str]:
+    """The Y and X dimension names an existing output store uses.
+
+    Its ``spatial:dimensions`` when it declares them, as every georeferenced store does; otherwise
+    its required ``scales`` array, ``(time, Y, X)``, which a store with pixel-index coordinates
+    still has; the presets' names for anything else (a mosaic, a malformed group), so an audit
+    reports it rather than raises. Takes a zarr group or the xarray dataset opened from one.
+    """
+    declared = cast("list[str] | None", group.attrs.get("spatial:dimensions"))
+    if declared and len(declared) == 2:
+        return declared[0], declared[1]
+    scales = group.get("scales")
+    # xarray names a variable's dims on the variable; zarr in the array's metadata.
+    dims = getattr(scales, "dims", None) or getattr(getattr(scales, "metadata", None), "dimension_names", None)
+    return (dims[1], dims[2]) if dims and len(dims) == 3 else (DIMS_3D[1], DIMS_3D[2])
 
 
 def _obs(chunks: tuple[int, ...], shards: tuple[int, ...] | None, codec: str) -> dict[str, ArrayLayout]:

@@ -1,8 +1,9 @@
-"""Shared Dask/ECS teardown hook for cluster-owning ingest flows.
+"""Dask helpers shared by the cluster-owning ingest flows: the ECS teardown hook, and
+:func:`run_on_cluster`, which runs a flow's task shell on the cluster it provisioned.
 
-The Dask analogue of :mod:`._ray_lifecycle`, for the leak found on the first real campaign cell:
-``ecs_cluster`` tears down in a ``finally``, which a hard cancel skips (Prefect kills the flow
-process first), leaving the scheduler and workers running in ECS. (NOT the provider's
+The hook is the Dask analogue of :mod:`._ray_lifecycle`, for the leak found on the first real
+campaign cell: ``ecs_cluster`` tears down in a ``finally``, which a hard cancel skips (Prefect kills
+the flow process first), leaving the scheduler and workers running in ECS. (NOT the provider's
 ``skip_cleanup`` flag — that only disables dask-cloudprovider's startup sweep for debris from
 PRIOR runs, and turning it off breaks cluster construction under AWS SSO.)
 
@@ -16,10 +17,10 @@ process. Register :func:`dask_cleanup_on_cancellation` as BOTH ``on_cancellation
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from prefect_dask import DaskTaskRunner
+    from prefect import Task
 
 #: Tag key stamped on every ECS resource a flow's Dask cluster creates.
 DASK_FLOW_RUN_TAG = "tessera-flow-run-id"
@@ -71,20 +72,19 @@ def _stop_ecs_tasks_by_tag(tag_key: str, tag_value: str, *, log: logging.Logger)
     stop_ecs_tasks_by_tag(tag_key, tag_value, log=log)
 
 
-def get_task_runner_for_cluster(scheduler_address: str) -> DaskTaskRunner:
-    """Create a ``DaskTaskRunner`` connected to ``scheduler_address``.
+def run_on_cluster[R](scheduler_address: str, task: Task[..., R], parameters: dict[str, Any]) -> R:
+    """Run ``task`` once on the Dask cluster at ``scheduler_address`` and return its result.
 
-    Apply it via ``inner_flow.with_options(task_runner=...)`` so Prefect binds the runner
-    late, after the cluster context manager has produced a real scheduler address.
+    The task body executes on a Dask worker: the ingest driver lives there, which is what the worker
+    sizing in ``providers.aws.dask`` accounts for. Prefect's task engine on that worker records it as
+    a task run of the calling flow run, so its ``get_run_logger()`` lines land on the flow's own run.
+    A flow-level ``DaskTaskRunner`` cannot do this, because it binds when the flow is defined, before
+    the flow has provisioned a cluster to point it at.
 
-    ``prefect_dask`` is imported here rather than at module scope to keep this module
-    import-light, matching :mod:`._ray_lifecycle`, which defers its provider import for the
-    same reason. Prefect re-imports a hook module in a fresh process, and a teardown hook is
-    the wrong place to add import-time weight.
+    ``prefect_dask`` is imported here, not at module scope, so that importing
+    :data:`DASK_FLOW_RUN_TAG`, which fleet sweeps do outside any flow, needs no Prefect install.
     """
-    from prefect_dask import DaskTaskRunner
+    from prefect_dask import PrefectDaskClient
 
-    return DaskTaskRunner(
-        address=scheduler_address,
-        client_kwargs={"timeout": "300s"},
-    )
+    with PrefectDaskClient(scheduler_address, timeout="300s") as client:
+        return client.submit(task, parameters=parameters).result()
