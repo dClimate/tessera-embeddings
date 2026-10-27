@@ -69,6 +69,10 @@ from tessera_embeddings.storage.time_axis import read_time_values, year_of
 
 _log = logging.getLogger(__name__)
 
+#: PROTOTYPE (not for merge; ADR 031's band-first scoping): this writer writes (time, band, northing, easting) arrays.
+#: The scale tests' T10 assembly phase reads it to include band-first arms.
+WRITES_BAND_FIRST = True
+
 #: How often :func:`run_forked`'s coordinator states how many payloads are still
 #: outstanding, and how often a worker states its own progress within one.
 #: A forked write emits nothing between its start and its finish, so without a
@@ -862,6 +866,11 @@ def _write_shards_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 - retu
             # Trailing dims (band) not indexed are written in full, so one
             # assignment covers both the 3-D and 4-D arrays.
             region = (slice(year, year + 1), slice(y0, y0 + h), slice(x0, x0 + w))
+            # PROTOTYPE: a (time, band, northing, easting) array takes its band-last staged block through a
+            # transposed view; zarr gathers each inner chunk from it.
+            if arr.ndim == 4 and arr.metadata.dimension_names[1] == "band":
+                region = (region[0], slice(None), *region[1:])
+                block = block.transpose(0, 3, 1, 2)
             if owned is not None:
                 # One variable at a time, so the extra memory is one shard of the widest array.
                 with timer.phase("pixel_merge"):
