@@ -305,11 +305,42 @@ def commit_tiles(repo: icechunk.Repository, zone: str, time_index: int, snapshot
     )
 
 
+def source_runs(attrs: Mapping[str, Any], year: int, tile: str) -> list[str] | None:
+    """The runs whose pixels ``tile`` holds in ``year``, oldest first, each with a provenance record.
+
+    From the zone group's own records, never from an older registry row: the fill in ``runs[year]``,
+    then each entry of ``updates[year]`` that wrote or cleared the tile, in order. A ``holes`` update
+    adds itself, since the tile keeps the earlier run's other pixels; a ``shards`` update replaces
+    the whole tile and restarts the list at itself. A run carries a record when its input mosaics
+    did, which it notes as ``input_coverage.provenance_version``.
+
+    ``None`` unless every run in the list carries one, so a reader can tell a tile with no complete
+    record — all of v1.1, and anything filled with the switch off — from one that has it
+    (``context_docs/storage/registry-provenance-plan.md`` §6).
+    """
+    head = (attrs.get("runs") or {}).get(str(year))
+    lineage: list[Mapping[str, Any]] = [head] if isinstance(head, Mapping) else []
+    for update in (attrs.get("updates") or {}).get(str(year), []):
+        if tile in (*update.get("written", ()), *update.get("cleared", ())):
+            lineage = [*lineage, update] if update.get("mode") == "holes" else [update]
+    carried = [entry for entry in lineage if (entry.get("input_coverage") or {}).get("provenance_version")]
+    return [str(entry["run_id"]) for entry in lineage] if lineage and len(carried) == len(lineage) else None
+
+
+def _no_source_runs(_tile: str) -> list[str] | None:
+    return None
+
+
 class StoreYear(NamedTuple):
-    """What the store says about one zone-year's writers: who committed, and what a commit wrote."""
+    """What the store says about one zone-year's writers.
+
+    Who committed, what a commit wrote, and which runs each tile's pixels came from
+    (:func:`source_runs`).
+    """
 
     commits: list[Commit]
     tiles_of: Callable[[str], frozenset[str]]
+    source_runs: Callable[[str], list[str] | None] = _no_source_runs
 
 
 def store_year(
@@ -325,7 +356,12 @@ def store_year(
     """
     time_index = calendar_years(group).index(year)
     runs = committed_runs(group.attrs, year, writes.get((zone, year), ()))
-    return StoreYear(runs, lambda snapshot: commit_tiles(repo, zone, time_index, snapshot))
+    attrs = dict(group.attrs)
+    return StoreYear(
+        runs,
+        lambda snapshot: commit_tiles(repo, zone, time_index, snapshot),
+        lambda tile: source_runs(attrs, year, tile),
+    )
 
 
 def shard_pixel_window(

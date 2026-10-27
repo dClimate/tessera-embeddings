@@ -84,6 +84,11 @@ second is refused and checks again. It runs before the tag because a deliberate 
   contend, and a reader sees a cell's old file or its new one, never a mixture. A local registry,
   for rehearsals, checks a content hash under a file lock instead.
 - **It is idempotent.** Re-running it over the same inputs writes the same bytes.
+- **`source_runs` comes from the store, never from a row.** The merge picks each tile's row by its
+  measurements, and a re-derived row carries a `rebuild-…` run id, so neither says which runs'
+  pixels a tile holds now. With the store's record in hand (`StoreYear.source_runs`, from the zone
+  group's `runs` and `updates`), every merge rewrites the column for every tile, and a fill
+  computes it the same way onto its own part. The repair script merges through the same path.
 - **It merges all of the cell's parts, not only the new one.** That costs a few small reads and
   means a cell whose earlier merge failed is healed by its next fill.
 - **It refuses a run whose own part is missing.** Publishing a part is best-effort, and merging

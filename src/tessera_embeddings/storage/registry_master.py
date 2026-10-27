@@ -478,10 +478,14 @@ def _schema_is_current(fs: AbstractFileSystem, meta: str) -> bool:
     """Whether ``_common_metadata`` at ``meta`` exists and declares every column of :func:`master_schema`."""
     try:
         with fs.open(meta, "rb") as f:
-            declared = set(pq.read_schema(f).remove_metadata())
+            declared = pq.read_schema(f)
     except FileNotFoundError:
         return False
-    return set(master_schema().remove_metadata()) <= declared
+    # Field by field, not as sets: a list column comes back from Parquet with its child renamed
+    # (`item` to `element`), which compares equal but hashes differently.
+    return all(
+        field.name in declared.names and declared.field(field.name).type == field.type for field in master_schema()
+    )
 
 
 def _on_s3(fs: AbstractFileSystem) -> bool:
@@ -578,7 +582,8 @@ def merge_cell(
         parts = read_cell(fs, registry_root, "parts", zone, year, dataset_schema())
         if run_id is not None and run_id not in set(parts.column("run_id").to_pylist()):
             raise ValueError(f"{zone}/{year} has no registry part for run {run_id!r}, so the master would miss it")
-        if store is not None and (found := store_disagreements(parts, store())):
+        record = store() if store is not None else None
+        if record is not None and (found := store_disagreements(parts, record)):
             raise ValueError(f"{zone}/{year}: the store cannot stand behind the registry parts: {'; '.join(found)}")
         fills = as_master_rows(parts, MEASURED_BY_FILL)
         held = still_published(read_cell(fs, registry_root, "master", zone, year, master_schema()), fills)
@@ -586,6 +591,8 @@ def merge_cell(
         # parts cannot supply, re-derived ones, come from the existing file, and a damaged copy cannot win.
         held = held.filter(pc.invert(pc.fill_null(pc.equal(held.column("measured_by"), MEASURED_BY_FILL), False)))
         master = merge(fills, held, *extra)
+        if record is not None:
+            master = with_source_runs(master, record.source_runs)
         if failures := invariant_failures(master, expected_rows=tile_years(parts)):
             raise ValueError(f"{zone}/{year} master breaks its invariants: {'; '.join(failures)}")
         if not write or (version is None and not master.num_rows):
@@ -593,6 +600,17 @@ def merge_cell(
         if write_cell(fs, registry_root, zone, year, master, version=version):
             return _live_disagreements(master, live)
     raise ValueError(f"{zone}/{year} master changed under each of {tries} attempts to merge it")
+
+
+def with_source_runs(master: pa.Table, source_runs: Callable[[str], list[str] | None]) -> pa.Table:
+    """``master`` with every row's ``source_runs`` derived afresh from the store's record.
+
+    Never kept from a row: the newest-run-wins merge picks a row by its measurements, and a re-derived
+    row carries a ``rebuild-…`` run id, so neither says which runs' pixels a tile holds now.
+    """
+    index = master.schema.get_field_index("source_runs")
+    values = [source_runs(tile) for tile in master.column("tile").to_pylist()]
+    return master.set_column(index, master.schema.field(index), pa.array(values, type=master.schema.field(index).type))
 
 
 def _live_disagreements(master: pa.Table, live: Collection[tuple[int, int]] | None) -> list[str]:

@@ -206,6 +206,13 @@ def _pins(mosaic_snapshots: Mapping[str, str]) -> dict[str, str]:
     return {_sensor_of(path): snap for path, snap in mosaic_snapshots.items()}
 
 
+def mosaics_carry_provenance(
+    mosaic_snapshots: Mapping[str, str], *, get_credentials: _Creds = None, s3_region: str | None = None
+) -> bool:
+    """Whether the pinned mosaics were ingested with the provenance record. Refuses a mix."""
+    return _provenance_mosaics(mosaic_snapshots, get_credentials, s3_region) is not None
+
+
 def _sensor_of(path: str) -> str:
     """The sensor a mosaic store path holds, from its name."""
     return _STORES[path.rstrip("/").rsplit("/", 1)[-1].removesuffix(".zarr")]

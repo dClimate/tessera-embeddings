@@ -476,3 +476,57 @@ class TestWhoWroteAYear:
     def test_a_year_marked_without_shards_contributes_no_run(self):
         marked = shard_writer.run_provenance(None, 2024, "ocean", empty=True, code={})
         assert published_store.committed_runs({"runs": marked}, 2024, []) == []
+
+
+def _run(run_id: str, *, record: bool = True, **fields: object) -> dict:
+    """A ``runs`` or ``updates`` entry; ``record`` says whether its mosaics carried provenance."""
+    return {"run_id": run_id, "input_coverage": {"provenance_version": 1} if record else {}, **fields}
+
+
+class TestSourceRuns:
+    """Which runs' pixels a tile holds, from the zone group's own records (plan §6)."""
+
+    @pytest.mark.parametrize(
+        ("updates", "expected"),
+        [
+            ([], ["fill"]),
+            ([_run("holes", mode="holes", written=["chunk_0_0"])], ["fill", "holes"]),
+            ([_run("holes", mode="holes", written=["chunk_9_9"])], ["fill"]),
+            ([_run("shards", mode="shards", written=["chunk_0_0"])], ["shards"]),
+            ([_run("shards", mode="shards", written=[], cleared=["chunk_0_0"])], ["shards"]),
+            (
+                [
+                    _run("shards", mode="shards", written=["chunk_0_0"]),
+                    _run("holes", mode="holes", written=["chunk_0_0"]),
+                ],
+                ["shards", "holes"],
+            ),
+        ],
+        ids=["fill", "holes-appends", "holes-elsewhere", "shards-restarts", "a-clear-restarts", "holes-after-shards"],
+    )
+    def test_the_lineage_of_a_tile(self, updates: list[dict], expected: list[str]) -> None:
+        attrs = {"runs": {"2025": _run("fill")}, "updates": {"2025": updates}}
+        assert published_store.source_runs(attrs, 2025, "chunk_0_0") == expected
+
+    @pytest.mark.parametrize(
+        "attrs",
+        [
+            {"runs": {"2025": _run("fill", record=False)}},
+            {
+                "runs": {"2025": _run("fill", record=False)},
+                "updates": {"2025": [_run("h", mode="holes", written=["chunk_0_0"])]},
+            },
+            {},
+        ],
+        ids=["switched-off", "a-recorded-update-over-an-unrecorded-fill", "never-filled"],
+    )
+    def test_a_tile_without_a_complete_record_is_null(self, attrs: dict) -> None:
+        assert published_store.source_runs(attrs, 2025, "chunk_0_0") is None
+
+    def test_a_shards_update_with_a_record_completes_a_tile_an_unrecorded_fill_left(self) -> None:
+        """It replaced every pixel the fill wrote, so nothing unrecorded is left in the tile."""
+        attrs = {
+            "runs": {"2025": _run("fill", record=False)},
+            "updates": {"2025": [_run("s", mode="shards", written=["chunk_0_0"])]},
+        }
+        assert published_store.source_runs(attrs, 2025, "chunk_0_0") == ["s"]

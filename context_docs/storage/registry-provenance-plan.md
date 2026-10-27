@@ -1,8 +1,8 @@
 # Registry provenance: which satellite images went into every embedding
 
 Status: plan, revision 5 (2026-10-27). It has been through two adversarial reviews and has no open
-questions. The ingest half and the model and assembly half are built; `source_runs` follows (§11).
-Revision 5 records what building them changed (§13). It is aimed at the v2 campaign and assumes two pull requests
+questions. It is built, in three stacked PRs (§11); revision 5 records what building it changed
+(§13). It is aimed at the v2 campaign and assumes two pull requests
 that are in review: [PR #240](https://github.com/dClimate/tessera-embeddings/pull/240), which
 teaches the ingest which catalogue entries are copies of the same image, and
 [PR #250](https://github.com/dClimate/tessera-embeddings/pull/250), which decides which radar
@@ -525,7 +525,10 @@ zones, years and an update run before the registry README publishes them.
    Built: tests on local stores reconstruct each mosaic's source index from the published planes,
    `shard_dates` and `granules`, and check that a failed publication leaves the cell untagged until
    its retry republishes. `source_runs` on parts and master, with the registry schema change and
-   the `_common_metadata` rewrite, ships as a third PR on the second.
+   the `_common_metadata` rewrite, ships as a third PR on the second. Built: the rule is derived
+   from the zone group's records (`published_store.source_runs`), a run notes that its mosaics
+   carried the record as `input_coverage.provenance_version`, and every merge rewrites the column
+   from the store.
 4. A dev test on the standard chain (tiny, then Iowa, then 35N) asserts: every slot has a granule
    list; every recorded asset URL returns 200 in-region; `valid_px` equals the mask-valid count in
    the mosaic for a sampled shard-date; a resumed zone-year publishes tables identical to an
@@ -610,6 +613,9 @@ the `pixel_sources` store.
   fails a cell before its tag, but the cell's shards and completion mark have landed, so its retry
   takes the landed branch and would otherwise tag it without a record.
 - **`source_runs` is its own PR** (2026-10-27). It changes the published registry's schema and
-  merge, independently of how the record is made.
+  merge, independently of how the record is made. A run records whether its mosaics carried the
+  record in its `input_coverage`, the run entry's existing summary of what its input held, so the
+  column can be derived from the store alone, and is null unless every run in a tile's list
+  carried one.
 - **Vocabulary:** shard, never tile, for the 2048-pixel unit; `granules`, never `scenes`, for the
   table.

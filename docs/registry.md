@@ -146,6 +146,7 @@ where `store_group` is the zone's group opened with xarray, as in the store's
 | `run_id`, `assembled_at` | the run the row came from, and when it was written: the fill, or for a re-derived row the re-derivation |
 | `code_version`, `code_commit` | the build of the tessera-embeddings repository that ran the fill |
 | `update_name` | the targeted update that last rewrote the tile ([ADR 027](../context_docs/decisions/027-targeted-updates.md)), null where the tile is still the campaign's fill |
+| `source_runs` | the runs whose pixels the tile holds, oldest first, for finding them in the provenance record below; null for v1.1 and wherever the tile has no complete record |
 
 The quality rule is the store's: a pixel is embedded only if it had at least `optical_min_obs`
 usable optical observations in the year: the store root's value, or a lower one a targeted update
@@ -246,11 +247,11 @@ dates = run["s2_date"][:]                                  # int64 nanoseconds, 
 picks = [(d, v - 1) for d, v in zip(dates, k) if v]        # (date, rank in that date's `sources`)
 ```
 
-Open the group of the run that wrote the tile's pixels: the run whose `parts/` file holds the
-tile's row with the master row's `filled_at`, as described under "Runs" above. After a holes
-update, the update's group covers the pixels in its `update_pixels` mask and the earlier run's
-group the rest. The record says what went in, not how much each image mattered: the model has no
-attribution. For a pixel observed more often than the model's longest sequence, the model reads
+Open the group of each run in the master row's `source_runs`. A fill alone is one run. After a
+holes update there are two: the update's group covers the pixels in its `update_pixels` mask and
+the earlier run's group the rest. `source_runs` is derived from the store's own record of who wrote
+the tile at every merge, never copied from an older row. The record says what went in, not how
+much each image mattered: the model has no attribution. For a pixel observed more often than the model's longest sequence, the model reads
 a fixed subset of these dates, chosen by a deterministic rule from the dates alone.
 
 ## Going deeper

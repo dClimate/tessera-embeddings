@@ -62,6 +62,7 @@ from tenacity import retry_if_not_exception_type
 from tessera_embeddings.config.assembly import AssemblyConfig
 from tessera_embeddings.config.fault_injection import ArmedFault
 from tessera_embeddings.config.inference import InferenceConfig
+from tessera_embeddings.config.ingest import PROVENANCE_VERSION
 from tessera_embeddings.config.paths import store_key
 from tessera_embeddings.config.store_layout import GLOBAL, REQUIRED_VARS
 from tessera_embeddings.config.time_windows import TimeWindow
@@ -74,12 +75,17 @@ from tessera_embeddings.inference.assembly import (
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, enumerate_chunks
 from tessera_embeddings.inference.data_loading import _active_orbits
-from tessera_embeddings.inference.provenance_publish import ProvenanceCheckError, publish_provenance
+from tessera_embeddings.inference.provenance_publish import (
+    ProvenanceCheckError,
+    mosaics_carry_provenance,
+    publish_provenance,
+)
 from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.ingest.land_mask import narrow_tile_live
 from tessera_embeddings.storage.campaign import mark_zone_year_empty, pin_tag, tag_zone_year, zone_year_tag
 from tessera_embeddings.storage.global_store import check_destination_types, open_global_repo
 from tessera_embeddings.storage.published_store import calendar_years, live_shards, shard_writes, store_year
+from tessera_embeddings.storage.published_store import source_runs as published_source_runs
 from tessera_embeddings.storage.registry_master import merge_cell
 from tessera_embeddings.storage.registry_rebuild import as_coverage_record, rebuild_tile
 from tessera_embeddings.storage.shard_writer import read_years_complete, shard_pitch
@@ -1305,6 +1311,11 @@ def assemble_zone_year(
     if handoff.done is not None:
         return handoff.done
     zone, year, run_id, t0 = handoff.zone, handoff.year, handoff.run_id, handoff.t0
+    # Recorded with the run, so the registry can tell which runs' pixels have a provenance record.
+    if handoff.mosaic_snapshots and mosaics_carry_provenance(
+        handoff.mosaic_snapshots, get_credentials=get_credentials, s3_region=s3_region
+    ):
+        input_coverage = {**(input_coverage or {}), "provenance_version": PROVENANCE_VERSION}
     summary, live, results = handoff.summary, handoff.live, handoff.results
     writer = ZarrWriter(staging_base)
 
@@ -1699,6 +1710,7 @@ def _publish_merged_rows(
     registry write after a commit: the cell has landed.
     """
     records: dict[str, dict] = {}
+    attrs: dict[str, Any] = {}
     # A store with no depth rule refused no pixel as thin, so none may be counted below a line.
     thin_below = optical_min_obs or 0
     try:
@@ -1706,6 +1718,7 @@ def _publish_merged_rows(
             branch="main"
         )
         node = cast(zarr.Group, zarr.open_group(session.store, mode="r")[zone])
+        attrs = dict(node.attrs)
         year_index = calendar_years(node).index(year)
         with ThreadPoolExecutor(max_workers=16) as pool:
             rows = pool.map(
@@ -1734,6 +1747,7 @@ def _publish_merged_rows(
         optical_min_obs=optical_min_obs,
         embedded_records=records,
         update_name=update_name,
+        source_runs=lambda tile: published_source_runs(attrs, year, tile) if attrs else None,
         get_credentials=get_credentials,
         s3_region=s3_region,
     )
