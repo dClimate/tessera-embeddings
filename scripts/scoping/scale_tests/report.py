@@ -402,6 +402,30 @@ def _t10_value(rows: list[dict], metric: str, variant: str, **params: Any) -> fl
     return statistics.median(vals) if vals else None
 
 
+def _unreadable(rows: list[dict], phase: str) -> list[dict]:
+    """A phase's ``unreadable`` rows: a workload this client could not open on an arm, recorded instead of a time."""
+    return [r for r in _sel(rows, test="t10", phase=phase, metric="unreadable") if r["variant"]]
+
+
+def _is_unreadable(unread: list[dict], arm: str, workload: str, dims: int, config: str | None = None) -> bool:
+    """Whether ``arm``'s ``workload`` at ``dims`` (and reader ``config``, when given) was recorded unreadable."""
+    return any(
+        r["variant"] == arm
+        and (r["params"]["workload"], r["params"]["dims"]) == (workload, dims)
+        and (config is None or r["params"].get("zarr_config", "") == config)
+        for r in unread
+    )
+
+
+def _unreadable_notes(unread: list[dict]) -> list[str]:
+    """One line under a table per recorded reason, naming the arms it stopped."""
+    by_reason: dict[str, set[str]] = {}
+    for r in unread:
+        by_reason.setdefault(r["params"]["reason"], set()).add(r["variant"])
+    notes = [f"> **unreadable** ({', '.join(sorted(arms))}): {reason}" for reason, arms in sorted(by_reason.items())]
+    return [*notes, ""] if notes else []
+
+
 def _vs(value: float, base: float | None) -> str:
     """``value / base`` to two places, or a dash when the control did not run, never a ratio to 1."""
     return f"{value / base:.2f}" if base else "—"
@@ -455,12 +479,12 @@ def _t10_tables(rows: list[dict]) -> list[str]:
     clients = sorted({r["params"]["client"] for r in reads})  # a points- or tune-only run has no read table
     for client in clients:
         phase = f"read_{client}"
-        read_arms = sorted({r["variant"] for r in _sel(rows, test="t10", phase=phase, metric="get_requests")})
+        # A workload this client could not open is a result too, so its rows count as run.
+        unread = _unreadable(rows, phase)
+        measured = [*_sel(rows, test="t10", phase=phase, metric="get_requests"), *unread]
+        read_arms = sorted({r["variant"] for r in measured})
         # Only the workloads this run's sweep scheduled: the sweep has been trimmed between runs.
-        ran = {
-            (r["params"].get("workload"), r["params"].get("dims"))
-            for r in _sel(rows, test="t10", phase=phase, metric="get_requests")
-        }
+        ran = {(r["params"].get("workload"), r["params"].get("dims")) for r in measured}
         cols = [c for c in _T10_READS if (c[1], c[2]) in ran]
         out += [
             f"## T10 — cold reads from S3, {client} (median of passes; wire MB in brackets)",
@@ -476,7 +500,7 @@ def _t10_tables(rows: list[dict]) -> list[str]:
                 wire = _t10_value(rows, "bytes_fetched", a, method="wire", **kw)
                 unit = "ms" if workload == "point" else "s"
                 cells.append(
-                    "—"
+                    ("unreadable" if _is_unreadable(unread, a, workload, dims) else "—")
                     if v is None
                     else f"{v:.0f} {unit} ({(wire or 0) / 1e6:.0f})"
                     if unit == "ms"
@@ -484,6 +508,7 @@ def _t10_tables(rows: list[dict]) -> list[str]:
                 )
             out.append(f"| {a} | " + " | ".join(cells) + " |")
         out.append("")
+        out += _unreadable_notes(unread)
         out += _vs_accepted(rows, phase, read_arms, cols)
     out += _mobile_tables(rows)
     for phase in sorted({r["phase"] for r in rows if r["test"] == "t10" and r["phase"].startswith("points_")}):
@@ -525,20 +550,23 @@ def _t10_tables(rows: list[dict]) -> list[str]:
     # One table per client, as for reads and points: the zarr versions read shards differently.
     for phase in sorted({r["phase"] for r in rows if r["test"] == "t10" and r["phase"].startswith("tune_")}):
         tune = [r for r in _sel(rows, test="t10", phase=phase, metric="wall_s") if r["variant"]]
-        configs = sorted({setting(r) for r in tune})
+        unread = _unreadable(rows, phase)
+        configs = sorted({setting(r) for r in [*tune, *unread]})
         out += [
             f"## T10 — full-vector reads, reader settings, {phase.removeprefix('tune_')} (wall s, median of passes)",
             "",
             "| arm | " + " | ".join(f"{w} {d} {c or 'default'}" for w, d, c in configs) + " |",
             "|---|" + "---|" * len(configs),
         ]
-        for a in sorted({r["variant"] for r in tune}):
+        for a in sorted({r["variant"] for r in [*tune, *unread]}):
             cells = []
             for config in configs:
                 vals = [r["value"] for r in tune if r["variant"] == a and setting(r) == config]
-                cells.append(f"{statistics.median(vals):.1f}" if vals else "—")
+                missing = "unreadable" if _is_unreadable(unread, a, config[0], config[1], config[2]) else "—"
+                cells.append(f"{statistics.median(vals):.1f}" if vals else missing)
             out.append(f"| {a} | " + " | ".join(cells) + " |")
         out.append("")
+        out += _unreadable_notes(unread)
     return out
 
 
@@ -577,10 +605,9 @@ def _mobile_tables(rows: list[dict]) -> list[str]:
         rtt = _sel(rows, test="t10", phase=phase, metric="probe_rtt_ms")
         mbps = _sel(rows, test="t10", phase=phase, metric="probe_mbps")
         link = f"{rtt[0]['value']:.0f} ms, {mbps[0]['value']:.1f} Mbit/s measured" if rtt and mbps else "unshaped"
-        tagged = [
-            r for r in _sel(rows, test="t10", phase=phase, metric="wall_s") if r["variant"]
-        ]  # not the phase's own
-        cols = sorted({(r["params"]["workload"], r["params"]["dims"]) for r in tagged})
+        tagged = [r for r in _sel(rows, test="t10", phase=phase, metric="wall_s") if r["variant"]]  # not the phase's
+        unread = _unreadable(rows, phase)
+        cols = sorted({(r["params"]["workload"], r["params"]["dims"]) for r in [*tagged, *unread]})
         out += [
             f"## T10 — mobile reads, {phase.removeprefix('mobile_')} "
             f"({link}; wall s / requests / MB, median of passes)",
@@ -588,16 +615,18 @@ def _mobile_tables(rows: list[dict]) -> list[str]:
             "| arm | " + " | ".join(f"{w} {d}" for w, d in cols) + " | first read s |",
             "|---|" + "---|" * (len(cols) + 1),
         ]
-        for a in sorted({r["variant"] for r in tagged}):
+        for a in sorted({r["variant"] for r in [*tagged, *unread]}):
             cells = []
             for workload, dims in cols:
                 kw = {"phase": phase, "workload": workload, "dims": dims}
                 wall, n = _t10_value(rows, "wall_s", a, **kw), _t10_value(rows, "get_requests", a, **kw)
                 mb = (_t10_value(rows, "bytes_fetched", a, method="store", **kw) or 0) / 1e6
-                cells.append("—" if wall is None else f"{wall:.2f} / {n or 0:.0f} / {mb:.1f}")
+                missing = "unreadable" if _is_unreadable(unread, a, workload, dims) else "—"
+                cells.append(missing if wall is None else f"{wall:.2f} / {n or 0:.0f} / {mb:.1f}")
             first = _t10_value(rows, "first_read_s", a, phase=phase)
             out.append(f"| {a} | " + " | ".join(cells) + f" | {first or 0:.2f} |")
         out.append("")
+        out += _unreadable_notes(unread)
     return out
 
 
