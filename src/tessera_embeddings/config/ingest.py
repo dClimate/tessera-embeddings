@@ -292,7 +292,7 @@ class IngestSettings(BaseModel):
     # source index, from which assembly publishes `provenance/` beside the registry. Off by
     # default, because only the public global store needs it; that campaign's deployment turns it
     # on. A mosaic records the setting and refuses a resume under the other one:
-    # context_docs/storage/registry-provenance-plan.md §5.4.
+    # context_docs/storage/registry-provenance-plan.md §4.
     provenance: bool = False
 
     @model_validator(mode="after")

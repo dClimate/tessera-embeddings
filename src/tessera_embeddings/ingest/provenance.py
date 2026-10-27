@@ -1,7 +1,7 @@
 """What an ingest records about the granules behind each mosaic slot: the ingest half of provenance.
 
 Two records, both written in the slot's own commit and only when the ingest runs with
-``provenance`` on (``context_docs/storage/registry-provenance-plan.md`` §4, §5.4):
+``provenance`` on (``context_docs/storage/registry-provenance-plan.md`` §4):
 
 * **The granule list.** One JSON array per slot naming the day's granules in fusion order, with
   the identifiers, acquisition time, footprint and exact object URLs read (:func:`day_granules`).

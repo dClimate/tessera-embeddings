@@ -196,7 +196,7 @@ class StoreManifest:
                 mismatches[key] = ("<not recorded, i.e. off>", current_val)
         for key in existing:
             if key in known_fields and key not in current and existing[key] is not None:
-                mismatches[key] = (existing[key], None)
+                mismatches[key] = (existing[key], "<not set, i.e. off>" if key in self.ABSENT_MEANS_OFF else None)
 
         if mismatches:
             lines = [f"Cannot append to {store_path}: structural parameters changed."]
@@ -271,7 +271,7 @@ class IngestManifest(StoreManifest):
     #: record, before it existed or with it off, holds no granule list and no source index, and
     #: is the same state either way. So a run with it on refuses such a store, and a run with it
     #: off refuses one that has it, which is what keeps a granule list from ever falling short of
-    #: its time axis (``context_docs/storage/registry-provenance-plan.md`` §5.4).
+    #: its time axis (``context_docs/storage/registry-provenance-plan.md`` §4).
     ABSENT_MEANS_OFF: ClassVar[frozenset[str]] = frozenset({"provenance_version"})
 
     roi_manifest_hash: str | None = None
