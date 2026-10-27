@@ -284,10 +284,9 @@ def stamp_array_conventions(node: zarr.Group) -> None:
     they cannot disagree with it however its CRS was found (a mosaic attr or the MGRS tile).
 
     * Every array spanning both of the group's ``spatial:dimensions`` registers ``spatial`` and
-      repeats them: the spec requires ``spatial:dimensions`` on every array, while the transform,
-      bbox and CRS stay on the group, which the spec lets child arrays inherit. So a variable
-      opened alone (an xarray ``DataArray``) knows its spatial dims but not its georeferencing.
-      Any other registration on the array is kept; ours is matched by uuid.
+      repeats them. The spec requires them on arrays when composed with ``proj``, and a reader
+      that opens one variable (an xarray ``DataArray``) never sees the group's attrs. Any other
+      registration on the array is kept; ours is matched by uuid.
     * The Y and X coordinate arrays get CF ``standard_name``/``units``/``axis``, which claim the values
       are projected metres. So both halves must be declared: real coordinates (the group has
       ``spatial:dimensions``, which bare pixel indices never get) in a metre-based ``proj:code``
