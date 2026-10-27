@@ -95,4 +95,20 @@ Harness and raw results: `s3://global-tessera-inputs-dev/perf/g7e/` (`warm_probe
 
 ## 5. End to end with the environment off the AMI
 
-PENDING: the dev test of the image-only path.
+On 2026-10-27 in global-tessera-dev, the single-area `tessera-embeddings` flow ran v2-large over one 1024-px
+chunk (`m10_parity_15S_epsg32715`, window December 2024) twice at once, on `g5.2xlarge` workers (no `g6e.xlarge`
+capacity that evening). One arm booted the yield-embeddings slim AMI, which has no venv, and mounted an 8.8 GB
+image of Python 3.12.13 (uv's build) and the PyTorch 2.14.1 closure. The other booted that account's prod AMI,
+which carries the same closure as a baked venv on deadsnakes' 3.12.16, and so skipped the mount.
+
+| | image mounted (slim AMI) | baked venv (control) |
+|---|---:|---:|
+| head: `ray up`, launch to Ray running | 1 min 49 s | 2 min 46 s |
+| worker: allocated to Ray running | 77 s | 82 s, 86 s |
+| embeddings | bit-identical to the control | |
+
+The head copies the image onto its root volume, having no instance store, and still starts faster than one
+reading a baked venv from a fresh snapshot. A worker's setup, which now copies and mounts the image itself, costs
+what the control's did. Every embedding and scale matched the control byte for byte, so the environment's move
+changed nothing the model computes. The driver, on Ubuntu's 3.12.3, connected over Ray Client to both clusters.
+One sample per arm.
