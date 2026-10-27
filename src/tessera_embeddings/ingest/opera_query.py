@@ -14,7 +14,7 @@ import re
 import time
 import warnings
 from collections import Counter
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime
 from typing import Any, cast
 from xml.etree import ElementTree
@@ -26,6 +26,7 @@ from pystac.utils import str_to_datetime
 from requests.adapters import HTTPAdapter
 
 from tessera_embeddings.config import S1_OPERA_BANDS
+from tessera_embeddings.errors import ConfigMismatchError
 from tessera_embeddings.ingest._http import (
     NonJsonResponseError,
     json_or_raise,
@@ -568,11 +569,19 @@ class BurstCensus:
     returns the same one. The batches that share it are prepared one at a time, so it takes no
     lock.
 
-    ``counts`` given up front, as read back from a store's :data:`BURST_CENSUS_ATTR`, are the
-    answer and nothing is queried: the catalogue keeps changing after a leg's first date commits,
-    a backfilled acquisition can flip a tied ranking, and a resumed leg that re-counted would fuse
+    ``recorded``, a store's :data:`BURST_CENSUS_ATTR` as :meth:`record` wrote it, is the answer
+    and nothing is queried: the catalogue keeps changing after a leg's first date commits, a
+    backfilled acquisition can flip a tied ranking, and a resumed leg that re-counted would fuse
     its later days by a different burst than the days already written. The census that ranked a
     store's first date ranks every date after it.
+
+    So it must be the census of THIS window. The record names the window and grouping longitude it
+    was counted over, and a resume asking for any other is refused: ranking new dates by a census
+    of another window would rank a burst first seen in them as never acquired, and recounting
+    would rank them differently from the dates already written.
+
+    Raises:
+        ConfigMismatchError: ``recorded`` was counted over another window or longitude.
     """
 
     def __init__(
@@ -583,11 +592,31 @@ class BurstCensus:
         orbit_direction: str,
         *,
         mid_longitude: float | None = None,
-        counts: dict[str, int] | None = None,
+        recorded: Mapping[str, Any] | None = None,
     ) -> None:
         self._args = (bbox, start_date, end_date, orbit_direction)
         self._mid_longitude = mid_longitude
-        self._waiter: Callable[..., dict[str, int]] | None = None if counts is None else lambda: counts
+        self._waiter: Callable[..., dict[str, int]] | None = None
+        if recorded is not None:
+            counted_over = {key: recorded.get(key) for key in self._scope()}
+            if counted_over != self._scope():
+                raise ConfigMismatchError(
+                    f"This {orbit_direction} store's dates were ranked by a burst census counted over "
+                    f"{counted_over}, and this ingest asks for {self._scope()}. Ranking new dates by "
+                    "another window's census, or recounting, would fuse them differently from the dates "
+                    "already written. Ingest this window into its own store, or delete this one and "
+                    "re-ingest the window whole."
+                )
+            counts = dict(recorded["counts"])
+            self._waiter = lambda: counts
+
+    def _scope(self) -> dict[str, Any]:
+        """What the counts depend on beyond the zone: the window and the solar-day longitude."""
+        return {"window": [self._args[1], self._args[2]], "mid_longitude": self._mid_longitude}
+
+    def record(self) -> dict[str, Any]:
+        """The census as a store records it: its counts and the window and longitude they cover."""
+        return {**self._scope(), "counts": self.counts()}
 
     def start(self) -> Callable[..., dict[str, int]]:
         """Send the query if nothing has yet, and return the waiter for its answer."""

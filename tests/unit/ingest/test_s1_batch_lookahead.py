@@ -126,7 +126,7 @@ def _run_ingest(
     existing: set[str],
     providers: list | None = None,
     writes: list | None = None,
-    recorded_census: dict[str, int] | None = None,
+    recorded_census: dict | None = None,
     **kwargs,
 ) -> list[str]:
     """Drive ``ingest_s1_roi_sar`` against a faked catalogue and store.
@@ -710,7 +710,7 @@ def test_one_burst_census_ranks_every_batch_over_the_requested_window(monkeypatc
         def __init__(self, *args, **kwargs) -> None:
             built.append((args, kwargs))
 
-        def counts(self) -> dict[str, int]:
+        def record(self) -> dict:
             return {}
 
     monkeypatch.setattr(s1_roi, "BurstCensus", _Census)
@@ -725,7 +725,9 @@ def test_one_burst_census_ranks_every_batch_over_the_requested_window(monkeypatc
         pipeline_batches=pipe,
     )
 
-    assert built == [(((0, 0, 1, 1), "2024-01-01", "2024-01-06", "ascending"), {"mid_longitude": 0.5, "counts": None})]
+    assert built == [
+        (((0, 0, 1, 1), "2024-01-01", "2024-01-06", "ascending"), {"mid_longitude": 0.5, "recorded": None})
+    ]
     assert len(providers) > 1, "needs several batches to show they share one census"
     assert all(k["burst_census"] is providers[0]["burst_census"] for k in providers)
 
@@ -734,7 +736,12 @@ def test_one_burst_census_ranks_every_batch_over_the_requested_window(monkeypatc
     ("existing", "recorded", "expected"),
     [
         pytest.param(set(), None, {"T001-000001-IW1": 2}, id="first-leg-counts-and-records"),
-        pytest.param({"2024-01-01"}, {"T001-000001-IW1": 9}, {"T001-000001-IW1": 9}, id="resume-reuses-the-record"),
+        pytest.param(
+            {"2024-01-01"},
+            {"window": ["2024-01-01", "2024-01-04"], "mid_longitude": 0.5, "counts": {"T001-000001-IW1": 9}},
+            {"T001-000001-IW1": 9},
+            id="resume-reuses-the-record",
+        ),
     ],
 )
 def test_a_store_holds_the_census_that_ranked_its_dates(monkeypatch, existing, recorded, expected) -> None:
@@ -756,4 +763,5 @@ def test_a_store_holds_the_census_that_ranked_its_dates(monkeypatch, existing, r
     )
 
     assert writes, "the open date is written"
-    assert all(w["store_attrs"] == {BURST_CENSUS_ATTR: expected} for w in writes)
+    record = {"window": ["2024-01-01", "2024-01-04"], "mid_longitude": 0.5, "counts": expected}
+    assert all(w["store_attrs"] == {BURST_CENSUS_ATTR: record} for w in writes)

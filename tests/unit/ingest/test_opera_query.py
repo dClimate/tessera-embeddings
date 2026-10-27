@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
+from tessera_embeddings.errors import ConfigMismatchError
 from tessera_embeddings.ingest._http import NonJsonResponseError
 from tessera_embeddings.ingest.opera_query import (
     _UNPARSEABLE_PAGE_ATTEMPTS,
@@ -483,6 +484,10 @@ def _reference_page(titles, search_after=None):
     return _raw_response(body.encode(), content_type="application/xml", search_after=search_after)
 
 
+#: A census as a store records it: the window and grouping longitude it was counted over, and the counts.
+_RECORD = {"window": ["2024-01-01", "2024-12-31"], "mid_longitude": 27.0, "counts": {_HIGH: 31}}
+
+
 class TestBurstAcquisitions:
     """The census: acquisitions per burst over the whole window, from titles alone."""
 
@@ -557,9 +562,22 @@ class TestBurstAcquisitions:
     def test_recorded_counts_are_the_answer_and_nothing_is_queried(self):
         """A resumed leg ranks by the census its store recorded, whatever the catalogue says now."""
         with patch("tessera_embeddings.ingest.opera_query.burst_acquisitions") as query:
-            census = BurstCensus(self.BBOX, "2024-01-01", "2024-12-31", "ascending", counts={_HIGH: 31})
+            census = BurstCensus(
+                self.BBOX, "2024-01-01", "2024-12-31", "ascending", mid_longitude=27.0, recorded=_RECORD
+            )
             assert census.counts() == {_HIGH: 31}
+            assert census.record() == _RECORD
         query.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("end", "longitude"), [("2025-02-28", 27.0), ("2024-12-31", 33.0)], ids=["another-window", "another-longitude"]
+    )
+    def test_a_record_counted_over_anything_else_is_refused(self, end, longitude):
+        """A burst first seen in the new days would rank as never acquired, and recounting would rank the
+        new days differently from those already written.
+        """
+        with pytest.raises(ConfigMismatchError, match="Ingest this window into its own store"):
+            BurstCensus(self.BBOX, "2024-01-01", end, "ascending", mid_longitude=longitude, recorded=_RECORD)
 
 
 # ---------------------------------------------------------------------------

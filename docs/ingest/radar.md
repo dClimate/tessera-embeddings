@@ -110,10 +110,13 @@ placed on its solar day before it is counted. One orbit of a zone-year at 35N to
 starts alongside the first batch's query, so most of it overlaps.
 
 The census is written on the orbit's store as the root attribute `burst_census`, in the same
-commit as every date, and a leg resuming a store that holds any date ranks by the census it reads
-back rather than counting again. The catalogue keeps changing, counts commonly tie, and a leg
-that re-counted after a backfilled acquisition could fuse its remaining days by a different burst
-than the days already written.
+commit as every date, with the window and grouping longitude it was counted over. A leg resuming a
+store that holds any date ranks by the census it reads back rather than counting again. The
+catalogue keeps changing, counts commonly tie, and a leg that re-counted after a backfilled
+acquisition could fuse its remaining days by a different burst than the days already written. A
+leg asking for a different window is refused: ranked by the stored census, a burst first seen in
+its new days would count as never acquired, and recounted, its days would be ranked differently
+from those already written. A different window goes into its own store.
 [ADR 033](../../context_docs/decisions/033-radar-overlaps-go-to-the-most-acquired-burst.md) has
 the measurements and what was left out, such as per-pixel layover and shadow masks.
 

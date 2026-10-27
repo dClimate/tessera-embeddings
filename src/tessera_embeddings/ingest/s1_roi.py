@@ -546,7 +546,7 @@ def ingest_s1_roi_sar(
     # nothing until the first batch's provider starts it alongside its own query.
     recorded_census = get_root_attr(orbit_store, BURST_CENSUS_ATTR, s3_region=s3_region) if written_dates else None
     burst_census = BurstCensus(
-        roi.bbox_wgs84, start_date, end_date, orbit, mid_longitude=mid_longitude, counts=recorded_census
+        roi.bbox_wgs84, start_date, end_date, orbit, mid_longitude=mid_longitude, recorded=recorded_census
     )
 
     # Where the CATALOGUE is searched from. Everything at or below the newest held date is closed,
@@ -931,7 +931,7 @@ def ingest_s1_roi_sar(
                                     chunks=INGEST_CHUNKS,
                                     parallel_windows=overlap_window_writes,
                                     s3_region=s3_region,
-                                    store_attrs={BURST_CENSUS_ATTR: burst_census.counts()},
+                                    store_attrs={BURST_CENSUS_ATTR: burst_census.record()},
                                 )
                 except Exception as exc:
                     # The retry is exhausted. Only a failure the source is answerable for is
