@@ -1,7 +1,8 @@
 """GeoZarr convention attribute builders for embedding stores.
 
 Implements the proj:, spatial:, and geoemb: Zarr conventions as purely additive
-metadata on the root group. No store layout changes.
+metadata on the root (or zone) group, repeats ``spatial:dimensions`` on each spatial
+array, and adds CF axis attrs to the Y/X coordinate arrays. No store layout changes.
 
 The geoembeddings (``geoemb:``) convention supersedes the earlier ``tessera:`` one
 (still stripped from pre-existing stores by ``assembly``): it records encoder-model
@@ -9,7 +10,7 @@ provenance, source datasets, and a structured quantization/dequantization descri
 following the convention repo's own ``tessera_example.json``.
 
 References:
-    - proj:    https://github.com/zarr-conventions/geo-proj
+    - proj:    https://github.com/zarr-conventions/proj
     - spatial: https://github.com/zarr-conventions/spatial
     - geoemb:  https://github.com/geo-embeddings/embeddings-zarr-convention
 """
@@ -20,12 +21,15 @@ import logging
 from collections.abc import Mapping
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _dist_version
-from typing import cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 from pyproj import CRS
 
 from tessera_embeddings.config.inference import ModelVersion, encoder_url, model_family, model_version_for_encoder
+
+if TYPE_CHECKING:
+    import zarr
 
 logger = logging.getLogger(__name__)
 
@@ -88,24 +92,23 @@ _SPATIAL_CONVENTION = {
     "description": "Spatial coordinate information",
 }
 
-# The convention repo has not cut a `v1` tag, so `refs/tags/v1` 404s. We pin the
-# schema/spec URLs to an immutable commit SHA that DOES resolve, so the emitted
-# registration is dereferenceable. Switch to `refs/tags/v1` once upstream tags it.
-_GEOEMB_REF = "0655212938f36351245dbd3e5e8868f811d43663"
+# Registered by uuid alone, as the geoemb README's own examples do. Its schema pins the URLs to
+# `refs/tags/v1`, a tag upstream has not cut, so those 404 — and the conventions spec defines
+# `schema_url`/`spec_url` as URLs that resolve. A commit-SHA URL resolves but fails the schema's
+# `const`. Add the `v1` URLs once the tag exists.
 _GEOEMB_CONVENTION = {
-    "schema_url": f"https://raw.githubusercontent.com/geo-embeddings/embeddings-zarr-convention/{_GEOEMB_REF}/schema.json",
-    "spec_url": f"https://github.com/geo-embeddings/embeddings-zarr-convention/blob/{_GEOEMB_REF}/README.md",
     "uuid": "61c12cc5-0e28-4056-999a-480cf3fb7e4c",
     "name": "geoemb:",
     "description": "Geoembeddings convention for geospatial embedding arrays with model provenance",
 }
 
 # --- geoemb: field defaults (this pipeline's fixed provenance) --------------
-#: Precise source datasets we pull from: Sentinel-2 L2A COGs (Earth Search AWS
-#: Open Data) and OPERA RTC-S1 (ASF datapool).
+#: The source datasets, as resolvable dataset references: the Earth Search Sentinel-2 L2A
+#: collection we query (it indexes both the `sentinel-cogs` and `sentinel-s2-l2a` buckets,
+#: ADR 021) and the OPERA RTC-S1 collection's DOI.
 DEFAULT_SOURCE_DATA: tuple[str, ...] = (
-    "s3://sentinel-cogs",
-    "https://datapool.asf.alaska.edu/RTC/OPERA-S1",
+    "https://earth-search.aws.element84.com/v1/collections/sentinel-2-l2a",
+    "https://doi.org/10.5067/SNWG/OPERA_L2_RTC-S1_V1",
 )
 #: Storage dtype of the quantized embeddings.
 QUANTIZED_DTYPE = "int8"
@@ -265,6 +268,47 @@ def _crs_fields_from_epsg(epsg_code: str) -> dict[str, str | dict]:
     return result
 
 
+#: CF attributes for the projected Y and X coordinate arrays, in that order (CF Appendix A
+#: standard names), so CF-reading tools identify the axes and their units without knowing the
+#: ``spatial:`` convention. Keyed by axis, not name: the names are the store's own.
+_CF_COORD_ATTRS: tuple[dict[str, str], dict[str, str]] = (
+    {"standard_name": "projection_y_coordinate", "units": "m", "axis": "Y"},
+    {"standard_name": "projection_x_coordinate", "units": "m", "axis": "X"},
+)
+
+
+def stamp_array_conventions(node: zarr.Group) -> None:
+    """Label *node*'s arrays for readers that open one array at a time, from the group's own attrs.
+
+    Call after the group attrs are written. Both labels derive from what the group declares, so
+    they cannot disagree with it however its CRS was found (a mosaic attr or the MGRS tile).
+
+    * Every array spanning both of the group's ``spatial:dimensions`` registers ``spatial`` and
+      repeats them. The spec requires them on arrays when composed with ``proj``, and a reader
+      that opens one variable (an xarray ``DataArray``) never sees the group's attrs. Any other
+      registration on the array is kept; ours is matched by uuid.
+    * The Y and X coordinate arrays get CF ``standard_name``/``units``/``axis``, which claim the values
+      are projected metres. So both halves must be declared: real coordinates (the group has
+      ``spatial:dimensions``, which bare pixel indices never get) in a metre-based ``proj:code``
+      (the ``geoemb:gsd`` rule). Anything else is left unlabelled rather than mislabelled.
+
+    Writes only arrays whose attrs differ, so re-stamping an unchanged store is a no-op.
+    """
+    dims = cast("list[str]", node.attrs.get("spatial:dimensions") or [])
+    epsg = cast("str | None", node.attrs.get("proj:code"))
+    wanted: dict[str, dict[str, Any]] = (
+        dict(zip(dims, _CF_COORD_ATTRS, strict=True)) if dims and _is_metre_crs(epsg) else {}
+    )
+    for name, arr in node.arrays() if dims else ():
+        if set(dims) <= set(getattr(arr.metadata, "dimension_names", None) or ()):
+            registered = cast("list[dict[str, Any]]", arr.attrs.get("zarr_conventions") or [])
+            others = [c for c in registered if c.get("uuid") != _SPATIAL_CONVENTION["uuid"]]
+            wanted[name] = {"zarr_conventions": [*others, _SPATIAL_CONVENTION], "spatial:dimensions": dims}
+    for name, attrs in wanted.items():
+        if any(node[name].attrs.get(k) != v for k, v in attrs.items()):
+            node[name].attrs.update(attrs)
+
+
 def _compute_affine_transform(y_coords: np.ndarray, x_coords: np.ndarray) -> list[float]:
     """Compute a 6-element affine transform from PIXEL-CENTRE coordinate arrays.
 
@@ -359,7 +403,6 @@ def _geoemb_fields(
     model_url: str | None,
     data_type: str,
     gsd: float | None,
-    spatial_layout: str | None,
     source_data: tuple[str, ...],
     model_version: ModelVersion | None,
 ) -> dict:
@@ -392,15 +435,12 @@ def _geoemb_fields(
         attrs["checkpoint_id"] = checkpoint_id
     if gsd is not None:
         attrs["geoemb:gsd"] = gsd
-    if spatial_layout is not None:
-        attrs["geoemb:spatial_layout"] = spatial_layout
     return attrs
 
 
 def build_geoemb_root_attrs(
     *,
     embedding_dim: int,
-    spatial_layout: str,
     gsd: float | None = None,
     checkpoint_id: str | None = None,
     model_version: ModelVersion | None = None,
@@ -408,10 +448,10 @@ def build_geoemb_root_attrs(
     data_type: str = QUANTIZED_DTYPE,
     source_data: tuple[str, ...] = DEFAULT_SOURCE_DATA,
 ) -> dict:
-    """``geoemb:`` attrs for the ROOT of a multi-group store (``utm_zones`` / ``global``).
+    """``geoemb:`` attrs for the ROOT of a multi-group (per-zone) store.
 
-    In the ``utm_zones`` layout the encoder/quantization provenance is stated ONCE at the
-    root, being identical across zones, while ``proj:``/``spatial:`` live on each per-zone
+    The encoder/quantization provenance is stated ONCE at the root, being identical across
+    zones, while ``proj:``/``spatial:`` live on each per-zone
     group whose CRS and grid differ — build those with :func:`build_convention_attrs` and
     ``include_geoemb=False``. *gsd* is explicit here because the root has no single
     coordinate grid to derive it from.
@@ -423,7 +463,6 @@ def build_geoemb_root_attrs(
         model_url=model_url,
         data_type=data_type,
         gsd=gsd,
-        spatial_layout=spatial_layout,
         source_data=source_data,
     )
     attrs["zarr_conventions"] = [_GEOEMB_CONVENTION]
@@ -437,6 +476,7 @@ def build_convention_attrs(
     total_y: int,
     total_x: int,
     embedding_dim: int,
+    spatial_dims: tuple[str, str],
     y_coords: np.ndarray | None = None,
     x_coords: np.ndarray | None = None,
     checkpoint_id: str | None = None,
@@ -444,7 +484,6 @@ def build_convention_attrs(
     model_url: str | None = None,
     data_type: str = QUANTIZED_DTYPE,
     gsd: float | None = None,
-    spatial_layout: str | None = None,
     source_data: tuple[str, ...] = DEFAULT_SOURCE_DATA,
     include_geoemb: bool = True,
 ) -> dict:
@@ -454,7 +493,8 @@ def build_convention_attrs(
     ``proj:*``, ``spatial:*`` and ``geoemb:*`` metadata. *epsg_code* takes precedence over
     *tile_id*, so a caller that reprojects records the actual output CRS rather than the
     MGRS tile's original UTM zone; if neither resolves to a valid EPSG code the ``proj:``
-    convention is omitted.
+    convention is omitted. *spatial_dims* names the store's Y and X dimensions, as the store
+    has them: its model's on creation, its own on an append.
 
     The ``geoemb:`` fields record encoder-model provenance and quantization:
 
@@ -467,9 +507,11 @@ def build_convention_attrs(
     * ``geoemb:gsd`` — metres, and emitted only when trustworthy: from a metre-based CRS's
       coordinate spacing, or an explicit *gsd* the caller vouches for. OMITTED for a
       non-metre CRS (degrees, feet) or absent coords rather than given a false value.
-    * ``geoemb:spatial_layout`` — ``"utm_zones"``/``"global"``; OMITTED when ``None``, since
-      a single-ROI store has no utmNN/global groups.
     * ``geoemb:source_data`` — the source-dataset URLs.
+
+    ``geoemb:spatial_layout`` is never written. Its schema allows only ``"utm_zones"`` (60
+    groups named ``utm01`` to ``utm60``) and ``"global"`` (one array in a global CRS); our stores
+    are 120 hemisphere groups (``01N`` to ``60S``) or a single ROI, so either value would mislead.
 
     *include_geoemb* False emits only ``proj:``/``spatial:``: the multi-group campaign store
     carries geoemb: once at the root (:func:`build_geoemb_root_attrs`) and uses this builder
@@ -493,7 +535,7 @@ def build_convention_attrs(
     # --- spatial: convention ---
     if y_coords is not None and x_coords is not None and len(y_coords) > 1 and len(x_coords) > 1:
         conventions.append(_SPATIAL_CONVENTION)
-        attrs["spatial:dimensions"] = ["northing", "easting"]
+        attrs["spatial:dimensions"] = list(spatial_dims)
         attrs["spatial:transform_type"] = "affine"
         attrs["spatial:transform"] = _compute_affine_transform(y_coords, x_coords)
         attrs["spatial:shape"] = [total_y, total_x]
@@ -517,7 +559,6 @@ def build_convention_attrs(
                 model_url=model_url,
                 data_type=data_type,
                 gsd=gsd_val,
-                spatial_layout=spatial_layout,
                 source_data=source_data,
             )
         )

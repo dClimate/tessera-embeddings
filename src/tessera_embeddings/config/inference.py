@@ -506,6 +506,10 @@ class ModelFamily:
     #: Whether it runs only on its own worker image, never the deployment default: v1.1 stays on
     #: PyTorch 2.5.1 (ADR 025), so a run without its image entry is refused before provisioning.
     own_worker_image: bool
+    #: The Y and X dimension names of an output store it creates, in ``spatial:dimensions`` order.
+    #: v1.1 keeps ``northing``/``easting``, which its published store already uses; later models
+    #: take the conventional ``y``/``x``. An existing store keeps its own names whatever the model.
+    spatial_dims: tuple[str, str]
 
     @property
     def takes_norm_source(self) -> bool:
@@ -543,6 +547,7 @@ MODEL_FAMILIES: dict[str, ModelFamily] = {
         generation="v1",
         radar_free_s1_bin=None,
         own_worker_image=True,
+        spatial_dims=("northing", "easting"),
     ),
     "v2-large": ModelFamily(
         arch=_V2_LARGE_ARCH,
@@ -555,6 +560,7 @@ MODEL_FAMILIES: dict[str, ModelFamily] = {
         generation="v2",
         radar_free_s1_bin=1,
         own_worker_image=False,
+        spatial_dims=("y", "x"),
     ),
 }
 

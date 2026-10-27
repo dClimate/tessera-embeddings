@@ -20,7 +20,7 @@ from prefect import flow, get_run_logger
 
 from tessera_embeddings.config.inference import DEFAULT_MODEL_VERSION, ModelVersion
 from tessera_embeddings.config.paths import BucketPaths
-from tessera_embeddings.config.store_layout import GLOBAL
+from tessera_embeddings.config.store_layout import GLOBAL, spatial_dims_of
 from tessera_embeddings.storage.campaign import campaign_status
 from tessera_embeddings.storage.global_store import (
     _check_layout_matches,
@@ -148,12 +148,14 @@ def seed_global_store(
         # at fill or read against a store an operator was told was fine. One group suffices:
         # every group shares one axis and one layout, the same invariant the helper's own
         # single-group check rests on.
-        _check_layout_matches(probe, probe_name, GLOBAL)
+        # Against the store's own Y/X names, which a store keeps whatever the model seeding it.
+        layout = GLOBAL.with_spatial_dims(spatial_dims_of(probe))
+        _check_layout_matches(probe, probe_name, layout)
         # And COMPLETENESS, which the layout check does not cover: it iterates `layout.arrays`,
         # the six data arrays, while a seed also writes six coordinates beside them. An older
         # store missing `month` or `time_bnds` therefore passed the layout check and still
         # failed at fill or read — the exact case this block exists to catch.
-        if missing := missing_seeded_arrays(probe, GLOBAL):
+        if missing := missing_seeded_arrays(probe, layout):
             raise ValueError(
                 f"Zone group {probe_name!r} in {store_path} is missing {sorted(missing)}. The store "
                 f"was seeded by an older schema or a crashed run, so reporting this reseed as "

@@ -45,7 +45,8 @@ context_docs/
 │   ├── 026-v1-1-runs-the-gru-it-was-trained-with.md
 │   ├── 027-targeted-updates.md
 │   ├── 028-embed-every-pixel-with-an-optical-observation.md
-│   └── 029-one-flow-per-ingest.md
+│   ├── 029-one-flow-per-ingest.md
+│   └── 032-v2-stores-name-their-axes-y-and-x.md
 │
 ├── campaign/                      THE GLOBAL CAMPAIGN — start here
 │   ├── campaign-plan.md                        <- START HERE. What runs, with what settings, in
@@ -117,6 +118,9 @@ context_docs/
     ├── reading-the-published-store.md          the reader's side: no credentials needed, what
     │                                              conforms, measured speeds in two regions, and
     │                                              what would surprise a consumer
+    ├── conforming-to-the-zarr-conventions.md   which proj, spatial and geoemb versions the stores
+    │                                              follow, how that is validated (not draft-07),
+    │                                              and the fields deliberately left out
     ├── staging-identity-and-resume.md          what a run id identifies, and what resumes
     ├── registry-master.md                      the one registry consumers read: merged in place
     │                                              by every fill, tile by tile, never dropping an
