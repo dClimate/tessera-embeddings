@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Literal, final
+from typing import Literal, cast, final
 
 from tessera_embeddings.config.code_identity import source_identity
 from tessera_embeddings.config.time_windows import TimeWindow
@@ -21,12 +22,35 @@ logger = logging.getLogger(__name__)
 # contract (band order, raw integer DOY, all-observation bucketing) is identical
 # across versions, so loading/sampling/bucketing is version-agnostic.
 #
-# NOTE: distinct from the ``model_version`` string threaded into store
-# provenance attrs (``conventions.build_convention_attrs``), which is a
-# checkpoint *filename stem*, not a member of this literal.
+# Everything that differs between versions lives on one ModelFamily record per
+# version (MODEL_FAMILIES, below): code asks the record, never compares version
+# strings. ``model_version`` always names a member of this literal; a checkpoint's
+# filename stem, recorded on stores, is ``checkpoint_id``.
 ModelVersion = Literal["v1.1", "v2-large"]
 
 DEFAULT_MODEL_VERSION: ModelVersion = "v1.1"
+
+
+def ami_ssm_name_for_model(
+    ami_ssm_name: str, ami_ssm_name_by_model: Mapping[str, str] | None, model_version: ModelVersion
+) -> str:
+    """The worker-image parameter for a run of *model_version*: its entry in the map, else *ami_ssm_name*.
+
+    A deployment keeps a model on its own worker image this way, and each run picks the image from the
+    model it actually runs. A model whose record says ``own_worker_image`` is refused without an entry
+    rather than sent to the default image, and so is an unknown model, which would otherwise fall back
+    silently. Both refusals happen before anything is provisioned.
+    """
+    by_model = ami_ssm_name_by_model or {}
+    if unknown := sorted(set(by_model) - set(MODEL_FAMILIES)):
+        raise ValueError(f"ami_ssm_name_by_model names unknown models {unknown}; known: {list(MODEL_FAMILIES)}")
+    if model_family(model_version).own_worker_image and model_version not in by_model:
+        raise ValueError(
+            f"{model_version} runs on its own worker image (ADR 025), and ami_ssm_name_by_model has no "
+            f"{model_version!r} entry: pass the SSM parameter naming that image."
+        )
+    return by_model.get(model_version, ami_ssm_name)
+
 
 #: Prefix marking a staging run_id whose chunks were produced by a v2 student.
 #:
@@ -51,7 +75,7 @@ def run_id_prefix(model_version: ModelVersion) -> str:
 
     v1.1 gets no prefix, so every existing id, staging path and resume is unchanged.
     """
-    return V2_RUN_PREFIX if model_version != "v1.1" else ""
+    return model_family(model_version).run_id_prefix
 
 
 def staged_by_v2(run_id: str | None) -> bool:
@@ -85,7 +109,7 @@ def assert_run_id_matches_model(run_id: str | None, model_version: ModelVersion)
             f"those tiles as its own already-staged work. Mint it as "
             f"run_id_prefix({model_version!r}) + <uuid>."
         )
-    if staged_by_v2(run_id) != (model_version != "v1.1"):
+    if staged_by_v2(run_id) != (model_family(model_version).generation == "v2"):
         staged = "v2" if staged_by_v2(run_id) else "v1.1"
         # Both causes are named because they cannot be told apart from here, and that is the
         # whole reason the prefix exists: an id carries the encoder or nothing does. Saying only
@@ -111,7 +135,9 @@ def assert_run_id_matches_model(run_id: str | None, model_version: ModelVersion)
 # v1.1 ships two checkpoints keyed by norm_source. We default to "aws" because
 # the AWS norm stats match the pixel distributions produced by Earth Search
 # ingestion (which does not re-apply the S2 baseline correction).
-_CHECKPOINT_NAMES: dict[str, str] = {
+DEFAULT_NORM_SOURCE = "aws"
+
+_CHECKPOINT_NAMES: dict[str | None, str] = {
     "mpc": "tessera_v1_1_mpc_encoder.pt",
     "aws": "tessera_v1_1_aws_encoder.pt",
 }
@@ -126,25 +152,17 @@ _CHECKPOINT_NAMES: dict[str, str] = {
 V2_LARGE_CHECKPOINT_NAME = "v2_student_large.pt"
 
 
-def checkpoint_filename(
-    norm_source: str = "aws",
-    *,
-    model_version: ModelVersion = DEFAULT_MODEL_VERSION,
-) -> str:
+def checkpoint_filename(norm_source: str | None = None, *, model_version: ModelVersion) -> str:
     """Return the canonical checkpoint filename for *model_version*.
 
     Args:
-        norm_source: Which v1.1 checkpoint to use — ``"aws"`` (default) or
-            ``"mpc"``. Ignored for ``"v2-large"``, which ships one checkpoint.
-        model_version: Which model family — ``"v1.1"`` (default) or
-            ``"v2-large"``.
+        norm_source: Which checkpoint of a model that ships several (v1.1: ``"aws"``, the default
+            when ``None``, or ``"mpc"``). Ignored by a model that ships one.
+        model_version: Which model. Required: a default here is how a v2 fill came to load
+            v1.1's checkpoint.
     """
-    if model_version == "v2-large":
-        return V2_LARGE_CHECKPOINT_NAME
-    if norm_source not in _CHECKPOINT_NAMES:
-        valid = ", ".join(repr(k) for k in _CHECKPOINT_NAMES)
-        raise ValueError(f"Unknown norm_source: {norm_source!r}. Must be one of {valid}.")
-    return _CHECKPOINT_NAMES[norm_source]
+    family = model_family(model_version)
+    return family.checkpoints[family.norm_source(norm_source)]
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +219,7 @@ def _normalize_obs_checkpoints(checkpoints: tuple[int, ...]) -> tuple[int, ...]:
 # S1 ascending and descending have DIFFERENT stats — each orbit is normalised
 # with its own mean/std BEFORE concatenation. This matches v1.1 training preprocessing.
 
-_NORM_STATS: dict[str, dict[str, list[float]]] = {
+_NORM_STATS: dict[str | None, dict[str, list[float]]] = {
     "mpc": {
         "s2_mean": [
             2683.4553,
@@ -305,31 +323,14 @@ _V2_NORM_STATS: dict[str, list[float]] = {
 }
 
 
-def band_stats(
-    model_version: ModelVersion = DEFAULT_MODEL_VERSION,
-    norm_source: str | None = None,
-) -> dict[str, list[float]]:
-    """Return the ``{s2,s1_asc,s1_desc}_{mean,std}`` stats for a model version.
+def band_stats(model_version: ModelVersion, norm_source: str | None = None) -> dict[str, list[float]]:
+    """Return the ``{s2,s1_asc,s1_desc}_{mean,std}`` stats for *model_version*.
 
-    v1.1 selects between the MPC- and AWS-normalised stat sets; v2 students
-    hard-code one set and ignore *norm_source*.
-
-    Args:
-        model_version: Which model family the stats are for.
-        norm_source: v1.1 stat set — ``"aws"`` (the default when ``None``) or
-            ``"mpc"``.
+    v1.1 selects between the MPC- and AWS-normalised stat sets (``"aws"`` when *norm_source* is
+    ``None``); v2 students hard-code one set and ignore *norm_source*.
     """
-    if model_version == "v2-large":
-        return _V2_NORM_STATS
-    # `is None`, not truthiness — the same trap as `InferenceConfig.__post_init__`, and the
-    # validation below cannot catch it: an explicit "" has already become "aws" by then, which
-    # IS valid. A caller passing an empty string from untyped YAML would silently get AWS
-    # statistics for a checkpoint trained on the other set.
-    source = "aws" if norm_source is None else norm_source
-    if source not in _NORM_STATS:
-        valid = ", ".join(repr(k) for k in _NORM_STATS)
-        raise ValueError(f"Invalid norm_source: {source!r}. Must be one of {valid}.")
-    return _NORM_STATS[source]
+    family = model_family(model_version)
+    return family.stats[family.norm_source(norm_source)]
 
 
 # Module-level aliases for the v1.1 default (AWS) stats — kept for direct importers.
@@ -469,46 +470,128 @@ _V2_LARGE_ARCH = ModelArch(
     enable_qk_norm=False,
 )
 
-MODEL_ARCHS: dict[str, ModelArch] = {
-    "v1.1": _V11_ARCH,
-    "v2-large": _V2_LARGE_ARCH,
+# ---------------------------------------------------------------------------
+# One record per model
+# ---------------------------------------------------------------------------
+# Everything that differs between models is a field of its ModelFamily, so code asks the record
+# (``model_family(version).fusion_method``, say) rather than comparing version strings. A
+# comparison written while there were two models silently routes a third one to the wrong side;
+# a record without a field cannot be constructed.
+
+
+@final
+@dataclass(frozen=True)
+class ModelFamily:
+    """Everything that differs between models: one record per :data:`ModelVersion`."""
+
+    #: Architecture hyperparameters its checkpoint was trained with.
+    arch: ModelArch
+    #: PUBLIC encoder URL a store advertises as ``geoemb:model``: the model's externally
+    #: resolvable identity, deliberately not its checkpoint filename (that is ``checkpoint_id``).
+    encoder_url: str
+    #: Checkpoint filename by ``norm_source``. A model that ships one checkpoint keys it under
+    #: ``None`` and takes no norm source.
+    checkpoints: Mapping[str | None, str]
+    #: Band normalisation statistics, keyed like ``checkpoints``.
+    stats: Mapping[str | None, dict[str, list[float]]]
+    #: The only fusion its checkpoint loads with, or ``None`` when any of FUSION_METHODS does.
+    fusion_method: str | None
+    #: Which student generation: it decides the checkpoint loader and the staging run-id prefix,
+    #: since a staged tile is (H, W, 128) int8 whichever model wrote it and the prefix is the only
+    #: record a resume has.
+    generation: Literal["v1", "v2"]
+    #: The S1 bin a pixel with no radar is given: ``None`` keeps the smallest bucket (v1.1), and
+    #: v2 gives it one zero step (upstream ``s1_B = max(s1_bin, 1)``).
+    radar_free_s1_bin: int | None
+    #: Whether it runs only on its own worker image, never the deployment default: v1.1 stays on
+    #: PyTorch 2.5.1 (ADR 025), so a run without its image entry is refused before provisioning.
+    own_worker_image: bool
+    #: The Y and X dimension names of an output store it creates, in ``spatial:dimensions`` order.
+    #: v1.1 keeps ``northing``/``easting``, which its published store already uses; later models
+    #: take the conventional ``y``/``x``. An existing store keeps its own names whatever the model.
+    spatial_dims: tuple[str, str]
+
+    @property
+    def takes_norm_source(self) -> bool:
+        """Whether the model ships more than one checkpoint, chosen by ``norm_source``."""
+        return None not in self.checkpoints
+
+    @property
+    def run_id_prefix(self) -> str:
+        """The staging run-id prefix that records this model's generation; empty for v1."""
+        return V2_RUN_PREFIX if self.generation == "v2" else ""
+
+    def norm_source(self, requested: str | None) -> str | None:
+        """Resolve *requested*: the default when ``None``, refused when the model has no such set.
+
+        A model with one set ignores the request; ``InferenceConfig`` is where a norm source that
+        does not apply is refused. ``is None`` rather than truthiness, so an explicit ``""`` from
+        untyped YAML is refused instead of silently selecting the default statistics.
+        """
+        if not self.takes_norm_source:
+            return None
+        source = DEFAULT_NORM_SOURCE if requested is None else requested
+        if source not in self.checkpoints:
+            valid = ", ".join(repr(k) for k in self.checkpoints)
+            raise ValueError(f"Invalid norm_source: {source!r}. Must be one of {valid}.")
+        return source
+
+
+MODEL_FAMILIES: dict[str, ModelFamily] = {
+    "v1.1": ModelFamily(
+        arch=_V11_ARCH,
+        encoder_url="https://geotessera.org/model/1.1",
+        checkpoints=_CHECKPOINT_NAMES,
+        stats=_NORM_STATS,
+        fusion_method=None,
+        generation="v1",
+        radar_free_s1_bin=None,
+        own_worker_image=True,
+        spatial_dims=("northing", "easting"),
+    ),
+    "v2-large": ModelFamily(
+        arch=_V2_LARGE_ARCH,
+        # Published as a Hugging Face repo, not under the geotessera.org/model/<version> scheme.
+        # Replace if a canonical path is minted; seed and fill need only agree on this value.
+        encoder_url="https://huggingface.co/geotessera/TESSERA-V-2.0-2B-L",
+        checkpoints={None: V2_LARGE_CHECKPOINT_NAME},
+        stats={None: _V2_NORM_STATS},
+        fusion_method=V2_FUSION_METHOD,
+        generation="v2",
+        radar_free_s1_bin=1,
+        own_worker_image=False,
+        spatial_dims=("y", "x"),
+    ),
 }
 
-# --- Per-model deployment facts (same keys as MODEL_ARCHS) -----------------
-# Non-architecture properties of the model. Centralised because the failure
-# mode is a constant that silently keeps a PREVIOUS version's value.
 
-#: PUBLIC encoder URL a store advertises as ``geoemb:model`` — the externally
-#: resolvable identity of the model FAMILY, deliberately not the internal
-#: checkpoint filename (that is ``checkpoint_id``).
-MODEL_ENCODER_URLS: dict[str, str] = {
-    "v1.1": "https://geotessera.org/model/1.1",
-    # v2 Large is published as a Hugging Face repo, not under the
-    # geotessera.org/model/<version> scheme. Replace if a canonical path is
-    # minted; seed and fill need only agree on whatever is registered here.
-    "v2-large": "https://huggingface.co/geotessera/TESSERA-V-2.0-2B-L",
-}
-
-
-def encoder_url(model_version: ModelVersion = DEFAULT_MODEL_VERSION) -> str:
-    """Public ``geoemb:model`` URL for *model_version*.
-
-    Raises on unknown versions rather than defaulting: a store stamped with
-    another encoder's URL misidentifies itself to every downstream reader, and
-    does so silently.
-
-    ``conventions.expected_model_url()`` re-derives this URL at fill time
-    through here, with the fill's ``model_version``. A single module constant
-    there would check a v2 fill against v1.1's URL — rejecting a correct run,
-    or waving through a real mismatch when the seed carried the same stale
-    constant.
-    """
+def model_family(model_version: str) -> ModelFamily:
+    """The record for *model_version*. An unknown version is refused, never defaulted."""
     try:
-        return MODEL_ENCODER_URLS[model_version]
+        return MODEL_FAMILIES[model_version]
     except KeyError:
-        valid = ", ".join(repr(k) for k in MODEL_ENCODER_URLS)
-        msg = f"No public encoder URL registered for model_version={model_version!r}. Known: {valid}."
-        raise ValueError(msg) from None
+        valid = ", ".join(repr(k) for k in MODEL_FAMILIES)
+        raise ValueError(f"Invalid model_version: {model_version!r}. Must be one of {valid}.") from None
+
+
+def encoder_url(model_version: ModelVersion) -> str:
+    """Public ``geoemb:model`` URL for *model_version*."""
+    return model_family(model_version).encoder_url
+
+
+def model_version_for_encoder(url: str | None) -> ModelVersion:
+    """The model a store's ``geoemb:model`` names: the store, not the caller, says what fills it.
+
+    A store without the attr holds v1.1 embeddings, because ``geoemb:model`` postdates v1.1 and
+    predates v2. An unknown URL is refused rather than guessed.
+    """
+    if url is None:
+        return "v1.1"
+    for version, family in MODEL_FAMILIES.items():
+        if family.encoder_url == url:
+            return cast("ModelVersion", version)
+    valid = ", ".join(repr(f.encoder_url) for f in MODEL_FAMILIES.values())
+    raise ValueError(f"geoemb:model {url!r} names no known model. Known: {valid}.")
 
 
 # v1.1 observation-count buckets. Every pixel with k valid observations is resampled
@@ -620,7 +703,7 @@ class InferenceConfig:
                 ``"v2-large"``. Selects the architecture, the checkpoint payload
                 format, the band normalisation stats, and the native output
                 width. Architecture fields left at their v1.1 defaults are
-                replaced with the selected version's spec (``MODEL_ARCHS``); a
+                replaced with the selected version's spec (its ``ModelFamily``); a
                 conflicting explicit value is rejected.
 
         Model architecture (must match checkpoint):
@@ -823,20 +906,12 @@ class InferenceConfig:
                 f"optical_min_obs={self.optical_min_obs} refuses nothing — pass None for no "
                 "minimum optical depth, or a positive number of observations."
             )
-        if self.model_version not in MODEL_ARCHS:
-            valid = ", ".join(repr(k) for k in MODEL_ARCHS)
-            raise ValueError(f"Invalid model_version: {self.model_version!r}. Must be one of {valid}.")
+        family = model_family(self.model_version)
 
-        if self.model_version == "v1.1":
-            # `is None`, not truthiness. An explicit "" is falsy, so `or "aws"` accepted it and
-            # silently selected AWS statistics — pairing a checkpoint with the wrong band stats
-            # produces embeddings that are wrong and entirely well-formed. Only the UNSET case
-            # defaults; every supplied value goes through the check below.
-            if self.norm_source is None:
-                self.norm_source = "aws"
-            if self.norm_source not in _NORM_STATS:
-                valid = ", ".join(repr(k) for k in _NORM_STATS)
-                raise ValueError(f"Invalid norm_source: {self.norm_source!r}. Must be one of {valid}.")
+        if family.takes_norm_source:
+            # Pairing a checkpoint with the wrong band stats produces embeddings that are wrong and
+            # entirely well-formed, so only the UNSET case defaults (see ModelFamily.norm_source).
+            self.norm_source = cast('Literal["mpc", "aws"] | None', family.norm_source(self.norm_source))
         elif self.norm_source is not None:
             raise ValueError(
                 f"norm_source={self.norm_source!r} does not apply to model_version={self.model_version!r}: "
@@ -852,12 +927,12 @@ class InferenceConfig:
         if self.fusion_method not in FUSION_METHODS:
             valid = ", ".join(repr(k) for k in sorted(FUSION_METHODS))
             raise ValueError(f"Invalid fusion_method: {self.fusion_method!r}. Must be one of {valid}.")
-        if self.model_version != "v1.1" and self.fusion_method != V2_FUSION_METHOD:
+        if family.fusion_method is not None and self.fusion_method != family.fusion_method:
             raise ValueError(
                 f"fusion_method={self.fusion_method!r} does not apply to "
-                f"model_version={self.model_version!r}: the v2 students were distilled with "
-                f"{V2_FUSION_METHOD!r} fusion and their published dim_reducer is shaped for the "
-                f"concatenated pair, so the checkpoint would not load. Leave fusion_method unset."
+                f"model_version={self.model_version!r}: it was distilled with "
+                f"{family.fusion_method!r} fusion and its published dim_reducer is shaped for it, "
+                f"so the checkpoint would not load. Leave fusion_method unset."
             )
 
         self._apply_arch_defaults()
@@ -896,14 +971,16 @@ class InferenceConfig:
 
         The dataclass defaults describe v1.1, so for any other version a field
         still carrying its v1.1 default is treated as "unset" and replaced by the
-        version's value (``MODEL_ARCHS``). A value that matches neither the v1.1
-        default nor the version's spec was set deliberately and wrongly — the
-        checkpoint would fail to load — so it is rejected here instead.
+        version's value. A value that matches neither the v1.1 default nor the
+        version's spec was set deliberately and wrongly — the checkpoint would fail
+        to load — so it is rejected here instead. A version whose architecture IS
+        the defaults leaves the fields alone, so test configs can shrink v1.1.
         """
-        if self.model_version == "v1.1":
+        arch = model_family(self.model_version).arch
+        if arch == _V11_ARCH:
             return
         v11 = _V11_ARCH.as_dict()
-        for name, value in MODEL_ARCHS[self.model_version].as_dict().items():
+        for name, value in arch.as_dict().items():
             current = getattr(self, name)
             if current not in (value, v11[name]):
                 raise ValueError(

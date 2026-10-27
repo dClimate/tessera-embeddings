@@ -46,6 +46,13 @@ Why updates work the way they do is in
   lists the deployment names.
 - **Replace the example values** below (`s3://my-inputs`, `amazon-thin-2024`, `18S`, and so on) with
   your own.
+- **Update with the PyTorch the store was made with.** Another version shifts the embeddings
+  slightly, so the store refuses an update computed on a different one, and the error names both.
+  A v1.1 store needs PyTorch 2.5.1 with CUDA 12.1, on Python 3.12 (see
+  [`environment-setup.md`](environment-setup.md)), which a plain `uv sync` does not install.
+  `python -c "import torch; print(torch.__version__)"` shows what you have. The global flows pick the
+  right worker image for you. A store made before stores recorded their PyTorch takes the stack of
+  its first update, so check yours before that one.
 
 ## The update's name ties everything together
 
@@ -97,7 +104,8 @@ You need the config file of the run that made the store, and the store itself, a
    In `holes` mode, leave out `tiles`: only holes are inferred anyway. In `shards` mode, list the
    tiles to rewrite. Keep every other setting as it was; the store refuses settings that would
    change what its embeddings mean, such as the radar settings.
-3. **Run the same command as before,** with your config file:
+3. **Run the same command as before,** with your config file, on the store's PyTorch (see *Before
+   you start*):
 
    ```bash
    python -m tessera_embeddings.orchestration.runners.plain path/to/config.yaml
@@ -205,6 +213,25 @@ written plan cannot be changed:** to change it, write a new plan under a new nam
 Two more options: `--mask` names a land mask other than the campaign's `global`, and
 `--on-skip clear` makes a `shards` update blank a chosen tile where nothing embeds any more, instead
 of keeping it.
+
+**To add land the campaign's mask leaves out**, such as small islands its source registry omits, run
+the update under a mask of your own. A mask lives at `{paths.inputs}/masks/<name>.icechunk`.
+
+1. **Write a registry file:** the campaign's `registry.txt`, unchanged, with one line added for each
+   0.1° cell to cover. Name a cell `grid_<lon>_<lat>.tiff` from its centre, which sits 0.05° from
+   the cell's edges, for example `grid_-77.15_25.05.tiff`.
+2. **Build the mask** with the `build-land-mask-coverage` flow: a `name`, the file as
+   `registry_uri`, and `verify=false`. Verification checks that every cell in the registry exists in
+   the partner's delivery, which the new cells do not, and samples the contents of a few hundred.
+3. **Compare it with `global`.** It must keep every land tile and add only the tiles you meant. A
+   cell is about 11 km across, so it can make up to four tiles live, sea included.
+4. **Plan with `--mask <name>`, listing every tile the new mask makes live** in each zone-year. A new
+   tile is processed whole, and a live tile left out of the plan reads as missing to the validator.
+   Also list the existing tiles the new land reaches into, if their pixels were left thin.
+5. **Keep the mask and its registry file unchanged** for as long as the store is validated. Each
+   updated year records the name of the mask it ran under, and the validator judges the year against
+   that mask, as it stands then, as well as the campaign's. So never rebuild a mask under a name an
+   update has used: build a changed mask under a new name.
 
 **To embed pixels the depth rule left empty**, give the update a lower rule of its own. A global
 store has a depth rule, `optical_min_obs`: the minimum number of valid optical (Sentinel-2)

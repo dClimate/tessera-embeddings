@@ -86,7 +86,7 @@ from tessera_embeddings import (
 config = InferenceConfig(
     time_window=parse_time_window("June 2025"),
     s1_orbit="both",               # "ascending", "descending", or "both"
-    checkpoint_path=f"{paths.inputs}/models/{checkpoint_filename()}",
+    checkpoint_path=f"{paths.inputs}/models/{checkpoint_filename(model_version='v1.1')}",
     inputs_bucket=paths.inputs,
     output_bucket=paths.outputs,
     num_gpus=1,                    # 0 for CPU runs

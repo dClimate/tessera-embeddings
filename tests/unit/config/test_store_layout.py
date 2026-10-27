@@ -5,11 +5,12 @@ from __future__ import annotations
 import icechunk
 import numpy as np
 import pytest
+import xarray as xr
 import zarr
 
 from tessera_embeddings.config.inference import EMBEDDING_DIM, INFERENCE_CHUNK_SIZE
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
-from tessera_embeddings.config.store_layout import GLOBAL, OBS_COUNT_VARS, SHARD_PX, SINGLE
+from tessera_embeddings.config.store_layout import GLOBAL, OBS_COUNT_VARS, SHARD_PX, SINGLE, spatial_dims_of
 
 
 def test_global_embeddings_geometry():
@@ -111,3 +112,29 @@ def test_sharded_roundtrip_and_fill(tmp_path):
     assert np.allclose(r["scales"][0, 0:256, 0:256], sdata[0])
     assert (r["embeddings"][0, 300:400, 300:400, :] == 0).all()  # unwritten -> fill
     assert np.isnan(r["scales"][0, 300:400, 300:400]).all()
+
+
+@pytest.mark.parametrize(
+    ("declared", "scales_dims", "expected"),
+    [
+        (["y", "x"], ("time", "y", "x"), ("y", "x")),
+        (None, ("time", "y", "x"), ("y", "x")),  # pixel-index coordinates declare nothing
+        (None, ("y", "x"), ("northing", "easting")),  # malformed: the audit reports, not raises
+    ],
+)
+def test_spatial_dims_of_reads_the_declaration_then_the_scales_array(declared, scales_dims, expected):
+    group = zarr.group(store=zarr.storage.MemoryStore())
+    group.create_array("scales", shape=(1,) * len(scales_dims), dtype="f4", dimension_names=scales_dims)
+    if declared:
+        group.attrs["spatial:dimensions"] = declared
+    assert spatial_dims_of(group) == expected
+    assert spatial_dims_of(xr.open_zarr(group.store, consolidated=False)) == expected
+
+
+def test_with_spatial_dims_renames_every_array_and_keeps_the_geometry():
+    renamed = GLOBAL.with_spatial_dims(("y", "x"))
+    assert renamed.spatial_dims == ("y", "x")
+    assert renamed.arrays["embeddings"].dims == ("time", "y", "x", "band")
+    assert renamed.arrays["s2_month_covered"].dims == ("time", "y", "x", "month")
+    geometry = [(a.chunks, a.shards, a.dtype, a.codec) for a in GLOBAL.arrays.values()]
+    assert [(a.chunks, a.shards, a.dtype, a.codec) for a in renamed.arrays.values()] == geometry

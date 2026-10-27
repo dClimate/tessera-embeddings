@@ -139,7 +139,7 @@ def assemble_embeddings_task(
     log.info("Assembling %d chunks into %s", len(chunks), output_path)
     writer = ZarrWriter(staging_base)
 
-    model_version = checkpoint_to_version(config.checkpoint_path)
+    checkpoint_id = checkpoint_to_version(config.checkpoint_path)
     # Same builder the flow's preflight gate uses, so the manifest validated
     # before the cluster is the manifest written here.
     embedding_manifest = build_embedding_manifest(
@@ -158,8 +158,8 @@ def assemble_embeddings_task(
         log=log,
         time_window=time_window or config.time_window,
         tile_id=roi_name,
-        model_version=model_version,
-        encoder_version=config.model_version,
+        checkpoint_id=checkpoint_id,
+        model_version=config.model_version,
         manifest=embedding_manifest,
         n_workers=n_workers,
         get_credentials=get_credentials,
