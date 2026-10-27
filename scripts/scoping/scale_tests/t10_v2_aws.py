@@ -12,6 +12,12 @@ own in-region EC2 box, in the dev account, into throwaway repos under the run's 
   finalist by the library's own assembly code, ``shard_writer.write_year_shards`` over a
   ``StagedShardSource`` — every array a fill writes, not just the two that change — in two passes of
   opposite order. Records worker CPU (total, read, compress-and-upload), wall time and stored bytes.
+* ``mobile`` (the read box, under ``tc netem`` shaping). The mobile reads of ADR 031 §6 through a
+  browser-like client: no merged requests, 6 in flight, no split downloads, on a phone network
+  profile (:data:`NETWORKS`) the phase measures before it runs.
+
+``--study`` picks the arms and workloads, as in T9: ``band16`` (the default) is ADR 031's scoping,
+``narrow`` its 4-, 8- and variable-width band chunks for mobile readers.
 
 Run from the REPOSITORY ROOT, with ``T10="-m scripts.scoping.scale_tests.t10_v2_aws --run-id v2b
 --backend s3 --bucket <bucket>/<prefix> --scale bench"``::
@@ -20,6 +26,7 @@ Run from the REPOSITORY ROOT, with ``T10="-m scripts.scoping.scale_tests.t10_v2_
     python $T10 --tiles <dir> --phase read        # once per client
     python $T10 --tiles <dir> --phase tune        # full-vector pulls under reader settings
     python $T10 --phase assemble --staging s3://<staged run dir> --extent 34964,53383 --n-tiles 64 --workers 16
+    python $T10 --study narrow --phase mobile --network poor   # after `tc` shapes the box's link
     python $T10 --phase verify                    # the built stores hold C0's values
     python $T10 --phase verify --staging s3://<staged run dir> --n-tiles 64   # the assembled stores do
 """
@@ -33,7 +40,7 @@ import multiprocessing
 import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 import numpy as np
 import xarray as xr
@@ -42,8 +49,8 @@ import zarr
 from scripts.scoping.scale_tests import harness
 from scripts.scoping.scale_tests import variants as V
 from scripts.scoping.scale_tests._workers import _open_repo
-from scripts.scoping.scale_tests.t9_v2_layout import CLIENT, DIMS_READ, TILE, CountingStore
-from tessera_embeddings.storage.shard_writer import partition_round_robin
+from scripts.scoping.scale_tests.t9_v2_layout import CLIENT, DIMS_READ, DIRECT_READ, TILE, CountingStore
+from tessera_embeddings.storage import shard_writer
 
 logger = logging.getLogger("scale_tests.t10")
 
@@ -61,6 +68,14 @@ FINALISTS: list[V.Variant] = [
 ]
 POINTS = 300
 PASSES = 2
+#: Phone networks for the mobile phase (ADR 031 §6): added round trip in ms, downlink in Mbit/s. The box's link is
+#: shaped to one with `tc netem` + `ifb` before the phase runs; "poor" is Lighthouse's mobile profile.
+NETWORKS: dict[str, tuple[int, float]] = {"good": (40, 20.0), "poor": (150, 1.6)}
+#: The browser-like client of the mobile phase: zarrita.js's one request per inner chunk, a browser's 6 connections
+#: per host, and each object fetched in one GET.
+MOBILE_CLIENT: dict[str, Any] = {"zarr_config": DIRECT_READ, "max_in_flight": 6, "split_large_gets": False}
+#: Workloads that read codes alone: a preview renders them, and cosine similarity ignores the per-pixel scale.
+SCALE_FREE = ("maptile", "viewport")
 
 
 def _side(cfg: harness.RunConfig) -> int:
@@ -72,10 +87,14 @@ def _regions(side: int) -> dict[str, tuple[slice, slice]]:
     """The region workloads: a 1,000-px tile inside one shard, a 2x2-shard bulk, an 8x8-shard pull."""
     k = min(side, 8)
     off = TILE * min(3, side - 1)
+    corner = TILE * max(1, min(4, side - 1))  # a shard corner, for a viewport that spans four shards
     return {
         "tile": (slice(off + 500, off + 1500), slice(off + 700, off + 1700)),
         "bulk": (slice(TILE * min(2, side - 1), TILE * min(4, side)),) * 2,
         "pull8": (slice(0, TILE * k),) * 2,
+        # The mobile windows, placed as in T9: a 256² map tile on the 256 grid, a 1,024 x 2,048 phone viewport.
+        "maptile": (slice(off + 512, off + 768), slice(off + 768, off + 1024)),
+        "viewport": (slice(corner - 512, corner + 512), slice(corner - 1024, corner + 1024)),
     }
 
 
@@ -96,24 +115,20 @@ def _write_tiles(payload: dict[str, Any]) -> tuple[Any, float, int]:
     cpu = 0.0
     for sy, sx, n in payload["shards"]:
         ys, xs = slice(sy * TILE, (sy + 1) * TILE), slice(sx * TILE, (sx + 1) * TILE)
-        block, scales = np.load(tiles / f"emb_{n:03d}.npy"), np.load(tiles / f"scales_{n:03d}.npy")
-        if arm.band_first:
-            block = np.ascontiguousarray(block.transpose(2, 0, 1))
+        block = V.to_storage_order(emb, np.load(tiles / f"emb_{n:03d}.npy"))
+        scales = np.load(tiles / f"scales_{n:03d}.npy")
         c0 = time.process_time()
-        if arm.band_first:
-            emb[0:1, :, ys, xs] = block[None]
-        else:
-            emb[0:1, ys, xs] = block[None]
+        emb[V.window_key(emb, slice(0, 1), ys, xs)] = block[None]
         scl[0:1, ys, xs] = scales[None]
         cpu += time.process_time() - c0
     return fork, cpu, len(payload["shards"])
 
 
-def phase_build(cfg: harness.RunConfig, tiles: Path, workers: int) -> None:
+def phase_build(cfg: harness.RunConfig, arms: list[V.Variant], tiles: Path, workers: int) -> None:
     """Build every finalist as an Icechunk repo of side x side shards, tiles cycled over the grid."""
     side, n_tiles = _side(cfg), len(list(tiles.glob("emb_*.npy")))
     jobs = [(sy, sx, (sy * side + sx) % n_tiles) for sy in range(side) for sx in range(side)]
-    for arm in FINALISTS:
+    for arm in arms:
         name = f"{BUILT}/{arm.name}"
         harness.reset_store(cfg, name)
         repo = harness.create_repo(cfg, name)
@@ -126,7 +141,7 @@ def phase_build(cfg: harness.RunConfig, tiles: Path, workers: int) -> None:
         fork = session.fork()
         payloads = [
             {"fork": fork, "arm": dataclasses.asdict(arm), "tiles": str(tiles), "shards": part}
-            for part in partition_round_robin(jobs, workers)
+            for part in shard_writer.partition_round_robin(jobs, workers)
         ]
         t0 = time.monotonic()
         with ProcessPoolExecutor(len(payloads), mp_context=multiprocessing.get_context("spawn")) as ex:
@@ -138,6 +153,9 @@ def phase_build(cfg: harness.RunConfig, tiles: Path, workers: int) -> None:
         cpu_per_shard = sum(c for _, c, _ in results) / sum(n for _, _, n in results)
         harness.emit_metric(cfg, TEST, "build", "encode_cpu_s", cpu_per_shard, "s", variant=arm.name, kind="write")
         harness.emit_metric(cfg, TEST, "build", "bytes_written", n_bytes, "bytes", variant=arm.name, objects=n_obj)
+        # A direct reader fetches an array's manifest on its first chunk read; it grows with the objects referenced.
+        _, m_bytes = harness.object_stats(harness.store_uri(cfg, name) + "/manifests")
+        harness.emit_metric(cfg, TEST, "build", "manifest_bytes", m_bytes, "bytes", variant=arm.name, objects=n_obj)
         logger.info("built %s: %d objects, %.1f GB", arm.name, n_obj, n_bytes / 1e9)
 
 
@@ -145,16 +163,33 @@ def phase_build(cfg: harness.RunConfig, tiles: Path, workers: int) -> None:
 
 
 def cold_read(payload: dict[str, Any]) -> dict[str, Any]:
-    """One workload on one arm in a fresh process: wall, requests, store bytes, wire bytes."""
+    """One workload on one arm in a fresh process: wall, requests, store bytes, wire bytes.
+
+    A ``client`` payload (:data:`MOBILE_CLIENT`) reads as a browser does, and first reads one pixel of
+    a distant shard, timed as ``first_read_s``: that read fetches the manifest, which every cold
+    workload would otherwise carry in its own time.
+    """
     import psutil
 
-    zarr.config.set(payload.get("zarr_config") or {})
+    client = payload.get("client") or {}
+    zarr.config.set({**(payload.get("zarr_config") or {}), **client.get("zarr_config", {})})
     t_open = time.monotonic()
-    store = CountingStore(_open_repo(payload["store_uri"]).readonly_session(branch="main").store)
+    repo = _open_repo(
+        payload["store_uri"],
+        max_concurrent_requests=client.get("max_in_flight"),
+        split_large_gets=client.get("split_large_gets", True),
+    )
+    store = CountingStore(repo.readonly_session(branch="main").store, max_in_flight=client.get("max_in_flight"))
     grp = zarr.open_group(store, mode="r")["zone"]
     emb, scl = grp["embeddings"], grp["scales"]
     out: dict[str, Any] = {"open_wall_s": time.monotonic() - t_open}
     workload, dims = payload["workload"], payload["dims"]
+    if client:
+        t_first = time.monotonic()
+        _, ny, nx = scl.shape
+        V.read_window(emb, 0, ny - 1, nx - 1, slice(0, 1))
+        out["first_read_s"] = time.monotonic() - t_first
+        store.requests.clear()
 
     regions = {k: tuple(slice(*s) for s in v) for k, v in payload["regions"].items()}
     net0, t0 = psutil.net_io_counters().bytes_recv, time.monotonic()
@@ -178,7 +213,8 @@ def cold_read(payload: dict[str, Any]) -> dict[str, Any]:
     else:
         ys, xs = regions[workload]
         V.read_window(emb, 0, ys, xs, slice(0, dims))
-        scl[0, ys, xs]
+        if workload not in SCALE_FREE:
+            scl[0, ys, xs]
     # Per read, as T9 records it: a point workload is many reads, one per probe.
     reads = len(payload["points"]) if workload == "point" else 1
     out |= {
@@ -222,7 +258,14 @@ TUNE_WORKLOADS: list[tuple[str, int, dict]] = [
 ]
 
 
-def phase_read(cfg: harness.RunConfig, phase: str, tiles: Path, workloads: list, arms: list[V.Variant]) -> None:
+def phase_read(
+    cfg: harness.RunConfig,
+    phase: str,
+    tiles: Path,
+    workloads: list,
+    arms: list[V.Variant],
+    client: dict[str, Any] | None = None,
+) -> None:
     """Every workload, cold, arms interleaved, PASSES passes with the arm order reversed each pass."""
     regions = {k: [(s.start, s.stop) for s in v] for k, v in _regions(_side(cfg)).items()}
     points = _points(cfg, tiles) if any(w == "point" for w, _, _ in workloads) else []
@@ -236,6 +279,7 @@ def phase_read(cfg: harness.RunConfig, phase: str, tiles: Path, workloads: list,
                     "regions": regions,
                     "points": points if workload == "point" else [],
                     "zarr_config": zarr_config,
+                    "client": client,
                 }
                 r = harness.run_cold("scripts.scoping.scale_tests.t10_v2_aws.cold_read", payload)
                 tags = {"variant": arm.name, "client": CLIENT, "workload": workload, "dims": dims, "pass": p}
@@ -248,10 +292,12 @@ def phase_read(cfg: harness.RunConfig, phase: str, tiles: Path, workloads: list,
                 for k in ("read_p50_ms", "read_p95_ms", "read_p50_lo_ms", "read_p50_hi_ms"):
                     if k in r:
                         harness.emit_metric(cfg, TEST, phase, k, r[k], "ms", **tags)
-                harness.emit_metric(cfg, TEST, phase, "open_wall_s", r["open_wall_s"], "s", **tags)
+                for k in ("open_wall_s", "first_read_s"):
+                    if k in r:
+                        harness.emit_metric(cfg, TEST, phase, k, r[k], "s", **tags)
                 logger.info(
                     "[%s] pass %d %s/%d %s: %.2fs %d req",
-                    CLIENT,
+                    phase,
                     p,
                     workload,
                     dims,
@@ -259,6 +305,68 @@ def phase_read(cfg: harness.RunConfig, phase: str, tiles: Path, workloads: list,
                     r["wall_s"],
                     r["requests"],
                 )
+
+
+class Study(NamedTuple):
+    """The arms a study builds, control first, and the workloads each read phase runs."""
+
+    arms: list[V.Variant]
+    read: list[tuple[str, int, dict]]
+    points: list[tuple[str, int, dict]]
+    tune: list[tuple[str, int, dict]]
+    mobile: list[tuple[str, int, dict]]
+
+
+#: The mobile reads (ADR 031 §6), at the prefixes a preview or an on-device comparison takes.
+MOBILE_WORKLOADS: list[tuple[str, int, dict]] = [(w, d, {}) for w in SCALE_FREE for d in (4, 8)]
+#: The narrow finalists, fixed before T9 ran: the control, the accepted layout, band-split 8 and 4, 16-band shards
+#: with 4-band inner chunks, and two variable-width grids.
+NARROW_FINALISTS: list[V.Variant] = [
+    V.VARIANTS["v2_c0"],
+    V.ACCEPTED,
+    *(
+        V.arm(V.VARIANTS[g], codec="zstd1", scales_chunks=_S256)
+        for g in ("v2_b2f8", "v2_b2f4", "v2_b2f_i4", "v2_m2f", "v2_m2f_x4")
+    ),
+]
+STUDIES: dict[str, Study] = {
+    "band16": Study(FINALISTS, READ_WORKLOADS, POINT_WORKLOADS, TUNE_WORKLOADS, mobile=[]),
+    "narrow": Study(
+        NARROW_FINALISTS, READ_WORKLOADS + MOBILE_WORKLOADS, POINT_WORKLOADS, TUNE_WORKLOADS, MOBILE_WORKLOADS
+    ),
+}
+assert all(study.arms[0].name == "v2_c0" for study in STUDIES.values()), "every study runs the control first"
+
+
+def _probe_network(cfg: harness.RunConfig, phase: str, arm: V.Variant, network: str) -> None:
+    """Measure the round trip and downlink to the stores, and refuse to run unless ``network``'s shaping holds."""
+    rtt_want, mbps_want = NETWORKS[network]
+    fs, path = harness.fs_and_path(harness.store_uri(cfg, f"{BUILT}/{arm.name}") + "/chunks")
+    key, meta = max(fs.find(path, detail=True).items(), key=lambda kv: int(kv[1].get("size") or 0))
+    rtts = []
+    for _ in range(20):
+        t0 = time.monotonic()
+        fs.cat_file(key, start=0, end=1)
+        rtts.append(1e3 * (time.monotonic() - t0))
+    n = min(int(meta["size"]), 2 << 20)
+    t0 = time.monotonic()
+    fs.cat_file(key, start=0, end=n)
+    rtt, mbps = float(np.median(rtts)), 8 * n / 1e6 / (time.monotonic() - t0)
+    harness.emit_metric(cfg, TEST, phase, "probe_rtt_ms", rtt, "ms", network=network)
+    harness.emit_metric(cfg, TEST, phase, "probe_mbps", mbps, "Mbit/s", network=network)
+    logger.info("network %s: %.0f ms round trip, %.1f Mbit/s down", network, rtt, mbps)
+    if rtt < rtt_want / 2 or mbps > 2 * mbps_want:
+        raise SystemExit(
+            f"network {network!r} wants about {rtt_want} ms and {mbps_want} Mbit/s, measured {rtt:.0f} ms and "
+            f"{mbps:.1f} Mbit/s: shape the link with tc first"
+        )
+
+
+def phase_mobile(cfg: harness.RunConfig, phase: str, study: Study, tiles: Path, network: str) -> None:
+    """The mobile reads through the browser-like client, on the shaped link (a local smoke skips the probe)."""
+    if cfg.is_s3:
+        _probe_network(cfg, phase, study.arms[0], network)
+    phase_read(cfg, phase, tiles, study.mobile, study.arms, client=MOBILE_CLIENT)
 
 
 # ── assemble ─────────────────────────────────────────────────────────────────
@@ -393,35 +501,44 @@ def main() -> int:
     parser.add_argument("--staging", default=None, help="A staged run directory, for assemble and its verify.")
     parser.add_argument("--extent", default=None, help="The staged run's ROI extent 'ny,nx', for assemble.")
     parser.add_argument("--n-tiles", type=int, default=64)
+    parser.add_argument("--study", choices=STUDIES, default="band16", help="Which arms and workloads to run.")
+    parser.add_argument("--network", choices=NETWORKS, default=None, help="The shaped link, for --phase mobile.")
     args = parser.parse_args()
     cfg = harness.config_from_args(args)
     harness.configure_logging()
     phase, cfg = cfg.phase, dataclasses.replace(cfg, phase=None)  # run_phase filters on the name it is given
-    # Each phase runs the arms it can. The library's assembly writes zarr's default order and stages
-    # band-last tiles, so it carries neither a non-default write order nor a band-first array; those arms'
-    # write cost comes from `build`.
-    assembled = [a for a in FINALISTS if a.write_order == "morton" and not a.band_first]
+    study = STUDIES[args.study]
+    # Each phase runs the arms it can. The library's assembly writes zarr's default order, and writes a band-first
+    # array only where its shard writer says it can (the band-first prototype of ADR 031 sets WRITES_BAND_FIRST);
+    # the other arms' write cost comes from `build`.
+    band_first_ok = getattr(shard_writer, "WRITES_BAND_FIRST", False)
+    assembled = [a for a in study.arms if a.write_order == "morton" and (band_first_ok or not a.band_first)]
     if phase == "build":
-        harness.run_phase(cfg, TEST, "build", lambda: phase_build(cfg, args.tiles, args.workers))
+        harness.run_phase(cfg, TEST, "build", lambda: phase_build(cfg, study.arms, args.tiles, args.workers))
     elif phase == "read":
         harness.run_phase(
             cfg,
             TEST,
             f"read_{CLIENT}",
-            lambda: phase_read(cfg, f"read_{CLIENT}", args.tiles, READ_WORKLOADS, FINALISTS),
+            lambda: phase_read(cfg, f"read_{CLIENT}", args.tiles, study.read, study.arms),
         )
     elif phase == "tune":
-        arms = [a for a in FINALISTS if a.write_order == "morton"]
+        arms = [a for a in study.arms if a.write_order == "morton"]
         harness.run_phase(
-            cfg, TEST, f"tune_{CLIENT}", lambda: phase_read(cfg, f"tune_{CLIENT}", args.tiles, TUNE_WORKLOADS, arms)
+            cfg, TEST, f"tune_{CLIENT}", lambda: phase_read(cfg, f"tune_{CLIENT}", args.tiles, study.tune, arms)
         )
     elif phase == "points":
         harness.run_phase(
             cfg,
             TEST,
             f"points_{CLIENT}",
-            lambda: phase_read(cfg, f"points_{CLIENT}", args.tiles, POINT_WORKLOADS, FINALISTS),
+            lambda: phase_read(cfg, f"points_{CLIENT}", args.tiles, study.points, study.arms),
         )
+    elif phase == "mobile":
+        if not study.mobile or args.network is None:
+            raise SystemExit("--phase mobile needs a study with mobile workloads (--study narrow) and --network")
+        name = f"mobile_{args.network}_{CLIENT}"
+        harness.run_phase(cfg, TEST, name, lambda: phase_mobile(cfg, name, study, args.tiles, args.network))
     elif phase == "assemble":
         extent = tuple(int(v) for v in args.extent.split(","))
         harness.run_phase(
@@ -438,12 +555,12 @@ def main() -> int:
             prefix, arms = f"{ASSEMBLED}/p0", assembled
             shards = [parse_chunk_label(label) for label in _picks(args.staging, args.n_tiles)]
         else:  # the built set: two full cycles of the tiles, each tile in two places
-            prefix, arms = BUILT, FINALISTS
+            prefix, arms = BUILT, study.arms
             shards = [divmod(i, _side(cfg)) for i in range(min(16, _side(cfg) ** 2))]
         name = f"verify_{prefix.replace('/', '_')}"
         harness.run_phase(cfg, TEST, name, lambda: phase_verify(cfg, name, prefix, shards, arms))
     else:
-        raise SystemExit("--phase must be build, read, points, tune, assemble or verify")
+        raise SystemExit("--phase must be build, read, points, tune, mobile, assemble or verify")
     return 0
 
 

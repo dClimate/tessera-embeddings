@@ -1,10 +1,11 @@
 """Store-layout variants under test — the single source of truth for T1/T2/T3/T8/T9.
 
 Variant names are stable join keys in the metrics, so the registry holds the five v1.1 entries the
-read benchmark was specified over plus the four v2 geometries T9 scopes; extend it rather than
+read benchmark was specified over plus the v2 geometries T9 and T10 scope; extend it rather than
 forking per-test layouts. The v1.1 entries fix only chunk/shard geometry; the v2 ones may also vary
-the int8 codec, a band-planar transpose, the inner-chunk order within a shard and the `scales`
-geometry, which T9 derives as arms with :func:`arm`. dtype, fill and dim order stay constant.
+the int8 codec, a band-planar transpose, the inner-chunk order within a shard, the `scales`
+geometry, the dimension order and variable-width band shards, which T9 and T10 derive as arms with
+:func:`arm`. dtype and fill stay constant.
 """
 
 from __future__ import annotations
@@ -18,6 +19,10 @@ from zarr.codecs import BloscCodec, ShardingCodec, TransposeCodec, ZstdCodec
 
 from tessera_embeddings.config.inference import EMBEDDING_DIM
 from tessera_embeddings.config.store_layout import clamp_chunks_and_shards, pcodec_serializer
+
+#: Variable-width band shards (a rectilinear chunk grid) are opt-in in zarr, for reading as for writing. Switched on
+#: here because every script and cold subprocess imports this module; regular arrays are unaffected.
+zarr.config.set({"array.rectilinear_chunks": True})
 
 #: Canonical dimension order for embedding arrays (ADR D2: band varies fastest).
 DIMS: tuple[str, str, str, str] = ("time", "northing", "easting", "band")
@@ -47,6 +52,8 @@ class Variant:
     of ``chunks`` on every axis (Zarr v3 requirement). ``scales_chunks`` of ``None``
     co-chunks ``scales`` with the embeddings' spatial chunk. ``band_first`` stores the array as
     (time, band, northing, easting); ``chunks`` and ``shards`` are still written over :data:`DIMS`.
+    ``band_edges`` makes the shard grid variable-width along the band axis: each shard's band extent
+    in turn, summing to 128, each a whole number of inner chunks. ``shards`` then sets the other axes.
     """
 
     name: str
@@ -57,12 +64,17 @@ class Variant:
     write_order: str = "morton"
     scales_chunks: tuple[int, int, int] | None = None
     band_first: bool = False
+    band_edges: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         """Validate shard/chunk alignment and arm names so a bad entry fails loudly."""
+        if self.band_edges is not None and (
+            self.shards is None or sum(self.band_edges) != BAND or any(e % self.chunks[3] for e in self.band_edges)
+        ):
+            raise ValueError(f"{self.name}: band edges {self.band_edges} must cover {BAND} bands in whole inner chunks")
         if self.shards is not None:
             for axis, (shard, chunk) in enumerate(zip(self.shards, self.chunks, strict=True)):
-                if shard % chunk != 0:
+                if shard % chunk != 0 and not (axis == 3 and self.band_edges):
                     raise ValueError(f"{self.name}: shard {shard} not a multiple of chunk {chunk} on axis {axis}")
         if self.codec not in COMPRESSORS or self.write_order not in WRITE_ORDERS:
             raise ValueError(f"{self.name}: unknown codec {self.codec!r} or write order {self.write_order!r}")
@@ -88,6 +100,20 @@ VARIANTS: dict[str, Variant] = {
         # band blocks rather than interleaved per pixel, and every chunk is band-planar by construction.
         Variant("v2_c2f", (1, 512, 512, 16), _V2_SHARD, band_first=True),
         Variant("v2_b2f", (1, 512, 512, 16), (1, 2048, 2048, 16), band_first=True),
+        # Narrower band chunks for mobile readers (ADR 031 §6), all band-first. Band-split shards of 8 or 4 bands, at
+        # 512² or 256² inner chunks; 16-band shards holding 8- or 4-band inner chunks; and variable-width shards whose
+        # band extents follow the Matryoshka prefixes, with inner chunks as narrow as the narrowest shard (zarr
+        # requires one inner shape that divides every shard).
+        Variant("v2_b2f8", (1, 512, 512, 8), (1, 2048, 2048, 8), band_first=True),
+        Variant("v2_b2f4", (1, 512, 512, 4), (1, 2048, 2048, 4), band_first=True),
+        Variant("v2_b1f8", (1, 256, 256, 8), (1, 2048, 2048, 8), band_first=True),
+        Variant("v2_b1f4", (1, 256, 256, 4), (1, 2048, 2048, 4), band_first=True),
+        Variant("v2_b2f_i8", (1, 512, 512, 8), (1, 2048, 2048, 16), band_first=True),
+        Variant("v2_b2f_i4", (1, 512, 512, 4), (1, 2048, 2048, 16), band_first=True),
+        Variant("v2_m2f", (1, 512, 512, 4), _V2_SHARD, band_first=True, band_edges=(4, 4, 8, 16, 32, 64)),
+        Variant("v2_m1f", (1, 256, 256, 4), _V2_SHARD, band_first=True, band_edges=(4, 4, 8, 16, 32, 64)),
+        Variant("v2_m2f_x4", (1, 512, 512, 4), _V2_SHARD, band_first=True, band_edges=(4, 4, 8, 112)),
+        Variant("v2_m2f_x3", (1, 512, 512, 8), _V2_SHARD, band_first=True, band_edges=(8, 8, 112)),
     ]
 }
 
@@ -117,15 +143,39 @@ def arm(base: Variant, **changes: object) -> Variant:
     return dataclasses.replace(v, name="_".join(p for p in parts if p))
 
 
-def read_window(arr: zarr.Array, t: int, ys: slice | int, xs: slice | int, trailing: slice = slice(None)) -> np.ndarray:
-    """``arr[t]`` over a window as ``(y, x[, band])``, whatever the array's dimension order.
+#: ADR 031's accepted layout, as T9 and T10 build it: band-first, band-split 16-band shards, zstd at level 1.
+ACCEPTED = arm(VARIANTS["v2_b2f"], codec="zstd1", scales_chunks=(1, 256, 256))
 
-    The order is read from the array's dimension names (ADR 031), so one reader serves band-last
-    and band-first stores alike, and arrays with no band axis.
+
+def _band_first(arr: zarr.Array) -> bool:
+    """Whether ``arr`` is stored band-first, read from its dimension names (ADR 031)."""
+    return arr.metadata.dimension_names[1] == "band"
+
+
+def window_key(
+    arr: zarr.Array, t: int | slice, ys: slice | int, xs: slice | int, trailing: slice = slice(None)
+) -> tuple:
+    """The index of ``arr[t]`` over a window, in the array's own dimension order.
+
+    One index serves band-last and band-first stores alike, and arrays with no band axis, for reads
+    (:func:`read_window`) and for writes of a block put in order by :func:`to_storage_order`.
     """
-    if arr.metadata.dimension_names[1] != "band":
-        return np.asarray(arr[(t, ys, xs, trailing)[: arr.ndim]])
-    return np.moveaxis(np.asarray(arr[t, trailing, ys, xs]), 0, -1)
+    return (t, trailing, ys, xs) if _band_first(arr) else (t, ys, xs, trailing)[: arr.ndim]
+
+
+def read_window(arr: zarr.Array, t: int, ys: slice | int, xs: slice | int, trailing: slice = slice(None)) -> np.ndarray:
+    """``arr[t]`` over a window as ``(y, x[, band])``, whatever the array's dimension order."""
+    out = np.asarray(arr[window_key(arr, t, ys, xs, trailing)])
+    return np.moveaxis(out, 0, -1) if _band_first(arr) else out
+
+
+def to_storage_order(arr: zarr.Array, block: np.ndarray) -> np.ndarray:
+    """A ``(y, x, band)`` tile in ``arr``'s own dimension order, contiguous.
+
+    Called outside any timer: a band-first pipeline stages its tiles band-first, so a write's cost
+    excludes the reorder.
+    """
+    return np.ascontiguousarray(block.transpose(2, 0, 1)) if _band_first(arr) else block
 
 
 def dask_chunks(arr: zarr.Array) -> dict[str, int]:
@@ -133,11 +183,12 @@ def dask_chunks(arr: zarr.Array) -> dict[str, int]:
 
     Read from the array, as :func:`read_window` reads its order, so each arm is chunked to its own
     geometry: the control's 128-band chunk stays whole and a band-16 arm gets one task per band chunk.
+    The footprint is the first shard's extent on each axis, from ``write_chunk_sizes``, which unlike
+    ``.shards`` is defined for a variable-width shard grid.
     """
     names = arr.metadata.dimension_names
-    return dict(zip(names, arr.shards or arr.chunks, strict=True)) | {
-        "band": dict(zip(names, arr.chunks, strict=True))["band"]
-    }
+    footprint = {name: sizes[0] for name, sizes in zip(names, arr.write_chunk_sizes, strict=True)}
+    return footprint | {"band": dict(zip(names, arr.chunks, strict=True))["band"]}
 
 
 def embeddings_array_kwargs(variant: Variant, shape: tuple[int, int, int, int]) -> dict:
@@ -149,7 +200,14 @@ def embeddings_array_kwargs(variant: Variant, shape: tuple[int, int, int, int]) 
     library writes. ``transpose`` stores each inner chunk band-planar (time, band, y, x) through
     the core ``transpose`` codec; the logical dim order is unchanged. Chunks are clamped to the
     shape so a store smaller than one nominal chunk still creates cleanly.
+
+    A variable-width shard grid rounds the spatial extent up to whole inner chunks, so the array can
+    be larger than ``shape``: icechunk parses such a grid only with every axis listed edge by edge,
+    refusing the specification's bare-integer shorthand, and zarr then requires the edges to sum to
+    the extent with every edge a whole number of inner chunks. The margin is fill, never stored.
     """
+    if variant.band_edges is not None:
+        shape = tuple(math.ceil(n / c) * c for n, c in zip(shape, variant.chunks, strict=True))  # type: ignore[assignment]
     chunks, shards = clamp_chunks_and_shards(shape, variant.chunks, variant.shards)
     order = BAND_FIRST if variant.band_first else (0, 1, 2, 3)
     kwargs: dict = {
@@ -163,7 +221,12 @@ def embeddings_array_kwargs(variant: Variant, shape: tuple[int, int, int, int]) 
     }
     if variant.transpose:
         kwargs["filters"] = (TransposeCodec(order=(0, 3, 1, 2)),)
-    if shards is not None:
+    if variant.band_edges is not None and shards is not None:
+        # Every axis edge by edge (see above); a last spatial edge is the remainder, in whole inner chunks.
+        edges = [[size] * (n // size) + [n % size] * bool(n % size) for n, size in zip(shape, shards, strict=True)]
+        edges[3] = list(variant.band_edges)
+        kwargs["shards"] = tuple(edges[i] for i in order)
+    elif shards is not None:
         kwargs["shards"] = tuple(shards[i] for i in order)
     return kwargs
 
