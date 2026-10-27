@@ -1,7 +1,7 @@
 """The provenance record beside the registry: where its pieces live and the shape of its tables.
 
 Everything sits under ``<registry>/provenance/`` and is written once per run, never rewritten by
-another run (``context_docs/storage/registry-provenance-plan.md`` §2, §5)::
+another run (``context_docs/storage/registry-provenance-plan.md`` §3, Appendix A)::
 
     provenance/
     ├── granules/      zone=<Z>/year=<Y>/<run_id>.parquet  one row per granule per solar day per sensor
@@ -59,7 +59,7 @@ def pixel_sources_group(zone: str, year: int, run_id: str) -> str:
 
 
 def granules_schema() -> pa.Schema:
-    """One row per granule per solar day per sensor, in the day's fusion order (§5.1).
+    """One row per granule per solar day per sensor, in the day's fusion order (the plan's Appendix A).
 
     ``geometry`` is the footprint as the catalogue published it, WKB in WGS84 (GeoParquet 1.1); the
     four ``bbox_*`` columns let any Parquet reader filter without decoding it.
@@ -94,7 +94,7 @@ def granules_schema() -> pa.Schema:
 
 
 def shard_dates_schema() -> pa.Schema:
-    """One row per shard, sensor and date a run used (§5.2).
+    """One row per shard, sensor and date a run used (the plan's Appendix A).
 
     ``tile`` names the shard as the registry does (``chunk_<row>_<col>``). ``sources`` are the
     ``fusion_order`` values that supplied at least one of the shard's pixels that date, ascending;

@@ -1,6 +1,6 @@
 """Publish a run's provenance record beside the registry, after its shards commit and before its tag.
 
-Assembly's last data step (``context_docs/storage/registry-provenance-plan.md`` §4, §7). From the
+Assembly's last data step (``context_docs/storage/registry-provenance-plan.md`` §4, Appendix C). From the
 mosaics, read at the snapshots the actors read, it exports each slot's granule list as the
 ``granules`` table. From the staged shards it writes the ``shard_dates`` table, the run's group in
 the ``pixel_sources`` store and, for a holes update, ``update_pixels``. It then checks that the four
@@ -105,7 +105,7 @@ def publish_provenance(
     zone group's. The mosaics and the registry may sit in different buckets, hence two credentials.
 
     Raises:
-        ProvenanceCheckError: the record fails a §7 check, or the mosaics disagree about whether
+        ProvenanceCheckError: the record fails a publication check, or the mosaics disagree about whether
             they carry one.
     """
     mosaics = _provenance_mosaics(mosaic_snapshots, mosaic_credentials, s3_region)
@@ -312,7 +312,7 @@ def _copy_shard(
 def _check_plane(
     label: str, sensor: str, time: int, plane: np.ndarray, record: Mapping[str, Any], i: int, counts: Sequence[int]
 ) -> None:
-    """§7: a plane's count is its row's ``valid_px``, its values rank its ``sources``, and they exist."""
+    """A plane's count is its row's ``valid_px``, its values rank its ``sources``, and they exist."""
     sources, valid = record["sources"][i], record["valid_px"][i]
     where = f"{label} {sensor} slot {time}"
     if time >= len(counts):
@@ -357,7 +357,7 @@ def _publish_update_pixels(
 ) -> int:
     """A holes update's per-shard pixel masks, one boolean array per shard; returns how many.
 
-    §7 holds the planes to them: no plane may name a pixel the run was not asked to embed.
+    The checks hold the planes to them: no plane may name a pixel the run was not asked to embed.
     """
     masks = {
         label: read_array(staged[0], STAGED_UPDATE_PIXELS)
