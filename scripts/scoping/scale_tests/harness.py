@@ -446,7 +446,8 @@ def bind_study(cfg: RunConfig, test: str, study: str) -> None:
     Phase markers belong to a run and a test, not to a study, so a second study under the same run
     id would skip the phases the first one completed and read stores it never built. A run whose
     markers predate this record ran the default study, ``band16``. On S3 the run's mirrored record is
-    pulled down first, so a fresh host resuming a run sees it too.
+    pulled down first, so a fresh host resuming a run sees it too, and a new record is mirrored at once,
+    before any phase writes a store.
     """
     d = cfg.results_dir / test
     d.mkdir(parents=True, exist_ok=True)
@@ -457,6 +458,8 @@ def bind_study(cfg: RunConfig, test: str, study: str) -> None:
     if bound != study:
         raise SystemExit(f"run {cfg.run_id!r} holds --study {bound}; give --study {study} a run id of its own")
     record.write_text(study)
+    if cfg.is_s3:
+        _mirror_to_s3(cfg, test)
 
 
 def mark_phase_done(cfg: RunConfig, test: str, phase: str) -> None:

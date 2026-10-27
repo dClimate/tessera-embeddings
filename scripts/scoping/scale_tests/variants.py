@@ -204,7 +204,9 @@ def embeddings_array_kwargs(variant: Variant, shape: tuple[int, int, int, int]) 
     A variable-width shard grid rounds the spatial extent up to whole inner chunks, so the array can
     be larger than ``shape``: icechunk parses such a grid only with every axis listed edge by edge,
     refusing the specification's bare-integer shorthand, and zarr then requires the edges to sum to
-    the extent with every edge a whole number of inner chunks. The margin is fill, never stored.
+    the extent with every edge a whole number of inner chunks. The margin is fill, never stored. Only
+    ``embeddings`` is rounded, so xarray refuses a group whose extent is not whole inner chunks (its
+    other arrays disagree on the spatial lengths); the study reads these arrays through zarr.
     """
     if variant.band_edges is not None:
         shape = tuple(math.ceil(n / c) * c for n, c in zip(shape, variant.chunks, strict=True))  # type: ignore[assignment]
