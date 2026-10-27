@@ -1,12 +1,11 @@
 """Fill many zones of one campaign year through a SINGLE shared Ray cluster.
 
-The per-cell path (:mod:`.run_global_campaign` dispatching :mod:`.fill_zone_year`)
-provisions a cluster per (zone, year), re-paying ``ray up`` (~5-10 min), per-worker EC2
-bringup, the model-load cold start, and a fresh roll of the EC2 capacity dice every
-time. This flow amortizes all of it: ONE cluster, ONE set of actors, zones streamed
-**near-sequentially** — strictly ordered, the next zone's tiles interleaving only once
-the current zone's queue is exhausted, so zone tails never idle the fleet and actors are
-never re-created between zones. The stream itself (interleaving, ingest look-ahead,
+Filling one cell per run (:mod:`.fill_zone_year`) provisions a cluster per (zone, year),
+re-paying ``ray up`` (~5-10 min), per-worker EC2 bringup, the model-load cold start, and a
+fresh roll of the EC2 capacity dice every time. This flow amortizes all of it: ONE cluster,
+ONE set of actors, zones streamed **near-sequentially** — strictly ordered, the next zone's
+tiles interleaving only once the current zone's queue is exhausted, so zone tails never idle
+the fleet and actors are never re-created between zones. The stream itself (interleaving, ingest look-ahead,
 trailing assembly) belongs to
 :mod:`tessera_embeddings.orchestration.runners.sequential_fill`; this flow supplies the
 Prefect-facing pieces (deployment-backed ingest, fingerprinted run_ids, per-cell config,
@@ -15,7 +14,7 @@ ingest-starved gaps in the stream never shed workers.
 
 Cheap cells never touch the cluster: complete cells are retagged and all-ocean cells
 marked complete-empty *before* Ray is provisioned, and an all-ocean cell is never
-ingested at all (unlike the per-cell path). Live cells are ordered largest-first (clamped
+ingested at all. Live cells are ordered largest-first (clamped
 ``min(num_actors, live tiles)`` requests) so the autoscaled fleet only ever shrinks.
 
 Triage also preflights each live cell's OPTICAL source
@@ -51,7 +50,7 @@ from prefect.runtime import flow_run as flow_run_ctx
 from prefect.states import Cancelling
 
 from tessera_embeddings.config.fault_injection import WITHHOLD_WORK, FaultInjection, hard_exit_after_flush
-from tessera_embeddings.config.inference import DEFAULT_MODEL_VERSION, ami_ssm_name_for_model, checkpoint_filename
+from tessera_embeddings.config.inference import ami_ssm_name_for_model, checkpoint_filename, run_id_prefix
 from tessera_embeddings.config.ingest import IngestSettings
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.store_layout import SHARD_PX
@@ -79,10 +78,7 @@ from tessera_embeddings.orchestration.prefect.flows._ray_lifecycle import (
     deactivate,
     ray_cleanup_on_cancellation,
 )
-from tessera_embeddings.orchestration.prefect.flows.fill_zone_year import (
-    _assert_seeded_model_matches,
-    _optical_min_obs_from_store,
-)
+from tessera_embeddings.orchestration.prefect.flows.fill_zone_year import _optical_min_obs_from_store
 from tessera_embeddings.orchestration.prefect.flows.run_global_campaign import (
     _ingest_dispatch_params,
     _resolve_ami_id,
@@ -105,7 +101,7 @@ from tessera_embeddings.orchestration.runners.zone_fill import (
     zone_year_complete,
     zone_year_on_axis,
 )
-from tessera_embeddings.storage.global_store import open_global_repo
+from tessera_embeddings.storage.global_store import open_global_repo, store_model_version
 from tessera_embeddings.storage.object_store import delete_prefix
 from tessera_embeddings.storage.update import (
     applied_optical_min_obs,
@@ -150,8 +146,7 @@ class _DeploymentCellInputs:
     (``hold_for_backlog``). The hard ceiling is ``ingest_limit_name``, a
     Prefect global concurrency limit shared by every cluster; the clusters are separate flow
     runs, so only a server-side gate can bound them together. ``cleanup`` deletes only mosaics
-    THIS adapter produced (a cell never started here is someone else's input), matching the
-    parallel driver's ``did_ingest and cleanup_mosaics`` rule.
+    THIS adapter produced (a cell never started here is someone else's input).
 
     Each ingest run is created as a subflow of the fill (``_dispatch_and_wait``), so the UI lists
     it under the fill. Cancellation does not rely on that link: a crashed fill gets no
@@ -708,7 +703,6 @@ def fill_zones_sequential_flow(
     n_assembly_workers: int | None = None,
     allow_partial_window: bool = False,
     allow_s2_only: bool = False,
-    allow_model_mismatch: bool = False,
     allow_ingest_code_mismatch: bool = False,
     launch_pacing: bool = False,
     gpu_fallback_instance_types: list[str] | None = None,
@@ -747,9 +741,9 @@ def fill_zones_sequential_flow(
         ami_id: Pre-resolved AMI ID the campaign pinned, used for BOTH the shared cluster's
             image AND this flow's own staging fingerprint, so a mid-campaign re-bake can't
             split them. ``None`` (direct calls) resolves ``ami_ssm_name``.
-        ami_ssm_name_by_model: Per-model overrides of ``ami_ssm_name``. This flow runs the
-            default model, so that model's entry replaces ``ami_ssm_name``; a v1.1 run without one is
-            refused (ADR 025).
+        ami_ssm_name_by_model: Per-model overrides of ``ami_ssm_name``. The entry for the model
+            the store holds replaces ``ami_ssm_name``; a model on its own worker image (v1.1) without
+            one is refused (ADR 025).
         time_window_end: End month of the inference window as ``"Month Year"``; defaults to
             ``"December {year}"`` per cell (the calendar-year window). Only valid for a
             SINGLE-year ``cells`` list — one literal override cannot describe several years,
@@ -765,7 +759,7 @@ def fill_zones_sequential_flow(
         staging_code_identity: The campaign's code component for the staging fingerprint —
             the narrowed inference-source hash, with its ``force_staging_reuse`` /
             ``force_staging_restage`` overrides already applied — passed by
-            ``run_global_campaign`` so both fill strategies resume and restage identically.
+            ``run_global_campaign`` so its staging levers reach every cell.
             ``None`` (a direct call) falls back to the AMI-plus-tarball artifact identity.
         num_actors: Fleet-size ceiling; each cell requests ``min(num_actors, its live tiles)``.
         s1_orbit: ``"ascending"``, ``"descending"``, or ``"both"`` (resolved per cell against
@@ -785,8 +779,6 @@ def fill_zones_sequential_flow(
             PER-PIXEL only — zone-level SAR gates stay strict. Folded into each cell's staging
             run_id so a retry across a flipped flag never resumes mixed tiles. Quality is
             unvalidated — see the optional-S1 ADR. Default False.
-        allow_model_mismatch: Fill even when the seeded store advertises a different
-            encoder/checkpoint than this build (default rejects).
         allow_ingest_code_mismatch: Resume a store built by different ingest code (off by default).
         launch_pacing: Pace this cluster's EC2 launch requests against the account's shared
             RunInstances quota — a budget concurrent clusters share, except it is a request RATE
@@ -908,7 +900,6 @@ def fill_zones_sequential_flow(
     """
     log = get_run_logger()
     t0_flow = time.monotonic()
-    ami_ssm_name = ami_ssm_name_for_model(ami_ssm_name, ami_ssm_name_by_model, DEFAULT_MODEL_VERSION)
 
     # Validate BEFORE any side effect (triage reads, primed ingests, `ray up`): look_ahead < 0
     # sizes the ingest driver's thread pool (1 + look_ahead) at zero width, so no cell would
@@ -971,6 +962,14 @@ def fill_zones_sequential_flow(
     if plan is not None and (outside := [c for c in cells if c not in set(plan.cell_list())]):
         raise ValueError(f"Cell(s) {outside} are not in update {plan.name!r}")
     store_path = paths.global_store(store_name)
+    # The store decides the model, and with it the checkpoint, worker image and staging prefix: an
+    # update of the v1.1 store runs v1.1 whatever any default says.
+    model_version = store_model_version(
+        store_path,
+        get_credentials=icechunk_credentials_for(store_path, iam_icechunk_credentials),
+        region=s3_region,
+    )
+    ami_ssm_name = ami_ssm_name_for_model(ami_ssm_name, ami_ssm_name_by_model, model_version)
     # Where this run's mosaics and staging live: the campaign's, or the update's own.
     update_root = paths.update_root(update) if update is not None else None
     mosaic_root = update_root or paths.inputs
@@ -985,7 +984,7 @@ def fill_zones_sequential_flow(
             "takes its own calendar year) or dispatch one year per flow run."
         )
     land_mask_path = paths.land_mask_store(mask_name)
-    checkpoint_path = f"{paths.inputs.rstrip('/')}/models/{checkpoint_filename()}"
+    checkpoint_path = f"{paths.inputs.rstrip('/')}/models/{checkpoint_filename(model_version=model_version)}"
 
     @cache
     def _window_for(cell_year: int) -> TimeWindow:
@@ -1035,6 +1034,7 @@ def fill_zones_sequential_flow(
             s1_orbit=resolved_orbit,
             time_window=_window_for(cell_year),
             checkpoint_path=checkpoint_path,
+            model_version=model_version,
             inputs_bucket=paths.inputs,
             output_bucket=paths.outputs,
             chunk_size=SHARD_PX,  # 1 inference tile == 1 shard (D3)
@@ -1049,7 +1049,7 @@ def fill_zones_sequential_flow(
     # ------------------------------------------------------------------
     # Triage (cheap metadata reads, all before any cluster exists): cells needing
     # only a retag or an empty mark are settled right here — and an all-ocean cell
-    # is never ingested at all, unlike the per-cell path. An off-axis year is a
+    # is never ingested at all. An off-axis year is a
     # configuration error worth failing the whole run for.
     # ------------------------------------------------------------------
     retagged: list[dict[str, Any]] = []
@@ -1170,7 +1170,7 @@ def fill_zones_sequential_flow(
             config=_config_for(s1_orbit, year),
             num_actors=1,
             log=log,
-            run_id=f"{zone}-{year}-{plan.name}-none",
+            run_id=run_id_prefix(model_version) + f"{zone}-{year}-{plan.name}-none",
             get_credentials=iam_icechunk_credentials,
             s3_region=s3_region,
             update=plan.target(zone, year, root=cast(str, update_root)),
@@ -1188,7 +1188,7 @@ def fill_zones_sequential_flow(
         if plan is None and zone_year_complete(
             store_path, zone, year, get_credentials=iam_icechunk_credentials, s3_region=s3_region
         ):
-            retagged.append(_fill_no_cluster(zone, year, f"{zone}-{year}-retag"))
+            retagged.append(_fill_no_cluster(zone, year, run_id_prefix(model_version) + f"{zone}-{year}-retag"))
             continue
         if not zone_year_on_axis(store_path, zone, year, get_credentials=iam_icechunk_credentials, s3_region=s3_region):
             raise ValueError(
@@ -1211,7 +1211,7 @@ def fill_zones_sequential_flow(
         if n_tiles == 0:
             # No mosaic exists or is needed; run_id is provenance-only here (no staging to
             # fingerprint and no mosaic to read).
-            empty.append(_fill_no_cluster(zone, year, f"{zone}-{year}-empty"))
+            empty.append(_fill_no_cluster(zone, year, run_id_prefix(model_version) + f"{zone}-{year}-empty"))
             continue
         # Optical preflight, only when THIS flow produces the mosaics: a cell whose source
         # confirmably publishes nothing for its live land would otherwise pay for its ingest
@@ -1284,16 +1284,6 @@ def fill_zones_sequential_flow(
         log.info("No live cells — no Ray cluster needed")
         return _finish({**summary, "sequential": None})
 
-    # Fail loudly BEFORE provisioning Ray if the store was seeded for a
-    # different encoder/checkpoint than this build embeds with.
-    _assert_seeded_model_matches(
-        store_path,
-        build_checkpoint=checkpoint_filename(),
-        allow_model_mismatch=allow_model_mismatch,
-        get_credentials=iam_icechunk_credentials,
-        s3_region=s3_region,
-    )
-
     _ingest_params = partial(
         _ingest_dispatch_params,
         paths=paths,
@@ -1341,7 +1331,7 @@ def fill_zones_sequential_flow(
     # between them boots a different image than the prefix was fingerprinted against.
     ami_id = ami_id or _resolve_ami_id(ami_ssm_name, None)
     # The campaign's staging identity when it supplied one, and only otherwise the
-    # AMI-plus-tarball artifact identity. This is the DEFAULT fill strategy: recomputing the
+    # AMI-plus-tarball artifact identity. This is the campaign's fill: recomputing the
     # artifact identity here would undo the narrowing for the path that actually runs — any AMI
     # re-bake or tarball change would abandon every staged tile, and the campaign's documented
     # `force_staging_reuse` / `force_staging_restage` parameters would do nothing here. The
@@ -1388,6 +1378,7 @@ def fill_zones_sequential_flow(
                 allow_s2_only=allow_s2_only,
                 optical_min_obs=_store_optical_min_obs(),
                 code_identity=code_identity,
+                model_version=model_version,
                 get_credentials=iam_icechunk_credentials,
                 s3_region=s3_region,
                 update=update,

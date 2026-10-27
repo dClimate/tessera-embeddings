@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 import torch
 
-from tessera_embeddings.config.inference import MODEL_ARCHS, InferenceConfig, band_stats
+from tessera_embeddings.config.inference import InferenceConfig, band_stats, model_family
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.models.builder import _build_v2_inference_model, _verify_v2_args
 from tessera_embeddings.inference.models.student_v2 import (
@@ -315,5 +315,5 @@ def test_v2_runs_the_unmodified_inference_loop(v2_model, sample_chunk_data, t_s1
 
 
 def test_v2_arch_spec_is_registered() -> None:
-    assert MODEL_ARCHS["v2-large"].enable_qk_norm is False
-    assert MODEL_ARCHS["v2-large"].representation_dim == 128
+    assert model_family("v2-large").arch.enable_qk_norm is False
+    assert model_family("v2-large").arch.representation_dim == 128

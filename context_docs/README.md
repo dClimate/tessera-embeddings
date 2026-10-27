@@ -46,7 +46,8 @@ context_docs/
 │   ├── 027-targeted-updates.md
 │   ├── 028-embed-every-pixel-with-an-optical-observation.md
 │   ├── 029-one-flow-per-ingest.md
-│   └── 030-forward-pass-reorderings-ship-at-a-store-boundary.md
+│   ├── 030-forward-pass-reorderings-ship-at-a-store-boundary.md
+│   └── 032-v2-stores-name-their-axes-y-and-x.md
 │
 ├── campaign/                      THE GLOBAL CAMPAIGN — start here
 │   ├── campaign-plan.md                        <- START HERE. What runs, with what settings, in
@@ -96,6 +97,9 @@ context_docs/
 │   ├── v2-on-blackwell.md                      the g7e (RTX PRO 6000) against the fleet's cards,
 │   │                                              v2's fused add + LayerNorm, prep workers by host
 │   │                                              size, outputs across cards, g7e capacity
+│   ├── fresh-worker-start.md                   a new worker's first minutes are its EBS volume
+│   │                                              loading the AMI, and the mounted venv image that
+│   │                                              removes them
 │   └── the-fleet-and-the-work-source.md        a fleet lives for one `run_inference` call, so a
 │                                                  retry through a second call rebuilt one; the
 │                                                  wind-down, and why the fleet is not held
@@ -118,6 +122,9 @@ context_docs/
     ├── reading-the-published-store.md          the reader's side: no credentials needed, what
     │                                              conforms, measured speeds in two regions, and
     │                                              what would surprise a consumer
+    ├── conforming-to-the-zarr-conventions.md   which proj, spatial and geoemb versions the stores
+    │                                              follow, how that is validated (not draft-07),
+    │                                              and the fields deliberately left out
     ├── staging-identity-and-resume.md          what a run id identifies, and what resumes
     ├── registry-master.md                      the one registry consumers read: merged in place
     │                                              by every fill, tile by tile, never dropping an

@@ -110,6 +110,17 @@ class TestChunkSummaryLine:
         assert payload["total_s"] == 4.5
 
 
+def test_report_reaches_its_last_command_without_pollers() -> None:
+    """SSM runs the report as one script: a command that exits it hides every later section."""
+    if any(Path(p).exists() for p in ("/tmp/s3_poll.log", "/tmp/ram_poll.log", "/tmp/gpu_poll.csv")):
+        pytest.skip("poller output present on this machine")
+    shell_commands = [c for c in observe_cluster.REPORT_COMMANDS if not c.startswith("python3")]
+    result = subprocess.run(
+        ["sh", "-c", "\n".join([*shell_commands, "echo REPORT-END"])], capture_output=True, text=True
+    )
+    assert "REPORT-END" in result.stdout
+
+
 class TestPhaseParser:
     """observe_cluster's on-worker phase-table builder."""
 

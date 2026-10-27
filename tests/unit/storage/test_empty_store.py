@@ -112,7 +112,7 @@ def test_both_creation_paths_store_the_mosaic_codec(tmp_path) -> None:
     for store in ("real.zarr", "empty.zarr"):
         group = open_store_as_zarr_group(str(tmp_path / store))
         for name in _VARS:
-            assert [(type(c).__name__, c.cname.value, c.shuffle.value) for c in group[name].compressors] == [
+            assert [(type(c).__name__, c.cname, c.shuffle) for c in group[name].compressors] == [
                 ("BloscCodec", "lz4", "shuffle")
             ], (store, name)
 

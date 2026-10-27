@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import math
 from dataclasses import fields
+from typing import get_args
 
 import pytest
 
 from tessera_embeddings.config.inference import (
     DEFAULT_NUM_OBS_CHECKPOINTS,
+    MODEL_FAMILIES,
     TUNED_BATCH_SIZE,
     TUNED_GPU_GIB,
     InferenceConfig,
+    ModelVersion,
     _normalize_obs_checkpoints,
     ami_ssm_name_for_model,
     band_stats,
@@ -20,6 +23,7 @@ from tessera_embeddings.config.inference import (
     prefetch_depth,
 )
 from tessera_embeddings.config.time_windows import parse_time_window
+from tessera_embeddings.inference.sampling import _CACHED_RESAMPLERS, _RESAMPLERS
 
 
 @pytest.mark.parametrize(
@@ -45,30 +49,25 @@ def test_v1_1_never_falls_back_to_the_default_image(by_model, match) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_checkpoint_filename_aws() -> None:
-    assert checkpoint_filename("aws") == "tessera_v1_1_aws_encoder.pt"
+@pytest.mark.parametrize(
+    ("norm_source", "model", "expected"),
+    [
+        ("aws", "v1.1", "tessera_v1_1_aws_encoder.pt"),
+        ("mpc", "v1.1", "tessera_v1_1_mpc_encoder.pt"),
+        (None, "v1.1", "tessera_v1_1_aws_encoder.pt"),  # aws is v1.1's default
+        (None, "v2-large", "v2_student_large.pt"),
+        ("mpc", "v2-large", "v2_student_large.pt"),  # v2 ships one checkpoint per student size
+    ],
+)
+def test_checkpoint_filename(norm_source: str | None, model: ModelVersion, expected: str) -> None:
+    assert checkpoint_filename(norm_source, model_version=model) == expected
 
 
-def test_checkpoint_filename_mpc() -> None:
-    assert checkpoint_filename("mpc") == "tessera_v1_1_mpc_encoder.pt"
-
-
-def test_checkpoint_filename_default_is_aws() -> None:
-    assert checkpoint_filename() == checkpoint_filename("aws")
-
-
-def test_checkpoint_filename_invalid_raises() -> None:
-    with pytest.raises(ValueError, match="Unknown norm_source"):
-        checkpoint_filename("bogus")
-
-
-def test_checkpoint_filename_v2_large() -> None:
-    assert checkpoint_filename(model_version="v2-large") == "v2_student_large.pt"
-
-
-def test_checkpoint_filename_v2_ignores_norm_source() -> None:
-    """v2 ships one checkpoint per student size — no norm_source split."""
-    assert checkpoint_filename("mpc", model_version="v2-large") == checkpoint_filename(model_version="v2-large")
+def test_checkpoint_filename_refuses_an_unknown_norm_source_or_model() -> None:
+    with pytest.raises(ValueError, match="Invalid norm_source"):
+        checkpoint_filename("bogus", model_version="v1.1")
+    with pytest.raises(ValueError, match="Invalid model_version"):
+        checkpoint_filename(model_version="tessera_v1_1_aws_encoder")  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -173,10 +172,7 @@ def test_the_newest_field_is_the_last_field() -> None:
 
     Moving this assertion is the expected cost of adding a field, and it is worth paying: the
     tripwire fires on an insertion and on an append alike, so whoever moves it has to look at
-    where their field landed. It named allow_s2_only until 2026-08-13, then optical_min_obs, then
-    actor_request_headroom, and now model_version — which arrived on the v2-large branch INSERTED
-    second, before this rule existed on that branch, and was moved to the end during the merge
-    rather than left to rebind every positional argument after ``time_window``.
+    where their field landed.
     """
     assert fields(InferenceConfig)[-1].name == "model_version"
 
@@ -230,27 +226,18 @@ def test_v2_refuses_a_fusion_it_was_not_distilled_with() -> None:
     assert _minimal_config(model_version="v2-large", fusion_method="concat").fusion_method == "concat"
 
 
-def test_every_per_model_table_covers_every_model_version() -> None:
-    """`model_version` is validated against MODEL_ARCHS alone, so a version added there and
-    forgotten in one of the sibling tables passes config validation and fails later — a
-    KeyError inside an actor, or a wrong figure, depending on which table was missed.
-
-    Asserted as one set comparison rather than per table: the defect is a version that is in
-    some of them, and the tables are only meaningful together.
+def test_every_model_version_has_one_record_and_one_resampler() -> None:
+    """A version named in ``ModelVersion`` but missing a table passes type-checking and fails
+    later — a KeyError inside an actor. The records and the sampler tables must cover exactly the
+    same versions.
     """
-    from tessera_embeddings.config.inference import (
-        MODEL_ARCHS,
-        MODEL_ENCODER_URLS,
-    )
-    from tessera_embeddings.inference.sampling import _CACHED_RESAMPLERS, _RESAMPLERS
-
-    versions = set(MODEL_ARCHS)
+    versions = set(get_args(ModelVersion))
     for name, table in (
-        ("MODEL_ENCODER_URLS", MODEL_ENCODER_URLS),
+        ("MODEL_FAMILIES", MODEL_FAMILIES),
         ("sampling._RESAMPLERS", _RESAMPLERS),
         ("sampling._CACHED_RESAMPLERS", _CACHED_RESAMPLERS),
     ):
-        assert set(table) == versions, f"{name} does not cover the same versions as MODEL_ARCHS"
+        assert set(table) == versions, f"{name} does not cover the versions ModelVersion names"
 
 
 def test_an_explicitly_empty_norm_source_is_refused_not_defaulted() -> None:

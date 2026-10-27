@@ -87,10 +87,15 @@ requires, read from the schema rather than assumed, with a test pinning it.
 
 **The three conventions genuinely disagree about `name`, which is why a uniform rule was wrong.**
 The proj and spatial schemas require `"proj"` and `"spatial"`; the geoembeddings schema requires
-`"geoemb:"`, colon included, describing it as "key-prefixed". So `geoemb:` was right all along and
-is untouched. Anything matching these entries must therefore key on `uuid` — the one field all three
+`"geoemb:"`, colon included, describing it as "key-prefixed". So `geoemb:`'s name was right all
+along. Anything matching these entries must therefore key on `uuid` — the one field all three
 describe as permanently identifying the convention, and the only key that still matches an entry
-whose name is being migrated.
+whose name is being migrated. The conventions specification says the same: a `name` "MUST NOT be
+used by tools to identify the Convention".
+
+A later audit (PR #218) found the geoemb entry failing its own schema as well, and kept the bare
+names even though rioxarray still looks for `"spatial:"`; both are recorded in
+[conforming to the Zarr conventions](../storage/conforming-to-the-zarr-conventions.md).
 
 ## 4. Why the store is repaired rather than reissued or documented
 

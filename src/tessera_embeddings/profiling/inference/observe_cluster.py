@@ -235,15 +235,17 @@ RAM_SUMMARY_CMD = (
 # 1 s outbound-:443 socket summary. The HISTOGRAM is the point, not the mean: a binding cap
 # shows up as samples piling onto one value, and a mean over a run that is mostly inference
 # (few sockets) and briefly writing (many) lands in between and says nothing.
+# SSM runs REPORT_COMMANDS as one script, so a shell `exit` here would end the whole report.
 S3_SUMMARY_CMD = (
-    'F=/tmp/s3_poll.log; [ -f "$F" ] || { echo "no s3_poll data (pollers not started?)"; exit 0; }; '
+    'F=/tmp/s3_poll.log; if [ -f "$F" ]; then '
     'awk \'/^S3POLL/{split($3,a,"="); e=a[2]+0; split($4,b,"="); s=b[2]+0; '
     "n++; se+=e; ss+=s; h[e]++; if(e>mx)mx=e; if(s>smx)smx=s} "
     'END{if(n==0){print "no samples"; exit} '
     'printf "samples=%d  established:443 mean=%.1f max=%d | sending mean=%.1f max=%d\\n", '
     "n, se/n, mx, ss/n, smx; "
     'print "concurrency histogram (sockets -> seconds at that level):"; '
-    'for(k=0;k<=mx;k++) if(h[k]>0) printf "  %3d -> %d\\n", k, h[k]}\' "$F"'
+    'for(k=0;k<=mx;k++) if(h[k]>0) printf "  %3d -> %d\\n", k, h[k]}\' "$F"; '
+    'else echo "no s3_poll data (pollers not started?)"; fi'
 )
 
 # Runs on the worker: build the per-chunk phase table. Preferred source is the actors'
