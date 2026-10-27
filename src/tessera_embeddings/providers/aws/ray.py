@@ -572,9 +572,9 @@ def resolve_code_artifact_identity(
 ) -> str:
     """Immutable identity of the code a Ray fill will run, for the staging fingerprint.
 
-    Returns ``ami=<ami-id>`` and, when a source tarball overlays the AMI, appends
-    ``|tarball=<etag>`` — the same two artifacts :func:`provision_ray_cluster` boots
-    from (the AMI behind ``ami_ssm_name`` and ``s3://{code_bucket}/code/src{suffix}.tar.gz``).
+    Returns ``ami=<ami-id>``, then ``|env=<uri>`` when an environment image is named
+    (:func:`env_image_identity`), then ``|tarball=<etag>`` when a source tarball overlays the
+    AMI — the artifacts :func:`provision_ray_cluster` boots from.
 
     The global campaign folds this into each cell's staging ``run_id`` because
     ``code_suffix`` alone is NOT immutable: it is empty for a baked production AMI and only
@@ -607,10 +607,34 @@ def resolve_code_artifact_identity(
             the SSM pointer at different instants and disagree.
     """
     parts = [f"ami={ami_id if ami_id is not None else resolve_ami_id(ami_ssm_name, region)}"]
-    tarball = source_tarball_identity(code_bucket, code_suffix, region)
-    if tarball:
-        parts.append(tarball)
+    parts += [
+        term
+        for term in (
+            env_image_identity(code_bucket, code_suffix, region),
+            source_tarball_identity(code_bucket, code_suffix, region),
+        )
+        if term
+    ]
     return "|".join(parts)
+
+
+def env_image_identity(code_bucket: str | None, code_suffix: str, region: str) -> str:
+    """``env=<uri>`` for the environment image nodes mount, or ``""`` when none is named.
+
+    The deployment writes the image's URI to ``s3://{code_bucket}/code/env-image{code_suffix}.uri``
+    (``cluster.yaml.template``, ``setup_commands``). It belongs with the AMI term, not the
+    tarball's: the dependency closure it holds used to be baked into the AMI, so it changes the
+    identity exactly as a re-bake did. The URI is content-addressed by its writer, so it is
+    immutable; the pointer is not, and carries the tarball's residual window.
+    """
+    if not code_bucket:
+        return ""
+    s3 = boto3.client("s3", region_name=region)
+    try:
+        body = s3.get_object(Bucket=code_bucket, Key=f"code/env-image{code_suffix}.uri")["Body"].read()
+    except s3.exceptions.NoSuchKey:
+        return ""
+    return f"env={body.decode().strip()}"
 
 
 def source_tarball_identity(code_bucket: str | None, code_suffix: str, region: str) -> str:

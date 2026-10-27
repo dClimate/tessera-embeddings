@@ -147,7 +147,9 @@ def test_resolve_ray_config_writes_a_complete_yaml(tmp_path: Path) -> None:
 
 @mock_aws
 def test_resolve_ray_config_substitutes_the_code_bucket_when_given(tmp_path: Path) -> None:
-    """The tarball fetch survives, fully substituted, when a bucket IS supplied."""
+    """The tarball fetch and the environment image's pointer both survive, fully substituted,
+    when a bucket IS supplied.
+    """
     ami_param, _, _ = _seed_ssm_and_vpc()
 
     resolved = _resolve_ray_config(
@@ -162,9 +164,10 @@ def test_resolve_ray_config_substitutes_the_code_bucket_when_given(tmp_path: Pat
     try:
         config = yaml.safe_load(Path(resolved).read_text())
         fetch = [cmd for cmd in config["setup_commands"] if "s3 cp" in str(cmd)]
-        assert len(fetch) == 1
-        assert "s3://my-code-bucket/code/src-mybranch.tar.gz" in fetch[0]
-        assert "{CODE_BUCKET}" not in fetch[0] and "{CODE_SUFFIX}" not in fetch[0]
+        assert len(fetch) == 2
+        assert "s3://my-code-bucket/code/env-image-mybranch.uri" in fetch[0]
+        assert "s3://my-code-bucket/code/src-mybranch.tar.gz" in fetch[1]
+        assert not any("{CODE_BUCKET}" in cmd or "{CODE_SUFFIX}" in cmd for cmd in fetch)
     finally:
         cleanup_ray_tempfiles(resolved)
 
@@ -279,6 +282,28 @@ def test_resolve_code_artifact_identity_tracks_tarball_overwrite() -> None:
     # Re-bake the AMI (new value behind the same SSM name) → different identity.
     ssm.put_parameter(Name="/tessera/ray/ami-id", Value="ami-bbb", Type="String", Overwrite=True)
     assert resolve_code_artifact_identity("/tessera/ray/ami-id", code_bucket="code-bkt", region=REGION) != id_v2
+
+
+@mock_aws
+def test_resolve_code_artifact_identity_tracks_the_environment_image() -> None:
+    """A named environment image enters the identity between the AMI and the tarball, and
+    repointing it to a new image flips the identity as a re-bake does.
+    """
+    ssm = boto3.client("ssm", region_name=REGION)
+    s3 = boto3.client("s3", region_name=REGION)
+    ssm.put_parameter(Name="/tessera/ray/ami-id", Value="ami-aaa", Type="String")
+    s3.create_bucket(Bucket="code-bkt", CreateBucketConfiguration={"LocationConstraint": REGION})
+    s3.put_object(Bucket="code-bkt", Key="code/src-b.tar.gz", Body=b"v1")
+    etag = s3.head_object(Bucket="code-bkt", Key="code/src-b.tar.gz")["ETag"].strip('"')
+
+    def identity() -> str:
+        return resolve_code_artifact_identity("/tessera/ray/ami-id", "code-bkt", "-b", region=REGION)
+
+    assert identity() == f"ami=ami-aaa|tarball={etag}"
+    s3.put_object(Bucket="code-bkt", Key="code/env-image-b.uri", Body=b"s3://code-bkt/ray-env-images/env-1.img\n")
+    assert identity() == f"ami=ami-aaa|env=s3://code-bkt/ray-env-images/env-1.img|tarball={etag}"
+    s3.put_object(Bucket="code-bkt", Key="code/env-image-b.uri", Body=b"s3://code-bkt/ray-env-images/env-2.img")
+    assert "env=s3://code-bkt/ray-env-images/env-2.img" in identity()
 
 
 @mock_aws

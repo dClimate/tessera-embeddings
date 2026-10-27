@@ -60,12 +60,19 @@ cache (12.7 s, against 2.4 s warm). The base interpreter and the driver librarie
 
 ## 3. How it is wired
 
-The AMI build packs the venv into an image, uploads it under a unique name and writes that URI into the AMI
-at `/opt/tessera/env-image.uri`, so every AMI names exactly the venv it was built with. `cluster.yaml.template`
-then copies the image to the instance store and mounts it over `/opt/tessera/venv` before `ray start`. Any
-miss leaves the AMI's own venv in place: an AMI without the file, an instance whose instance store is not
-mounted at `/opt/dlami/nvme` within 60 s (the DLAMI's boot service mounts it, and can finish after Ray's setup
-begins), a venv already mounted, or a copy that fails.
+**Since 2026-10-27 the environment is not in the AMI at all.** The image holds Python 3.12 (uv's build) and the
+venv, laid out as they are mounted at `/opt/tessera`. The deployment uploads it under a content-addressed name
+and writes its URI to `s3://{CODE_BUCKET}/code/env-image{CODE_SUFFIX}.uri`, beside the source tarball.
+`cluster.yaml.template`'s first `setup_commands` entry copies it on every node, head included, onto the
+instance store where there is one and the root volume otherwise, and mounts it read-only at `/opt/tessera`.
+A node that cannot mount it fails its setup: with no venv on the AMI there is nothing to fall back to. An AMI
+that still carries a venv at `/opt/tessera/venv` skips the entry. Section 5 measures this path.
+
+Before that, each AMI build packed its own venv into an image and wrote the URI into the AMI at
+`/opt/tessera/env-image.uri`, and only workers mounted it, over `/opt/tessera/venv`; any miss left the AMI's
+venv in place. `worker_setup_commands` still does this for AMIs built that way. Moving the environment out let
+a dependency change ship without a re-bake, which spent most of its time waiting on the snapshot of the venv
+(yield-embeddings `context_docs/docker-build-caching/ci-build-speed.md`).
 
 ## 4. End to end on a built AMI
 
@@ -85,3 +92,7 @@ compile reads fewer files on first use than PyTorch 2.14.1 with one.
 Harness and raw results: `s3://global-tessera-inputs-dev/perf/g7e/` (`warm_probe.py` for the phase timings,
 `warm.sh` for the decomposition, `image_build.sh` and `image_test.sh` for the mounted image, `env_e2e.sh` and
 `e2emount/`, `e2econtrol/` for §4).
+
+## 5. End to end with the environment off the AMI
+
+PENDING: the dev test of the image-only path.

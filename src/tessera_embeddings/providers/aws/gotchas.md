@@ -16,7 +16,7 @@ are no hardcoded AWS account IDs in source control.
 - [The provisioning contract](#the-provisioning-contract)
 - [The cluster YAML template](#the-cluster-yaml-template)
 - [Subnet / AZ placement — multi-AZ with capacity failover](#subnet--az-placement--multi-az-with-capacity-failover)
-- [AMI baking pattern](#ami-baking-pattern)
+- [Worker image: an AMI plus an environment image](#worker-image-an-ami-plus-an-environment-image)
 - [Code sync (`sync_source_path`)](#code-sync-sync_source_path)
 - [CloudWatch logging](#cloudwatch-logging)
 - [Teardown — three layers of defence](#teardown--three-layers-of-defence)
@@ -125,40 +125,44 @@ for a run window should read cents.
 
 ---
 
-## AMI baking pattern
+## Worker image: an AMI plus an environment image
 
 Strongly recommended for production. The default `cluster.yaml.template`
-expects the worker AMI to have:
+runs Ray from `/opt/tessera/venv` and expects two artifacts:
 
-- NVIDIA drivers + CUDA (use the AWS Ubuntu 22.04 GPU DLAMI as base)
-- Python 3.12 venv at `/opt/tessera/venv` with all inference deps
-  (`torch`, `ray`, `tessera_embeddings`)
-- `aws` CLI for the optional source-tarball pull
+- **An AMI** with NVIDIA drivers and CUDA (the AWS Ubuntu 22.04 GPU DLAMI
+  as base) and the `aws` CLI. It changes rarely: nothing about the Python
+  environment is in it.
+- **An environment image**: an ext4 filesystem holding Python 3.12 and
+  every inference dependency (`torch`, `ray`, ...), laid out as it will be
+  mounted at `/opt/tessera` (`python/` and `venv/`). Upload it to S3 and
+  write its URI to `s3://{code_bucket}/code/env-image{code_suffix}.uri`,
+  beside the source tarball. Every node, head included, copies it and
+  mounts it read-only before Ray starts: onto the instance store where
+  there is one (`/opt/dlami/nvme`), else the root volume. A node that
+  cannot mount it fails its setup. The node's instance profile must be
+  able to read the image.
 
-**Bake rather than install on boot:** at 100–500 workers, `pip install`
+**Build rather than install on boot:** at 100–500 workers, `pip install`
 of `torch` + `ray` and their transitives dominates provisioning at ~5 min
-per worker; baking moves that to one CI job and nodes boot ready in ~1
-minute. The reference repo builds the AMI with Packer in CI and publishes
-its ID to SSM, so the cluster YAML resolves it at runtime — any baking
-tool works.
-
-For a different layout (venv path, install location), edit
-`head_start_ray_commands` / `worker_start_ray_commands` and
-`setup_commands`.
-
-**Optionally, ship the venv as a mountable image too.** A fresh EBS
-volume reads the AMI's snapshot block by block on first use, which holds
-a new worker's first forward back by minutes. If the AMI writes the S3
-URI of an ext4 image of its venv to `/opt/tessera/env-image.uri`,
-`worker_setup_commands` copies the image to the instance store
-(`/opt/dlami/nvme`) and mounts it read-only over the venv before
-`ray start`; without the file, nothing changes. The file is read per
-AMI, so each worker image a run can pick (`ami_ssm_name` and every
-`ami_ssm_name_by_model` entry, such as v1.1's PyTorch 2.5.1 image)
-carries its own venv image or none. The worker's instance profile must
-be able to read the image. The reference repo's Packer build produces
-both. Measurements:
+per worker. **Keep the environment out of the AMI:** a dependency change
+then ships as a new image in a few minutes, where re-baking an AMI waited
+on an EBS snapshot of the whole venv. The image also starts workers faster,
+because a fresh EBS volume reads an AMI's snapshot block by block on first
+use, holding a new worker's first forward back by minutes. Measurements:
 [`fresh-worker-start.md`](../../../../context_docs/inference/fresh-worker-start.md).
+The reference repo builds the image in CI, content-addressed by its
+dependency closure, and bakes the AMI with Packer.
+
+**An AMI that carries its own venv** at `/opt/tessera/venv` skips the
+image and runs its baked venv; that is how a per-model worker AMI (an
+`ami_ssm_name_by_model` entry, such as v1.1's PyTorch 2.5.1 one) keeps
+its own environment. If such an AMI also writes the URI of an image of
+its venv to `/opt/tessera/env-image.uri`, `worker_setup_commands`
+mounts that image over the venv on the instance store; without the
+file, nothing changes.
+
+For a different layout, edit `setup_commands` and the `*_start_ray_commands`.
 
 ---
 
@@ -168,10 +172,10 @@ Three supported paths for getting application code onto workers,
 selected by which of `code_bucket` / `sync_source_path` you set:
 
 1. **AMI-baked (default — neither set).** The source is already
-   inside the AMI's venv. Leave both `None`; the `{CODE_BUCKET}`
-   placeholder is left untouched (so a customised template should
-   omit or no-op the `aws s3 cp` line). Recommended for production
-   when source is versioned into the AMI.
+   inside the AMI's venv. Leave both `None`; the provider drops every
+   `setup_commands` entry naming `{CODE_BUCKET}`, which includes the
+   environment image's, so this path needs an AMI that carries its
+   own venv.
 2. **Pre-uploaded tarball (`code_bucket` only).** The provider
    rewrites the `setup_commands` `aws s3 cp` line to pull
    `s3://{code_bucket}/code/src{code_suffix}.tar.gz`, but does **not**
