@@ -95,8 +95,9 @@ Band-split band-first is faster than C0 in every pass on both clients.
 
 ## 3. Band-last against band-first
 
-Band-last is v1.1's order, `(time, northing, easting, band)`. Band-first is
-`(time, band, northing, easting)`. Within a band-first chunk, each band is a contiguous plane.
+Band-last is v1.1's order, `(time, northing, easting, band)`. Band-first is `(time, band, y, x)`,
+v2 naming its spatial axes `y` and `x` ([ADR 032](032-v2-stores-name-their-axes-y-and-x.md)).
+Within a band-first chunk, each band is a contiguous plane.
 
 | | band-last | band-first |
 |---|---|---|
@@ -148,12 +149,11 @@ At 16 dims it takes 0.05 s. A channel-first reader of a band-last store pays the
 staging validation, the shard writer and the update merge, the layout helpers, validation and the
 registry, and about 11 sites in yield-embeddings (coarsening and validation). Each must handle both
 orders, because the v1.1 store stays band-last. Some failures would be silent. `commit_tiles`, for
-example, labels a tile by chunk coordinates 1 and 2, which in band-first order are band and
-northing.
+example, labels a tile by chunk coordinates 1 and 2, which in band-first order are band and `y`.
 
 ## 4. Decision
 
-**Band-first, with band-split shards.** `embeddings` is `(time, band, northing, easting)`, stored as
+**Band-first, with band-split shards.** `embeddings` is `(time, band, y, x)`, stored as
 shards of 1 × 16 × 2,048 × 2,048 holding inner chunks of 1 × 16 × 512 × 512, compressed with zstd at
 level 1. Each tile is eight objects, one per 16-dimension group. `scales` and the per-tile arrays keep
 their v1.1 geometry.
@@ -193,7 +193,7 @@ band-first all the way through is the cleaner pipeline, and inference's part of 
 - **Inference stages v2 tiles band-first.** `ZarrWriter.write_chunk` writes the actor's
   `(y, x, band)` buffer through a transposed view on the writer thread. Staging validation and
   `StagedShardSource` read `(band, y, x)`, and the shard writer and the holes merge index band-first
-  arrays as `(time, band, northing, easting)`.
+  arrays as `(time, band, y, x)`.
 - **The chunk-sizing function moves out of `store_layout.py` first**, as its own change at a store
   boundary. It moves the ingest identity once, and keeps later layout changes from moving it.
 - **`_layout_band` takes the band count from the shard**, not the chunk. Otherwise a v2 store is
