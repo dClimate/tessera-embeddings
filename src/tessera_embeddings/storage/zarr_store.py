@@ -39,7 +39,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import fsspec
 import icechunk
@@ -858,7 +858,7 @@ _CHUNKS_UNSET = _ChunksUnset()
 
 # Accepted ``chunks`` values, mirroring ``xr.open_zarr``: a per-dimension mapping,
 # a uniform block size, ``"auto"``, or ``None`` (no dask graph).
-type ChunksArg = dict | int | str | None | _ChunksUnset
+type ChunksArg = dict | int | Literal["auto"] | None | _ChunksUnset
 
 
 def _open_readonly(
