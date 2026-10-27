@@ -144,7 +144,7 @@ alone removes the whole class, and the timestamp is no longer read at all.
 - One datastrip published twice still reduces to one copy.
 - Where a reprocessing omits a datastrip (the lacks row), the older copy of that datastrip is kept
   beside the newer ones. The day then mixes baselines across datastrips, never within one: coverage
-  outranks one baseline per pass ([ADR 029](../decisions/029-an-acquisition-is-one-datastrip-of-one-pass.md)).
+  outranks one baseline per pass ([ADR 034](../decisions/034-an-acquisition-is-one-datastrip-of-one-pass.md)).
 - A copy naming no readable pass or datastrip is kept on its own, and the run logs how many. None was
   found in the corpus.
 

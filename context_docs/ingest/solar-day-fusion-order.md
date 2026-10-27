@@ -131,14 +131,10 @@ in `stac.py` maps each name to its sort, and the same field sets `preserve_origi
 collection is sorted exactly when the loader keeps the order, and a collection that names none
 (Landsat, Planetary Computer's Sentinel-2) keeps odc's deterministic `(time, id)`.
 
-**What this replaced.** The flag was first set for every collection, which gave radar the flag's
-effect with no sort behind it: the winner of an overlap was whatever order the CMR granule query
-returned. It was then keyed on `has_scl`, the condition gating the cloud sort, which restored odc's
-`(time, id)` for radar and made the result reproducible. The reasoning recorded with that change
-held that radar had no quality ordering, so neither of two overlapping bursts was the worse
-observation and a radar sort would buy nothing. It missed the two-track case above. With every
-item of a day on one noon timestamp, `(time, id)` resolves by granule title, which hands every
-contested day to the lowest track number, whatever track supplies most of the pixel's year.
+**What this replaced.** The flag was first set for every collection, leaving radar in whatever
+order CMR returned, then keyed on `has_scl`, which gave radar odc's `(time, id)`: with every item of
+a day on one noon timestamp, that hands every contested day to the lowest track number. The
+reasoning then, that radar has no quality ordering, missed the two-track case above.
 
 The radar footprint join is unaffected by any of this: `normalize_to_solar_day` gives every item
 in a group the same canonical noon timestamp and odc reads `item.datetime`, so that join key never

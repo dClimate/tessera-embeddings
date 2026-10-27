@@ -11,12 +11,11 @@ Lives above the low-level primitives on purpose: it pulls together
 (:mod:`~tessera_embeddings.config.store_layout`), the coord/schema writers in
 :mod:`~tessera_embeddings.storage.empty_store`, and GeoZarr convention attrs.
 
-Convention placement follows the geoembeddings ``utm_zones`` layout: the encoder
-and quantization provenance (``geoemb:``) is written ONCE on the root group
-(:func:`~tessera_embeddings.storage.conventions.build_geoemb_root_attrs`, with
-``spatial_layout="utm_zones"``), while each zone group carries only its own
-``proj:``/``spatial:`` (``build_convention_attrs(..., include_geoemb=False)``) —
-their CRS and grid differ by zone.
+Convention placement: the encoder and quantization provenance (``geoemb:``) is written
+ONCE on the root group
+(:func:`~tessera_embeddings.storage.conventions.build_geoemb_root_attrs`), while each zone
+group carries only its own ``proj:``/``spatial:``
+(``build_convention_attrs(..., include_geoemb=False)``) — their CRS and grid differ by zone.
 """
 
 from __future__ import annotations
@@ -29,7 +28,13 @@ import icechunk
 import numpy as np
 import zarr
 
-from tessera_embeddings.config.inference import ModelVersion
+from tessera_embeddings.config.inference import (
+    DEFAULT_MODEL_VERSION,
+    ModelVersion,
+    checkpoint_filename,
+    model_family,
+    model_version_for_encoder,
+)
 from tessera_embeddings.config.store_layout import (
     CARRIED_VARS,
     GLOBAL,
@@ -37,8 +42,14 @@ from tessera_embeddings.config.store_layout import (
     MONTHS_IN_YEAR,
     REQUIRED_VARS,
     StoreLayout,
+    spatial_dims_of,
 )
-from tessera_embeddings.storage.conventions import build_convention_attrs, build_geoemb_root_attrs
+from tessera_embeddings.storage.conventions import (
+    assert_model_matches,
+    build_convention_attrs,
+    build_geoemb_root_attrs,
+    stamp_array_conventions,
+)
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
 from tessera_embeddings.storage.time_axis import (
     CAMPAIGN_YEARS,
@@ -99,6 +110,29 @@ def open_global_repo(
             anonymous=anonymous,
         )
     )
+
+
+def store_model_version(
+    store_path: str,
+    *,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+    region: str | None = None,
+) -> ModelVersion:
+    """The model a global store holds, from its root's ``geoemb:model``, and so the model that fills it.
+
+    Resolved once per fill, campaign or update, before anything is provisioned, and everything
+    model-specific follows from it: the checkpoint, the worker image, the staging run-id prefix and
+    the inference config. A store is seeded for one model and its checkpoint and never mixes two, so
+    the store, not a code default, is the authority. A root naming no known model, or another
+    checkpoint than its model's, is refused here rather than after the ingest has been paid for.
+    """
+    repo = open_global_repo(store_path, get_credentials=get_credentials, region=region)
+    attrs = zarr.open_group(repo.readonly_session(branch="main").store, mode="r").attrs
+    model_version = model_version_for_encoder(cast("str | None", attrs.get("geoemb:model")))
+    assert_model_matches(
+        attrs, model_version, checkpoint_filename(model_version=model_version), where=f"global store {store_path}"
+    )
+    return model_version
 
 
 def set_saved_manifest_preload(
@@ -172,7 +206,7 @@ def create_layout_arrays(
     zone-group seeder here and the single-ROI schema creator in
     :mod:`tessera_embeddings.inference.assembly`, so the two write paths cannot
     diverge in how a layout becomes on-disk arrays. ``sizes`` maps dim name →
-    extent (``{"time": ..., "northing": ..., "easting": ..., "band": ...}``).
+    extent, keyed by the layout's own dimension names (``{"time": ..., y: ..., x: ..., "band": ...}``).
     """
     for var in variables:
         array_layout = layout.for_var(var)
@@ -252,9 +286,8 @@ def _layout_band(layout: StoreLayout) -> int:
 def _zone_attrs(spec: ZoneSpec, north: np.ndarray, east: np.ndarray, layout: StoreLayout) -> dict:
     """Per-zone group attrs: campaign markers + per-zone ``proj:``/``spatial:``.
 
-    Encoder/quantization provenance (``geoemb:``) is NOT here — in the geoembeddings
-    ``utm_zones`` layout it lives once on the root group (see :func:`_root_attrs`);
-    each zone group carries only its own CRS/grid conventions.
+    Encoder/quantization provenance (``geoemb:``) is NOT here — it lives once on the root
+    group (see :func:`_root_attrs`); each zone group carries only its own CRS/grid conventions.
     """
     attrs: dict = {
         "crs": spec.crs,
@@ -277,6 +310,7 @@ def _zone_attrs(spec: ZoneSpec, north: np.ndarray, east: np.ndarray, layout: Sto
             total_y=spec.height,
             total_x=spec.width,
             embedding_dim=_layout_band(layout),
+            spatial_dims=layout.spatial_dims,
             y_coords=north,
             x_coords=east,
             include_geoemb=False,  # geoemb: is stated once on the root, not per zone
@@ -287,14 +321,13 @@ def _zone_attrs(spec: ZoneSpec, north: np.ndarray, east: np.ndarray, layout: Sto
 
 def _root_attrs(
     layout: StoreLayout,
-    model_version: str | None,
+    *,
+    model_version: ModelVersion,
     optical_min_obs: int | None,
-    encoder_version: ModelVersion | None = None,
 ) -> dict:
     """Root-group attrs for the multi-zone campaign store: geoemb: stated once.
 
-    The geoembeddings ``utm_zones`` layout puts the encoder/quantization provenance
-    on the root (identical across all zones), with ``spatial_layout="utm_zones"``.
+    The encoder/quantization provenance is identical across all zones, so it lives on the root.
 
     ``optical_min_obs`` is the minimum valid optical observations a pixel needed to be
     embedded at all, or ``None`` for a store that embedded every pixel it had input for. On the
@@ -304,15 +337,14 @@ def _root_attrs(
     store advertises. Absent rather than zero when there was no rule — zero is a threshold that
     refuses nothing, a different statement from never having had one.
     """
-    # The FAMILY, separate from the checkpoint stem. Without it a v2 store is stamped with
-    # v1.1's public URL — wrong provenance, and the cross-family gate then refuses the very
-    # append the store was seeded for.
+    # geoemb:model is what every later fill reads to decide which model fills this store, so a v2
+    # store stamped with v1.1's URL would be filled by v1.1. The checkpoint is the model's own: every
+    # fill runs it, so a store recording any other could never be filled.
     attrs = build_geoemb_root_attrs(
         embedding_dim=_layout_band(layout),
-        spatial_layout="utm_zones",
         gsd=float(PIXEL_M),  # every zone is the same fixed-metre grid; the root has none to derive from
+        checkpoint_id=checkpoint_filename(model_version=model_version),
         model_version=model_version,
-        encoder_version=encoder_version,
     )
     if optical_min_obs is not None:
         attrs["optical_min_obs"] = int(optical_min_obs)
@@ -356,7 +388,7 @@ def missing_seeded_arrays(node: zarr.Group, layout: StoreLayout) -> set[str]:
     per spec while creating, and `seed_global_store` asks it on the path where nothing is created
     at all, which otherwise applies no completeness check.
     """
-    expected = set(layout.arrays) | {"time", "northing", "easting", "band", "month", "time_bnds"}
+    expected = set(layout.arrays) | {"time", *layout.spatial_dims, "band", "month", "time_bnds"}
     return expected - set(node.array_keys())
 
 
@@ -429,7 +461,7 @@ def check_root_identity(
     root_attrs: Mapping[str, object],
     *,
     layout: StoreLayout,
-    model_version: str | None = None,
+    model_version: ModelVersion,
     optical_min_obs: int | None = None,
 ) -> None:
     """Raise unless *root_attrs* already publishes the identity this seed requests.
@@ -437,7 +469,7 @@ def check_root_identity(
     Split out of :func:`seed_zone_groups` so the two callers that must not disagree share one
     implementation. The seed itself runs it before creating groups; the ``seed_global_store``
     flow runs it on the path where every zone already exists and no groups are created — without
-    it, a rerun requesting a different checkpoint or minimum-depth rule reports a clean seed and
+    it, a rerun requesting a different model or minimum-depth rule reports a clean seed and
     leaves the old identity in place for the campaign to follow.
 
     A store with no identity stamped yet passes: the first seed is what stamps it.
@@ -449,7 +481,7 @@ def check_root_identity(
         )
     if "geoemb:model" not in root_attrs:
         return
-    new_root = _root_attrs(layout, model_version, optical_min_obs)
+    new_root = _root_attrs(layout, model_version=model_version, optical_min_obs=optical_min_obs)
     identity = ("geoemb:model", "geoemb:dimensions", "geoemb:data_type", "checkpoint_id", "optical_min_obs")
     mismatched = {k: (root_attrs.get(k), new_root.get(k)) for k in identity if root_attrs.get(k) != new_root.get(k)}
     if mismatched:
@@ -464,7 +496,7 @@ def stamp_root_identity(
     repo: icechunk.Repository,
     *,
     layout: StoreLayout = GLOBAL,
-    model_version: str | None = None,
+    model_version: ModelVersion,
     optical_min_obs: int | None = None,
     commit_msg: str | None = None,
 ) -> str | None:
@@ -477,7 +509,7 @@ def stamp_root_identity(
     Exists because "already stamped" and "seeding created no groups" are different questions and
     a store seeded before the root carried an identity answers no to both. :func:`seed_zone_groups`
     stamps as a side effect of creating groups, so a store with all 120 already present never
-    reaches that line: the flow would report a clean seed having recorded neither the checkpoint
+    reaches that line: the flow would report a clean seed having recorded neither the model
     nor the depth rule the operator asked for, after which the fill-side gates — which pass on an
     ABSENT attr — let anything write.
 
@@ -489,7 +521,7 @@ def stamp_root_identity(
     root = zarr.open_group(session.store, mode="a")
     if "geoemb:model" in root.attrs:
         return None
-    root.attrs.update(_root_attrs(layout, model_version, optical_min_obs))
+    root.attrs.update(_root_attrs(layout, model_version=model_version, optical_min_obs=optical_min_obs))
     return session.commit(commit_msg or "stamp root identity on an already-seeded store")
 
 
@@ -499,7 +531,7 @@ def seed_zone_groups(
     *,
     years: tuple[int, ...] = CAMPAIGN_YEARS,
     layout: StoreLayout = GLOBAL,
-    model_version: str | None = None,
+    model_version: ModelVersion = DEFAULT_MODEL_VERSION,
     optical_min_obs: int | None = None,
     commit_msg: str | None = None,
 ) -> str:
@@ -524,7 +556,7 @@ def seed_zone_groups(
         )
     session = repo.writable_session("main")
     root = zarr.open_group(session.store, mode="a")
-    # geoemb: provenance is stated once on the root (utm_zones layout). It is WRITE-ONCE: a later
+    # geoemb: provenance is stated once on the root. It is WRITE-ONCE: a later
     # fill's model gate (fill_zone_year) trusts it to decide which encoder may write, so an
     # incremental seed must NOT silently re-stamp it with a different encoder — that would let
     # already-seeded/filled zones (encoder A) mix with a new one (encoder B) under a root now
@@ -532,7 +564,12 @@ def seed_zone_groups(
     # rejected. (Software build_version may drift and is not part of the identity.) Both that
     # refusal and the zero-is-not-a-rule check live in `check_root_identity`, which the
     # seed_global_store flow also calls on the every-zone-exists path.
-    check_root_identity(root.attrs, layout=layout, model_version=model_version, optical_min_obs=optical_min_obs)
+    check_root_identity(
+        root.attrs,
+        layout=layout,
+        model_version=model_version,
+        optical_min_obs=optical_min_obs,
+    )
     stamped_now = "geoemb:model" not in root.attrs
     if stamped_now:
         # optical_min_obs is in the identity for the same reason the encoder is: a fill reads it to
@@ -540,16 +577,21 @@ def seed_zone_groups(
         # sit beside zones filled under another, under a root advertising only the second. The
         # consequence to know is that the root's rule never moves. A targeted update may apply a
         # looser line to its own cells (ADR 028), and its update records, not the root, say so.
-        root.attrs.update(_root_attrs(layout, model_version, optical_min_obs))
+        root.attrs.update(_root_attrs(layout, model_version=model_version, optical_min_obs=optical_min_obs))
     # The time axis is fixed and UNIFORM across all zone groups (ADR-008 D1): campaign status and
     # fill code assume every group shares one axis. An incremental seed passing a different
     # `years` than the groups already present would silently leave a mixed-axis store, so validate
     # against any seeded group HERE — not only in the seed_global_store flow's retry guard, which
     # a lower-level caller bypasses.
+    #
+    # A new store takes its model's Y/X names; one already seeded keeps its own, so extending it
+    # never leaves two vocabularies in one store.
+    layout = layout.with_spatial_dims(model_family(model_version).spatial_dims)
     for gname in root.group_keys():
         grp = cast("zarr.Group", root[gname])
         if "time" not in grp:
             continue
+        layout = layout.with_spatial_dims(spatial_dims_of(grp))
         existing_years = tuple(year_of(t) for t in read_time_values(grp))
         if existing_years != tuple(years):
             raise ValueError(
@@ -607,20 +649,15 @@ def seed_zone_groups(
         created += 1
         north = northing_coords(spec)
         east = easting_coords(spec)
-        sizes = {
-            "time": nt,
-            "northing": spec.height,
-            "easting": spec.width,
-            "band": band,
-            "month": MONTHS_IN_YEAR,
-        }
+        y, x = layout.spatial_dims
+        sizes = {"time": nt, y: spec.height, x: spec.width, "band": band, "month": MONTHS_IN_YEAR}
         create_layout_arrays(node, layout, layout.arrays, sizes)
         _write_coord_arrays(
             node,
             {
                 "time": times,
-                "northing": north,
-                "easting": east,
+                y: north,
+                x: east,
                 "band": np.arange(band),
                 # 1..12, not 0..11, so ``cov.sel(month=7)`` means July. A 0-based axis would put
                 # every reader's selection one off from the calendar they are thinking in.
@@ -631,6 +668,7 @@ def seed_zone_groups(
         bnds.attrs.update(TIME_ENCODING)  # same int64-ns encoding as `time`
         node["time"].attrs["bounds"] = "time_bnds"  # CF: this coordinate represents an interval
         node.attrs.update(_zone_attrs(spec, north, east, layout))
+        stamp_array_conventions(node)
     if not created and not stamped_now:
         # Every requested zone was already complete AND the root already carried its identity, so
         # nothing was written — and icechunk refuses an empty commit unless asked. Committing

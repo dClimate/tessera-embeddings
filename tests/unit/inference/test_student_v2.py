@@ -11,13 +11,15 @@ import numpy as np
 import pytest
 import torch
 
-from tessera_embeddings.config.inference import MODEL_ARCHS, InferenceConfig, band_stats
+from tessera_embeddings.config.inference import InferenceConfig, band_stats, model_family
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.models.builder import _build_v2_inference_model, _verify_v2_args
 from tessera_embeddings.inference.models.student_v2 import (
     AttentionPooling,
     QKNormEncoderLayer,
     StudentTransformerEncoder,
+    _add_layer_norm,
+    _encoder_layer_forward,
     build_v2_dim_reducer,
 )
 
@@ -170,6 +172,22 @@ def test_v2_backbone_output_shape(band_num: int, channels: int) -> None:
     assert enc(torch.randn(4, 12, channels)).shape == (4, 64)
 
 
+@pytest.mark.parametrize("t", [1, 13], ids=["radar-free-step", "sequence"])
+def test_hand_written_encoder_layer_computes_the_module(t: int) -> None:
+    """The CUDA path's layer, given the plain add + LayerNorm, is the backbone's own layers' forward."""
+    torch.manual_seed(0)
+    enc = StudentTransformerEncoder(
+        band_num=10, latent_dim=16, nhead=4, num_encoder_layers=2, dim_feedforward=96
+    ).eval()
+    x = torch.randn(3, t, 64)
+    with torch.no_grad():
+        for layer in enc.transformer_encoder.layers:
+            torch.testing.assert_close(
+                _encoder_layer_forward(layer, x, _add_layer_norm), layer(x), atol=1e-5, rtol=1e-5
+            )
+            x = layer(x)
+
+
 def test_qk_norm_layer_preserves_shape() -> None:
     """The QK-norm variant (unused by the Large checkpoint) still runs."""
     layer = QKNormEncoderLayer(d_model=32, nhead=4, dim_feedforward=64, dropout=0.0).eval()
@@ -297,5 +315,5 @@ def test_v2_runs_the_unmodified_inference_loop(v2_model, sample_chunk_data, t_s1
 
 
 def test_v2_arch_spec_is_registered() -> None:
-    assert MODEL_ARCHS["v2-large"].enable_qk_norm is False
-    assert MODEL_ARCHS["v2-large"].representation_dim == 128
+    assert model_family("v2-large").arch.enable_qk_norm is False
+    assert model_family("v2-large").arch.representation_dim == 128

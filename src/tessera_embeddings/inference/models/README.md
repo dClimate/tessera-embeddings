@@ -17,7 +17,7 @@ has to treat sampling as model-specific
 |---|---|---|
 | `modules.py` | `tessera_infer/src/models/modules.py` | Type hints, ruff formatting. Upstream's `TransformerEncoder` renamed `V11TransformerEncoder` (upstream v2 has a same-named class; see `student_v2.py`). `TemporalPositionalEncoder` caches `div_term` per device in FP32 (computed on the CPU for v1.1 and on the device for v2, as each upstream does) and takes an explicit output dtype, and the encoder casts bands (not DOY) to the weights' dtype — see "The input stays FP32" in `../README.md` §7. `TemporalAwarePooling` runs its GRU, LayerNorm and attention score as one compiled step per timestep. Layer shapes and forward-pass math are unchanged. |
 | `ssl_model.py` | `tessera_infer/src/models/ssl_model.py` | Type hints, ruff formatting. Backbone annotations widened to `nn.Module` so the wrapper hosts either version's backbones. |
-| `student_v2.py` | `geotessera/TESSERA-V-2.0-2B-L` (Hugging Face) `model.py`, = `ucam-eo/tessera` `tessera_infer_v2/student/model.py` | Type hints, ruff formatting; upstream's `TransformerEncoder` renamed `StudentTransformerEncoder`; upstream's inline positional encoder replaced by the shared `modules.TemporalPositionalEncoder` (bit-identical at fp32, plus an explicit output-dtype cast and a per-device FP32 `div_term` cache); the top-level `PixelStudent` assembly is not duplicated — see below. |
+| `student_v2.py` | `geotessera/TESSERA-V-2.0-2B-L` (Hugging Face) `model.py`, = `ucam-eo/tessera` `tessera_infer_v2/student/model.py` | Type hints, ruff formatting; upstream's `TransformerEncoder` renamed `StudentTransformerEncoder`; upstream's inline positional encoder replaced by the shared `modules.TemporalPositionalEncoder` (bit-identical at fp32, plus an explicit output-dtype cast and a per-device FP32 `div_term` cache); in inference on CUDA the encoder layers run through `_encoder_layer_forward` with each residual add + LayerNorm as one compiled kernel, which moves outputs slightly (ADR 030; `../README.md` §7); the top-level `PixelStudent` assembly is not duplicated — see below. |
 | `builder.py` | `tessera_infer/src/models/builder.py` | Type hints, ruff formatting. Added FSDP prefix stripping in `load_v11_checkpoint()`, plus the v2 build/load path (`_build_v2_inference_model`, `load_v2_checkpoint`, `_verify_v2_args`). |
 
 Both models are pinned to upstream by golden tests that run a **verbatim** copy of
@@ -30,6 +30,11 @@ upstream's code beside our port on the real checkpoint, in FP32 on CPU:
 
 Each skips unless its environment variable points at the checkpoint, and refuses a file whose digest
 differs. Re-fetch instructions are in the vendored files' headers.
+
+They run on CPU, where v2 runs its encoder modules as written. v2's CUDA path is held to them in two
+steps: `test_hand_written_encoder_layer_computes_the_module` pins `_encoder_layer_forward` to the
+modules, and the fused add + LayerNorm it adds on the GPU was measured against today's output on
+three cards ([ADR 030](../../../../context_docs/decisions/030-forward-pass-reorderings-ship-at-a-store-boundary.md)).
 
 ## v1.1 vs v2 Large
 
@@ -65,6 +70,46 @@ multiply. PyTorch's `nn.GRU` applies it after and cannot stand in for it
 ([ADR 026](../../../../context_docs/decisions/026-v1-1-runs-the-gru-it-was-trained-with.md)).
 v2 has no GRU.
 
+## One record per model
+
+Everything that differs between models is a field of its `ModelFamily` record in
+`../../config/inference.py`:
+
+- the architecture, checkpoint file names and band statistics
+- the public encoder URL a store advertises as `geoemb:model`
+- the fusion its checkpoint loads with
+- the student generation, which picks the checkpoint loader and the staging run-id prefix
+- the S1 bin given to a pixel with no radar
+- whether it runs only on its own worker image
+- the names of an output store's Y and X dimensions: `northing`/`easting` for v1.1, `y`/`x` for v2.
+  A new store takes them once; an existing store keeps its own
+  ([ADR 032](../../../../context_docs/decisions/032-v2-stores-name-their-axes-y-and-x.md))
+
+Code asks `model_family(version)` for the field it needs rather than comparing version strings, so
+a new model is a new record, and a record missing a field cannot be built. Two names carry one
+meaning each:
+
+| name | means | example |
+|---|---|---|
+| `model_version` | the model | `"v1.1"`, `"v2-large"` |
+| `checkpoint_id` | the stem of the checkpoint file, recorded at a store's root | `tessera_v1_1_aws_encoder` |
+
+**Each run decides its model once:**
+
+- **Single-area runs** take it from `InferenceConfig.model_version`, v1.1 by default.
+- **A global store** is seeded for one model (`seed_global_store(model_version=...)`), which stamps
+  its `geoemb:model` and that model's own checkpoint as `checkpoint_id`. Every fill, campaign and
+  targeted update reads them back through `store_model_version`, before anything is provisioned, and
+  the checkpoint, worker image, staging run-id prefix and inference config all follow. No fill flow
+  takes a model parameter, and there is no override.
+- **The guard is in the write, not the callers.** A staging run records the stack that computed it,
+  model and checkpoint included, and every write into a store compares that record with the root
+  ([One stack per run, one stack per store](../README.md)). Reading the model at the flows only
+  chooses the image and checkpoint before Ray starts.
+- **Defaults** exist only at those entry points and on the workers that are handed a config: the
+  dataset, the sampler, assembly and zone seeding. The functions that name a checkpoint or write
+  provenance (`checkpoint_filename`, `band_stats`, `expected_model_url`) require the model.
+
 ## What not to touch
 
 - **`modules.py`**: `V11TransformerEncoder`, `TemporalPositionalEncoder`,
@@ -97,7 +142,8 @@ v2 has no GRU.
   A payload storing `args` as an `argparse.Namespace` is rejected rather than
   allowlisted — convert it to a dict and re-save.
 
-- **`InferenceConfig`** (in `../../config/inference.py`): per-version architecture
-  defaults live in `MODEL_ARCHS`; fields left at their v1.1 defaults adopt the
-  selected version's spec, and a conflicting explicit value is rejected. If you
-  train a new model with different hyperparameters, add/update its `ModelArch`.
+- **`InferenceConfig`** (in `../../config/inference.py`): per-model architecture
+  defaults live in each `ModelFamily` record's `arch`; fields left at their v1.1
+  defaults adopt the selected model's spec, and a conflicting explicit value is
+  rejected. A new model with different hyperparameters gets its own record
+  ([One record per model](#one-record-per-model)).

@@ -141,8 +141,8 @@ def gke_cluster(
     ...
 ```
 
-The handle needs to expose `cluster.scheduler_address` for the
-flow's `DaskTaskRunner` wiring. That's the only contract — the
+The handle needs to expose `cluster.scheduler_address`, which the
+flow submits its task shell to. That's the only contract — the
 underlying `Cluster` class can be `dask_kubernetes.KubeCluster`,
 `dask_cloudprovider.gcp.GoogleComputeCluster`, or anything else.
 

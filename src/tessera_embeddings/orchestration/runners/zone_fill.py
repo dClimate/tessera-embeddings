@@ -61,9 +61,9 @@ from tenacity import retry_if_not_exception_type
 
 from tessera_embeddings.config.assembly import AssemblyConfig
 from tessera_embeddings.config.fault_injection import ArmedFault
-from tessera_embeddings.config.inference import InferenceConfig
+from tessera_embeddings.config.inference import InferenceConfig, run_id_prefix
 from tessera_embeddings.config.paths import store_key
-from tessera_embeddings.config.store_layout import GLOBAL, REQUIRED_VARS
+from tessera_embeddings.config.store_layout import GLOBAL, REQUIRED_VARS, spatial_dims_of
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import (
     SpatialCoords,
@@ -765,7 +765,7 @@ def plan_zone_inference(
     finished (:func:`_publish_provenance`).
     """
     t0 = time.monotonic()
-    run_id = run_id or uuid.uuid4().hex[:12]
+    run_id = run_id or run_id_prefix(config.model_version) + uuid.uuid4().hex[:12]
 
     # The seeded zone group is the grid authority.
     repo = open_global_repo(
@@ -1029,8 +1029,9 @@ def plan_zone_inference(
     # grid than reflectance would otherwise slip through. Validate reflectance AND each active
     # SAR orbit against the seeded group, the grid authority. (Read only now — an all-ocean
     # cell already returned above without touching the mosaic, which may not even exist.)
-    z_north = cast(zarr.Array, node["northing"])
-    z_east = cast(zarr.Array, node["easting"])
+    y_name, x_name = spatial_dims_of(node)  # the group's own names: v1.1 northing/easting, later y/x
+    z_north = cast(zarr.Array, node[y_name])
+    z_east = cast(zarr.Array, node[x_name])
     # Absolute half-pixel tolerance, NOT np.isclose's default relative one: at a ~9.3e6 m
     # northing the default rtol=1e-5 would admit ~93 m (~9 px) of drift. A real shift is
     # >=1 px (10 m); half a pixel (5 m) sits above float32 coordinate roundtrip (~1 m at this
@@ -1073,8 +1074,8 @@ def plan_zone_inference(
         # against the zone geobox), but `ingest=False` accepts an operator-staged mosaic, and
         # that path is supported.
         for axis, values, seeded in (
-            ("northing", coords.northing, z_north),
-            ("easting", coords.easting, z_east),
+            (y_name, coords.northing, z_north),
+            (x_name, coords.easting, z_east),
         ):
             got = np.asarray(values, dtype="float64")
             want = np.asarray(seeded[:], dtype="float64")
@@ -1225,7 +1226,7 @@ def _infer_planned(
 def complete_zone_inference(plan: ZonePlan, *, results: list[dict] | None) -> ZoneFillHandoff:
     """Fold per-tile results back into the handoff the assembly phase consumes.
 
-    Shared by the per-cell path and the chained runner, which collects a zone's results from
+    Shared by the single-cell flow and the chained runner, which collects a zone's results from
     the streamed session instead of a dedicated ``run_inference`` call. Raises if any tile
     failed: the zone must not assemble partial output, and its cell stays pending in the
     campaign ledger.

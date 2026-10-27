@@ -88,7 +88,11 @@ them afterwards (`provenance.day_granules`) numbers the granules exactly as the 
 On the optical path the index is masked to the ROI only, like SCL: it names the granule behind
 every pixel, cloudy or clear, and the model's own validity test decides later which of those it
 saw. On the radar path the dB transform runs over the bands before the index is added, so the
-index is never rescaled.
+index is never rescaled. The index follows the granule's own data, not the stored value: an
+amplitude too faint for the dB scale is stored as VV zero, the store's nodata, yet the index still
+names the granule that supplied it. About one radar pixel in ten thousand does this. The model's
+validity test drops such a pixel unless its VH holds data, so the published record never names a
+granule for a pixel the model did not see.
 
 ## What it costs
 

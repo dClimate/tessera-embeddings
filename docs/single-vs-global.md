@@ -52,9 +52,10 @@ and is vastly more cost-effective for small area analysis.
 
 **The same inference code runs in both.** The single-area flow and the global campaign both call
 the same `run_inference` function, producing the same 128-dimensional embedding per pixel. There is
-no "global model" and no "small model" — by default they run the same checkpoint too, though the
-single-area path can select the v2 Large encoder with `model_version` or point at another checkpoint
-with `checkpoint_url`, in which case the outputs are of course no longer comparable.
+no "global model" and no "small model" — by default they run the same checkpoint too. Either can
+run the v2 Large encoder instead: the single-area path per run with `model_version`, a global store
+when it is seeded. The single-area path can also point at another checkpoint with `checkpoint_url`.
+Outputs from different models are of course not comparable.
 
 **The same ingest code runs in both, and it sees the same kind of input.** This is the part that
 surprises people. The global campaign holds its coverage information in one format and the
@@ -414,10 +415,11 @@ You do not need any of this to read the store. It is here because the layout is 
 job this size possible at all, and because two of the choices are visible to a consumer.
 
 **Zones are named, not numbered.** Zone groups, mosaic paths and campaign tags all use the UTM
-**common name** — `canonicalize_zone` parses `"33n"` or `" 7s "` into `"33N"` and `"07S"`. This is
-a deliberate deviation from the geoembeddings `utm_zones` specification, whose `utm{NN}` group
-name cannot say which hemisphere it means. The EPSG code (326xx north, 327xx south) is kept, but
-only as the coordinate reference system.
+**common name** — `canonicalize_zone` parses `"33n"` or `" 7s "` into `"33N"` and `"07S"`. The
+geoembeddings `utm_zones` layout names groups `utm{NN}`, which cannot say which hemisphere is meant,
+so new stores do not claim that layout: they omit the optional `geoemb:spatial_layout` (the
+published v1.1 store, seeded earlier, still declares `utm_zones`). The EPSG code (326xx north,
+327xx south) is kept, but only as the coordinate reference system.
 
 **Zones are pure six-degree longitude bands.** Every pixel centre falls in exactly one zone, and
 the per-zone pixel grids come from the EPSG registry (`storage/zone_grid.py`), snapped to the

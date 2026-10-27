@@ -35,6 +35,7 @@ from tessera_embeddings.storage.provenance import (
     update_pixels_uri,
 )
 from tessera_embeddings.storage.zarr_store import open_repo, open_store_as_zarr_group, write_days_windows
+from tests.unit.inference_stack import STACK
 
 SIZE, SHARD = 8, 4
 DATES = ["2024-06-01", "2024-06-13"]
@@ -127,6 +128,7 @@ def _stage(staging: Path, pins: dict[str, str], *, pixels: np.ndarray | None = N
             RUN,
             scales=np.ones((SHARD, SHARD), dtype=np.float32),
             coverage={"embedded_px": SHARD * SHARD if pixels is None else int(pixels.sum())},
+            stack=STACK,
             planes=_planes(pins, chunk),
             pixels=pixels,
         )

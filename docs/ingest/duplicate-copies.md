@@ -43,7 +43,7 @@ because the offset is corrected per image
 different images loses ground for the day, silently. So under doubt the cheap mistake is made, and the run logs how many copies it kept
 that way. Where a reprocessing omits one of a pass's datastrips, the older copy of that datastrip is
 kept beside the newer ones for the same reason
-([ADR 029](../../context_docs/decisions/029-an-acquisition-is-one-datastrip-of-one-pass.md)). The
+([ADR 034](../../context_docs/decisions/034-an-acquisition-is-one-datastrip-of-one-pass.md)). The
 census behind these choices is in
 [`context_docs/ingest/split-datastrips.md`](../../context_docs/ingest/split-datastrips.md).
 

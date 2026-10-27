@@ -1,7 +1,7 @@
-# 034 — A provenance record for the published store
+# 035 — A provenance record for the published store
 
-**Status:** Proposed 2026-10-27, ingest half in PR #253 and the model and assembly half in the PR
-stacked on it. The design, its sizes and its reviews are in
+**Status:** Proposed 2026-10-27, ingest half in PR #253, the model and assembly half in #255 and
+`source_runs` in #256. The design, its sizes and its reviews are in
 [`storage/registry-provenance-plan.md`](../storage/registry-provenance-plan.md); this record keeps
 the decisions and what was deliberately left out.
 

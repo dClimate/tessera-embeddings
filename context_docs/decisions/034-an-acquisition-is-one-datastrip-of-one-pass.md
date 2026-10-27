@@ -1,4 +1,4 @@
-# 029 — An acquisition is one datastrip of one pass
+# 034 — An acquisition is one datastrip of one pass
 
 **Status:** Accepted 2026-10-20 (Robert). Amends decision 4 of
 [ADR 020](020-boa-offset-applies-to-every-valid-dn.md). Evidence in

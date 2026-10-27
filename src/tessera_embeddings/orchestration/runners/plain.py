@@ -160,6 +160,9 @@ def _staging_run_id(
     Staging is removed after a successful assemble, so in practice a prefix only survives a run
     that failed — which is exactly the run worth resuming.
 
+    ``stack-record`` is a fixed term: it moved every id once, so a prefix staged before a run
+    recorded its stack (``ZarrWriter._join_run``) is never found, and so never resumed.
+
     An ``update`` is a term too, when there is one: its tiles are inferred against the store's holes
     rather than whole, so they must never resume a full run's, nor another update's.
     """
@@ -178,6 +181,7 @@ def _staging_run_id(
             f"s2_only={config.allow_s2_only}",
             json.dumps(content, sort_keys=True, default=str),
             *([json.dumps(dict(update), sort_keys=True)] if update else []),
+            "stack-record",  # staging from before runs recorded their stack is never resumed
         ]
     )
     return hashlib.sha256(terms.encode()).hexdigest()[:12]
@@ -514,10 +518,14 @@ def _run_inference_and_assemble(
     if planned is not None:
         summary["update"] = planned.target.name
         summary["snapshot_id"] = _write_update(
-            writer, planned, output_path=output_path, run_id=run_id, results=results, log=log
+            writer,
+            planned,
+            output_path=output_path,
+            run_id=run_id,
+            results=results,
+            log=log,
         )
     else:
-        # Provenance id: the checkpoint filename stem, not the ModelVersion literal.
         checkpoint_id = checkpoint_to_version(config.checkpoint_path)
         manifest = EmbeddingManifest.from_upstream_stores(
             model_checkpoint=checkpoint_id,
@@ -536,8 +544,8 @@ def _run_inference_and_assemble(
             log=log,
             time_window=time_window,
             tile_id=roi_name,
-            model_version=checkpoint_id,
-            encoder_version=config.model_version,
+            checkpoint_id=checkpoint_id,
+            model_version=config.model_version,
             manifest=manifest,
             n_workers=AssemblyConfig().compute_n_workers(n_live),
         )

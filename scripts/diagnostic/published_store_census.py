@@ -48,14 +48,12 @@ CAMPAIGN_YEARS = tuple(range(2017, 2026))
 #: audited groups too — so a store that lost a whole zone would reconcile against its smaller self.
 EXPECTED_ZONES = tuple(f"{n:02d}{hemisphere}" for n in range(1, 61) for hemisphere in ("N", "S"))
 
-#: Root attributes a consumer needs to interpret the product at all. In the ``utm_zones`` layout the
-#: encoder and quantization provenance is stated ONCE at the root, so a zone group cannot make up
-#: for a root that lost it.
+#: Root attributes a consumer needs to interpret the product at all. The encoder and quantization
+#: provenance is stated ONCE at the root, so a zone group cannot make up for a root that lost it.
 _REQUIRED_ROOT_VALUES = {
     "geoemb:type": "pixel",
     "geoemb:dimensions": EMBEDDING_DIM,
     "geoemb:data_type": "int8",
-    "geoemb:spatial_layout": "utm_zones",
 }
 #: Present-and-non-empty is all that can be asked of these: the model URL and build version depend
 #: on the run, so a value check would only pin whatever the last run happened to write.
