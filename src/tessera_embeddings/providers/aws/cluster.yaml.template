@@ -224,9 +224,11 @@ upscaling_speed: 2.0  # Cluster can add 2x current nodes per autoscaling round
 #                at runtime. Empty string for production tarballs.
 #
 # The environment: Python 3.12 and every inference dependency, as an ext4 image that the node
-# copies from S3 and mounts read-only at /opt/tessera, giving /opt/tessera/venv. Its URI is read
-# from s3://{CODE_BUCKET}/code/env-image{CODE_SUFFIX}.uri, which the deployment writes beside the
-# tarball, so a dependency change ships as a new image rather than a new AMI. The image goes on
+# copies from S3 and mounts read-only at /opt/tessera, giving /opt/tessera/venv. The deployment
+# names it in s3://{CODE_BUCKET}/code/env-image{CODE_SUFFIX}.uri, beside the tarball, so a
+# dependency change ships as a new image rather than a new AMI. The provider reads that pointer
+# once and substitutes the URI for {ENV_IMAGE_URI} (or takes the URI a campaign pinned), so every
+# node of a cluster mounts the same image even if the pointer moves while the fleet grows. The image goes on
 # the instance store when the node has one (GPU workers; the DLAMI's boot service mounts it at
 # /opt/dlami/nvme and can finish after Ray's setup begins, so the command waits up to 60 s), and
 # on the root volume otherwise (the head). Any failure fails the node's setup. The command is a
@@ -238,7 +240,7 @@ upscaling_speed: 2.0  # Cluster can add 2x current nodes per autoscaling round
 # `providers/aws/cloudwatch-agent.json.tpl` (heredocs in YAML break over
 # SSH due to indented terminators).
 setup_commands:
-    - mountpoint -q /opt/tessera || [ -e /opt/tessera/venv ] || { u=$(aws s3 cp --only-show-errors s3://{CODE_BUCKET}/code/env-image{CODE_SUFFIX}.uri -) || { echo "No environment image named at s3://{CODE_BUCKET}/code/env-image{CODE_SUFFIX}.uri" >&2; exit 1; }; d=/var/tmp; if lsblk -dno MODEL | grep -q 'Instance Storage' && timeout 60 sh -c 'until mountpoint -q /opt/dlami/nvme; do sleep 2; done'; then d=/opt/dlami/nvme; fi; sudo aws configure set default.s3.max_concurrent_requests 32 && sudo aws s3 cp --only-show-errors "$u" "$d/env.img" && sudo mkdir -p /opt/tessera && sudo mount -o loop,ro "$d/env.img" /opt/tessera; }
+    - mountpoint -q /opt/tessera || [ -e /opt/tessera/venv ] || { u='{ENV_IMAGE_URI}'; [ -n "$u" ] || { echo "No environment image named at s3://{CODE_BUCKET}/code/env-image{CODE_SUFFIX}.uri" >&2; exit 1; }; d=/var/tmp; if lsblk -dno MODEL | grep -q 'Instance Storage' && timeout 60 sh -c 'until mountpoint -q /opt/dlami/nvme; do sleep 2; done'; then d=/opt/dlami/nvme; fi; sudo aws configure set default.s3.max_concurrent_requests 32 && sudo aws s3 cp --only-show-errors "$u" "$d/env.img" && sudo mkdir -p /opt/tessera && sudo mount -o loop,ro "$d/env.img" /opt/tessera; }
     - aws s3 cp s3://{CODE_BUCKET}/code/src{CODE_SUFFIX}.tar.gz /tmp/src.tar.gz && mkdir -p ~/tessera-embeddings && tar -xzf /tmp/src.tar.gz -C ~/tessera-embeddings/ && rm /tmp/src.tar.gz
     - echo 'export PATH=/opt/tessera/venv/bin:$PATH' >> ~/.bashrc && echo 'export PYTHONPATH=$HOME/tessera-embeddings:$PYTHONPATH' >> ~/.bashrc
 
