@@ -17,7 +17,8 @@ own in-region EC2 box, in the dev account, into throwaway repos under the run's 
   profile (:data:`NETWORKS`) the phase measures before it runs.
 
 ``--study`` picks the arms and workloads, as in T9: ``band16`` (the default) is ADR 031's scoping,
-``narrow`` its 4-, 8- and variable-width band chunks for mobile readers.
+``narrow`` its 4-, 8- and variable-width band chunks for mobile readers. A run holds one study, so each
+study takes a run id of its own (``harness.bind_study`` refuses a second).
 
 Run from the REPOSITORY ROOT, with ``T10="-m scripts.scoping.scale_tests.t10_v2_aws --run-id v2b
 --backend s3 --bucket <bucket>/<prefix> --scale bench"``::
@@ -26,7 +27,7 @@ Run from the REPOSITORY ROOT, with ``T10="-m scripts.scoping.scale_tests.t10_v2_
     python $T10 --tiles <dir> --phase read        # once per client
     python $T10 --tiles <dir> --phase tune        # full-vector pulls under reader settings
     python $T10 --phase assemble --staging s3://<staged run dir> --extent 34964,53383 --n-tiles 64 --workers 16
-    python $T10 --study narrow --phase mobile --network poor   # after `tc` shapes the box's link
+    python $T10N --tiles <dir> --phase mobile --network poor   # T10N: a run id of its own, --study narrow
     python $T10 --phase verify                    # the built stores hold C0's values
     python $T10 --phase verify --staging s3://<staged run dir> --n-tiles 64   # the assembled stores do
 """
@@ -355,10 +356,12 @@ def _probe_network(cfg: harness.RunConfig, phase: str, arm: V.Variant, network: 
     harness.emit_metric(cfg, TEST, phase, "probe_rtt_ms", rtt, "ms", network=network)
     harness.emit_metric(cfg, TEST, phase, "probe_mbps", mbps, "Mbit/s", network=network)
     logger.info("network %s: %.0f ms round trip, %.1f Mbit/s down", network, rtt, mbps)
-    if rtt < rtt_want / 2 or mbps > 2 * mbps_want:
+    # Within a factor of two either way. A faster link is unshaped and a slower one mis-shaped (a stale or doubled
+    # tc rule); either would label incomparable numbers with the profile's name.
+    if not (rtt_want / 2 <= rtt <= 2 * rtt_want and mbps_want / 2 <= mbps <= 2 * mbps_want):
         raise SystemExit(
             f"network {network!r} wants about {rtt_want} ms and {mbps_want} Mbit/s, measured {rtt:.0f} ms and "
-            f"{mbps:.1f} Mbit/s: shape the link with tc first"
+            f"{mbps:.1f} Mbit/s: shape the link with tc to that profile first"
         )
 
 
@@ -508,6 +511,7 @@ def main() -> int:
     harness.configure_logging()
     phase, cfg = cfg.phase, dataclasses.replace(cfg, phase=None)  # run_phase filters on the name it is given
     study = STUDIES[args.study]
+    harness.bind_study(cfg, TEST, args.study)
     # Each phase runs the arms it can. The library's assembly writes zarr's default order, and writes a band-first
     # array only where its shard writer says it can (the band-first prototype of ADR 031 sets WRITES_BAND_FIRST);
     # the other arms' write cost comes from `build`.
