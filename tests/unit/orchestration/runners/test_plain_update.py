@@ -15,6 +15,7 @@ from tessera_embeddings.inference.chunk_spec import enumerate_chunks
 from tessera_embeddings.orchestration.runners.plain import _plan_update, _write_update
 from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.update import base_tag, read_updates
+from tests.unit.inference_stack import IDENTITY, OTHER_STACK, STACK
 
 log = logging.getLogger("test_plain_update")
 
@@ -30,7 +31,7 @@ CHUNKS = enumerate_chunks(_NY, _NX, chunk_size=_TILE)
 GRID = SpatialCoords(northing=np.arange(_NY), easting=np.arange(_NX))
 
 
-def _stage(writer: ZarrWriter, run_id: str, value: int, *, holes: bool) -> None:
+def _stage(writer: ZarrWriter, run_id: str, value: int, *, holes: bool, stack: dict = STACK) -> None:
     """Stage every tile at ``value``; ``holes`` refuses the left half of chunk_0_0 and all of chunk_1_1."""
     for chunk in CHUNKS:
         emb = np.full((chunk.height, chunk.width, _BAND), value, dtype=np.int8)
@@ -41,7 +42,7 @@ def _stage(writer: ZarrWriter, run_id: str, value: int, *, holes: bool) -> None:
         if holes and chunk.label == "chunk_1_1":
             refused[:] = True
         emb[refused], scales[refused] = 0, np.nan
-        writer.write_chunk(chunk, emb, run_id, scales=scales)
+        writer.write_chunk(chunk, emb, run_id, scales=scales, stack=stack)
 
 
 @pytest.fixture()
@@ -52,7 +53,9 @@ def area(tmp_path):
     writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=_BAND)
     _stage(writer, "fill", 1, holes=True)
     output = str(tmp_path / "out.zarr")
-    writer.assemble(CHUNKS, _NY, _NX, "fill", output, roi_zarr_path=roi, time_window=WINDOW, n_workers=1, layout=SMALL)
+    writer.assemble(
+        CHUNKS, _NY, _NX, "fill", output, roi_zarr_path=roi, time_window=WINDOW, n_workers=1, layout=SMALL, **IDENTITY
+    )
     return {"writer": writer, "output": output, "holes": str(tmp_path / "holes")}
 
 
@@ -70,13 +73,25 @@ def _plan(area, window: str = WINDOW.window_end_label, spatial: SpatialCoords = 
     )
 
 
-def _update(area, **update):
-    """Plan, stage every planned tile at 2s, and write; return the store's root afterwards."""
+def _update(area, *, stack: dict = STACK, **update):
+    """Plan, stage every planned tile at 2s on *stack*, and write; return the store's root afterwards."""
     planned = _plan(area, **update)
-    _stage(area["writer"], "upd", 2, holes=False)
+    _stage(area["writer"], "upd", 2, holes=False, stack=stack)
     results = [{"chunk": c.label, "status": "success"} for c in planned.chunks]
-    _write_update(area["writer"], planned, output_path=area["output"], run_id="upd", results=results, log=log)
+    _write_update(
+        area["writer"],
+        planned,
+        output_path=area["output"],
+        run_id="upd",
+        results=results,
+        log=log,
+    )
     return zarr.open_group(open_global_repo(area["output"]).readonly_session(branch="main").store, mode="r")
+
+
+def test_an_update_on_another_stack_is_refused(area):
+    with pytest.raises(ValueError, match="Refusing to write"):
+        _update(area, stack=OTHER_STACK)
 
 
 def test_a_holes_update_fills_only_the_holes_and_records_itself(area):

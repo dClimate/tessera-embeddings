@@ -135,9 +135,9 @@ def export_zone_rois(
 ) -> dict[str, Any]:
     """Export and validate the ROI masks for ``zones`` (default: all 120).
 
-    The two-flow split is the repo's standard task-runner idiom: ``task_runner=`` binds at
-    flow-definition time, so the fan-out width can only be a runtime parameter if the outer
-    flow passes it to an inner one via ``with_options``.
+    It is split into two flows because ``task_runner=`` binds at flow-definition time, so the
+    fan-out width can only be a runtime parameter if the outer flow passes it to an inner one
+    via ``with_options``.
 
     Args:
         paths: Deployment storage contract. Masks are written to

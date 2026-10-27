@@ -57,6 +57,7 @@ from tenacity import (
 )
 
 from tessera_embeddings.config.ingest import INGEST_COMPRESSORS, mosaic_chunk_layout
+from tessera_embeddings.config.store_layout import spatial_dims_of
 from tessera_embeddings.errors import CorruptedStoreError, NonMonotonicDateError
 from tessera_embeddings.storage.manifest import MIXED_CODE_IDENTITIES_ATTR, IngestManifest, extract_manifest
 from tessera_embeddings.storage.region_writes import (
@@ -1288,7 +1289,9 @@ def resolve_region(
     """Map coordinate-value ranges to half-open integer slices for an existing store.
 
     Each argument is a fully-inclusive ``(low, high)`` coordinate range or ``None`` (= the
-    full axis, omitted from the result). Both ends are matched (``coord >= low & coord <=
+    full axis, omitted from the result). *northing* and *easting* address the store's Y and X
+    axes whatever it names them (:func:`spatial_dims_of`), and the slices come back under
+    those names. Both ends are matched (``coord >= low & coord <=
     high``) and the returned slices are half-open ``[start, stop)``. The bounds may be given
     in either order — they are sorted before matching — so a descending axis (northing
     typically) can be addressed either way. ``time`` accepts anything ``np.datetime64``
@@ -1305,12 +1308,13 @@ def resolve_region(
     The matched coordinates must also be contiguous; a range straddling a gap (an
     out-of-order time axis) raises rather than silently widening the slice over it.
     """
-    # chunks=None: only the 1-D northing/easting/time coords are read here, never pixels, so
+    # chunks=None: only the 1-D spatial and time coords are read here, never pixels, so
     # skip building a per-chunk dask graph — it matters when this is called repeatedly, e.g.
     # resolving many features against a continental master.
     ds = _open_readonly(store_path, get_credentials=get_credentials, region=s3_region, chunks=None, group=group)
     try:
-        ranges = {"time": time, "northing": northing, "easting": easting}
+        y, x = spatial_dims_of(ds)
+        ranges = {"time": time, y: northing, x: easting}
         region: dict[str, slice] = {}
         for dim, rng in ranges.items():
             if rng is None:
@@ -1353,7 +1357,7 @@ def write_region(
 ) -> None:
     """Overwrite a region of an existing store in place, in one atomic commit.
 
-    ``region`` maps dimension names (``time``/``northing``/``easting``) to integer slices,
+    ``region`` maps dimension names (``time`` and the store's Y and X names) to integer slices,
     typically from :func:`resolve_region`; dimensions absent from it are written in full.
     ``data`` must cover exactly the cells the region selects (same shape along each region
     dim), and its own coordinate values are dropped before writing since the store's coords

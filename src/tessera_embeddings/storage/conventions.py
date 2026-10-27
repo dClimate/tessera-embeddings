@@ -1,7 +1,8 @@
 """GeoZarr convention attribute builders for embedding stores.
 
 Implements the proj:, spatial:, and geoemb: Zarr conventions as purely additive
-metadata on the root group. No store layout changes.
+metadata on the root (or zone) group, repeats ``spatial:dimensions`` on each spatial
+array, and adds CF axis attrs to the Y/X coordinate arrays. No store layout changes.
 
 The geoembeddings (``geoemb:``) convention supersedes the earlier ``tessera:`` one
 (still stripped from pre-existing stores by ``assembly``): it records encoder-model
@@ -9,7 +10,7 @@ provenance, source datasets, and a structured quantization/dequantization descri
 following the convention repo's own ``tessera_example.json``.
 
 References:
-    - proj:    https://github.com/zarr-conventions/geo-proj
+    - proj:    https://github.com/zarr-conventions/proj
     - spatial: https://github.com/zarr-conventions/spatial
     - geoemb:  https://github.com/geo-embeddings/embeddings-zarr-convention
 """
@@ -17,13 +18,18 @@ References:
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _dist_version
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 from pyproj import CRS
 
-from tessera_embeddings.config.inference import DEFAULT_MODEL_VERSION, ModelVersion, encoder_url
+from tessera_embeddings.config.inference import ModelVersion, encoder_url, model_family, model_version_for_encoder
+
+if TYPE_CHECKING:
+    import zarr
 
 logger = logging.getLogger(__name__)
 
@@ -86,52 +92,46 @@ _SPATIAL_CONVENTION = {
     "description": "Spatial coordinate information",
 }
 
-# The convention repo has not cut a `v1` tag, so `refs/tags/v1` 404s. We pin the
-# schema/spec URLs to an immutable commit SHA that DOES resolve, so the emitted
-# registration is dereferenceable. Switch to `refs/tags/v1` once upstream tags it.
-_GEOEMB_REF = "0655212938f36351245dbd3e5e8868f811d43663"
+# Registered by uuid alone, as the geoemb README's own examples do. Its schema pins the URLs to
+# `refs/tags/v1`, a tag upstream has not cut, so those 404 — and the conventions spec defines
+# `schema_url`/`spec_url` as URLs that resolve. A commit-SHA URL resolves but fails the schema's
+# `const`. Add the `v1` URLs once the tag exists.
 _GEOEMB_CONVENTION = {
-    "schema_url": f"https://raw.githubusercontent.com/geo-embeddings/embeddings-zarr-convention/{_GEOEMB_REF}/schema.json",
-    "spec_url": f"https://github.com/geo-embeddings/embeddings-zarr-convention/blob/{_GEOEMB_REF}/README.md",
     "uuid": "61c12cc5-0e28-4056-999a-480cf3fb7e4c",
     "name": "geoemb:",
     "description": "Geoembeddings convention for geospatial embedding arrays with model provenance",
 }
 
 # --- geoemb: field defaults (this pipeline's fixed provenance) --------------
-#: v1.1's public encoder version. The live ``geoemb:model`` lookup is
-#: :func:`~tessera_embeddings.config.inference.encoder_url`, keyed by model
-#: family; this remains the v1.1 identifier. (``geoemb:build_version`` is the
-#: software/package version, not this.)
-ENCODER_VERSION = "1.1"
-#: Precise source datasets we pull from: Sentinel-2 L2A COGs (Earth Search AWS
-#: Open Data) and OPERA RTC-S1 (ASF datapool).
+#: The source datasets, as resolvable dataset references: the Earth Search Sentinel-2 L2A
+#: collection we query (it indexes both the `sentinel-cogs` and `sentinel-s2-l2a` buckets,
+#: ADR 021) and the OPERA RTC-S1 collection's DOI.
 DEFAULT_SOURCE_DATA: tuple[str, ...] = (
-    "s3://sentinel-cogs",
-    "https://datapool.asf.alaska.edu/RTC/OPERA-S1",
+    "https://earth-search.aws.element84.com/v1/collections/sentinel-2-l2a",
+    "https://doi.org/10.5067/SNWG/OPERA_L2_RTC-S1_V1",
 )
 #: Storage dtype of the quantized embeddings.
 QUANTIZED_DTYPE = "int8"
 
 
-def expected_model_url(model_url: str | None = None, model_version: ModelVersion | None = None) -> str:
-    """The ``geoemb:model`` URL this build stamps for the current encoder version.
+def expected_model_url(model_url: str | None = None, *, model_version: ModelVersion | None) -> str:
+    """The ``geoemb:model`` URL a store of *model_version* carries: *model_url* if given, else its record's.
 
-    A seeded store records this once at its root; the fill re-derives it to check the
-    running code embeds with the SAME encoder the store was seeded for — a mismatch means a
-    model upgrade slipped in between seeding and filling. Passing *model_url* mirrors the
-    seed-time override so a store seeded with a custom URL round-trips.
-
-    Routed through :func:`~tessera_embeddings.config.inference.encoder_url` rather than a
-    module constant, and taking *model_version*, because with one hard-coded encoder version
-    the gate compares a v2 fill against v1.1's URL — rejecting a correct run, or waving through a real mismatch
-    when the seed happened to carry the same stale constant. Omitting *model_version* keeps
-    the historical single-encoder behaviour.
+    A seeded store records this once at its root; the fill re-derives it to check the running
+    code embeds with the SAME encoder the store was seeded for. Passing *model_url* mirrors the
+    seed-time override so a store seeded with a custom URL round-trips. With neither, the call is
+    refused: a default here once compared a v2 fill against v1.1's URL.
     """
-    return model_url or encoder_url(model_version or DEFAULT_MODEL_VERSION)
+    if model_version is not None:
+        model_family(model_version)  # a checkpoint name passed under the old meaning fails here, loudly
+    if model_url:
+        return model_url
+    if model_version is None:
+        raise ValueError("expected_model_url needs a model_version or an explicit model_url")
+    return encoder_url(model_version)
 
 
-def assert_encoder_matches(published: str | None, *, model_version: ModelVersion | None, where: str) -> None:
+def assert_encoder_matches(published: str | None, *, model_version: ModelVersion, where: str) -> None:
     """Refuse a write whose encoder disagrees with the store's published one.
 
     **One implementation because there are several readers.** The assembly append gate and the
@@ -144,8 +144,8 @@ def assert_encoder_matches(published: str | None, *, model_version: ModelVersion
     predates v2, so a store lacking it necessarily holds v1.1 embeddings. Treating absence as "no
     claim" is what let a v2 run append to a legacy store and restamp the whole thing.
     """
-    expected = expected_model_url(model_version=model_version)
-    actual = published or expected_model_url(model_version=DEFAULT_MODEL_VERSION)
+    expected = encoder_url(model_version)
+    actual = published or encoder_url(model_version_for_encoder(None))
     if actual != expected:
         raise ValueError(
             f"Refusing to append to {where}: it was published by encoder {actual!r} and this run "
@@ -153,6 +153,65 @@ def assert_encoder_matches(published: str | None, *, model_version: ModelVersion
             "the whole thing with this run's encoder. Assemble into a store of the matching "
             "family, or a fresh path. (A store carrying no geoemb:model at all is read as v1.1 — "
             "the attr predates v2, so its absence dates the store rather than leaving it open.)"
+        )
+
+
+#: Store-root attr: the PyTorch and CUDA that computed the store's embeddings, ``{"torch", "cuda"}``.
+#: CUDA is ``None`` on a CPU run. The root already names the model and checkpoint (``geoemb:model``,
+#: ``checkpoint_id``), so this holds only what nothing else records. Not recorded, deliberately: the
+#: GPU model, cuDNN and the driver, which ADR 025 measured within tolerance across the cards we run.
+STACK_ATTR = "inference_stack"
+
+
+def checkpoint_stem(checkpoint: str) -> str:
+    """A checkpoint path or file name reduced to its stem, the form ``checkpoint_id`` compares in."""
+    return checkpoint.rsplit("/", 1)[-1].removesuffix(".pt")
+
+
+def library_stack(stack: Mapping[str, str | None]) -> dict[str, str | None]:
+    """The part of a run's stack a store root records under :data:`STACK_ATTR`."""
+    return {k: stack.get(k) for k in ("torch", "cuda")}
+
+
+def assert_model_matches(
+    root_attrs: Mapping[str, object], model_version: str, checkpoint_id: str, *, where: str
+) -> None:
+    """Refuse a write whose model or checkpoint disagrees with the store root's.
+
+    A root without ``geoemb:model`` reads as v1.1 (:func:`assert_encoder_matches`); checkpoints
+    compare as stems, because a global root records the file name and a single-area root its stem.
+    """
+    assert_encoder_matches(
+        cast("str | None", root_attrs.get("geoemb:model")),
+        model_version=cast("ModelVersion", model_version),
+        where=where,
+    )
+    stored = root_attrs.get("checkpoint_id")
+    if stored is not None and checkpoint_stem(str(stored)) != checkpoint_stem(checkpoint_id):
+        raise ValueError(
+            f"Refusing to write into {where}: it holds checkpoint {stored!r} and this run uses "
+            f"{checkpoint_id!r}. The encoder matches but the checkpoint (norm source) differs, so the "
+            "embeddings would be mixed. Write a fresh store."
+        )
+
+
+def assert_stack_matches(root_attrs: Mapping[str, object], stack: Mapping[str, str | None], *, where: str) -> None:
+    """Refuse a write whose run stack disagrees with the store root's: the one check every write makes.
+
+    ADR 025: another model, checkpoint, PyTorch or CUDA shifts the embeddings, and nothing downstream
+    would notice the mix. A root without :data:`STACK_ATTR` takes the stack of its first write.
+    Changing a store's stack is a deliberate restamp after measuring equivalence (ADR 025), never a flag.
+    """
+    assert_model_matches(root_attrs, str(stack["model_version"]), str(stack["checkpoint_id"]), where=where)
+    # Present means compared, whatever its type: a malformed stamp is refused, never read as absent.
+    if STACK_ATTR in root_attrs and (stored := root_attrs[STACK_ATTR]) != library_stack(stack):
+        cuda = stack.get("cuda")
+        raise ValueError(
+            f"Refusing to write into {where}: it was computed on {stored!r}, and this run on PyTorch "
+            f"{stack.get('torch')} with {f'CUDA {cuda}' if cuda else 'CPU'}. One store never mixes two "
+            "stacks (ADR 025). Run on the store's stack: the global flows pick its worker image through "
+            "ami_ssm_name_by_model, and a local run needs that PyTorch installed (docs/environment-setup.md). "
+            "Moving a store to another stack is a restamp after an equivalence check (ADR 025)."
         )
 
 
@@ -207,6 +266,48 @@ def _crs_fields_from_epsg(epsg_code: str) -> dict[str, str | dict]:
     except Exception:
         logger.debug("Failed to derive CRS fields from %s", epsg_code, exc_info=True)
     return result
+
+
+#: CF attributes for the projected Y and X coordinate arrays, in that order (CF Appendix A
+#: standard names), so CF-reading tools identify the axes and their units without knowing the
+#: ``spatial:`` convention. Keyed by axis, not name: the names are the store's own.
+_CF_COORD_ATTRS: tuple[dict[str, str], dict[str, str]] = (
+    {"standard_name": "projection_y_coordinate", "units": "m", "axis": "Y"},
+    {"standard_name": "projection_x_coordinate", "units": "m", "axis": "X"},
+)
+
+
+def stamp_array_conventions(node: zarr.Group) -> None:
+    """Label *node*'s arrays for readers that open one array at a time, from the group's own attrs.
+
+    Call after the group attrs are written. Both labels derive from what the group declares, so
+    they cannot disagree with it however its CRS was found (a mosaic attr or the MGRS tile).
+
+    * Every array spanning both of the group's ``spatial:dimensions`` registers ``spatial`` and
+      repeats them: the spec requires ``spatial:dimensions`` on every array, while the transform,
+      bbox and CRS stay on the group, which the spec lets child arrays inherit. So a variable
+      opened alone (an xarray ``DataArray``) knows its spatial dims but not its georeferencing.
+      Any other registration on the array is kept; ours is matched by uuid.
+    * The Y and X coordinate arrays get CF ``standard_name``/``units``/``axis``, which claim the values
+      are projected metres. So both halves must be declared: real coordinates (the group has
+      ``spatial:dimensions``, which bare pixel indices never get) in a metre-based ``proj:code``
+      (the ``geoemb:gsd`` rule). Anything else is left unlabelled rather than mislabelled.
+
+    Writes only arrays whose attrs differ, so re-stamping an unchanged store is a no-op.
+    """
+    dims = cast("list[str]", node.attrs.get("spatial:dimensions") or [])
+    epsg = cast("str | None", node.attrs.get("proj:code"))
+    wanted: dict[str, dict[str, Any]] = (
+        dict(zip(dims, _CF_COORD_ATTRS, strict=True)) if dims and _is_metre_crs(epsg) else {}
+    )
+    for name, arr in node.arrays() if dims else ():
+        if set(dims) <= set(getattr(arr.metadata, "dimension_names", None) or ()):
+            registered = cast("list[dict[str, Any]]", arr.attrs.get("zarr_conventions") or [])
+            others = [c for c in registered if c.get("uuid") != _SPATIAL_CONVENTION["uuid"]]
+            wanted[name] = {"zarr_conventions": [*others, _SPATIAL_CONVENTION], "spatial:dimensions": dims}
+    for name, attrs in wanted.items():
+        if any(node[name].attrs.get(k) != v for k, v in attrs.items()):
+            node[name].attrs.update(attrs)
 
 
 def _compute_affine_transform(y_coords: np.ndarray, x_coords: np.ndarray) -> list[float]:
@@ -299,13 +400,12 @@ def _compute_bbox(y_coords: np.ndarray, x_coords: np.ndarray) -> list[float]:
 def _geoemb_fields(
     *,
     embedding_dim: int,
-    model_version: str | None,
+    checkpoint_id: str | None,
     model_url: str | None,
     data_type: str,
     gsd: float | None,
-    spatial_layout: str | None,
     source_data: tuple[str, ...],
-    encoder_version: ModelVersion | None = None,
+    model_version: ModelVersion | None,
 ) -> dict:
     """The ``geoemb:*`` (+ ``checkpoint_id``) attrs, shared by the single-ROI and multi-group builders.
 
@@ -315,12 +415,10 @@ def _geoemb_fields(
     attrs: dict = {
         "geoemb:type": "pixel",  # per-pixel embeddings (not chip)
         "geoemb:dimensions": embedding_dim,
-        # The PUBLIC encoder reference, resolved from the model FAMILY and never from
-        # *model_version* — which in production is an internal checkpoint filename stem
-        # (`checkpoint_to_version(...)`). That stem is kept separately as `checkpoint_id`
-        # below, so a v1.0 / future / custom checkpoint cannot advertise a synthetic public
-        # URL. Keyed by encoder_version so v2 Large stamps its own URL rather than v1.1's.
-        "geoemb:model": model_url or encoder_url(encoder_version or DEFAULT_MODEL_VERSION),
+        # The PUBLIC encoder reference, resolved from the model and never from the checkpoint's
+        # filename stem, which is kept separately as `checkpoint_id` below, so a custom checkpoint
+        # cannot advertise a synthetic public URL.
+        "geoemb:model": expected_model_url(model_url, model_version=model_version),
         "geoemb:source_data": list(source_data),
         "geoemb:data_type": data_type,
         # build_version is the SOFTWARE build (this package) per the convention.
@@ -334,42 +432,38 @@ def _geoemb_fields(
             "scale": {"type": "array", "array_name": "scales", "nodata": "NaN"},
         },
     }
-    if model_version:
-        attrs["checkpoint_id"] = model_version
+    if checkpoint_id:
+        attrs["checkpoint_id"] = checkpoint_id
     if gsd is not None:
         attrs["geoemb:gsd"] = gsd
-    if spatial_layout is not None:
-        attrs["geoemb:spatial_layout"] = spatial_layout
     return attrs
 
 
 def build_geoemb_root_attrs(
     *,
     embedding_dim: int,
-    spatial_layout: str,
     gsd: float | None = None,
-    model_version: str | None = None,
-    encoder_version: ModelVersion | None = None,
+    checkpoint_id: str | None = None,
+    model_version: ModelVersion | None = None,
     model_url: str | None = None,
     data_type: str = QUANTIZED_DTYPE,
     source_data: tuple[str, ...] = DEFAULT_SOURCE_DATA,
 ) -> dict:
-    """``geoemb:`` attrs for the ROOT of a multi-group store (``utm_zones`` / ``global``).
+    """``geoemb:`` attrs for the ROOT of a multi-group (per-zone) store.
 
-    In the ``utm_zones`` layout the encoder/quantization provenance is stated ONCE at the
-    root, being identical across zones, while ``proj:``/``spatial:`` live on each per-zone
+    The encoder/quantization provenance is stated ONCE at the root, being identical across
+    zones, while ``proj:``/``spatial:`` live on each per-zone
     group whose CRS and grid differ — build those with :func:`build_convention_attrs` and
     ``include_geoemb=False``. *gsd* is explicit here because the root has no single
     coordinate grid to derive it from.
     """
     attrs = _geoemb_fields(
         embedding_dim=embedding_dim,
+        checkpoint_id=checkpoint_id,
         model_version=model_version,
-        encoder_version=encoder_version,
         model_url=model_url,
         data_type=data_type,
         gsd=gsd,
-        spatial_layout=spatial_layout,
         source_data=source_data,
     )
     attrs["zarr_conventions"] = [_GEOEMB_CONVENTION]
@@ -383,14 +477,14 @@ def build_convention_attrs(
     total_y: int,
     total_x: int,
     embedding_dim: int,
+    spatial_dims: tuple[str, str],
     y_coords: np.ndarray | None = None,
     x_coords: np.ndarray | None = None,
-    model_version: str | None = None,
-    encoder_version: ModelVersion | None = None,
+    checkpoint_id: str | None = None,
+    model_version: ModelVersion | None = None,
     model_url: str | None = None,
     data_type: str = QUANTIZED_DTYPE,
     gsd: float | None = None,
-    spatial_layout: str | None = None,
     source_data: tuple[str, ...] = DEFAULT_SOURCE_DATA,
     include_geoemb: bool = True,
 ) -> dict:
@@ -400,24 +494,25 @@ def build_convention_attrs(
     ``proj:*``, ``spatial:*`` and ``geoemb:*`` metadata. *epsg_code* takes precedence over
     *tile_id*, so a caller that reprojects records the actual output CRS rather than the
     MGRS tile's original UTM zone; if neither resolves to a valid EPSG code the ``proj:``
-    convention is omitted.
+    convention is omitted. *spatial_dims* names the store's Y and X dimensions, as the store
+    has them: its model's on creation, its own on an append.
 
     The ``geoemb:`` fields record encoder-model provenance and quantization:
 
     * ``geoemb:model`` — the PUBLIC encoder reference URL: *model_url* when the caller
-      supplies the exact public URI, else looked up from *encoder_version*, the model FAMILY
-      (e.g. ``"v2-large"``). NEVER built from *model_version*, an internal checkpoint filename
-      stem in production, which is recorded as a plain ``checkpoint_id`` provenance attr
-      instead. Passing the family matters: omitting it stamps the default model's URL, so a v2
-      store would advertise itself as v1.1.
+      supplies the exact public URI, else *model_version*'s (e.g. ``"v2-large"``); one of the
+      two is required. Never built from the checkpoint's filename stem, which is recorded as
+      a plain ``checkpoint_id`` provenance attr instead.
     * ``geoemb:build_version`` — the software/package version.
     * ``geoemb:data_type`` — the quantized storage dtype (*data_type*).
     * ``geoemb:gsd`` — metres, and emitted only when trustworthy: from a metre-based CRS's
       coordinate spacing, or an explicit *gsd* the caller vouches for. OMITTED for a
       non-metre CRS (degrees, feet) or absent coords rather than given a false value.
-    * ``geoemb:spatial_layout`` — ``"utm_zones"``/``"global"``; OMITTED when ``None``, since
-      a single-ROI store has no utmNN/global groups.
     * ``geoemb:source_data`` — the source-dataset URLs.
+
+    ``geoemb:spatial_layout`` is never written. Its schema allows only ``"utm_zones"`` (60
+    groups named ``utm01`` to ``utm60``) and ``"global"`` (one array in a global CRS); our stores
+    are 120 hemisphere groups (``01N`` to ``60S``) or a single ROI, so either value would mislead.
 
     *include_geoemb* False emits only ``proj:``/``spatial:``: the multi-group campaign store
     carries geoemb: once at the root (:func:`build_geoemb_root_attrs`) and uses this builder
@@ -441,7 +536,7 @@ def build_convention_attrs(
     # --- spatial: convention ---
     if y_coords is not None and x_coords is not None and len(y_coords) > 1 and len(x_coords) > 1:
         conventions.append(_SPATIAL_CONVENTION)
-        attrs["spatial:dimensions"] = ["northing", "easting"]
+        attrs["spatial:dimensions"] = list(spatial_dims)
         attrs["spatial:transform_type"] = "affine"
         attrs["spatial:transform"] = _compute_affine_transform(y_coords, x_coords)
         attrs["spatial:shape"] = [total_y, total_x]
@@ -460,12 +555,11 @@ def build_convention_attrs(
         attrs.update(
             _geoemb_fields(
                 embedding_dim=embedding_dim,
+                checkpoint_id=checkpoint_id,
                 model_version=model_version,
-                encoder_version=encoder_version,
                 model_url=model_url,
                 data_type=data_type,
                 gsd=gsd_val,
-                spatial_layout=spatial_layout,
                 source_data=source_data,
             )
         )

@@ -17,8 +17,10 @@ CI verifies that the names listed here match `tessera_embeddings.__all__`.
 - `TimeWindow` — 12-month rolling window.
 - `parse_time_window(s: str) -> TimeWindow` — parses
   `"Month YYYY"` strings.
-- `checkpoint_filename(norm_source: str = "aws") -> str` — canonical
-  filename for the bundled model checkpoints (`"aws"` or `"mpc"`).
+- `checkpoint_filename(norm_source: str | None = None, *, model_version) -> str`
+  — canonical checkpoint filename for `model_version` (`"v1.1"` or
+  `"v2-large"`). v1.1 ships two, chosen by `norm_source` (`"aws"`, the
+  default, or `"mpc"`); v2 ships one and ignores it.
 - `INFERENCE_CHUNK_SIZE` — pixel size of one spatial inference tile (2048).
   One tile is exactly one output shard, and both paths use this constant — the
   global fill rejects any `InferenceConfig.chunk_size` that is not the zone's

@@ -76,9 +76,9 @@ uv run python -m scripts.scoping.scale_tests.teardown --run-id run1 --backend s3
 
 Install the extra deps once: `uv sync --group scale-tests`.
 
-**Bench environment must pin `icechunk>=2.1.1`** (ADR D9): 2.0.4 has a
-concurrent-manifest-fetch bug (#2158, ~25× slowdown) that poisons read
-benchmarks.
+**Bench environment runs the library's own lock** (`uv.lock`). Never go below
+`icechunk>=2.1.1` (ADR D9): 2.0.4 has a concurrent-manifest-fetch bug (#2158,
+~25× slowdown) that poisons read benchmarks.
 
 ### Common flags (every `tN` script)
 
@@ -129,7 +129,7 @@ estimate below is priced against, so the two belong together.
 | EC2 | `r7i.4xlarge` (16 vCPU / 128 GB), us-west-2 | RAM headroom for the commit-RSS tests — T2 sweeps to ~10⁷ refs, about 4 GB, plus the fork processes — and it matches the store's default region |
 | Bucket | fresh, us-west-2, same account | throwaway; expect a `SlowDown` ramp on the first heavy writes |
 | IAM | `s3:*` on the test bucket only | |
-| Env | `uv` venv; **icechunk ≥ 2.1.1** (ADR-008 D9), zarr 3.2.1 pinned; package installed from the branch under test | |
+| Env | `uv` venv from `uv.lock` (never below **icechunk 2.1.1**, ADR-008 D9); package installed from the branch under test | |
 | Results | `s3://<bucket>/<prefix>/results/<run-id>/*.jsonl` plus a local mirror — with the documented `--bucket <bucket>/global-embeddings/` that is `s3://<bucket>/global-embeddings/results/<run-id>/` | survives instance death. The mirror sits UNDER the `--bucket` prefix, beside the stores rather than at the bucket root, because a prefix-scoped bucket only grants write access under its prefix |
 
 **Teardown**, in the order that works:

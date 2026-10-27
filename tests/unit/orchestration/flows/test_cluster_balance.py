@@ -41,7 +41,7 @@ from tests.unit.zone_density import LIVE_ZONES, ZONE_TILES, plan
 DEFAULT_CLUSTERS: int = inspect.signature(campaign.run_global_campaign.fn).parameters["max_parallel_clusters"].default
 
 #: Spanning the plausible operating range: one cluster for the year, the shipped
-#: 8, and well past it. 120 is the degenerate cluster-per-zone end.
+#: 8, and well past it. 120 is the degenerate one-zone-per-cluster end.
 CLUSTER_COUNTS = [1, 2, 4, 6, 8, 12, 16, 24, 40, 120]
 
 

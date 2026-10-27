@@ -815,9 +815,8 @@ order the credentials were *used*. The reviewer's alternative — hold a lock ac
 fetch — was declined: that fetch can block on a network call, so holding a lock across it would put
 every storage request in the process behind a network round trip.
 
-**Versions.** We run Icechunk **2.1.1**. The only later release is **2.1.2** (29 July 2026), and its
-release notes contain no change to the credential-caching code, so upgrading does not address issue
-#2077. That issue has no linked fix.
+**Versions.** We run Icechunk **2.3.0**. No release notes from 2.1.2 to 2.3.0 mention the
+credential-caching code, so the upgrade does not address issue #2077. That issue has no linked fix.
 
 ---
 

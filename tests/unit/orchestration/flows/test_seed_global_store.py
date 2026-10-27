@@ -1,7 +1,6 @@
-"""seed_global_store flow: the recorded checkpoint identity default.
+"""seed_global_store flow: which model and minimum-depth rule a seed stamps.
 
-Exercised via ``.fn`` with the repo ops mocked, so no Icechunk store is created —
-the point is only which ``model_version`` (→ ``checkpoint_id``) is stamped.
+Exercised via ``.fn`` with the repo ops mocked, so no Icechunk store is created.
 """
 
 from __future__ import annotations
@@ -14,14 +13,13 @@ import pytest
 import zarr.errors
 
 import tessera_embeddings.orchestration.prefect.flows.seed_global_store as mod
-from tessera_embeddings.config.inference import checkpoint_filename
 from tessera_embeddings.config.paths import BucketPaths
 
 _PATHS = BucketPaths(inputs="s3://in", outputs="s3://out")
 
 
 def _capture_seed(monkeypatch) -> dict:
-    """Force the create path and capture the model_version passed to seed_zone_groups."""
+    """Force the create path and capture the model and depth rule passed to seed_zone_groups."""
     monkeypatch.setattr(mod, "get_run_logger", lambda: logging.getLogger("test-seed"))
     monkeypatch.setattr(mod, "create_global_repo", lambda *a, **k: object())
 
@@ -40,20 +38,12 @@ def _capture_seed(monkeypatch) -> dict:
     return captured
 
 
-def test_seed_defaults_checkpoint_id_to_checkpoint_filename(monkeypatch):
-    """model_version defaults to checkpoint_filename() so the fill's checkpoint gate
-    is effective by default — geoemb:model alone can't distinguish aws vs mpc.
-    """
+@pytest.mark.parametrize("model", ["v1.1", "v2-large"])
+def test_seed_stamps_the_model(monkeypatch, model):
+    """The seed records the model every later fill follows."""
     captured = _capture_seed(monkeypatch)
-    mod.seed_global_store.fn(paths=_PATHS)
-    assert captured["model_version"] == checkpoint_filename()
-
-
-def test_seed_preserves_explicit_model_version(monkeypatch):
-    """An explicit model_version overrides the checkpoint-filename default."""
-    captured = _capture_seed(monkeypatch)
-    mod.seed_global_store.fn(paths=_PATHS, model_version="custom-encoder-v2")
-    assert captured["model_version"] == "custom-encoder-v2"
+    mod.seed_global_store.fn(paths=_PATHS, model_version=model)
+    assert captured["model_version"] == model
 
 
 def test_seed_creates_on_missing_repo_icechunk_error(monkeypatch):
@@ -65,7 +55,7 @@ def test_seed_creates_on_missing_repo_icechunk_error(monkeypatch):
 
     monkeypatch.setattr(mod, "open_global_repo", _raise_missing)
     mod.seed_global_store.fn(paths=_PATHS)
-    assert captured["model_version"] == checkpoint_filename()  # seed_zone_groups ran → create path taken
+    assert captured["model_version"] == "v1.1"  # seed_zone_groups ran
 
 
 def test_seed_reraises_transient_icechunk_error(monkeypatch):
@@ -100,7 +90,7 @@ def test_seed_treats_rootless_existing_repo_as_unseeded(monkeypatch):
     monkeypatch.setattr(mod, "campaign_status", _rootless)
     mod.seed_global_store.fn(paths=_PATHS)
     # Reached seeding (seeded=set()) instead of propagating the read error.
-    assert captured["model_version"] == checkpoint_filename()
+    assert captured["model_version"] == "v1.1"
 
 
 def test_the_minimum_depth_rule_is_not_defaulted_from_the_config_constant(monkeypatch):
@@ -148,6 +138,7 @@ def _fully_seeded(monkeypatch, root_attrs: dict, *, cells_landed: int):
     # layout check needs real arrays. Covered on its own below.
     monkeypatch.setattr(mod, "_check_layout_matches", lambda *a, **k: None)
     monkeypatch.setattr(mod, "missing_seeded_arrays", lambda *a, **k: set())
+    monkeypatch.setattr(mod, "spatial_dims_of", lambda grp: ("northing", "easting"))
     monkeypatch.setattr(mod, "read_time_values", lambda grp: list(mod.CAMPAIGN_YEARS))
     monkeypatch.setattr(mod, "year_of", lambda t: t)
     monkeypatch.setattr(mod, "check_root_identity", lambda *a, **k: None)
@@ -203,7 +194,7 @@ def test_an_unstamped_but_empty_store_gets_its_identity_written(monkeypatch):
 
     `seed_zone_groups` stamps as a side effect of creating groups, so a store whose 120
     groups already exist never reaches that line. The flow reported a clean seed having
-    written neither the checkpoint nor the depth rule — and the fill gates pass on an
+    written neither the model nor the depth rule — and the fill gates pass on an
     ABSENT attr, so the store would then accept anything.
     """
     _fully_seeded(monkeypatch, {}, cells_landed=0)
@@ -258,6 +249,7 @@ def _partially_seeded(monkeypatch, root_attrs: dict, *, cells_landed: int, seede
     # layout check needs real arrays. Covered on its own below.
     monkeypatch.setattr(mod, "_check_layout_matches", lambda *a, **k: None)
     monkeypatch.setattr(mod, "missing_seeded_arrays", lambda *a, **k: set())
+    monkeypatch.setattr(mod, "spatial_dims_of", lambda grp: ("northing", "easting"))
     monkeypatch.setattr(mod, "read_time_values", lambda grp: list(mod.CAMPAIGN_YEARS))
     monkeypatch.setattr(mod, "year_of", lambda t: t)
     monkeypatch.setattr(mod, "check_root_identity", lambda *a, **k: None)
@@ -309,7 +301,7 @@ def test_a_fully_seeded_store_still_validates_the_requested_identity(monkeypatch
     """The every-zone-exists path returns before seed_zone_groups, which is the only place
     the write-once root identity is compared.
 
-    So a rerun asking for a different checkpoint — or a different minimum-depth rule —
+    So a rerun asking for a different model — or a different minimum-depth rule —
     reported a clean seed, left the old identity standing, and the campaign then followed
     the OLD rule while the operator believed they had configured a new one. Nothing raised
     and nothing logged a difference.
@@ -339,6 +331,7 @@ def test_a_fully_seeded_store_still_validates_the_requested_identity(monkeypatch
     # layout check needs real arrays. Covered on its own below.
     monkeypatch.setattr(mod, "_check_layout_matches", lambda *a, **k: None)
     monkeypatch.setattr(mod, "missing_seeded_arrays", lambda *a, **k: set())
+    monkeypatch.setattr(mod, "spatial_dims_of", lambda grp: ("northing", "easting"))
     # The year-axis guard runs first and must pass, so the identity check is what raises.
     monkeypatch.setattr(mod, "read_time_values", lambda grp: list(mod.CAMPAIGN_YEARS))
     monkeypatch.setattr(mod, "year_of", lambda t: t)
