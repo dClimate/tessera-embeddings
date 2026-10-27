@@ -660,6 +660,11 @@ is documented as an index); per-card `get_batch` latency; sustained network thro
 multi-GPU sizes of either family, which refused in all availability zones every time they were
 probed.
 
+**Blackwell, measured later.** The `g7e.2xlarge` (RTX PRO 6000) does about twice an L40S's work at 1.81×
+the price, so it is worth adopting where it can be had, on the PyTorch 2.14.1 workers only; the
+`g7.2xlarge` (RTX PRO 4500) is worse value than the A10G. Method, numbers and the day's capacity are in
+[`v2-on-blackwell.md`](v2-on-blackwell.md).
+
 ---
 
 ## 5. Why the batch is sized to the card it lands on
