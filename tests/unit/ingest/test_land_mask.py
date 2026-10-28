@@ -59,9 +59,10 @@ def test_zone_for_cell_matches_delivery_samples() -> None:
     assert land_mask.zone_for_cell(179.95, 0.05) == "60N"
     assert land_mask.zone_for_cell(0.05, 0.05) == "31N"
     assert land_mask.zone_for_cell(0.05, -0.05) == "31S"
-    # A utm_zones column spans both hemispheres.
-    assert (
-        land_mask.zone_for_cell(0.05, -0.05, "utm_zones") == land_mask.zone_for_cell(0.05, 0.05, "utm_zones") == "utm31"
+    # A utm_zones column is filled in halves, split at the equator (ADR 036).
+    assert (land_mask.zone_for_cell(0.05, 0.05, "utm_zones"), land_mask.zone_for_cell(0.05, -0.05, "utm_zones")) == (
+        "utm31n",
+        "utm31s",
     )
 
 
@@ -93,6 +94,21 @@ def test_build_zone_coverage_consistency_and_or() -> None:
     # The invariant the runner + validation rely on.
     ratio = SHARD_PX // INNER_PX
     assert np.array_equal(cov.tile_live, land_mask._block_any(cov.chunk_live, ratio))
+
+
+def test_column_halves_split_the_column_coverage_exactly() -> None:
+    """ADR 036: the halves are the column's coverage cut at the equator — together all of it, sharing no shard.
+
+    Cells hug the equator from both sides, so a footprint crossing it is the case that matters.
+    """
+    lons, lats = np.array([2.35, 2.35, 2.45]), np.array([0.05, -0.05, 48.85])
+    column = land_mask.build_zone_coverage("utm31", lons, lats)
+    north, south = (land_mask.build_zone_coverage(z, lons, lats) for z in ("utm31n", "utm31s"))
+    for bitmap in ("tile_live", "chunk_live"):
+        n, s = getattr(north, bitmap), getattr(south, bitmap)
+        assert np.array_equal(n | s, getattr(column, bitmap)) and not (n & s).any()
+    assert (north.n_cells, south.n_cells) == (2, 1)
+    assert north.tile_live[: zone_grid.zone("utm31s").tile_rows[0]].any() and south.tile_live.any()
 
 
 def test_build_zone_coverage_empty_zone_is_all_false() -> None:

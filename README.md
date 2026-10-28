@@ -445,11 +445,12 @@ one Icechunk repo (BucketPaths.global_store())
 │           scales / obs counts sharded on the same 2048² spatial grid
 ├── utm02/  … one group per UTM zone, seeded metadata-only up front …
 ⋮
-└── utm60/  attrs: crs, zone_scheme, years_complete, runs, conventions
+└── utm60/  attrs: crs, zone_scheme, years_complete, halves_complete, runs, conventions
 ```
 
 `run_global_campaign` drives the fill year-serial with bounded zone parallelism and
-triggers its own ingestion (ADR-011); `orchestration/runners/zone_fill.py` is the
+triggers its own ingestion (ADR-011). It fills each `utm` column as two halves, `utm01n` …
+`utm60s`, split on the equator's shard boundary (ADR 036); `orchestration/runners/zone_fill.py` is the
 end-to-end (zone, year) callable, and `storage/campaign.py` holds the per-cell tags,
 snapshot expiry and the zone×year progress reader. The
 [Prefect flow README](src/tessera_embeddings/orchestration/prefect/README.md) documents

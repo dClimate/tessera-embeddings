@@ -113,7 +113,7 @@ from tessera_embeddings.storage.zarr_store import (
     open_store_as_zarr_group,
     plain_zarr_storage_options,
 )
-from tessera_embeddings.storage.zone_grid import PIXEL_M
+from tessera_embeddings.storage.zone_grid import PIXEL_M, Half
 
 logger = logging.getLogger(__name__)
 
@@ -2364,6 +2364,7 @@ class ZarrWriter:
         commit_attrs: Callable[[icechunk.Repository, str, int, Mapping[str, str]], str] | None = None,
         update_name: str | None = None,
         time_index: int | None = None,
+        half: Half | None = None,
     ) -> str:
         """Assemble a run's staged tiles into one (zone, year) of the global store.
 
@@ -2392,6 +2393,8 @@ class ZarrWriter:
         Args:
             store_path: URI of the global Icechunk repo (``BucketPaths.global_store()``).
             zone: Zone group name, e.g. ``"utm33"`` or ``"01N"`` (ADR 034).
+            half: The column half this run fills, when ``zone`` is a ``utm_zones`` column filled
+                in halves (ADR 036): only that half is marked complete.
             year: Campaign calendar year to fill; must be on the group's pre-allocated time axis.
             run_id: Run identifier (locates staged files).
             registry_root: Root of the published registry dataset
@@ -2646,6 +2649,7 @@ class ZarrWriter:
             fault=fault,
             input_coverage=input_coverage,
             commit_attrs=commit_attrs,
+            half=half,
         )
         # THE CELL IS COMMITTED. Only now may the registry say so: nothing reconciles it against
         # the store, and consumers are told they need not open the store, so a part written any

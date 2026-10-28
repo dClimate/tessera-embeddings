@@ -26,7 +26,8 @@ campaign's own, which it rewrites and sweeps (:meth:`BucketPaths.update_root`).
 
 **What the store records.** Each cell an update lands in gains one entry in its zone group's
 ``updates`` attr, per year an append-only list of records naming the update, its run, its code,
-the depth rule it applied (``optical_min_obs``) and the shards it ``written``/``kept``/``cleared``.
+the depth rule it applied (``optical_min_obs``) and the shards it ``written``/``kept``/``cleared``
+— and, for a column half of a ``utm_zones`` store (ADR 036), the ``half`` it covered.
 ``years_complete``, ``runs`` and the zone-year tags stay exactly as the original fill left them,
 so a cell's state is ``runs[year]`` with ``updates[year]`` applied on top, in order.
 ``update-<name>-base`` pins the store before an update's first write and ``update-<name>-complete``
@@ -68,8 +69,8 @@ from tessera_embeddings.inference.chunk_spec import (
 )
 from tessera_embeddings.storage.campaign import pin_tag
 from tessera_embeddings.storage.registry_master import master_schema
-from tessera_embeddings.storage.shard_writer import commit_with_rebase, read_years_complete
-from tessera_embeddings.storage.zone_grid import canonicalize_zone
+from tessera_embeddings.storage.shard_writer import cell_complete, commit_with_rebase
+from tessera_embeddings.storage.zone_grid import Half, canonicalize_zone, group_and_half
 
 UpdateMode = Literal["holes", "shards"]
 OnSkip = Literal["keep", "clear"]
@@ -404,7 +405,7 @@ def cell_optical_min_obs(root: zarr.Group, zone: str, year: int) -> int | None:
     rule = root.attrs.get("optical_min_obs")
     if rule is None:
         return None
-    records = read_updates(cast(zarr.Group, root[zone]), year)
+    records = read_updates(cast(zarr.Group, root[group_and_half(zone)[0]]), year)
     return min([int(cast("int", rule)), *(int(r["optical_min_obs"]) for r in records if r.get("optical_min_obs"))])
 
 
@@ -428,15 +429,16 @@ def check_no_tightening(
             )
 
 
-def update_state(node: zarr.Group, year: int, name: str) -> UpdateState:
-    """Where update ``name`` stands on one cell.
+def update_state(node: zarr.Group, year: int, name: str, half: Half | None = None) -> UpdateState:
+    """Where update ``name`` stands on one cell: a group's year, or one column half of it (ADR 036).
 
     ``not_complete`` when the year was never filled: an update is an insert into existing data,
-    and an unfilled year is the campaign's to fill.
+    and an unfilled year is the campaign's to fill. A half's update records carry its ``half``,
+    so the other half of the column still has it to do.
     """
-    if any(record.get("update") == name for record in read_updates(node, year)):
+    if any(r.get("update") == name and r.get("half") == half for r in read_updates(node, year)):
         return "done"
-    return "pending" if year in read_years_complete(node) else "not_complete"
+    return "pending" if cell_complete(node, year, half) else "not_complete"
 
 
 def update_states(
@@ -450,9 +452,10 @@ def update_states(
     root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
     states: dict[tuple[str, int], UpdateState] = {}
     for zone, year in cells:
-        if zone not in root:
+        group, half = group_and_half(zone)
+        if group not in root:
             raise ValueError(f"Update {name!r} names zone {zone}, which is not seeded in the store")
-        states[(zone, year)] = update_state(cast(zarr.Group, root[zone]), year, name)
+        states[(zone, year)] = update_state(cast(zarr.Group, root[group]), year, name, half)
     return states
 
 
@@ -477,8 +480,11 @@ def update_record(
     cleared: Sequence[str] = (),
     radar_coverage: Mapping[str, Any] | None = None,
     input_coverage: Mapping[str, Any] | None = None,
+    half: Half | None = None,
 ) -> dict[str, Any]:
     """One cell's record of an update: what it wrote, what it kept, under which depth rule and with which code.
+
+    ``half`` is the column half the cell is, in a ``utm_zones`` store (ADR 036).
 
     ``optical_min_obs`` is the line the update judged its pixels against (``None``: no rule), which
     differs from the original fill's when the plan set a looser one.
@@ -494,6 +500,8 @@ def update_record(
         "kept": sorted(kept),
         "cleared": sorted(cleared),
     }
+    if half:
+        record["half"] = half
     if radar_coverage:
         record["radar_coverage"] = dict(radar_coverage)
     if input_coverage:
@@ -524,7 +532,7 @@ def commit_update_record(
     for attempt in range(1, tries + 1):
         session = repo.writable_session("main")
         node = cast(zarr.Group, zarr.open_group(session.store, mode="a")[group])
-        if update_state(node, year, str(record["update"])) == "done":
+        if update_state(node, year, str(record["update"]), record.get("half")) == "done":
             return repo.lookup_branch("main")
         updates = dict(cast("dict[str, list[dict[str, Any]]]", node.attrs.get(UPDATES_ATTR) or {}))
         updates[str(year)] = [*updates.get(str(year), []), {**record, "commit": dict(commit) if commit else None}]

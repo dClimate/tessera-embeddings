@@ -24,7 +24,7 @@ from tessera_embeddings.config.store_layout import (
     spatial_dims_of,
 )
 from tessera_embeddings.storage.global_store import _codec_id, missing_seeded_arrays
-from tessera_embeddings.storage.shard_writer import SHARD_WRITE
+from tessera_embeddings.storage.shard_writer import SHARD_WRITE, year_runs
 
 if TYPE_CHECKING:
     import icechunk
@@ -271,8 +271,8 @@ def committed_runs(attrs: Mapping[str, Any], year: int, writes: Sequence[Commit]
     nothing can afterwards. A targeted update records itself in the same shape beside the fill, in
     ``updates[year]`` (``storage.update``), so its expired commits are found the same way.
     """
-    head = (attrs.get("runs") or {}).get(str(year))
-    current, replaced = ([head], head.get("previous", [])) if isinstance(head, dict) else ([], [])
+    current = year_runs(attrs.get("runs"), year)  # one record, or one per column half (ADR 036)
+    replaced = [entry for head in current for entry in head.get("previous", [])]
     current += (attrs.get("updates") or {}).get(str(year), [])
     tagged = {commit.snapshot for commit in writes}
     recorded = [c for entry in current if (c := _recorded(entry, tagged)) is not None]

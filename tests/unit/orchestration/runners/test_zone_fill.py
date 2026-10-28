@@ -119,7 +119,8 @@ def _make_mask(
     tmp_path,
     live_tiles: list[tuple[int, int]],
     *,
-    zone_attr: str = _ZONE,
+    group: str = _ZONE,
+    zone_attr: str | None = None,
     crs: str | None = None,
     grid_shape: list[int] | None = None,
     tile_shape: tuple[int, int] | None = None,
@@ -137,12 +138,12 @@ def _make_mask(
     path = str(tmp_path / "coverage.icechunk")
     repo, _ = open_or_create_repo(path)
     session = repo.writable_session("main")
-    node = zarr.open_group(session.store, mode="a").require_group(_ZONE)
+    node = zarr.open_group(session.store, mode="a").require_group(group)
     tile_live = np.zeros((nr, nc), dtype=bool)
     for row, col in live_tiles:
         tile_live[row, col] = True
     node.create_array("tile_live_2048", data=tile_live, chunks=(nr, nc), dimension_names=("tile_row", "tile_col"))
-    node.attrs.update({"zone": zone_attr, "crs": crs, "grid_shape": grid_shape})
+    node.attrs.update({"zone": zone_attr or group, "crs": crs, "grid_shape": grid_shape})
     session.commit("seed test coverage")
     return path
 
@@ -278,6 +279,38 @@ def test_fill_zone_year_end_to_end(tmp_path, monkeypatch):
         np.testing.assert_array_equal(got, emb, err_msg=label)
     # Staging cleaned up after success.
     assert not (tmp_path / "staging" / "runZ").exists()
+
+
+def test_a_columns_two_halves_fill_one_group(tmp_path, monkeypatch):
+    """ADR 036: each half writes only its own tiles of the column's group; the year completes with the second."""
+    store = str(tmp_path / "global.icechunk")
+    column = ZoneSpec("32601", None, 1, _SPEC.easting, _SPEC.northing)
+    global_store.seed_zone_groups(global_store.create_global_repo(store), [column], years=_YEARS, layout=SMALL)
+    mosaic_base = _make_mosaic(tmp_path)
+    mask = _make_mask(tmp_path, [(0, 0)], group="utm01n")
+    _make_mask(tmp_path, [(1, 1)], group="utm01s")
+    staged: dict[str, np.ndarray] = {}
+    monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub(staged))
+    repo = global_store.open_global_repo(store)
+
+    def _node():
+        return zarr.open_group(repo.readonly_session(branch="main").store, mode="r")["utm01"]
+
+    north = _fill(tmp_path, store, zone="utm01n", land_mask_path=mask, mosaic_base=mosaic_base, run_id="runN")
+    assert (north["tag"], _node().attrs["years_complete"]) == ("zone-utm01n-2025", [])
+    assert zone_fill.zone_year_complete(store, "utm01n", 2025) and not zone_fill.zone_year_complete(
+        store, "utm01s", 2025
+    )
+
+    south = _fill(tmp_path, store, zone="utm01s", land_mask_path=mask, mosaic_base=mosaic_base, run_id="runS")
+    node = _node()
+    assert (south["tag"], node.attrs["years_complete"]) == ("zone-utm01s-2025", [2025])
+    assert {h: r["run_id"] for h, r in node.attrs["runs"]["2025"].items()} == {"n": "runN", "s": "runS"}
+    result = np.asarray(node["embeddings"][1])
+    for label, emb in staged.items():
+        row, col = (int(p) for p in label.split("_")[1:])
+        np.testing.assert_array_equal(result[row * _TILE : (row + 1) * _TILE, col * _TILE : (col + 1) * _TILE], emb)
+    assert sorted(staged) == ["chunk_0_0", "chunk_1_1"]
 
 
 def test_all_ocean_cell_marked_complete_without_inference(tmp_path, monkeypatch):

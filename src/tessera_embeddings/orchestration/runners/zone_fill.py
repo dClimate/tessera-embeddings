@@ -21,11 +21,12 @@ Contracts (all caller-owned):
   (:func:`tessera_embeddings.storage.global_store.seed_zone_groups`); the group's array shape
   and shard size are the grid authority. Nothing is created or resized here (D1).
 - **Ingest mosaics**: cover the zone grid exactly; a mismatch is a loud error.
-- **One fill per zone at a time**: concurrent fills of *different* zones commit to disjoint
-  groups and rebase cleanly, but two concurrent fills of the *same* zone (different years)
-  both rewrite that group's ``years_complete``/``runs`` attrs, and icechunk's
-  ``ConflictDetector`` cannot auto-merge attribute conflicts — the loser raises
-  ``RebaseFailedError``. Schedule zone-parallel, year-serial.
+- **Concurrent fills**: fills of different zones commit to disjoint groups. Fills that share
+  a group — two years of one zone, or the two halves of a ``utm_zones`` column (ADR 036),
+  which address their group through :func:`~tessera_embeddings.storage.zone_grid.group_and_half`
+  — write disjoint shards, and their year attrs commit separately and retry
+  (:func:`~tessera_embeddings.storage.shard_writer.commit_year_attrs`). Only the same cell
+  twice at once is unsafe.
 
 An all-ocean cell (the mask selects no tiles) — or one whose live tiles all skip (zero valid
 pixels) — is legitimate: it is marked complete with no data
@@ -80,7 +81,7 @@ from tessera_embeddings.storage.global_store import check_destination_types, ope
 from tessera_embeddings.storage.published_store import calendar_years, live_shards, shard_writes, store_year
 from tessera_embeddings.storage.registry_master import merge_cell
 from tessera_embeddings.storage.registry_rebuild import as_coverage_record, rebuild_tile
-from tessera_embeddings.storage.shard_writer import read_years_complete, shard_pitch
+from tessera_embeddings.storage.shard_writer import cell_complete, shard_pitch
 from tessera_embeddings.storage.time_axis import time_index_of, year_timestamp
 from tessera_embeddings.storage.update import (
     UpdateTarget,
@@ -94,7 +95,7 @@ from tessera_embeddings.storage.update import (
     update_state,
 )
 from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group, plain_zarr_storage_options
-from tessera_embeddings.storage.zone_grid import PIXEL_M, canonicalize_zone, tile_row_latitudes
+from tessera_embeddings.storage.zone_grid import PIXEL_M, canonicalize_zone, group_and_half, tile_row_latitudes
 from tessera_embeddings.storage.zone_grid import zone as zone_spec
 
 
@@ -243,7 +244,7 @@ def zone_year_complete(
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
 ) -> bool:
-    """Whether ``(zone, year)`` is already recorded in the group's ``years_complete``.
+    """Whether ``(zone, year)`` is already recorded complete in its group (a column half: its own mark).
 
     A cheap metadata read so a caller can skip provisioning a GPU cluster for a
     crash-recovery retry of a landed-but-untagged cell (:func:`fill_zone_year` re-checks and,
@@ -253,9 +254,10 @@ def zone_year_complete(
         store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
     )
     root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
-    if zone not in root:
+    group, half = group_and_half(zone)
+    if group not in root:
         return False
-    return year in read_years_complete(cast(zarr.Group, root[zone]))
+    return cell_complete(cast(zarr.Group, root[group]), year, half)
 
 
 def zone_year_on_axis(
@@ -276,9 +278,10 @@ def zone_year_on_axis(
         store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
     )
     root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
-    if zone not in root:
+    group = group_and_half(zone)[0]
+    if group not in root:
         return False
-    return time_index_of(cast(zarr.Group, root[zone]), year_timestamp(year)) is not None
+    return time_index_of(cast(zarr.Group, root[group]), year_timestamp(year)) is not None
 
 
 @dataclass
@@ -384,6 +387,8 @@ def _merge_registry_master(
     """
     if not registry_root:
         return
+    # The registry describes the store's groups, so a column half merges its whole column's cell.
+    zone = group_and_half(zone)[0]
     try:
         credentials = _store_credentials(store_path, get_credentials)
         repo = open_global_repo(store_path, get_credentials=credentials, region=s3_region)
@@ -576,9 +581,10 @@ def preflight_destination(
         store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
     )
     root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
-    if zone not in root:
-        raise ValueError(f"Zone group {zone!r} is not seeded in {store_path} — run seed_zone_groups first (D1).")
-    node = cast(zarr.Group, root[zone])
+    group = group_and_half(zone)[0]
+    if group not in root:
+        raise ValueError(f"Zone group {group!r} is not seeded in {store_path} — run seed_zone_groups first (D1).")
+    node = cast(zarr.Group, root[group])
     # PRESENCE OF THE REQUIRED ARRAYS, which the type check deliberately does not test: it skips
     # an absent array so an older store missing an OPTIONAL carried variable still fills. That
     # tolerance is right for the optional set and wrong for `embeddings`/`scales` — a zone
@@ -634,9 +640,10 @@ def plan_zone_inference(
         store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
     )
     root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
-    if zone not in root:
-        raise ValueError(f"Zone group {zone!r} is not seeded in {store_path} — run seed_zone_groups first (D1).")
-    node = cast(zarr.Group, root[zone])
+    group, half = group_and_half(zone)
+    if group not in root:
+        raise ValueError(f"Zone group {group!r} is not seeded in {store_path} — run seed_zone_groups first (D1).")
+    node = cast(zarr.Group, root[group])
 
     # The store's minimum-depth rule is part of its write-once root identity, so the store —
     # not this call's config — is the authority on what rule its zones are filled under. A fill
@@ -686,7 +693,7 @@ def plan_zone_inference(
     # deletion — so deliberate refills need a fresh tag name.
     if update is not None:
         check_radar_policy(update, allow_s2_only=config.allow_s2_only)
-        state = update_state(node, year, update.name)
+        state = update_state(node, year, update.name, half)
         if state == "not_complete":
             raise ValueError(
                 f"Update {update.name!r} targets {zone}-{year}, which has not been filled. An update "
@@ -711,7 +718,7 @@ def plan_zone_inference(
         # recorded branch, so rerunning an update that already landed still works.
         check_no_tightening(repo, update.name, rule, [(zone, year)])
     tag = zone_year_tag(zone, year)
-    if update is None and year in read_years_complete(node):
+    if update is None and cell_complete(node, year, half):
         if tag in repo.list_tags():
             snapshot = repo.lookup_tag(tag)
             log.info("Zone %s year %d already complete and tagged (%s) — nothing to do", zone, year, tag)
@@ -836,10 +843,15 @@ def plan_zone_inference(
             # dispatched again. Never marked empty: the cell keeps everything it held.
             snapshot = commit_update_record(
                 repo,
-                zone,
+                group,
                 year,
                 record=update_record(
-                    update, run_id=run_id, written=[], kept=update.kept, optical_min_obs=config.optical_min_obs
+                    update,
+                    run_id=run_id,
+                    written=[],
+                    kept=update.kept,
+                    optical_min_obs=config.optical_min_obs,
+                    half=half,
                 ),
             )
             result = {**summary, "snapshot_id": snapshot, "elapsed_sec": time.monotonic() - t0}
@@ -1135,6 +1147,7 @@ def assemble_zone_year(
     if handoff.done is not None:
         return handoff.done
     zone, year, run_id, t0 = handoff.zone, handoff.year, handoff.run_id, handoff.t0
+    group, half = group_and_half(zone)
     summary, live, results = handoff.summary, handoff.live, handoff.results
     writer = ZarrWriter(staging_base)
 
@@ -1191,7 +1204,8 @@ def assemble_zone_year(
             # can never be marked empty over shards this run did not clear.
             snapshot = writer.assemble_global(
                 store_path,
-                zone,
+                group,
+                half=half,
                 year=year,
                 run_id=run_id,
                 n_workers=n_assembly_workers or AssemblyConfig().compute_n_workers(len(live)),
@@ -1296,7 +1310,8 @@ def assemble_zone_year(
         )
     snapshot = writer.assemble_global(
         store_path,
-        zone,
+        group,
+        half=half,
         year=year,
         registry_root=registry_root,
         optical_min_obs=optical_min_obs,
@@ -1365,6 +1380,7 @@ def _assemble_update(
     """
     update = cast(UpdateTarget, handoff.update)
     zone, year, run_id, live, results = handoff.zone, handoff.year, handoff.run_id, handoff.live, handoff.results
+    group, half = group_and_half(zone)
     staged = writer.verify_staged_completeness(run_id, live, log=log)
     skipped = sorted({c.label for c in live} - staged)
     cleared = skipped if update.on_skip == "clear" else []
@@ -1378,6 +1394,7 @@ def _assemble_update(
         cleared=cleared,
         radar_coverage=radar_coverage,
         input_coverage=input_coverage,
+        half=half,
     )
     store_credentials = _store_credentials(store_path, get_credentials)
     merged = update.mode == "holes"
@@ -1390,7 +1407,7 @@ def _assemble_update(
     if staged or cleared:
         snapshot = writer.assemble_global(
             store_path,
-            zone,
+            group,
             year=year,
             run_id=run_id,
             n_workers=n_assembly_workers or AssemblyConfig().compute_n_workers(len(staged) + len(cleared)),
@@ -1421,7 +1438,7 @@ def _assemble_update(
                 writer,
                 registry_root,
                 store_path,
-                zone,
+                group,
                 year,
                 run_id,
                 committed_at=committed["committed_at"],
@@ -1437,7 +1454,10 @@ def _assemble_update(
         )
     else:
         snapshot = commit_update_record(
-            open_global_repo(store_path, get_credentials=store_credentials, region=s3_region), zone, year, record=record
+            open_global_repo(store_path, get_credentials=store_credentials, region=s3_region),
+            group,
+            year,
+            record=record,
         )
     cleanup()
     log.info(

@@ -333,9 +333,27 @@ would have let a future field rename silently disable a whole class of check.
 **One behaviour worth knowing rather than fixing.** A block latches: the checked range only grows once
 the base stops moving, so one same-zone commit early in a fill makes every later tick report
 `blocked`. That is safe — it is exactly today's behaviour — but it means the mechanism switches off
-for the rest of that fill. Advancing to the last snapshot before the offending commit would keep most
+for the rest of that fill. (When the two halves of a `utm` column made same-group commits routine,
+the guard was narrowed to the shards being written; see "Two writers in one group" below.) Advancing to the last snapshot before the offending commit would keep most
 of the benefit and is not possible today, because `rebase` accepts no target snapshot. That is a
 second reason to want the upstream fix.
+
+### Two writers in one group (ADR 036)
+
+The guard was written GROUP-wide on the premise that the campaign's concurrent writers are other
+zones. ADR 036 broke that premise: a v2 column is filled as two halves at once, into one group. The
+other half's shard commit, or its attrs-only "empty" mark (most columns are mostly ocean in one
+hemisphere), would latch the block above for the rest of the fill, which is the deep walk this
+section exists to prevent.
+
+So the shard writer now passes `_diff_touches` the `(time, row, col)` shards it writes, and promises
+it writes nothing else. A commit inside the group is then skipped only if it touched none of those
+shards and changed nothing of the group but its attributes. Those are exactly the commits
+`ConflictDetector` accepts for a session that holds only those chunks. Structural changes (arrays
+added, removed, renamed or resized) and coordinate-array chunks still block. The commit's own
+rebase is unchanged and remains the correctness mechanism. A real-repository test pins both
+directions: the other half's shard and its completion mark are skipped, and a commit to our own
+shard blocks. A later commit landing both halves' pixels is checked as well.
 
 ### A second review, of the tests rather than the code
 
@@ -899,7 +917,9 @@ the whole consequence. There is no correctness cliff at 16, or anywhere up to 12
 `RebaseFailedError` needs a genuine chunk conflict, and commits touch disjoint zone GROUPS even while
 sharing a branch tip. The same-zone case that could conflict is serialised elsewhere: the driver
 partitions zones across clusters, a cluster's trailing assembly is single-threaded, and
-`commit_year_attrs` carries its own `tries=8` retry for exactly that collision.
+`commit_year_attrs` carries its own `tries=8` retry for exactly that collision. (Since ADR 036 the
+two halves of a v2 column share a group on different clusters by design. Their shards are disjoint,
+so that retry is the only interaction.)
 
 **Weighed against that, the gate costs more than it saves.** It bounds a slowdown measured in
 seconds, and it misled its own operator twice in one night. A control that cannot fail dangerously

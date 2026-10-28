@@ -11,10 +11,16 @@ model's layout; an existing store keeps the one its groups already use.
   ``"60S"``), each in its hemisphere's CRS (EPSG:326xx north, EPSG:327xx south).
 
 A zone name says which layout it belongs to, so every zone resolves through one
-:func:`zone` lookup; only "every zone" questions (:func:`zones`) take a layout. The
-southern half of a ``utm`` zone is NOT the matching ``S`` zone moved: 10 000 km of false
-northing is a whole number of pixels but not of shards, so the two grids share pixels
-and disagree on shard boundaries.
+:func:`zone` lookup; only "every zone" questions take a layout. The southern half of a
+``utm`` zone is NOT the matching ``S`` zone moved: 10 000 km of false northing is a whole
+number of pixels but not of shards, so the two grids share pixels and disagree on shard
+boundaries.
+
+**The campaign fills a column in two halves (ADR 036).** ``utm33n`` and ``utm33s`` are the
+work units for group ``utm33``: each has the column's whole grid but owns only the shard rows
+on its side of the equator, which falls on a shard boundary. :func:`zones` lists the store's
+groups; :func:`fill_zones` lists the units the campaign fills, which in the ``hemispheres``
+layout are the groups themselves.
 
 **Boundary policy — pure nominal 6° longitude bands.** Zone extents are the
 *nominal* 6°-wide UTM bands; coverage is disjoint and every pixel-center belongs
@@ -42,6 +48,7 @@ import math
 import re
 from collections.abc import Iterable
 from functools import cache
+from typing import Literal
 
 import numpy as np
 from pyproj import CRS, Transformer
@@ -59,6 +66,7 @@ PITCH_M: float = SHARD_PX * PIXEL_M  # 20 480 m
 ZONE_SCHEME: str = "utm_6deg_nominal"
 
 Extent = tuple[float, float]  # (low, high) in projected metres
+Half = Literal["n", "s"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -70,11 +78,26 @@ class ZoneSpec:
     utm_zone: int  # 1..60
     easting: Extent
     northing: Extent
+    half: Half | None = None  # a column's fill half; None for a whole group
 
     @property
     def group_name(self) -> str:
         """Zarr group name for this zone: ``"utm01"`` for a column, else its UTM common name (``"01N"``)."""
         return f"utm{self.utm_zone:02d}" if self.hemisphere is None else f"{self.utm_zone:02d}{self.hemisphere}"
+
+    @property
+    def name(self) -> str:
+        """The zone's own name: its group's, or a column half's (``"utm01s"``)."""
+        return self.group_name + (self.half or "")
+
+    @property
+    def tile_rows(self) -> tuple[int, int]:
+        """The ``[start, stop)`` shard rows this zone owns: all of them, or a half's side of the equator."""
+        n_rows = self.height // SHARD_PX
+        if self.half is None:
+            return 0, n_rows
+        equator = round(self.northing[1] / PITCH_M)
+        return (0, equator) if self.half == "n" else (equator, n_rows)
 
     @property
     def crs(self) -> str:
@@ -134,7 +157,7 @@ _COLUMN_NORTHING: Extent = (-8_888_320.0, 9_338_880.0)
 
 
 def _build_zones() -> dict[ZoneLayout, dict[str, ZoneSpec]]:
-    """Build both layouts' zone tables, each keyed by group name."""
+    """Build both layouts' group tables, each keyed by group name."""
     hemispheres: dict[str, ZoneSpec] = {}
     columns: dict[str, ZoneSpec] = {}
     for utm in range(1, 61):
@@ -149,19 +172,45 @@ def _build_zones() -> dict[ZoneLayout, dict[str, ZoneSpec]]:
 
 
 _ZONES_BY_LAYOUT: dict[ZoneLayout, dict[str, ZoneSpec]] = _build_zones()
+#: What the campaign fills: each column as its two halves, each hemisphere group whole.
+_FILL_ZONES_BY_LAYOUT: dict[ZoneLayout, dict[str, ZoneSpec]] = {
+    "hemispheres": _ZONES_BY_LAYOUT["hemispheres"],
+    "utm_zones": {
+        half.name: half
+        for column in _ZONES_BY_LAYOUT["utm_zones"].values()
+        for half in (dataclasses.replace(column, half="n"), dataclasses.replace(column, half="s"))
+    },
+}
 
 
 def zones(layout: ZoneLayout) -> dict[str, ZoneSpec]:
-    """Every zone of *layout*, keyed by group name: ``"01N"``…``"60S"`` or ``"utm01"``…``"utm60"``."""
+    """Every group of *layout*, keyed by name: ``"01N"``…``"60S"`` or ``"utm01"``…``"utm60"``."""
     return _ZONES_BY_LAYOUT[layout]
 
 
+def fill_zones(layout: ZoneLayout) -> dict[str, ZoneSpec]:
+    """Every unit the campaign fills in *layout*, keyed by name: the groups, or each column's two halves."""
+    return _FILL_ZONES_BY_LAYOUT[layout]
+
+
 def zone(name: str) -> ZoneSpec:
-    """Look up a zone of either layout by its group name (e.g. ``"01N"``, ``"utm33"``)."""
-    for table in _ZONES_BY_LAYOUT.values():
-        if name in table:
-            return table[name]
+    """Look up a group or a column half of either layout by name (``"01N"``, ``"utm33"``, ``"utm33s"``)."""
+    for tables in (_ZONES_BY_LAYOUT, _FILL_ZONES_BY_LAYOUT):
+        for table in tables.values():
+            if name in table:
+                return table[name]
     raise KeyError(name)
+
+
+def group_and_half(name: str) -> tuple[str, Half | None]:
+    """The store group a fill zone writes, and the column half it owns there.
+
+    ``"utm33s"`` → ``("utm33", "s")``; any other name — a group, or a single-area store's ``""``
+    — is its own group, whole. The one mapping from a fill zone to what it addresses in the store,
+    where a column's two halves share one group (ADR 036).
+    """
+    spec = _FILL_ZONES_BY_LAYOUT["utm_zones"].get(name)
+    return (spec.group_name, spec.half) if spec else (name, None)
 
 
 def zone_layout_of(names: Iterable[str]) -> ZoneLayout | None:
@@ -170,7 +219,13 @@ def zone_layout_of(names: Iterable[str]) -> ZoneLayout | None:
     How a store's existing groups decide its layout. Names that are no zone's are ignored;
     zones of BOTH layouts are refused, since one store holding both would cover the world twice.
     """
-    found = {layout for name in names for layout, table in _ZONES_BY_LAYOUT.items() if name in table}
+    found = {
+        layout
+        for name in names
+        for tables in (_ZONES_BY_LAYOUT, _FILL_ZONES_BY_LAYOUT)
+        for layout, table in tables.items()
+        if name in table
+    }
     if len(found) > 1:
         raise ValueError("zone names mix the 'hemispheres' and 'utm_zones' layouts; one store holds one layout.")
     return found.pop() if found else None
@@ -180,7 +235,8 @@ def canonicalize_zone(zone: str) -> str:
     """Normalize a UTM-zone id to its canonical zone (group) name.
 
     Accepts ``"33N"``, ``"15s"``, ``" 7S "``, ``"07S"`` → ``"33N"`` / ``"15S"`` /
-    ``"07S"``, and ``"utm33"``, ``"UTM7"`` → ``"utm33"`` / ``"utm07"``. Zone number is
+    ``"07S"``; ``"utm33"``, ``"UTM7"`` → ``"utm33"`` / ``"utm07"``; and a column half,
+    ``"UTM33S"`` → ``"utm33s"``. Zone number is
     1-60, hemisphere ``N``/``S`` and prefix case-insensitive, optional leading zero and
     surrounding whitespace. Raises ``ValueError`` on a malformed or out-of-range id.
 
@@ -189,15 +245,15 @@ def canonicalize_zone(zone: str) -> str:
     ``zone(name).epsg`` / ``.crs``.
     """
     text = zone.strip().upper()
-    m = re.fullmatch(r"(?:(UTM)(\d{1,2})|(\d{1,2})([NS]))", text)
+    m = re.fullmatch(r"(?:(UTM)(\d{1,2})([NS]?)|(\d{1,2})([NS]))", text)
     if not m:
         raise ValueError(
-            f"UTM zone {zone!r} is malformed — expected 'utm<1-60>' or '<1-60><N|S>', e.g. 'utm33' or '33N'."
+            f"UTM zone {zone!r} is malformed — expected 'utm<1-60>[n|s]' or '<1-60><N|S>', e.g. 'utm33' or '33N'."
         )
-    number = int(m.group(2) or m.group(3))
+    number = int(m.group(2) or m.group(4))
     if not 1 <= number <= 60:
         raise ValueError(f"UTM zone number {number} out of range (1-60) in {zone!r}.")
-    return f"utm{number:02d}" if m.group(1) else f"{number:02d}{m.group(4)}"
+    return f"utm{number:02d}{m.group(3).lower()}" if m.group(1) else f"{number:02d}{m.group(5)}"
 
 
 def easting_coords(spec: ZoneSpec) -> np.ndarray:

@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Collection, Iterator
 from contextlib import contextmanager
 
 import icechunk
@@ -87,17 +87,23 @@ class CaughtUpPastAConflictError(RuntimeError):
     """
 
 
-def _diff_touches(diff: icechunk.Diff, group: str) -> bool:
-    """Did anything in ``diff`` change inside ``group``?
+def _diff_touches(diff: icechunk.Diff, group: str, shards: Collection[tuple[int, int, int]] | None = None) -> bool:
+    """Did anything in ``diff`` change inside ``group`` that our commit could collide with?
 
     The safety half of :func:`catch_up_to_branch`. Moving a session's base past a commit is also
     a decision to stop looking at it: harmless for a commit that touched some other zone,
     unacceptable for one that touched ours.
 
-    Deliberately GROUP-wide rather than chunk-exact. The campaign's concurrent writers are other
-    zones, so a group-level test blocks essentially nothing in practice, while a chunk-exact test
-    would have to model shard geometry to stay correct — precision bought with a second thing to
-    get wrong, in the direction that fails silently.
+    GROUP-wide when ``shards`` is ``None``. Given ``shards`` — the ``(time, row, col)`` shard
+    coordinates the session writes, and a promise that it writes NOTHING else — a commit inside
+    the group is skipped only when it touched none of those shards and changed nothing of the
+    group but its attributes: exactly the commits icechunk's own conflict check accepts. The
+    shard writer passes them because the two halves of a column fill one group at once
+    (ADR 036), and a sibling's commit — its shards, or its attrs-only completion mark — would
+    otherwise block the other half's catch-up for the rest of its write. Every per-tile array
+    holds one shard per tile in its first three coordinates (the reading
+    ``published_store.commit_tiles`` relies on too); a chunk with fewer, a coordinate array's,
+    always counts.
     """
     own = f"/{group.strip('/')}"
     prefix = f"{own}/"
@@ -106,8 +112,15 @@ def _diff_touches(diff: icechunk.Diff, group: str) -> bool:
     # omission of `moved_nodes` below, and a future icechunk that renamed a field would silently
     # stop checking that whole class of change rather than raising.
     for attr in _DIFF_NODE_FIELDS:
-        paths |= {str(node) for node in getattr(diff, attr)}
-    paths |= {str(node) for node in diff.updated_chunks}
+        found = {str(node) for node in getattr(diff, attr)}
+        if shards is not None and attr == "updated_groups":
+            found.discard(own)  # our group's attributes: a shard-only session never sets them
+        paths |= found
+    paths |= {
+        str(path)
+        for path, coords in diff.updated_chunks.items()
+        if shards is None or any(len(c) < 3 or tuple(c[:3]) in shards for c in coords)
+    }
     # A rename populates `moved_nodes` and NOTHING else — no chunks, no arrays, no groups — so
     # omitting it made a commit that renamed our own array read as untouched. Both ends count:
     # moving a node out of our group changes it, and so does moving one in.
@@ -121,6 +134,7 @@ def catch_up_to_branch(
     session: icechunk.Session,
     group: str,
     *,
+    shards: Collection[tuple[int, int, int]] | None = None,
     branch: str = "main",
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
 ) -> str:
@@ -138,8 +152,9 @@ def catch_up_to_branch(
     replay. This moves a base pointer.
 
     **Why it can refuse.** See :func:`_diff_touches`: a commit that touched our own group is never
-    skipped. The base stays where it is, the gap stops closing, and the commit's own rebase then
-    behaves as it always has, including raising ``RebaseFailedError`` on a real collision.
+    skipped — or, given ``shards``, one that touched our shards or our group's structure. The
+    base stays where it is, the gap stops closing, and the commit's own rebase then behaves as
+    it always has, including raising ``RebaseFailedError`` on a real collision.
 
     Returns:
         ``"current"`` — already at the tip, nothing to do.
@@ -151,7 +166,7 @@ def catch_up_to_branch(
     base = session.snapshot_id
     if tip == base:
         return "current"
-    if _diff_touches(repo.diff(from_snapshot_id=base, to_snapshot_id=tip), group):
+    if _diff_touches(repo.diff(from_snapshot_id=base, to_snapshot_id=tip), group, shards):
         _logger.info(
             "Not catching up %s: another writer has touched this group since %s, so the "
             "commit must still compare against it.",
@@ -161,7 +176,7 @@ def catch_up_to_branch(
         return "blocked"
     session.rebase(icechunk.ConflictDetector())
     landed = session.snapshot_id
-    if landed != tip and _diff_touches(repo.diff(from_snapshot_id=tip, to_snapshot_id=landed), group):
+    if landed != tip and _diff_touches(repo.diff(from_snapshot_id=tip, to_snapshot_id=landed), group, shards):
         # THE RACE, CLOSED AS FAR AS IT CAN BE. `rebase` takes no target snapshot — it goes to
         # whatever the tip is when it runs — so a commit landing between the check above and this
         # call is skipped without ever being vetted. That cannot be undone, but it must not pass
@@ -181,6 +196,7 @@ def catch_up_best_effort(
     session: icechunk.Session,
     group: str,
     *,
+    shards: Collection[tuple[int, int, int]] | None = None,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
 ) -> str:
     """:func:`catch_up_to_branch`, but a failure costs the optimisation rather than the fill.
@@ -200,7 +216,7 @@ def catch_up_best_effort(
     """
     before = session.snapshot_id
     try:
-        return catch_up_to_branch(repo, session, group, log=log)
+        return catch_up_to_branch(repo, session, group, shards=shards, log=log)
     except CaughtUpPastAConflictError:
         raise
     except Exception as exc:
