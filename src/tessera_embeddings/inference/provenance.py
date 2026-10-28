@@ -1,4 +1,4 @@
-"""The model half of the provenance record: which granule supplied each pixel the model's input carried.
+"""The model half of the provenance record: which granule supplied each observation valid for the model.
 
 A mosaic built with the provenance switch on carries a ``source_index`` band beside its imagery
 (``ingest/provenance.py``): per pixel and slot, the fusion position plus one of the granule the
@@ -159,7 +159,7 @@ class SourcePlanes:
     def dates(self, sensor: str, pixels: np.ndarray | None = None) -> Iterator[ShardDate]:
         """Each date's ranked plane for ``sensor``, in time order, cut to ``pixels`` when given.
 
-        A date with no valid pixel left after the cut is dropped: the shard did not see it.
+        A date with no valid pixel left after the cut is dropped: the shard has no record for it.
 
         Raises:
             ValueError: a shard-date with more than 255 contributing granules, which the ``uint8``

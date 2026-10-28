@@ -14,10 +14,11 @@ provenance beyond its registry, and none can be reconstructed.
 
 ## Decision
 
-1. **Record, beside the registry, every granule fused into each mosaic slot, which of a shard's
-   dates the model used, and per pixel and date which granule supplied the pixel.** Four pieces
-   under `provenance/`: `granules`, `shard_dates`, `pixel_sources` and, for holes updates,
-   `update_pixels`. A run writes its own files and never another run's.
+1. **Record, beside the registry, every granule fused into each mosaic slot, on which dates a
+   shard's pixels had observations valid for the model, and per pixel and date which granule
+   supplied the observation.** Four pieces under `provenance/`: `granules`, `shard_dates`,
+   `pixel_sources` and, for holes updates, `update_pixels`. A run writes its own `shard_dates`,
+   planes and mask and never another run's; `granules` belongs to the mosaic (5).
 2. **Per pixel, an integer, not a bit.** Measured on a real shard-year, the integer naming the
    winning granule costs 4% more than a validity bit (1.17 MB against 1.12 MB a shard-year, about
    3.7 TB for the campaign) and is exact where footprints overlap, where a bit would leave a list of
@@ -28,10 +29,15 @@ provenance beyond its registry, and none can be reconstructed.
    per-shard ranks.
 4. **The index rides on the loader's own per-source hook.** The mask band (SCL, VV) is read through
    a reader that packs each granule's position above its pixels, so odc's unchanged first-wins fuser
-   picks the winner and a split returns the band bit-identical. One read, no extra tasks. Loading the
-   mask band per granule instead would multiply the load graph by the granules in a day.
-5. **Granule rows stay per zone-day; the per-shard list is `shard_dates.sources`**, derived from the
-   planes, so it names granules that supplied pixels rather than those whose footprints touch.
+   picks the winner and a split returns the band bit-identical. One read and an unchanged fuse; the
+   split and the index's writes are the new work. Loading the mask band per granule instead would
+   multiply the load graph by the granules in a day.
+5. **Granule rows stay per zone-day, keyed by the mosaic snapshot they were read from; the
+   per-shard list is `shard_dates.sources`.** A granule list belongs to its mosaic, so it is
+   written once per snapshot, a later run reading the same snapshot checks it instead, and each
+   `shard_dates` row names its snapshot: a reader joining through it never counts one mosaic's list
+   twice. `sources` is derived from the planes, so it names granules that supplied pixels rather
+   than those whose footprints touch.
 6. **Publication failure fails the zone-year, before the tag and the cleanup.** It is retried as
    store writes are, and a retry of a landed but untagged cell republishes from its staging before
    tagging. No marker, gate or held state.
@@ -43,7 +49,12 @@ provenance beyond its registry, and none can be reconstructed.
    setting is refused both ways and a store from before the term resumes off. The model and
    assembly follow the mosaics.
 9. **`zone` and `year` are partition keys, not columns**, as in the registry, whose module records
-   the pyarrow type collision that carrying them as columns causes. `run_id` is a column.
+   the pyarrow type collision that carrying them as columns causes. `run_id` and `snapshot_id` are
+   columns.
+10. **A holes update records the pixels it embedded.** Its `update_pixels` mask marks them and its
+    planes are cut to it, so the mask is exactly where a reader takes the update's record. Every
+    other pixel keeps the earlier run's record, which covers it: a fill or a shards update records
+    every pixel it was asked to embed, refused ones included.
 
 ## Left out
 
@@ -62,6 +73,9 @@ provenance beyond its registry, and none can be reconstructed.
 - The mosaic gains a `granules` array and a `source_index` band while the switch is on; the
   ingest's code fingerprint moves, so the ingest half deploys while nothing is mid-ingest or under
   `allow_ingest_code_mismatch`.
-- About 3.7 TB of planes and under 100 GB of tables are added beside the store over the whole
-  campaign, about 0.2% of it.
-- A pixel query joins three things: the plane, the shard-date's `sources`, and `granules`.
+- About 4.7 TB of planes and under 200 GB of tables are added beside the store over the whole
+  campaign, about a quarter of a percent of it.
+- The ingest takes about 6–20% more worker time at zone scale, much of it unchanged work running
+  slower for a reason still under investigation (plan §6, §10).
+- A pixel query joins three things: the plane, the shard-date's `sources`, and `granules` through
+  the row's `snapshot_id`.

@@ -215,9 +215,9 @@ the record existed. A zone-year filled without the record has no files under `pr
 
 ```
   provenance/
-  ├── granules/      zone=<ZONE>/year=<YEAR>/<run_id>.parquet   every image fused into each day's mosaic
-  ├── shard_dates/   zone=<ZONE>/year=<YEAR>/<run_id>.parquet   per tile, sensor and date: what the run used
-  ├── update_pixels/ zone=<ZONE>/year=<YEAR>/<run_id>.zarr      holes updates only: the pixels they wrote
+  ├── granules/      zone=<ZONE>/year=<YEAR>/<sensor>-<snapshot_id>.parquet  each mosaic's images, per day
+  ├── shard_dates/   zone=<ZONE>/year=<YEAR>/<run_id>.parquet   per run, tile, sensor and date
+  ├── update_pixels/ zone=<ZONE>/year=<YEAR>/<run_id>.zarr      holes updates only: the pixels they embedded
   └── pixel_sources.icechunk/                                  per run, per pixel and date: which image
 ```
 
@@ -225,20 +225,23 @@ A tile here is the same 2048-pixel unit as a registry row, and the `tile` column
 way. The sensors are `s2` (optical), `s1_asc` and `s1_desc` (radar by orbit direction).
 
 - **`granules`**: one row per image per day per sensor, in the order the day's mosaic was built
-  (`fusion_order`, 0 first; the first image with data at a pixel supplies it). Each row carries
-  the image's catalogue ID and link, acquisition time, cloud cover, footprint (GeoParquet) and the
-  exact object URLs that were read. A URL that no longer resolves is itself information: the
-  catalogue entry has moved since.
-- **`shard_dates`**: one row per tile, sensor and date a run used, with `valid_px`, the tile's
-  pixels valid that day, and `sources`, the `fusion_order` of every image that supplied at least
-  one of them.
+  (`fusion_order`, 0 first; the first image with data at a pixel supplies it). A file holds one
+  mosaic snapshot's lists, named on every row as `snapshot_id`, and is written once, by the first
+  run that read that snapshot. Each row carries the image's catalogue ID and link, acquisition
+  time, cloud cover, footprint (GeoParquet) and the exact object URLs that were read. A URL that no
+  longer resolves is itself information: the catalogue entry has moved since.
+- **`shard_dates`**: one row per tile, sensor and date on which a run's record has a valid
+  observation, with `valid_px`, the tile's pixels valid that day; `sources`, the `fusion_order` of
+  every image that supplied at least one of them; and `snapshot_id`, the mosaic the run read, which
+  is the key into `granules`.
 - **`pixel_sources`**: one Icechunk repository with a group `<ZONE>/<YEAR>/<run_id>`, holding a
   `(date, northing, easting)` array per sensor on the zone group's grid, and its dates as
   `<sensor>_date`. A value `k > 0` means the pixel had a valid observation that date and the image
   at `fusion_order = sources[k - 1]` of the tile's `shard_dates` row supplied it; `0` means none did.
 
 To trace one pixel, open the run's group, read the pixel's column of values, and join each
-non-zero value through the tile's `shard_dates` row to `granules`:
+non-zero value through the tile's `shard_dates` row to `granules`, on the row's `snapshot_id`, its
+day and `sources[k - 1]`:
 
 ```python
 k = run["s2"][:, row, col]                                 # one value per date of the optical axis
@@ -248,8 +251,8 @@ picks = [(d, v - 1) for d, v in zip(dates, k) if v]        # (date, rank in that
 
 Open the group of the run that wrote the tile's pixels: the run whose `parts/` file holds the
 tile's row with the master row's `filled_at`, as described under "Runs" above. After a holes
-update, the update's group covers the pixels in its `update_pixels` mask and the earlier run's
-group the rest. The record says what went in, not how much each image mattered: the model has no
+update, the update's group covers the pixels in its `update_pixels` mask, the pixels it embedded,
+and the earlier run's group the rest. The record says what went in, not how much each image mattered: the model has no
 attribution. For a pixel observed more often than the model's longest sequence, the model reads
 a fixed subset of these dates, chosen by a deterministic rule from the dates alone.
 

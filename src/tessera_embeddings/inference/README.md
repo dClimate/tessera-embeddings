@@ -884,7 +884,8 @@ loader reads a sensor's validity (the whole-shard SCL mask for optical, each str
 radar) it reads the index over the same window, zeroes it where the model's test fails, and keeps it
 compressed per date. At the staging write, on the background writer, each date becomes one `uint8`
 plane of ranks into that date's `sources`, staged as `pixel_sources_<sensor>` with the summary as the
-tile's `provenance` attribute, and for a holes update the pixel mask beside it. Assembly then
+tile's `provenance` attribute. A holes update cuts its planes to the pixels it embedded and stages
+that mask beside them, which becomes its `update_pixels`. Assembly then
 publishes the record before tagging the cell (`provenance_publish.py`,
 [`docs/registry.md`](../../../docs/registry.md)). Every mosaic read is pinned to the snapshot the
 plan sampled, so the record describes what the model read.
