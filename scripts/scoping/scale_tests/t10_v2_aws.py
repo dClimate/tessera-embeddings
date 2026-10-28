@@ -38,6 +38,7 @@ import argparse
 import dataclasses
 import logging
 import multiprocessing
+import socket
 import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -348,14 +349,20 @@ assert all(study.arms[0].name == "v2_c0" for study in STUDIES.values()), "every 
 
 
 def _probe_network(cfg: harness.RunConfig, phase: str, arm: V.Variant, network: str) -> None:
-    """Measure the round trip and downlink to the stores, and refuse to run unless ``network``'s shaping holds."""
+    """Measure the round trip and downlink to the stores, and refuse to run unless ``network``'s shaping holds.
+
+    The round trip is a TCP handshake with the bucket's endpoint. A GET would add S3's own first-byte latency,
+    which the workloads pay but the profile's round trip does not include.
+    """
     rtt_want, mbps_want = NETWORKS[network]
     fs, path = harness.fs_and_path(harness.store_uri(cfg, f"{BUILT}/{arm.name}") + "/chunks")
     key, meta = max(fs.find(path, detail=True).items(), key=lambda kv: int(kv[1].get("size") or 0))
+    # DNS answers a bucket's global name with its region's endpoint; resolved once, so no lookup is timed.
+    addr = socket.getaddrinfo(f"{path.split('/', 1)[0]}.s3.amazonaws.com", 443, type=socket.SOCK_STREAM)[0][4][:2]
     rtts = []
     for _ in range(20):
         t0 = time.monotonic()
-        fs.cat_file(key, start=0, end=1)
+        socket.create_connection(addr, timeout=10).close()
         rtts.append(1e3 * (time.monotonic() - t0))
     n = min(int(meta["size"]), 2 << 20)
     t0 = time.monotonic()

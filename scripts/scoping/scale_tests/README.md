@@ -174,10 +174,10 @@ Each phase runs on its own in-region EC2 box, writing throwaway repos under the 
   viewport at 4 and 8 dims, without `scales`, through a browser-like client: no merged requests, at
   most 6 in flight, each object in one GET. It runs on a phone link that `tc netem` and an `ifb`
   device shape first. `--network good|poor` names the profile (`t10_v2_aws.NETWORKS`); the phase
-  measures the round trip and downlink, and refuses to run unless both are within a factor of two
-  of the profile's. Each
-  cold read fetches one distant pixel first, timed apart as the first read, since that is where the
-  manifest download lands.
+  measures the round trip (a TCP handshake with the bucket's endpoint, which S3's first-byte latency
+  does not inflate) and the downlink, and refuses to run unless both are within a factor of two of
+  the profile's. Each cold read fetches one distant pixel first, timed apart as the first read,
+  since that is where the manifest download lands.
 - **`assemble`** (Graviton, like the assembly runner). Staged v2 tiles are written into each
   finalist by the library's own `shard_writer.write_year_shards` over a `StagedShardSource`, every
   array included. Band-first arms are written only where the shard writer says it can
