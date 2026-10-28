@@ -45,6 +45,7 @@ scale_tests/
 ├── report.py         collate metrics → decision matrix markdown
 ├── scale_testing_results.md   archived reports, v1.1 runs (ADR-008)
 ├── v2_layout_results.md       archived reports, v2 layout runs (ADR 031)
+├── v2_narrow_band_results.md  archived reports, narrow-band runs (ADR 031 §6)
 └── teardown.py       delete a run's stores; verify $0 residue
 ```
 
@@ -137,7 +138,9 @@ markers belong to a run, so `harness.bind_study` refuses a second study under th
 `array.rectilinear_chunks` setting on (`variants.py` sets it for every script; zarr 3.2.1 and 3.4.1
 both read the grid then), and xarray ≥ 2026.9 for xarray readers. icechunk
 accepts the grid only with every axis listed edge by edge, and zarr then requires every edge to be a
-whole number of inner chunks, so such an array's extent is rounded up to whole inner chunks.
+whole number of inner chunks, so such an array's extent is rounded up to whole inner chunks. Only
+`embeddings` is rounded, so xarray refuses such a group unless its extent is already whole inner
+chunks; the study reads these arrays through zarr.
 
 **Requests are counted by a store wrapper** that also intercepts zarr ≥ 3.3's merged-range path.
 `WrapperStore` would otherwise forward it unseen, and so would zarr 3.4's sync path.
@@ -225,8 +228,9 @@ also builds its own stores so any single `tN` is independently runnable.
 2. Update the status of each affected decision in ADR-008 (`PENDING → FIRM`, or
    supersede with a new ADR — the decisions file is append-only for reversals).
 3. Archive the report beside the others: `scale_testing_results.md` holds the v1.1 runs behind
-   ADR-008, and `v2_layout_results.md` the T9/T10 runs behind ADR 031, each section under its
-   run's own provenance.
+   ADR-008, `v2_layout_results.md` the band-16 T9/T10 runs behind ADR 031, and
+   `v2_narrow_band_results.md` the narrow study behind its §6, each section under its run's own
+   provenance.
 
 ## Infrastructure a bench run needs
 

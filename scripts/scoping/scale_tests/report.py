@@ -439,7 +439,7 @@ def _t10_tables(rows: list[dict]) -> list[str]:
         cpu0, gb0 = (_t10_value(rows, m, "v2_c0", phase="build") for m in ("encode_cpu_s", "bytes_written"))
         # Objects and the manifest a direct reader downloads first, where the run recorded them.
         manifests = bool(_sel(rows, test="t10", phase="build", metric="manifest_bytes"))
-        extra = " objects | manifest KB per object |" if manifests else ""
+        extra = " objects | manifest bytes per object |" if manifests else ""
         out += [
             "## T10 — bench store build, encode CPU per shard",
             "",
@@ -454,7 +454,7 @@ def _t10_tables(rows: list[dict]) -> list[str]:
                 manifest_rows = _sel(rows, test="t10", phase="build", metric="manifest_bytes")
                 m = next(r for r in manifest_rows if r["variant"] == a)
                 objects = m["params"]["objects"]
-                line += f" {objects} | {m['value'] / 1e3 / objects:.2f} |"
+                line += f" {objects} | {m['value'] / objects:.0f} |"
             out.append(line)
         out.append("")
     arms = sorted({r["variant"] for r in _sel(rows, test="t10", phase="assemble", metric="wall_s") if r["variant"]})
@@ -511,9 +511,10 @@ def _t10_tables(rows: list[dict]) -> list[str]:
         out += _unreadable_notes(unread)
         out += _vs_accepted(rows, phase, read_arms, cols)
     out += _mobile_tables(rows)
-    for phase in sorted({r["phase"] for r in rows if r["test"] == "t10" and r["phase"].startswith("points_")}):
-        # One interval per pass: each pass bootstraps its own probes, and the median of two passes'
-        # endpoints is not an interval for the passes combined.
+    for phase in sorted({r["phase"] for r in _sel(rows, test="t10", metric="read_p50_lo_ms")}):
+        # Every phase that bootstrapped its point reads, `points` and the narrow study's `read`. One interval
+        # per pass: each pass bootstraps its own probes, and the median of two passes' endpoints is not an
+        # interval for the passes combined.
         passes = sorted({r["params"]["pass"] for r in _sel(rows, test="t10", phase=phase, metric="read_p50_ms")})
         out += [
             f"## T10 — point reads, p50 [95% interval] by pass ({', '.join(map(str, passes))}), "
