@@ -15,7 +15,7 @@ fusion position into the high bits of every pixel it returns (:func:`pack`). The
 zero exactly where the granule's own pixel is nodata, so odc's unchanged fuser, which fills only
 where the destination is still zero, keeps the first granule with data, as it always has. Splitting
 the fused result (:func:`unpack`) gives back the band, identical to an unpacked load, and the index.
-One read, the fuser's own rule, no extra tasks in the graph.
+One read and the fuser's own rule; the split and the index's writes are the only new work.
 """
 
 from __future__ import annotations

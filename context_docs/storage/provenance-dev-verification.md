@@ -1,7 +1,7 @@
 # The provenance record: dev verification (2026-10-27)
 
 The end-to-end check of the provenance record ([ADR 035](../decisions/035-a-provenance-record-for-the-published-store.md);
-PRs #253, #255 and #256) on global-tessera-dev, against the dev test in the plan's §11.
+PRs #253, #255 and #256) on global-tessera-dev.
 **Every correctness check passed.** The run also found that the record costs ingest time at zone
 scale, about 6–20% of ingest worker time, where the plan expected none, and that the plan's size
 for the `granules` table was low by about half. Both are now in the plan and the ingest docs.
@@ -40,6 +40,11 @@ and `ingest-s1-roi-sar`, ascending):
 | index zero where the band is nodata | optical: exactly. Radar: the index is never zero where VV has data, but names a granule at about one pixel in ten thousand whose VV is stored as zero (finding 3) |
 
 ### The published record
+
+The record tested here had the first layout: one `granules` file per run, holding every list that
+run read, and an `update_pixels` mask of the pixels a holes update was asked to fill. The plan has
+since keyed `granules` by mosaic snapshot, with a `snapshot_id` on every `shard_dates` row, and made
+the mask the pixels the update embedded; those changes have unit tests and await the next dev run.
 
 `fill-zones-sequential` filled 33N/2024 with the switch on (run `33N-2024-9a1fc94c`, 13 min), and
 publication wrote 575 `granules` rows and 386 `shard_dates` rows over the two shards. The cell
@@ -146,7 +151,7 @@ one's.
 
 | piece | measured | per zone-year |
 |---|---|---|
-| `pixel_sources`, optical | 1.14 and 1.22 MB a shard-year | as the plan's §9 (1.17) |
+| `pixel_sources`, optical | 1.14 and 1.22 MB a shard-year | as the plan's Appendix A (1.17) |
 | `pixel_sources`, radar | 0.07–0.20 MB a shard-year per orbit | a sixth of optical or less |
 | `granules`, zone 35N, one week | about 970 optical granules a day (151 B a row), 900–2,600 ascending and 1,000–2,500 descending bursts a day (93–110 B a row) | about 160 MB for a land-dense zone; the plan said under 100 MB |
 | the `granules` lists inside the mosaic | 0.10–0.17 MB a day per sensor, compressed | about 150 MB, deleted with the mosaic |

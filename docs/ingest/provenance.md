@@ -85,23 +85,37 @@ items just before the load (`provenance.stamp_fusion_positions`), so the granule
 them afterwards (`provenance.day_granules`) numbers the granules exactly as the index does.
 
 On the optical path the index is masked to the ROI only, like SCL: it names the granule behind
-every pixel, cloudy or clear, and the model's own validity test decides later which of those it
-saw. On the radar path the dB transform runs over the bands before the index is added, so the
-index is never rescaled. The index follows the granule's own data, not the stored value: an
-amplitude too faint for the dB scale is stored as VV zero, the store's nodata, yet the index still
-names the granule that supplied it. About one radar pixel in ten thousand does this. The model's
+every pixel, cloudy or clear, and the model's own validity test decides later which of those
+observations were valid. On the radar path the dB transform runs over the bands before the index
+is added, so the index is never rescaled. The index follows the granule's own data, not the stored
+value: an amplitude too faint for the dB scale is stored as VV zero, the store's nodata, yet the
+index still names the granule that supplied it. About one radar pixel in ten thousand does this. The model's
 validity test drops such a pixel unless its VH holds data, so the published record never names a
-granule for a pixel the model did not see.
+granule for an observation that was not valid for the model.
 
 ## What it costs
 
-The granule list is under 100 MB a zone-year. The index band adds two bytes a pixel per slot
-before compression; compressed, it is about 0.1% of an optical mosaic and 0.3% of a radar one, for
-as long as the mosaic exists.
+The granule lists are about 150 MB for a land-dense zone-year, inside the mosaic; published as the
+`granules` table they are about 160 MB, the same lists in another encoding. The index band adds two
+bytes a pixel per slot before compression; compressed, it is about 0.1% of an optical mosaic and
+0.3% of a radar one, for as long as the mosaic exists.
 
-The record costs ingest time. Across a whole UTM zone, each date takes about 5–17% longer for
-optical and 10–30% longer for radar than with the switch off, roughly 6–20% more ingest worker time
-in all. The cost is CPU: the wider mask band is packed and fused on every worker, and the index is
-written as a third array. It hides on a small area, whose workers have time to spare. The paired
-measurements and the performance reports are in
-[`provenance-dev-verification.md`](../../context_docs/storage/provenance-dev-verification.md).
+The record costs ingest time. Across a whole UTM zone, each date took about 5–17% longer for
+optical and 10–30% longer for radar than with the switch off over two paired runs, roughly 6–20%
+more ingest worker time in all; the optical figure is the noisy one and sets the range, and a small
+area, whose workers had time to spare, showed none. A Dask performance report of one radar pair
+splits the extra task time:
+
+| where the extra task-seconds went | share |
+|---|---|
+| writing the index, a third array per window | ~20% |
+| packing the position into the mask band | ~6% |
+| the split, and the extra transfers | ~8% |
+| unchanged work running slower: VH reads (never packed), VV reads, band writes | ~60% |
+
+Packing, the wide fuse and the split are cheap in themselves: about 40 ms per 4,096² chunk on a
+laptop, against about 1.4 s to load it. Why the unchanged work runs slower is
+under investigation and open; a working hypothesis, unproven, is the extra Dask tasks (28% more)
+on workers that run six threads on four vCPUs. The paired measurements and the performance reports
+are in [`provenance-dev-verification.md`](../../context_docs/storage/provenance-dev-verification.md),
+and the open question in the plan's §10.
