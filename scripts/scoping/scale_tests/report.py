@@ -554,7 +554,7 @@ def _t10_tables(rows: list[dict]) -> list[str]:
         unread = _unreadable(rows, phase)
         configs = sorted({setting(r) for r in [*tune, *unread]})
         out += [
-            f"## T10 — full-vector reads, reader settings, {phase.removeprefix('tune_')} (wall s, median of passes)",
+            f"## T10 — reader settings, {phase.removeprefix('tune_')} (wall s, median of passes)",
             "",
             "| arm | " + " | ".join(f"{w} {d} {c or 'default'}" for w, d, c in configs) + " |",
             "|---|" + "---|" * len(configs),

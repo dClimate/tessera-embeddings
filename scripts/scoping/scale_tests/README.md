@@ -170,8 +170,10 @@ Each phase runs on its own in-region EC2 box, writing throwaway repos under the 
   in a fresh process, arms interleaved, in two passes of opposite order: points at 16 and 128 dims,
   a 128-d read of 2 × 2 shards, an 8 × 8-tile pull at 16, 64 and 128 dims, and Dask at its default
   chunks. `read` runs once per client. `points` repeats only the point reads, with bootstrap
-  intervals on their medians. `tune` repeats the full-vector pulls with wider fetch concurrency and
-  band-aligned Dask chunks; like `read`, it is reported per client. `build` also records the
+  intervals on their medians. `tune` re-runs reads under reader settings: in the band-16 study the
+  full-vector pulls with wider fetch concurrency and band-aligned Dask chunks; in the narrow study
+  Dask at 16 and 128 dims with one task per whole object (`dask_chunks(whole_objects=True)`), beside
+  Dask's default chunks and the direct pull. Like `read`, it is reported per client. `build` also records the
   manifest bytes per object, which a direct reader downloads before its first chunk.
 - **`mobile`** (the read box, narrow study). The mobile reads, a 256² map tile and a 1,024 × 2,048
   viewport at 4 and 8 dims, without `scales`, through a browser-like client: no merged requests, at

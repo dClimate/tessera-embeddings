@@ -208,7 +208,7 @@ def cold_read(payload: dict[str, Any]) -> dict[str, Any]:
         out |= {"read_p50_ms": float(np.median(ms)), "read_p95_ms": float(np.percentile(ms, 95))}
         out |= {"read_p50_lo_ms": float(lo), "read_p50_hi_ms": float(hi)}
     elif workload.startswith("dask"):
-        chunks = {} if workload == "dask_default" else V.dask_chunks(emb)
+        chunks = {} if workload == "dask_default" else V.dask_chunks(emb, whole_objects=workload == "dask_objects")
         try:
             ds = xr.open_zarr(store, group="zone", consolidated=False, chunks=chunks)
         except NotImplementedError as exc:  # xarray before 2026.9 cannot open a variable-width shard grid
@@ -243,8 +243,9 @@ def _points(cfg: harness.RunConfig, tiles: Path) -> list[list[int]]:
     return pts
 
 
-#: The read sweep: (workload, dims, zarr config). ``tune`` re-runs the full-vector pulls with a wider
-#: fetch concurrency and band-aligned Dask chunks, to see how much of their cost a reader can recover.
+#: The read sweep: (workload, dims, zarr config). ``tune`` re-runs reads with reader settings, to see how much
+#: of a layout's cost a reader can recover: the band-16 study's full-vector pulls with a wider fetch concurrency
+#: and band-aligned Dask chunks, the narrow study's Dask reads with one task per whole object.
 READ_WORKLOADS: list[tuple[str, int, dict]] = [
     ("point", 16, {}),
     ("point", 128, {}),
@@ -260,6 +261,11 @@ TUNE_WORKLOADS: list[tuple[str, int, dict]] = [
     ("dask_aligned", 128, {}),
     ("bulk", 128, {"async.concurrency": 64}),
     ("pull8", 16, {"async.concurrency": 64}),
+]
+#: Dask at default chunks, one task per inner chunk, against one task per object, beside the direct pull it
+#: should approach.
+NARROW_TUNE_WORKLOADS: list[tuple[str, int, dict]] = [
+    (w, d, {}) for d in (16, 128) for w in ("dask_default", "dask_objects", "pull8")
 ]
 
 
@@ -342,7 +348,7 @@ NARROW_FINALISTS: list[V.Variant] = [
 STUDIES: dict[str, Study] = {
     "band16": Study(FINALISTS, READ_WORKLOADS, POINT_WORKLOADS, TUNE_WORKLOADS, mobile=[]),
     "narrow": Study(
-        NARROW_FINALISTS, READ_WORKLOADS + MOBILE_WORKLOADS, POINT_WORKLOADS, TUNE_WORKLOADS, MOBILE_WORKLOADS
+        NARROW_FINALISTS, READ_WORKLOADS + MOBILE_WORKLOADS, POINT_WORKLOADS, NARROW_TUNE_WORKLOADS, MOBILE_WORKLOADS
     ),
 }
 assert all(study.arms[0].name == "v2_c0" for study in STUDIES.values()), "every study runs the control first"
