@@ -80,7 +80,8 @@ provenance beyond its registry, and none can be reconstructed.
   `allow_ingest_code_mismatch`.
 - About 4.7 TB of planes and under 200 GB of tables are added beside the store over the whole
   campaign, about a quarter of a percent of it.
-- The ingest takes about 6–20% more worker time at zone scale, much of it unchanged work running
-  slower for a reason still under investigation (plan §6, §10).
+- The ingest's time cost is inside run-to-run variation over seven paired runs of a dense zone;
+  what the record adds for certain is one more chunk write per date, the index's, for the Dask
+  scheduler (plan §6, §10).
 - A pixel query joins three things: the plane, the shard-date's `sources`, and `granules` through
   the row's `snapshot_id`; `pixel_granules` does it, after picking the run.
