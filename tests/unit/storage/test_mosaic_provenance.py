@@ -37,13 +37,22 @@ class _Roi:
 
 def _day(date: str, index: int | None) -> xr.Dataset:
     shape, chunks = (1, 8, 8), (1, 4, 4)
-    data = {"band": (("time", "northing", "easting"), da.full(shape, 7, dtype=np.uint16, chunks=chunks))}
+    # A ramp, not a constant: every window's blocks must land where they belong.
+    ramp = da.from_array(np.arange(64, dtype=np.uint16).reshape(shape) + 7, chunks=chunks)
+    data = {"band": (("time", "northing", "easting"), ramp)}
     if index is not None:
-        data[SOURCE_INDEX_VAR] = (
-            ("time", "northing", "easting"),
-            da.full(shape, index, dtype=np.uint16, chunks=chunks),
-        )
+        data[SOURCE_INDEX_VAR] = (("time", "northing", "easting"), ramp % 3 + index)
     return xr.Dataset(data, coords={"time": np.array([np.datetime64(date, "ns")])})
+
+
+def _expected(index: int | None) -> np.ndarray:
+    """What the store holds after the windows are written: the ramp (or its index) inside them, fill outside."""
+    ramp = np.arange(64, dtype=np.uint16).reshape(8, 8) + 7
+    values = ramp if index is None else ramp % 3 + index
+    out = np.zeros((8, 8), dtype=np.uint16)
+    for y0, y1, x0, x1 in WINDOWS:
+        out[y0:y1, x0:x1] = values[y0:y1, x0:x1]
+    return out
 
 
 def _granules(date: str) -> str:
@@ -76,10 +85,8 @@ def test_each_slot_holds_its_own_granule_list(tmp_path, parallel) -> None:
     lists = root[GRANULES_ARRAY][:].tolist()
     assert lists == [_granules(d) for d in ("2024-06-01", "2024-06-02", "2024-06-03")]
     assert len(lists) == root["time"].shape[0]
-    written = np.zeros((8, 8), dtype=np.uint16)
-    for y0, y1, x0, x1 in WINDOWS:
-        written[y0:y1, x0:x1] = 1
-    np.testing.assert_array_equal(open_store(store)[SOURCE_INDEX_VAR].values, np.broadcast_to(written, (3, 8, 8)))
+    np.testing.assert_array_equal(open_store(store)[SOURCE_INDEX_VAR].values, np.broadcast_to(_expected(1), (3, 8, 8)))
+    np.testing.assert_array_equal(open_store(store)["band"].values, np.broadcast_to(_expected(None), (3, 8, 8)))
 
 
 def test_a_failed_batch_leaves_no_granule_list(tmp_path, monkeypatch) -> None:
