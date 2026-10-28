@@ -1352,8 +1352,8 @@ class ZarrWriter:
             planes: The shard's provenance planes (``inference/provenance.py``), ranked and staged
                 beside the embeddings, with their ``shard_dates`` summary as the ``provenance``
                 attribute, written before ``staged_complete`` like ``coverage``.
-            pixels: The pixels this run was asked to embed, for a holes update; the planes are cut
-                to them.
+            pixels: For a holes update, the pixels this run embedded: the planes are cut to them and
+                they are staged as the update's ``update_pixels`` mask.
 
         Returns:
             Path to the staged Zarr store.

@@ -1,15 +1,18 @@
 """Publish a run's provenance record beside the registry, after its shards commit and before its tag.
 
 Assembly's last data step (``context_docs/storage/registry-provenance-plan.md`` §4, Appendix C). From the
-mosaics, read at the snapshots the actors read, it exports each slot's granule list as the
-``granules`` table. From the staged shards it writes the ``shard_dates`` table, the run's group in
-the ``pixel_sources`` store and, for a holes update, ``update_pixels``. It then checks that the four
-agree with each other and with the mosaics.
+mosaics, read at the snapshots the actors read, it exports each slot's granule list as that
+snapshot's ``granules`` file, unless an earlier run already did, in which case it checks the file
+holds the same lists. From the staged shards it writes the run's ``shard_dates`` table, whose rows
+name the snapshot, the run's group in the ``pixel_sources`` store and, for a holes update,
+``update_pixels``, the pixels it embedded. It checks that they agree with each other and with the
+mosaics as it goes. The layout is drawn in ``storage/provenance.py``.
 
 **A failure fails the zone-year.** :func:`publish_provenance` raises rather than logging: the caller
 runs it before the tag and the staging cleanup, so a failed publication leaves the zone-year
-untagged with everything its retry needs, and the retry republishes. Every write replaces the run's
-previous attempt, so publishing twice yields the same record. There is no separate marker.
+untagged with everything its retry needs, and the retry republishes. Every per-run write replaces the
+run's previous attempt and a snapshot's granule file is written once, so publishing twice yields the
+same record. There is no separate marker.
 
 **The record follows the mosaics.** It is published when the zone-year's mosaics were ingested with
 the ``provenance`` switch on, and nothing is published when none of them was. A mix can only be
@@ -26,14 +29,16 @@ from typing import Any, cast
 
 import icechunk
 import numpy as np
+import pyarrow.parquet as pq
 import zarr
+from fsspec import AbstractFileSystem
 
 from tessera_embeddings.config.ingest import GRANULES_ARRAY
+from tessera_embeddings.config.store_layout import SENSORS
 from tessera_embeddings.inference.assembly import _COVERAGE_SUFFIX, _fs_for, _open_staged_tile
 from tessera_embeddings.inference.chunk_spec import parse_chunk_label
 from tessera_embeddings.inference.provenance import (
     PLANE_COMPRESSORS,
-    SENSORS,
     STAGED_UPDATE_PIXELS,
     provenance_summary,
     read_array,
@@ -41,16 +46,15 @@ from tessera_embeddings.inference.provenance import (
 )
 from tessera_embeddings.storage.manifest import extract_manifest
 from tessera_embeddings.storage.provenance import (
-    GRANULES,
-    SHARD_DATES,
     days_of,
     granule_rows,
     granules_schema,
+    granules_uri,
     pixel_sources_group,
     pixel_sources_uri,
     shard_date_rows,
     shard_dates_schema,
-    table_uri,
+    shard_dates_uri,
     update_pixels_uri,
     write_table,
 )
@@ -119,24 +123,24 @@ def publish_provenance(
         fs.makedirs(uri.rsplit("/", 1)[0], exist_ok=True)
         return fs.open(uri, "wb")
 
-    metadata = {
-        "zone": zone,
-        "year": str(year),
-        "run_id": run_id,
-        **{f"snapshot_{s}": p for s, p in _pins(mosaic_snapshots).items()},
-    }
+    pins = _pins(mosaic_snapshots)
+    metadata = {"zone": zone, "year": str(year), "run_id": run_id, **{f"snapshot_{s}": p for s, p in pins.items()}}
 
-    granules = write_table(
-        table_uri(registry_root, GRANULES, zone, year, run_id),
-        (
-            row
-            for sensor, root in mosaics.items()
-            for row in granule_rows(run_id, sensor, axes[sensor], read_array(root, GRANULES_ARRAY).tolist())
-        ),
-        granules_schema(),
-        open_output=_open_output,
-        metadata=metadata,
-        geometry=True,
+    granules = sum(
+        _publish_granules(
+            granules_uri(registry_root, zone, year, sensor, pins[sensor]),
+            granule_rows(pins[sensor], sensor, axes[sensor], read_array(root, GRANULES_ARRAY).tolist()),
+            fs,
+            _open_output,
+            {
+                "zone": zone,
+                "year": str(year),
+                "sensor": sensor,
+                "snapshot_id": pins[sensor],
+                "first_published_by": run_id,
+            },
+        )
+        for sensor, root in mosaics.items()
     )
 
     shards = _staged_shards(staging_base, run_id, embedded, refused)
@@ -172,14 +176,14 @@ def publish_provenance(
         if staged is None:
             return []
         group, embedded_px = staged
-        return _copy_shard(label, group, run_group, mosaics, axes, counts, embedded_px, shard_px, run_id)
+        return _copy_shard(label, group, run_group, mosaics, axes, counts, pins, embedded_px, shard_px, run_id)
 
     with ThreadPoolExecutor(max_workers=_COPY_WORKERS) as pool:
         rows = [row for shard_rows in pool.map(_copy, sorted(shards)) for row in shard_rows]
     commit_with_rebase(session, f"provenance {zone}/{year} run {run_id}")
 
     shard_dates = write_table(
-        table_uri(registry_root, SHARD_DATES, zone, year, run_id),
+        shard_dates_uri(registry_root, zone, year, run_id),
         rows,
         shard_dates_schema(),
         open_output=_open_output,
@@ -204,6 +208,28 @@ def publish_provenance(
 def _pins(mosaic_snapshots: Mapping[str, str]) -> dict[str, str]:
     """``{sensor: snapshot}`` from ``{store path: snapshot}``."""
     return {_sensor_of(path): snap for path, snap in mosaic_snapshots.items()}
+
+
+def _publish_granules(
+    uri: str,
+    rows: list[dict[str, Any]],
+    fs: AbstractFileSystem,
+    open_output: Callable[[str], Any],
+    metadata: Mapping[str, str],
+) -> int:
+    """Write one snapshot's granule lists, once; returns their rows.
+
+    A later run that read the same snapshot, a retry among them, leaves the file and checks it holds
+    the lists read now, day by day, so every run that names the snapshot reads the same lists.
+    """
+    if fs.exists(uri):
+        key = ("solar_day", "fusion_order", "granule_id")
+        with fs.open(uri, "rb") as f:
+            have = pq.read_table(f, columns=list(key)).to_pylist()
+        if [tuple(r[k] for k in key) for r in have] != [tuple(r[k] for k in key) for r in rows]:
+            raise ProvenanceCheckError(f"{uri}: already published with granule lists other than its snapshot's")
+        return len(rows)
+    return write_table(uri, rows, granules_schema(), open_output=open_output, metadata=metadata, geometry=True)
 
 
 def _sensor_of(path: str) -> str:
@@ -282,6 +308,7 @@ def _copy_shard(
     mosaics: Mapping[str, zarr.Group],
     axes: Mapping[str, Sequence[Any]],
     counts: Mapping[str, Sequence[int]],
+    pins: Mapping[str, str],
     embedded_px: int,
     shard_px: int,
     run_id: str,
@@ -305,14 +332,18 @@ def _copy_shard(
             target.oindex[
                 times[start : start + len(batch)], slice(ys.start, ys.start + h), slice(xs.start, xs.start + w)
             ] = batch
-        rows += shard_date_rows(run_id, label, sensor, record, axes[sensor], embedded_px)
+        rows += shard_date_rows(run_id, label, sensor, pins[sensor], record, axes[sensor], embedded_px)
     return rows
 
 
 def _check_plane(
     label: str, sensor: str, time: int, plane: np.ndarray, record: Mapping[str, Any], i: int, counts: Sequence[int]
 ) -> None:
-    """A plane's count is its row's ``valid_px``, its values rank its ``sources``, and they exist."""
+    """A plane's count is its row's ``valid_px``, its values rank its ``sources``, and they exist.
+
+    ``counts`` are the day lengths of the snapshot the row names, which is what its ``granules``
+    file holds, so a source below the count is a granule of that day in that file.
+    """
     sources, valid = record["sources"][i], record["valid_px"][i]
     where = f"{label} {sensor} slot {time}"
     if time >= len(counts):
@@ -355,9 +386,10 @@ def _publish_update_pixels(
     get_credentials: _Creds,
     s3_region: str | None,
 ) -> int:
-    """A holes update's per-shard pixel masks, one boolean array per shard; returns how many.
+    """A holes update's per-shard masks of the pixels it embedded, one boolean array per shard.
 
-    The checks hold the planes to them: no plane may name a pixel the run was not asked to embed.
+    Returns how many. The checks hold each mask to the shard's embedded count and the planes to the
+    mask: no plane may name a pixel the update did not embed.
     """
     masks = {
         label: read_array(staged[0], STAGED_UPDATE_PIXELS)
@@ -368,12 +400,12 @@ def _publish_update_pixels(
         return 0
     for label, mask in masks.items():
         group = cast("tuple[zarr.Group, int]", shards[label])[0]
-        if (embedded_px := cast("tuple[zarr.Group, int]", shards[label])[1]) > int(mask.sum()):
-            raise ProvenanceCheckError(f"{label}: {embedded_px} pixels embedded, {int(mask.sum())} asked for")
+        if (embedded_px := cast("tuple[zarr.Group, int]", shards[label])[1]) != int(mask.sum()):
+            raise ProvenanceCheckError(f"{label}: {embedded_px} pixels embedded, {int(mask.sum())} in its mask")
         for sensor in SENSORS:
             planes = staged_planes(group, sensor)
             if planes is not None and any(np.asarray(planes[1][i])[~mask].any() for i in range(planes[1].shape[0])):
-                raise ProvenanceCheckError(f"{label} {sensor}: a plane names a pixel outside the update's holes")
+                raise ProvenanceCheckError(f"{label} {sensor}: a plane names a pixel the update did not embed")
     uri = update_pixels_uri(registry_root, zone, year, run_id)
     out = zarr.open_group(uri, mode="w", storage_options=plain_zarr_storage_options(uri, get_credentials, s3_region))
     out.attrs.update({"zone": zone, "year": year, "run_id": run_id})
