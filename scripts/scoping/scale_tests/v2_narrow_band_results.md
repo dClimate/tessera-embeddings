@@ -10,6 +10,7 @@ own provenance. The band-16 study behind the rest of ADR 031 is archived in
 | `n9iowa`, `n9puget` | T9 | laptop (Apple M3 Max), local stores | zarr 3.4.1 + icechunk 2.3.0, the direct-read client on them, and zarr 3.2.1 + icechunk 2.1.1 | `930bffdb` |
 | `v2n` | T10 build, read, verify | r7i.4xlarge, us-west-2 | zarr 3.4.1 + icechunk 2.3.0 + xarray 2026.9.0, and zarr 3.2.1 + icechunk 2.1.1 + xarray 2026.4.0 | `824d5c4b` |
 | `v2n` | T10 mobile | r7i.4xlarge, us-west-2 | the direct-read client on zarr 3.4.1 + icechunk 2.3.0 | `60a3c362` |
+| `v2n` | T10 tune (Dask with one task per object) | r7i.4xlarge, us-west-2 | zarr 3.4.1 + icechunk 2.3.0 + xarray 2026.9.0 + dask 2026.3.0 | `0a9fac68` |
 | `v2n-arm` | T10 build, assemble | m7g.4xlarge (Graviton) | zarr 3.4.1 + icechunk 2.3.0 | `500e5ebf` on `proto/narrow-band-assembly` |
 | `v2n-arm` | T10 verify | m7g.4xlarge (Graviton) | zarr 3.4.1 + icechunk 2.3.0 | `0935d8c3` on `proto/narrow-band-assembly` |
 
@@ -37,13 +38,13 @@ the per-pixel scale.
 with zstd at level 1 (`zstd1`), with `scales` at 256² inner chunks (`s256`), in 2,048² spatial
 shards.
 
-| arm | band axis, per shard | inner chunk | embedding objects per tile |
+| arm | band axis, per object | inner chunk | embedding objects per shard |
 |---|---|---|---|
 | `v2_c0`, the control | 128 bands, band-last: v1.1's geometry | 256² × 128 | 1 |
-| `v2_b2f`, accepted (ADR 031 §4) | 16 | 512² × 16 | 8 |
+| `v2_b2f`, 16-band chunks (ADR 031 §4, path 1) | 16 | 512² × 16 | 8 |
 | `v2_b2f8`, `v2_b2f4` | 8; 4 | 512² × 8; × 4 | 16; 32 |
 | `v2_b1f8`, `v2_b1f4` (T9 only) | 8; 4 | 256² × 8; × 4 | 16; 32 |
-| `v2_b2f_i8`, `v2_b2f_i4` | 16 | 512² × 8; × 4 | 8 |
+| `v2_b2f_i8`; `v2_b2f_i4` (ADR 031 §4, path 2) | 16 | 512² × 8; × 4 | 8 |
 | `v2_m2f` | variable: 4, 4, 8, 16, 32, 64 | 512² × 4 | 6 |
 | `v2_m1f` (T9 only) | variable: 4, 4, 8, 16, 32, 64 | 256² × 4 | 6 |
 | `v2_m2f_x4` | variable: 4, 4, 8, 112 | 512² × 4 | 4 |
@@ -293,8 +294,8 @@ the order only changes which pieces sit side by side for a merged request.
 
 - backend: **s3**, scale: **bench**
 - icechunk **2.1.1**, zarr **3.2.1**, git `unknown`: read_zarr3.2
-- icechunk **2.3.0**, zarr **3.4.1**, git `unknown`: build, mobile_good_zarr3.4, mobile_poor_zarr3.4, read_zarr3.4, verify_t10
-- rows: 3206
+- icechunk **2.3.0**, zarr **3.4.1**, git `unknown`: build, mobile_good_zarr3.4, mobile_poor_zarr3.4, read_zarr3.4, tune_zarr3.4, verify_t10
+- rows: 3687
 
 > Contention/latency numbers are only load-bearing on `--backend s3`.
 
@@ -328,7 +329,7 @@ the order only changes which pieces sit side by side for a merged request.
 
 > **unreadable** (v2_m2f_bandfirst_zstd1_colexicographic_s256, v2_m2f_bandfirst_zstd1_s256, v2_m2f_x3_bandfirst_zstd1_s256, v2_m2f_x4_bandfirst_zstd1_s256): xarray 2026.4.0: The `chunks` attribute is only defined for arrays using regular chunk grids. This array has a rectilinear chunk grid. Use `read_chunk_sizes` for general access.
 
-#### The same, as a ratio to the accepted layout (v2_b2f_bandfirst_zstd1_s256)
+#### The same, as a ratio to 16-band objects with 16-band chunks (v2_b2f_bandfirst_zstd1_s256)
 
 | arm | point 16 p50 | point 128 p50 | bulk 128 | 8x8 pull 16 | 8x8 pull 64 | 8x8 pull 128 | dask default | maptile 4 | maptile 8 | viewport 4 | viewport 8 |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -356,7 +357,7 @@ the order only changes which pieces sit side by side for a merged request.
 | v2_m2f_x3_bandfirst_zstd1_s256 | 412 ms (3) | 506 ms (22) | 2.5 s (1269) | 5.4 s (3146) | 16.0 s (10756) | 29.6 s (20258) | 13.9 s (2979) | 0.3 s (2) | 0.2 s (2) | 0.3 s (10) | 0.3 s (10) |
 | v2_m2f_x4_bandfirst_zstd1_s256 | 403 ms (3) | 543 ms (22) | 2.7 s (1269) | 6.0 s (3133) | 17.4 s (10792) | 32.4 s (20204) | 21.9 s (2985) | 0.3 s (1) | 0.3 s (2) | 0.3 s (8) | 0.3 s (16) |
 
-#### The same, as a ratio to the accepted layout (v2_b2f_bandfirst_zstd1_s256)
+#### The same, as a ratio to 16-band objects with 16-band chunks (v2_b2f_bandfirst_zstd1_s256)
 
 | arm | point 16 p50 | point 128 p50 | bulk 128 | 8x8 pull 16 | 8x8 pull 64 | 8x8 pull 128 | dask default | maptile 4 | maptile 8 | viewport 4 | viewport 8 |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -436,6 +437,19 @@ the order only changes which pieces sit side by side for a merged request.
 | v2_m2f_bandfirst_zstd1_s256 | t10 | 16 | 0 |
 | v2_m2f_x3_bandfirst_zstd1_s256 | t10 | 16 | 0 |
 | v2_m2f_x4_bandfirst_zstd1_s256 | t10 | 16 | 0 |
+
+### T10 — reader settings, zarr3.4 (wall s, median of passes)
+
+| arm | dask_default 16 default | dask_default 128 default | dask_objects 16 default | dask_objects 128 default | pull8 16 default | pull8 128 default |
+|---|---|---|---|---|---|---|
+| v2_b2f4_bandfirst_zstd1_s256 | 24.1 | 205.7 | 5.3 | 41.5 | 6.6 | 46.0 |
+| v2_b2f8_bandfirst_zstd1_s256 | 14.9 | 114.1 | 4.8 | 34.7 | 5.5 | 35.2 |
+| v2_b2f_bandfirst_zstd1_s256 | 10.0 | 72.3 | 4.8 | 33.0 | 5.1 | 27.7 |
+| v2_b2f_i4_bandfirst_zstd1_s256 | 22.4 | 198.3 | 5.3 | 36.9 | 5.4 | 28.7 |
+| v2_c0 | 52.9 | 57.4 | 19.5 | 32.4 | 20.8 | 26.3 |
+| v2_m2f_bandfirst_zstd1_s256 | 23.4 | 204.7 | 4.9 | 38.3 | 6.0 | 30.3 |
+| v2_m2f_x3_bandfirst_zstd1_s256 | 14.3 | 130.7 | 4.4 | 36.9 | 5.7 | 28.7 |
+| v2_m2f_x4_bandfirst_zstd1_s256 | 23.2 | 211.2 | 5.0 | 39.3 | 6.0 | 31.8 |
 
 ## T10 — build and assembly on Graviton (`v2n-arm`)
 

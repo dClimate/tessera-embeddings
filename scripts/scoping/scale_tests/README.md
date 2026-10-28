@@ -128,7 +128,7 @@ markers belong to a run, so `harness.bind_study` refuses a second study under th
   each crossed with int8 codecs, a band-planar transpose, the inner-chunk order within a shard and
   the `scales` geometry, read at 16, 64 and 128 dims. Every archived command reruns as it ran.
 - **`narrow`** measures narrower band chunks for mobile readers (ADR 031 §6), all band-first, against
-  C0 and the accepted layout: band-split shards of 8 or 4 bands at 512² or 256² inner chunks,
+  C0 and ADR 031's 16-band chunks: band-split shards of 8 or 4 bands at 512² or 256² inner chunks,
   16-band shards holding 8- or 4-band inner chunks, and variable-width band shards (4, 4, 8, 16, 32, 64
   and two coarser sets). It adds prefix widths of 4 and 8, a 256² map tile and a 1,024 × 2,048
   viewport, and a third request plan: the direct-read client of a browser or app, which merges no

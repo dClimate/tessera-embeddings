@@ -585,7 +585,7 @@ def _vs_accepted(rows: list[dict], phase: str, arms: list[str], cols: list[tuple
         return _t10_value(rows, metric, arm, phase=phase, workload=workload, dims=dims)
 
     out = [
-        f"### The same, as a ratio to the accepted layout ({ACCEPTED.name})",
+        f"### The same, as a ratio to 16-band objects with 16-band chunks ({ACCEPTED.name})",
         "",
         "| arm | " + " | ".join(c[0] for c in cols) + " |",
         "|---|" + "---|" * len(cols),
