@@ -77,6 +77,6 @@ provenance beyond its registry, and none can be reconstructed.
   campaign, about a quarter of a percent of it.
 - The ingest's time cost is inside run-to-run variation over seven paired runs of a dense zone;
   what the record adds for certain is one more chunk write per date, the index's, for the Dask
-  scheduler (plan §6, §10).
+  scheduler, accepted (plan §6).
 - A pixel query joins three things: the plane, the shard-date's `sources`, and `granules` through
   the row's `snapshot_id`.
