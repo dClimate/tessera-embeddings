@@ -422,8 +422,13 @@ locate(45.5071, 14.3761)              # PixelLocation(zone='33N', tile='chunk_20
 pixel_granules(REGISTRY, 45.5071, 14.3761, 2024)
 ```
 
-The same in raw polars, for one run, here the update. Every join from `shard_dates` to `granules`
-goes through the snapshot the run read:
+The same in raw polars, for one run, here the update. Two rules from the helpers apply to any
+reader: a shard's pixels may come from several runs, listed oldest first in the registry's
+`source_runs`, and a pixel belongs to the newest run that claims it, where a holes update claims a
+pixel only where its `update_pixels` mask marks it and a fill or a shards update claims every
+pixel (§5); and every join from `shard_dates` to `granules` goes through the snapshot the run
+read, `snapshot_id`, never through `run_id`, because a granule list is written once per mosaic
+snapshot and shared by every run that read it:
 
 ```python
 import numpy as np
@@ -433,9 +438,14 @@ from tessera_embeddings.storage.zarr_store import open_repo
 
 table = f"{REGISTRY}/provenance/{{}}/zone=33N/year=2024/*.parquet"
 granules, key = pl.scan_parquet(table.format("granules")), ["sensor", "snapshot_id", "solar_day", "fusion_order"]
+# The shard: the rows one run wrote for it, one per sensor and date; `sources` lists the fusion
+# orders of the granules that supplied at least one of its pixels, so exploding it and joining
+# through the snapshot gives the shard's exact granule list.
 rows = pl.scan_parquet(table.format("shard_dates")).filter(pl.col("run_id") == UPDATE, pl.col("tile") == "chunk_209_14")
 rows.explode("sources").rename({"sources": "fusion_order"}).join(granules, on=key).collect()      # the shard
 
+# The pixel: its plane values are ranks, one per date on the run's time axis; 0 means the date
+# was not valid for the model there, and k > 0 names `sources[k - 1]` of that shard-date's row.
 run = zarr.open_group(open_repo(f"{REGISTRY}/provenance/pixel_sources.icechunk").readonly_session("main").store,
                       path=f"33N/2024/{UPDATE}", mode="r")
 k = np.asarray(run["s2"][:, 209 * 2048 + 1908, 14 * 2048 + 70])     # the pixel's ranks, one per date
@@ -448,6 +458,48 @@ days = np.asarray(run["s2_date"][:]).astype("datetime64[ns]").astype("datetime64
 ```
 
 For a shard with several `source_runs`, pick the run by §5's rule first, as `pixel_granules` does.
+
+The same in DuckDB, for readers who prefer SQL. The tables are plain Parquet, so `read_parquet`
+takes the same paths (add `INSTALL httpfs; LOAD httpfs` for `s3://`). The pixel's ranks still come
+from the Icechunk planes, read as above and handed to DuckDB as the small `seen` frame:
+
+```python
+import duckdb
+
+con = duckdb.connect()
+con.sql(f"""
+-- A day: every granule fused into 9 May's optical mosaic, in fusion order. One row set per
+-- mosaic snapshot that recorded the day; a fill and an update that read the same mosaic share it.
+SELECT snapshot_id, fusion_order, granule_id, platform, acquired_at, cloud_cover
+FROM read_parquet('{table.format("granules")}')
+WHERE sensor = 's2' AND solar_day = DATE '2024-05-09'
+ORDER BY snapshot_id, fusion_order""")
+
+con.sql(f"""
+-- The shard: each sensor and date the update used in chunk_209_14 and every granule that supplied
+-- a pixel of it. `sources` holds fusion orders; UNNEST it and join through the snapshot the run read.
+SELECT d.sensor, d.solar_day, d.valid_px, g.fusion_order, g.granule_id, g.platform, g.acquired_at, g.cloud_cover
+FROM read_parquet('{table.format("shard_dates")}') AS d, UNNEST(d.sources) AS s(fusion_order)
+JOIN read_parquet('{table.format("granules")}') AS g
+  ON g.sensor = d.sensor AND g.snapshot_id = d.snapshot_id AND g.solar_day = d.solar_day AND g.fusion_order = s.fusion_order
+WHERE d.run_id = '{UPDATE}' AND d.tile = 'chunk_209_14'
+ORDER BY d.sensor, d.solar_day, g.fusion_order""")
+
+con.register("seen", seen)  # the pixel's (sensor, solar_day, rank) from the planes, as above
+con.sql(f"""
+-- The pixel: rank k names the k-th entry of that shard-date's `sources` (DuckDB lists are 1-based,
+-- so rank + 1), which is the fusion order of the granule that supplied the pixel.
+SELECT p.sensor, p.solar_day, g.fusion_order, g.granule_id, g.platform, g.acquired_at, g.cloud_cover, g.assets
+FROM seen AS p
+JOIN read_parquet('{table.format("shard_dates")}') AS d
+  ON d.run_id = '{UPDATE}' AND d.tile = 'chunk_209_14' AND d.sensor = p.sensor AND d.solar_day = p.solar_day
+JOIN read_parquet('{table.format("granules")}') AS g
+  ON g.sensor = d.sensor AND g.snapshot_id = d.snapshot_id AND g.solar_day = d.solar_day
+ AND g.fusion_order = list_extract(d.sources, p.rank + 1)
+ORDER BY p.solar_day""")
+```
+
+Both forms were run against the record the unit tests build and return the same rows.
 
 ## Appendix C. For implementers
 
