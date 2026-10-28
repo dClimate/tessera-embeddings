@@ -45,7 +45,7 @@ from tessera_embeddings.inference.assembly import (
     summarise_optical_skips,
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
-from tessera_embeddings.storage.registry import REASONS, part_uri, registry_rows, write_registry_part
+from tessera_embeddings.storage.registry import REASONS, registry_rows, run_file_uri, write_run_file
 from tests.unit.inference_stack import STACK
 
 #: A shard commit's timestamp, as `write_year_shards` reports it.
@@ -510,7 +510,7 @@ class TestWhetherTheRadarRuleWasEvenOn:
 class TestThePartIsPublishedOnlyAfterTheCellCommits:
     """The registry is a sibling of the store, and nothing reconciles the two.
 
-    So a part written while the assembly was still running advertises embedded and refused tiles for
+    So a run file written while the assembly was still running advertises embedded and refused tiles for
     a zone-year that may never land — a failed worker, a failed merge, an injected fault — and the
     claim is permanent, to consumers who are explicitly told they need not open the store. The write
     therefore happens after the commit, and these tests pin that rather than the writing.
@@ -527,7 +527,7 @@ class TestThePartIsPublishedOnlyAfterTheCellCommits:
         summary = writer._skip_summary("run1", [], [chunk.label])
 
         assert summary["refused_px_by_reason"]["thin"] == 64, "the pooled summary is unchanged"
-        assert "registry_part" not in summary, "and it promises no part"
+        assert "registry_run_file" not in summary, "and it promises no run file"
         assert not list((tmp_path / "registry").glob("**/*.parquet")), "nothing was written"
 
     def test_publishing_writes_a_row_per_live_tile(self, tmp_path: Path) -> None:
@@ -539,7 +539,7 @@ class TestThePartIsPublishedOnlyAfterTheCellCommits:
             writer.write_skip_marker(chunk, "run1", _record(chunk.label, thin=64, obs_max=14))
         writer._skip_summary("run1", ["chunk_9_9"], ["chunk_0_0", "chunk_0_1"])
 
-        uri = writer.publish_registry_part(
+        uri = writer.publish_registry_run_file(
             root,
             "32S",
             2021,
@@ -549,7 +549,7 @@ class TestThePartIsPublishedOnlyAfterTheCellCommits:
             refused=["chunk_0_0", "chunk_0_1"],
         )
 
-        assert uri == part_uri(root, "32S", 2021, "run1")
+        assert uri == run_file_uri(root, "32S", 2021, "run1")
         by_tile = {r["tile"]: r for r in pq.read_table(uri).to_pylist()}
         assert set(by_tile) == {"chunk_9_9", "chunk_0_0", "chunk_0_1"}, "every live tile"
         assert {r["assembled_at"] for r in by_tile.values()} == {COMMITTED}, "stamped with the commit, not the clock"
@@ -564,7 +564,7 @@ class TestThePartIsPublishedOnlyAfterTheCellCommits:
 
     def test_a_failed_publish_never_costs_a_committed_cell(self, tmp_path: Path, monkeypatch) -> None:
         """The cell has already landed by the time this runs. Raising here would fail a complete cell
-        over its index, and every column is derivable from the store, so a lost part is rebuildable.
+        over its index, and every column is derivable from the store, so a lost run file is rebuildable.
         """
         writer = ZarrWriter(str(tmp_path / "staging"))
         chunk = _chunk(0, 0)
@@ -576,7 +576,7 @@ class TestThePartIsPublishedOnlyAfterTheCellCommits:
 
         monkeypatch.setattr(_assembly_mod, "_fs_for", _boom)
         assert (
-            writer.publish_registry_part(
+            writer.publish_registry_run_file(
                 str(tmp_path / "reg"), "32S", 2021, "run1", committed_at=COMMITTED, embedded=[], refused=[chunk.label]
             )
             is None
@@ -603,19 +603,19 @@ def test_an_unopenable_staging_filesystem_does_not_fail_the_cell(tmp_path: Path,
 
 
 class TestTheDatasetIsActuallyReadable:
-    """The two defects a red-team pass found, both of which every individual part survived.
+    """The two defects a red-team pass found, both of which every individual run file survived.
 
-    A registry is 1,008 parts read as one dataset, so a part that is valid alone and unmergeable with
-    its siblings is worse than a broken part: nothing notices until the whole thing is read.
+    A registry is 1,008 run files read as one dataset, so a file that is valid alone and unmergeable
+    with its siblings is worse than a broken one: nothing notices until the whole thing is read.
     """
 
     @staticmethod
     def _write(root: str, zone: str, year: int, run: str, rows: list[dict]) -> str:
-        uri = part_uri(root, zone, year, run)
+        uri = run_file_uri(root, zone, year, run)
         Path(uri).parent.mkdir(parents=True, exist_ok=True)
-        # The lambda is not a leak: `write_registry_part` consumes it as
+        # The lambda is not a leak: `write_run_file` consumes it as
         # `with open_output(uri) as f`, which is the contract the parameter exists to express.
-        write_registry_part(
+        write_run_file(
             uri,
             rows,
             open_output=lambda u: Path(u).open("wb"),  # noqa: SIM115
@@ -650,14 +650,14 @@ class TestTheDatasetIsActuallyReadable:
     def test_the_whole_dataset_reads_with_hive_partitioning(self, tmp_path: Path) -> None:
         """Carrying zone/year as columns as well as partition keys made this raise
         `ArrowTypeError: Field year has incompatible types: int64 vs int32` — the dataset was
-        unreadable as a dataset while every part opened fine on its own.
+        unreadable as a dataset while every run file opened fine on its own.
         """
         ds = pytest.importorskip("pyarrow.dataset")
         root = str(tmp_path / "reg")
         self._write(root, "32S", 2021, "r1", registry_rows("r1", "t", embedded=["chunk_0_0"], refused=[]))
         self._write(root, "09S", 2022, "r2", registry_rows("r2", "t", embedded=["chunk_1_1"], refused=[]))
 
-        table = ds.dataset(f"{root}/parts", partitioning="hive").to_table()
+        table = ds.dataset(f"{root}/runs", partitioning="hive").to_table()
         assert table.num_rows == 2
         assert set(table.column("zone").to_pylist()) == {"32S", "09S"}, "from the path, not a column"
         assert set(table.column("year").to_pylist()) == {2021, 2022}
@@ -673,7 +673,7 @@ class TestTheDatasetIsActuallyReadable:
         assert pq.read_table(fill).column("update_name").to_pylist() == [None]
         assert pq.read_table(update).column("update_name").to_pylist() == ["u1"]
 
-    def test_a_refill_adds_a_part_rather_than_replacing_one(self, tmp_path: Path) -> None:
+    def test_a_refill_adds_a_run_file_rather_than_replacing_one(self, tmp_path: Path) -> None:
         """Keyed by run so the registry holds both fills of a cell. A fixed name would silently
         replace the original, and dedup is the compaction's decision to make, not a write's.
         """
@@ -682,7 +682,7 @@ class TestTheDatasetIsActuallyReadable:
         self._write(root, "32S", 2021, "first", registry_rows("first", "t1", embedded=["chunk_0_0"], refused=[]))
         self._write(root, "32S", 2021, "refill", registry_rows("refill", "t2", embedded=["chunk_0_0"], refused=[]))
 
-        table = ds.dataset(f"{root}/parts", partitioning="hive").to_table()
+        table = ds.dataset(f"{root}/runs", partitioning="hive").to_table()
         assert table.num_rows == 2, "both fills are on the record"
         assert set(table.column("run_id").to_pylist()) == {"first", "refill"}
         assert set(table.column("assembled_at").to_pylist()) == {"t1", "t2"}, "and a clock to pick by"
@@ -803,9 +803,9 @@ class TestTheDepthRuleTheRowsWereJudgedAgainst:
 
     @staticmethod
     def _write(root: str, zone: str, year: int, run: str, rows: list[dict], rule: int | None) -> str:
-        uri = part_uri(root, zone, year, run)
+        uri = run_file_uri(root, zone, year, run)
         Path(uri).parent.mkdir(parents=True, exist_ok=True)
-        write_registry_part(
+        write_run_file(
             uri,
             rows,
             open_output=lambda u: Path(u).open("wb"),  # noqa: SIM115
@@ -863,12 +863,12 @@ class TestTheDepthRuleTheRowsWereJudgedAgainst:
             rows = registry_rows("r", "t", embedded=["chunk_0_0"], refused=[], optical_min_obs=rule)
             self._write(root, zone, 2021, f"r-{zone}", rows, rule)
 
-        table = ds.dataset(f"{root}/parts", partitioning="hive").to_table()
+        table = ds.dataset(f"{root}/runs", partitioning="hive").to_table()
         assert table.num_rows == 2
         by_zone = dict(zip(table.column("zone").to_pylist(), table.column("optical_min_obs").to_pylist(), strict=True))
         assert by_zone == {"32S": 15, "09S": 30}
 
-    def test_a_part_read_alone_still_states_the_rule(self, tmp_path: Path) -> None:
+    def test_a_run_file_read_alone_still_states_the_rule(self, tmp_path: Path) -> None:
         """Also in the key-value block, for a reader that opens one file without the partitioning."""
         pq = pytest.importorskip("pyarrow.parquet")
         root = str(tmp_path / "reg")
@@ -905,7 +905,7 @@ class TestOneCellsRefusalsNeverReachAnother:
 
         # Second cell, same writer, no skips of its own — the reset `assemble_global` performs.
         writer._last_skip_records = {}
-        uri = writer.publish_registry_part(
+        uri = writer.publish_registry_run_file(
             str(tmp_path / "registry"),
             "60S",
             2024,
@@ -932,7 +932,7 @@ class TestOneCellsRefusalsNeverReachAnother:
         writer.write_skip_marker(chunk, "run-A", _record(chunk.label, thin=64, obs_max=14))
         writer._skip_summary("run-A", [], [chunk.label])
 
-        uri = writer.publish_registry_part(  # no reset — the old behaviour
+        uri = writer.publish_registry_run_file(  # no reset — the old behaviour
             str(tmp_path / "registry"),
             "60S",
             2024,
@@ -948,11 +948,11 @@ class TestOneCellsRefusalsNeverReachAnother:
 
 
 class TestPartsWrittenByDifferentBuilds:
-    """A nine-year campaign crosses code versions, so parts will disagree about their columns.
+    """A nine-year campaign crosses code versions, so run files will disagree about their columns.
 
     The failure is silent and order-dependent, which is what makes it worth a test rather than a
-    note: `ds.dataset` infers its schema from the FIRST file in sorted path order, so an older part
-    under `zone=01N` hides a column that a newer part under `zone=60S` carries — and hides it by
+    note: `ds.dataset` infers its schema from the FIRST file in sorted path order, so an older run file
+    under `zone=01N` hides a column that a newer one under `zone=60S` carries — and hides it by
     omission, which reads as "never recorded" rather than as an error.
     """
 
@@ -961,7 +961,7 @@ class TestPartsWrittenByDifferentBuilds:
         pq = pytest.importorskip("pyarrow.parquet")
         pa = pytest.importorskip("pyarrow")
         trimmed = [{k: v for k, v in r.items() if k in schema.names} for r in rows]
-        uri = part_uri(root, zone, 2021, f"run-{zone}")
+        uri = run_file_uri(root, zone, 2021, f"run-{zone}")
         Path(uri).parent.mkdir(parents=True, exist_ok=True)
         pq.write_table(pa.Table.from_pylist(trimmed, schema=schema), uri, compression="zstd")
 
@@ -996,19 +996,19 @@ class TestPartsWrittenByDifferentBuilds:
             )
         return root
 
-    def test_an_inferred_read_drops_a_column_the_older_part_lacks(self, tmp_path: Path) -> None:
+    def test_an_inferred_read_drops_a_column_the_older_run_file_lacks(self, tmp_path: Path) -> None:
         """Pinned as a HAZARD, not as desired behaviour. This is why the docstring tells a reader to
         state the schema, and why the assertion is about silence rather than about an exception.
         """
         ds = pytest.importorskip("pyarrow.dataset")
         root = self._two_builds(tmp_path, older_zone="01N", newer_zone="60S")
-        table = ds.dataset(f"{root}/parts", partitioning="hive").to_table()
+        table = ds.dataset(f"{root}/runs", partitioning="hive").to_table()
         assert table.num_rows == 2, "it reads, which is the problem"
         assert "median_obs_where_thin" not in table.schema.names, (
-            "the older part sorts first, so the newer column vanishes with no error"
+            "the older run file sorts first, so the newer column vanishes with no error"
         )
 
-    def test_stating_the_schema_recovers_it_and_nulls_the_older_part(self, tmp_path: Path) -> None:
+    def test_stating_the_schema_recovers_it_and_nulls_the_older_run_file(self, tmp_path: Path) -> None:
         """The prescribed read: the column is present, and the run that never measured it says null
         rather than claiming a value.
         """
@@ -1016,7 +1016,7 @@ class TestPartsWrittenByDifferentBuilds:
         from tessera_embeddings.storage.registry import dataset_schema
 
         root = self._two_builds(tmp_path, older_zone="01N", newer_zone="60S")
-        table = ds.dataset(f"{root}/parts", schema=dataset_schema(), partitioning="hive").to_table()
+        table = ds.dataset(f"{root}/runs", schema=dataset_schema(), partitioning="hive").to_table()
         by_zone = dict(
             zip(table.column("zone").to_pylist(), table.column("median_obs_where_thin").to_pylist(), strict=True)
         )
@@ -1028,8 +1028,8 @@ class TestPartsWrittenByDifferentBuilds:
         """
         ds = pytest.importorskip("pyarrow.dataset")
         root = self._two_builds(tmp_path, older_zone="60S", newer_zone="01N")
-        table = ds.dataset(f"{root}/parts", partitioning="hive").to_table()
-        assert "median_obs_where_thin" in table.schema.names, "newer part sorts first, so it survives"
+        table = ds.dataset(f"{root}/runs", partitioning="hive").to_table()
+        assert "median_obs_where_thin" in table.schema.names, "newer run file sorts first, so it survives"
 
 
 class TestRankingAnInfillByTheRightDepth:

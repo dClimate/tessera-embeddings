@@ -197,7 +197,7 @@ def test_a_cells_line_is_the_loosest_any_write_to_it_applied(zone_repo):
 
 def test_an_update_whose_shard_commit_expired_is_still_known_to_the_store_check(zone_repo):
     """An update records itself in ``updates[year]``, not ``runs``, so after snapshot expiry that record is
-    the store's only account of the write; without it the update's registry part names a run the store lacks.
+    the store's only account of the write; without it the update's registry run file names a run the store lacks.
     """
     commit = {"snapshot": "expired", "committed_at": "2026-10-13T00:00:00+00:00"}
     wrote = upd.update_record(_target(), run_id="u-run", written=["chunk_0_0"], kept=[], optical_min_obs=1)

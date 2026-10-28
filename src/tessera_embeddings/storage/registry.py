@@ -22,28 +22,30 @@ the same terms and are directly comparable.
 **A convenience layer, never a second source of truth.** Every column is derivable from the store
 itself, so a wrong row is a rebuildable inconvenience rather than a data defect and a correction
 never touches published data. That property is what the Open Data access request promises Cambridge,
-and it is why ``registry_master`` may rebuild any zone-year of the master from parts and store.
+and it is why ``registry_master`` may rebuild any zone-year of the master from its run files and the
+store.
+
+**One run file per cell, keyed by run.** Each run's rows for a cell land in a file of its own,
+``runs/zone=<Z>/year=<Y>/<run_id>.parquet``. Keying by run rather than a fixed name means a refill
+writes a NEW file instead of overwriting the original fill's: the registry holds both, the honest
+record of a cell filled twice, and dedup becomes the master merge's decision rather than a silent
+overwrite's. ``assembled_at`` is what makes that decision possible — latest-wins needs a clock, and
+a run id is not one.
 
 **READING THE WHOLE DATASET REQUIRES STATING THE SCHEMA.** A nine-year campaign will cross code
-versions, so an older part will be missing a column a newer one has — and ``ds.dataset(...)`` infers
-its schema from the FIRST file it discovers, in sorted path order. If the older part sorts first
-(``zone=01N`` before ``zone=60S``), the newer column is **silently dropped from the read**: no error,
-and a consumer sees it as absent rather than unset, so whether a column added mid-campaign is visible
-depends on whether zone 01N was filled before or after the change. A whole-dataset read must pass the
-schema explicitly::
+versions, so an older run file will be missing a column a newer one has — and ``ds.dataset(...)``
+infers its schema from the FIRST file it discovers, in sorted path order. If the older file sorts
+first (``zone=01N`` before ``zone=60S``), the newer column is **silently dropped from the read**: no
+error, and a consumer sees it as absent rather than unset, so whether a column added mid-campaign is
+visible depends on whether zone 01N was filled before or after the change. A whole-dataset read
+must pass the schema explicitly::
 
-    ds.dataset(f"{root}/parts", schema=dataset_schema(), partitioning="hive")
+    ds.dataset(f"{root}/runs", schema=dataset_schema(), partitioning="hive")
 
-which backfills the missing column as null on the older parts — the honest answer, since those runs
+which backfills the missing column as null on the older files — the honest answer, since those runs
 did not measure it. Consumers should read ``master/`` instead (``registry_master``), which is written
-with one schema and a dataset-level ``_common_metadata``; parts are written concurrently by cells that
-cannot agree on one.
-
-**One part per cell, keyed by run.** Parts land under ``parts/zone=<Z>/year=<Y>/<run_id>.parquet``.
-Keying by run rather than a fixed name means a refill writes a NEW part instead of overwriting the
-original fill's: the registry holds both, the honest record of a cell filled twice, and dedup becomes
-the master merge's decision rather than a silent overwrite's. ``assembled_at`` is what makes that
-decision possible — latest-wins needs a clock, and a run id is not one.
+with one schema and a dataset-level ``_common_metadata``; run files are written concurrently by
+cells that cannot agree on one.
 
 Three things this module does deliberately, each because the obvious version is broken:
 
@@ -51,12 +53,12 @@ Three things this module does deliberately, each because the obvious version is 
   column null, and ``pa.Table.from_pylist`` then types those columns ``null`` — which fails to
   concatenate against a cell that did refuse something (``ArrowInvalid: Schema at index 1 was
   different``). Since most cells refuse nothing, an inferred schema breaks the master merge and any
-  read across the whole dataset while every individual part looks fine.
+  read across the whole dataset while every individual run file looks fine.
 * **``zone`` and ``year`` are NOT columns.** They are the hive partition keys, and carrying them as
   columns too makes the dataset unreadable: pyarrow infers ``year=2021`` from the path as ``int32``
   and refuses to merge it with an ``int64`` column of the same name
   (``ArrowTypeError: Field year has incompatible types``). The path is the authority; the same
-  identity is repeated in the file's key-value metadata, which collides with nothing, so a part
+  identity is repeated in the file's key-value metadata, which collides with nothing, so a file
   opened on its own still says what it describes.
 * **Null means "not measured", never zero.** A tile whose coverage record did not survive — a
   resumed success carries none, an unreadable marker leaves none — is null across every
@@ -96,25 +98,25 @@ logger = logging.getLogger(__name__)
 REASONS = ("no_optical", "thin", "no_radar")
 
 
-def part_uri(registry_root: str, zone: str, year: int, run_id: str) -> str:
-    """Where one cell's part lands inside the registry dataset.
+def run_file_uri(registry_root: str, zone: str, year: int, run_id: str) -> str:
+    """Where one run's file for a cell lands inside the registry dataset.
 
     The dataset's LAYOUT lives here rather than on ``BucketPaths`` because it is a property of the
     dataset, not of the bucket: ``BucketPaths.optical_registry`` owns where the registry is (in
-    production, somebody else's bucket), while partitioning and part naming are this module's. It
+    production, somebody else's bucket), while partitioning and file naming are this module's. It
     also has to be here — the run id is not known until the runner derives it from the cell's
     inputs, long after the flow resolved its paths.
     """
-    return f"{registry_root.rstrip('/')}/parts/zone={zone}/year={year}/{run_id}.parquet"
+    return f"{registry_root.rstrip('/')}/runs/zone={zone}/year={year}/{run_id}.parquet"
 
 
 def registry_schema() -> pa.Schema:
-    """The part schema, declared so every part is mergeable with every other.
+    """The run file schema, declared so every run file is mergeable with every other.
 
     Every measurement column is nullable, load-bearing rather than lax: null is how a row says
     "nothing measured this", which an embedded tile's refusal columns and an unrecorded refusal both
     need to say. Integers are ``int64`` throughout — a 2048-px tile's counts fit in far less, but a
-    uniform width means no part can disagree with another about a column's type.
+    uniform width means no run file can disagree with another about a column's type.
     """
     import pyarrow as pa
 
@@ -195,17 +197,17 @@ def registry_schema() -> pa.Schema:
 
 
 def dataset_schema() -> pa.Schema:
-    """The schema to read the WHOLE dataset with: the part columns plus the hive partition keys.
+    """The schema to read the WHOLE dataset with: the run file columns plus the hive partition keys.
 
     Passing :func:`registry_schema` alone loses ``zone`` and ``year``: an explicit schema replaces
     what the partitioning would have contributed, so the keys have to be in it, typed as the path
     yields them — ``zone`` a string, ``year`` an ``int32``.
 
-    Use it for any read spanning more than one part::
+    Use it for any read spanning more than one run file::
 
-        ds.dataset(f"{root}/parts", schema=dataset_schema(), partitioning="hive")
+        ds.dataset(f"{root}/runs", schema=dataset_schema(), partitioning="hive")
 
-    which keeps a column added mid-campaign visible on the newer parts and null on the older ones
+    which keeps a column added mid-campaign visible on the newer files and null on the older ones
     instead of dropped from the read entirely — see the module docstring.
     """
     import pyarrow as pa
@@ -353,7 +355,7 @@ def _float_or_none(value: object) -> float | None:
     return float(value) if isinstance(value, int | float) and not isinstance(value, bool) else None
 
 
-def write_registry_part(
+def write_run_file(
     uri: str,
     rows: list[dict[str, Any]],
     *,
@@ -362,17 +364,17 @@ def write_registry_part(
     year: int = 0,
     extra_metadata: Mapping[str, str] | None = None,
 ) -> int:
-    """Write ``rows`` as one Parquet part at ``uri``; returns the rows written.
+    """Write ``rows`` as one run file at ``uri``; returns the rows written.
 
     ``open_output`` returns a binary writable for the URI — the caller's filesystem, so nothing here
     knows whether the registry is local or in somebody else's bucket.
 
-    ``zone``/``year`` go into the file's key-value metadata rather than a column, so a part opened on
+    ``zone``/``year`` go into the file's key-value metadata rather than a column, so a file opened on
     its own still says what it describes while the dataset's partition keys stay the single
     authority. ``extra_metadata`` adds to that key-value block — for provenance describing the whole
-    part rather than any one tile, that a reader may want without decoding a row.
+    file rather than any one tile, that a reader may want without decoding a row.
 
-    Buffered and written in one shot rather than streamed: a part is at most a few hundred rows and a
+    Buffered and written in one shot rather than streamed: a run file is at most a few hundred rows and a
     partial Parquet file is unreadable, so one write is both cheap and the only version that fails
     cleanly.
     """

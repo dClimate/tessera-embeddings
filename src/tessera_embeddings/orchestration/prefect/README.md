@@ -408,15 +408,15 @@ and is worth finishing even when its parent fill is cancelled.
 
 ### A landed cell is merged into the registry master
 
-Once a cell with live tiles has committed and published its part, and before the tag, the
-runner merges its registry parts into the cell's file under the registry's `master/`
+Once a cell with live tiles has committed and published its run file, and before the tag, the
+runner merges its registry run files into the cell's file under the registry's `master/`
 (`runners/zone_fill.py`, `_merge_registry_master`), so consumers read every fill as soon as
 it lands, including a deliberate refill, which fails at the tag step by design. Like the
 validator dispatch, a failure there is logged and never fails the landed cell; the registry
 census names the cell and `scripts/maintenance/rebuild_registry_measurements.py repair`
 rebuilds it. Planning a retry of a cell that already landed, or of an update already recorded there, runs the merge again, on every runner
 and in triage, so a process that died before it still reaches the master. The merge refuses while a run the store records writing the
-year has no part for a tile it last wrote; refilling those tiles clears it. See
+year has no run file for a tile it last wrote; refilling those tiles clears it. See
 [`registry-master.md`](../../../../context_docs/storage/registry-master.md).
 
 ### Cancelling reaches every level

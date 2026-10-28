@@ -18,14 +18,14 @@ tell what the numbers mean without asking us. A new metadata standard goes here.
 
 **`registry.py`** builds the summary table published beside the data: one row per tile per
 year saying whether it was filled and how good the coverage was. New columns that help
-someone judge whether an area is usable belong here. Each fill writes one raw part per zone-year
-to `parts/`; `registry_master.py` merges it into the zone-year's file in `master/`, the one
-registry consumers read, tile by tile, so `master/` always describes what the store holds now. It
-writes each file conditionally, so concurrent writers cannot lose each other's rows, and only when
-the store's record of the year's runs (`published_store.committed_runs`) accounts for every part.
-`registry_rebuild.py` re-derives a row's measurements from the store when a fill left them null.
-Both sit outside the inference code identity, so changing them never invalidates staged work. The
-design is in
+someone judge whether an area is usable belong here. Each run, a fill or an update, writes one
+raw file per zone-year to `runs/`, named by its run ID; `registry_master.py` merges it into the
+zone-year's file in `master/`, the one registry consumers read, tile by tile, so `master/` always
+describes what the store holds now. It writes each file conditionally, so concurrent writers
+cannot lose each other's rows, and only when the store's record of the year's runs
+(`published_store.committed_runs`) accounts for every run file. `registry_rebuild.py` re-derives
+a row's measurements from the store when a fill left them null. Both sit outside the inference
+code identity, so changing them never invalidates staged work. The design is in
 [`context_docs/storage/registry-master.md`](../../../context_docs/storage/registry-master.md).
 
 ## The rest

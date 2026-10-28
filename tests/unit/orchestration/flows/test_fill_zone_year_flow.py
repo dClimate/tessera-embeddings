@@ -210,8 +210,8 @@ def test_the_registry_root_follows_the_store_this_run_writes(wired):
     """The flow must derive the registry from the store it is FILLING, not the default repo.
 
     Observed in dev on 2026-08-19: a campaign against `store_name="tessera-radar"` published its
-    parts beside `tessera.icechunk`, because `optical_registry()` re-derived from the default
-    basename. The part was valid and the log said it was published, so nothing looked wrong — it
+    run files beside `tessera.icechunk`, because `optical_registry()` re-derived from the default
+    basename. The run file was valid and the log said it was published, so nothing looked wrong — it
     simply described a zone-year the store it sat beside does not contain.
     """
     wired.setattr(mod, "zone_year_complete", lambda *a, **k: True)  # retag-only: no cluster

@@ -72,7 +72,7 @@ def _table(rows: list[dict], schema: pa.Schema) -> pa.Table:
 
 
 def _parts(rows: list[dict]) -> pa.Table:
-    """Rows as a fill part reads back from ``parts/``."""
+    """Rows as a fill's run file reads back from ``runs/``."""
     return _table(rows, dataset_schema())
 
 
@@ -247,7 +247,7 @@ class TestInvariants:
         assert any(message in failure for failure in invariant_failures(master, expected_rows=expected_rows))
 
 
-#: One cell's parts for the audit: a tile the fill measured, and one it left null.
+#: One cell's run files for the audit: a tile the fill measured, and one it left null.
 _AUDITED = [
     _row("chunk_0_0", measured=True, stamp=FILLED, refused_thin_px=6),
     _row("chunk_0_1", measured=False, stamp=FILLED),
@@ -255,7 +255,7 @@ _AUDITED = [
 
 
 def _sound() -> pa.Table:
-    """The master those parts should produce, with the null tile re-derived."""
+    """The master those run files should produce, with the null tile re-derived."""
     return merge(_fill(_AUDITED), _rebuilt([_row("chunk_0_1", measured=True, stamp=REBUILT)]))
 
 
@@ -265,7 +265,7 @@ def _altered(master: pa.Table) -> pa.Table:
 
 
 class TestAudit:
-    """The master checked against the parts it should describe, as ``verify`` and the census run it."""
+    """The master checked against the run files it should describe, as ``verify`` and the census run it."""
 
     def test_a_sound_master_reports_nothing(self) -> None:
         assert audit(_sound(), _parts(_AUDITED)) == {}
@@ -274,7 +274,7 @@ class TestAudit:
         ("damage", "problem"),
         [
             (lambda m: m.filter(pc.equal(m.column("tile"), "chunk_0_0")), "tile(s) missing"),
-            (lambda m: merge(m, _fill([_row("chunk_9_9", measured=True, stamp=FILLED)])), "no part names"),
+            (lambda m: merge(m, _fill([_row("chunk_9_9", measured=True, stamp=FILLED)])), "no run file names"),
             (_altered, "fill row(s) altered"),
             (
                 lambda m: m.set_column(m.schema.get_field_index("run_id"), "run_id", pa.array(["x"] * m.num_rows)),
@@ -288,7 +288,7 @@ class TestAudit:
         ],
         ids=[
             "a-dropped-tile",
-            "a-tile-no-part-names",
+            "a-tile-no-run-file-names",
             "an-altered-fill-measurement",
             "an-altered-fill-run-id",
             "an-altered-fill-field",
@@ -307,8 +307,8 @@ class TestAudit:
 
 
 def _publish(root: Path, run: str, rows: list[dict]) -> None:
-    """One part of cell 33N/2017, written the way the fill writes its own."""
-    cell = root / "parts" / "zone=33N" / "year=2017"
+    """One run file of cell 33N/2017, written the way the fill writes its own."""
+    cell = root / "runs" / "zone=33N" / "year=2017"
     cell.mkdir(parents=True, exist_ok=True)
     pq.write_table(_table(rows, registry_schema()), cell / f"{run}.parquet")
 
@@ -324,7 +324,7 @@ def registry(tmp_path: Path) -> Path:
 
 
 class TestUpdateCell:
-    """The update every fill runs: the cell's parts merged into its existing master file, in place."""
+    """The update every fill runs: the cell's run files merged into its existing master file, in place."""
 
     MASTER = Path("master/zone=33N/year=2017/part-0.parquet")
 
@@ -336,8 +336,8 @@ class TestUpdateCell:
         assert master.column("run_id").to_pylist() == ["update", "rebuild-1"], "the re-derived row survives"
         assert pq.read_schema(registry / "master" / "_common_metadata").names == master_schema().names
 
-    def test_a_damaged_copy_of_a_fill_row_loses_to_its_part(self, registry: Path) -> None:
-        """The file's fill rows are copies of the parts'; a later stamp on a damaged one must not let it win."""
+    def test_a_damaged_copy_of_a_fill_row_loses_to_its_run_file(self, registry: Path) -> None:
+        """The file's fill rows are copies of the run files'; a later stamp on a damaged one must not let it win."""
         held = registry_master.read_cell(LOCAL, str(registry), "master", "33N", 2017, master_schema()).to_pylist()
         held[0] |= {"assembled_at": LATER, "refused_thin_px": 999}
         version = cell_version(LOCAL, str(registry), "33N", 2017)
@@ -362,28 +362,28 @@ class TestUpdateCell:
         assert "chunk_0_0" in findings[0] and "chunk_5_5" in findings[1]
         assert (registry / self.MASTER).exists()
 
-    def test_a_withdrawn_run_does_not_outlive_its_part(self, registry: Path) -> None:
-        """Deleting a run's part and updating must restore the run before it, not keep the master's copy."""
+    def test_a_withdrawn_run_does_not_outlive_its_run_file(self, registry: Path) -> None:
+        """Deleting a run's file and updating must restore the run before it, not keep the master's copy."""
         _publish(registry, "update", [_row("chunk_0_0", measured=True, stamp=LATER, run_id="update")])
         merge_cell(LOCAL, str(registry), "33N", 2017)
-        (registry / "parts" / "zone=33N" / "year=2017" / "update.parquet").unlink()
+        (registry / "runs" / "zone=33N" / "year=2017" / "update.parquet").unlink()
         merge_cell(LOCAL, str(registry), "33N", 2017)
         assert pq.read_table(registry / self.MASTER).column("run_id").to_pylist() == ["run-a", "rebuild-1"]
 
-    def test_a_run_whose_part_never_published_is_refused_rather_than_reported_merged(self, registry: Path) -> None:
-        """Part publishing is best-effort; merging the older parts would report a fill the master lacks."""
+    def test_a_run_whose_run_file_never_published_is_refused_rather_than_reported_merged(self, registry: Path) -> None:
+        """Publishing a run file is best-effort; merging the older run files would report a fill the master lacks."""
         before = (registry / self.MASTER).read_bytes()
-        with pytest.raises(ValueError, match="no registry part for run 'refill'"):
+        with pytest.raises(ValueError, match="no registry run file for run 'refill'"):
             merge_cell(LOCAL, str(registry), "33N", 2017, run_id="refill")
         assert (registry / self.MASTER).read_bytes() == before
 
-    def test_a_cell_whose_last_part_is_withdrawn_is_emptied(self, registry: Path) -> None:
-        """Withdrawal deletes the run's part; with none left, the master must not keep describing it."""
-        (registry / "parts" / "zone=33N" / "year=2017" / "run-a.parquet").unlink()
+    def test_a_cell_whose_last_run_file_is_withdrawn_is_emptied(self, registry: Path) -> None:
+        """Withdrawal deletes the run's file; with none left, the master must not keep describing it."""
+        (registry / "runs" / "zone=33N" / "year=2017" / "run-a.parquet").unlink()
         assert merge_cell(LOCAL, str(registry), "33N", 2017) == []
         assert pq.read_table(registry / self.MASTER).num_rows == 0
 
-    def test_a_cell_with_neither_a_part_nor_a_master_file_is_left_alone(self, tmp_path: Path) -> None:
+    def test_a_cell_with_neither_a_run_file_nor_a_master_file_is_left_alone(self, tmp_path: Path) -> None:
         """A retried all-ocean cell lands here, and must not get a file describing nothing."""
         assert merge_cell(LOCAL, str(tmp_path), "33N", 2017) == []
         assert not (tmp_path / "master").exists()
@@ -435,12 +435,12 @@ def _store(*commits: Commit, wrote: dict[str, set[str]] = _WROTE) -> StoreYear:
     return StoreYear(list(commits), lambda snapshot: frozenset(wrote[snapshot]))
 
 
-def _parts_of(*runs: tuple[str, str, list[str]]) -> pa.Table:
-    """Parts for ``(run, stamp, tiles)``, as each run published them."""
+def _run_rows(*runs: tuple[str, str, list[str]]) -> pa.Table:
+    """Run files for ``(run, stamp, tiles)``, as each run published them."""
     return _parts([_row(t, measured=True, stamp=stamp, run_id=run) for run, stamp, tiles in runs for t in tiles])
 
 
-_FILL_AND_UPDATE = _parts_of(("run-a", FILLED, ["chunk_0_0", "chunk_0_1"]), ("run-c", LATER, ["chunk_0_1"]))
+_FILL_AND_UPDATE = _run_rows(("run-a", FILLED, ["chunk_0_0", "chunk_0_1"]), ("run-c", LATER, ["chunk_0_1"]))
 
 
 class TestSourceRunsComeFromTheStore:
@@ -458,23 +458,23 @@ class TestSourceRunsComeFromTheStore:
 
 
 class TestTheStoreStandsBehindTheParts:
-    """Newest-part-wins is right only if the parts account for every run the store says wrote the year."""
+    """Newest-run-wins is right only if the run files account for every run the store says wrote the year."""
 
     def test_parts_for_every_run_stamped_with_their_commits_pass(self) -> None:
         assert store_disagreements(_FILL_AND_UPDATE, _store(_A, _C)) == []
 
-    def test_a_run_with_no_part_that_last_wrote_a_tile_is_refused(self) -> None:
-        """A refill that never published, then an update that did: the store's latest run has a part,
-        but ``chunk_0_0`` holds the refill's pixels, and the parts describe it by the original fill.
+    def test_a_run_with_no_run_file_that_last_wrote_a_tile_is_refused(self) -> None:
+        """A refill that never published, then an update that did: the store's latest run has a run file,
+        but ``chunk_0_0`` holds the refill's pixels, and the run files describe it by the original fill.
         """
         (found,) = store_disagreements(_FILL_AND_UPDATE, _store(_A, _B, _C))
         assert "run 'run-b' committed at" in found and "last wrote 1 tile(s)" in found and "chunk_0_0" in found
 
-    def test_a_run_with_no_part_that_later_runs_wrote_over_does_not_block(self) -> None:
+    def test_a_run_with_no_run_file_that_later_runs_wrote_over_does_not_block(self) -> None:
         """It describes nothing the store still holds, so refilling its tiles is how a cell recovers."""
         assert store_disagreements(_FILL_AND_UPDATE, _store(_A, _B, _C, wrote=_WROTE | {"snap-b": {"chunk_0_1"}})) == []
 
-    def test_a_part_stamped_away_from_its_commit_is_refused(self) -> None:
+    def test_a_run_file_stamped_away_from_its_commit_is_refused(self) -> None:
         """Commit order is the order a tile's pixels landed in; any other stamp can pick the wrong run."""
         found = store_disagreements(_FILL_AND_UPDATE, _store(_A, _C._replace(at="2026-08-09T00:00:01+00:00")))
         assert any("run 'run-c'" in entry and "misordered" in entry for entry in found)
@@ -485,24 +485,24 @@ class TestTheStoreStandsBehindTheParts:
         ids=["the-retry-rewrote-every-tile", "the-first-attempt-wrote-a-tile-the-retry-did-not"],
     )
     def test_a_retry_s_earlier_attempt_counts_on_its_own(self, first_attempt_wrote: set[str], blocks: bool) -> None:
-        """One run id, two commits: the part describes the retry, so the first attempt is a commit no part
-        describes, and its tiles are the store's until something rewrites them.
+        """One run id, two commits: the run file describes the retry, so the first attempt is a commit
+        no run file describes, and its tiles are the store's until something rewrites them.
         """
-        parts = _parts_of(("run-a", MIDWAY, ["chunk_0_0", "chunk_0_1"]))
+        run_rows = _run_rows(("run-a", MIDWAY, ["chunk_0_0", "chunk_0_1"]))
         attempts = (Commit("run-a", FILLED, "snap-a1"), Commit("run-a", MIDWAY, "snap-a2"))
-        found = store_disagreements(parts, _store(*attempts, wrote={"snap-a1": first_attempt_wrote}))
+        found = store_disagreements(run_rows, _store(*attempts, wrote={"snap-a1": first_attempt_wrote}))
         assert [("chunk_9_9" in entry) for entry in found] == ([True] if blocks else [])
 
     def test_a_retry_that_rewrote_its_tiles_but_never_republished_is_refused(self) -> None:
-        """The part describes the first attempt; the store holds the retry's pixels."""
-        parts = _parts_of(("run-a", FILLED, ["chunk_0_0", "chunk_0_1"]))
+        """The run file describes the first attempt; the store holds the retry's pixels."""
+        run_rows = _run_rows(("run-a", FILLED, ["chunk_0_0", "chunk_0_1"]))
         retry = Commit("run-a", MIDWAY, "snap-a2")
-        (found,) = store_disagreements(parts, _store(_A, retry, wrote=_WROTE | {"snap-a2": {"chunk_0_0"}}))
-        assert f"committed at {MIDWAY} and last wrote 1 tile(s) no part describes" in found
+        (found,) = store_disagreements(run_rows, _store(_A, retry, wrote=_WROTE | {"snap-a2": {"chunk_0_0"}}))
+        assert f"committed at {MIDWAY} and last wrote 1 tile(s) no run file describes" in found
 
-    def test_a_part_naming_a_run_the_store_never_committed_is_refused(self) -> None:
+    def test_a_run_file_naming_a_run_the_store_never_committed_is_refused(self) -> None:
         (found,) = store_disagreements(_FILL_AND_UPDATE, _store(_A))
-        assert "run 'run-c' has a part" in found
+        assert "run 'run-c' has a run file" in found
 
     @pytest.mark.parametrize(
         ("commits", "expected"),
@@ -516,11 +516,11 @@ class TestTheStoreStandsBehindTheParts:
             "recorded-before-commits-were-and-published",
             "recorded-before-commits-were-and-never-published",
             "recorded-before-commits-were-marking-the-year-empty",
-            "replaced-and-expired-with-its-part",
+            "replaced-and-expired-with-its-run-file",
         ],
     )
     def test_a_run_recorded_before_commits_were(self, commits: list[Commit], expected: list[str]) -> None:
-        """v1.1's records name no commit: one with a part is taken on trust, one without cannot be bounded,
+        """v1.1's records name no commit: one with a run file is taken on trust, one without cannot be bounded,
         and one that marked the year empty left no embeddings to describe.
         """
         found = store_disagreements(_FILL_AND_UPDATE, _store(*commits))
@@ -536,7 +536,7 @@ class TestConcurrentWriters:
     def test_a_writer_overtaken_between_its_reads_and_its_write_merges_again(
         self, registry: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """An update run lands after this writer read the parts and before it writes, which an unconditional
+        """An update run lands after this writer read the run files and before it writes, which an unconditional
         write would then overwrite with the cell as it was, both updates reporting success.
         """
         read, landed = registry_master.read_cell, []
@@ -564,11 +564,11 @@ class TestConcurrentWriters:
     def test_a_fill_landing_mid_update_is_merged_not_refused(
         self, registry: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Its commit precedes its part, so a store record read after the parts names the run of every part read."""
+        """Its commit precedes its run file, so a store record read after the run files names every one's run."""
         read, commits = registry_master.read_cell, [_A]
 
         def landing(fs: object, root: str, prefix: str, zone: str, year: int, schema: pa.Schema) -> pa.Table:
-            if prefix == "parts" and len(commits) == 1:
+            if prefix == "runs" and len(commits) == 1:
                 commits.append(_C)
                 _publish(registry, "run-c", [_row("chunk_0_1", measured=True, stamp=LATER, run_id="run-c")])
             return read(fs, root, prefix, zone, year, schema)

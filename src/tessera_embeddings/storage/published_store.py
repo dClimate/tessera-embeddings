@@ -226,7 +226,7 @@ class Commit(NamedTuple):
 
     ``at`` orders runs: the commit's own timestamp, or for an untagged run the time it was marked.
     ``snapshot`` is the shard commit, ``None`` for an untagged run, and is what :func:`commit_tiles`
-    reads the tiles it wrote from. ``empty`` is a run that holds no tile now, so it needs no part: an
+    reads the tiles it wrote from. ``empty`` is a run that holds no tile now, so it needs no run file: an
     untagged run that marked the year as holding no data, or a run a refill replaced whose commit has
     expired, every tile of which the refill rewrote.
     """
@@ -266,7 +266,7 @@ def committed_runs(attrs: Mapping[str, Any], year: int, writes: Sequence[Commit]
     zone-year tag points at the attrs commit, not the shard commit before it. Either way the record
     says when the run wrote and not what, so the entry has no snapshot to diff. A ``commit`` of null
     is a year marked without shards, which wrote nothing. A run a refill replaced whose commit has
-    expired is marked ``empty``: its part, if it has one, is still the store's, but the refill rewrote
+    expired is marked ``empty``: its run file, if it has one, is still the store's, but the refill rewrote
     every tile it wrote, which the store check confirms while the commit is still there to diff, and
     nothing can afterwards. A targeted update records itself in the same shape beside the fill, in
     ``updates[year]`` (``storage.update``), so its expired commits are found the same way.
