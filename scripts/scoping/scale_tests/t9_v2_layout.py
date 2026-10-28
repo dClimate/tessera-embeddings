@@ -1,9 +1,9 @@
 """T9 — v2 store layout: band chunks, int8 codecs, shard orders, measured without AWS.
 
-Builds each arm of a study as a plain local Zarr store of 2x2 shards from real v2 tiles, then
+Builds each arm of a study as a plain local Zarr store of 2x2 meta-shards from real v2 meta-shards, then
 records what the layout decision needs that does not depend on the network:
 
-* **write cost** — stored bytes and encode CPU per shard, through the same whole-shard assignment
+* **write cost** — stored bytes and encode CPU per meta-shard, through the same whole-meta-shard assignment
   the assembly writer makes;
 * **request plans** — the exact requests and bytes every read workload makes, through a counting
   store, on whichever zarr version runs the phase. They carry over to S3 because they depend only
@@ -66,14 +66,15 @@ ARMS: list[V.Variant] = [
 ]
 
 Region = tuple[str, int, int, int, int]
-# (label, y0, x0, height, width): non-aligned windows inside shard (0, 0), then aligned whole shards.
+# (label, y0, x0, height, width): non-aligned windows inside meta-shard (0, 0), then aligned whole meta-shards.
 REGIONS: tuple[Region, ...] = (
     ("patch", 700, 900, 100, 100),
     ("tile", 500, 700, 1000, 1000),
     ("shard", 0, 0, TILE, TILE),
     ("bulk", 0, 0, 2 * TILE, 2 * TILE),
 )
-#: The mobile reads (ADR 031 §6): one 256² web-map tile on the 256 grid, and a phone viewport across a shard corner.
+#: The mobile reads (ADR 031 §6): one 256² web-map tile on the 256 grid, and a phone viewport across a
+#: meta-shard corner.
 MOBILE_REGIONS: tuple[Region, ...] = (
     ("maptile", 512, 768, 256, 256),
     ("viewport", TILE - 512, TILE - 1024, 1024, 2048),
@@ -188,7 +189,7 @@ def _tile(cfg: harness.RunConfig, tiles: Path | None, n: int, h: int, w: int) ->
 
 
 def _side(cfg: harness.RunConfig) -> int:
-    """Store side in pixels: 2x2 shards at bench, one partial shard at tiny."""
+    """Store side in pixels: 2x2 meta-shards at bench, one partial meta-shard at tiny."""
     return 1024 if cfg.is_tiny else 2 * TILE
 
 
@@ -249,7 +250,7 @@ def _dir_bytes(path: Path) -> int:
 
 
 def phase_build(cfg: harness.RunConfig, study: Study, tiles: Path | None) -> None:
-    """Write every arm from the same tiles, one whole-shard assignment per shard, timing each."""
+    """Write every arm from the same meta-shards, one whole-meta-shard assignment each, timing each."""
     side = _side(cfg)
     for arm in study.arms:
         path = _store_dir(cfg, arm)

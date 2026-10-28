@@ -4,11 +4,11 @@ T9 settled what does not depend on the network. This measures the two things tha
 own in-region EC2 box, in the dev account, into throwaway repos under the run's store root:
 
 * ``build`` then ``read_<client>`` (x86, the read benchmark's r7i.4xlarge). Every finalist is built as
-  an Icechunk repo of 10 x 10 shards cycled from real v2 tiles, so no cache holds the working set.
+  an Icechunk repo of 10 x 10 meta-shards cycled from real v2 meta-shards, so no cache holds the working set.
   Each workload then runs cold in a fresh process, arms interleaved, in two passes of opposite arm
   order. Records wall time, requests, store bytes and wire bytes (psutil). Run ``read`` once per
   client: the library's environment, then one pinned to zarr 3.2.1 + icechunk 2.1.1.
-* ``assemble`` (Graviton, like the assembly runner). The same staged v2 tiles are written into each
+* ``assemble`` (Graviton, like the assembly runner). The same staged v2 meta-shards are written into each
   finalist by the library's own assembly code, ``shard_writer.write_year_shards`` over a
   ``StagedShardSource`` — every array a fill writes, not just the two that change — in two passes of
   opposite order. Records worker CPU (total, read, compress-and-upload), wall time and stored bytes.
@@ -74,22 +74,22 @@ PASSES = 2
 #: shaped to one with `tc netem` + `ifb` before the phase runs; "poor" is Lighthouse's mobile profile.
 NETWORKS: dict[str, tuple[int, float]] = {"good": (40, 20.0), "poor": (150, 1.6)}
 #: The browser-like client of the mobile phase: zarrita.js's one request per inner chunk, a browser's 6 connections
-#: per host, and each object fetched in one GET.
+#: per host, and no GET split into parts.
 MOBILE_CLIENT: dict[str, Any] = {"zarr_config": DIRECT_READ, "max_in_flight": 6, "split_large_gets": False}
 #: Workloads that read codes alone: a preview renders them, and cosine similarity ignores the per-pixel scale.
 SCALE_FREE = ("maptile", "viewport")
 
 
 def _side(cfg: harness.RunConfig) -> int:
-    """Bench zone side in shards: 10 at bench, 1 for a tiny smoke."""
+    """Bench zone side in meta-shards: 10 at bench, 1 for a tiny smoke."""
     return 1 if cfg.is_tiny else 10
 
 
 def _regions(side: int) -> dict[str, tuple[slice, slice]]:
-    """The region workloads: a 1,000-px tile inside one shard, a 2x2-shard bulk, an 8x8-shard pull."""
+    """The region workloads: a 1,000-px window inside one meta-shard, a 2x2-meta-shard bulk, an 8x8 pull."""
     k = min(side, 8)
     off = TILE * min(3, side - 1)
-    corner = TILE * max(1, min(4, side - 1))  # a shard corner, for a viewport that spans four shards
+    corner = TILE * max(1, min(4, side - 1))  # a meta-shard corner, for a viewport that spans four
     return {
         "tile": (slice(off + 500, off + 1500), slice(off + 700, off + 1700)),
         "bulk": (slice(TILE * min(2, side - 1), TILE * min(4, side)),) * 2,
@@ -104,7 +104,7 @@ def _regions(side: int) -> dict[str, tuple[slice, slice]]:
 
 
 def _write_tiles(payload: dict[str, Any]) -> tuple[Any, float, int]:
-    """Spawned worker: write whole shards into the fork in the arm's order; return (fork, write CPU, shards).
+    """Spawned worker: write whole meta-shards into the fork in arm order; return (fork, write CPU, meta-shards).
 
     A band-first arm's tiles are put in band-first order BEFORE the timer: a band-first pipeline
     stages them that way, so the write cost excludes any transpose.
@@ -127,7 +127,7 @@ def _write_tiles(payload: dict[str, Any]) -> tuple[Any, float, int]:
 
 
 def phase_build(cfg: harness.RunConfig, arms: list[V.Variant], tiles: Path, workers: int) -> None:
-    """Build every finalist as an Icechunk repo of side x side shards, tiles cycled over the grid."""
+    """Build every finalist as an Icechunk repo of side x side meta-shards, the real ones cycled over the grid."""
     side, n_tiles = _side(cfg), len(list(tiles.glob("emb_*.npy")))
     jobs = [(sy, sx, (sy * side + sx) % n_tiles) for sy in range(side) for sx in range(side)]
     for arm in arms:
@@ -155,7 +155,7 @@ def phase_build(cfg: harness.RunConfig, arms: list[V.Variant], tiles: Path, work
         cpu_per_shard = sum(c for _, c, _ in results) / sum(n for _, _, n in results)
         harness.emit_metric(cfg, TEST, "build", "encode_cpu_s", cpu_per_shard, "s", variant=arm.name, kind="write")
         harness.emit_metric(cfg, TEST, "build", "bytes_written", n_bytes, "bytes", variant=arm.name, objects=n_obj)
-        # A direct reader fetches an array's manifest on its first chunk read; it grows with the objects referenced.
+        # A direct reader fetches an array's manifest on its first chunk read; it grows with the shards referenced.
         _, m_bytes = harness.object_stats(harness.store_uri(cfg, name) + "/manifests")
         harness.emit_metric(cfg, TEST, "build", "manifest_bytes", m_bytes, "bytes", variant=arm.name, objects=n_obj)
         logger.info("built %s: %d objects, %.1f GB", arm.name, n_obj, n_bytes / 1e9)
@@ -168,7 +168,7 @@ def cold_read(payload: dict[str, Any]) -> dict[str, Any]:
     """One workload on one arm in a fresh process: wall, requests, store bytes, wire bytes.
 
     A ``client`` payload (:data:`MOBILE_CLIENT`) reads as a browser does, and first reads one pixel of
-    a distant shard, timed as ``first_read_s``: that read fetches the manifest, which every cold
+    a distant meta-shard, timed as ``first_read_s``: that read fetches the manifest, which every cold
     workload would otherwise carry in its own time.
     """
     import psutil
@@ -208,7 +208,7 @@ def cold_read(payload: dict[str, Any]) -> dict[str, Any]:
         out |= {"read_p50_ms": float(np.median(ms)), "read_p95_ms": float(np.percentile(ms, 95))}
         out |= {"read_p50_lo_ms": float(lo), "read_p50_hi_ms": float(hi)}
     elif workload.startswith("dask"):
-        chunks = {} if workload == "dask_default" else V.dask_chunks(emb, whole_objects=workload == "dask_objects")
+        chunks = {} if workload == "dask_default" else V.dask_chunks(emb, whole_shards=workload == "dask_objects")
         try:
             ds = xr.open_zarr(store, group="zone", consolidated=False, chunks=chunks)
         except NotImplementedError as exc:  # xarray before 2026.9 cannot open a variable-width shard grid
@@ -232,7 +232,7 @@ def cold_read(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _points(cfg: harness.RunConfig, tiles: Path) -> list[list[int]]:
-    """POINTS pixels holding an embedding, spread over every shard of the zone."""
+    """POINTS pixels holding an embedding, spread over every meta-shard of the zone."""
     side, n_tiles = _side(cfg), len(list(tiles.glob("emb_*.npy")))
     rng, pts = np.random.default_rng(7), []
     valid = [np.argwhere(np.isfinite(np.load(tiles / f"scales_{n:03d}.npy"))) for n in range(n_tiles)]
@@ -245,7 +245,7 @@ def _points(cfg: harness.RunConfig, tiles: Path) -> list[list[int]]:
 
 #: The read sweep: (workload, dims, zarr config). ``tune`` re-runs reads with reader settings, to see how much
 #: of a layout's cost a reader can recover: the band-16 study's full-vector pulls with a wider fetch concurrency
-#: and band-aligned Dask chunks, the narrow study's Dask reads with one task per whole object.
+#: and band-aligned Dask chunks, the narrow study's Dask reads with one task per shard.
 READ_WORKLOADS: list[tuple[str, int, dict]] = [
     ("point", 16, {}),
     ("point", 128, {}),
@@ -262,8 +262,8 @@ TUNE_WORKLOADS: list[tuple[str, int, dict]] = [
     ("bulk", 128, {"async.concurrency": 64}),
     ("pull8", 16, {"async.concurrency": 64}),
 ]
-#: Dask at default chunks, one task per inner chunk, against one task per object, beside the direct pull it
-#: should approach.
+#: Dask at default chunks, one task per inner chunk, against one task per shard (the recorded workload key
+#: ``dask_objects``), beside the direct pull it should approach.
 NARROW_TUNE_WORKLOADS: list[tuple[str, int, dict]] = [
     (w, d, {}) for d in (16, 128) for w in ("dask_default", "dask_objects", "pull8")
 ]
@@ -488,7 +488,7 @@ def phase_assemble(
 
 
 def _margin_is_fill(arr: zarr.Array, sy: int, sx: int, ny: int, nx: int) -> bool:
-    """Whether shard ``(sy, sx)``'s part beyond the zone's ``ny x nx``, which only a rounded-up array has, is fill."""
+    """Whether meta-shard ``(sy, sx)``'s part beyond the zone's ``ny x nx`` is fill; only a rounded-up array has one."""
     extent = dict(zip(arr.metadata.dimension_names, arr.shape, strict=True))
     y0, x0 = sy * TILE, sx * TILE
     y1, x1 = min(y0 + TILE, extent["northing"]), min(x0 + TILE, extent["easting"])
@@ -503,7 +503,7 @@ def _margin_is_fill(arr: zarr.Array, sy: int, sx: int, ny: int, nx: int) -> bool
 def phase_verify(
     cfg: harness.RunConfig, phase: str, prefix: str, shards: list[tuple[int, int]], arms: list[V.Variant]
 ) -> None:
-    """Every arm under ``prefix`` holds exactly C0's values in every array of every listed shard.
+    """Every arm under ``prefix`` holds exactly C0's values in every array of every listed meta-shard.
 
     Layouts must be lossless: a band-first array is read back and reordered before the comparison, and
     floats compare with NaN equal to NaN. Any mismatch raises after the counts are recorded, so the
@@ -532,14 +532,20 @@ def phase_verify(
                 same = np.array_equal(want, got, equal_nan=want.dtype.kind == "f")
                 if not same or not _margin_is_fill(arr, sy, sx, ny, nx):
                     mismatched[arm.name] += 1
-                    logger.warning("verify %s: %s differs from C0 in shard (%d, %d)", arm.name, var, sy, sx)
+                    logger.warning("verify %s: %s differs from C0 in meta-shard (%d, %d)", arm.name, var, sy, sx)
     for name, n in mismatched.items():
         harness.emit_metric(
             cfg, TEST, phase, "mismatched_arrays", n, "count", variant=name, prefix=prefix, shards=len(shards)
         )
-        logger.info("verify %s under %s: %d mismatched array-shards over %d shards", name, prefix, n, len(shards))
+        logger.info(
+            "verify %s under %s: %d mismatched (array, meta-shard) pairs over %d meta-shards",
+            name,
+            prefix,
+            n,
+            len(shards),
+        )
     if failed := {name: n for name, n in mismatched.items() if n}:
-        raise RuntimeError(f"layouts are not lossless under {prefix}: mismatched array-shards {failed}")
+        raise RuntimeError(f"layouts are not lossless under {prefix}: mismatched (array, meta-shard) pairs {failed}")
 
 
 def main() -> int:
@@ -601,7 +607,7 @@ def main() -> int:
     elif phase == "verify":
         from tessera_embeddings.inference.chunk_spec import parse_chunk_label
 
-        # Each set names its own stores, shards and arms, so a check can never open the other set's stores.
+        # Each set names its own stores, meta-shards and arms, so a check can never open the other set's stores.
         if args.staging:  # the assembled set's first pass: the tiles assembly wrote, in the arms it wrote them to
             prefix, arms = f"{ASSEMBLED}/p0", assembled
             shards = [parse_chunk_label(label) for label in _picks(args.staging, args.n_tiles)]

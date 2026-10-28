@@ -89,9 +89,9 @@ VARIANTS: dict[str, Variant] = {
         Variant("c500_full", (1, 500, 500, 128), None),  # 32 MB chunks
         Variant("c384_full", (1, 384, 384, 128), None),  # ~19 MB
         Variant("c256_full", (1, 256, 256, 128), None),  # 8.4 MB, AlphaEarth-like
-        Variant("c256_sharded", (1, 256, 256, 128), (1, 2048, 2048, 128)),  # ~0.5 GB objects
+        Variant("c256_sharded", (1, 256, 256, 128), (1, 2048, 2048, 128)),  # ~0.5 GB shards
         # v2 (T9): the v1.1 geometry as control, then band-16 inner chunks in the same shard, and
-        # band-split shards (8 objects per tile) as the fallback rung.
+        # band-split shards (8 per meta-shard) as the fallback rung.
         Variant("v2_c0", (1, 256, 256, 128), _V2_SHARD),
         Variant("v2_c1", (1, 256, 256, 16), _V2_SHARD),
         Variant("v2_c2", (1, 512, 512, 16), _V2_SHARD),
@@ -178,20 +178,20 @@ def to_storage_order(arr: zarr.Array, block: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(block.transpose(2, 0, 1)) if _band_first(arr) else block
 
 
-def dask_chunks(arr: zarr.Array, *, whole_objects: bool = False) -> dict[str, int | tuple[int, ...]]:
+def dask_chunks(arr: zarr.Array, *, whole_shards: bool = False) -> dict[str, int | tuple[int, ...]]:
     """Dask chunks of one task per shard footprint and band chunk, keyed by the array's dimension names.
 
     Read from the array, as :func:`read_window` reads its order, so each arm is chunked to its own
     geometry: the control's 128-band chunk stays whole and a band-16 arm gets one task per band chunk.
     The footprint is the first shard's extent on each axis, from ``write_chunk_sizes``, which unlike
-    ``.shards`` is defined for a variable-width shard grid. ``whole_objects`` takes the band axis from
-    the shards too, so each task reads one whole object: 16 bands where 4-band inner chunks sit in
+    ``.shards`` is defined for a variable-width shard grid. ``whole_shards`` takes the band axis from
+    the shards too, so each task reads one whole shard: 16 bands where 4-band inner chunks sit in
     16-band shards, and each shard's own width on a variable-width grid.
     """
     names = arr.metadata.dimension_names
     footprint = {name: sizes[0] for name, sizes in zip(names, arr.write_chunk_sizes, strict=True)}
     sizes = dict(zip(names, arr.write_chunk_sizes, strict=True))
-    band = tuple(sizes["band"]) if whole_objects else dict(zip(names, arr.chunks, strict=True))["band"]
+    band = tuple(sizes["band"]) if whole_shards else dict(zip(names, arr.chunks, strict=True))["band"]
     return footprint | {"band": band}
 
 

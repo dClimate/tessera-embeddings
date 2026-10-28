@@ -10,22 +10,22 @@ own provenance. The band-16 study behind the rest of ADR 031 is archived in
 | `n9iowa`, `n9puget` | T9 | laptop (Apple M3 Max), local stores | zarr 3.4.1 + icechunk 2.3.0, the direct-read client on them, and zarr 3.2.1 + icechunk 2.1.1 | `930bffdb` |
 | `v2n` | T10 build, read, verify | r7i.4xlarge, us-west-2 | zarr 3.4.1 + icechunk 2.3.0 + xarray 2026.9.0, and zarr 3.2.1 + icechunk 2.1.1 + xarray 2026.4.0 | `824d5c4b` |
 | `v2n` | T10 mobile | r7i.4xlarge, us-west-2 | the direct-read client on zarr 3.4.1 + icechunk 2.3.0 | `60a3c362` |
-| `v2n` | T10 tune (Dask with one task per object) | r7i.4xlarge, us-west-2 | zarr 3.4.1 + icechunk 2.3.0 + xarray 2026.9.0 + dask 2026.3.0 | `0a9fac68` |
+| `v2n` | T10 tune (Dask with one task per shard) | r7i.4xlarge, us-west-2 | zarr 3.4.1 + icechunk 2.3.0 + xarray 2026.9.0 + dask 2026.3.0 | `0a9fac68` |
 | `v2n-arm` | T10 build, assemble | m7g.4xlarge (Graviton) | zarr 3.4.1 + icechunk 2.3.0 | `500e5ebf` on `proto/narrow-band-assembly` |
 | `v2n-arm` | T10 verify | m7g.4xlarge (Graviton) | zarr 3.4.1 + icechunk 2.3.0 | `0935d8c3` on `proto/narrow-band-assembly` |
 
 The T10 boxes ran a tarball of the commit in the code column, so their records say `git unknown`.
 The old client ran the same scale-test code against its own pinned libraries.
 `proto/narrow-band-assembly` is a prototype whose shard writer accepts band-first arrays. It writes
-each band-last staged tile through a transposed view, a reorder ADR 031 moves into inference, so its
+each band-last staged meta-shard through a transposed view, a reorder ADR 031 moves into inference, so its
 assembly CPU is an upper bound, as in the band-16 study.
 
 **Point reads** are 300 probes per arm in each pass, two passes in opposite arm order, each pass with
 its own 95% bootstrap interval on the median. ADR 031 §6's gate calls use those intervals.
 
-**The tiles** are the band-16 study's: four Iowa and four Puget Sound v2 Large tiles, fetched again
-from the dev stores. T9 builds 2 × 2 shards per area. T10 cycles all eight into 10 × 10 shards, and
-assembles 64 staged Iowa tiles.
+**The meta-shards** are the band-16 study's: four Iowa and four Puget Sound v2 Large meta-shards,
+fetched again from the dev stores. T9 builds 2 × 2 meta-shards per area. T10 cycles all eight into
+10 × 10 meta-shards, and assembles 64 staged Iowa meta-shards.
 
 **The direct-read client** stands in for a browser or app reading Zarr straight from S3. It runs
 zarr 3.4.1 with request merging off, at most 6 requests in flight, and icechunk's splitting of
@@ -34,11 +34,15 @@ large GETs off. T9 counts its requests. T10's `mobile` phase times it on two lin
 1.6 Mbit/s). Mobile reads skip `scales`: a preview renders the codes, and cosine similarity ignores
 the per-pixel scale.
 
-**Arm names.** Every arm except C0 is band-first (`bandfirst`, `(time, band, y, x)`), compressed
-with zstd at level 1 (`zstd1`), with `scales` at 256² inner chunks (`s256`), in 2,048² spatial
-shards.
+**Reader settings.** In the `tune` tables, `dask_default` is Dask at xarray's default chunks, one
+task per chunk; `dask_objects` is Dask with one task per shard; `pull8` is the direct read of
+8 × 8 meta-shards.
 
-| arm | band axis, per object | inner chunk | embedding objects per shard |
+**Arm names.** Every arm except C0 is band-first (`bandfirst`, `(time, band, y, x)`), compressed
+with zstd at level 1 (`zstd1`), with `scales` at 256² inner chunks (`s256`), in shards one
+meta-shard (2,048²) across.
+
+| arm | band axis, per shard | inner chunk | embeddings shards per meta-shard |
 |---|---|---|---|
 | `v2_c0`, the control | 128 bands, band-last: v1.1's geometry | 256² × 128 | 1 |
 | `v2_b2f`, 16-band chunks (ADR 031 §4, path 1) | 16 | 512² × 16 | 8 |
@@ -65,7 +69,7 @@ the order only changes which pieces sit side by side for a merged request.
 
 ### T9 — v2 layout arms
 
-| arm | embeddings MB | vs C0 | vs B2f | encode CPU s/shard |
+| arm | embeddings MB | vs C0 | vs B2f | encode CPU s/meta-shard |
 |---|---|---|---|---|
 | v2_b1f4_bandfirst_zstd1_s256 | 1101 | 0.82 | 1.05 | 1.070 |
 | v2_b1f8_bandfirst_zstd1_s256 | 1128 | 0.84 | 1.07 | 0.771 |
@@ -88,7 +92,7 @@ the order only changes which pieces sit side by side for a merged request.
 
 #### Requests / MB fetched, direct_zarr3.4
 
-| arm | point 4 | point 8 | maptile 4 | maptile 8 | viewport 4 | viewport 8 | point 16 | point 128 | tile 16 | shard 16 | bulk 16 | bulk 64 | bulk 128 |
+| arm | point 4 | point 8 | maptile 4 | maptile 8 | viewport 4 | viewport 8 | point 16 | point 128 | window 16 | meta-shard 16 | bulk 16 | bulk 64 | bulk 128 |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | v2_b1f4_bandfirst_zstd1_s256 | 2 / 0.2 | 4 / 0.3 | 1 / 0.0 | 2 / 0.0 | 36 / 6.7 | 72 / 13.5 | 7 / 0.6 | 56 / 4.1 | 64 / 9.9 | 4 / 22.6 | 16 / 167.4 | 64 / 583.6 | 128 / 1101.4 |
 | v2_b1f8_bandfirst_zstd1_s256 | 2 / 0.3 | 2 / 0.3 | 1 / 0.0 | 1 / 0.0 | 36 / 13.6 | 36 / 13.6 | 4 / 0.6 | 28 / 4.2 | 32 / 10.0 | 2 / 23.1 | 8 / 168.5 | 32 / 593.6 | 64 / 1127.6 |
@@ -111,7 +115,7 @@ the order only changes which pieces sit side by side for a merged request.
 
 #### Requests / MB fetched, zarr3.2
 
-| arm | point 4 | point 8 | maptile 4 | maptile 8 | viewport 4 | viewport 8 | point 16 | point 128 | tile 16 | shard 16 | bulk 16 | bulk 64 | bulk 128 |
+| arm | point 4 | point 8 | maptile 4 | maptile 8 | viewport 4 | viewport 8 | point 16 | point 128 | window 16 | meta-shard 16 | bulk 16 | bulk 64 | bulk 128 |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | v2_b1f4_bandfirst_zstd1_s256 | 2 / 0.2 | 4 / 0.3 | 1 / 0.0 | 2 / 0.0 | 36 / 6.7 | 72 / 13.5 | 7 / 0.6 | 56 / 4.1 | 64 / 9.9 | 4 / 22.6 | 16 / 167.4 | 64 / 583.6 | 128 / 1101.4 |
 | v2_b1f8_bandfirst_zstd1_s256 | 2 / 0.3 | 2 / 0.3 | 1 / 0.0 | 1 / 0.0 | 36 / 13.6 | 36 / 13.6 | 4 / 0.6 | 28 / 4.2 | 32 / 10.0 | 2 / 23.1 | 8 / 168.5 | 32 / 593.6 | 64 / 1127.6 |
@@ -134,7 +138,7 @@ the order only changes which pieces sit side by side for a merged request.
 
 #### Requests / MB fetched, zarr3.4
 
-| arm | point 4 | point 8 | maptile 4 | maptile 8 | viewport 4 | viewport 8 | point 16 | point 128 | tile 16 | shard 16 | bulk 16 | bulk 64 | bulk 128 |
+| arm | point 4 | point 8 | maptile 4 | maptile 8 | viewport 4 | viewport 8 | point 16 | point 128 | window 16 | meta-shard 16 | bulk 16 | bulk 64 | bulk 128 |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | v2_b1f4_bandfirst_zstd1_s256 | 2 / 0.2 | 4 / 0.3 | 1 / 0.0 | 2 / 0.0 | 8 / 10.2 | 16 / 20.7 | 7 / 0.6 | 56 / 4.1 | 8 / 17.6 | 4 / 22.6 | 16 / 167.4 | 64 / 583.6 | 128 / 1101.4 |
 | v2_b1f8_bandfirst_zstd1_s256 | 2 / 0.3 | 2 / 0.3 | 1 / 0.0 | 1 / 0.0 | 12 / 13.6 | 12 / 13.6 | 4 / 0.6 | 28 / 4.2 | 8 / 11.1 | 2 / 23.1 | 8 / 168.5 | 32 / 593.6 | 64 / 1127.6 |
@@ -183,7 +187,7 @@ the order only changes which pieces sit side by side for a merged request.
 
 ### T9 — v2 layout arms
 
-| arm | embeddings MB | vs C0 | vs B2f | encode CPU s/shard |
+| arm | embeddings MB | vs C0 | vs B2f | encode CPU s/meta-shard |
 |---|---|---|---|---|
 | v2_b1f4_bandfirst_zstd1_s256 | 1450 | 0.82 | 1.05 | 1.088 |
 | v2_b1f8_bandfirst_zstd1_s256 | 1467 | 0.83 | 1.06 | 0.874 |
@@ -206,7 +210,7 @@ the order only changes which pieces sit side by side for a merged request.
 
 #### Requests / MB fetched, direct_zarr3.4
 
-| arm | point 4 | point 8 | maptile 4 | maptile 8 | viewport 4 | viewport 8 | point 16 | point 128 | tile 16 | shard 16 | bulk 16 | bulk 64 | bulk 128 |
+| arm | point 4 | point 8 | maptile 4 | maptile 8 | viewport 4 | viewport 8 | point 16 | point 128 | window 16 | meta-shard 16 | bulk 16 | bulk 64 | bulk 128 |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | v2_b1f4_bandfirst_zstd1_s256 | 2 / 0.2 | 4 / 0.4 | 2 / 0.2 | 4 / 0.5 | 36 / 6.4 | 72 / 12.9 | 8 / 0.9 | 64 / 5.8 | 104 / 17.5 | 4 / 47.1 | 16 / 217.7 | 64 / 756.6 | 128 / 1450.1 |
 | v2_b1f8_bandfirst_zstd1_s256 | 2 / 0.4 | 2 / 0.4 | 2 / 0.5 | 2 / 0.5 | 36 / 13.3 | 36 / 13.3 | 4 / 0.9 | 32 / 5.8 | 52 / 18.2 | 2 / 48.5 | 8 / 220.1 | 32 / 765.9 | 64 / 1467.0 |
@@ -229,7 +233,7 @@ the order only changes which pieces sit side by side for a merged request.
 
 #### Requests / MB fetched, zarr3.2
 
-| arm | point 4 | point 8 | maptile 4 | maptile 8 | viewport 4 | viewport 8 | point 16 | point 128 | tile 16 | shard 16 | bulk 16 | bulk 64 | bulk 128 |
+| arm | point 4 | point 8 | maptile 4 | maptile 8 | viewport 4 | viewport 8 | point 16 | point 128 | window 16 | meta-shard 16 | bulk 16 | bulk 64 | bulk 128 |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | v2_b1f4_bandfirst_zstd1_s256 | 2 / 0.2 | 4 / 0.4 | 2 / 0.2 | 4 / 0.5 | 36 / 6.4 | 72 / 12.9 | 8 / 0.9 | 64 / 5.8 | 104 / 17.5 | 4 / 47.1 | 16 / 217.7 | 64 / 756.6 | 128 / 1450.1 |
 | v2_b1f8_bandfirst_zstd1_s256 | 2 / 0.4 | 2 / 0.4 | 2 / 0.5 | 2 / 0.5 | 36 / 13.3 | 36 / 13.3 | 4 / 0.9 | 32 / 5.8 | 52 / 18.2 | 2 / 48.5 | 8 / 220.1 | 32 / 765.9 | 64 / 1467.0 |
@@ -252,7 +256,7 @@ the order only changes which pieces sit side by side for a merged request.
 
 #### Requests / MB fetched, zarr3.4
 
-| arm | point 4 | point 8 | maptile 4 | maptile 8 | viewport 4 | viewport 8 | point 16 | point 128 | tile 16 | shard 16 | bulk 16 | bulk 64 | bulk 128 |
+| arm | point 4 | point 8 | maptile 4 | maptile 8 | viewport 4 | viewport 8 | point 16 | point 128 | window 16 | meta-shard 16 | bulk 16 | bulk 64 | bulk 128 |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | v2_b1f4_bandfirst_zstd1_s256 | 2 / 0.2 | 4 / 0.4 | 2 / 0.2 | 4 / 0.5 | 8 / 9.7 | 16 / 19.7 | 8 / 0.9 | 64 / 5.8 | 13 / 27.6 | 4 / 47.1 | 16 / 217.7 | 64 / 756.6 | 128 / 1450.1 |
 | v2_b1f8_bandfirst_zstd1_s256 | 2 / 0.4 | 2 / 0.4 | 2 / 0.5 | 2 / 0.5 | 12 / 13.3 | 12 / 13.3 | 4 / 0.9 | 32 / 5.8 | 10 / 22.6 | 2 / 48.5 | 8 / 220.1 | 32 / 765.9 | 64 / 1467.0 |
@@ -299,9 +303,9 @@ the order only changes which pieces sit side by side for a merged request.
 
 > Contention/latency numbers are only load-bearing on `--backend s3`.
 
-### T10 — bench store build, encode CPU per shard
+### T10 — bench store build, encode CPU per meta-shard
 
-| arm | encode CPU s | vs C0 | stored GB | vs C0 | objects | manifest bytes per object |
+| arm | encode CPU s | vs C0 | stored GB | vs C0 | S3 objects | manifest bytes per S3 object |
 |---|---|---|---|---|---|---|
 | v2_b2f4_bandfirst_zstd1_s256 | 3.18 | 0.97 | 30.5 | 0.78 | 3300 | 21 |
 | v2_b2f8_bandfirst_zstd1_s256 | 2.94 | 0.90 | 30.5 | 0.78 | 1700 | 21 |
@@ -329,7 +333,7 @@ the order only changes which pieces sit side by side for a merged request.
 
 > **unreadable** (v2_m2f_bandfirst_zstd1_colexicographic_s256, v2_m2f_bandfirst_zstd1_s256, v2_m2f_x3_bandfirst_zstd1_s256, v2_m2f_x4_bandfirst_zstd1_s256): xarray 2026.4.0: The `chunks` attribute is only defined for arrays using regular chunk grids. This array has a rectilinear chunk grid. Use `read_chunk_sizes` for general access.
 
-#### The same, as a ratio to 16-band objects with 16-band chunks (v2_b2f_bandfirst_zstd1_s256)
+#### The same, as a ratio to 16-band shards with 16-band chunks (v2_b2f_bandfirst_zstd1_s256)
 
 | arm | point 16 p50 | point 128 p50 | bulk 128 | 8x8 pull 16 | 8x8 pull 64 | 8x8 pull 128 | dask default | maptile 4 | maptile 8 | viewport 4 | viewport 8 |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -357,7 +361,7 @@ the order only changes which pieces sit side by side for a merged request.
 | v2_m2f_x3_bandfirst_zstd1_s256 | 412 ms (3) | 506 ms (22) | 2.5 s (1269) | 5.4 s (3146) | 16.0 s (10756) | 29.6 s (20258) | 13.9 s (2979) | 0.3 s (2) | 0.2 s (2) | 0.3 s (10) | 0.3 s (10) |
 | v2_m2f_x4_bandfirst_zstd1_s256 | 403 ms (3) | 543 ms (22) | 2.7 s (1269) | 6.0 s (3133) | 17.4 s (10792) | 32.4 s (20204) | 21.9 s (2985) | 0.3 s (1) | 0.3 s (2) | 0.3 s (8) | 0.3 s (16) |
 
-#### The same, as a ratio to 16-band objects with 16-band chunks (v2_b2f_bandfirst_zstd1_s256)
+#### The same, as a ratio to 16-band shards with 16-band chunks (v2_b2f_bandfirst_zstd1_s256)
 
 | arm | point 16 p50 | point 128 p50 | bulk 128 | 8x8 pull 16 | 8x8 pull 64 | 8x8 pull 128 | dask default | maptile 4 | maptile 8 | viewport 4 | viewport 8 |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -427,7 +431,7 @@ the order only changes which pieces sit side by side for a merged request.
 
 ### T10 — lossless check against C0
 
-| arm | stores | shards | mismatched array-shards |
+| arm | stores | meta-shards | mismatched (array, meta-shard) pairs |
 |---|---|---|---|
 | v2_b2f4_bandfirst_zstd1_s256 | t10 | 16 | 0 |
 | v2_b2f8_bandfirst_zstd1_s256 | t10 | 16 | 0 |
@@ -459,9 +463,9 @@ the order only changes which pieces sit side by side for a merged request.
 
 > Contention/latency numbers are only load-bearing on `--backend s3`.
 
-### T10 — bench store build, encode CPU per shard
+### T10 — bench store build, encode CPU per meta-shard
 
-| arm | encode CPU s | vs C0 | stored GB | vs C0 | objects | manifest bytes per object |
+| arm | encode CPU s | vs C0 | stored GB | vs C0 | S3 objects | manifest bytes per S3 object |
 |---|---|---|---|---|---|---|
 | v2_b2f4_bandfirst_zstd1_s256 | 2.73 | 0.86 | 30.5 | 0.78 | 3300 | 21 |
 | v2_b2f8_bandfirst_zstd1_s256 | 2.56 | 0.80 | 30.5 | 0.78 | 1700 | 21 |
@@ -473,7 +477,7 @@ the order only changes which pieces sit side by side for a merged request.
 | v2_m2f_x3_bandfirst_zstd1_s256 | 2.53 | 0.79 | 30.5 | 0.78 | 400 | 22 |
 | v2_m2f_x4_bandfirst_zstd1_s256 | 2.60 | 0.82 | 30.5 | 0.78 | 500 | 22 |
 
-### T10 — assembly code: CPU per staged tile, wall per run (median of passes)
+### T10 — assembly code: CPU per staged meta-shard, wall per run (median of passes)
 
 | arm | worker CPU s | vs C0 | write CPU s | vs C0 | wall s, whole run | stored GB |
 |---|---|---|---|---|---|---|
@@ -488,7 +492,7 @@ the order only changes which pieces sit side by side for a merged request.
 
 ### T10 — lossless check against C0
 
-| arm | stores | shards | mismatched array-shards |
+| arm | stores | meta-shards | mismatched (array, meta-shard) pairs |
 |---|---|---|---|
 | v2_b2f4_bandfirst_zstd1_s256 | t10 | 16 | 0 |
 | v2_b2f8_bandfirst_zstd1_s256 | t10 | 16 | 0 |

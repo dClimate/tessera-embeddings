@@ -300,8 +300,8 @@ _T9_READS = (
     ("viewport 8", "viewport", 8),
     ("point 16", "point", 16),
     ("point 128", "point", 128),
-    ("tile 16", "tile", 16),
-    ("shard 16", "shard", 16),
+    ("window 16", "tile", 16),
+    ("meta-shard 16", "shard", 16),
     ("bulk 16", "bulk", 16),
     ("bulk 64", "bulk", 64),
     ("bulk 128", "bulk", 128),
@@ -331,7 +331,11 @@ def _t9_tables(rows: list[dict]) -> list[str]:
     has_raw, has_accepted = any(r in arms for r in raws.values()), ACCEPTED.name in arms
     cols = ["embeddings MB", *(["ratio"] if has_raw else []), "vs C0", *(["vs B2f"] if has_accepted else [])]
     if arms:
-        out += ["", "| arm | " + " | ".join([*cols, "encode CPU s/shard"]) + " |", "|---|" + "---|" * (len(cols) + 1)]
+        out += [
+            "",
+            "| arm | " + " | ".join([*cols, "encode CPU s/meta-shard"]) + " |",
+            "|---|" + "---|" * (len(cols) + 1),
+        ]
     for a in arms:
         cells = [f"{stored(a) / 1e6:.0f}"]
         if has_raw:
@@ -381,7 +385,7 @@ def _t9_tables(rows: list[dict]) -> list[str]:
 _T10_READS = (
     ("point 16 p50", "point", 16),
     ("point 128 p50", "point", 128),
-    ("tile 16", "tile", 16),
+    ("window 16", "tile", 16),
     ("bulk 16", "bulk", 16),
     ("bulk 128", "bulk", 128),
     ("8x8 pull 16", "pull8", 16),
@@ -437,11 +441,11 @@ def _t10_tables(rows: list[dict]) -> list[str]:
     built = sorted({r["variant"] for r in _sel(rows, test="t10", phase="build", metric="encode_cpu_s") if r["variant"]})
     if built:
         cpu0, gb0 = (_t10_value(rows, m, "v2_c0", phase="build") for m in ("encode_cpu_s", "bytes_written"))
-        # Objects and the manifest a direct reader downloads first, where the run recorded them.
+        # S3 objects and the manifest a direct reader downloads first, where the run recorded them.
         manifests = bool(_sel(rows, test="t10", phase="build", metric="manifest_bytes"))
-        extra = " objects | manifest bytes per object |" if manifests else ""
+        extra = " S3 objects | manifest bytes per S3 object |" if manifests else ""
         out += [
-            "## T10 — bench store build, encode CPU per shard",
+            "## T10 — bench store build, encode CPU per meta-shard",
             "",
             "| arm | encode CPU s | vs C0 | stored GB | vs C0 |" + extra,
             "|---|---|---|---|---|" + "---|---|" * manifests,
@@ -461,7 +465,7 @@ def _t10_tables(rows: list[dict]) -> list[str]:
     if arms:
         base = {k: _t10_value(rows, "encode_cpu_s", "v2_c0", phase="assemble", kind=k) for k in ("worker", "write")}
         out += [
-            "## T10 — assembly code: CPU per staged tile, wall per run (median of passes)",
+            "## T10 — assembly code: CPU per staged meta-shard, wall per run (median of passes)",
             "",
             "| arm | worker CPU s | vs C0 | write CPU s | vs C0 | wall s, whole run | stored GB |",
             "|---|---|---|---|---|---|---|",
@@ -539,7 +543,11 @@ def _t10_tables(rows: list[dict]) -> list[str]:
         out.append("")
     verified = _sel(rows, test="t10", metric="mismatched_arrays")
     if verified:
-        out += ["## T10 — lossless check against C0", "", "| arm | stores | shards | mismatched array-shards |"]
+        out += [
+            "## T10 — lossless check against C0",
+            "",
+            "| arm | stores | meta-shards | mismatched (array, meta-shard) pairs |",
+        ]
         out.append("|---|---|---|---|")
         for r in sorted(verified, key=lambda r: (r["params"]["prefix"], r["variant"])):
             out.append(f"| {r['variant']} | {r['params']['prefix']} | {r['params']['shards']} | {r['value']:.0f} |")
@@ -585,7 +593,7 @@ def _vs_accepted(rows: list[dict], phase: str, arms: list[str], cols: list[tuple
         return _t10_value(rows, metric, arm, phase=phase, workload=workload, dims=dims)
 
     out = [
-        f"### The same, as a ratio to 16-band objects with 16-band chunks ({ACCEPTED.name})",
+        f"### The same, as a ratio to 16-band shards with 16-band chunks ({ACCEPTED.name})",
         "",
         "| arm | " + " | ".join(c[0] for c in cols) + " |",
         "|---|" + "---|" * len(cols),
