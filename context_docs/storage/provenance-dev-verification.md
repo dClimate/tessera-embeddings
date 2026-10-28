@@ -2,9 +2,9 @@
 
 The end-to-end check of the provenance record ([ADR 035](../decisions/035-a-provenance-record-for-the-published-store.md);
 PRs #253, #255 and #256) on global-tessera-dev.
-**Every correctness check passed.** The run also found that the record costs ingest time at zone
-scale, about 6–20% of ingest worker time, where the plan expected none, and that the plan's size
-for the `granules` table was low by about half. Both are now in the plan and the ingest docs.
+**Every correctness check passed.** The first run's one radar pair suggested the record costs
+ingest time at zone scale; a second day of paired runs (below) put that inside run-to-run variation.
+The plan's size for the `granules` table was low by about half. Both are in the plan and the ingest docs.
 
 ## Setup
 
@@ -118,7 +118,8 @@ re-ingesting the year), then a registry rebuild, then a `shards` update of `chun
 ### Ingest time
 
 Each pair ran both arms at once, on separate Dask clusters, so contention falls on both alike.
-Per-date time from the ingest's `Stage timings` and `S1 stage timings` lines, on against off:
+Per-date time from the ingest's `Stage timings` and `S1 stage timings` lines, on against off.
+The first day (2026-10-27, x86 workers of the previous image):
 
 | per-date time, on ÷ off | Iowa, July 2024 | zone 35N, 1–7 January 2024, first pair | second pair |
 |---|---|---|---|
@@ -126,26 +127,32 @@ Per-date time from the ingest's `Stage timings` and `S1 stage timings` lines, on
 | radar, ascending | 0.95 | 1.31 | 1.30 |
 | radar, descending | | 1.10 | 1.29 |
 
-Every radar date of the second pair was slower, by 6–40%. Iowa's workers had time to spare; a
-whole zone saturates them, as a campaign does, so the zone figures are the ones to plan on.
-Weighting optical at about four-fifths of ingest worker time (60 workers for 12–13 min against two
-radar orbits of 13 workers for 7–8 min), the record adds about 6–20% to the ingest.
+The second day (2026-10-28, ARM64 workers, the standing image), zone 35N, 1–7 January 2024, run as
+nine ingests under `_prov-cost/`, with worker CPU from Container Insights:
 
-A third pair, radar ascending only, ran with Dask performance reports
-(`_prov-test/perf/z35c-s1a-{on,off}.html`):
+| pair | off | on | on ÷ off | worker CPU off / on |
+|---|---|---|---|---|
+| optical 1, write s over six batched dates | 472 | 528 | 1.12 | 34% / 46% |
+| optical 2 | 461 | 467 | 1.01 | 35% / 48% |
+| optical 3, alongside three radar arms | 766 | 669 | 0.87 | 35% / 30% |
+| radar ascending, batch write s | 230 | 201 | 0.87 | 42% / 41% |
+| radar ascending, graph fused before the compute | 165 | 226 | 1.37 | 31% / 34% |
 
-| task-seconds over the week | off | on |
-|---|---|---|
-| all tasks | 10,895 | 14,212 (+30%) |
-| VV load (packed when on) | 3,392 | 4,309 |
-| VH load (never packed) | 3,427 | 4,034 |
-| chunk writes, with their count | 2,856 (4,888) | 4,293 (7,332) |
+The plain radar ingest took 230 s in one run and 165 s in the next, same code; the dense optical
+ingest's three pairs span 0.87–1.12. Every arm's workers sat at 30–48% CPU. The record's ingest
+time cost is inside that spread, and the first day's +30% radar pair was one draw from it.
 
-The index is a third array in every window, so there are half as many writes again; each of the
-index's costs about a third of a band's (median 0.28 s against 0.80 s). The rest is the loads and
-band writes running slower on workers with more to do: VH, which is never packed, slowed 18%. The
-stored index is not the cost: it is 0.1% of an optical mosaic's stored bytes and 0.3% of a radar
-one's.
+What the record adds for certain is tasks. Dask performance reports of the radar arms (task-stream
+rows over the week; `_prov-cost/perf/`): off 38,293 and 38,500; on 49,525, and 46,012 with the
+graph fused before the compute, which folds the index's `astype` into its write. The index is one
+more chunk write per date: +50% writes on a two-band radar graph, +8% on a twelve-band optical one.
+
+Writing the index inside its band's task (`pair_index_write`, branch `provenance/ingest-merged-write`)
+was built and verified correct on these stores, bands and index bit-identical to the unpaired arm's,
+but gave 52,250 and 52,193 rows: distributed Dask never fuses a two-input task with its parents, so
+the pairing only moved the task boundary. Not shipped. Attempt 2 of it, pairing after the window
+cut, wrote an all-zero index on the cluster while passing locally; its cause was not established and
+its code is gone.
 
 ### Storage
 
@@ -165,8 +172,9 @@ planes eight shards at a time, so a zone-year of about 3,000 shards is unmeasure
 
 ## Findings
 
-1. **The record costs ingest time** (above). The plan and the ingest docs said it would be level;
-   both now state the measured cost. Nothing was changed in the code.
+1. **The record's ingest time cost is inside run-to-run variation** (above); its certain cost is
+   one more chunk write per date. The first day's one radar pair read as +30%, and the plan and
+   the ingest docs state the seven-pair result.
 2. **The `granules` table is larger than planned.** A land-dense zone-year is about 160 MB, not
    under 100 MB; the campaign total stays in the order of 100 GB.
 3. **A radar index can name a granule where VV is stored as zero.** The dB transform stores an
@@ -192,7 +200,8 @@ planes eight shards at a time, so a zone-year of about 3,000 shards is unmeasure
 
 Removed in-region with the dev-test skill's `teardown.py`, which confirmed each prefix empty:
 `_prov-test/` in both dev buckets, `_prov-test-b/` and `_prov-test-c/`, including the 35N one-week
-mosaics and the performance reports. The optical mosaic changed in the mid-fill test was reset to
+mosaics and the performance reports, and on the second day `_prov-cost/` with its fourteen mosaic
+stores and reports. The optical mosaic changed in the mid-fill test was reset to
 its earlier snapshot first. The shared ROI stores were only read. The branch's 11 deployments were
 unregistered, and the yield-embeddings branch `dev/global-tessera-provenance` and the TE branch
 `dev-test/provenance-on-main` were deleted.

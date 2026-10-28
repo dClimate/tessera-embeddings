@@ -102,22 +102,12 @@ The granule lists are about 150 MB for a land-dense zone-year, inside the mosaic
 bytes a pixel per slot before compression; compressed, it is about 0.1% of an optical mosaic and
 0.3% of a radar one, for as long as the mosaic exists.
 
-The record costs ingest time. Across a whole UTM zone, each date took about 5–17% longer for
-optical and 10–30% longer for radar than with the switch off over two paired runs, roughly 6–20%
-more ingest worker time in all; the optical figure is the noisy one and sets the range, and a small
-area, whose workers had time to spare, showed none. A Dask performance report of one radar pair
-splits the extra task time:
-
-| where the extra task-seconds went | share |
-|---|---|
-| writing the index, a third array per window | ~20% |
-| packing the position into the mask band | ~6% |
-| the split, and the extra transfers | ~8% |
-| unchanged work running slower: VH reads (never packed), VV reads, band writes | ~60% |
-
-Packing, the wide fuse and the split are cheap in themselves: about 40 ms per 4,096² chunk on a
-laptop, against about 1.4 s to load it. Why the unchanged work runs slower is
-under investigation and open; a working hypothesis, unproven, is the extra Dask tasks (28% more)
-on workers that run six threads on four vCPUs. The paired measurements and the performance reports
-are in [`provenance-dev-verification.md`](../../context_docs/storage/provenance-dev-verification.md),
-and the open question in the plan's §10.
+The record's ingest time cost is inside run-to-run variation. Over seven paired runs of a dense
+zone (35N, one week), per-date write time with the record on divided by off was 1.12, 1.01 and 0.87
+for optical and 1.31, 1.30, 0.87 and 1.37 for radar, while the same arm varied up to 28% between
+runs and workers sat at 30–48% CPU: the ingest is read-bound, and the record's arithmetic is about
+40 ms per 4,096² chunk. What it adds for certain is one more chunk write per date, the index's: +8%
+Dask tasks on an optical graph, +20% on a radar one. The write graph is fused before the compute
+(`zarr_store._write_windows_overlapped`), which folds the index's cast into its write. The paired
+measurements are in
+[`provenance-dev-verification.md`](../../context_docs/storage/provenance-dev-verification.md).
