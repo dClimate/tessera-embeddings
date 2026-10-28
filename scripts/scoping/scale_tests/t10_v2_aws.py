@@ -208,7 +208,7 @@ def cold_read(payload: dict[str, Any]) -> dict[str, Any]:
         out |= {"read_p50_ms": float(np.median(ms)), "read_p95_ms": float(np.percentile(ms, 95))}
         out |= {"read_p50_lo_ms": float(lo), "read_p50_hi_ms": float(hi)}
     elif workload.startswith("dask"):
-        chunks = {} if workload == "dask_default" else V.dask_chunks(emb, whole_shards=workload == "dask_objects")
+        chunks = {} if workload == "dask_default" else V.dask_chunks(emb, whole_shards=workload == "dask_shards")
         try:
             ds = xr.open_zarr(store, group="zone", consolidated=False, chunks=chunks)
         except NotImplementedError as exc:  # xarray before 2026.9 cannot open a variable-width shard grid
@@ -262,10 +262,10 @@ TUNE_WORKLOADS: list[tuple[str, int, dict]] = [
     ("bulk", 128, {"async.concurrency": 64}),
     ("pull8", 16, {"async.concurrency": 64}),
 ]
-#: Dask at default chunks, one task per inner chunk, against one task per shard (the recorded workload key
-#: ``dask_objects``), beside the direct pull it should approach.
+#: Dask at default chunks, one task per inner chunk, against one task per shard, beside the direct pull it should
+#: approach.
 NARROW_TUNE_WORKLOADS: list[tuple[str, int, dict]] = [
-    (w, d, {}) for d in (16, 128) for w in ("dask_default", "dask_objects", "pull8")
+    (w, d, {}) for d in (16, 128) for w in ("dask_default", "dask_shards", "pull8")
 ]
 
 

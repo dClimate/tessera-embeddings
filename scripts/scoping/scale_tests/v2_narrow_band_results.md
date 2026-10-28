@@ -35,7 +35,7 @@ large GETs off. T9 counts its requests. T10's `mobile` phase times it on two lin
 the per-pixel scale.
 
 **Reader settings.** In the `tune` tables, `dask_default` is Dask at xarray's default chunks, one
-task per chunk; `dask_objects` is Dask with one task per shard; `pull8` is the direct read of
+task per chunk; `dask_shards` is Dask with one task per shard; `pull8` is the direct read of
 8 × 8 meta-shards.
 
 **Arm names.** Every arm except C0 is band-first (`bandfirst`, `(time, band, y, x)`), compressed
@@ -444,7 +444,7 @@ the order only changes which pieces sit side by side for a merged request.
 
 ### T10 — reader settings, zarr3.4 (wall s, median of passes)
 
-| arm | dask_default 16 default | dask_default 128 default | dask_objects 16 default | dask_objects 128 default | pull8 16 default | pull8 128 default |
+| arm | dask_default 16 default | dask_default 128 default | dask_shards 16 default | dask_shards 128 default | pull8 16 default | pull8 128 default |
 |---|---|---|---|---|---|---|
 | v2_b2f4_bandfirst_zstd1_s256 | 24.1 | 205.7 | 5.3 | 41.5 | 6.6 | 46.0 |
 | v2_b2f8_bandfirst_zstd1_s256 | 14.9 | 114.1 | 4.8 | 34.7 | 5.5 | 35.2 |
