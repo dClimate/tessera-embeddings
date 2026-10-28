@@ -447,12 +447,13 @@ def bind_study(cfg: RunConfig, test: str, study: str) -> None:
     id would skip the phases the first one completed and read stores it never built. A run whose
     markers predate this record ran the default study, ``band16``. On S3 the run's mirrored record is
     pulled down first, so a fresh host resuming a run sees it too, and a new record is mirrored at once,
-    before any phase writes a store.
+    before any phase writes a store. A failed pull is fatal here: binding without the run's record would
+    let a second study take over its stores.
     """
     d = cfg.results_dir / test
     d.mkdir(parents=True, exist_ok=True)
     if cfg.is_s3:
-        _sync_results_from_s3(cfg, test)
+        _sync_results_from_s3(cfg, test, strict=True)
     record = d / "study"
     bound = record.read_text().strip() if record.exists() else ("band16" if any(d.glob("*.done")) else study)
     if bound != study:
@@ -483,8 +484,8 @@ def _mirror_to_s3(cfg: RunConfig, test: str) -> None:
         logger.warning("S3 results mirror failed for %s: %s", test, exc)
 
 
-def _sync_results_from_s3(cfg: RunConfig, test: str) -> None:
-    """Best-effort download of a test's mirrored result files to the local results dir.
+def _sync_results_from_s3(cfg: RunConfig, test: str, strict: bool = False) -> None:
+    """Download a test's mirrored result files to the local results dir; best-effort unless ``strict``.
 
     The inverse of :func:`_mirror_to_s3`: used on a fresh-host resume so metrics for a
     phase skipped on the strength of its S3 marker are present locally for report.py.
@@ -501,6 +502,8 @@ def _sync_results_from_s3(cfg: RunConfig, test: str) -> None:
         for key in fs.ls(src, detail=False):
             fs.get_file(key, str(local / key.rstrip("/").rsplit("/", 1)[-1]))
     except Exception as exc:
+        if strict:
+            raise
         logger.warning("S3 results sync-down failed for %s: %s", test, exc)
 
 

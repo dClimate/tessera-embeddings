@@ -449,6 +449,9 @@ def phase_assemble(
                 dtypes=dtypes,
                 embedding_dim=V.BAND,
                 extent=(ny, nx),
+                # As production assembly passes its destination's optional set: every tile is checked for an
+                # optional variable the probe tile lacked, so none is silently left out of the timed write.
+                optional_present=tuple(v for v in CARRIED_VARS if v in GLOBAL.arrays),
             )
             telemetry: dict[str, Any] = {}
             t0 = time.monotonic()
