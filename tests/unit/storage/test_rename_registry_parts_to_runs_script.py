@@ -126,3 +126,12 @@ def test_rollback_puts_parts_back(script: Any, registry: Path) -> None:
 def test_a_registry_with_neither_folder_is_refused(script: Any, tmp_path: Path) -> None:
     """A mistyped ``--registry`` must not read as a registry already migrated."""
     assert _run(script, tmp_path / "typo", "--apply") == 1
+
+
+def test_an_apply_to_the_published_bucket_without_its_writer_role_is_refused_before_any_read(
+    script: Any, monkeypatch: Any
+) -> None:
+    """Our own identity cannot write that bucket, so the move must stop before it lists anything."""
+    monkeypatch.delenv("PUBLISHED_STORE_WRITER_ROLE_ARN", raising=False)
+    monkeypatch.setattr(script, "_filesystem", lambda *_args, **_kwargs: pytest.fail("opened the bucket"))
+    assert script.main(["--registry", script.DEFAULT_REGISTRY, "--apply"]) == 1

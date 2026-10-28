@@ -20,9 +20,11 @@ in the destination is reported as already migrated. A non-``s3://`` ``--registry
 moved through the same calls, which is how a move is rehearsed.
 
 Dry run unless ``--apply``; ``--rollback`` moves ``runs/`` back to ``parts/`` under the same checks.
-An S3 move uses the ambient AWS credentials, as ``rebuild_registry_measurements.py`` does, so run
-it under a profile that can write the registry's bucket; ``--anonymous`` lists a public registry
-for a dry run. Run from the REPOSITORY ROOT::
+Credentials are resolved as a fill resolves them (``icechunk_credentials_for``): the published
+registry's bucket is written through the role ``PUBLISHED_STORE_WRITER_ROLE_ARN`` names, and an
+apply there without it is refused, since our own identity is read-only in that bucket; any other
+bucket uses the ambient chain. ``--anonymous`` lists a public registry for a dry run with no
+credentials at all. Run from the REPOSITORY ROOT::
 
     uv run python scripts/maintenance/rename_registry_parts_to_runs.py --registry s3://<bucket>/<store>.registry
     uv run python scripts/maintenance/rename_registry_parts_to_runs.py --registry ... --apply
@@ -38,6 +40,13 @@ from typing import Any
 import fsspec
 from fsspec import AbstractFileSystem
 
+from tessera_embeddings.providers.aws.credentials import (
+    PARTNER_DELIVERY_BUCKET,
+    icechunk_credentials_for,
+    published_store_writer_role,
+)
+from tessera_embeddings.storage.zarr_store import plain_zarr_storage_options
+
 DEFAULT_REGISTRY = "s3://tessera-embeddings/v1.1/dclimate.registry"
 DEFAULT_REGION = "us-west-2"
 OLD, NEW = "parts", "runs"
@@ -49,9 +58,11 @@ def _filesystem(root: str, region: str, *, anonymous: bool) -> AbstractFileSyste
     ``auto_mkdir`` because a local copy needs its ``zone=``/``year=`` folders made before a file
     lands in them, where S3 has no folders to make.
     """
-    if root.startswith("s3://"):
-        return fsspec.filesystem("s3", anon=anonymous, client_kwargs={"region_name": region})
-    return fsspec.filesystem("file", auto_mkdir=True)
+    if not root.startswith("s3://"):
+        return fsspec.filesystem("file", auto_mkdir=True)
+    if anonymous:
+        return fsspec.filesystem("s3", anon=True, client_kwargs={"region_name": region})
+    return fsspec.filesystem("s3", **(plain_zarr_storage_options(root, icechunk_credentials_for(root), region) or {}))
 
 
 def _base(root: str) -> str:
@@ -119,6 +130,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.anonymous and args.apply:
         parser.error("--anonymous cannot write; drop it to apply")
+    if (
+        args.apply
+        and args.registry.startswith(f"s3://{PARTNER_DELIVERY_BUCKET}/")
+        and not published_store_writer_role()
+    ):
+        print("REFUSING: writing the published registry needs PUBLISHED_STORE_WRITER_ROLE_ARN; our own identity")
+        print("is read-only there by design.")
+        return 1
     source, dest = (NEW, OLD) if args.rollback else (OLD, NEW)
 
     fs = _filesystem(args.registry, args.region, anonymous=args.anonymous)
