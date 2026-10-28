@@ -41,6 +41,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, cast
 
+import dask
 import fsspec
 import icechunk
 import numpy as np
@@ -1595,20 +1596,23 @@ def _write_windows_overlapped(
             writer.writer.targets = [
                 zarr.open_array(fork.store, path=target.path, mode="a") for target in writer.writer.targets
             ]
-            stored.extend(
-                writer.writer.sync(
-                    compute=False,
-                    chunkmanager_store_kwargs={"load_stored": False, "return_stored": True},
-                )
+            lazy = writer.writer.sync(
+                compute=False,
+                chunkmanager_store_kwargs={"load_stored": False, "return_stored": True},
             )
+            # One source comes back as one array, not a list of one; iterating it would slice it.
+            stored.extend(lazy if isinstance(lazy, list | tuple) else [lazy])
     except (AttributeError, TypeError) as exc:
         logger.warning("Overlapped window write failed to assemble (%s); writing sequentially", exc)
         return False
 
     if stored:
         # The single compute: every window's loads, masks and chunk writes in one graph,
-        # reduced to one mergeable changeset.
-        session.merge(session_merge_reduction(stored, split_every=_MERGE_SPLIT_EVERY))
+        # reduced to one mergeable changeset. Fused here first, because the distributed client
+        # submits a graph without dask's blockwise fusion: a block two writes share, such as the
+        # source index's cast, then reaches the scheduler as a task of its own (measured on a
+        # recorded radar week: 7% fewer tasks; a plain mosaic's graph is unchanged).
+        session.merge(session_merge_reduction(list(dask.optimize(*stored)), split_every=_MERGE_SPLIT_EVERY))
     # DEBUG, not INFO: the chattiest line this path produces, once per write, and Prefect
     # ships task logs to the orchestrator API from whichever Dask worker ran the task, so it
     # scales with total worker count. The timing is already in the caller's per-batch line.
