@@ -1078,10 +1078,10 @@ class InferenceActor:
                 pool.shutdown(wait=False, cancel_futures=True)
 
             if planes:
-                staged_planes = {
-                    "planes": planes,
-                    "pixels": None if chunk.pixels is None else _pixel_mask(chunk.pixels),
-                }
+                # A holes update records the pixels it EMBEDDED, not the holes it was asked to fill:
+                # `scales` is NaN wherever no embedding was written, so it is that mask. A reader then
+                # takes exactly these pixels from the update and the rest from the run before it.
+                staged_planes = {"planes": planes, "pixels": None if chunk.pixels is None else ~np.isnan(scales)}
 
             # All strips done: the last strip's inputs and the full-chunk SCL mask are no longer needed (obs counts
             # and embeddings already live in the whole-chunk output buffers). Freed before the S3 write so peak RAM

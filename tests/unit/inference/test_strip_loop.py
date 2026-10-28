@@ -222,6 +222,7 @@ class _CapturingWriter:
             "stack": dict(stack),
             # Ranked here, as the real writer ranks them, so a test compares what would be staged.
             "planes": _ranked(planes, pixels),
+            "pixels": None if pixels is None else pixels.copy(),
         }
 
     def write_coverage_only(self, chunk, run_id, obs_counts, month_covered, *, planes=None, pixels=None):
@@ -1295,6 +1296,23 @@ class TestProvenancePlanes:
             for _, plane, sources, valid in dates:
                 assert plane.dtype == np.uint8 and int(np.count_nonzero(plane)) == valid
                 assert sorted(np.unique(plane[plane > 0]).tolist()) == list(range(1, len(sources) + 1))
+
+    def test_a_holes_update_records_the_pixels_it_embedded_not_the_holes_it_was_given(
+        self, inference_config, test_model, tmp_path
+    ):
+        """Its staged mask is the embedded pixels, and its planes name nothing outside them."""
+        write_pixel_mask(str(tmp_path / "holes.npz"), np.ones((_CHUNK.height, _CHUNK.width), dtype=bool))
+        inference_config.optical_min_obs = 5
+        _, write = _run_process_chunk(
+            inference_config,
+            test_model,
+            chunk=dataclasses.replace(_CHUNK, pixels=str(tmp_path / "holes.npz")),
+            source_index=True,
+        )
+        embedded = ~np.isnan(write["scales"])
+        assert 0 < embedded.sum() < embedded.size, "the line must refuse some holes for this test to mean anything"
+        np.testing.assert_array_equal(write["pixels"], embedded)
+        assert all(not plane[~embedded].any() for dates in write["planes"].values() for _, plane, _, _ in dates)
 
     def test_the_planes_do_not_depend_on_how_the_shard_was_striped(self, inference_config, test_model):
         """Radar arrives strip by strip and optical whole-shard; stitched, they must agree."""

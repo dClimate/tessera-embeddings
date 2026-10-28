@@ -12,16 +12,19 @@ fuser took the pixel from. The actor turns that into the per-shard record the re
   shard holds kilobytes per date rather than a full plane.
 * **Planes, ranked at the staging write.** :class:`SourcePlanes` collects a shard's pieces across
   strips. At the write, on the actor's background writer, each date's pieces are stitched into one
-  plane, cut to the pixels the run was asked to embed, and its values replaced by their rank in the
-  shard-date's ``sources``: the distinct fusion positions that supplied a pixel, ascending. A day's
+  plane, cut for a holes update to the pixels it embedded, and its values replaced by their rank in
+  the shard-date's ``sources``: the distinct fusion positions that supplied a pixel, ascending. A day's
   fusion order is zone-wide and can exceed 255, while a shard has a handful of contributing
   granules on a date, so the rank keeps the published plane ``uint8``. The plane and its
   ``sources`` and valid-pixel count are staged with the shard.
 
-A non-zero value means the observation was valid by the model's test and the granule supplied it.
-For a pixel with an embedding those are the observations its input drew on; a pixel deeper than the
-deepest bucket is resampled to a deterministic subset of them (``inference/sampling.py``). A refused
-pixel keeps its valid observations too, which is how a refused shard still has rows.
+A non-zero value means the observation was valid for the model, by its own test, and names the
+granule that supplied it. For a pixel with an embedding those are the observations its input drew
+on; a pixel deeper than the deepest bucket is resampled to a deterministic subset of them
+(``inference/sampling.py``). A fill or a shards update records every pixel it was asked to embed,
+refused ones included, which is how a refused shard still has rows. A holes update records only the
+pixels it embedded, and stages them as its ``update_pixels`` mask: a reader takes those pixels from
+the update and every other pixel from the run before it (plan §5).
 """
 
 from __future__ import annotations
@@ -37,9 +40,7 @@ import zarr
 from zarr.codecs import BloscCodec
 
 from tessera_embeddings.config.ingest import SOURCE_INDEX_VAR
-
-#: The three sensors the record covers, named as the published planes are.
-SENSORS = ("s2", "s1_asc", "s1_desc")
+from tessera_embeddings.config.store_layout import SENSORS
 
 #: The staged and published planes' codec: Blosc zstd 3 with bit shuffle, measured at 1.17 MB a
 #: shard-year where plain zstd took 2.83 MB (the plan's Appendix A).
@@ -59,8 +60,8 @@ STAGED_TIMES = "pixel_sources_{sensor}_time"
 #: The staged shard's attribute holding its ``shard_dates`` summary, beside the planes it describes.
 PROVENANCE_ATTR = "provenance"
 
-#: A holes update's staged pixel mask: the pixels the run was asked to embed, which the planes are
-#: cut to and which publication copies to ``update_pixels``.
+#: A holes update's staged pixel mask: the pixels the run embedded, which the planes are cut to and
+#: which publication copies to ``update_pixels``.
 STAGED_UPDATE_PIXELS = "update_pixels"
 
 
@@ -189,7 +190,8 @@ def stage_planes(group: zarr.Group, planes: SourcePlanes, pixels: np.ndarray | N
     their mosaic time indices beside them. The summary is ``{sensor: {"time", "sources",
     "valid_px"}}``; the caller stores it as the shard's ``provenance`` attribute. A sensor whose
     mosaic had no index is absent from both, so the record follows the mosaics sensor by sensor.
-    ``pixels``, a holes update's mask, is staged too, as the record of which pixels this run wrote.
+    ``pixels``, given only for a holes update, is the pixels the run embedded; the planes are cut to
+    it and it is staged too, as the update's ``update_pixels`` mask.
     """
     summary: dict[str, Any] = {}
     if pixels is not None:
