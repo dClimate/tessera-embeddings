@@ -1,6 +1,6 @@
 # 036 — The registry's per-run folder is `runs/`
 
-**Status:** Proposed 2026-10-28 in PR #PRNUM, stacked on #256. Moving a registry written before it
+**Status:** Proposed 2026-10-28 in PR #259, stacked on #256. Moving a registry written before it
 is a deploy step: `scripts/maintenance/rename_registry_parts_to_runs.py`.
 
 ## Context
