@@ -103,7 +103,7 @@ def publish_provenance(
 ) -> dict[str, Any] | None:
     """Publish ``run_id``'s record for one zone-year; ``None`` when its mosaics carry none.
 
-    ``embedded`` and ``refused`` partition the live shards the run evaluated, as the registry part
+    ``embedded`` and ``refused`` partition the live shards the run evaluated, as the registry run file
     does. ``mosaic_snapshots`` maps each mosaic store the run read to the snapshot the plan sampled,
     so the export describes exactly what the model read. ``grid_shape`` and ``shard_px`` are the
     zone group's. The mosaics and the registry may sit in different buckets, hence two credentials.

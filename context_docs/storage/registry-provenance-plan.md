@@ -118,7 +118,7 @@ Four new pieces under `provenance/` beside the registry, and one new registry co
 
 ```text
   <store>.registry/
-  ├── master/  parts/          the existing registry; both gain a `source_runs` column
+  ├── master/  runs/           the existing registry; both gain a `source_runs` column
   └── provenance/
       ├── granules/      zone=33N/year=2024/<sensor>-<snapshot>.parquet   per mosaic snapshot: its granules
       ├── shard_dates/   zone=33N/year=2024/<run>.parquet    per run: one row per shard, sensor and date
@@ -128,8 +128,9 @@ Four new pieces under `provenance/` beside the registry, and one new registry co
 ```
 
 The Parquet folders use hive `key=value` names because Parquet readers turn them into columns;
-the Icechunk groups use plain names because Zarr readers do not. `parts/` is to be renamed `runs/`
-in a separate pull request after this stack.
+the Icechunk groups use plain names because Zarr readers do not. `runs/` holds one file per run
+per zone-year, as `shard_dates/` does, so the registry and the record are both keyed by run
+([ADR 036](../decisions/036-the-registry-folder-is-runs.md)).
 
 **`granules`: what went into each day's mosaic.** One row per granule per solar day, per zone
 rather than per shard because one Sentinel-2 scene covers about thirty shards. A list belongs to
@@ -297,7 +298,7 @@ boundary. It is not shipped. Fusing the write graph before the compute, which di
 otherwise skips, folds the index's cast into its write and is shipped: 7% fewer tasks on a recorded
 radar graph, none on a plain one. Measurements: [`provenance-dev-verification.md`](provenance-dev-verification.md).
 
-**Publication** took about 16 seconds for two shards, including the registry part. It copies
+**Publication** took about 16 seconds for two shards, including the registry run file. It copies
 planes eight shards at a time, for three sensors; if a batch of eight takes as long as that pair, a
 zone-year of about 3,000 shards takes of the order of an hour or two, a risk to examine separately.
 
@@ -330,7 +331,7 @@ The last column is the first draft's choice, where reviews of the plan or the bu
 | a record per run, with `update_pixels` and `source_runs` | one record per shard-year | a holes update mixes two runs in one shard | one per shard-year |
 | `update_pixels` marks what a holes update embedded, and its planes are cut to it | the pixels it was asked to embed | one meaning: exactly where a reader takes the update's record; its refused pixels keep the earlier run's record, which covers them | the pixels asked for |
 | a fill or shards update records refused pixels too | only embedded pixels | a refused shard still says what imagery it had; the store says what was embedded | |
-| `source_runs` recomputed from the store at every merge and rebuild, on part rows too | kept on the master only | a rebuild replaces the master's run id and rebuilds the master from parts | the master only |
+| `source_runs` recomputed from the store at every merge and rebuild, on run file rows too | kept on the master only | a rebuild replaces the master's run id and rebuilds the master from run files | the master only |
 | a separate Icechunk store for the planes | arrays inside the published store | each run has its own dates; the published store and its conventions stay untouched | |
 | failure to publish fails the zone-year | publish best-effort and log | a zone-year can never be published without its record, and the retry repairs it | best-effort, then a gate |
 | one switch, off by default, recorded in the mosaic, mismatches refused | always on | internal and dev stores neither need it nor pay its ingest cost, and dev stores from before the change stay usable | always on, no ingest cost expected |

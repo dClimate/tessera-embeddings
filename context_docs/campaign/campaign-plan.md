@@ -183,7 +183,7 @@ best unrecognised and at worst collected. The prefix is named in the access requ
 be in the bucket policy, and renaming it later means asking Cambridge twice.
 
 **What the registry contains is settled and built** (2026-08-19): a Parquet dataset of one row per
-2048-pixel tile per year, under `parts/zone=<Z>/year=<Y>/<run_id>.parquet`, written as each cell
+2048-pixel tile per year, under `runs/zone=<Z>/year=<Y>/<run_id>.parquet`, written as each cell
 lands. Each row carries its WGS84 bounding box, whether the tile holds embeddings, how much of its
 land the depth rule removed and for which reason, how deep the pixels that fell short actually got,
 the depth rule they were judged against, whether radar reached the tile at all, and the build that

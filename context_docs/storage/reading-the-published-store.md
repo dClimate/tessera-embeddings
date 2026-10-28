@@ -311,7 +311,7 @@ evidence that the preload only ever affected the open.
 | the census's whole per-zone audit (median of 120) | 0.36 s | 0.67 s |
 | shard enumeration, one zone, all nine years (median of 120) | 0.36 s | 0.83 s |
 | shard enumeration, **all 120 zones** | **43 s** | 99 s |
-| registry: list all 994 parts | 0.17 s | 0.58 s |
+| registry: list all 994 run files | 0.17 s | 0.58 s |
 | registry: read all 994 schema footers | 72 s | 186 s |
 | registry: whole dataset, 3,247,410 rows | 14.4 s | 53.0 s |
 | registry: **"is my area covered", one box, one year** | **1.7 s** | 5.7 s |
@@ -483,7 +483,7 @@ two prefixes:
 | prefix | contents | what it is |
 |---|---|---|
 | `master/` | 994 files at `master/zone=<ZONE>/year=<YEAR>/part-0.parquet` + `_common_metadata`, 151 MB | **what a consumer reads**: one row per tile-year, one schema, measurements on every row; its guide is [`docs/registry.md`](../../docs/registry.md), published beside it as `README.md` |
-| `parts/` | 994 files, 142 MB, at `parts/zone=<ZONE>/year=<YEAR>/<run_id>.parquet` | the fills' raw output, one part per cell per run, named by run id; internal |
+| `runs/` | 994 files, 142 MB, at `runs/zone=<ZONE>/year=<YEAR>/<run_id>.parquet` | the fills' raw output, one file per cell per run, named by run id; internal |
 
 **`master/` describes what the store holds now.** Every run merges its rows into its zone-year's
 master file tile by tile as it lands: a tile's row comes from the newest run that wrote that tile,
@@ -491,9 +491,9 @@ and a tile no later run touched keeps its row. A refill or a future update there
 `master/` without anybody re-running anything, and a reader never has to choose between runs. See
 [`registry-master.md`](registry-master.md).
 
-**The campaign's parts are written as designed, on every check.** All 994 parts carry all 23
-declared columns at the declared types; every part's key-value metadata agrees with the zone and
-year in its path; no path fails to parse; and no cell has more than one part, so nothing was
+**The campaign's run files are written as designed, on every check.** All 994 run files carry all 23
+declared columns at the declared types; every run file's key-value metadata agrees with the zone and
+year in its path; no path fails to parse; and no cell has more than one run file, so nothing was
 filled twice.
 
 **It agrees with the store, tile for tile.** A registry tile label is `chunk_<shard_y>_<shard_x>`,
@@ -512,7 +512,7 @@ record of it — and every tile in 33N/2017 with counts but no embeddings appear
 not-embedded row. Without that, deleting every `embedded=False` row would leave the embedded
 comparison untouched and the audit would still say the two agree.
 
-**Every row in `master/` carries measurements, and `measured_by` says whose.** In `parts/`,
+**Every row in `master/` carries measurements, and `measured_by` says whose.** In `runs/`,
 1,519,045 of the 3,247,410 rows (47%) are null across every measurement column: `refused_px`, the
 three reasons, the depth statistics, `px_with_any_radar`. The cause is an asymmetry in how the
 record reached the registry. A refused tile's went into its skip marker on object storage and
@@ -520,7 +520,7 @@ survived a resume; an embedded tile's rode back in the actor's result and did no
 wholly refused tiles were measured, and only 53% of embedded ones. Every column is derivable from
 the store, so those rows were re-derived from it and published in `master/` on 2026-10-12:
 1,728,365 rows are `measured_by = "fill"`, 1,519,045 are `"rebuild"`, and none are unmeasured.
-**Read `master/`, not `parts/`**: counting refusals over `parts/` counts the measured half only.
+**Read `master/`, not `runs/`**: counting refusals over `runs/` counts the measured half only.
 One column differs by origin. Rebuilt rows leave `eligible_px` null and count over the whole tile,
 so divide refusals by `eligible_px` where it is present and by `chunk_px` otherwise; the two differ
 on 237 fill-measured tiles. See [`registry-backfill.md`](registry-backfill.md).
@@ -543,11 +543,11 @@ schema = pq.read_schema(f"{master}/_common_metadata", filesystem=fs)
 dataset = ds.dataset(master, filesystem=fs, schema=schema, partitioning="hive")
 ```
 
-**Reading `parts/` needs the schema stated**, or a column added mid-campaign is silently dropped:
+**Reading `runs/` needs the schema stated**, or a column added mid-campaign is silently dropped:
 `pyarrow` infers a dataset's schema from the first file in sorted path order. Pass
 `schema=tessera_embeddings.storage.registry.dataset_schema()`. On v1.1 the hazard is latent rather
-than live: the campaign's parts span nine commits (their `code_commit`), but all of them wrote the
-same 23 columns, so every part has the same schema.
+than live: the campaign's run files span nine commits (their `code_commit`), but all of them wrote the
+same 23 columns, so every run file has the same schema.
 
 ## 6. What is missing, and what would surprise a consumer
 

@@ -19,7 +19,7 @@ and maintains this table.
   ├── master/       READ THIS: one row per tile per year, describing the store as it is now
   │   ├── _common_metadata                          the dataset's schema
   │   └── zone=<ZONE>/year=<YEAR>/part-0.parquet    one file per zone-year
-  └── parts/        internal: one file per fill run, named by its run ID
+  └── runs/         internal: one file per run, named by its run ID
       └── zone=<ZONE>/year=<YEAR>/<run_id>.parquet
 ```
 
@@ -28,11 +28,13 @@ and maintains this table.
 in 994 zone-year files: every one of those groups in 2022–2025, and all but 14 zone-years in
 2017–2021, which were never filled and so have no file.
 
-**Read `master/`, not `parts/`.** `parts/` is the raw record the master is built from. It can hold
+**Read `master/`, not `runs/`.** `runs/` is the raw record the master is built from. It can hold
 a tile more than once, one row per run that wrote it, and 47% of its v1.1 rows lack measurements
-that `master/` carries.
+that `master/` carries. A copy of the registry taken before the folder was renamed has `parts/`
+where this has `runs/`, with the same files inside; [`rename_registry_parts_to_runs.py`][rename]
+moves them across.
 
-### Runs, and how `parts/` relates to `master/`
+### Runs, and how `runs/` relates to `master/`
 
 A *run* is one fill of one zone-year under one set of inputs. Its ID is
 `<ZONE>-<YEAR>-<fingerprint>`, such as `43S-2020-090ca792`, where the fingerprint hashes
@@ -41,18 +43,18 @@ Each run writes one file, named by its ID, into its zone-year's folder, and neve
 run's file:
 
 ```
-  parts/zone=43S/year=2020/
+  runs/zone=43S/year=2020/
   ├── 43S-2020-090ca792.parquet    the first fill: a row for every tile it evaluated
   └── 43S-2020-<later-id>.parquet  a later run, such as an update: rows for the tiles it wrote
 ```
 
 - **A re-run with unchanged inputs keeps its ID**, such as a retry after an interruption, so it
   replaces its own file rather than adding one.
-- **A run with any input changed gets a new ID** and a new file beside the old one, so `parts/`
+- **A run with any input changed gets a new ID** and a new file beside the old one, so `runs/`
   keeps every run's own account of the tiles it wrote.
 - **`master/` combines a zone-year's runs tile by tile**, taking each tile's row from the newest
   run that wrote it. The first fill's file goes on describing every tile no later run touched.
-- **v1.1 has one run per zone-year**, so `parts/` holds 994 files, one for each zone-year file in
+- **v1.1 has one run per zone-year**, so `runs/` holds 994 files, one for each zone-year file in
   `master/`.
 
 A master row's `run_id` names the file it came from, with one exception. The 1,519,045 re-derived
@@ -182,7 +184,7 @@ Every run, whether a zone-year's first fill, a refill or a later update of some 
 reaches the registry right after its pixels are committed to the store:
 
 ```
-  a run commits to the store ──▶ writes its rows as a new file in parts/
+  a run commits to the store ──▶ writes its rows as a new file in runs/
                              ──▶ merges them into master/zone=Z/year=Y/part-0.parquet
 ```
 
@@ -202,15 +204,15 @@ reaches the registry right after its pixels are committed to the store:
   exactly on every uncropped tile of a 39,578-row sample the fill had measured. Fills now keep
   their measurements across a resume.
 - **The registry is checked against the store.** Each merge compares the master's embedded
-  tiles with the shards the store actually holds, and a census checks `master/` against `parts/`
-  zone-year by zone-year. Either names any zone-year that fails, for repair from `parts/` and the
+  tiles with the shards the store actually holds, and a census checks `master/` against `runs/`
+  zone-year by zone-year. Either names any zone-year that fails, for repair from `runs/` and the
   store. Every column can be derived from the store, so the registry is a convenience, never a
   second source of truth.
 
 ## Which imagery is behind an embedding (v2 onward)
 
 From v2, stores filled for publication also carry a provenance record under `provenance/`,
-beside `master/` and `parts/`. It names the satellite images behind every embedding, down to the
+beside `master/` and `runs/`. It names the satellite images behind every embedding, down to the
 one image that supplied each pixel on each date. v1.1 has none: its imagery was deleted before
 the record existed. A zone-year filled without the record has no files under `provenance/`.
 
@@ -275,6 +277,7 @@ dates alone.
 - Why the provenance record is shaped as it is: [ADR 035][provenance-adr].
 
 [self]: https://github.com/dClimate/tessera-embeddings/blob/main/docs/registry.md
+[rename]: https://github.com/dClimate/tessera-embeddings/blob/main/scripts/maintenance/rename_registry_parts_to_runs.py
 [store]: https://github.com/dClimate/tessera-embeddings/blob/main/docs/global-store.md
 [master]: https://github.com/dClimate/tessera-embeddings/blob/main/context_docs/storage/registry-master.md
 [backfill]: https://github.com/dClimate/tessera-embeddings/blob/main/context_docs/storage/registry-backfill.md
