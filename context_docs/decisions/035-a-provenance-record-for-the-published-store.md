@@ -1,7 +1,7 @@
 # 035 — A provenance record for the published store
 
-**Status:** Proposed 2026-10-27, ingest half in PR #253, the model and assembly half in #255 and
-`source_runs` in #256. The design, its sizes and its reviews are in
+**Status:** Proposed 2026-10-27, ingest half in PR #253, the model and assembly half in #255, and
+`source_runs` with the reader helpers in #256. The design, its sizes and its reviews are in
 [`storage/registry-provenance-plan.md`](../storage/registry-provenance-plan.md); this record keeps
 the decisions and what was deliberately left out.
 
@@ -55,6 +55,11 @@ provenance beyond its registry, and none can be reconstructed.
     planes are cut to it, so the mask is exactly where a reader takes the update's record. Every
     other pixel keeps the earlier run's record, which covers it: a fill or a shards update records
     every pixel it was asked to embed, refused ones included.
+11. **Reader helpers answer the three questions** (`storage/provenance_reader.py`): a day's
+    granules, a shard's dates and granules for one run, and a pixel's granules from a latitude and
+    longitude, located on the store's own zone grid and read from the run that claims the pixel.
+    Walking `source_runs` from the newest, a holes update claims the pixels its `update_pixels`
+    marks and a fill or a shards update claims every pixel.
 
 ## Left out
 
@@ -78,4 +83,4 @@ provenance beyond its registry, and none can be reconstructed.
 - The ingest takes about 6–20% more worker time at zone scale, much of it unchanged work running
   slower for a reason still under investigation (plan §6, §10).
 - A pixel query joins three things: the plane, the shard-date's `sources`, and `granules` through
-  the row's `snapshot_id`.
+  the row's `snapshot_id`; `pixel_granules` does it, after picking the run.
