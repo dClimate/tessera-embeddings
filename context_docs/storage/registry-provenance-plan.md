@@ -287,8 +287,11 @@ pair at +30%, was one draw from that spread.
 
 What the record does add, every time: one more chunk write per date, the index's, which is one more
 task for the Dask scheduler per chunk-date (+8% tasks on an optical graph of 12 bands, +20% on a
-radar graph of two), and more CPU on workers that have it to spare. Writing the index inside its
-band's task was built and is correct, but it does not reduce the task count on the cluster:
+radar graph of two), and more CPU on workers that have it to spare. That is accepted: it costs no
+ingest time, and if the scheduler ever becomes the limit the lever is fewer, larger chunks for the
+index, not a cheaper index. Dropping the planes would not escape it, since `sources` is derived
+from the per-pixel index. Writing the index inside its band's task was built and is correct, but
+it does not reduce the task count on the cluster:
 distributed Dask never fuses a two-input task with its parents, so the pairing step only moved the
 boundary. It is not shipped. Fusing the write graph before the compute, which distributed Dask
 otherwise skips, folds the index's cast into its write and is shipped: 7% fewer tasks on a recorded
@@ -348,22 +351,17 @@ The last column is the first draft's choice, where reviews of the plan or the bu
 
 ## 10. Open questions
 
-1. **Is one more chunk write per date acceptable for the scheduler?** The record's ingest time
-   cost is inside run-to-run variation (§6), but its task count is not: +8% on optical, +20% on
-   radar. Dropping the planes would not escape it: `sources` is derived from the per-pixel index,
-   so the shard tables are cheap in storage, not in ingest. If the scheduler is the limit, the
-   lever is fewer, larger chunks for the index, not a cheaper index.
-2. **Plane chunking.** A one-pixel read fetches 40–130 objects per sensor. The next dev run will
+1. **Plane chunking.** A one-pixel read fetches 40–130 objects per sensor. The next dev run will
    compare chunks of all dates × 256 × 256 and all dates × 128 × 128 against the current one date
    × one shard on a real shard-year, for size and for the time to read one pixel.
-3. **Rank or fusion order in the plane.** The rank (plane value k → `sources[k − 1]` → fusion
+2. **Rank or fusion order in the plane.** The rank (plane value k → `sources[k − 1]` → fusion
    order) exists to fit a byte. Storing the fusion order itself as `uint16` with bit-shuffled zstd
    would remove `sources` and one hop; the next dev run will measure its size on a real shard-year.
-4. **Publication time at zone scale,** of the order of an hour or two per zone-year if it grows
+3. **Publication time at zone scale,** of the order of an hour or two per zone-year if it grows
    linearly (§6), to be examined separately.
-5. **Radar file URLs need Earthdata credentials to fetch.** Is it enough to record them, or should
+4. **Radar file URLs need Earthdata credentials to fetch.** Is it enough to record them, or should
    the record also point to a public mirror where one exists?
-6. **Is anything missing** that a user would need to trust or reproduce an embedding?
+5. **Is anything missing** that a user would need to trust or reproduce an embedding?
 
 ## Appendix A. Table schemas
 
