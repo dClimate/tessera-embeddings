@@ -25,8 +25,9 @@ questions in §10. The appendices are reference material and can be skipped.
   It sits beside the store's existing registry.
 - **Three questions it answers,** each with a reader helper: what went into this day's mosaic,
   into this 20 km shard, and which granule supplied this pixel on each date?
-- **Cost.** About 4.7 TB of storage over the campaign, a quarter of a percent of the store, and
-  about 6–20% more ingest worker time, much of whose cause is still under investigation (§6).
+- **Cost.** About 4.7 TB of storage over the campaign, a quarter of a percent of the store. Its
+  ingest time cost is inside run-to-run variation, measured over seven paired runs of a dense zone
+  (§6); what it certainly adds is one more chunk write per date for the Dask scheduler.
   Correctness checks run at publication and fail the zone-year if the record is wrong.
 - **Scope.** Only the public global store needs it. Internal and dev stores leave it off and are
   unchanged.
@@ -268,25 +269,30 @@ The ~150 MB inside the mosaics and the ~160 MB `granules` table are the same lis
 encodings; the mosaics' copy is deleted at publication. The planes are chunked one date by one
 shard, so reading one pixel's year fetches one object per date, 40–130 per sensor (§10).
 
-**Ingest time.** With the record on, each date of a whole zone took 5–17% longer for optical and
-10–30% longer for radar over two paired runs; weighting optical at about four-fifths of ingest
-worker time, that is about 6–20% more in all, roughly $7,000–24,000 on the campaign cost model's
-ingest line of about $121,000. The optical figure is the noisy one, 5% in one pair and 17% in the
-other, while a small area (Iowa) ran 11% faster with the record on; it drives the range. A Dask
-performance report of one radar pair (ascending, zone 35N, one week) splits the extra 3,317
-task-seconds (10,895 off, 14,212 on):
+**Ingest time.** Measured on zone 35N, 1–7 January 2024, over two days, each pair's two arms run
+side by side on their own clusters. Per-date write time with the record on, divided by off:
 
-| where the extra task-seconds went | task-seconds | share |
-|---|---|---|
-| writing the index, one more array per window | ~700 | ~20% |
-| packing the position into the mask band | ~200 | ~6% |
-| splitting it back out, and the extra transfers | ~250 | ~8% |
-| unchanged work running slower: VH reads (never packed, +18%), VV reads, band writes | ~2,050 | ~60% |
+| pairs | on ÷ off | workers | CPU |
+|---|---|---|---|
+| optical, three pairs at 60 workers | 1.12, 1.01, 0.87 | 60 | 30–48% |
+| radar ascending, four pairs at 13 workers | 1.31, 1.30, 0.87, 1.37 | 13 | 31–42% |
 
-The task count rose 28% and task time 30%. On a laptop, packing, the wide fuse and the split take
-about 40 ms per 4,096² chunk against about 1.4 s to load it. Why the unchanged work runs slower is
-under investigation; a working hypothesis, unproven, is the extra Dask tasks on workers that run
-six threads on four vCPUs.
+The same arm, same code, varied as much between runs as any pair did between its arms: the plain
+radar ingest took 230 s one run and 165 s the next, a 28% swing, and the dense optical ingest ran
+level in one pair and 13% faster with the record on in another. Workers in every arm sat at
+30–48% CPU, so the ingest is bound by its reads, not by the record's arithmetic, which a laptop
+puts at about 40 ms per 4,096² chunk against about 1.4 s to load it. The record's ingest time
+cost is therefore not distinguishable from zero at this fleet; the first measurement, one radar
+pair at +30%, was one draw from that spread.
+
+What the record does add, every time: one more chunk write per date, the index's, which is one more
+task for the Dask scheduler per chunk-date (+8% tasks on an optical graph of 12 bands, +20% on a
+radar graph of two), and more CPU on workers that have it to spare. Writing the index inside its
+band's task was built and is correct, but it does not reduce the task count on the cluster:
+distributed Dask never fuses a two-input task with its parents, so the pairing step only moved the
+boundary. It is not shipped. Fusing the write graph before the compute, which distributed Dask
+otherwise skips, folds the index's cast into its write and is shipped: 7% fewer tasks on a recorded
+radar graph, none on a plain one. Measurements: [`provenance-dev-verification.md`](provenance-dev-verification.md).
 
 **Publication** took about 16 seconds for two shards, including the registry part. It copies
 planes eight shards at a time, for three sensors; if a batch of eight takes as long as that pair, a
@@ -342,11 +348,11 @@ The last column is the first draft's choice, where reviews of the plan or the bu
 
 ## 10. Open questions
 
-1. **Is 6–20% more ingest time acceptable for the public store,** or should it be reduced before
-   the campaign? A third of the extra time is the new steps, mostly writing the index; the rest is
-   unchanged work running slower, for a reason under investigation (§6) that an arm computing the
-   index without writing it would help settle. Dropping the planes would not escape it: `sources`
-   is derived from the per-pixel index, so the shard tables are cheap in storage, not in ingest.
+1. **Is one more chunk write per date acceptable for the scheduler?** The record's ingest time
+   cost is inside run-to-run variation (§6), but its task count is not: +8% on optical, +20% on
+   radar. Dropping the planes would not escape it: `sources` is derived from the per-pixel index,
+   so the shard tables are cheap in storage, not in ingest. If the scheduler is the limit, the
+   lever is fewer, larger chunks for the index, not a cheaper index.
 2. **Plane chunking.** A one-pixel read fetches 40–130 objects per sensor. The next dev run will
    compare chunks of all dates × 256 × 256 and all dates × 128 × 128 against the current one date
    × one shard on a real shard-year, for size and for the time to read one pixel.
