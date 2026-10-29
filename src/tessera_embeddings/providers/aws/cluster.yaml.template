@@ -25,11 +25,10 @@
 #   - `provider.use_internal_ips: true` (private-subnet deployment)
 #   - `provider.cache_stopped_nodes: false` (terminate, don't stop)
 #
-# A custom AMI with Python 3.12, a venv, and the inference deps
-# pre-installed (built by the user's own Packer pipeline) is strongly
-# recommended — runtime `pip install` of torch + ray on every worker
-# bottlenecks at scale. See `providers/aws/gotchas.md` for the AMI
-# baking pattern.
+# Nodes run from a prebuilt Python environment: an image mounted at
+# /opt/tessera (`setup_commands` below), or a venv baked into the AMI.
+# Runtime `pip install` of torch + ray on every worker bottlenecks at
+# scale. See `providers/aws/gotchas.md`, "Worker image".
 
 cluster_name: tessera-inference  # INJECT: overridden at runtime to allow concurrent clusters
 max_workers: 500  # Global ceiling — Ray defaults to 2 if omitted!
@@ -213,40 +212,48 @@ head_node_type: head
 idle_timeout_minutes: 2
 upscaling_speed: 2.0  # Cluster can add 2x current nodes per autoscaling round
 
-# Setup commands assume a custom AMI with Python + venv + dependencies
-# pre-installed. The placeholder substitution lets the provider point
-# workers at a versioned tarball of the package source code in S3.
+# The placeholder substitution points nodes at a versioned tarball of the
+# package source, and at the Python environment image, in S3.
 #
 # {CODE_BUCKET}: S3 bucket name (without s3:// prefix). REPLACED at
 #                runtime when a `code_bucket` is given. With none, the
-#                provider DROPS the whole command — an unsubstituted
-#                bucket name is a copy that fails and takes node setup
-#                with it — and workers use the code baked into the AMI.
+#                provider DROPS every command that names it — an
+#                unsubstituted bucket name is a copy that fails and takes
+#                node setup with it — and nodes use what the AMI carries.
 # {CODE_SUFFIX}: optional filename suffix (e.g. `-mybranch`); REPLACED
 #                at runtime. Empty string for production tarballs.
+#
+# The environment: Python 3.12 and every inference dependency, as an ext4 image that the node
+# copies from S3 and mounts read-only at /opt/tessera, giving /opt/tessera/venv. The deployment
+# names it in s3://{CODE_BUCKET}/code/env-image{CODE_SUFFIX}.uri, beside the tarball, so a
+# dependency change ships as a new image rather than a new AMI. The provider reads that pointer
+# once and substitutes the URI for {ENV_IMAGE_URI} (or takes the URI a campaign pinned), so every
+# node of a cluster mounts the same image even if the pointer moves while the fleet grows. The image goes on
+# the instance store when the node has one (GPU workers; the DLAMI's boot service mounts it at
+# /opt/dlami/nvme and can finish after Ray's setup begins, so the command waits up to 60 s), and
+# on the root volume otherwise (the head). Any failure fails the node's setup. The command is a
+# no-op on an AMI that carries its own venv at /opt/tessera/venv, which keeps such AMIs (and so
+# each `ami_ssm_name_by_model` image, such as v1.1's PyTorch 2.5.1 one) on their baked venv.
+# Measurements: context_docs/inference/fresh-worker-start.md.
 #
 # CloudWatch agent setup is INJECTed by the AWS provider from
 # `providers/aws/cloudwatch-agent.json.tpl` (heredocs in YAML break over
 # SSH due to indented terminators).
 setup_commands:
+    - mountpoint -q /opt/tessera || [ -e /opt/tessera/venv ] || { u='{ENV_IMAGE_URI}'; [ -n "$u" ] || { echo "No environment image named at s3://{CODE_BUCKET}/code/env-image{CODE_SUFFIX}.uri" >&2; exit 1; }; d=/var/tmp; if lsblk -dno MODEL | grep -q 'Instance Storage' && timeout 60 sh -c 'until mountpoint -q /opt/dlami/nvme; do sleep 2; done'; then d=/opt/dlami/nvme; fi; sudo aws configure set default.s3.max_concurrent_requests 32 && sudo aws s3 cp --only-show-errors "$u" "$d/env.img" && sudo mkdir -p /opt/tessera && sudo mount -o loop,ro "$d/env.img" /opt/tessera; }
     - aws s3 cp s3://{CODE_BUCKET}/code/src{CODE_SUFFIX}.tar.gz /tmp/src.tar.gz && mkdir -p ~/tessera-embeddings && tar -xzf /tmp/src.tar.gz -C ~/tessera-embeddings/ && rm /tmp/src.tar.gz
     - echo 'export PATH=/opt/tessera/venv/bin:$PATH' >> ~/.bashrc && echo 'export PYTHONPATH=$HOME/tessera-embeddings:$PYTHONPATH' >> ~/.bashrc
 
 head_setup_commands: []
 
-# A fresh EBS volume reads the AMI's snapshot block by block on first use, which holds a new
-# worker's first forward pass back by minutes; an ext4 image of the venv copied from S3 to the
-# instance store takes seconds (context_docs/inference/fresh-worker-start.md). An AMI that ships
-# one names it in /opt/tessera/env-image.uri, and the worker mounts it read-only over the venv
-# before `ray start`. The DLAMI mounts the instance store at /opt/dlami/nvme from a boot service
-# that can finish after Ray's setup begins, so the worker waits up to 60 s for it. No file, no
-# instance store by then, a venv already mounted or a failed copy all leave the AMI's own venv
-# in place.
+# For an AMI that carries its own venv AND names an image of it in /opt/tessera/env-image.uri
+# (yield-embeddings' AMIs baked before the environment left the AMI): the worker mounts that
+# image read-only over the venv on the instance store. Any miss leaves the AMI's own venv in
+# place. A no-op everywhere else.
 worker_setup_commands:
     - mountpoint -q /opt/tessera/venv || { u=$(cat /opt/tessera/env-image.uri 2>/dev/null) && timeout 60 sh -c 'until mountpoint -q /opt/dlami/nvme; do sleep 2; done' && sudo aws configure set default.s3.max_concurrent_requests 32 && sudo aws s3 cp --only-show-errors "$u" /opt/dlami/nvme/venv.img && sudo mount -o loop,ro /opt/dlami/nvme/venv.img /opt/tessera/venv || true; }
 
-# Ray start commands activate the pre-installed venv at /opt/tessera/venv.
-# Adjust the venv path if your AMI puts it elsewhere.
+# Ray start commands run Ray from the venv at /opt/tessera/venv (PATH, set above).
 #
 # INJECT: launch-pacing environment — when the caller asks for it, the provider
 # assigns LAUNCH_PACING_ENV on the head's `ray start` invocation below, so the
