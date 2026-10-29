@@ -460,7 +460,7 @@ def bind_study(cfg: RunConfig, test: str, study: str) -> None:
         raise SystemExit(f"run {cfg.run_id!r} holds --study {bound}; give --study {study} a run id of its own")
     record.write_text(study)
     if cfg.is_s3:
-        _mirror_to_s3(cfg, test)
+        _mirror_to_s3(cfg, test, strict=True)
 
 
 def mark_phase_done(cfg: RunConfig, test: str, phase: str) -> None:
@@ -470,8 +470,8 @@ def mark_phase_done(cfg: RunConfig, test: str, phase: str) -> None:
         _mirror_to_s3(cfg, test)
 
 
-def _mirror_to_s3(cfg: RunConfig, test: str) -> None:
-    """Best-effort upload of a test's local result files to the S3 results prefix."""
+def _mirror_to_s3(cfg: RunConfig, test: str, strict: bool = False) -> None:
+    """Upload a test's local result files to the S3 results prefix; best-effort unless ``strict``."""
     if not cfg.bucket:
         return
     try:
@@ -481,6 +481,8 @@ def _mirror_to_s3(cfg: RunConfig, test: str) -> None:
         for f in local.glob("*"):
             fs.put_file(str(f), f"{dest}/{f.name}")
     except Exception as exc:
+        if strict:
+            raise
         logger.warning("S3 results mirror failed for %s: %s", test, exc)
 
 

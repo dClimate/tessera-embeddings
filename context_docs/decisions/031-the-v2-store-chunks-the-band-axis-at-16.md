@@ -113,6 +113,12 @@ root/          geoemb: attributes                  root/     geoemb:, proj:, spa
   system. Each level is a child group holding that level's arrays, and the convention's geospatial
   example puts `proj:code` on the pyramid's group. Each UTM zone has its own coordinate system, so
   each zone group is one pyramid, and its 10 m level is `utm33/0`.
+- **The one pyramid among the peer stores is built the same way.** The Source Coop copy of our v1.1
+  store has a `global_rgb` group beside its zones: an RGB preview in EPSG:4326, whose ten levels
+  are child groups `0` to `9`, each a 2× mean of the one before. It sidesteps the zones' sixty
+  coordinate systems by building its pyramid in a single global one. Its 10 m embeddings, and
+  OlmoEarth's, sit directly in each zone group, with no levels. AlphaEarth's Zarr mosaic is a
+  single EPSG:4326 array at the root, with no zones and no levels.
 - **Rejected: levels outermost (`root/0/utm01`).** Group `0` would span sixty coordinate systems and
   hold no arrays of its own, so it could not be one level of one pyramid. The zone groups would also
   leave the root, which is where the geoembeddings `utm_zones` layout puts them.
@@ -135,7 +141,8 @@ root/          geoemb: attributes                  root/     geoemb:, proj:, spa
   - Readers open one group deeper: `group="utm33/0"`, or `group="0"` for a single-area store.
   - The geoembeddings `utm_zones` layout says each zone group contains the embedding arrays, but in
     a v2 store they sit in its `0` group. So a reader that knows only geoembeddings has to add `/0`,
-    and so does one moving between our store and the Source Coop copy, AlphaEarth or OlmoEarth.
+    and so does one moving between our store and the other `utm_zones` stores, the Source Coop copy
+    and OlmoEarth.
   - It is worth asking the geoembeddings convention to allow a zone group that is a multiscales
     pyramid.
 - **Scope: v2 stores only**, chosen from the model, as [ADR 032](032-v2-stores-name-their-axes-y-and-x.md)
