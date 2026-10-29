@@ -868,6 +868,10 @@ def _tile_bboxes_wgs84(zone: str, labels: Iterable[str]) -> dict[str, tuple[floa
     return boxes
 
 
+#: A staged tile's ``Dataset`` variables: ``(dims, data)``, or ``(dims, data, attrs)`` for a month mask.
+StagedVars = dict[str, tuple[list[str], np.ndarray] | tuple[list[str], np.ndarray, dict[str, str]]]
+
+
 class ZarrWriter:
     """Write embeddings to Zarr stores.
 
@@ -989,7 +993,7 @@ class ZarrWriter:
 
     @staticmethod
     def _stage_month_masks(
-        data_vars: dict[str, tuple[list[str], np.ndarray]],
+        data_vars: StagedVars,
         encoding: dict[str, dict],
         month_covered: Mapping[str, np.ndarray | None] | None,
         chunk: ChunkSpec,
@@ -1005,11 +1009,12 @@ class ZarrWriter:
         ``(northing, easting, month)`` so nothing transposes on the way in. The actor keeps it
         FIRST, because that is the axis the mask bundle slices on.
 
-        No dtype in the encoding, deliberately: ``to_zarr`` stores a bool array as int8 with
-        ``attrs dtype="bool"`` and IGNORES an encoding dtype asking for bool, so the staged tile is
-        int8 either way. The destination is seeded int8 to match, because assembly reads staged
-        tiles with RAW zarr and compares against what is on disk rather than what xarray hands
-        back — a bool destination refuses every staged month tile on the dtype guard.
+        Staged as int8 carrying ``attrs dtype="bool"``, xarray's own representation of a boolean,
+        built here rather than left to ``to_zarr``: xarray up to 2026.4 converted a bool array that
+        way itself, but from 2026.9 its Zarr writer stores bool natively. The destination is seeded
+        int8 to match, because assembly reads staged tiles with RAW zarr and compares against what
+        is on disk rather than what xarray hands back — a bool staged tile is refused on the dtype
+        guard. Explicit, the staged tile is the same on either xarray.
         """
         if month_covered is None:
             return
@@ -1022,7 +1027,8 @@ class ZarrWriter:
                 raise ValueError(f"Expected {var} shape {expected}, got {arr.shape}")
             data_vars[var] = (
                 ["northing", "easting", "month"],
-                np.ascontiguousarray(arr.transpose(1, 2, 0)),
+                np.ascontiguousarray(arr.transpose(1, 2, 0), dtype=np.int8),
+                {"dtype": "bool"},
             )
             encoding[var] = {"chunks": (*staged_chunks_2d, MONTHS_IN_YEAR), "compressors": None}
 
@@ -1046,7 +1052,7 @@ class ZarrWriter:
         """
         path = self._coverage_path(run_id, chunk)
         staged_chunks_2d = (min(INNER_PX, chunk.height), min(INNER_PX, chunk.width))
-        data_vars: dict[str, tuple[list[str], np.ndarray]] = {}
+        data_vars: StagedVars = {}
         encoding: dict[str, dict] = {}
         expected_2d = (chunk.height, chunk.width)
         for var_name in OBS_COUNT_VARS:
@@ -1349,7 +1355,7 @@ class ZarrWriter:
         staged_chunks = (min(INNER_PX, chunk.height), min(INNER_PX, chunk.width), self.embedding_dim)
         staged_chunks_2d = (min(INNER_PX, chunk.height), min(INNER_PX, chunk.width))
 
-        data_vars: dict[str, tuple[list[str], np.ndarray]] = {
+        data_vars: StagedVars = {
             "embeddings": (["northing", "easting", "band"], embeddings),
         }
         encoding: dict[str, dict] = {

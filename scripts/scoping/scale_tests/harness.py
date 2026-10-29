@@ -42,6 +42,8 @@ METRICS = frozenset(
         "peak_rss_bytes",
         "read_p50_ms",
         "read_p95_ms",
+        "read_p50_lo_ms",
+        "read_p50_hi_ms",
         "bytes_fetched",
         "throughput_mbps",
         "open_wall_s",
@@ -57,6 +59,15 @@ METRICS = frozenset(
         "gc_wall_s",
         "slowdown_503_count",
         "puts_per_s",
+        "get_requests",
+        "encode_cpu_s",
+        "decode_cpu_s",
+        "dask_tasks",
+        "mismatched_arrays",
+        "first_read_s",
+        "probe_rtt_ms",
+        "probe_mbps",
+        "unreadable",
     }
 )
 
@@ -429,6 +440,29 @@ def phase_done(cfg: RunConfig, test: str, phase: str) -> bool:
     return False
 
 
+def bind_study(cfg: RunConfig, test: str, study: str) -> None:
+    """Hold a run to one study: record ``study`` on first use, and refuse a different one later.
+
+    Phase markers belong to a run and a test, not to a study, so a second study under the same run
+    id would skip the phases the first one completed and read stores it never built. A run whose
+    markers predate this record ran the default study, ``band16``. On S3 the run's mirrored record is
+    pulled down first, so a fresh host resuming a run sees it too, and a new record is mirrored at once,
+    before any phase writes a store. A failed pull is fatal here: binding without the run's record would
+    let a second study take over its stores.
+    """
+    d = cfg.results_dir / test
+    d.mkdir(parents=True, exist_ok=True)
+    if cfg.is_s3:
+        _sync_results_from_s3(cfg, test, strict=True)
+    record = d / "study"
+    bound = record.read_text().strip() if record.exists() else ("band16" if any(d.glob("*.done")) else study)
+    if bound != study:
+        raise SystemExit(f"run {cfg.run_id!r} holds --study {bound}; give --study {study} a run id of its own")
+    record.write_text(study)
+    if cfg.is_s3:
+        _mirror_to_s3(cfg, test, strict=True)
+
+
 def mark_phase_done(cfg: RunConfig, test: str, phase: str) -> None:
     """Record a (test, phase) as complete and best-effort mirror to S3."""
     _marker(cfg, test, phase).write_text(_utcnow())
@@ -436,8 +470,8 @@ def mark_phase_done(cfg: RunConfig, test: str, phase: str) -> None:
         _mirror_to_s3(cfg, test)
 
 
-def _mirror_to_s3(cfg: RunConfig, test: str) -> None:
-    """Best-effort upload of a test's local result files to the S3 results prefix."""
+def _mirror_to_s3(cfg: RunConfig, test: str, strict: bool = False) -> None:
+    """Upload a test's local result files to the S3 results prefix; best-effort unless ``strict``."""
     if not cfg.bucket:
         return
     try:
@@ -447,11 +481,13 @@ def _mirror_to_s3(cfg: RunConfig, test: str) -> None:
         for f in local.glob("*"):
             fs.put_file(str(f), f"{dest}/{f.name}")
     except Exception as exc:
+        if strict:
+            raise
         logger.warning("S3 results mirror failed for %s: %s", test, exc)
 
 
-def _sync_results_from_s3(cfg: RunConfig, test: str) -> None:
-    """Best-effort download of a test's mirrored result files to the local results dir.
+def _sync_results_from_s3(cfg: RunConfig, test: str, strict: bool = False) -> None:
+    """Download a test's mirrored result files to the local results dir; best-effort unless ``strict``.
 
     The inverse of :func:`_mirror_to_s3`: used on a fresh-host resume so metrics for a
     phase skipped on the strength of its S3 marker are present locally for report.py.
@@ -468,7 +504,14 @@ def _sync_results_from_s3(cfg: RunConfig, test: str) -> None:
         for key in fs.ls(src, detail=False):
             fs.get_file(key, str(local / key.rstrip("/").rsplit("/", 1)[-1]))
     except Exception as exc:
+        if strict:
+            raise
         logger.warning("S3 results sync-down failed for %s: %s", test, exc)
+
+
+def phase_matches(requested: str, name: str) -> bool:
+    """Whether ``--phase requested`` selects ``name``; a phase recorded per client answers to its plain name."""
+    return requested in (name, re.sub(r"_zarr[\d.]+$", "", name))
 
 
 def run_phase(
@@ -485,7 +528,7 @@ def run_phase(
     stores — phases must be resumable, so nothing is threaded through in memory.
     Honors ``--phase`` (run only the matching phase) and ``--variant``.
     """
-    if cfg.phase and cfg.phase != name:
+    if cfg.phase and not phase_matches(cfg.phase, name):
         return
     if phase_done(cfg, test, name):
         logger.info("[%s/%s] already done — skipping", test, name)
