@@ -1,9 +1,12 @@
-# 031 — The v2 store is band-first and splits the band axis at 16
+# 031 — The v2 store layout: a level-0 group, band-first, and 16-band shards
 
 **Status:**
 
 - **Accepted 2026-10-22 (repo owner):** `embeddings` is band-first, and each meta-shard is stored as
   eight 16-band shards (§4). Inference makes the reorder to band-first as it stages each meta-shard.
+- **Accepted 2026-10-28 (repo owner):** a v2 store keeps its 10 m arrays in a child group `0` of each
+  zone group (`utm33/0/`, or `0/` in a single-area store), so coarser multiscale levels can be added
+  beside it later (§1).
 - **Open:** how phones and browsers are served. There are two equally weighted paths (§4): keep
   16-band chunks and add a small preview store, or cut each 16-band shard into 4-band chunks. Path 2
   has to be chosen before the v2 campaign writes; path 1 can be added at any time.
@@ -18,7 +21,7 @@ test on AWS (T10): the 16-band study
 ([results](../../scripts/scoping/scale_tests/v2_layout_results.md)) and the narrow-band study
 ([results](../../scripts/scoping/scale_tests/v2_narrow_band_results.md)).
 
-**Meta-shards, shards and chunks.** The store has three levels. *Shard* and *chunk* mean what zarr
+**Meta-shards, shards and chunks.** An array divides into three nested pieces. *Shard* and *chunk* mean what zarr
 means by them; the 2,048² block above them is a *meta-shard*:
 
 ```
@@ -83,6 +86,63 @@ into shards and chunks changes.
 | `scales` | 256² chunks, as v1.1 | its geometry made no measurable difference; PCodec compresses it about 7× |
 | float arrays | PCodec | unchanged |
 | readers | zarr ≥ 3.3, Dask chunks matched to shards | zarr 3.3 merges a shard's ranges into concurrent requests; Dask's default makes one task per chunk, each refetching the shard's index (§6) |
+
+### Where the arrays sit: a level-0 group
+
+**Accepted 2026-10-28 (repo owner).** A v2 store keeps its 10 m arrays in a child group named `0`.
+In a global store, each zone group has one. A single-area store has one under its root. Coarser
+multiscale levels go beside it as `1/`, `2/` and so on, once they are built.
+
+```
+global store                                       single-area store
+
+root/          geoemb: attributes                  root/     geoemb:, proj:, spatial:,
+├── utm01/     proj:, spatial:, multiscales        │         multiscales
+│   ├── 0/     10 m arrays: embeddings, scales, …  └── 0/    10 m arrays
+│   └── 1/ …   coarser levels, once built
+├── utm02/
+│   └── 0/
+└── … utm60/
+```
+
+- **Why now.** How to pool embeddings into coarser levels is still open (the draft plan in #222).
+  Where the 10 m arrays sit cannot change once readers depend on their paths. A level group costs
+  nothing to create now, and a later level is only a new group beside it.
+- **Why inside each zone.** The [multiscales convention](https://github.com/zarr-conventions/multiscales)
+  (v0.1) treats the group that carries its `multiscales` attribute as one pyramid in one coordinate
+  system. Each level is a child group holding that level's arrays, and the convention's geospatial
+  example puts `proj:code` on the pyramid's group. Each UTM zone has its own coordinate system, so
+  each zone group is one pyramid, and its 10 m level is `utm33/0`.
+- **Rejected: levels outermost (`root/0/utm01`).** Group `0` would span sixty coordinate systems and
+  hold no arrays of its own, so it could not be one level of one pyramid. The zone groups would also
+  leave the root, which is where the geoembeddings `utm_zones` layout puts them.
+- **Rejected: arrays left in the zone group, with no level group.** A group carries one `multiscales`
+  attribute, which names each level by a path below that group. With the arrays in the zone group
+  itself, level 0 could only be named array by array. The layout would then cover `embeddings` alone
+  and leave out `scales`, which a reader needs to decode it.
+- **What the store declares.**
+  - Each zone group, or the root of a single-area store, registers the convention by its uuid
+    (`d35379db-88df-4056-af3a-620245f8e347`).
+  - It holds a `layout` with one entry, `0`, until coarser levels exist. Each later level adds an
+    entry naming the level it was derived from and its scale.
+  - `proj:` and `spatial:` stay on the zone group, where the convention's example puts them.
+  - The attribute is checked against the convention's published schema.
+- **The convention is a v0.1 pilot** and may change before its v1, which is expected by the end of
+  2026. Its attributes are metadata and can be rewritten without touching a chunk. The group paths,
+  which are what readers depend on, follow the structure every one of its examples shares: levels as
+  child groups of the pyramid's group.
+- **What it costs readers.**
+  - Readers open one group deeper: `group="utm33/0"`, or `group="0"` for a single-area store.
+  - The geoembeddings `utm_zones` layout says each zone group contains the embedding arrays, but in
+    a v2 store they sit in its `0` group. So a reader that knows only geoembeddings has to add `/0`,
+    and so does one moving between our store and the Source Coop copy, AlphaEarth or OlmoEarth.
+  - It is worth asking the geoembeddings convention to allow a zone group that is a multiscales
+    pyramid.
+- **Scope: v2 stores only**, chosen from the model, as [ADR 032](032-v2-stores-name-their-axes-y-and-x.md)
+  chooses axis names.
+  - The published v1.1 store, its targeted updates and v1.1 single-area stores keep their arrays
+    where they are.
+  - Mosaic, staging and land-mask stores are internal and unchanged.
 
 ## 2. What was measured in the 16-band study
 
@@ -225,7 +285,7 @@ example, labels a meta-shard by chunk coordinates 1 and 2, which in band-first o
 
 **Accepted: band-first, each meta-shard stored as eight 16-band shards.** `embeddings` is
 `(time, band, y, x)`. Each meta-shard's 128 bands are stored as eight shards of
-1 × 16 × 2,048 × 2,048, one per 16-dimension group (zarr's `shards=`), compressed with zstd at
+1 × 16 × 2,048 × 2,048, one for each block of 16 dimensions (zarr's `shards=`), compressed with zstd at
 level 1. `scales` and the other arrays keep their v1.1 geometry.
 
 **It is the only layout in the 16-band study that passes every limit, and it leads every read.**
@@ -307,6 +367,15 @@ chunks, a gentler path 2, were measured only on the laptop.
 
 - **A v2 preset** in `config/store_layout.py`, selected by model version for the global and
   single-area paths. `INNER_PX` stays 256, so the land mask's `chunk_live_256` stays valid.
+- **The arrays move into level group `0`** (§1).
+  - The seed flow creates each zone's `0` group with the arrays inside it, and writes the zone's
+    `multiscales` attribute. `storage/conventions.py`, the one place that builds `zarr_conventions`
+    entries, registers the convention.
+  - Code that opens a zone's arrays resolves `utm33/0` through one helper: zone fill, targeted
+    updates and the readers' open functions.
+  - Fill bookkeeping kept as zone-group attributes, such as completed years and update records, can
+    stay on the zone group.
+  - The reading guide gives the new paths.
 - **Inference stages v2 meta-shards band-first.** `ZarrWriter.write_chunk` writes the actor's
   `(y, x, band)` buffer through a transposed view on the writer thread. Staging validation and
   `StagedShardSource` read `(band, y, x)`, and the shard writer and the holes merge index band-first
@@ -333,7 +402,8 @@ chunks, a gentler path 2, were measured only on the laptop.
 
 - **A preview store and its writer.** Assembly, or a separate pass over the stored embeddings, writes
   each meta-shard's first 4 or 8 bands into it. Its location, band count and format (icechunk or
-  plain Zarr) are fixed before it is first written.
+  plain Zarr) are fixed before it is first written, and its groups follow the main store's
+  (`utm33/0`).
 - **Targeted updates rewrite a meta-shard's preview with the meta-shard**, or the two stores drift
   apart.
 - **The reader guide and a root attribute point to the preview store.**
