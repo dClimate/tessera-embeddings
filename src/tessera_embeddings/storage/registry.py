@@ -185,6 +185,11 @@ def registry_schema() -> pa.Schema:
             # update rewrites only its own tiles, and the master keeps every tile's newest row, so
             # this names the update a tile's current data came from (ADR 027).
             pa.field("update_name", pa.string()),
+            # THE RUNS WHOSE PIXELS THE TILE HOLDS, oldest first, for finding the tile in the
+            # provenance record: one run for a fill, two after a holes update. Derived from the
+            # store's run records at every write and merge (`published_store.source_runs`), never
+            # copied from an older row. Null where the tile has no complete provenance record.
+            pa.field("source_runs", pa.list_(pa.string())),
         ]
     )
 
@@ -243,6 +248,7 @@ def registry_rows(
     bboxes: Mapping[str, tuple[float, float, float, float]] | None = None,
     code: Mapping[str, Any] | None = None,
     update_name: str | None = None,
+    source_runs: Callable[[str], list[str] | None] | None = None,
 ) -> list[dict[str, Any]]:
     """One row per live tile: what it holds, and for a refused tile why, and how close it came.
 
@@ -263,6 +269,7 @@ def registry_rows(
     ``code`` is the build that produced the cell, as
     :func:`~tessera_embeddings.config.environment.code_identity` reports it — cell-level, so it is
     stamped on every row. ``update_name`` names the targeted update that wrote these rows, if any.
+    ``source_runs`` gives each tile's runs as the store records them after this run's commit.
     """
     records = {**(embedded_records or {}), **(records or {})}
     rule = _int_or_none(optical_min_obs)
@@ -284,6 +291,7 @@ def registry_rows(
         row |= _bbox_fields(boxes.get(label))
         row |= build
         row["update_name"] = update_name
+        row["source_runs"] = source_runs(label) if source_runs is not None else None
         row |= _measurement_fields(records.get(label) or {})
         rows.append(row)
     return rows

@@ -51,6 +51,13 @@ attr, never over it, and `shard_writer.py` merges a holes update into the tiles 
 ([ADR 027](../../../context_docs/decisions/027-targeted-updates.md)). It sits outside both code
 identities, like `campaign.py`.
 
+**`provenance.py`** lays out the provenance record published beside the registry for the public
+store: which satellite images went into each day's mosaic, and which one supplied every pixel on
+every date. **`provenance_reader.py`** reads it back as polars tables: a day's images, a tile's,
+and a pixel's from a latitude and longitude, following the registry's `source_runs`. The design is
+in
+[`context_docs/storage/registry-provenance-plan.md`](../../../context_docs/storage/registry-provenance-plan.md).
+
 `campaign.py` tracks what is finished and clears out old versions, `published_store.py`
 checks a finished dataset from outside, and `object_store.py` deletes what we no longer need.
 `time_axis.py` and `icechunk_logging.py` are small shared helpers.

@@ -146,6 +146,7 @@ where `store_group` is the zone's group opened with xarray, as in the store's
 | `run_id`, `assembled_at` | the run the row came from, and when it was written: the fill, or for a re-derived row the re-derivation |
 | `code_version`, `code_commit` | the build of the tessera-embeddings repository that ran the fill |
 | `update_name` | the targeted update that last rewrote the tile ([ADR 027](../context_docs/decisions/027-targeted-updates.md)), null where the tile is still the campaign's fill |
+| `source_runs` | the runs whose pixels the tile holds, oldest first, for finding them in the provenance record below; null for v1.1 and wherever the tile has no complete record |
 
 The quality rule is the store's: a pixel is embedded only if it had at least `optical_min_obs`
 usable optical observations in the year: the store root's value, or a lower one a targeted update
@@ -239,9 +240,12 @@ way. The sensors are `s2` (optical), `s1_asc` and `s1_desc` (radar by orbit dire
   `<sensor>_date`. A value `k > 0` means the pixel had a valid observation that date and the image
   at `fusion_order = sources[k - 1]` of the tile's `shard_dates` row supplied it; `0` means none did.
 
-To trace one pixel, open the run's group, read the pixel's column of values, and join each
-non-zero value through the tile's `shard_dates` row to `granules`, on the row's `snapshot_id`, its
-day and `sources[k - 1]`:
+The helpers in `storage/provenance_reader.py` answer the usual questions as polars tables:
+`day_granules` for a day's mosaic, `shard_granules` for a tile and one run, and
+`pixel_granules(registry_root, lat, lon, year)`, which finds the pixel's zone, tile, row and column
+on the store's grid and picks the run by the rule below. By hand, to trace one pixel, open the
+run's group, read the pixel's column of values, and join each non-zero value through the tile's
+`shard_dates` row to `granules`, on the row's `snapshot_id`, its day and `sources[k - 1]`:
 
 ```python
 k = run["s2"][:, row, col]                                 # one value per date of the optical axis
@@ -249,12 +253,15 @@ dates = run["s2_date"][:]                                  # int64 nanoseconds, 
 picks = [(d, v - 1) for d, v in zip(dates, k) if v]        # (date, rank in that date's `sources`)
 ```
 
-Open the group of the run that wrote the tile's pixels: the run whose `parts/` file holds the
-tile's row with the master row's `filled_at`, as described under "Runs" above. After a holes
-update, the update's group covers the pixels in its `update_pixels` mask, the pixels it embedded,
-and the earlier run's group the rest. The record says what went in, not how much each image mattered: the model has no
-attribution. For a pixel observed more often than the model's longest sequence, the model reads
-a fixed subset of these dates, chosen by a deterministic rule from the dates alone.
+Open the group of the run that holds the pixel, from the master row's `source_runs`: the runs
+whose pixels the tile holds, oldest first. Walk them from the newest: a holes update holds the
+pixels its `update_pixels` mask marks, the pixels it embedded, and a fill or a shards update holds
+every pixel; the first run that holds the pixel has its record. `source_runs` is null where the tile
+has no complete record, and is derived from the store's own record of who wrote the tile at every
+merge, never copied from an older row. The record says what went in, not how much each image
+mattered: the model has no attribution. For a pixel observed more often than the model's longest
+sequence, the model reads a fixed subset of these dates, chosen by a deterministic rule from the
+dates alone.
 
 ## Going deeper
 

@@ -1,17 +1,20 @@
-"""Publishing a run's provenance record: tables, pixel planes and the checks between them.
+"""Publishing a run's provenance record, and reading it back: tables, planes and the checks between them.
 
 Built on the real pieces end to end, on local stores: mosaics written by the ingest's own writer
-with the switch on, shards staged by the real staging writer from pieces read off those mosaics, and
-publication reading both. A 2 x 2 grid of 4-pixel shards, three sensors, two dates each.
+with the switch on, shards staged by the real staging writer from pieces read off those mosaics,
+publication reading both, and the reader helpers reading what it published. A 2 x 2 grid of 4-pixel
+shards, three sensors, two dates each.
 """
 
 from __future__ import annotations
 
+import datetime
 import json
 from pathlib import Path
 
 import dask.array as da
 import numpy as np
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 import shapely
@@ -33,6 +36,13 @@ from tessera_embeddings.storage.provenance import (
     shard_dates_uri,
     update_pixels_uri,
 )
+from tessera_embeddings.storage.provenance_reader import (
+    PixelLocation,
+    day_granules,
+    locate,
+    pixel_granules_at,
+    shard_granules,
+)
 from tessera_embeddings.storage.zarr_store import open_repo, open_store_as_zarr_group, write_days_windows
 from tests.unit.inference_stack import STACK
 
@@ -40,6 +50,10 @@ SIZE, SHARD = 8, 4
 DATES = ["2024-06-01", "2024-06-13"]
 STORES = {"reflectance": "s2", "sar_ascending": "s1_asc", "sar_descending": "s1_desc"}
 ZONE, YEAR, RUN, UPDATE = "33N", 2024, "33N-2024-abcd1234", "33N-2024-holes123"
+
+#: The pixels a holes update embedded in each of its embedding shards: the top two rows.
+EMBEDDED_BY_UPDATE = np.zeros((SHARD, SHARD), dtype=bool)
+EMBEDDED_BY_UPDATE[:2] = True
 
 
 class _Roi:
@@ -264,11 +278,6 @@ def test_an_embedded_shard_with_no_record_fails_the_publication(tmp_path: Path) 
         _publish(tmp_path, pins, embedded, refused)
 
 
-#: The pixels a holes update embedded in each of its embedding shards: the top two rows.
-EMBEDDED_BY_UPDATE = np.zeros((SHARD, SHARD), dtype=bool)
-EMBEDDED_BY_UPDATE[:2] = True
-
-
 def test_a_holes_update_publishes_the_pixels_it_embedded_and_planes_inside_them(tmp_path: Path) -> None:
     pins = _mosaics(tmp_path / "mosaics")
     embedded, refused = _stage(tmp_path / "staging", pins, pixels=EMBEDDED_BY_UPDATE)
@@ -289,3 +298,67 @@ def test_a_holes_mask_that_is_not_what_the_update_embedded_fails_the_publication
     group.attrs["coverage"] = {"embedded_px": int(EMBEDDED_BY_UPDATE.sum()) + 1}
     with pytest.raises(ProvenanceCheckError, match="in its mask"):
         _publish(tmp_path, pins, embedded, refused)
+
+
+@pytest.fixture
+def updated(published):
+    """The fill, then a holes update embedding the top two rows of each embedding shard, and the master.
+
+    The master's ``source_runs`` names both runs for the three shards the update wrote, and is null
+    for the fourth, as for a shard with no complete record.
+    """
+    tmp_path, pins, _ = published
+    embedded, refused = _stage(tmp_path / "staging", pins, pixels=EMBEDDED_BY_UPDATE, run=UPDATE)
+    _publish(tmp_path, pins, embedded, refused, run=UPDATE)
+    master = tmp_path / "registry" / "master" / f"zone={ZONE}" / f"year={YEAR}"
+    master.mkdir(parents=True)
+    runs = pa.array([[RUN, UPDATE], [RUN, UPDATE], [RUN, UPDATE], None], pa.list_(pa.string()))
+    pq.write_table(pa.table({"tile": embedded + refused, "source_runs": runs}), master / "part-0.parquet")
+    return str(tmp_path / "registry"), pins
+
+
+@pytest.mark.parametrize(
+    ("lat", "lon", "where"),
+    [
+        (45.5071, 14.3761, PixelLocation("33N", "chunk_209_14", 1908, 70)),
+        (45.5149, 14.3794, PixelLocation("33N", "chunk_209_14", 1822, 96)),
+    ],
+)
+def test_a_point_is_located_on_the_stores_grid(lat: float, lon: float, where: PixelLocation) -> None:
+    """The two pixels the dev test traced, at the shard, row and column it found them."""
+    assert locate(lat, lon) == where
+
+
+@pytest.mark.parametrize(("row", "col", "run"), [(0, 0, UPDATE), (3, 3, RUN)], ids=["update-marked", "fill"])
+def test_a_pixel_is_read_from_the_run_that_claims_it(updated, row: int, col: int, run: str) -> None:
+    """The update claims the pixels its mask marks, the fill the rest; each date names the mosaic's granule."""
+    registry, pins = updated
+    got = pixel_granules_at(registry, PixelLocation(ZONE, "chunk_0_1", row, col), YEAR)
+    expected = []
+    for path, pin in pins.items():
+        sensor = STORES[Path(path).stem]
+        index = open_store_as_zarr_group(path, snapshot_id=pin)[SOURCE_INDEX_VAR][:, row, SHARD + col]
+        expected += [(sensor, DATES[t], f"{sensor}-{DATES[t]}-{v - 1}") for t, v in enumerate(index) if v]
+    assert set(got["run_id"]) == {run}
+    rows = [(r["sensor"], str(r["solar_day"]), r["granule_id"]) for r in got.iter_rows(named=True)]
+    assert sorted(rows) == sorted(expected)
+
+
+def test_a_shard_with_no_complete_record_has_no_pixel_answer(updated) -> None:
+    registry, _ = updated
+    with pytest.raises(LookupError, match="no complete provenance record"):
+        pixel_granules_at(registry, PixelLocation(ZONE, "chunk_1_1", 0, 0), YEAR)
+
+
+def test_a_day_and_a_shard_read_through_the_snapshot_each_run_names(updated) -> None:
+    registry, _ = updated
+    day = datetime.date(2024, 6, 1)
+    for run in (None, RUN, UPDATE):
+        assert day_granules(registry, ZONE, YEAR, "s2", day, run_id=run)["granule_id"].to_list() == [
+            "s2-2024-06-01-0",
+            "s2-2024-06-01-1",
+        ]
+    shard = shard_granules(registry, ZONE, YEAR, "chunk_0_0", RUN)
+    rows = _shard_dates(Path(registry).parent).to_pylist()
+    assert shard.height == sum(len(r["sources"]) for r in rows if r["tile"] == "chunk_0_0")
+    assert all(g.startswith(f"{s}-{d}-") for s, d, g in shard.select("sensor", "solar_day", "granule_id").iter_rows())

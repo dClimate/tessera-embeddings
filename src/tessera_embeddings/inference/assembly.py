@@ -97,6 +97,7 @@ from tessera_embeddings.storage.global_store import create_layout_arrays, open_g
 from tessera_embeddings.storage.icechunk_logging import traced_commit
 from tessera_embeddings.storage.manifest import EmbeddingManifest, extract_manifest
 from tessera_embeddings.storage.object_store import delete_prefix
+from tessera_embeddings.storage.published_store import source_runs as published_source_runs
 from tessera_embeddings.storage.registry import part_uri, registry_rows, write_registry_part
 from tessera_embeddings.storage.shard_writer import (
     PhaseTimer,
@@ -1145,6 +1146,7 @@ class ZarrWriter:
         optical_min_obs: int | None = None,
         embedded_records: Mapping[str, dict] | None = None,
         update_name: str | None = None,
+        source_runs: Callable[[str], list[str] | None] | None = None,
         get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
         s3_region: str | None = None,
     ) -> str | None:
@@ -1197,6 +1199,7 @@ class ZarrWriter:
                     bboxes=boxes,
                     code=build,
                     update_name=update_name,
+                    source_runs=source_runs,
                 ),
                 open_output=lambda target: fs.open(target, "wb"),
                 zone=zone,
@@ -2675,11 +2678,14 @@ class ZarrWriter:
         # the store, and consumers are told they need not open the store, so a part written any
         # earlier could advertise a cell that never landed.
         if registry_root:
+            # The tiles' runs as the store records them now, this run's record included.
+            attrs = dict(zarr.open_group(repo.readonly_session(snapshot_id=snapshot).store, mode="r")[zone].attrs)
             self.publish_registry_part(
                 registry_root,
                 zone,
                 year,
                 run_id,
+                source_runs=lambda tile: published_source_runs(attrs, year, tile),
                 committed_at=telemetry["commit"]["committed_at"],
                 embedded=registry_embedded,
                 refused=registry_refused,

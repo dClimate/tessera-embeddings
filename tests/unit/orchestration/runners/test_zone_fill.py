@@ -1439,3 +1439,25 @@ def test_a_failed_publication_leaves_the_cell_untagged_and_its_retry_republishes
     assert retry["already_complete"] is True
     assert calls[-1]["tagged"] is False and calls[-1]["embedded"] == ["chunk_0_0"]
     assert "zone-01N-2025" in global_store.open_global_repo(store).list_tags()
+
+
+@pytest.mark.parametrize("carried", [True, False], ids=["mosaics-with-the-record", "mosaics-without"])
+def test_a_fill_names_its_run_in_source_runs_only_when_its_mosaics_carried_the_record(tmp_path, monkeypatch, carried):
+    store, registry_root = _seed_global(tmp_path), str(tmp_path / "registry")
+    monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub({}))
+    monkeypatch.setattr(zone_fill, "mosaics_carry_provenance", lambda *_a, **_k: carried)
+    monkeypatch.setattr(zone_fill, "publish_provenance", lambda **_k: None)
+    _fill(
+        tmp_path,
+        store,
+        land_mask_path=_make_mask(tmp_path, [(0, 0)]),
+        mosaic_base=_make_mosaic(tmp_path),
+        registry_root=registry_root,
+        run_id="runP",
+    )
+    expected = [["runP"]] if carried else [None]
+    assert _published_part(registry_root)["source_runs"] == expected
+    master = pytest.importorskip("pyarrow.parquet").read_table(
+        f"{registry_root}/master/zone={_ZONE}/year=2025/part-0.parquet"
+    )
+    assert master.column("source_runs").to_pylist() == expected

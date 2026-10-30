@@ -443,6 +443,20 @@ def _parts_of(*runs: tuple[str, str, list[str]]) -> pa.Table:
 _FILL_AND_UPDATE = _parts_of(("run-a", FILLED, ["chunk_0_0", "chunk_0_1"]), ("run-c", LATER, ["chunk_0_1"]))
 
 
+class TestSourceRunsComeFromTheStore:
+    """Every merge derives ``source_runs`` afresh, so no row's copy, stale or absent, can win."""
+
+    def test_the_master_takes_the_store_s_lineage_for_every_tile(self, registry: Path) -> None:
+        lineage = {"chunk_0_0": ["run-a", "update"], "chunk_0_1": ["run-a"]}
+        store = StoreYear([_A], lambda snapshot: frozenset(_WROTE[snapshot]), lineage.get)
+        merge_cell(LOCAL, str(registry), "33N", 2017, store=lambda: store)
+        master = pq.read_table(registry / TestUpdateCell.MASTER)
+        assert (
+            dict(zip(master.column("tile").to_pylist(), master.column("source_runs").to_pylist(), strict=True))
+            == lineage
+        )
+
+
 class TestTheStoreStandsBehindTheParts:
     """Newest-part-wins is right only if the parts account for every run the store says wrote the year."""
 

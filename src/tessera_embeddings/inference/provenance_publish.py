@@ -232,6 +232,13 @@ def _publish_granules(
     return write_table(uri, rows, granules_schema(), open_output=open_output, metadata=metadata, geometry=True)
 
 
+def mosaics_carry_provenance(
+    mosaic_snapshots: Mapping[str, str], *, get_credentials: _Creds = None, s3_region: str | None = None
+) -> bool:
+    """Whether the pinned mosaics were ingested with the provenance record. Refuses a mix."""
+    return _provenance_mosaics(mosaic_snapshots, get_credentials, s3_region) is not None
+
+
 def _sensor_of(path: str) -> str:
     """The sensor a mosaic store path holds, from its name."""
     return _STORES[path.rstrip("/").rsplit("/", 1)[-1].removesuffix(".zarr")]
