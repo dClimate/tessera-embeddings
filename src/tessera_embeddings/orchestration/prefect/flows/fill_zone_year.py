@@ -99,6 +99,7 @@ def fill_zone_year_flow(
     paths: BucketPaths,
     ami_ssm_name: str,
     ami_id: str | None = None,
+    env_image_uri: str | None = None,
     ami_ssm_name_by_model: dict[str, str] | None = None,
     time_window_end: str | None = None,
     store_name: str = "tessera",
@@ -138,6 +139,8 @@ def fill_zone_year_flow(
             ``ami_ssm_name`` — so a mid-campaign re-bake can't run new code under a fingerprint
             that recorded the old image. ``None`` (direct calls) resolves ``ami_ssm_name`` at
             provisioning.
+        env_image_uri: Pre-resolved environment image URI, pinned for the same reason.
+            ``None`` reads the deployment's pointer once at provisioning.
         ami_ssm_name_by_model: Per-model overrides of ``ami_ssm_name``. The entry for the model
             the store holds replaces ``ami_ssm_name``; a model on its own worker image (v1.1) without
             one is refused (ADR 025).
@@ -463,6 +466,7 @@ def fill_zone_year_flow(
             log,
             ami_ssm_name=ami_ssm_name,
             ami_id=ami_id,
+            env_image_uri=env_image_uri,
             ssm_prefix=ssm_prefix,
             cloudwatch_log_group=cloudwatch_log_group,
             code_bucket=code_bucket,

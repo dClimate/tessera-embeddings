@@ -88,6 +88,7 @@ def wired(monkeypatch):
     monkeypatch.setattr(mod, "_resolve_code_identity", lambda *a: "ami=ami-test")
     # Same for the AMI pointer, which an unpinned (direct, non-campaign) run resolves.
     monkeypatch.setattr(mod, "_resolve_ami_id", lambda *a: "ami-resolved")
+    monkeypatch.setattr(mod, "_resolve_env_image_uri", lambda *a: "s3://b/ray-env-images/env-resolved.img")
 
     def fake_sequential(**kwargs):
         rec["seq_kwargs"] = kwargs
@@ -435,12 +436,15 @@ def test_cluster_gets_idle_timeout_and_code_params(wired):
     assert wired["ray_kwargs"]["code_suffix"] == "-branch"
 
 
-def test_pinned_ami_id_reaches_ray_cluster(wired):
-    """A campaign-pinned ami_id is threaded into the shared cluster's ray_cluster,
-    so the fleet boots the exact image this flow's staging fingerprint recorded.
+@pytest.mark.parametrize(
+    ("kwarg", "value"), [("ami_id", "ami-pinned-01"), ("env_image_uri", "s3://b/ray-env-images/env-pinned.img")]
+)
+def test_campaign_pins_reach_ray_cluster(wired, kwarg, value):
+    """A campaign-pinned AMI or environment image is threaded into the shared cluster's
+    ray_cluster, so the fleet boots exactly what this flow's staging fingerprint recorded.
     """
-    _run(ami_id="ami-pinned-01")
-    assert wired["ray_kwargs"]["ami_id"] == "ami-pinned-01"
+    _run(**{kwarg: value})
+    assert wired["ray_kwargs"][kwarg] == value
 
 
 @pytest.mark.parametrize("model", ["v1.1", "v2-large"])

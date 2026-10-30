@@ -572,6 +572,22 @@ def test_the_ami_is_still_pinned_even_though_it_no_longer_fingerprints(wired, mo
     assert _dep(wired, "fill-zones-sequential")[1]["ami_id"] == "ami-test", "and pinned into the fill"
 
 
+def test_the_environment_image_is_pinned_like_the_ami(wired, monkeypatch):
+    """The environment image is resolved once and pinned into the fill, as the AMI is.
+
+    The nodes' Python and dependencies live in the image, not the AMI, so a dependency change
+    merged mid-campaign repoints the deployment's pointer; without the pin, later fills would
+    run a different environment. Resolved in the provisioning region, like the AMI.
+    """
+    calls: list = []
+    uri = "s3://code-bkt/ray-env-images/env-1.img"
+    monkeypatch.setattr(mod, "_resolve_env_image_uri", lambda *a: calls.append(a) or uri)
+    monkeypatch.setattr(mod, "_resolve_tarball_identity", lambda *a: "tarball=etag")
+    _campaign(code_bucket="code-bkt", code_suffix="-x", s3_region="eu-west-1")
+    assert calls == [("code-bkt", "-x", None)]
+    assert _dep(wired, "fill-zones-sequential")[1]["env_image_uri"] == uri
+
+
 class TestValidationDeploymentForwarding:
     """An explicit validator reaches the chained fill; an absent one is left ALONE.
 
