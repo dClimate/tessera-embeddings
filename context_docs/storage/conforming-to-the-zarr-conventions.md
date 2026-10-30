@@ -88,7 +88,7 @@ spec forbids, so registering it would not validate.
 
 **`geoemb:spatial_layout` is written only where it is true.** The schema allows two values:
 `"utm_zones"`, defined as 60 groups named `utm01` to `utm60`, and `"global"`, one array in a global
-CRS. A store in the `utm_zones` layout (v2 onward, [ADR 034](../decisions/034-v2-stores-use-the-utm-zones-layout.md))
+CRS. A store in the `utm_zones` layout (v2 onward, [ADR 037](../decisions/037-v2-stores-use-the-utm-zones-layout.md))
 declares the first on its root. Each of its groups is a full column in the northern CRS, with the
 south as negative northings, as in the convention's own TESSERA example. A hemisphere-layout store
 (120 groups named `01N` to `60S`, [ADR 011](../decisions/011-campaign-zone-ingestion.md)) and a

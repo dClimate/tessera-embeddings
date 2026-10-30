@@ -478,7 +478,7 @@ _V2_LARGE_ARCH = ModelArch(
 # comparison written while there were two models silently routes a third one to the wrong side;
 # a record without a field cannot be constructed.
 
-#: How a global store divides the world into zone groups (ADR 034). ``"hemispheres"``: 120 groups
+#: How a global store divides the world into zone groups (ADR 037). ``"hemispheres"``: 120 groups
 #: ``01N``..``60S``, each in its hemisphere's own EPSG code. ``"utm_zones"``: the geoembeddings
 #: layout, 60 groups ``utm01``..``utm60``, each in its northern EPSG code with the south as
 #: negative northings.

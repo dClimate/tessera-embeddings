@@ -27,7 +27,7 @@ campaign's own, which it rewrites and sweeps (:meth:`BucketPaths.update_root`).
 **What the store records.** Each cell an update lands in gains one entry in its zone group's
 ``updates`` attr, per year an append-only list of records naming the update, its run, its code,
 the depth rule it applied (``optical_min_obs``) and the shards it ``written``/``kept``/``cleared``
-— and, for a column half of a ``utm_zones`` store (ADR 036), the ``half`` it covered.
+— and, for a column half of a ``utm_zones`` store (ADR 038), the ``half`` it covered.
 ``years_complete``, ``runs`` and the zone-year tags stay exactly as the original fill left them,
 so a cell's state is ``runs[year]`` with ``updates[year]`` applied on top, in order.
 ``update-<name>-base`` pins the store before an update's first write and ``update-<name>-complete``
@@ -430,7 +430,7 @@ def check_no_tightening(
 
 
 def update_state(node: zarr.Group, year: int, name: str, half: Half | None = None) -> UpdateState:
-    """Where update ``name`` stands on one cell: a group's year, or one column half of it (ADR 036).
+    """Where update ``name`` stands on one cell: a group's year, or one column half of it (ADR 038).
 
     ``not_complete`` when the year was never filled: an update is an insert into existing data,
     and an unfilled year is the campaign's to fill. A half's update records carry its ``half``,
@@ -484,7 +484,7 @@ def update_record(
 ) -> dict[str, Any]:
     """One cell's record of an update: what it wrote, what it kept, under which depth rule and with which code.
 
-    ``half`` is the column half the cell is, in a ``utm_zones`` store (ADR 036).
+    ``half`` is the column half the cell is, in a ``utm_zones`` store (ADR 038).
 
     ``optical_min_obs`` is the line the update judged its pixels against (``None``: no rule), which
     differs from the original fill's when the plan set a looser one.

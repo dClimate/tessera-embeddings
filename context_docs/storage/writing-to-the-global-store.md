@@ -338,10 +338,10 @@ the guard was narrowed to the shards being written; see "Two writers in one grou
 of the benefit and is not possible today, because `rebase` accepts no target snapshot. That is a
 second reason to want the upstream fix.
 
-### Two writers in one group (ADR 036)
+### Two writers in one group (ADR 038)
 
 The guard was written GROUP-wide on the premise that the campaign's concurrent writers are other
-zones. ADR 036 broke that premise: a v2 column is filled as two halves at once, into one group. The
+zones. ADR 038 broke that premise: a v2 column is filled as two halves at once, into one group. The
 other half's shard commit, or its attrs-only "empty" mark (most columns are mostly ocean in one
 hemisphere), would latch the block above for the rest of the fill, which is the deep walk this
 section exists to prevent.
@@ -917,7 +917,7 @@ the whole consequence. There is no correctness cliff at 16, or anywhere up to 12
 `RebaseFailedError` needs a genuine chunk conflict, and commits touch disjoint zone GROUPS even while
 sharing a branch tip. The same-zone case that could conflict is serialised elsewhere: the driver
 partitions zones across clusters, a cluster's trailing assembly is single-threaded, and
-`commit_year_attrs` carries its own `tries=8` retry for exactly that collision. (Since ADR 036 the
+`commit_year_attrs` carries its own `tries=8` retry for exactly that collision. (Since ADR 038 the
 two halves of a v2 column share a group on different clusters by design. Their shards are disjoint,
 so that retry is the only interaction.)
 

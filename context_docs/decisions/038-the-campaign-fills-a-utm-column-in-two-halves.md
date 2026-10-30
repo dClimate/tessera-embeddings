@@ -1,9 +1,9 @@
 # 036 — The campaign fills a `utm` column in two halves
 
-**Status:** Proposed 2026-10-28. Builds on [ADR 034](034-v2-stores-use-the-utm-zones-layout.md),
+**Status:** Proposed 2026-10-28. Builds on [ADR 037](037-v2-stores-use-the-utm-zones-layout.md),
 which made a v2 store 60 full-column groups, `utm01` to `utm60`.
 
-ADR 034 changed the store's groups, and with them the campaign's unit of work: one column-year is
+ADR 037 changed the store's groups, and with them the campaign's unit of work: one column-year is
 roughly a v1.1 northern zone-year and a southern one together. The campaign hands zones to
 clusters densest-first, so 60 coarser units per year balance the clusters less evenly than v1.1's
 120. This decision keeps the store's layout and splits the *work* back into halves: the campaign
@@ -29,7 +29,7 @@ row 889  ┴ northing −8,888,320
 ```
 
 Each half therefore writes a set of shards the other never touches. This is not the alternative
-ADR 034 rejected: that one kept v1.1's southern grid, which is 10,000 km of false northing away,
+ADR 037 rejected: that one kept v1.1's southern grid, which is 10,000 km of false northing away,
 a whole number of pixels but not of shards, so its shards straddled the column's. Both halves here
 use the column's own grid.
 
@@ -87,7 +87,7 @@ Structural changes and coordinate-array chunks still block, and the commit's reb
 
 ## 3. Rejected alternatives
 
-- **Fill whole columns.** This is what ADR 034 shipped. It gives 60 units of about twice the size,
+- **Fill whole columns.** This is what ADR 037 shipped. It gives 60 units of about twice the size,
   and the campaign's cluster balance is set over those units.
 - **Separate groups per half.** This would bring back 120 groups, which the `utm_zones` layout
   exists to avoid; readers following the convention look for `utm33`.
@@ -114,4 +114,4 @@ Structural changes and coordinate-array chunks still block, and the commit's reb
 - **Not yet run anywhere.** The unit tests fill both halves of a miniature column end to end and
   exercise the catch-up against a real repository. A v2 dev run straddling the equator should
   confirm the split, the master merge and the catch-up at scale, alongside the 327xx → 326xx warp
-  that ADR 034 left to measure.
+  that ADR 037 left to measure.

@@ -22,7 +22,7 @@ Contracts (all caller-owned):
   and shard size are the grid authority. Nothing is created or resized here (D1).
 - **Ingest mosaics**: cover the zone grid exactly; a mismatch is a loud error.
 - **Concurrent fills**: fills of different zones commit to disjoint groups. Fills that share
-  a group — two years of one zone, or the two halves of a ``utm_zones`` column (ADR 036),
+  a group — two years of one zone, or the two halves of a ``utm_zones`` column (ADR 038),
   which address their group through :func:`~tessera_embeddings.storage.zone_grid.group_and_half`
   — write disjoint shards, and their year attrs commit separately and retry
   (:func:`~tessera_embeddings.storage.shard_writer.commit_year_attrs`). Only the same cell
@@ -457,7 +457,7 @@ def fill_zone_year(
 
     Args:
         store_path: URI of the global Icechunk repo (``BucketPaths.global_store()``).
-        zone: Zone group name, e.g. ``"utm33"`` or ``"01N"`` (ADR 034).
+        zone: Zone group name, e.g. ``"utm33"`` or ``"01N"`` (ADR 037).
         year: Campaign calendar year — must be on the group's pre-allocated axis.
         land_mask_path: Partner-supplied boolean zarr on the zone pixel grid.
         mosaic_base: Base path of the zone's ingest mosaic stores.

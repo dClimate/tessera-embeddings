@@ -1,4 +1,4 @@
-"""Seed the UTM-zone groups of the global embeddings store (ADR-008 D1, ADR-034).
+"""Seed the UTM-zone groups of the global embeddings store (ADR-008 D1, ADR-037).
 
 Metadata-only and cluster-less: it runs entirely on the flow runner, because a zone
 group is a handful of schema arrays with no chunk data and so costs the same at any
@@ -57,7 +57,7 @@ def seed_global_store(
             one place a global store's model is chosen. Its checkpoint, stamped as
             ``checkpoint_id``, is the model's own (:func:`checkpoint_filename`), the one every
             fill runs. A new store also takes the model's zone layout — ``utm01``…``utm60``
-            for v2 onward, ``01N``…``60S`` for v1.1 (ADR 034); an existing store keeps its own.
+            for v2 onward, ``01N``…``60S`` for v1.1 (ADR 037); an existing store keeps its own.
         optical_min_obs: Minimum valid optical observations for a pixel to be embedded,
             stamped on the root as part of its write-once identity. **Deliberately has no
             default and is not read from the config constant**: it decides what the product
@@ -185,7 +185,7 @@ def seed_global_store(
             f"freshly seeded store."
         )
 
-    # A new store takes its model's zone layout; one already seeded keeps its own (ADR 034), the
+    # A new store takes its model's zone layout; one already seeded keeps its own (ADR 037), the
     # same rule as its Y/X names, so extending a store never mixes the two grids.
     all_zones = zones(zone_layout_of(seeded) or model_family(model_version).zone_layout)
     todo = [spec for zone_name, spec in all_zones.items() if zone_name not in seeded]

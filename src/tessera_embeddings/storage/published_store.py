@@ -271,7 +271,7 @@ def committed_runs(attrs: Mapping[str, Any], year: int, writes: Sequence[Commit]
     nothing can afterwards. A targeted update records itself in the same shape beside the fill, in
     ``updates[year]`` (``storage.update``), so its expired commits are found the same way.
     """
-    current = year_runs(attrs.get("runs"), year)  # one record, or one per column half (ADR 036)
+    current = year_runs(attrs.get("runs"), year)  # one record, or one per column half (ADR 038)
     replaced = [entry for head in current for entry in head.get("previous", [])]
     current += (attrs.get("updates") or {}).get(str(year), [])
     tagged = {commit.snapshot for commit in writes}

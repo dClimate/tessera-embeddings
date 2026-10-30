@@ -54,10 +54,10 @@ orchestration/prefect/
 
 The global 10 m embeddings campaign (ADR-008) has its own four flows, distinct
 from the single-ROI path above. A store's zones are 60 `utm01`…`utm60` columns
-from v2 on, or 120 `01N`…`60S` hemisphere zones for v1.1 (ADR 034): the seed
+from v2 on, or 120 `01N`…`60S` hemisphere zones for v1.1 (ADR 037): the seed
 takes the model's layout, and `build_land_mask` and `export_zone_rois` take it
 as `zone_layout`. The campaign fills a v2 column as two halves, `utm01n`…`utm60s`,
-so it has 120 units a year either way (ADR 036): mask groups, mosaics, flow
+so it has 120 units a year either way (ADR 038): mask groups, mosaics, flow
 parameters and zone-year tags use the half's name.
 
 ```text
@@ -319,7 +319,7 @@ current mask through the campaign's own partitioner.
 Zone-parallelism is safe because inference is independent across zones, and fills
 that share a group write disjoint shards and retry their small attrs commit
 (`commit_year_attrs`). That covers two years of one zone and the two halves of a
-v2 column, which routinely land on different clusters (ADR 036). The partition is
+v2 column, which routinely land on different clusters (ADR 038). The partition is
 over ZONES, so all of a zone's years land in one cluster on its single
 trailing-assembly thread. **Commits are ungated.**
 They contend on the branch-tip CAS, since all 120 zone groups share one repo, but

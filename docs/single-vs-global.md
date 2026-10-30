@@ -415,7 +415,7 @@ You do not need any of this to read the store. It is here because the layout is 
 job this size possible at all, and because two of the choices are visible to a consumer.
 
 **Zones come in two layouts, and the model picks one for a new store**
-([ADR 034](../context_docs/decisions/034-v2-stores-use-the-utm-zones-layout.md)). From v2 on, a
+([ADR 037](../context_docs/decisions/037-v2-stores-use-the-utm-zones-layout.md)). From v2 on, a
 store uses the geoembeddings `utm_zones` layout, as the Source Coop copy, AlphaEarth and OlmoEarth
 do: 60 groups, `utm01` to `utm60`, each a full column in its northern EPSG code (326xx), with the
 southern hemisphere as negative northings. Such a store says so in `geoemb:spatial_layout`. v1.1
@@ -438,7 +438,7 @@ into `"07S"`. The two grids share every pixel but not their shard boundaries sou
 equator, so a `utm_zones` store needs its own land mask and its own mosaics.
 
 **The campaign fills a column as two halves**, `utm33n` and `utm33s`
-([ADR 036](../context_docs/decisions/036-the-campaign-fills-a-utm-column-in-two-halves.md)), so it
+([ADR 038](../context_docs/decisions/038-the-campaign-fills-a-utm-column-in-two-halves.md)), so it
 still has 120 units of work a year, each about a v1.1 zone-year. The equator falls on a shard
 boundary, so the halves write disjoint shards of the one `utm33` group and can run at once. Each
 has its own mask group, mosaics and zone-year tag. The group records each half's year in

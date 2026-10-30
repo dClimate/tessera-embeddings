@@ -38,7 +38,7 @@ from tessera_embeddings.orchestration.runners.zone_fill import zone_live_tile_co
 from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
 from tessera_embeddings.storage.zone_grid import zones
 
-#: The mask this reads is on the v1.1 campaign's grid (ADR 034).
+#: The mask this reads is on the v1.1 campaign's grid (ADR 037).
 ZONES = zones("hemispheres")
 
 

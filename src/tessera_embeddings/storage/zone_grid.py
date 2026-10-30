@@ -1,4 +1,4 @@
-"""The UTM-zone grids for the global embeddings store (ADR-008, ADR-034).
+"""The UTM-zone grids for the global embeddings store (ADR-008, ADR-037).
 
 The world is one Icechunk repo of zone groups, each in its own CRS, in one of two
 layouts (:data:`~tessera_embeddings.config.inference.ZoneLayout`). A new store takes its
@@ -16,7 +16,7 @@ A zone name says which layout it belongs to, so every zone resolves through one
 number of pixels but not of shards, so the two grids share pixels and disagree on shard
 boundaries.
 
-**The campaign fills a column in two halves (ADR 036).** ``utm33n`` and ``utm33s`` are the
+**The campaign fills a column in two halves (ADR 038).** ``utm33n`` and ``utm33s`` are the
 work units for group ``utm33``: each has the column's whole grid but owns only the shard rows
 on its side of the equator, which falls on a shard boundary. :func:`zones` lists the store's
 groups; :func:`fill_zones` lists the units the campaign fills, which in the ``hemispheres``
@@ -207,7 +207,7 @@ def group_and_half(name: str) -> tuple[str, Half | None]:
 
     ``"utm33s"`` → ``("utm33", "s")``; any other name — a group, or a single-area store's ``""``
     — is its own group, whole. The one mapping from a fill zone to what it addresses in the store,
-    where a column's two halves share one group (ADR 036).
+    where a column's two halves share one group (ADR 038).
     """
     spec = _FILL_ZONES_BY_LAYOUT["utm_zones"].get(name)
     return (spec.group_name, spec.half) if spec else (name, None)

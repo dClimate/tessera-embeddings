@@ -145,11 +145,11 @@ def export_zone_rois(
         paths: Deployment storage contract. Masks are written to
             ``paths.zone_roi_store(zone)`` — the same path the ingest reads.
         zones: Zone names (e.g. ``["33N", "35N"]`` or ``["utm33n", "utm33s"]``). Defaults to every
-            fill zone of ``zone_layout`` — each column's two halves in ``utm_zones`` (ADR 036).
+            fill zone of ``zone_layout`` — each column's two halves in ``utm_zones`` (ADR 038).
             The all-ocean ones cost one bitmap read and are reported as such rather than
             excluded up front, so the land-zone count is an output of the run and not a
             hardcoded constant.
-        zone_layout: Which zone grid ``zones=None`` means (ADR 034): ``"hemispheres"`` for the
+        zone_layout: Which zone grid ``zones=None`` means (ADR 037): ``"hemispheres"`` for the
             v1.1 stores, ``"utm_zones"`` for v2 onward.
         mask_name: Land-mask coverage repo basename.
         max_parallel_zones: Zones in flight at once.

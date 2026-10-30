@@ -1,4 +1,4 @@
-"""Zone grids: both layouts, shard-aligned, pinned to the EPSG registry (ADR 034), filled by halves (ADR 036)."""
+"""Zone grids: both layouts, shard-aligned, pinned to the EPSG registry (ADR 037), filled by halves (ADR 038)."""
 
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ def test_column_shares_pixels_not_shards_with_the_southern_zone():
 
 
 def test_a_column_is_filled_as_two_halves_split_on_a_shard_row():
-    # ADR 036: the equator (northing 0 in 326xx) falls on a shard boundary, so the halves own
+    # ADR 038: the equator (northing 0 in 326xx) falls on a shard boundary, so the halves own
     # disjoint shard rows that together are the column, each on the column's own grid.
     col, north, south = zg.zone("utm10"), zg.zone("utm10n"), zg.zone("utm10s")
     assert (north.name, north.group_name, south.name, south.group_name) == ("utm10n", "utm10", "utm10s", "utm10")

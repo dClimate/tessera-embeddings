@@ -30,7 +30,7 @@ every zone-year infers in minutes, can hold the request for a backlog with
 
 **Scheduling (ADR-008 D6 + the runner contract).** Inference is parallel across zones; only
 commits contend. Fills that share a group write disjoint shards and retry their attrs commit,
-so they are safe together — the two halves of a ``utm_zones`` column (ADR 036) are separate
+so they are safe together — the two halves of a ``utm_zones`` column (ADR 038) are separate
 zones here and routinely land on different clusters. By default (``overlap_years``) every
 requested year is ONE batch partitioned by ZONE, so a zone's years all land in one cluster and
 serialize on its single trailing assembly thread. ``overlap_years=False`` restores the

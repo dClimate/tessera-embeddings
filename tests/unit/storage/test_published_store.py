@@ -474,7 +474,7 @@ class TestWhoWroteAYear:
         ]
 
     def test_each_half_of_a_column_year_is_its_own_run(self):
-        """ADR 036: a column's halves record one run each, and a half's refill keeps its own history."""
+        """ADR 038: a column's halves record one run each, and a half's refill keeps its own history."""
         north, south, refill = (
             {"snapshot": s, "committed_at": f"2026-0{m}-01T00:00:00+00:00"} for s, m in (("n", 7), ("s", 8), ("r", 9))
         )

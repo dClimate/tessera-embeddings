@@ -1114,7 +1114,7 @@ class TestDiffTouches:
         ],
     )
     def test_given_its_shards_only_a_collision_is_ours(self, diff, touched):
-        # ADR 036: the other half of a column fills the same group at once, writing other shards
+        # ADR 038: the other half of a column fills the same group at once, writing other shards
         # and marking itself in the group's attrs. Neither can collide with a shard-only session.
         assert session_catch_up._diff_touches(diff, "01N", {(0, 1, 0)}) is touched
         assert session_catch_up._diff_touches(_FakeDiff(chunks=["/01N/embeddings"]), "01N", {(0, 0, 0)})
@@ -1187,7 +1187,7 @@ class TestCatchUpToBranch:
             session.commit("fill 01N", rebase_with=icechunk.ConflictDetector())
 
     def test_given_its_shards_it_advances_past_the_other_half_of_its_group(self, tmp_path):
-        """ADR 036: two halves fill one group at once; each must keep catching up past the other.
+        """ADR 038: two halves fill one group at once; each must keep catching up past the other.
 
         The other half writes shard (0, 0) and marks itself complete; this session owns shard
         (1, 0). The catch-up advances past both commits, and the commit that follows still

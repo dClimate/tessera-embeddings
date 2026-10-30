@@ -282,7 +282,7 @@ def test_fill_zone_year_end_to_end(tmp_path, monkeypatch):
 
 
 def test_a_columns_two_halves_fill_one_group(tmp_path, monkeypatch):
-    """ADR 036: each half writes only its own tiles of the column's group; the year completes with the second."""
+    """ADR 038: each half writes only its own tiles of the column's group; the year completes with the second."""
     store = str(tmp_path / "global.icechunk")
     column = ZoneSpec("32601", None, 1, _SPEC.easting, _SPEC.northing)
     global_store.seed_zone_groups(global_store.create_global_repo(store), [column], years=_YEARS, layout=SMALL)

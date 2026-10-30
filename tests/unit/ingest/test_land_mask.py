@@ -59,7 +59,7 @@ def test_zone_for_cell_matches_delivery_samples() -> None:
     assert land_mask.zone_for_cell(179.95, 0.05) == "60N"
     assert land_mask.zone_for_cell(0.05, 0.05) == "31N"
     assert land_mask.zone_for_cell(0.05, -0.05) == "31S"
-    # A utm_zones column is filled in halves, split at the equator (ADR 036).
+    # A utm_zones column is filled in halves, split at the equator (ADR 038).
     assert (land_mask.zone_for_cell(0.05, 0.05, "utm_zones"), land_mask.zone_for_cell(0.05, -0.05, "utm_zones")) == (
         "utm31n",
         "utm31s",
@@ -97,7 +97,7 @@ def test_build_zone_coverage_consistency_and_or() -> None:
 
 
 def test_column_halves_split_the_column_coverage_exactly() -> None:
-    """ADR 036: the halves are the column's coverage cut at the equator — together all of it, sharing no shard.
+    """ADR 038: the halves are the column's coverage cut at the equator — together all of it, sharing no shard.
 
     Cells hug the equator from both sides, so a footprint crossing it is the case that matters.
     """

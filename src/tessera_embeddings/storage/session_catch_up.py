@@ -99,7 +99,7 @@ def _diff_touches(diff: icechunk.Diff, group: str, shards: Collection[tuple[int,
     the group is skipped only when it touched none of those shards and changed nothing of the
     group but its attributes: exactly the commits icechunk's own conflict check accepts. The
     shard writer passes them because the two halves of a column fill one group at once
-    (ADR 036), and a sibling's commit — its shards, or its attrs-only completion mark — would
+    (ADR 038), and a sibling's commit — its shards, or its attrs-only completion mark — would
     otherwise block the other half's catch-up for the rest of its write. Every per-tile array
     holds one shard per tile in its first three coordinates (the reading
     ``published_store.commit_tiles`` relies on too); a chunk with fewer, a coordinate array's,

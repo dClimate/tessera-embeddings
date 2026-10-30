@@ -512,7 +512,7 @@ def build_convention_attrs(
 
     ``geoemb:spatial_layout`` is not written here: it describes how a store divides into groups,
     which this per-group builder cannot see. The global-store seed writes ``"utm_zones"`` on the
-    root of a store in that layout (ADR 034); a hemisphere-layout store and a single ROI match
+    root of a store in that layout (ADR 037); a hemisphere-layout store and a single ROI match
     neither value the schema allows, so they omit it.
 
     *include_geoemb* False emits only ``proj:``/``spatial:``: the multi-group campaign store

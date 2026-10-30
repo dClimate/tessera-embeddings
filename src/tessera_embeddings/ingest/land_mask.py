@@ -218,7 +218,7 @@ def build_zone_coverage(zone: str, lons: np.ndarray, lats: np.ndarray) -> ZoneCo
     from the same clamped pixel box via ``ceil(ceil(x/256)/8) == ceil(x/2048)``, which is
     what makes ``tile_live == 8x8-block-any(chunk_live)`` hold globally.
 
-    **A column half (ADR 036) takes its whole column's cells**, so a footprint that crosses
+    **A column half (ADR 038) takes its whole column's cells**, so a footprint that crosses
     the equator still sets its bits, then keeps only the bits on its own shard rows and counts
     only the cells centred on its side. The two halves are therefore exactly the column's
     coverage, split at a shard boundary, and never share a shard.

@@ -423,7 +423,7 @@ Alongside per-area stores, the library ships the storage layout and the write pa
 pre-allocated with a 2017–2025 annual time axis and filled one (zone, year) at a time. From v2 on
 the groups are the 60 columns `utm01`–`utm60`, the geoembeddings `utm_zones` layout that the Source
 Coop copy uses; v1.1 stores have 120, named by hemisphere (`01N`–`60N`, `01S`–`60S`). See
-[ADR 034](context_docs/decisions/034-v2-stores-use-the-utm-zones-layout.md). The published result is **global
+[ADR 037](context_docs/decisions/037-v2-stores-use-the-utm-zones-layout.md). The published result is **global
 TESSERA v1.1** at `s3://tessera-embeddings/v1.1/dclimate.icechunk/`, and it is readable
 without an AWS account.
 
@@ -450,7 +450,7 @@ one Icechunk repo (BucketPaths.global_store())
 
 `run_global_campaign` drives the fill year-serial with bounded zone parallelism and
 triggers its own ingestion (ADR-011). It fills each `utm` column as two halves, `utm01n` …
-`utm60s`, split on the equator's shard boundary (ADR 036); `orchestration/runners/zone_fill.py` is the
+`utm60s`, split on the equator's shard boundary (ADR 038); `orchestration/runners/zone_fill.py` is the
 end-to-end (zone, year) callable, and `storage/campaign.py` holds the per-cell tags,
 snapshot expiry and the zone×year progress reader. The
 [Prefect flow README](src/tessera_embeddings/orchestration/prefect/README.md) documents

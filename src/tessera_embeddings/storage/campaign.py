@@ -10,7 +10,7 @@ The bookkeeping around the shard-writer fills (ADR-008 D7). Three concerns:
   multi-zone campaign.
 - **Progress** (`campaign_status`) reads each zone group's ``years_complete`` attr — and a
   column's ``halves_complete``, since the campaign fills a ``utm_zones`` column as two halves
-  (ADR 036) — into a resume-oriented view: what is done, what is still pending.
+  (ADR 038) — into a resume-oriented view: what is done, what is still pending.
 
 That attr is advanced by :func:`tessera_embeddings.storage.shard_writer.write_year_shards` in the
 same commit as the data (D1), so status is always consistent with what has actually landed. The
@@ -178,7 +178,7 @@ def mark_zone_year_empty(
 ) -> str:
     """Mark a ``(zone, year)`` complete with **no data** — an all-ocean cell.
 
-    ``zone`` is a fill zone: a group, or a column half (ADR 036), which marks only its half.
+    ``zone`` is a fill zone: a group, or a column half (ADR 038), which marks only its half.
 
     Some zones (and some zone-years under the partner land mask) contain no land at
     all, so there is nothing to stage or shard-write — but the campaign work list
@@ -274,7 +274,7 @@ class CampaignStatus:
         return sum(len(v) for v in self.zones.values())
 
     def campaign_zones(self) -> tuple[str, ...]:
-        """The full campaign: every fill zone of the layout this store's groups use (ADR 034, 036)."""
+        """The full campaign: every fill zone of the layout this store's groups use (ADR 037, 038)."""
         layout = zone_layout_of(self.zones)
         if layout is None:
             raise ValueError("the store has no zone groups, so it has no layout yet — seed it first.")

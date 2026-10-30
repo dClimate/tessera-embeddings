@@ -559,7 +559,7 @@ def run_forked(
 
 
 #: The snapshot-metadata key on every shard commit a run makes: ``{"run_id", "zone", "year"}``, plus
-#: ``"half"`` for a column half (ADR 036); ``zone`` is always the group. Read
+#: ``"half"`` for a column half (ADR 038); ``zone`` is always the group. Read
 #: back by :func:`~tessera_embeddings.storage.published_store.shard_writes`.
 SHARD_WRITE = "shard_write"
 
@@ -575,7 +575,7 @@ def read_years_complete(node: zarr.Group) -> list[int]:
     return sorted(int(y) for y in raw) if isinstance(raw, list) else []
 
 
-#: A ``utm_zones`` column's two fill halves (ADR 036).
+#: A ``utm_zones`` column's two fill halves (ADR 038).
 HALVES: tuple[Half, ...] = ("n", "s")
 #: Group attr ``{"<year>": ["n", "s"]}``: which halves of a column have landed each year.
 HALVES_COMPLETE = "halves_complete"
@@ -617,7 +617,7 @@ def run_provenance(
 ) -> dict:
     """Merge a per-year run record into a group's ``runs`` attr (the schema's one owner).
 
-    A column's two halves each write the year (ADR 036), so for a ``half`` the year holds one
+    A column's two halves each write the year (ADR 038), so for a ``half`` the year holds one
     record per half, ``runs[year] = {"n": record, "s": record}``, each with its own history;
     :func:`year_runs` reads either shape.
 
@@ -732,7 +732,7 @@ def commit_year_attrs(
     The single writer of those attrs, and the reason concurrent fills of the SAME
     zone group are safe.
 
-    **A column half (ADR 036)** marks itself in ``halves_complete[year]`` and writes its own
+    **A column half (ADR 038)** marks itself in ``halves_complete[year]`` and writes its own
     ``runs[year][half]``; the year enters ``years_complete`` only with the second half, so every
     reader of ``years_complete`` still means "the whole group has this year". Both halves'
     marks go through the same loop, and each again inserts only its own key.
@@ -1002,7 +1002,7 @@ def write_year_shards(
     one function, there is nothing outside the process to aim a kill at, and a state
     documented as benign but never observed is an assumption.
 
-    ``half`` is the column half being filled (ADR 036): ``source`` holds only its shards, and the
+    ``half`` is the column half being filled (ADR 038): ``source`` holds only its shards, and the
     attrs commit marks only that half.
 
     ``commit_attrs(repo, group, year, commit)`` replaces the second commit, given the shard commit
@@ -1035,7 +1035,7 @@ def write_year_shards(
         # to walk every snapshot published during the write, and that walk is where seven of
         # nine assemblies stopped dead on 2026-08-29. See `catch_up_to_branch`.
         # Narrowed to this write's shards, so the other half of a column filling the same group
-        # (ADR 036) does not block it; see `_diff_touches`.
+        # (ADR 038) does not block it; see `_diff_touches`.
         catch_up=lambda: catch_up_best_effort(
             repo, session, group, shards={(year_index, sy, sx) for sy, sx in shards}, log=log
         ),
