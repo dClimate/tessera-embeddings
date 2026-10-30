@@ -136,7 +136,7 @@ def test_work_list_includes_complete_but_untagged(tmp_path):
     ("hemisphere", "layout", "unseeded"), [("N", "hemispheres", ("60N", 2023)), (None, "utm_zones", ("utm60", 2023))]
 )
 def test_work_list_defaults_to_every_zone_of_the_store_layout(tmp_path, hemisphere, layout, unseeded):
-    """`expected_zones=None` drives the whole globe in the store's own layout (ADR 034)."""
+    """`expected_zones=None` drives the whole globe in the store's own layout (ADR 037)."""
     specs = [ZoneSpec(f"3260{n}", hemisphere, n, (0.0, 5_120.0), (0.0, 10_240.0)) for n in (1, 2)]
     _, repo = _seed(tmp_path, zones=specs)  # only 2 zones seeded, but the default spans the layout
     status = campaign.campaign_status(repo, years=_YEARS)

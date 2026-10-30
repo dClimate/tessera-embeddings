@@ -58,7 +58,7 @@ def build_land_mask(
         zones: Restrict to these zone names, e.g. ``["33N", "07S"]`` or ``["utm33"]``
             (default: every zone of ``zone_layout``). NOT EPSG codes — ``zone_grid.zone()``
             keys on the name, so an ``"EPSG:32633"`` here raises ``KeyError``.
-        zone_layout: Which zone grid to build when ``zones`` is not given (ADR 034):
+        zone_layout: Which zone grid to build when ``zones`` is not given (ADR 037):
             ``"hemispheres"`` (the v1.1 stores) or ``"utm_zones"`` (v2 onward). A mask is
             keyed to one grid, so a ``utm_zones`` store needs a mask built this way.
         verify: Reconcile the registry against the bucket and spot-check delivery tiles

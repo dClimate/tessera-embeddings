@@ -149,7 +149,7 @@ def export_zone_rois(
             ``zone_layout``; the all-ocean ones cost one bitmap read and are reported as such rather
             than excluded up front, so the land-zone count is an output of the run and not a
             hardcoded constant.
-        zone_layout: Which zone grid ``zones=None`` means (ADR 034): ``"hemispheres"`` for the
+        zone_layout: Which zone grid ``zones=None`` means (ADR 037): ``"hemispheres"`` for the
             v1.1 stores, ``"utm_zones"`` for v2 onward.
         mask_name: Land-mask coverage repo basename.
         max_parallel_zones: Zones in flight at once.

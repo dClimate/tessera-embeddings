@@ -269,7 +269,7 @@ class CampaignStatus:
         return sum(len(v) for v in self.zones.values())
 
     def campaign_zones(self) -> tuple[str, ...]:
-        """The full campaign: every zone of the layout this store's groups use (ADR 034)."""
+        """The full campaign: every zone of the layout this store's groups use (ADR 037)."""
         layout = zone_layout_of(self.zones)
         if layout is None:
             raise ValueError("the store has no zone groups, so it has no layout yet — seed it first.")

@@ -54,7 +54,7 @@ orchestration/prefect/
 
 The global 10 m embeddings campaign (ADR-008) has its own four flows, distinct
 from the single-ROI path above. A store's zones are 60 `utm01`…`utm60` columns
-from v2 on, or 120 `01N`…`60S` hemisphere zones for v1.1 (ADR 034): the seed
+from v2 on, or 120 `01N`…`60S` hemisphere zones for v1.1 (ADR 037): the seed
 takes the model's layout, and `build_land_mask` and `export_zone_rois` take it
 as `zone_layout`.
 

@@ -1,4 +1,4 @@
-"""The UTM-zone grids for the global embeddings store (ADR-008, ADR-034).
+"""The UTM-zone grids for the global embeddings store (ADR-008, ADR-037).
 
 The world is one Icechunk repo of zone groups, each in its own CRS, in one of two
 layouts (:data:`~tessera_embeddings.config.inference.ZoneLayout`). A new store takes its

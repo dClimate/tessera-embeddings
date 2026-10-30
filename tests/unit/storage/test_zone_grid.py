@@ -1,4 +1,4 @@
-"""Zone grids: both layouts, shard-aligned, pinned to the EPSG registry (ADR 034)."""
+"""Zone grids: both layouts, shard-aligned, pinned to the EPSG registry (ADR 037)."""
 
 from __future__ import annotations
 

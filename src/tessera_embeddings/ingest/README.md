@@ -192,7 +192,7 @@ The S2 `min_valid_coverage` bar is lowered far below the ROI default (5 % → ~0
 solar-day's swath covers only a sliver of a whole 6° zone, so a high bar would drop nearly
 every date. Mosaics are per `(zone, year)` and deleted after the fill is tagged — they are
 re-derivable inputs at ~TB scale (ADR-011). Zones are named as the store's groups are, `utm33` in a
-v2 store or `33N`/`07S` in a v1.1 one, never by EPSG (ADR 034; see `storage/zone_grid.canonicalize_zone`).
+v2 store or `33N`/`07S` in a v1.1 one, never by EPSG (ADR 037; see `storage/zone_grid.canonicalize_zone`).
 
 #### Pre-generating the zone masks — `export-zone-rois`
 

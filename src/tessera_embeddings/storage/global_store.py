@@ -1,7 +1,7 @@
 """Global embeddings store: seed the zone groups; open/create the repo.
 
 The composition layer for the global campaign (ADR-008). One Icechunk repo holds
-one Zarr group per UTM zone — 60 ``utm`` columns or 120 hemisphere zones (ADR-034,
+one Zarr group per UTM zone — 60 ``utm`` columns or 120 hemisphere zones (ADR-037,
 :mod:`~tessera_embeddings.storage.zone_grid`); this module seeds them as pre-allocated,
 metadata-only empty stores — full 2017-2025 time axis, per-zone coordinates and
 CRS, ``GLOBAL`` sharded array schemas — so the campaign can then fill years as
@@ -579,7 +579,7 @@ def seed_zone_groups(
         model_version=model_version,
         optical_min_obs=optical_min_obs,
     )
-    # One store holds one zone layout (ADR 034): the groups it has and the ones requested must agree.
+    # One store holds one zone layout (ADR 037): the groups it has and the ones requested must agree.
     zone_layout = zone_layout_of([*root.group_keys(), *(spec.group_name for spec in specs)])
     stamped_now = "geoemb:model" not in root.attrs
     if stamped_now:

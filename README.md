@@ -423,7 +423,7 @@ Alongside per-area stores, the library ships the storage layout and the write pa
 pre-allocated with a 2017–2025 annual time axis and filled one (zone, year) at a time. From v2 on
 the groups are the 60 columns `utm01`–`utm60`, the geoembeddings `utm_zones` layout that the Source
 Coop copy uses; v1.1 stores have 120, named by hemisphere (`01N`–`60N`, `01S`–`60S`). See
-[ADR 034](context_docs/decisions/034-v2-stores-use-the-utm-zones-layout.md). The published result is **global
+[ADR 037](context_docs/decisions/037-v2-stores-use-the-utm-zones-layout.md). The published result is **global
 TESSERA v1.1** at `s3://tessera-embeddings/v1.1/dclimate.icechunk/`, and it is readable
 without an AWS account.
 
