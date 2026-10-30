@@ -318,7 +318,7 @@ def _staging_run_id(
     ``context_docs/storage/staging-identity-and-resume.md``.
 
     ``update`` names a targeted update, whose run must never share an id with another update's or
-    the campaign's: registry parts are named by run id, and the mosaic identity is content, so two
+    the campaign's: registry run files are named by run id, and the mosaic identity is content, so two
     runs on identical mosaics would otherwise publish over each other. ``None`` adds nothing, so
     campaign ids are unchanged.
     """

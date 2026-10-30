@@ -75,7 +75,7 @@ def _row(tile: str, *, measured: bool, **extra: Any) -> dict[str, Any]:
 
 
 #: One cell as v1.1 published it: two tiles the fill measured, two it left null.
-PARTS = [
+FILL_ROWS = [
     _row("chunk_0_0", measured=True),
     _row("chunk_0_1", measured=True),
     _row("chunk_1_0", measured=False),
@@ -83,8 +83,8 @@ PARTS = [
 ]
 
 
-def _seed(root: Path, rows: list[dict[str, Any]] = PARTS, run: str = "fill-1") -> None:
-    cell = root / "parts" / "zone=33N" / "year=2017"
+def _seed(root: Path, rows: list[dict[str, Any]] = FILL_ROWS, run: str = "fill-1") -> None:
+    cell = root / "runs" / "zone=33N" / "year=2017"
     cell.mkdir(parents=True, exist_ok=True)
     trimmed = [{field.name: row.get(field.name) for field in registry_schema()} for row in rows]
     pq.write_table(pa.Table.from_pylist(trimmed, schema=registry_schema()), cell / f"{run}.parquet")
@@ -97,7 +97,7 @@ def _seed_master(root: Path, *, radar: int | None) -> None:
         for t in ("chunk_1_0", "chunk_1_1")
     ]
     table = pa.Table.from_pylist(rebuilt, schema=master_schema())
-    fill = as_master_rows(pa.Table.from_pylist(PARTS, schema=master_schema()), MEASURED_BY_FILL)
+    fill = as_master_rows(pa.Table.from_pylist(FILL_ROWS, schema=master_schema()), MEASURED_BY_FILL)
     write_cell(LOCAL, str(root), "33N", 2017, merge(fill, as_master_rows(table, MEASURED_BY_REBUILD)), version=None)
 
 
@@ -123,7 +123,7 @@ def _repair(script: Any, root: Path, *flags: str) -> int:
 
 
 class TestRepair:
-    """Rebuilding a cell from its parts, its master rows and a fresh re-derivation."""
+    """Rebuilding a cell from its run files, its master rows and a fresh re-derivation."""
 
     def test_a_dry_run_writes_nothing(self, script: Any, store: zarr.Group, tmp_path: Path) -> None:
         """Every writing subcommand is a dry run without ``--write`` — the default has to be safe."""
@@ -154,10 +154,10 @@ class TestRepair:
         assert _repair(script, tmp_path, "--skip-radar", "--write") == 0
         assert _master(tmp_path)["chunk_1_0"]["px_with_any_radar"] == 123
 
-    def test_a_master_file_whose_last_part_was_withdrawn_is_emptied(
+    def test_a_master_file_whose_last_run_file_was_withdrawn_is_emptied(
         self, script: Any, store: zarr.Group, tmp_path: Path
     ) -> None:
-        """No part is left to list the cell, so the pass has to find it from the master file itself."""
+        """No run file is left to list the cell, so the pass has to find it from the master file itself."""
         _seed(tmp_path)
         withdrawn = pa.Table.from_pylist([_row("chunk_0_0", measured=True, year=2018)], schema=master_schema())
         write_cell(LOCAL, str(tmp_path), "33N", 2018, as_master_rows(withdrawn, MEASURED_BY_FILL), version=None)
@@ -170,12 +170,12 @@ class TestRepair:
     def test_a_cell_the_store_cannot_stand_behind_is_left_as_it_was(
         self, script: Any, store: zarr.Group, tmp_path: Path, null_rows: bool
     ) -> None:
-        """A store holding a run the registry has no part for: the parts no longer describe the cell.
+        """A store holding a run the registry has no run file for: the run files no longer describe the cell.
 
         Rewriting it would drop the measurements it holds, or, when nothing is null, report success on
         rows the store has moved past.
         """
-        _seed(tmp_path, PARTS if null_rows else [_row(row["tile"], measured=True) for row in PARTS])
+        _seed(tmp_path, FILL_ROWS if null_rows else [_row(row["tile"], measured=True) for row in FILL_ROWS])
         _seed_master(tmp_path, radar=None)
         before = (tmp_path / "master" / "zone=33N" / "year=2017" / "part-0.parquet").read_bytes()
         store.attrs["runs"] = {"2017": {"run_id": "a-refill-the-registry-never-saw", "assembled_at": FILLED}}
@@ -184,11 +184,11 @@ class TestRepair:
 
 
 @pytest.mark.parametrize("command", ["gate", "repair", "verify"])
-def test_a_registry_without_parts_fails_rather_than_passing_vacuously(
+def test_a_registry_without_run_files_fails_rather_than_passing_vacuously(
     script: Any, tmp_path: Path, command: str
 ) -> None:
     """A mistyped ``--registry`` must not read as an empty registry that every check passes."""
-    with pytest.raises(SystemExit, match="parts does not exist"):
+    with pytest.raises(SystemExit, match="runs does not exist"):
         script.main([command, "--registry", str(tmp_path / "typo")])
 
 
@@ -200,10 +200,10 @@ def test_a_zone_the_registry_does_not_hold_fails(script: Any, store: zarr.Group,
         script.main([command, "--registry", str(tmp_path), "--zones", "33N,99X"])
 
 
-def test_repair_reaches_a_zone_with_no_part_left(
+def test_repair_reaches_a_zone_with_no_run_file_left(
     script: Any, store: zarr.Group, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Every part of zone 34N was withdrawn, so only its master file names it, and ``--zones`` must still find it."""
+    """Every run file of zone 34N was withdrawn, so only its master file names it; ``--zones`` must still find it."""
     _seed(tmp_path)
     withdrawn = pa.Table.from_pylist([_row("chunk_0_0", measured=True, zone="34N")], schema=master_schema())
     write_cell(LOCAL, str(tmp_path), "34N", 2017, as_master_rows(withdrawn, MEASURED_BY_FILL), version=None)
@@ -227,7 +227,7 @@ def test_a_refill_that_never_published_blocks_only_while_it_holds_a_tile(
     refill_wrote: set[str],
     expected: int,
 ) -> None:
-    """A refill that died after its shard commit, so it published no part and never reached the year's
+    """A refill that died after its shard commit, so it published no run file and never reached the year's
     ``runs`` record, then an update that landed whole. Only the refill's tagged commit in the store's
     history shows it at all, and only its diff says whether a tile it wrote is still its own.
     """
@@ -250,7 +250,7 @@ def test_a_refill_that_never_published_blocks_only_while_it_holds_a_tile(
 
 
 class TestVerify:
-    """The master itself, checked against the parts it should describe."""
+    """The master itself, checked against the run files it should describe."""
 
     def test_a_sound_master_verifies(self, script: Any, store: zarr.Group, tmp_path: Path) -> None:
         _seed(tmp_path)
@@ -258,7 +258,7 @@ class TestVerify:
         assert script.main(["verify", "--registry", str(tmp_path)]) == 0
 
     @pytest.mark.parametrize("zones", [[], ["--zones", "35N"]], ids=["every-zone", "only-that-zone"])
-    def test_a_first_fill_whose_part_never_published_fails(
+    def test_a_first_fill_whose_run_file_never_published_fails(
         self,
         script: Any,
         store: zarr.Group,
@@ -267,7 +267,7 @@ class TestVerify:
         capsys: Any,
         zones: list[str],
     ) -> None:
-        """Its zone has no part and no master file, so only the store's tagged commit shows it, named or not."""
+        """Its zone has no run file and no master file, so only the store's tagged commit shows it, named or not."""
         _seed(tmp_path)
         _seed_master(tmp_path, radar=None)
         zone = zarr.open_group(str(tmp_path / "35N.zarr"), mode="w")
@@ -277,7 +277,7 @@ class TestVerify:
         monkeypatch.setattr(script, "_open_store", lambda *_args, **_kwargs: (None, root, lambda: writes))
         monkeypatch.setattr(published_store, "commit_tiles", lambda *_args: frozenset({"chunk_0_0"}))
         assert script.main(["verify", "--registry", str(tmp_path), *zones]) == 1
-        assert "35N/2017: the store cannot stand behind its parts: run 'first-fill'" in capsys.readouterr().out
+        assert "35N/2017: the store cannot stand behind its run files: run 'first-fill'" in capsys.readouterr().out
 
     @pytest.mark.parametrize(
         "damage",

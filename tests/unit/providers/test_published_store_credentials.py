@@ -27,7 +27,7 @@ from tessera_embeddings.providers.aws import credentials as creds_mod
 
 _OURS = "s3://global-tessera-embeddings/global-tessera/global/tessera.icechunk"
 _THEIRS = "s3://tessera-embeddings/v1.1/dclimate.icechunk"
-_THEIR_REGISTRY = "s3://tessera-embeddings/v1.1/dclimate.registry/parts/zone=16S/year=2021/r.parquet"
+_THEIR_REGISTRY = "s3://tessera-embeddings/v1.1/dclimate.registry/runs/zone=16S/year=2021/r.parquet"
 _ROLE = "arn:aws:iam::601791338954:role/TesseraDClimateWriterRole"
 
 
@@ -348,7 +348,7 @@ class TestTheWiringReachesTheStore:
     def test_the_registry_write_is_given_the_stores_credential(self) -> None:
         """The registry is a sibling of the store in the SAME bucket, so it needs the same role.
 
-        Asserted on the signature rather than by writing: `publish_registry_part` builds its
+        Asserted on the signature rather than by writing: `publish_registry_run_file` builds its
         filesystem from `plain_zarr_storage_options(uri, get_credentials, s3_region)`, and before
         this it called `_fs_for(uri)` bare — falling back to fsspec's ambient chain, which is the
         task role and cannot write there.
@@ -357,10 +357,10 @@ class TestTheWiringReachesTheStore:
 
         from tessera_embeddings.inference.assembly import ZarrWriter
 
-        params = inspect.signature(ZarrWriter.publish_registry_part).parameters
+        params = inspect.signature(ZarrWriter.publish_registry_run_file).parameters
         assert "get_credentials" in params and "s3_region" in params
 
-        src = inspect.getsource(ZarrWriter.publish_registry_part)
+        src = inspect.getsource(ZarrWriter.publish_registry_run_file)
         assert "plain_zarr_storage_options(uri, get_credentials, s3_region)" in src
         assert "_fs_for(uri)" not in src, "a bare _fs_for falls back to the ambient chain"
 

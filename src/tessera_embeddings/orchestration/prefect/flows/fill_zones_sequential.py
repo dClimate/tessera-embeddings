@@ -1485,9 +1485,9 @@ def fill_zones_sequential_flow(
                 store_path=store_path,
                 staging_base=prep.staging_base,
                 # The published registry's ROOT, derived from the STORE THIS RUN WRITES. Deriving
-                # it from the default repo name instead put this flow's parts beside
+                # it from the default repo name instead put this flow's run files beside
                 # `tessera.icechunk` while it filled `tessera-radar` (2026-08-19). Bucket
-                # conventions belong to BucketPaths (§0.3); the part's name is composed
+                # conventions belong to BucketPaths (§0.3); the run file's name is composed
                 # downstream, where the run id is.
                 registry_root=paths.optical_registry(store_path),
                 # The depth rule every registry row is judged against, from the store root — the

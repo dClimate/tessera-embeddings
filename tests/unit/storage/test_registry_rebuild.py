@@ -128,8 +128,8 @@ class TestDriftAgainstTheFill:
         assert rebuilt["median_obs_where_thin"] == fill["s2_obs"]["median_where_thin"]
         assert rebuilt["px_with_any_radar"] == fill["px_with_any_radar"]
 
-    def test_re_derived_measurements_survive_the_fills_part_writer(self) -> None:
-        """A targeted update publishes a merged shard's re-derived measurements through the fill's part
+    def test_re_derived_measurements_survive_the_fills_run_file_writer(self) -> None:
+        """A targeted update publishes a merged shard's re-derived measurements through the fill's run file
         writer, which reads coverage records. Passed as row columns, every count arrived as zero or null.
         """
         rng = np.random.default_rng(2)

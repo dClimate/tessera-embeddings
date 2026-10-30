@@ -399,7 +399,7 @@ def fill_zone_year_flow(
         # The published registry's ROOT, derived from the STORE THIS RUN WRITES rather than the
         # default repo name — the registry is a sibling of the store, so a registry beside a
         # different store describes a zone-year that store does not contain. Bucket conventions
-        # belong to BucketPaths (§0.3); the part's own name is the registry module's, since it
+        # belong to BucketPaths (§0.3); the run file's own name is the registry module's, since it
         # keys by a run id nothing here knows yet.
         "registry_root": paths.optical_registry(store_path),
         "config": config,

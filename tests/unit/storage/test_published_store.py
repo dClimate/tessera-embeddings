@@ -434,7 +434,7 @@ class TestWhoWroteAYear:
         ]
 
     def test_a_refill_keeps_that_the_run_it_replaced_marked_the_year_empty(self):
-        """A v1.1 year marked empty published no part, and the store check must not mistake it for a write."""
+        """A v1.1 year marked empty published no run file, and the store check must not mistake it for a write."""
         marked = {"2024": {"run_id": "v11", "assembled_at": "2026-07-01T00:00:00+00:00", "empty": True}}
         runs = shard_writer.run_provenance(marked, 2024, "refill", code={})
         assert published_store.committed_runs({"runs": runs}, 2024, []) == [
@@ -461,7 +461,7 @@ class TestWhoWroteAYear:
 
     def test_a_replaced_run_whose_shard_commit_expired_holds_nothing(self):
         """The refill rewrote every tile of the run it replaced, which the store check confirms before expiry;
-        the replaced run is still known, so its part is not mistaken for a stranger's.
+        the replaced run is still known, so its run file is not mistaken for a stranger's.
         """
         first, refill = (
             {"snapshot": s, "committed_at": f"2026-0{m}-01T00:00:00+00:00"} for s, m in (("s1", 7), ("s2", 8))

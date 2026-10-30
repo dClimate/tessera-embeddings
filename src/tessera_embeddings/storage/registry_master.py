@@ -1,11 +1,11 @@
 """The registry master: the one registry consumers read, one current row per tile-year.
 
-**What this is for.** :mod:`~tessera_embeddings.storage.registry` writes one part per cell per run,
-which is the right shape for a campaign writing cells concurrently and the wrong shape for anybody
-reading the result. Two consequences the master closes:
+**What this is for.** :mod:`~tessera_embeddings.storage.registry` writes one run file per cell per
+run, which is the right shape for a campaign writing cells concurrently and the wrong shape for
+anybody reading the result. Two consequences the master closes:
 
-* **A cell filled more than once has more than one part**, and something has to decide which row
-  describes each tile now.
+* **A cell filled more than once has more than one run file**, and something has to decide which
+  row describes each tile now.
 * **``pyarrow`` infers a dataset's schema from the first file in sorted path order**, so a column
   added mid-campaign is silently dropped if zone ``01N`` was written before the change. A master
   written with one schema, and a dataset-level ``_common_metadata`` beside it, removes the hazard
@@ -14,18 +14,18 @@ reading the result. Two consequences the master closes:
 **Two prefixes, and only one of them is for reading.**
 
 ```
-  parts/     each fill's raw output, one part per cell per run, append-only, never rewritten.
+  runs/      each run's raw output, one file per cell per run, append-only, never rewritten.
              Internal: the record the master is built from and checked against.
   master/    one file per cell, master/zone=<Z>/year=<Y>/part-0.parquet: one row per tile, one
              schema, and two columns saying where each row's numbers came from. Consumers read this.
 ```
 
 **It is merged in place, by every fill.** The zone-fill runner calls :func:`merge_cell` as soon as
-a cell's part is published. That merges the cell's parts into the cell's existing master file and
-replaces the file in one conditional PUT, so two writers of one cell — two fills, or a fill and a
-repair — cannot lose each other's rows: the one that read first is refused and merges again. The
-merge is idempotent, and merging every part rather than only the newest costs a few small reads
-and means a cell whose earlier merge failed is healed by its next one.
+a cell's run file is published. That merges the cell's run files into the cell's existing master
+file and replaces the file in one conditional PUT, so two writers of one cell — two fills, or a fill
+and a repair — cannot lose each other's rows: the one that read first is refused and merges again.
+The merge is idempotent, and merging every run file rather than only the newest costs a few small
+reads and means a cell whose earlier merge failed is healed by its next one.
 
 **A tile's row comes from the newest run that wrote that tile.** A run writes only the tiles it
 staged or refused and leaves the year's other shards as they were (``assemble_global``'s refill
@@ -33,16 +33,17 @@ caveat). So the store holds each tile as the most recently committed run that wr
 whichever run supplied the cell's other tiles, and the master follows the store: a full refill
 supersedes every tile, and an update of some tiles supersedes only its own and removes none. A
 run's row must therefore describe the whole tile as that run leaves it, because it becomes the
-tile's only row. ``filled_at`` names the run a row describes, by its part's stamp, which is the
+tile's only row. ``filled_at`` names the run a row describes, by its run file's stamp, which is the
 run's shard commit time: Icechunk refuses a commit older than its parent, so the newest parsed
 ``filled_at`` is the run whose pixels the store holds, and a measurement re-derived against a
 superseded run loses to the newer run's row, measured or not.
 
-**The store stands behind the parts, or the cell is not written.** Newest-part-wins is right only
-if every run that wrote the year has a part. Every shard commit is tagged with its run, in the same
-commit as the pixels, and Icechunk's diff of each commit says which tiles it wrote, so
-:func:`store_disagreements` refuses a cell in which a run with no part is the last to have written
-any tile, a part is stamped out of commit order, or a part names a run the store never committed.
+**The store stands behind the run files, or the cell is not written.** Newest-run-wins is right
+only if every run that wrote the year has a run file. Every shard commit is tagged with its run, in
+the same commit as the pixels, and Icechunk's diff of each commit says which tiles it wrote, so
+:func:`store_disagreements` refuses a cell in which a run with no run file is the last to have
+written any tile, a run file is stamped out of commit order, or a run file names a run the store
+never committed.
 
 **Within that run, precedence is not latest-wins, and the difference matters.** A fill measured pixels
 as it wrote them; a re-derivation recomputed them afterwards from what was written. They should
@@ -124,7 +125,7 @@ def master_schema() -> pa.Schema:
 def _aligned(table: pa.Table, schema: pa.Schema) -> pa.Table:
     """``table`` widened to ``schema``, missing columns null, column order fixed.
 
-    A fill part has neither ``measured_by`` nor ``filled_at``. Concatenating it with master rows
+    A run file has neither ``measured_by`` nor ``filled_at``. Concatenating it with master rows
     needs one shape, and a missing column must arrive as null — the honest value for a pass that did
     not record it — rather than as a default.
     """
@@ -138,7 +139,7 @@ def _aligned(table: pa.Table, schema: pa.Schema) -> pa.Table:
 
 
 def as_master_rows(table: pa.Table, origin: str) -> pa.Table:
-    """Registry rows — a fill part's, or a re-derivation's — as master rows from ``origin``.
+    """Registry rows — a run file's, or a re-derivation's — as master rows from ``origin``.
 
     ``filled_at`` is kept where the row carries one and is the row's own ``assembled_at`` otherwise,
     which on a fill row is the same thing. A re-derived row must name the fill it re-derived: given
@@ -231,9 +232,9 @@ def _aware(stamp: str | None) -> datetime.datetime:
     return parsed
 
 
-def tile_years(parts: pa.Table) -> int:
-    """Distinct ``(zone, year, tile)`` across every run: the rows a master of ``parts`` must hold."""
-    return parts.group_by(_KEYS).aggregate([]).num_rows
+def tile_years(run_rows: pa.Table) -> int:
+    """Distinct ``(zone, year, tile)`` across every run: the rows a master of ``run_rows`` must hold."""
+    return run_rows.group_by(_KEYS).aggregate([]).num_rows
 
 
 def invariant_failures(master: pa.Table, *, expected_rows: int | None = None) -> list[str]:
@@ -242,7 +243,7 @@ def invariant_failures(master: pa.Table, *, expected_rows: int | None = None) ->
     Checked rather than assumed, because every one of these has a silent failure mode: a duplicate
     tile-year reads as coverage counted twice, a lost one as ground nobody wrote, and a label that
     disagrees with the numbers would let a re-derivation pass as a measurement. ``expected_rows``
-    is :func:`tile_years` of the cell's parts, since no run removes a tile.
+    is :func:`tile_years` of the cell's run files, since no run removes a tile.
     """
     failures: list[str] = []
     if expected_rows is not None and master.num_rows != expected_rows:
@@ -263,10 +264,10 @@ def invariant_failures(master: pa.Table, *, expected_rows: int | None = None) ->
     return failures
 
 
-def audit(master: pa.Table, parts: pa.Table) -> dict[str, list[str]]:
-    """Per cell ``zone/year``, what is wrong with its master rows against its parts. Empty is sound.
+def audit(master: pa.Table, run_rows: pa.Table) -> dict[str, list[str]]:
+    """Per cell ``zone/year``, what is wrong with its master rows against its run files. Empty is sound.
 
-    Checks the master itself, the file consumers read: every tile any part names is present and no
+    Checks the master itself, the file consumers read: every tile any run file names is present and no
     other; each row describes its tile's latest run and carries that run's fill fields — ``embedded``,
     the bounding box, the depth rule, the build — whoever measured it; wherever that run's fill
     measured the tile, the master carries the fill's own row, numbers and provenance alike, labelled
@@ -274,7 +275,7 @@ def audit(master: pa.Table, parts: pa.Table) -> dict[str, list[str]]:
     unmeasured. A cell with no master file at all reports every tile missing. Pair it with
     :func:`invariant_failures`.
     """
-    want = merge(as_master_rows(parts, MEASURED_BY_FILL))
+    want = merge(as_master_rows(run_rows, MEASURED_BY_FILL))
     carried = [column for column in CARRIED_COLUMNS if column not in _KEYS]
     columns = [*_KEYS, "filled_at", "measured_by", "run_id", "assembled_at", *carried, *REBUILT_COLUMNS]
     joined = want.select(columns).join(
@@ -296,7 +297,7 @@ def audit(master: pa.Table, parts: pa.Table) -> dict[str, list[str]]:
     fill_measured = pc.fill_null(pc.equal(joined.column("measured_by:want"), MEASURED_BY_FILL), False)
     flags = {
         "tile(s) missing": pc.invert(held),
-        "tile(s) no part names": pc.invert(wanted),
+        "tile(s) no run file names": pc.invert(wanted),
         "row(s) not from the tile's latest run": pc.and_(both, differs("filled_at")),
         "fill field(s) altered": pc.and_(both, differs(*carried)),
         "fill row(s) altered": pc.and_(
@@ -329,35 +330,35 @@ def cell_tables(table: pa.Table) -> Iterator[tuple[str, int, pa.Table]]:
             start = end
 
 
-def store_disagreements(parts: pa.Table, store: StoreYear) -> list[str]:
-    """Why the store cannot stand behind one cell's ``parts``, as sentences. Empty means it can.
+def store_disagreements(run_rows: pa.Table, store: StoreYear) -> list[str]:
+    """Why the store cannot stand behind one cell's ``run_rows``, as sentences. Empty means it can.
 
-    A tile's master row comes from the newest part naming it, so the master is right only if the
-    parts account for every commit that wrote the year, in the order the store wrote them. A commit
-    no part describes leaves its tiles described by an older run, and nothing in the registry can
-    tell; a part stamped out of commit order picks the wrong run. The store records every commit
-    that wrote the year (:func:`~.published_store.committed_runs`), so:
+    A tile's master row comes from the newest run file naming it, so the master is right only if the
+    run files account for every commit that wrote the year, in the order the store wrote them. A
+    commit no run file describes leaves its tiles described by an older run, and nothing in the
+    registry can tell; a run file stamped out of commit order picks the wrong run. The store records
+    every commit that wrote the year (:func:`~.published_store.committed_runs`), so:
 
-    * every part's run is one the store records — a withdrawn run's part must be deleted;
-    * every part is stamped with one of its run's shard commits, the one it describes;
-    * no commit that no part describes is the last to have written any tile, as the store's own diff
-      of it says (:func:`~.published_store.commit_tiles`). That covers a run with no part and also a
-      retry: a part describes one commit of its run, so an earlier attempt's commit counts on its
-      own. One that later commits superseded on every tile it wrote describes nothing, so it does
-      not block, and neither does an untagged run that marked the year empty, which left no
-      embeddings behind.
+    * every run file's run is one the store records — a withdrawn run's file must be deleted;
+    * every run file is stamped with one of its run's shard commits, the one it describes;
+    * no commit that no run file describes is the last to have written any tile, as the store's own
+      diff of it says (:func:`~.published_store.commit_tiles`). That covers a run with no file and
+      also a retry: a run file describes one commit of its run, so an earlier attempt's commit
+      counts on its own. One that later commits superseded on every tile it wrote describes nothing,
+      so it does not block, and neither does an untagged run that marked the year empty, which left
+      no embeddings behind.
     """
     stamps: dict[str, set[datetime.datetime]] = {}
     tiles: dict[str, set[str]] = {}
-    for row in parts.select(["run_id", "assembled_at", "tile"]).to_pylist():
+    for row in run_rows.select(["run_id", "assembled_at", "tile"]).to_pylist():
         stamps.setdefault(row["run_id"], set()).add(_aware(row["assembled_at"]))
         tiles.setdefault(row["run_id"], set()).add(row["tile"])
     runs = {commit.run_id for commit in store.commits}
     found = [
-        f"run {run!r} has a part, but the store records no commit by it; a withdrawn run's part must be deleted"
+        f"run {run!r} has a run file, but the store records no commit by it; a withdrawn run's file must be deleted"
         for run in sorted(set(tiles) - runs)
     ]
-    # The one commit each part describes: the one it is stamped with, or a run's only, untagged one.
+    # The one commit each run file describes: the one it is stamped with, or a run's only, untagged one.
     described = {
         run: next(
             (c for c in store.commits if c.run_id == run and (c.snapshot is None or _aware(c.at) in stamps[run])), None
@@ -365,7 +366,7 @@ def store_disagreements(parts: pa.Table, store: StoreYear) -> list[str]:
         for run in sorted(set(tiles) & runs)
     }
     found += [
-        f"run {run!r} has a part stamped at none of its commits, so it would be misordered"
+        f"run {run!r} has a run file stamped at none of its commits, so it would be misordered"
         for run, commit in described.items()
         if commit is None
     ]
@@ -376,14 +377,14 @@ def store_disagreements(parts: pa.Table, store: StoreYear) -> list[str]:
         elif commit.snapshot is None:
             if not commit.empty:
                 found.append(
-                    f"run {commit.run_id!r} wrote the year with no part, and no recorded commit bounds its tiles"
+                    f"run {commit.run_id!r} wrote the year with no run file, and no recorded commit bounds its tiles"
                 )
             continue
         else:
             written = set(store.tiles_of(commit.snapshot))
             if own := sorted(written - later):
                 found.append(
-                    f"run {commit.run_id!r} committed at {commit.at} and last wrote {len(own)} tile(s) no part "
+                    f"run {commit.run_id!r} committed at {commit.at} and last wrote {len(own)} tile(s) no run file "
                     f"describes, so the master would describe them by an older run: {own[:5]}"
                 )
         later |= written
@@ -405,7 +406,7 @@ def read_cell(
     """One cell's rows under ``prefix``, partition keys included; empty when the cell has none there.
 
     The listing is dropped first, because a filesystem instance is shared within a process and its
-    cached listing would hide a part another process published since.
+    cached listing would hide a run file another process published since.
     """
     base = f"{_bare(registry_root)}/{prefix}"
     path = f"{base}/zone={zone}/year={year}"
@@ -516,7 +517,7 @@ def _put_if(fs: AbstractFileSystem, path: str, data: bytes, version: str | None)
         current = hashlib.sha256(Path(path).read_bytes()).hexdigest() if Path(path).exists() else None
         if current != version:
             return False
-        # Dot-prefixed, so a dataset read of master/ never takes it for a part.
+        # Dot-prefixed, so a dataset read of master/ never takes it for a cell's file.
         staged = folder / f".{Path(path).name}.tmp"
         staged.write_bytes(data)
         staged.replace(path)
@@ -524,9 +525,9 @@ def _put_if(fs: AbstractFileSystem, path: str, data: bytes, version: str | None)
 
 
 def still_published(held: pa.Table, fills: pa.Table) -> pa.Table:
-    """The ``held`` master rows whose run still has a part among ``fills``' rows for that tile.
+    """The ``held`` master rows whose run still has a run file among ``fills``' rows for that tile.
 
-    A withdrawn run — its part deleted — must not outlive its part in the master: its rows carry the
+    A withdrawn run — its file deleted — must not outlive its file in the master: its rows carry the
     newest ``filled_at`` and would otherwise beat every run that remains.
     """
     return held.filter(pc.is_in(_key(held, "tile", "filled_at"), value_set=_key(fills, "tile", "filled_at")))
@@ -552,23 +553,24 @@ def merge_cell(
     write: bool = True,
     tries: int = 8,
 ) -> list[str]:
-    """Merge one cell's parts into its existing master file, tile by tile, and replace the file.
+    """Merge one cell's run files into its existing master file, tile by tile, and replace the file.
 
     The one writer of a cell's master, used by every fill and by repair. Idempotent, and independent
-    of every other cell. Raises, writing nothing, when the cell has no part for ``run_id`` — the run
-    the caller just landed, whose part publishing is best-effort and may have failed — the store
-    cannot stand behind the parts (:func:`store_disagreements`, when ``store`` is given), or the
+    of every other cell. Raises, writing nothing, when the cell has no run file for ``run_id`` — the
+    run the caller just landed, whose publishing is best-effort and may have failed — the store
+    cannot stand behind the run files (:func:`store_disagreements`, when ``store`` is given), or the
     merge breaks an invariant. ``extra`` is more master rows to merge, a repair's re-derived ones;
-    ``write=False`` checks everything and writes nothing. A cell whose last part was deleted, its
-    run withdrawn, has its master file emptied; one with neither a part nor a file is left alone.
+    ``write=False`` checks everything and writes nothing. A cell whose last run file was deleted,
+    its run withdrawn, has its master file emptied; one with neither a run file nor a master file is
+    left alone.
 
     **Two writers of one cell cannot lose each other's rows.** The file's version is read first and
     the write is conditional on it (:func:`write_cell`), so a writer that read before another
     landed is refused and merges again from what is there now, up to ``tries`` times.
 
-    ``store`` reads the store's record of the year, and is called after the parts on every attempt:
-    a run publishes its part only after its commit, so a record read then names the run of every
-    part read, and a fill landing mid-merge is merged rather than refused.
+    ``store`` reads the store's record of the year, and is called after the run files on every
+    attempt: a run publishes its file only after its commit, so a record read then names the run of
+    every run file read, and a fill landing mid-merge is merged rather than refused.
 
     ``live`` is the store's live ``(shard_y, shard_x)`` shards for this zone-year, from
     :func:`~.published_store.live_shards`. Returns where the master's embedded tiles disagree with
@@ -579,21 +581,21 @@ def merge_cell(
     """
     for _ in range(tries):
         version = cell_version(fs, registry_root, zone, year)
-        parts = read_cell(fs, registry_root, "parts", zone, year, dataset_schema())
-        if run_id is not None and run_id not in set(parts.column("run_id").to_pylist()):
-            raise ValueError(f"{zone}/{year} has no registry part for run {run_id!r}, so the master would miss it")
+        run_rows = read_cell(fs, registry_root, "runs", zone, year, dataset_schema())
+        if run_id is not None and run_id not in set(run_rows.column("run_id").to_pylist()):
+            raise ValueError(f"{zone}/{year} has no registry run file for run {run_id!r}, so the master would miss it")
         record = store() if store is not None else None
-        if record is not None and (found := store_disagreements(parts, record)):
-            raise ValueError(f"{zone}/{year}: the store cannot stand behind the registry parts: {'; '.join(found)}")
-        fills = as_master_rows(parts, MEASURED_BY_FILL)
+        if record is not None and (found := store_disagreements(run_rows, record)):
+            raise ValueError(f"{zone}/{year}: the store cannot stand behind the registry run files: {'; '.join(found)}")
+        fills = as_master_rows(run_rows, MEASURED_BY_FILL)
         held = still_published(read_cell(fs, registry_root, "master", zone, year, master_schema()), fills)
-        # A held fill row is a copy of a part's, so the part's own copy is merged: only the rows the
-        # parts cannot supply, re-derived ones, come from the existing file, and a damaged copy cannot win.
+        # A held fill row is a copy of a run file's, so the run file's own copy is merged: only the rows
+        # the run files cannot supply, re-derived ones, come from the existing file, and a damaged copy cannot win.
         held = held.filter(pc.invert(pc.fill_null(pc.equal(held.column("measured_by"), MEASURED_BY_FILL), False)))
         master = merge(fills, held, *extra)
         if record is not None:
             master = with_source_runs(master, record.source_runs)
-        if failures := invariant_failures(master, expected_rows=tile_years(parts)):
+        if failures := invariant_failures(master, expected_rows=tile_years(run_rows)):
             raise ValueError(f"{zone}/{year} master breaks its invariants: {'; '.join(failures)}")
         if not write or (version is None and not master.num_rows):
             return _live_disagreements(master, live)

@@ -17,7 +17,7 @@ from __future__ import annotations
 import pytest
 
 from tessera_embeddings.config.paths import BucketPaths
-from tessera_embeddings.storage.registry import part_uri
+from tessera_embeddings.storage.registry import run_file_uri
 
 #: The real target, so the test says what this exists for.
 OPEN_DATA = "s3://tessera-embeddings/v1.1/dclimate.icechunk"
@@ -134,7 +134,7 @@ class TestTheRegistrySitsBesideWhicheverStoreIsInUse:
         ):
             assert not paths.optical_registry(paths.global_store()).startswith(paths.global_store() + "/")
 
-    def test_registry_parts_follow_the_store_not_our_outputs(self):
+    def test_registry_run_files_follow_the_store_not_our_outputs(self):
         """The mistake this class exists to prevent, made once and caught here.
 
         The per-tile refusal records were first placed under ``outputs``, which works in dev — where
@@ -147,7 +147,7 @@ class TestTheRegistrySitsBesideWhicheverStoreIsInUse:
             outputs="s3://ours",
             global_store_uri="s3://tessera-embeddings/v1.1/dclimate.icechunk",
         )
-        detail = part_uri(prod.optical_registry(prod.global_store()), "32S", 2021, "run-1")
+        detail = run_file_uri(prod.optical_registry(prod.global_store()), "32S", 2021, "run-1")
 
         registry = prod.optical_registry(prod.global_store())
         assert detail.startswith(registry + "/"), "inside the registry beside the store"
@@ -159,10 +159,10 @@ class TestTheRegistrySitsBesideWhicheverStoreIsInUse:
 
         `optical_registry` used to call `global_store()` with no arguments, so it derived from the
         DEFAULT repo basename whatever store the run was writing. A campaign against
-        `store_name="tessera-radar"` published its registry beside `tessera.icechunk`: the part was
+        `store_name="tessera-radar"` published its registry beside `tessera.icechunk`: the run file was
         valid, every tool worked, and it described a zone-year that store does not contain.
 
-        Worse than an overwrite. Two stores' parts then merge into one dataset under the same
+        Worse than an overwrite. Two stores' run files then merge into one dataset under the same
         `zone=`/`year=` keys, and nothing IN the dataset can tell them apart — so the wrongness is
         unfalsifiable from the artifact a consumer was told to trust instead of the store.
         """
@@ -172,8 +172,8 @@ class TestTheRegistrySitsBesideWhicheverStoreIsInUse:
         assert paths.optical_registry(radar) == "s3://out/global/tessera-radar.registry"
         assert paths.optical_registry(radar) != paths.optical_registry(paths.global_store())
 
-        # And the part lands beside the store it describes, not beside the default one.
-        detail = part_uri(paths.optical_registry(radar), "16S", 2022, "16S-2022-792816d6")
+        # And the run file lands beside the store it describes, not beside the default one.
+        detail = run_file_uri(paths.optical_registry(radar), "16S", 2022, "16S-2022-792816d6")
         assert detail.startswith("s3://out/global/tessera-radar.registry/")
         assert "tessera.registry" not in detail
 
@@ -181,7 +181,7 @@ class TestTheRegistrySitsBesideWhicheverStoreIsInUse:
         """Structural, not documentary: there is no default to fall back to silently.
 
         A defaulted argument would have reintroduced exactly the original bug the moment a caller
-        forgot it, and the failure was invisible — a plausible part in the wrong place.
+        forgot it, and the failure was invisible — a plausible run file in the wrong place.
         """
         paths = BucketPaths(inputs="s3://in", outputs="s3://out")
         with pytest.raises(TypeError):
@@ -195,11 +195,11 @@ class TestTheRegistrySitsBesideWhicheverStoreIsInUse:
         paths = BucketPaths(inputs="s3://in", outputs="s3://out")
         assert paths.optical_registry("s3://pub/v1/dclimate.icechunk/") == "s3://pub/v1/dclimate.registry"
 
-    def test_registry_parts_are_partitioned_for_a_parquet_dataset(self):
-        """The registry is specified as Parquet indexing what each shard holds. The parts are JSON
+    def test_registry_run_files_are_partitioned_for_a_parquet_dataset(self):
+        """The registry is specified as Parquet indexing what each shard holds. The run files are JSON
         for now — pyarrow is not in the fill's runtime — so the LAYOUT has to be the one a later
         compaction wants, or every path changes when the format does.
         """
         paths = BucketPaths(inputs="s3://in", outputs="s3://out")
-        detail = part_uri(paths.optical_registry(paths.global_store()), "09S", 2024, "run-1")
+        detail = run_file_uri(paths.optical_registry(paths.global_store()), "09S", 2024, "run-1")
         assert "zone=09S" in detail and "year=2024" in detail
