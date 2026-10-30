@@ -121,7 +121,7 @@ def _names_a_real_cell(part: dict[str, Any]) -> bool:
     return (
         part["zone"] is not None
         and part["year"] is not None
-        and part["zone"] in zone_grid.ZONES
+        and zone_grid.zone_layout_of([part["zone"]]) is not None
         and part["year"] in CAMPAIGN_YEARS
     )
 

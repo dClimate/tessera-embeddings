@@ -419,9 +419,11 @@ for the rule definitions, the allowlist schema, and worked examples.
 ## The global embeddings store
 
 Alongside per-area stores, the library ships the storage layout and the write path for a
-**global 10 m store**: one Icechunk repository holding 120 Zarr groups — one per UTM zone,
-named by its common name (`01N`–`60N`, `01S`–`60S`) — each pre-allocated with a 2017–2025
-annual time axis and filled one (zone, year) at a time. The published result is **global
+**global 10 m store**: one Icechunk repository holding one Zarr group per UTM zone, each
+pre-allocated with a 2017–2025 annual time axis and filled one (zone, year) at a time. From v2 on
+the groups are the 60 columns `utm01`–`utm60`, the geoembeddings `utm_zones` layout that the Source
+Coop copy uses; v1.1 stores have 120, named by hemisphere (`01N`–`60N`, `01S`–`60S`). See
+[ADR 037](context_docs/decisions/037-v2-stores-use-the-utm-zones-layout.md). The published result is **global
 TESSERA v1.1** at `s3://tessera-embeddings/v1.1/dclimate.icechunk/`, and it is readable
 without an AWS account.
 
@@ -438,12 +440,12 @@ if it did (UTM's usable range stops at 80°S). See
 
 ```
 one Icechunk repo (BucketPaths.global_store())
-├── 01N/    embeddings (time, y, x, band)  int8      (v1.1: northing, easting)
+├── utm01/  embeddings (time, y, x, band)  int8      (v1.1: 01N … 60S; northing, easting)
 │           (1, 256, 256, 128) inner chunks in (1, 2048, 2048, 128) shards
 │           scales / obs counts sharded on the same 2048² spatial grid
-├── 02N/    … one group per UTM zone, seeded metadata-only up front …
+├── utm02/  … one group per UTM zone, seeded metadata-only up front …
 ⋮
-└── 60S/    attrs: crs, zone_scheme, years_complete, runs, conventions
+└── utm60/  attrs: crs, zone_scheme, years_complete, runs, conventions
 ```
 
 `run_global_campaign` drives the fill year-serial with bounded zone parallelism and

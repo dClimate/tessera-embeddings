@@ -414,12 +414,28 @@ one ingest store chunk (4096²) — what one satellite read/write touches
 You do not need any of this to read the store. It is here because the layout is what makes a
 job this size possible at all, and because two of the choices are visible to a consumer.
 
-**Zones are named, not numbered.** Zone groups, mosaic paths and campaign tags all use the UTM
-**common name** — `canonicalize_zone` parses `"33n"` or `" 7s "` into `"33N"` and `"07S"`. The
-geoembeddings `utm_zones` layout names groups `utm{NN}`, which cannot say which hemisphere is meant,
-so new stores do not claim that layout: they omit the optional `geoemb:spatial_layout` (the
-published v1.1 store, seeded earlier, still declares `utm_zones`). The EPSG code (326xx north,
-327xx south) is kept, but only as the coordinate reference system.
+**Zones come in two layouts, and the model picks one for a new store**
+([ADR 037](../context_docs/decisions/037-v2-stores-use-the-utm-zones-layout.md)). From v2 on, a
+store uses the geoembeddings `utm_zones` layout, as the Source Coop copy, AlphaEarth and OlmoEarth
+do: 60 groups, `utm01` to `utm60`, each a full column in its northern EPSG code (326xx), with the
+southern hemisphere as negative northings. Such a store says so in `geoemb:spatial_layout`. v1.1
+stores, the published one included, are 120 groups named by hemisphere, `01N` to `60S`, each in
+its own hemisphere's EPSG code. An existing store keeps its layout whichever model extends it.
+
+```
+utm_zones (v2 onward)                    hemispheres (v1.1)
+utm33   EPSG:32633                       33N   EPSG:32633
+  9,338,880 m  ── top ──                   9,338,880 m ── top ──
+        north half (= 33N's grid)               (northern half only)
+          0 m  ── equator ──                       0 m ── bottom ──
+        south half (negative northings)  33S   EPSG:32733, its own group
+ -8,888,320 m  ── bottom ──                 (false northing 10,000 km)
+```
+
+A zone's name says which layout it is in, so group names, mosaic paths, campaign tags and flow
+parameters all carry it as-is, and `canonicalize_zone` parses `"UTM7"` into `"utm07"` or `" 7s "`
+into `"07S"`. The two grids share every pixel but not their shard boundaries south of the
+equator, so a `utm_zones` store needs its own land mask and its own mosaics.
 
 **Zones are pure six-degree longitude bands.** Every pixel centre falls in exactly one zone, and
 the per-zone pixel grids come from the EPSG registry (`storage/zone_grid.py`), snapped to the

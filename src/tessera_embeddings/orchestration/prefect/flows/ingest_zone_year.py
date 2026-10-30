@@ -437,7 +437,7 @@ async def ingest_zone_year(
     """Ingest the S1/S2 mosaics for one ``(zone, year)`` onto the zone grid.
 
     Args:
-        zone: UTM common name (e.g. ``"33N"``); canonicalized on entry.
+        zone: Zone name (e.g. ``"utm33"`` or ``"33N"``); canonicalized on entry.
         year: Campaign calendar year (the default Dec-Y calendar-year window).
         paths: Deployment storage contract (mosaics, ROI zarrs, land mask).
         deployments: S1/S2 ingest deployment refs.

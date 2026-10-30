@@ -34,7 +34,7 @@ what it costs to read from inside and outside its region:
 
 Four things about the write path carry every argument below.
 
-**One repository, one branch tip.** All 120 UTM zone groups live in a single Icechunk repository on
+**One repository, one branch tip.** All of a store's UTM zone groups live in a single Icechunk repository on
 one `main` branch. Commits touch **disjoint groups**, so there are no data conflicts — but every
 commit re-serialises the repo-global snapshot through a branch-tip compare-and-swap. **Disjoint
 groups and a shared compare-and-swap are different things**, and conflating them is an error this

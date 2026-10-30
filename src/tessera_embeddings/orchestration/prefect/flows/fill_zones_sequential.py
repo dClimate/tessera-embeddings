@@ -730,8 +730,8 @@ def fill_zones_sequential_flow(
     """Fill many (zone, year) cells sequentially on a single shared Ray cluster.
 
     Args:
-        cells: ``(zone, year)`` pairs for this cluster — zone as a UTM common name, e.g.
-            ``[("33N", 2025), ("15S", 2025)]``. **May span campaign years**, which is what
+        cells: ``(zone, year)`` pairs for this cluster — zone as its group name, e.g.
+            ``[("utm33", 2025), ("utm15", 2025)]``. **May span campaign years**, which is what
             lets the driver drop the year barrier: each cell carries its OWN inference window
             to the actors (``ZoneContext.time_window``, so a cell is never inferred over
             another year's months), and assemblies serialize on the runner's single trailing

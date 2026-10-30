@@ -13,7 +13,7 @@ import tessera_embeddings.storage.shard_writer as shard_writer
 from tessera_embeddings.config.store_layout import DIMS_3D, DIMS_4D, ArrayLayout, StoreLayout
 from tessera_embeddings.storage import campaign, global_store
 from tessera_embeddings.storage.shard_writer import commit_with_rebase, write_year_shards
-from tessera_embeddings.storage.zone_grid import ZONES, ZoneSpec
+from tessera_embeddings.storage.zone_grid import ZoneSpec, zones
 
 _BAND = 8
 _SHARD = 512
@@ -132,13 +132,17 @@ def test_work_list_includes_complete_but_untagged(tmp_path):
     assert ("01N", 2023) in work  # complete but untagged -> still dispatched (retag)
 
 
-def test_work_list_defaults_to_all_120_zones(tmp_path):
-    """`expected_zones=None` drives the whole globe (an unseeded zone needs every year)."""
-    _, repo = _seed(tmp_path)  # only 2 zones seeded, but the default list spans all 120
+@pytest.mark.parametrize(
+    ("hemisphere", "layout", "unseeded"), [("N", "hemispheres", ("60N", 2023)), (None, "utm_zones", ("utm60", 2023))]
+)
+def test_work_list_defaults_to_every_zone_of_the_store_layout(tmp_path, hemisphere, layout, unseeded):
+    """`expected_zones=None` drives the whole globe in the store's own layout (ADR 037)."""
+    specs = [ZoneSpec(f"3260{n}", hemisphere, n, (0.0, 5_120.0), (0.0, 10_240.0)) for n in (1, 2)]
+    _, repo = _seed(tmp_path, zones=specs)  # only 2 zones seeded, but the default spans the layout
     status = campaign.campaign_status(repo, years=_YEARS)
     work = campaign.campaign_work_list(status, set(), years=_YEARS)  # expected_zones=None
-    assert len(work) == len(ZONES) * len(_YEARS)
-    assert ("60N", 2023) in work  # an unseeded zone still needs every year
+    assert len(work) == len(zones(layout)) * len(_YEARS)
+    assert unseeded in work  # an unseeded zone still needs every year
 
 
 def test_years_fully_complete(tmp_path):
@@ -192,7 +196,7 @@ def test_tag_zone_year_default_is_idempotent_after_head_moves(tmp_path):
 
 
 def test_tag_year_complete_requires_all_zones(tmp_path, monkeypatch):
-    monkeypatch.setattr(campaign, "ZONES", ("01N", "02N"))
+    monkeypatch.setattr(campaign, "zones", lambda layout: dict.fromkeys(("01N", "02N")))
     _, repo = _seed(tmp_path)
     _fill(repo, "01N", year_index=0)  # only one of two zones has 2023
     with pytest.raises(ValueError, match="have not landed it"):
@@ -200,7 +204,7 @@ def test_tag_year_complete_requires_all_zones(tmp_path, monkeypatch):
 
 
 def test_tag_year_complete_when_all_land(tmp_path, monkeypatch):
-    monkeypatch.setattr(campaign, "ZONES", ("01N", "02N"))
+    monkeypatch.setattr(campaign, "zones", lambda layout: dict.fromkeys(("01N", "02N")))
     _, repo = _seed(tmp_path)
     _fill(repo, "01N", year_index=0)
     _fill(repo, "02N", year_index=0)

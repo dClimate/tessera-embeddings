@@ -1,12 +1,20 @@
-"""The 120 UTM-zone grid for the global embeddings store (ADR-008).
+"""The UTM-zone grids for the global embeddings store (ADR-008, ADR-037).
 
-The world is one Icechunk repo of 120 Zarr groups — 60 UTM zones x 2
-hemispheres — each in its own CRS (EPSG:326xx north, EPSG:327xx south) and
-named by its UTM **common name** (``"01N"`` … ``"60S"``: zero-padded zone
-number + hemisphere). The EPSG code is retained as the CRS only
-(:attr:`ZoneSpec.epsg` / :attr:`ZoneSpec.crs`). This is a deliberate deviation
-from the geoembeddings ``utm_zones`` spec, whose ``utm{NN}`` group name cannot
-express the hemisphere.
+The world is one Icechunk repo of zone groups, each in its own CRS, in one of two
+layouts (:data:`~tessera_embeddings.config.inference.ZoneLayout`). A new store takes its
+model's layout; an existing store keeps the one its groups already use.
+
+* ``"utm_zones"`` (v2 onward) — the geoembeddings ``utm_zones`` layout, as on Source
+  Coop: 60 groups ``utm01`` … ``utm60``, each a full pole-to-pole column in its
+  NORTHERN CRS (EPSG:326xx), the southern hemisphere carried as negative northings.
+* ``"hemispheres"`` (v1.1) — 120 groups named by UTM **common name** (``"01N"`` …
+  ``"60S"``), each in its hemisphere's CRS (EPSG:326xx north, EPSG:327xx south).
+
+A zone name says which layout it belongs to, so every zone resolves through one
+:func:`zone` lookup; only "every zone" questions (:func:`zones`) take a layout. The
+southern half of a ``utm`` zone is NOT the matching ``S`` zone moved: 10 000 km of false
+northing is a whole number of pixels but not of shards, so the two grids share pixels
+and disagree on shard boundaries.
 
 **Boundary policy — pure nominal 6° longitude bands.** Zone extents are the
 *nominal* 6°-wide UTM bands; coverage is disjoint and every pixel-center belongs
@@ -21,8 +29,8 @@ this is recorded machine-readably in the dataset attr
 projected bounding box is derived from that CRS's official *area of use* in the
 EPSG registry (via ``pyproj``), then snapped outward to the 2048-px shard pitch
 (:data:`SHARD_PX` x :data:`PIXEL_M` = 20 480 m). Because every 6° band has the
-same geometry in its own CRS, all northern zones share one extent template and
-all southern zones another — but :func:`derive_extent` and the pinning test
+same geometry in its own CRS, all zones of one kind (north, south, full column)
+share one extent template — but :func:`derive_extent` and the pinning test
 (``tests/unit/storage/test_zone_grid.py``) re-derive per zone from pyproj so an
 EPSG-database change can't silently move the grid.
 """
@@ -32,11 +40,13 @@ from __future__ import annotations
 import dataclasses
 import math
 import re
+from collections.abc import Iterable
 from functools import cache
 
 import numpy as np
 from pyproj import CRS, Transformer
 
+from tessera_embeddings.config.inference import ZoneLayout
 from tessera_embeddings.config.store_layout import SHARD_PX
 
 #: Ground sample distance in metres (10 m embeddings grid).
@@ -56,15 +66,15 @@ class ZoneSpec:
     """One UTM zone: CRS, hemisphere, and shard-aligned projected extents."""
 
     epsg: str  # e.g. "32601"
-    hemisphere: str  # "N" | "S"
+    hemisphere: str | None  # "N" | "S", or None for a utm_zones column spanning both
     utm_zone: int  # 1..60
     easting: Extent
     northing: Extent
 
     @property
     def group_name(self) -> str:
-        """Zarr group name for this zone: its UTM common name, e.g. ``"01N"``/``"60S"``."""
-        return f"{self.utm_zone:02d}{self.hemisphere}"
+        """Zarr group name for this zone: ``"utm01"`` for a column, else its UTM common name (``"01N"``)."""
+        return f"utm{self.utm_zone:02d}" if self.hemisphere is None else f"{self.utm_zone:02d}{self.hemisphere}"
 
     @property
     def crs(self) -> str:
@@ -82,28 +92,30 @@ class ZoneSpec:
         return round((self.northing[1] - self.northing[0]) / PIXEL_M)
 
 
-def derive_extent(epsg: int) -> tuple[Extent, Extent]:
+def derive_extent(epsg: int, *also: int) -> tuple[Extent, Extent]:
     """Derive a zone's shard-aligned ``(easting, northing)`` extent from pyproj.
 
-    Projects the CRS's EPSG area-of-use (WGS84 lon/lat box, densely sampled to
-    capture meridian curvature) into the zone CRS, then snaps the bounding box
-    outward to the shard pitch. This is the authoritative derivation; the static
-    :data:`ZONES` table is pinned against it by the unit test.
+    Projects the EPSG area-of-use (WGS84 lon/lat box, densely sampled to capture
+    meridian curvature) of ``epsg`` and of each CRS in ``also`` into ``epsg``'s CRS,
+    then snaps the bounding box outward to the shard pitch — a ``utm_zones`` column
+    passes its southern CRS in ``also``. This is the authoritative derivation; the
+    static zone tables are pinned against it by the unit test.
     """
     crs = CRS.from_epsg(epsg)
-    aou = crs.area_of_use
-    if aou is None:
-        raise ValueError(f"EPSG:{epsg} has no area_of_use")
     to_utm = Transformer.from_crs(CRS.from_epsg(4326), crs, always_xy=True)
-    lons = [aou.west + (aou.east - aou.west) * i / 8 for i in range(9)]
-    lats = [aou.south + (aou.north - aou.south) * j / 8 for j in range(9)]
     xs, ys = [], []
-    for lon in lons:
-        for lat in lats:
-            x, y = to_utm.transform(lon, lat)
-            if math.isfinite(x) and math.isfinite(y):
-                xs.append(x)
-                ys.append(y)
+    for code in (epsg, *also):
+        aou = CRS.from_epsg(code).area_of_use
+        if aou is None:
+            raise ValueError(f"EPSG:{code} has no area_of_use")
+        for i in range(9):
+            for j in range(9):
+                x, y = to_utm.transform(
+                    aou.west + (aou.east - aou.west) * i / 8, aou.south + (aou.north - aou.south) * j / 8
+                )
+                if math.isfinite(x) and math.isfinite(y):
+                    xs.append(x)
+                    ys.append(y)
     easting = (math.floor(min(xs) / PITCH_M) * PITCH_M, math.ceil(max(xs) / PITCH_M) * PITCH_M)
     northing = (math.floor(min(ys) / PITCH_M) * PITCH_M, math.ceil(max(ys) / PITCH_M) * PITCH_M)
     return easting, northing
@@ -117,48 +129,75 @@ _NORTH_EASTING: Extent = (163_840.0, 839_680.0)
 _NORTH_NORTHING: Extent = (0.0, 9_338_880.0)
 _SOUTH_EASTING: Extent = (163_840.0, 839_680.0)
 _SOUTH_NORTHING: Extent = (1_105_920.0, 10_014_720.0)
+# A utm_zones column: both areas of use in the northern CRS, the south as negative northings.
+_COLUMN_NORTHING: Extent = (-8_888_320.0, 9_338_880.0)
 
 
-def _build_zones() -> dict[str, ZoneSpec]:
-    """Build the 120-zone registry, keyed by UTM common name (``"01N"``…``"60S"``)."""
-    zones: dict[str, ZoneSpec] = {}
+def _build_zones() -> dict[ZoneLayout, dict[str, ZoneSpec]]:
+    """Build both layouts' zone tables, each keyed by group name."""
+    hemispheres: dict[str, ZoneSpec] = {}
+    columns: dict[str, ZoneSpec] = {}
     for utm in range(1, 61):
-        north = ZoneSpec(f"326{utm:02d}", "N", utm, _NORTH_EASTING, _NORTH_NORTHING)
-        south = ZoneSpec(f"327{utm:02d}", "S", utm, _SOUTH_EASTING, _SOUTH_NORTHING)
-        zones[north.group_name] = north
-        zones[south.group_name] = south
-    return zones
+        for spec in (
+            ZoneSpec(f"326{utm:02d}", "N", utm, _NORTH_EASTING, _NORTH_NORTHING),
+            ZoneSpec(f"327{utm:02d}", "S", utm, _SOUTH_EASTING, _SOUTH_NORTHING),
+        ):
+            hemispheres[spec.group_name] = spec
+        column = ZoneSpec(f"326{utm:02d}", None, utm, _NORTH_EASTING, _COLUMN_NORTHING)
+        columns[column.group_name] = column
+    return {"hemispheres": hemispheres, "utm_zones": columns}
 
 
-#: The 120 zones, keyed by UTM common name (``"01N"``…``"60S"``).
-ZONES: dict[str, ZoneSpec] = _build_zones()
+_ZONES_BY_LAYOUT: dict[ZoneLayout, dict[str, ZoneSpec]] = _build_zones()
+
+
+def zones(layout: ZoneLayout) -> dict[str, ZoneSpec]:
+    """Every zone of *layout*, keyed by group name: ``"01N"``…``"60S"`` or ``"utm01"``…``"utm60"``."""
+    return _ZONES_BY_LAYOUT[layout]
 
 
 def zone(name: str) -> ZoneSpec:
-    """Look up a zone by its UTM common name (e.g. ``"01N"``, ``"60S"``)."""
-    return ZONES[name]
+    """Look up a zone of either layout by its group name (e.g. ``"01N"``, ``"utm33"``)."""
+    for table in _ZONES_BY_LAYOUT.values():
+        if name in table:
+            return table[name]
+    raise KeyError(name)
+
+
+def zone_layout_of(names: Iterable[str]) -> ZoneLayout | None:
+    """The layout the zone *names* belong to, or ``None`` when none is a zone.
+
+    How a store's existing groups decide its layout. Names that are no zone's are ignored;
+    zones of BOTH layouts are refused, since one store holding both would cover the world twice.
+    """
+    found = {layout for name in names for layout, table in _ZONES_BY_LAYOUT.items() if name in table}
+    if len(found) > 1:
+        raise ValueError("zone names mix the 'hemispheres' and 'utm_zones' layouts; one store holds one layout.")
+    return found.pop() if found else None
 
 
 def canonicalize_zone(zone: str) -> str:
-    """Normalize a UTM-zone id to the canonical zero-padded common name.
+    """Normalize a UTM-zone id to its canonical zone (group) name.
 
     Accepts ``"33N"``, ``"15s"``, ``" 7S "``, ``"07S"`` → ``"33N"`` / ``"15S"`` /
-    ``"07S"``. Zone number is 1-60, hemisphere ``N``/``S`` (case-insensitive),
-    optional leading zero and surrounding whitespace. Raises ``ValueError`` on a
-    malformed or out-of-range id.
+    ``"07S"``, and ``"utm33"``, ``"UTM7"`` → ``"utm33"`` / ``"utm07"``. Zone number is
+    1-60, hemisphere ``N``/``S`` and prefix case-insensitive, optional leading zero and
+    surrounding whitespace. Raises ``ValueError`` on a malformed or out-of-range id.
 
     This is the single parser for the zone identifier used across group names,
     mosaic paths, tags, and flow params; the EPSG code stays available via
-    ``ZONES[name].epsg`` / ``.crs``.
+    ``zone(name).epsg`` / ``.crs``.
     """
     text = zone.strip().upper()
-    m = re.fullmatch(r"(\d{1,2})([NS])", text)
+    m = re.fullmatch(r"(?:(UTM)(\d{1,2})|(\d{1,2})([NS]))", text)
     if not m:
-        raise ValueError(f"UTM zone {zone!r} is malformed — expected '<1-60><N|S>', e.g. '33N' or '15S'.")
-    number = int(m.group(1))
+        raise ValueError(
+            f"UTM zone {zone!r} is malformed — expected 'utm<1-60>' or '<1-60><N|S>', e.g. 'utm33' or '33N'."
+        )
+    number = int(m.group(2) or m.group(3))
     if not 1 <= number <= 60:
         raise ValueError(f"UTM zone number {number} out of range (1-60) in {zone!r}.")
-    return f"{number:02d}{m.group(2)}"
+    return f"utm{number:02d}" if m.group(1) else f"{number:02d}{m.group(4)}"
 
 
 def easting_coords(spec: ZoneSpec) -> np.ndarray:
@@ -241,7 +280,8 @@ def tile_row_latitudes(spec: ZoneSpec, n_rows: int) -> np.ndarray:
     20-degree bands this feeds, and it spares the caller a projection round-trip per
     tile row. Southern zones carry UTM's 10,000,000 m false northing, so their
     northings are shifted first; both hemispheres' extents confirm the convention
-    (north tops out at 83.9 degrees, south bottoms at -79.9).
+    (north tops out at 83.9 degrees, south bottoms at -79.9). A ``utm_zones`` column
+    is in its northern CRS, whose southern northings are already negative.
     """
     northing = spec.northing[1] - (np.arange(n_rows, dtype="float64") + 0.5) * PITCH_M
     if spec.hemisphere == "S":

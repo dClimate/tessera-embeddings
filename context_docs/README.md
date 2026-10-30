@@ -48,7 +48,8 @@ context_docs/
 │   ├── 029-one-flow-per-ingest.md
 │   ├── 030-forward-pass-reorderings-ship-at-a-store-boundary.md
 │   ├── 032-v2-stores-name-their-axes-y-and-x.md
-│   └── 034-an-acquisition-is-one-datastrip-of-one-pass.md
+│   ├── 034-an-acquisition-is-one-datastrip-of-one-pass.md
+│   └── 037-v2-stores-use-the-utm-zones-layout.md
 │
 ├── campaign/                      THE GLOBAL CAMPAIGN — start here
 │   ├── campaign-plan.md                        <- START HERE. What runs, with what settings, in

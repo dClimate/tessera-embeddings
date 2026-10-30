@@ -10,7 +10,7 @@ PR #218 (2026-10-22).
 
 | node | conventions registered | what it carries |
 |---|---|---|
-| root (global store) | `geoemb` | encoder, source data, quantization, `gsd`; once for all 120 zones |
+| root (global store) | `geoemb` | encoder, source data, quantization, `gsd`; once for every zone; `spatial_layout` in a `utm_zones` store |
 | zone group, or root of a single-ROI store | `proj`, `spatial` (+ `geoemb` on a single-ROI root) | CRS as `proj:code`, `proj:wkt2` and `proj:projjson`; the grid as `spatial:dimensions`, `transform`, `shape`, `bbox`, `registration` |
 | every array spanning both spatial dimensions | `spatial` | `spatial:dimensions` repeated from the group |
 | the Y and X coordinate arrays | none (CF attributes) | `standard_name`, `units: m`, `axis`, only for real coordinates in a metre CRS |
@@ -86,13 +86,14 @@ either: a reader pairing a CRS with indices would place the raster at that CRS's
 is a proposal with no release, and its registration example adds a `version` field the conventions
 spec forbids, so registering it would not validate.
 
-**`geoemb:spatial_layout` is not written.** The schema allows two values: `"utm_zones"`, defined as
-60 groups named `utm01` to `utm60`, and `"global"`, one array in a global CRS. Our global store is
-120 groups named `01N` to `60S`, each in its hemisphere's own EPSG code
-([ADR 011](../decisions/011-campaign-zone-ingestion.md)), and a single-ROI store is neither. A tool
-following the spec would look for `utm33` and not find it, so the optional field is omitted. The
-convention's own TESSERA example instead extends the northern CRS south with negative northings. A
-hemisphere amendment upstream would let us declare a layout again.
+**`geoemb:spatial_layout` is written only where it is true.** The schema allows two values:
+`"utm_zones"`, defined as 60 groups named `utm01` to `utm60`, and `"global"`, one array in a global
+CRS. A store in the `utm_zones` layout (v2 onward, [ADR 037](../decisions/037-v2-stores-use-the-utm-zones-layout.md))
+declares the first on its root. Each of its groups is a full column in the northern CRS, with the
+south as negative northings, as in the convention's own TESSERA example. A hemisphere-layout store
+(120 groups named `01N` to `60S`, [ADR 011](../decisions/011-campaign-zone-ingestion.md)) and a
+single-ROI store match neither value, so they omit the optional field: a tool following the spec
+would look for `utm33` and not find it.
 
 **`geoemb:source_data` lists resolvable dataset references:** the Earth Search `sentinel-2-l2a`
 collection we query, which indexes both the `sentinel-cogs` and `sentinel-s2-l2a` buckets

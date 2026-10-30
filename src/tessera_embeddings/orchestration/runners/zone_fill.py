@@ -452,7 +452,7 @@ def fill_zone_year(
 
     Args:
         store_path: URI of the global Icechunk repo (``BucketPaths.global_store()``).
-        zone: Zone group name — UTM common name, e.g. ``"01N"``/``"60S"``.
+        zone: Zone group name, e.g. ``"utm33"`` or ``"01N"`` (ADR 037).
         year: Campaign calendar year — must be on the group's pre-allocated axis.
         land_mask_path: Partner-supplied boolean zarr on the zone pixel grid.
         mosaic_base: Base path of the zone's ingest mosaic stores.
