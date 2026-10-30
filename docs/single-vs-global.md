@@ -426,9 +426,9 @@ its own hemisphere's EPSG code. An existing store keeps its layout whichever mod
 utm_zones (v2 onward)                    hemispheres (v1.1)
 utm33   EPSG:32633                       33N   EPSG:32633
   9,338,880 m  ── top ──                   9,338,880 m ── top ──
-        north half (= 33N's grid)               (northern half only)
+  utm33n: north half (= 33N's grid)            (northern half only)
           0 m  ── equator ──                       0 m ── bottom ──
-        south half (negative northings)  33S   EPSG:32733, its own group
+  utm33s: south half (negative northings)  33S EPSG:32733, its own group
  -8,888,320 m  ── bottom ──                 (false northing 10,000 km)
 ```
 
@@ -436,6 +436,14 @@ A zone's name says which layout it is in, so group names, mosaic paths, campaign
 parameters all carry it as-is, and `canonicalize_zone` parses `"UTM7"` into `"utm07"` or `" 7s "`
 into `"07S"`. The two grids share every pixel but not their shard boundaries south of the
 equator, so a `utm_zones` store needs its own land mask and its own mosaics.
+
+**The campaign fills a column as two halves**, `utm33n` and `utm33s`
+([ADR 038](../context_docs/decisions/038-the-campaign-fills-a-utm-column-in-two-halves.md)), so it
+still has 120 units of work a year, each about a v1.1 zone-year. The equator falls on a shard
+boundary, so the halves write disjoint shards of the one `utm33` group and can run at once. Each
+has its own mask group, mosaics and zone-year tag. The group records each half's year in
+`halves_complete`, and adds the year to `years_complete` only when both halves are in, so
+`years_complete` always means the whole column. `runs[year]` holds one record per half.
 
 **Zones are pure six-degree longitude bands.** Every pixel centre falls in exactly one zone, and
 the per-zone pixel grids come from the EPSG registry (`storage/zone_grid.py`), snapped to the

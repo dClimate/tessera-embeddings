@@ -29,13 +29,13 @@ every zone-year infers in minutes, can hold the request for a backlog with
 ``inference_start_delay_minutes``.
 
 **Scheduling (ADR-008 D6 + the runner contract).** Inference is parallel across zones; only
-commits contend, and only *same-zone* fills conflict (shared ``years_complete``/``runs``
-attrs → ``RebaseFailedError``). By default (``overlap_years``) every requested year is ONE
-batch partitioned by ZONE, so a zone's years all land in one cluster and serialize on its
-single trailing assembly thread — which keeps same-zone fills apart without a year barrier.
-``overlap_years=False`` restores the year-by-year outer loop, dispatching each year's zones
-concurrently, where distinct zones make same-zone overlap impossible by construction. Either
-way ``max_parallel_clusters`` bounds concurrency. Commits are UNGATED: at 10 clusters the
+commits contend. Fills that share a group write disjoint shards and retry their attrs commit,
+so they are safe together — the two halves of a ``utm_zones`` column (ADR 038) are separate
+zones here and routinely land on different clusters. By default (``overlap_years``) every
+requested year is ONE batch partitioned by ZONE, so a zone's years all land in one cluster and
+serialize on its single trailing assembly thread. ``overlap_years=False`` restores the
+year-by-year outer loop, dispatching each year's zones concurrently. Either way
+``max_parallel_clusters`` bounds concurrency. Commits are UNGATED: at 10 clusters the
 committer ceiling is ~2N=20 on a single branch tip, measured at ~2.2 s commits
 (``context_docs/storage/writing-to-the-global-store.md``). ``pending()`` is year-major, the
 drain pattern the barrier path relies on.
@@ -100,7 +100,7 @@ from tessera_embeddings.storage.update import (
     update_states,
 )
 from tessera_embeddings.storage.zarr_store import is_missing_repo, open_store_group_and_tip
-from tessera_embeddings.storage.zone_grid import canonicalize_zone
+from tessera_embeddings.storage.zone_grid import canonicalize_zone, group_and_half
 
 # S1/S2 grandchild ingest refs derive from this single source rather than duplicated string
 # literals, so a rename of the ingest deployments stays in ingest_zone_year.IngestDeployments.
@@ -1064,7 +1064,7 @@ async def run_global_campaign(
     # fill to reject an unseeded group. (The default None spans every zone; a not-fully-seeded
     # store surfaces at the fill.)
     if expected_zones is not None:
-        unseeded = [z for z in expected_zones if z not in status.zones]
+        unseeded = [z for z in expected_zones if group_and_half(z)[0] not in status.zones]
         if unseeded:
             raise ValueError(f"Requested zone(s) {unseeded} are not seeded in {store_path} — run the seed flow first.")
 
@@ -1104,7 +1104,7 @@ async def run_global_campaign(
     # subset, but the default `zones=None` expands to every zone in campaign_work_list, so a
     # partially-seeded store would ingest each unseeded cell (expensive) only for the fill to
     # reject the missing group.
-    unseeded_work = sorted({z for z, _ in work if z not in status.zones})
+    unseeded_work = sorted({z for z, _ in work if group_and_half(z)[0] not in status.zones})
     if unseeded_work:
         raise ValueError(
             f"Zone(s) {unseeded_work} in the work list are not seeded in {store_path} — run the seed flow "

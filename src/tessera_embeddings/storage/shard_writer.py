@@ -66,6 +66,7 @@ from tessera_embeddings.storage.session_catch_up import (
     ticking,
 )
 from tessera_embeddings.storage.time_axis import read_time_values, year_of
+from tessera_embeddings.storage.zone_grid import Half
 
 _log = logging.getLogger(__name__)
 
@@ -557,7 +558,8 @@ def run_forked(
     return telemetry
 
 
-#: The snapshot-metadata key on every shard commit a run makes: ``{"run_id", "zone", "year"}``. Read
+#: The snapshot-metadata key on every shard commit a run makes: ``{"run_id", "zone", "year"}``, plus
+#: ``"half"`` for a column half (ADR 038); ``zone`` is always the group. Read
 #: back by :func:`~tessera_embeddings.storage.published_store.shard_writes`.
 SHARD_WRITE = "shard_write"
 
@@ -573,6 +575,33 @@ def read_years_complete(node: zarr.Group) -> list[int]:
     return sorted(int(y) for y in raw) if isinstance(raw, list) else []
 
 
+#: A ``utm_zones`` column's two fill halves (ADR 038).
+HALVES: tuple[Half, ...] = ("n", "s")
+#: Group attr ``{"<year>": ["n", "s"]}``: which halves of a column have landed each year.
+HALVES_COMPLETE = "halves_complete"
+
+
+def read_halves_complete(node: zarr.Group, year: int) -> set[str]:
+    """The halves of ``node``'s column that have landed ``year`` (empty for a hemisphere group)."""
+    raw = node.attrs.get(HALVES_COMPLETE) or {}
+    return set(raw.get(str(year), [])) if isinstance(raw, dict) else set()
+
+
+def cell_complete(node: zarr.Group, year: int, half: Half | None = None) -> bool:
+    """Whether a fill zone has landed ``year``: its group's ``years_complete``, or the half's own mark."""
+    return year in read_years_complete(node) or (half is not None and half in read_halves_complete(node, year))
+
+
+def year_runs(runs: object, year: int) -> list[dict]:
+    """The run records of ``year`` in a ``runs`` attr: the year's one record, or one per column half."""
+    entry = runs.get(str(year)) if isinstance(runs, dict) else None
+    if not isinstance(entry, dict):
+        return []
+    if "run_id" in entry:
+        return [entry]
+    return [entry[h] for h in HALVES if isinstance(entry.get(h), dict)]
+
+
 def run_provenance(
     existing: object,
     year: int,
@@ -584,8 +613,13 @@ def run_provenance(
     input_coverage: dict | None = None,
     code: dict | None = None,
     commit: Mapping[str, str] | None = None,
+    half: Half | None = None,
 ) -> dict:
     """Merge a per-year run record into a group's ``runs`` attr (the schema's one owner).
+
+    A column's two halves each write the year (ADR 038), so for a ``half`` the year holds one
+    record per half, ``runs[year] = {"n": record, "s": record}``, each with its own history;
+    :func:`year_runs` reads either shape.
 
     ``commit`` is the run's shard commit, ``{"snapshot", "committed_at"}``, recorded as null for
     a year marked without writing shards; a record with no ``commit`` key predates the field. The
@@ -656,14 +690,16 @@ def run_provenance(
     if resolved_code:
         record["code"] = dict(resolved_code)
     runs = dict(existing) if isinstance(existing, dict) else {}
-    prior = runs.get(str(year))
+    slots = runs if half is None else dict(runs.get(str(year)) or {})
+    key = str(year) if half is None else half
+    prior = slots.get(key)
     if isinstance(prior, dict):
         # A re-run under the same id replaces its own entry; any other run joins the history.
         replaced = [] if prior.get("run_id") == run_id else [{k: prior[k] for k in _HISTORY if k in prior}]
         previous = [p for p in [*prior.get("previous", []), *replaced] if p.get("run_id") != run_id]
         if previous:
             record["previous"] = previous
-    return {**runs, str(year): record}
+    return {**runs, str(year): record if half is None else {**slots, half: record}}
 
 
 #: What ``previous`` keeps of a replaced run: enough to know it wrote the year, when, in which commit,
@@ -689,11 +725,17 @@ def commit_year_attrs(
     commit: Mapping[str, str] | None = None,
     tries: int = 8,
     skip_if_marked: bool = False,
+    half: Half | None = None,
 ) -> str:
     """Advance one year's ``years_complete``/``runs`` in its own small commit, retrying.
 
-    The single writer of those two attrs, and the reason concurrent fills of the SAME
+    The single writer of those attrs, and the reason concurrent fills of the SAME
     zone group are safe.
+
+    **A column half (ADR 038)** marks itself in ``halves_complete[year]`` and writes its own
+    ``runs[year][half]``; the year enters ``years_complete`` only with the second half, so every
+    reader of ``years_complete`` still means "the whole group has this year". Both halves'
+    marks go through the same loop, and each again inserts only its own key.
 
     **Why a separate commit.** Chunk data for different years of one zone is strictly
     disjoint — every chunk and shard is 1 in the time dimension — so those writes always
@@ -726,9 +768,14 @@ def commit_year_attrs(
         session = repo.writable_session("main")
         node = _group_node(session.store, group)
         done = read_years_complete(node)
-        if year_label in done and (run_id is None or skip_if_marked):
+        if cell_complete(node, year_label, half) and (run_id is None or skip_if_marked):
             return repo.lookup_branch("main")
-        if year_label not in done:
+        landed = read_halves_complete(node, year_label) | {half} if half is not None else set(HALVES)
+        if half is not None and year_label not in done:
+            marks = node.attrs.get(HALVES_COMPLETE)
+            marks = dict(marks) if isinstance(marks, dict) else {}
+            node.attrs[HALVES_COMPLETE] = {**marks, str(year_label): sorted(landed)}
+        if year_label not in done and landed >= set(HALVES):
             node.attrs["years_complete"] = sorted([*done, year_label])
         if run_id is not None:
             node.attrs["runs"] = run_provenance(
@@ -740,9 +787,10 @@ def commit_year_attrs(
                 optical_skips=optical_skips,
                 input_coverage=input_coverage,
                 commit=commit,
+                half=half,
             )
         try:
-            return commit_with_rebase(session, f"mark {group} year {year_label} complete")
+            return commit_with_rebase(session, f"mark {group}{half or ''} year {year_label} complete")
         except icechunk.RebaseFailedError:
             if attempt == tries:
                 raise
@@ -897,6 +945,7 @@ def write_year_shards(
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     fault: ArmedFault | None = None,
     commit_attrs: Callable[[icechunk.Repository, str, int, Mapping[str, str]], str] | None = None,
+    half: Half | None = None,
 ) -> str:
     """Fill one (zone, year) with whole shards from ``source`` in one commit.
 
@@ -953,6 +1002,9 @@ def write_year_shards(
     one function, there is nothing outside the process to aim a kill at, and a state
     documented as benign but never observed is an assumption.
 
+    ``half`` is the column half being filled (ADR 038): ``source`` holds only its shards, and the
+    attrs commit marks only that half.
+
     ``commit_attrs(repo, group, year, commit)`` replaces the second commit, given the shard commit
     as ``commit_year_attrs`` is. A targeted update passes its own record writer here, so writing
     shards into a year that is already complete records the update and leaves ``years_complete``
@@ -982,7 +1034,11 @@ def write_year_shards(
         # Keep the session current WHILE the workers write. Without this the commit below has
         # to walk every snapshot published during the write, and that walk is where seven of
         # nine assemblies stopped dead on 2026-08-29. See `catch_up_to_branch`.
-        catch_up=lambda: catch_up_best_effort(repo, session, group, log=log),
+        # Narrowed to this write's shards, so the other half of a column filling the same group
+        # (ADR 038) does not block it; see `_diff_touches`.
+        catch_up=lambda: catch_up_best_effort(
+            repo, session, group, shards={(year_index, sy, sx) for sy, sx in shards}, log=log
+        ),
     )
 
     year_label = _year_label(_group_node(session.store, group), year_index)
@@ -992,7 +1048,9 @@ def write_year_shards(
     shard_snapshot = commit_with_rebase(
         session,
         commit_msg or f"fill {group} year {year_label}",
-        metadata={SHARD_WRITE: {"run_id": run_id, "zone": group, "year": year_label}} if run_id else None,
+        metadata={SHARD_WRITE: {"run_id": run_id, "zone": group, "year": year_label} | ({"half": half} if half else {})}
+        if run_id
+        else None,
     )
     # The store's own clock for this write. Icechunk refuses a snapshot older than its parent, so
     # along `main` these stamps are commit order, which is the order a tile's pixels were written
@@ -1023,6 +1081,7 @@ def write_year_shards(
             input_coverage=input_coverage,
             empty=empty,
             commit=commit,
+            half=half,
         )
     )
     if telemetry is not None:

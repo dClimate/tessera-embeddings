@@ -8,8 +8,9 @@ The bookkeeping around the shard-writer fills (ADR-008 D7). Three concerns:
 - **Snapshot hygiene** (`expire_and_gc`) expires old snapshots and garbage-collects the
   now-unreferenced objects, keeping the repo's manifest/object count bounded over a nine-year,
   multi-zone campaign.
-- **Progress** (`campaign_status`) reads each zone group's ``years_complete`` attr into a
-  resume-oriented view: what is done, what is still pending.
+- **Progress** (`campaign_status`) reads each zone group's ``years_complete`` attr — and a
+  column's ``halves_complete``, since the campaign fills a ``utm_zones`` column as two halves
+  (ADR 038) — into a resume-oriented view: what is done, what is still pending.
 
 That attr is advanced by :func:`tessera_embeddings.storage.shard_writer.write_year_shards` in the
 same commit as the data (D1), so status is always consistent with what has actually landed. The
@@ -21,16 +22,16 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import cast
 
 import icechunk
 import zarr
 
-from tessera_embeddings.storage.shard_writer import commit_year_attrs
+from tessera_embeddings.storage.shard_writer import HALVES, commit_year_attrs, read_halves_complete
 from tessera_embeddings.storage.time_axis import CAMPAIGN_YEARS, time_index_of, year_timestamp
-from tessera_embeddings.storage.zone_grid import zone_layout_of, zones
+from tessera_embeddings.storage.zone_grid import fill_zones, group_and_half, zone_layout_of, zones
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +178,8 @@ def mark_zone_year_empty(
 ) -> str:
     """Mark a ``(zone, year)`` complete with **no data** — an all-ocean cell.
 
+    ``zone`` is a fill zone: a group, or a column half (ADR 038), which marks only its half.
+
     Some zones (and some zone-years under the partner land mask) contain no land at
     all, so there is nothing to stage or shard-write — but the campaign work list
     (:meth:`CampaignStatus.pending`) must still see them land. This advances ``years_complete``
@@ -190,7 +193,8 @@ def mark_zone_year_empty(
     """
     # Axis check on a read-only view: it must fail before any session is opened, so a rejected
     # year cannot leave a writable session dangling.
-    node = cast(zarr.Group, zarr.open_group(repo.readonly_session("main").store, mode="r")[zone])
+    group, half = group_and_half(zone)
+    node = cast(zarr.Group, zarr.open_group(repo.readonly_session("main").store, mode="r")[group])
     if time_index_of(node, year_timestamp(year)) is None:
         raise ValueError(
             f"Year {year} is not on {zone}'s pre-allocated time axis — refusing to mark an "
@@ -198,7 +202,7 @@ def mark_zone_year_empty(
         )
     # Delegated so there is exactly ONE writer of years_complete/runs, with one retry-on-conflict
     # policy — what makes a no-land mark safe to run concurrently with another year of the zone.
-    return commit_year_attrs(repo, zone, year, run_id=run_id, empty=True, skip_if_marked=True)
+    return commit_year_attrs(repo, group, year, run_id=run_id, empty=True, skip_if_marked=True, half=half)
 
 
 @dataclass(frozen=True)
@@ -257,6 +261,7 @@ class CampaignStatus:
 
     years: tuple[int, ...]  # the campaign year axis (e.g. 2017..2025)
     zones: dict[str, tuple[int, ...]]  # seeded group name -> years landed (sorted)
+    halves: dict[str, tuple[int, ...]] = field(default_factory=dict)  # column half -> years landed
 
     @property
     def zones_seeded(self) -> int:
@@ -269,15 +274,15 @@ class CampaignStatus:
         return sum(len(v) for v in self.zones.values())
 
     def campaign_zones(self) -> tuple[str, ...]:
-        """The full campaign: every zone of the layout this store's groups use (ADR 037)."""
+        """The full campaign: every fill zone of the layout this store's groups use (ADR 037, 038)."""
         layout = zone_layout_of(self.zones)
         if layout is None:
             raise ValueError("the store has no zone groups, so it has no layout yet — seed it first.")
-        return tuple(zones(layout))
+        return tuple(fill_zones(layout))
 
     def has(self, zone: str, year: int) -> bool:
-        """Whether ``zone`` has landed ``year``."""
-        return year in self.zones.get(zone, ())
+        """Whether ``zone`` — a group, or a column half — has landed ``year``."""
+        return year in self.zones.get(zone, ()) or year in self.halves.get(zone, ())
 
     def pending(
         self,
@@ -288,10 +293,8 @@ class CampaignStatus:
         """The ``(zone, year)`` cells still to fill, for the orchestrator's work list.
 
         Defaults to :meth:`campaign_zones` x the campaign years; a zone not yet seeded counts
-        every year as pending. Ordered year-major (all zones of one year before the next) so a scheduler
-        draining the list concurrently never queues two years of the SAME zone back to back —
-        same-zone fills must be serial, since their attr commits conflict (see
-        :func:`~tessera_embeddings.storage.shard_writer.write_year_shards`).
+        every year as pending. Ordered year-major (all zones of one year before the next), so a
+        scheduler draining the list works across the world rather than down one zone's years.
         """
         zone_names = tuple(expected_zones) if expected_zones is not None else self.campaign_zones()
         yrs = tuple(years) if years is not None else self.years
@@ -320,13 +323,17 @@ def campaign_status(
     """
     session = repo.readonly_session(snapshot_id=snapshot_id) if snapshot_id else repo.readonly_session(branch)
     root = zarr.open_group(session.store, mode="r")
-    zones: dict[str, tuple[int, ...]] = {}
+    landed_by_group: dict[str, tuple[int, ...]] = {}
+    halves: dict[str, tuple[int, ...]] = {}
     for name in sorted(root.group_keys()):
         node = cast(zarr.Group, root[name])
         raw = node.attrs.get("years_complete", [])
         landed = tuple(sorted(int(y) for y in raw)) if isinstance(raw, list) else ()
-        zones[name] = landed
-    return CampaignStatus(years=tuple(years), zones=zones)
+        landed_by_group[name] = landed
+        if name in zones("utm_zones"):
+            for h in HALVES:
+                halves[name + h] = tuple(y for y in years if y in landed or h in read_halves_complete(node, y))
+    return CampaignStatus(years=tuple(years), zones=landed_by_group, halves=halves)
 
 
 def campaign_work_list(

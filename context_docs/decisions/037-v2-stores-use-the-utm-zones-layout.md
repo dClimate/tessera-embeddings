@@ -2,7 +2,8 @@
 
 **Status:** Proposed 2026-10-27. Follows the pattern of
 [ADR 032](032-v2-stores-name-their-axes-y-and-x.md): one more per-model field, and a store keeps
-what it was created with.
+what it was created with. The campaign fills each column as two halves:
+[ADR 038](038-the-campaign-fills-a-utm-column-in-two-halves.md).
 
 A global store has so far been 120 zone groups, `01N` to `60S`, each in its hemisphere's own EPSG
 code. Other global embedding datasets use a different layout: the Source Coop copy of our v1.1
@@ -35,9 +36,9 @@ layouts in one store, because the two would cover the world twice.
 **A zone's name says which layout it belongs to.** `utm33` and `33N` never collide, so
 `zone_grid.zone(name)` resolves either one, and mosaic paths, tags, staging run ids, mask groups
 and flow parameters all work unchanged. Only questions about every zone take a layout:
-`zone_grid.zones(layout)`. These are seeding, building the land mask, exporting the regions to
-ingest, and the campaign's default scope. That scope is every zone of the layout the store's
-groups use. `canonicalize_zone` accepts `utm33`, `UTM7` and the old forms alike.
+`zone_grid.zones(layout)` for the groups seeding creates, and `zone_grid.fill_zones(layout)` for
+what the land mask, the ROI export and the campaign's default scope cover (ADR 038). That scope is
+every fill zone of the layout the store's groups use. `canonicalize_zone` accepts `utm33`, `UTM7` and the old forms alike.
 
 **The grid of a `utm` column** comes from the same pyproj derivation as before, taking the union
 of both hemispheres' areas of use projected into the northern CRS and snapping outward to the
@@ -54,10 +55,10 @@ its root, which is now true. Hemisphere stores still omit it.
 
 - **Keep 120 groups and rename them** (`utm33n`, `utm33s`). This is a cheap rename that matches
   nothing: readers following the convention would still not find `utm33`.
-- **Keep the hemisphere halves as the work unit and map them into columns when writing.** This
-  would reuse v1.1's southern mosaics and mask, but the southern half's shards do not line up
-  with the column's. Every southern shard would straddle two column shards, and two writers would
-  contend for one shard.
+- **Keep v1.1's hemisphere zones as the work unit and map them into columns when writing.** This
+  would reuse v1.1's southern mosaics and mask, but the `S` zone's shards do not line up with the
+  column's. Every southern shard would straddle two column shards, and two writers would contend
+  for one shard. (ADR 038's halves are cut from the column's own grid, so they do not.)
 - **Copy Source Coop's extents exactly.** That copy pads each column to a 4,096-pixel pitch for
   its own chunking. Our grid snaps to our own shard pitch, as it always has. Only the group names
   and the CRS are what make the layout match.
@@ -67,10 +68,10 @@ its root, which is now true. Hemisphere stores still omit it.
 - **A `utm_zones` store needs its own mask and its own mosaics.** Run `build_land_mask` with
   `zone_layout="utm_zones"` into a new mask name, then `export_zone_rois` with the same layout.
   The build is pure geometry over the registry and takes under a minute. Mosaics are keyed by
-  zone name, so a v2 ingest writes `utm33` mosaics and never touches v1.1's `33N` and `33S`.
-- **A zone-year is a whole column**, which is roughly the north and south zone-years combined, and
-  the campaign has 60 units per year instead of 120. The campaign partitions clusters over zones,
-  so its balance is now set over 60 coarser units.
+  fill zone, so a v2 ingest writes `utm33n` and `utm33s` mosaics and never touches v1.1's `33N`
+  and `33S`.
+- **A zone-year of the store is a whole column**, roughly the north and south zone-years combined.
+  The campaign fills it as two halves (ADR 038), so it still has 120 units per year.
 - **Southern imagery is warped into the northern CRS.** Sentinel-2 tiles south of the equator
   arrive in EPSG:327xx. Their pixel grid coincides with the column's, so the warp is a pure shift,
   but it is a warp rather than a copy. Neither its output nor its cost has been measured yet; a

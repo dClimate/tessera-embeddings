@@ -1,4 +1,4 @@
-"""Zone grids: both layouts, shard-aligned, pinned to the EPSG registry (ADR 037)."""
+"""Zone grids: both layouts, shard-aligned, pinned to the EPSG registry (ADR 037), filled by halves (ADR 038)."""
 
 from __future__ import annotations
 
@@ -41,9 +41,32 @@ def test_column_shares_pixels_not_shards_with_the_southern_zone():
     assert col.northing[1] == north.northing[1] and col.easting == north.easting
 
 
+def test_a_column_is_filled_as_two_halves_split_on_a_shard_row():
+    # ADR 038: the equator (northing 0 in 326xx) falls on a shard boundary, so the halves own
+    # disjoint shard rows that together are the column, each on the column's own grid.
+    col, north, south = zg.zone("utm10"), zg.zone("utm10n"), zg.zone("utm10s")
+    assert (north.name, north.group_name, south.name, south.group_name) == ("utm10n", "utm10", "utm10s", "utm10")
+    assert (north.northing, north.easting, north.epsg) == (col.northing, col.easting, col.epsg)
+    assert col.northing[1] % zg.PITCH_M == 0
+    assert north.tile_rows == (0, south.tile_rows[0]) and south.tile_rows[1] == col.tile_rows[1]
+    assert (
+        zg.northing_coords(col)[north.tile_rows[1] * SHARD_PX]
+        < 0
+        < zg.northing_coords(col)[north.tile_rows[1] * SHARD_PX - 1]
+    )
+    assert sorted(zg.fill_zones("utm_zones")) == sorted(f"utm{u:02d}{h}" for u in range(1, 61) for h in "ns")
+    assert zg.fill_zones("hemispheres") is zg.zones("hemispheres")
+    assert [zg.group_and_half(n) for n in ("utm10s", "utm10", "10S", "")] == [
+        ("utm10", "s"),
+        ("utm10", None),
+        ("10S", None),
+        ("", None),
+    ]
+
+
 def test_zone_layout_of():
     assert zg.zone_layout_of(["01N", "60S", "not-a-zone"]) == "hemispheres"
-    assert zg.zone_layout_of(["utm01"]) == "utm_zones"
+    assert zg.zone_layout_of(["utm01"]) == zg.zone_layout_of(["utm01s"]) == "utm_zones"
     assert zg.zone_layout_of([]) is None
     with pytest.raises(ValueError, match="mix"):
         zg.zone_layout_of(["01N", "utm01"])
@@ -80,6 +103,7 @@ def test_calendar_year_times():
         (" 7s ", "07S"),  # surrounding whitespace + zero-pad
         ("utm33", "utm33"),
         ("UTM7", "utm07"),
+        ("UTM33S", "utm33s"),  # a column half
     ],
 )
 def test_canonicalize_zone(raw, expected):
@@ -90,7 +114,7 @@ def test_canonicalize_zone(raw, expected):
 
 
 @pytest.mark.parametrize(
-    "bad", ["", "33", "N33", "0N", "61N", "33X", "33NN", "abc", "-5N", "utm", "utm0", "utm61", "utm33N"]
+    "bad", ["", "33", "N33", "0N", "61N", "33X", "33NN", "abc", "-5N", "utm", "utm0", "utm61", "utm33x", "utm33ns"]
 )
 def test_canonicalize_zone_rejects_malformed(bad):
     with pytest.raises(ValueError, match="UTM zone"):

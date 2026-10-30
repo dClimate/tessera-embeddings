@@ -56,7 +56,9 @@ The global 10 m embeddings campaign (ADR-008) has its own four flows, distinct
 from the single-ROI path above. A store's zones are 60 `utm01`…`utm60` columns
 from v2 on, or 120 `01N`…`60S` hemisphere zones for v1.1 (ADR 037): the seed
 takes the model's layout, and `build_land_mask` and `export_zone_rois` take it
-as `zone_layout`.
+as `zone_layout`. The campaign fills a v2 column as two halves, `utm01n`…`utm60s`,
+so it has 120 units a year either way (ADR 038): mask groups, mosaics, flow
+parameters and zone-year tags use the half's name.
 
 ```text
 build_land_mask   →   seed_global_store   →   run_global_campaign
@@ -314,11 +316,12 @@ current mask through the campaign's own partitioner.
 > of EC2; lower `num_actors` and `max_workers` alongside, since running many narrow
 > fleets rather than few wide ones is the point of these defaults.
 
-Zone-parallelism is safe because inference is independent across zones and only
-*same-zone* fills conflict (shared group attrs → `RebaseFailedError`) — the
-partition is over ZONES, so all of a zone's years land in one cluster, and that
-cluster's single trailing-assembly thread never overlaps two commits for the same
-zone group. **Commits are otherwise ungated.**
+Zone-parallelism is safe because inference is independent across zones, and fills
+that share a group write disjoint shards and retry their small attrs commit
+(`commit_year_attrs`). That covers two years of one zone and the two halves of a
+v2 column, which routinely land on different clusters (ADR 038). The partition is
+over ZONES, so all of a zone's years land in one cluster on its single
+trailing-assembly thread. **Commits are ungated.**
 They contend on the branch-tip CAS, since all 120 zone groups share one repo, but
 run 1 measured that as 2.2 s at 16 committers and 15 s at 120 with zero
 unresolvable conflicts. See `context_docs/storage/writing-to-the-global-store.md`. `build_land_mask` and `seed_global_store` are
