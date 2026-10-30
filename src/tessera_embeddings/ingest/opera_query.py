@@ -1,8 +1,9 @@
-"""OPERA RTC-S1 query utilities: MGRS bbox, orbit filtering, UTM EPSG.
+"""OPERA RTC-S1 query utilities: MGRS bbox, orbit filtering, UTM EPSG, burst fusion order.
 
 OPERA RTC-S1 items on CMR-STAC carry no MGRS tile ID, orbit direction or projection metadata, so
 these helpers query by spatial extent, filter orbit via the native CMR Granule Search API, derive
-the CRS, and prepare items for loading.
+the CRS, and prepare items for loading. They also rank each burst by its acquisitions over the
+window, the radar fusion order (``context_docs/decisions/033-radar-overlaps-go-to-the-most-acquired-burst.md``).
 """
 
 from __future__ import annotations
@@ -12,8 +13,10 @@ import re
 import time
 import warnings
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
+from datetime import UTC, datetime
 from typing import Any, cast
+from xml.etree import ElementTree
 
 import mgrs
 import requests
@@ -22,9 +25,15 @@ from pystac.utils import str_to_datetime
 from requests.adapters import HTTPAdapter
 
 from tessera_embeddings.config import S1_OPERA_BANDS
-from tessera_embeddings.ingest._http import NonJsonResponseError, json_or_raise, make_logging_retry
+from tessera_embeddings.errors import ConfigMismatchError
+from tessera_embeddings.ingest._http import (
+    NonJsonResponseError,
+    json_or_raise,
+    make_logging_retry,
+    spawn_abandonable,
+)
 from tessera_embeddings.ingest.auth import get_edl_session, resolve_item_assets, rewrite_assets_to_s3
-from tessera_embeddings.ingest.solar_days import normalize_to_solar_day
+from tessera_embeddings.ingest.solar_days import normalize_to_solar_day, solar_day_of_instant, whole_window_range
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +43,9 @@ logger = logging.getLogger(__name__)
 # host and honours ``attribute[]`` filtering, which CMR-STAC silently ignores — so orbit direction
 # is filtered server-side rather than by intersecting a separate STAC result.
 _CMR_GRANULE_URL = "https://cmr.earthdata.nasa.gov/search/granules.json"
+#: The same search in CMR's reference format: each granule's title and concept id and nothing else,
+#: a small fraction of the JSON's bytes. All the burst census needs.
+_CMR_REFERENCE_URL = "https://cmr.earthdata.nasa.gov/search/granules.xml"
 _CMR_OPERA_SHORT_NAME = "OPERA_L2_RTC-S1_V1"
 _CMR_PROVIDER = "ASF"
 _CMR_PAGE_SIZE = 2000
@@ -54,6 +66,18 @@ _REQUIRED_POLARIZATIONS = ("VV", "VH")
 _CMR_DATA_REL_SUFFIX = "/data#"
 _BAND_HREF_RE = re.compile(r"_(VV|VH|HH|HV|mask)\.tif$")
 
+#: An OPERA RTC-S1 granule title, e.g.
+#: ``OPERA_L2_RTC-S1_T115-245714-IW1_20240101T015432Z_20240102T091011Z_S1A_30_v1.0``: the burst id
+#: (fixed-width relative orbit, burst number, sub-swath), the acquisition start, the production time.
+_TITLE_RE = re.compile(r"^OPERA_L2_RTC-S1_(?P<burst>T\d{3}-\d{6}-IW[123])_(?P<acquired>\d{8}T\d{6}Z)_")
+
+#: Item property: the burst id the title names; absent where it does not parse.
+BURST_ID = "opera:burst_id"
+#: Item property: the burst's acquisitions over the ingest window, from the :class:`BurstCensus`.
+BURST_ACQUISITIONS = "tessera:burst_acquisitions"
+#: Root attribute of a radar mosaic store: the census that ranked its dates (:meth:`BurstCensus.record`).
+BURST_CENSUS_ATTR = "burst_census"
+
 
 # CMR intermittently times out or 5xxes under load. urllib3's Retry covers read timeouts (``read``
 # defaults to ``total``) as well as the listed statuses, backing off and honouring Retry-After.
@@ -70,8 +94,8 @@ _CMR_RETRY = make_logging_retry(
 #: Attempts at ONE page whose body did not parse, and the seconds between them (times the
 #: attempt number). Scoped to that case alone: it is the single failure ``_CMR_RETRY``
 #: cannot see, since its ladder keys on status and this response's status is fine.
-_NON_JSON_PAGE_ATTEMPTS = 4
-_NON_JSON_PAGE_BACKOFF_S = 5.0
+_UNPARSEABLE_PAGE_ATTEMPTS = 4
+_UNPARSEABLE_PAGE_BACKOFF_S = 5.0
 
 
 def _cmr_session() -> requests.Session:
@@ -157,7 +181,9 @@ def _granule_to_item(entry: dict[str, Any], skip_counts: Counter[str] | None = N
     Maps the granule's data download links onto the ``S1_OPERA_BANDS`` asset keys (``0_VV``,
     ``0_VH``) so the item is shape-compatible with the CMR-STAC items the rest of the pipeline
     expects. odc.stac.load reads dtype, nodata and CRS from the COGs themselves (we pass an
-    explicit geobox), so only band hrefs, id, datetime, geometry and bbox matter.
+    explicit geobox), so only band hrefs, id, datetime, geometry and bbox matter to the load.
+    ``properties["datetime"]`` keeps the raw acquisition time for ``normalize_to_solar_day``, and
+    :data:`BURST_ID` the burst the fusion order ranks, absent where the title does not parse.
 
     Only dual-pol VV+VH granules are accepted: a partial-pol granule would ingest a fabricated
     all-nodata band that the encoder reads as a confident physical signal (see the optional-S1
@@ -225,12 +251,16 @@ def _granule_to_item(entry: dict[str, Any], skip_counts: Counter[str] | None = N
     geometry = _polygon_to_geojson(polygons[0][0]) if polygons else None
     bbox = _geometry_bbox(geometry) if geometry else None
 
+    properties: dict[str, Any] = {"datetime": entry["time_start"]}
+    if burst := _TITLE_RE.match(entry["title"]):
+        properties[BURST_ID] = burst["burst"]
+
     return Item(
         id=entry["title"],
         geometry=geometry,
         bbox=bbox,
         datetime=str_to_datetime(entry["time_start"]),
-        properties={},
+        properties=properties,
         assets=assets,
     )
 
@@ -254,6 +284,18 @@ def _geometry_bbox(geometry: dict[str, Any]) -> list[float]:
     return [min(lons), min(lats), max(lons), max(lats)]
 
 
+def _cmr_boxes(bbox: tuple[float, float, float, float]) -> list[tuple[float, float, float, float]]:
+    """``bbox`` as boxes CMR can read: itself, or its two halves where it crosses ±180°.
+
+    CMR's ``bounding_box`` is lower-left/upper-right (west,south,east,north) and does NOT read a
+    west>east box as antimeridian-crossing — it would match nothing. An ROI whose live-tile
+    envelope crosses ±180° (zones 01*/60*) is stored with a GeoJSON-style west>east bbox (see
+    ``land_mask.export_zone_roi``), so it is queried as the two halves either side of the line.
+    """
+    west, south, east, north = bbox
+    return [(west, south, 180.0, north), (-180.0, south, east, north)] if west > east else [bbox]
+
+
 def _query_cmr_granules(
     bbox: tuple[float, float, float, float],
     start_date: str,
@@ -262,11 +304,8 @@ def _query_cmr_granules(
 ) -> list[Item]:
     """Query the CMR Granule Search API for OPERA items in a bbox/date/orbit.
 
-    CMR's ``bounding_box`` is lower-left/upper-right (west,south,east,north) and does NOT read a
-    west>east box as antimeridian-crossing — it would match nothing. An ROI whose live-tile
-    envelope crosses ±180° (zones 01*/60*) is stored with a GeoJSON-style west>east bbox (see
-    ``land_mask.export_zone_roi``), so it is split at the antimeridian into two CMR-valid boxes
-    and merged, deduped by granule id. A normal box queries once.
+    A box crossing ±180° is queried as two halves (:func:`_cmr_boxes`), deduped by granule id,
+    since a granule straddling the line comes back from both.
 
     Args:
         bbox: (west, south, east, north) in WGS84 degrees; west>east = crosses ±180°.
@@ -277,58 +316,115 @@ def _query_cmr_granules(
     Returns:
         List of pystac ``Item`` objects matching the orbit direction.
     """
-    west, south, east, north = bbox
-    if west > east:
-        left = _query_cmr_granules_one((west, south, 180.0, north), start_date, end_date, orbit_direction)
-        right = _query_cmr_granules_one((-180.0, south, east, north), start_date, end_date, orbit_direction)
-        merged: list[Item] = []
-        seen: set[str] = set()
-        for item in (*left, *right):
-            if item.id not in seen:
-                seen.add(item.id)
-                merged.append(item)
-        logger.info(
-            f"CMR granule query ({orbit_direction}): antimeridian bbox split into 2 → "
-            f"{len(merged)} unique items ({len(left)}+{len(right)} pre-dedup)"
+    found = {
+        item.id: item
+        for box in _cmr_boxes(bbox)
+        for item in _query_cmr_granules_one(box, start_date, end_date, orbit_direction)
+    }
+    return list(found.values())
+
+
+def _granule_params(
+    bbox: tuple[float, float, float, float], start_date: str, end_date: str, orbit_direction: str
+) -> dict[str, str | int | list[str]]:
+    """The search parameters for OPERA granules in ONE (west<=east) box, window and orbit.
+
+    BOTH filters server-side; the polarisation one stops us paying to page granules ingest can
+    never use, and excludes nothing reachable. The list value is how requests encodes a repeated
+    query parameter (a dict cannot hold two "attribute[]" keys), and repeating the polarisation
+    name is what makes CMR require both rather than either.
+    """
+    return {
+        "short_name": _CMR_OPERA_SHORT_NAME,
+        "provider": _CMR_PROVIDER,
+        "bounding_box": ",".join(str(c) for c in bbox),
+        "temporal": f"{start_date}T00:00:00Z,{end_date}T23:59:59Z",
+        "page_size": _CMR_PAGE_SIZE,
+        "attribute[]": [
+            f"string,ASCENDING_DESCENDING,{orbit_direction.upper()}",
+            *(f"string,POLARIZATION,{pol}" for pol in _REQUIRED_POLARIZATIONS),
+        ],
+    }
+
+
+def _json_entries(resp: requests.Response) -> list[dict[str, Any]]:
+    """The granule entries of one JSON page; raises :class:`NonJsonResponseError` if it is not JSON."""
+    body = cast(dict[str, Any], json_or_raise(resp, log_body=True))
+    return cast(list[dict[str, Any]], body.get("feed", {}).get("entry", []))
+
+
+def _reference_titles(resp: requests.Response) -> list[str]:
+    """The granule titles of one reference-format page; raises ``ParseError`` for any other body.
+
+    The message never quotes the body, for the reason :func:`json_or_raise` gives.
+    """
+    root = ElementTree.fromstring(resp.content)
+    if root.tag != "results":
+        raise ElementTree.ParseError(
+            f"{resp.url} answered HTTP {resp.status_code} with a body that is not a CMR result"
         )
-        return merged
-    return _query_cmr_granules_one(bbox, start_date, end_date, orbit_direction)
+    return [name.text or "" for name in root.iterfind("references/reference/name")]
 
 
-def _fetch_granule_page(
+def _fetch_granule_page[T](
     session: requests.Session,
     params: dict[str, str | int | list[str]],
     headers: dict[str, str],
     page: int,
-) -> tuple[dict[str, Any], str | None]:
-    """Fetch ONE page of granules, re-asking when the body is not JSON.
+    *,
+    url: str,
+    parse: Callable[[requests.Response], T],
+) -> tuple[T, str | None]:
+    """Fetch ONE page of granules from ``url``, re-asking when ``parse`` cannot read the body.
 
-    Returns the decoded body and the cursor to carry into the next page.
+    Returns the parsed page and the cursor to carry into the next page.
 
     Retried here because the session's ladder keys on status and an unparseable body arrives
     under a success status that ``raise_for_status`` passes. Unretried, one such page ends a leg
     holding a zone-year of already-written batches. Safe to repeat: a GET whose cursor the archive
     itself issued names the identical page.
     """
-    for attempt in range(1, _NON_JSON_PAGE_ATTEMPTS + 1):
-        resp = session.get(_CMR_GRANULE_URL, params=params, headers=headers, timeout=30)
+    for attempt in range(1, _UNPARSEABLE_PAGE_ATTEMPTS + 1):
+        resp = session.get(url, params=params, headers=headers, timeout=30)
         resp.raise_for_status()
         try:
-            body = cast(dict[str, Any], json_or_raise(resp, log_body=True))
-        except NonJsonResponseError:
-            if attempt == _NON_JSON_PAGE_ATTEMPTS:
+            body = parse(resp)
+        except (NonJsonResponseError, ElementTree.ParseError) as exc:
+            if attempt == _UNPARSEABLE_PAGE_ATTEMPTS:
                 raise
             logger.warning(
-                "CMR page %d unparseable (attempt %d/%d), re-asking in %.0fs",
+                "CMR page %d unparseable (attempt %d/%d: %s), re-asking in %.0fs",
                 page,
                 attempt,
-                _NON_JSON_PAGE_ATTEMPTS,
-                _NON_JSON_PAGE_BACKOFF_S * attempt,
+                _UNPARSEABLE_PAGE_ATTEMPTS,
+                exc,
+                _UNPARSEABLE_PAGE_BACKOFF_S * attempt,
             )
-            time.sleep(_NON_JSON_PAGE_BACKOFF_S * attempt)
+            time.sleep(_UNPARSEABLE_PAGE_BACKOFF_S * attempt)
             continue
         return body, resp.headers.get("CMR-Search-After")
     raise AssertionError("unreachable: the loop either returns or raises")  # pragma: no cover
+
+
+def _granule_pages[T](
+    params: dict[str, str | int | list[str]], *, url: str, parse: Callable[[requests.Response], list[T]]
+) -> Iterator[list[T]]:
+    """Every page of one search, in order, following the ``CMR-Search-After`` cursor.
+
+    Ends at the first empty page or the first short one, since CMR sends no cursor past the last.
+    """
+    session = _cmr_session()
+    headers: dict[str, str] = {}
+    page = 0
+    while True:
+        page += 1
+        entries, search_after = _fetch_granule_page(session, params, headers, page, url=url, parse=parse)
+        if not entries:
+            return
+        yield entries
+        if not (search_after and len(entries) == _CMR_PAGE_SIZE):
+            return
+        headers["CMR-Search-After"] = search_after
 
 
 def _query_cmr_granules_one(
@@ -343,48 +439,19 @@ def _query_cmr_granules_one(
     using the ``CMR-Search-After`` header for pagination and ``attribute[]``
     for server-side orbit-direction filtering.
     """
-    # BOTH filters server-side; the polarisation one stops us paying to page granules ingest can
-    # never use, and excludes nothing reachable. The list value is how requests encodes a repeated
-    # query parameter (a dict cannot hold two "attribute[]" keys), and repeating the polarisation
-    # name is what makes CMR require both rather than either.
-    params: dict[str, str | int | list[str]] = {
-        "short_name": _CMR_OPERA_SHORT_NAME,
-        "provider": _CMR_PROVIDER,
-        "bounding_box": ",".join(str(c) for c in bbox),
-        "temporal": f"{start_date}T00:00:00Z,{end_date}T23:59:59Z",
-        "page_size": _CMR_PAGE_SIZE,
-        "attribute[]": [
-            f"string,ASCENDING_DESCENDING,{orbit_direction.upper()}",
-            *(f"string,POLARIZATION,{pol}" for pol in _REQUIRED_POLARIZATIONS),
-        ],
-    }
-
+    params = _granule_params(bbox, start_date, end_date, orbit_direction)
     items: list[Item] = []
-    headers: dict[str, str] = {}
     skip_counts: Counter[str] = Counter()
 
     logger.info(f"CMR granule query ({orbit_direction}) starting for {start_date}..{end_date} bbox={bbox}")
     t0 = time.monotonic()
-    session = _cmr_session()
     page = 0
-    while True:
-        page += 1
-        body, search_after = _fetch_granule_page(session, params, headers, page)
-
-        entries = body.get("feed", {}).get("entry", [])
-        if not entries:
-            break
-
+    for page, entries in enumerate(_granule_pages(params, url=_CMR_GRANULE_URL, parse=_json_entries), start=1):
         items.extend(item for item in (_granule_to_item(e, skip_counts) for e in entries) if item is not None)
         logger.info(
             f"CMR granule query ({orbit_direction}): page {page} returned {len(entries)} entries "
             f"({len(items)} items so far, {time.monotonic() - t0:.1f}s)"
         )
-
-        if search_after and len(entries) == params["page_size"]:
-            headers["CMR-Search-After"] = search_after
-        else:
-            break
 
     logger.info(
         f"CMR granule query ({orbit_direction}): {len(items)} items across {page} page(s) "
@@ -405,6 +472,129 @@ def _query_cmr_granules_one(
     return items
 
 
+def burst_acquisitions(
+    bbox: tuple[float, float, float, float],
+    start_date: str,
+    end_date: str,
+    orbit_direction: str,
+    *,
+    mid_longitude: float | None = None,
+) -> dict[str, int]:
+    """How many times each burst touching ``bbox`` was acquired in the window, by burst id.
+
+    From titles alone, through CMR's light reference format. Counts distinct ACQUISITIONS, so a
+    reprocessed one counts once. ``start_date..end_date`` are solar days at ``mid_longitude``, as
+    the batches own them: the query reaches a UTC day either side and each acquisition is placed on
+    its solar day before it counts. Rationale and cost: ADR 033.
+    """
+    window = whole_window_range(start_date, end_date)
+    acquired: dict[str, set[str]] = {}
+    titles = unnamed = 0
+    t0 = time.monotonic()
+    for box in _cmr_boxes(bbox):
+        params = _granule_params(box, window.query_start, window.query_end, orbit_direction)
+        for page in _granule_pages(params, url=_CMR_REFERENCE_URL, parse=_reference_titles):
+            titles += len(page)
+            for title in page:
+                if burst := _TITLE_RE.match(title):
+                    instant = datetime.strptime(burst["acquired"], "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
+                    if window.owns(solar_day_of_instant(instant, mid_longitude=mid_longitude).isoformat()):
+                        acquired.setdefault(burst["burst"], set()).add(burst["acquired"])
+                else:
+                    unnamed += 1
+    logger.info(
+        "Burst census (%s) %s..%s: %d granule(s), %d burst(s), %d acquisition(s), %d unnamed, in %.1fs",
+        orbit_direction,
+        start_date,
+        end_date,
+        titles,
+        len(acquired),
+        sum(len(times) for times in acquired.values()),
+        unnamed,
+        time.monotonic() - t0,
+    )
+    return {burst: len(times) for burst, times in acquired.items()}
+
+
+class BurstCensus:
+    """One window's :func:`burst_acquisitions`, queried once in the background and shared.
+
+    :meth:`start` sends the query on a daemon thread, alongside the first batch's own query, and
+    :meth:`counts` waits for it. ``recorded``, a store's :data:`BURST_CENSUS_ATTR`, is the answer
+    instead and nothing is queried, so a resumed leg ranks as the run it resumes did (ADR 033).
+
+    Raises:
+        ConfigMismatchError: ``recorded`` was counted over another window or longitude, so neither
+            it nor a recount would rank the new dates as the stored ones were.
+    """
+
+    def __init__(
+        self,
+        bbox: tuple[float, float, float, float],
+        start_date: str,
+        end_date: str,
+        orbit_direction: str,
+        *,
+        mid_longitude: float | None = None,
+        recorded: Mapping[str, Any] | None = None,
+    ) -> None:
+        self._args = (bbox, start_date, end_date, orbit_direction)
+        self._mid_longitude = mid_longitude
+        self._waiter: Callable[..., dict[str, int]] | None = None
+        if recorded is not None:
+            counted_over = {key: recorded.get(key) for key in self._scope()}
+            if counted_over != self._scope():
+                raise ConfigMismatchError(
+                    f"This {orbit_direction} store's dates were ranked by a burst census counted over "
+                    f"{counted_over}, and this ingest asks for {self._scope()}. Ranking new dates by "
+                    "another window's census, or recounting, would fuse them differently from the dates "
+                    "already written. Ingest this window into its own store, or delete this one and "
+                    "re-ingest the window whole."
+                )
+            counts = dict(recorded["counts"])
+            self._waiter = lambda: counts
+
+    def _scope(self) -> dict[str, Any]:
+        """What the counts depend on beyond the zone: the window and the solar-day longitude."""
+        return {"window": [self._args[1], self._args[2]], "mid_longitude": self._mid_longitude}
+
+    def record(self) -> dict[str, Any]:
+        """The census as a store records it: its counts and the window and longitude they cover."""
+        return {**self._scope(), "counts": self.counts()}
+
+    def start(self) -> Callable[..., dict[str, int]]:
+        """Send the query if nothing has yet, and return the waiter for its answer."""
+        if self._waiter is None:
+            self._waiter = spawn_abandonable(
+                lambda args: burst_acquisitions(*args, mid_longitude=self._mid_longitude), self._args
+            )
+        return self._waiter
+
+    def counts(self) -> dict[str, int]:
+        """Acquisitions per burst id, waiting for the query (and sending it, if nothing has)."""
+        return self.start()()
+
+
+def burst_fusion_sort_key(item: Any) -> tuple[str, bool, int, str, str, str]:  # noqa: ANN401 — any STAC-like item
+    """The order a solar day's radar items go to the loader in, which keeps the first valid source.
+
+    Most-acquired burst first, so a contested pixel keeps the look geometry most of its series has;
+    ties by burst id, acquisition time and item id, so a rerun builds the same mosaic. A title
+    naming no burst sorts last and only fills gaps. Keyed on the solar day, like the optical
+    :func:`~tessera_embeddings.ingest.stac.solar_day_sort_key`. See ADR 033.
+    """
+    properties = item.properties
+    burst = properties.get(BURST_ID)
+    return (
+        item.datetime.strftime("%Y-%m-%d"),
+        burst is None,
+        -properties.get(BURST_ACQUISITIONS, 0),
+        burst or "",
+        properties.get("datetime", ""),
+        item.id,
+    )
+
+
 def make_s1_item_provider(
     orbit_direction: str,
     bbox: tuple[float, float, float, float],
@@ -412,6 +602,7 @@ def make_s1_item_provider(
     end_date: str,
     use_s3_direct: bool = True,
     *,
+    burst_census: BurstCensus,
     mid_longitude: float | None = None,
 ) -> Callable[[], list[Item]]:
     """Create an item_provider_fn that builds OPERA items from the native CMR granule API.
@@ -426,6 +617,8 @@ def make_s1_item_provider(
        access, or through ASF's OAuth redirect chain to CloudFront signed URLs otherwise.
     3. **Normalizes timestamps** so same-day bursts share one, and odc.stac.load groups them into
        a single time slice for mosaicking.
+    4. **Ranks each item's burst**, stamping :data:`BURST_ACQUISITIONS` from ``burst_census``,
+       started before this query so the two overlap.
 
     Args:
         orbit_direction: "ascending" or "descending".
@@ -436,6 +629,7 @@ def make_s1_item_provider(
             URIs for direct in-region bucket access. When False, resolve each
             asset through ASF's OAuth redirect chain to obtain a CloudFront
             signed URL.
+        burst_census: The run's one census of the whole window; a burst missing from it counts as never acquired.
         mid_longitude: ROI geobox centroid longitude, used to stamp each granule with
             the SOLAR day it belongs to. Supply it whenever the loader groups by solar
             day — which the campaign always does. Omitting it groups by UTC date.
@@ -453,6 +647,7 @@ def make_s1_item_provider(
         raise ValueError(f"orbit_direction must be 'ascending' or 'descending', got '{orbit_direction}'")
 
     def provide_items() -> list[Item]:
+        burst_census.start()
         items = _query_cmr_granules(bbox, start_date, end_date, orbit_direction)
 
         if use_s3_direct:
@@ -462,6 +657,11 @@ def make_s1_item_provider(
             session = get_edl_session()
             for item in items:
                 resolve_item_assets(session, item, S1_OPERA_BANDS)
+
+        counts = burst_census.counts()
+        for item in items:
+            if (burst := item.properties.get(BURST_ID)) is not None:
+                item.properties[BURST_ACQUISITIONS] = counts.get(burst, 0)
 
         normalize_opera_timestamps(items, mid_longitude=mid_longitude)
         return items

@@ -9,11 +9,17 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
+from tessera_embeddings.errors import ConfigMismatchError
 from tessera_embeddings.ingest._http import NonJsonResponseError
 from tessera_embeddings.ingest.opera_query import (
-    _NON_JSON_PAGE_ATTEMPTS,
+    _UNPARSEABLE_PAGE_ATTEMPTS,
+    BURST_ACQUISITIONS,
+    BURST_ID,
+    BurstCensus,
     _granule_to_item,
     _query_cmr_granules,
+    burst_acquisitions,
+    burst_fusion_sort_key,
     make_s1_item_provider,
     mgrs_tile_to_bbox,
     mgrs_tile_to_utm_epsg,
@@ -364,12 +370,43 @@ class TestQueryCmrGranules:
 # ---------------------------------------------------------------------------
 
 
+class _Census:
+    """A census answering with fixed counts, recording whether the provider started it first."""
+
+    def __init__(self, counts: dict[str, int]) -> None:
+        self._counts = counts
+        self.started = False
+
+    def start(self) -> None:
+        self.started = True
+
+    def counts(self) -> dict[str, int]:
+        assert self.started, "the census must be started before the query so the two overlap"
+        return self._counts
+
+
+def _provide(items, counts: dict[str, int]) -> list:
+    """Run the real provider over ``items`` as if CMR had returned them."""
+    with (
+        patch("tessera_embeddings.ingest.opera_query._query_cmr_granules", return_value=items),
+        patch("tessera_embeddings.ingest.opera_query.rewrite_assets_to_s3"),
+    ):
+        return make_s1_item_provider(
+            "ascending", (-122, 37, -121, 38), "2024-01-01", "2024-01-15", burst_census=_Census(counts)
+        )()
+
+
+def _title(burst: str, acquired: str = "20240602T070352Z", produced: str = "20240603T091011Z") -> str:
+    """A real-shaped OPERA RTC-S1 granule title."""
+    return f"OPERA_L2_RTC-S1_{burst}_{acquired}_{produced}_S1A_30_v1.0"
+
+
 class TestMakeS1ItemProvider:
     """Tests for make_s1_item_provider()."""
 
     def test_invalid_direction_raises(self):
         with pytest.raises(ValueError, match=r"ascending.*descending"):
-            make_s1_item_provider("invalid", (-122, 37, -121, 38), "2024-01-01", "2024-01-15")
+            make_s1_item_provider("invalid", (-122, 37, -121, 38), "2024-01-01", "2024-01-15", burst_census=_Census({}))
 
     def test_builds_rewrites_and_normalizes_items(self):
         """The provider queries CMR, rewrites assets to S3, and normalizes timestamps."""
@@ -379,7 +416,9 @@ class TestMakeS1ItemProvider:
             patch("tessera_embeddings.ingest.opera_query._query_cmr_granules", return_value=items),
             patch("tessera_embeddings.ingest.opera_query.rewrite_assets_to_s3") as mock_rewrite,
         ):
-            provide = make_s1_item_provider("ascending", (-122, 37, -121, 38), "2024-01-01", "2024-01-15")
+            provide = make_s1_item_provider(
+                "ascending", (-122, 37, -121, 38), "2024-01-01", "2024-01-15", burst_census=_Census({})
+            )
             result = provide()
 
         assert len(result) == 2
@@ -387,6 +426,156 @@ class TestMakeS1ItemProvider:
         assert mock_rewrite.call_count == 2
         # Same-date bursts share the canonical noon-UTC timestamp.
         assert all(item.datetime == datetime(2024, 6, 2, 12, 0, 0, tzinfo=UTC) for item in result)
+
+
+# ---------------------------------------------------------------------------
+# The burst fusion order: title -> burst, census -> rank, rank -> order
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "title, named",
+    [
+        (_title("T115-245714-IW1"), "T115-245714-IW1"),
+        (_title("T003-004321-IW3"), "T003-004321-IW3"),
+        (_title("T115-245714-EW1"), None),
+        ("granule-123", None),
+    ],
+    ids=["iw1", "zero-padded-track", "not-iw", "not-opera"],
+)
+def test_the_title_names_the_burst_and_never_fails_the_item(title, named) -> None:
+    """A title that does not parse still yields a loadable item, with no burst named."""
+    item = _granule_to_item(_granule_entry(title))
+    assert item.properties.get(BURST_ID) == named
+    # The raw acquisition time is what `normalize_to_solar_day` reads, and it never overwrites it.
+    assert item.properties["datetime"] == "2024-06-02T07:03:52.000Z"
+
+
+_LOW, _HIGH = "T029-061234-IW2", "T131-279876-IW1"  # adjacent high-latitude tracks, one solar day
+
+
+@pytest.mark.parametrize(
+    "counts, order",
+    [
+        ({_LOW: 31, _HIGH: 29}, [_LOW, _HIGH, None]),
+        ({_LOW: 29, _HIGH: 31}, [_HIGH, _LOW, None]),
+        ({_LOW: 30, _HIGH: 30}, [_LOW, _HIGH, None]),
+        ({_HIGH: 1}, [_HIGH, _LOW, None]),
+    ],
+    ids=["low-track-more-acquired", "high-track-more-acquired", "tie-goes-to-burst-id", "absent-ranks-as-none"],
+)
+def test_the_most_acquired_burst_is_loaded_first(counts, order) -> None:
+    """Census counts reach the items through the provider, and the sort ranks bursts by them.
+
+    The unnamed granule is supplied FIRST and still sorts last: it can only fill gaps.
+    """
+    entries = [_granule_entry("granule-unnamed"), _granule_entry(_title(_HIGH)), _granule_entry(_title(_LOW))]
+    items = sorted(_provide([_granule_to_item(e) for e in entries], counts), key=burst_fusion_sort_key)
+    assert [item.properties.get(BURST_ID) for item in items] == order
+    assert [item.properties.get(BURST_ACQUISITIONS) for item in items[:2]] == [counts.get(b, 0) for b in order[:2]]
+
+
+def _reference_page(titles, search_after=None):
+    """A REAL reference-format response, as CMR's granules.xml answers."""
+    refs = "".join(f"<reference><name>{t}</name><id>G{i}-ASF</id></reference>" for i, t in enumerate(titles))
+    body = f'<?xml version="1.0"?><results><hits>{len(titles)}</hits><references>{refs}</references></results>'
+    return _raw_response(body.encode(), content_type="application/xml", search_after=search_after)
+
+
+#: A census as a store records it: the window and grouping longitude it was counted over, and the counts.
+_RECORD = {"window": ["2024-01-01", "2024-12-31"], "mid_longitude": 27.0, "counts": {_HIGH: 31}}
+
+
+class TestBurstAcquisitions:
+    """The census: acquisitions per burst over the whole window, from titles alone."""
+
+    BBOX = (-122.0, 37.0, -121.0, 38.0)
+
+    def test_counts_acquisitions_not_granules(self, caplog):
+        """A reprocessed acquisition is a second granule of the SAME acquisition, counted once."""
+        titles = [
+            _title(_LOW, acquired="20240101T010000Z"),
+            _title(_LOW, acquired="20240101T010000Z", produced="20240901T000000Z"),
+            _title(_LOW, acquired="20240113T010000Z"),
+            _title(_HIGH, acquired="20240105T010000Z"),
+            "not-an-opera-title",
+        ]
+        patcher, mock_get = _patch_cmr_session(side_effect=[_reference_page(titles)])
+        with patcher, caplog.at_level(logging.INFO):
+            counts = burst_acquisitions(self.BBOX, "2024-01-01", "2024-12-31", "ascending")
+
+        assert counts == {_LOW: 2, _HIGH: 1}
+        assert mock_get.call_args.args[0].endswith("granules.xml"), "titles only: the light format"
+        assert "1 unnamed" in caplog.text
+
+    def test_counts_the_solar_day_window_at_the_zone_longitude(self):
+        """The window is solar days: the catalogue is asked a UTC day either side and each
+        acquisition is placed on its solar day first. At +150° (a +10 h offset) a pass late on
+        UTC 31 December belongs to 1 January and counts; the same pass a year on does not.
+        """
+        titles = [
+            _title(_LOW, acquired="20231231T150000Z"),  # 2024-01-01 solar: in
+            _title(_LOW, acquired="20240601T000000Z"),  # in
+            _title(_LOW, acquired="20241231T150000Z"),  # 2025-01-01 solar: out
+        ]
+        patcher, mock_get = _patch_cmr_session(side_effect=[_reference_page(titles)])
+        with patcher:
+            counts = burst_acquisitions(self.BBOX, "2024-01-01", "2024-12-31", "ascending", mid_longitude=150.0)
+
+        assert counts == {_LOW: 2}
+        assert mock_get.call_args.kwargs["params"]["temporal"] == "2023-12-31T00:00:00Z,2025-01-01T23:59:59Z"
+
+    def test_a_burst_returned_by_both_antimeridian_halves_counts_once(self):
+        patcher, mock_get = _patch_cmr_session(side_effect=[_reference_page([_title(_LOW)]) for _ in range(2)])
+        with patcher:
+            assert burst_acquisitions((170.0, -10.0, -170.0, 10.0), "2024-01-01", "2024-12-31", "ascending") == {
+                _LOW: 1
+            }
+        assert mock_get.call_count == 2
+
+    def test_a_page_that_is_not_a_cmr_result_is_re_asked(self):
+        """Well-formed XML is not enough: a page that is not a result must not read as the last one."""
+        busy = _raw_response(b"<html><body>busy</body></html>", content_type="text/html")
+        patcher, mock_get = _patch_cmr_session(side_effect=[busy, _reference_page([_title(_LOW)])])
+        with patcher, patch("tessera_embeddings.ingest.opera_query.time.sleep"):
+            assert burst_acquisitions(self.BBOX, "2024-01-01", "2024-12-31", "ascending") == {_LOW: 1}
+        assert mock_get.call_count == 2
+
+    def test_one_query_answers_every_batch(self):
+        """Constructing the census queries nothing; every later caller shares one answer."""
+        calls: list[tuple] = []
+
+        def fake(*args, **kwargs):
+            calls.append((args, kwargs))
+            return {_LOW: 3}
+
+        with patch("tessera_embeddings.ingest.opera_query.burst_acquisitions", side_effect=fake):
+            census = BurstCensus(self.BBOX, "2024-01-01", "2024-12-31", "ascending", mid_longitude=27.0)
+            assert calls == []
+            census.start()
+            assert census.counts() == census.counts() == {_LOW: 3}
+
+        assert calls == [((self.BBOX, "2024-01-01", "2024-12-31", "ascending"), {"mid_longitude": 27.0})]
+
+    def test_recorded_counts_are_the_answer_and_nothing_is_queried(self):
+        """A resumed leg ranks by the census its store recorded, whatever the catalogue says now."""
+        with patch("tessera_embeddings.ingest.opera_query.burst_acquisitions") as query:
+            census = BurstCensus(
+                self.BBOX, "2024-01-01", "2024-12-31", "ascending", mid_longitude=27.0, recorded=_RECORD
+            )
+            assert census.counts() == {_HIGH: 31}
+            assert census.record() == _RECORD
+        query.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("end", "longitude"), [("2025-02-28", 27.0), ("2024-12-31", 33.0)], ids=["another-window", "another-longitude"]
+    )
+    def test_a_record_counted_over_anything_else_is_refused(self, end, longitude):
+        """A burst first seen in the new days would rank as never acquired, and recounting would rank the
+        new days differently from those already written.
+        """
+        with pytest.raises(ConfigMismatchError, match="Ingest this window into its own store"):
+            BurstCensus(self.BBOX, "2024-01-01", end, "ascending", mid_longitude=longitude, recorded=_RECORD)
 
 
 # ---------------------------------------------------------------------------
@@ -458,7 +647,7 @@ class TestUnparseableGranulePage:
         assert "granules.json" in message and "200" in message and "text/html" in message
         assert "ValidationError" not in message
         assert "ValidationError" in caplog.text
-        assert mock_get.call_count == _NON_JSON_PAGE_ATTEMPTS
+        assert mock_get.call_count == _UNPARSEABLE_PAGE_ATTEMPTS
 
     def test_a_server_error_is_not_re_asked_by_this_path(self):
         """Scope check: a 5xx belongs to the session ladder, which has already backed off."""

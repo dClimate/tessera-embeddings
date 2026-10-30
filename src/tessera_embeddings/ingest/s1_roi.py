@@ -14,7 +14,8 @@ and (where required) a credential callback.
      one-hour life is unrelated to the shape of the loop, and any unit that outlives the
      remaining margin cannot renew from inside itself. The loop also checks at a batch boundary
      and before every date's write, which costs nothing while the ticker keeps it fresh.
-   * Build an OPERA RTC item filter for the orbit / bounding box / batch window.
+   * Build an OPERA RTC item filter for the orbit / bounding box / batch window, ranking its
+     items by one census of the window's bursts (ADR 033).
    * Call :func:`ingest_tile` to produce a per-batch ``xarray.Dataset``.
    * Apply the ROI mask, then write each date's live windows via
      :func:`tessera_embeddings.storage.zarr_store.write_day_windows` with a narrow tenacity retry
@@ -50,7 +51,7 @@ from tessera_embeddings.ingest.live_windows import (
     windows_for_date,
 )
 from tessera_embeddings.ingest.loader_failures import install_capture_everywhere, refusal_wait_out
-from tessera_embeddings.ingest.opera_query import make_s1_item_provider
+from tessera_embeddings.ingest.opera_query import BURST_CENSUS_ATTR, BurstCensus, make_s1_item_provider
 from tessera_embeddings.ingest.roi import (
     read_roi_mask,
     read_roi_metadata,
@@ -72,6 +73,7 @@ from tessera_embeddings.storage.manifest import IngestManifest
 from tessera_embeddings.storage.zarr_store import (
     StorageOptions,
     get_existing_dates,
+    get_root_attr,
     record_assessed_window,
     resolve_storage_options,
     store_write_retrying,
@@ -533,6 +535,14 @@ def ingest_s1_roi_sar(
     start_date, end_date = _start.isoformat(), _end.isoformat()
     validated_batch_days(batch_days)
 
+    # ONE census for the leg, over the REQUESTED window (not per batch, not the resumed window), and
+    # the one a store already holds when resuming it, so every date of a store is ranked alike
+    # (ADR 033). Written with every date's commit (`store_attrs` below).
+    recorded_census = get_root_attr(orbit_store, BURST_CENSUS_ATTR, s3_region=s3_region) if written_dates else None
+    burst_census = BurstCensus(
+        roi.bbox_wgs84, start_date, end_date, orbit, mid_longitude=mid_longitude, recorded=recorded_census
+    )
+
     # Where the CATALOGUE is searched from. Everything at or below the newest held date is closed,
     # so searching back there cannot write anything — and searching is most of what a resumed run
     # does.
@@ -702,6 +712,7 @@ def ingest_s1_roi_sar(
             rng.query_start,
             rng.query_end,
             use_s3_direct=use_s3_direct,
+            burst_census=burst_census,
             mid_longitude=mid_longitude,
         )
         seen_items: list = []
@@ -914,6 +925,7 @@ def ingest_s1_roi_sar(
                                     chunks=INGEST_CHUNKS,
                                     parallel_windows=overlap_window_writes,
                                     s3_region=s3_region,
+                                    store_attrs={BURST_CENSUS_ATTR: burst_census.record()},
                                 )
                 except Exception as exc:
                     # The retry is exhausted. Only a failure the source is answerable for is
