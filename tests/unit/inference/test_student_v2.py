@@ -18,6 +18,8 @@ from tessera_embeddings.inference.models.student_v2 import (
     AttentionPooling,
     QKNormEncoderLayer,
     StudentTransformerEncoder,
+    _add_layer_norm,
+    _encoder_layer_forward,
     build_v2_dim_reducer,
 )
 
@@ -168,6 +170,22 @@ def test_v2_backbone_has_no_recurrence() -> None:
 def test_v2_backbone_output_shape(band_num: int, channels: int) -> None:
     enc = StudentTransformerEncoder(band_num=band_num, latent_dim=16, nhead=4, num_encoder_layers=2)
     assert enc(torch.randn(4, 12, channels)).shape == (4, 64)
+
+
+@pytest.mark.parametrize("t", [1, 13], ids=["radar-free-step", "sequence"])
+def test_hand_written_encoder_layer_computes_the_module(t: int) -> None:
+    """The CUDA path's layer, given the plain add + LayerNorm, is the backbone's own layers' forward."""
+    torch.manual_seed(0)
+    enc = StudentTransformerEncoder(
+        band_num=10, latent_dim=16, nhead=4, num_encoder_layers=2, dim_feedforward=96
+    ).eval()
+    x = torch.randn(3, t, 64)
+    with torch.no_grad():
+        for layer in enc.transformer_encoder.layers:
+            torch.testing.assert_close(
+                _encoder_layer_forward(layer, x, _add_layer_norm), layer(x), atol=1e-5, rtol=1e-5
+            )
+            x = layer(x)
 
 
 def test_qk_norm_layer_preserves_shape() -> None:

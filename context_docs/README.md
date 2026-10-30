@@ -46,7 +46,9 @@ context_docs/
 │   ├── 027-targeted-updates.md
 │   ├── 028-embed-every-pixel-with-an-optical-observation.md
 │   ├── 029-one-flow-per-ingest.md
+│   ├── 030-forward-pass-reorderings-ship-at-a-store-boundary.md
 │   ├── 032-v2-stores-name-their-axes-y-and-x.md
+│   ├── 034-an-acquisition-is-one-datastrip-of-one-pass.md
 │   ├── 037-v2-stores-use-the-utm-zones-layout.md
 │   └── 038-the-campaign-fills-a-utm-column-in-two-halves.md
 │
@@ -74,8 +76,10 @@ context_docs/
 │   │                                              budget, live-tile cropping, region writes
 │   ├── source-read-failures.md                 twelve ways a source read fails, the guard each
 │   │                                              earned, and the retry budget they share
-│   └── solar-day-fusion-order.md               which scene wins a contested pixel, and why the
-│                                                  answer was inverted for the life of the code
+│   ├── solar-day-fusion-order.md               which scene wins a contested pixel, and why the
+│   │                                              answer was inverted for the life of the code
+│   └── split-datastrips.md                     why a pass split across datastrips keeps every
+│                                                  granule, and what dropping one cost
 │
 ├── inference/                     RUNNING THE ENCODER
 │   ├── simplifying-the-strip-loader.md         the October 2026 loading experiments: what was
@@ -95,6 +99,9 @@ context_docs/
 │   │                                              one observation. Four measurement campaigns
 │   ├── gpu-fleet-launch-throttling.md          why several clusters asking EC2 for GPUs at once
 │   │                                              throttle each other, and the two bounds
+│   ├── v2-on-blackwell.md                      the g7e (RTX PRO 6000) against the fleet's cards,
+│   │                                              v2's fused add + LayerNorm, prep workers by host
+│   │                                              size, outputs across cards, g7e capacity
 │   ├── fresh-worker-start.md                   a new worker's first minutes are its EBS volume
 │   │                                              loading the AMI, and the mounted venv image that
 │   │                                              removes them

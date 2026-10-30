@@ -569,12 +569,15 @@ def resolve_code_artifact_identity(
     code_suffix: str = "",
     region: str = "us-west-2",
     ami_id: str | None = None,
+    env_image_uri: str | None = None,
 ) -> str:
     """Immutable identity of the code a Ray fill will run, for the staging fingerprint.
 
-    Returns ``ami=<ami-id>`` and, when a source tarball overlays the AMI, appends
-    ``|tarball=<etag>`` — the same two artifacts :func:`provision_ray_cluster` boots
-    from (the AMI behind ``ami_ssm_name`` and ``s3://{code_bucket}/code/src{suffix}.tar.gz``).
+    Returns ``ami=<ami-id>``, then ``|env=<uri>`` when an environment image is named
+    (:func:`resolve_env_image_uri`), then ``|tarball=<etag>`` when a source tarball overlays the
+    AMI — the artifacts :func:`provision_ray_cluster` boots from. The environment image belongs
+    with the AMI term, not the tarball's: the dependency closure it holds used to be baked into
+    the AMI, so it changes the identity exactly as a re-bake did.
 
     The global campaign folds this into each cell's staging ``run_id`` because
     ``code_suffix`` alone is NOT immutable: it is empty for a baked production AMI and only
@@ -605,12 +608,37 @@ def resolve_code_artifact_identity(
             so the fingerprint and the booted image are guaranteed identical — a caller
             that pins provisioning must pin the fingerprint too, or the two could resolve
             the SSM pointer at different instants and disagree.
+        env_image_uri: A pre-resolved environment image URI to fingerprint instead of reading
+            the pointer, for the same reason as ``ami_id``.
     """
     parts = [f"ami={ami_id if ami_id is not None else resolve_ami_id(ami_ssm_name, region)}"]
+    env = env_image_uri if env_image_uri is not None else resolve_env_image_uri(code_bucket, code_suffix, region)
+    if env:
+        parts.append(f"env={env}")
     tarball = source_tarball_identity(code_bucket, code_suffix, region)
     if tarball:
         parts.append(tarball)
     return "|".join(parts)
+
+
+def resolve_env_image_uri(code_bucket: str | None, code_suffix: str, region: str = "us-west-2") -> str | None:
+    """The environment image a deployment names, or ``None`` when it names none.
+
+    The deployment writes the image's URI to ``s3://{code_bucket}/code/env-image{code_suffix}.uri``
+    beside the source tarball. The URI is content-addressed by its writer, so it is immutable,
+    but the pointer is not: a deploy can repoint it at any time. So it is read ONCE per cluster
+    (:func:`_resolve_ray_config` substitutes the URI into the nodes' setup, which never read the
+    pointer themselves), and once per campaign, which pins it into every fill exactly as it
+    pins ``ami_id``.
+    """
+    if not code_bucket:
+        return None
+    s3 = boto3.client("s3", region_name=region)
+    try:
+        body = s3.get_object(Bucket=code_bucket, Key=f"code/env-image{code_suffix}.uri")["Body"].read()
+    except s3.exceptions.NoSuchKey:
+        return None
+    return body.decode().strip()
 
 
 def source_tarball_identity(code_bucket: str | None, code_suffix: str, region: str) -> str:
@@ -694,6 +722,7 @@ def _resolve_ray_config(
     region: str = "us-west-2",
     ami_ssm_name: str,
     ami_id: str | None = None,
+    env_image_uri: str | None = None,
     ssm_prefix: str = DEFAULT_SSM_PREFIX,
     cluster_name: str | None = None,
     instance_tags: list[dict[str, str]] | None = None,
@@ -726,6 +755,9 @@ def _resolve_ray_config(
             ``ami_ssm_name`` lookup. The campaign resolves the AMI once and threads it here
             so a mid-campaign re-bake can't repoint the SSM parameter and boot a different
             image than a fill's staging fingerprint recorded.
+        env_image_uri: A pre-resolved environment image URI that PINS the nodes' Python
+            environment, for the same reason. ``None`` reads the deployment's pointer
+            (:func:`resolve_env_image_uri`) here, once for the whole cluster.
         ssm_prefix: Prefix under which Ray resource IDs are stored. Required keys:
             ``security-group-id``, ``instance-profile-arn``, ``private-subnet-ids``,
             ``key-pair-name``, ``key-pair-id``. Optional: ``gpu-worker-ladder`` (see
@@ -893,9 +925,14 @@ def _resolve_ray_config(
     # command is DROPPED, not left alone: an unsubstituted `aws s3 cp s3://{CODE_BUCKET}/…`
     # is a valid command line over an impossible bucket name, so `ray up` runs it on every
     # node and every node fails setup. `None` means the AMI already carries the code.
+    # The environment image's URI is substituted too, resolved here once, so every node of the
+    # cluster mounts the same image even if the deployment repoints it while the fleet grows.
     if code_bucket is not None:
+        env = env_image_uri if env_image_uri is not None else resolve_env_image_uri(code_bucket, code_suffix, region)
         config["setup_commands"] = [
-            cmd.replace("{CODE_BUCKET}", code_bucket).replace("{CODE_SUFFIX}", code_suffix)
+            cmd.replace("{CODE_BUCKET}", code_bucket)
+            .replace("{CODE_SUFFIX}", code_suffix)
+            .replace("{ENV_IMAGE_URI}", env or "")
             if isinstance(cmd, str)
             else cmd
             for cmd in config["setup_commands"]
@@ -1172,6 +1209,7 @@ def ray_cluster(
     *,
     ami_ssm_name: str,
     ami_id: str | None = None,
+    env_image_uri: str | None = None,
     ray_address: str | None = None,
     cluster_yaml: str | Path | None = None,
     cluster_name: str | None = None,
@@ -1206,6 +1244,9 @@ def ray_cluster(
             ``ami_ssm_name`` lookup). The campaign threads the AMI it resolved once into
             every fill so a mid-campaign re-bake can't boot a different image than the
             fill's staging fingerprint recorded.
+        env_image_uri: Pre-resolved environment image URI that PINS the nodes' Python
+            environment, threaded by the campaign for the same reason as ``ami_id``.
+            ``None`` reads the deployment's pointer once at provisioning.
         ray_address: Connect to an existing cluster instead of launching one.
         cluster_yaml: Path to the cluster YAML template. Defaults to
             :data:`DEFAULT_CLUSTER_TEMPLATE`.
@@ -1278,6 +1319,7 @@ def ray_cluster(
                 region=region,
                 ami_ssm_name=ami_ssm_name,
                 ami_id=ami_id,
+                env_image_uri=env_image_uri,
                 ssm_prefix=ssm_prefix,
                 cluster_name=cluster_name,
                 instance_tags=instance_tags,
