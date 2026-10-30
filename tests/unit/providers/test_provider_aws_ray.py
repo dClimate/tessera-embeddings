@@ -146,25 +146,33 @@ def test_resolve_ray_config_writes_a_complete_yaml(tmp_path: Path) -> None:
 
 
 @mock_aws
-def test_resolve_ray_config_substitutes_the_code_bucket_when_given(tmp_path: Path) -> None:
-    """The tarball fetch survives, fully substituted, when a bucket IS supplied."""
+@pytest.mark.parametrize("pinned", [None, "s3://my-code-bucket/ray-env-images/env-pinned.img"])
+def test_resolve_ray_config_substitutes_the_code_bucket_when_given(pinned: str | None) -> None:
+    """With a bucket, the tarball fetch survives fully substituted, and the environment image's
+    URI is written into the setup command: the pinned one when given, else the pointer's,
+    read here once so no node reads the pointer itself.
+    """
     ami_param, _, _ = _seed_ssm_and_vpc()
+    s3 = boto3.client("s3", region_name=REGION)
+    s3.create_bucket(Bucket="my-code-bucket", CreateBucketConfiguration={"LocationConstraint": REGION})
+    pointed = "s3://my-code-bucket/ray-env-images/env-pointed.img"
+    s3.put_object(Bucket="my-code-bucket", Key="code/env-image-mybranch.uri", Body=pointed.encode())
 
     resolved = _resolve_ray_config(
         DEFAULT_CLUSTER_TEMPLATE,
         region=REGION,
         ami_ssm_name=ami_param,
+        env_image_uri=pinned,
         ssm_prefix=SSM_PREFIX,
         cluster_name="test-cluster",
         code_bucket="my-code-bucket",
         code_suffix="-mybranch",
     )
     try:
-        config = yaml.safe_load(Path(resolved).read_text())
-        fetch = [cmd for cmd in config["setup_commands"] if "s3 cp" in str(cmd)]
-        assert len(fetch) == 1
-        assert "s3://my-code-bucket/code/src-mybranch.tar.gz" in fetch[0]
-        assert "{CODE_BUCKET}" not in fetch[0] and "{CODE_SUFFIX}" not in fetch[0]
+        env, fetch, _ = config_cmds = yaml.safe_load(Path(resolved).read_text())["setup_commands"]
+        assert f"u='{pinned or pointed}'" in env
+        assert "s3://my-code-bucket/code/src-mybranch.tar.gz" in fetch
+        assert not any("{" + k + "}" in c for c in config_cmds for k in ("CODE_BUCKET", "CODE_SUFFIX", "ENV_IMAGE_URI"))
     finally:
         cleanup_ray_tempfiles(resolved)
 
@@ -279,6 +287,31 @@ def test_resolve_code_artifact_identity_tracks_tarball_overwrite() -> None:
     # Re-bake the AMI (new value behind the same SSM name) → different identity.
     ssm.put_parameter(Name="/tessera/ray/ami-id", Value="ami-bbb", Type="String", Overwrite=True)
     assert resolve_code_artifact_identity("/tessera/ray/ami-id", code_bucket="code-bkt", region=REGION) != id_v2
+
+
+@mock_aws
+def test_resolve_code_artifact_identity_tracks_the_environment_image() -> None:
+    """A named environment image enters the identity between the AMI and the tarball, and
+    repointing it to a new image flips the identity as a re-bake does.
+    """
+    ssm = boto3.client("ssm", region_name=REGION)
+    s3 = boto3.client("s3", region_name=REGION)
+    ssm.put_parameter(Name="/tessera/ray/ami-id", Value="ami-aaa", Type="String")
+    s3.create_bucket(Bucket="code-bkt", CreateBucketConfiguration={"LocationConstraint": REGION})
+    s3.put_object(Bucket="code-bkt", Key="code/src-b.tar.gz", Body=b"v1")
+    etag = s3.head_object(Bucket="code-bkt", Key="code/src-b.tar.gz")["ETag"].strip('"')
+
+    def identity() -> str:
+        return resolve_code_artifact_identity("/tessera/ray/ami-id", "code-bkt", "-b", region=REGION)
+
+    assert identity() == f"ami=ami-aaa|tarball={etag}"
+    s3.put_object(Bucket="code-bkt", Key="code/env-image-b.uri", Body=b"s3://code-bkt/ray-env-images/env-1.img\n")
+    assert identity() == f"ami=ami-aaa|env=s3://code-bkt/ray-env-images/env-1.img|tarball={etag}"
+    s3.put_object(Bucket="code-bkt", Key="code/env-image-b.uri", Body=b"s3://code-bkt/ray-env-images/env-2.img")
+    assert "env=s3://code-bkt/ray-env-images/env-2.img" in identity()
+    # A pinned URI is fingerprinted as given, without reading the pointer.
+    pinned = resolve_code_artifact_identity("/tessera/ray/ami-id", "code-bkt", "-b", REGION, env_image_uri="s3://p.img")
+    assert "|env=s3://p.img|" in pinned
 
 
 @mock_aws
