@@ -49,7 +49,8 @@ context_docs/
 │   ├── 030-forward-pass-reorderings-ship-at-a-store-boundary.md
 │   ├── 032-v2-stores-name-their-axes-y-and-x.md
 │   ├── 033-radar-overlaps-go-to-the-most-acquired-burst.md
-│   └── 034-an-acquisition-is-one-datastrip-of-one-pass.md
+│   ├── 034-an-acquisition-is-one-datastrip-of-one-pass.md
+│   └── 035-a-provenance-record-for-the-published-store.md
 │
 ├── campaign/                      THE GLOBAL CAMPAIGN — start here
 │   ├── campaign-plan.md                        <- START HERE. What runs, with what settings, in

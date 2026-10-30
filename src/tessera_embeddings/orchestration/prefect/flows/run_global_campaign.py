@@ -239,13 +239,10 @@ def _mosaic_identity(
     can change after an early read — either would let stale staged tiles resume against a
     rebuilt mosaic. Genuinely-absent stores (missing repo / not found) are skipped.
 
-    SCOPE: this pins the inputs at RESUME time, not at read time. The tip is sampled once
-    here while the fill's actors later open each mosaic from the moving ``main``, so it
-    answers "have the inputs changed since the last attempt?" and NOT "did they hold still
-    while this attempt ran?". Nothing in the pipeline writes a mosaic during its own fill (a
-    cell's ingest completes before it dispatches, mosaics are per-(zone,year), cleanup runs
-    after), so the remaining window needs an out-of-band writer committing mid-fill. Closing
-    it would mean threading these snapshot IDs into every actor store open.
+    SCOPE: this pins the inputs at RESUME time: it answers "have the inputs changed since the
+    last attempt?". What holds them still DURING the attempt is the runner's own sample of the
+    same tips when it plans the cell, which every actor store open and the provenance export use
+    (``zone_fill.mosaic_snapshots``).
 
     Only the ACTIVE orbit set is fingerprinted (reflectance + ``_active_orbits(s1_orbit)``),
     because the fill reads only those. An inactive opposite-orbit store that happens to be

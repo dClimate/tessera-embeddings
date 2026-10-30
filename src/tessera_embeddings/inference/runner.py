@@ -14,7 +14,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import ray
@@ -64,6 +64,7 @@ def run_inference(
     source_has_work: Callable[[], bool] | None = None,
     on_item_done: Callable[[WorkItem, dict], None] | None = None,
     cell: str | None = None,
+    mosaic_snapshots: Mapping[str, str] | None = None,
 ) -> list[dict]:
     """Create Ray actors, run work-stealing inference, return per-chunk results.
 
@@ -116,6 +117,8 @@ def run_inference(
         on_item_done: Optional per-item final-outcome callback (chained sessions use it for
             per-zone completion accounting). Runs on the scheduler thread — must not block.
         cell: What to call this run's cell in the progress line (:attr:`ZoneContext.cell`).
+        mosaic_snapshots: Mosaic store path to the snapshot every actor read must open
+            (:attr:`ZoneContext.mosaic_snapshots`). ``None`` reads each store's tip.
             ``None`` for a single-area run, whose ``run_id`` names nothing to a reader.
 
     Returns:
@@ -276,6 +279,7 @@ def run_inference(
             source_has_work=source_has_work,
             on_item_done=on_item_done,
             cell=cell,
+            mosaic_snapshots=mosaic_snapshots,
         )
     finally:
         fleet.clear()

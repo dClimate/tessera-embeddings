@@ -876,6 +876,20 @@ count. Every column is derivable from the store, so such rows are repairable:
 null rows of the v1.1 campaign, which ran before the embedded path persisted its record
 ([`registry-backfill.md`](../../../context_docs/storage/registry-backfill.md)).
 
+#### The provenance planes ride on the tile too
+
+When the mosaics were ingested with the `provenance` switch on, they carry a per-pixel
+`source_index`, and the actor turns it into the shard's share of the provenance record. Wherever the
+loader reads a sensor's validity (the whole-shard SCL mask for optical, each strip's VV and VH for
+radar) it reads the index over the same window, zeroes it where the model's test fails, and keeps it
+compressed per date. At the staging write, on the background writer, each date becomes one `uint8`
+plane of ranks into that date's `sources`, staged as `pixel_sources_<sensor>` with the summary as the
+tile's `provenance` attribute. A holes update cuts its planes to the pixels it embedded and stages
+that mask beside them, which becomes its `update_pixels`. Assembly then
+publishes the record before tagging the cell (`provenance_publish.py`,
+[`docs/registry.md`](../../../docs/registry.md)). Every mosaic read is pinned to the snapshot the
+plan sampled, so the record describes what the model read.
+
 ### 2. Assembling the staged tiles into the store
 
 Once the live tiles are done, `writer.assemble` writes them into the final Icechunk store
@@ -1229,6 +1243,8 @@ New code (not ported):
 | `dataset.py` | Valid-pixel filtering and lazy per-batch indexing |
 | `quantization.py` | Int8 quantization with per-pixel scale factors and dequantization |
 | `assembly.py` | Staged Zarr writes + raw-zarr fork/merge assembly into Icechunk (single-ROI + global modes) |
+| `provenance.py` | The actor's half of the provenance record: source-index pieces read beside the masks, ranked per shard-date and staged |
+| `provenance_publish.py` | Publishing a run's provenance record beside the registry, and its checks, before the cell is tagged |
 | `actors.py` | Ray actor wrapping the full per-chunk pipeline |
 | `scheduling.py` | Work-stealing scheduler (`_process_chunks_work_stealing`) and `ActorPool` — manages dispatch, actor replacement, idle retirement, and tracker polling |
 | `progress.py` | Lightweight Ray actor (`num_cpus=0`) polled by the flow runner every 60s for batch-level progress and 5-minute stall detection |
