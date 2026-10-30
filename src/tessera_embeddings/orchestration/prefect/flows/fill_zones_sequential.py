@@ -83,6 +83,7 @@ from tessera_embeddings.orchestration.prefect.flows.run_global_campaign import (
     _ingest_dispatch_params,
     _resolve_ami_id,
     _resolve_code_identity,
+    _resolve_env_image_uri,
     _staging_run_id,
 )
 from tessera_embeddings.orchestration.runners.sequential_fill import (
@@ -686,6 +687,7 @@ def fill_zones_sequential_flow(
     paths: BucketPaths,
     ami_ssm_name: str,
     ami_id: str | None = None,
+    env_image_uri: str | None = None,
     ami_ssm_name_by_model: dict[str, str] | None = None,
     time_window_end: str | None = None,
     store_name: str = "tessera",
@@ -741,6 +743,8 @@ def fill_zones_sequential_flow(
         ami_id: Pre-resolved AMI ID the campaign pinned, used for BOTH the shared cluster's
             image AND this flow's own staging fingerprint, so a mid-campaign re-bake can't
             split them. ``None`` (direct calls) resolves ``ami_ssm_name``.
+        env_image_uri: Pre-resolved environment image URI the campaign pinned, used the same
+            two ways as ``ami_id``. ``None`` (direct calls) reads the deployment's pointer.
         ami_ssm_name_by_model: Per-model overrides of ``ami_ssm_name``. The entry for the model
             the store holds replaces ``ami_ssm_name``; a model on its own worker image (v1.1) without
             one is refused (ADR 025).
@@ -1330,6 +1334,7 @@ def fill_zones_sequential_flow(
     # would read the SSM pointer twice — here and again in ray_cluster — so a re-bake landing
     # between them boots a different image than the prefix was fingerprinted against.
     ami_id = ami_id or _resolve_ami_id(ami_ssm_name, None)
+    env_image_uri = env_image_uri or _resolve_env_image_uri(code_bucket, code_suffix, None)
     # The campaign's staging identity when it supplied one, and only otherwise the
     # AMI-plus-tarball artifact identity. This is the campaign's fill: recomputing the
     # artifact identity here would undo the narrowing for the path that actually runs — any AMI
@@ -1337,7 +1342,7 @@ def fill_zones_sequential_flow(
     # `force_staging_reuse` / `force_staging_restage` parameters would do nothing here. The
     # fallback is for a direct call, which has no parent to inherit from.
     code_identity = staging_code_identity or _resolve_code_identity(
-        ami_ssm_name, code_bucket, code_suffix, None, ami_id
+        ami_ssm_name, code_bucket, code_suffix, None, ami_id, env_image_uri
     )
 
     def _prepare(cell: SequentialCell) -> PreparedCell:
@@ -1571,6 +1576,7 @@ def fill_zones_sequential_flow(
             log,
             ami_ssm_name=ami_ssm_name,
             ami_id=ami_id,
+            env_image_uri=env_image_uri,
             ssm_prefix=ssm_prefix,
             cloudwatch_log_group=cloudwatch_log_group,
             code_bucket=code_bucket,

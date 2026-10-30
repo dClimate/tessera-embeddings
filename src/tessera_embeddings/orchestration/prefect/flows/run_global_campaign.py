@@ -501,7 +501,12 @@ def _update_work(
 
 
 def _resolve_code_identity(
-    ami_ssm_name: str, code_bucket: str | None, code_suffix: str, region: str | None, ami_id: str | None = None
+    ami_ssm_name: str,
+    code_bucket: str | None,
+    code_suffix: str,
+    region: str | None,
+    ami_id: str | None = None,
+    env_image_uri: str | None = None,
 ) -> str:
     """Lazy-import wrapper over the AWS provider's code-artifact resolver.
 
@@ -512,11 +517,14 @@ def _resolve_code_identity(
     the region the fills' ``ray_cluster`` PROVISIONS from, where the AMI SSM parameter and
     source tarball live; NOT the storage ``s3_region``, which may differ. ``ami_id`` pins the
     AMI component to a pre-resolved id so the fingerprint matches the image the fill will
-    boot. See :func:`tessera_embeddings.providers.aws.ray.resolve_code_artifact_identity`.
+    boot, and ``env_image_uri`` the environment image likewise. See
+    :func:`tessera_embeddings.providers.aws.ray.resolve_code_artifact_identity`.
     """
     from tessera_embeddings.providers.aws.ray import resolve_code_artifact_identity
 
-    return resolve_code_artifact_identity(ami_ssm_name, code_bucket, code_suffix, region or "us-west-2", ami_id=ami_id)
+    return resolve_code_artifact_identity(
+        ami_ssm_name, code_bucket, code_suffix, region or "us-west-2", ami_id=ami_id, env_image_uri=env_image_uri
+    )
 
 
 def _resolve_tarball_identity(code_bucket: str | None, code_suffix: str, region: str | None) -> str:
@@ -530,6 +538,19 @@ def _resolve_tarball_identity(code_bucket: str | None, code_suffix: str, region:
     from tessera_embeddings.providers.aws.ray import source_tarball_identity
 
     return source_tarball_identity(code_bucket, code_suffix, region or "us-west-2")
+
+
+def _resolve_env_image_uri(code_bucket: str | None, code_suffix: str, region: str | None) -> str | None:
+    """Lazy-import wrapper over the AWS provider's environment-image resolver (see
+    :func:`tessera_embeddings.providers.aws.ray.resolve_env_image_uri`). ``None`` without a
+    code bucket, or when the deployment names no image. Kept thin so the flow imports on
+    non-AWS machines.
+    """
+    if not code_bucket:
+        return None
+    from tessera_embeddings.providers.aws.ray import resolve_env_image_uri
+
+    return resolve_env_image_uri(code_bucket, code_suffix, region or "us-west-2")
 
 
 def _resolve_ami_id(ami_ssm_name: str, region: str | None) -> str:
@@ -1233,6 +1254,19 @@ async def run_global_campaign(
             ami_id_cache.append(_resolve_ami_id(ami_ssm_name, None))
         return ami_id_cache[0]
 
+    env_image_cache: list[str | None] = []
+
+    def _env_image_uri() -> str | None:
+        # The environment image, pinned the same way and for the same reason as _ami_id: the
+        # nodes' Python and every dependency live in it rather than in the AMI, so a
+        # dependency change merged mid-campaign repoints the deployment's pointer, and without
+        # this pin later fills would run a different environment under the same fingerprint.
+        # Switching is still a deliberate act: restart the campaign, which reads the pointer
+        # afresh, and its staged tiles resume (or pass force_staging_restage to redo them).
+        if not env_image_cache:
+            env_image_cache.append(_resolve_env_image_uri(code_bucket, code_suffix, None))
+        return env_image_cache[0]
+
     runs_by_year: dict[int, list[str]] = {}
     #: Cells still missing after every attempt, per year. Collected rather than
     #: raised on, so one bad zone cannot cost the years that follow it.
@@ -1389,6 +1423,7 @@ async def run_global_campaign(
                         # THROUGH rather than defaulted here, so an immediate refill probes
                         # against the store it just read rather than the one the round opened on.
                         "ami_id": _ami_id() if _needs_ray(cells, snapshot) else None,
+                        "env_image_uri": _env_image_uri() if _needs_ray(cells, snapshot) else None,
                         "store_name": store_name,
                         "mask_name": mask_name,
                         "num_actors": num_actors,

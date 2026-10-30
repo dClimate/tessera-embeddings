@@ -70,7 +70,10 @@ reference on representative dense + sparse chunks:
 
 A change that cannot pass does not ship. Changes that can be kept
 bit-identical (pipelining, memory movement, resampler vectorization) are
-kept bit-identical and tested as such.
+kept bit-identical and tested as such. A reordering that cannot meet this
+gate may instead ship at a store boundary on the cross-config envelope and
+measured usability ([ADR 030](030-forward-pass-reorderings-ship-at-a-store-boundary.md)),
+as library upgrades do ([ADR 025](025-library-upgrades-ship-on-measured-usability-at-a-store-boundary.md)).
 
 **Scope.** These gates decide changes to the forward pass and its config. A
 change upstream that alters the mosaics it reads, such as the ingest hosts'
