@@ -1,5 +1,10 @@
 # Duplicate copies: which copy of a Sentinel-2 image is read
 
+**In table terms, this is a deduplication of catalogue rows on the key (tile, solar day, pass,
+datastrip),** keeping the best-ranked row per key; the loader's mosaicking then combines the surviving
+rows. The datastrip column (`s2:datastrip_id`) joined the key so two halves of one pass are no longer
+treated as duplicates, and a row missing either `s2:datatake_id` or `s2:datastrip_id` is never deduplicated.
+
 A tile-date often has several catalogue items, and they are not all the same kind of thing. Some are
 **copies of one image**: ESA reprocesses a granule at a newer baseline, a product is published twice,
 or one granule is served by two producers. Others are **different images**: a high-latitude tile is
