@@ -201,6 +201,7 @@ def _assert_store_manifest_matches(
     *,
     min_valid_coverage: float | None,
     allow_ingest_code_mismatch: bool,
+    provenance: bool,
     get_credentials: _Creds,
     s3_region: str | None,
 ) -> None:
@@ -223,6 +224,7 @@ def _assert_store_manifest_matches(
         roi_zarr_path,
         min_valid_coverage=min_valid_coverage,
         allow_ingest_code_mismatch=allow_ingest_code_mismatch,
+        provenance=provenance,
         # The ROI is a plain zarr and does not travel on the Icechunk callback. Without this
         # the check fails on a callback-only deployment, leaving the stores UNMARKED after a
         # successful ingest so every retry re-reads a finished mosaic as an interrupted one.
@@ -539,6 +541,10 @@ async def ingest_zone_year(
         "coverage_sha256": _coverage_sha(
             land_mask_path, zone, get_credentials=iam_icechunk_credentials, s3_region=s3_region, tiles=tiles
         ),
+        # Only when on, so every mosaic marked before the record existed keeps its fingerprint. A
+        # mosaic marked without the record must not satisfy a run that wants it, so its marker
+        # no longer matches and is refused below, rather than embedded with no record.
+        **({"provenance": True} if ingest_settings.provenance else {}),
     }
 
     def _resolved_stores() -> list[str] | None:
@@ -658,6 +664,7 @@ async def ingest_zone_year(
         "max_workers": max_workers,
         "use_local": use_local,
         "allow_ingest_code_mismatch": allow_ingest_code_mismatch,
+        "provenance": ingest_settings.provenance,
         # The children open and CREATE the mosaic repos; without this they sign against the
         # storage default while this flow's probes use s3_region, so a non-default-region
         # campaign fails inside the costly S1/S2 jobs rather than at preflight.
@@ -1154,6 +1161,7 @@ async def ingest_zone_year(
             # carry none and expecting one would fail every radar store.
             min_valid_coverage=ingest_settings.min_valid_coverage if store.endswith("reflectance.zarr") else None,
             allow_ingest_code_mismatch=allow_ingest_code_mismatch,
+            provenance=ingest_settings.provenance,
             get_credentials=iam_icechunk_credentials,
             s3_region=s3_region,
         )

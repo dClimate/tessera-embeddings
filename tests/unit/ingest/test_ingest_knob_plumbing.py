@@ -32,8 +32,8 @@ from tessera_embeddings.orchestration.prefect.tasks.ingest import process_roi_re
 #: lists the ones a flow forwards: what a CALLER can set, plus ``pipeline_dates`` and
 #: ``batch_chunk_budget``, which the S2 flow decides itself from its fleet width and hands to
 #: the shell the same way.
-S1_KNOBS = ("batch_days", "overlap_window_writes", "pipeline_batches")
-S2_KNOBS = ("overlap_window_writes", "pipeline_dates", "batch_dates", "batch_chunk_budget")
+S1_KNOBS = ("batch_days", "overlap_window_writes", "pipeline_batches", "provenance")
+S2_KNOBS = ("overlap_window_writes", "pipeline_dates", "batch_dates", "batch_chunk_budget", "provenance")
 
 
 def _params(fn) -> dict[str, inspect.Parameter]:

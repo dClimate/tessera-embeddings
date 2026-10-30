@@ -18,6 +18,19 @@ from tessera_embeddings.config.code_identity import source_identity
 #: including it would make a mask rebuild look like an ingest code change.
 _MOSAIC_CONTENT_SOURCES: tuple[str, ...] = ("ingest/s1_roi.py", "ingest/s2_roi.py")
 
+#: The provenance record's version, stamped on a mosaic's ingest manifest when the ingest runs with
+#: ``provenance`` on. Its absence means the mosaic was built without the record; the manifest
+#: refuses to resume a store under the other setting (``IngestManifest.provenance_version``).
+PROVENANCE_VERSION = 1
+
+#: A provenance mosaic's per-slot granule list: one JSON array per time slot naming the day's
+#: granules in fusion order, written in the same commit as the slot's pixels.
+GRANULES_ARRAY = "granules"
+
+#: A provenance mosaic's per-pixel source index: the fusion position plus one of the granule that
+#: supplied the pixel, 0 where none had data. ``uint16`` because a day's fusion order is zone-wide.
+SOURCE_INDEX_VAR = "source_index"
+
 
 def ingest_code_identity() -> str:
     """Fingerprint of the code that decides a mosaic's CONTENT.
@@ -275,6 +288,12 @@ class IngestSettings(BaseModel):
     # set it only on a probe rung. ingest-zone-year composes a unique per-child filename
     # (``s2.html``, ``s1-<orbit>.html``) under it.
     perf_report_uri: str | None = None
+    # Write the provenance record into every mosaic: each date's granule list and a per-pixel
+    # source index, from which assembly publishes `provenance/` beside the registry. Off by
+    # default, because only the public global store needs it; that campaign's deployment turns it
+    # on. A mosaic records the setting and refuses a resume under the other one:
+    # context_docs/storage/registry-provenance-plan.md §4.
+    provenance: bool = False
 
     @model_validator(mode="after")
     def _worker_bounds_ordered(self) -> IngestSettings:

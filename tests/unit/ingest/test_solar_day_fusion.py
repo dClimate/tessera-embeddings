@@ -22,9 +22,13 @@ from odc.geo.geom import BoundingBox
 from pystac import Item
 from rasterio.transform import from_origin
 
+from tessera_embeddings.config.ingest import SOURCE_INDEX_VAR
 from tessera_embeddings.config.providers import CollectionConfig
+from tessera_embeddings.ingest import stac as stac_module
 from tessera_embeddings.ingest.opera_query import BURST_ACQUISITIONS, BURST_ID, _granule_to_item
-from tessera_embeddings.ingest.stac import _load_from_stac, ingest_tile
+from tessera_embeddings.ingest.provenance import FUSION_POSITION
+from tessera_embeddings.ingest.stac import _load_from_stac, ingest_tile, load_stac_items
+from tessera_embeddings.ingest.transforms import amplitude_to_db
 
 CLOUDY_DN = 100
 CLEAR_DN = 200
@@ -164,12 +168,18 @@ LOW_TRACK, HIGH_TRACK = "T029-061234-IW2", "T131-279876-IW1"
 AMPLITUDE = {LOW_TRACK: 0.1, HIGH_TRACK: 0.2}
 
 
-def _burst(tmp_path: pathlib.Path, burst: str) -> Item:
+def _burst(tmp_path: pathlib.Path, burst: str, *, holed: bool = False) -> Item:
     """One OPERA granule over the test ground, built from a CMR entry exactly as the query builds it."""
     title = f"OPERA_L2_RTC-S1_{burst}_20240615T163000Z_20240616T000000Z_S1A_30_v1.0"
     links = []
     for band in ("VV", "VH"):
-        _write(tmp_path / f"{title}_{band}.tif", AMPLITUDE[burst], dtype="float32", nodata=np.nan)
+        _write(
+            tmp_path / f"{title}_{band}.tif",
+            AMPLITUDE[burst],
+            dtype="float32",
+            nodata=np.nan,
+            left_half_only=holed,
+        )
         links.append(
             {"rel": "http://esipfed.org/ns/fedsearch/1.1/data#", "href": str(tmp_path / f"{title}_{band}.tif")}
         )
@@ -212,3 +222,86 @@ def test_the_most_acquired_burst_wins_a_contested_radar_pixel(tmp_path, favoured
 
     assert ds is not None and ds.sizes["time"] == 1, "both bursts must land in ONE solar-day slice"
     np.testing.assert_allclose(ds["0_VV"].compute().values[0], AMPLITUDE[favoured])
+
+
+def _load_indexed(items: list[Item], monkeypatch: pytest.MonkeyPatch, *, source_index: bool = True):
+    """Load through `load_stac_items`, with the test band as the collection's source-index band."""
+    cfg = CollectionConfig(
+        collection_id="test",
+        bands=["blue"],
+        resolution=int(RES),
+        fusion_order="clearest_scene",
+        source_index_band="blue",
+    )
+    monkeypatch.setattr(stac_module, "_get_collection_config", lambda *_: cfg)
+    ds = load_stac_items(
+        items, provider="test", collection="test", geobox=GBOX, chunks=CHUNKS, source_index=source_index
+    )
+    return ds.compute()
+
+
+def test_the_source_index_names_the_granule_the_fuser_kept(scenes, tmp_path, monkeypatch) -> None:
+    """The index is the fuser's own choice, and asking for it leaves the fused band untouched.
+
+    The clear scene goes first with a hole, so it supplies the left half and the cloudy scene the
+    right. Positions are 0-based in fusion order; the index stores position + 1.
+    """
+    cloudy, _ = scenes
+    holed = tmp_path / "clear_holed.tif"
+    _write(holed, CLEAR_DN, left_half_only=True)
+    items = [_item("CLEAR", str(holed), cloud=5.0), cloudy]
+
+    indexed = _load_indexed(items, monkeypatch)
+    plain = _load_indexed(items, monkeypatch, source_index=False)
+
+    np.testing.assert_array_equal(indexed["blue"].values, plain["blue"].values)
+    assert indexed["blue"].dtype == plain["blue"].dtype == np.uint16
+    index = indexed[SOURCE_INDEX_VAR].values[0]
+    assert index.dtype == np.uint16
+    assert np.unique(index[:, : SIZE // 2]).tolist() == [1], "the first granule supplies what it covers"
+    assert np.unique(index[:, SIZE // 2 :]).tolist() == [2], "the second fills its hole"
+    assert [item.properties[FUSION_POSITION] for item in items] == [0, 1]
+
+
+def test_a_pixel_no_granule_covers_has_index_zero_and_the_fill(tmp_path, monkeypatch) -> None:
+    """Zero means no granule had data, and the band keeps the nodata an unpacked load leaves."""
+    left = tmp_path / "left.tif"
+    _write(left, CLEAR_DN, left_half_only=True)
+    indexed = _load_indexed([_item("ONLY", str(left), cloud=5.0)], monkeypatch)
+    assert np.unique(indexed[SOURCE_INDEX_VAR].values[0][:, SIZE // 2 :]).tolist() == [0]
+    assert np.unique(indexed["blue"].values[0][:, SIZE // 2 :]).tolist() == [NODATA]
+
+
+def test_the_radar_source_index_follows_the_burst_order(tmp_path) -> None:
+    """Float radar, NaN nodata, through `ingest_tile`: the favoured burst's hole falls to the other.
+
+    The dB transform runs over the bands only; the index is added after it, unscaled.
+    """
+    items = [_burst(tmp_path, HIGH_TRACK), _burst(tmp_path, LOW_TRACK, holed=True)]
+    for item in items:
+        item.properties[BURST_ACQUISITIONS] = 31 if item.properties[BURST_ID] == LOW_TRACK else 29
+
+    def load(source_index: bool):
+        ds, _ = ingest_tile(
+            provider="cmr-asf",
+            collection="opera-rtc-s1",
+            tile_id=None,
+            start_date="2024-06-14",
+            end_date="2024-06-16",
+            bbox=(14.9, 45.0, 15.2, 45.3),
+            geobox=GBOX,
+            chunks=CHUNKS,
+            item_provider_fn=lambda: items,
+            mid_longitude=15.0,
+            post_load_fn=amplitude_to_db,
+            source_index=source_index,
+        )
+        assert ds is not None
+        return ds.compute()
+
+    indexed, plain = load(True), load(False)
+    for band in ("0_VV", "0_VH"):
+        np.testing.assert_array_equal(indexed[band].values, plain[band].values)
+    index = indexed[SOURCE_INDEX_VAR].values[0]
+    assert np.unique(index[:, : SIZE // 2]).tolist() == [1], "the most-acquired burst is first"
+    assert np.unique(index[:, SIZE // 2 :]).tolist() == [2], "its hole falls to the other burst"
