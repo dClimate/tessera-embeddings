@@ -333,6 +333,13 @@ needs enough points to show it is monotonic before one of them becomes a recomme
   nodata" where the code masks on **dst**, so checking the docstring confirmed the error; and every
   test in the area asserted the order handed *to* the loader, never the pixels that came *out*.
   (`ingest/solar-day-fusion-order.md`)
+- **"Copies sharing a datatake are reprocessings of one image, so only one is kept."** Stated in
+  the duplicate selector's docstrings and the ingest README, and never checked against the
+  catalogue's own structure. A pass crossing a datastrip boundary reaches a tile as one granule per
+  datastrip, same datatake and baseline, different ground; the rule kept one and dropped the other,
+  about 1.2% of clear optical observations and up to a fifth of a year in places. Every test built
+  its duplicates as reprocessings, so none could see it; it surfaced only when a replication queried
+  a smaller area than production and kept the other granule. (`ingest/split-datastrips.md`)
 
 **The cure:** an unexplained result is a publishable state. Recording "the effect is real
 and the mechanism is unknown" costs nothing and blocks nothing; a mechanism invented to

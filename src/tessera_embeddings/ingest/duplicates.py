@@ -1,8 +1,11 @@
 """Choosing between duplicate catalogue items for one tile and one solar day.
 
 Element 84's Sentinel-2 catalogue holds **more than one item per tile-date** whenever a granule
-has been reprocessed: same tile, same acquisition, different processing baseline, distinguished by
+has been reprocessed: same tile, same image, different processing baseline, distinguished by
 ``s2:sequence``. It is common — a single MGRS tile can have dozens of duplicated dates in a season.
+Not every second item is a copy: a tile can be imaged twice in a day, and a pass crossing a
+datastrip boundary reaches the tile once per datastrip, each covering part of it. Those are separate
+IMAGES to keep; :func:`image_identity` says which image a copy is of.
 
 **The loader fuses them.** ``odc.stac.load`` groups by solar day and mosaics every item in the
 group, so both copies are read and one unreadable copy fails the whole date. Choosing one copy up
@@ -10,6 +13,13 @@ front is what makes a fallback possible at all: while both are in the group ther
 fall back *to*. Reading two copies of one photograph is also pure waste, and costs the egress of
 whichever copy sits in another region. (The reflectance offset is removed per IMAGE as it is read,
 before anything is fused, so a date mixing two baselines is not mis-corrected.)
+
+**Copies are merged only on proof.** Two items are copies of one image when both name the same pass
+and the same datastrip, and in no other case: a copy whose image cannot be read is kept as an image
+of its own. The two possible mistakes are not alike. Keeping a copy that was in fact a duplicate
+costs a second read and a missing fallback rung, and its pixels are still right because the offset
+is corrected per image. Merging two different images loses ground for the day, silently. Under
+doubt, the cheap mistake is the one made.
 
 **The order lives in one place.** :func:`_preference_key` states it term by term, with the reason
 for each position; add a term there and nowhere else. Two invariants govern where a new term may
@@ -32,9 +42,7 @@ wants with an older pixel, so both sit below the baseline, the pixel claim above
 from __future__ import annotations
 
 import collections
-import datetime
 import functools
-import itertools
 import logging
 import re
 from collections.abc import Iterable, Sequence
@@ -221,20 +229,11 @@ def _owes_a_correction(
     return harmonisation is not Harmonisation.HARMONISED
 
 
-def _acquisition_is_known(item: Any) -> bool:  # noqa: ANN401 — any STAC-like item
-    """Whether this copy says which observation it came from.
-
-    True on either evidence :func:`_by_acquisition` clusters by. A copy with neither was attached
-    to a cluster arbitrarily, so nothing may be concluded from which cluster it landed in.
-    """
-    return acquisition_identity(item) is not None or acquisition_instant(item) is not None
-
-
 def _preference_key(
     item: Any,  # noqa: ANN401
     read_keys: tuple[str, ...] = READ_ASSET_KEYS,
     known_harmonisation: Harmonisation | None = None,
-) -> tuple[int, int, int, int, float, int, int, int, int, str]:
+) -> tuple[int, int, int, float, int, int, int, int, str]:
     """How much we would rather read this copy than another. Lower sorts first.
 
     **The canonical statement of the ranking order.** The module docstring holds the two invariants
@@ -242,7 +241,7 @@ def _preference_key(
     this list. Nothing else states the order.
 
     **Context-free:** no term is relative to the set being sorted, so the same key orders copies
-    of one acquisition and copies from different acquisitions. That is what lets one key serve
+    of one image and copies of different images. That is what lets one key serve
     both, and it must hold for any term added here.
 
     The fields, in order:
@@ -250,27 +249,21 @@ def _preference_key(
     1. **Read-set completeness**, over ``read_keys`` — the assets THIS load will request. First,
        because a copy missing one cannot deliver the tile-date at any baseline, and a missing band
        is not one of the read failures the fallback ladder recognises, so an incomplete winner
-       fails the acquisition outright.
+       fails that image outright.
     2. **Whether the producer is decidable**, where it would matter. A copy from a bucket nobody
        has classified cannot have its correction decided, so it refuses its date at or above the
        correction threshold — and neither the generic path nor the read-failure ladder retries a
        refusal. A copy whose own bands span a harmonised and a raw producer is NOT one of these:
        each source is decided on its own bucket. Inert below the threshold, where the producer
        changes no pixel.
-    3. **Whether this copy demonstrably belongs to the acquisition it is ranked in.** A copy naming
-       neither an observation nor an instant was attached to a cluster arbitrarily, so it must not
-       displace one that does say which pass it came from, whatever its baseline. Above the
-       baseline terms deliberately: a known member at an older baseline still represents that pass,
-       while a possibly-unrelated copy at a newer one may duplicate another pass and drop this
-       one's coverage entirely.
-    4. **Whether the baseline is readable — for producers whose correction depends on it.** A copy
+    3. **Whether the baseline is readable — for producers whose correction depends on it.** A copy
        declaring nothing cannot have its correction decided, so it refuses its date. Above the next
        term because a refusal has no recovery while owing a correction merely gets one. An
        already-harmonised copy is the exception: its pixels need no correction whatever the
        baseline says, so penalising it here would hand a tile-date to an OLDER raw reprocessing.
-    5. **The baseline, descending, by value** — not by "is it the best", so every rung of the
+    4. **The baseline, descending, by value** — not by "is it the best", so every rung of the
        fallback ladder stays in descending baseline order.
-    6. **Whether the copy owes an offset correction at all**, where the producer is an item's own
+    5. **Whether the copy owes an offset correction at all**, where the producer is an item's own
        property. Below the baseline, because both reasons to prefer a copy owing nothing are about
        the PIXEL rather than about coverage:
 
@@ -287,10 +280,10 @@ def _preference_key(
        reprocessing — which is why locality sits below the baseline too. This sits above locality
        only because a pixel argument outranks a cost one. Inert below the threshold, and inert
        without a read set, where every copy reports an undecidable producer and the term ties.
-    7. **Locality, only where the baseline is readable.** Below the baseline so it cannot buy
+    6. **Locality, only where the baseline is readable.** Below the baseline so it cannot buy
        cheaper egress with an older pixel, and inert for unreadable baselines so it cannot decide
        a comparison the baseline could not enter.
-    8. **Sequence, descending, then id.** The id makes the order total, so the choice is
+    7. **Sequence, descending, then id.** The id makes the order total, so the choice is
        independent of catalogue response order and a rerun cannot produce a different mosaic.
     """
     baseline = item_processing_baseline(item)
@@ -304,7 +297,6 @@ def _preference_key(
     return (
         0 if read_set_is_complete(item, read_keys) else 1,
         1 if _would_refuse_its_date(baseline, harmonisation) else 0,
-        0 if _acquisition_is_known(item) else 1,
         0 if baseline is not None or not baseline_matters else 1,
         -(baseline or 0.0),
         1 if owes else 0,
@@ -320,7 +312,7 @@ def _rank_copies(
     read_keys: tuple[str, ...] = READ_ASSET_KEYS,
     known_harmonisation: Harmonisation | None = None,
 ) -> list[Any]:
-    """Order copies of one acquisition, PREFERRED first.
+    """Order copies of one image, PREFERRED first.
 
     An unreadable baseline ranks last rather than suspending the comparison: such a copy refuses
     its date in :class:`~tessera_embeddings.ingest.stac.BoaOffsetParser`, and the
@@ -333,146 +325,55 @@ def _rank_copies(
     )
 
 
-#: How far apart two catalogue timestamps must be to be different acquisitions rather than
-#: reprocessings of one, used only where :func:`acquisition_identity` cannot answer. The closest
-#: genuinely distinct pair observed on the live catalogue is a successive orbit ~50 minutes later.
-#: It is NOT a safe margin against reprocessings, which is why identity is tried first: copies of
-#: one granule at baselines 02.06 and 05.00 are timestamped more than three minutes apart.
-_SAME_ACQUISITION_S = 120.0
-
-#: ``s2:datatake_id``, e.g. ``GS2B_20171219T095409_004109_N05.00``: mission, sensing start,
-#: absolute orbit, then the processing baseline. Only the last field changes between
-#: reprocessings, so the head of it names the observation itself.
+#: ``s2:datatake_id``, e.g. ``GS2B_20171219T095409_004109_N05.00``: mission, sensing start and
+#: absolute orbit, which name the PASS, then the processing baseline.
 _DATATAKE_RE = re.compile(r"(G[A-Z0-9]{2,}_[0-9]{8}T[0-9]{6}_[0-9]+)_N[0-9]{1,2}\.[0-9]{1,2}")
 
+#: ``s2:datastrip_id``, e.g. ``S2B_OPER_MSI_L2A_DS_2BPS_20250619T191325_S20250619T153625_N05.11``:
+#: mission, processing centre and time, the datastrip's SENSING START, then the baseline. The start
+#: names the datastrip within its pass; reprocessing changes the processing fields and keeps it.
+_DATASTRIP_RE = re.compile(
+    r"S2[A-Z]_OPER_MSI_L2A_DS_[A-Z0-9_]{4}_[0-9]{8}T[0-9]{6}_S([0-9]{8}T[0-9]{6})_N[0-9]{1,2}\.[0-9]{1,2}"
+)
 
-def acquisition_identity(item: Any) -> str | None:  # noqa: ANN401 — any STAC-like item
-    """A stable name for the OBSERVATION, shared by every reprocessing of it.
 
-    Preferred over :func:`acquisition_instant` for deciding whether two copies are the same
-    acquisition: the catalogue ``datetime`` is per-copy and reprocessings do not agree on it, so no
-    tolerance around it separates "two reprocessings" from "two passes" without getting one wrong.
-    Mission, sensing start and orbit are identical across a reprocessing pair and different across
-    passes, so no tolerance is needed at all.
+def image_identity(item: Any) -> tuple[str, str] | None:  # noqa: ANN401 — any STAC-like item
+    """Which IMAGE a copy is of — its pass and its datastrip — or ``None`` if either cannot be read.
 
-    ``None`` where the property is absent or not this shape, which sends the caller to the
-    instant. Matched as a whole rather than split on underscores, so a value that is not a
-    datatake id is rejected instead of yielding a plausible-looking wrong key.
+    An image is what one datastrip of one pass recorded over a tile. Its copies, ESA's reprocessings
+    at newer baselines or one product published twice, name the same pass and the same datastrip
+    sensing start. Two different images of a tile on one day differ in one or the other: a second
+    pass at high latitude has its own datatake, and a pass crossing a datastrip boundary reaches the
+    tile once per datastrip, each covering part of it. Empirical, see
+    ``context_docs/ingest/split-datastrips.md``.
+
+    Read from the identifiers rather than the catalogue ``datetime``, which is per copy:
+    reprocessings of one image disagree on it, and two datastrips of one pass are seconds apart.
+
+    ``None`` means "cannot be shown to be a copy of anything", and the caller keeps such a copy as
+    an image of its own. Both properties are matched as a whole rather than split on underscores,
+    so a value of another shape reads as unknown instead of yielding a plausible-looking wrong key.
     """
-    raw = item.properties.get("s2:datatake_id")
-    if not isinstance(raw, str):
-        return None
-    match = _DATATAKE_RE.fullmatch(raw.strip())
-    if match is None:
-        logger.debug("Not a datatake id: %r on %s", raw, getattr(item, "id", "?"))
-        return None
-    return match.group(1)
+    datatake, datastrip = item.properties.get("s2:datatake_id"), item.properties.get("s2:datastrip_id")
+    take = _DATATAKE_RE.fullmatch(datatake.strip()) if isinstance(datatake, str) else None
+    strip = _DATASTRIP_RE.fullmatch(datastrip.strip()) if isinstance(datastrip, str) else None
+    return (take.group(1), strip.group(1)) if take and strip else None
 
 
-def acquisition_instant(item: Any) -> datetime.datetime | None:  # noqa: ANN401 — any STAC-like item
-    """The instant an item was ACQUIRED, or ``None`` if it cannot be read.
+def _images(copies: list[Any]) -> list[list[Any]]:
+    """One tile-date's copies, one list per image; a copy whose image cannot be read stands alone.
 
-    Read from ``properties["datetime"]`` and never from ``item.datetime``, because by
-    the time duplicates are selected the latter has been overwritten with the canonical
-    noon-UTC solar-day stamp (:func:`normalize_to_solar_day`) and every copy of a day
-    therefore carries an identical value.
-
-    A per-copy field: reprocessings of one granule do not agree on it, so it is the FALLBACK
-    for placing a copy and :func:`acquisition_identity` is the primary.
+    Sorted by identity, so the order is a property of the items and not of catalogue response order.
     """
-    raw = item.properties.get("datetime")
-    if not isinstance(raw, str) or not raw:
-        return None
-    try:
-        parsed = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except ValueError:
-        logger.debug("Unparseable datetime %r on %s", raw, getattr(item, "id", "?"))
-        return None
-    # No offset means UNREADABLE, not assumed UTC: guessing would place the acquisition up to a
-    # day out, and a naive value alongside aware ones makes the sort in `_by_acquisition` raise.
-    if parsed.tzinfo is None:
-        logger.debug("Timezone-less datetime %r on %s", raw, getattr(item, "id", "?"))
-        return None
-    return parsed
-
-
-def _by_acquisition(copies: list[Any]) -> list[list[Any]]:
-    """Split one tile-date's copies into one list per distinct acquisition.
-
-    **Identity first, timestamps only where there is no identity.** Copies naming the same
-    observation (:func:`acquisition_identity`) are one cluster however far apart their catalogue
-    timestamps are — which is how reprocessings of one granule actually present themselves, so
-    grouping by timestamp fuses nothing and leaves both copies to be loaded and mosaicked together.
-    The remainder falls back to the timestamps, clustered within :data:`_SAME_ACQUISITION_S`.
-
-    **A copy without an identity JOINS an identified acquisition its timestamp places it in**,
-    rather than always starting a cluster of its own. One reprocessing declaring the datatake while
-    its sibling omits it would otherwise never be compared, however close their timestamps, so both
-    would survive to be fused — the same defect identity exists to fix, by a different route.
-
-    **A copy with neither JOINS a cluster rather than forming its own**, so it competes for one slot
-    instead of adding one — that is what stops two copies of a pass being fused at two processing
-    baselines. Collapsing the whole tile-date would prevent the same fusion by discarding coverage
-    from passes that identified themselves perfectly well, which this function exists to preserve.
-    Which cluster such a copy joins is arbitrary, which is why it cannot WIN one
-    (:func:`_preference_key` ranks a known acquisition above data vintage) and why attributed
-    recovery will not place one (:func:`_first_for_failed_acquisition`).
-
-    Splitting on a real acquisition protects real coverage — see
-    :func:`select_preferred_duplicates` for what keying on (tile, solar day) alone discarded.
-    """
-    # Sorted so the cluster ORDER is a property of the items and not of catalogue response order.
-    identified: dict[str, list[Any]] = {}
-    known: list[tuple[datetime.datetime, Any]] = []
-    unplaceable: list[Any] = []
+    same: dict[tuple[str, str], list[Any]] = {}
+    alone: list[list[Any]] = []
     for item in copies:
-        identity = acquisition_identity(item)
-        if identity is not None:
-            identified.setdefault(identity, []).append(item)
-            continue
-        instant = acquisition_instant(item)
-        if instant is None:
-            unplaceable.append(item)
+        identity = image_identity(item)
+        if identity is None:
+            alone.append([item])
         else:
-            known.append((instant, item))
-
-    clusters: list[list[Any]] = [group for _, group in sorted(identified.items())]
-
-    # A timestamp-only copy joins an identified acquisition it is close to, before it is allowed to
-    # start one. Matched against ANY member: members of one acquisition do not agree on the
-    # timestamp (that disagreement is why identity is the primary key), so being close to any of
-    # them is the whole of the available evidence.
-    orphans: list[tuple[datetime.datetime, Any]] = []
-    for instant, item in sorted(known, key=lambda pair: pair[0]):
-        joined = next(
-            (
-                cluster
-                for cluster in clusters
-                if any(
-                    (sibling_instant := acquisition_instant(sibling)) is not None
-                    and abs((instant - sibling_instant).total_seconds()) <= _SAME_ACQUISITION_S
-                    for sibling in cluster
-                )
-            ),
-            None,
-        )
-        if joined is None:
-            orphans.append((instant, item))
-        else:
-            joined.append(item)
-
-    if orphans:
-        clusters.append([orphans[0][1]])
-        for previous, current in itertools.pairwise(orphans):
-            if (current[0] - previous[0]).total_seconds() > _SAME_ACQUISITION_S:
-                clusters.append([current[1]])
-            else:
-                clusters[-1].append(current[1])
-
-    if not clusters:
-        return [copies]
-    clusters[0].extend(unplaceable)
-    return clusters
+            same.setdefault(identity, []).append(item)
+    return [group for _, group in sorted(same.items())] + alone
 
 
 def select_preferred_duplicates(
@@ -480,7 +381,7 @@ def select_preferred_duplicates(
     read_keys: tuple[str, ...] = READ_ASSET_KEYS,
     known_harmonisation: Harmonisation | None = None,
 ) -> tuple[list[Any], dict[tuple[str, str], list[Any]]]:
-    """Keep one item per (tile, solar day); return the survivors and the alternates.
+    """Keep one copy of each image of each tile-date; return the survivors and the alternates.
 
     Items must already be normalised to solar days — the grouping key is the solar day, so
     an un-normalised item would be grouped under the wrong one. :func:`solar_day_of` raises
@@ -501,22 +402,20 @@ def select_preferred_duplicates(
     the radar path has no such duplicates, and an item we cannot key is safer kept than
     silently dropped.
 
-    **One per ACQUISITION, not one per day.** A tile-date can hold two genuinely different
-    acquisitions as well as reprocessings of one — at high latitude, successive orbits revisit the
-    same tile the same day. Those are separate imagery, mosaicked together by the loader, and
-    collapsing them to one copy silently discards coverage. Measured against the live catalogue
-    over eight tiles and 2021: keying on (tile, solar day) alone dropped **493 of 2,733 items** as
-    duplicates when they were distinct acquisitions — nothing at all in the mid-latitude tiles,
-    196 of 500 at 33XVG and 297 of 500 at 22XER. So copies are split by acquisition first, and
-    only true reprocessings of one acquisition compete on ``s2:sequence``.
+    **One per IMAGE, not one per day.** A tile-date can hold several images as well as copies of
+    one (:func:`image_identity`), and each is separate imagery that the loader mosaics together, so
+    only copies of ONE image compete. Keying on (tile, solar day) alone dropped second passes at
+    high latitude, and keying on the pass alone dropped split datastrips (see
+    ``context_docs/ingest/split-datastrips.md``). A copy whose image cannot be read is kept on its
+    own and has no spares, which the module docstring explains.
 
     Returns:
         ``(kept, alternates)``. ``kept`` preserves the input order of the survivors, so a
-        caller's own sort still decides fusion order, and holds one item per acquisition, so a
-        tile-date with two acquisitions keeps both. ``alternates`` maps each ``(tile, solar_day)``
+        caller's own sort still decides fusion order, and holds one item per image, so a
+        tile-date with two images keeps both. ``alternates`` maps each ``(tile, solar_day)``
         that had a rejected copy to those copies, most preferred first — the ladder a caller steps
         down when a chosen copy cannot be read. It stays keyed by tile-date rather than by
-        acquisition because that is the granularity a read failure is attributed at.
+        image because that is the granularity a read failure is attributed at.
     """
     groups: dict[tuple[str, str], list[Any]] = {}
     ungrouped: list[Any] = []
@@ -531,15 +430,18 @@ def select_preferred_duplicates(
     # __eq__ may not compare, so a value-based membership test could drop the wrong copy.
     survivors: set[int] = {id(it) for it in ungrouped}
     alternates: dict[tuple[str, str], list[Any]] = {}
+    unproven: list[str] = []
     for key, copies in groups.items():
         rejected: list[Any] = []
-        for acquisition in _by_acquisition(copies):
-            ranked = _rank_copies(acquisition, read_keys, known_harmonisation)
+        for image in _images(copies):
+            ranked = _rank_copies(image, read_keys, known_harmonisation)
             survivors.add(id(ranked[0]))
             rejected.extend(ranked[1:])
+        if len(copies) > 1:
+            unproven += [str(getattr(it, "id", "?")) for it in copies if image_identity(it) is None]
         if rejected:
             # ONE order over every rejected copy of the tile-date, not a concatenation of
-            # per-acquisition ladders. The unattributed recovery consumes `copies[0]` on each
+            # per-image ladders. The unattributed recovery consumes `copies[0]` on each
             # retry, so every position is a choice and the whole list has to be ranked.
             #
             # Only copies that would REFUSE ON THEIR OWN ACCOUNT are dropped rather than offered.
@@ -566,6 +468,13 @@ def select_preferred_duplicates(
                     ),
                 )
 
+    if unproven:
+        logger.info(
+            "%d catalogue copies name no readable pass or datastrip (e.g. %s), so each was kept as an "
+            "image of its own rather than merged with the copies beside it",
+            len(unproven),
+            unproven[0],
+        )
     kept = [it for it in items if id(it) in survivors]
     return kept, alternates
 
@@ -649,8 +558,8 @@ def log_duplicate_selection(
     # operator reads this line to explain a selected pixel, so a stale order gives them the wrong
     # explanation.
     how = (
-        "complete read set, then a decidable producer, then a known acquisition, then a readable "
-        "baseline, then newest baseline, then owing no offset correction, then in-region, then "
+        "complete read set, then a decidable producer, then a readable baseline, then newest "
+        "baseline, then owing no offset correction, then in-region, then "
         "newest sequence"
     )
     log.info(
@@ -1161,11 +1070,11 @@ def step_down_copies(
     everything: the failure was attributed, and to nothing here.
 
     ``implicated`` is the failed ITEMS, when the caller could identify them. A tile-date can hold
-    several distinct acquisitions, and without this the rung taken is whichever alternate ranks
-    highest across the whole tile-date — possibly one belonging to an acquisition that read
-    perfectly well. Stepping that downgrades healthy imagery to an older baseline and leaves the
-    unreadable copy selected, so the next rung has to step again: two rungs spent, one acquisition
-    needlessly older. With it the ladder steps the acquisition that actually failed.
+    several images, and without this the rung taken is whichever alternate ranks highest across the
+    whole tile-date — possibly a spare of an image that read perfectly well. Stepping that
+    downgrades healthy imagery to an older baseline and leaves the unreadable copy selected, so the
+    next rung has to step again: two rungs spent, one image needlessly older. With it the ladder
+    steps the image that actually failed.
 
     Returns the new item list and the keys that were stepped, so a caller can name what
     changed rather than the whole date.
@@ -1182,15 +1091,14 @@ def step_down_copies(
         if tile is not None:
             survivors.setdefault((tile, solar_day_of(item)), []).append(item)
 
-    # BY IDENTITY, not by key. A tile-date can hold several distinct acquisitions
-    # (`_by_acquisition`), and swapping on the key replaces every one of them with the same
-    # alternate — turning `[a_new, b_new]` into `[a_old, a_old]`, which duplicates one acquisition
-    # and silently drops the other, feeding the loader the same granule twice.
+    # BY IMAGE, not by key. A tile-date can hold several images, and swapping on the key replaces
+    # every one of them with the same alternate — turning `[a_new, b_new]` into `[a_old, a_old]`,
+    # which duplicates one image and silently drops the other.
     #
-    # Bucketed by the SAME key the alternates use. `implicated` carries the failed items from
-    # every tile in the date, and acquisition matching is by INSTANT — so neighbouring MGRS tiles
-    # imaged on one pass share an instant and cross-match. Unfiltered, a failure in tile B picks
-    # tile A's spare, downgrading A while leaving B's own failure selected.
+    # Bucketed by the SAME key the alternates use. `implicated` carries the failed items from every
+    # tile in the date, and an image identity names a pass and datastrip but not a tile, so
+    # neighbouring MGRS tiles imaged by one datastrip share it. Unfiltered, a failure in tile B
+    # picks tile A's spare, downgrading A while leaving B's own failure selected.
     failed_by_key: dict[tuple[str, str], list[Any]] = {}
     for item in implicated:
         tile = item_tile(item)
@@ -1200,10 +1108,10 @@ def step_down_copies(
     swap: dict[int, Any] = {}
     stepped: set[tuple[str, str]] = set()
     for key, copies in remaining.items():
-        alternate = _first_for_failed_acquisition(copies, failed_by_key.get(key, ()))
+        alternate = _spare_for_failed_image(copies, failed_by_key.get(key, ()))
         if alternate is None:
-            # The failed acquisition has no placeable spare. Leave every copy available and step
-            # nothing: swapping a healthy acquisition cannot fix the failure and costs a re-read.
+            # The failed image has no spare. Leave every copy available and step nothing: swapping
+            # a healthy image cannot fix the failure and costs a re-read.
             continue
         target = _alternate_for(alternate, survivors.get(key, ()), taken=swap)
         if target is None:
@@ -1221,55 +1129,30 @@ def step_down_copies(
     return [swap.get(id(item), item) for item in items], stepped
 
 
-def _first_for_failed_acquisition(copies: list[Any], implicated: Sequence[Any]) -> Any | None:  # noqa: ANN401
-    """The best-ranked alternate belonging to an acquisition that FAILED, or ``None``.
+def _spare_for_failed_image(copies: list[Any], implicated: Sequence[Any]) -> Any | None:  # noqa: ANN401
+    """The best-ranked spare of an image that FAILED, or ``None``.
 
-    ``copies`` is already preference-ordered, so the plain answer is ``copies[0]`` — which is what
-    this returns when nothing was attributed.
-
-    **When attribution DID name the failing objects, only candidates whose own acquisition is
-    known are considered, and the answer is ``None`` if none of them belongs to the failing
-    acquisition.** Preferring an alternate that shares an acquisition with a failed item is what
-    keeps every other acquisition on its newest copy: otherwise a tile-date holding two
-    acquisitions steps whichever has the higher-ranked spare, which can be the one that read fine,
-    dropping it to an older baseline for no reason while the broken copy stays selected. And
-    falling back to the best overall alternate when none matches re-read the whole date once per
-    unrelated spare, failing the same way each time, before recording the loss. Nothing to step
-    means nothing to step.
+    ``copies`` is already preference-ordered, so with nothing attributed the answer is ``copies[0]``.
+    With the failing copies named, only a spare of one of THEIR images is offered: stepping a
+    healthy image would drop it to an older baseline for nothing and leave the failure selected,
+    and re-reading the date once per unrelated spare only fails the same way each time. A failed
+    copy whose image cannot be read has no spares (:func:`select_preferred_duplicates`), so nothing
+    is offered for it.
     """
     if not implicated:
         return copies[0]
-    for candidate in copies:
-        # A candidate naming neither an observation nor an instant is attached to a cluster
-        # ARBITRARILY, and the two calls that need its acquisition see different item sets: this
-        # one clusters it against the implicated copies, `_alternate_for` against the survivors.
-        # So it could be chosen as the spare for the acquisition that FAILED and then swapped onto
-        # a healthy one — consuming the spare, leaving the failure selected, recovering nothing.
-        # Attributed recovery therefore only considers candidates whose acquisition is a fact.
-        if not _acquisition_is_known(candidate):
-            continue
-        for cluster in _by_acquisition([*implicated, candidate]):
-            if any(it is candidate for it in cluster) and any(any(it is bad for bad in implicated) for it in cluster):
-                return candidate
-    return None
+    failed = {image_identity(it) for it in implicated}
+    return next((spare for spare in copies if image_identity(spare) in failed), None)
 
 
 def _alternate_for(alternate: Any, survivors: Iterable[Any], *, taken: dict[int, Any]) -> Any | None:  # noqa: ANN401
-    """The surviving item ``alternate`` is a fallback FOR: the one sharing its acquisition.
+    """The surviving copy ``alternate`` is a spare FOR: the one of the same image, not yet swapped.
 
-    Decided by :func:`_by_acquisition` rather than by a second notion of sameness, so the ladder
-    can only ever step a copy down onto the acquisition it came from. Falls back to the first
-    un-swapped survivor when no copy names its acquisition at all, which is correct for the
-    single-acquisition case that is the only way to reach it.
+    Only copies of an identified image have spares, so the match is exact and the ladder can only
+    ever step a copy down onto its own image.
     """
-    free = [it for it in survivors if id(it) not in taken]
-    if not free:
-        return None
-    for cluster in _by_acquisition([*free, alternate]):
-        if any(it is alternate for it in cluster):
-            sibling = [it for it in cluster if it is not alternate]
-            return sibling[0] if sibling else None
-    return free[0]
+    identity = image_identity(alternate)
+    return next((it for it in survivors if id(it) not in taken and image_identity(it) == identity), None)
 
 
 #: How many tiles a label names before it summarises the rest. A label is read by a human
