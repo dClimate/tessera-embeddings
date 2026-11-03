@@ -32,9 +32,22 @@ scans `src/` and `tests/` for three kinds of clone:
 
 On failure the job names each file whose duplication rose and the clones touching it.
 
-**Complexity: no function over McCabe 15 may grow, and none may newly cross it** (ruff's
-`C901` scores, read by the script). Existing debt carries no suppression comment, and a function
-that is split below 15 simply leaves the comparison.
+**Per function: complexity, arguments and return statements may not get worse** (ruff's `C901`,
+`PLR0913` and `PLR0911` scores, read by the script). A function over a limit may not grow on that
+measure, and none may newly cross one. Existing debt carries no suppression comment, and a
+function brought under a limit simply leaves the comparison.
+
+| Measure | Limit | Over it on `main` | What it signals |
+|---|---|---|---|
+| McCabe complexity | 15 | 19 | a function too branchy to review |
+| Arguments | 8 | 65 in `src/`, 4 in `tests/` | a missing abstraction, or a function doing too much |
+| Return statements | 6 | 4 | tangled control flow |
+
+Ruff's argument default of 5 would flag 142 functions in this keyword-heavy codebase; 8 keeps
+the signal on the outliers. **Prefect `@flow` functions are exempt from the argument limit**: a
+flow's parameters are its interface, the one deployments and the Prefect UI expose. Everything
+else in a flow module, its closures and helpers included, is held to it, and so are flows on
+the other two measures.
 
 ## What was measured (2026-11-03, `main` at `cc0dec14`)
 
