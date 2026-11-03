@@ -60,7 +60,7 @@ select = [
 # scripts/ passes the whole rule set as it stands (checked 2026-08-25), and the per-file
 # ignores below already anticipate it being linted, so adding it to lint.yml would be green
 # today. That is a CI-scope decision rather than part of the test-suite work, so it is left.
-extend-select = ["E501", "PLE1205", "PLE1206", "TID251", "C901"]
+extend-select = ["E501", "PLE1205", "PLE1206", "TID251"]
 
 ignore = [
     "D100",   # Missing docstring in public module
@@ -87,13 +87,6 @@ ignore = [
 # normalize_to_solar_day. A second application shifts an already-shifted timestamp; a
 # per-site application drifted before (src/tessera_embeddings/ingest/README.md).
 "tessera_embeddings.ingest.solar_days.solar_day_offset_seconds".msg = "Use solar_days.normalize_to_solar_day; the offset is applied only there."
-
-# Per-function McCabe complexity, gated so a NEW function stays small enough to review: a
-# change that would push one past this is the cue to split it. The functions already past it
-# carry `# noqa: C901` (grandfathered, mostly flow and runner entry points); an edit that
-# grows one should still prefer extracting a helper. Rationale: ADR 040.
-[lint.mccabe]
-max-complexity = 15
 
 [lint.isort]
 known-first-party = ["tessera_embeddings"]

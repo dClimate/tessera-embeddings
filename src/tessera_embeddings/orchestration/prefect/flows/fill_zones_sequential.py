@@ -681,7 +681,7 @@ _cancel_child_ingests_on_cancellation = make_child_cancel_hook(_INGEST_TAG_PREFI
     on_crashed=[ray_cleanup_on_cancellation, _cancel_child_ingests_on_cancellation],
 )
 # jscpd:ignore-start: flow parameters and their docs, shared with fill_zone_year_flow; Prefect shows each flow's own
-def fill_zones_sequential_flow(  # noqa: C901
+def fill_zones_sequential_flow(
     *,
     cells: list[tuple[str, int]] | None = None,
     paths: BucketPaths,

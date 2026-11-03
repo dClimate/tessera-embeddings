@@ -415,10 +415,10 @@ request ([ADR 039](context_docs/decisions/039-architecture-rules-run-on-import-l
 Run them with `uv run lint-imports` and `uv run ruff check src/`; both scan the package, not
 `scripts/` ([ADR 014](context_docs/decisions/014-architecture-rules-scan-the-package.md)). A
 downstream repo adopts the contract by copying `.importlinter` and the `banned-api` table.
-Two more checks bind only what a pull request adds: a function over McCabe complexity 15 (ruff
-`C901`), and a copy of existing code, exact, with a few lines changed, or a function of the same
-shape (`uv run jscpd`, against the base branch in CI;
-[ADR 040](context_docs/decisions/040-new-code-is-gated-on-duplication-and-complexity.md)).
+A ratchet also compares every pull request with the commit it merges into: no file may gain
+duplicated lines (jscpd: exact copies, copies with a few lines changed, functions of the same
+shape) and no function may gain complexity once over McCabe 15
+([ADR 040](context_docs/decisions/040-new-code-is-gated-on-duplication-and-complexity.md)).
 
 ## The global embeddings store
 
