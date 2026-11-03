@@ -288,7 +288,7 @@ class TestWriteChunk:
 
         assert seen == ["retract:done", "retract:skipped", "retract:zarr", "tile", "attribute", "done"]
 
-    def test_write_chunk_wrong_shape_raises(self, tmp_path, writer):
+    def test_write_chunk_wrong_shape_raises(self, writer):
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=10, x_start=0, x_stop=10)
         bad_embeddings = np.zeros((5, 5, EMBEDDING_DIM), dtype=np.float32)
 
@@ -301,7 +301,7 @@ class TestWriteChunk:
                 stack=STACK,
             )
 
-    def test_coordinates_in_output(self, tmp_path, writer):
+    def test_coordinates_in_output(self, writer):
         """Written Zarr has correct northing, easting, band coordinates."""
         chunk = ChunkSpec(row=1, col=2, y_start=1500, y_stop=3000, x_start=3000, x_stop=4500)
         embeddings = np.zeros((1500, 1500, EMBEDDING_DIM), dtype=np.float32)
@@ -319,7 +319,7 @@ class TestWriteChunk:
         np.testing.assert_array_equal(ds.coords["easting"].values, np.arange(3000, 4500))
         np.testing.assert_array_equal(ds.coords["band"].values, np.arange(EMBEDDING_DIM))
 
-    def test_write_chunk_with_obs_counts(self, tmp_path, writer):
+    def test_write_chunk_with_obs_counts(self, writer):
         """Write chunk with obs counts dict, read back, verify shape/dtype/values."""
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=10, x_start=0, x_stop=10)
 
@@ -354,7 +354,7 @@ class TestWriteChunk:
             assert result.dtype == np.uint16
             np.testing.assert_array_equal(result, expected)
 
-    def test_write_chunk_without_obs_counts_backward_compat(self, tmp_path, writer):
+    def test_write_chunk_without_obs_counts_backward_compat(self, writer):
         """Write without obs counts, verify no obs count vars in zarr."""
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=10, x_start=0, x_stop=10)
 
