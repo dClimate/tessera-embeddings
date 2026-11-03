@@ -1110,7 +1110,7 @@ def _batch_actors_to_request(
 # ---------------------------------------------------------------------------
 
 
-def _process_chunks_work_stealing(  # noqa: C901
+def _process_chunks_work_stealing(
     actors: list[ray.actor.ActorHandle],
     actor_instance_ids: list[str],
     chunks: list[ChunkSpec],

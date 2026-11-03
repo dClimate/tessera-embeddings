@@ -15,11 +15,14 @@ on what a pull request *adds* needs neither, and it is the signal that steers th
 
 ## Decision
 
-Two checks fail a pull request, each on new code only.
+**A ratchet against the base commit** (`.github/workflows/quality-ratchet.yml`, rules in
+`.github/scripts/quality_ratchet.py`) fails a pull request that makes either measure worse than
+the commit it merges into. Both trees are measured with the head's settings, on every PR,
+stacked ones included, and against the merge commit's first parent rather than the base branch,
+which can move while the job is queued.
 
-**Duplication: jscpd against the base branch** (`.github/workflows/duplication.yml`, settings in
-`.jscpd.json`). jscpd scans `src/` and `tests/` and builds a baseline from the base branch's tree
-with the same settings; the job fails on any clone absent from it. Three kinds are checked:
+**Duplication: no file's duplicated lines may rise** (jscpd, settings in `.jscpd.json`). jscpd
+scans `src/` and `tests/` for three kinds of clone:
 
 - **Exact copies** of at least 50 tokens and 5 lines (jscpd's defaults).
 - **Gap clones** (`maxGapLines: 3`): two copies separated by at most three inserted or changed
@@ -27,20 +30,20 @@ with the same settings; the job fails on any clone absent from it. Three kinds a
 - **Similar functions** (`similarity: 0.8`): functions whose syntax trees match after local
   names and literals are normalised. jscpd leaves test files out of this kind.
 
-A clone's fingerprint is its content, so moving code within a file does not report it as new;
-editing a line inside an existing clone does, which is deliberate, since that PR touched
-duplicated code.
+On failure the job names each file whose duplication rose and the clones touching it.
 
-**Complexity: ruff `C901` at 15** (`ruff.toml`), McCabe complexity per function, run by the
-existing lint job. Ten of the 19 functions over 15 when the gate landed were split under it,
-each by extracting a self-contained block. The nine left carry `# noqa: C901`: the campaign and
-ingest orchestration functions (`fill_zones_sequential`, `run_global_campaign`,
-`ingest_s2_roi_reflectance`, `_process_chunks_work_stealing`, `fill_zones_sequential_flow`,
-`ingest_zone_year`, `ingest_s1_roi_sar`) and two closures inside them (`_feed`, `_drive`). Their
-branches share state through `nonlocal` closures, so splitting one moves branches between
-closures of the same function; getting them under 15 means turning those closures into
-classes, a redesign of the paths the campaign depends on rather than a cleanup. Ruff's `RUF100`
-flags a `noqa: C901` that no longer suppresses anything, so the list cannot go stale.
+**Complexity: no function over McCabe 15 may grow, and none may newly cross it** (ruff's
+`C901` scores, read by the script). Existing debt carries no suppression comment, and a function
+that is split below 15 simply leaves the comparison.
+
+Ten of the 19 functions over 15 when the ratchet landed were split under it, each by extracting
+a self-contained block. The nine left are the campaign and ingest orchestration functions
+(`fill_zones_sequential`, `run_global_campaign`, `ingest_s2_roi_reflectance`,
+`_process_chunks_work_stealing`, `fill_zones_sequential_flow`, `ingest_zone_year`,
+`ingest_s1_roi_sar`) and two closures inside them (`_feed`, `_drive`). Their branches share
+state through `nonlocal` closures, so splitting one moves branches between closures of the same
+function; getting them under 15 means turning those closures into classes, a redesign of the
+paths the campaign depends on rather than a cleanup. The ratchet holds each at its current score.
 
 **Intended mirrors are marked, not refactored.** A block that must repeat another, such as a
 Prefect flow's parameter docs (Prefect shows each flow's own), an explicit keyword signature
@@ -54,10 +57,9 @@ mirrors marked, `src/` reports no clones.
 - `src/` has 28 exact clones, 0.46% of lines. With gaps and similar functions on, 32. `tests/`
   has 149 exact or gap clones, 2.2% of lines. None of these fail the gate.
 - **Controls.** A 100-line function copied into a new module with two lines inserted and a
-  variable renamed was reported as one new gap clone at 0.99 similarity, and the job failed.
-  The same file with 30 lines added at its top reported nothing new. A new 17-branch function
-  failed `C901`.
-- A full run against the base branch takes under half a second.
+  variable renamed raised two files' duplicated lines by 101 each, and the job failed. A new
+  17-branch function failed, and so did one added branch in a function already at 19.
+- Each jscpd run takes about a tenth of a second.
 - Complexity thresholds: 40 functions in `src/` exceed 10, 19 exceed 15, 13 exceed 20. None in
   `tests/` exceed 15. 15 grandfathers a manageable list while still catching the
   large-function habit early.
@@ -66,7 +68,22 @@ mirrors marked, `src/` reports no clones.
 
 **jscpd's complexity report.** It ranks whole files, with no per-function figure, no threshold
 and no comparison against the base branch, and the ranking tracks file size. It cannot screen a
-pull request. Ruff's per-function `C901` can.
+pull request. Ruff's per-function `C901` scores can.
+
+**Failing on any clone absent from the base** (jscpd's own `--baseline-from-ref
+--fail-on-new-clones`), the first version. jscpd identifies a clone by its exact extent, so an
+edit that moves a clone's boundary makes it new: a `# noqa` added to a function's first line,
+or a refactor that SHRINKS an existing clone. The test clean-up that cut test clones from 140 to
+119 reported 21 of them as new. A rule that fails changes for reducing duplication cannot steer
+toward less of it.
+
+**One repository-wide total.** Simpler, but a PR that removes duplication in one place could
+add a fresh copy elsewhere and pass. Per file, a fresh copy fails unless the same PR removes as
+much from the same file.
+
+**`# noqa: C901` on each function already over the limit**, the first version for complexity.
+A suppression is permanent: the function could then grow without limit and the gate would
+never fire.
 
 **Gating jscpd's dead-code analysis.** With orchestration, providers, profiling and package
 `__init__` files declared as entry points (in `.jscpd.json`, so they count as live and their
@@ -114,8 +131,9 @@ The other three (two URI one-liners and a six-line flow fragment) are incidental
 
 - An agent that copies code gets a failing check naming both locations, which points it at the
   call it should have made.
-- The `# noqa: C901` list records the orchestration functions whose closure-shared state makes
-  splitting them a redesign; `RUF100` keeps it current.
+- A file renamed in a PR counts all its duplication as new, and so does a function renamed while
+  over the limit; the job's output says which, and the fix is to reduce it or split the rename
+  into its own PR.
 - A deliberate duplicate is marked at the site with its reason, or, for a whole directory such
   as the vendored upstream fixtures, excluded in `.jscpd.json`'s `ignore`. Both are reviewed
   like any other change.

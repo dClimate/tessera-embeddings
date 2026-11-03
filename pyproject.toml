@@ -139,7 +139,7 @@ dev = [
     # arrives transitively via odc-geo, but the tests import it directly, so
     # declare it.
     "affine",
-    # Duplication gate on new code (.jscpd.json; .github/workflows/duplication.yml).
+    # Duplication measure for the quality ratchet (.jscpd.json; .github/workflows/quality-ratchet.yml).
     "jscpd",
 ]
 # Standalone scale-test benchmarks under scripts/scale_tests/ (NOT pytest).

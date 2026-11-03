@@ -1,0 +1,40 @@
+name: Quality ratchet
+
+# Fails a pull request that raises any file's duplicated lines or any function's complexity
+# above the base it merges into. Measured against the base rather than a fixed limit, so existing
+# debt needs no suppression and a change that reduces it always passes. Every PR, including one
+# stacked on another branch. Settings in .jscpd.json; rules in .github/scripts/quality_ratchet.py;
+# rationale in ADR 040.
+
+on:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ratchet:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The base tree is checked out beside this one, so its commit must be here.
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          cache-dependency-glob: "uv.lock"
+          prune-cache: true
+
+      - name: Install jscpd and ruff
+        run: uv sync --frozen --only-group dev
+
+      # The checkout is GitHub's merge commit; its first parent is the base it was built on.
+      # Not the base branch, which can move while this job is queued.
+      - name: Check out the base
+        run: git worktree add "$RUNNER_TEMP/base" HEAD^1
+
+      - name: Compare with the base
+        run: uv run --no-sync python .github/scripts/quality_ratchet.py "$RUNNER_TEMP/base" .

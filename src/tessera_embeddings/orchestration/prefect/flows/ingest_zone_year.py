@@ -512,7 +512,7 @@ _cancel_children_on_cancellation = make_child_cancel_hook(_CHILD_TAG_PREFIX, "ch
     on_cancellation=[_cancel_children_on_cancellation],
     on_crashed=[_cancel_children_on_cancellation],
 )
-async def ingest_zone_year(  # noqa: C901
+async def ingest_zone_year(
     *,
     zone: str,
     year: int,
