@@ -32,13 +32,14 @@ jobs:
         run: uv sync --frozen --only-group dev
 
       - name: New clones against the base branch
+        id: jscpd
         run: >-
           uv run --no-sync jscpd --baseline-from-ref "origin/${{ github.base_ref }}"
           --fail-on-new-clones --reporters silent,json --output jscpd-report
 
       # The console reporter lists every clone, old ones included; print only the new.
       - name: List the new clones
-        if: failure()
+        if: failure() && steps.jscpd.outcome == 'failure'
         run: >-
           jq -r '.duplicates[] | select(.isNew) | "\(.kind // "exact") clone, \(.lines) lines:
           \(.secondFile.name):\(.secondFile.start)-\(.secondFile.end) duplicates
