@@ -19,6 +19,7 @@ from tessera_embeddings.config.code_identity import source_identity
 _MOSAIC_CONTENT_SOURCES: tuple[str, ...] = ("ingest/s1_roi.py", "ingest/s2_roi.py")
 
 
+# jscpd:ignore-start: same shape as inference_code_identity; each fingerprints its own sources
 def ingest_code_identity() -> str:
     """Fingerprint of the code that decides a mosaic's CONTENT.
 
@@ -32,6 +33,7 @@ def ingest_code_identity() -> str:
     finished mosaic stale on any ingest change, and there are petabytes of them; on the append it
     only ever rejects work that was already incomplete.
     """
+    # jscpd:ignore-end
     return source_identity(_MOSAIC_CONTENT_SOURCES, "ingcode")
 
 

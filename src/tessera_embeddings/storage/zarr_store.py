@@ -1639,6 +1639,7 @@ def write_day_windows(
     )
 
 
+# jscpd:ignore-start: explicit keyword signature and Args, mirroring write_day_windows
 def write_days_windows(  # noqa: C901
     store_path: str,
     days: "list[tuple[xr.Dataset, list[tuple[int, int, int, int]]]]",
@@ -1684,6 +1685,7 @@ def write_days_windows(  # noqa: C901
     manifest is validated BEFORE anything is written — the per-append structural gate must
     not be lost to batching.
     """
+    # jscpd:ignore-end
     from tessera_embeddings.storage.empty_store import create_empty_store  # local: storage-internal, avoids cycle
 
     if not days:

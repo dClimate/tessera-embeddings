@@ -45,6 +45,7 @@ def _resumed_result(label: str, *, skipped: bool) -> dict:
     }
 
 
+# jscpd:ignore-start: explicit keyword signature and Args, mirroring the scheduler it drives
 def run_inference(
     num_actors: int,
     config: InferenceConfig,
@@ -128,6 +129,7 @@ def run_inference(
         RuntimeError: If too few actors initialize within the timeout (see
             :func:`tessera_embeddings.inference.runner.wait_for_actors`).
     """
+    # jscpd:ignore-end
     if num_actors < 1:
         raise ValueError(f"num_actors must be >= 1, got {num_actors}")
 

@@ -214,6 +214,7 @@ def filter_low_coverage_dates(
     return data.isel(time=keep_mask)
 
 
+# jscpd:ignore-start: explicit keyword signature and Args, mirroring filter_low_coverage_dates
 def identify_low_coverage_ds(
     data: xr.Dataset,
     roi_pixel_count: int,
@@ -242,6 +243,7 @@ def identify_low_coverage_ds(
         the time dimension. Downstream code computes that one scalar to decide whether to skip
         the timestep, without reading any band data.
     """
+    # jscpd:ignore-end
     if quality_band not in data.data_vars:
         logger.warning(f"No '{quality_band}' band in dataset — skipping coverage filter")
         return data

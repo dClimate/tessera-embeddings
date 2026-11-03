@@ -99,6 +99,7 @@ def process_roi_reflectance(
 
 
 @task(name="process-roi-sar")
+# jscpd:ignore-start: task shell signature mirroring the domain function it calls
 def process_roi_sar(
     *,
     roi_zarr_path: str,
@@ -141,6 +142,7 @@ def process_roi_sar(
     The botocore-backed helpers stay confined to providers/aws/ (imported lazily), keeping
     the storage layer cloud-agnostic per the architecture rules.
     """
+    # jscpd:ignore-end
     cred_provider_cm: Any = nullcontext()
     if use_s3_direct:
         # Lazy import: providers.aws.credentials pulls in botocore, which lives only in the

@@ -224,6 +224,7 @@ class SpatialCoords:
     crs: str | None = None
 
 
+# jscpd:ignore-start: same convention as actors._chunk_summary_line, kept per phase
 def _assembly_summary_line(**fields: Any) -> str:  # noqa: ANN401 — heterogeneous JSON payload
     """One machine-readable per-assembly record for the profiling tools.
 
@@ -253,6 +254,7 @@ def _assembly_summary_line(**fields: Any) -> str:  # noqa: ANN401 — heterogene
     * ``fill_wall_s``/``merge_s`` — the fork-to-merge span and the merge alone;
       ``commit_s``/``attrs_commit_s`` — the data and attrs commits; ``total_s`` — the whole call.
     """
+    # jscpd:ignore-end
     return "ASSEMBLY_SUMMARY: " + json.dumps(fields, sort_keys=True)
 
 
@@ -928,6 +930,7 @@ class ZarrWriter:
         """
         return f"{self.staging_base}/{run_id}/{chunk.label}.skipped"
 
+    # jscpd:ignore-start: same shape as _skip_marker_path; one path per marker kind
     def _done_marker_path(self, run_id: str, chunk: ChunkSpec) -> str:
         """Get the completion-marker path for a staged chunk.
 
@@ -943,6 +946,7 @@ class ZarrWriter:
         ``staged_complete`` attribute written just before it is the same fact in a form a reader
         that already has the group open can check for free — see :meth:`_validate_staged_chunk`.
         """
+        # jscpd:ignore-end
         return f"{self.staging_base}/{run_id}/{chunk.label}.done"
 
     def _skip_summary(

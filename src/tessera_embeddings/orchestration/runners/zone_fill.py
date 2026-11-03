@@ -440,6 +440,7 @@ def _merge_registry_master(
     log.info("Zone %s year %d: registry master merged", zone, year)
 
 
+# jscpd:ignore-start: Args shared with assemble_zone_year
 def fill_zone_year(
     *,
     store_path: str,
@@ -511,6 +512,7 @@ def fill_zone_year(
         Summary dict: zone, year, run_id, snapshot_id, tag, tile counts,
         inference outcome counts, ``empty`` flag, and elapsed seconds.
     """
+    # jscpd:ignore-end
     _check_assembly_workers(n_assembly_workers)
     handoff = infer_zone_year(
         store_path=store_path,
@@ -962,6 +964,7 @@ def plan_zone_inference(  # noqa: C901
     )
 
 
+# jscpd:ignore-start: explicit keyword signature and Args, mirroring fill_zone_year
 def infer_zone_year(
     *,
     store_path: str,
@@ -996,6 +999,7 @@ def infer_zone_year(
     Raises:
         RuntimeError: If any live tile fails inference.
     """
+    # jscpd:ignore-end
     plan = plan_zone_inference(
         store_path=store_path,
         zone=zone,
