@@ -2023,8 +2023,6 @@ class ZarrWriter:
                     + (f" (adding variables {missing})" if missing else ""),
                 )
                 _log.info("Extended %s time axis to index %d (%s)", output_path, time_index, time_date)
-
-        # --- Phase 2: banded parallel fill (fork/merge) -----------------------
         return time_index, overwrite
 
     def _band_payloads(
@@ -2040,7 +2038,8 @@ class ZarrWriter:
         variables: list[str],
     ) -> list[dict[str, Any]]:
         """One worker payload per row band holding work: the staged tiles to write, and the
-        footprints to reset to fill when overwriting a timestep. Bands are balanced on live tiles.
+        footprints to reset to fill when overwriting a timestep. Bands are weighted by live tiles,
+        so a clustered ROI does not starve most workers.
         """
         unit_weights = [0] * (-(-total_y // granularity))
         for c in live_chunks:
@@ -2277,7 +2276,6 @@ class ZarrWriter:
         # --- Phase 1: schema (create) or time-axis placement (extend) --------
         session = repo.writable_session(work_branch)
         root = zarr.open_group(session.store, mode="a")
-        overwrite = False
         # "time" absent means a created-but-never-seeded repo (a crash between repo creation and
         # the schema commit) — treat as fresh.
         fresh = is_new or "time" not in root
@@ -2301,9 +2299,10 @@ class ZarrWriter:
             checkpoint_id=checkpoint_id,
             _log=_log,
         )
+
+        # --- Phase 2: banded parallel fill (fork/merge) -----------------------
         session = repo.writable_session(work_branch)
         granularity = _write_granularity(zarr.open_group(session.store, mode="r"), variables)
-        # Weight bands by live tiles so clustered ROIs don't starve most workers.
         # On a same-date overwrite, clear EVERY destination chunk this run does not write, not
         # just the ROI-live ones it skip-marked: a prior run under a LARGER or shifted ROI may have
         # written real data outside THIS run's ROI, which would survive as stale published

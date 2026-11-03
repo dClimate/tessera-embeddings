@@ -114,7 +114,8 @@ The other three (two URI one-liners and a six-line flow fragment) are incidental
 
 - An agent that copies code gets a failing check naming both locations, which points it at the
   call it should have made.
-- The grandfathered `# noqa: C901` list is a visible record of the functions most worth splitting.
+- The `# noqa: C901` list records the orchestration functions whose closure-shared state makes
+  splitting them a redesign; `RUF100` keeps it current.
 - A deliberate duplicate is marked at the site with its reason, or, for a whole directory such
   as the vendored upstream fixtures, excluded in `.jscpd.json`'s `ignore`. Both are reviewed
   like any other change.

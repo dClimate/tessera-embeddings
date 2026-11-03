@@ -1639,7 +1639,6 @@ def write_day_windows(
     )
 
 
-# jscpd:ignore-start: explicit keyword signature and Args, mirroring write_day_windows
 def _batch_times(
     days: "list[tuple[xr.Dataset, list[tuple[int, int, int, int]]]]", chunks: dict[str, int], height: int, width: int
 ) -> list[np.datetime64]:
@@ -1672,6 +1671,7 @@ def _batch_times(
     return whens
 
 
+# jscpd:ignore-start: explicit keyword signature and Args, mirroring write_day_windows
 def write_days_windows(
     store_path: str,
     days: "list[tuple[xr.Dataset, list[tuple[int, int, int, int]]]]",
