@@ -255,7 +255,7 @@ class TestPerCellValidation:
         (call,) = dispatched
         assert call["deployment"] == "v/v"
         assert (call["zone"], call["year"]) == ("33N", 2025)
-        assert call["parameters"]["store_name"] == "tessera"
+        assert call["store_name"] == "tessera"
 
     def test_the_no_cluster_path_validates_a_retagged_cell(self, wired, dispatched):
         wired.setattr(mod, "zone_year_complete", lambda *a, **k: True)

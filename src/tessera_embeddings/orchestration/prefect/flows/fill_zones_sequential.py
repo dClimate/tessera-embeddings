@@ -61,7 +61,6 @@ from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.inference.scheduling import WorkItem
 from tessera_embeddings.ingest.source_coverage import SourceFinding, preflight_optical_source
 from tessera_embeddings.orchestration.prefect.flows._cell_validation import (
-    cell_validation_parameters,
     dispatch_cell_validation,
     validation_run_tag,
 )
@@ -1118,14 +1117,10 @@ def fill_zones_sequential_flow(  # noqa: C901
             zone=zone,
             year=year,
             summary=summary,
-            parameters=cell_validation_parameters(
-                zone=zone,
-                year=year,
-                paths=paths,
-                store_name=store_name,
-                mask_name=mask_name,
-                s3_region=s3_region,
-            ),
+            paths=paths,
+            store_name=store_name,
+            mask_name=mask_name,
+            s3_region=s3_region,
             log=log,
             tag=validation_tag,
         )

@@ -50,7 +50,10 @@ def dispatch_cell_validation(
     zone: str,
     year: int,
     summary: dict[str, Any],
-    parameters: dict[str, Any],
+    paths: BucketPaths,
+    store_name: str,
+    mask_name: str,
+    s3_region: str | None,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     tag: str | None = None,
 ) -> str | None:
@@ -66,9 +69,12 @@ def dispatch_cell_validation(
             EMPTY (no pixels to check) and whether it landed — it carries a ``tag``, or is a
             targeted update that ``written`` or ``cleared`` shards in a tagged cell. Without
             either no committed change exists for a validator to judge.
-        parameters: Flow parameters for the validation run. Built by the caller so the
-            fill's own resolved paths are validated, not whatever the validation
-            deployment was registered with.
+        paths: The fill's buckets. With the three below, passed to the validation run
+            through :func:`cell_validation_parameters`, so the store this fill wrote is what
+            gets validated, not whatever the validation deployment was registered with.
+        store_name: The fill's global store name.
+        mask_name: The fill's land-mask name.
+        s3_region: The fill's store region.
         log: The fill's run logger.
         tag: Trace tag from :func:`validation_run_tag`, resolved by the caller in the
             flow's main thread — the trailing assembly thread has no Prefect context, so
@@ -101,6 +107,9 @@ def dispatch_cell_validation(
         # timeout=0 returns as soon as the run exists; anything else puts a three-minute
         # read in front of the next cell's assembly. run_deployment is @sync_compatible
         # (typed as a union with its coroutine form) and runs synchronously on this thread.
+        parameters = cell_validation_parameters(
+            zone=zone, year=year, paths=paths, store_name=store_name, mask_name=mask_name, s3_region=s3_region
+        )
         run: Any = run_deployment(deployment, parameters=parameters, timeout=0, tags=[tag] if tag else None)
     except Exception:
         # Swallowed on purpose — see the module docstring. What is lost is the CHECK, and

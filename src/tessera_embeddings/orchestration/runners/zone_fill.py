@@ -249,13 +249,8 @@ def zone_year_complete(
     crash-recovery retry of a landed-but-untagged cell (:func:`fill_zone_year` re-checks and,
     for such a cell, only re-creates the tag — no inference). False for an unseeded zone.
     """
-    repo = open_global_repo(
-        store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
-    )
-    root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
-    if zone not in root:
-        return False
-    return year in read_years_complete(cast(zarr.Group, root[zone]))
+    _, _, node = _open_zone(store_path, zone, get_credentials=get_credentials, s3_region=s3_region)
+    return node is not None and year in read_years_complete(node)
 
 
 def zone_year_on_axis(
@@ -272,13 +267,8 @@ def zone_year_on_axis(
     cluster for an off-axis or unseeded year: :func:`fill_zone_year` rejects one up front,
     but only after the flow would have stood Ray up. False for an unseeded or off-axis year.
     """
-    repo = open_global_repo(
-        store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
-    )
-    root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
-    if zone not in root:
-        return False
-    return time_index_of(cast(zarr.Group, root[zone]), year_timestamp(year)) is not None
+    _, _, node = _open_zone(store_path, zone, get_credentials=get_credentials, s3_region=s3_region)
+    return node is not None and time_index_of(node, year_timestamp(year)) is not None
 
 
 @dataclass
@@ -306,6 +296,38 @@ class ZoneFillHandoff:
     done: dict[str, Any] | None = None
     # The targeted update this cell runs for, or None for a campaign fill (see `_assemble_update`).
     update: UpdateTarget | None = None
+
+
+def _open_zone(
+    store_path: str,
+    zone: str,
+    *,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None,
+    s3_region: str | None,
+) -> tuple[icechunk.Repository, zarr.Group, zarr.Group | None]:
+    """Open the global store read-only at ``main``: the repo, its root group and ``zone``'s group.
+
+    The zone group is ``None`` when the zone is not seeded; :func:`_require_zone` raises instead.
+    """
+    repo = open_global_repo(
+        store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
+    )
+    root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
+    return repo, root, (cast(zarr.Group, root[zone]) if zone in root else None)
+
+
+def _require_zone(
+    store_path: str,
+    zone: str,
+    *,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None,
+    s3_region: str | None,
+) -> tuple[icechunk.Repository, zarr.Group, zarr.Group]:
+    """:func:`_open_zone` for a zone that must already be seeded."""
+    repo, root, node = _open_zone(store_path, zone, get_credentials=get_credentials, s3_region=s3_region)
+    if node is None:
+        raise ValueError(f"Zone group {zone!r} is not seeded in {store_path} — run seed_zone_groups first (D1).")
+    return repo, root, node
 
 
 def _store_credentials(
@@ -572,13 +594,7 @@ def preflight_destination(
         ValueError: If the zone is not seeded, if a REQUIRED array is missing from it, or if its
             arrays disagree with the layout the staging writer produces (dtype or logical attrs).
     """
-    repo = open_global_repo(
-        store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
-    )
-    root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
-    if zone not in root:
-        raise ValueError(f"Zone group {zone!r} is not seeded in {store_path} — run seed_zone_groups first (D1).")
-    node = cast(zarr.Group, root[zone])
+    _, _, node = _require_zone(store_path, zone, get_credentials=get_credentials, s3_region=s3_region)
     # PRESENCE OF THE REQUIRED ARRAYS, which the type check deliberately does not test: it skips
     # an absent array so an older store missing an OPTIONAL carried variable still fills. That
     # tolerance is right for the optional set and wrong for `embeddings`/`scales` — a zone
@@ -630,13 +646,7 @@ def plan_zone_inference(  # noqa: C901
     run_id = run_id or run_id_prefix(config.model_version) + uuid.uuid4().hex[:12]
 
     # The seeded zone group is the grid authority.
-    repo = open_global_repo(
-        store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
-    )
-    root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
-    if zone not in root:
-        raise ValueError(f"Zone group {zone!r} is not seeded in {store_path} — run seed_zone_groups first (D1).")
-    node = cast(zarr.Group, root[zone])
+    repo, root, node = _require_zone(store_path, zone, get_credentials=get_credentials, s3_region=s3_region)
 
     # The store's minimum-depth rule is part of its write-once root identity, so the store —
     # not this call's config — is the authority on what rule its zones are filled under. A fill
