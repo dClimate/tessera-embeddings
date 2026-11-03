@@ -53,10 +53,10 @@ def duplicated_lines(found: list[dict]) -> Counter[str]:
 
 
 def complexity(tree: Path) -> dict[tuple[str, str], int]:
-    """``{(file, function): score}`` for every function in ``tree/src`` over the limit."""
+    """``{(file, function): score}`` for every function in ``tree/src`` and ``tests`` over the limit."""
     result = subprocess.run(
         ["ruff", "check", "--isolated", "--ignore-noqa", "--select", "C901", "--output-format", "json"]
-        + ["--config", f"lint.mccabe.max-complexity = {MAX_COMPLEXITY}", "src"],
+        + ["--config", f"lint.mccabe.max-complexity = {MAX_COMPLEXITY}", "src", "tests"],
         cwd=tree,
         capture_output=True,
         text=True,

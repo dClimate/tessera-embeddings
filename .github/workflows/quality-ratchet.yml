@@ -31,10 +31,10 @@ jobs:
       - name: Install jscpd and ruff
         run: uv sync --frozen --only-group dev
 
-      # The event's base commit, not the base branch: the branch can move while this job is
-      # queued, which would compare the merge result against a base it was not built on.
+      # The checkout is GitHub's merge commit; its first parent is the base it was built on.
+      # Not the base branch, which can move while this job is queued.
       - name: Check out the base
-        run: git worktree add "$RUNNER_TEMP/base" "${{ github.event.pull_request.base.sha }}"
+        run: git worktree add "$RUNNER_TEMP/base" HEAD^1
 
       - name: Compare with the base
         run: uv run --no-sync python .github/scripts/quality_ratchet.py "$RUNNER_TEMP/base" .

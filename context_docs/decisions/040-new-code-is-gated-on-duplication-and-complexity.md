@@ -18,8 +18,8 @@ on what a pull request *adds* needs neither, and it is the signal that steers th
 **A ratchet against the base commit** (`.github/workflows/quality-ratchet.yml`, rules in
 `.github/scripts/quality_ratchet.py`) fails a pull request that makes either measure worse than
 the commit it merges into. Both trees are measured with the head's settings, on every PR,
-stacked ones included, and against the event's base SHA rather than the base branch, which can
-move while the job is queued.
+stacked ones included, and against the merge commit's first parent rather than the base branch,
+which can move while the job is queued.
 
 **Duplication: no file's duplicated lines may rise** (jscpd, settings in `.jscpd.json`). jscpd
 scans `src/` and `tests/` for three kinds of clone:
