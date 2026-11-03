@@ -17,7 +17,6 @@ from __future__ import annotations
 import logging
 import re
 import time
-from datetime import datetime
 from itertools import pairwise
 from types import SimpleNamespace
 
@@ -31,6 +30,7 @@ from tessera_embeddings.ingest import live_windows as live_windows_mod
 from tessera_embeddings.ingest import s2_roi
 from tessera_embeddings.ingest.stac import HeterogeneousProducerError
 from tessera_embeddings.storage.zarr_store import store_write_retrying
+from tests.stac_items import fake_stac_item
 
 
 @pytest.fixture(autouse=True)
@@ -119,16 +119,6 @@ class _FakeClient:
         state nothing had established.
         """
         return {"inproc://fake": fn(*args, **kwargs)}
-
-
-def _item(date: str, item_id: str | None = None):
-    # `id` is carried because the ingest sort breaks cloud-cover ties on it, so an item without
-    # one is not a stand-in for a real item.
-    return SimpleNamespace(
-        id=item_id or f"S2A_T13TDE_{date.replace('-', '')}_0_L2A",
-        datetime=datetime.fromisoformat(f"{date}T10:00:00"),
-        properties={"eo:cloud_cover": 0.0},
-    )
 
 
 def _day_ds(date: str, *, valid: bool) -> xr.Dataset:
@@ -238,7 +228,7 @@ def run_ingest(monkeypatch):
             for day_ds, _windows in days:
                 _record_write(day_ds)
 
-        monkeypatch.setattr(s2_roi, "query_stac_items", lambda **_kwargs: ([_item(d) for d in dates], {}))
+        monkeypatch.setattr(s2_roi, "query_stac_items", lambda **_kwargs: ([fake_stac_item(d) for d in dates], {}))
         monkeypatch.setattr(s2_roi, "load_stac_items", load_stac_items)
         # What the store already holds. Default empty — a fresh ingest — but a test can
         # populate it to stand a run up over an existing store, which is what a resume is.

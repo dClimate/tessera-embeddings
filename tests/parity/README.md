@@ -56,10 +56,10 @@ don't accidentally run the slow ones.
 
 Some parity tests compare two configurations of the *same* path rather than two
 orchestrators. A performance mode meant to change only *when* or *how
-concurrently* work happens — S2 date pipelining in
-`test_ingest_s2_roi_pipeline_parity.py`, date batching in
-`test_ingest_s2_roi_batching_parity.py` — is safe only if the store is identical
-in both modes, which is what lets the flows choose the mode on their own.
+concurrently* work happens — S2 date batching and pipelining, each alone and
+composed, in `test_ingest_s2_roi_date_loop_parity.py` — is safe only if the store
+is identical in every mode, which is what lets the flows choose the mode on their
+own.
 
 Those tests take the same shape (two temp stores, one `assert_zarr_equivalent`)
 and carry the same weight, but a failure means a third thing beyond the two
