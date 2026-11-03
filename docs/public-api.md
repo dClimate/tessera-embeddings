@@ -132,4 +132,4 @@ rather than re-exported from the top-level package:
   `orchestration.prefect.flows._dask_lifecycle`).
 - `_`-prefixed function / attribute names → private to that module.
 - `@typing.final` on public dataclasses / pydantic models → no
-  subclassing. mypy enforces statically.
+  subclassing. ty enforces statically.

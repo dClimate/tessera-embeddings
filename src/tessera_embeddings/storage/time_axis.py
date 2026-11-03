@@ -35,7 +35,7 @@ def read_time_values(node: zarr.Group) -> np.ndarray:
             f"Unsupported time units {units!r} on {node.store!r} — every engine-written "
             "store uses TIME_ENCODING (nanoseconds since 1970-01-01)."
         )
-    return np.asarray(time_arr[:]).astype("int64").astype("datetime64[ns]")  # type: ignore[index]
+    return np.asarray(time_arr[:]).astype("int64").astype("datetime64[ns]")  # ty: ignore[invalid-argument-type]
 
 
 def time_index_of(node: zarr.Group, value: np.datetime64) -> int | None:

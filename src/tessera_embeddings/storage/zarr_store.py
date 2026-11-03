@@ -34,7 +34,7 @@ Sentinel-2 reflectance and cloud masks. Five write paths, all committing atomica
 import itertools
 import logging
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
@@ -42,10 +42,12 @@ from pathlib import Path
 from typing import Any, cast
 
 import fsspec
+import fsspec.utils
 import icechunk
 import numpy as np
 import xarray as xr
 import zarr
+import zarr.errors
 from icechunk.xarray import to_icechunk
 from tenacity import (
     RetryCallState,
@@ -120,7 +122,7 @@ CONCURRENT_WRITER_ERRORS: tuple[type[BaseException], ...] = (icechunk.ConflictEr
 
 #: Failures that must NEVER trigger `cleanup_on_failure`'s delete, because each one means
 #: the store holds data somebody else committed. Named rather than unpacked inline in the
-#: `except` clause: mypy cannot verify a starred tuple there and rejects it outright.
+#: `except` clause: a type checker cannot verify a starred tuple there and rejects it outright.
 NEVER_CLEAN_UP: tuple[type[BaseException], ...] = (
     StoreHoldsCommittedDataError,
     InconclusiveStoreProbeError,
@@ -287,7 +289,7 @@ def cleanup_on_failure[**P, T](func: Callable[P, T]) -> Callable[P, T]:
 
     @wraps(func)
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
-        store_path: str = args[0] if args else kwargs.get("store_path")  # type: ignore[assignment]
+        store_path: str = args[0] if args else kwargs.get("store_path")  # ty: ignore[invalid-assignment]
         if not store_path:
             raise ValueError("cleanup_on_failure requires store_path as first argument")
         try:
@@ -308,8 +310,8 @@ def cleanup_on_failure[**P, T](func: Callable[P, T]) -> Callable[P, T]:
             logger.warning(f"Store creation failed, cleaning up {store_path}")
             _delete_store(
                 store_path,
-                get_credentials=kwargs.get("get_credentials"),  # type: ignore[arg-type]
-                s3_region=kwargs.get("s3_region"),  # type: ignore[arg-type]
+                get_credentials=kwargs.get("get_credentials"),  # ty: ignore[invalid-argument-type]
+                s3_region=kwargs.get("s3_region"),  # ty: ignore[invalid-argument-type]
             )
             raise
 
@@ -380,7 +382,7 @@ def plain_zarr_storage_options(
 @contextmanager
 def credentials_provider(
     provider: "Callable[[], icechunk.S3StaticCredentials] | None",
-) -> "Iterator[None]":
+) -> "Generator[None]":
     """Temporarily register a fallback credential provider for icechunk S3 opens.
 
     Used by :func:`_create_storage` whenever an S3 open inside the ``with`` block has no
@@ -530,7 +532,7 @@ _DEFAULT_STORAGE_MAX_BACKOFF_MS = 30_000
 
 
 @contextmanager
-def manifest_split(split_sizes: "dict[str, int] | None" = DEFAULT_MANIFEST_SPLIT_SIZES) -> "Iterator[None]":
+def manifest_split(split_sizes: "dict[str, int] | None" = DEFAULT_MANIFEST_SPLIT_SIZES) -> "Generator[None]":
     """Enable manifest splitting for repos opened in this block.
 
     Every ``open_repo`` / ``_create_repo`` inside the ``with`` block applies a
@@ -1456,7 +1458,7 @@ def batched_region_writes(
     message: str,
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     s3_region: str | None = None,
-) -> Iterator[RegionWriteBatch]:
+) -> Generator[RegionWriteBatch]:
     """One writable session, N window writes (+ optional attr edits), one commit.
 
     The per-date write unit of the live-window ingest path: everything done through the
@@ -1992,4 +1994,5 @@ def resolve_storage_options(storage_options: StorageOptions) -> dict | None:
     credential is actually consumed. Resolving inside the reader rather than at each call site
     means a new call site cannot silently reintroduce the frozen behaviour.
     """
-    return storage_options() if callable(storage_options) else storage_options
+    # ty does not narrow StorageOptions's callable member through callable().
+    return storage_options() if callable(storage_options) else storage_options  # ty: ignore[invalid-return-type]

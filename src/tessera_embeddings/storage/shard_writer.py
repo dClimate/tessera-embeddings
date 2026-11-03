@@ -44,7 +44,7 @@ import multiprocessing
 import threading
 import time
 from collections import Counter
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Generator, Iterable, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
@@ -361,7 +361,7 @@ def _fork_stall_watchdog(
     *,
     timeout_s: float,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
-) -> Iterator[None]:
+) -> Generator[None]:
     """Fail a wedged fork phase instead of letting it hang forever — the assembly's one backstop.
 
     A daemon thread watches the shard counters the workers write into shared memory, which advance
