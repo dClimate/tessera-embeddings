@@ -198,7 +198,7 @@ python-version = "3.12"
 
 [tool.ty.analysis]
 # Compiled modules that ship no stubs.
-allowed-unresolved-imports = ["rasterio._base", "rasterio._env", "rasterio._err", "rasterio.crs", "ray._raylet"]
+allowed-unresolved-imports = ["rasterio._base", "rasterio._env", "rasterio._err", "rasterio.crs"]
 # Built at import time (pyarrow registers its compute kernels dynamically), so a static
 # checker cannot see their members.
 replace-imports-with-any = ["pyarrow.compute"]
