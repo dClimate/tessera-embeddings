@@ -1,0 +1,45 @@
+name: Duplication
+
+# Fails a pull request that ADDS duplicated code: an exact copy, a copy with up to three lines
+# inserted or changed (gap clone), or a function with the same structure as an existing one
+# (similar function). Clones already on the base branch are not reported, so the gate needs no
+# calibration to the existing code. Settings in .jscpd.json; rationale in ADR 040.
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  new-clones:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The baseline is built from the base branch's tree, so its history must be here.
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          cache-dependency-glob: "uv.lock"
+          prune-cache: true
+
+      - name: Install jscpd
+        run: uv sync --frozen --only-group dev
+
+      - name: New clones against the base branch
+        run: >-
+          uv run --no-sync jscpd --baseline-from-ref "origin/${{ github.base_ref }}"
+          --fail-on-new-clones --reporters silent,json --output jscpd-report
+
+      # The console reporter lists every clone, old ones included; print only the new.
+      - name: List the new clones
+        if: failure()
+        run: >-
+          jq -r '.duplicates[] | select(.isNew) | "\(.kind // "exact") clone, \(.lines) lines:
+          \(.secondFile.name):\(.secondFile.start)-\(.secondFile.end) duplicates
+          \(.firstFile.name):\(.firstFile.start)-\(.firstFile.end)"' jscpd-report/jscpd-report.json
