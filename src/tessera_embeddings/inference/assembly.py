@@ -547,6 +547,27 @@ def _extend_time_axis(node: zarr.Group, time_date: np.datetime64) -> int:
 
 
 @dataclasses.dataclass(frozen=True)
+class _AssemblyRun:
+    """One single-ROI assembly: what it writes, where, and by which model.
+
+    Built once in :meth:`ZarrWriter.assemble` and read by the phases it delegates to, so a
+    phase takes the run rather than a dozen of its fields.
+    """
+
+    run_id: str
+    output_path: str
+    total_y: int
+    total_x: int
+    variables: list[str]
+    time_date: np.datetime64
+    spatial: SpatialCoords | None
+    manifest: EmbeddingManifest | None
+    stack: dict[str, str | None] | None
+    model_version: ModelVersion
+    checkpoint_id: str
+
+
+@dataclasses.dataclass(frozen=True)
 class StagedListing:
     """What one LIST of a run's staging prefix says about each chunk's artifacts.
 
@@ -1925,17 +1946,7 @@ class ZarrWriter:
         *,
         fresh: bool,
         layout: StoreLayout,
-        variables: list[str],
-        run_id: str,
-        output_path: str,
-        total_y: int,
-        total_x: int,
-        time_date: np.datetime64,
-        spatial: SpatialCoords | None,
-        manifest: EmbeddingManifest | None,
-        stack: dict[str, str | None] | None,
-        model_version: ModelVersion,
-        checkpoint_id: str,
+        run: _AssemblyRun,
         _log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     ) -> tuple[int, bool]:
         """Ready the work branch's store for this run's timestep: ``(time_index, overwrite)``.
@@ -1946,42 +1957,53 @@ class ZarrWriter:
         """
         overwrite = False
         if fresh:
-            self._create_schema(root, layout, variables, total_y, total_x, time_date, spatial)
-            traced_commit(session, f"Run {run_id}: create schema ({layout.name})")
+            self._create_schema(root, layout, run.variables, run.total_y, run.total_x, run.time_date, run.spatial)
+            traced_commit(session, f"Run {run.run_id}: create schema ({layout.name})")
             time_index = 0
-            _log.info("Created %s with layout %s", output_path, layout.name)
+            _log.info("Created %s with layout %s", run.output_path, layout.name)
         else:
-            if manifest:
-                manifest.validate_against(extract_manifest(root.attrs), output_path)
+            if run.manifest:
+                run.manifest.validate_against(extract_manifest(root.attrs), run.output_path)
             # A CROSS-FAMILY APPEND, refused here rather than discovered later. The manifest
             # check above cannot catch it: it compares the checkpoint filename STEM, which two
             # families can share, and is skipped ENTIRELY for a legacy store with no `_manifest`.
             # Past both, the attrs write at the end of this method restamps `geoemb:model` for the
             # WHOLE store. Shared with the pre-flight so the two doors cannot disagree.
-            if stack is not None:
-                assert_stack_matches(root.attrs, stack, where=output_path)
+            if run.stack is not None:
+                assert_stack_matches(root.attrs, run.stack, where=run.output_path)
             else:
-                assert_model_matches(root.attrs, model_version, checkpoint_id, where=output_path)
+                assert_model_matches(root.attrs, run.model_version, run.checkpoint_id, where=run.output_path)
 
             assert_on_store_grid(
-                root, spatial, total_y=total_y, total_x=total_x, embedding_dim=self.embedding_dim, where=output_path
+                root,
+                run.spatial,
+                total_y=run.total_y,
+                total_x=run.total_x,
+                embedding_dim=self.embedding_dim,
+                where=run.output_path,
             )
             # Variables staged by this run but absent from the store (a store created before obs
             # counts, or compute_std newly on) are created schema-only at the current time extent;
             # prior timesteps read back as the layout fill.
-            missing = [v for v in variables if v not in root]
+            missing = [v for v in run.variables if v not in root]
             if missing:
                 nt = cast(zarr.Array, root["time"]).shape[0]
                 y, x = layout.spatial_dims
-                sizes = {"time": nt, y: total_y, x: total_x, "band": self.embedding_dim, "month": MONTHS_IN_YEAR}
+                sizes = {
+                    "time": nt,
+                    y: run.total_y,
+                    x: run.total_x,
+                    "band": self.embedding_dim,
+                    "month": MONTHS_IN_YEAR,
+                }
                 create_layout_arrays(root, _layout_matching_store(root, layout, missing), missing, sizes)
                 if any(var in missing for var in MONTH_COVERED_VARS) and "month" not in root:
                     # The axis this array introduces to a store that predates it; without the
                     # coordinate a reader gets a positional month axis and must know it is 0-based
                     # (see `_create_schema`).
                     _write_coord_arrays(root, {"month": np.asarray(MONTH_COORD, dtype="int16")})
-                _log.info("Created missing variable(s) %s in %s from layout %s", missing, output_path, layout.name)
-            time_index_found = time_index_of(root, time_date)
+                _log.info("Created missing variable(s) %s in %s from layout %s", missing, run.output_path, layout.name)
+            time_index_found = time_index_of(root, run.time_date)
             if time_index_found is not None:
                 time_index = time_index_found
                 overwrite = True
@@ -1994,7 +2016,7 @@ class ZarrWriter:
                     name
                     for name, arr in root.arrays()
                     if name != "time"
-                    and name not in variables
+                    and name not in run.variables
                     and (getattr(arr.metadata, "dimension_names", None) or ("",))[0] == "time"
                 ]
                 for name in untouched:
@@ -2006,57 +2028,55 @@ class ZarrWriter:
                     parts = ([f"add {missing}"] if missing else []) + (
                         [f"reset untouched {untouched}"] if untouched else []
                     )
-                    traced_commit(session, f"Run {run_id}: overwrite {time_date} — {'; '.join(parts)}")
+                    traced_commit(session, f"Run {run.run_id}: overwrite {run.time_date} — {'; '.join(parts)}")
                 _log.warning(
                     "Time %s already exists at index %d in %s — overwriting in place "
                     "(live positions rewritten, skip-marked footprints reset to fill%s)",
-                    time_date,
+                    run.time_date,
                     time_index,
-                    output_path,
+                    run.output_path,
                     f"; untouched vars reset to fill: {untouched}" if untouched else "",
                 )
             else:
-                time_index = _extend_time_axis(root, time_date)
+                time_index = _extend_time_axis(root, run.time_date)
                 traced_commit(
                     session,
-                    f"Run {run_id}: extend time axis to {time_date}"
+                    f"Run {run.run_id}: extend time axis to {run.time_date}"
                     + (f" (adding variables {missing})" if missing else ""),
                 )
-                _log.info("Extended %s time axis to index %d (%s)", output_path, time_index, time_date)
+                _log.info("Extended %s time axis to index %d (%s)", run.output_path, time_index, run.time_date)
         return time_index, overwrite
 
     def _band_payloads(
         self,
-        run_id: str,
+        run: _AssemblyRun,
         live_chunks: list[ChunkSpec],
         clear_chunks: list[ChunkSpec],
         *,
-        total_y: int,
         granularity: int,
         n_workers: int,
         time_index: int,
-        variables: list[str],
     ) -> list[dict[str, Any]]:
         """One worker payload per row band holding work: the staged tiles to write, and the
         footprints to reset to fill when overwriting a timestep. Bands are weighted by live tiles,
         so a clustered ROI does not starve most workers.
         """
-        unit_weights = [0] * (-(-total_y // granularity))
+        unit_weights = [0] * (-(-run.total_y // granularity))
         for c in live_chunks:
             for unit in range(c.y_start // granularity, -(-c.y_stop // granularity)):
                 unit_weights[unit] += 1
-        bands = _partition_bands(total_y, granularity, n_workers, weights=unit_weights)
+        bands = _partition_bands(run.total_y, granularity, n_workers, weights=unit_weights)
         payloads: list[dict[str, Any]] = []
         for band in bands:
             y0b, y1b = band
-            tiles = [(c, self._staging_path(run_id, c)) for c in live_chunks if c.y_start < y1b and c.y_stop > y0b]
+            tiles = [(c, self._staging_path(run.run_id, c)) for c in live_chunks if c.y_start < y1b and c.y_stop > y0b]
             clear = [c for c in clear_chunks if c.y_start < y1b and c.y_stop > y0b]
             if tiles or clear:
                 payloads.append(
                     {
                         "band": band,
                         "time_index": time_index,
-                        "variables": tuple(variables),
+                        "variables": tuple(run.variables),
                         "tiles": tiles,
                         "clear": clear,
                     }
@@ -2281,24 +2301,20 @@ class ZarrWriter:
         fresh = is_new or "time" not in root
         # A new store takes its model's Y/X names; an existing one keeps its own, whatever the model.
         layout = layout.with_spatial_dims(model_family(model_version).spatial_dims if fresh else spatial_dims_of(root))
-        time_index, overwrite = self._prepare_time_slot(
-            root,
-            session,
-            fresh=fresh,
-            layout=layout,
-            variables=variables,
+        run = _AssemblyRun(
             run_id=run_id,
             output_path=output_path,
             total_y=total_y,
             total_x=total_x,
+            variables=variables,
             time_date=time_date,
             spatial=spatial,
             manifest=manifest,
             stack=stack,
             model_version=model_version,
             checkpoint_id=checkpoint_id,
-            _log=_log,
         )
+        time_index, overwrite = self._prepare_time_slot(root, session, fresh=fresh, layout=layout, run=run, _log=_log)
 
         # --- Phase 2: banded parallel fill (fork/merge) -----------------------
         session = repo.writable_session(work_branch)
@@ -2310,14 +2326,7 @@ class ZarrWriter:
         # ocean chunks) makes the timestep exactly this run's ROI however the ROI changed.
         clear_chunks = [c for c in chunks if c.label not in {lc.label for lc in live_chunks}] if overwrite else []
         payloads = self._band_payloads(
-            run_id,
-            live_chunks,
-            clear_chunks,
-            total_y=total_y,
-            granularity=granularity,
-            n_workers=n_workers,
-            time_index=time_index,
-            variables=variables,
+            run, live_chunks, clear_chunks, granularity=granularity, n_workers=n_workers, time_index=time_index
         )
         _log.info(
             "Filling %d band(s) (granularity %d px) across %d process(es)",
