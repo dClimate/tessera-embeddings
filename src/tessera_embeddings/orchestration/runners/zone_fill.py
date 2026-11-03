@@ -611,7 +611,125 @@ def preflight_destination(
     check_destination_types(node, GLOBAL, where=f"{zone} year {year}")
 
 
-def plan_zone_inference(  # noqa: C901
+def _assert_on_zone_grid(node: zarr.Group, zone: str, label: str, store_path: str, coords: SpatialCoords) -> None:
+    """Raise unless ``coords`` lie exactly on the seeded zone group's pixel grid."""
+    _, ny, nx, _ = cast(zarr.Array, node["embeddings"]).shape
+    zone_crs = node.attrs.get("crs")
+    y_name, x_name = spatial_dims_of(node)  # the group's own names: v1.1 northing/easting, later y/x
+    z_north = cast(zarr.Array, node[y_name])
+    z_east = cast(zarr.Array, node[x_name])
+    # Absolute half-pixel tolerance, NOT np.isclose's default relative one: at a ~9.3e6 m
+    # northing the default rtol=1e-5 would admit ~93 m (~9 px) of drift. A real shift is
+    # >=1 px (10 m); half a pixel (5 m) sits above float32 coordinate roundtrip (~1 m at this
+    # magnitude) yet below one pixel.
+    atol = PIXEL_M / 2
+
+    total_y, total_x = len(coords.northing), len(coords.easting)
+    if (total_y, total_x) != (ny, nx):
+        raise ValueError(
+            f"{label} grid ({total_y} x {total_x}) at {store_path} does not match "
+            f"zone {zone}'s grid ({ny} x {nx}) — the campaign ingest must cover the zone extent exactly."
+        )
+    if coords.crs != zone_crs:
+        raise ValueError(
+            f"{label} CRS {coords.crs!r} at {store_path} does not match zone {zone}'s CRS "
+            f"{zone_crs!r} — a wrong-zone mosaic would be written positionally and misgeoreferenced."
+        )
+    endpoints_match = (
+        np.isclose(coords.northing[0], z_north[0], rtol=0.0, atol=atol)
+        and np.isclose(coords.northing[-1], z_north[-1], rtol=0.0, atol=atol)
+        and np.isclose(coords.easting[0], z_east[0], rtol=0.0, atol=atol)
+        and np.isclose(coords.easting[-1], z_east[-1], rtol=0.0, atol=atol)
+    )
+    if not endpoints_match:
+        raise ValueError(
+            f"{label} coordinates at {store_path} (northing {coords.northing[0]}..{coords.northing[-1]}, "
+            f"easting {coords.easting[0]}..{coords.easting[-1]}) do not lie on zone {zone}'s grid — "
+            "shifted or reversed axes would silently misgeoreference the fill."
+        )
+    # Length, CRS and endpoints still do not pin an axis: a REORDERED or non-affine
+    # interior satisfies all three, and inference writes positionally onto the seeded
+    # grid, so such a mosaic would publish real pixels at the wrong coordinates with
+    # nothing to signal it. Hence the COMPLETE coordinate vectors, element-wise against
+    # the seeded axes, rather than a spacing test — a per-step tolerance must admit float
+    # round-trip noise, and whatever it admits per step an adversarial axis accumulates
+    # (half a pixel of slack permits a 5-to-15 m stride, and a pattern that wanders and
+    # returns still matches length and both endpoints). Two 1-D reads per store, once per
+    # fill. The campaign's own ingest cannot produce a bad axis (odc builds every load
+    # against the zone geobox), but `ingest=False` accepts an operator-staged mosaic, and
+    # that path is supported.
+    for axis, values, seeded in (
+        (y_name, coords.northing, z_north),
+        (x_name, coords.easting, z_east),
+    ):
+        got = np.asarray(values, dtype="float64")
+        want = np.asarray(seeded[:], dtype="float64")
+        # atol is a float round-trip allowance, NOT a geometric one: coordinates round-trip
+        # through float32 at ~1 m near a 9.3e6 m northing, and any real displacement is a
+        # whole pixel (10 m).
+        bad = ~np.isclose(got, want, rtol=0.0, atol=1.0)
+        if bad.any():
+            i = int(np.argmax(bad))
+            raise ValueError(
+                f"{label} {axis} at {store_path} does not match zone {zone}'s seeded axis: "
+                f"index {i} is {got[i]} where the grid says {want[i]} "
+                f"({int(bad.sum())} of {got.size} coordinates differ). Length, CRS and "
+                "endpoints all match, so this is a reordered or non-affine interior — "
+                "inference writes positionally and would misgeoreference those pixels silently."
+            )
+
+
+def _live_tile_bitmap(
+    land_mask_path: str,
+    zone: str,
+    *,
+    zone_crs: object,
+    ny: int,
+    nx: int,
+    shard_px: int,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None,
+    s3_region: str | None,
+) -> np.ndarray:
+    """The zone's ``tile_live_2048`` bitmap, after checking the coverage group matches the zone."""
+    cov = open_store_as_zarr_group(land_mask_path, group=zone, get_credentials=get_credentials, region=s3_region)
+    cov_zone = cov.attrs.get("zone")
+    cov_crs = cov.attrs.get("crs")
+    cov_shape = list(cast("list[int]", cov.attrs.get("grid_shape", [])))
+    if cov_zone != zone or cov_crs != zone_crs or cov_shape != [ny, nx]:
+        raise ValueError(
+            f"Coverage group for {zone} at {land_mask_path} has zone={cov_zone!r} crs={cov_crs!r} "
+            f"grid_shape={cov_shape} — expected zone={zone!r} crs={zone_crs!r} grid_shape={[ny, nx]}. "
+            "A wrong-zone coverage mask would be read positionally and misclassify tiles."
+        )
+    tile_live = np.asarray(cast("zarr.Array", cov["tile_live_2048"]), dtype=bool)
+    n_tile_rows, n_tile_cols = ny // shard_px, nx // shard_px
+    if tile_live.shape != (n_tile_rows, n_tile_cols):
+        raise ValueError(
+            f"Coverage bitmap for {zone} has tile_live shape {tile_live.shape} but the zone's tile grid is "
+            f"({n_tile_rows}, {n_tile_cols}) — the coverage build is inconsistent with the seeded grid."
+        )
+    return tile_live
+
+
+def _ensure_tagged(
+    repo: icechunk.Repository,
+    zone: str,
+    year: int,
+    tag: str,
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+) -> str:
+    """The snapshot of a landed cell's tag, creating the tag on ``main`` if a crash skipped it."""
+    if tag in repo.list_tags():
+        snapshot = repo.lookup_tag(tag)
+        log.info("Zone %s year %d already complete and tagged (%s) — nothing to do", zone, year, tag)
+    else:
+        snapshot = repo.lookup_branch("main")
+        tag_zone_year(repo, zone, year, snapshot_id=snapshot)
+        log.info("Zone %s year %d landed but was untagged (crash before tag) — tagged %s", zone, year, tag)
+    return snapshot
+
+
+def plan_zone_inference(
     *,
     store_path: str,
     zone: str,
@@ -724,13 +842,7 @@ def plan_zone_inference(  # noqa: C901
         check_no_tightening(repo, update.name, rule, [(zone, year)])
     tag = zone_year_tag(zone, year)
     if update is None and year in read_years_complete(node):
-        if tag in repo.list_tags():
-            snapshot = repo.lookup_tag(tag)
-            log.info("Zone %s year %d already complete and tagged (%s) — nothing to do", zone, year, tag)
-        else:
-            snapshot = repo.lookup_branch("main")
-            tag_zone_year(repo, zone, year, snapshot_id=snapshot)
-            log.info("Zone %s year %d landed but was untagged (crash before tag) — tagged %s", zone, year, tag)
+        snapshot = _ensure_tagged(repo, zone, year, tag, log)
         _merge_registry_master(
             registry_root, store_path, zone, year, None, get_credentials=get_credentials, s3_region=s3_region, log=log
         )
@@ -769,23 +881,16 @@ def plan_zone_inference(  # noqa: C901
     # validated by attrs because all 60 same-hemisphere zones share one grid shape, so a
     # wrong-zone mask would be read positionally and silently misclassify tiles, permanently
     # tagging the cell empty. Guarding zone + CRS + grid_shape closes that hole.
-    cov = open_store_as_zarr_group(land_mask_path, group=zone, get_credentials=get_credentials, region=s3_region)
-    cov_zone = cov.attrs.get("zone")
-    cov_crs = cov.attrs.get("crs")
-    cov_shape = list(cast("list[int]", cov.attrs.get("grid_shape", [])))
-    if cov_zone != zone or cov_crs != zone_crs or cov_shape != [ny, nx]:
-        raise ValueError(
-            f"Coverage group for {zone} at {land_mask_path} has zone={cov_zone!r} crs={cov_crs!r} "
-            f"grid_shape={cov_shape} — expected zone={zone!r} crs={zone_crs!r} grid_shape={[ny, nx]}. "
-            "A wrong-zone coverage mask would be read positionally and misclassify tiles."
-        )
-    tile_live = np.asarray(cast("zarr.Array", cov["tile_live_2048"]), dtype=bool)
-    n_tile_rows, n_tile_cols = ny // shard_px, nx // shard_px
-    if tile_live.shape != (n_tile_rows, n_tile_cols):
-        raise ValueError(
-            f"Coverage bitmap for {zone} has tile_live shape {tile_live.shape} but the zone's tile grid is "
-            f"({n_tile_rows}, {n_tile_cols}) — the coverage build is inconsistent with the seeded grid."
-        )
+    tile_live = _live_tile_bitmap(
+        land_mask_path,
+        zone,
+        zone_crs=zone_crs,
+        ny=ny,
+        nx=nx,
+        shard_px=shard_px,
+        get_credentials=get_credentials,
+        s3_region=s3_region,
+    )
     tile_live = narrow_tile_live(tile_live, None if update is None else update.tiles)
 
     # 1 inference tile == 1 shard == 1 coverage tile (ADR-008 D3), so a chunk's (row, col) ARE
@@ -876,71 +981,9 @@ def plan_zone_inference(  # noqa: C901
     # grid than reflectance would otherwise slip through. Validate reflectance AND each active
     # SAR orbit against the seeded group, the grid authority. (Read only now — an all-ocean
     # cell already returned above without touching the mosaic, which may not even exist.)
-    y_name, x_name = spatial_dims_of(node)  # the group's own names: v1.1 northing/easting, later y/x
-    z_north = cast(zarr.Array, node[y_name])
-    z_east = cast(zarr.Array, node[x_name])
-    # Absolute half-pixel tolerance, NOT np.isclose's default relative one: at a ~9.3e6 m
-    # northing the default rtol=1e-5 would admit ~93 m (~9 px) of drift. A real shift is
-    # >=1 px (10 m); half a pixel (5 m) sits above float32 coordinate roundtrip (~1 m at this
-    # magnitude) yet below one pixel.
-    atol = PIXEL_M / 2
-
-    def _assert_on_zone_grid(label: str, store_path: str, coords: SpatialCoords) -> None:
-        total_y, total_x = len(coords.northing), len(coords.easting)
-        if (total_y, total_x) != (ny, nx):
-            raise ValueError(
-                f"{label} grid ({total_y} x {total_x}) at {store_path} does not match "
-                f"zone {zone}'s grid ({ny} x {nx}) — the campaign ingest must cover the zone extent exactly."
-            )
-        if coords.crs != zone_crs:
-            raise ValueError(
-                f"{label} CRS {coords.crs!r} at {store_path} does not match zone {zone}'s CRS "
-                f"{zone_crs!r} — a wrong-zone mosaic would be written positionally and misgeoreferenced."
-            )
-        endpoints_match = (
-            np.isclose(coords.northing[0], z_north[0], rtol=0.0, atol=atol)
-            and np.isclose(coords.northing[-1], z_north[-1], rtol=0.0, atol=atol)
-            and np.isclose(coords.easting[0], z_east[0], rtol=0.0, atol=atol)
-            and np.isclose(coords.easting[-1], z_east[-1], rtol=0.0, atol=atol)
-        )
-        if not endpoints_match:
-            raise ValueError(
-                f"{label} coordinates at {store_path} (northing {coords.northing[0]}..{coords.northing[-1]}, "
-                f"easting {coords.easting[0]}..{coords.easting[-1]}) do not lie on zone {zone}'s grid — "
-                "shifted or reversed axes would silently misgeoreference the fill."
-            )
-        # Length, CRS and endpoints still do not pin an axis: a REORDERED or non-affine
-        # interior satisfies all three, and inference writes positionally onto the seeded
-        # grid, so such a mosaic would publish real pixels at the wrong coordinates with
-        # nothing to signal it. Hence the COMPLETE coordinate vectors, element-wise against
-        # the seeded axes, rather than a spacing test — a per-step tolerance must admit float
-        # round-trip noise, and whatever it admits per step an adversarial axis accumulates
-        # (half a pixel of slack permits a 5-to-15 m stride, and a pattern that wanders and
-        # returns still matches length and both endpoints). Two 1-D reads per store, once per
-        # fill. The campaign's own ingest cannot produce a bad axis (odc builds every load
-        # against the zone geobox), but `ingest=False` accepts an operator-staged mosaic, and
-        # that path is supported.
-        for axis, values, seeded in (
-            (y_name, coords.northing, z_north),
-            (x_name, coords.easting, z_east),
-        ):
-            got = np.asarray(values, dtype="float64")
-            want = np.asarray(seeded[:], dtype="float64")
-            # atol is a float round-trip allowance, NOT a geometric one: coordinates round-trip
-            # through float32 at ~1 m near a 9.3e6 m northing, and any real displacement is a
-            # whole pixel (10 m).
-            bad = ~np.isclose(got, want, rtol=0.0, atol=1.0)
-            if bad.any():
-                i = int(np.argmax(bad))
-                raise ValueError(
-                    f"{label} {axis} at {store_path} does not match zone {zone}'s seeded axis: "
-                    f"index {i} is {got[i]} where the grid says {want[i]} "
-                    f"({int(bad.sum())} of {got.size} coordinates differ). Length, CRS and "
-                    "endpoints all match, so this is a reordered or non-affine interior — "
-                    "inference writes positionally and would misgeoreference those pixels silently."
-                )
-
     _assert_on_zone_grid(
+        node,
+        zone,
         "Mosaic reflectance",
         f"{mosaic_base}/reflectance.zarr",
         read_spatial_coords(mosaic_base, get_credentials=get_credentials, s3_region=s3_region),
@@ -948,6 +991,8 @@ def plan_zone_inference(  # noqa: C901
     for orbit in _active_orbits(config.s1_orbit):
         sar_path = f"{mosaic_base}/sar_{orbit}.zarr"
         _assert_on_zone_grid(
+            node,
+            zone,
             f"Mosaic SAR {orbit}",
             sar_path,
             read_store_spatial_coords(sar_path, get_credentials=get_credentials, s3_region=s3_region),
