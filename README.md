@@ -407,8 +407,8 @@ request ([ADR 039](context_docs/decisions/039-architecture-rules-run-on-import-l
 | Check | Tool | Where |
 |---|---|---|
 | The layers above import only downward: `profiling` > `orchestration` > `providers` > `ingest`, `inference`, `storage` > `config` > `errors`, `utils` | [import-linter](https://import-linter.readthedocs.io/) | [`.importlinter`](.importlinter) |
-| No Prefect outside `orchestration/prefect/`, even transitively (covers rule 2: `get_run_logger` comes from Prefect) | import-linter | `.importlinter` |
-| No boto3 or botocore in the domain, even transitively; flows reach them only through `providers/aws/` | import-linter | `.importlinter` |
+| No Prefect outside `orchestration/prefect/` (covers rule 2: `get_run_logger` comes from Prefect) | import-linter | `.importlinter` |
+| No boto3 or botocore outside `providers/aws/` (boto3 also in `profiling/`) | import-linter | `.importlinter` |
 | No Dask `get_client()` below the flow layer (rule 6) | ruff `TID251` banned API | [`ruff.toml`](ruff.toml) |
 | The solar-day offset is applied only in `ingest/solar_days.py` | ruff `TID251` | `ruff.toml` |
 
@@ -551,10 +551,9 @@ provider are reference implementations you are meant to replace, not extend.
 Prefect, and [`docs/providers/adding-your-own.md`](docs/providers/adding-your-own.md)
 through targeting another cloud.
 
-**Apply the same layering rules to your own code.** The hard rules in
-[Architecture](#architecture) ship as a reusable checker you can point at any source
-tree, with a TOML allowlist for the deviations you intend — see
-[Using these architecture checks in your own repo](#using-these-architecture-checks-in-your-own-repo).
+**Apply the same layering rules to your own code.** Copy `.importlinter` and the
+`banned-api` table from `ruff.toml`, rename the root package, and write any deviation you
+intend into the copy — see [What CI enforces](#what-ci-enforces).
 
 **Consider a smoke test against your own project**, so a breaking change here is caught at
 the point of change rather than after a release. Check the dependent project out beside this

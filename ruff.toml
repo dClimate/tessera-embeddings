@@ -81,6 +81,8 @@ ignore = [
 # summons one from context.
 "dask.distributed.get_client".msg = "Take the Dask client as a parameter; only Prefect task shells fetch it."
 "distributed.get_client".msg = "Take the Dask client as a parameter; only Prefect task shells fetch it."
+"distributed.client.get_client".msg = "Take the Dask client as a parameter; only Prefect task shells fetch it."
+"distributed.worker.get_client".msg = "Take the Dask client as a parameter; only Prefect task shells fetch it."
 # The UTC-to-solar offset is applied exactly once, at the catalogue chokepoint, by
 # normalize_to_solar_day. A second application shifts an already-shifted timestamp; a
 # per-site application drifted before (src/tessera_embeddings/ingest/README.md).

@@ -246,20 +246,20 @@ uv run lint-imports
 ```
 
 `providers/gcp/` falls in the `providers` layer of
-[`.importlinter`](../../.importlinter) automatically. To keep the
-Google SDK out of the domain the way boto3 is, add a contract
-mirroring `aws-domain`:
+[`.importlinter`](../../.importlinter) automatically, and the `aws`
+contract already keeps boto3 out of it. To confine the Google SDK
+the same way, add a contract mirroring `aws`:
 
 ```ini
-[importlinter:contract:gcp-domain]
-name = Domain never reaches the Google Cloud SDK, even transitively
+[importlinter:contract:gcp]
+name = Google Cloud SDK only in providers.gcp
 type = forbidden
 source_modules =
-    tessera_embeddings.ingest
-    tessera_embeddings.inference
-    tessera_embeddings.storage
+    tessera_embeddings
 forbidden_modules =
     google
+ignore_imports =
+    tessera_embeddings.providers.gcp.** -> google
 ```
 
 ## Maintenance commitment

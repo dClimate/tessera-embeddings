@@ -25,16 +25,24 @@ and the `architecture-tests` extra are deleted. Contracts live in `.importlinter
 
 | Former rule | Now |
 |---|---|
-| `no-prefect-outside-prefect-layer` | `prefect` forbidden contract, transitive |
+| `no-prefect-outside-prefect-layer` | `prefect` forbidden contract |
 | `no-prefect-context-helpers-outside-prefect-layer` (`get_run_logger`) | Subsumed: the function cannot be reached without importing Prefect |
-| `no-boto3-outside-aws-provider`, `no-botocore-outside-aws-provider` | `aws-domain` (transitive, domain packages) and `aws-orchestration` (direct only, since flows compose `providers.aws`) |
+| `no-boto3-outside-aws-provider`, `no-botocore-outside-aws-provider` | `aws` forbidden contract |
 | `no-profiling-imports-outside-profiling` | `profiling` is the top of the `layers` contract, so nothing may import it |
-| `no-dask-distributed-get_client-in-domain` | `TID251` on `dask.distributed.get_client` and `distributed.get_client`; the two legitimate imports carry `# noqa: TID251` |
+| `no-dask-distributed-get_client-in-domain` | `TID251` on `get_client` at all four import paths (`dask.distributed`, `distributed`, `distributed.client`, `distributed.worker`); the two legitimate imports carry `# noqa: TID251` |
 | `solar-offset-applied-only-in-solar-days` | `TID251` on `solar_days.solar_day_offset_seconds` |
 
 New: a `layers` contract (`profiling` > `orchestration` > `providers` >
 `ingest : inference : storage` > `config` > `errors | utils`), exhaustive so a new top-level
 subpackage must be placed. It held on the tree as it stood.
+
+**Each forbidden contract covers the whole package and exempts only the allowed subtree**
+(`ignore_imports = tessera_embeddings.providers.aws.** -> boto3`). Listing the covered
+modules instead was the first draft, and review found what it missed: the package root,
+`orchestration/__init__`, a future orchestrator adapter, a non-AWS provider. Anything
+nobody listed escaped. Ignoring an edge also hides the paths through it, so transitive reach
+is left to the `layers` contract: domain code cannot import `providers`, `orchestration` or
+`profiling` at all, so it cannot reach their SDKs through them.
 
 **Why two tools.** import-linter models a third-party package as its top-level module, so it
 cannot name `dask.distributed.get_client`, and it checks imports, not calls. Ruff resolves
@@ -47,9 +55,11 @@ exempted by file, matching the old scope, because they exercise the banned names
 
 ## Verification
 
-- All four contracts and `ruff check src/ tests/` pass on the tree.
-- **Control:** a planted `storage/_plant.py` importing `providers.aws.credentials` failed
-  `aws-domain` and printed the chain down to botocore. The old checker passes that file.
+- All three contracts and `ruff check src/ tests/` pass on the tree.
+- **Controls**, each a planted file that must fail: `storage/` importing
+  `providers.aws.credentials` (fails `layers`; the old checker passes it), a new
+  `orchestration/` adapter importing Prefect, `providers/local/` importing boto3, and a new
+  root module importing Prefect. All four fail.
 - In a scratch tree, `TID251` flagged all five usage forms tried (a direct import, an
   attribute call through `dask.distributed`, an attribute call through an aliased
   `distributed`, an import and an attribute call of the solar offset) and left a file
@@ -66,6 +76,9 @@ exempted by file, matching the old scope, because they exercise the banned names
 - The `get_client` ban is narrower and more accurate than before. The old rule matched any
   call named `get_client`, which is why the whole Prefect layer was exempt; Prefect's own
   `prefect.client.orchestration.get_client` is now simply not banned.
+- **Known gap:** the package's root `__init__.py` sits outside every layer, so a re-export of a
+  `profiling` tool from it would pass. The root is the public API surface and changes rarely;
+  a contract for that alone was judged not worth its lines.
 - Rules 3–5 of the README (pydantic config, fsspec storage, secrets at flow entry) were never
   machine-checked and still are not; the README now says so.
 
