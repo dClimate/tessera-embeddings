@@ -1491,6 +1491,39 @@ class TestAPermanentLegFailureSkipsTheLadder:
         assert dispatched.count("ascending") == 3, "an unclassified failure was denied its retries"
 
 
+def _s2_leg_failing_every_attempt(monkeypatch, clock, *, leg_duration: float) -> list[str]:
+    """The optical leg fails every attempt, consuming ``leg_duration`` of the clock each time.
+
+    The radar legs complete. Returns the legs dispatched, in order.
+    """
+    monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+    monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
+    monkeypatch.setattr(mod, "monotonic", clock)
+    dispatched: list[str] = []
+
+    async def fake_arun(dep, parameters=None, tags=None):
+        leg = parameters.get("orbit") or "s2"
+        dispatched.append(leg)
+        if leg != "s2":
+            return _completed_run()
+        clock.now += leg_duration
+        return SimpleNamespace(
+            id="r", state=SimpleNamespace(type=StateType.FAILED, name="Failed", message=_TRANSIENT_DETAIL)
+        )
+
+    monkeypatch.setattr(mod, "arun_deployment", fake_arun)
+    return dispatched
+
+
+#: A leg allowed three attempts and 500 s, whose store earns 2000 s per grant of progress.
+_PROGRESS_SETTINGS: dict[str, int] = {
+    "max_leg_attempts": 3,
+    "max_leg_wall_clock_s": 500,
+    "leg_progress_extension_s": 2000,
+    "leg_stagger_window_s": 0,
+}
+
+
 #: Sized so the SECOND rung (200 s) overruns the budget while the first (100 s) fits: two attempts
 #: of 120 s leave 110 s of a 350 s budget. The progress extension is off, so the ladder is the only
 #: thing deciding whether another attempt happens.
@@ -1522,29 +1555,8 @@ class TestABackoffThatDoesNotFitDescendsTheLadder:
     thing the budget forbids. A rung is taken only if it leaves room after it.
     """
 
-    @staticmethod
-    def _one_failing_leg(monkeypatch, clock, *, leg_duration: float):
-        """The optical leg fails every attempt, consuming ``leg_duration`` of the clock each time."""
-        monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
-        monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
-        monkeypatch.setattr(mod, "monotonic", clock)
-        dispatched: list[str] = []
-
-        async def fake_arun(dep, parameters=None, tags=None):
-            leg = parameters.get("orbit") or "s2"
-            dispatched.append(leg)
-            if leg != "s2":
-                return _completed_run()
-            clock.now += leg_duration
-            return SimpleNamespace(
-                id="r", state=SimpleNamespace(type=StateType.FAILED, name="Failed", message=_TRANSIENT_DETAIL)
-            )
-
-        monkeypatch.setattr(mod, "arun_deployment", fake_arun)
-        return dispatched
-
     def test_the_shorter_rung_is_taken_rather_than_the_attempt_refused(self, wired, monkeypatch, waited):
-        dispatched = self._one_failing_leg(monkeypatch, _ManualClock(), leg_duration=120.0)
+        dispatched = _s2_leg_failing_every_attempt(monkeypatch, _ManualClock(), leg_duration=120.0)
 
         with pytest.raises(RuntimeError, match="token has expired"):
             _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(**_RUNG_SETTINGS))
@@ -1559,7 +1571,7 @@ class TestABackoffThatDoesNotFitDescendsTheLadder:
         notice what was refusing it. Given room, it fires — so the evidence for deleting it was
         produced by the defect, not by the rung.
         """
-        dispatched = self._one_failing_leg(monkeypatch, _ManualClock(), leg_duration=120.0)
+        dispatched = _s2_leg_failing_every_attempt(monkeypatch, _ManualClock(), leg_duration=120.0)
 
         with pytest.raises(RuntimeError, match="token has expired"):
             _run(
@@ -1578,7 +1590,7 @@ class TestABackoffThatDoesNotFitDescendsTheLadder:
         that has no time to both wait and start, so waiting would only delay a decision already
         made.
         """
-        dispatched = self._one_failing_leg(monkeypatch, _ManualClock(), leg_duration=280.0)
+        dispatched = _s2_leg_failing_every_attempt(monkeypatch, _ManualClock(), leg_duration=280.0)
 
         with pytest.raises(RuntimeError, match="token has expired"):
             _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(**_RUNG_SETTINGS))
@@ -1608,27 +1620,6 @@ class TestALegStillCommittingDatesEarnsWallClock:
     """
 
     @staticmethod
-    def _leg_that_runs_long(monkeypatch, clock, *, leg_duration: float):
-        """The optical leg fails every attempt after ``leg_duration`` of clock."""
-        monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
-        monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
-        monkeypatch.setattr(mod, "monotonic", clock)
-        dispatched: list[str] = []
-
-        async def fake_arun(dep, parameters=None, tags=None):
-            leg = parameters.get("orbit") or "s2"
-            dispatched.append(leg)
-            if leg != "s2":
-                return _completed_run()
-            clock.now += leg_duration
-            return SimpleNamespace(
-                id="r", state=SimpleNamespace(type=StateType.FAILED, name="Failed", message=_TRANSIENT_DETAIL)
-            )
-
-        monkeypatch.setattr(mod, "arun_deployment", fake_arun)
-        return dispatched
-
-    @staticmethod
     def _growing_store(monkeypatch) -> list[str]:
         """Every reading of a leg's store shows one more date than the last. Records what was read."""
         seen: list[str] = []
@@ -1644,18 +1635,13 @@ class TestALegStillCommittingDatesEarnsWallClock:
 
     def test_a_leg_still_committing_dates_gets_the_attempt_the_deadline_refused(self, wired, monkeypatch):
         """The whole point: the same clock, the same failure, and a store that grew."""
-        dispatched = self._leg_that_runs_long(monkeypatch, _ManualClock(), leg_duration=1000.0)
+        dispatched = _s2_leg_failing_every_attempt(monkeypatch, _ManualClock(), leg_duration=1000.0)
         self._growing_store(monkeypatch)
 
         with pytest.raises(RuntimeError, match="token has expired"):
             _run(
                 s1_orbit="ascending",
-                ingest_settings=mod.IngestSettings(
-                    max_leg_attempts=3,
-                    max_leg_wall_clock_s=500,
-                    leg_progress_extension_s=2000,
-                    leg_stagger_window_s=0,
-                ),
+                ingest_settings=mod.IngestSettings(**_PROGRESS_SETTINGS),
             )
 
         assert dispatched.count("s2") == 3, "a leg that is still committing dates is not the stuck one"
@@ -1668,43 +1654,32 @@ class TestALegStillCommittingDatesEarnsWallClock:
         no room to wait before starting. A leg whose store grew must not lose its attempt to
         which side of the deadline its failure happened to land on.
         """
-        dispatched = self._leg_that_runs_long(monkeypatch, _ManualClock(), leg_duration=480.0)
+        dispatched = _s2_leg_failing_every_attempt(monkeypatch, _ManualClock(), leg_duration=480.0)
         self._growing_store(monkeypatch)
 
         with pytest.raises(RuntimeError, match="token has expired"):
             _run(
                 s1_orbit="ascending",
-                ingest_settings=mod.IngestSettings(
-                    max_leg_attempts=3,
-                    max_leg_wall_clock_s=500,
-                    leg_retry_backoff_s=30,
-                    leg_progress_extension_s=2000,
-                    leg_stagger_window_s=0,
-                ),
+                ingest_settings=mod.IngestSettings(**_PROGRESS_SETTINGS, leg_retry_backoff_s=30),
             )
 
         assert dispatched.count("s2") == 3, "the rung refusal must credit progress like the elapsed one"
 
     def test_a_leg_committing_nothing_is_refused_exactly_as_before(self, wired, monkeypatch):
         """The control, and the polarity. Only progress buys anything; the default buys nothing."""
-        dispatched = self._leg_that_runs_long(monkeypatch, _ManualClock(), leg_duration=1000.0)
+        dispatched = _s2_leg_failing_every_attempt(monkeypatch, _ManualClock(), leg_duration=1000.0)
 
         with pytest.raises(RuntimeError, match="token has expired"):
             _run(
                 s1_orbit="ascending",
-                ingest_settings=mod.IngestSettings(
-                    max_leg_attempts=3,
-                    max_leg_wall_clock_s=500,
-                    leg_progress_extension_s=2000,
-                    leg_stagger_window_s=0,
-                ),
+                ingest_settings=mod.IngestSettings(**_PROGRESS_SETTINGS),
             )
 
         assert dispatched.count("s2") == 1, "the store never grew, so the deadline stands where it was"
 
     def test_the_extension_can_be_turned_off(self, wired, monkeypatch):
         """0 restores the plain deadline, growing store or not — the one lever, and it reaches 0."""
-        dispatched = self._leg_that_runs_long(monkeypatch, _ManualClock(), leg_duration=1000.0)
+        dispatched = _s2_leg_failing_every_attempt(monkeypatch, _ManualClock(), leg_duration=1000.0)
         seen = self._growing_store(monkeypatch)
 
         with pytest.raises(RuntimeError, match="token has expired"):
@@ -1731,7 +1706,7 @@ class TestALegStillCommittingDatesEarnsWallClock:
         """
         clock = _ManualClock()
         attempts, budget, extension, leg_duration = 5, 500, 600, 600.0
-        dispatched = self._leg_that_runs_long(monkeypatch, clock, leg_duration=leg_duration)
+        dispatched = _s2_leg_failing_every_attempt(monkeypatch, clock, leg_duration=leg_duration)
         self._growing_store(monkeypatch)
 
         with pytest.raises(RuntimeError, match="token has expired"):
@@ -1761,7 +1736,7 @@ class TestALegStillCommittingDatesEarnsWallClock:
         Here only the radar store grows. The optical leg must be refused on exactly the terms it
         would have been if nothing in the cell had moved.
         """
-        dispatched = self._leg_that_runs_long(monkeypatch, _ManualClock(), leg_duration=1000.0)
+        dispatched = _s2_leg_failing_every_attempt(monkeypatch, _ManualClock(), leg_duration=1000.0)
         counts: dict[str, int] = {}
 
         def _only_the_sibling_grows(store, log, **kw):
@@ -1775,12 +1750,7 @@ class TestALegStillCommittingDatesEarnsWallClock:
         with pytest.raises(RuntimeError, match="token has expired"):
             _run(
                 s1_orbit="ascending",
-                ingest_settings=mod.IngestSettings(
-                    max_leg_attempts=3,
-                    max_leg_wall_clock_s=500,
-                    leg_progress_extension_s=2000,
-                    leg_stagger_window_s=0,
-                ),
+                ingest_settings=mod.IngestSettings(**_PROGRESS_SETTINGS),
             )
 
         assert dispatched.count("s2") == 1, "the optical leg's own store never grew"

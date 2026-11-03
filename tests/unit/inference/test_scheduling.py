@@ -59,10 +59,16 @@ def _ray_calls_are_mocked():
     ``patch.object(_sched_mod.ray, "kill")``, which nests inside this one and shadows it, so
     they still observe their own mock. Verified by mutation — removing the ``ray.kill`` call
     from the retire path still fails ``TestRetireIdle::test_idle_actor_killed_after_grace``.
+
+    **``log_worker_failure_diagnostic``** — it only logs, and no test asserts on it.
+
+    ``time.sleep`` stays with the tests that patch it: patching it module-wide was measured and
+    bought nothing, and some loop tests run their background threads on the real one.
     """
     with (
         patch.object(_sched_mod.ray, "cluster_resources", return_value={"CPU": 8.0}),
         patch.object(_sched_mod.ray, "kill"),
+        patch.object(_sched_mod, "log_worker_failure_diagnostic"),
     ):
         yield
 
@@ -131,7 +137,6 @@ def _do_replace(pool: ActorPool, actor_idx: int = 0) -> None:
         # suppress(Exception) around the kill in replace() does not help; the
         # auto-init runs before kill raises. (2026-07-17: three concurrent
         # pytest runs of this file ate ~60 GB RAM this way.)
-        patch.object(_sched_mod.ray, "kill"),
     ):
         cls.options.return_value.remote.return_value = mock_actor
         pool.replace(actor_idx, "i-dead")
@@ -587,8 +592,7 @@ class TestRetireIdle:
         pool = _make_pool(3, idle_grace_sec=1)
         for idx in range(3):
             pool._idle_since[idx] = time.monotonic() - 200
-        with patch.object(_sched_mod.ray, "kill"):
-            pool.retire_idle(outstanding_work=0, floor=1)
+        pool.retire_idle(outstanding_work=0, floor=1)
         assert pool.live_count == 1, f"the floor was not honoured: {pool.live_count} live"
 
     def test_without_a_floor_the_pool_empties(self) -> None:
@@ -596,8 +600,7 @@ class TestRetireIdle:
         pool = _make_pool(3, idle_grace_sec=1)
         for idx in range(3):
             pool._idle_since[idx] = time.monotonic() - 200
-        with patch.object(_sched_mod.ray, "kill"):
-            pool.retire_idle(outstanding_work=0)
+        pool.retire_idle(outstanding_work=0)
         assert pool.live_count == 0
 
     def test_outstanding_work_still_outranks_a_smaller_floor(self) -> None:
@@ -605,8 +608,7 @@ class TestRetireIdle:
         pool = _make_pool(4, idle_grace_sec=1)
         for idx in range(4):
             pool._idle_since[idx] = time.monotonic() - 200
-        with patch.object(_sched_mod.ray, "kill"):
-            pool.retire_idle(outstanding_work=3, floor=1)
+        pool.retire_idle(outstanding_work=3, floor=1)
         assert pool.live_count == 3
 
     def test_kill_exception_suppressed(self) -> None:
@@ -621,8 +623,7 @@ class TestRetireIdle:
         callback = MagicMock()
         pool = _make_pool(3, idle_grace_sec=1, on_retire=callback)
         pool._idle_since[0] = time.monotonic() - 200
-        with patch.object(_sched_mod.ray, "kill"):
-            pool.retire_idle(outstanding_work=1)
+        pool.retire_idle(outstanding_work=1)
         callback.assert_called_once_with("i-0000")
 
     def test_on_retire_skipped_for_placeholder_ids(self) -> None:
@@ -631,8 +632,7 @@ class TestRetireIdle:
         pool = _make_pool(2, idle_grace_sec=1, on_retire=callback)
         pool.actor_instance_ids[0] = "pending-init"
         pool._idle_since[0] = time.monotonic() - 200
-        with patch.object(_sched_mod.ray, "kill"):
-            pool.retire_idle(outstanding_work=0)
+        pool.retire_idle(outstanding_work=0)
         assert 0 in pool._retired
         callback.assert_not_called()
 
@@ -641,8 +641,7 @@ class TestRetireIdle:
         callback = MagicMock(side_effect=RuntimeError("EC2 API error"))
         pool = _make_pool(3, idle_grace_sec=1, on_retire=callback)
         pool._idle_since[0] = time.monotonic() - 200
-        with patch.object(_sched_mod.ray, "kill"):
-            pool.retire_idle(outstanding_work=1)
+        pool.retire_idle(outstanding_work=1)
         assert 0 in pool._retired
         callback.assert_called_once()
 
@@ -650,8 +649,7 @@ class TestRetireIdle:
         """No error when on_retire is None (default)."""
         pool = _make_pool(2, idle_grace_sec=1)
         pool._idle_since[0] = time.monotonic() - 200
-        with patch.object(_sched_mod.ray, "kill"):
-            pool.retire_idle(outstanding_work=0)
+        pool.retire_idle(outstanding_work=0)
         assert 0 in pool._retired
 
     def test_resolve_iid_called_before_kill(self) -> None:
@@ -665,7 +663,6 @@ class TestRetireIdle:
         pool._pending_iid_refs[0] = ref
         # resolve_iid will find the ready ref and update the instance ID
         with (
-            patch.object(_sched_mod.ray, "kill"),
             patch.object(_sched_mod.ray, "wait", return_value=([ref], [])),
             patch.object(_sched_mod.ray, "get", return_value="i-newly-resolved"),
         ):
@@ -687,7 +684,6 @@ class TestRetireIdle:
         pool._initializing.add(1)
         pool._idle_since[0] = time.monotonic() - 200
         with (
-            patch.object(_sched_mod.ray, "kill"),
             patch.object(_sched_mod.ray, "wait", return_value=([], [MagicMock()])),  # still in __init__
         ):
             pool.retire_idle(outstanding_work=0)
@@ -705,7 +701,6 @@ class TestRetireIdle:
         pool._initializing.add(1)
         pool._idle_since[0] = time.monotonic() - 200
         with (
-            patch.object(_sched_mod.ray, "kill"),
             patch.object(_sched_mod.ray, "wait", return_value=([ref], [])),
             patch.object(_sched_mod.ray, "get", return_value="i-somewhere-else"),
         ):
@@ -720,8 +715,7 @@ class TestRetireIdle:
         pool._pending_iid_refs[1] = MagicMock()
         pool._initializing.add(1)
         pool._idle_since[0] = time.monotonic() - 200
-        with patch.object(_sched_mod.ray, "kill"):
-            pool.retire_idle(outstanding_work=0)
+        pool.retire_idle(outstanding_work=0)
         callback.assert_called_once_with("i-0000")
 
     def test_grace_period_always_applies(self) -> None:
@@ -845,16 +839,14 @@ class TestRetiringAPackedInstance:
         pool = _make_pool(3, idle_grace_sec=1, on_retire=callback)
         pool.actor_instance_ids = ["i-shared", "i-shared", "i-alone"]
         pool._idle_since[0] = time.monotonic() - 200
-        with patch.object(_sched_mod.ray, "kill"):
-            pool.retire_idle(outstanding_work=0, floor=2)
+        pool.retire_idle(outstanding_work=0, floor=2)
         # The control: slot 0 really was retired, and slot 1 really is still live on that
         # instance — so "not terminated" is the rule under test and not an untaken branch.
         assert pool._retired == {0}, f"the wind-down did not retire exactly one actor: {pool._retired}"
         callback.assert_not_called()
 
         pool._idle_since[1] = time.monotonic() - 200
-        with patch.object(_sched_mod.ray, "kill"):
-            pool.retire_idle(outstanding_work=0, floor=1)
+        pool.retire_idle(outstanding_work=0, floor=1)
         assert pool._retired == {0, 1}
         assert callback.call_args_list == [mock.call("i-shared")], (
             f"the last actor off the instance must release it: {callback.call_args_list}"
@@ -1140,8 +1132,7 @@ class TestFleetSizeAcrossDroughts:
         self._resolve_all(pool)
         for idx in range(len(pool.actors)):
             pool._idle_since[idx] = time.monotonic() - 200
-        with patch.object(_sched_mod.ray, "kill"):
-            pool.retire_idle(outstanding_work=0, floor=1)
+        pool.retire_idle(outstanding_work=0, floor=1)
         assert pool.live_count == 1, f"the wind-down did not reach the floor: {pool.live_count} live"
         regrown = [MagicMock() for _ in range(target - pool.live_count)]
         for a in regrown:
@@ -1176,8 +1167,7 @@ class TestFleetSizeAcrossDroughts:
         self._resolve_all(pool)
         for idx in range(len(pool.actors)):
             pool._idle_since[idx] = time.monotonic() - 200
-        with patch.object(_sched_mod.ray, "kill"):
-            pool.retire_idle(outstanding_work=0, floor=1)
+        pool.retire_idle(outstanding_work=0, floor=1)
         assert pool.live_count == 1  # control: the wind-down happened
         assert pool.max_actor_deaths == 40, "one death during a drought must not read as systemic"
         assert pool.systemic_stall_threshold == 4
@@ -1538,9 +1528,7 @@ class TestWorkStealingLoopCondition:
         with (
             patch.object(_sched_mod.ray, "wait") as mock_wait,
             patch.object(_sched_mod.ray, "get", side_effect=fake_get),
-            patch.object(_sched_mod.ray, "kill"),
             patch.object(_sched_mod, "InferenceActor") as cls,
-            patch.object(_sched_mod, "log_worker_failure_diagnostic"),
             patch.object(_sched_mod.time, "sleep"),
         ):
             # ray.wait dispatches differently for the main loop vs resolve_iid
@@ -1792,7 +1780,6 @@ class TestWorkStealingReturnedFailure:
             patch.object(_sched_mod.ray, "get", side_effect=fake_get),
             patch.object(_sched_mod.ray, "kill") as mock_kill,
             patch.object(_sched_mod, "InferenceActor") as cls,
-            patch.object(_sched_mod, "log_worker_failure_diagnostic"),
             patch.object(_sched_mod.time, "sleep"),
         ):
             cls.options.return_value.remote.return_value = replacement_actor
@@ -1840,9 +1827,7 @@ class TestWorkStealingReturnedFailure:
         with (
             patch.object(_sched_mod.ray, "wait", side_effect=fake_wait),
             patch.object(_sched_mod.ray, "get", side_effect=fake_get),
-            patch.object(_sched_mod.ray, "kill"),
             patch.object(_sched_mod, "InferenceActor") as cls,
-            patch.object(_sched_mod, "log_worker_failure_diagnostic"),
             patch.object(_sched_mod.time, "sleep"),
         ):
             cls.options.return_value.remote.return_value = replacement
@@ -1919,7 +1904,6 @@ class TestWorkStealingBatching:
             patch.object(_sched_mod.ray, "wait", side_effect=fake_wait),
             patch.object(_sched_mod.ray, "get", side_effect=fake_get),
             patch.object(_sched_mod.ray, "nodes", side_effect=fake_nodes),
-            patch.object(_sched_mod.ray, "kill"),
             patch.object(_sched_mod.time, "sleep"),
         ):
             results = _work_steal(
@@ -1998,7 +1982,6 @@ class TestWorkStealingBatching:
             patch.object(_sched_mod.ray, "wait", side_effect=fake_wait),
             patch.object(_sched_mod.ray, "get", side_effect=fake_get),
             patch.object(_sched_mod.ray, "cluster_resources", side_effect=fake_cluster_resources),
-            patch.object(_sched_mod.ray, "kill"),
             patch.object(_sched_mod.time, "sleep"),
         ):
             _work_steal(
@@ -2056,7 +2039,6 @@ class TestWorkStealingBatching:
             patch.object(_sched_mod.ray, "wait", side_effect=fake_wait),
             patch.object(_sched_mod.ray, "get", return_value={"chunk": "x", "status": "ok"}),
             patch.object(_sched_mod.ray, "nodes", side_effect=AssertionError("nodes() must not be polled")),
-            patch.object(_sched_mod.ray, "kill"),
             patch.object(_sched_mod.time, "sleep"),
         ):
             results = _work_steal(
@@ -2083,9 +2065,7 @@ class TestDeferredWrites:
         with (
             patch.object(_sched_mod.ray, "wait", side_effect=kwargs.pop("fake_wait")),
             patch.object(_sched_mod.ray, "get", side_effect=kwargs.pop("fake_get")),
-            patch.object(_sched_mod.ray, "kill"),
             patch.object(_sched_mod, "InferenceActor") as cls,
-            patch.object(_sched_mod, "log_worker_failure_diagnostic"),
             patch.object(_sched_mod.time, "sleep"),
         ):
             replacement = MagicMock(name="replacement")
@@ -2243,9 +2223,7 @@ class TestDeferredWrites:
         with (
             patch.object(_sched_mod.ray, "wait", side_effect=fake_wait),
             patch.object(_sched_mod.ray, "get", side_effect=fake_get),
-            patch.object(_sched_mod.ray, "kill"),
             patch.object(_sched_mod, "InferenceActor") as cls,
-            patch.object(_sched_mod, "log_worker_failure_diagnostic"),
             patch.object(_sched_mod.time, "sleep"),
         ):
             cls.options.return_value.remote.return_value = replacement
@@ -2362,7 +2340,6 @@ class TestDeferredWrites:
             patch.object(_sched_mod.ray, "get", side_effect=fake_get),
             patch.object(_sched_mod.ray, "kill") as kill,
             patch.object(_sched_mod, "InferenceActor") as cls,
-            patch.object(_sched_mod, "log_worker_failure_diagnostic"),
             patch.object(_sched_mod.time, "sleep"),
         ):
             cls.options.return_value.remote.return_value = replacement
@@ -2412,7 +2389,6 @@ class TestRetireIdleGate:
         with (
             patch.object(_sched_mod.ray, "wait", side_effect=lambda refs, **kw: (list(refs), [])),
             patch.object(_sched_mod.ray, "get", side_effect=fake_get),
-            patch.object(_sched_mod.ray, "kill"),
             patch.object(_sched_mod.time, "sleep"),
             patch.object(_sched_mod.ActorPool, "retire_idle") as retire_mock,
         ):
@@ -2471,7 +2447,6 @@ class TestMidRunWindDownNeedsRegrowth:
             patch.object(_sched_mod.ray, "wait", side_effect=lambda refs, **kw: (list(refs), [])),
             patch.object(_sched_mod.ray, "get", side_effect=fake_get),
             patch.object(_sched_mod.ray, "nodes", return_value=[{"Alive": True, "Resources": {"GPU": 1}}]),
-            patch.object(_sched_mod.ray, "kill"),
             patch.object(_sched_mod.time, "sleep"),
             patch.object(_sched_mod.ActorPool, "retire_idle") as idle_mock,
             patch.object(_sched_mod.ActorPool, "retire_initializing") as init_mock,
@@ -2546,7 +2521,6 @@ class TestChainedWorkSource:
         with (
             patch.object(_sched_mod.ray, "wait", side_effect=lambda refs, **kw: (list(refs), [])),
             patch.object(_sched_mod.ray, "get", side_effect=fake_get),
-            patch.object(_sched_mod.ray, "kill"),
             patch.object(_sched_mod.time, "sleep"),
             patch.object(_sched_mod.ActorPool, "retire_idle") as retire_mock,
         ):
@@ -2619,7 +2593,6 @@ class TestChainedWorkSource:
         with (
             patch.object(_sched_mod.ray, "wait", side_effect=fake_wait),
             patch.object(_sched_mod.ray, "get", side_effect=fake_get),
-            patch.object(_sched_mod.ray, "kill"),
             patch.object(_sched_mod.time, "sleep"),
             patch.object(_sched_mod.ActorPool, "retire_idle"),
         ):
@@ -2674,7 +2647,6 @@ class TestChainedWorkSource:
         with (
             patch.object(_sched_mod.ray, "wait", side_effect=lambda refs, **kw: (list(refs), [])),
             patch.object(_sched_mod.ray, "get", return_value=MagicMock()),
-            patch.object(_sched_mod.ray, "kill"),
             patch.object(_sched_mod.time, "sleep"),
             patch.object(_sched_mod.ActorPool, "retire_idle", spy),
         ):
@@ -2724,7 +2696,6 @@ class TestChainedWorkSource:
         with (
             patch.object(_sched_mod.ray, "wait", side_effect=lambda refs, **kw: (list(refs), [])),
             patch.object(_sched_mod.ray, "get", return_value=MagicMock()),
-            patch.object(_sched_mod.ray, "kill"),
             patch.object(_sched_mod.time, "sleep"),
             patch.object(_sched_mod.ActorPool, "retire_idle", real_retire),
         ):
@@ -2775,7 +2746,6 @@ class TestChainedWorkSource:
         with (
             patch.object(_sched_mod.ray, "wait", side_effect=lambda refs, **kw: (list(refs), [])),
             patch.object(_sched_mod.ray, "get", return_value=MagicMock()),
-            patch.object(_sched_mod.ray, "kill"),
             patch.object(_sched_mod.time, "sleep"),
             patch.object(_sched_mod, "_joined_gpu_count", lambda last, per: 0.0),
             patch.object(_sched_mod.ActorPool, "retire_idle", retire_everything),
@@ -2805,7 +2775,6 @@ class TestChainedWorkSource:
         with (
             patch.object(_sched_mod.ray, "wait", side_effect=lambda refs, **kw: (list(refs), [])),
             patch.object(_sched_mod.ray, "get", return_value={"chunk": "c0", "status": "ok"}),
-            patch.object(_sched_mod.ray, "kill"),
             patch.object(_sched_mod.time, "sleep"),
             patch.object(_sched_mod.ActorPool, "retire_idle", retire_everything),
         ):
@@ -2855,9 +2824,7 @@ class TestChainedWorkSource:
         with (
             patch.object(_sched_mod.ray, "wait", side_effect=lambda r, **kw: (list(r), [])),
             patch.object(_sched_mod.ray, "get", side_effect=fake_get),
-            patch.object(_sched_mod.ray, "kill"),
             patch.object(_sched_mod, "InferenceActor") as cls,
-            patch.object(_sched_mod, "log_worker_failure_diagnostic"),
             patch.object(_sched_mod.time, "sleep"),
         ):
             cls.options.return_value.remote.return_value = replacement
@@ -2950,7 +2917,6 @@ class TestSessionScopedStateIsNotPerCell:
         with (
             patch.object(_sched_mod.ray, "wait", side_effect=lambda refs, **kw: (list(refs), [])),
             patch.object(_sched_mod.ray, "get", return_value=MagicMock()),
-            patch.object(_sched_mod.ray, "kill"),
             patch.object(_sched_mod.time, "sleep"),
             patch.object(_sched_mod.ActorPool, "retire_idle", retire_most),
         ):
@@ -2987,6 +2953,5 @@ class TestSessionScopedStateIsNotPerCell:
         for idx in range(4):
             pool._idle_since[idx] = time.monotonic() - 200
         pool._initializing.update({1, 2, 3})  # one ready actor, three still coming up
-        with patch.object(_sched_mod.ray, "kill"):
-            pool.retire_idle(outstanding_work=0, floor=1)
+        pool.retire_idle(outstanding_work=0, floor=1)
         assert pool.ready_count == 1, f"the only dispatchable actor was retired: {pool._retired}"

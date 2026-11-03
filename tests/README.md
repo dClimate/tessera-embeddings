@@ -57,11 +57,18 @@ theme and mirroring would split it. **`orchestration/flows/` vs `runners/`** kee
 away from its runner's — `test_fill_zone_year_flow.py` and `test_zone_fill.py` are different
 subjects with confusingly similar names.
 
-**Nine things stay at `unit/` root** and nothing else should join them: `__init__.py` and
-`conftest.py`; the three shared helpers `zone_density.py`, `mosaic_stores.py` and
-`coverage_repo.py`, which other tests import by absolute path and which therefore must not move;
-and four tests with no single subject — `test_imports`, `test_public_api`,
-`test_prefect_layer`, `test_properties`.
+**Eleven things stay at `unit/` root** and nothing else should join them: `__init__.py` and
+`conftest.py`; the five shared helpers `zone_density.py`, `mosaic_stores.py`, `coverage_repo.py`,
+`inference_stack.py` and `deadline.py`, which other tests import by absolute path and which
+therefore must not move; and four tests with no single subject — `test_imports`,
+`test_public_api`, `test_prefect_layer`, `test_properties`.
+
+**A helper lives at the narrowest scope with two users:** the test file, then its subject
+directory's `conftest.py`, then a module at `unit/` root, then `tests/` root for one shared
+across tiers (`stac_items.py`, used by unit and parity tests, beside `_paths.py`). A shared
+builder takes a few keyword arguments with defaults; one that grows flags for its callers'
+differences is two builders. Setup every test in a module needs but none asserts on (inert
+patches, a logger) belongs in an autouse fixture, so each test shows only what it is about.
 
 **Do not locate files by counting directories up from `__file__`.** Import `REPO_ROOT`, `SRC_ROOT`
 or `FIXTURES` from `tests/_paths.py`, which anchors on the directory holding `pyproject.toml` and
