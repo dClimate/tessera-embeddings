@@ -398,8 +398,8 @@ crosses midnight.
   is a plausible-looking wrong answer — right at central longitudes, wrong only where the
   offset crosses midnight — so a path that skips the chokepoint would look correct
   everywhere anyone checks interactively.
-- An **architecture rule** (`solar-offset-applied-only-in-solar-days`) fails CI if
-  `solar_day_offset_seconds` is called outside this module. One application is the
+- A **ruff banned-API rule** (`TID251`, in `ruff.toml`) fails CI if
+  `solar_day_offset_seconds` is used outside this module. One application is the
   invariant; a second is a bug in the opposite direction.
 - Every consumption point **re-normalises defensively** rather than trusting call order, because
   every supplier (`query_fn`, `item_provider_fn`) is injectable and `normalize_to_solar_day` is
@@ -1099,7 +1099,7 @@ credentials, bypassing the env vars. The mechanism:
   open lacking an explicit one, for the duration of the block — scoped rather than permanent, so a
   reused Dask worker is not left pinned to it, and the previous provider is restored even if the
   body raises. The storage layer ships this as `None` and never imports botocore, per the
-  `no-botocore-outside-aws-provider` architecture rule; only the AWS provider supplies it.
+  `aws-domain` import contract in `.importlinter`; only the AWS provider supplies it.
 - The `process_roi_sar` Prefect task registers `iam_icechunk_credentials` through that hook when
   `use_s3_direct=True`. **In the task shell, not the flow body** — under the Dask task runner the
   domain function and its store writes execute in a *worker* process, so a provider registered in

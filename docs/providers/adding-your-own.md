@@ -239,25 +239,28 @@ Pattern is identical to
 function on the same inputs, then `assert_zarr_equivalent` the
 outputs.
 
-## Step 9: run the architecture tests
+## Step 9: run the architecture contracts
 
 ```bash
-uv run python -m tessera_embeddings.architecture_tests \
-    --source src/tessera_embeddings/ \
-    --allowlist your-arch-allowlist.toml
+uv run lint-imports
 ```
 
-Your allowlist permits Google SDK imports under `providers/gcp/`:
+`providers/gcp/` falls in the `providers` layer of
+[`.importlinter`](../../.importlinter) automatically. To keep the
+Google SDK out of the domain the way boto3 is, add a contract
+mirroring `aws-domain`:
 
-```toml
-# your-arch-allowlist.toml
-[allowed_imports."no-google-cloud-outside-gcp-provider"]
-paths = ["providers/gcp/"]
+```ini
+[importlinter:contract:gcp-domain]
+name = Domain never reaches the Google Cloud SDK, even transitively
+type = forbidden
+source_modules =
+    tessera_embeddings.ingest
+    tessera_embeddings.inference
+    tessera_embeddings.storage
+forbidden_modules =
+    google
 ```
-
-(The bundled rules don't ship a `no-google-cloud-...` rule because
-GCP isn't supported core. Add your own; the architecture-tests
-module accepts arbitrary forbidden-import patterns.)
 
 ## Maintenance commitment
 

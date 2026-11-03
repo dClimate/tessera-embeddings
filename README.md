@@ -309,7 +309,7 @@ follow, and together they are why this is the bar we hold ourselves to:
 **Neither variant runs in CI.** `plain.py --skip-inference` is the fast check to run by hand,
 and the end-to-end run on the quickstart region of interest is verified by hand too
 ([ADR 023](context_docs/decisions/023-the-single-path-end-to-end-is-the-quickstart-run.md)).
-Pull-request checks also apply the AST-based architecture rules described under
+Pull-request checks also apply the architecture contracts described under
 [Architecture](#architecture), which catch Prefect leaks at the import level without
 running the pipeline.
 
@@ -384,7 +384,7 @@ Per-cloud provisioning lives separately:
 └─────────────────────────────────────────────────────────────┘
 ```
 
-Six hard rules enforced in CI:
+Six hard rules:
 
 1. No `import prefect` outside the flow layer.
 2. Stdlib `logging` in the domain layer, not `get_run_logger()`.
@@ -399,22 +399,22 @@ Six hard rules enforced in CI:
 If those rules hold, you can rewrite the flow layer for any
 orchestrator without touching the domain.
 
-### Using these architecture checks in your own repo
+### What CI enforces
 
-The hard-rule checks ship as a reusable module, so a fork or an adapter can hold its own
-code to the same contract:
+Rules 3–5 are held by review; the rest, and the layering itself, are checked on every pull
+request ([ADR 039](context_docs/decisions/039-architecture-rules-run-on-import-linter-and-ruff.md)):
 
-```bash
-# Run against any source tree
-uv run python -m tessera_embeddings.architecture_tests \
-    --source path/to/your_package/ \
-    --allowlist your-arch-allowlist.toml
-```
+| Check | Tool | Where |
+|---|---|---|
+| The layers above import only downward: `profiling` > `orchestration` > `providers` > `ingest`, `inference`, `storage` > `config` > `errors`, `utils` | [import-linter](https://import-linter.readthedocs.io/) | [`.importlinter`](.importlinter) |
+| No Prefect outside `orchestration/prefect/`, even transitively (covers rule 2: `get_run_logger` comes from Prefect) | import-linter | `.importlinter` |
+| No boto3 or botocore in the domain, even transitively; flows reach them only through `providers/aws/` | import-linter | `.importlinter` |
+| No Dask `get_client()` below the flow layer (rule 6) | ruff `TID251` banned API | [`ruff.toml`](ruff.toml) |
+| The solar-day offset is applied only in `ingest/solar_days.py` | ruff `TID251` | `ruff.toml` |
 
-The allowlist file (TOML) documents intentional deviations — for example, "Prefect
-imports in my own `orchestration/prefect/` are expected". See
-[`src/tessera_embeddings/architecture_tests/`](src/tessera_embeddings/architecture_tests/)
-for the rule definitions, the allowlist schema, and worked examples.
+Run them with `uv run lint-imports` and `uv run ruff check src/`; both scan the package, not
+`scripts/` ([ADR 014](context_docs/decisions/014-architecture-rules-scan-the-package.md)). A
+downstream repo adopts the contract by copying `.importlinter` and the `banned-api` table.
 
 ## The global embeddings store
 
@@ -489,7 +489,6 @@ src/tessera_embeddings/
                          cluster.yaml.template, gotchas.md
     local/               ray.py, dask.py — demo and tests
   profiling/             AWS-specific harnesses for watching a live run
-  architecture_tests/    reusable layer-rule checker (CLI + Python API)
 
 docs/                    how to run, configure and port it  (docs/README.md)
 context_docs/            why it is shaped this way, and what was measured

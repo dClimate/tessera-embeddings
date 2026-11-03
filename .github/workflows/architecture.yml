@@ -25,7 +25,9 @@ jobs:
       - name: Install dependencies
         run: uv sync --python 3.13 --all-extras
 
-      - name: Run architecture tests
+      # The import contracts in .importlinter. The name bans (get_client, the solar-day
+      # offset) are ruff TID251 rules and run in lint.yml with the rest of ruff.
+      - name: Import contracts
+        run: uv run lint-imports
+      - name: Cassette safety
         run: uv run pytest tests/architecture -v
-      - name: Run architecture-tests CLI directly
-        run: uv run python -m tessera_embeddings.architecture_tests --source src/tessera_embeddings/
