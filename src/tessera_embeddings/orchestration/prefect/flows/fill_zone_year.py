@@ -31,6 +31,7 @@ from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.data_loading import check_time_window_coverage, resolve_s1_orbit
 from tessera_embeddings.inference.orchestration_helpers import build_inference_config
 from tessera_embeddings.orchestration.prefect.flows._cell_validation import (
+    ValidationTarget,
     dispatch_cell_validation,
     validation_run_tag,
 )
@@ -413,6 +414,8 @@ def fill_zone_year_flow(
         "input_coverage": input_coverage,
     }
 
+    validation_target = ValidationTarget(paths, store_name, mask_name, s3_region)
+
     def _validate(summary: dict[str, Any]) -> dict[str, Any]:
         """Hand the landed cell to its validation deployment, without waiting for it.
 
@@ -426,10 +429,7 @@ def fill_zone_year_flow(
             zone=zone,
             year=year,
             summary=summary,
-            paths=paths,
-            store_name=store_name,
-            mask_name=mask_name,
-            s3_region=s3_region,
+            target=validation_target,
             log=log,
             tag=validation_run_tag(flow_run_ctx.id),
         )

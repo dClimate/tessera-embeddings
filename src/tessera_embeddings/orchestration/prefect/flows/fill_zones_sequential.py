@@ -61,6 +61,7 @@ from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.inference.scheduling import WorkItem
 from tessera_embeddings.ingest.source_coverage import SourceFinding, preflight_optical_source
 from tessera_embeddings.orchestration.prefect.flows._cell_validation import (
+    ValidationTarget,
     dispatch_cell_validation,
     validation_run_tag,
 )
@@ -1100,6 +1101,7 @@ def fill_zones_sequential_flow(
     # Prefect context, so reading the runtime id inside `_validate` would yield None for every
     # cell this cluster fills, and the validations would be untraceable back to the fill.
     validation_tag = validation_run_tag(flow_run_ctx.id)
+    validation_target = ValidationTarget(paths, store_name, mask_name, s3_region)
 
     def _validate(zone: str, year: int, summary: dict[str, Any]) -> dict[str, Any]:
         """Hand one landed cell to its validation deployment, without waiting for it.
@@ -1119,10 +1121,7 @@ def fill_zones_sequential_flow(
             zone=zone,
             year=year,
             summary=summary,
-            paths=paths,
-            store_name=store_name,
-            mask_name=mask_name,
-            s3_region=s3_region,
+            target=validation_target,
             log=log,
             tag=validation_tag,
         )

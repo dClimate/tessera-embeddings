@@ -371,26 +371,20 @@ class _LegBudget:
     def __init__(
         self,
         *,
-        store: str,
+        count_dates: Callable[[], int | None],
         zone: str,
         year: int,
         label: str,
         settings: IngestSettings,
         log: logging.Logger | logging.LoggerAdapter[logging.Logger],
-        get_credentials: Callable[[], icechunk.S3StaticCredentials] | None,
-        s3_region: str | None,
     ) -> None:
-        self._store, self._zone, self._year, self._label, self._log = store, zone, year, label, log
-        self._get_credentials, self._s3_region = get_credentials, s3_region
+        """``count_dates`` reads how many dates the leg's store has committed (``None`` if unreadable)."""
+        self._count = count_dates
+        self._zone, self._year, self._label, self._log = zone, year, label, log
         self._extension_s = settings.leg_progress_extension_s
         self.budget_s = float(settings.max_leg_wall_clock_s)
         # Skipped entirely when the extension is off, so turning it off costs no reads.
         self.committed = self._count() if self._extension_s > 0 else None
-
-    def _count(self) -> int | None:
-        return _committed_date_count(
-            self._store, self._log, get_credentials=self._get_credentials, s3_region=self._s3_region
-        )
 
     def overdue(self, elapsed: float, *, backoff_base_s: float | None = None) -> bool:
         """Whether a leg ``elapsed`` seconds in is past its deadline, after asking for credit.
@@ -937,14 +931,14 @@ async def ingest_zone_year(
         # wall-clock anchor, for the reason the stagger is: a reading is not patience, and
         # charging it to the budget would let the measurement shorten what it measures.
         budget = _LegBudget(
-            store=store,
+            count_dates=lambda: _committed_date_count(
+                store, log, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+            ),
             zone=zone,
             year=year,
             label=label,
             settings=ingest_settings,
             log=log,
-            get_credentials=iam_icechunk_credentials,
-            s3_region=s3_region,
         )
         started = monotonic()
 
