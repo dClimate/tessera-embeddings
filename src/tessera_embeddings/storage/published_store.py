@@ -38,7 +38,7 @@ if TYPE_CHECKING:
 COVERAGE_VAR = "scales"
 
 
-def layout_departures(group: zarr.Group, layout: StoreLayout = GLOBAL) -> list[str]:  # noqa: C901
+def layout_departures(group: zarr.Group, layout: StoreLayout = GLOBAL) -> list[str]:
     """Every way ``group`` departs from ``layout``, as one sentence each; empty means it conforms.
 
     An array the layout declares and the group lacks is a departure; the reverse is not, because

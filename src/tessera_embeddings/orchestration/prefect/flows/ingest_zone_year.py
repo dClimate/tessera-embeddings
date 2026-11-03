@@ -418,7 +418,7 @@ _cancel_children_on_cancellation = make_child_cancel_hook(_CHILD_TAG_PREFIX, "ch
     on_cancellation=[_cancel_children_on_cancellation],
     on_crashed=[_cancel_children_on_cancellation],
 )
-async def ingest_zone_year(  # noqa: C901
+async def ingest_zone_year(
     *,
     zone: str,
     year: int,
@@ -784,7 +784,7 @@ async def ingest_zone_year(  # noqa: C901
             wait /= 2
         return wait if wait < remaining_s else None
 
-    async def _run_leg(label: str, dep: str, params: dict, store: str) -> str | None:  # noqa: C901
+    async def _run_leg(label: str, dep: str, params: dict, store: str) -> str | None:
         """Dispatch one leg, retrying on its own schedule; its failure detail, or None if it ran.
 
         Classifies per leg: a deterministic repeat from the source catalogue, a marker meaning

@@ -27,7 +27,7 @@ from pathlib import Path
 _PACKAGE = __name__.split(".")[0]
 
 
-def first_party_import_closure(seed: list[Path], root: Path) -> set[Path]:  # noqa: C901
+def first_party_import_closure(seed: list[Path], root: Path) -> set[Path]:
     """Every in-package module reachable from *seed*, following imports transitively.
 
     The seed names the code that OBVIOUSLY produces the artifact; the closure finds what it

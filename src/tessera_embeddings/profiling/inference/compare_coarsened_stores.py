@@ -324,7 +324,7 @@ def _row_slabs(height: int, sample_rows: int | None) -> list[tuple[slice, list[i
     return [(slice(r0, min(r0 + ROW_BLOCK, height)), None) for r0 in range(0, height, ROW_BLOCK)]
 
 
-def main(argv: list[str] | None = None) -> int:  # noqa: C901
+def main(argv: list[str] | None = None) -> int:
     """CLI entry point; returns process exit code (0 = bit-identical)."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("ref", help="Reference coarsened store (s3:// icechunk path)")

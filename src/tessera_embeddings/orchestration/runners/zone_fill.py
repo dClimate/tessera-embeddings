@@ -593,7 +593,7 @@ def preflight_destination(
     check_destination_types(node, GLOBAL, where=f"{zone} year {year}")
 
 
-def plan_zone_inference(  # noqa: C901
+def plan_zone_inference(
     *,
     store_path: str,
     zone: str,

@@ -1639,7 +1639,7 @@ def write_day_windows(
     )
 
 
-def write_days_windows(  # noqa: C901
+def write_days_windows(
     store_path: str,
     days: "list[tuple[xr.Dataset, list[tuple[int, int, int, int]]]]",
     *,

@@ -787,7 +787,7 @@ class InferenceActor:
             )
 
     # jscpd:ignore-start: explicit keyword signature and Args, mirroring the public process_chunk it backs
-    def _process_chunk(  # noqa: C901
+    def _process_chunk(
         self,
         chunk: ChunkSpec,
         mosaic_base: str,
