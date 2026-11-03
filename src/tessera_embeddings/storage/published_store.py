@@ -38,7 +38,7 @@ if TYPE_CHECKING:
 COVERAGE_VAR = "scales"
 
 
-def layout_departures(group: zarr.Group, layout: StoreLayout = GLOBAL) -> list[str]:  # noqa: C901
+def layout_departures(group: zarr.Group, layout: StoreLayout = GLOBAL) -> list[str]:
     """Every way ``group`` departs from ``layout``, as one sentence each; empty means it conforms.
 
     An array the layout declares and the group lacks is a departure; the reverse is not, because
@@ -98,19 +98,26 @@ def layout_departures(group: zarr.Group, layout: StoreLayout = GLOBAL) -> list[s
         actual_shards = tuple(array.shards) if array.shards else None
         if actual_shards != shards:
             out.append(f"{var}: shards are {actual_shards}, the layout declares {shards}")
-        # Extents against the COORDINATE arrays, because the expectations above come from this
-        # array's own shape and cannot see it being short: truncating it by a whole shard keeps the
-        # nominal chunk and shard sizes and passes every check above.
-        for axis, dim in enumerate(expected.dims):
-            coord = present.get(dim)
-            if coord is None:
-                continue  # already reported above, from `missing_seeded_arrays`
-            if coord.ndim != 1:
-                # The name exists, so `missing_seeded_arrays` is happy, and a coordinate of the
-                # wrong rank still indexes nothing.
-                out.append(f"{var}: coordinate {dim} has {coord.ndim} dimensions, a coordinate must have one")
-            elif coord.shape[0] != array.shape[axis]:
-                out.append(f"{var}: dimension {dim} is {array.shape[axis]}, its coordinate array is {coord.shape[0]}")
+        out.extend(_extent_departures(var, array, tuple(expected.dims), present))
+    return out
+
+
+def _extent_departures(var: str, array: zarr.Array, dims: tuple[str, ...], present: dict[str, zarr.Array]) -> list[str]:
+    """Departures of ``array``'s extents from its coordinate arrays."""
+    out: list[str] = []
+    # Extents against the COORDINATE arrays, because layout_departures' other expectations come
+    # from this array's own shape and cannot see it being short: truncating it by a whole shard
+    # keeps the nominal chunk and shard sizes and passes every one of them.
+    for axis, dim in enumerate(dims):
+        coord = present.get(dim)
+        if coord is None:
+            continue  # reported by layout_departures, from `missing_seeded_arrays`
+        if coord.ndim != 1:
+            # The name exists, so `missing_seeded_arrays` is happy, and a coordinate of the
+            # wrong rank still indexes nothing.
+            out.append(f"{var}: coordinate {dim} has {coord.ndim} dimensions, a coordinate must have one")
+        elif coord.shape[0] != array.shape[axis]:
+            out.append(f"{var}: dimension {dim} is {array.shape[axis]}, its coordinate array is {coord.shape[0]}")
     return out
 
 

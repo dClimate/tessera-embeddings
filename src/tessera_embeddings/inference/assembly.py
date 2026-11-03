@@ -2342,7 +2342,62 @@ class ZarrWriter:
         _log.info("Assembly complete: %s", output_path)
         return output_path
 
-    def assemble_global(  # noqa: C901
+    def _probe_staged_tile(
+        self,
+        run_id: str,
+        label: str,
+        node: zarr.Group,
+        zone: str,
+        shard_px: int,
+        extent: tuple[int, int],
+    ) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
+        """Validate one staged tile against the zone: ``(variables to write, their dtypes)``.
+
+        Required vars, dtypes, the variable set, and the exact tile pitch (a truncated half-tile
+        must not pass). Every other tile is re-validated by ``StagedShardSource.load`` as it is
+        read.
+        """
+        probe_path = f"{self.staging_base}/{run_id}/{label}.zarr"
+        staged_group = zarr.open_group(probe_path, mode="r", storage_options=_staged_storage_options(probe_path))
+        missing = [v for v in REQUIRED_VARS if v not in staged_group]
+        if missing:
+            raise IncompleteStageError(
+                f"Staged tile {probe_path} is missing required variable(s) {missing} — refusing to "
+                "mark the year complete over a corrupt or partial staged run."
+            )
+        for var, want in (("embeddings", np.int8), ("scales", np.float32)):
+            got = cast(zarr.Array, staged_group[var]).dtype
+            if got != want:
+                raise IncompleteStageError(
+                    f"Staged tile {probe_path} has {var} dtype {got}, expected {np.dtype(want)} — "
+                    "a raw-zarr write would silently C-cast (wraparound); re-stage correctly."
+                )
+        staged_shape = tuple(cast(zarr.Array, staged_group["embeddings"]).shape[:2])
+        if staged_shape != tile_extent(parse_chunk_label(label), shard_px, extent):
+            raise ValueError(
+                f"Staged tiles are {staged_shape[0]} x {staged_shape[1]} px but {zone} shards are "
+                f"{shard_px} px — the global write path requires 1 inference tile == 1 shard (ADR-008 D3)."
+            )
+        variables = tuple(v for v in (*REQUIRED_VARS, *CARRIED_VARS) if v in staged_group and v in node)
+        # Check every staged variable's dtype against its DESTINATION array, not just the
+        # embeddings/scales asserted above: a raw-zarr shard write C-casts silently, so a
+        # uniformly int64/uint32 observation count — which agrees with the probe, so
+        # StagedShardSource's tile-vs-probe check passes — would be narrowed into a seeded
+        # uint16 without this guard.
+        for v in variables:
+            if v in REQUIRED_VARS:
+                continue
+            staged_dt = cast(zarr.Array, staged_group[v]).dtype
+            dest_dt = cast(zarr.Array, node[v]).dtype
+            if staged_dt != dest_dt:
+                raise IncompleteStageError(
+                    f"Staged tile {probe_path} has {v} dtype {staged_dt} but {zone}/{v} is seeded "
+                    f"{dest_dt} — a raw-zarr write would silently C-cast; re-stage at the seeded dtype."
+                )
+        probe_dtypes = tuple((v, str(cast(zarr.Array, staged_group[v]).dtype)) for v in variables)
+        return variables, probe_dtypes
+
+    def assemble_global(
         self,
         store_path: str,
         zone: str,
@@ -2523,47 +2578,7 @@ class ZarrWriter:
         dest_optional = tuple(v for v in CARRIED_VARS if v in node)
 
         if labels:
-            # One probe of a staged tile: required vars, dtypes, variable set, and exact tile
-            # pitch (a truncated half-tile must not pass). Every other tile is re-validated by
-            # StagedShardSource.load as it is read.
-            probe_path = f"{self.staging_base}/{run_id}/{labels[0]}.zarr"
-            staged_group = zarr.open_group(probe_path, mode="r", storage_options=_staged_storage_options(probe_path))
-            missing = [v for v in REQUIRED_VARS if v not in staged_group]
-            if missing:
-                raise IncompleteStageError(
-                    f"Staged tile {probe_path} is missing required variable(s) {missing} — refusing to "
-                    "mark the year complete over a corrupt or partial staged run."
-                )
-            for var, want in (("embeddings", np.int8), ("scales", np.float32)):
-                got = cast(zarr.Array, staged_group[var]).dtype
-                if got != want:
-                    raise IncompleteStageError(
-                        f"Staged tile {probe_path} has {var} dtype {got}, expected {np.dtype(want)} — "
-                        "a raw-zarr write would silently C-cast (wraparound); re-stage correctly."
-                    )
-            staged_shape = tuple(cast(zarr.Array, staged_group["embeddings"]).shape[:2])
-            if staged_shape != tile_extent(parse_chunk_label(labels[0]), shard_px, extent):
-                raise ValueError(
-                    f"Staged tiles are {staged_shape[0]} x {staged_shape[1]} px but {zone} shards are "
-                    f"{shard_px} px — the global write path requires 1 inference tile == 1 shard (ADR-008 D3)."
-                )
-            variables = tuple(v for v in (*REQUIRED_VARS, *CARRIED_VARS) if v in staged_group and v in node)
-            # Check every staged variable's dtype against its DESTINATION array, not just the
-            # embeddings/scales asserted above: a raw-zarr shard write C-casts silently, so a
-            # uniformly int64/uint32 observation count — which agrees with the probe, so
-            # StagedShardSource's tile-vs-probe check passes — would be narrowed into a seeded
-            # uint16 without this guard.
-            for v in variables:
-                if v in REQUIRED_VARS:
-                    continue
-                staged_dt = cast(zarr.Array, staged_group[v]).dtype
-                dest_dt = cast(zarr.Array, node[v]).dtype
-                if staged_dt != dest_dt:
-                    raise IncompleteStageError(
-                        f"Staged tile {probe_path} has {v} dtype {staged_dt} but {zone}/{v} is seeded "
-                        f"{dest_dt} — a raw-zarr write would silently C-cast; re-stage at the seeded dtype."
-                    )
-            probe_dtypes = tuple((v, str(cast(zarr.Array, staged_group[v]).dtype)) for v in variables)
+            variables, probe_dtypes = self._probe_staged_tile(run_id, labels[0], node, zone, shard_px, extent)
             stack: dict[str, str | None] | None = self.run_stack(run_id)
         else:
             # Nothing staged, so there is no tile to probe and the write is fill only. The
