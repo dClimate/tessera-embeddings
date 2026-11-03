@@ -14,7 +14,7 @@ from contextlib import nullcontext
 from dataclasses import asdict
 from typing import Any
 
-from dask.distributed import get_client
+from dask.distributed import get_client  # noqa: TID251 — task shells fetch the client from context
 from prefect import get_run_logger, task
 
 from tessera_embeddings.config.ingest import INGEST_MANIFEST_SPLIT

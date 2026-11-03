@@ -120,9 +120,6 @@ aws = [
 all = [
     "tessera_embeddings[inference,prefect,aws]",
 ]
-# Pure-stdlib package exposing the architecture-test runner so downstream
-# repos can enforce the same layer rules without pulling pytest.
-architecture-tests = []
 
 [dependency-groups]
 dev = [
@@ -134,6 +131,8 @@ dev = [
     "mypy",
     "moto[server]",
     "hypothesis",
+    # Enforces the architecture contracts in .importlinter (`uv run lint-imports`).
+    "import-linter",
     "vcrpy",
     "pytest-recording",
     # Empty-store tests build grids from explicit affine transforms. affine

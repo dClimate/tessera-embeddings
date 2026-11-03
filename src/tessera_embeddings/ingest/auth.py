@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 import requests
-from dask.distributed import WorkerPlugin, get_client
+from dask.distributed import WorkerPlugin, get_client  # noqa: TID251 — registers a worker plugin cluster-wide
 from odc.loader._rio import ThreadSession as _OdcThreadSession  # type: ignore[attr-defined]
 from odc.loader._rio import _local as _odc_thread_session  # type: ignore[attr-defined]
 from requests.adapters import HTTPAdapter

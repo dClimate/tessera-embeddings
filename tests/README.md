@@ -57,11 +57,11 @@ theme and mirroring would split it. **`orchestration/flows/` vs `runners/`** kee
 away from its runner's — `test_fill_zone_year_flow.py` and `test_zone_fill.py` are different
 subjects with confusingly similar names.
 
-**Ten things stay at `unit/` root** and nothing else should join them: `__init__.py` and
+**Nine things stay at `unit/` root** and nothing else should join them: `__init__.py` and
 `conftest.py`; the three shared helpers `zone_density.py`, `mosaic_stores.py` and
 `coverage_repo.py`, which other tests import by absolute path and which therefore must not move;
-and five tests with no single subject — `test_imports`, `test_public_api`,
-`test_architecture_rules`, `test_prefect_layer`, `test_properties`.
+and four tests with no single subject — `test_imports`, `test_public_api`,
+`test_prefect_layer`, `test_properties`.
 
 **Do not locate files by counting directories up from `__file__`.** Import `REPO_ROOT`, `SRC_ROOT`
 or `FIXTURES` from `tests/_paths.py`, which anchors on the directory holding `pyproject.toml` and

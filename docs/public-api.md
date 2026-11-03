@@ -95,9 +95,6 @@ rather than re-exported from the top-level package:
 - `tessera_embeddings.orchestration.prefect.tasks` — thin task shells.
 - `tessera_embeddings.orchestration.runners.plain` — orchestrator-free
   YAML-driven pipeline runner.
-- `tessera_embeddings.architecture_tests` — reusable architecture-rule
-  checker. Run via
-  `python -m tessera_embeddings.architecture_tests --source path/`.
 - `tessera_embeddings.profiling` — operator profiling harnesses for the
   ingest (Dask scheduler) and inference (Ray GPU) stages. Installed as
   console scripts: `te-watch-scheduler`, `te-ingest-log-queries`,
