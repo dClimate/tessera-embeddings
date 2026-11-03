@@ -592,8 +592,7 @@ class TestRetireIdle:
         pool = _make_pool(3, idle_grace_sec=1)
         for idx in range(3):
             pool._idle_since[idx] = time.monotonic() - 200
-        with patch.object(_sched_mod.ray, "kill"):
-            pool.retire_idle(outstanding_work=0, floor=1)
+        pool.retire_idle(outstanding_work=0, floor=1)
         assert pool.live_count == 1, f"the floor was not honoured: {pool.live_count} live"
 
     def test_without_a_floor_the_pool_empties(self) -> None:
@@ -601,8 +600,7 @@ class TestRetireIdle:
         pool = _make_pool(3, idle_grace_sec=1)
         for idx in range(3):
             pool._idle_since[idx] = time.monotonic() - 200
-        with patch.object(_sched_mod.ray, "kill"):
-            pool.retire_idle(outstanding_work=0)
+        pool.retire_idle(outstanding_work=0)
         assert pool.live_count == 0
 
     def test_outstanding_work_still_outranks_a_smaller_floor(self) -> None:
@@ -610,8 +608,7 @@ class TestRetireIdle:
         pool = _make_pool(4, idle_grace_sec=1)
         for idx in range(4):
             pool._idle_since[idx] = time.monotonic() - 200
-        with patch.object(_sched_mod.ray, "kill"):
-            pool.retire_idle(outstanding_work=3, floor=1)
+        pool.retire_idle(outstanding_work=3, floor=1)
         assert pool.live_count == 3
 
     def test_kill_exception_suppressed(self) -> None:
@@ -626,8 +623,7 @@ class TestRetireIdle:
         callback = MagicMock()
         pool = _make_pool(3, idle_grace_sec=1, on_retire=callback)
         pool._idle_since[0] = time.monotonic() - 200
-        with patch.object(_sched_mod.ray, "kill"):
-            pool.retire_idle(outstanding_work=1)
+        pool.retire_idle(outstanding_work=1)
         callback.assert_called_once_with("i-0000")
 
     def test_on_retire_skipped_for_placeholder_ids(self) -> None:
@@ -636,8 +632,7 @@ class TestRetireIdle:
         pool = _make_pool(2, idle_grace_sec=1, on_retire=callback)
         pool.actor_instance_ids[0] = "pending-init"
         pool._idle_since[0] = time.monotonic() - 200
-        with patch.object(_sched_mod.ray, "kill"):
-            pool.retire_idle(outstanding_work=0)
+        pool.retire_idle(outstanding_work=0)
         assert 0 in pool._retired
         callback.assert_not_called()
 
@@ -646,8 +641,7 @@ class TestRetireIdle:
         callback = MagicMock(side_effect=RuntimeError("EC2 API error"))
         pool = _make_pool(3, idle_grace_sec=1, on_retire=callback)
         pool._idle_since[0] = time.monotonic() - 200
-        with patch.object(_sched_mod.ray, "kill"):
-            pool.retire_idle(outstanding_work=1)
+        pool.retire_idle(outstanding_work=1)
         assert 0 in pool._retired
         callback.assert_called_once()
 
@@ -655,8 +649,7 @@ class TestRetireIdle:
         """No error when on_retire is None (default)."""
         pool = _make_pool(2, idle_grace_sec=1)
         pool._idle_since[0] = time.monotonic() - 200
-        with patch.object(_sched_mod.ray, "kill"):
-            pool.retire_idle(outstanding_work=0)
+        pool.retire_idle(outstanding_work=0)
         assert 0 in pool._retired
 
     def test_resolve_iid_called_before_kill(self) -> None:
@@ -722,8 +715,7 @@ class TestRetireIdle:
         pool._pending_iid_refs[1] = MagicMock()
         pool._initializing.add(1)
         pool._idle_since[0] = time.monotonic() - 200
-        with patch.object(_sched_mod.ray, "kill"):
-            pool.retire_idle(outstanding_work=0)
+        pool.retire_idle(outstanding_work=0)
         callback.assert_called_once_with("i-0000")
 
     def test_grace_period_always_applies(self) -> None:
@@ -847,16 +839,14 @@ class TestRetiringAPackedInstance:
         pool = _make_pool(3, idle_grace_sec=1, on_retire=callback)
         pool.actor_instance_ids = ["i-shared", "i-shared", "i-alone"]
         pool._idle_since[0] = time.monotonic() - 200
-        with patch.object(_sched_mod.ray, "kill"):
-            pool.retire_idle(outstanding_work=0, floor=2)
+        pool.retire_idle(outstanding_work=0, floor=2)
         # The control: slot 0 really was retired, and slot 1 really is still live on that
         # instance — so "not terminated" is the rule under test and not an untaken branch.
         assert pool._retired == {0}, f"the wind-down did not retire exactly one actor: {pool._retired}"
         callback.assert_not_called()
 
         pool._idle_since[1] = time.monotonic() - 200
-        with patch.object(_sched_mod.ray, "kill"):
-            pool.retire_idle(outstanding_work=0, floor=1)
+        pool.retire_idle(outstanding_work=0, floor=1)
         assert pool._retired == {0, 1}
         assert callback.call_args_list == [mock.call("i-shared")], (
             f"the last actor off the instance must release it: {callback.call_args_list}"
@@ -1142,8 +1132,7 @@ class TestFleetSizeAcrossDroughts:
         self._resolve_all(pool)
         for idx in range(len(pool.actors)):
             pool._idle_since[idx] = time.monotonic() - 200
-        with patch.object(_sched_mod.ray, "kill"):
-            pool.retire_idle(outstanding_work=0, floor=1)
+        pool.retire_idle(outstanding_work=0, floor=1)
         assert pool.live_count == 1, f"the wind-down did not reach the floor: {pool.live_count} live"
         regrown = [MagicMock() for _ in range(target - pool.live_count)]
         for a in regrown:
@@ -1178,8 +1167,7 @@ class TestFleetSizeAcrossDroughts:
         self._resolve_all(pool)
         for idx in range(len(pool.actors)):
             pool._idle_since[idx] = time.monotonic() - 200
-        with patch.object(_sched_mod.ray, "kill"):
-            pool.retire_idle(outstanding_work=0, floor=1)
+        pool.retire_idle(outstanding_work=0, floor=1)
         assert pool.live_count == 1  # control: the wind-down happened
         assert pool.max_actor_deaths == 40, "one death during a drought must not read as systemic"
         assert pool.systemic_stall_threshold == 4
@@ -2965,6 +2953,5 @@ class TestSessionScopedStateIsNotPerCell:
         for idx in range(4):
             pool._idle_since[idx] = time.monotonic() - 200
         pool._initializing.update({1, 2, 3})  # one ready actor, three still coming up
-        with patch.object(_sched_mod.ray, "kill"):
-            pool.retire_idle(outstanding_work=0, floor=1)
+        pool.retire_idle(outstanding_work=0, floor=1)
         assert pool.ready_count == 1, f"the only dispatchable actor was retired: {pool._retired}"
