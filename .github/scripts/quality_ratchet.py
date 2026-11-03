@@ -10,14 +10,16 @@ no calibration or suppression, and a change that reduces it always passes:
 - **Duplication, per file.** A file's duplicated lines (jscpd, ``.jscpd.json``) may not rise.
   Per file rather than per clone because jscpd identifies a clone by its exact extent, so a
   refactor that shrinks an existing clone would otherwise report it as new.
-- **Complexity, per function.** A function's McCabe complexity may not rise once it is over
-  ``MAX_COMPLEXITY``, and a function may not newly cross it.
+- **Per function: complexity, arguments and return statements** (ruff's ``C901``, ``PLR0913``,
+  ``PLR0911``). A function over a limit in ``LIMITS`` may not get worse on that measure, and no
+  function may newly cross one. Prefect ``@flow`` functions are exempt from the argument limit.
 
 Rationale: context_docs/decisions/040-new-code-is-gated-on-duplication-and-complexity.md.
 """
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import shutil
@@ -26,8 +28,6 @@ import sys
 import tempfile
 from collections import Counter
 from pathlib import Path
-
-MAX_COMPLEXITY = 15
 
 
 def clones(tree: Path, config: Path) -> list[dict]:
@@ -52,20 +52,51 @@ def duplicated_lines(found: list[dict]) -> Counter[str]:
     return lines
 
 
-def complexity(tree: Path) -> dict[tuple[str, str], int]:
-    """``{(file, function): score}`` for every function in ``tree/src`` and ``tests`` over the limit."""
+#: ``{metric: (ruff rule, setting, limit)}``. A function over a limit may not get worse.
+LIMITS = {
+    "complexity": ("C901", "lint.mccabe.max-complexity", 15),
+    "arguments": ("PLR0913", "lint.pylint.max-args", 8),
+    "return statements": ("PLR0911", "lint.pylint.max-returns", 6),
+}
+
+
+def _flow_lines(path: Path) -> set[int]:
+    """The ``def`` lines of the Prefect ``@flow`` functions in ``path``.
+
+    A flow's parameters are its interface, the one a deployment and the Prefect UI expose, so
+    flows are exempt from the argument limit. Nothing else about them is.
+    """
+    return {
+        node.lineno
+        for node in ast.walk(ast.parse(path.read_text()))
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and any(
+            (d.func if isinstance(d, ast.Call) else d).id == "flow"
+            for d in node.decorator_list
+            if isinstance(d.func if isinstance(d, ast.Call) else d, ast.Name)
+        )
+    }
+
+
+def function_scores(tree: Path, rule: str, setting: str, limit: int) -> dict[tuple[str, str], int]:
+    """``{(file, function): score}`` for every function in ``tree/src`` and ``tests`` over ``limit``."""
     result = subprocess.run(
-        ["ruff", "check", "--isolated", "--ignore-noqa", "--select", "C901", "--output-format", "json"]
-        + ["--config", f"lint.mccabe.max-complexity = {MAX_COMPLEXITY}", "src", "tests"],
+        ["ruff", "check", "--isolated", "--ignore-noqa", "--select", rule, "--output-format", "json"]
+        + ["--config", f"{setting} = {limit}", "src", "tests"],
         cwd=tree,
         capture_output=True,
         text=True,
     )
     scores: dict[tuple[str, str], int] = {}
     for finding in json.loads(result.stdout):
-        name, score = re.match(r"`(.+)` is too complex \((\d+) >", finding["message"]).groups()
-        key = (Path(finding["filename"]).relative_to(tree.resolve()).as_posix(), name)
-        scores[key] = max(scores.get(key, 0), int(score))
+        path, row, col = Path(finding["filename"]), finding["location"]["row"], finding["location"]["column"]
+        if rule == "PLR0913" and row in _flow_lines(path):
+            continue
+        # Ruff reports at the function's name, which only C901's message repeats.
+        name = re.match(r"\w+", path.read_text().splitlines()[row - 1][col - 1 :]).group()
+        score = int(re.search(r"\((\d+) >", finding["message"]).group(1))
+        key = (path.relative_to(tree.resolve()).as_posix(), name)
+        scores[key] = max(scores.get(key, 0), score)
     return scores
 
 
@@ -80,14 +111,15 @@ def main(base: Path, head: Path) -> int:
             if name in (c["firstFile"]["name"], c["secondFile"]["name"]):
                 a, b = c["firstFile"], c["secondFile"]
                 failures.append(f"    {c['lines']} lines: {a['name']}:{a['start']} ~ {b['name']}:{b['start']}")
-    old, new = complexity(base), complexity(head)
-    for (path, fn), score in sorted(new.items()):
-        was = old.get((path, fn))
-        if was is None:
-            failures.append(f"{path}: {fn} has complexity {score}, over {MAX_COMPLEXITY}")
-        elif score > was:
-            failures.append(f"{path}: {fn} grew from complexity {was} to {score}")
-    print("\n".join(failures) or "No file gained duplication and no function gained complexity.")
+    for metric, (rule, setting, limit) in LIMITS.items():
+        old, new = function_scores(base, rule, setting, limit), function_scores(head, rule, setting, limit)
+        for (path, fn), score in sorted(new.items()):
+            was = old.get((path, fn))
+            if was is None:
+                failures.append(f"{path}: {fn} has {score} {metric}, over {limit}")
+            elif score > was:
+                failures.append(f"{path}: {fn} grew from {was} to {score} {metric}")
+    print("\n".join(failures) or "No file gained duplication and no function got worse.")
     return 1 if failures else 0
 
 

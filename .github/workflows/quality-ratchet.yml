@@ -1,7 +1,7 @@
 name: Quality ratchet
 
-# Fails a pull request that raises any file's duplicated lines or any function's complexity
-# above the base it merges into. Measured against the base rather than a fixed limit, so existing
+# Fails a pull request that raises any file's duplicated lines, or any function's complexity,
+# argument count or return statements, above the base it merges into. Measured against the base rather than a fixed limit, so existing
 # debt needs no suppression and a change that reduces it always passes. Every PR, including one
 # stacked on another branch. Settings in .jscpd.json; rules in .github/scripts/quality_ratchet.py;
 # rationale in ADR 040.
