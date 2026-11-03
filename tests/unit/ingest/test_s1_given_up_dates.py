@@ -19,6 +19,7 @@ import logging
 import pytest
 
 from tessera_embeddings.errors import ProviderRefusedReadsError
+from tessera_embeddings.ingest import live_windows as live_windows_mod
 from tessera_embeddings.ingest import s1_roi
 from tessera_embeddings.storage.zarr_store import STORE_WRITE_ATTEMPTS, store_write_retrying
 
@@ -109,7 +110,9 @@ def _run(
         lambda _p, **_k: type("M", (), {"geobox": object(), "native_crs": "EPSG:32635", "bbox_wgs84": (0, 0, 1, 1)})(),
     )
     monkeypatch.setattr(
-        s1_roi, "live_windows_for_mask", lambda *a, **k: [type("W", (), {"y0": 0, "y1": 1, "x0": 0, "x1": 1})()]
+        live_windows_mod,
+        "live_windows_for_mask",
+        lambda *a, **k: [type("W", (), {"y0": 0, "y1": 1, "x0": 0, "x1": 1})()],
     )
     monkeypatch.setattr(s1_roi, "make_s1_item_provider", lambda *a, **k: lambda: [])
     monkeypatch.setattr(s1_roi.IngestManifest, "from_roi_store", classmethod(lambda _c, _p, **_k: object()))

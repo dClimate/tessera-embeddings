@@ -57,12 +57,7 @@ from tessera_embeddings.ingest.duplicates import (
     select_preferred_duplicates,
     step_down_copies,
 )
-from tessera_embeddings.ingest.live_windows import (
-    WINDOW_COST_IN_CHUNKS,
-    WINDOW_COST_IN_CHUNKS_OVERLAPPED,
-    live_windows_for_mask,
-    windows_for_date,
-)
+from tessera_embeddings.ingest.live_windows import run_live_windows, windows_for_date
 from tessera_embeddings.ingest.loader_failures import (
     collect_aborted_hrefs,
     implicated_items,
@@ -447,14 +442,9 @@ def ingest_s2_roi_reflectance(  # noqa: C901
     # a boundary is cheap and the DP should stop trading ocean area for fewer windows; sequential
     # writes still pay the serial cost. Bound once because per-date narrowing re-merges on the
     # same terms, and a second differing rate there would undo this for every narrowed date.
-    window_cost = WINDOW_COST_IN_CHUNKS_OVERLAPPED if overlap_window_writes else WINDOW_COST_IN_CHUNKS
-    run_windows = live_windows_for_mask(
-        roi_zarr_path,
-        window_px=INGEST_CHUNK_SIZE,
-        window_cost_in_chunks=window_cost,
-        storage_options=storage_options,
+    window_cost, run_windows, live_windows = run_live_windows(
+        roi_zarr_path, overlapped=overlap_window_writes, storage_options=storage_options
     )
-    live_windows: list[tuple[int, int, int, int]] = [(w.y0, w.y1, w.x0, w.x1) for w in run_windows]
     log.info("Writing %d live window(s)", len(run_windows))
 
     if batch_dates is None:

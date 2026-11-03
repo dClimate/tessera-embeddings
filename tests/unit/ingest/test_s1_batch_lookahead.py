@@ -28,6 +28,7 @@ import time
 
 import pytest
 
+from tessera_embeddings.ingest import live_windows as live_windows_mod
 from tessera_embeddings.ingest._pipeline import pipelined
 
 
@@ -170,7 +171,9 @@ def _run_ingest(monkeypatch, catalogue: list[str], existing: set[str], **kwargs)
         lambda _p, **_k: type("M", (), {"geobox": object(), "native_crs": "EPSG:32635", "bbox_wgs84": (0, 0, 1, 1)})(),
     )
     monkeypatch.setattr(
-        s1_roi, "live_windows_for_mask", lambda *a, **k: [type("W", (), {"y0": 0, "y1": 1, "x0": 0, "x1": 1})()]
+        live_windows_mod,
+        "live_windows_for_mask",
+        lambda *a, **k: [type("W", (), {"y0": 0, "y1": 1, "x0": 0, "x1": 1})()],
     )
     monkeypatch.setattr(s1_roi, "make_s1_item_provider", lambda *a, **k: lambda: [])
     # Reads the ROI store for provenance; irrelevant here and the only other S3 caller.
@@ -303,7 +306,7 @@ def _run_with_footprints(
     monkeypatch.setattr(s1_roi, "get_existing_dates", lambda _s, **_kw: set())
     monkeypatch.setattr(s1_roi, "apply_roi_mask", lambda data, *a, **k: data)
     monkeypatch.setattr(s1_roi, "read_roi_mask", lambda *a, **k: object())
-    monkeypatch.setattr(s1_roi, "live_windows_for_mask", fake_live_windows_for_mask)
+    monkeypatch.setattr(live_windows_mod, "live_windows_for_mask", fake_live_windows_for_mask)
     monkeypatch.setattr(s1_roi, "solar_grouping_longitude", lambda _roi: 0.0)
     monkeypatch.setattr(
         s1_roi,
@@ -496,7 +499,7 @@ def test_an_all_ocean_roi_banks_no_empty_dates(monkeypatch) -> None:
         "read_roi_metadata",
         lambda *a, **k: SimpleNamespace(bbox_wgs84=(0.0, 0.0, 1.0, 1.0), geobox=object(), crs="EPSG:32615"),
     )
-    monkeypatch.setattr(s1_roi, "live_windows_for_mask", lambda *a, **k: [])  # all ocean
+    monkeypatch.setattr(live_windows_mod, "live_windows_for_mask", lambda *a, **k: [])  # all ocean
     monkeypatch.setattr(s1_roi, "solar_grouping_longitude", lambda *a, **k: 0.0)
     monkeypatch.setattr(s1_roi, "make_s1_item_provider", lambda *a, **k: lambda: [])
     monkeypatch.setattr(s1_roi.IngestManifest, "from_roi_store", classmethod(lambda _cls, _p, **_k: object()))

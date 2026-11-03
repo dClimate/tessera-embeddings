@@ -27,6 +27,7 @@ import pytest
 import xarray as xr
 
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
+from tessera_embeddings.ingest import live_windows as live_windows_mod
 from tessera_embeddings.ingest import s2_roi
 from tessera_embeddings.ingest.stac import HeterogeneousProducerError
 from tessera_embeddings.storage.zarr_store import store_write_retrying
@@ -185,7 +186,7 @@ def run_ingest(monkeypatch):
     # assert on the arguments they receive does so in its own body, which runs after the
     # fixture and before the helper, so setting them here lets that override win.
     whole_roi = SimpleNamespace(y0=0, y1=SIZE, x0=0, x1=SIZE)
-    monkeypatch.setattr(s2_roi, "live_windows_for_mask", lambda *_a, **_k: [whole_roi])
+    monkeypatch.setattr(live_windows_mod, "live_windows_for_mask", lambda *_a, **_k: [whole_roi])
     monkeypatch.setattr(s2_roi, "windows_for_date", lambda run_windows, *_a, **_k: run_windows)
 
     runs: list[_Run] = []
@@ -433,7 +434,7 @@ def test_per_date_narrowing_is_priced_like_the_run(run_ingest, monkeypatch, over
         seen["date"] = window_cost_in_chunks
         return run_windows
 
-    monkeypatch.setattr(s2_roi, "live_windows_for_mask", fake_live_windows_for_mask)
+    monkeypatch.setattr(live_windows_mod, "live_windows_for_mask", fake_live_windows_for_mask)
     monkeypatch.setattr(s2_roi, "windows_for_date", fake_windows_for_date)
     monkeypatch.setattr(s2_roi, "write_day_windows", lambda *_a, **_k: None)
     monkeypatch.setattr(s2_roi, "write_days_windows", lambda *_a, **_k: None)
@@ -443,7 +444,9 @@ def test_per_date_narrowing_is_priced_like_the_run(run_ingest, monkeypatch, over
         pipeline_dates=False,
         overlap_window_writes=overlapped,
     )
-    expected = s2_roi.WINDOW_COST_IN_CHUNKS_OVERLAPPED if overlapped else s2_roi.WINDOW_COST_IN_CHUNKS
+    expected = (
+        live_windows_mod.WINDOW_COST_IN_CHUNKS_OVERLAPPED if overlapped else live_windows_mod.WINDOW_COST_IN_CHUNKS
+    )
     assert seen == {"run": expected, "date": expected}
 
 

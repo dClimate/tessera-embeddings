@@ -2793,10 +2793,21 @@ def read_skip_records(
             # aborts the whole assembly on one bad object. Provenance is fail-soft by design.
             return label, None, True
 
+    return _gather_records(labels, one, workers)
+
+
+def _gather_records(
+    labels: list[str], read: Callable[[str], tuple[str, Any, bool]], workers: int
+) -> tuple[dict[str, dict], int]:
+    """Run ``read`` over ``labels`` concurrently: ``({label: record}, n_unreadable)``.
+
+    ``read`` returns ``(label, record, unreadable)``. A record that is not a dict is dropped
+    as absent, so a marker holding valid JSON of the wrong shape does not abort the read.
+    """
     out: dict[str, dict] = {}
     unreadable = 0
     with ThreadPoolExecutor(max_workers=min(workers, len(labels))) as pool:
-        for label, record, bad in pool.map(one, labels):
+        for label, record, bad in pool.map(read, labels):
             if bad:
                 unreadable += 1
             elif isinstance(record, dict):
@@ -2837,15 +2848,7 @@ def read_staged_coverage(
         record = group.attrs.get("coverage")
         return label, (record if isinstance(record, dict) else None), False
 
-    out: dict[str, dict] = {}
-    unreadable = 0
-    with ThreadPoolExecutor(max_workers=min(workers, len(labels))) as pool:
-        for label, record, bad in pool.map(one, labels):
-            if bad:
-                unreadable += 1
-            elif record is not None:
-                out[label] = record
-    return out, unreadable
+    return _gather_records(labels, one, workers)
 
 
 def summarise_optical_skips(
