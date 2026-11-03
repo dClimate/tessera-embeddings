@@ -355,11 +355,6 @@ def _schema_ok(ref: xr.Dataset, test: xr.Dataset, ref_vars: set[str], test_vars:
         for tag, ds in (("ref", ref), ("test", test))
         if str(ds[v].dtype) != EXPECTED_DTYPES[v]
     ]
-    if dtype_problems:
-        print("\nVERDICT: INVALID coarsened store — required variable(s) have unexpected dtype:")
-        for p in dtype_problems:
-            print(f"  - {p}")
-        return False
 
     # Same for the dims layout: a wrong-but-agreeing axis order passes the dtype and
     # agreement checks yet breaks the slab reader. A leading `time` axis is allowed.
@@ -369,13 +364,12 @@ def _schema_ok(ref: xr.Dataset, test: xr.Dataset, ref_vars: set[str], test_vars:
         for tag, ds in (("ref", ref), ("test", test))
         if tuple(d for d in ds[v].dims if d != "time") != EXPECTED_DIMS[v]
     ]
-    if dim_problems:
-        print("\nVERDICT: INVALID coarsened store — required variable(s) have unexpected dims:")
-        for p in dim_problems:
-            print(f"  - {p}")
-        return False
-
-    return True
+    for what, problems in (("dtype", dtype_problems), ("dims", dim_problems)):
+        if problems:
+            print(f"\nVERDICT: INVALID coarsened store — required variable(s) have unexpected {what}:")
+            for p in problems:
+                print(f"  - {p}")
+    return not (dtype_problems or dim_problems)
 
 
 def main(argv: list[str] | None = None) -> int:

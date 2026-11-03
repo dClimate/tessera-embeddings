@@ -682,15 +682,17 @@ def _assert_on_zone_grid(node: zarr.Group, zone: str, label: str, store_path: st
 def _live_tile_bitmap(
     land_mask_path: str,
     zone: str,
+    node: zarr.Group,
     *,
-    zone_crs: object,
-    ny: int,
-    nx: int,
-    shard_px: int,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None,
     s3_region: str | None,
 ) -> np.ndarray:
-    """The zone's ``tile_live_2048`` bitmap, after checking the coverage group matches the zone."""
+    """The zone's ``tile_live_2048`` bitmap, after checking the coverage group matches the seeded
+    zone group ``node``: its zone, CRS, pixel grid and tile grid.
+    """
+    emb = cast(zarr.Array, node["embeddings"])
+    _, ny, nx, _ = emb.shape
+    shard_px, zone_crs = shard_pitch(emb), node.attrs.get("crs")
     cov = open_store_as_zarr_group(land_mask_path, group=zone, get_credentials=get_credentials, region=s3_region)
     cov_zone = cov.attrs.get("zone")
     cov_crs = cov.attrs.get("crs")
@@ -872,8 +874,6 @@ def plan_zone_inference(
     # Beside the shard-pitch check above because it is the same kind of gate.
     check_destination_types(node, GLOBAL, where=f"{zone} year {year}")
 
-    zone_crs = node.attrs.get("crs")
-
     # Read the coverage mask BEFORE the mosaic: an all-ocean cell, whose ingest mosaic may
     # never have been created, must reach the empty-cell path below rather than fail on a
     # missing reflectance store. The land mask is this zone's coverage group in the mask repo
@@ -881,16 +881,7 @@ def plan_zone_inference(
     # validated by attrs because all 60 same-hemisphere zones share one grid shape, so a
     # wrong-zone mask would be read positionally and silently misclassify tiles, permanently
     # tagging the cell empty. Guarding zone + CRS + grid_shape closes that hole.
-    tile_live = _live_tile_bitmap(
-        land_mask_path,
-        zone,
-        zone_crs=zone_crs,
-        ny=ny,
-        nx=nx,
-        shard_px=shard_px,
-        get_credentials=get_credentials,
-        s3_region=s3_region,
-    )
+    tile_live = _live_tile_bitmap(land_mask_path, zone, node, get_credentials=get_credentials, s3_region=s3_region)
     tile_live = narrow_tile_live(tile_live, None if update is None else update.tiles)
 
     # 1 inference tile == 1 shard == 1 coverage tile (ADR-008 D3), so a chunk's (row, col) ARE
