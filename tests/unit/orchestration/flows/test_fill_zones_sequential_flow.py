@@ -102,16 +102,14 @@ def wired(monkeypatch):
     # Recorded so a test can assert the dispatch is genuinely made per cell.
     rec["validations"] = []
 
-    def fake_validation_dispatch(
-        deployment, *, zone, year, summary, paths, store_name, mask_name, s3_region, log, tag=None
-    ):
+    def fake_validation_dispatch(deployment, *, zone, year, summary, target, log, tag=None):
         rec["validations"].append(
             {
                 "deployment": deployment,
                 "zone": zone,
                 "year": year,
                 "summary": summary,
-                "paths": paths,
+                "target": target,
                 "tag": tag,
             }
         )
@@ -316,7 +314,7 @@ class TestPerCellValidation:
         (call,) = wired["validations"]
         assert call["deployment"] == "validate-zone-year/validate-zone-year-x"
         assert (call["zone"], call["year"]) == ("33N", 2025)
-        assert call["paths"] == _PATHS
+        assert call["target"].paths == _PATHS
 
     def test_the_cell_is_identified_by_the_handoff_not_the_summary(self, wired, monkeypatch):
         """A summary missing its coordinates must not raise inside the assembly thread."""
