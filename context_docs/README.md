@@ -49,7 +49,8 @@ context_docs/
 │   ├── 030-forward-pass-reorderings-ship-at-a-store-boundary.md
 │   ├── 032-v2-stores-name-their-axes-y-and-x.md
 │   ├── 034-an-acquisition-is-one-datastrip-of-one-pass.md
-│   └── 039-architecture-rules-run-on-import-linter-and-ruff.md
+│   ├── 039-architecture-rules-run-on-import-linter-and-ruff.md
+│   └── 040-new-code-is-gated-on-duplication-and-complexity.md
 │
 ├── campaign/                      THE GLOBAL CAMPAIGN — start here
 │   ├── campaign-plan.md                        <- START HERE. What runs, with what settings, in
