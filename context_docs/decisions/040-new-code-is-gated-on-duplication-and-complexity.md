@@ -57,7 +57,10 @@ pull request. Ruff's per-function `C901` can.
 **Gating jscpd's dead-code analysis.** With orchestration, providers, profiling and package
 `__init__` files declared as entry points (in `.jscpd.json`, so they count as live and their
 imports count as uses), it reports 30 findings, 15 at confidence 85 or above. Only one was
-dead code, `config/ingest.py::auto_batch_dates` and its threshold constant. Of the rest:
+dead code, `config/ingest.py::auto_batch_dates` and its threshold constant, now removed. Removing
+them moved both code identities (`config/ingest.py` is in both closures), accepted as a one-off:
+a run resumed across the change re-infers its staged tiles, and its mosaics need
+`allow_ingest_code_mismatch=true`. Of the rest:
 
 - used by `scripts/` operator tools: four `storage/registry_rebuild.py` exports;
 - used by yield-embeddings, which a scan of this repo cannot see: `daily_times`,
