@@ -56,7 +56,7 @@ def duplicated_lines(found: list[dict]) -> Counter[str]:
 LIMITS = {
     "complexity": ("C901", "lint.mccabe.max-complexity", 15),
     "arguments": ("PLR0913", "lint.pylint.max-args", 7),
-    "return statements": ("PLR0911", "lint.pylint.max-returns", 5),
+    "return statements": ("PLR0911", "lint.pylint.max-returns", 4),
 }
 
 
