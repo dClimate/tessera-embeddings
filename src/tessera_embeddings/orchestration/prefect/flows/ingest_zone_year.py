@@ -372,15 +372,14 @@ class _LegBudget:
         self,
         *,
         count_dates: Callable[[], int | None],
-        zone: str,
-        year: int,
-        label: str,
+        where: str,
         settings: IngestSettings,
         log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     ) -> None:
-        """``count_dates`` reads how many dates the leg's store has committed (``None`` if unreadable)."""
-        self._count = count_dates
-        self._zone, self._year, self._label, self._log = zone, year, label, log
+        """``count_dates`` reads how many dates the leg's store has committed (``None`` if unreadable);
+        ``where`` names the leg in log lines, e.g. ``"Zone 33N year 2025: s2"``.
+        """
+        self._count, self._where, self._log = count_dates, where, log
         self._extension_s = settings.leg_progress_extension_s
         self.budget_s = float(settings.max_leg_wall_clock_s)
         # Skipped entirely when the extension is off, so turning it off costs no reads.
@@ -434,13 +433,11 @@ class _LegBudget:
         before, self.committed = self.committed, grown
         self.budget_s += self._extension_s
         self._log.warning(
-            "Zone %s year %s: %s reached its wall-clock budget while still committing dates — "
+            "%s reached its wall-clock budget while still committing dates — "
             "its store now holds %d, up from %d — so the budget is extended by %d s to %.0f s "
             "and the attempt it was about to be refused goes ahead. A leg that stops committing "
             "stops earning this.",
-            self._zone,
-            self._year,
-            self._label,
+            self._where,
             grown,
             before,
             self._extension_s,
@@ -934,9 +931,7 @@ async def ingest_zone_year(
             count_dates=lambda: _committed_date_count(
                 store, log, get_credentials=iam_icechunk_credentials, s3_region=s3_region
             ),
-            zone=zone,
-            year=year,
-            label=label,
+            where=f"Zone {zone} year {year}: {label}",
             settings=ingest_settings,
             log=log,
         )

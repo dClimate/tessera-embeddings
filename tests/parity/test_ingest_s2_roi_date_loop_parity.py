@@ -93,17 +93,21 @@ def _ingest(
     store_path: Path,
     client: Client,
     monkeypatch: pytest.MonkeyPatch,
-    batch_dates: int = 1,
-    pipeline_dates: bool = False,
+    **mode,
 ):
-    """Run the real domain ingest over the toy dates, with only the band load stubbed."""
+    """Run the real domain ingest over the toy dates, with only the band load stubbed.
+
+    ``mode`` is the write mode under test (``batch_dates``, ``pipeline_dates``); without one the
+    run is plain per-date writing, the baseline every mode is compared against.
+    """
+    mode = {"batch_dates": 1, "pipeline_dates": False, **mode}
     monkeypatch.setattr(s2_roi, "query_stac_items", lambda **_kwargs: ([fake_stac_item(d) for d in DATES], {}))
     monkeypatch.setattr(
         s2_roi,
         "load_stac_items",
         lambda day_items, **_kwargs: _toy_day(day_items[0].datetime.strftime("%Y-%m-%d")),
     )
-    log = logging.getLogger(f"parity-s2-batch-{batch_dates}-pipeline-{pipeline_dates}")
+    log = logging.getLogger(f"parity-s2-batch-{mode['batch_dates']}-pipeline-{mode['pipeline_dates']}")
     log.setLevel(logging.INFO)
     return s2_roi.ingest_s2_roi_reflectance(
         roi_zarr_path=str(roi_zarr),
@@ -114,8 +118,7 @@ def _ingest(
         min_valid_coverage=50.0,
         log=log,
         stream_stac_monthly=False,
-        batch_dates=batch_dates,
-        pipeline_dates=pipeline_dates,
+        **mode,
     )
 
 

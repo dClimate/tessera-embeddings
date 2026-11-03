@@ -565,6 +565,7 @@ class _AssemblyRun:
     stack: dict[str, str | None] | None
     model_version: ModelVersion
     checkpoint_id: str
+    n_workers: int
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2054,7 +2055,6 @@ class ZarrWriter:
         clear_chunks: list[ChunkSpec],
         *,
         granularity: int,
-        n_workers: int,
         time_index: int,
     ) -> list[dict[str, Any]]:
         """One worker payload per row band holding work: the staged tiles to write, and the
@@ -2065,7 +2065,7 @@ class ZarrWriter:
         for c in live_chunks:
             for unit in range(c.y_start // granularity, -(-c.y_stop // granularity)):
                 unit_weights[unit] += 1
-        bands = _partition_bands(run.total_y, granularity, n_workers, weights=unit_weights)
+        bands = _partition_bands(run.total_y, granularity, run.n_workers, weights=unit_weights)
         payloads: list[dict[str, Any]] = []
         for band in bands:
             y0b, y1b = band
@@ -2313,6 +2313,7 @@ class ZarrWriter:
             stack=stack,
             model_version=model_version,
             checkpoint_id=checkpoint_id,
+            n_workers=n_workers,
         )
         time_index, overwrite = self._prepare_time_slot(root, session, fresh=fresh, layout=layout, run=run, _log=_log)
 
@@ -2325,9 +2326,7 @@ class ZarrWriter:
         # embeddings. Clearing the full non-live footprint (scalar fill, elided for already-empty
         # ocean chunks) makes the timestep exactly this run's ROI however the ROI changed.
         clear_chunks = [c for c in chunks if c.label not in {lc.label for lc in live_chunks}] if overwrite else []
-        payloads = self._band_payloads(
-            run, live_chunks, clear_chunks, granularity=granularity, n_workers=n_workers, time_index=time_index
-        )
+        payloads = self._band_payloads(run, live_chunks, clear_chunks, granularity=granularity, time_index=time_index)
         _log.info(
             "Filling %d band(s) (granularity %d px) across %d process(es)",
             len(payloads),
@@ -2430,8 +2429,6 @@ class ZarrWriter:
         label: str,
         node: zarr.Group,
         zone: str,
-        shard_px: int,
-        extent: tuple[int, int],
     ) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
         """Validate one staged tile against the zone: ``(variables to write, their dtypes)``.
 
@@ -2439,6 +2436,9 @@ class ZarrWriter:
         must not pass). Every other tile is re-validated by ``StagedShardSource.load`` as it is
         read.
         """
+        embeddings = cast(zarr.Array, node["embeddings"])
+        shard_px = shard_pitch(embeddings)
+        extent = cast("tuple[int, int]", tuple(embeddings.shape[1:3]))
         probe_path = f"{self.staging_base}/{run_id}/{label}.zarr"
         staged_group = zarr.open_group(probe_path, mode="r", storage_options=_staged_storage_options(probe_path))
         missing = [v for v in REQUIRED_VARS if v not in staged_group]
@@ -2660,7 +2660,7 @@ class ZarrWriter:
         dest_optional = tuple(v for v in CARRIED_VARS if v in node)
 
         if labels:
-            variables, probe_dtypes = self._probe_staged_tile(run_id, labels[0], node, zone, shard_px, extent)
+            variables, probe_dtypes = self._probe_staged_tile(run_id, labels[0], node, zone)
             stack: dict[str, str | None] | None = self.run_stack(run_id)
         else:
             # Nothing staged, so there is no tile to probe and the write is fill only. The

@@ -87,49 +87,53 @@ class _ChunkPrologue:
 logger = logging.getLogger(__name__)
 
 
-def _record_strip_coverage(
-    chunk_data: ChunkData,
-    mask_bundle: S2MaskBundle,
-    x_sub: slice | None,
-    strip: slice,
-    obs_buffers: dict[str, np.ndarray],
-    month_buffers: dict[str, np.ndarray],
-) -> None:
-    """Copy one strip's observation counts and month coverage into the chunk-wide buffers."""
-    # SAR month masks: the strip's own when the grid is uncropped, the full-width side channel when it
-    # is — the same choice the SAR obs counts make, so the saved provenance layers keep full extent
-    # even where the inferred grid is narrower. Either way the array is (month, strip rows, full
-    # width), so both assign through the same slice below.
-    sar_months = (
-        (chunk_data.s1_asc_month_covered, chunk_data.s1_desc_month_covered)
-        if x_sub is None
-        else (chunk_data.s1_asc_month_covered_full, chunk_data.s1_desc_month_covered_full)
-    )
-    if x_sub is None:
-        for var in OBS_COUNT_VARS:
-            arr = getattr(chunk_data, var)
-            if arr is not None:
-                obs_buffers[var][strip] = arr
-        if mask_bundle is not None:
-            # Sliced, not assigned whole: the bundle is a WHOLE-CHUNK array loaded once and shared by
-            # every strip, unlike the strip-shaped SAR arrays.
-            month_buffers["s2_month_covered"][:, strip, :] = mask_bundle.month_covered[:, strip, :]
-    else:
-        # Cropped grid: the saved obs layers keep full extent — S2 counts from the (full-width) mask
-        # bundle, SAR counts from the full-width side channel (SAR is read full-width regardless; see
-        # load_chunk).
-        obs_buffers["s2_obs_count"][strip] = mask_bundle.obs_count[strip, :]
-        month_buffers["s2_month_covered"][:, strip, :] = mask_bundle.month_covered[:, strip, :]
-        for var, full in (
-            ("s1_asc_obs_count", chunk_data.s1_asc_obs_count_full),
-            ("s1_desc_obs_count", chunk_data.s1_desc_obs_count_full),
-        ):
-            if full is not None:
-                obs_buffers[var][strip] = full
+@dataclass(frozen=True)
+class _ChunkCoverage:
+    """One chunk's observation-count and month-coverage buffers, filled strip by strip.
 
-    for var, arr in zip(("s1_asc_month_covered", "s1_desc_month_covered"), sar_months, strict=True):
-        if arr is not None:
-            month_buffers[var][:, strip, :] = arr
+    ``x_sub`` is the chunk's crop, if any: the saved layers keep full width either way.
+    """
+
+    obs: dict[str, np.ndarray]
+    month: dict[str, np.ndarray]
+    x_sub: slice | None
+
+    def record(self, chunk_data: ChunkData, mask_bundle: S2MaskBundle, strip: slice) -> None:
+        """Copy one strip's observation counts and month coverage into the buffers."""
+        # SAR month masks: the strip's own when the grid is uncropped, the full-width side channel when it
+        # is — the same choice the SAR obs counts make, so the saved provenance layers keep full extent
+        # even where the inferred grid is narrower. Either way the array is (month, strip rows, full
+        # width), so both assign through the same slice below.
+        sar_months = (
+            (chunk_data.s1_asc_month_covered, chunk_data.s1_desc_month_covered)
+            if self.x_sub is None
+            else (chunk_data.s1_asc_month_covered_full, chunk_data.s1_desc_month_covered_full)
+        )
+        if self.x_sub is None:
+            for var in OBS_COUNT_VARS:
+                arr = getattr(chunk_data, var)
+                if arr is not None:
+                    self.obs[var][strip] = arr
+            if mask_bundle is not None:
+                # Sliced, not assigned whole: the bundle is a WHOLE-CHUNK array loaded once and shared by
+                # every strip, unlike the strip-shaped SAR arrays.
+                self.month["s2_month_covered"][:, strip, :] = mask_bundle.month_covered[:, strip, :]
+        else:
+            # Cropped grid: the saved obs layers keep full extent — S2 counts from the (full-width) mask
+            # bundle, SAR counts from the full-width side channel (SAR is read full-width regardless; see
+            # load_chunk).
+            self.obs["s2_obs_count"][strip] = mask_bundle.obs_count[strip, :]
+            self.month["s2_month_covered"][:, strip, :] = mask_bundle.month_covered[:, strip, :]
+            for var, full in (
+                ("s1_asc_obs_count", chunk_data.s1_asc_obs_count_full),
+                ("s1_desc_obs_count", chunk_data.s1_desc_obs_count_full),
+            ):
+                if full is not None:
+                    self.obs[var][strip] = full
+
+        for var, arr in zip(("s1_asc_month_covered", "s1_desc_month_covered"), sar_months, strict=True):
+            if arr is not None:
+                self.month[var][:, strip, :] = arr
 
 
 def _tally_refusals(refused: dict[str, int], dataset: MosaicChunkInferenceDataset) -> None:
@@ -955,6 +959,7 @@ class InferenceActor:
             month_buffers: dict[str, np.ndarray] = {
                 var: np.zeros((MONTHS_IN_YEAR, chunk.height, chunk.width), dtype=bool) for var in MONTH_COVERED_VARS
             }
+            buffers = _ChunkCoverage(obs_buffers, month_buffers, x_sub)
 
             total_valid = 0
             # Refusals accumulate across STRIPS: one dataset is built per strip, so its counters describe a slice
@@ -1031,7 +1036,7 @@ class InferenceActor:
                     t_s1_asc = len(chunk_data.s1_asc_doys)
                     t_s1_desc = len(chunk_data.s1_desc_doys)
 
-                    _record_strip_coverage(chunk_data, mask_bundle, x_sub, strip, obs_buffers, month_buffers)
+                    buffers.record(chunk_data, mask_bundle, strip)
 
                     if len(dataset) == 0:
                         # Empty strip: leave its output rows at the initialised zero embeddings / NaN scale, mirroring

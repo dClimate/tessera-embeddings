@@ -326,25 +326,26 @@ def _row_slabs(height: int, sample_rows: int | None) -> list[tuple[slice, list[i
 
 def _schema_ok(ref: xr.Dataset, test: xr.Dataset, ref_vars: set[str], test_vars: set[str]) -> bool:
     """Whether both stores carry the same, valid coarsened schema; prints the verdict when not."""
-    if ref_vars != test_vars:
-        print(
-            f"\nVERDICT: NOT bit-identical — variable sets differ: "
-            f"only-ref={ref_vars - test_vars} only-test={test_vars - ref_vars}"
-        )
-        return False
-
     # Format contract: without it, two identically-malformed stores (both missing
     # `embeddings`, say) would vacuously "pass" on whatever variables remain in common.
     missing = [v for v in REQUIRED_VARS if v not in ref_vars]
-    if missing:
-        print(f"\nVERDICT: INVALID coarsened store(s) — required variable(s) absent from both: {missing}")
-        return False
     forbidden = [v for v in FORBIDDEN_VARS if v in ref_vars]
-    if forbidden:
-        print(
-            f"\nVERDICT: NOT a coarsened store — {forbidden} present (full-resolution int8 "
+    if ref_vars != test_vars:
+        verdict = (
+            f"NOT bit-identical — variable sets differ: "
+            f"only-ref={ref_vars - test_vars} only-test={test_vars - ref_vars}"
+        )
+    elif missing:
+        verdict = f"INVALID coarsened store(s) — required variable(s) absent from both: {missing}"
+    elif forbidden:
+        verdict = (
+            f"NOT a coarsened store — {forbidden} present (full-resolution int8 "
             "format; compare those runs with compare_outputs.py instead)."
         )
+    else:
+        verdict = None
+    if verdict:
+        print(f"\nVERDICT: {verdict}")
         return False
 
     # Pin dtypes in BOTH stores; compare_var_structure only checks the two AGREE, and two

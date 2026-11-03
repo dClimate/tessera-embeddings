@@ -32,25 +32,27 @@ scans `src/` and `tests/` for three kinds of clone:
 
 On failure the job names each file whose duplication rose and the clones touching it.
 
-**Per function: complexity, arguments and return statements may not get worse** (ruff's `C901`,
-`PLR0913` and `PLR0911` scores, read by the script). A function over a limit may not grow on that
-measure, and none may newly cross one. Existing debt carries no suppression comment, and a
-function brought under a limit simply leaves the comparison.
+**Per function** (ruff's `C901`, `PLR0913` and `PLR0911` scores, read by the script). Existing
+debt carries no suppression comment.
 
-| Measure | Limit | Over it when the ratchet landed | What it signals |
-|---|---|---|---|
-| McCabe complexity | 15 | 19 | a function too branchy to review |
-| Arguments | 7 | about 80 in `src/`, 14 in `tests/` (Prefect flows included) | a missing abstraction, or a function doing too much |
-| Return statements | 4 | 25 | tangled control flow |
+| Measure | Limit | Binds | Over it on `main` when set | What it signals |
+|---|---|---|---|---|
+| McCabe complexity | 15 | every function: none may newly cross it, none over it may grow | 19 | a function too branchy to review |
+| Arguments | 5 | new functions only | 191 (124 in `src/`) | a missing abstraction, or a function doing too much |
+| Return statements | 3 | new functions only | 58 (42 in `src/`) | tangled control flow |
 
-Ruff's argument default of 5 would flag 142 functions in this keyword-heavy codebase; 7 keeps
-the signal on the outliers. Returns are held at 4 deliberately strictly: most of the 25 functions over it
-are guard clauses, one early return per disqualifying case, and the ratchet holds them rather
-than requiring a rewrite. New code that needs more exits than that should combine its guards or
-split the function, not nest the branches. **Prefect `@flow` functions are exempt from the argument limit**: a
-flow's parameters are its interface, the one deployments and the Prefect UI expose. Everything
-else in a flow module, its closures and helpers included, is held to it, and so are flows on
-the other two measures.
+**Arguments and returns bind new functions only**: a function whose qualified name is not in
+the base, so a renamed or moved one counts as new. Existing functions are left alone on these
+two measures, whatever their counts, until a deliberate clean-up. Holding them at 7 and 4 was
+measured first: 88 functions over 7 arguments and 27 over 4 returns across the repository,
+thirty of them five or more arguments over, and those are the pipeline's entry points
+(`assemble`, `ingest_tile`, `run_inference` and the like). Bringing them in is a refactor of
+configuration objects across ingest, inference and assembly, not a clean-up, so it is deferred.
+
+A new function that needs more than three exits should combine its guards or split, not nest
+branches. **Prefect `@flow` functions are exempt from the argument limit**: a flow's
+parameters are its interface, the one deployments and the Prefect UI expose. Everything else in
+a flow module, its closures and helpers included, is held to it.
 
 Ten of the 19 functions over 15 when the ratchet landed were split under it, each by extracting
 a self-contained block. The nine left are the campaign and ingest orchestration functions
