@@ -29,5 +29,5 @@ jobs:
         run: uv run ruff check src/ tests/
       - name: ruff format check
         run: uv run ruff format --check src/ tests/
-      - name: mypy
-        run: uv run mypy src/tessera_embeddings/
+      - name: ty
+        run: uv run ty check src
