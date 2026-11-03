@@ -8,13 +8,18 @@ name: Quality ratchet
 
 on:
   pull_request:
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+    # `edited` so a PR retargeted onto a new base (a stacked PR whose parent merged) is
+    # measured against it; the job skips every other kind of edit.
+    types: [opened, synchronize, reopened, edited]
 
 jobs:
   ratchet:
+    if: github.event.action != 'edited' || github.event.changes.base != null
+    # On the job, not the workflow: a skipped run (a title or description edit) must not cancel
+    # the run measuring the latest push.
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
