@@ -37,14 +37,16 @@ On failure the job names each file whose duplication rose and the clones touchin
 measure, and none may newly cross one. Existing debt carries no suppression comment, and a
 function brought under a limit simply leaves the comparison.
 
-| Measure | Limit | Over it on `main` | What it signals |
+| Measure | Limit | Over it when the ratchet landed | What it signals |
 |---|---|---|---|
 | McCabe complexity | 15 | 19 | a function too branchy to review |
-| Arguments | 8 | 65 in `src/`, 4 in `tests/` | a missing abstraction, or a function doing too much |
-| Return statements | 6 | 4 | tangled control flow |
+| Arguments | 7 | about 80 in `src/`, 14 in `tests/` (Prefect flows included) | a missing abstraction, or a function doing too much |
+| Return statements | 5 | 11 | tangled control flow |
 
-Ruff's argument default of 5 would flag 142 functions in this keyword-heavy codebase; 8 keeps
-the signal on the outliers. **Prefect `@flow` functions are exempt from the argument limit**: a
+Ruff's argument default of 5 would flag 142 functions in this keyword-heavy codebase; 7 keeps
+the signal on the outliers. Four returns was tried and rejected: 25 functions exceed it, most of
+them written as guard clauses (one early return per disqualifying case), the readable style a
+limit that low would push toward nested branches. **Prefect `@flow` functions are exempt from the argument limit**: a
 flow's parameters are its interface, the one deployments and the Prefect UI expose. Everything
 else in a flow module, its closures and helpers included, is held to it, and so are flows on
 the other two measures.

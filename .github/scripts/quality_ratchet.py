@@ -55,27 +55,33 @@ def duplicated_lines(found: list[dict]) -> Counter[str]:
 #: ``{metric: (ruff rule, setting, limit)}``. A function over a limit may not get worse.
 LIMITS = {
     "complexity": ("C901", "lint.mccabe.max-complexity", 15),
-    "arguments": ("PLR0913", "lint.pylint.max-args", 8),
-    "return statements": ("PLR0911", "lint.pylint.max-returns", 6),
+    "arguments": ("PLR0913", "lint.pylint.max-args", 7),
+    "return statements": ("PLR0911", "lint.pylint.max-returns", 5),
 }
 
 
-def _flow_lines(path: Path) -> set[int]:
-    """The ``def`` lines of the Prefect ``@flow`` functions in ``path``.
+def _functions(path: Path) -> dict[int, tuple[str, bool]]:
+    """``{def line: (qualified name, is a Prefect @flow)}`` for every function in ``path``.
 
-    A flow's parameters are its interface, the one a deployment and the Prefect UI expose, so
-    flows are exempt from the argument limit. Nothing else about them is.
+    Qualified (``ActorPool.__init__``, ``ingest_zone_year._run_leg``) so two same-named functions
+    in one file are compared separately. A flow's parameters are its interface, the one a
+    deployment and the Prefect UI expose, so flows are exempt from the argument limit.
     """
-    return {
-        node.lineno
-        for node in ast.walk(ast.parse(path.read_text()))
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and any(
-            (d.func if isinstance(d, ast.Call) else d).id == "flow"
-            for d in node.decorator_list
-            if isinstance(d.func if isinstance(d, ast.Call) else d, ast.Name)
-        )
-    }
+    found: dict[int, tuple[str, bool]] = {}
+
+    def visit(node: ast.AST, prefix: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                name = f"{prefix}{child.name}"
+                if not isinstance(child, ast.ClassDef):
+                    decorators = [d.func if isinstance(d, ast.Call) else d for d in child.decorator_list]
+                    found[child.lineno] = (name, any(isinstance(d, ast.Name) and d.id == "flow" for d in decorators))
+                visit(child, f"{name}.")
+            else:
+                visit(child, prefix)
+
+    visit(ast.parse(path.read_text()), "")
+    return found
 
 
 def function_scores(tree: Path, rule: str, setting: str, limit: int) -> dict[tuple[str, str], int]:
@@ -89,11 +95,11 @@ def function_scores(tree: Path, rule: str, setting: str, limit: int) -> dict[tup
     )
     scores: dict[tuple[str, str], int] = {}
     for finding in json.loads(result.stdout):
-        path, row, col = Path(finding["filename"]), finding["location"]["row"], finding["location"]["column"]
-        if rule == "PLR0913" and row in _flow_lines(path):
+        path = Path(finding["filename"])
+        # Ruff reports on the function's def line, which is where ast places it.
+        name, is_flow = _functions(path)[finding["location"]["row"]]
+        if rule == "PLR0913" and is_flow:
             continue
-        # Ruff reports at the function's name, which only C901's message repeats.
-        name = re.match(r"\w+", path.read_text().splitlines()[row - 1][col - 1 :]).group()
         score = int(re.search(r"\((\d+) >", finding["message"]).group(1))
         key = (path.relative_to(tree.resolve()).as_posix(), name)
         scores[key] = max(scores.get(key, 0), score)
