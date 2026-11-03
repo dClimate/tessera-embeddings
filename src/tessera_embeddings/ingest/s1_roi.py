@@ -249,7 +249,7 @@ def _baselines_for(baselines: dict[str, int], dates: Iterable[str]) -> dict[str,
     return {k: v for k, v in baselines.items() if k[:10] in wanted}
 
 
-def ingest_s1_roi_sar(
+def ingest_s1_roi_sar(  # noqa: C901
     *,
     roi_zarr_path: str,
     start_date: str,

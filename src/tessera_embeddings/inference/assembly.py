@@ -1914,7 +1914,7 @@ class ZarrWriter:
             coords["month"] = np.asarray(MONTH_COORD, dtype="int16")
         _write_coord_arrays(root, coords)
 
-    def assemble(
+    def assemble(  # noqa: C901
         self,
         chunks: list[ChunkSpec],
         total_y: int,
@@ -2338,7 +2338,7 @@ class ZarrWriter:
         _log.info("Assembly complete: %s", output_path)
         return output_path
 
-    def assemble_global(
+    def assemble_global(  # noqa: C901
         self,
         store_path: str,
         zone: str,

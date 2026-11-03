@@ -388,7 +388,7 @@ def drain_trailing_assemblies(
         pending = [f for f in pending if not f.done()]
 
 
-def fill_zones_sequential(
+def fill_zones_sequential(  # noqa: C901
     *,
     cells: list[SequentialCell],
     prepare: Callable[[SequentialCell], PreparedCell],
@@ -914,7 +914,7 @@ def fill_zones_sequential(
             undecided += 1
             return snapshot[picked]
 
-    def _feed() -> None:
+    def _feed() -> None:  # noqa: C901
         """Drain the work queue: inputs → prepare → plan → scan → enqueue, readiest first.
 
         Ends only when the queue is empty AND no taken cell is still undecided — see

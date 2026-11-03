@@ -786,7 +786,7 @@ class InferenceActor:
                 chunk, mosaic_base, staging_base, run_id, tracker, prefetch_hint, time_window, s1_orbit
             )
 
-    def _process_chunk(
+    def _process_chunk(  # noqa: C901
         self,
         chunk: ChunkSpec,
         mosaic_base: str,

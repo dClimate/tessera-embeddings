@@ -724,7 +724,7 @@ def log_dashboard_ssm_command(
 
 
 @contextlib.contextmanager
-def ecs_cluster(
+def ecs_cluster(  # noqa: C901
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     *,
     min_workers: int = 1,

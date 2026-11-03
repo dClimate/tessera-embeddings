@@ -569,7 +569,7 @@ def _resolve_ami_id(ami_ssm_name: str, region: str | None) -> str:
     on_cancellation=[_cancel_children_on_cancellation],
     on_crashed=[_cancel_children_on_cancellation],
 )
-async def run_global_campaign(
+async def run_global_campaign(  # noqa: C901
     *,
     paths: BucketPaths,
     ami_ssm_name: str,

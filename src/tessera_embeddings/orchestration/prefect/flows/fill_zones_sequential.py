@@ -681,7 +681,7 @@ _cancel_child_ingests_on_cancellation = make_child_cancel_hook(_INGEST_TAG_PREFI
     on_cancellation=[ray_cleanup_on_cancellation, _cancel_child_ingests_on_cancellation],
     on_crashed=[ray_cleanup_on_cancellation, _cancel_child_ingests_on_cancellation],
 )
-def fill_zones_sequential_flow(
+def fill_zones_sequential_flow(  # noqa: C901
     *,
     cells: list[tuple[str, int]] | None = None,
     paths: BucketPaths,

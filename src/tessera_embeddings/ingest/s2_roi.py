@@ -326,7 +326,7 @@ class _PreparedDate:
     """
 
 
-def ingest_s2_roi_reflectance(
+def ingest_s2_roi_reflectance(  # noqa: C901
     *,
     roi_zarr_path: str,
     start_date: str,
@@ -891,7 +891,7 @@ def ingest_s2_roi_reflectance(
             _covered_chunks(w for p in batch for w in p.windows),
         )
 
-    def _drive(items: list) -> None:
+    def _drive(items: list) -> None:  # noqa: C901
         """Sort one supply of items cloudiest-first, group by date, and ingest each.
 
         Normalises defensively on the way in: both suppliers already do it, but both are
