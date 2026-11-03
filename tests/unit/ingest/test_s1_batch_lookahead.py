@@ -473,7 +473,6 @@ def test_an_all_ocean_roi_banks_no_empty_dates(monkeypatch) -> None:
     monkeypatch.setattr(s1_roi, "ingest_tile", fake_ingest_tile)
     monkeypatch.setattr(s1_roi, "write_day_windows", lambda *a, **k: written.append("write"))
     monkeypatch.setattr(s1_roi, "get_existing_dates", lambda _store, **_kw: set())
-    monkeypatch.setattr(s1_roi, "read_roi_mask", lambda *a, **k: object())
     monkeypatch.setattr(
         s1_roi,
         "read_roi_metadata",
@@ -481,8 +480,6 @@ def test_an_all_ocean_roi_banks_no_empty_dates(monkeypatch) -> None:
     )
     monkeypatch.setattr(live_windows_mod, "live_windows_for_mask", lambda *a, **k: [])  # all ocean
     monkeypatch.setattr(s1_roi, "solar_grouping_longitude", lambda *a, **k: 0.0)
-    monkeypatch.setattr(s1_roi, "make_s1_item_provider", lambda *a, **k: lambda: [])
-    monkeypatch.setattr(s1_roi.IngestManifest, "from_roi_store", classmethod(lambda _cls, _p, **_k: object()))
 
     result = s1_roi.ingest_s1_roi_sar(
         roi_zarr_path="s3://bucket/ocean.zarr",
