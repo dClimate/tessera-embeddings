@@ -32,8 +32,22 @@ editing a line inside an existing clone does, which is deliberate, since that PR
 duplicated code.
 
 **Complexity: ruff `C901` at 15** (`ruff.toml`), McCabe complexity per function, run by the
-existing lint job. The 19 functions already over 15, mostly flow and runner entry points, carry
-`# noqa: C901`, so the gate binds new functions and functions newly pushed past the limit.
+existing lint job. Ten of the 19 functions over 15 when the gate landed were split under it,
+each by extracting a self-contained block. The nine left carry `# noqa: C901`: the campaign and
+ingest orchestration functions (`fill_zones_sequential`, `run_global_campaign`,
+`ingest_s2_roi_reflectance`, `_process_chunks_work_stealing`, `fill_zones_sequential_flow`,
+`ingest_zone_year`, `ingest_s1_roi_sar`) and two closures inside them (`_feed`, `_drive`). Their
+branches share state through `nonlocal` closures, so splitting one moves branches between
+closures of the same function; getting them under 15 means turning those closures into
+classes, a redesign of the paths the campaign depends on rather than a cleanup. Ruff's `RUF100`
+flags a `noqa: C901` that no longer suppresses anything, so the list cannot go stale.
+
+**Intended mirrors are marked, not refactored.** A block that must repeat another, such as a
+Prefect flow's parameter docs (Prefect shows each flow's own), an explicit keyword signature
+that forwards to another, or v2 model code that reproduces the v1.1 encoder as trained, is
+wrapped in `# jscpd:ignore-start: <reason>` and `# jscpd:ignore-end`. For a similar-function
+finding the markers must enclose the whole function. With logic duplicates extracted and
+mirrors marked, `src/` reports no clones.
 
 ## What was measured (2026-11-03, `main` at `cc0dec14`)
 
@@ -101,8 +115,9 @@ The other three (two URI one-liners and a six-line flow fragment) are incidental
 - An agent that copies code gets a failing check naming both locations, which points it at the
   call it should have made.
 - The grandfathered `# noqa: C901` list is a visible record of the functions most worth splitting.
-- A deliberate duplicate (a fixture, a golden reference) is excluded in `.jscpd.json`'s
-  `ignore`, which is reviewed like any other change.
+- A deliberate duplicate is marked at the site with its reason, or, for a whole directory such
+  as the vendored upstream fixtures, excluded in `.jscpd.json`'s `ignore`. Both are reviewed
+  like any other change.
 
 ## Related
 
