@@ -44,7 +44,10 @@ function brought under a limit simply leaves the comparison.
 | Return statements | 4 | 25 | tangled control flow |
 
 Ruff's argument default of 5 would flag 142 functions in this keyword-heavy codebase; 7 keeps
-the signal on the outliers. **Prefect `@flow` functions are exempt from the argument limit**: a
+the signal on the outliers. Returns are held at 4 deliberately strictly: most of the 25 functions over it
+are guard clauses, one early return per disqualifying case, and the ratchet holds them rather
+than requiring a rewrite. New code that needs more exits than that should combine its guards or
+split the function, not nest the branches. **Prefect `@flow` functions are exempt from the argument limit**: a
 flow's parameters are its interface, the one deployments and the Prefect UI expose. Everything
 else in a flow module, its closures and helpers included, is held to it, and so are flows on
 the other two measures.
