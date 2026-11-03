@@ -67,6 +67,15 @@ def _ray_calls_are_mocked():
         yield
 
 
+def _work_steal(**kwargs):
+    """``_process_chunks_work_stealing`` with the fixed test paths, run id and logger as defaults."""
+    kwargs.setdefault("mosaic_base", "m")
+    kwargs.setdefault("staging_base", "s")
+    kwargs.setdefault("run_id", "r")
+    kwargs.setdefault("log", logging.getLogger("test"))
+    return _process_chunks_work_stealing(**kwargs)
+
+
 def _make_pool(n: int = 3, **kwargs) -> ActorPool:
     actors = [MagicMock(name=f"actor_{i}") for i in range(n)]
     config = MagicMock()
@@ -1542,15 +1551,11 @@ class TestWorkStealingLoopCondition:
             )
             cls.options.return_value.remote.return_value = replacement_actor
 
-            results = _process_chunks_work_stealing(
+            results = _work_steal(
                 actors=[actor],
                 actor_instance_ids=["i-0000"],
                 chunks=[chunk],
-                mosaic_base="m",
-                staging_base="s",
-                run_id="r",
                 config=config,
-                log=logging.getLogger("test"),
                 max_chunk_retries=2,
             )
 
@@ -1624,15 +1629,11 @@ class TestWorkStealingGpuHours:
             patch.object(_sched_mod, "_CAPACITY_SAMPLE_INTERVAL_SEC", sample_interval),
             patch.object(_sched_mod, "_poll_tracker", side_effect=record_poll),
         ):
-            results = _process_chunks_work_stealing(
+            results = _work_steal(
                 actors=actors,  # type: ignore[arg-type]
                 actor_instance_ids=["i-0000"] + ["pending-init"] * n_unplaced,
                 chunks=[_fake_chunk(f"c{i}") for i in range(n_chunks)],
-                mosaic_base="m",
-                staging_base="s",
-                run_id="r",
                 config=config,
-                log=logging.getLogger("test"),
                 tracker=MagicMock(),
                 still_initializing=set(range(1, 1 + n_unplaced)),
             )
@@ -1795,15 +1796,11 @@ class TestWorkStealingReturnedFailure:
             patch.object(_sched_mod.time, "sleep"),
         ):
             cls.options.return_value.remote.return_value = replacement_actor
-            results = _process_chunks_work_stealing(
+            results = _work_steal(
                 actors=[actor],
                 actor_instance_ids=["i-0000"],
                 chunks=[chunk],
-                mosaic_base="m",
-                staging_base="s",
-                run_id="r",
                 config=config,
-                log=logging.getLogger("test"),
                 max_chunk_retries=2,
             )
 
@@ -1849,15 +1846,11 @@ class TestWorkStealingReturnedFailure:
             patch.object(_sched_mod.time, "sleep"),
         ):
             cls.options.return_value.remote.return_value = replacement
-            results = _process_chunks_work_stealing(
+            results = _work_steal(
                 actors=[actor],
                 actor_instance_ids=["i-0000"],
                 chunks=[chunk],
-                mosaic_base="m",
-                staging_base="s",
-                run_id="r",
                 config=config,
-                log=logging.getLogger("test"),
                 max_chunk_retries=2,
             )
 
@@ -1929,15 +1922,11 @@ class TestWorkStealingBatching:
             patch.object(_sched_mod.ray, "kill"),
             patch.object(_sched_mod.time, "sleep"),
         ):
-            results = _process_chunks_work_stealing(
+            results = _work_steal(
                 actors=[actor0],
                 actor_instance_ids=["i-0000"],
                 chunks=chunks,
-                mosaic_base="m",
-                staging_base="s",
-                run_id="r",
                 config=config,
-                log=logging.getLogger("test"),
                 actor_factory=factory,
                 total_actors_target=3,
                 placement_timeout_sec=300.0,
@@ -2012,15 +2001,11 @@ class TestWorkStealingBatching:
             patch.object(_sched_mod.ray, "kill"),
             patch.object(_sched_mod.time, "sleep"),
         ):
-            _process_chunks_work_stealing(
+            _work_steal(
                 actors=[_make_actor() for _ in range(created[0])],
                 actor_instance_ids=["i-0000"] * created[0],
                 chunks=[_fake_chunk(f"c{i}") for i in range(n_chunks)],
-                mosaic_base="m",
-                staging_base="s",
-                run_id="r",
                 config=config,
-                log=logging.getLogger("test"),
                 actor_factory=factory,
                 total_actors_target=target,
                 placement_timeout_sec=300.0,
@@ -2074,15 +2059,11 @@ class TestWorkStealingBatching:
             patch.object(_sched_mod.ray, "kill"),
             patch.object(_sched_mod.time, "sleep"),
         ):
-            results = _process_chunks_work_stealing(
+            results = _work_steal(
                 actors=[actor0],
                 actor_instance_ids=["i-0000"],
                 chunks=[_fake_chunk("c0")],
-                mosaic_base="m",
-                staging_base="s",
-                run_id="r",
                 config=config,
-                log=logging.getLogger("test"),
             )
         assert len(results) == 1
 
@@ -2110,15 +2091,11 @@ class TestDeferredWrites:
             replacement = MagicMock(name="replacement")
             replacement.get_instance_id.remote.return_value = MagicMock()
             cls.options.return_value.remote.return_value = replacement
-            return _process_chunks_work_stealing(
+            return _work_steal(
                 actors=[actor],
                 actor_instance_ids=["i-0000"],
                 chunks=chunks,
-                mosaic_base="m",
-                staging_base="s",
-                run_id="r",
                 config=config,
-                log=logging.getLogger("test"),
                 **kwargs,
             )
 
@@ -2272,15 +2249,11 @@ class TestDeferredWrites:
             patch.object(_sched_mod.time, "sleep"),
         ):
             cls.options.return_value.remote.return_value = replacement
-            results = _process_chunks_work_stealing(
+            results = _work_steal(
                 actors=[actor],
                 actor_instance_ids=["i-0000"],
                 chunks=chunks,
-                mosaic_base="m",
-                staging_base="s",
-                run_id="r",
                 config=config,
-                log=logging.getLogger("test"),
             )
 
         # Both chunks completed (on the replacement) despite the death, and c0
@@ -2326,15 +2299,11 @@ class TestDeferredWrites:
             patch.object(_sched_mod, "_poll_tracker", return_value=[chunk_uid("r", "c0")]),
             patch.object(_sched_mod.time, "sleep"),
         ):
-            results = _process_chunks_work_stealing(
+            results = _work_steal(
                 actors=[actor],
                 actor_instance_ids=["i-0000"],
                 chunks=chunks,
-                mosaic_base="m",
-                staging_base="s",
-                run_id="r",
                 config=config,
-                log=logging.getLogger("test"),
                 tracker=MagicMock(name="tracker"),
             )
 
@@ -2397,15 +2366,11 @@ class TestDeferredWrites:
             patch.object(_sched_mod.time, "sleep"),
         ):
             cls.options.return_value.remote.return_value = replacement
-            results = _process_chunks_work_stealing(
+            results = _work_steal(
                 actors=[actor],
                 actor_instance_ids=["i-0000"],
                 chunks=chunks,
-                mosaic_base="m",
-                staging_base="s",
-                run_id="r",
                 config=config,
-                log=logging.getLogger("test"),
             )
 
         # c0 completed (write-confirmed) on the replacement, not the wedged actor.
@@ -2451,15 +2416,11 @@ class TestRetireIdleGate:
             patch.object(_sched_mod.time, "sleep"),
             patch.object(_sched_mod.ActorPool, "retire_idle") as retire_mock,
         ):
-            results = _process_chunks_work_stealing(
+            results = _work_steal(
                 actors=[actor],
                 actor_instance_ids=["i-0000"],
                 chunks=[chunk],
-                mosaic_base="m",
-                staging_base="s",
-                run_id="r",
                 config=config,
-                log=logging.getLogger("test"),
                 retire_idle_actors=retire_idle_actors,
             )
         assert len(results) == 1 and results[0]["status"] == "ok"
@@ -2515,15 +2476,11 @@ class TestMidRunWindDownNeedsRegrowth:
             patch.object(_sched_mod.ActorPool, "retire_idle") as idle_mock,
             patch.object(_sched_mod.ActorPool, "retire_initializing") as init_mock,
         ):
-            results = _process_chunks_work_stealing(
+            results = _work_steal(
                 actors=[actor],
                 actor_instance_ids=["i-0000"],
                 chunks=[_fake_chunk("c0")],
-                mosaic_base="m",
-                staging_base="s",
-                run_id="r",
                 config=config,
-                log=logging.getLogger("test"),
                 more_work=lambda: next(polls),
                 actor_factory=lambda n: [],
                 total_actors_target=4,
@@ -2593,7 +2550,7 @@ class TestChainedWorkSource:
             patch.object(_sched_mod.time, "sleep"),
             patch.object(_sched_mod.ActorPool, "retire_idle") as retire_mock,
         ):
-            results = _process_chunks_work_stealing(
+            results = _work_steal(
                 actors=[actor],
                 actor_instance_ids=["i-0000"],
                 chunks=[item.chunk for item in zones[0]] if zones and not loop_kwargs.pop("wrap_first", True) else [],
@@ -2601,7 +2558,6 @@ class TestChainedWorkSource:
                 staging_base="s/zone-a",
                 run_id="run-zone-a",
                 config=config,
-                log=logging.getLogger("test"),
                 more_work=more_work,
                 **loop_kwargs,
             )
@@ -2667,15 +2623,11 @@ class TestChainedWorkSource:
             patch.object(_sched_mod.time, "sleep"),
             patch.object(_sched_mod.ActorPool, "retire_idle"),
         ):
-            _process_chunks_work_stealing(
+            _work_steal(
                 actors=[actor],
                 actor_instance_ids=["i-0000"],
                 chunks=[],
-                mosaic_base="m",
-                staging_base="s",
-                run_id="r",
                 config=config,
-                log=logging.getLogger("test"),
                 more_work=lambda: remaining.pop(0) if remaining else None,
             )
         assert 5 in timeouts  # boundary wait while the source was still active
@@ -2726,15 +2678,11 @@ class TestChainedWorkSource:
             patch.object(_sched_mod.time, "sleep"),
             patch.object(_sched_mod.ActorPool, "retire_idle", spy),
         ):
-            _process_chunks_work_stealing(
+            _work_steal(
                 actors=[actor],
                 actor_instance_ids=["i-0000"],
                 chunks=[],
-                mosaic_base="m",
-                staging_base="s",
-                run_id="r",
                 config=config,
-                log=logging.getLogger("test"),
                 more_work=more_work,
                 actor_factory=lambda n: [],
                 total_actors_target=1,
@@ -2780,15 +2728,11 @@ class TestChainedWorkSource:
             patch.object(_sched_mod.time, "sleep"),
             patch.object(_sched_mod.ActorPool, "retire_idle", real_retire),
         ):
-            _process_chunks_work_stealing(
+            _work_steal(
                 actors=actors,
                 actor_instance_ids=["i-0000"] * len(actors),
                 chunks=[],
-                mosaic_base="m",
-                staging_base="s",
-                run_id="r",
                 config=config,
-                log=logging.getLogger("test"),
                 more_work=more_work,
                 actor_factory=lambda n: [],
                 total_actors_target=4,
@@ -2836,15 +2780,11 @@ class TestChainedWorkSource:
             patch.object(_sched_mod, "_joined_gpu_count", lambda last, per: 0.0),
             patch.object(_sched_mod.ActorPool, "retire_idle", retire_everything),
         ):
-            _process_chunks_work_stealing(
+            _work_steal(
                 actors=actors,
                 actor_instance_ids=["i-0000"] * len(actors),
                 chunks=[],
-                mosaic_base="m",
-                staging_base="s",
-                run_id="r",
                 config=config,
-                log=logging.getLogger("test"),
                 more_work=more_work,
                 actor_factory=factory,
                 total_actors_target=60,
@@ -2869,15 +2809,11 @@ class TestChainedWorkSource:
             patch.object(_sched_mod.time, "sleep"),
             patch.object(_sched_mod.ActorPool, "retire_idle", retire_everything),
         ):
-            results = _process_chunks_work_stealing(
+            results = _work_steal(
                 actors=[actor],
                 actor_instance_ids=["i-0000"],
                 chunks=[_fake_chunk("c0")],
-                mosaic_base="m",
-                staging_base="s",
-                run_id="r",
                 config=config,
-                log=logging.getLogger("test"),
             )
         assert len(results) == 1
 
@@ -2925,15 +2861,11 @@ class TestChainedWorkSource:
             patch.object(_sched_mod.time, "sleep"),
         ):
             cls.options.return_value.remote.return_value = replacement
-            results = _process_chunks_work_stealing(
+            results = _work_steal(
                 actors=[actor],
                 actor_instance_ids=["i-0000"],
                 chunks=[],
-                mosaic_base="m",
-                staging_base="s",
-                run_id="r",
                 config=config,
-                log=logging.getLogger("test"),
                 more_work=lambda: remaining.pop(0) if remaining else None,
             )
         by_status = sorted((r["chunk"], r["status"]) for r in results)
@@ -3022,15 +2954,11 @@ class TestSessionScopedStateIsNotPerCell:
             patch.object(_sched_mod.time, "sleep"),
             patch.object(_sched_mod.ActorPool, "retire_idle", retire_most),
         ):
-            _process_chunks_work_stealing(
+            _work_steal(
                 actors=actors,
                 actor_instance_ids=["i-0000"] * len(actors),
                 chunks=[],
-                mosaic_base="m",
-                staging_base="s",
-                run_id="r",
                 config=config,
-                log=logging.getLogger("test"),
                 more_work=more_work,
                 fleet=fleet,
                 actor_factory=lambda n: [],
