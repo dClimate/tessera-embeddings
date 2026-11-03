@@ -44,11 +44,15 @@ def clones(tree: Path, config: Path) -> list[dict]:
 
 
 def duplicated_lines(found: list[dict]) -> Counter[str]:
-    """Duplicated lines per file, counting each side of each clone."""
+    """Duplicated lines per file, counting each side of each clone over its own span.
+
+    jscpd's ``lines`` is the FIRST side's span; a gap or similar-function clone's sides can
+    differ in length.
+    """
     lines: Counter[str] = Counter()
     for clone in found:
-        for side in ("firstFile", "secondFile"):
-            lines[clone[side]["name"]] += clone["lines"]
+        for side in (clone["firstFile"], clone["secondFile"]):
+            lines[side["name"]] += side["end"] - side["start"] + 1
     return lines
 
 
@@ -75,7 +79,12 @@ def _functions(path: Path) -> dict[int, tuple[str, bool]]:
                 name = f"{prefix}{child.name}"
                 if not isinstance(child, ast.ClassDef):
                     decorators = [d.func if isinstance(d, ast.Call) else d for d in child.decorator_list]
-                    found[child.lineno] = (name, any(isinstance(d, ast.Name) and d.id == "flow" for d in decorators))
+                    is_flow = any(
+                        (isinstance(d, ast.Name) and d.id == "flow")
+                        or (isinstance(d, ast.Attribute) and d.attr == "flow")
+                        for d in decorators
+                    )
+                    found[child.lineno] = (name, is_flow)
                 visit(child, f"{name}.")
             else:
                 visit(child, prefix)
