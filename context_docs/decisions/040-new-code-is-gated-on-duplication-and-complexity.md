@@ -32,8 +32,9 @@ scans `src/` and `tests/` for three kinds of clone:
 
 On failure the job names each file whose duplication rose and the clones touching it.
 
-**Per function: complexity, arguments and return statements may not get worse** (ruff's `C901`,
-`PLR0913` and `PLR0911` scores, read by the script). A function over a limit may not grow on that
+**Per function: complexity, arguments and return statements may not get worse** (ruff's `C901`
+and `PLR0911` scores, read by the script; arguments are counted by the script itself, because
+ruff's `PLR0913` skips methods decorated with `@override`). A function over a limit may not grow on that
 measure, and none may newly cross one. Existing debt carries no suppression comment, and a
 function brought under a limit simply leaves the comparison.
 
