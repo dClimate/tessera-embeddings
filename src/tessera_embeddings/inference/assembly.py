@@ -567,6 +567,7 @@ class _AssemblyRun:
     model_version: ModelVersion
     checkpoint_id: str
     n_workers: int
+    layout: StoreLayout
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1947,7 +1948,6 @@ class ZarrWriter:
         session: icechunk.Session,
         *,
         fresh: bool,
-        layout: StoreLayout,
         run: _AssemblyRun,
         _log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     ) -> tuple[int, bool]:
@@ -1959,10 +1959,10 @@ class ZarrWriter:
         """
         overwrite = False
         if fresh:
-            self._create_schema(root, layout, run.variables, run.total_y, run.total_x, run.time_date, run.spatial)
-            traced_commit(session, f"Run {run.run_id}: create schema ({layout.name})")
+            self._create_schema(root, run.layout, run.variables, run.total_y, run.total_x, run.time_date, run.spatial)
+            traced_commit(session, f"Run {run.run_id}: create schema ({run.layout.name})")
             time_index = 0
-            _log.info("Created %s with layout %s", run.output_path, layout.name)
+            _log.info("Created %s with layout %s", run.output_path, run.layout.name)
         else:
             if run.manifest:
                 run.manifest.validate_against(extract_manifest(root.attrs), run.output_path)
@@ -1990,7 +1990,7 @@ class ZarrWriter:
             missing = [v for v in run.variables if v not in root]
             if missing:
                 nt = cast(zarr.Array, root["time"]).shape[0]
-                y, x = layout.spatial_dims
+                y, x = run.layout.spatial_dims
                 sizes = {
                     "time": nt,
                     y: run.total_y,
@@ -1998,13 +1998,15 @@ class ZarrWriter:
                     "band": self.embedding_dim,
                     "month": MONTHS_IN_YEAR,
                 }
-                create_layout_arrays(root, _layout_matching_store(root, layout, missing), missing, sizes)
+                create_layout_arrays(root, _layout_matching_store(root, run.layout, missing), missing, sizes)
                 if any(var in missing for var in MONTH_COVERED_VARS) and "month" not in root:
                     # The axis this array introduces to a store that predates it; without the
                     # coordinate a reader gets a positional month axis and must know it is 0-based
                     # (see `_create_schema`).
                     _write_coord_arrays(root, {"month": np.asarray(MONTH_COORD, dtype="int16")})
-                _log.info("Created missing variable(s) %s in %s from layout %s", missing, run.output_path, layout.name)
+                _log.info(
+                    "Created missing variable(s) %s in %s from layout %s", missing, run.output_path, run.layout.name
+                )
             time_index_found = time_index_of(root, run.time_date)
             if time_index_found is not None:
                 time_index = time_index_found
@@ -2315,8 +2317,9 @@ class ZarrWriter:
             model_version=model_version,
             checkpoint_id=checkpoint_id,
             n_workers=n_workers,
+            layout=layout,
         )
-        time_index, overwrite = self._prepare_time_slot(root, session, fresh=fresh, layout=layout, run=run, _log=_log)
+        time_index, overwrite = self._prepare_time_slot(root, session, fresh=fresh, run=run, _log=_log)
 
         # --- Phase 2: banded parallel fill (fork/merge) -----------------------
         session = repo.writable_session(work_branch)
