@@ -23,7 +23,7 @@ def _read_zarr_block(zarr_arr: zarr.Array, region: tuple[slice, ...]) -> np.ndar
     """Read one chunk-block out of a raw zarr array. The unit of work per task."""
     # zarr v3 stubs type __getitem__ as a wide union; a basic-slice index always
     # returns an ndarray at runtime.
-    return zarr_arr[region]  # type: ignore[return-value]
+    return zarr_arr[region]  # ty: ignore[invalid-return-type]
 
 
 def _slab_array_from_zarr(
@@ -79,8 +79,9 @@ def _slab_array_from_zarr(
     for block_idx in itertools.product(*(range(len(axis_blocks)) for axis_blocks in dim_blocks)):
         region = tuple(dim_blocks[axis][block_idx[axis]][0] for axis in range(ndim))
         dsk[(name, *block_idx)] = (_read_zarr_block, zarr_arr, region)
-    hlg = HighLevelGraph.from_collections(name, dsk, dependencies=[])  # type: ignore[arg-type]
-    return da.Array(hlg, name, out_chunks, dtype=zarr_arr.dtype)
+    hlg = HighLevelGraph.from_collections(name, dsk, dependencies=[])  # ty: ignore[invalid-argument-type]
+    # dask builds Array in __new__, which ty does not model.
+    return da.Array(hlg, name, out_chunks, dtype=zarr_arr.dtype)  # ty: ignore[too-many-positional-arguments, unknown-argument]
 
 
 def _store_chunk_sizes(existing: xr.Dataset, dims: "tuple[str, ...]") -> dict[str, int]:
@@ -173,7 +174,7 @@ def _match_region_shapes(
     matched: dict[str, xr.DataArray] = {}
     for var in data.data_vars:
         name = str(var)
-        dims = existing[name].dims  # store dimension order is authoritative
+        dims = tuple(map(str, existing[name].dims))  # store dimension order is authoritative
         incoming = data[name].transpose(*dims)
         expected = tuple(
             (normalized[d].stop - normalized[d].start) if d in normalized else existing.sizes[d] for d in dims
@@ -259,7 +260,7 @@ def _pad_region_to_chunks(
     padded_vars: dict[str, Any] = {}
     for name, incoming in matched.data_vars.items():
         name = str(name)
-        dims = existing[name].dims  # store dimension order is authoritative
+        dims = tuple(map(str, existing[name].dims))  # store dimension order is authoritative
         # group[name] is a data-var array; zarr v3 stubs widen __getitem__ to
         # Array | Group, so narrow it for the slab builder.
         zarr_arr = cast("zarr.Array", group[name])
@@ -280,7 +281,7 @@ def _pad_region_to_chunks(
             else slice(None)
             for d in dims
         )
-        shell[idx] = incoming.data  # positional overlay; incoming wins
+        shell[idx] = incoming.data  # ty: ignore[invalid-assignment]  # dask stubs omit item assignment; positional overlay, incoming wins
         padded_vars[name] = (dims, shell)
 
     # Coords come from the lazy store view (authoritative). They are 1-D and dropped

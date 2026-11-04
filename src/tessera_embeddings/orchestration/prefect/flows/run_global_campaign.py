@@ -52,6 +52,7 @@ from typing import Any
 
 import icechunk
 import zarr
+import zarr.errors
 from prefect import flow, get_run_logger
 from prefect.client.orchestration import get_client
 from prefect.deployments import arun_deployment
@@ -568,7 +569,7 @@ def _resolve_ami_id(ami_ssm_name: str, region: str | None) -> str:
     name="run-global-campaign",
     on_cancellation=[_cancel_children_on_cancellation],
     on_crashed=[_cancel_children_on_cancellation],
-)
+)  # ty: ignore[no-matching-overload]  # Prefect's hook-list overloads reject a list of differently typed hooks
 async def run_global_campaign(
     *,
     paths: BucketPaths,

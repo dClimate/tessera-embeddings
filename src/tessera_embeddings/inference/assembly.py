@@ -46,6 +46,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, cast
 
 import fsspec
+import fsspec.utils
 import icechunk
 import numpy as np
 import xarray as xr
@@ -1494,7 +1495,7 @@ class ZarrWriter:
             group = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
         except Exception as exc:
             raise FileNotFoundError(f"Cannot open {path}: {exc}") from exc
-        arr: zarr.Array = group["embeddings"]  # type: ignore[assignment]
+        arr: zarr.Array = group["embeddings"]  # ty: ignore[invalid-assignment]
         h, w, _ = arr.shape
         return max(h, w)
 
@@ -1718,7 +1719,7 @@ class ZarrWriter:
         for var in required_vars:
             if var not in group:
                 return ("invalid", f"missing variable '{var}'")
-            arr: zarr.Array = group[var]  # type: ignore[assignment]
+            arr: zarr.Array = group[var]  # ty: ignore[invalid-assignment]
             # scales is a 2-D per-pixel factor (H, W); embeddings/embedding_std carry the band dim
             # (H, W, band). Checking scales against the 3-D shape false-rejects every valid tile.
             expected_shape = (
@@ -2292,7 +2293,7 @@ class ZarrWriter:
         if time_window:
             # Raw writes never clobber attrs, so prior windows are read straight off the store
             # and merged.
-            windows: dict[str, Any] = dict(node.attrs.get("time_windows", {}))  # type: ignore[arg-type]
+            windows: dict[str, Any] = dict(node.attrs.get("time_windows", {}))
             windows[time_window.window_end_label] = {
                 "range": [
                     f"{time_window.window_start[0]}-{time_window.window_start[1]:02d}",

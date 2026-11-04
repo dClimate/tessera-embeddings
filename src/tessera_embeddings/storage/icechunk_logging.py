@@ -15,7 +15,7 @@ import faulthandler
 import logging
 import os
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager, suppress
 from typing import Any
 
@@ -80,7 +80,7 @@ def set_base_logs_filter(directive: str | None) -> None:
 
 
 @contextmanager
-def _commit_alarm(what: str) -> Iterator[None]:
+def _commit_alarm(what: str) -> Generator[None]:
     """Shout, repeatedly, for as long as a commit has not returned — and dump the stacks.
 
     A stalled commit is silent by construction: our last line is printed before the call and the
@@ -161,7 +161,7 @@ def traced_commit(
 
 
 @contextmanager
-def commit_tracing() -> Iterator[None]:
+def commit_tracing() -> Generator[None]:
     """Raise icechunk's internal tracing for the duration of one commit.
 
     On 2026-08-29 seven of eleven assemblies reached this call and never returned — no exception,
