@@ -559,7 +559,7 @@ def ingest_s2_roi_reflectance(
         """The live windows a date's imagery reaches: pure geometry, no read."""
         return windows_for_date(
             run_windows,
-            [getattr(item, "bbox", None) for item in day_items],  # type: ignore[misc]
+            [getattr(item, "bbox", None) for item in day_items],  # ty: ignore[invalid-argument-type]
             roi.geobox,
             chunk_px=INGEST_CHUNK_SIZE,
             window_cost_in_chunks=window_cost,

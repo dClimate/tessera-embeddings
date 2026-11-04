@@ -317,8 +317,8 @@ def _ensure_gcs_client_for_request_resources(ray: ModuleType) -> None:
 
     if internal_kv_get_gcs_client() is not None:
         return
-    # `ray._raylet` is a compiled extension, so mypy cannot see `GcsClient` on it.
-    from ray._raylet import GcsClient  # type: ignore[attr-defined]
+    # `ray._raylet` is a compiled extension, so a type checker cannot see `GcsClient` on it.
+    from ray._raylet import GcsClient  # ty: ignore[unresolved-import]
 
     _initialize_internal_kv(GcsClient(address=ray.get_runtime_context().gcs_address))
 

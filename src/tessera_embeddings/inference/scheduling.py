@@ -462,7 +462,7 @@ class ActorPool:
             hint = _as_item(chunk_queue.popleft(), item.ctx)
             self.reserved[actor_idx] = hint
 
-        ref: ray.ObjectRef = self.actors[actor_idx].process_chunk.remote(  # type: ignore[union-attr]
+        ref: ray.ObjectRef = self.actors[actor_idx].process_chunk.remote(
             item.chunk,
             item.ctx.mosaic_base,
             item.ctx.staging_base,
@@ -558,7 +558,7 @@ class ActorPool:
             placeholder_iid: Placeholder string for the instance-ID list
                 until the real ID is resolved.
         """
-        self._pending_iid_refs[actor_idx] = self.actors[actor_idx].get_instance_id.remote()  # type: ignore[union-attr]
+        self._pending_iid_refs[actor_idx] = self.actors[actor_idx].get_instance_id.remote()
         self.actor_instance_ids[actor_idx] = placeholder_iid
         self._initializing.add(actor_idx)
         # Every ENTRY into the initializing state starts the cancellation clock over. `replace`
@@ -627,10 +627,10 @@ class ActorPool:
         with contextlib.suppress(Exception):
             ray.kill(self.actors[actor_idx])
 
-        new_actor = InferenceActor.options(num_gpus=self.config.num_gpus).remote(  # type: ignore[attr-defined]
+        new_actor = InferenceActor.options(num_gpus=self.config.num_gpus).remote(
             self.config, self.config.checkpoint_path, self._get_credentials, self._s3_region
         )
-        self.actors[actor_idx] = new_actor
+        self.actors[actor_idx] = new_actor  # ty: ignore[invalid-assignment]  # ray types .remote() as handle-or-class
         self.mark_initializing(actor_idx, placeholder_iid=f"pending-replacement-of-{instance_id}")
 
     def retire_idle(self, outstanding_work: int, floor: int = 0) -> None:
@@ -923,7 +923,7 @@ def _poll_tracker(
         RuntimeError: When ``>= max_simultaneous_stalls`` chunks are stalled.
     """
     try:
-        progress = cast(dict, ray.get(tracker.get_all.remote(), timeout=5))  # type: ignore[union-attr]
+        progress = cast(dict, ray.get(tracker.get_all.remote(), timeout=5))
         stalled_chunks: list[str] = []
         needs_recovery: list[str] = []
         for label, (batch, total, staleness, phase) in progress.items():
@@ -1326,7 +1326,7 @@ def _process_chunks_work_stealing(
         """
         chunk_label = item.chunk.label
         if tracker:
-            tracker.remove.remote(item.uid)  # type: ignore[union-attr]  # run-qualified: labels alias across zones
+            tracker.remove.remote(item.uid)  # run-qualified: labels alias across zones
         # The actor is killed below, taking its writer thread with it, so any deferred write it
         # held is of unknown state and that chunk requeues too. Safe: staged writes are
         # idempotent (run-scoped keys, mode="w"; the resume scan tolerates rewrites).
@@ -1447,7 +1447,7 @@ def _process_chunks_work_stealing(
             try:
                 prior = cast(
                     "dict | None",
-                    ray.get(pool.actors[actor_idx].flush_writes.remote(), timeout=600),  # type: ignore[union-attr]
+                    ray.get(pool.actors[actor_idx].flush_writes.remote(), timeout=600),
                 )
             except Exception as exc:
                 _requeue_unconfirmed(pending_write.pop(actor_idx), f"flush failed: {exc}")
@@ -1506,7 +1506,7 @@ def _process_chunks_work_stealing(
         # the next zone's head); a smaller zone cannot fill the fleet alone, so successive small
         # zones are pulled to pack it — one zone per poll, the caller bounding how many coexist.
         if source_active and len(chunk_queue) <= pool.live_count:
-            fetched = more_work()  # type: ignore[misc]  # source_active implies more_work is not None
+            fetched = more_work()  # ty: ignore[call-non-callable]  # source_active implies more_work is not None
             if fetched is None:
                 source_active = False
                 source_idle = False
@@ -1652,7 +1652,7 @@ def _process_chunks_work_stealing(
                         if on_item_done is not None:
                             on_item_done(item, result)
                     if tracker:
-                        tracker.remove.remote(item.uid)  # type: ignore[union-attr]  # run-qualified (see chunk_uid)
+                        tracker.remove.remote(item.uid)  # run-qualified (see chunk_uid)
                     pool._initializing.discard(actor_idx)
 
             # Immediately re-feed the actor that just freed up, unless it is a freshly-spawned

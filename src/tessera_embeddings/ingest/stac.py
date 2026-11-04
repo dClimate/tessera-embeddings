@@ -1692,7 +1692,7 @@ def load_stac_items(
             # config, and `MDParseConfig.from_dict` does a containment test on it.
             {},
             reflectance_assets,
-            collection_config.baseline_threshold,  # type: ignore[arg-type]
+            collection_config.baseline_threshold,  # ty: ignore[invalid-argument-type]
             collection_config.baseline_offset,
             collection_harmonisation(collection_config),
         )
@@ -1981,7 +1981,7 @@ def stream_stac_months(
     # One query in flight, one month in the caller's hands: the depth-1 buffer.
     pending = _prefetch(run, months[0]) if months else None
     for i, mr in enumerate(months):
-        items, baselines = pending()  # type: ignore[misc]
+        items, baselines = pending()  # ty: ignore[call-non-callable]
         if i + 1 < len(months):
             pending = _prefetch(run, months[i + 1])
         # Normalise HERE as well as in query_stac_items: `query_fn` is injectable, so this is the

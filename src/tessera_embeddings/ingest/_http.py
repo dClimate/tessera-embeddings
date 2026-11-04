@@ -89,7 +89,7 @@ def make_logging_retry(label: str, **kwargs: object) -> Retry:
                 _stacktrace=_stacktrace,
             )
 
-    return _LoggingRetry(**kwargs)  # type: ignore[arg-type]
+    return _LoggingRetry(**kwargs)  # ty: ignore[invalid-argument-type]
 
 
 def spawn_abandonable[A, T](fn: Callable[[A], T], arg: A) -> Callable[..., T]:

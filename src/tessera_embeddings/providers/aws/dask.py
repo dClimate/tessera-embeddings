@@ -41,10 +41,10 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Generator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from distributed import Scheduler
@@ -407,7 +407,7 @@ def maybe_performance_report(
     # Both call sites are Prefect flows, whose get_run_logger() returns a LoggerAdapter, not
     # a Logger. Only .warning/.info are used, which both have.
     log: logging.Logger | logging.LoggerAdapter[Any],
-) -> Iterator[None]:
+) -> Generator[None]:
     """Optionally capture a Dask ``performance_report`` for the wrapped compute.
 
     No-op when ``uri`` is falsy (the default). When set, it opens a short-lived client on
@@ -698,7 +698,8 @@ def log_dashboard_ssm_command(
     and returns without raising.
     """
     try:
-        scheduler = cluster.scheduler
+        # dask_cloudprovider types the scheduler as a union; an ECS cluster's is always its ECS task.
+        scheduler = cast(Any, cluster.scheduler)
         cluster_name, task_id = scheduler.task_arn.rsplit("/", 2)[1:]
         # arn:aws:ecs:<region>:<account>:task/<cluster>/<task-id>
         region = scheduler.task_arn.split(":")[3]
@@ -741,7 +742,7 @@ def ecs_cluster(
     diagnostic_task_stream: bool = False,
     image: str | None = None,
     resource_tags: dict[str, str] | None = None,
-) -> Iterator[ECSCluster]:
+) -> Generator[ECSCluster]:
     """Provision a Dask cluster backed by AWS Fargate (or hybrid EC2 scheduler).
 
     Reads the environment-variable contract in this module's docstring. The cluster adapts

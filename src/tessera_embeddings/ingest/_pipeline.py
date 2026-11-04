@@ -56,7 +56,7 @@ def pipelined[T, P](items: Iterable[T], prepare: Callable[[T], P], *, depth: int
             nxt = next(it, done)
             if nxt is done:
                 break
-            pending.append(pool.submit(prepare, nxt))  # type: ignore[arg-type]
+            pending.append(pool.submit(prepare, nxt))  # ty: ignore[invalid-argument-type]
         while pending:
             waited_from = time.monotonic()
             prepared = pending.popleft().result()
@@ -65,7 +65,7 @@ def pipelined[T, P](items: Iterable[T], prepare: Callable[[T], P], *, depth: int
             # the consumer's runtime rather than waiting to be asked once it returns.
             nxt = next(it, done)
             if nxt is not done:
-                pending.append(pool.submit(prepare, nxt))  # type: ignore[arg-type]
+                pending.append(pool.submit(prepare, nxt))  # ty: ignore[invalid-argument-type]
             yield prepared, stall
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
