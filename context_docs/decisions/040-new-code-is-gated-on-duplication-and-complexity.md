@@ -32,8 +32,9 @@ scans `src/` and `tests/` for three kinds of clone:
 
 On failure the job names each file whose duplication rose and the clones touching it.
 
-**Per function** (ruff's `C901`, `PLR0913` and `PLR0911` scores, read by the script). Existing
-debt carries no suppression comment.
+**Per function** (ruff's `C901` and `PLR0911` scores, read by the script; arguments are counted
+by the script itself, because ruff's `PLR0913` skips methods decorated with `@override`).
+Existing debt carries no suppression comment.
 
 | Measure | Limit | Binds | Over it on `main` when set | What it signals |
 |---|---|---|---|---|

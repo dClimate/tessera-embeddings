@@ -10,11 +10,12 @@ no calibration or suppression, and a change that reduces it always passes:
 - **Duplication, per file.** A file's duplicated lines (jscpd, ``.jscpd.json``) may not rise.
   Per file rather than per clone because jscpd identifies a clone by its exact extent, so a
   refactor that shrinks an existing clone would otherwise report it as new.
-- **Per function** (ruff's ``C901``, ``PLR0913``, ``PLR0911``; limits in ``LIMITS``). No function
-  may newly cross the complexity limit, and one already over it may not grow. Arguments and
-  return statements bind NEW functions only (``NEW_ONLY``): a function whose qualified name is
-  absent from the base, so a renamed or moved one counts as new. Prefect ``@flow`` functions are
-  exempt from the argument limit.
+- **Per function** (ruff's ``C901`` and ``PLR0911``; arguments counted here, because ruff's
+  ``PLR0913`` skips ``@override`` methods; limits in ``LIMITS``). No function may newly cross the
+  complexity limit, and one already over it may not grow. Arguments and return statements bind
+  NEW functions only (``NEW_ONLY``): a function whose qualified name is absent from the base, so a
+  renamed or moved one counts as new. Prefect ``@flow`` functions are exempt from the argument
+  limit.
 
 Rationale: context_docs/decisions/040-new-code-is-gated-on-duplication-and-complexity.md.
 """
@@ -59,10 +60,11 @@ def duplicated_lines(found: list[dict]) -> Counter[str]:
     return lines
 
 
-#: ``{metric: (ruff rule, setting, limit)}``. A function over a limit may not get worse.
+#: ``{metric: (ruff rule, setting, limit)}``; no rule means counted from the syntax tree.
+#: A function over a limit may not get worse.
 LIMITS = {
     "complexity": ("C901", "lint.mccabe.max-complexity", 15),
-    "arguments": ("PLR0913", "lint.pylint.max-args", 5),
+    "arguments": (None, None, 5),
     "return statements": ("PLR0911", "lint.pylint.max-returns", 3),
 }
 
@@ -72,14 +74,16 @@ NEW_ONLY = {"arguments", "return statements"}
 
 
 @functools.cache
-def _functions(path: Path) -> dict[int, tuple[str, bool]]:
-    """``{def line: (qualified name, is a Prefect @flow)}`` for every function in ``path``.
+def _functions(path: Path) -> dict[int, tuple[str, int]]:
+    """``{def line: (qualified name, argument count)}`` for every function in ``path``.
 
     Qualified (``ActorPool.__init__``, ``ingest_zone_year._run_leg``) so two same-named functions
     in one file are compared separately. A flow's parameters are its interface, the one a
-    deployment and the Prefect UI expose, so flows are exempt from the argument limit.
+    deployment and the Prefect UI expose, so a flow's count is 0. As in ruff's ``PLR0913``,
+    ``self``, ``cls``, ``*args`` and ``**kwargs`` are not counted; unlike it, ``_``-prefixed
+    parameters are, so renaming one is no way around the limit.
     """
-    found: dict[int, tuple[str, bool]] = {}
+    found: dict[int, tuple[str, int]] = {}
 
     def visit(node: ast.AST, prefix: str) -> None:
         for child in ast.iter_child_nodes(node):
@@ -92,7 +96,9 @@ def _functions(path: Path) -> dict[int, tuple[str, bool]]:
                         or (isinstance(d, ast.Attribute) and d.attr == "flow")
                         for d in decorators
                     )
-                    found[child.lineno] = (name, is_flow)
+                    a = child.args
+                    params = [p.arg for p in a.posonlyargs + a.args + a.kwonlyargs]
+                    found[child.lineno] = (name, 0 if is_flow else len(set(params) - {"self", "cls"}))
                 visit(child, f"{name}.")
             else:
                 visit(child, prefix)
@@ -103,16 +109,19 @@ def _functions(path: Path) -> dict[int, tuple[str, bool]]:
 
 def all_functions(tree: Path) -> set[tuple[str, str]]:
     """``{(file, function)}`` for every function in ``tree/src`` and ``tests``."""
-    return {
-        (path.relative_to(tree).as_posix(), name)
-        for root in ("src", "tests")
-        for path in (tree / root).rglob("*.py")
-        for name, _ in _functions(path).values()
-    }
+    return set(function_scores(tree, None, None, -1))
 
 
-def function_scores(tree: Path, rule: str, setting: str, limit: int) -> dict[tuple[str, str], int]:
+def function_scores(tree: Path, rule: str | None, setting: str | None, limit: int) -> dict[tuple[str, str], int]:
     """``{(file, function): score}`` for every function in ``tree/src`` and ``tests`` over ``limit``."""
+    if rule is None:
+        return {
+            (path.relative_to(tree).as_posix(), name): count
+            for root in ("src", "tests")
+            for path in (tree / root).rglob("*.py")
+            for name, count in _functions(path).values()
+            if count > limit
+        }
     result = subprocess.run(
         ["ruff", "check", "--isolated", "--ignore-noqa", "--select", rule, "--output-format", "json"]
         + ["--config", f"{setting} = {limit}", "src", "tests"],
@@ -124,9 +133,7 @@ def function_scores(tree: Path, rule: str, setting: str, limit: int) -> dict[tup
     for finding in json.loads(result.stdout):
         path = Path(finding["filename"])
         # Ruff reports on the function's def line, which is where ast places it.
-        name, is_flow = _functions(path)[finding["location"]["row"]]
-        if rule == "PLR0913" and is_flow:
-            continue
+        name, _ = _functions(path)[finding["location"]["row"]]
         score = int(re.search(r"\((\d+) >", finding["message"]).group(1))
         key = (path.relative_to(tree.resolve()).as_posix(), name)
         scores[key] = max(scores.get(key, 0), score)
