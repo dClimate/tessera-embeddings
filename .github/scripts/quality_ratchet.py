@@ -31,7 +31,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
 
 
@@ -49,18 +49,18 @@ def clones(tree: Path, config: Path) -> list[dict]:
 
 
 def duplicated_lines(found: list[dict]) -> Counter[str]:
-    """Duplicated lines per file: the union of every clone side's span in that file.
+    """Duplicated lines per file, counting each side of each clone over its own span.
 
-    A union, not a sum: jscpd reports clones in pairs, and when one of three copies is deleted it
-    re-pairs the rest against a single file, so a sum would count that file's lines once per
-    partner and fail the clean-up. Each side's own span, because jscpd's ``lines`` is the FIRST
-    side's, and a gap or similar-function clone's sides can differ in length.
+    A sum over clones, so a span that copies two files counts twice: an edit that makes an
+    already-duplicated span copy one more file still raises the edited file's count. jscpd's
+    ``lines`` is the FIRST side's span; a gap or similar-function clone's sides can differ in
+    length.
     """
-    lines: defaultdict[str, set[int]] = defaultdict(set)
+    lines: Counter[str] = Counter()
     for clone in found:
         for side in (clone["firstFile"], clone["secondFile"]):
-            lines[side["name"]].update(range(side["start"], side["end"] + 1))
-    return Counter({name: len(covered) for name, covered in lines.items()})
+            lines[side["name"]] += side["end"] - side["start"] + 1
+    return lines
 
 
 #: ``{metric: (ruff rule, setting, limit)}``. A function over a limit may not get worse.
@@ -141,9 +141,10 @@ def grew(before: Counter[str], after: Counter[str], base: Path, head: Path) -> l
     """Files whose duplicated lines rose, among those the pull request added or modified.
 
     Duplication a PR adds lives in a file it wrote, so an untouched file is not judged: its count
-    can rise only because jscpd re-paired its clones. Deleting one copy can make jscpd report lines
-    it had folded into the deleted pair, which were duplicated all along. A survivor the PR also
-    edits is still judged; the job names the clone, to merge or mark.
+    can rise only because jscpd re-paired its clones. Deleting one of three copies makes jscpd pair
+    the other two against one file, counted once per partner, and can report lines it had folded
+    into the deleted pair, which were duplicated all along. A survivor the PR also edits is still
+    judged; the job names the clone, to merge or mark.
     """
 
     def changed(name: str) -> bool:

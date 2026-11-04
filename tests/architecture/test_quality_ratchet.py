@@ -22,18 +22,33 @@ def _clone(a: tuple[str, int, int], b: tuple[str, int, int]) -> dict:
     }
 
 
-def test_deleting_the_shared_copy_does_not_raise_a_survivor():
-    """The remaining copies are re-paired against one file, whose lines must count once."""
+def _grew(before: list[dict], after: list[dict], changed: set[str], tmp_path: Path) -> list[str]:
+    """``grew`` over two trees in which only ``changed`` files differ."""
+    base, head = tmp_path / "base", tmp_path / "head"
+    names = {side["name"] for c in before + after for side in (c["firstFile"], c["secondFile"])}
+    for tree in (base, head):
+        tree.mkdir()
+        for name in names:
+            (tree / name).write_text(f"{name} {tree.name if name in changed else ''}")
+    return ratchet.grew(ratchet.duplicated_lines(before), ratchet.duplicated_lines(after), base, head)
+
+
+def test_deleting_the_shared_copy_does_not_fail(tmp_path):
+    """The remaining copies are re-paired against one untouched file, raising its count."""
     x, a, c, d = (("x.py", 1, 10), ("a.py", 1, 10), ("c.py", 1, 10), ("d.py", 1, 10))
-    before = ratchet.duplicated_lines([_clone(x, a), _clone(x, c), _clone(x, d)])
-    after = ratchet.duplicated_lines([_clone(a, c), _clone(a, d)])
-    assert after["a.py"] <= before["a.py"]
+    assert _grew([_clone(x, a), _clone(x, c), _clone(x, d)], [_clone(a, c), _clone(a, d)], set(), tmp_path) == []
+
+
+def test_an_edit_that_copies_one_more_file_fails(tmp_path):
+    """An already-duplicated span in an edited file that now also copies an untouched file."""
+    a, b, c = (("a.py", 1, 10), ("b.py", 1, 10), ("c.py", 1, 10))
+    assert _grew([_clone(a, c)], [_clone(a, c), _clone(a, b)], {"a.py"}, tmp_path) == ["a.py"]
 
 
 def test_each_side_counts_its_own_span():
-    """A gap clone's sides differ in length; overlapping spans in one file are a union."""
-    found = [_clone(("a.py", 1, 10), ("b.py", 1, 13)), _clone(("a.py", 5, 14), ("c.py", 1, 10))]
-    assert ratchet.duplicated_lines(found) == {"a.py": 14, "b.py": 13, "c.py": 10}
+    """A gap clone's sides differ in length."""
+    found = [_clone(("a.py", 1, 10), ("b.py", 1, 13))]
+    assert ratchet.duplicated_lines(found) == {"a.py": 10, "b.py": 13}
 
 
 @pytest.mark.parametrize(
