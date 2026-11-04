@@ -20,6 +20,7 @@ Rationale: context_docs/decisions/040-new-code-is-gated-on-duplication-and-compl
 from __future__ import annotations
 
 import ast
+import functools
 import json
 import re
 import shutil
@@ -64,6 +65,7 @@ LIMITS = {
 }
 
 
+@functools.cache
 def _functions(path: Path) -> dict[int, tuple[str, bool]]:
     """``{def line: (qualified name, is a Prefect @flow)}`` for every function in ``path``.
 
