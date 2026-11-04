@@ -32,9 +32,8 @@ scans `src/` and `tests/` for three kinds of clone:
 
 On failure the job names each file whose duplication rose and the clones touching it.
 
-**Per function** (ruff's `C901` and `PLR0911` scores, read by the script; arguments are counted
-by the script itself, because ruff's `PLR0913` skips methods decorated with `@override`).
-Existing debt carries no suppression comment.
+**Per function** (ruff's `C901`, `PLR0913` and `PLR0911` scores, read by the script). Existing
+debt carries no suppression comment.
 
 | Measure | Limit | Binds | Over it on `main` when set | What it signals |
 |---|---|---|---|---|
@@ -145,6 +144,23 @@ importing from here:
   `config/assembly.py::compute_n_workers`.
 
 The other three (two URI one-liners and a six-line flow fragment) are incidental.
+
+## Scope
+
+The gate catches habits, not evasion. Every pull request is reviewed by a person, and the
+gate's own escape, an ignore marker, is open by design, so a dodge such as a non-Prefect
+decorator named `flow` or a parameter renamed to slip a count shows up in the diff, where it
+belongs. The script compares the tools' output between base and head and takes their semantics
+as they are rather than re-deriving them:
+
+- Ruff's `PLR0913` skips methods decorated with `@override`, whose signature is the parent's
+  and is checked there, and parameters it treats as unused (`_`-prefixed names).
+- A file's duplicated lines are each clone side's whole span, so a line added inside an existing
+  gap or similar-function clone counts as more duplication. The job names the clone: merge it or
+  mark it.
+- A pull request is measured when it is opened, pushed or retargeted, not when its base branch
+  advances. As for every other check, keeping a pull request current with its base is a
+  repository setting (required up-to-date branches or a merge queue), not this workflow's job.
 
 ## Consequences
 
