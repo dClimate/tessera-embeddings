@@ -104,13 +104,12 @@ def _functions(path: Path) -> dict[int, tuple[str, int]]:
 def function_scores(tree: Path, rule: str | None, setting: str | None, limit: int) -> dict[tuple[str, str], int]:
     """``{(file, function): score}`` for every function in ``tree/src`` and ``tests`` over ``limit``."""
     if rule is None:
-        return {
-            (path.relative_to(tree).as_posix(), name): count
-            for root in ("src", "tests")
-            for path in (tree / root).rglob("*.py")
-            for name, count in _functions(path).values()
-            if count > limit
-        }
+        counts: dict[tuple[str, str], int] = {}
+        for path in [*(tree / "src").rglob("*.py"), *(tree / "tests").rglob("*.py")]:
+            for name, count in _functions(path).values():  # same-named definitions: keep the worst
+                key = (path.relative_to(tree).as_posix(), name)
+                counts[key] = max(counts.get(key, -1), count)
+        return {key: count for key, count in counts.items() if count > limit}
     result = subprocess.run(
         ["ruff", "check", "--isolated", "--ignore-noqa", "--select", rule, "--output-format", "json"]
         + ["--config", f"{setting} = {limit}", "src", "tests"],
