@@ -180,7 +180,7 @@ def build_inference_config(
     """
     return InferenceConfig(
         time_window=time_window,
-        s1_orbit=s1_orbit,  # type: ignore[arg-type]
+        s1_orbit=s1_orbit,  # ty: ignore[invalid-argument-type]
         checkpoint_path=checkpoint_path,
         inputs_bucket=inputs_bucket,
         output_bucket=output_bucket,

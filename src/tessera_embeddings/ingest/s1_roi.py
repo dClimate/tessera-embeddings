@@ -29,7 +29,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
@@ -125,7 +125,7 @@ def credential_ticker(
     orbit: str,
     roi: str,
     interval_sec: float = CRED_TICK_INTERVAL_SEC,
-) -> Iterator[None]:
+) -> Generator[None]:
     """Call ``refresh`` on a timer for the duration of the block, in a daemon thread.
 
     A credential renewed only from the work loop can renew only *between* units of work, so any

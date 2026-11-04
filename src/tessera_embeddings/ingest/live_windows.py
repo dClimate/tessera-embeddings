@@ -379,9 +379,9 @@ def footprint_grid(
     try:
         from odc.geo.geom import box
 
-        height, width = int(geobox.height), int(geobox.width)  # type: ignore[attr-defined]
-        inverse = ~geobox.transform  # type: ignore[attr-defined]
-        crs = geobox.crs  # type: ignore[attr-defined]
+        height, width = int(geobox.height), int(geobox.width)  # ty: ignore[unresolved-attribute]
+        inverse = ~geobox.transform  # ty: ignore[unresolved-attribute]
+        crs = geobox.crs  # ty: ignore[unresolved-attribute]
     except Exception:  # any geobox we cannot read means "assume everything"
         logger.debug("footprint: unusable geobox; computing the full extent", exc_info=True)
         return None
@@ -458,7 +458,7 @@ def windows_for_date(
     footprint = footprint_grid(bboxes, geobox, chunk_px=chunk_px)
     if footprint is None:
         return windows
-    height, width = int(geobox.height), int(geobox.width)  # type: ignore[attr-defined]
+    height, width = int(geobox.height), int(geobox.width)  # ty: ignore[unresolved-attribute]
     covered = grid_from_windows(windows, height=height, width=width, chunk_px=chunk_px) & footprint
     if not covered.any():
         return []

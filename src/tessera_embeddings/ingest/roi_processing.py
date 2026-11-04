@@ -6,7 +6,7 @@ and a quality band. They are shared by S2 and S1 ROI ingestion flows.
 
 import logging
 import time
-from collections.abc import Iterator, Sequence, Set
+from collections.abc import Generator, Sequence, Set
 from contextlib import contextmanager
 from typing import cast
 
@@ -69,7 +69,7 @@ def read_failure_context(
     date: str,
     items: Sequence[object] = (),
     client: dask.distributed.Client | None = None,
-) -> Iterator[None]:
+) -> Generator[None]:
     """Name the ROI, the date and the granules on any failure raised inside, and complete its reason.
 
     Per-date telemetry is emitted *after* a date commits, so the last date in a log is the last

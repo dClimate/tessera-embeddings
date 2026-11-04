@@ -181,8 +181,9 @@ def compute_bin_keys(
     s2_idx = np.clip(s2_idx, 0, len(ckps_arr) - 1)
     s1_idx = np.clip(s1_idx, 0, len(ckps_arr) - 1)
     keys = np.empty(len(s2_valid), dtype=np.dtype([("s2", np.int32), ("s1", np.int32)]))
-    keys["s2"] = ckps_arr[s2_idx]
-    keys["s1"] = ckps_arr[s1_idx]
+    # numpy's stubs do not model assigning to a structured array's named field.
+    keys["s2"] = ckps_arr[s2_idx]  # ty: ignore[invalid-assignment]
+    keys["s1"] = ckps_arr[s1_idx]  # ty: ignore[invalid-assignment]
     return keys
 
 

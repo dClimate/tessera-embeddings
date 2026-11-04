@@ -195,11 +195,11 @@ def run_inference(
         config.checkpoint_path,
     )
     t_actors = time.monotonic()
-    actor_cls = InferenceActor.options(num_gpus=config.num_gpus)  # type: ignore[attr-defined]
+    actor_cls = InferenceActor.options(num_gpus=config.num_gpus)
 
     def actor_factory(n: int) -> list[ray.actor.ActorHandle]:
         """Request ``n`` new inference actors (one .remote() each)."""
-        return [actor_cls.remote(config, config.checkpoint_path, get_credentials, s3_region) for _ in range(n)]
+        return [actor_cls.remote(config, config.checkpoint_path, get_credentials, s3_region) for _ in range(n)]  # ty: ignore[invalid-return-type]  # ray types .remote() as handle-or-class
 
     # Request the first batch up front; the work-stealing scheduler requests the rest as
     # slots are placed (scheduling._maybe_request_next_batch). The size is the config's to
@@ -246,14 +246,14 @@ def run_inference(
         # Pin the lightweight ProgressTracker to a GPU-less node (typically the head): off
         # the GPU workers it neither competes with actors for memory nor loses progress
         # state when a worker dies.
-        head_nodes = [n for n in ray.nodes() if n["Alive"] and n["Resources"].get("GPU", 0) == 0]  # type: ignore[attr-defined]
+        head_nodes = [n for n in ray.nodes() if n["Alive"] and n["Resources"].get("GPU", 0) == 0]
         if head_nodes:
             head_strategy = NodeAffinitySchedulingStrategy(node_id=head_nodes[0]["NodeID"], soft=True)
-            progress_tracker = ProgressTracker.options(scheduling_strategy=head_strategy).remote()  # type: ignore[attr-defined]
+            progress_tracker = ProgressTracker.options(scheduling_strategy=head_strategy).remote()  # ty: ignore[invalid-assignment]
             log.info("ProgressTracker pinned to head node %s", head_nodes[0]["NodeID"][:8])
         else:
             log.warning("Could not identify head node — ProgressTracker will use default scheduling")
-            progress_tracker = ProgressTracker.remote()  # type: ignore[attr-defined]
+            progress_tracker = ProgressTracker.remote()  # ty: ignore[invalid-assignment]
 
         results = _process_chunks_work_stealing(
             actors=actors,
@@ -284,11 +284,11 @@ def run_inference(
         log.info("Killing %d actors to release resource reservations", len(actors))
         for actor in actors:
             with contextlib.suppress(Exception):
-                ray.kill(actor)  # type: ignore[attr-defined]
+                ray.kill(actor)
         del actors
         if progress_tracker is not None:
             with contextlib.suppress(Exception):
-                ray.kill(progress_tracker)  # type: ignore[attr-defined]
+                ray.kill(progress_tracker)
 
     # Merge resumed chunks (already staged) with newly-processed results
     if already_done:
@@ -357,7 +357,7 @@ def wait_for_actors(
         RuntimeError: If fewer than ``min_required`` actors initialized
             within the timeout.
     """
-    ping_refs: list[Any] = [a.ping.remote() for a in actors]  # type: ignore[union-attr]
+    ping_refs: list[Any] = [a.ping.remote() for a in actors]
     ref_to_idx: dict[Any, int] = {ref: i for i, ref in enumerate(ping_refs)}
 
     ready_indices: set[int] = set()
@@ -369,10 +369,10 @@ def wait_for_actors(
     while pending and time.monotonic() < deadline:
         remaining_sec = max(0, deadline - time.monotonic())
         timeout = min(remaining_sec, 30.0)
-        done, pending = ray.wait(pending, num_returns=len(pending), timeout=timeout)  # type: ignore[attr-defined]
+        done, pending = ray.wait(pending, num_returns=len(pending), timeout=timeout)
         for ref in done:
             try:
-                ray.get(ref)  # type: ignore[attr-defined]
+                ray.get(ref)
                 ready_indices.add(ref_to_idx[ref])
             except Exception as exc:
                 idx = ref_to_idx[ref]
@@ -406,8 +406,8 @@ def wait_for_actors(
     actor_instance_ids: list[str] = ["pending-init"] * len(actors)
     if ready_indices:
         sorted_ready = sorted(ready_indices)
-        iid_refs = [actors[i].get_instance_id.remote() for i in sorted_ready]  # type: ignore[union-attr]
-        iids: list[str] = ray.get(iid_refs, timeout=30)  # type: ignore[attr-defined]
+        iid_refs = [actors[i].get_instance_id.remote() for i in sorted_ready]
+        iids: list[str] = ray.get(iid_refs, timeout=30)
         for i, iid in zip(sorted_ready, iids, strict=True):
             actor_instance_ids[i] = iid
 

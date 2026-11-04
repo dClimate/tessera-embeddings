@@ -154,7 +154,7 @@ class FleetGate(AbstractContextManager):
         # Typed loosely at the splat, deliberately: the parameter above declares what a CALLER may
         # pass, which is the useful contract, while `concurrency` itself takes heterogeneous
         # parameters (int | None, float, a lease holder, bool | None) that a homogeneous
-        # `**dict[str, X]` cannot be checked against — mypy reports one error per parameter
+        # `**dict[str, X]` cannot be checked against — a type checker reports one error per parameter
         # whatever X is. A `**kwargs` typing limitation, confined to this one attribute.
         self._kwargs: dict[str, Any] = dict(concurrency_kwargs)
         self._local = threading.local()

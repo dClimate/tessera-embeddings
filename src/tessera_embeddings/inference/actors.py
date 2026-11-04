@@ -881,7 +881,7 @@ class InferenceActor:
 
         # Report loading phase so stall detection has visibility before batch 50
         if tracker:
-            tracker.report.remote(uid, 0, 0, "loading")  # type: ignore[union-attr]
+            tracker.report.remote(uid, 0, 0, "loading")
 
         try:
             # The prologue — repo handles, full-chunk SCL mask (which sizes the density-based strips), and the first
@@ -940,11 +940,7 @@ class InferenceActor:
                     x_sub=x_sub,
                 )
 
-            on_batch = (
-                (lambda b, t: tracker.report.remote(uid, b, t, "inference"))  # type: ignore[union-attr]
-                if tracker
-                else None
-            )
+            on_batch = (lambda b, t: tracker.report.remote(uid, b, t, "inference")) if tracker else None
 
             # Obs counts accumulate per strip into whole-chunk buffers so the single write_chunk carries the
             # full-chunk obs maps.
@@ -996,7 +992,7 @@ class InferenceActor:
                     # read so _poll_tracker does not misclassify a slow multi-strip load as an inference stall. (Strip
                     # 0's was reported above.)
                     if tracker and i > 0:
-                        tracker.report.remote(uid, 0, 0, "loading")  # type: ignore[union-attr]
+                        tracker.report.remote(uid, 0, 0, "loading")
 
                     # Release the previous strip's input arrays BEFORE blocking on this strip's load and submitting
                     # the next prefetch. The dataset retains chunk_data.s2_bands (dataset.py), so without this drop

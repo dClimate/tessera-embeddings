@@ -29,7 +29,7 @@ import subprocess
 import tempfile
 import uuid
 from collections import defaultdict
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Generator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -1226,7 +1226,7 @@ def ray_cluster(
     launch_pacing: bool = False,
     gpu_fallback_instance_types: Sequence[str] = (),
     gpu_fallback_vcpu_budget: int | None = None,
-) -> Iterator[str | None]:
+) -> Generator[str | None]:
     """Provision an AWS-backed Ray cluster; tear it down on exit.
 
     Two modes:

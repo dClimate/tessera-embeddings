@@ -58,6 +58,7 @@ from typing import Any, cast
 
 import icechunk
 import zarr
+import zarr.errors
 from prefect import flow, get_run_logger
 from prefect.deployments import arun_deployment
 from prefect.runtime import flow_run as flow_run_ctx
@@ -502,7 +503,7 @@ _cancel_children_on_cancellation = make_child_cancel_hook(_CHILD_TAG_PREFIX, "ch
     name="ingest-zone-year",
     on_cancellation=[_cancel_children_on_cancellation],
     on_crashed=[_cancel_children_on_cancellation],
-)
+)  # ty: ignore[no-matching-overload]  # Prefect's hook-list overloads reject a list of differently typed hooks
 async def ingest_zone_year(
     *,
     zone: str,
