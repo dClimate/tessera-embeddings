@@ -1,6 +1,7 @@
 """The quality ratchet's duplication count (``.github/scripts/quality_ratchet.py``).
 
-A clean-up that deletes a copy must never be reported as adding duplication.
+A clean-up that deletes a copy is not reported as adding duplication to files it leaves
+untouched, and an edit that copies one more file is.
 """
 
 import importlib.util
