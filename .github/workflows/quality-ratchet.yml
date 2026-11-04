@@ -1,8 +1,9 @@
 name: Quality ratchet
 
-# Fails a pull request that raises any file's duplicated lines or any function's complexity
-# above the base it merges into, or adds a function over the argument or return limits. Measured against the base rather than a fixed limit, so existing
-# debt needs no suppression and a change that reduces it always passes. Every PR, including one
+# Fails a pull request that writes a copy of existing code, raises any function's complexity
+# above the base it merges into, or adds a function over the argument or return limits. Only what
+# the PR writes or changes is judged, so existing debt needs no suppression and a change that
+# reduces it always passes. Every PR, including one
 # stacked on another branch. Settings in .jscpd.json; rules in .github/scripts/quality_ratchet.py;
 # rationale in ADR 040.
 
@@ -24,7 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # The base tree is checked out beside this one, so its commit must be here.
+          # The base is checked out beside this one and diffed against it, so its commit must be here.
           fetch-depth: 0
 
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
