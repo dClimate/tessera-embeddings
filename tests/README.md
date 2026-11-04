@@ -7,7 +7,7 @@ records what it would take to light it up.
 | Directory | Marker | Runs in | Goal |
 |---|---|---|---|
 | `unit/` | (default) | `unit.yml` — PRs to `main` and pushes to `main`, on Python 3.12 and 3.13, with coverage | Fast, isolated. No test should exceed 30 s. |
-| `architecture/` | (default) | `architecture.yml` — PRs to `main` and pushes to `main` | Layer-rule enforcement (no Prefect outside `orchestration/prefect/`, etc.). |
+| `architecture/` | (default) | `architecture.yml` — PRs to `main` and pushes to `main` | Layer-rule enforcement (no Prefect outside `orchestration/prefect/`, etc.), and the quality ratchet's duplication count. |
 | `integration/` | `integration` | `integration.yml` — PRs to `main`, filtered to `src/`, `tests/integration/`, `tests/parity/`, `tests/fixtures/`, `pyproject.toml`, `uv.lock` | Hit moto / VCR cassettes / LocalCluster. Minutes. |
 | `parity/` | `parity` | `integration.yml`, same trigger, as `-m "parity and not slow"` | Prefect flow ↔ plain runner output equivalence. 5–30 min. |
 | `slow/` | `slow` | **nothing — the directory is empty and no occupant is planned** ([ADR 023](../context_docs/decisions/023-the-single-path-end-to-end-is-the-quickstart-run.md)). | A home for a genuinely slow test, if one ever needs it. |

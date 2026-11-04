@@ -30,6 +30,14 @@ scans `src/` and `tests/` for three kinds of clone:
 - **Similar functions** (`similarity: 0.8`): functions whose syntax trees match after local
   names and literals are normalised. jscpd leaves test files out of this kind.
 
+A file's count is the set of its lines inside any clone, so a line shared with several copies
+counts once. Only files the pull request adds or modifies are judged: a copy always lands in a
+file the PR wrote, while an untouched file's count can rise when a deletion elsewhere makes
+jscpd re-pair its clones and report lines it had folded into the deleted pair. A surviving copy
+the PR also edits is still judged, and can fail the same way. jscpd scans from the repository
+root (`"path": ["."]` with a `pattern`), so the names it reports are repository paths, which
+both the changed-file check and the job's output need.
+
 On failure the job names each file whose duplication rose and the clones touching it.
 
 **Per function** (ruff's `C901`, `PLR0913` and `PLR0911` scores, read by the script). Existing
@@ -155,9 +163,9 @@ as they are rather than re-deriving them:
 
 - Ruff's `PLR0913` skips methods decorated with `@override`, whose signature is the parent's
   and is checked there, and parameters it treats as unused (`_`-prefixed names).
-- A file's duplicated lines are each clone side's whole span, so a line added inside an existing
-  gap or similar-function clone counts as more duplication. The job names the clone: merge it or
-  mark it.
+- A file's duplicated lines are the union of its clone sides' spans, so a line added inside an
+  existing gap or similar-function clone counts as more duplication. The job names the clone:
+  merge it or mark it.
 - A pull request is measured when it is opened, pushed or retargeted, not when its base branch
   advances. As for every other check, keeping a pull request current with its base is a
   repository setting (required up-to-date branches or a merge queue), not this workflow's job.

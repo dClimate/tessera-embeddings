@@ -7,9 +7,10 @@ predates them is measured the same way.
 Each measure is compared with the base rather than with a fixed limit, so existing debt needs
 no calibration or suppression, and a change that reduces it always passes:
 
-- **Duplication, per file.** A file's duplicated lines (jscpd, ``.jscpd.json``) may not rise.
-  Per file rather than per clone because jscpd identifies a clone by its exact extent, so a
-  refactor that shrinks an existing clone would otherwise report it as new.
+- **Duplication, per file.** A file's duplicated lines (jscpd, ``.jscpd.json``) may not rise,
+  judged only in files the PR adds or modifies. Per file rather than per clone because jscpd
+  identifies a clone by its exact extent, so a refactor that shrinks an existing clone would
+  otherwise report it as new.
 - **Per function** (ruff's ``C901``, ``PLR0913``, ``PLR0911``; limits in ``LIMITS``). No function
   may newly cross the complexity limit, and one already over it may not grow. Arguments and
   return statements bind NEW functions only (``NEW_ONLY``): a function whose qualified name is
@@ -30,7 +31,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
 
@@ -48,16 +49,18 @@ def clones(tree: Path, config: Path) -> list[dict]:
 
 
 def duplicated_lines(found: list[dict]) -> Counter[str]:
-    """Duplicated lines per file, counting each side of each clone over its own span.
+    """Duplicated lines per file: the union of every clone side's span in that file.
 
-    jscpd's ``lines`` is the FIRST side's span; a gap or similar-function clone's sides can
-    differ in length.
+    A union, not a sum: jscpd reports clones in pairs, and when one of three copies is deleted it
+    re-pairs the rest against a single file, so a sum would count that file's lines once per
+    partner and fail the clean-up. Each side's own span, because jscpd's ``lines`` is the FIRST
+    side's, and a gap or similar-function clone's sides can differ in length.
     """
-    lines: Counter[str] = Counter()
+    lines: defaultdict[str, set[int]] = defaultdict(set)
     for clone in found:
         for side in (clone["firstFile"], clone["secondFile"]):
-            lines[side["name"]] += side["end"] - side["start"] + 1
-    return lines
+            lines[side["name"]].update(range(side["start"], side["end"] + 1))
+    return Counter({name: len(covered) for name, covered in lines.items()})
 
 
 #: ``{metric: (ruff rule, setting, limit)}``. A function over a limit may not get worse.
@@ -134,12 +137,27 @@ def function_scores(tree: Path, rule: str, setting: str, limit: int) -> dict[tup
     return scores
 
 
+def grew(before: Counter[str], after: Counter[str], base: Path, head: Path) -> list[str]:
+    """Files whose duplicated lines rose, among those the pull request added or modified.
+
+    Duplication a PR adds lives in a file it wrote, so an untouched file is not judged: its count
+    can rise only because jscpd re-paired its clones. Deleting one copy can make jscpd report lines
+    it had folded into the deleted pair, which were duplicated all along. A survivor the PR also
+    edits is still judged; the job names the clone, to merge or mark.
+    """
+
+    def changed(name: str) -> bool:
+        return not (base / name).exists() or (base / name).read_bytes() != (head / name).read_bytes()
+
+    return sorted(n for n in after if after[n] > before[n] and changed(n))
+
+
 def main(base: Path, head: Path) -> int:
     """Print every regression and return the exit code."""
     failures: list[str] = []
     head_clones = clones(head, head / ".jscpd.json")
     before, after = duplicated_lines(clones(base, head / ".jscpd.json")), duplicated_lines(head_clones)
-    for name in sorted(n for n in after if after[n] > before[n]):
+    for name in grew(before, after, base, head):
         failures.append(f"{name}: duplicated lines rose from {before[name]} to {after[name]}")
         for c in head_clones:
             if name in (c["firstFile"]["name"], c["secondFile"]["name"]):
