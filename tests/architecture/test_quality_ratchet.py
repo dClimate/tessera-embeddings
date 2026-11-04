@@ -52,7 +52,7 @@ def test_a_copy_is_a_clone_side_the_pr_wrote(clones, written, flagged):
 
 def _git(repo: Path, *args: str) -> None:
     subprocess.run(
-        ["git", "-c", "user.email=x@x", "-c", "user.name=x", *args],
+        ["git", "-c", "user.email=x@x", "-c", "user.name=x", "-c", "commit.gpgsign=false", *args],
         cwd=repo,
         check=True,
         capture_output=True,
