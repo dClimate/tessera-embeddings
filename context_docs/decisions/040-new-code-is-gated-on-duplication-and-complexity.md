@@ -1,0 +1,156 @@
+# 040 — New code is gated on duplication and complexity
+
+**Status:** Proposed 2026-11-03.
+
+## Context
+
+Much of the code arriving in this repository is written by AI agents. Their characteristic
+failures are ones a reviewer reading the PR description will not see: a near-copy of an existing
+function with a few lines changed rather than a call to it, and a new function that keeps
+growing branches rather than being split. Both make the codebase larger and harder to change, and
+both are cheap to detect mechanically.
+
+A gate on the whole codebase would first need the existing debt fixed or calibrated away. A gate
+on what a pull request *adds* needs neither, and it is the signal that steers the next change.
+
+## Decision
+
+**A ratchet against the base commit** (`.github/workflows/quality-ratchet.yml`, rules in
+`.github/scripts/quality_ratchet.py`) fails a pull request that makes either measure worse than
+the commit it merges into. Both trees are measured with the head's settings, on every PR,
+stacked ones included, and against the merge commit's first parent rather than the base branch,
+which can move while the job is queued.
+
+**Duplication: no file's duplicated lines may rise** (jscpd, settings in `.jscpd.json`). jscpd
+scans `src/` and `tests/` for three kinds of clone:
+
+- **Exact copies** of at least 50 tokens and 5 lines (jscpd's defaults).
+- **Gap clones** (`maxGapLines: 3`): two copies separated by at most three inserted or changed
+  lines are merged into one finding. This is the copy-then-tweak pattern.
+- **Similar functions** (`similarity: 0.8`): functions whose syntax trees match after local
+  names and literals are normalised. jscpd leaves test files out of this kind.
+
+On failure the job names each file whose duplication rose and the clones touching it.
+
+**Per function: complexity, arguments and return statements may not get worse** (ruff's `C901`,
+`PLR0913` and `PLR0911` scores, read by the script). A function over a limit may not grow on that
+measure, and none may newly cross one. Existing debt carries no suppression comment, and a
+function brought under a limit simply leaves the comparison.
+
+| Measure | Limit | Over it when the ratchet landed | What it signals |
+|---|---|---|---|
+| McCabe complexity | 15 | 19 | a function too branchy to review |
+| Arguments | 7 | about 80 in `src/`, 14 in `tests/` (Prefect flows included) | a missing abstraction, or a function doing too much |
+| Return statements | 5 | 11 | tangled control flow |
+
+Ruff's argument default of 5 would flag 142 functions in this keyword-heavy codebase; 7 keeps
+the signal on the outliers. Four returns was tried and rejected: 25 functions exceed it, most of
+them written as guard clauses (one early return per disqualifying case), the readable style a
+limit that low would push toward nested branches. **Prefect `@flow` functions are exempt from the argument limit**: a
+flow's parameters are its interface, the one deployments and the Prefect UI expose. Everything
+else in a flow module, its closures and helpers included, is held to it, and so are flows on
+the other two measures.
+
+## What was measured (2026-11-03, `main` at `cc0dec14`)
+
+- `src/` has 28 exact clones, 0.46% of lines. With gaps and similar functions on, 32. `tests/`
+  has 149 exact or gap clones, 2.2% of lines. None of these fail the gate.
+- **Controls.** A 100-line function copied into a new module with two lines inserted and a
+  variable renamed raised two files' duplicated lines by 101 each, and the job failed. A new
+  17-branch function failed, and so did one added branch in a function already at 19.
+- Each jscpd run takes about a tenth of a second.
+- Complexity thresholds: 40 functions in `src/` exceed 10, 19 exceed 15, 13 exceed 20. None in
+  `tests/` exceed 15. 15 grandfathers a manageable list while still catching the
+  large-function habit early.
+
+## Rejected
+
+**jscpd's complexity report.** It ranks whole files, with no per-function figure, no threshold
+and no comparison against the base branch, and the ranking tracks file size. It cannot screen a
+pull request. Ruff's per-function `C901` scores can.
+
+**Failing on any clone absent from the base** (jscpd's own `--baseline-from-ref
+--fail-on-new-clones`), the first version. jscpd identifies a clone by its exact extent, so an
+edit that moves a clone's boundary makes it new: a `# noqa` added to a function's first line,
+or a refactor that SHRINKS an existing clone. The test clean-up that cut test clones from 140 to
+119 reported 21 of them as new. A rule that fails changes for reducing duplication cannot steer
+toward less of it.
+
+**One repository-wide total.** Simpler, but a PR that removes duplication in one place could
+add a fresh copy elsewhere and pass. Per file, a fresh copy fails unless the same PR removes as
+much from the same file.
+
+**`# noqa: C901` on each function already over the limit**, the first version for complexity.
+A suppression is permanent: the function could then grow without limit and the gate would
+never fire.
+
+**Gating jscpd's dead-code analysis.** With orchestration, providers, profiling and package
+`__init__` files declared as entry points (in `.jscpd.json`, so they count as live and their
+imports count as uses), it reports 30 findings, 15 at confidence 85 or above. Only one was
+dead code, `config/ingest.py::auto_batch_dates` and its threshold constant. Of the rest:
+
+- used by `scripts/` operator tools: four `storage/registry_rebuild.py` exports;
+- used by yield-embeddings, which a scan of this repo cannot see: `daily_times`,
+  `mgrs_tile_to_bbox`, `quantize_rows`;
+- used only by tests: `inference/shard_record.py`, `quantize_embeddings`,
+  `dequantize_embeddings`, `mgrs_tile_to_utm_epsg`;
+- wrong: `_equal` in `registry_rebuild.py` is called in its own file, and `ConfigMismatchError`
+  is a deliberate re-export.
+
+Below confidence 85 most findings were wrong. Its `ignore` takes file globs only, so an export
+cannot be exempted individually, and it has no baseline, so it cannot be limited to new code.
+It stays configured for an on-demand run (`uv run jscpd --dead-code`) and is not in CI.
+
+**A duplication percentage threshold.** It would fail on existing code until calibrated, then
+let a large copy through as long as the total stays under the line.
+
+## Cross-repository duplication
+
+jscpd over this repo's `src/` and yield-embeddings' `src/` and `scripts/` found six clones
+between the two. Three are the same logic maintained twice, where yield-embeddings should be
+importing from here:
+
+- `yield_embeddings/domain/coarsen.py::_slab_array_from_zarr` is a copy of
+  `storage/region_writes.py::_slab_array_from_zarr`, and they have already diverged: this repo
+  enumerates read blocks on the shard grid (`zarr_arr.shards or zarr_arr.chunks`), the copy on
+  the inner chunk grid, so on a sharded store it issues one read task per chunk instead of per
+  shard.
+- `yield_embeddings/domain/roi_merge.py` re-applies the Icechunk timeout and retry settings of
+  `storage/zarr_store.py`'s repository config, constants included, because `open_repo` takes no
+  config to extend.
+- `yield_embeddings/config/coarsen.py::compute_n_workers` repeats
+  `config/assembly.py::compute_n_workers`.
+
+The other three (two URI one-liners and a six-line flow fragment) are incidental.
+
+## Scope
+
+The gate catches habits, not evasion. Every pull request is reviewed by a person, and the
+gate's own escape, an ignore marker, is open by design, so a dodge such as a non-Prefect
+decorator named `flow` or a parameter renamed to slip a count shows up in the diff, where it
+belongs. The script compares the tools' output between base and head and takes their semantics
+as they are rather than re-deriving them:
+
+- Ruff's `PLR0913` skips methods decorated with `@override`, whose signature is the parent's
+  and is checked there, and parameters it treats as unused (`_`-prefixed names).
+- A file's duplicated lines are each clone side's whole span, so a line added inside an existing
+  gap or similar-function clone counts as more duplication. The job names the clone: merge it or
+  mark it.
+- A pull request is measured when it is opened, pushed or retargeted, not when its base branch
+  advances. As for every other check, keeping a pull request current with its base is a
+  repository setting (required up-to-date branches or a merge queue), not this workflow's job.
+
+## Consequences
+
+- An agent that copies code gets a failing check naming both locations, which points it at the
+  call it should have made.
+- A file renamed in a PR counts all its duplication as new, and so does a function renamed while
+  over the limit; the job's output says which, and the fix is to reduce it or split the rename
+  into its own PR.
+- A deliberate duplicate (a fixture, a golden reference) is excluded in `.jscpd.json`'s
+  `ignore`, which is reviewed like any other change.
+
+## Related
+
+- [ADR 039](039-architecture-rules-run-on-import-linter-and-ruff.md) — the import and
+  banned-API rules, the other deterministic gate

@@ -786,6 +786,7 @@ class InferenceActor:
                 chunk, mosaic_base, staging_base, run_id, tracker, prefetch_hint, time_window, s1_orbit
             )
 
+    # jscpd:ignore-start: explicit keyword signature and Args, mirroring the public process_chunk it backs
     def _process_chunk(
         self,
         chunk: ChunkSpec,
@@ -802,6 +803,7 @@ class InferenceActor:
         Always invoked through :meth:`process_chunk`, which establishes the scoped icechunk
         credential provider this body's S3 opens depend on.
         """
+        # jscpd:ignore-end
         # Resolved ONCE and passed down. The three loader call sites (serial prologue, cross-chunk prefetch, strip
         # loop) must receive identical kwargs for bit-identity, so neither fallback may be re-evaluated at each of
         # them.
