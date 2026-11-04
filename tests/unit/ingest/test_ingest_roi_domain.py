@@ -104,7 +104,7 @@ def test_no_prefect_or_get_client_in_domain_modules() -> None:
 # Window derivation runs on every path now that cropping is unconditional, and this test
 # has no ROI mask on disk. One window stands in; the test is about how the DATE RANGE is
 # tiled into batches, which the windows do not affect.
-@patch("tessera_embeddings.ingest.s1_roi.live_windows_for_mask", return_value=[MagicMock(y0=0, y1=1, x0=0, x1=1)])
+@patch("tessera_embeddings.ingest.live_windows.live_windows_for_mask", return_value=[MagicMock(y0=0, y1=1, x0=0, x1=1)])
 @patch("tessera_embeddings.ingest.s1_roi.make_s1_item_provider")
 @patch("tessera_embeddings.ingest.s1_roi.get_existing_dates", return_value=set())
 @patch("tessera_embeddings.ingest.s1_roi.read_roi_mask")

@@ -823,16 +823,14 @@ def ecs_cluster(
             cluster_kwargs["subnets"] = [scheduler_subnet]
         log.info("EC2 scheduler enabled via capacity provider: %s", capacity_provider)
 
-    if worker_cpu is not None:
-        cluster_kwargs["worker_cpu"] = worker_cpu
-    if worker_mem is not None:
-        cluster_kwargs["worker_mem"] = worker_mem
-    if scheduler_cpu is not None:
-        cluster_kwargs["scheduler_cpu"] = scheduler_cpu
-    if scheduler_mem is not None:
-        cluster_kwargs["scheduler_mem"] = scheduler_mem
-    if image is not None:
-        cluster_kwargs["image"] = image
+    overrides = {
+        "worker_cpu": worker_cpu,
+        "worker_mem": worker_mem,
+        "scheduler_cpu": scheduler_cpu,
+        "scheduler_mem": scheduler_mem,
+        "image": image,
+    }
+    cluster_kwargs.update({key: val for key, val in overrides.items() if val is not None})
     if resource_tags:
         cluster_kwargs["tags"] = dict(resource_tags)
     cluster_kwargs["worker_nthreads"] = worker_nthreads

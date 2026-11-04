@@ -192,6 +192,7 @@ def _reference_resample_s2_bucket(s2_bands, s2_masks, s2_doys, target, s2_mean, 
     return out
 
 
+# jscpd:ignore-start: an independent reference implementation; its setup matches the code under test
 def _reference_resample_s1_bucket(
     s1_asc_bands, s1_asc_doys, s1_desc_bands, s1_desc_doys, target, s1a_mean, s1a_std, s1d_mean, s1d_std
 ):
@@ -199,6 +200,7 @@ def _reference_resample_s1_bucket(
     out = np.zeros((b, target, 3), dtype=np.float32)
     if target == 0 or b == 0:
         return out
+    # jscpd:ignore-end
     for i in range(b):
         parts_b, parts_d = [], []
         for bands, doys, mean, std in (

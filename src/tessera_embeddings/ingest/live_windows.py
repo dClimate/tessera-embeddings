@@ -518,3 +518,19 @@ def live_windows_for_mask(
     if not merge:
         return windows
     return merge_bands(windows, chunk_px=window_px, window_cost_in_chunks=window_cost_in_chunks)
+
+
+def run_live_windows(
+    mask_path: str, *, overlapped: bool, storage_options: StorageOptions = None
+) -> tuple[int, list[LiveWindow], list[tuple[int, int, int, int]]]:
+    """A run's live windows at the ingest chunk size: ``(window_cost, windows, as_tuples)``.
+
+    The merge cost depends on how the run writes (see :data:`WINDOW_COST_IN_CHUNKS_OVERLAPPED`)
+    and is returned so per-date narrowing re-merges on the same terms; the tuples are the
+    ``(y0, y1, x0, x1)`` form the writers take.
+    """
+    window_cost = WINDOW_COST_IN_CHUNKS_OVERLAPPED if overlapped else WINDOW_COST_IN_CHUNKS
+    windows = live_windows_for_mask(
+        mask_path, window_px=INGEST_CHUNK_SIZE, window_cost_in_chunks=window_cost, storage_options=storage_options
+    )
+    return window_cost, windows, [(w.y0, w.y1, w.x0, w.x1) for w in windows]

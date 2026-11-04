@@ -23,12 +23,7 @@ from tessera_embeddings.ingest.stac import (
     _prefetch,
     stream_stac_months,
 )
-
-
-def _item(date: str, cloud: float = 0.0):
-    return SimpleNamespace(
-        datetime=datetime.datetime.fromisoformat(f"{date}T10:00:00"), properties={"eo:cloud_cover": cloud}
-    )
+from tests.stac_items import fake_stac_item
 
 
 def _dates(start: str, end: str) -> list[str]:
@@ -129,7 +124,7 @@ class TestStreaming:
             if calls is not None:
                 calls.append((start_date, end_date, frozenset(existing_dates or ())))
             items = [
-                _item(d)
+                fake_stac_item(d)
                 for d in _dates(start_date, end_date)
                 for _ in range(per_date.get(d, 0))
                 if d not in (existing_dates or set())
@@ -195,7 +190,7 @@ class TestStreaming:
             # Every date in the PADDED range, so each month still owns something after
             # the ownership filter — returning only the query's first date would hand
             # each month nothing but the pad day its neighbour owns.
-            return [_item(d) for d in _dates(start_date, end_date)], {}
+            return [fake_stac_item(d) for d in _dates(start_date, end_date)], {}
 
         gen = stream_stac_months(
             provider="p",
@@ -220,7 +215,7 @@ class TestStreaming:
         def query(*, provider, collection, tile_id, start_date, end_date, existing_dates, bbox, **_):
             if start_date.startswith("2024-02"):
                 raise RuntimeError("STAC exhausted its retries")
-            return [_item(start_date)], {}
+            return [fake_stac_item(start_date)], {}
 
         gen = stream_stac_months(
             provider="p",

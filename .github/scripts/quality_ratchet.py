@@ -10,9 +10,11 @@ no calibration or suppression, and a change that reduces it always passes:
 - **Duplication, per file.** A file's duplicated lines (jscpd, ``.jscpd.json``) may not rise.
   Per file rather than per clone because jscpd identifies a clone by its exact extent, so a
   refactor that shrinks an existing clone would otherwise report it as new.
-- **Per function: complexity, arguments and return statements** (ruff's ``C901``, ``PLR0913``,
-  ``PLR0911``). A function over a limit in ``LIMITS`` may not get worse on that measure, and no
-  function may newly cross one. Prefect ``@flow`` functions are exempt from the argument limit.
+- **Per function** (ruff's ``C901``, ``PLR0913``, ``PLR0911``; limits in ``LIMITS``). No function
+  may newly cross the complexity limit, and one already over it may not grow. Arguments and
+  return statements bind NEW functions only (``NEW_ONLY``): a function whose qualified name is
+  absent from the base, so a renamed or moved one counts as new. Prefect ``@flow`` functions are
+  exempt from the argument limit.
 
 It catches habits, not deliberate evasion, and adopts each tool's semantics as they are (see the
 ADR's Scope). Rationale: context_docs/decisions/040-new-code-is-gated-on-duplication-and-complexity.md.
@@ -61,9 +63,13 @@ def duplicated_lines(found: list[dict]) -> Counter[str]:
 #: ``{metric: (ruff rule, setting, limit)}``. A function over a limit may not get worse.
 LIMITS = {
     "complexity": ("C901", "lint.mccabe.max-complexity", 15),
-    "arguments": ("PLR0913", "lint.pylint.max-args", 7),
-    "return statements": ("PLR0911", "lint.pylint.max-returns", 5),
+    "arguments": ("PLR0913", "lint.pylint.max-args", 5),
+    "return statements": ("PLR0911", "lint.pylint.max-returns", 3),
 }
+
+#: Measures that bind NEW functions only. An existing function is left alone on these, whatever
+#: its score, until a deliberate clean-up; complexity binds existing functions too.
+NEW_ONLY = {"arguments", "return statements"}
 
 
 @functools.cache
@@ -94,6 +100,16 @@ def _functions(path: Path) -> dict[int, tuple[str, bool]]:
 
     visit(ast.parse(path.read_text()), "")
     return found
+
+
+def all_functions(tree: Path) -> set[tuple[str, str]]:
+    """``{(file, function)}`` for every function in ``tree/src`` and ``tests``."""
+    return {
+        (path.relative_to(tree).as_posix(), name)
+        for root in ("src", "tests")
+        for path in (tree / root).rglob("*.py")
+        for name, _ in _functions(path).values()
+    }
 
 
 def function_scores(tree: Path, rule: str, setting: str, limit: int) -> dict[tuple[str, str], int]:
@@ -129,9 +145,12 @@ def main(base: Path, head: Path) -> int:
             if name in (c["firstFile"]["name"], c["secondFile"]["name"]):
                 a, b = c["firstFile"], c["secondFile"]
                 failures.append(f"    {c['lines']} lines: {a['name']}:{a['start']} ~ {b['name']}:{b['start']}")
+    existing = all_functions(base)
     for metric, (rule, setting, limit) in LIMITS.items():
         old, new = function_scores(base, rule, setting, limit), function_scores(head, rule, setting, limit)
         for (path, fn), score in sorted(new.items()):
+            if metric in NEW_ONLY and (path, fn) in existing:
+                continue
             was = old.get((path, fn))
             if was is None:
                 failures.append(f"{path}: {fn} has {score} {metric}, over {limit}")

@@ -1204,6 +1204,7 @@ def _stop_ray_cluster(
 
 
 @contextlib.contextmanager
+# jscpd:ignore-start: explicit keyword signature and Args, mirroring the cluster-YAML builder it passes them to
 def ray_cluster(
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     *,
@@ -1285,6 +1286,7 @@ def ray_cluster(
         lifecycle, or ``None`` when ``ray_address`` was supplied. The yielded path is for an
         on-cancellation hook to pass to :func:`cleanup_ray_tempfiles`.
     """
+    # jscpd:ignore-end
     resolved_yaml: str | None = None
     manages_cluster = False
     cluster_yaml = Path(cluster_yaml) if cluster_yaml is not None else DEFAULT_CLUSTER_TEMPLATE

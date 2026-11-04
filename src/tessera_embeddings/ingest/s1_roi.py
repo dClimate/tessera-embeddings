@@ -43,12 +43,7 @@ from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE, INGEST_CHUNKS
 from tessera_embeddings.errors import ProviderRefusedReadsError
 from tessera_embeddings.ingest._pipeline import pipelined
 from tessera_embeddings.ingest.duplicates import is_provider_refusal, is_unreadable_source
-from tessera_embeddings.ingest.live_windows import (
-    WINDOW_COST_IN_CHUNKS,
-    WINDOW_COST_IN_CHUNKS_OVERLAPPED,
-    live_windows_for_mask,
-    windows_for_date,
-)
+from tessera_embeddings.ingest.live_windows import run_live_windows, windows_for_date
 from tessera_embeddings.ingest.loader_failures import install_capture_everywhere, refusal_wait_out
 from tessera_embeddings.ingest.opera_query import make_s1_item_provider
 from tessera_embeddings.ingest.roi import (
@@ -414,14 +409,9 @@ def ingest_s1_roi_sar(
     # windows share one graph, so a boundary is cheap and the DP should stop trading ocean area
     # for fewer windows, while a sequential writer still pays the serial cost per boundary and
     # keeps the high rate. Bound once because per-date narrowing re-merges on the same terms.
-    window_cost = WINDOW_COST_IN_CHUNKS_OVERLAPPED if overlap_window_writes else WINDOW_COST_IN_CHUNKS
-    run_windows = live_windows_for_mask(
-        roi_zarr_path,
-        window_px=INGEST_CHUNK_SIZE,
-        window_cost_in_chunks=window_cost,
-        storage_options=storage_options,
+    window_cost, run_windows, live_windows = run_live_windows(
+        roi_zarr_path, overlapped=overlap_window_writes, storage_options=storage_options
     )
-    live_windows: list[tuple[int, int, int, int]] = [(w.y0, w.y1, w.x0, w.x1) for w in run_windows]
     # roi= and orbit both present: this is the first line a leg emits, and at fleet width a bare
     # count ties to neither a cell nor an orbit — the log stream is the Dask worker's task id,
     # and the two orbits of one zone are separate runs.

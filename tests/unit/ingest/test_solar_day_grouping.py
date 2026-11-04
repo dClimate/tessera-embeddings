@@ -14,25 +14,16 @@ zones never hit it, which is why it stayed hidden.
 
 from __future__ import annotations
 
-import datetime
-from types import SimpleNamespace
-
 import pytest
 
 from tessera_embeddings.ingest.solar_days import normalize_to_solar_day, solar_day_offset_seconds
 from tessera_embeddings.ingest.stac import group_items_by_date
+from tests.stac_items import fake_stac_item
 
 # +10 h: the offset for UTM zone 56 (150-156 E), where the failure was observed.
 FAR_EAST_LON = 153.0
 # Greenwich: no shift, so UTC and solar day coincide.
 PRIME_LON = 0.0
-
-
-def _item(iso: str, cloud: float = 0.0):
-    return SimpleNamespace(
-        datetime=datetime.datetime.fromisoformat(iso),
-        properties={"eo:cloud_cover": cloud},
-    )
 
 
 def test_offset_matches_the_loaders_whole_hour_truncation() -> None:
@@ -50,7 +41,7 @@ def test_far_east_acquisitions_across_utc_midnight_are_one_solar_day() -> None:
     This is the case that broke: grouped by UTC date these are two days; the loader
     grouped them as one.
     """
-    items = [_item("2026-01-05T23:30:00"), _item("2026-01-06T00:30:00")]
+    items = [fake_stac_item("2026-01-05T23:30:00"), fake_stac_item("2026-01-06T00:30:00")]
     groups = group_items_by_date(normalize_to_solar_day(items, mid_longitude=FAR_EAST_LON))
     assert len(groups) == 1, groups
     assert sum(len(v) for v in groups.values()) == 2
@@ -62,7 +53,7 @@ def test_far_east_one_utc_date_can_hold_two_solar_days() -> None:
     00:30 and 23:30 on the same UTC date fall on different local days at +10 h, so a
     UTC-date group would hand the loader two solar days at once.
     """
-    items = [_item("2026-01-06T00:30:00"), _item("2026-01-06T23:30:00")]
+    items = [fake_stac_item("2026-01-06T00:30:00"), fake_stac_item("2026-01-06T23:30:00")]
     # Grouped the OLD way — raw UTC dates, no normalisation — they collapse to one,
     # which is precisely the bug.
     assert len(group_items_by_date(list(items))) == 1
@@ -76,13 +67,13 @@ def test_central_longitudes_are_unaffected(lon: float) -> None:
 
     Explains why this survived every earlier test: the zones exercised were central.
     """
-    items = [_item("2026-01-06T10:30:00"), _item("2026-01-06T11:30:00")]
+    items = [fake_stac_item("2026-01-06T10:30:00"), fake_stac_item("2026-01-06T11:30:00")]
     assert len(group_items_by_date(normalize_to_solar_day(items, mid_longitude=lon))) == 1
 
 
 def test_omitting_longitude_keeps_utc_behaviour() -> None:
     """The parameter is opt-in, so callers that do not group by solar day are unchanged."""
-    items = [_item("2026-01-06T00:30:00"), _item("2026-01-06T23:30:00")]
+    items = [fake_stac_item("2026-01-06T00:30:00"), fake_stac_item("2026-01-06T23:30:00")]
     assert list(group_items_by_date(items)) == ["2026-01-06"]
 
 
@@ -91,6 +82,6 @@ def test_within_group_order_is_preserved() -> None:
 
     Grouping must not reorder, or the mosaic silently takes the cloudier pixel.
     """
-    items = [_item("2026-01-06T00:30:00", cloud=5.0), _item("2026-01-06T00:40:00", cloud=90.0)]
+    items = [fake_stac_item("2026-01-06T00:30:00", cloud=5.0), fake_stac_item("2026-01-06T00:40:00", cloud=90.0)]
     (group,) = group_items_by_date(normalize_to_solar_day(items, mid_longitude=FAR_EAST_LON)).values()
     assert [i.properties["eo:cloud_cover"] for i in group] == [5.0, 90.0]

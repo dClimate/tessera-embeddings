@@ -32,24 +32,43 @@ scans `src/` and `tests/` for three kinds of clone:
 
 On failure the job names each file whose duplication rose and the clones touching it.
 
-**Per function: complexity, arguments and return statements may not get worse** (ruff's `C901`,
-`PLR0913` and `PLR0911` scores, read by the script). A function over a limit may not grow on that
-measure, and none may newly cross one. Existing debt carries no suppression comment, and a
-function brought under a limit simply leaves the comparison.
+**Per function** (ruff's `C901`, `PLR0913` and `PLR0911` scores, read by the script). Existing
+debt carries no suppression comment.
 
-| Measure | Limit | Over it when the ratchet landed | What it signals |
-|---|---|---|---|
-| McCabe complexity | 15 | 19 | a function too branchy to review |
-| Arguments | 7 | about 80 in `src/`, 14 in `tests/` (Prefect flows included) | a missing abstraction, or a function doing too much |
-| Return statements | 5 | 11 | tangled control flow |
+| Measure | Limit | Binds | Over it on `main` when set | What it signals |
+|---|---|---|---|---|
+| McCabe complexity | 15 | every function: none may newly cross it, none over it may grow | 19 | a function too branchy to review |
+| Arguments | 5 | new functions only | 191 (124 in `src/`) | a missing abstraction, or a function doing too much |
+| Return statements | 3 | new functions only | 58 (42 in `src/`) | tangled control flow |
 
-Ruff's argument default of 5 would flag 142 functions in this keyword-heavy codebase; 7 keeps
-the signal on the outliers. Four returns was tried and rejected: 25 functions exceed it, most of
-them written as guard clauses (one early return per disqualifying case), the readable style a
-limit that low would push toward nested branches. **Prefect `@flow` functions are exempt from the argument limit**: a
-flow's parameters are its interface, the one deployments and the Prefect UI expose. Everything
-else in a flow module, its closures and helpers included, is held to it, and so are flows on
-the other two measures.
+**Arguments and returns bind new functions only**: a function whose qualified name is not in
+the base, so a renamed or moved one counts as new. Existing functions are left alone on these
+two measures, whatever their counts, until a deliberate clean-up. Holding them at 7 and 4 was
+measured first: 88 functions over 7 arguments and 27 over 4 returns across the repository,
+thirty of them five or more arguments over, and those are the pipeline's entry points
+(`assemble`, `ingest_tile`, `run_inference` and the like). Bringing them in is a refactor of
+configuration objects across ingest, inference and assembly, not a clean-up, so it is deferred.
+
+A new function that needs more than three exits should combine its guards or split, not nest
+branches. **Prefect `@flow` functions are exempt from the argument limit**: a flow's
+parameters are its interface, the one deployments and the Prefect UI expose. Everything else in
+a flow module, its closures and helpers included, is held to it.
+
+Ten of the 19 functions over 15 when the ratchet landed were split under it, each by extracting
+a self-contained block. The nine left are the campaign and ingest orchestration functions
+(`fill_zones_sequential`, `run_global_campaign`, `ingest_s2_roi_reflectance`,
+`_process_chunks_work_stealing`, `fill_zones_sequential_flow`, `ingest_zone_year`,
+`ingest_s1_roi_sar`) and two closures inside them (`_feed`, `_drive`). Their branches share
+state through `nonlocal` closures, so splitting one moves branches between closures of the same
+function; getting them under 15 means turning those closures into classes, a redesign of the
+paths the campaign depends on rather than a cleanup. The ratchet holds each at its current score.
+
+**Intended mirrors are marked, not refactored.** A block that must repeat another, such as a
+Prefect flow's parameter docs (Prefect shows each flow's own), an explicit keyword signature
+that forwards to another, or v2 model code that reproduces the v1.1 encoder as trained, is
+wrapped in `# jscpd:ignore-start: <reason>` and `# jscpd:ignore-end`. For a similar-function
+finding the markers must enclose the whole function. With logic duplicates extracted and
+mirrors marked, `src/` reports no clones.
 
 ## What was measured (2026-11-03, `main` at `cc0dec14`)
 
@@ -87,7 +106,10 @@ never fire.
 **Gating jscpd's dead-code analysis.** With orchestration, providers, profiling and package
 `__init__` files declared as entry points (in `.jscpd.json`, so they count as live and their
 imports count as uses), it reports 30 findings, 15 at confidence 85 or above. Only one was
-dead code, `config/ingest.py::auto_batch_dates` and its threshold constant. Of the rest:
+dead code, `config/ingest.py::auto_batch_dates` and its threshold constant, now removed. Removing
+them moved both code identities (`config/ingest.py` is in both closures), accepted as a one-off:
+a run resumed across the change re-infers its staged tiles, and its mosaics need
+`allow_ingest_code_mismatch=true`. Of the rest:
 
 - used by `scripts/` operator tools: four `storage/registry_rebuild.py` exports;
 - used by yield-embeddings, which a scan of this repo cannot see: `daily_times`,
@@ -147,8 +169,9 @@ as they are rather than re-deriving them:
 - A file renamed in a PR counts all its duplication as new, and so does a function renamed while
   over the limit; the job's output says which, and the fix is to reduce it or split the rename
   into its own PR.
-- A deliberate duplicate (a fixture, a golden reference) is excluded in `.jscpd.json`'s
-  `ignore`, which is reviewed like any other change.
+- A deliberate duplicate is marked at the site with its reason, or, for a whole directory such
+  as the vendored upstream fixtures, excluded in `.jscpd.json`'s `ignore`. Both are reviewed
+  like any other change.
 
 ## Related
 

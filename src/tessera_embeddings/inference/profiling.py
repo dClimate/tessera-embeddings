@@ -107,18 +107,19 @@ def enable_model_profiling(model: MultimodalBTInferenceModel) -> None:
     When ``_profile=True``, the forward methods in ``modules.py`` and
     ``ssl_model.py`` log per-layer timing and intermediate dtypes.
     """
-    object.__setattr__(model, "_profile", True)
-    for name, mod in model.named_modules():
-        if hasattr(mod, "forward") and name:
-            object.__setattr__(mod, "_profile", True)
+    _set_model_profiling(model, True)
 
 
 def disable_model_profiling(model: MultimodalBTInferenceModel) -> None:
     """Clear ``_profile`` flag from model and all sub-modules."""
-    object.__setattr__(model, "_profile", False)
+    _set_model_profiling(model, False)
+
+
+def _set_model_profiling(model: MultimodalBTInferenceModel, on: bool) -> None:
+    object.__setattr__(model, "_profile", on)
     for name, mod in model.named_modules():
         if hasattr(mod, "forward") and name:
-            object.__setattr__(mod, "_profile", False)
+            object.__setattr__(mod, "_profile", on)
 
 
 def log_profiled_batch_summary(

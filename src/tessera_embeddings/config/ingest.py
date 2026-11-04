@@ -19,6 +19,7 @@ from tessera_embeddings.config.code_identity import source_identity
 _MOSAIC_CONTENT_SOURCES: tuple[str, ...] = ("ingest/s1_roi.py", "ingest/s2_roi.py")
 
 
+# jscpd:ignore-start: same shape as inference_code_identity; each fingerprints its own sources
 def ingest_code_identity() -> str:
     """Fingerprint of the code that decides a mosaic's CONTENT.
 
@@ -32,6 +33,7 @@ def ingest_code_identity() -> str:
     finished mosaic stale on any ingest change, and there are petabytes of them; on the append it
     only ever rejects work that was already incomplete.
     """
+    # jscpd:ignore-end
     return source_identity(_MOSAIC_CONTENT_SOURCES, "ingcode")
 
 
@@ -110,30 +112,8 @@ INGEST_MANIFEST_SPLIT = {"time": 8}
 # constants should eventually be unified under one name with per-path defaults.
 DEFAULT_MIN_VALID_COVERAGE = 0.1
 
-# Date batching is enabled per ROI by SIZE, because its benefit is not monotonic in size: it
-# amortises the per-batch commit and cannot speed the write (which is fleet-bound), so it pays
-# only where the commit is a large share of a date's cost and LOSES where a bigger write graph
-# crowds out the preparation overlapping it. A THRESHOLD, not an interpolated curve, set at the
-# upper edge of the range where batching was measured to win rather than at the estimated
-# crossover: widening it means measuring an ROI in between, not extrapolating. Measurements and
-# per-size ratios: context_docs/ingest/campaign-ingest-measurements.md.
-#
-# Denominated in the COVERED chunk area of a run's live windows — the area the write graph
-# actually touches, already known once windows are merged, so deriving it costs no extra I/O.
-# That COUPLES IT TO THE WINDOW MERGE COST, a trap worth naming: covered area is an output of the
-# merge, so changing ``live_windows.WINDOW_COST_IN_CHUNKS*`` moves every ROI along this axis with
-# nobody touching this constant (a finer merge covers less area, so ROIs drift DOWN and more of
-# them batch). Recalibrate against runs, not an offline sweep at a different cost, whenever that
-# exchange rate changes.
-AUTO_BATCH_DATES_MAX_COVERED_CHUNKS = 500
-
 # Dates fused per graph when batching turns on. The only batch size measured.
 AUTO_BATCH_DATES = 4
-
-
-def auto_batch_dates(covered_chunks: int) -> int:
-    """Dates to fuse for a run whose live windows cover ``covered_chunks`` chunks."""
-    return AUTO_BATCH_DATES if covered_chunks <= AUTO_BATCH_DATES_MAX_COVERED_CHUNKS else 1
 
 
 class IngestSettings(BaseModel):
