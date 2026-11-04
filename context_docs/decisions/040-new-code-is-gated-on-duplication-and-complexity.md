@@ -15,14 +15,14 @@ on what a pull request *adds* needs neither, and it is the signal that steers th
 
 ## Decision
 
-**A ratchet against the base commit** (`.github/workflows/quality-ratchet.yml`, rules in
-`.github/scripts/quality_ratchet.py`) fails a pull request that makes either measure worse than
-the commit it merges into. Both trees are measured with the head's settings, on every PR,
-stacked ones included, and against the merge commit's first parent rather than the base branch,
-which can move while the job is queued.
+**A ratchet** (`.github/workflows/quality-ratchet.yml`, rules in
+`.github/scripts/quality_ratchet.py`) fails a pull request that writes a copy of existing code or
+makes a function worse than in the commit it merges into. It runs on every PR, stacked ones
+included, against the merge commit's first parent rather than the base branch, which can move
+while the job is queued.
 
-**Duplication: no file's duplicated lines may rise** (jscpd, settings in `.jscpd.json`). jscpd
-scans `src/` and `tests/` for three kinds of clone:
+**Duplication: code a PR writes may not be a copy.** jscpd (settings in `.jscpd.json`) runs once,
+on the head, over `src/` and `tests/`, and finds three kinds of clone:
 
 - **Exact copies** of at least 50 tokens and 5 lines (jscpd's defaults).
 - **Gap clones** (`maxGapLines: 3`): two copies separated by at most three inserted or changed
@@ -30,19 +30,19 @@ scans `src/` and `tests/` for three kinds of clone:
 - **Similar functions** (`similarity: 0.8`): functions whose syntax trees match after local
   names and literals are normalised. jscpd leaves test files out of this kind.
 
-A file's count sums the span of each clone side in it, so a span that copies two files counts
-twice. Only files the pull request adds or modifies are judged: a copy always lands in a file the
-PR wrote, while an untouched file's count can rise when a deletion elsewhere makes jscpd re-pair
-its clones. Deleting one of three copies pairs the other two against one file, counted once per
-partner, and can surface lines jscpd had folded into the deleted pair. A surviving copy the PR
-also edits is still judged, and can fail the same way. The count is a sum rather than the set of
-duplicated lines because a set would miss an edit that makes an already-duplicated span copy one
-more, untouched, file: the edited file's set would not grow, and the file that did grow is not
-judged. jscpd scans from the repository
-root (`"path": ["."]` with a `pattern`), so the names it reports are repository paths, which
-both the changed-file check and the job's output need.
+`git diff` from the base gives the lines the PR added or changed, following renames. A clone side
+holding 5 or more of those lines, or at least half of a side 5 or more lines long, is a copy the
+PR made, and the job names it and the code it copies. Five is jscpd's minimum clone length, and
+catches an existing copy extended by five or more lines. The half catches a short copy that `git
+diff` aligns with the lines it replaced: a shared `return` or blank line reads as unchanged, and a
+10-line copy over a function with the same skeleton showed only 6 lines written. A side under five
+lines is the short end of a gap or similar-function clone and is not judged on its own. jscpd
+scans from the repository root (`"path": ["."]` with a `pattern`), so the names it reports are the
+repository paths `git diff` uses.
 
-On failure the job names each file whose duplication rose and the clones touching it.
+Only lines the PR writes are judged, so how jscpd pairs code the PR did not touch cannot fail it:
+deleting a copy never fails, and neither does a jscpd upgrade or a settings change. Why the
+duplication is not compared with the base is under Rejected.
 
 **Per function** (ruff's `C901`, `PLR0913` and `PLR0911` scores, read by the script). Existing
 debt carries no suppression comment.
@@ -86,6 +86,10 @@ mirrors marked, `src/` reports no clones.
 
 - `src/` has 28 exact clones, 0.46% of lines. With gaps and similar functions on, 32. `tests/`
   has 149 exact or gap clones, 2.2% of lines. None of these fail the gate.
+- **The duplication rule replayed over the last 30 merged PRs** (2026-11-04) flags 3, none of
+  them the large clean-ups (#221, #263, #264). The one inspected, #209, is a new test repeating
+  the previous test's four setup lines. With four copies of one function, jscpd pairs the new one
+  against the first, so a new copy is always reported.
 - **Controls.** A 100-line function copied into a new module with two lines inserted and a
   variable renamed raised two files' duplicated lines by 101 each, and the job failed. A new
   17-branch function failed, and so did one added branch in a function already at 19.
@@ -100,6 +104,19 @@ mirrors marked, `src/` reports no clones.
 and no comparison against the base branch, and the ranking tracks file size. It cannot screen a
 pull request. Ruff's per-function `C901` scores can.
 
+**Comparing each file's duplicated lines between the base and the head**, the rule this ADR
+first adopted. Nothing identifies the same clone across two jscpd runs: jscpd reports clones in
+pairs, each new copy against the first it saw, and re-pairs them whenever a copy is deleted or
+changed. A rule comparing the two runs' totals has to choose which errors to make, and review
+found one after another while porting it to yield-model (Arbol-Project/yield-model#72):
+
+- Summing each file's clone spans failed a clean-up. Deleting one of three copies pairs the
+  other two against one file, counted once per partner: an untouched file "rose from 16 to 75".
+- Counting each line once hid an edit that made an already-duplicated span copy one more file.
+- Judging only files the PR changed fixed the clean-ups (an untouched file had "risen from 41 to
+  47" when a deletion surfaced lines jscpd had folded into the deleted pair) but hid an edit that
+  swapped a copy of one file for a copy of another, leaving the edited file's total unchanged.
+
 **Failing on any clone absent from the base** (jscpd's own `--baseline-from-ref
 --fail-on-new-clones`), the first version. jscpd identifies a clone by its exact extent, so an
 edit that moves a clone's boundary makes it new: a `# noqa` added to a function's first line,
@@ -108,8 +125,7 @@ or a refactor that SHRINKS an existing clone. The test clean-up that cut test cl
 toward less of it.
 
 **One repository-wide total.** Simpler, but a PR that removes duplication in one place could
-add a fresh copy elsewhere and pass. Per file, a fresh copy fails unless the same PR removes as
-much from the same file.
+add a fresh copy elsewhere and pass.
 
 **`# noqa: C901` on each function already over the limit**, the first version for complexity.
 A suppression is permanent: the function could then grow without limit and the gate would
@@ -167,9 +183,12 @@ as they are rather than re-deriving them:
 
 - Ruff's `PLR0913` skips methods decorated with `@override`, whose signature is the parent's
   and is checked there, and parameters it treats as unused (`_`-prefixed names).
-- A file's duplicated lines are each clone side's whole span, so a line added inside an existing
-  gap or similar-function clone counts as more duplication. The job names the clone:
-  merge it or mark it.
+- Lines a PR writes inside an existing clone count toward it. Rewriting five or more lines of a
+  block that stays duplicated fails, as do moving a still-duplicated function to another file,
+  reverting a commit that removed one, and a partial clean-up that rewrites a surviving copy. The
+  job names the clone: merge it or mark it. None of these occurred in the replay.
+- A copy completed mostly from lines already in the file, a copy split across several small PRs,
+  and anything jscpd cannot see (under its minimum size, or outside `src/` and `tests/`) pass.
 - A pull request is measured when it is opened, pushed or retargeted, not when its base branch
   advances. As for every other check, keeping a pull request current with its base is a
   repository setting (required up-to-date branches or a merge queue), not this workflow's job.
@@ -178,9 +197,9 @@ as they are rather than re-deriving them:
 
 - An agent that copies code gets a failing check naming both locations, which points it at the
   call it should have made.
-- A file renamed in a PR counts all its duplication as new, and so does a function renamed while
-  over the limit; the job's output says which, and the fix is to reduce it or split the rename
-  into its own PR.
+- A renamed file counts only the lines that changed in it. A function renamed while over a
+  limit counts as new; the job's output says which, and the fix is to reduce it or split the
+  rename into its own PR.
 - A deliberate duplicate is marked at the site with its reason, or, for a whole directory such
   as the vendored upstream fixtures, excluded in `.jscpd.json`'s `ignore`. Both are reviewed
   like any other change.

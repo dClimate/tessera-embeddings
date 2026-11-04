@@ -1,21 +1,19 @@
-"""Fail a pull request that adds duplication to a file or complexity to a function.
+"""Fail a pull request that writes a copy of existing code or adds complexity to a function.
 
 Usage: ``python quality_ratchet.py BASE_TREE HEAD_TREE`` from the head checkout, with jscpd and
-ruff on PATH (``uv run``). Both trees are measured with the HEAD's settings, so a base that
-predates them is measured the same way.
+ruff on PATH (``uv run``). BASE_TREE is a worktree of the commit the PR merges into, so ``git``
+can diff the two.
 
-Each measure is compared with the base rather than with a fixed limit, so existing debt needs
-no calibration or suppression, and a change that reduces it always passes:
-
-- **Duplication, per file.** A file's duplicated lines (jscpd, ``.jscpd.json``) may not rise,
-  judged only in files the PR adds or modifies. Per file rather than per clone because jscpd
-  identifies a clone by its exact extent, so a refactor that shrinks an existing clone would
-  otherwise report it as new.
-- **Per function** (ruff's ``C901``, ``PLR0913``, ``PLR0911``; limits in ``LIMITS``). No function
-  may newly cross the complexity limit, and one already over it may not grow. Arguments and
-  return statements bind NEW functions only (``NEW_ONLY``): a function whose qualified name is
-  absent from the base, so a renamed or moved one counts as new. Prefect ``@flow`` functions are
-  exempt from the argument limit.
+- **Duplication: code the PR writes may not be a copy.** jscpd (``.jscpd.json``) runs once, on
+  the head, and ``git diff`` gives the lines the PR added or changed. A clone side holding at
+  least ``MIN_WRITTEN`` of those lines, or at least half of a side that long, is a copy the PR
+  made. Only written lines are judged, so how jscpd pairs copies the PR did not touch (it
+  re-pairs them whenever one is deleted) cannot fail a PR, and deleting a copy never does.
+- **Per function** (ruff's ``C901``, ``PLR0913``, ``PLR0911``; limits in ``LIMITS``), compared
+  with the base. No function may newly cross the complexity limit, and one already over it may
+  not grow. Arguments and return statements bind NEW functions only (``NEW_ONLY``): a function
+  whose qualified name is absent from the base, so a renamed or moved one counts as new. Prefect
+  ``@flow`` functions are exempt from the argument limit.
 
 It catches habits, not deliberate evasion, and adopts each tool's semantics as they are (see the
 ADR's Scope). Rationale: context_docs/decisions/040-new-code-is-gated-on-duplication-and-complexity.md.
@@ -27,40 +25,64 @@ import ast
 import functools
 import json
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
-from collections import Counter
 from pathlib import Path
 
+#: A clone side holding this many lines the PR wrote, or at least half of a side this long, is a
+#: copy it made. jscpd's own minimum clone length. The half catches a short copy that ``git diff``
+#: aligns with lines it replaced (a shared ``return`` or blank line reads as unchanged); a side
+#: shorter than this is the short end of a gap or similar-function clone and is not judged alone.
+MIN_WRITTEN = 5
 
-def clones(tree: Path, config: Path) -> list[dict]:
-    """Every clone jscpd reports in ``tree`` under ``config``.
 
-    jscpd resolves a config's paths and ignore globs against the config file's directory, so
-    the config is copied INTO ``tree`` (the base is a throwaway worktree) rather than pointed at.
-    """
-    if config.parent != tree:
-        shutil.copy(config, tree / ".jscpd.json")
+def clones(tree: Path) -> list[dict]:
+    """Every clone jscpd reports in ``tree``, under the ``.jscpd.json`` there."""
     with tempfile.TemporaryDirectory() as out:
         subprocess.run(["jscpd", "--reporters", "silent,json", "--output", out], cwd=tree, check=True)
         return json.loads((Path(out) / "jscpd-report.json").read_text())["duplicates"]
 
 
-def duplicated_lines(found: list[dict]) -> Counter[str]:
-    """Duplicated lines per file, counting each side of each clone over its own span.
+def written_lines(head: Path, base_commit: str) -> dict[str, set[int]]:
+    """``{file: head line numbers}`` the PR added or changed since ``base_commit``.
 
-    A sum over clones, so a span that copies two files counts twice: an edit that makes an
-    already-duplicated span copy one more file still raises the edited file's count. jscpd's
-    ``lines`` is the FIRST side's span; a gap or similar-function clone's sides can differ in
-    length.
+    Renames are followed (``-M``), so a renamed file counts only the lines that changed in it.
     """
-    lines: Counter[str] = Counter()
+    diff = subprocess.run(
+        ["git", "diff", "--unified=0", "-M", "--no-color", "--no-ext-diff", base_commit, "HEAD"],
+        cwd=head,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    written: dict[str, set[int]] = {}
+    name = None
+    for line in diff.splitlines():
+        if line.startswith("+++ "):
+            name = None if line == "+++ /dev/null" else line.removeprefix("+++ b/")
+        elif line.startswith("@@") and name:
+            start, _, count = re.search(r"\+(\d+)(,(\d+))?", line).groups()
+            first = int(start)
+            written.setdefault(name, set()).update(range(first, first + int(count or 1)))
+    return written
+
+
+def copies(found: list[dict], written: dict[str, set[int]]) -> list[str]:
+    """One line for each clone side the PR wrote, naming the code it copies."""
+    made = []
     for clone in found:
-        for side in (clone["firstFile"], clone["secondFile"]):
-            lines[side["name"]] += side["end"] - side["start"] + 1
-    return lines
+        sides = (clone["firstFile"], clone["secondFile"])
+        for side, other in (sides, sides[::-1]):
+            span = side["end"] - side["start"] + 1
+            lines = range(side["start"], side["end"] + 1)
+            n = len(written.get(side["name"], set()).intersection(lines))
+            if n >= MIN_WRITTEN or (span >= MIN_WRITTEN and 2 * n >= span):
+                made.append(
+                    f"{side['name']}:{side['start']}: wrote {n} of these {span} lines,"
+                    f" a copy of {other['name']}:{other['start']}"
+                )
+    return sorted(set(made))
 
 
 #: ``{metric: (ruff rule, setting, limit)}``. A function over a limit may not get worse.
@@ -137,33 +159,12 @@ def function_scores(tree: Path, rule: str, setting: str, limit: int) -> dict[tup
     return scores
 
 
-def grew(before: Counter[str], after: Counter[str], base: Path, head: Path) -> list[str]:
-    """Files whose duplicated lines rose, among those the pull request added or modified.
-
-    Duplication a PR adds lives in a file it wrote, so an untouched file is not judged: its count
-    can rise only because jscpd re-paired its clones. Deleting one of three copies makes jscpd pair
-    the other two against one file, counted once per partner, and can report lines it had folded
-    into the deleted pair, which were duplicated all along. A survivor the PR also edits is still
-    judged; the job names the clone, to merge or mark.
-    """
-
-    def changed(name: str) -> bool:
-        return not (base / name).exists() or (base / name).read_bytes() != (head / name).read_bytes()
-
-    return sorted(n for n in after if after[n] > before[n] and changed(n))
-
-
 def main(base: Path, head: Path) -> int:
     """Print every regression and return the exit code."""
-    failures: list[str] = []
-    head_clones = clones(head, head / ".jscpd.json")
-    before, after = duplicated_lines(clones(base, head / ".jscpd.json")), duplicated_lines(head_clones)
-    for name in grew(before, after, base, head):
-        failures.append(f"{name}: duplicated lines rose from {before[name]} to {after[name]}")
-        for c in head_clones:
-            if name in (c["firstFile"]["name"], c["secondFile"]["name"]):
-                a, b = c["firstFile"], c["secondFile"]
-                failures.append(f"    {c['lines']} lines: {a['name']}:{a['start']} ~ {b['name']}:{b['start']}")
+    base_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=base, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    failures = copies(clones(head), written_lines(head, base_commit))
     existing = all_functions(base)
     for metric, (rule, setting, limit) in LIMITS.items():
         old, new = function_scores(base, rule, setting, limit), function_scores(head, rule, setting, limit)
@@ -175,7 +176,7 @@ def main(base: Path, head: Path) -> int:
                 failures.append(f"{path}: {fn} has {score} {metric}, over {limit}")
             elif score > was:
                 failures.append(f"{path}: {fn} grew from {was} to {score} {metric}")
-    print("\n".join(failures) or "No file gained duplication and no function got worse.")
+    print("\n".join(failures) or "The PR wrote no copies, and no function got worse.")
     return 1 if failures else 0
 
 

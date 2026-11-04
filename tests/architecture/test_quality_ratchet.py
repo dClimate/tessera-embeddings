@@ -1,11 +1,10 @@
-"""The quality ratchet's duplication count (``.github/scripts/quality_ratchet.py``).
+"""The quality ratchet's duplication rule (``.github/scripts/quality_ratchet.py``).
 
-A clean-up that deletes a copy is not reported as adding duplication to files it leaves
-untouched, and an edit that copies one more file is.
+Code a PR writes may not be a copy; code it did not write is never judged, however jscpd pairs it.
 """
 
 import importlib.util
-from collections import Counter
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -23,46 +22,53 @@ def _clone(a: tuple[str, int, int], b: tuple[str, int, int]) -> dict:
     }
 
 
-def _grew(before: list[dict], after: list[dict], changed: set[str], tmp_path: Path) -> list[str]:
-    """``grew`` over two trees in which only ``changed`` files differ."""
-    base, head = tmp_path / "base", tmp_path / "head"
-    names = {side["name"] for c in before + after for side in (c["firstFile"], c["secondFile"])}
-    for tree in (base, head):
-        tree.mkdir()
-        for name in names:
-            (tree / name).write_text(f"{name} {tree.name if name in changed else ''}")
-    return ratchet.grew(ratchet.duplicated_lines(before), ratchet.duplicated_lines(after), base, head)
-
-
-def test_deleting_the_shared_copy_does_not_fail(tmp_path):
-    """The remaining copies are re-paired against one untouched file, raising its count."""
-    x, a, c, d = (("x.py", 1, 10), ("a.py", 1, 10), ("c.py", 1, 10), ("d.py", 1, 10))
-    assert _grew([_clone(x, a), _clone(x, c), _clone(x, d)], [_clone(a, c), _clone(a, d)], set(), tmp_path) == []
-
-
-def test_an_edit_that_copies_one_more_file_fails(tmp_path):
-    """An already-duplicated span in an edited file that now also copies an untouched file."""
-    a, b, c = (("a.py", 1, 10), ("b.py", 1, 10), ("c.py", 1, 10))
-    assert _grew([_clone(a, c)], [_clone(a, c), _clone(a, b)], {"a.py"}, tmp_path) == ["a.py"]
-
-
-def test_each_side_counts_its_own_span():
-    """A gap clone's sides differ in length."""
-    found = [_clone(("a.py", 1, 10), ("b.py", 1, 13))]
-    assert ratchet.duplicated_lines(found) == {"a.py": 10, "b.py": 13}
+def _lines(first: int, last: int) -> set[int]:
+    return set(range(first, last + 1))
 
 
 @pytest.mark.parametrize(
-    ("base_text", "head_text", "judged"),
-    [("x = 1\n", "x = 1\n", False), ("x = 1\n", "x = 2\n", True), (None, "x = 1\n", True)],
-    ids=["untouched", "modified", "added"],
+    ("clones", "written", "flagged"),
+    [
+        # Deleting one of three copies re-pairs the survivors; the PR wrote none of them.
+        ([_clone(("a.py", 1, 10), ("c.py", 1, 10))], {}, []),
+        # A new file copying an existing one.
+        ([_clone(("b.py", 1, 10), ("new.py", 1, 10))], {"new.py": _lines(1, 10)}, ["new.py"]),
+        # An edited file swaps a copy of c.py for a copy of untouched b.py.
+        ([_clone(("a.py", 1, 10), ("b.py", 1, 10))], {"a.py": _lines(1, 10)}, ["a.py"]),
+        # Extending an existing copy by 8 lines: under half the side, over the minimum.
+        ([_clone(("a.py", 1, 19), ("b.py", 1, 19))], {"a.py": _lines(12, 19)}, ["a.py"]),
+        # A short copy git aligned with the lines it replaced: 4 of 7 written.
+        ([_clone(("a.py", 1, 7), ("b.py", 1, 7))], {"a.py": {1, 3, 4, 6}}, ["a.py"]),
+        # Renaming a variable inside an existing copy touches 3 of its 11 lines.
+        ([_clone(("a.py", 1, 11), ("b.py", 1, 11))], {"a.py": {1, 4, 10}}, []),
+        # The 3-line short end of a gap clone is not judged on its own.
+        ([_clone(("a.py", 1, 3), ("b.py", 1, 8))], {"a.py": _lines(1, 3)}, []),
+    ],
+    ids=["deletion", "new-file", "swap", "extend", "aligned-short-copy", "rename", "short-side"],
 )
-def test_only_files_the_pr_wrote_are_judged(tmp_path, base_text, head_text, judged):
-    """An untouched file's count can rise when a deletion makes jscpd re-pair its clones."""
-    base, head = tmp_path / "base", tmp_path / "head"
-    for tree, text in ((base, base_text), (head, head_text)):
-        tree.mkdir()
-        if text is not None:
-            (tree / "f.py").write_text(text)
-    expected = ["f.py"] if judged else []
-    assert ratchet.grew(Counter({"f.py": 5}), Counter({"f.py": 9}), base, head) == expected
+def test_a_copy_is_a_clone_side_the_pr_wrote(clones, written, flagged):
+    assert [line.split(":")[0] for line in ratchet.copies(clones, written)] == flagged
+
+
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-c", "user.email=x@x", "-c", "user.name=x", *args],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+
+
+def test_written_lines_are_head_line_numbers_and_follow_renames(tmp_path):
+    _git(tmp_path, "init", "-q")
+    (tmp_path / "old.py").write_text("".join(f"line_{i} = {i}\n" for i in range(20)))
+    (tmp_path / "edited.py").write_text("a = 1\nb = 2\nc = 3\n")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-q", "-m", "base")
+    (tmp_path / "old.py").rename(tmp_path / "renamed.py")
+    (tmp_path / "edited.py").write_text("a = 1\nb = 20\nc = 3\nd = 4\n")
+    (tmp_path / "new.py").write_text("x = 1\ny = 2\n")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-q", "-m", "head")
+
+    assert ratchet.written_lines(tmp_path, "HEAD~1") == {"edited.py": {2, 4}, "new.py": {1, 2}}
