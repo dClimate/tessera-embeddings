@@ -164,7 +164,7 @@ the quickstart by hand ([ADR 023](../context_docs/decisions/023-the-single-path-
 
 Things this suite is *designed* to have and does not yet. Each is a deliberate gap with a
 known shape, not an oversight — recorded here so they can be picked up rather than
-rediscovered. Full analysis in `context_docs/test-suite-streamlining.md`.
+rediscovered. Full analysis in `context_docs/test-suite-reduction/README.md`.
 
 ### 1. ~~The `slow/` tier and the full-pipeline end-to-end~~ — CLOSED, and not by building it
 
@@ -243,7 +243,7 @@ remain valid.
 ### Closed, for reference
 
 Items that were on this list and are now closed, so they do not read as open work. Detail in
-`context_docs/test-suite-streamlining.md`.
+`context_docs/test-suite-reduction/README.md`.
 
 - Two tests no CI job ran — one deleted, one moved to `tests/integration/`.
 - A unit test that broke the 30-second bound; it now asserts the retry ladder's shape rather
