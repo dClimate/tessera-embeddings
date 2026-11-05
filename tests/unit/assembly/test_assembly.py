@@ -49,7 +49,7 @@ from tessera_embeddings.inference.assembly import (
     _write_granularity,
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, enumerate_chunks, filter_chunks_by_roi_mask
-from tessera_embeddings.inference.quantization import quantize_embeddings
+from tessera_embeddings.inference.quantization import quantize_rows
 from tessera_embeddings.storage import shard_writer
 from tessera_embeddings.storage.conventions import STACK_ATTR, library_stack
 from tessera_embeddings.storage.global_store import create_global_repo, create_layout_arrays, open_global_repo
@@ -117,8 +117,8 @@ def _quantized_embeddings(
     rng: np.random.Generator, h: int, w: int, dim: int = EMBEDDING_DIM
 ) -> tuple[np.ndarray, np.ndarray]:
     """Generate random float32 embeddings and return (int8_quantized, scales)."""
-    raw = rng.standard_normal((h, w, dim)).astype(np.float32)
-    return quantize_embeddings(raw)
+    quantized, scales = quantize_rows(rng.standard_normal((h * w, dim)).astype(np.float32))
+    return quantized.reshape(h, w, dim), scales.reshape(h, w)
 
 
 #: The 2x2 tile grid most assembly tests use: 5-px rows except the short bottom
@@ -1243,8 +1243,7 @@ class TestAssemblyValidation:
         run_id = "conv_test"
 
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
-        emb = np.random.default_rng(42).standard_normal((4, 4, EMBEDDING_DIM)).astype(np.float32)
-        quantized, scales = quantize_embeddings(emb)
+        quantized, scales = _quantized_embeddings(np.random.default_rng(42), 4, 4)
         custom = {**STACK, "checkpoint_id": "test_model_v1"}
         writer.write_chunk(chunk, quantized, run_id, scales=scales, stack=custom)
 

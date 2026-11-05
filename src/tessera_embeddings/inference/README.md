@@ -513,7 +513,7 @@ Each bucket needs a fixed-length sequence per pixel. For a bucket `(s2_bin, s1_b
   `(B, s1_bin, 3)`: the normalised VV/VH pair plus a day-of-year feature.
 
 **Which observations fill the sequence is decided per encoder.** Each was trained under its
-own padding and subsampling rule, and `resampler_for(model_version)` selects it. Both are
+own padding and subsampling rule, and the dataset selects it by `model_version`. Both are
 deterministic in both directions:
 
 - **v1.1 — `build_resample_indices`.** Too **few** observations for the bucket target: every
@@ -713,8 +713,7 @@ host, which is roughly a quarter of the device-to-host traffic the float32 rows 
 W, 128)` tile is never materialised in float32. That is numerically identical to compressing the
 whole array at the end, and it shrinks the resident accumulator about fourfold — from roughly 2
 GB to 0.5 GB at a 2048-pixel tile — while removing an end-of-tile whole-array pass and its
-multi-gigabyte temporaries. `quantize_embeddings` remains as the `(H, W, D)` entry point and
-delegates to `quantize_rows`.
+multi-gigabyte temporaries.
 
 **What comes out:**
 

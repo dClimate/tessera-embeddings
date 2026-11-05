@@ -22,7 +22,7 @@ from tessera_embeddings.config.inference import (
     prefetch_depth,
 )
 from tessera_embeddings.config.time_windows import parse_time_window
-from tessera_embeddings.inference.sampling import _CACHED_RESAMPLERS, _RESAMPLERS
+from tessera_embeddings.inference.sampling import _CACHED_RESAMPLERS
 
 
 @pytest.mark.parametrize(
@@ -168,7 +168,6 @@ def test_every_model_version_has_one_record_and_one_resampler() -> None:
     versions = set(get_args(ModelVersion))
     for name, table in (
         ("MODEL_FAMILIES", MODEL_FAMILIES),
-        ("sampling._RESAMPLERS", _RESAMPLERS),
         ("sampling._CACHED_RESAMPLERS", _CACHED_RESAMPLERS),
     ):
         assert set(table) == versions, f"{name} does not cover the versions ModelVersion names"
