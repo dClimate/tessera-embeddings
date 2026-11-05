@@ -7,6 +7,7 @@ reference are intentionally omitted — tessera-embeddings has no cloudmask modu
 
 from __future__ import annotations
 
+import dataclasses
 import os
 
 # Suppress Icechunk's Rust-level warning about local filesystem concurrency: valid for
@@ -65,9 +66,9 @@ class _InProcessForkPool(ThreadPoolExecutor):
         inner = super().submit(_call_roundtripped, pickle.dumps((fn, args)))
         outer: Future = Future()
         inner.add_done_callback(
-            lambda f: outer.set_exception(f.exception())
-            if f.exception()
-            else outer.set_result(pickle.loads(f.result()))
+            lambda f: (
+                outer.set_exception(f.exception()) if f.exception() else outer.set_result(pickle.loads(f.result()))
+            )
         )
         return outer
 
@@ -239,9 +240,11 @@ def local_zarr_path(tmp_path):
 # -----------------------------------------------------------------------------
 
 
-@pytest.fixture
-def inference_config():
-    """Minimal v1.1 inference config for tests (small model, tiny buckets)."""
+@pytest.fixture(scope="session")
+def inference_config_template():
+    """Minimal v1.1 inference config for tests (small model, tiny buckets). Never mutate it: tests
+    take a copy through ``inference_config``; module-scoped fixtures read it to build shared models.
+    """
     from tessera_embeddings.config.inference import InferenceConfig
     from tessera_embeddings.config.time_windows import parse_time_window
 
@@ -260,6 +263,12 @@ def inference_config():
         checkpoint_path="dummy",  # non-empty so __post_init__ doesn't hit resolve_buckets
         time_window=parse_time_window("June 2025"),
     )
+
+
+@pytest.fixture
+def inference_config(inference_config_template):
+    """A per-test copy of the template, so a test may mutate its fields."""
+    return dataclasses.replace(inference_config_template)
 
 
 @pytest.fixture

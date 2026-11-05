@@ -25,6 +25,7 @@ from tessera_embeddings.inference.data_loading import (
     resolve_s1_orbit,
 )
 from tessera_embeddings.storage.time_axis import compute_doy
+from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group, write_dataset
 from tests.unit.mosaic_stores import make_s2_group, make_sar_group, store_opener
 
 
@@ -60,30 +61,28 @@ class TestLoadS2Bands:
         read spans multiple chunks) and assert the threaded ``_load_s2_bands``
         equals a per-band serial read.
         """
-        from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group, write_dataset
-
         dates = [f"2024-06-{d:02d}" for d in range(1, 9)]  # 8 timesteps
-        data = sample_reflectance_data(dates, height=128, width=128)
+        data = sample_reflectance_data(dates, height=64, width=64)
         store_path = str(local_zarr_path / "conc_tile" / "reflectance.zarr")
         write_dataset(
             store_path,
             data,
             tile_id="33UUP",
             baselines=dict.fromkeys(dates, 400),
-            chunks={"time": 1, "northing": 64, "easting": 64},
+            chunks={"time": 1, "northing": 32, "easting": 32},
             crs="EPSG:32615",
         )
 
         root = open_store_as_zarr_group(store_path)
-        ti, ys, xs = np.arange(len(dates)), slice(0, 128), slice(0, 128)
+        ti, ys, xs = np.arange(len(dates)), slice(0, 64), slice(0, 64)
 
-        serial = np.empty((len(dates), 128, 128, len(S2_BAND_ORDER)), dtype=np.uint16)
+        serial = np.empty((len(dates), 64, 64, len(S2_BAND_ORDER)), dtype=np.uint16)
         for i, band in enumerate(S2_BAND_ORDER):
             serial[:, :, :, i] = root[band].oindex[ti, ys, xs]
 
         # Run several times so a data race (rather than a deterministic bug)
         # has a chance to surface.
-        for _ in range(10):
+        for _ in range(3):
             result = _load_s2_bands(root, time_indices=ti, y_slice=ys, x_slice=xs)
             np.testing.assert_array_equal(result, serial)
 

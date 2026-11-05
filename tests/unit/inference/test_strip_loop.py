@@ -33,6 +33,7 @@ from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.actors import InferenceActor
 from tessera_embeddings.inference.assembly import summarise_optical_skips
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, write_pixel_mask
+from tessera_embeddings.inference.models.builder import _build_inference_model
 from tessera_embeddings.inference.read_plan import (
     _MIN_STRIP_H,
     _S2_STRIP_BYTE_BUDGET,
@@ -276,18 +277,30 @@ def _force_strip_plan(strip_h: int):
     return _plan
 
 
+@pytest.fixture(scope="module")
+def test_model(inference_config_template):
+    """One model for the module, so a cached reference and the test comparing against it agree."""
+    return _build_inference_model(inference_config_template, torch.device("cpu")).eval()
+
+
+@pytest.fixture(scope="module")
+def serial_reference(inference_config_template, test_model):
+    """``_CHUNK`` run once under a forced 4-row strip plan: the write several tests compare against."""
+    with patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(4)):
+        return _run_process_chunk(dataclasses.replace(inference_config_template), test_model)
+
+
 class TestProcessChunkStriping:
     """1-strip vs N-strip equality and skip-marker behavior."""
 
-    def test_single_vs_multi_strip_identical(self, inference_config, test_model):
+    def test_single_vs_multi_strip_identical(self, inference_config, test_model, serial_reference):
         # Force the tiling via _strip_plan so the test controls the strip count
         # regardless of the synthetic chunk's density. strip_h > height -> one
         # strip (== unstriped path); a small strip height forces a multi-strip
         # split of this tiny chunk. Both tilings must yield bit-identical output.
         with patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(10**6)):
             res_one, write_one = _run_process_chunk(inference_config, test_model)
-        with patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(4)):
-            res_multi, write_multi = _run_process_chunk(inference_config, test_model)
+        res_multi, write_multi = serial_reference
 
         assert res_one["status"] == res_multi["status"] == "success"
         assert res_one["valid_pixels"] == res_multi["valid_pixels"]
@@ -311,7 +324,7 @@ class TestProcessChunkStriping:
                 np.testing.assert_array_equal(write_one["month_covered"][var], other["month_covered"][var], err_msg=var)
 
     def test_a_holes_tile_reads_only_its_holes_and_infers_them_as_a_full_run_does(
-        self, inference_config, test_model, tmp_path
+        self, inference_config, test_model, serial_reference, tmp_path
     ):
         """Rows and columns without holes are never loaded, and the hole pixels come out as in a full run."""
         holes = np.zeros((_CHUNK.height, _CHUNK.width), dtype=bool)
@@ -323,12 +336,14 @@ class TestProcessChunkStriping:
             loaded.append((kwargs["y_sub"], kwargs["x_sub"]))
             return real_load(*args, **kwargs)
 
-        with patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(4)):
-            _, full = _run_process_chunk(inference_config, test_model)
-            with patch.object(_actors_mod, "load_chunk", side_effect=_spy):
-                result, part = _run_process_chunk(
-                    inference_config, test_model, chunk=dataclasses.replace(_CHUNK, pixels=str(tmp_path / "holes.npz"))
-                )
+        _, full = serial_reference
+        with (
+            patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(4)),
+            patch.object(_actors_mod, "load_chunk", side_effect=_spy),
+        ):
+            result, part = _run_process_chunk(
+                inference_config, test_model, chunk=dataclasses.replace(_CHUNK, pixels=str(tmp_path / "holes.npz"))
+            )
 
         assert loaded == [(slice(9, 11), slice(2, 5))]
         assert result["valid_pixels"] == holes.sum()
@@ -834,7 +849,9 @@ class TestXChunkPrefetch:
     """End-to-end bit-identity and failure handling for the cross-chunk prefetch."""
 
     @pytest.mark.parametrize("strip_h", [10**6, 4], ids=["one-strip", "multi-strip"])
-    def test_prefetched_chunk_is_bit_identical_to_serial(self, inference_config, test_model, caplog, strip_h):
+    def test_prefetched_chunk_is_bit_identical_to_serial(
+        self, inference_config, test_model, serial_reference, caplog, strip_h
+    ):
         # The stash carries the next chunk's mask, plan and loaded first strip;
         # consuming it must produce output identical to a serial run under the
         # same tiling.
@@ -844,8 +861,13 @@ class TestXChunkPrefetch:
                 inference_config, test_model, [(_CHUNK, _CHUNK_B), (_CHUNK_B, None)], patches
             )
         assert f"xchunk prefetch: hit for {_CHUNK_B.label}" in caplog.text
-        serial, _ = _run_chunk_chain(inference_config, test_model, [(_CHUNK_B, None)], patches)
-        _assert_writes_identical(chained[1], serial[0])
+        # _CHUNK_B covers _CHUNK's pixels, so the cached serial write of _CHUNK is its reference.
+        serial = (
+            serial_reference[1]
+            if strip_h == 4
+            else _run_chunk_chain(inference_config, test_model, [(_CHUNK_B, None)], patches)[0][0]
+        )
+        _assert_writes_identical(chained[1], serial)
         assert actor._xchunk_prefetched == {}  # stash consumed
 
     def test_prefetch_starts_on_the_last_strip_with_pixels(self, inference_config, test_model, caplog):
