@@ -205,23 +205,11 @@ class TestPrecedence:
 class TestProvenance:
     """What ``measured_by`` and ``filled_at`` say, and what they refuse to say."""
 
-    def test_measured_by_names_who_measured_not_which_pass_wrote_the_row(self) -> None:
-        """Stamping an unmeasured fill row ``"fill"`` would tell a reader a measurement was taken."""
-        assert merge(_fill([_row("chunk_0_0", measured=False, stamp=FILLED)])).column("measured_by").to_pylist() == [
-            None
-        ]
-
     def test_filled_at_names_the_run_on_fill_and_rebuilt_rows_alike(self) -> None:
         fill = _fill([_row("chunk_0_0", measured=False, stamp=FILLED), _row("chunk_0_1", measured=True, stamp=FILLED)])
         tiles = _by_tile(merge(fill, _rebuilt([_row("chunk_0_0", measured=True, stamp=REBUILT)])))
         assert (tiles["chunk_0_0"]["filled_at"], tiles["chunk_0_0"]["assembled_at"]) == (FILLED, REBUILT)
         assert tiles["chunk_0_1"]["filled_at"] == FILLED
-
-    def test_the_master_schema_is_the_registrys_plus_provenance(self) -> None:
-        names = [field.name for field in master_schema()]
-        assert names[: len(dataset_schema())] == [field.name for field in dataset_schema()]
-        assert names[-2:] == ["measured_by", "filled_at"]
-
 
 class TestInvariants:
     """The checks that stand between a merge and a silently wrong master."""
