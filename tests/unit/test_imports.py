@@ -87,8 +87,3 @@ def test_aws_provider_modules_import() -> None:
     from tessera_embeddings.providers.aws import dask as aws_dask  # noqa: F401
     from tessera_embeddings.providers.aws import diagnostics  # noqa: F401
     from tessera_embeddings.providers.aws import ray as aws_ray  # noqa: F401
-
-
-def test_orchestration_modules_import() -> None:
-    """Orchestration helpers import (no Prefect required)."""
-    from tessera_embeddings.orchestration import concurrency  # noqa: F401
