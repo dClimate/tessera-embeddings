@@ -85,3 +85,25 @@ def test_canonicalize_zone(raw, expected):
 def test_canonicalize_zone_rejects_malformed(bad):
     with pytest.raises(ValueError, match="UTM zone"):
         zg.canonicalize_zone(bad)
+
+
+def test_a_tile_box_steps_by_one_shard_pitch_per_row() -> None:
+    """The label's row/col index the SHARD grid — the same reading assembly uses to place a
+    tile — so a box must step by one tile pitch per row, not by a pixel or by a chunk of some
+    other size. A pitch error yields boxes that look plausible and describe the wrong ground.
+    """
+    spec = zg.zone("16S")
+    top = zg.tile_range_bbox_wgs84(spec, 0, 1, 0, 1)
+    next_row = zg.tile_range_bbox_wgs84(spec, 1, 2, 0, 1)
+    deg_per_m = 1.0 / 111_320.0
+
+    # One tile south, and by one tile PITCH: ~20.48 km of latitude per row.
+    assert next_row[3] < top[3] and next_row[1] < top[1], "row 1 is south of row 0"
+    assert abs((top[3] - top[1]) - SHARD_PX * zg.PIXEL_M * deg_per_m) < 0.01
+
+    # Adjacent boxes OVERLAP rather than abut, and that is the containment guarantee showing
+    # through: each is the WGS84 envelope of its own projected quad, so along the northing line
+    # the two tiles share, one box takes that curve's maximum latitude and the other its
+    # minimum. What must never happen is a GAP — land in neither box.
+    assert next_row[3] >= top[1], "no gap between vertically adjacent tiles"
+    assert (next_row[3] - top[1]) < 10.0 * deg_per_m, "and the overlap stays inside one pixel"
