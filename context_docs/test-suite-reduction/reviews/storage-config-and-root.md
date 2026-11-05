@@ -239,9 +239,9 @@ Keep the handler/propagation tests: they guard the doubled-CloudWatch-log regres
 ## tests/unit/test_imports.py — DELETE — tests 9→0, LOC 94→0, cpu-s 0→0
 - all 9 — DUP — every listed module is imported by its own unit test file at collection, so a circular import or missing dependency already fails collection; the hand-kept list also goes stale ("Update this file whenever a new public module is added").
 
-## tests/unit/test_public_api.py — DELETE — tests 4→0, LOC 43→0, cpu-s 0
+## tests/unit/test_public_api.py — TRIM — tests 4→1, LOC 43→~12, cpu-s 0 (corrected 2026-11-05: was DELETE)
 - test_public_api_doc_lists_every_exported_name — PEDANTIC — a docs test; owner ruling is not to test docs.
-- test_every_exported_name_resolves — HISTORY — ruff F822 (undefined name in `__all__`, on by default) enforces it.
+- KEEP test_every_exported_name_resolves. Ruff F822 does not cover it: F822 is skipped in `__init__.py`, and names resolved through the package's module-level `__getattr__` are invisible to it.
 - test_all_contains_no_private_names, test_init_does_not_import_private_names — PEDANTIC — naming conventions on one file.
 
 ## tests/unit/test_prefect_layer.py — DELETE — tests 4→0, LOC 78→0, cpu-s 0.4→0
@@ -270,6 +270,6 @@ Slow cause: test_sliding_window_respects_concurrency_cap sleeps 5 ms per job, up
 - Shared dead list corrections: `daily_times` (storage/time_axis.py) and `resolve_region` (storage/zarr_store.py) are imported by yield-embeddings src; grep ../yield-embeddings/src before deleting anything on that list.
 - Merges: test_write_days_windows_batched → test_write_day_windows; TestSavedManifestPreload (test_published_store) → test_global_store; TestCheckTimeWindowCoverage (config/test_time_window) → inference/test_assessed_window_coverage; fault_injection's AST scans → tests/architecture/; the four commit_year_attrs tests in test_campaign → assembly/test_shard_writer.
 - Script tests: rebuild_registry_measurements re-asserts registry_master verdicts (layer duplication) and trims to its CLI plumbing; fix_published_store_spatial_transform is a one-shot whose fix is now structural (DELETE once the owner confirms the store was repaired); plan_update stays.
-- Architecture tests already enforced elsewhere: Prefect confinement (.importlinter), `__all__` names (ruff F822); delete the pytest copies.
+- Architecture tests already enforced elsewhere: Prefect confinement (.importlinter), delete that pytest copy. `__all__` names are NOT covered by ruff F822 (see test_public_api above); keep test_every_exported_name_resolves.
 - Hidden CI cost: Hypothesis "ci" profile (200 examples) multiplies test_properties' 5 ms sleeps to ~20 s per CI leg; deleting the file removes it.
 - Inline-import cleanup: test_open_or_create, test_write_day_windows, test_write_days_windows_batched, test_fault_injection (TestTheSharedHardExit), test_inference_code_identity, test_time_window (six `import ... data_loading as dl`).

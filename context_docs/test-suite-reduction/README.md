@@ -119,10 +119,20 @@ CPU-seconds measured before and after; expected ~618 → ~300.
    `submit` round-trips the payload through `pickle.dumps`/`pickle.loads` (so each worker still gets
    its own fork session and picklability is still checked) and sets `shard_writer._PROGRESS_SLOTS`
    from `initargs` directly (not via `_init_fork_worker`, which calls `configure_logging()` and
-   breaks caplog). `_fork_stall_watchdog` / `_terminate_pool` must tolerate the thread pool. A
-   `real_fork_pool` marker opts out the ~3 tests whose subject is the pool itself
-   (`TestRunForkedCatchUp`, `TestForkTelemetry` and the drill-death test in `test_shard_writer`).
-   Record it as an ADR (§6). Detail: `reviews/assembly-and-runners.md`, top.
+   breaks caplog). `_fork_stall_watchdog` / `_terminate_pool` must tolerate the thread pool. Register
+   one marker, `real_fork_pool`, in `pyproject.toml`; the fixture leaves the real pool in place for any test carrying it. **Exactly
+   two tests carry it** — the only ones whose subject is the real spawned pool end to end:
+   - `assembly/test_shard_writer.py::TestWorkerProgressReporting::test_run_forked_ships_index_and_interval_to_workers`
+     (one payload through the real spawn pool: initializer, shared-memory slots, worker function).
+   - `assembly/test_assembly.py::TestAssembly::test_assemble_multiband_parallel_matches_serial`
+     (`n_workers > 1` on the real pool, byte-compared with serial).
+
+   Every other pool-adjacent test needs no marker: `TestForkStallWatchdog`,
+   `test_a_failed_fork_terminates_the_workers_still_running` and `TestForkedWorkersGetLoggingConfigured`
+   install their own fake executor (their `monkeypatch` overrides the autouse shim), and
+   `TestWorkerProgressReporting`'s other tests, `TestRunForkedCatchUp` and the drill-death class call
+   the worker in-process or inject the fault. **This list overrides the marker name and test lists in
+   `reviews/assembly-and-runners.md`.** Record it as an ADR (§6). Detail: that review, top.
 2. `flows/test_run_global_campaign`: stub `inference_code_identity` in the `wired` fixture.
 3. `flows/test_dask_lifecycle::test_run_on_cluster_logs_onto_the_calling_flow_run` → `tests/integration/`
    with the `integration` marker; the other four tests stay.
@@ -131,10 +141,12 @@ CPU-seconds measured before and after; expected ~618 → ~300.
 5. `config/test_inference_code_identity`: module-scoped import-closure fixture.
 6. `providers/test_provider_aws_ray`: module-scoped moto VPC/SSM seed.
 7. `ingest/test_roi_mask_credential_expiry`: issuer as a shell script, not a Python interpreter.
-8. `ingest/test_roi_mask_construction`: one `provider-callable` case, one worker.
+8. `ingest/test_roi_mask_construction`: one worker instead of two in each `LocalCluster`. Both
+   parametrize cases stay; dropping the `[dict]` case is a Group 4 cut.
 9. `inference/test_strip_loop`: module-scoped cached serial reference; `inference_config` copied
    per test. `inference/test_data_loading`: real-icechunk concurrency test at 64×64 × 3 repeats.
-   `inference/test_sampling_v2_parity`: keep one of the three 8,451-pair loops (the upstream one).
+   `inference/test_sampling_v2_parity`: no change here; deleting `test_v11_is_untouched_by_the_addition`
+   and `test_the_two_rules_really_do_disagree` (two of its three 8,451-pair loops) is a Group 5 cut.
 10. `tests/unit/storage/conftest.py`: one session-scoped seeded GLOBAL-layout template,
     `shutil.copytree`'d per mutating test, used by `test_published_store`, `test_global_store`,
     `test_campaign`, `test_fix_published_store_spatial_transform`.
@@ -163,8 +175,10 @@ loop; `test_zarr_store`'s dead region-write and rollback classes go with `region
 `write_region`, `rollback_commits`, `set_s3_config`; `test_write_days_windows_batched` →
 `test_write_day_windows`; `TestSavedManifestPreload` → `test_global_store`;
 `TestCheckTimeWindowCoverage` → `inference/test_assessed_window_coverage`; fault-injection AST scans →
-`tests/architecture/`; delete `test_imports`, `test_public_api`, `test_prefect_layer` (import-linter
-and ruff F822 enforce them) and `test_properties`; `test_rebuild_registry_measurements_script`
+`tests/architecture/`; delete `test_imports`, `test_prefect_layer` (import-linter enforces it) and
+`test_properties`; `test_public_api` drops to the one test **`test_every_exported_name_resolves`,
+which stays**: ruff F822 does not check `__init__.py`, and cannot see names the package resolves
+through its module-level `__getattr__` — five more of which arrive in Group 1; `test_rebuild_registry_measurements_script`
 trimmed to CLI plumbing; `test_fix_published_store_spatial_transform` and its script deleted (ruling
 §5.1).
 
@@ -175,7 +189,7 @@ trimmed to CLI plumbing; `test_fix_published_store_spatial_transform` and its sc
 `test_roi_mask_*` files → one `test_roi_mask.py`; `test_solar_day_grouping` → `test_solar_days`,
 `test_solar_day_labelling` deleted (tests a helper defined in the test); `test_s2_coverage_windows` →
 `test_s2_coverage_gate`; `test_ingest_roi_domain` deleted after its two live tests move;
-`test_radar_free_zone` → `tests/unit/inference/`; dead `filter_low_coverage_dates`, `mgrs_tile_*`,
+`test_radar_free_zone` → `tests/unit/inference/`; `test_roi_mask_construction`'s `[dict]` parametrize case dropped; dead `filter_low_coverage_dates`, `mgrs_tile_*`,
 `item_filter_fn`, `apply_roi_mask` fallback deleted.
 
 ### Group 5 — inference + profiling cuts (`reviews/inference-and-profiling.md`)
@@ -183,7 +197,8 @@ trimmed to CLI plumbing; `test_fix_published_store_spatial_transform` and its sc
 587 → ~400 tests, 11,100 → ~7,500 lines. Includes: `test_gpu_starvation.py` (1,482 lines) leaves the
 suite — it is the campaign's cost/starvation model, reaching no `src/` beyond the partitioner that
 `test_cluster_balance` already covers; relocate to `scripts/` and repoint its five doc references
-(ruling §5.2); delete `shard_record.py`,
+(ruling §5.2); delete `test_sampling_v2_parity::test_v11_is_untouched_by_the_addition` and
+`::test_the_two_rules_really_do_disagree` (the upstream-parity loop stays); delete `shard_record.py`,
 `resampler_for`, `bucket_for_count`, `quantize_embeddings`/`dequantize_embeddings`, the legacy
 `PHASE_PARSER` branch; dead `ray.nodes` patches in `test_scheduling`; the two golden tests stay
 (skip without a checkpoint env var, the only real-weights fidelity evidence); `test_observe_cluster_parser`
@@ -228,7 +243,7 @@ Decided; the executor does not re-ask.
   source-text tests" rules from §3. Links to the deleted `context_docs/test-suite-streamlining.md` now point at this directory
   (tests/README.md Roadmap, context_docs/README.md tree); two other citations of it were dropped.
 - New ADR `041-unit-tests-run-the-forked-writer-in-threads.md`: the spawn pool is production
-  behaviour; unit tests exercise it through an in-process pool with a pickled payload, and three
+  behaviour; unit tests exercise it through an in-process pool with a pickled payload, and two
   tests opt out to cover the real pool. Why: §2a.
 - ADR 040's list of test-only modules loses `shard_record.py` (deleted).
 - `storage/shard_writer.py::write_year_shards` docstring says "in-process when 1": stale, fix.
