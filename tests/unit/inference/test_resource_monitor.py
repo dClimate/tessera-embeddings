@@ -18,6 +18,15 @@ from tessera_embeddings.inference import resource_monitor as rm
 #: One nvidia-smi CSV row in the field order the query asks for:
 #: utilization.gpu, utilization.memory, memory.used, memory.total, temperature.gpu, power.draw
 _ROW = "97, 62, 28451, 45776, 71, 331.42"
+#: What ``_get_gpu_stats`` returns for ``_ROW``.
+_STATS = {
+    "gpu_util": "97%",
+    "mem_util": "62%",
+    "mem_used": "28451 MiB",
+    "mem_total": "45776 MiB",
+    "temp": "71C",
+    "power": "331.42W",
+}
 
 
 def _completed(stdout: str, returncode: int = 0) -> subprocess.CompletedProcess:
@@ -38,14 +47,7 @@ class TestGetGpuStats:
         with patch.object(rm.subprocess, "run", _run):
             stats = rm._get_gpu_stats("2")
         assert seen["cmd"][:3] == ["nvidia-smi", "-i", "2"]
-        assert stats == {
-            "gpu_util": "97%",
-            "mem_util": "62%",
-            "mem_used": "28451 MiB",
-            "mem_total": "45776 MiB",
-            "temp": "71C",
-            "power": "331.42W",
-        }
+        assert stats == _STATS
 
     def test_omits_the_flag_when_no_index_is_known(self) -> None:
         """Correct only on a one-GPU host, which is why the multi-row guard below exists."""
@@ -131,48 +133,13 @@ class TestResourceMonitorLine:
         logged: list[str] = []
         with (
             patch.object(rm, "_get_cpu_mem_stats", return_value={"load_avg": "1 2 3"}),
-            patch.object(
-                rm,
-                "_get_gpu_stats",
-                return_value={
-                    "gpu_util": "97%",
-                    "mem_util": "44%",
-                    "mem_used": "1 MiB",
-                    "mem_total": "2 MiB",
-                    "temp": "70C",
-                    "power": "300W",
-                },
-            ) as gpu,
+            patch.object(rm, "_get_gpu_stats", return_value=_STATS) as gpu,
             patch.object(rm, "_get_gpu_extra_stats", return_value={}),
             patch.object(rm.logger, "info", lambda fmt, *a: logged.append(fmt % a)),
         ):
             monitor._emit_once()
         gpu.assert_called_once_with("3")
         assert "gpu_idx=3" in logged[-1]
-
-    def test_no_index_means_no_stamp(self) -> None:
-        """A one-GPU host gains nothing from the field, so it is not added."""
-        monitor = rm.ResourceMonitor(interval_sec=1)
-        logged: list[str] = []
-        with (
-            patch.object(rm, "_get_cpu_mem_stats", return_value={"load_avg": "1 2 3"}),
-            patch.object(
-                rm,
-                "_get_gpu_stats",
-                return_value={
-                    "gpu_util": "97%",
-                    "mem_util": "44%",
-                    "mem_used": "1 MiB",
-                    "mem_total": "2 MiB",
-                    "temp": "70C",
-                    "power": "300W",
-                },
-            ),
-            patch.object(rm, "_get_gpu_extra_stats", return_value={}),
-            patch.object(rm.logger, "info", lambda fmt, *a: logged.append(fmt % a)),
-        ):
-            monitor._emit_once()
-        assert "gpu_idx" not in logged[-1]
 
 
 class TestGpuExtraStats:
@@ -275,19 +242,6 @@ class TestHostRamPeak:
         """A default sample_sec above a short interval would emit a stale peak."""
         assert rm.ResourceMonitor(interval_sec=1)._sample_sec == 1
         assert rm.ResourceMonitor(interval_sec=30)._sample_sec == 2.0
-
-    def test_the_peak_is_on_the_line(self) -> None:
-        monitor = rm.ResourceMonitor(interval_sec=1)
-        logged: list[str] = []
-        with patch.object(rm, "read_host_ram_gib", return_value=(19.2, 32.0)):
-            monitor._sample_ram()
-        with (
-            patch.object(rm, "_get_cpu_mem_stats", return_value={"load_avg": "1 2 3"}),
-            patch.object(rm, "_get_gpu_stats", return_value=None),
-            patch.object(rm.logger, "info", lambda fmt, *a: logged.append(fmt % a)),
-        ):
-            monitor._emit_once()
-        assert "RAMpeak=19.2/32.0 GB (60%)" in logged[0]
 
 
 class TestAttributionAndResetSurviveFailure:

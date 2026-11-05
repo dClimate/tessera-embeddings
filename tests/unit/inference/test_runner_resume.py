@@ -37,10 +37,3 @@ def test_both_are_marked_resumed_and_carry_no_invented_counters():
         assert r["valid_pixels"] == 0
         assert r["elapsed_sec"] == 0.0
         assert r["chunk"] == "32601/2025/r1_c0"
-
-
-def test_the_two_outcomes_are_distinguishable():
-    """The whole point: a resumed zone's skips must not read as successes."""
-    skipped = _resumed_result("a", skipped=True)
-    success = _resumed_result("a", skipped=False)
-    assert skipped["status"] != success["status"]

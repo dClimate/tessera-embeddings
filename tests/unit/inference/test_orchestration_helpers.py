@@ -32,21 +32,13 @@ def _mock_stores():
 class TestReadUpstreamManifests:
     """Verify read_upstream_manifests handles all orbit values."""
 
-    def test_both_includes_both_sar_stores(self, _mock_stores):
-        result = read_upstream_manifests("/tmp/mosaic", "both")
-        assert "reflectance" in result
-        assert "sar_ascending" in result
-        assert "sar_descending" in result
-        assert len(result) == 3
-
-    def test_ascending_includes_only_ascending(self, _mock_stores):
-        result = read_upstream_manifests("/tmp/mosaic", "ascending")
-        assert "sar_ascending" in result
-        assert "sar_descending" not in result
-        assert len(result) == 2
-
-    def test_descending_includes_only_descending(self, _mock_stores):
-        result = read_upstream_manifests("/tmp/mosaic", "descending")
-        assert "sar_descending" in result
-        assert "sar_ascending" not in result
-        assert len(result) == 2
+    @pytest.mark.parametrize(
+        ("orbit", "stores"),
+        [
+            ("both", {"reflectance", "sar_ascending", "sar_descending"}),
+            ("ascending", {"reflectance", "sar_ascending"}),
+            ("descending", {"reflectance", "sar_descending"}),
+        ],
+    )
+    def test_reads_reflectance_and_each_selected_orbit(self, _mock_stores, orbit, stores):
+        assert set(read_upstream_manifests("/tmp/mosaic", orbit)) == stores
