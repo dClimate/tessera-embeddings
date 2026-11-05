@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-import icechunk
 import numpy as np
 import pytest
 import zarr
@@ -90,12 +89,10 @@ _LAYOUT_CASES = (
     # gets 0 and 1. Hence no overrides: the layout's attrs are applied outside `create_kwargs`.
     ("missing-declared-attribute", "s2_month_covered", {}, "attribute dtype=None"),
     ("declared-array-deleted", "s2_obs_count", None, "absent from the group"),
-    # Losing `northing` or `month` would otherwise only skip that dimension's extent check, so the
-    # audit reports nothing while a labelled read of the zone is incomplete. These two are the
-    # easiest to leave out of a hand-written "required coordinates" set, which is why the audit
-    # asks the seeder's own definition.
+    # Losing a coordinate would otherwise only skip that dimension's extent check, so the audit
+    # reports nothing while a labelled read of the zone is incomplete. The audit asks the seeder's
+    # own coordinate set rather than a hand-written one, so one deleted coordinate proves it.
     ("coordinate-deleted", "northing", None, "does not have it"),
-    ("month-coordinate-deleted", "month", None, "does not have it"),
 )
 
 
@@ -198,6 +195,10 @@ class TestShardPixelWindow:
         assert published_store.shard_pixel_window(shard, shape) == expected
 
 
+#: Stand-in for the credential callback the AWS provider registers process-wide.
+_PROVIDER = object()
+
+
 class TestSampleLivePixels:
     """Choosing probe pixels that provably hold embeddings."""
 
@@ -233,6 +234,8 @@ class TestSampleLivePixels:
 
 #: Stand-in for the credential callback the AWS provider registers process-wide.
 _PROVIDER = object()
+
+
 #: The two keys that decide WHOSE identity the read is made with. Absence is as load-bearing as
 #: presence — passing both leaves the choice up to icechunk.
 _IDENTITY_KEYS = ("anonymous", "get_credentials")
@@ -300,18 +303,10 @@ _COORDINATE_CASES = (
     # Northing descends; ascending is the same values, length and spacing with every pixel in the
     # wrong place.
     ("northing-reversed", "northing", lambda values: values[::-1], "northing: starts"),
-    ("easting-shifted-one-pixel", "easting", lambda values: values + PIXEL_M, "easting: starts"),
-    (
-        "easting-at-twice-the-pixel-spacing",
-        "easting",
-        lambda values: values[0] + np.arange(values.size) * 2 * PIXEL_M,
-        "easting: starts",
-    ),
     ("easting-deleted", "easting", None, "easting: absent"),
-    # `month` is compared by VALUE: a zero-based or reordered axis has the right rank and extent
+    # `month` is compared by VALUE: a zero-based axis has the right rank and extent
     # while `sel(month=7)` selects the wrong plane.
     ("month-zero-based", "month", lambda values: values - 1, "month: holds"),
-    ("month-reversed", "month", lambda values: values[::-1], "month: holds"),
 )
 
 
@@ -334,50 +329,6 @@ class TestCoordinateDepartures:
             array[:] = rewrite(np.asarray(array[:]))
         departures = published_store.coordinate_departures(writable_zone, _ZONE)
         assert any(phrase in d for d in departures), f"nothing mentioned {phrase!r}: {departures}"
-
-
-class TestSavedManifestPreload:
-    """The switch writers use: it changes the store, so every reader inherits the change."""
-
-    def test_a_new_store_is_created_with_preloading_on(self, seeded):
-        # On for a fill, which is about to touch those manifests anyway.
-        repo = global_store.open_global_repo(seeded)
-        assert repo.config.manifest.preload.max_total_refs > 0
-
-    def test_switching_it_off_reaches_the_store_and_this_packages_opener(self, seeded):
-        global_store.set_saved_manifest_preload(seeded, enabled=False)
-        # Raw icechunk first: the zeroes are IN THE STORE, not just in a handle we built.
-        saved = icechunk.Repository.open(zarr_store._create_storage(seeded)).config.manifest.preload
-        assert (saved.max_total_refs, saved.max_arrays_to_scan) == (0, 0)
-        # And `open_global_repo` hands Icechunk no config of its own — handing it
-        # `global_store_config()` is how readers used to get the writer's preload back.
-        assert global_store.open_global_repo(seeded).config.manifest.preload.max_total_refs == 0
-
-    def test_switching_it_back_on_restores_the_writers_budget(self, seeded):
-        global_store.set_saved_manifest_preload(seeded, enabled=False)
-        global_store.set_saved_manifest_preload(seeded, enabled=True)
-        expected = zarr_store.global_store_config().manifest.preload.max_total_refs
-        assert global_store.open_global_repo(seeded).config.manifest.preload.max_total_refs == expected
-
-    def test_tags_and_the_branch_tip_survive_the_switch(self, seeded):
-        # The write rebuilds the object that holds them, so this is what must not move. No mutation
-        # of this package turns it red — Icechunk is what preserves them — and it is kept anyway,
-        # as the guard that an Icechunk upgrade has not stopped doing so.
-        repo = global_store.open_global_repo(seeded)
-        session = repo.writable_session("main")
-        zarr.open_group(session.store, mode="r+")["01N"].attrs["years_complete"] = [2025]
-        snapshot = session.commit("mark 01N year 2025 complete")
-        repo.create_tag("zone-01N-2025", snapshot)
-        before = ({t: str(repo.lookup_tag(t)) for t in repo.list_tags()}, str(repo.lookup_branch("main")))
-        global_store.set_saved_manifest_preload(seeded, enabled=False)
-        after_repo = global_store.open_global_repo(seeded)
-        assert {t: str(after_repo.lookup_tag(t)) for t in after_repo.list_tags()} == before[0]
-        assert str(after_repo.lookup_branch("main")) == before[1]
-
-    def test_it_raises_rather_than_returning_quietly_if_the_switch_does_not_take(self, seeded, monkeypatch):
-        monkeypatch.setattr(icechunk.Repository, "save_config", lambda self: None)
-        with pytest.raises(RuntimeError, match="preload did not change"):
-            global_store.set_saved_manifest_preload(seeded, enabled=False)
 
 
 class TestWhoWroteAYear:

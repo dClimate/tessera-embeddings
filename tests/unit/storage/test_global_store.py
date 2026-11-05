@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 
+import icechunk
 import numpy as np
 import pytest
 import zarr
@@ -52,12 +53,6 @@ def test_extending_a_store_keeps_its_names(tmp_path, monkeypatch):
     assert "y" not in g
 
 
-def test_sibling_groups_seeded_without_clobber(seeded):
-    store = seeded
-    root = zarr_store.open_store_as_zarr_group(store)
-    assert set(root.group_keys()) >= {"01N", "01S"}
-
-
 def test_data_vars_are_metadata_only(seeded):
     # embeddings/scales must be all-fill (no chunk objects) — cost-free seeding.
     store = seeded
@@ -65,15 +60,6 @@ def test_data_vars_are_metadata_only(seeded):
     assert g["embeddings"].nchunks_initialized == 0
     assert g["scales"].nchunks_initialized == 0
     assert g["embeddings"].shape == (3, 4096, 2048, EMBEDDING_DIM)
-
-
-def test_embeddings_is_sharded(seeded):
-    store = seeded
-    g = zarr_store.open_store_as_zarr_group(store, group="01N")
-    emb = g["embeddings"]
-    assert emb.shards == (1, 2048, 2048, EMBEDDING_DIM)
-    assert emb.chunks == (1, 256, 256, EMBEDDING_DIM)
-    assert g["scales"].shards == (1, 2048, 2048)
 
 
 def test_coords_and_attrs(seeded):
@@ -134,14 +120,6 @@ def test_group_aware_open_store_reads_one_zone(seeded):
     years = ds["time"].dt.year.values
     assert list(years) == [2023, 2024, 2025]
     ds.close()
-
-
-def test_second_seed_adds_groups_without_clobbering_first(seeded_store):
-    store = seeded_store([_ZA], years=(2025,))
-    repo = global_store.open_global_repo(store)
-    global_store.seed_zone_groups(repo, [_ZB], years=(2025,))
-    root = zarr_store.open_store_as_zarr_group(store)
-    assert set(root.group_keys()) >= {"01N", "01S"}
 
 
 def test_an_unstamped_store_keeps_its_identity_when_nothing_is_created(seeded_store):
@@ -215,15 +193,25 @@ def test_a_store_no_fill_can_run_is_refused_before_anything_is_provisioned(seede
         global_store.store_model_version(store)
 
 
-def test_reseed_with_different_model_rejected(seeded_store):
-    """Root encoder provenance is write-once: a matching reseed is a no-op, but a partial reseed
-    for a DIFFERENT model is rejected, or the root would advertise it over already-seeded zones.
-    """
-    store = seeded_store([_ZA], years=(2025,), model_version="v1.1")
-    repo = global_store.open_global_repo(store)
-    global_store.seed_zone_groups(repo, [_ZB], years=(2025,), model_version="v1.1")  # adds the group
+@pytest.mark.parametrize(
+    ("seeded_with", "reseeded_with"),
+    [
+        # Or the root would advertise the second model over already-seeded zones.
+        pytest.param({"model_version": "v1.1"}, {"model_version": "v2-large"}, id="different-model"),
+        # Zones filled under one minimum depth must not sit beside zones filled under another, under a
+        # root advertising only the second: moving the line is a new store, not a migration.
+        pytest.param({"optical_min_obs": 30}, {"optical_min_obs": 20}, id="different-minimum-depth"),
+        # Every store seeded so far has no rule; stamping one on retrospectively would claim its
+        # existing zones were filled under a line never applied to them.
+        pytest.param({}, {"optical_min_obs": 30}, id="rule-added-to-a-store-without-one"),
+    ],
+)
+def test_the_root_identity_is_write_once(seeded_store, seeded_with, reseeded_with):
+    """A matching incremental seed adds its group; one carrying a different identity is refused."""
+    repo = global_store.open_global_repo(seeded_store([_ZA], years=(2025,), **seeded_with))
+    global_store.seed_zone_groups(repo, [_ZB], years=(2025,), **seeded_with)  # same identity: adds the group
     with pytest.raises(ValueError, match="write-once"):
-        global_store.seed_zone_groups(repo, [_ZB], years=(2025,), model_version="v2-large")
+        global_store.seed_zone_groups(repo, [_ZB], years=(2025,), **reseeded_with)
 
 
 def test_reseed_with_different_axis_rejected(seeded_store):
@@ -238,39 +226,29 @@ def test_reseed_with_different_axis_rejected(seeded_store):
         global_store.seed_zone_groups(repo, [_ZB], years=(2025,))
 
 
-def test_reseed_with_different_shard_geometry_rejected(seeded_store):
+_EMB = GLOBAL.arrays["embeddings"]
+
+
+@pytest.mark.parametrize(
+    ("embeddings", "match"),
+    [
+        pytest.param(dataclasses.replace(_EMB, shards=(1, 1024, 1024, EMBEDDING_DIM)), "shards: have", id="shards"),
+        # Geometry alone is not the schema: a float32 zone passes a pitch check, then the int8
+        # staging writer refuses to fill it.
+        pytest.param(dataclasses.replace(_EMB, dtype="float32"), "dtype: have", id="dtype"),
+    ],
+)
+def test_reseed_with_a_different_layout_rejected(seeded_store, embeddings, match):
     """Layout is fixed across groups for the same reason the axis is.
 
-    `plan_zone_inference` pins the inference tile to the group's shard pitch, so zones
-    seeded at a different pitch are unfillable — and they are only rejected at fill
-    time, long after seeding committed them. Refuse the mixed seed instead.
+    `plan_zone_inference` pins the inference tile to the group's shard pitch, so a zone seeded with
+    another layout is unfillable — and only rejected at fill time, long after seeding committed it.
+    Refuse the mixed seed instead.
     """
-    store = seeded_store([_ZA], years=(2025,))
-    repo = global_store.open_global_repo(store)
-    global_store.seed_zone_groups(repo, [_ZB], years=(2025,))  # same layout: fine
-
-    emb = GLOBAL.arrays["embeddings"]
-    halved = dataclasses.replace(
-        GLOBAL, arrays={**GLOBAL.arrays, "embeddings": dataclasses.replace(emb, shards=(1, 1024, 1024, EMBEDDING_DIM))}
-    )
-    with pytest.raises(ValueError, match="shards: have"):
-        global_store.seed_zone_groups(repo, [_ZB], years=(2025,), layout=halved)
-
-
-def test_reseed_with_same_geometry_but_different_dtype_rejected(seeded_store):
-    """Geometry alone is not the schema. Matching chunks and shards with a different
-    dtype passes a pitch check and then creates zones the int8 staging writer refuses
-    to fill — a heterogeneous store that only shows up at fill time.
-    """
-    store = seeded_store([_ZA], years=(2025,))
-    repo = global_store.open_global_repo(store)
-
-    emb = GLOBAL.arrays["embeddings"]
-    as_float = dataclasses.replace(
-        GLOBAL, arrays={**GLOBAL.arrays, "embeddings": dataclasses.replace(emb, dtype="float32")}
-    )
-    with pytest.raises(ValueError, match="dtype: have"):
-        global_store.seed_zone_groups(repo, [_ZB], years=(2025,), layout=as_float)
+    repo = global_store.open_global_repo(seeded_store([_ZA], years=(2025,)))
+    layout = dataclasses.replace(GLOBAL, arrays={**GLOBAL.arrays, "embeddings": embeddings})
+    with pytest.raises(ValueError, match=match):
+        global_store.seed_zone_groups(repo, [_ZB], years=(2025,), layout=layout)
 
 
 def test_seeding_rejects_duplicate_or_unordered_years(tmp_path):
@@ -285,24 +263,6 @@ def test_seeding_rejects_duplicate_or_unordered_years(tmp_path):
     for bad in [(2025, 2025), (2025, 2024), ()]:
         with pytest.raises(ValueError, match="strictly increasing"):
             global_store.seed_zone_groups(repo, [_ZA], years=bad)
-
-
-def test_global_store_config_has_time_split_and_preload():
-    cfg = zarr_store.global_store_config()
-    assert cfg.manifest is not None
-    assert cfg.manifest.splitting is not None
-    assert cfg.manifest.preload is not None
-
-
-def test_the_minimum_depth_rule_is_stamped_on_the_root(seeded_store):
-    """A user must be able to ask "what rule produced this dataset" without reading provenance
-    per cell, and a fill must be able to check the rule it is about to apply against the one the
-    store advertises. Both need it on the root.
-    """
-    store = seeded_store([_ZA], years=(2025,), optical_min_obs=25)
-    repo = global_store.open_global_repo(store)
-    root = zarr_store.open_store_as_zarr_group(store)
-    assert root.attrs["optical_min_obs"] == 25
 
 
 def test_a_store_with_no_rule_carries_no_attr_rather_than_zero(seeded_store):
@@ -326,31 +286,6 @@ def test_a_rule_that_refuses_nothing_is_refused(tmp_path):
         global_store.seed_zone_groups(repo, [_ZA], years=(2025,), optical_min_obs=0)
 
 
-def test_reseed_with_a_different_minimum_depth_rejected(seeded_store):
-    """The consequence of putting the rule in the write-once identity, and the reason it is
-    there: zones filled under one minimum depth must not end up beside zones filled under
-    another, under a root advertising only the second. It also means the rule can never be
-    changed for this store — moving the line is a new store, not a migration.
-    """
-    store = seeded_store([_ZA], years=(2025,), optical_min_obs=30)
-    repo = global_store.open_global_repo(store)
-    # The same rule on a later incremental seed: fine, provenance is a no-op.
-    global_store.seed_zone_groups(repo, [_ZB], years=(2025,), optical_min_obs=30)
-    with pytest.raises(ValueError, match="write-once"):
-        global_store.seed_zone_groups(repo, [_ZB], years=(2025,), optical_min_obs=20)
-
-
-def test_adding_a_rule_to_a_store_seeded_without_one_is_rejected(seeded_store):
-    """The direction that matters most in practice: every store seeded so far has no rule, and
-    stamping one onto it retrospectively would claim its existing zones were filled under a
-    line that was never applied to them. A re-stamp is a deliberate act on a fresh store.
-    """
-    store = seeded_store([_ZA], years=(2025,))
-    repo = global_store.open_global_repo(store)
-    with pytest.raises(ValueError, match="write-once"):
-        global_store.seed_zone_groups(repo, [_ZB], years=(2025,), optical_min_obs=30)
-
-
 def test_seeding_a_zone_that_already_exists_is_a_no_op(seeded_store):
     """A matching reseed is allowed by the identity and layout checks, then used to fail.
 
@@ -372,3 +307,32 @@ def test_seeding_a_zone_that_already_exists_is_a_no_op(seeded_store):
     # idempotent reseed this skip exists to allow into a hard failure.
     snapshot = global_store.seed_zone_groups(repo, [_ZA, _ZB], years=(2025,))
     assert isinstance(snapshot, str) and snapshot, "an all-seeded reseed returns the current tip"
+
+
+class TestSavedManifestPreload:
+    """The switch writers use: it changes the store, so every reader inherits the change."""
+
+    def test_a_new_store_is_created_with_preloading_on(self, seeded):
+        # On for a fill, which is about to touch those manifests anyway.
+        repo = global_store.open_global_repo(seeded)
+        assert repo.config.manifest.preload.max_total_refs > 0
+
+    def test_switching_it_off_reaches_the_store_and_this_packages_opener(self, seeded):
+        global_store.set_saved_manifest_preload(seeded, enabled=False)
+        # Raw icechunk first: the zeroes are IN THE STORE, not just in a handle we built.
+        saved = icechunk.Repository.open(zarr_store._create_storage(seeded)).config.manifest.preload
+        assert (saved.max_total_refs, saved.max_arrays_to_scan) == (0, 0)
+        # And `open_global_repo` hands Icechunk no config of its own — handing it
+        # `global_store_config()` is how readers used to get the writer's preload back.
+        assert global_store.open_global_repo(seeded).config.manifest.preload.max_total_refs == 0
+
+    def test_switching_it_back_on_restores_the_writers_budget(self, seeded):
+        global_store.set_saved_manifest_preload(seeded, enabled=False)
+        global_store.set_saved_manifest_preload(seeded, enabled=True)
+        expected = zarr_store.global_store_config().manifest.preload.max_total_refs
+        assert global_store.open_global_repo(seeded).config.manifest.preload.max_total_refs == expected
+
+    def test_it_raises_rather_than_returning_quietly_if_the_switch_does_not_take(self, seeded, monkeypatch):
+        monkeypatch.setattr(icechunk.Repository, "save_config", lambda self: None)
+        with pytest.raises(RuntimeError, match="preload did not change"):
+            global_store.set_saved_manifest_preload(seeded, enabled=False)

@@ -264,3 +264,4 @@ without: coverage is not the CI cost). Five Opus reviewers each read one slice o
 grepped `src/` for callers, and wrote the per-file lists in `reviews/`. Every dead-code claim in §2c
 and the pool finding in §2a were re-verified by hand before this plan was written.
 - `assembly/test_assembly.py::TestAssembly::test_same_date_overwrite_resets_untouched_vars_to_fill` — DEAD (only `embedding_std` can be dropped) — the reset also covers the other S1 orbit's obs count on a single-orbit refill; rewritten on that variable instead of deleted.
+- `storage/test_published_store.py::TestSampleLivePixels` (4 tests) — DEAD (`sample_live_pixels` only reached by a bench script; move it there) — `tests/integration/test_published_store_access.py` also calls it to find a live pixel in the published store, so it stays in `published_store` with its unit tests.

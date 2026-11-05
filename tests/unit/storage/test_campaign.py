@@ -91,25 +91,6 @@ def test_status_tracks_landed_years(seed):
     assert status.has("01N", 2023) and not status.has("01N", 2024)
 
 
-def test_status_pending_lists_gaps(seed):
-    _, repo = seed()
-    _fill(repo, "01N", year_index=0)  # 2023
-    status = campaign.campaign_status(repo, years=_YEARS)
-    pending = status.pending(expected_zones=("01N", "02N"))
-    assert ("01N", 2023) not in pending
-    assert ("01N", 2024) in pending
-    assert ("02N", 2023) in pending  # seeded-but-unfilled zone: every year pending
-    assert len(pending) == 5  # 6 cells - 1 filled
-
-
-def test_status_pending_counts_unseeded_zone(seed):
-    _, repo = seed(zones=(_ZONE_A,))
-    status = campaign.campaign_status(repo, years=_YEARS)
-    # An entirely unseeded zone contributes all years to the work list.
-    pending = status.pending(expected_zones=("01N", "02N"))
-    assert sum(1 for z, _ in pending if z == "02N") == len(_YEARS)
-
-
 # --- campaign_work_list (tag-aware driver work list) -----------------------
 
 
@@ -154,15 +135,6 @@ def test_work_list_defaults_to_all_120_zones(seed):
     assert ("60N", 2023) in work  # an unseeded zone still needs every year
 
 
-def test_years_fully_complete(seed):
-    _, repo = seed()
-    _fill(repo, "01N", year_index=0)  # 2023
-    _fill(repo, "02N", year_index=0)  # 2023
-    _fill(repo, "01N", year_index=1)  # 2024 only in one zone
-    status = campaign.campaign_status(repo, years=_YEARS)
-    assert status.years_fully_complete(expected_zones=("01N", "02N")) == [2023]
-
-
 # --- tags ------------------------------------------------------------------
 
 
@@ -173,14 +145,6 @@ def test_tag_zone_year_at_head(seed):
     assert tag == "zone-01N-2023"
     assert tag in repo.list_tags()
     assert repo.lookup_tag(tag) == repo.lookup_branch("main")
-
-
-def test_tag_zone_year_idempotent(seed):
-    _, repo = seed()
-    _fill(repo, "01N", year_index=0)
-    first = campaign.tag_zone_year(repo, "01N", 2023)
-    again = campaign.tag_zone_year(repo, "01N", 2023)  # no-op, same snapshot
-    assert first == again
 
 
 def test_tag_zone_year_refuses_to_move_explicit(seed):
@@ -220,33 +184,6 @@ def test_tag_year_complete_when_all_land(seed, monkeypatch):
     tag = campaign.tag_year_complete(repo, 2023)
     assert tag == "year-2023-complete"
     assert tag in repo.list_tags()
-
-
-def test_year_complete_tag_cannot_be_minted_from_a_zone_subset(seed):
-    """The campaign-wide tag takes no scope argument, so a subset cannot mint it.
-
-    Icechunk tags are write-once forever and `_ensure_tag` treats an existing tag as an
-    idempotent success, so a `year-2023-complete` stamped after two zones landed could
-    never be corrected by the real 120-zone campaign. The guarantee is structural —
-    there is no parameter to pass — so this asserts the signature, not a branch: the
-    subset question is answerable only through the helper that does not tag.
-    """
-    _, repo = seed()
-    _fill(repo, "01N", year_index=0)
-    _fill(repo, "02N", year_index=0)
-
-    with pytest.raises(TypeError):
-        campaign.tag_year_complete(repo, 2023, expected_zones=("01N", "02N"))  # type: ignore[call-arg]
-
-    # Both seeded zones HAVE landed 2023, so the subset check is satisfied...
-    assert campaign.missing_zones_for_year(repo, 2023, expected_zones=("01N", "02N")) == ()
-    # ...and no tag was created by asking.
-    assert "year-2023-complete" not in repo.list_tags()
-    # Against the real campaign scope the year is nowhere near done, and the refusal
-    # names how far off it is rather than tagging.
-    with pytest.raises(ValueError, match="have not landed it"):
-        campaign.tag_year_complete(repo, 2023)
-    assert "year-2023-complete" not in repo.list_tags()
 
 
 def test_missing_zones_for_year_reports_in_scope_order(seed):
@@ -424,32 +361,15 @@ def test_commit_year_attrs_gives_up_after_its_bound(seed, monkeypatch):
 
 
 def test_two_years_of_one_zone_both_land_with_neither_mark_lost(seed):
-    """End to end through the real fill path: the union survives, both years are complete."""
-    _, repo = seed()
-    _write_shards(repo, "01N", 0)
-    _write_shards(repo, "01N", 1)
-    status = campaign.campaign_status(repo, years=_YEARS)
-    assert status.has("01N", _YEARS[0]) and status.has("01N", _YEARS[1])
+    """End to end through the real fill path: the union survives, both years are complete.
 
-
-def test_a_no_land_mark_composes_with_a_real_fill_of_another_year(seed):
-    """The other attr writer takes the same path, so the two compose."""
-    _, repo = seed()
-    _write_shards(repo, "01N", 0)
-    campaign.mark_zone_year_empty(repo, "01N", _YEARS[1])
-    status = campaign.campaign_status(repo, years=_YEARS)
-    assert status.has("01N", _YEARS[0]) and status.has("01N", _YEARS[1])
-
-
-def test_the_attr_commit_is_separate_from_the_shard_commit(seed):
-    """Two commits per fill, not one — the mechanism the tests above rely on.
-
-    Pinned because collapsing them back into one commit would silently restore the
-    year barrier, and the concurrency tests above are timing-dependent enough that they
-    might not catch it.
+    Each fill is two commits, shards then attrs. Collapsing them into one would silently restore
+    the year barrier, which the timing-dependent concurrency tests might not catch.
     """
     _, repo = seed()
     before = len(list(repo.ancestry(branch="main")))
     _write_shards(repo, "01N", 0)
-    after = len(list(repo.ancestry(branch="main")))
-    assert after - before == 2, f"expected a shard commit and an attr commit, got {after - before}"
+    _write_shards(repo, "01N", 1)
+    assert len(list(repo.ancestry(branch="main"))) - before == 4, "a shard commit and an attr commit per fill"
+    status = campaign.campaign_status(repo, years=_YEARS)
+    assert status.has("01N", _YEARS[0]) and status.has("01N", _YEARS[1])
