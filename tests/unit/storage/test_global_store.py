@@ -18,11 +18,10 @@ _ZA = ZoneSpec("32601", "N", 1, (0.0, 20_480.0), (0.0, 40_960.0))
 _ZB = ZoneSpec("32701", "S", 1, (0.0, 20_480.0), (1_105_920.0, 1_146_880.0))
 
 
-def _seed(tmp_path):
-    store = str(tmp_path / "global.icechunk")
-    repo = global_store.create_global_repo(store)
-    global_store.seed_zone_groups(repo, [_ZA, _ZB], years=(2023, 2024, 2025))
-    return store
+@pytest.fixture
+def seeded(seeded_store):
+    """Both stand-in zones, three years: a private copy per test."""
+    return seeded_store([_ZA, _ZB], years=(2023, 2024, 2025))
 
 
 @pytest.mark.parametrize(("model", "names"), [("v1.1", ("northing", "easting")), ("v2-large", ("y", "x"))])
@@ -53,23 +52,23 @@ def test_extending_a_store_keeps_its_names(tmp_path, monkeypatch):
     assert "y" not in g
 
 
-def test_sibling_groups_seeded_without_clobber(tmp_path):
-    store = _seed(tmp_path)
+def test_sibling_groups_seeded_without_clobber(seeded):
+    store = seeded
     root = zarr_store.open_store_as_zarr_group(store)
     assert set(root.group_keys()) >= {"01N", "01S"}
 
 
-def test_data_vars_are_metadata_only(tmp_path):
+def test_data_vars_are_metadata_only(seeded):
     # embeddings/scales must be all-fill (no chunk objects) — cost-free seeding.
-    store = _seed(tmp_path)
+    store = seeded
     g = zarr_store.open_store_as_zarr_group(store, group="01N")
     assert g["embeddings"].nchunks_initialized == 0
     assert g["scales"].nchunks_initialized == 0
     assert g["embeddings"].shape == (3, 4096, 2048, EMBEDDING_DIM)
 
 
-def test_embeddings_is_sharded(tmp_path):
-    store = _seed(tmp_path)
+def test_embeddings_is_sharded(seeded):
+    store = seeded
     g = zarr_store.open_store_as_zarr_group(store, group="01N")
     emb = g["embeddings"]
     assert emb.shards == (1, 2048, 2048, EMBEDDING_DIM)
@@ -77,8 +76,8 @@ def test_embeddings_is_sharded(tmp_path):
     assert g["scales"].shards == (1, 2048, 2048)
 
 
-def test_coords_and_attrs(tmp_path):
-    store = _seed(tmp_path)
+def test_coords_and_attrs(seeded):
+    store = seeded
     g = zarr_store.open_store_as_zarr_group(store, group="01N")
     assert g["easting"].shape == (2048,)
     assert g["northing"].shape == (4096,)
@@ -109,11 +108,11 @@ def test_coords_and_attrs(tmp_path):
     assert {"proj", "spatial"} <= set(zone_conventions)
 
 
-def test_root_carries_geoemb_convention(tmp_path):
+def test_root_carries_geoemb_convention(seeded):
     """Encoder/quantization provenance sits once on the root group;
     zones carry only their own proj:/spatial:.
     """
-    store = _seed(tmp_path)
+    store = seeded
     attrs = dict(zarr_store.open_store_as_zarr_group(store).attrs)
     assert attrs["geoemb:type"] == "pixel"
     assert attrs["geoemb:dimensions"] == EMBEDDING_DIM
@@ -126,8 +125,8 @@ def test_root_carries_geoemb_convention(tmp_path):
     assert "proj:code" not in attrs
 
 
-def test_group_aware_open_store_reads_one_zone(tmp_path):
-    store = _seed(tmp_path)
+def test_group_aware_open_store_reads_one_zone(seeded):
+    store = seeded
     ds = zarr_store.open_store(store, chunks=None, group="01S")
     assert "embeddings" in ds.data_vars
     assert ds.sizes["time"] == 3
@@ -137,16 +136,15 @@ def test_group_aware_open_store_reads_one_zone(tmp_path):
     ds.close()
 
 
-def test_second_seed_adds_groups_without_clobbering_first(tmp_path):
-    store = str(tmp_path / "g.icechunk")
-    repo = global_store.create_global_repo(store)
-    global_store.seed_zone_groups(repo, [_ZA], years=(2025,))
+def test_second_seed_adds_groups_without_clobbering_first(seeded_store):
+    store = seeded_store([_ZA], years=(2025,))
+    repo = global_store.open_global_repo(store)
     global_store.seed_zone_groups(repo, [_ZB], years=(2025,))
     root = zarr_store.open_store_as_zarr_group(store)
     assert set(root.group_keys()) >= {"01N", "01S"}
 
 
-def test_an_unstamped_store_keeps_its_identity_when_nothing_is_created(tmp_path):
+def test_an_unstamped_store_keeps_its_identity_when_nothing_is_created(seeded_store):
     """The stamp is written to the SESSION, so a call that creates nothing must still commit it.
 
     A reseed of already-complete zones on a store predating the root identity added `_root_attrs` to
@@ -154,9 +152,8 @@ def test_an_unstamped_store_keeps_its_identity_when_nothing_is_created(tmp_path)
     the root stayed unstamped, and the fill gates (which pass on an ABSENT attr) then accepted
     anything while the operator believed the store had been stamped.
     """
-    store = str(tmp_path / "g.icechunk")
-    repo = global_store.create_global_repo(store)
-    global_store.seed_zone_groups(repo, [_ZA], years=(2025,))
+    store = seeded_store([_ZA], years=(2025,))
+    repo = global_store.open_global_repo(store)
 
     # A store predating the root identity. Simulated by removing the attr, since every seed since
     # then stamps one — which is exactly why such a store can only arrive from an older build.
@@ -175,16 +172,15 @@ def test_an_unstamped_store_keeps_its_identity_when_nothing_is_created(tmp_path)
     assert root.attrs["optical_min_obs"] == 15
 
 
-def test_a_group_missing_a_later_schema_array_is_refused_not_skipped(tmp_path):
+def test_a_group_missing_a_later_schema_array_is_refused_not_skipped(seeded_store):
     """The completeness check must name every array the seeder writes.
 
     `month` and `time_bnds` were absent from it, so a group holding the layout arrays and the four
     other coordinates counted as complete without them — and the reseed reported idempotent success
     while leaving `s2_month_covered` with no calendar labels and the time axis with no CF bounds.
     """
-    store = str(tmp_path / "g.icechunk")
-    repo = global_store.create_global_repo(store)
-    global_store.seed_zone_groups(repo, [_ZA], years=(2025,))
+    store = seeded_store([_ZA], years=(2025,))
+    repo = global_store.open_global_repo(store)
 
     # Simulate a group seeded by a schema that predates `month`.
     session = repo.writable_session("main")
@@ -196,10 +192,9 @@ def test_a_group_missing_a_later_schema_array_is_refused_not_skipped(tmp_path):
 
 
 @pytest.mark.parametrize("model", ["v1.1", "v2-large"])
-def test_the_store_names_the_model_that_fills_it(tmp_path, model):
+def test_the_store_names_the_model_that_fills_it(seeded_store, model):
     """Every fill takes its model from the store's root, and runs that model's checkpoint."""
-    store = str(tmp_path / "g.icechunk")
-    global_store.seed_zone_groups(global_store.create_global_repo(store), [_ZA], years=(2025,), model_version=model)
+    store = seeded_store([_ZA], years=(2025,), model_version=model)
     assert global_store.store_model_version(store) == model
 
 
@@ -210,10 +205,9 @@ def test_the_store_names_the_model_that_fills_it(tmp_path, model):
         ("checkpoint_id", "tessera_v1_1_mpc_encoder.pt", "checkpoint"),
     ],
 )
-def test_a_store_no_fill_can_run_is_refused_before_anything_is_provisioned(tmp_path, attr, value, match):
+def test_a_store_no_fill_can_run_is_refused_before_anything_is_provisioned(seeded_store, attr, value, match):
     """A root naming an unknown model, or a checkpoint other than its model's, is one no fill runs."""
-    store = str(tmp_path / "g.icechunk")
-    global_store.seed_zone_groups(global_store.create_global_repo(store), [_ZA], years=(2025,))
+    store = seeded_store([_ZA], years=(2025,))
     session = global_store.open_global_repo(store).writable_session("main")
     zarr.open_group(session.store, mode="a").attrs[attr] = value
     session.commit("a root no fill can run")
@@ -221,41 +215,38 @@ def test_a_store_no_fill_can_run_is_refused_before_anything_is_provisioned(tmp_p
         global_store.store_model_version(store)
 
 
-def test_reseed_with_different_model_rejected(tmp_path):
+def test_reseed_with_different_model_rejected(seeded_store):
     """Root encoder provenance is write-once: a matching reseed is a no-op, but a partial reseed
     for a DIFFERENT model is rejected, or the root would advertise it over already-seeded zones.
     """
-    store = str(tmp_path / "g.icechunk")
-    repo = global_store.create_global_repo(store)
-    global_store.seed_zone_groups(repo, [_ZA], years=(2025,), model_version="v1.1")
+    store = seeded_store([_ZA], years=(2025,), model_version="v1.1")
+    repo = global_store.open_global_repo(store)
     global_store.seed_zone_groups(repo, [_ZB], years=(2025,), model_version="v1.1")  # adds the group
     with pytest.raises(ValueError, match="write-once"):
         global_store.seed_zone_groups(repo, [_ZB], years=(2025,), model_version="v2-large")
 
 
-def test_reseed_with_different_axis_rejected(tmp_path):
+def test_reseed_with_different_axis_rejected(seeded_store):
     """The time axis is fixed + uniform across groups (ADR-008 D1): a direct
     incremental seed with a different `years` than already-seeded groups is
     rejected at the helper (not only in the seed_global_store flow).
     """
-    store = str(tmp_path / "g.icechunk")
-    repo = global_store.create_global_repo(store)
-    global_store.seed_zone_groups(repo, [_ZA], years=(2024, 2025))
+    store = seeded_store([_ZA], years=(2024, 2025))
+    repo = global_store.open_global_repo(store)
     global_store.seed_zone_groups(repo, [_ZB], years=(2024, 2025))  # same axis: fine
     with pytest.raises(ValueError, match="existing axis"):
         global_store.seed_zone_groups(repo, [_ZB], years=(2025,))
 
 
-def test_reseed_with_different_shard_geometry_rejected(tmp_path):
+def test_reseed_with_different_shard_geometry_rejected(seeded_store):
     """Layout is fixed across groups for the same reason the axis is.
 
     `plan_zone_inference` pins the inference tile to the group's shard pitch, so zones
     seeded at a different pitch are unfillable — and they are only rejected at fill
     time, long after seeding committed them. Refuse the mixed seed instead.
     """
-    store = str(tmp_path / "g.icechunk")
-    repo = global_store.create_global_repo(store)
-    global_store.seed_zone_groups(repo, [_ZA], years=(2025,))
+    store = seeded_store([_ZA], years=(2025,))
+    repo = global_store.open_global_repo(store)
     global_store.seed_zone_groups(repo, [_ZB], years=(2025,))  # same layout: fine
 
     emb = GLOBAL.arrays["embeddings"]
@@ -266,14 +257,13 @@ def test_reseed_with_different_shard_geometry_rejected(tmp_path):
         global_store.seed_zone_groups(repo, [_ZB], years=(2025,), layout=halved)
 
 
-def test_reseed_with_same_geometry_but_different_dtype_rejected(tmp_path):
+def test_reseed_with_same_geometry_but_different_dtype_rejected(seeded_store):
     """Geometry alone is not the schema. Matching chunks and shards with a different
     dtype passes a pitch check and then creates zones the int8 staging writer refuses
     to fill — a heterogeneous store that only shows up at fill time.
     """
-    store = str(tmp_path / "g.icechunk")
-    repo = global_store.create_global_repo(store)
-    global_store.seed_zone_groups(repo, [_ZA], years=(2025,))
+    store = seeded_store([_ZA], years=(2025,))
+    repo = global_store.open_global_repo(store)
 
     emb = GLOBAL.arrays["embeddings"]
     as_float = dataclasses.replace(
@@ -304,26 +294,24 @@ def test_global_store_config_has_time_split_and_preload():
     assert cfg.manifest.preload is not None
 
 
-def test_the_minimum_depth_rule_is_stamped_on_the_root(tmp_path):
+def test_the_minimum_depth_rule_is_stamped_on_the_root(seeded_store):
     """A user must be able to ask "what rule produced this dataset" without reading provenance
     per cell, and a fill must be able to check the rule it is about to apply against the one the
     store advertises. Both need it on the root.
     """
-    store = str(tmp_path / "g.icechunk")
-    repo = global_store.create_global_repo(store)
-    global_store.seed_zone_groups(repo, [_ZA], years=(2025,), optical_min_obs=25)
+    store = seeded_store([_ZA], years=(2025,), optical_min_obs=25)
+    repo = global_store.open_global_repo(store)
     root = zarr_store.open_store_as_zarr_group(store)
     assert root.attrs["optical_min_obs"] == 25
 
 
-def test_a_store_with_no_rule_carries_no_attr_rather_than_zero(tmp_path):
+def test_a_store_with_no_rule_carries_no_attr_rather_than_zero(seeded_store):
     """Absent and zero are different statements. Zero is a threshold that refuses nothing;
     absent is a store that never had a rule, which is every store seeded before 2026-08-13.
     Recording zero for the second would let a later reader believe a rule was applied.
     """
-    store = str(tmp_path / "g.icechunk")
-    repo = global_store.create_global_repo(store)
-    global_store.seed_zone_groups(repo, [_ZA], years=(2025,))
+    store = seeded_store([_ZA], years=(2025,))
+    repo = global_store.open_global_repo(store)
     root = zarr_store.open_store_as_zarr_group(store)
     assert "optical_min_obs" not in root.attrs
 
@@ -338,34 +326,32 @@ def test_a_rule_that_refuses_nothing_is_refused(tmp_path):
         global_store.seed_zone_groups(repo, [_ZA], years=(2025,), optical_min_obs=0)
 
 
-def test_reseed_with_a_different_minimum_depth_rejected(tmp_path):
+def test_reseed_with_a_different_minimum_depth_rejected(seeded_store):
     """The consequence of putting the rule in the write-once identity, and the reason it is
     there: zones filled under one minimum depth must not end up beside zones filled under
     another, under a root advertising only the second. It also means the rule can never be
     changed for this store — moving the line is a new store, not a migration.
     """
-    store = str(tmp_path / "g.icechunk")
-    repo = global_store.create_global_repo(store)
-    global_store.seed_zone_groups(repo, [_ZA], years=(2025,), optical_min_obs=30)
+    store = seeded_store([_ZA], years=(2025,), optical_min_obs=30)
+    repo = global_store.open_global_repo(store)
     # The same rule on a later incremental seed: fine, provenance is a no-op.
     global_store.seed_zone_groups(repo, [_ZB], years=(2025,), optical_min_obs=30)
     with pytest.raises(ValueError, match="write-once"):
         global_store.seed_zone_groups(repo, [_ZB], years=(2025,), optical_min_obs=20)
 
 
-def test_adding_a_rule_to_a_store_seeded_without_one_is_rejected(tmp_path):
+def test_adding_a_rule_to_a_store_seeded_without_one_is_rejected(seeded_store):
     """The direction that matters most in practice: every store seeded so far has no rule, and
     stamping one onto it retrospectively would claim its existing zones were filled under a
     line that was never applied to them. A re-stamp is a deliberate act on a fresh store.
     """
-    store = str(tmp_path / "g.icechunk")
-    repo = global_store.create_global_repo(store)
-    global_store.seed_zone_groups(repo, [_ZA], years=(2025,))
+    store = seeded_store([_ZA], years=(2025,))
+    repo = global_store.open_global_repo(store)
     with pytest.raises(ValueError, match="write-once"):
         global_store.seed_zone_groups(repo, [_ZB], years=(2025,), optical_min_obs=30)
 
 
-def test_seeding_a_zone_that_already_exists_is_a_no_op(tmp_path):
+def test_seeding_a_zone_that_already_exists_is_a_no_op(seeded_store):
     """A matching reseed is allowed by the identity and layout checks, then used to fail.
 
     `require_group` returns the existing group and `create_array` raises on its first array —
@@ -375,9 +361,8 @@ def test_seeding_a_zone_that_already_exists_is_a_no_op(tmp_path):
     So seeding the same zone twice must be a no-op, and a call carrying a new zone alongside
     an existing one must still seed the new one.
     """
-    store = str(tmp_path / "g.icechunk")
-    repo = global_store.create_global_repo(store)
-    global_store.seed_zone_groups(repo, [_ZA], years=(2025,))
+    store = seeded_store([_ZA], years=(2025,))
+    repo = global_store.open_global_repo(store)
     global_store.seed_zone_groups(repo, [_ZA, _ZB], years=(2025,))
     root = zarr_store.open_store_as_zarr_group(store)
     assert set(root.group_keys()) >= {"01N", "01S"}, "the new zone must land beside the existing one"

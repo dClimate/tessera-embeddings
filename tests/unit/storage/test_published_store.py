@@ -20,12 +20,9 @@ _YEARS = (2024, 2025)
 
 
 @pytest.fixture
-def seeded(tmp_path):
+def seeded(seeded_store):
     """A two-year, one-zone global store with nothing written into its data arrays."""
-    path = str(tmp_path / "global.icechunk")
-    repo = global_store.create_global_repo(path)
-    global_store.seed_zone_groups(repo, [_ZONE], years=_YEARS)
-    return path
+    return seeded_store([_ZONE], years=_YEARS)
 
 
 @pytest.fixture
