@@ -900,11 +900,11 @@ def write_year_shards(
 ) -> str:
     """Fill one (zone, year) with whole shards from ``source`` in one commit.
 
-    Forks the session, writes the source's live shards across ``n_workers``
-    (in-process when 1, else spawned processes), merges, advances
-    ``years_complete``, and commits via :func:`commit_with_rebase`.
+    Forks the session, writes the source's live shards across ``n_workers`` spawned processes
+    (always through :func:`run_forked`'s pool, even for one), merges, commits the shards via
+    :func:`commit_with_rebase`, then advances ``years_complete`` in a second commit.
     When ``run_id`` is given, per-year run provenance (:func:`run_provenance`)
-    is merged into the group's ``runs`` attr in the same commit — read and
+    is merged into the group's ``runs`` attr in that attr commit — read and
     written inside THIS writable session, so a commit landing between a
     caller's earlier probe and this write cannot be silently clobbered.
 
