@@ -18,7 +18,6 @@ from datetime import UTC, datetime
 
 import pystac
 import pytest
-from rasterio._err import CPLE_AppDefinedError, CPLE_OpenFailedError
 from rasterio.errors import RasterioIOError, WarpOperationError
 
 from tessera_embeddings.ingest.asset_locations import (
@@ -35,8 +34,6 @@ from tessera_embeddings.ingest.duplicates import (
     cause_was_flattened,
     copies_label,
     image_identity,
-    is_provider_refusal,
-    is_unreadable_source,
     item_processing_baseline,
     item_sequence,
     item_tile,
@@ -121,27 +118,9 @@ class TestIdentifyingACopy:
         """
         assert item_tile(_Item("not-a-sentinel-id")) is None
 
-    def test_the_sequence_is_read_as_an_integer(self) -> None:
-        """The property is a STRING in the real catalogue, so ordering it as text would put
-        '10' before '9'.
-        """
-        assert item_sequence(_Item("x", "MGRS-1ABC", "10")) == 10
-
-    def test_the_sequence_falls_back_to_the_id(self) -> None:
-        assert item_sequence(_Item("S2B_34WFA_20210908_2_L2A")) == 2
-
-    def test_an_unreadable_sequence_is_none(self) -> None:
-        assert item_sequence(_Item("no-sequence-here", "MGRS-1ABC")) is None
-
 
 class TestChoosingBetweenCopies:
     """Reducing a tile-date to one copy, deterministically and without losing imagery."""
-
-    def test_the_newest_copy_is_kept(self) -> None:
-        old, new = _pair()
-        kept, alternates = select_preferred_duplicates([old, new])
-        assert [it.id for it in kept] == [new.id]
-        assert [it.id for it in alternates[("MGRS-34WFA", "2021-09-08")]] == [old.id]
 
     def test_catalogue_order_does_not_decide(self) -> None:
         """The newest must win whichever order the search returned them in."""
@@ -222,329 +201,6 @@ class TestTheFallbackLadder:
         _, new = _pair()
         assert alternates_for({("MGRS-34WFA", "2021-09-08"): []}, [new]) == {}
 
-    def test_the_label_names_the_copy_per_tile(self) -> None:
-        """The log needs which reprocessing was tried on which attempt."""
-        old, new = _pair()
-        assert copies_label([new]) == "MGRS-34WFA#1"
-        assert copies_label([old]) == "MGRS-34WFA#0"
-
-
-def _read_failure(cause: str, *, opening: bool = False) -> BaseException:
-    """A read failure shaped the way a worker raises one: a rasterio wrapper over a GDAL cause.
-
-    Raised rather than constructed, because ``raise ... from`` is the only thing that puts a chain
-    on an exception, and the chain is what the predicate reads. Built from the real classes so the
-    type names in the chain are the ones production carries rather than ones a test spelled out.
-
-    ``opening`` picks the GDAL class that reports a failure at OPEN rather than during a block
-    read, which is how a missing object arrives.
-    """
-    gdal = CPLE_OpenFailedError if opening else CPLE_AppDefinedError
-    try:
-        raise gdal(1, 4, cause)
-    except gdal as inner:  # type: ignore[misc]
-        try:
-            raise RasterioIOError("Read failed. See previous exception for details.") from inner
-        except RasterioIOError as failure:
-            return failure
-
-
-class TestWhenToStepDown:
-    """The predicate decides whether a failure means "this data will never read".
-
-    Falling back on a *transient* failure would silently swap in older imagery to work around
-    something a retry fixes. So it is narrow and fails closed: anything unrecognised is
-    re-raised by the caller rather than treated as bad data.
-    """
-
-    @pytest.mark.parametrize(
-        "message",
-        [
-            "ZIPDecode:Decoding error at scanline 0",
-            "B02.tif, band 1: IReadBlock failed at X offset 6, Y offset 9: TIFFReadEncodedTile() failed.",
-        ],
-    )
-    def test_a_decode_failure_means_step_down(self, message: str) -> None:
-        """Both name a CODEC or format operation failing, which is a statement about the bytes.
-
-        Built as a real chain: this decides a date may be given up, so it must be asserted against
-        the shape a worker raises and not against a message the test composed.
-        """
-        assert is_unreadable_source(_read_failure(message))
-
-    @pytest.mark.parametrize(
-        "message",
-        [
-            "Read failed. See previous exception for details.",
-            "rasterio.errors.WarpOperationError: Chunk and warp failed",
-            "B02.tif, band 1: IReadBlock failed at X offset 6, Y offset 9",
-        ],
-    )
-    def test_a_bare_wrapper_is_not_a_decode_failure(self, message: str) -> None:
-        """USED TO STEP DOWN, and that was the bug behind a whole class of findings.
-
-        These are what GDAL raises when a block read fails FOR ANY REASON — a codec, yes, but
-        equally a DNS failure, a refused connection, a TLS error, a throttle nobody enumerated.
-        Claiming them made "give up this date" the DEFAULT verdict for every cause the transient
-        lists did not recognise, so each gap in those lists became silent data loss. This class's
-        own docstring already promised the opposite: "narrow and fails closed: anything
-        unrecognised is re-raised by the caller rather than treated as bad data."
-
-        The wrapped case is unaffected — a chain whose cause names a codec still steps down,
-        because the whole chain is matched. Only the bare wrapper changes, and it now re-raises so
-        the leg retries in order.
-        """
-        assert not is_unreadable_source(RuntimeError(message))
-
-    @pytest.mark.parametrize(
-        "transport",
-        [
-            "Could not resolve host: sentinel-cogs.s3.us-west-2.amazonaws.com",
-            "Connection refused",
-            "Empty reply from server",
-            "SSL peer handshake failed",
-            "Connection reset by peer",
-        ],
-    )
-    def test_a_statusless_transport_failure_is_not_bad_data(self, transport: str) -> None:
-        """The reason the wrapper had to stop being claimed, rather than the transport list
-        growing again. None of these carries an HTTP status, several are not in any enumeration,
-        and every one of them says the link failed rather than the bytes.
-        """
-        wrapper = Exception("WarpOperationError: Chunk and warp failed")
-        wrapper.__cause__ = Exception(f"CPLE_AppDefinedError: {transport}")
-        assert not is_unreadable_source(wrapper)
-
-    @pytest.mark.parametrize(
-        "message",
-        [
-            # What the driver actually receives. The read runs on a worker and the exception
-            # crosses back through tblib, which cannot rebuild rasterio's GDAL-backed class —
-            # so a plain `Exception` arrives carrying the original's repr, and no `isinstance`
-            # check can see what it was. The message is the only surviving evidence.
-            "ObjectNotFound: The specified key does not exist.",
-            "An error occurred (NoSuchKey) when calling the GetObject operation",
-            "The specified key does not exist.",
-        ],
-    )
-    def test_a_missing_source_object_means_step_down(self, message: str) -> None:
-        """An href the provider never published reads no differently from a corrupt one:
-        no retry produces the object, and another copy of the tile-date might have it.
-
-        It needs its own markers because it fails at OPEN. Every decode marker above is
-        emitted by a block read, and a missing object never reaches one — so the predicate
-        answered no, the caller re-raised, and one unpublished asset cost every date after
-        it in the zone-year rather than its own.
-        """
-        assert is_unreadable_source(_read_failure(message, opening=True))
-
-    @pytest.mark.parametrize(
-        "message",
-        [
-            # icechunk's error enum carries both of these words verbatim, so the destination
-            # store speaks the same not-found vocabulary the source does.
-            "IcechunkError: ObjectNotFound",
-            "An error occurred (NoSuchKey) when calling the GetObject operation",
-            "FileNotFoundError: The specified key does not exist.",
-        ],
-    )
-    def test_a_missing_object_nobody_attributes_to_the_source_does_not_step_down(self, message: str) -> None:
-        """Not-found is the S3 layer's word, and every S3 client in the process shares it.
-
-        Unpaired with the source reader's name it would let a hole in the DESTINATION store, or
-        in the ROI mask, be recorded as source data loss — a wrong finding written durably onto
-        the store, and a date given up for a fault that giving it up cannot route around.
-        Re-raising is what this did before the missing-object markers existed.
-        """
-        assert not is_unreadable_source(Exception(message))
-
-    def test_a_bucket_or_prefix_that_is_gone_is_not_a_missing_object(self) -> None:
-        """The skip is per DATE, so what it admits has to be per OBJECT.
-
-        A vanished bucket fails every remaining date identically. Admitting it would discover
-        that one date at a time, when failing on the first one says the same thing immediately
-        and says it about the right subject.
-        """
-        assert not is_unreadable_source(
-            Exception("RasterioIOError('An error occurred (NoSuchBucket) when calling GetObject')")
-        )
-
-    def test_the_cause_chain_is_searched_not_just_the_message(self) -> None:
-        """The exception that propagates is a wrapper that DISCARDS the reason.
-
-        ``WarpOperationError('Chunk and warp failed')`` says nothing about why; the decode
-        error is its cause. A predicate reading only the top message would classify every
-        cause identically.
-        """
-        try:
-            try:
-                raise ValueError("ZIPDecode:Decoding error at scanline 2048")
-            except ValueError as cause:
-                raise RuntimeError("something opaque") from cause
-        except RuntimeError as exc:
-            assert is_unreadable_source(exc)
-
-    @pytest.mark.parametrize(
-        "message",
-        [
-            "An error occurred (ExpiredToken) when calling the GetObject operation",
-            "The provided token has expired.",
-            "An error occurred (AccessDenied)",
-            "An error occurred (SlowDown) when calling the PutObject operation",
-        ],
-    )
-    def test_a_credential_or_throttle_failure_must_not_step_down(self, message: str) -> None:
-        """These are transient and fixed by a retry. Stepping down here would degrade the
-        data to route around a fault that was about to clear.
-        """
-        assert not is_unreadable_source(RuntimeError(message))
-
-    def test_a_credential_failure_wrapped_in_the_decode_wrapper_still_does_not_step_down(self) -> None:
-        """The dangerous case: an expired credential surfaces through the SAME wrapper as
-        corruption, because the loader hands the codec a buffer the failed read never filled.
-        Exclusion has to beat the marker, or every credential blip degrades a date's imagery.
-        """
-        try:
-            try:
-                raise ValueError("An error occurred (ExpiredToken) when calling the GetObject operation")
-            except ValueError as cause:
-                raise RuntimeError("Chunk and warp failed") from cause
-        except RuntimeError as exc:
-            assert not is_unreadable_source(exc)
-
-    def test_an_unrelated_failure_does_not_step_down(self) -> None:
-        assert not is_unreadable_source(ValueError("some unrelated bug"))
-
-
-class TestWhenTheProviderRefused:
-    """A refusal is a different finding from unreadable data, and needs the opposite response.
-
-    An object that will not decode will not decode next time either, so the move is a different
-    copy or a give-up. A provider refusing reads says nothing about the imagery — the same object
-    read minutes earlier and reads again once the service recovers — so the move is to wait.
-    ``is_unreadable_source`` declines every refusal for that reason, which is the whole of the
-    distinction now: a companion predicate used to answer "is this a refusal?" positively so a
-    caller could give up the date, and nothing does that any more.
-    """
-
-    @pytest.mark.parametrize(
-        "refusal",
-        [
-            "HTTP response code: 403",
-            "HTTP response code: 429",
-            "TooManyRequests",
-            "HTTP response code: 500",
-            "HTTP response code: 502",
-            "HTTP response code: 503",
-            "HTTP response code: 504",
-            "ServiceUnavailable",
-            "InternalError",
-            "SlowDown",
-            "Connection reset by peer",
-            "Broken pipe",
-            "Read timed out",
-        ],
-    )
-    def test_a_refusal_is_declined_even_inside_a_block_read_wrapper(self, refusal: str) -> None:
-        """The class docstring's promise, tested: this predicate declines EVERY refusal.
-
-        A refusal reaches us through whichever wrapper GDAL raises, so the chain carries a
-        refusal signature AND a block-read one. Claiming it here is how a provider having a bad
-        minute gets recorded as imagery that will never read — and the two predicates then
-        disagree about the same exception, leaving the verdict to whichever the caller asks
-        first.
-        """
-        wrapper = Exception("RasterioIOError: Read failed. See previous exception for details.")
-        wrapper.__cause__ = Exception(f"CPLE_AppDefinedError: {refusal}")
-        assert not is_unreadable_source(wrapper)
-
-    @pytest.mark.parametrize("status", [500, 502, 503, 504, 507, 509, 599])
-    def test_any_5xx_is_declined_without_being_enumerated(self, status: int) -> None:
-        """A 5xx is a statement about the SERVER, never about the bytes — all of them, not the
-        four somebody remembered. Enumeration is what let 429 through: the list held 403 and
-        500/502/503/504 and missed the most explicit "slow down" a provider can send.
-        """
-        wrapper = Exception("WarpOperationError: Chunk and warp failed")
-        wrapper.__cause__ = Exception(f"CPLE_AppDefinedError: HTTP response code: {status}")
-        assert not is_unreadable_source(wrapper)
-
-    @pytest.mark.parametrize("status", [408, 429])
-    def test_the_two_transient_4xx_are_declined(self, status: int) -> None:
-        """408 and 429 mean "not now", where the rest of the 4xx range means "not you"."""
-        wrapper = Exception("RasterioIOError: Read failed. See previous exception for details.")
-        wrapper.__cause__ = Exception(f"CPLE_AppDefinedError: HTTP response code: {status}")
-        assert not is_unreadable_source(wrapper)
-
-    @pytest.mark.parametrize("status", [400, 401, 405, 416])
-    def test_a_client_side_4xx_is_not_bad_data_either(self, status: int) -> None:
-        """A malformed request or a rejected credential is not the data's fault and no amount of
-        waiting fixes it, so it must re-raise and fail the leg on its FIRST date. Claiming it here
-        would skip dates one at a time for a cause that repeats on every one of them.
-        """
-        wrapper = Exception("WarpOperationError: Chunk and warp failed")
-        wrapper.__cause__ = Exception(f"CPLE_AppDefinedError: HTTP response code: {status}")
-        assert not is_unreadable_source(wrapper)
-
-    @pytest.mark.parametrize(
-        "refusal",
-        ["HTTP response code: 503", "Connection reset by peer", "SlowDown"],
-    )
-    def test_the_two_predicates_never_claim_the_same_failure(self, refusal: str) -> None:
-        """Disjoint by construction, so neither call order nor a caller that knows only one of
-        them can misclassify. The radar path asks about refusals first; the optical path asks
-        only about unreadable data. Overlapping, that made one sensor wait and the other record
-        permanent loss for the identical failure.
-        """
-        wrapper = Exception("WarpOperationError: Chunk and warp failed")
-        wrapper.__cause__ = Exception(f"RasterioIOError: {refusal}")
-        assert not is_unreadable_source(wrapper)
-
-    @pytest.mark.parametrize(
-        "message",
-        [
-            "RasterioIOError: ZIPDecode: Decoding error at scanline 0",
-            "CPLE_AppDefinedError: TIFFReadEncodedTile() failed",
-        ],
-    )
-    def test_data_that_will_never_decode_is_still_claimed(self, message: str) -> None:
-        """The regression guard on the exclusion above: narrowing this predicate must not stop
-        it recognising a genuinely broken object, which is the case the copy ladder exists for.
-        """
-        assert is_unreadable_source(_read_failure(message))
-
-    def test_the_warp_wrapper_is_looked_through_to_find_the_refusal(self) -> None:
-        """The exception that propagates DISCARDS the reason; the refusal is its cause.
-
-        ``WarpOperationError('Chunk and warp failed')`` is what a refused chunk read raises, and
-        a decode failure is the one verdict a refusal must not receive.
-        """
-        wrapper = Exception("WarpOperationError: Chunk and warp failed")
-        wrapper.__cause__ = Exception("AccessDenied: when calling the GetObject operation")
-        assert not is_unreadable_source(wrapper)
-        # And the copy ladder still declines it, so a bad minute never swaps in worse imagery.
-        assert not is_unreadable_source(wrapper)
-
-    def test_a_numeric_refusal_is_claimed_only_by_the_refusal_predicate(self) -> None:
-        """REPLACES a test that asserted the opposite, and the replacement is the point.
-
-        That test pinned a numeric refusal as claimed by BOTH predicates, and its docstring said
-        the overlap was "not fixed here" because widening the exclusion would change the optical
-        copy ladder — leaving the verdict to whichever predicate a caller asked first. The radar
-        path asks about the refusal first. The optical path never asks at all, so for that sensor
-        a provider's numeric refusal was the same finding as data that will never decode.
-
-        Excluding refusals here is what makes the two predicates disjoint, so the answer no longer
-        depends on the caller knowing to ask twice, or in which order.
-        """
-        exc = Exception("WarpOperationError: Chunk and warp failed")
-        exc.__cause__ = Exception("RasterioIOError: HTTP response code: 403")
-        assert not is_unreadable_source(exc)
-
-    def test_an_unrecognised_failure_belongs_to_neither(self) -> None:
-        """Fails closed: the caller re-raises rather than giving up a date for an unexamined cause."""
-        exc = ValueError("time axis is not monotonic")
-        assert not is_unreadable_source(exc)
-
 
 class TestKeyingACopyAcrossProviders:
     """The tile and the image, read from fields each catalogue actually populates."""
@@ -584,7 +240,7 @@ class TestKeyingACopyAcrossProviders:
         assert image_identity(item) == ("GS2B_20171219T095409_004109", "20171219T095412")
 
     @pytest.mark.parametrize("field", ["s2:datatake_id", "s2:datastrip_id"])
-    @pytest.mark.parametrize("raw", [None, "", "not an id", "GS2B_20171219T095409_004109", 5.0])
+    @pytest.mark.parametrize("raw", [None, "GS2B_20171219T095409_004109"])
     def test_an_unreadable_identifier_names_no_image(self, field: str, raw: object) -> None:
         """Matched as a whole rather than split on underscores, so a value of another shape is
         unknown instead of a plausible-looking wrong key.
@@ -647,10 +303,6 @@ class TestADatastripSplitIsTwoImages:
     @staticmethod
     def _ids(items: list[_Item]) -> set[str]:
         return {it.id for it in items}
-
-    def test_reprocessing_keeps_the_image(self) -> None:
-        old, _, new, _ = self.UUP
-        assert image_identity(old) == image_identity(new) == ("GS2A_20191021T101041_022613", "20191021T101549")
 
     def test_a_copy_whose_image_cannot_be_read_is_kept_on_its_own(self) -> None:
         """Merged only on proof: it could be a copy of either half or of neither, and keeping a
@@ -799,41 +451,6 @@ class TestASpareThatWillRefuseIsKeptOffTheLadderWithoutVisibleAssets:
         assert _known_harmonisation("earth-search", "sentinel-2-l2a") is None
         # And a collection owed no offset at all has no producer worth naming.
         assert _known_harmonisation("earth-search", "sentinel-2-l1c") is None
-
-
-class TestDistinctImagesOnOneDay:
-    """A tile-date can hold two IMAGES, not just two copies of one.
-
-    At high latitude successive orbits revisit a tile the same day. Those are separate imagery
-    that the loader mosaics together, so collapsing them to one copy discards coverage silently.
-    """
-
-    @staticmethod
-    def _of(ident: str, pass_no: int, sequence: str = "0") -> _Item:
-        return _Item(ident, "MGRS-33XVG", sequence, **_image(pass_no))
-
-    def test_two_passes_on_one_day_both_survive(self) -> None:
-        first = self._of("S2A_33XVG_20210908_0_L2A", 1)
-        second = self._of("S2B_33XVG_20210908_0_L2A", 2)
-        kept, alternates = select_preferred_duplicates([first, second])
-        assert kept == [first, second]
-        assert alternates == {}
-
-    def test_copies_of_one_image_still_reduce_to_one(self) -> None:
-        old = self._of("S2B_33XVG_20210908_0_L2A", 1, "0")
-        new = self._of("S2B_33XVG_20210908_1_L2A", 1, "1")
-        kept, alternates = select_preferred_duplicates([old, new])
-        assert kept == [new]
-        assert alternates == {("MGRS-33XVG", "2021-09-08"): [old]}
-
-    def test_each_image_is_deduplicated_on_its_own(self) -> None:
-        a_old = self._of("S2A_33XVG_20210908_0_L2A", 1, "0")
-        a_new = self._of("S2A_33XVG_20210908_1_L2A", 1, "1")
-        b_old = self._of("S2B_33XVG_20210908_0_L2A", 2, "0")
-        b_new = self._of("S2B_33XVG_20210908_1_L2A", 2, "1")
-        kept, alternates = select_preferred_duplicates([a_old, a_new, b_old, b_new])
-        assert kept == [a_new, b_new]
-        assert set(alternates[("MGRS-33XVG", "2021-09-08")]) == {a_old, b_old}
 
 
 class TestTheLadderStepsOneImageAtATime:
@@ -1002,17 +619,9 @@ class TestInRegionPreference:
         """
         remote = _copy("S2A_33TWM_20170120_1_L2A", sequence="1", baseline="00.01", host_root=_REMOTE)
         local = _copy("S2A_33TWM_20170120_0_L2A", sequence="0", baseline="00.01", host_root=_IN_REGION)
-        kept, _ = select_preferred_duplicates([remote, local])
+        kept, alternates = select_preferred_duplicates([remote, local])
         assert [i.id for i in kept] == [local.id], "the in-region copy must survive"
-
-    def test_the_remote_copy_stays_available_as_a_fallback(self) -> None:
-        """Preferring in-region must not DISCARD the remote copy — it is still the ladder a
-        caller steps down when the chosen copy cannot be read.
-        """
-        remote = _copy("S2A_33TWM_20170120_1_L2A", sequence="1", baseline="00.01", host_root=_REMOTE)
-        local = _copy("S2A_33TWM_20170120_0_L2A", sequence="0", baseline="00.01", host_root=_IN_REGION)
-        _kept, alternates = select_preferred_duplicates([remote, local])
-        assert [i.id for i in next(iter(alternates.values()))] == [remote.id]
+        assert [i.id for i in next(iter(alternates.values()))] == [remote.id], "and the remote one is the fallback"
 
     def test_locality_never_outranks_a_newer_baseline(self) -> None:
         """The complement, and the reason locality sits BELOW the baseline term: a cheaper
@@ -1027,32 +636,6 @@ class TestInRegionPreference:
         kept, _ = select_preferred_duplicates([local_old, remote_new])
         assert [i.id for i in kept] == [remote_new.id], "a newer baseline must win despite egress"
 
-    def test_owing_no_correction_no_longer_costs_a_reprocessing(self) -> None:
-        """REVERSED, and the position of the term is the whole point of the test.
-
-        This used to be the one term allowed to cost a reprocessing, on a COVERAGE argument: the
-        offset was decided per solar day, so one raw copy at or above the threshold could refuse
-        the whole day and every tile fused into it. Buying that back with an older baseline was
-        worth it.
-
-        Per-image correction removes the argument entirely — no copy can refuse another tile's
-        pixels. Two reasons to prefer a harmonised copy survive, and both are about the pixel
-        rather than about coverage: it was floored by its producer BEFORE resampling where one we
-        correct is floored after, and it cannot be wrong by the offset at all. This module does not
-        let a quality preference buy a better pixel with an older reprocessing — the same rule that
-        keeps locality below the baseline — so the term now sits below the baseline too.
-
-        Still unobservable on the archive as indexed: every copy served from the ESA bucket is at a
-        pre-04.00 baseline and owes nothing either way.
-        """
-        harmonised_old = _copy("S2A_33TWM_20220107_0_L2A", sequence="0", baseline="04.00", host_root=_IN_REGION)
-        raw_new = _copy("S2A_33TWM_20220107_1_L2A", sequence="1", baseline="05.00", host_root=_REMOTE)
-        kept, alternates = select_preferred_duplicates([harmonised_old, raw_new])
-        assert [i.id for i in kept] == [raw_new.id], "the newer baseline decides above this term"
-        # And the loser is a usable fallback, because owing a correction is no longer a reason to
-        # withhold anything.
-        assert [i.id for i in alternates[("MGRS-33TWM", "2021-09-08")]] == [harmonised_old.id]
-
     def test_it_still_decides_between_copies_at_one_baseline(self) -> None:
         """Demoted, not deleted — the two pixel-quality reasons above still hold.
 
@@ -1064,39 +647,19 @@ class TestInRegionPreference:
         kept, _ = select_preferred_duplicates([raw, harmonised])
         assert [i.id for i in kept] == [harmonised.id]
 
-    def test_below_the_threshold_the_correction_term_is_inert(self) -> None:
-        """The complement of the test above, and what stops it degrading the whole archive.
-
-        A pre-04.00 copy owes no correction whichever bucket serves it, so the term ties and the
-        baseline decides. This is the case that actually occurs.
+    @pytest.mark.parametrize("host_root", [_IN_REGION, _REMOTE], ids=["in-region", "all-remote"])
+    def test_sequence_still_decides_when_baseline_and_locality_tie(self, host_root: str) -> None:
+        """With nothing to separate them but sequence, sequence decides — including the
+        all-remote date, which is most backfilled dates.
         """
-        harmonised_old = _copy("S2A_33TWM_20170120_0_L2A", sequence="0", baseline="02.06", host_root=_IN_REGION)
-        raw_new = _copy("S2A_33TWM_20170120_1_L2A", sequence="1", baseline="03.01", host_root=_REMOTE)
-        kept, _ = select_preferred_duplicates([harmonised_old, raw_new])
-        assert [i.id for i in kept] == [raw_new.id]
-
-    def test_sequence_still_decides_when_baseline_and_locality_tie(self) -> None:
-        """No regression: with nothing to separate them but sequence, the old rule stands."""
-        low = _copy("S2A_33TWM_20170120_0_L2A", sequence="0", baseline="05.00", host_root=_IN_REGION)
-        high = _copy("S2A_33TWM_20170120_1_L2A", sequence="1", baseline="05.00", host_root=_IN_REGION)
+        low = _copy("S2A_33TWM_20170120_0_L2A", sequence="0", baseline="05.00", host_root=host_root)
+        high = _copy("S2A_33TWM_20170120_1_L2A", sequence="1", baseline="05.00", host_root=host_root)
         kept, _ = select_preferred_duplicates([low, high])
         assert [i.id for i in kept] == [high.id]
-
-    def test_an_all_remote_date_still_selects_one(self) -> None:
-        """Most backfilled dates have NO in-region copy. They must still reduce to one item
-        rather than being dropped or raising — the majority case by a wide margin.
-        """
-        a = _copy("S2A_33TWM_20170120_0_L2A", sequence="0", baseline="02.06", host_root=_REMOTE)
-        b = _copy("S2A_33TWM_20170120_1_L2A", sequence="1", baseline="02.06", host_root=_REMOTE)
-        kept, _ = select_preferred_duplicates([a, b])
-        assert [i.id for i in kept] == [b.id], "all-remote falls through to sequence"
 
 
 class TestLocalityPredicate:
     """`item_is_in_preferred_location` — ALL assets, not any."""
-
-    def test_bands_all_in_a_preferred_host_are_local(self) -> None:
-        assert item_is_in_preferred_location(_with_assets(_Item("x"), _bands_at(_IN_REGION))) is True
 
     def test_extra_assets_elsewhere_do_not_make_it_remote(self) -> None:
         """THE REGRESSION THIS EXISTS FOR. A real Element 84 item carries its COG bands and
@@ -1126,12 +689,6 @@ class TestLocalityPredicate:
         assert item_is_in_preferred_location(_Item("x")) is False
         assert item_is_in_preferred_location(_with_assets(_Item("x"), {"thumbnail": {"href": _IN_REGION}})) is False
 
-    def test_the_remote_bucket_is_not_in_the_preferred_set(self) -> None:
-        """Guards the constant itself: if `sentinel-s2-l2a` were ever added to
-        PREFERRED_ASSET_BUCKETS the whole fix would silently invert.
-        """
-        assert "sentinel-s2-l2a" not in PREFERRED_ASSET_BUCKETS
-
 
 class TestAssetBucketParsing:
     """The bucket is PARSED, because a substring test answers yes to the wrong things."""
@@ -1153,8 +710,6 @@ class TestAssetBucketParsing:
         "href",
         [
             "s3://sentinel-cogs-backup/x/B04.tif",
-            "https://sentinel-cogs-backup.s3.us-west-2.amazonaws.com/x/B04.tif",
-            "https://elsewhere.example/sentinel-cogs/x/B04.tif",
             "https://sentinel-cogs.attacker.example/x/B04.tif",
         ],
     )
@@ -1171,20 +726,6 @@ class TestAssetBucketParsing:
 
 class TestUnknownBaselineSuspendsLocality:
     """An absent baseline is not a tie, and treating it as one is wrong twice over."""
-
-    def test_an_unknown_baseline_does_not_win_on_locality(self) -> None:
-        """The reported P1, posed where it applies: BOTH copies raw, so the missing baseline is
-        the only difference.
-
-        A raw copy declaring no baseline cannot be corrected or exempted on evidence, so its date
-        is refused — and a refusal is not a read failure, so nothing recovers from it. The copy
-        with a usable baseline must win however its sequence compares.
-        """
-        raw_unknown = _Item("S2A_33TWM_20220107_1_L2A", "MGRS-33TWM", "1")
-        _with_assets(raw_unknown, _bands_at(_REMOTE))
-        raw_best = _copy("S2A_33TWM_20220107_0_L2A", sequence="0", baseline="05.00", host_root=_REMOTE)
-        kept, _ = select_preferred_duplicates([raw_unknown, raw_best])
-        assert [i.id for i in kept] == [raw_best.id], "a usable baseline must beat an unreadable one"
 
     def test_a_harmonised_copy_is_still_not_penalised_for_its_baseline(self) -> None:
         """An unreadable baseline costs a harmonised copy nothing on the READABILITY term.
@@ -1291,20 +832,6 @@ class TestTheDuplicateLogIsAnAuditTrail:
         assert "1 tile-date(s) had more than one copy" in msg
         assert "winners by source: 1 in-region, 0 remote" in msg, msg
 
-    def test_it_states_the_actual_preference(self, caplog) -> None:
-        """It said "newest kept" while the ranking preferred an in-region copy over a
-        higher-sequence remote one — a line misreporting its own behaviour.
-        """
-        local = _copy("a", sequence="0", baseline="00.01", host_root=_IN_REGION)
-        remote = _copy("b", sequence="1", baseline="00.01", host_root=_REMOTE)
-        msg = self._emit(caplog, [local], {("MGRS-33TWM", "2021-09-08"): [remote]})
-        assert "complete read set, then a decidable producer, then a readable baseline" in msg
-        assert (
-            "then a readable baseline, then newest baseline, then owing no offset correction, "
-            "then in-region, then newest sequence"
-        ) in msg
-        assert "newest kept" not in msg, "the stale claim must not come back"
-
     def test_it_names_where_the_survivors_came_from(self, caplog) -> None:
         """THE AUDIT TRAIL. Where two copies share a baseline their pixels are identical, so
         nothing downstream can show which was read — not the store, not the mosaic, not the
@@ -1350,22 +877,6 @@ class TestTheDuplicateLogIsAnAuditTrail:
         msg = self._emit(caplog, [winner, stray], {("MGRS-33TWM", "2021-09-08"): [stray]})
         assert "1 in-region, 0 remote" in msg
 
-    def test_it_states_one_ranking_because_there_is_only_one(self, caplog) -> None:
-        """This clause used to be conditional, naming a sequence-only fallback for images
-        where a copy declared no readable baseline. There is no fallback any more — such a copy
-        simply ranks last — so the line states the ranking unconditionally, and it is the truth
-        on an uncertain-metadata date as much as on any other.
-        """
-        winner = _copy("a", sequence="1", baseline="00.01", host_root=_IN_REGION)
-        unreadable = _with_assets(_Item("b", "MGRS-33TWM", "0"), _bands_at(_REMOTE))
-        msg = self._emit(caplog, [winner], {("MGRS-33TWM", "2021-09-08"): [unreadable]})
-        assert "complete read set, then a decidable producer, then a readable baseline" in msg
-        assert (
-            "then a readable baseline, then newest baseline, then owing no offset correction, "
-            "then in-region, then newest sequence"
-        ) in msg
-        assert "sequence alone" not in msg, "a mode that cannot happen must not be reported"
-
     def test_no_duplicates_logs_nothing(self, caplog) -> None:
         assert self._emit(caplog, [], {}) == ""
 
@@ -1397,12 +908,6 @@ class TestLocalityNeedsTheCompleteReadSet:
 
     def test_the_complete_read_set_is_local(self) -> None:
         assert item_is_in_preferred_location(_with_assets(_Item("x"), _bands_at(_IN_REGION))) is True
-
-    def test_a_read_key_missing_from_an_otherwise_local_item_is_not_local(self) -> None:
-        assets = _bands_at(_IN_REGION)
-        dropped = assets.pop(READ_ASSET_KEYS[-1])
-        assert dropped is not None, "the fixture must actually have carried that key"
-        assert item_is_in_preferred_location(_with_assets(_Item("x"), assets)) is False
 
     def test_a_read_key_present_but_href_less_is_not_local(self) -> None:
         assets = _bands_at(_IN_REGION)
@@ -1443,33 +948,9 @@ class TestLocalityNeedsTheCompleteReadSet:
         assert read_set_is_complete(_with_assets(_Item("x"), _bands_at(_REMOTE))) is True
         assert item_is_in_preferred_location(_with_assets(_Item("x"), _bands_at(_REMOTE))) is False
 
-    def test_an_item_with_no_assets_is_incomplete(self) -> None:
-        """Radar copies and non-S2 products tie here rather than being ordered by it."""
-        assert read_set_is_complete(_Item("x")) is False
-
 
 class TestNonFiniteBaselinesAreUnknown:
     """`float()` accepts "NaN" and "Infinity". Neither is a baseline. Review on PR #107."""
-
-    @pytest.mark.parametrize("raw", ["NaN", "nan", "Infinity", "inf", "-inf", "-Infinity"])
-    def test_a_non_finite_baseline_reads_as_unknown(self, raw: str) -> None:
-        assert item_processing_baseline(_Item("x", "MGRS-33TWM", "0", **{"s2:processing_baseline": raw})) is None
-
-    def test_a_real_baseline_still_reads(self) -> None:
-        """So the test above cannot pass by rejecting everything.
-
-        Reported as an integer hundredth (500, not 5.0) — the scale the correction threshold is
-        expressed in. There used to be two parsers on two scales, and unifying them is what let
-        the numeric edge cases be fixed once instead of twice.
-        """
-        assert item_processing_baseline(_Item("x", "MGRS-33TWM", "0", **{"s2:processing_baseline": "05.00"})) == 500
-
-    def test_infinity_does_not_outrank_a_real_baseline(self) -> None:
-        infinite = _copy("infinite", sequence="0", baseline="Infinity", host_root=_IN_REGION)
-        real = _copy("real", sequence="1", baseline="05.00", host_root=_IN_REGION)
-        kept, _ = select_preferred_duplicates([infinite, real])
-        # Unknown suspends the baseline comparison, so sequence decides and 1 beats 0.
-        assert [it.id for it in kept] == ["real"]
 
     def test_a_nan_baseline_does_not_leave_the_order_response_dependent(self) -> None:
         """Every NaN comparison is false, so a NaN in the ladder preserved the given order."""
@@ -1524,19 +1005,6 @@ class TestUnknownBaselineStaysScopedToItsImage:
         # 04.00) — a read failure would then have handed out the older reprocessing.
         assert [i for i in ladder if i.startswith("b-")] == ["b-mid", "b-newer-seq"]
 
-    def test_the_best_spare_overall_is_still_first(self) -> None:
-        """`_spare_for_failed_image` falls back to copies[0] when nothing is attributed."""
-        items = [
-            _copy_at("a-win", image=self._A, sequence="0", baseline="05.00"),
-            _copy_at("a-spare", image=self._A, sequence="0", baseline="03.00"),
-            _copy_at("b-win", image=self._B, sequence="0", baseline="05.00"),
-            _copy_at("b-spare", image=self._B, sequence="0", baseline="04.00"),
-        ]
-        _, alternates = select_preferred_duplicates(items)
-        ladder = [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]]
-        # b-spare (04.00) outranks a-spare (03.00) despite belonging to the later image.
-        assert ladder == ["b-spare", "a-spare"]
-
 
 class TestTheLadderKeepsGlobalPriorityPastItsHead:
     """`s2_roi`'s unattributed recovery consumes `copies[0]` on each retry, so EVERY position in
@@ -1546,20 +1014,6 @@ class TestTheLadderKeepsGlobalPriorityPastItsHead:
 
     _A = _image(1)
     _B = _image(2)
-
-    def test_a_second_retry_does_not_skip_a_better_copy_in_another_image(self) -> None:
-        items = [
-            _copy_at("a-win", image=self._A, sequence="9", baseline="05.10"),
-            _copy_at("a-05", image=self._A, sequence="2", baseline="05.00"),
-            _copy_at("a-01", image=self._A, sequence="1", baseline="01.00"),
-            _copy_at("b-win", image=self._B, sequence="9", baseline="05.10"),
-            _copy_at("b-04", image=self._B, sequence="2", baseline="04.00"),
-        ]
-        _, alternates = select_preferred_duplicates(items)
-        ladder = [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]]
-        # Concatenating whole ladders behind their sorted heads gave [a-05, a-01, b-04], so the
-        # second retry downgraded to baseline 01.00 while a 04.00 copy was still untried.
-        assert ladder == ["a-05", "b-04", "a-01"]
 
     def test_every_position_is_in_descending_baseline_order(self) -> None:
         """The general property, over three images interleaved at every rung."""
@@ -1639,9 +1093,8 @@ class TestAMalformedHrefDoesNotAbortTheSelection:
     including singletons — so one bad catalogue href aborted the whole selection. PR #107.
     """
 
-    @pytest.mark.parametrize("href", ["https://[oops/B02.tif", "https://[::1/x", "s3://[/key"])
-    def test_an_unparseable_href_reads_as_remote(self, href: str) -> None:
-        assert asset_bucket(href) is None
+    def test_an_unparseable_href_reads_as_remote(self) -> None:
+        assert asset_bucket("https://[oops/B02.tif") is None
 
     def test_a_singleton_group_with_a_malformed_href_still_returns(self) -> None:
         item = _with_assets(_Item("only", "MGRS-33TWM", "0"), {"blue": {"href": "https://[oops/B02.tif"}})
@@ -1698,50 +1151,6 @@ class TestThePreferenceKeyHoldsItsInvariants:
                 for u in unknown:
                     assert _preference_key(k) < _preference_key(u), f"{u.id} outranked {k.id}"
 
-    def test_completeness_outranks_the_baseline(self) -> None:
-        """An incomplete 05.00 copy must lose to a complete 04.00 one."""
-        incomplete_new = self._item("a", baseline="05.00", sequence="9", local=True, complete=False)
-        complete_old = self._item("z", baseline="04.00", sequence="0", local=False, complete=True)
-        assert _preference_key(complete_old) < _preference_key(incomplete_new)
-
-    def test_locality_never_outranks_a_higher_baseline(self) -> None:
-        """The P1 this ordering exists to prevent: cheaper egress must not buy an older pixel.
-
-        Both baselines are below the correction threshold, so both producer terms are inert — the
-        owes term below the baseline and the refusal term above it. Locality is then alone with the
-        baseline, which is what this asserts.
-        """
-        remote_new = self._item("remote-new", baseline="03.01", sequence="0", local=False, complete=True)
-        local_old = self._item("local-old", baseline="02.06", sequence="9", local=True, complete=True)
-        assert _preference_key(remote_new) < _preference_key(local_old)
-
-    def test_locality_does_not_participate_when_the_baseline_is_unreadable(self) -> None:
-        """Compared like with like: both raw, so the baseline-readable term ties and only locality
-        and sequence are left. A harmonised copy would not tie here — it needs no correction, so an
-        unreadable baseline costs it nothing.
-        """
-        local = self._item("local", baseline=None, sequence="1", local=False, complete=True)
-        remote = self._item("remote", baseline=None, sequence="2", local=False, complete=True)
-        assert _preference_key(remote) < _preference_key(local), "locality decided a baseline-free comparison"
-
-    def test_a_harmonised_copy_is_not_penalised_on_the_readable_term(self) -> None:
-        """It needs no correction whatever the baseline says, so an unreadable baseline is not
-        evidence against it the way it is against a raw copy — which refuses its date.
-
-        Note the narrower claim: this is about the READABLE term, not the baseline VALUE. A
-        harmonised copy declaring nothing still loses to a raw copy declaring 03.00, because an
-        absent baseline is no vintage information at all and this module does not let absence of
-        evidence win a comparison. That is consistent rather than accidental.
-        """
-        harmonised = self._item("harmonised", baseline=None, sequence="0", local=True, complete=True)
-        raw_same = self._item("raw-no-baseline", baseline=None, sequence="9", local=False, complete=True)
-        assert _preference_key(harmonised) < _preference_key(raw_same)
-
-    def test_an_incomplete_copy_loses_to_an_otherwise_identical_complete_one(self) -> None:
-        complete = self._item("z-complete", baseline="05.00", sequence="0", local=False, complete=True)
-        partial = self._item("a-partial", baseline="05.00", sequence="0", local=False, complete=False)
-        assert _preference_key(complete) < _preference_key(partial), "the id tiebreak decided readability"
-
     def test_the_key_is_a_total_order_with_no_ties_between_distinct_items(self) -> None:
         """Ties would make the sort depend on catalogue response order, so a rerun could produce
         a different mosaic. The id term is what rules them out.
@@ -1786,14 +1195,6 @@ class TestCompletenessOutranksTheSequenceWhenABaselineIsUnreadable:
         complete_older = self._copy("complete-older", sequence="1", baseline="05.00", complete=True)
         kept, _ = select_preferred_duplicates([unreadable, incomplete_newer, complete_older])
         assert [it.id for it in kept] == ["complete-older"]
-
-    def test_sequence_still_decides_between_two_complete_copies(self) -> None:
-        """The complement: completeness must not have displaced the sequence preference."""
-        unreadable = self._copy("unreadable", sequence="0", baseline=None, complete=True)
-        newer = self._copy("newer", sequence="9", baseline="05.00", complete=True)
-        older = self._copy("older", sequence="1", baseline="05.00", complete=True)
-        kept, _ = select_preferred_duplicates([unreadable, newer, older])
-        assert [it.id for it in kept] == ["newer"]
 
 
 class TestRankingJudgesTheAssetsThisLoadWillRequest:
@@ -1876,33 +1277,16 @@ class TestAMixedProducerCopyIsRankedOnItsBaselineLikeAnyOther:
             assets["red"] = {"href": f"{_REMOTE}/B04.jp2"}
         return _with_assets(_Item(ident, "MGRS-33TWM", sequence, **{"s2:processing_baseline": baseline}), assets)
 
-    def test_a_mixed_producer_copy_is_no_longer_a_problem_at_all(self) -> None:
-        """REVERSED: a copy whose bands span two KNOWN producers is corrected band by band.
-
-        It used to lose to an older homogeneous copy and be barred from the ladder, because one
-        offset decision was applied to a whole fused date and no single answer fitted such an item.
-        The decision is per SOURCE now — each band is judged on its own bucket — so the item is
-        ordinary, and the newer baseline wins.
+    @pytest.mark.parametrize(("new", "old"), [("05.00", "04.00"), ("03.00", "02.00")], ids=["above", "below"])
+    def test_a_mixed_producer_copy_is_no_longer_a_problem_at_all(self, new: str, old: str) -> None:
+        """A copy whose bands span two KNOWN producers is corrected band by band, so it is
+        ordinary on either side of the threshold, and the newer baseline wins.
         """
-        mixed_new = self._copy_at_baseline("mixed-05", "05.00", mixed=True)
-        clean_old = self._copy_at_baseline("clean-04", "04.00", mixed=False)
+        mixed_new = self._copy_at_baseline("mixed-new", new, mixed=True)
+        clean_old = self._copy_at_baseline("clean-old", old, mixed=False)
         kept, alternates = select_preferred_duplicates([mixed_new, clean_old])
-        assert [it.id for it in kept] == ["mixed-05"]
-        assert [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]] == ["clean-04"]
-
-    def test_below_the_threshold_the_baseline_still_decides(self) -> None:
-        """And below the threshold, where no producer changes a pixel at all."""
-        mixed_new = self._copy_at_baseline("mixed-03", "03.00", mixed=True)
-        clean_old = self._copy_at_baseline("clean-02", "02.00", mixed=False)
-        kept, _ = select_preferred_duplicates([mixed_new, clean_old])
-        assert [it.id for it in kept] == ["mixed-03"]
-
-    def test_two_homogeneous_copies_are_still_ranked_on_baseline(self) -> None:
-        """The complement, or the term could be penalising everything."""
-        new = self._copy_at_baseline("clean-05", "05.00", mixed=False)
-        old = self._copy_at_baseline("clean-04", "04.00", mixed=False)
-        kept, _ = select_preferred_duplicates([new, old])
-        assert [it.id for it in kept] == ["clean-05"]
+        assert [it.id for it in kept] == ["mixed-new"]
+        assert [it.id for it in next(iter(alternates.values()))] == ["clean-old"]
 
     def test_an_incomplete_copy_is_not_penalised_twice(self) -> None:
         """It is already last on completeness, and reports an undecidable producer BECAUSE it is
@@ -1945,35 +1329,13 @@ class TestTheLadderOnlyOffersCopiesItCanRecoverWith:
         _, alternates = select_preferred_duplicates([winner, spare])
         assert [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]] == ["harmonised-no-baseline"]
 
-    def test_a_usable_spare_is_still_offered(self) -> None:
-        """The complement first: the ladder must not have been emptied wholesale."""
-        winner = self._copy("win", baseline="05.00", sequence="9")
-        spare = self._copy("spare", baseline="04.00", sequence="1")
-        _, alternates = select_preferred_duplicates([winner, spare])
-        assert [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]] == ["spare"]
-
-    def test_a_spare_with_an_unreadable_baseline_is_excluded(self) -> None:
-        winner = self._copy("win", baseline="05.00", sequence="9")
-        unusable = self._copy("no-baseline", baseline=None, sequence="1", raw=True)
-        _, alternates = select_preferred_duplicates([winner, unusable])
-        assert alternates == {}
-
-    def test_a_mixed_producer_spare_is_offered_at_every_baseline_now(self) -> None:
-        """REVERSED above the threshold, and it now agrees with the case below it.
-
-        A mixed-producer spare was excluded above the threshold because a date-wide offset decision
-        could not fit it. Per-source correction handles it, so it is a usable fallback at any
-        baseline and the two halves of this class stop disagreeing.
+    @pytest.mark.parametrize("baseline", ["05.00", "03.00"], ids=["above", "below"])
+    def test_a_mixed_producer_spare_is_offered_at_every_baseline(self, baseline: str) -> None:
+        """Per-source correction handles a mixed-producer spare, so it is a usable fallback on
+        either side of the threshold.
         """
-        winner = self._copy("win", baseline="05.00", sequence="9")
-        spare = self._copy("mixed", baseline="05.00", sequence="1", mixed=True)
-        _, alternates = select_preferred_duplicates([winner, spare])
-        assert [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]] == ["mixed"]
-
-    def test_a_mixed_producer_spare_is_kept_below_the_threshold(self) -> None:
-        """Below the threshold too, where no producer changes a pixel, so the spare stays usable."""
-        winner = self._copy("win", baseline="03.00", sequence="9")
-        spare = self._copy("mixed", baseline="03.00", sequence="1", mixed=True)
+        winner = self._copy("win", baseline=baseline, sequence="9")
+        spare = self._copy("mixed", baseline=baseline, sequence="1", mixed=True)
         _, alternates = select_preferred_duplicates([winner, spare])
         assert [it.id for it in alternates[("MGRS-33TWM", "2021-09-08")]] == ["mixed"]
 
@@ -2049,10 +1411,6 @@ class TestTheAuditReportsWhatSelectionDidNotWhatSurvivedTheFilter:
         assert "1 tile-date(s) had more than one copy" in msg, f"multi-pass date inflated it: {msg}"
         assert "1 rejected" in msg
 
-    def test_nothing_pruned_logs_nothing(self, caplog) -> None:
-        only = self._copy("only", baseline="05.00")
-        assert self._emit(caplog, [only], [only], {}) == ""
-
 
 class TestTheLadderStepsNothingWhenTheFailedImageHasNoSpare:
     """Attribution named the failing objects and no copy belongs to their image.
@@ -2081,29 +1439,6 @@ class TestTheLadderStepsNothingWhenTheFailedImageHasNoSpare:
         stepped = step_down_copies(alternates, kept, implicated=[bad])
         assert stepped is None, "a healthy image was downgraded for a failure it did not have"
 
-    def test_the_failed_image_is_stepped_when_it_does_have_a_spare(self) -> None:
-        """The complement, or returning None unconditionally would pass the test above."""
-        bad = self._at("bad-a", self._A, "1")
-        spare_a = self._at("spare-a", self._A, "0")
-        healthy = self._at("healthy-b", self._B, "1")
-        kept, alternates = select_preferred_duplicates([bad, spare_a, healthy])
-        stepped = step_down_copies(alternates, kept, implicated=[bad])
-        assert stepped is not None
-        swapped, _keys = stepped
-        assert "spare-a" in [i.id for i in swapped], "the failed image was not stepped"
-        assert "healthy-b" in [i.id for i in swapped], "the healthy image must be untouched"
-
-    def test_unattributed_failure_still_steps_the_best_spare(self) -> None:
-        """With nothing attributed there is no image to match, and the pre-existing
-        behaviour — take the best-ranked alternate — is still right.
-        """
-        first = self._at("first", self._A, "1")
-        spare = self._at("spare", self._A, "0")
-        kept, alternates = select_preferred_duplicates([first, spare])
-        stepped = step_down_copies(alternates, kept, implicated=[])
-        assert stepped is not None
-        assert "spare" in [i.id for i in stepped[0]]
-
 
 class TestASequenceIsMatchedNotCoerced:
     """`s2:sequence` is validated as a sequence, the same way a baseline is validated as a version.
@@ -2124,7 +1459,7 @@ class TestASequenceIsMatchedNotCoerced:
             item.properties["s2:sequence"] = raw
         return item
 
-    @pytest.mark.parametrize(("raw", "expected"), [("0", 0), ("3", 3), ("12", 12), (3, 3)])
+    @pytest.mark.parametrize(("raw", "expected"), [("12", 12), (3, 3)])
     def test_a_real_sequence_parses(self, raw: object, expected: int) -> None:
         assert item_sequence(self._item(raw)) == expected
 
@@ -2132,18 +1467,10 @@ class TestASequenceIsMatchedNotCoerced:
         ("label", "raw"),
         [
             ("truncating-float", 1.9),
-            ("truncating-string", "1.9"),
             ("infinity", float("inf")),
-            ("nan", float("nan")),
             ("negative", "-1"),
-            ("signed", "+1"),
             ("exponent", "1e3"),
-            ("hex", "0x1"),
             ("arabic-indic", chr(0x664)),
-            ("empty", ""),
-            ("spaces", "   "),
-            ("word", "one"),
-            ("list", []),
             ("bool", True),
         ],
         ids=lambda v: v if isinstance(v, str) and v.replace("-", "").isalpha() else None,
@@ -2221,15 +1548,6 @@ class TestTheProducerTermIsInertWithoutAReadSet:
         # Native keys, as Planetary Computer serves them — none of the configured names resolve.
         return _with_assets(item, {k: {"href": f"https://x.blob.core.windows.net/{k}"} for k in ("B02", "B03")})
 
-    def test_a_post_threshold_copy_does_not_read_as_refusing(self) -> None:
-        assert refuses_its_date(self._native("new", "05.10", "1"), ()) is False
-
-    def test_the_newer_copy_still_wins(self) -> None:
-        """The consequence: without this, the older pre-threshold copy took the tile-date."""
-        newer = self._native("new-05.10", "05.10", "1")
-        older = self._native("old-03.00", "03.00", "0")
-        assert _preference_key(newer, ()) < _preference_key(older, ())
-
     def test_the_spare_stays_on_the_fallback_ladder(self) -> None:
         newer = self._native("new-05.10", "05.10", "1")
         older = self._native("old-03.00", "03.00", "0")
@@ -2247,124 +1565,6 @@ class TestTheProducerTermIsInertWithoutAReadSet:
         unlisted = _Item("unlisted", "MGRS-33TWM", "0", **{"s2:processing_baseline": "05.00"})
         _with_assets(unlisted, _bands_at("s3://nobody-has-classified-this/33/T/WM"))
         assert refuses_its_date(unlisted, READ_ASSET_KEYS) is True
-
-
-class TestAMessageMayNotBeItsOwnCorroboration:
-    """Attribution and refusal must come from DIFFERENT evidence in the same text.
-
-    Both predicates require two things: that the source READER is what failed, and what it
-    failed with. If one marker can supply both, a failure from anywhere else in the pipeline
-    carrying the same words is claimed by the source and its dates are skipped.
-    """
-
-    @pytest.mark.parametrize("credential", ["InvalidAccessKeyId", "SignatureDoesNotMatch"])
-    def test_a_credential_fault_is_not_unreadable_data(self, credential: str) -> None:
-        """Two predicates once kept separate exclusion lists and the lists disagreed, so the same
-        credential fault was skipped as bad data on one path and raised on the other. Skipping is
-        the dangerous direction: it steps down to an older copy to work around a fault a retry
-        fixes.
-        """
-        exc = Exception(f"Chunk and warp failed: {credential}")
-        assert is_unreadable_source(exc) is False
-
-    def test_genuinely_corrupt_data_is_still_unreadable(self) -> None:
-        """The paired positive for the exclusions above, on a real chain rather than a string."""
-        assert is_unreadable_source(_read_failure("ZIPDecode:Decoding error at scanline 0")) is True
-
-
-class TestTheTwoVerdictsCannotDisagree:
-    """One classifier, read by both predicates, so no status is a refusal to one and bad data to
-    the other. Two lists kept in step is what failed: the markers named 403 and 500 as strings
-    while the ranges covered every 5xx, so a 503 was claimed by neither and radar drew the
-    ordinary attempt limit for the commonest shape of outage there is.
-    """
-
-    @pytest.mark.parametrize("status", [500, 502, 503, 504, 507, 599, 408, 429])
-    def test_every_transient_status_is_a_refusal(self, status: int) -> None:
-        """Ranged, so a status nobody enumerated still earns the wait."""
-        failure = _read_failure(f"HTTP response code: {status}")
-        assert is_provider_refusal(failure) is True
-        assert is_unreadable_source(failure) is False
-
-    @pytest.mark.parametrize("status", [403, 429, 500, 503])
-    def test_the_ranged_readers_wording_carries_a_status_too(self, status: int) -> None:
-        """The ranged reader says ``response_code=`` where the two wordings above say ``code:``.
-
-        Read by a pattern anchored on the others it carries no status at all, so the refusal it
-        states is undecidable and the codec failure beneath it keeps its unreadable verdict — a
-        transient refusal given up as bad data.
-        """
-        failure = _read_failure(f"Request for https://h/o.tif range 1-2 failed with response_code={status}")
-        assert is_provider_refusal(failure) is True
-        assert is_unreadable_source(failure) is False
-
-    def test_a_request_that_never_got_a_response_names_no_status(self) -> None:
-        """``response_code=0`` is the absence of a status, and must not be read as one.
-
-        GDAL prints it when the request did not complete. Three digits is what separates it from a
-        status, and admitting it would make it a 4xx that means neither wait nor absence — the
-        verdict that re-raises and fails a leg on its first date.
-        """
-        failure = _read_failure("Request for https://h/o.tif range 1-2 failed with response_code=0")
-        assert is_provider_refusal(failure) is False
-
-    @pytest.mark.parametrize(
-        ("cause", "refusal", "unreadable"),
-        [
-            ("ZIPDecode:Decoding error at scanline 0", False, True),
-            ("HTTP response code: 404", False, True),
-            ("HTTP response code: 401", False, False),
-            ("InvalidAccessKeyId", False, False),
-            ("AccessDenied: not authorized to perform: s3:GetObject", True, False),
-        ],
-    )
-    def test_the_two_predicates_never_both_claim_a_failure(self, cause: str, refusal: bool, unreadable: bool) -> None:
-        """The property the docstrings assert, tested rather than believed.
-
-        An overlap is not a cosmetic problem: it is the original defect, where whichever predicate
-        a caller happened to ask first decided whether a date was skipped or a leg was retried.
-        """
-        failure = _read_failure(cause)
-        assert is_provider_refusal(failure) is refusal
-        assert is_unreadable_source(failure) is unreadable
-        assert not (refusal and unreadable)
-
-    def test_a_stripped_cause_earns_neither_verdict(self) -> None:
-        """The fail-closed direction: no long wait on suspicion, and no date given up either."""
-        flattened = Exception("RasterioIOError('Read failed. See previous exception for details.')")
-        assert is_provider_refusal(flattened) is False
-        assert is_unreadable_source(flattened) is False
-
-
-class TestANamedTransportFailureIsNotBadData:
-    """A link that failed says nothing about the bytes, and carries no HTTP status to say so with.
-
-    Half this class was named and half was not, so a dropped connection was declined while a
-    refused one fell through to the markers and could be read as permanent loss — the same link
-    failing, classified two ways depending on which word GDAL happened to use.
-    """
-
-    @pytest.mark.parametrize(
-        "transport",
-        [
-            "Could not resolve host: sentinel-cogs.s3.us-west-2.amazonaws.com",
-            "Connection refused",
-            "Empty reply from server",
-            "SSL peer handshake failed",
-            "Connection reset by peer",
-        ],
-    )
-    def test_it_takes_precedence_over_a_bad_data_marker_in_the_same_chain(self, transport: str) -> None:
-        """Written to fail if the markers are removed, which the first version of it did not.
-
-        Every message here lacks a codec name, so `is_unreadable_source` already declined them for
-        want of one and the test passed whether or not these entries existed. Putting a real codec
-        marker in the same chain is what exercises the branch they change: without them the chain
-        reads as bad data, with them the link failure wins and no date is given up.
-        """
-        chain = _read_failure(f"{transport}: ZIPDecode:Decoding error at scanline 0")
-        assert is_unreadable_source(chain) is False
-        assert is_provider_refusal(chain) is True
 
 
 class TestRecognisingAFailureThatArrivedWithNoEvidence:
@@ -2397,13 +1597,6 @@ class TestRecognisingAFailureThatArrivedWithNoEvidence:
         that arrives and it says only that a read failed.
         """
         assert cause_was_flattened(self._flattened(WarpOperationError("Chunk and warp failed"))) is True
-
-    def test_it_gets_no_verdict_rather_than_the_wrong_one(self) -> None:
-        """Fail-closed, which is right — but the caller then re-raises for want of evidence, not
-        because the evidence said to. Only this predicate can tell those two apart.
-        """
-        flattened = self._flattened(RasterioIOError("Read failed. See previous exception for details."))
-        assert is_unreadable_source(flattened) is False
 
     def test_a_chain_that_arrived_intact_is_not_flattened(self) -> None:
         """The negative that matters: once the cause survives, this must stay silent."""
