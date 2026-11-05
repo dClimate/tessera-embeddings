@@ -1,12 +1,11 @@
 """Ownership of icechunk's process-global log filter.
 
-Deliberately a light module: it imports nothing from this package, so a caller that only wants to
-register a filter — the test suite's conftest, for one — does not drag in the writer or its logging
-configuration. Living in ``shard_writer`` did exactly that and broke ten unrelated log-capture
-tests.
+Deliberately a light module: it imports nothing from this package, so importing it does not drag
+in the writer or its logging configuration.
 
 The filter is global and write-only — icechunk offers a setter and no getter — so "put it back
-how it was" is only possible if exactly one place tracks what "it was" is. That place is here.
+how it was" is only possible if exactly one place tracks what "it was" is. That place is here,
+seeded from ``ICECHUNK_LOG``, the one standing filter icechunk reads at import.
 """
 
 from __future__ import annotations
@@ -49,34 +48,6 @@ _base_log_filter: str | None = os.environ.get("ICECHUNK_LOG") or None
 #: commits an assembly, so this overlap is a real schedule and not a hypothetical one.
 _tracing_depth = 0
 _tracing_lock = threading.Lock()
-
-
-def set_base_logs_filter(directive: str | None) -> None:
-    """Install a standing icechunk log filter, and record it as the one to return to.
-
-    Call this instead of :func:`icechunk.set_logs_filter`: the filter is process-global and
-    write-only, so a directive set behind this module's back is one it cannot see, cannot
-    preserve, and will overwrite the next time a commit finishes.
-
-    **Installed first, recorded only if that succeeded, and errors are NOT swallowed.** Recording
-    a directive icechunk then rejected would leave every later :func:`commit_tracing` believing an
-    operator filter was in force and skipping the commit diagnostics, on the strength of a filter
-    that was never installed. This is a start-up configuration call, not a commit path: a malformed
-    directive is worth raising.
-
-    Args:
-        directive: A tracing directive, or ``None`` for icechunk's default.
-
-    Raises:
-        Exception: Whatever icechunk raises for a directive it will not accept. The
-            previously recorded base is left untouched.
-    """
-    global _base_log_filter
-    with _tracing_lock:
-        setter = getattr(icechunk, "set_logs_filter", None)
-        if setter is not None:
-            setter(directive)
-        _base_log_filter = directive
 
 
 @contextmanager

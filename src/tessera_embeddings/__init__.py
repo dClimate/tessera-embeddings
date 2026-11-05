@@ -7,8 +7,8 @@ Conventions:
 
 * Underscore-prefixed module names, functions and attributes are private.
 * ``@typing.final`` classes must not be subclassed; the type checker (ty) enforces this.
-* Domain code (``ingest``, ``inference``, ``storage``, ``providers``,
-  ``orchestration.concurrency``) is orchestrator-agnostic — the same function works under
+* Domain code (``ingest``, ``inference``, ``storage``, ``providers``) is
+  orchestrator-agnostic — the same function works under
   Prefect flows, the plain runner, and any future orchestrator.
 """
 

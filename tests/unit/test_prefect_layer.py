@@ -2,8 +2,7 @@
 
 These tests enforce the architectural invariant that ``import prefect``
 appears **only** under ``orchestration/prefect/``. Domain modules
-(``ingest/``, ``inference/``, ``storage/``, ``providers/``,
-``orchestration/concurrency.py``) must stay orchestrator-agnostic so
+(``ingest/``, ``inference/``, ``storage/``, ``providers/``) must stay orchestrator-agnostic so
 they remain testable without a Prefect runtime.
 """
 

@@ -263,3 +263,4 @@ Measured on 2026-11-04 with `pytest -n auto --junitxml` (per-file CPU-seconds, t
 without: coverage is not the CI cost). Five Opus reviewers each read one slice of the suite in full,
 grepped `src/` for callers, and wrote the per-file lists in `reviews/`. Every dead-code claim in §2c
 and the pool finding in §2a were re-verified by hand before this plan was written.
+- `assembly/test_assembly.py::TestAssembly::test_same_date_overwrite_resets_untouched_vars_to_fill` — DEAD (only `embedding_std` can be dropped) — the reset also covers the other S1 orbit's obs count on a single-orbit refill; rewritten on that variable instead of deleted.

@@ -458,29 +458,6 @@ class TestAssembly:
         np.testing.assert_array_equal(ds.coords["easting"].values, np.arange(10))
         np.testing.assert_array_equal(ds.coords["band"].values, np.arange(EMBEDDING_DIM))
 
-    def test_assemble_with_std(self, tmp_path, writer, output):
-        """Assembly includes embedding_std when compute_std=True."""
-        rng = np.random.default_rng(42)
-        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
-
-        emb, scales = _quantized_embeddings(rng, 4, 4)
-        std = rng.random((4, 4, EMBEDDING_DIM)).astype(np.float32)
-        writer.write_chunk(chunk, emb, run_id="run1", scales=scales, embeddings_std=std, stack=STACK)
-        _assemble(
-            writer,
-            [chunk],
-            run_id="run1",
-            output_path=output,
-            compute_std=True,
-            roi_zarr_path=_make_full_roi_mask(tmp_path, 4, 4),
-        )
-
-        ds = open_store(output)
-        assert ds["embeddings"].shape == (1, 4, 4, EMBEDDING_DIM)
-        assert ds["embedding_std"].shape == (1, 4, 4, EMBEDDING_DIM)
-        np.testing.assert_array_equal(ds["embeddings"].values[0, ...], emb)
-        np.testing.assert_array_almost_equal(ds["embedding_std"].values[0, ...], std, decimal=5)
-
     def test_a_second_encoder_cannot_append_to_a_store_the_first_published(self, tmp_path, writer, output):
         """The relabelling this refuses is silent and total.
 
@@ -850,108 +827,25 @@ class TestAssembly:
         assert worker["read_s"] >= 0 and worker["write_s"] >= 0
         assert rec["commit_s"] >= 0 and rec["total_s"] > 0
 
-    def test_assemble_append_with_std(self, tmp_path, writer, output):
-        """Append preserves both embedding and embedding_std across runs."""
-        rng = np.random.default_rng(42)
-        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
-
-        roi = _make_full_roi_mask(tmp_path, 4, 4)
-
-        # Run 1 with std
-        emb1, scales1 = _quantized_embeddings(rng, 4, 4)
-        std1 = rng.random((4, 4, EMBEDDING_DIM)).astype(np.float32)
-        writer.write_chunk(
-            chunk,
-            emb1,
-            run_id="run1",
-            scales=scales1,
-            embeddings_std=std1,
-            stack=STACK,
-        )
-        _assemble(
-            writer,
-            [chunk],
-            run_id="run1",
-            output_path=output,
-            compute_std=True,
-            roi_zarr_path=roi,
-            run_started_at=datetime.datetime(2024, 6, 1, tzinfo=datetime.UTC),
-        )
-
-        # Run 2 with std, at a later date
-        emb2, scales2 = _quantized_embeddings(rng, 4, 4)
-        std2 = rng.random((4, 4, EMBEDDING_DIM)).astype(np.float32)
-        writer.write_chunk(
-            chunk,
-            emb2,
-            run_id="run2",
-            scales=scales2,
-            embeddings_std=std2,
-            stack=STACK,
-        )
-        _assemble(
-            writer,
-            [chunk],
-            run_id="run2",
-            output_path=output,
-            compute_std=True,
-            roi_zarr_path=roi,
-            run_started_at=datetime.datetime(2025, 6, 1, tzinfo=datetime.UTC),
-        )
-
-        ds = open_store(output)
-        assert ds["embeddings"].shape == (2, 4, 4, EMBEDDING_DIM)
-        assert ds["embedding_std"].shape == (2, 4, 4, EMBEDDING_DIM)
-        np.testing.assert_array_almost_equal(ds["embedding_std"].values[0, ...], std1, decimal=5)
-        np.testing.assert_array_almost_equal(ds["embedding_std"].values[1, ...], std2, decimal=5)
-
     def test_same_date_overwrite_resets_untouched_vars_to_fill(self, tmp_path, writer, output):
-        """A same-date overwrite that drops a variable resets that variable's
-        slice to fill, so no stale metadata describes the overwritten data.
+        """A same-date overwrite that drops a variable — the other S1 orbit's obs count on a
+        single-orbit refill — resets that variable's slice to fill, so no stale metadata describes
+        the overwritten data.
         """
         rng = np.random.default_rng(7)
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
         roi = _make_full_roi_mask(tmp_path, 4, 4)
         started = datetime.datetime(2024, 6, 1, tzinfo=datetime.UTC)
-
-        # Run 1: with std.
-        emb1, scales1 = _quantized_embeddings(rng, 4, 4)
-        std1 = rng.random((4, 4, EMBEDDING_DIM)).astype(np.float32)
-        writer.write_chunk(
-            chunk,
-            emb1,
-            run_id="run1",
-            scales=scales1,
-            embeddings_std=std1,
-            stack=STACK,
-        )
-        _assemble(
-            writer,
-            [chunk],
-            run_id="run1",
-            output_path=output,
-            compute_std=True,
-            roi_zarr_path=roi,
-            run_started_at=started,
-        )
-
-        # Run 2: SAME date, WITHOUT std — embedding_std is now untouched and stale.
-        emb2, scales2 = _quantized_embeddings(rng, 4, 4)
-        writer.write_chunk(chunk, emb2, run_id="run2", scales=scales2, stack=STACK)
-        _assemble(
-            writer,
-            [chunk],
-            run_id="run2",
-            output_path=output,
-            compute_std=False,
-            roi_zarr_path=roi,
-            run_started_at=started,
-        )
+        dropped = "s1_desc_obs_count"
+        for run_id, vars_ in (("run1", OBS_COUNT_VARS), ("run2", [v for v in OBS_COUNT_VARS if v != dropped])):
+            emb, scales = _quantized_embeddings(rng, 4, 4)
+            obs = {v: np.full((4, 4), 7, dtype=np.uint16) for v in vars_}
+            writer.write_chunk(chunk, emb, run_id=run_id, scales=scales, obs_counts=obs, stack=STACK)
+            _assemble(writer, [chunk], run_id=run_id, output_path=output, roi_zarr_path=roi, run_started_at=started)
 
         ds = open_store(output)
         assert ds["embeddings"].shape == (1, 4, 4, EMBEDDING_DIM)  # overwrite, not append
-        # embedding_std at the overwritten timestep is reset to fill (NaN), not stale std1.
-        assert np.isnan(ds["embedding_std"].values[0]).all()
+        assert (ds[dropped].values[0] == 0).all(), "the dropped variable kept run1's stale counts"
         # The atomic-publish work branch is cleaned up after a successful assemble.
         assert "_assemble-wip" not in open_or_create_repo(output)[0].list_branches()
 

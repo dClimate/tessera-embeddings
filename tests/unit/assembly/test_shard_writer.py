@@ -857,33 +857,6 @@ class TestCommitTracing:
             pass
         assert calls == []
 
-    def test_a_rejected_directive_is_not_recorded_as_the_base(self, monkeypatch):
-        """Record only what actually got installed.
-
-        Recording first and swallowing the error left every later `commit_tracing` believing
-        an operator filter was in force, so it skipped the commit diagnostics — on the
-        strength of a filter icechunk had refused — while the caller heard nothing.
-        """
-        monkeypatch.setattr(icechunk_logging, "_base_log_filter", "icechunk=warn")
-        monkeypatch.setattr(icechunk_logging, "_tracing_depth", 0)
-
-        def _reject(_directive):
-            raise ValueError("malformed directive")
-
-        monkeypatch.setattr(icechunk, "set_logs_filter", _reject)
-        with pytest.raises(ValueError, match="malformed"):
-            icechunk_logging.set_base_logs_filter("not a directive")
-        assert icechunk_logging._base_log_filter == "icechunk=warn", "the prior base was lost"
-
-    def test_the_base_filter_is_applied_and_is_what_a_scope_returns_to(self, monkeypatch):
-        calls = []
-        monkeypatch.setattr(icechunk, "set_logs_filter", calls.append)
-        monkeypatch.setattr(icechunk_logging, "_tracing_depth", 0)
-        monkeypatch.setattr(icechunk_logging, "_base_log_filter", None)
-        icechunk_logging.set_base_logs_filter("icechunk::storage::object_store=error")
-        assert calls == ["icechunk::storage::object_store=error"]
-        assert icechunk_logging._base_log_filter == "icechunk::storage::object_store=error"
-
     def test_a_failure_to_set_the_filter_does_not_break_the_commit(self, monkeypatch, no_base):
         """Diagnostics are never worth losing a commit over."""
 

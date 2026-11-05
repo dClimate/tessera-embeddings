@@ -1,11 +1,10 @@
 """Property-based tests for the most generic invariants in the package.
 
 We use Hypothesis where the input space is genuinely combinatorial
-(many-shapes-of-jobs, many-bucket-paths) and where the property is
+(many bucket paths, many manifests) and where the property is
 better expressed as "for all X: P(X)" than as a curated list of
 inputs.
 
-* :func:`sliding_window_submit` — max-concurrent invariant + completeness.
 * :class:`BucketPaths.store_for` — output URI is deterministic and
   uniquely keyed by ``(roi_name, kind)``.
 * :class:`RoiManifest`, :class:`EmbeddingManifest` — ``to_dict ↔ from_dict``
@@ -16,73 +15,15 @@ Hypothesis configuration is in ``tests/conftest.py``.
 
 from __future__ import annotations
 
-import threading
-import time
-from concurrent.futures import ThreadPoolExecutor
-
 from hypothesis import given
 from hypothesis import strategies as st
 
 from tessera_embeddings.config.paths import BucketPaths
-from tessera_embeddings.orchestration.concurrency import sliding_window_submit
 from tessera_embeddings.storage.manifest import (
     EmbeddingManifest,
     IngestManifest,
     RoiManifest,
 )
-
-# ---------------------------------------------------------------------------
-# sliding_window_submit
-# ---------------------------------------------------------------------------
-
-
-@given(
-    n_jobs=st.integers(min_value=0, max_value=50),
-    max_concurrent=st.integers(min_value=1, max_value=8),
-)
-def test_sliding_window_returns_one_pair_per_job(n_jobs: int, max_concurrent: int) -> None:
-    """Every job appears exactly once in the returned list, regardless of size."""
-    with ThreadPoolExecutor(max_workers=max_concurrent + 2) as pool:
-        jobs = [(i, {"x": i}) for i in range(n_jobs)]
-        completed = sliding_window_submit(
-            submit_fn=lambda kw: pool.submit(lambda x: x, **kw),
-            jobs=jobs,
-            max_concurrent=max_concurrent,
-        )
-    assert sorted(k for k, _ in completed) == list(range(n_jobs))
-
-
-@given(
-    n_jobs=st.integers(min_value=4, max_value=20),
-    max_concurrent=st.integers(min_value=1, max_value=4),
-)
-def test_sliding_window_respects_concurrency_cap(n_jobs: int, max_concurrent: int) -> None:
-    """In-flight count never exceeds ``max_concurrent``, regardless of timing."""
-    in_flight = 0
-    peak = 0
-    lock = threading.Lock()
-
-    def slow(_: int) -> int:
-        nonlocal in_flight, peak
-        with lock:
-            in_flight += 1
-            peak = max(peak, in_flight)
-        time.sleep(0.005)
-        with lock:
-            in_flight -= 1
-        return 0
-
-    # Pool capacity is intentionally larger than max_concurrent so that
-    # the only concurrency limiter is sliding_window_submit itself.
-    with ThreadPoolExecutor(max_workers=n_jobs) as pool:
-        jobs = [(i, {"_": i}) for i in range(n_jobs)]
-        sliding_window_submit(
-            submit_fn=lambda kw: pool.submit(slow, **kw),
-            jobs=jobs,
-            max_concurrent=max_concurrent,
-        )
-    assert peak <= max_concurrent
-
 
 # ---------------------------------------------------------------------------
 # BucketPaths.store_for
