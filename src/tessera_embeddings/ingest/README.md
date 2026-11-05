@@ -302,7 +302,7 @@ Six things happen between a region and a written mosaic, and they are the order 
 
 S2 and Landsat are queried by tile ID property (e.g., `grid:code = T33UUP`), which returns
 only items for that specific MGRS tile. OPERA RTC-S1 on CMR-STAC lacks an equivalent
-property, so queries use a bbox derived from the MGRS tile via `mgrs_tile_to_bbox()`.
+property, so queries use the ROI's WGS84 bbox.
 
 #### Cloud cover decides which scene wins a pixel
 
@@ -628,11 +628,11 @@ radar-free ROI necessarily means embedding S2-only pixels, and `InferenceConfig`
 `allow_s2_only` for that case rather than asking the caller, because the alternative is a fill
 that writes nothing and reports success.
 
-#### UTM CRS derivation
+#### Output CRS
 
 CMR-STAC OPERA items lack the `proj:` extension, so `odc.stac.load` cannot infer the output
-CRS. `mgrs_tile_to_utm_epsg` derives the correct UTM EPSG from the tile's zone number and
-latitude band (C–M = southern hemisphere, N–X = northern hemisphere), e.g. `33UUP` → EPSG:32633.
+CRS. The radar leg never asks it to: every load passes the ROI's own `geobox` (CRS, transform and
+shape from `read_roi_metadata`), so the output grid is the ROI's.
 
 ### Date deduplication before loading
 

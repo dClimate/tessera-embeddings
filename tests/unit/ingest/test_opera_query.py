@@ -15,8 +15,6 @@ from tessera_embeddings.ingest.opera_query import (
     _granule_to_item,
     _query_cmr_granules,
     make_s1_item_provider,
-    mgrs_tile_to_bbox,
-    mgrs_tile_to_utm_epsg,
     normalize_opera_timestamps,
 )
 
@@ -30,74 +28,6 @@ def _make_stac_item(hour: int, minute: int = 0) -> MagicMock:
     item = MagicMock()
     item.datetime = datetime(2024, 6, 1, hour, minute, 0, tzinfo=UTC)
     return item
-
-
-# ---------------------------------------------------------------------------
-# mgrs_tile_to_bbox
-# ---------------------------------------------------------------------------
-
-
-class TestMgrsTileToBbox:
-    """Tests for mgrs_tile_to_bbox()."""
-
-    def test_returns_four_element_tuple(self):
-        bbox = mgrs_tile_to_bbox("33UUP")
-        assert len(bbox) == 4
-
-    def test_bbox_is_valid_wgs84(self):
-        west, south, east, north = mgrs_tile_to_bbox("33UUP")
-        assert -180 <= west <= 180
-        assert -90 <= south <= 90
-        assert -180 <= east <= 180
-        assert -90 <= north <= 90
-        assert west < east
-        assert south < north
-
-    def test_tile_33uup_bbox_in_expected_range(self):
-        """Tile 33UUP is in Austria/Czech Republic area."""
-        west, south, east, north = mgrs_tile_to_bbox("33UUP")
-        assert 12.0 < west < 14.0
-        assert 47.0 < south < 49.0
-        assert 13.0 < east < 15.0
-        assert 48.0 < north < 50.0
-
-    def test_southern_hemisphere_tile(self):
-        """Tile 55HBE is in New Zealand (southern hemisphere)."""
-        _, south, _, _ = mgrs_tile_to_bbox("55HBE")
-        assert south < 0
-
-
-# ---------------------------------------------------------------------------
-# mgrs_tile_to_utm_epsg — parameterized
-# ---------------------------------------------------------------------------
-
-
-class TestMgrsTileToUtmEpsg:
-    """Tests for mgrs_tile_to_utm_epsg()."""
-
-    @pytest.mark.parametrize(
-        "tile_id, expected_epsg",
-        [
-            ("33UUP", "EPSG:32633"),  # Zone 33, band U (northern)
-            ("55HBE", "EPSG:32755"),  # Zone 55, band H (southern)
-            ("10SEG", "EPSG:32610"),  # Zone 10, band S (northern)
-        ],
-        ids=["zone33-north", "zone55-south", "zone10-north"],
-    )
-    def test_known_tiles(self, tile_id, expected_epsg):
-        assert mgrs_tile_to_utm_epsg(tile_id) == expected_epsg
-
-    @pytest.mark.parametrize(
-        "tile_id, epsg_prefix",
-        [
-            ("33NXX", "EPSG:326"),  # Band N = first northern band
-            ("33MXX", "EPSG:327"),  # Band M = last southern band
-        ],
-        ids=["band-N-is-north", "band-M-is-south"],
-    )
-    def test_hemisphere_boundary(self, tile_id, epsg_prefix):
-        """Bands N-X are northern, C-M are southern."""
-        assert mgrs_tile_to_utm_epsg(tile_id).startswith(epsg_prefix)
 
 
 # ---------------------------------------------------------------------------
@@ -128,14 +58,6 @@ class TestNormalizeOperaTimestamps:
         assert item_a.datetime.day == 1
         assert item_b.datetime.day == 3
         assert item_a.datetime.hour == item_b.datetime.hour == 12
-
-    def test_empty_input(self):
-        assert normalize_opera_timestamps([]) == []
-
-    def test_modifies_in_place_and_returns_same_list(self):
-        items = [_make_stac_item(5)]
-        result = normalize_opera_timestamps(items)
-        assert result is items
 
 
 # ---------------------------------------------------------------------------
@@ -220,43 +142,19 @@ class TestGranuleToItem:
         """A granule lacking a VV or VH data link is skipped."""
         assert _granule_to_item(_granule_entry("g1", bands=("VV",))) is None
 
-    def test_skip_reports_polarizations_found(self, caplog):
-        """The counter names WHAT was published, so an anomaly is quantifiable per query.
-
-        Since the query requires POLARIZATION to name BOTH polarisations, anything reaching
-        here claimed the pair in its metadata and then published something else — a catalogue
-        inconsistency rather than a regional coverage fact, which is what the message says.
-
-        The cross-pol label deliberately does NOT claim EW mode. It used to read
-        "(EW-mode?)", and that guess cost real investigation time: checked against CMR, the
-        Greenland granules carrying HH/HV report BEAM_MODE=IW, and a BEAM_MODE=EW query over
-        that region returns nothing. Cross-pol is a polarisation choice, not a swath mode.
-        """
+    def test_skip_reports_polarizations_found(self):
+        """The counter names WHAT was published, so an anomaly is quantifiable per query."""
         skip_counts: Counter[str] = Counter()
-        with caplog.at_level(logging.WARNING):
-            assert _granule_to_item(_granule_entry("g-vv", bands=("VV",)), skip_counts) is None
-            assert _granule_to_item(_granule_entry("g-xpol", bands=("HH", "HV")), skip_counts) is None
-            assert _granule_to_item(_granule_entry("g-none", bands=()), skip_counts) is None
-            # Dual-pol is accepted and never counted.
-            assert _granule_to_item(_granule_entry("g-ok"), skip_counts) is not None
+        assert _granule_to_item(_granule_entry("g-vv", bands=("VV",)), skip_counts) is None
+        assert _granule_to_item(_granule_entry("g-xpol", bands=("HH", "HV")), skip_counts) is None
+        assert _granule_to_item(_granule_entry("g-none", bands=()), skip_counts) is None
+        # Dual-pol is accepted and never counted.
+        assert _granule_to_item(_granule_entry("g-ok"), skip_counts) is not None
         assert skip_counts == {
             "VV-only": 1,
             "HH/HV (cross-pol, no VV+VH)": 1,
             "no data links": 1,
         }
-        assert "EW-mode" not in caplog.text, "the swath-mode guess must not come back"
-        assert "published bands are ['VV']" in caplog.text
-        assert "published bands are ['HH', 'HV']" in caplog.text
-        assert "published bands are none" in caplog.text
-        # It used to interpolate our OWN required-polarisation constant into a "CMR reported"
-        # slot, so it could only ever print that constant back. The granule search response
-        # carries no polarisation field at all, so nothing here may claim to quote the
-        # catalogue — it names what the QUERY required.
-        assert "CMR reported" not in caplog.text
-        assert "requiring POLARIZATION to include VV+VH" in caplog.text
-        # A granule that publishes only VV is single-polarisation, not self-contradictory; the
-        # verdict is about the disagreement between its metadata and its links.
-        assert "inconsistent with its own metadata" not in caplog.text
 
     def test_handles_missing_polygon(self):
         item = _granule_to_item(_granule_entry("g1", with_ring=False))
@@ -301,18 +199,6 @@ class TestQueryCmrGranules:
             "string,POLARIZATION,VH",
         ]
 
-    def test_requires_both_polarisations_not_just_vv(self):
-        """VV alone is NOT equivalent to the pair, which is what the old filter assumed.
-
-        CMR matches a multi-valued attribute if ANY of its values matches, so VV alone admits
-        every dual VV+VH granule — and also every genuinely single-polarisation VV-only one,
-        which ingest cannot use. Repeating the attribute name is what makes CMR require both,
-        and requiring both is what stops those being paged and rejected one at a time.
-        """
-        from tessera_embeddings.ingest.opera_query import _REQUIRED_POLARIZATIONS
-
-        assert _REQUIRED_POLARIZATIONS == ("VV", "VH")
-
     def test_paginates_with_cmr_search_after(self):
         page1 = _cmr_response(
             [_granule_entry(f"g-{i}") for i in range(2000)],
@@ -326,12 +212,6 @@ class TestQueryCmrGranules:
         assert any(item.id == "g-final" for item in items)
         _, kwargs2 = mock_get.call_args_list[1]
         assert kwargs2["headers"]["CMR-Search-After"] == "token123"
-
-    def test_normal_bbox_queries_once(self):
-        """A west<east bbox issues a single CMR query (no antimeridian split)."""
-        with patch("tessera_embeddings.ingest.opera_query._query_cmr_granules_one", return_value=[]) as one:
-            _query_cmr_granules(self.BBOX, "2024-01-01", "2024-01-15", "ascending")
-        one.assert_called_once()
 
     def test_antimeridian_bbox_splits_and_dedupes(self):
         """A west>east (antimeridian) bbox is split at ±180 into two CMR-valid

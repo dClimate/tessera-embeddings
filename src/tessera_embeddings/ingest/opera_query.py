@@ -1,8 +1,8 @@
-"""OPERA RTC-S1 query utilities: MGRS bbox, orbit filtering, UTM EPSG.
+"""OPERA RTC-S1 query utilities: CMR granule search, orbit filtering and item preparation.
 
 OPERA RTC-S1 items on CMR-STAC carry no MGRS tile ID, orbit direction or projection metadata, so
-these helpers query by spatial extent, filter orbit via the native CMR Granule Search API, derive
-the CRS, and prepare items for loading.
+these helpers query by spatial extent, filter orbit via the native CMR Granule Search API, and
+prepare items for loading onto the ROI's own grid.
 """
 
 from __future__ import annotations
@@ -10,12 +10,10 @@ from __future__ import annotations
 import logging
 import re
 import time
-import warnings
 from collections import Counter
 from collections.abc import Callable
 from typing import Any, cast
 
-import mgrs
 import requests
 from pystac import Asset, Item
 from pystac.utils import str_to_datetime
@@ -81,57 +79,6 @@ def _cmr_session() -> requests.Session:
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     return session
-
-
-def mgrs_tile_to_bbox(tile_id: str) -> tuple[float, float, float, float]:
-    """Convert an MGRS tile ID to a WGS84 bounding box.
-
-    Uses 1m precision (10-digit MGRS coordinates) for the SW and NE
-    corners of the 100km tile.
-
-    Args:
-        tile_id: MGRS tile ID (e.g., "33UUP")
-
-    Returns:
-        (west, south, east, north) in WGS84 degrees
-    """
-    m = mgrs.MGRS()
-
-    # Tile corners near band boundaries produce a harmless latitude warning
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message="Warning in.*Convert_MGRS_To_Geodetic")
-
-        # SW corner: easting=00000, northing=00000
-        sw_mgrs = f"{tile_id}0000000000"
-        sw_lat, sw_lon = m.toLatLon(sw_mgrs)
-
-        # NE corner: easting=99999, northing=99999
-        ne_mgrs = f"{tile_id}9999999999"
-        ne_lat, ne_lon = m.toLatLon(ne_mgrs)
-
-    return (sw_lon, sw_lat, ne_lon, ne_lat)
-
-
-def mgrs_tile_to_utm_epsg(tile_id: str) -> str:
-    """Derive UTM EPSG code from an MGRS tile ID.
-
-    MGRS tile IDs encode the UTM zone number (first 2 digits) and
-    hemisphere (latitude band letter: C-M = south, N-X = north).
-
-    Args:
-        tile_id: MGRS tile ID (e.g., "33UUP")
-
-    Returns:
-        EPSG code string (e.g., "EPSG:32633" for 33N, "EPSG:32752" for 52S)
-    """
-    zone_number = int(tile_id[:2])
-    lat_band = tile_id[2].upper()
-
-    # Latitude bands C-M are southern hemisphere, N-X are northern
-    if lat_band >= "N":
-        return f"EPSG:326{zone_number:02d}"
-    else:
-        return f"EPSG:327{zone_number:02d}"
 
 
 def normalize_opera_timestamps(items: list[Any], *, mid_longitude: float | None = None) -> list[Any]:
