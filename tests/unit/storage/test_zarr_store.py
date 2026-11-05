@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from types import SimpleNamespace
 
 import icechunk
 import numpy as np
@@ -49,6 +50,7 @@ from tessera_embeddings.storage.zarr_store import (
     open_repo,
     open_store,
     open_store_as_zarr_group,
+    plain_zarr_storage_options,
     resolve_region,
     rollback_commits,
     set_s3_config,
@@ -1119,3 +1121,40 @@ class TestEmptyChunkElision:
         assert red.shape == (1, 8, 8)
         # 2x2 spatial chunks; the three all-zero (fill) chunks are elided.
         assert red.nchunks_initialized == 1
+
+
+class TestPlainZarrIsReadWithTheRunsCredentials:
+    """The ROI mask is a PLAIN zarr, so it is read through fsspec and does not travel on
+    the Icechunk callback threaded everywhere else — leaving the one read that decides
+    which chunks exist opening on whatever ambient credentials the process had.
+    """
+
+    def _creds(self):
+        return SimpleNamespace(access_key_id="AK", secret_access_key="SK", session_token="TK")
+
+    def test_a_local_roi_needs_no_options(self, tmp_path):
+        assert plain_zarr_storage_options(str(tmp_path / "roi.zarr"), lambda: self._creds(), "us-east-2") is None
+
+    def test_the_callbacks_credentials_and_the_region_both_reach_the_open(self):
+        options = plain_zarr_storage_options("s3://in/rois/roi.zarr", lambda: self._creds(), "us-east-2")
+        assert options == {
+            "client_kwargs": {"region_name": "us-east-2"},
+            "key": "AK",
+            "secret": "SK",
+            "token": "TK",
+        }
+
+    def test_no_callback_and_no_region_leaves_the_default_chain_alone(self):
+        assert plain_zarr_storage_options("s3://in/rois/roi.zarr", None, None) is None
+
+    def test_the_credential_is_resolved_per_call(self):
+        """An IAM credential expires in hours; a value captured once outlives its own TTL."""
+        calls = []
+
+        def get_credentials():
+            calls.append(1)
+            return self._creds()
+
+        plain_zarr_storage_options("s3://in/rois/roi.zarr", get_credentials, None)
+        plain_zarr_storage_options("s3://in/rois/roi.zarr", get_credentials, None)
+        assert len(calls) == 2

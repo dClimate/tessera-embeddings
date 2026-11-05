@@ -99,6 +99,15 @@ class TestLocatingTheGapCoarsely:
         assert summary["tiles_fully_s1_free"] == 2
         assert summary["tiles_reporting"] == 3
 
+    def test_the_tiles_may_be_a_one_shot_iterable(self) -> None:
+        """The signature takes an Iterable, so it may traverse it once: a second pass over a
+        generator for ``tiles_fully_s1_free`` would see nothing and record zero.
+        """
+        tiles = [_chunk(100, 100), _chunk(100, 100), _chunk(100, 10)]
+        from_list = summarise_radar_coverage(tiles)
+        assert from_list is not None and from_list["tiles_fully_s1_free"] == 2
+        assert summarise_radar_coverage(t for t in tiles) == from_list
+
     def test_a_partly_radar_free_tile_is_not_counted_as_wholly_free(self) -> None:
         summary = summarise_radar_coverage([_chunk(100, 99)])
         assert summary is not None
