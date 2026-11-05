@@ -26,22 +26,22 @@ The timeline model:
   has landed, so a queue is the right abstraction.
 * **Starvation** — actors alive, queue empty. Billed, produces nothing.
 
-The finding these tests pin is counter-intuitive and is the reason the module exists: **a
+The finding these checks pin is counter-intuitive and is the reason the module exists: **a
 WIDER ingest look-ahead makes duty cycle worse**, because it pulls smaller zones into the
 opening window, one of them lands early, and the fleet boots against a shallow queue.
 
 **The file also carries the campaign's inference cost line.** Unlike the starvation half it
 is measured, not modelled: the per-cell radar-telemetry measurements are first-class tables
 below, and the combined-token rate and the GPU-hour interval are derived from them live
-rather than quoted. :func:`test_cost_report` prints the line and its interval. The
+rather than quoted. :func:`cost_report` prints the line and its interval. The
 measurement history behind the tables is in `campaign-cost-model.md` §6b-6c and
 `context_docs/inference/inference-on-gpus.md` §6.
 
 **AND, since 2026-09-10, what the finished campaign actually did.** The campaign ran, so the
 model can be checked rather than only self-checked: the ``CAMPAIGN_*`` constants hold the
 outturn from `campaign-cost-model.md` §12 and
-:func:`test_the_model_reconciles_against_the_campaign_outturn` welds the two together. Read
-that test before trusting a prediction from the tables — the model was 17% light on work and
+:func:`check_the_model_reconciles_against_the_campaign_outturn` welds the two together. Read
+that check before trusting a prediction from the tables — the model was 17% light on work and
 6% high on the card bill, in opposite directions and for different reasons.
 
 **Two things in this file were withdrawn by that campaign**, and both are named rather than
@@ -50,28 +50,49 @@ re-measured 1.7x slower than the figure ``SUPERSEDED_ASSEMBLY_S_PER_TILE`` holds
 "~275-actor assembly ceiling" it produced does not survive: the crossover is a function of the
 assembly POOL WIDTH *and* of which cell's inference rate it is divided by, which places it
 anywhere from 158 to 394 actors at the shipped 16 workers.
-:func:`test_the_assembly_crossover_depends_on_the_pool_width` replaces it, and asserts the
+:func:`check_the_assembly_crossover_depends_on_the_pool_width` replaces it, and asserts the
 range rather than a number.
 
 **The ``CAMPAIGN_*`` token figures are MODELLED, not measured.** Nothing in the campaign
 counted tokens; "delivered work" is delivered tile-years times §6c's single land-weighted
 depth. Every ratio built from them divides a modelled numerator by a measured denominator.
+
+**Running it.** From the repository root, ``uv run python -m scripts.scoping.gpu_starvation``
+runs every ``check_*`` self-check (an ``AssertionError`` means the model no longer says what the
+documents citing it say) and then prints both reports, :func:`report` and :func:`cost_report`, so
+the numbers behind a planning decision are regenerated rather than quoted. It runs as a module so
+the shared zone-count snapshot, ``tests/unit/zone_density.py``, imports; that snapshot also feeds
+``tests/unit/orchestration/flows/test_cluster_balance.py``.
 """
 
 from __future__ import annotations
 
-# The reports (`test_report`, `test_cost_report`) print by design: they are diagnostics whose
-# output IS their product, run with `-s` to regenerate the numbers behind a planning decision
-# rather than quoting a document that may have drifted. Same contract as the repo's other
-# operator-facing tools.
-# ruff: noqa: T201
+import builtins
 from collections.abc import Sequence
 from statistics import fmean
 from typing import NamedTuple
 
-import pytest
-
 from tests.unit.zone_density import ZONE_TILES, plan
+
+
+class approx:  # noqa: N801 - reads like the pytest.approx it stands in for
+    """``pytest.approx`` for one float: relative 1e-6 by default, absolute only when ``abs`` alone is given."""
+
+    def __init__(self, expected: float, rel: float | None = None, abs: float | None = None) -> None:
+        self.expected = expected
+        self.tolerance = builtins.max(
+            0.0 if rel is None and abs is not None else (1e-6 if rel is None else rel) * builtins.abs(expected),
+            1e-12 if abs is None else abs,
+        )
+
+    def __eq__(self, other: object) -> bool:
+        """Whether ``other`` is a number within the tolerance of the expected value."""
+        return isinstance(other, int | float) and builtins.abs(other - self.expected) <= self.tolerance
+
+    def __repr__(self) -> str:
+        """The expected value and its tolerance, for an assertion message."""
+        return f"{self.expected} ± {self.tolerance:.3g}"
+
 
 PX_PER_TILE = 2048 * 2048
 
@@ -132,6 +153,7 @@ def _width_scale(workers: int) -> float:
 
 
 def seconds_per_date(tiles: int, workers: int = SHIPPED_WORKERS) -> float:
+    """Ingest seconds per S2 date for a zone of ``tiles`` live tiles at ``workers`` Dask workers."""
     chunks = tiles / TILES_PER_CHUNK
     return (DENSITY_FIXED_S + DENSITY_PER_CHUNK_S * chunks) * _width_scale(workers)
 
@@ -258,7 +280,7 @@ class OrbitBand(NamedTuple):
 #: the Sentinel-1 observation plan tasking Europe and the Middle East densely. The honest
 #: claim is WEAK AND NON-MONOTONIC, never "zero". The defensible form is a constant with a
 #: stated spread, enforced by
-#: :func:`test_radar_depth_does_not_follow_latitude_and_optical_depth_does`.
+#: :func:`check_radar_depth_does_not_follow_latitude_and_optical_depth_does`.
 BOTH_ORBIT_BANDS = [
     OrbitBand(2.5, 1064, 80.7, 71.9, 67.2),
     OrbitBand(7.5, 156, 80.6, 69.9, 72.0),
@@ -285,7 +307,7 @@ class OpticalBand(NamedTuple):
 #: follow latitude, which is exactly what radar depth does not do. Band tiles sum to the
 #: same coverage snapshot `zone_density.ZONE_TILES` holds, so the land weighting is the
 #: campaign's real geography — asserted in
-#: :func:`test_the_measurement_tables_are_internally_consistent`.
+#: :func:`check_the_measurement_tables_are_internally_consistent`.
 OPTICAL_DEPTH_BY_BAND = [
     OpticalBand(0, 26_811, 74.0),
     OpticalBand(5, 27_940, 77.1),
@@ -380,7 +402,7 @@ def _land_weighted_radar_depth(bands: Sequence[OrbitBand], land: Sequence[Optica
     difference between the two weightings is geographic, not statistical.
 
     The LEVEL is the weakest input in the basis and the widest driver of the interval — the
-    measured bands span more than 2x, and :func:`test_cost_report` prints what that does to
+    measured bands span more than 2x, and :func:`cost_report` prints what that does to
     the line. Interpolation narrows no uncertainty; it only stops the weighting from being
     wrong.
     """
@@ -441,7 +463,7 @@ CAMPAIGN_OPTICAL_TOK_PER_PX = _land_weighted_optical(OPTICAL_DEPTH_BY_BAND)
 
 #: The campaign's combined depth: land-weighted optical plus composition-weighted radar.
 #: Typed rather than computed so the planning constant cannot wander when a table row is
-#: edited — but a test asserts it stays within one token of the live-derived sum, so it
+#: edited — but a check asserts it stays within one token of the live-derived sum, so it
 #: cannot drift from the tables either. NOT comparable to census-convention depths — see the
 #: section header. Depth and rate come from the same measurement and move together: the
 #: campaign can get cheaper per pixel and slower per token in one revision, so neither may
@@ -457,7 +479,7 @@ RATE_CAPACITY_PLANNING = COMBINED_TOK_PER_SEC / CAMPAIGN_TOK_PER_PX
 #: correction did NOT move. Two errors of similar size pointed opposite ways — the rate was
 #: optical-only, and the censused depth undercounts the measured convention — so the px/s
 #: the fleet is sized on barely moved, while fixing only the error that was NAMED overshoots
-#: in the wrong direction. THE NEAR-CANCELLATION IS THE POINT. :func:`test_cost_report`
+#: in the wrong direction. THE NEAR-CANCELLATION IS THE POINT. :func:`cost_report`
 #: asserts both; the arithmetic is `campaign-cost-model.md` §6b's.
 SUPERSEDED_OPTICAL_TOK_PER_SEC = 1_900_000.0
 SUPERSEDED_TOK_PER_PX = 145.0
@@ -510,7 +532,7 @@ def run(
     ``bank_work_hours`` is the start policy: hold the fleet until the queue holds that many
     hours of work FOR THIS FLEET. Zero reproduces the shipped rule, which boots on the first
     mosaic to land. Expressed in work-hours rather than mosaic count deliberately — see
-    :func:`test_a_mosaic_count_is_the_wrong_buffer_unit`.
+    :func:`check_a_mosaic_count_is_the_wrong_buffer_unit`.
     """
     landings = _landings(zones, look_ahead, workers)
     px_per_h = n_actors * rate * 3600
@@ -586,7 +608,6 @@ ACTORS_PROVISIONED = 228
 ACTORS_PER_CLUSTER = ACTORS_PROVISIONED
 
 
-@pytest.fixture(scope="module")
 def opener_cluster() -> list[int]:
     """The densest cluster's zones, in the order it will work them.
 
@@ -596,8 +617,7 @@ def opener_cluster() -> list[int]:
     return max(plan(CLUSTERS), key=lambda c: c.opener).tiles
 
 
-@pytest.mark.parametrize("workers", WIDTHS.values(), ids=WIDTHS.keys())
-def test_a_wider_ingest_window_makes_duty_cycle_worse(opener_cluster, workers: int) -> None:
+def check_a_wider_ingest_window_makes_duty_cycle_worse(opener_cluster: list[int], workers: int) -> None:
     """The counter-intuitive result, and the reason this module exists.
 
     Raising the ingest cap is the cost model's highest-value setting — it buys wall clock and
@@ -617,8 +637,7 @@ def test_a_wider_ingest_window_makes_duty_cycle_worse(opener_cluster, workers: i
     assert wide["idle_gpu_hours"] > 0, "the wide window should show real idle GPU-hours"
 
 
-@pytest.mark.parametrize("workers", WIDTHS.values(), ids=WIDTHS.keys())
-def test_banking_work_hours_removes_the_starvation_entirely(opener_cluster, workers: int) -> None:
+def check_banking_work_hours_removes_the_starvation_entirely(opener_cluster: list[int], workers: int) -> None:
     """A work-hours buffer closes the gap the wider window opens, at a bounded delay.
 
     This is the recommendation: hold the fleet until the queue can keep it busy for a few
@@ -630,12 +649,12 @@ def test_banking_work_hours_removes_the_starvation_entirely(opener_cluster, work
         opener_cluster, n_actors=ACTORS_PER_CLUSTER, look_ahead=LOOK_AHEAD_AT_45, workers=workers, bank_work_hours=6.0
     )
     assert unbuffered["idle_h"] > 0, "precondition: the unbuffered case must starve"
-    assert buffered["idle_h"] == pytest.approx(0.0, abs=0.05), (
+    assert buffered["idle_h"] == approx(0.0, abs=0.05), (
         f"a 6-work-hour bank should remove the starvation; got {buffered['idle_h']:.1f} h idle"
     )
 
 
-def test_a_mosaic_count_is_the_wrong_buffer_unit(opener_cluster) -> None:
+def check_a_mosaic_count_is_the_wrong_buffer_unit(opener_cluster: list[int]) -> None:
     """Counting mosaics is fooled by size; counting work is not.
 
     A cluster's zones span three orders of magnitude in tiles (a continental zone against a
@@ -664,7 +683,7 @@ def test_a_mosaic_count_is_the_wrong_buffer_unit(opener_cluster) -> None:
     )
 
 
-def test_the_dense_end_is_what_keeps_the_fleet_fed(opener_cluster) -> None:
+def check_the_dense_end_is_what_keeps_the_fleet_fed(opener_cluster: list[int]) -> None:
     """Frontloading dense zones is load-bearing, and this says by how much.
 
     Blocking on the densest zone was rejected as too slow, and the flow instead takes
@@ -680,7 +699,7 @@ def test_the_dense_end_is_what_keeps_the_fleet_fed(opener_cluster) -> None:
     )
 
 
-def test_report(capsys: pytest.CaptureFixture[str]) -> None:
+def report() -> None:
     """Print the full policy comparison. Run with `-s` to read it.
 
     Not an assertion — a diagnostic, so the numbers behind a plan decision can be regenerated
@@ -688,22 +707,21 @@ def test_report(capsys: pytest.CaptureFixture[str]) -> None:
     """
     clusters = plan(CLUSTERS)
     cluster = max(clusters, key=lambda c: c.opener)
-    with capsys.disabled():
-        print(f"\n  densest cluster: {len(cluster.zones)} zones, {cluster.total:,} tiles, opener {cluster.opener:,}")
-        for width_name, workers in WIDTHS.items():
-            print(f"\n  ingest {width_name}: opener ingests in {ingest_hours(cluster.opener, workers):.1f} h")
-            for la, cap in ((LOOK_AHEAD_AT_40, 40), (LOOK_AHEAD_AT_45, 45)):
-                print(f"    ingest cap {cap} -> look_ahead {la}")
-                for bank in (0.0, 3.0, 6.0, 12.0):
-                    r = run(
-                        cluster.tiles, n_actors=ACTORS_PER_CLUSTER, look_ahead=la, workers=workers, bank_work_hours=bank
-                    )
-                    tag = "boot on 1st mosaic" if bank == 0 else f"bank {bank:.0f} work-hours"
-                    print(
-                        f"      {tag:22s} duty={r['duty']:4.0%}  idle={r['idle_h']:5.1f}h  "
-                        f"gaps={len(r['gaps']):2d}  worst={r['worst_gap_h']:4.1f}h  "
-                        f"delay={r['start_h']:5.1f}h  idle GPU-h={r['idle_gpu_hours']:8,.0f}"
-                    )
+    print(f"\n  densest cluster: {len(cluster.zones)} zones, {cluster.total:,} tiles, opener {cluster.opener:,}")
+    for width_name, workers in WIDTHS.items():
+        print(f"\n  ingest {width_name}: opener ingests in {ingest_hours(cluster.opener, workers):.1f} h")
+        for la, cap in ((LOOK_AHEAD_AT_40, 40), (LOOK_AHEAD_AT_45, 45)):
+            print(f"    ingest cap {cap} -> look_ahead {la}")
+            for bank in (0.0, 3.0, 6.0, 12.0):
+                r = run(
+                    cluster.tiles, n_actors=ACTORS_PER_CLUSTER, look_ahead=la, workers=workers, bank_work_hours=bank
+                )
+                tag = "boot on 1st mosaic" if bank == 0 else f"bank {bank:.0f} work-hours"
+                print(
+                    f"      {tag:22s} duty={r['duty']:4.0%}  idle={r['idle_h']:5.1f}h  "
+                    f"gaps={len(r['gaps']):2d}  worst={r['worst_gap_h']:4.1f}h  "
+                    f"delay={r['start_h']:5.1f}h  idle GPU-h={r['idle_gpu_hours']:8,.0f}"
+                )
 
 
 def wall_clock_optimum(
@@ -736,8 +754,7 @@ def wall_clock_optimum(
     return best
 
 
-@pytest.mark.parametrize("workers", WIDTHS.values(), ids=WIDTHS.keys())
-def test_the_fleet_size_supply_can_feed_depends_on_the_ingest_width(opener_cluster, workers: int) -> None:
+def check_the_fleet_size_supply_can_feed_depends_on_the_ingest_width(opener_cluster: list[int], workers: int) -> None:
     """Beyond a point a bigger fleet stops buying wall clock, and the point depends on ingest.
 
     With a work-hours bank an oversized fleet wastes no GPU-hours — it waits longer to boot
@@ -786,9 +803,7 @@ FLEET_CONFIGS = {
 }
 
 
-@pytest.mark.parametrize("workers", WIDTHS.values(), ids=WIDTHS.keys())
-@pytest.mark.parametrize("look_ahead", [LOOK_AHEAD_AT_40, LOOK_AHEAD_AT_45])
-def test_one_bank_figure_serves_both_fleet_policies(opener_cluster, workers: int, look_ahead: int) -> None:
+def check_one_bank_figure_serves_both_fleet_policies(opener_cluster: list[int], workers: int, look_ahead: int) -> None:
     """One bank figure covers matched and under-provisioned fleets alike.
 
     This is a property of expressing the buffer in WORK-HOURS rather than in mosaics or pixels.
@@ -812,20 +827,19 @@ def test_one_bank_figure_serves_both_fleet_policies(opener_cluster, workers: int
         for name, actors in FLEET_CONFIGS.items()
     }
     for name, r in results.items():
-        assert r["idle_h"] == pytest.approx(0.0, abs=0.05), f"{name} starves on the recommended bank"
+        assert r["idle_h"] == approx(0.0, abs=0.05), f"{name} starves on the recommended bank"
     assert results["provisioned 85%"]["start_h"] <= results["matched 100%"]["start_h"] + 1e-9, (
         "the under-provisioned fleet must not need a LONGER wait than the matched one"
     )
 
 
-@pytest.mark.parametrize("workers", WIDTHS.values(), ids=WIDTHS.keys())
-def test_one_and_a_half_hours_is_not_enough(opener_cluster, workers: int) -> None:
+def check_one_and_a_half_hours_is_not_enough(opener_cluster: list[int], workers: int) -> None:
     """Why the recommendation is not a rounder 1.5 hours.
 
     1.5 h is not merely a smaller number below a working one: it starves in 14 of the 96
     combinations scanned. Asserted over the whole envelope rather than on this one cluster,
     because which combinations fail depends on where each cluster's opener sits relative to the
-    discrete mosaic landings, and singling out one case would make the test fragile.
+    discrete mosaic landings, and singling out one case would make the check fragile.
     """
     assert run(
         opener_cluster,
@@ -834,7 +848,7 @@ def test_one_and_a_half_hours_is_not_enough(opener_cluster, workers: int) -> Non
         workers=workers,
         rate=RATE_CAPACITY_PLANNING,
         bank_work_hours=BANK_WORK_HOURS,
-    )["idle_h"] == pytest.approx(0.0, abs=0.05)
+    )["idle_h"] == approx(0.0, abs=0.05)
     assert any(
         run(
             cluster.tiles,
@@ -852,7 +866,7 @@ def test_one_and_a_half_hours_is_not_enough(opener_cluster, workers: int) -> Non
     ), "if 1.5 h were safe everywhere, the recommendation should be 1.5 h"
 
 
-def test_the_campaign_costs_more_per_pixel_than_the_site_every_rate_came_from() -> None:
+def check_the_campaign_costs_more_per_pixel_than_the_site_every_rate_came_from() -> None:
     """Iowa is cheaper per pixel than the campaign, so its px/s figures flatter us.
 
     Every throughput measurement we hold comes from one ROI, and that ROI is SINGLE-orbit —
@@ -868,7 +882,7 @@ def test_the_campaign_costs_more_per_pixel_than_the_site_every_rate_came_from() 
     """
     assert IOWA_TOK_PER_PX < CAMPAIGN_TOK_PER_PX
     # The rate this model plans at must be the CAMPAIGN one, not the reference site's.
-    assert pytest.approx(COMBINED_TOK_PER_SEC / CAMPAIGN_TOK_PER_PX) == RATE_CAPACITY_PLANNING
+    assert approx(COMBINED_TOK_PER_SEC / CAMPAIGN_TOK_PER_PX) == RATE_CAPACITY_PLANNING
     assert RATE_CAPACITY_PLANNING < COMBINED_TOK_PER_SEC / IOWA_TOK_PER_PX
 
 
@@ -906,7 +920,7 @@ SUPERSEDED_ASSEMBLY_S_PER_TILE = 196.6 * 60 / 8714
 #: timeline below is a per-cell model and the two figures answer different questions. The
 #: campaign-wide equivalent is `CAMPAIGN_GPU_H_PER_TILE_YEAR`, 7.2% higher because it divides
 #: by delivered work every card that was BILLED, ramp and idleness included;
-#: :func:`test_the_model_reconciles_against_the_campaign_outturn` welds the two.
+#: :func:`check_the_model_reconciles_against_the_campaign_outturn` welds the two.
 #:
 #: **THE ZONE IS PART OF THE FIGURE.** This is 37N, and the assembly rates above are 48N and 51S,
 #: so any ratio built from this constant and one of those compares two cells -- which is the
@@ -948,7 +962,7 @@ CAMPAIGN_YEARS = 9
 #: **It does affect the assembly crossover**, because that is per CLUSTER: inference time per tile
 #: falls as a cluster's actor count rises while its single assembly thread does not speed up. So
 #: the two shapes sit on opposite sides of it at the 16-worker assembly width -- see
-#: :func:`test_the_assembly_crossover_depends_on_the_pool_width`.
+#: :func:`check_the_assembly_crossover_depends_on_the_pool_width`.
 CAMPAIGN_SHAPES = ((10, 250), (25, 100))  # (clusters, actors per cluster)
 #: Assembly pool width per phase: 16 workers until 2026-09-08, 32 after.
 CAMPAIGN_ASSEMBLY_WORKERS_EARLY = 16
@@ -1017,7 +1031,7 @@ def assembly_queue(
     return {"tail_h": (thread_free - now_inference) / 3600, "peak_backlog_h": peak / 3600}
 
 
-def test_the_trailing_assembly_thread_is_not_the_critical_path() -> None:
+def check_the_trailing_assembly_thread_is_not_the_critical_path() -> None:
     """F8's question, answered over the real dealt order rather than a synthetic pair.
 
     The concern is structural: assemblies serialise on one thread, so a cluster holding every
@@ -1027,7 +1041,7 @@ def test_the_trailing_assembly_thread_is_not_the_critical_path() -> None:
     **The answer is "it depends on the pair", and the pair has to come from ONE cell.** At 100
     actors per cluster the queue drains on every basis available, which is the only unconditional
     statement here. At 250 actors on the shipped 16-worker pool the answer depends entirely on
-    which cell's inference rate is used, and the two available answers disagree — so this test
+    which cell's inference rate is used, and the two available answers disagree — so this check
     asserts the disagreement rather than picking a side. See the crossover test.
     """
     a16 = ASSEMBLY_S_PER_TILE_BY_WORKERS[16]
@@ -1086,7 +1100,7 @@ def test_the_trailing_assembly_thread_is_not_the_critical_path() -> None:
     )
 
 
-def test_the_assembly_crossover_depends_on_the_pool_width() -> None:
+def check_the_assembly_crossover_depends_on_the_pool_width() -> None:
     """Where the trailing thread becomes binding — and that the answer is a pool width, not a number.
 
     The margin is not a property of assembly; it is a property of the RATIO, and both terms move.
@@ -1130,7 +1144,7 @@ def test_the_assembly_crossover_depends_on_the_pool_width() -> None:
     be32 = break_even(a32)
     matched16 = break_even(a16, MATCHED_INFERENCE_GPU_H_PER_TILE)
 
-    # THE POOL-WIDTH EFFECT IS MECHANICAL, NOT MEASURED, and this test no longer pretends
+    # THE POOL-WIDTH EFFECT IS MECHANICAL, NOT MEASURED, and this check no longer pretends
     # otherwise. More workers cannot make a fixed cell's assembly slower, so a wider pool raises
     # the crossover by construction. But the two entries of ASSEMBLY_S_PER_TILE_BY_WORKERS come
     # from DIFFERENT CELLS -- 48N at 16 workers, 51S at 32 -- so their 2.4x ratio is pool width
@@ -1144,9 +1158,9 @@ def test_the_assembly_crossover_depends_on_the_pool_width() -> None:
 
     # The two ends of the range, and the fact that they ARE two ends: same assembly rate, inference
     # from two different cells, 2.5x apart. Pinned so that neither can be quoted as "the" crossover.
-    assert be16 == pytest.approx(158, rel=0.02)
-    assert be32 == pytest.approx(383, rel=0.02)
-    assert matched16 == pytest.approx(394, rel=0.02)
+    assert be16 == approx(158, rel=0.02)
+    assert be32 == approx(383, rel=0.02)
+    assert matched16 == approx(394, rel=0.02)
 
     narrow = min(actors for _, actors in CAMPAIGN_SHAPES)
     wide = max(actors for _, actors in CAMPAIGN_SHAPES)
@@ -1158,7 +1172,7 @@ def test_the_assembly_crossover_depends_on_the_pool_width() -> None:
         "which basis it assumes"
     )
     # And 250 is UNDECIDED: inside the range the two inference bases bracket. Asserted as the
-    # finding, because a test that placed it on one side would be asserting a cell, not a rate.
+    # finding, because a check that placed it on one side would be asserting a cell, not a rate.
     assert be16 < wide < matched16, (
         "the campaign's 250-actor shape no longer sits between the unmatched and matched "
         "crossovers — one of the two bases has moved, and §6c's withdrawal needs re-deriving"
@@ -1180,7 +1194,7 @@ def test_the_assembly_crossover_depends_on_the_pool_width() -> None:
     assert worst_tail(wide, slow) > worst_tail(narrow, slow)
 
 
-def test_the_model_reconciles_against_the_campaign_outturn() -> None:
+def check_the_model_reconciles_against_the_campaign_outturn() -> None:
     """The model's prediction against what the finished campaign actually did.
 
     Nothing else in this suite could notice that the model had been overtaken by reality. These
@@ -1194,15 +1208,15 @@ def test_the_model_reconciles_against_the_campaign_outturn() -> None:
 
     # Work: the model was 17% light. It predicted per-pixel cost well and per-card delivery badly,
     # because the delivered figure absorbs ramp and idleness that the model has no term for.
-    assert CAMPAIGN_GPU_HOURS / predicted_gpu_hours == pytest.approx(1.17, rel=0.03), (
+    assert CAMPAIGN_GPU_HOURS / predicted_gpu_hours == approx(1.17, rel=0.03), (
         "the work gap between model and outturn has moved from the +17% §12 records"
     )
-    assert pytest.approx(1.072, rel=0.03) == CAMPAIGN_GPU_H_PER_TILE_YEAR / INFERENCE_GPU_H_PER_TILE
+    assert approx(1.072, rel=0.03) == CAMPAIGN_GPU_H_PER_TILE_YEAR / INFERENCE_GPU_H_PER_TILE
 
     # The hours overrun IS the basis shortfall, and NEARLY definitionally so: both sides divide the
     # same modelled token count, so this reproduces rather than checks. Asserted anyway, because it
     # says the overrun has ONE term and a future edit that introduces a second will break it.
-    assert pytest.approx(CAMPAIGN_GPU_HOURS, rel=0.01) == predicted_gpu_hours / 0.854, (
+    assert approx(CAMPAIGN_GPU_HOURS, rel=0.01) == predicted_gpu_hours / 0.854, (
         "the hours overrun no longer equals the per-card basis shortfall — something other than "
         "the card mix is now moving the work, and §12 needs a second term"
     )
@@ -1213,23 +1227,23 @@ def test_the_model_reconciles_against_the_campaign_outturn() -> None:
         "the blended price no longer sits below the single-card figure the model uses — the "
         "fleet mix has changed and every cost line divides by the wrong rate"
     )
-    assert pytest.approx(1.490, rel=0.02) == CAMPAIGN_BLENDED_GPU_HOUR_USD
-    assert pytest.approx(predicted_gpu_hours * GPU_HOUR_USD * 0.94, rel=0.03) == CAMPAIGN_GPU_COST_USD
+    assert approx(1.490, rel=0.02) == CAMPAIGN_BLENDED_GPU_HOUR_USD
+    assert approx(predicted_gpu_hours * GPU_HOUR_USD * 0.94, rel=0.03) == CAMPAIGN_GPU_COST_USD
 
     # THE MODEL'S HOURS ARE THE L40S-ONLY CASE: a minimum on card-hours, and so on schedule, but
     # NOT a minimum on spend. Pinned because the intuition runs the other way — the faster card
     # needs fewer hours, so it looks cheaper, and on these figures it is not.
     hours_all_fast = CAMPAIGN_GPU_HOURS * 0.854  # the same work at the full L40S rate
     assert hours_all_fast < CAMPAIGN_GPU_HOURS, "the L40S-only case must need FEWER hours"
-    assert pytest.approx(307_731, rel=0.01) == hours_all_fast
-    assert pytest.approx(572_688, rel=0.01) == hours_all_fast * GPU_HOUR_USD
+    assert approx(307_731, rel=0.01) == hours_all_fast
+    assert approx(572_688, rel=0.01) == hours_all_fast * GPU_HOUR_USD
 
     # The A10G speed, solved for from the blend and the hour split rather than measured. Weak, and
     # asserted only so the SIGN of the conclusion cannot drift unnoticed: the price premium is
     # 1.54x against a speed premium of about 1.34x, so the premium is not covered.
     a10g_price = 1.2120
     a10g_speed = (0.854 * CAMPAIGN_GPU_HOURS - 154_152.0) / 206_130.0
-    assert pytest.approx(0.745, rel=0.02) == a10g_speed
+    assert approx(0.745, rel=0.02) == a10g_speed
     assert GPU_HOUR_USD / a10g_price > 1 / a10g_speed, (
         "the L40S price premium is now covered by its speed premium — the per-token value "
         "comparison has flipped and §12's wording needs re-deriving"
@@ -1243,10 +1257,10 @@ def test_the_model_reconciles_against_the_campaign_outturn() -> None:
     # It is ALSO the only one of the model's inputs the campaign independently confirmed: the token
     # depth did not get checked, because nothing counted tokens. §12 withdraws that confirmation.
     assert live_tiles * CAMPAIGN_YEARS == 3_248_577
-    assert CAMPAIGN_TILE_YEARS / (live_tiles * CAMPAIGN_YEARS) == pytest.approx(0.9996, abs=0.0005)
+    assert CAMPAIGN_TILE_YEARS / (live_tiles * CAMPAIGN_YEARS) == approx(0.9996, abs=0.0005)
 
 
-def test_the_bank_holds_across_the_whole_envelope() -> None:
+def check_the_bank_holds_across_the_whole_envelope() -> None:
     """Every cluster, both fleet policies, three widths, both ingest caps — 96 combinations.
 
     The figure is sized to the worst combination rather than to the densest cluster, because a
@@ -1279,7 +1293,7 @@ def test_the_bank_holds_across_the_whole_envelope() -> None:
 
 
 # --- the cost line and its guards ----------------------------------------------------------
-# The tests the measurement tables name: the radar-geography finding, the cross-table welds,
+# The checks the measurement tables name: the radar-geography finding, the cross-table welds,
 # and the printed cost line itself.
 
 #: g6e.xlarge on-demand, us-west-2 — verified against the fleet's live instance type, not
@@ -1294,7 +1308,7 @@ def _pearson(xs: Sequence[float], ys: Sequence[float]) -> float:
     return cov / (sum((x - mx) ** 2 for x in xs) * sum((y - my) ** 2 for y in ys)) ** 0.5
 
 
-def test_radar_depth_does_not_follow_latitude_and_optical_depth_does() -> None:
+def check_radar_depth_does_not_follow_latitude_and_optical_depth_does() -> None:
     """Radar depth is a level with a spread; optical depth is a function of latitude.
 
     This is the guard the band table names: the campaign carries radar depth as a constant
@@ -1304,7 +1318,7 @@ def test_radar_depth_does_not_follow_latitude_and_optical_depth_does() -> None:
     and the constant-with-spread form needs re-deriving before any constant is retyped.
 
     The radar correlation is asserted WEAK, deliberately not near-zero: r moves from one
-    regeneration of the band table to the next, and a test pinned at zero would fail on the
+    regeneration of the band table to the next, and a check pinned at zero would fail on the
     next real measurement while the finding it protects — "not a usable function of
     latitude" — would still be true.
     """
@@ -1339,7 +1353,7 @@ def test_radar_depth_does_not_follow_latitude_and_optical_depth_does() -> None:
     )
 
 
-def test_the_measurement_tables_are_internally_consistent() -> None:
+def check_the_measurement_tables_are_internally_consistent() -> None:
     """The cross-table identities that would silently break if one table were edited alone.
 
     The planning constants above are DERIVED from tables so the tables are load-bearing — but
@@ -1379,15 +1393,13 @@ def test_the_measurement_tables_are_internally_consistent() -> None:
     )
 
     shares = DUAL_ORBIT_SHARE + SINGLE_ORBIT_SHARE + RADAR_FREE_SHARE
-    assert shares == pytest.approx(1.0, abs=0.005), (
-        f"the orbit composition covers {shares:.3f} of pixel-years, not all land"
-    )
+    assert shares == approx(1.0, abs=0.005), f"the orbit composition covers {shares:.3f} of pixel-years, not all land"
 
 
-def test_cost_report(capsys: pytest.CaptureFixture[str]) -> None:
+def cost_report() -> None:
     """Print the cost line, its interval, and what the unit correction did NOT move. `-s` to read.
 
-    Same contract as :func:`test_report`: a diagnostic whose output is its product, so the
+    Same contract as :func:`report`: a diagnostic whose output is its product, so the
     numbers behind the campaign's dollar line can be regenerated rather than quoted. The
     sensitivity bounds are derived FROM the tables — band extremes for radar depth, cell
     extremes for the rate — so the report cannot drift from the data; the assertions sit at
@@ -1428,13 +1440,13 @@ def test_cost_report(capsys: pytest.CaptureFixture[str]) -> None:
     named_only_px_s = COMBINED_TOK_PER_SEC / SUPERSEDED_TOK_PER_PX
     named_only_move = named_only_px_s / superseded_px_s - 1
 
-    assert gpu_hours == pytest.approx(307_854, rel=0.02)
-    assert cost == pytest.approx(573_000, rel=0.02)
-    assert cost_radar_lo == pytest.approx(504_000, rel=0.02)
-    assert cost_radar_mid == pytest.approx(573_000, rel=0.02)
-    assert cost_radar_hi == pytest.approx(713_000, rel=0.02)
-    assert cost_slow == pytest.approx(598_000, rel=0.02)
-    assert cost_fast == pytest.approx(472_000, rel=0.02)
+    assert gpu_hours == approx(307_854, rel=0.02)
+    assert cost == approx(573_000, rel=0.02)
+    assert cost_radar_lo == approx(504_000, rel=0.02)
+    assert cost_radar_mid == approx(573_000, rel=0.02)
+    assert cost_radar_hi == approx(713_000, rel=0.02)
+    assert cost_slow == approx(598_000, rel=0.02)
+    assert cost_fast == approx(472_000, rel=0.02)
     # Depth spans more of the interval than the rate — the widest-driver claim above.
     assert cost_radar_hi - cost_radar_lo > cost_slow - cost_fast, (
         "the rate has re-taken the interval: the widest-driver claim needs re-deriving"
@@ -1442,41 +1454,72 @@ def test_cost_report(capsys: pytest.CaptureFixture[str]) -> None:
     # The near-cancellation: a small net move, where the one-error fix was large AND pointed
     # the other way. (The -19% in the printed line is `campaign-cost-model.md` §6b's
     # arithmetic; it is not re-derivable from the current tables.)
-    assert move == pytest.approx(-0.062, abs=0.005)
+    assert move == approx(-0.062, abs=0.005)
     assert named_only_move > 0.10 > abs(move), (
         "fixing the named error alone must overshoot the true correction and point the other way"
     )
 
-    with capsys.disabled():
-        print(f"\n  the campaign inference cost line — {live_tiles:,} live tiles x 9 years")
-        print(
-            f"    {CAMPAIGN_TOK_PER_PX:.0f} tok/px at {COMBINED_TOK_PER_SEC / 1e6:.3f}M combined tok/s/actor"
-            f" -> {gpu_hours:,.0f} GPU-hours -> ${cost:,.0f}"
-            f" at ${GPU_HOUR_USD}/h (g6e.xlarge on-demand us-west-2)"
-        )
-        print("\n  the interval, one driver at a time")
-        print(
-            f"    radar depth (band extremes, central rate):  {radar_lo:.1f} -> ${cost_radar_lo:,.0f}   "
-            f"{RADAR_BOTH_ORBIT_TOK_PER_PX:.2f} land-weighted -> ${cost_radar_mid:,.0f}   "
-            f"{radar_hi:.1f} -> ${cost_radar_hi:,.0f}"
-        )
-        # The two weightings side by side: same bands, different question, and the gap is the
-        # geography of where radar is deepest against where the measured cells happen to be.
-        print(
-            f"      weighting: land {RADAR_BOTH_ORBIT_TOK_PER_PX:.2f} vs sample"
-            f" {RADAR_CHUNK_WEIGHTED_TOK_PER_PX:.2f} tok/px"
-            f" ({RADAR_BOTH_ORBIT_TOK_PER_PX / RADAR_CHUNK_WEIGHTED_TOK_PER_PX - 1:+.1%})"
-        )
-        print(
-            f"    rate (cell extremes, central depth):        slowest {rate_slow / 1e6:.3f}M -> ${cost_slow:,.0f}   "
-            f"fastest {rate_fast / 1e6:.3f}M -> ${cost_fast:,.0f}"
-        )
-        print("\n  what the 2026-08 unit correction did NOT move")
-        print(
-            f"    capacity-planning rate {RATE_CAPACITY_PLANNING:,.0f} px/s"
-            f" against the superseded {superseded_px_s:,.0f} px/s: {move:+.1%}"
-        )
-        print(
-            f"    correcting the named error alone: {named_only_px_s:,.0f} px/s ({named_only_move:+.1%})"
-            " — the WRONG direction; the correction recorded that one-error fix as moving the line -19%"
-        )
+    print(f"\n  the campaign inference cost line — {live_tiles:,} live tiles x 9 years")
+    print(
+        f"    {CAMPAIGN_TOK_PER_PX:.0f} tok/px at {COMBINED_TOK_PER_SEC / 1e6:.3f}M combined tok/s/actor"
+        f" -> {gpu_hours:,.0f} GPU-hours -> ${cost:,.0f}"
+        f" at ${GPU_HOUR_USD}/h (g6e.xlarge on-demand us-west-2)"
+    )
+    print("\n  the interval, one driver at a time")
+    print(
+        f"    radar depth (band extremes, central rate):  {radar_lo:.1f} -> ${cost_radar_lo:,.0f}   "
+        f"{RADAR_BOTH_ORBIT_TOK_PER_PX:.2f} land-weighted -> ${cost_radar_mid:,.0f}   "
+        f"{radar_hi:.1f} -> ${cost_radar_hi:,.0f}"
+    )
+    # The two weightings side by side: same bands, different question, and the gap is the
+    # geography of where radar is deepest against where the measured cells happen to be.
+    print(
+        f"      weighting: land {RADAR_BOTH_ORBIT_TOK_PER_PX:.2f} vs sample"
+        f" {RADAR_CHUNK_WEIGHTED_TOK_PER_PX:.2f} tok/px"
+        f" ({RADAR_BOTH_ORBIT_TOK_PER_PX / RADAR_CHUNK_WEIGHTED_TOK_PER_PX - 1:+.1%})"
+    )
+    print(
+        f"    rate (cell extremes, central depth):        slowest {rate_slow / 1e6:.3f}M -> ${cost_slow:,.0f}   "
+        f"fastest {rate_fast / 1e6:.3f}M -> ${cost_fast:,.0f}"
+    )
+    print("\n  what the 2026-08 unit correction did NOT move")
+    print(
+        f"    capacity-planning rate {RATE_CAPACITY_PLANNING:,.0f} px/s"
+        f" against the superseded {superseded_px_s:,.0f} px/s: {move:+.1%}"
+    )
+    print(
+        f"    correcting the named error alone: {named_only_px_s:,.0f} px/s ({named_only_move:+.1%})"
+        " — the WRONG direction; the correction recorded that one-error fix as moving the line -19%"
+    )
+
+
+def main() -> None:
+    """Run every self-check against the tables above, then print both reports.
+
+    A failed check raises ``AssertionError``: the model no longer says what the documents that
+    cite it say, so the documents or the tables need re-reading before either is quoted again.
+    """
+    cluster = opener_cluster()
+    for workers in WIDTHS.values():
+        check_a_wider_ingest_window_makes_duty_cycle_worse(cluster, workers)
+        check_banking_work_hours_removes_the_starvation_entirely(cluster, workers)
+        check_the_fleet_size_supply_can_feed_depends_on_the_ingest_width(cluster, workers)
+        check_one_and_a_half_hours_is_not_enough(cluster, workers)
+        for look_ahead in (LOOK_AHEAD_AT_40, LOOK_AHEAD_AT_45):
+            check_one_bank_figure_serves_both_fleet_policies(cluster, workers, look_ahead)
+    check_a_mosaic_count_is_the_wrong_buffer_unit(cluster)
+    check_the_dense_end_is_what_keeps_the_fleet_fed(cluster)
+    check_the_campaign_costs_more_per_pixel_than_the_site_every_rate_came_from()
+    check_the_trailing_assembly_thread_is_not_the_critical_path()
+    check_the_assembly_crossover_depends_on_the_pool_width()
+    check_the_model_reconciles_against_the_campaign_outturn()
+    check_the_bank_holds_across_the_whole_envelope()
+    check_radar_depth_does_not_follow_latitude_and_optical_depth_does()
+    check_the_measurement_tables_are_internally_consistent()
+    print("all self-checks passed")
+    report()
+    cost_report()
+
+
+if __name__ == "__main__":
+    main()

@@ -68,6 +68,7 @@ changed upstream may need repair first, and that is a decision, not a defect.
 |---|---|---|
 | `census_s1_coverage.py` | Global OPERA radar coverage on an equal-area land grid | `context_docs/campaign/campaign-cost-model.md` §6 |
 | `census_s2_coverage.py` | Global Sentinel-2 usable-observation counts on the same grid | `context_docs/inference/minimum-optical-depth.md` |
+| `gpu_starvation.py` | Whether a cluster's GPU fleet starves while ingest feeds it, and which start policy prevents it; also the campaign's inference cost line and its reconciliation against the outturn. Run as `uv run python -m scripts.scoping.gpu_starvation` from the repository root: self-checks, then both reports | `context_docs/campaign/campaign-cost-model.md` §6c and §12, `campaign-plan.md` |
 | `cluster_work_spread.py` | How evenly N Ray clusters divide the work, from the real mask — the campaign ends when the LAST cluster does | `context_docs/campaign/campaign-plan.md` §10, cost model §5b |
 | `campaign_cost_actuals.py` | What a finished campaign cost: measured usage from Cost Explorer priced at list rates from the Pricing API. Not a bill — see its docstring for why this account cannot produce one | `context_docs/campaign/campaign-cost-model.md` §12 |
 | `campaign_delivery_census.py` | What a finished campaign delivered: cells and tile-years published against the roster, reconciled, separating tiles carrying embeddings from tiles written as fill, with the per-day delivery curve | `context_docs/campaign/campaign-cost-model.md` §12 |

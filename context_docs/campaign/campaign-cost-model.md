@@ -736,7 +736,7 @@ throughput discrepancy between two halves of one zone in one year.
 **The cell spans 0.1–32.1° of latitude and its both-orbit radar depth is 89.9 tokens per pixel**,
 in line with 60N's 76.4 and 47S's 66.3. **Never take a whole-cell figure off a partial sweep**:
 this run swept north to south, so a median over its opening chunks is biased rather than merely
-noisy. Arithmetic in `tests/unit/inference/test_gpu_starvation.py`.
+noisy. Arithmetic in `scripts/scoping/gpu_starvation.py`.
 
 **The pooled rate rests on 2,596 both-orbit chunks over 10 latitude bands, and it is dominated by
 this one cell, which carries 77% of the weight.** That is why the unexplained deficit below is
@@ -845,7 +845,7 @@ side. What holds without an argument is that **100 actors is under every crossov
 basis**, and that widening the assembly pool raises the crossover — mechanically, because more
 workers cannot make a fixed cell's assembly slower, but by **no measured factor**: the 16-worker
 rate is 48N's and the 32-worker rate is 51S's, so their 2.4× ratio is pool width confounded with
-geography. Arithmetic in `tests/unit/inference/test_gpu_starvation.py`.
+geography. Arithmetic in `scripts/scoping/gpu_starvation.py`.
 
 **The commit really is negligible, confirmed twice.** 0.77 s for the shard commit and 0.475 s for
 the attrs commit, out of 20,815 s. Assembly IS the shard write.
