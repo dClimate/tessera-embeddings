@@ -21,6 +21,9 @@ import os
 _ICECHUNK_LOG = "icechunk::storage::object_store=error"
 os.environ.setdefault("ICECHUNK_LOG", _ICECHUNK_LOG)
 
+import pickle  # noqa: E402
+from concurrent.futures import Future, ThreadPoolExecutor  # noqa: E402
+
 import boto3  # noqa: E402
 import icechunk  # noqa: E402
 import numpy as np  # noqa: E402
@@ -28,9 +31,54 @@ import pytest  # noqa: E402
 import xarray as xr  # noqa: E402
 from moto.server import ThreadedMotoServer  # noqa: E402
 
+from tessera_embeddings.storage import shard_writer  # noqa: E402
+
 # Belt and braces: if anything imported icechunk before this file was loaded, it has already
 # read the variable and missed it. Applying it directly costs nothing and the value is the same.
 icechunk.set_logs_filter(os.environ["ICECHUNK_LOG"])
+
+# -----------------------------------------------------------------------------
+# The forked writer, in-process
+# -----------------------------------------------------------------------------
+
+
+def _call_roundtripped(blob: bytes) -> bytes:
+    fn, args = pickle.loads(blob)
+    return pickle.dumps(fn(*args))
+
+
+class _InProcessForkPool(ThreadPoolExecutor):
+    """``run_forked``'s spawn pool, in threads. Production spawns a fresh interpreter per pool,
+    which re-imports the package (~0.8 s) on every assemble; see ADR 041. The worker function, its
+    payload and its result still cross a pickle boundary, so each worker gets its own fork session
+    and an unpicklable payload still fails. ``initializer`` is not run: it configures logging,
+    which a thread inherits and pytest's ``caplog`` owns."""
+
+    def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=()):
+        super().__init__(max_workers=max_workers)
+        if initargs:
+            shard_writer._PROGRESS_SLOTS = initargs[0]
+
+    def submit(self, fn, /, *args, **kwargs):
+        assert not kwargs, "run_forked submits positional payloads only"
+        inner = super().submit(_call_roundtripped, pickle.dumps((fn, args)))
+        outer: Future = Future()
+        inner.add_done_callback(
+            lambda f: outer.set_exception(f.exception())
+            if f.exception()
+            else outer.set_result(pickle.loads(f.result()))
+        )
+        return outer
+
+
+@pytest.fixture(autouse=True)
+def _forks_in_process(request, monkeypatch):
+    """Every unit test runs ``run_forked`` in-process unless marked ``real_fork_pool``."""
+    if request.node.get_closest_marker("real_fork_pool"):
+        return
+    monkeypatch.setattr(shard_writer, "ProcessPoolExecutor", _InProcessForkPool)
+    monkeypatch.setattr(shard_writer, "_PROGRESS_SLOTS", None)
+
 
 # -----------------------------------------------------------------------------
 # AWS Mock Fixtures

@@ -192,6 +192,7 @@ markers = [
     "parity: Prefect vs plain.py output equivalence (slow)",
     "slow: >30s runtime (CPU inference, etc.)",
     "gpu: requires CUDA",
+    "real_fork_pool: run run_forked on the real spawn pool instead of the in-process stand-in",
 ]
 testpaths = ["tests"]
 

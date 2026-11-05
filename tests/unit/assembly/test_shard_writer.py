@@ -544,6 +544,7 @@ class TestWorkerProgressReporting:
             _write_shards_worker(self._payload(repo, interval=300.0))
         assert self._worker_lines(caplog) == []
 
+    @pytest.mark.real_fork_pool
     def test_run_forked_ships_index_and_interval_to_workers(self, tmp_path):
         # The worker's clock comes from the coordinator via the payload; if the
         # injection is dropped the worker silently falls back to the default

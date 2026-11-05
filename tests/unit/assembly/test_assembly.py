@@ -775,6 +775,7 @@ class TestAssembly:
         np.testing.assert_array_equal(result[:, :5, :], emb2)
         assert np.all(result[:, 5:, :] == 0), "run1's data outside the shrunken ROI must be cleared"
 
+    @pytest.mark.real_fork_pool
     def test_assemble_multiband_parallel_matches_serial(self, tmp_path):
         """n_workers>1 partitions into y-bands across processes; result matches serial.
 
