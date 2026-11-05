@@ -242,8 +242,7 @@ remain valid.
 
 ### Closed, for reference
 
-Items that were on this list and are now closed, so they do not read as open work. Detail in
-`context_docs/test-suite-reduction/README.md`.
+Items that were on this list and are now closed, so they do not read as open work.
 
 - Two tests no CI job ran — one deleted, one moved to `tests/integration/`.
 - A unit test that broke the 30-second bound; it now asserts the retry ladder's shape rather
