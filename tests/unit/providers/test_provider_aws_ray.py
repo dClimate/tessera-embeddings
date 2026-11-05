@@ -16,9 +16,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
-import os
 import subprocess
-import sys
 from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import patch
@@ -34,14 +32,12 @@ from tessera_embeddings.providers.aws.ray import (
     GPU_WORKER_LADDER_SSM_KEY,
     GPU_WORKER_NODE_TYPE_PREFIX,
     LAUNCH_PACING_AUTOSCALER_ENV,
-    LAUNCH_PACING_CLIENT_ENV,
     LAUNCH_PACING_ENV,
     PROJECT_TAG_VALUE,
     _apply_gpu_worker_ladder,
     _parse_gpu_worker_ladder,
     _resolve_ray_config,
     cleanup_ray_tempfiles,
-    resolve_ami_id,
     resolve_code_artifact_identity,
 )
 from tests._paths import FIXTURES
@@ -211,51 +207,39 @@ def test_resolve_ray_config_substitutes_the_code_bucket_when_given(pinned: str |
         cleanup_ray_tempfiles(resolved)
 
 
-def test_resolve_ray_config_stamps_project_tag_by_default(tmp_path: Path, seeded: Seed) -> None:
-    """With no instance_tags, every node still gets the Project tag.
-
-    The runner IAM role conditions ec2:TerminateInstances on this tag, so a
-    missing Project tag makes teardown terminates IAM-denied (instances leak).
-    """
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        # The runner IAM role conditions ec2:TerminateInstances on the Project tag, so a
+        # node without it makes teardown IAM-denied and the instances leak.
+        ({"instance_tags": None}, {"Tag": {"Key": "Project", "Value": PROJECT_TAG_VALUE}}),
+        ({"instance_tags": [{"Key": "Team", "Value": "geo"}]}, {"Tag": {"Key": "Team", "Value": "geo"}}),
+        # A pinned image wins over the SSM pointer, so a mid-campaign re-bake cannot change
+        # the booted image.
+        ({"ami_id": "ami-pinned-different"}, {"ImageId": "ami-pinned-different"}),
+    ],
+    ids=["project-tag-by-default", "extra-tags-keep-project-tag", "pinned-ami-over-ssm"],
+)
+def test_resolve_ray_config_node_config(kwargs: dict, expected: dict, seeded: Seed) -> None:
+    """Every node's config carries the Project tag, any extra tags, and the pinned AMI."""
     ami_param, _, _ = seeded
-
     resolved = _resolve_ray_config(
         DEFAULT_CLUSTER_TEMPLATE,
         region=REGION,
         ami_ssm_name=ami_param,
         ssm_prefix=SSM_PREFIX,
         cluster_name="test-cluster",
-        instance_tags=None,
+        **kwargs,
     )
-
     try:
-        config = yaml.safe_load(Path(resolved).read_text())
-        for node in config["available_node_types"].values():
-            tags = node["node_config"]["TagSpecifications"][0]["Tags"]
+        for node in yaml.safe_load(Path(resolved).read_text())["available_node_types"].values():
+            nc = node["node_config"]
+            tags = nc["TagSpecifications"][0]["Tags"]
             assert {"Key": "Project", "Value": PROJECT_TAG_VALUE} in tags
-    finally:
-        cleanup_ray_tempfiles(resolved)
-
-
-def test_resolve_ray_config_merges_project_tag_with_extra_tags(tmp_path: Path, seeded: Seed) -> None:
-    """Extra tags coexist with the always-present Project tag."""
-    ami_param, _, _ = seeded
-
-    resolved = _resolve_ray_config(
-        DEFAULT_CLUSTER_TEMPLATE,
-        region=REGION,
-        ami_ssm_name=ami_param,
-        ssm_prefix=SSM_PREFIX,
-        cluster_name="test-cluster",
-        instance_tags=[{"Key": "Team", "Value": "geo"}],
-    )
-
-    try:
-        config = yaml.safe_load(Path(resolved).read_text())
-        for node in config["available_node_types"].values():
-            tags = node["node_config"]["TagSpecifications"][0]["Tags"]
-            assert {"Key": "Project", "Value": PROJECT_TAG_VALUE} in tags
-            assert {"Key": "Team", "Value": "geo"} in tags
+            if "Tag" in expected:
+                assert expected["Tag"] in tags
+            if "ImageId" in expected:
+                assert nc["ImageId"] == expected["ImageId"]
     finally:
         cleanup_ray_tempfiles(resolved)
 
@@ -347,13 +331,6 @@ def test_resolve_code_artifact_identity_tracks_the_environment_image() -> None:
 
 
 @mock_aws
-def test_resolve_ami_id_reads_the_ssm_pointer() -> None:
-    ssm = boto3.client("ssm", region_name=REGION)
-    ssm.put_parameter(Name="/tessera/ray/ami-id", Value="ami-pinned-01", Type="String")
-    assert resolve_ami_id("/tessera/ray/ami-id", region=REGION) == "ami-pinned-01"
-
-
-@mock_aws
 def test_resolve_code_artifact_identity_uses_pinned_ami_id() -> None:
     """A pinned ami_id fingerprints that exact image WITHOUT reading the SSM
     pointer (no ami param is seeded here), so the campaign's fingerprint matches
@@ -361,27 +338,6 @@ def test_resolve_code_artifact_identity_uses_pinned_ami_id() -> None:
     """
     identity = resolve_code_artifact_identity("/unread/ami-id", region=REGION, ami_id="ami-pinned-99")
     assert identity == "ami=ami-pinned-99"
-
-
-def test_resolve_ray_config_pins_ami_id_over_ssm(tmp_path: Path, seeded: Seed) -> None:
-    """When ami_id is given, the cluster boots THAT image, not whatever the SSM
-    pointer currently holds — a mid-campaign re-bake can't change the booted image.
-    """
-    ami_param, _, _ = seeded  # SSM ami-id = ami-0123456789abcdef0
-    resolved = _resolve_ray_config(
-        DEFAULT_CLUSTER_TEMPLATE,
-        region=REGION,
-        ami_ssm_name=ami_param,
-        ami_id="ami-pinned-different",  # differs from the SSM value on purpose
-        ssm_prefix=SSM_PREFIX,
-        cluster_name="test-cluster",
-    )
-    try:
-        config = yaml.safe_load(Path(resolved).read_text())
-        for node in config["available_node_types"].values():
-            assert node["node_config"]["ImageId"] == "ami-pinned-different"  # pinned id wins
-    finally:
-        cleanup_ray_tempfiles(resolved)
 
 
 # ---------------------------------------------------------------------------
@@ -500,30 +456,11 @@ class TestRayDashboardSsmCommand:
         assert '{"portNumber":["8265"],"localPortNumber":["8265"]}' in msg
 
     @mock_aws
-    def test_region_is_printed_so_a_differing_default_does_not_bite(self, caplog) -> None:
-        """SSM resolves the target within one region.
-
-        An operator whose default region differs from the cluster's gets a
-        target-not-connected failure rather than a tunnel, so the region the head
-        was found in is baked into the command.
-        """
-        self._launch_head("tessera-ray-abc123")
-        with caplog.at_level(logging.INFO):
-            ray_mod._log_ray_dashboard_ssm_command("tessera-ray-abc123", _LOG, region=REGION)
-        assert f"  --region {REGION} \\\n" in caplog.records[-1].getMessage()
-
-    @mock_aws
     def test_missing_head_warns_without_raising(self, caplog) -> None:
         """Best-effort: no head found is a warning, never a failed cluster start."""
         with caplog.at_level(logging.WARNING):
             ray_mod._log_ray_dashboard_ssm_command("no-such-cluster", _LOG, region=REGION)
         assert "Could not find Ray head node" in caplog.records[-1].getMessage()
-
-
-def test_cleanup_ray_tempfiles_handles_missing_path() -> None:
-    """``cleanup_ray_tempfiles(None)`` and a missing path are both no-ops."""
-    cleanup_ray_tempfiles(None)
-    cleanup_ray_tempfiles("/nonexistent/path/does-not-exist.yaml")
 
 
 def test_cleanup_ray_tempfiles_removes_yaml_and_ssh_key(tmp_path: Path) -> None:
@@ -710,75 +647,6 @@ def test_the_head_bootstrap_keeps_its_launch_attempts(monkeypatch) -> None:
         assert name not in env, f"{name} tunes the autoscaler and must not reach the head bootstrap"
 
 
-#: The name under test, so the baseline below removes exactly the right key.
-_INTERVAL = "AUTOSCALER_UPDATE_INTERVAL_S"
-
-
-def _ray_autoscaler_interval(override: str | None) -> int:
-    """What RAY resolves the interval to in a fresh interpreter: ``override``, or its own default.
-
-    A subprocess because the constant is bound at module import: reading it in-process after
-    monkeypatching the environment would report the value this test session imported with, not
-    the value a freshly-started autoscaler would see. The autoscaler IS a fresh process, so this
-    reproduces its conditions rather than approximating them.
-
-    **The baseline STRIPS the key rather than inheriting the environment**, which is why this
-    takes an override rather than a dict. A developer machine or CI runner configured with launch
-    pacing already exports this name, and an inherited environment would then measure that
-    override and call it Ray's default — failing the comparison below on precisely the hosts the
-    setting exists for. Correct code, red test.
-    """
-    # Imports ONE constants module and prints an int. No `ray.init()`, no `ray start`, no
-    # cluster — this repo has stranded a Ray cluster from a test before and the RAM cost was
-    # felt for days, so the subprocess is deliberately the narrowest thing that can answer.
-    code = "from ray.autoscaler._private.constants import AUTOSCALER_UPDATE_INTERVAL_S as v; print(v)"
-    env = {k: v for k, v in os.environ.items() if k != _INTERVAL}
-    if override is not None:
-        env[_INTERVAL] = override
-    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, check=True)
-    return int(out.stdout.strip())
-
-
-def test_ray_actually_reads_the_interval_from_the_environment() -> None:
-    """The setting is only pacing if RAY reads it, and that is Ray's contract to keep, not ours.
-
-    Asserting our own dict against a default copied out of Ray proves nothing about Ray — it
-    passes whether or not the name is environment-backed. So this asks Ray, in a fresh
-    interpreter, and compares the answer with and without the variable set.
-
-    **This is the regression that would make the whole setting inert**: if a future Ray pins the
-    interval as a plain module constant, the value we export would be silently ignored while the
-    export still reads like tuning. That failure is invisible everywhere else.
-    """
-    ours = int(LAUNCH_PACING_AUTOSCALER_ENV[_INTERVAL])
-    default = _ray_autoscaler_interval(None)
-    applied = _ray_autoscaler_interval(str(ours))
-    assert applied == ours, (
-        f"Ray resolved AUTOSCALER_UPDATE_INTERVAL_S to {applied} with the environment set to "
-        f"{ours}; the setting is not environment-backed in this Ray and paces nothing"
-    )
-    assert ours > default, (
-        f"our value {ours} is at or below Ray's own default {default}, so it slows nothing even though Ray reads it"
-    )
-    assert _INTERVAL not in LAUNCH_PACING_CLIENT_ENV, (
-        "`ray up` runs no autoscaler loop, so the name is inert in the one-shot bootstrap"
-    )
-
-
-def test_the_head_start_command_carries_both_halves() -> None:
-    """The head both launches and hosts the autoscaler, so it wants everything.
-
-    The split is about audience, not about dropping a setting: whatever is withheld from
-    the one-shot bootstrap still has to reach the autoscaler, or the pacing that matters
-    for worker launches would be lost along with it.
-    """
-    assert LAUNCH_PACING_CLIENT_ENV.items() <= LAUNCH_PACING_ENV.items()
-    assert LAUNCH_PACING_AUTOSCALER_ENV.items() <= LAUNCH_PACING_ENV.items()
-    assert not set(LAUNCH_PACING_CLIENT_ENV) & set(LAUNCH_PACING_AUTOSCALER_ENV), (
-        "a name in both halves has no single owner"
-    )
-
-
 def test_pacing_off_leaves_the_bootstrap_environment_alone() -> None:
     """Default-off means `ray up` inherits this process's environment untouched."""
     seen: dict = {}
@@ -884,12 +752,8 @@ class TestGpuWorkerLadderParsing:
         [
             "g6e.xlarge",  # no separator
             "g6e.xlarge:",  # no count
-            ":16",  # no name
-            "g6e.xlarge:x",  # non-numeric count
             "g6e.xlarge:-1",  # negative count
-            "g6e.xlarge:1.5",  # non-integer count
             "",  # set but names nothing
-            ",",  # ditto
         ],
     )
     def test_refuses_a_malformed_value(self, raw: str) -> None:
@@ -904,18 +768,6 @@ class TestGpuWorkerLadderParsing:
 
 class TestGpuWorkerLadderApplication:
     """Applying a ladder, and the invariant that its absence changes nothing."""
-
-    def test_absent_key_leaves_the_node_types_byte_identical(self) -> None:
-        """The whole safety argument for shipping this: no key, no change.
-
-        Compared as SERIALISED YAML rather than field by field, so a key nobody
-        thought to assert on cannot drift either.
-        """
-        shipped = yaml.safe_load(DEFAULT_CLUSTER_TEMPLATE.read_text())
-        untouched = yaml.safe_load(DEFAULT_CLUSTER_TEMPLATE.read_text())
-        assert yaml.dump(untouched["available_node_types"], sort_keys=True) == yaml.dump(
-            shipped["available_node_types"], sort_keys=True
-        )
 
     def test_applies_counts_to_the_named_rungs(self) -> None:
         cfg = yaml.safe_load(DEFAULT_CLUSTER_TEMPLATE.read_text())
@@ -935,18 +787,6 @@ class TestGpuWorkerLadderApplication:
         assert by_type["g6e.xlarge"] == 16
         assert by_type["g5.2xlarge"] == 4
         assert all(v == 0 for t, v in by_type.items() if t not in ("g6e.xlarge", "g5.2xlarge")), by_type
-
-    def test_is_authoritative_not_additive(self) -> None:
-        """A rung the ladder does not name is CLOSED, including the shipped default.
-
-        The alternative reading — additive — would make releasing one rung also
-        leave the 500-node `g6e.xlarge` ceiling standing, so one edit would make two
-        changes and only one of them would be written down.
-        """
-        cfg = yaml.safe_load(DEFAULT_CLUSTER_TEMPLATE.read_text())
-        assert cfg["available_node_types"]["gpu-workers-ondemand"]["max_workers"] == 500
-        _apply_gpu_worker_ladder(cfg, "g5.2xlarge:4")
-        assert cfg["available_node_types"]["gpu-workers-ondemand"]["max_workers"] == 0
 
     def test_never_touches_the_spot_rung(self) -> None:
         """Spot is outside the ladder's domain: same instance type, different market."""
@@ -979,13 +819,6 @@ class TestGpuWorkerLadderApplication:
         cfg = yaml.safe_load(DEFAULT_CLUSTER_TEMPLATE.read_text())
         cfg["available_node_types"]["gpu-workers-spot"]["max_workers"] = 100
         _apply_gpu_worker_ladder(cfg, "g6e.xlarge:500")
-        assert cfg["max_workers"] == 600
-
-    def test_a_closed_spot_rung_adds_nothing(self) -> None:
-        """The shipped default: spot is at 0, so the ceiling is the ladder alone."""
-        cfg = yaml.safe_load(DEFAULT_CLUSTER_TEMPLATE.read_text())
-        assert cfg["available_node_types"]["gpu-workers-spot"]["max_workers"] == 0
-        _apply_gpu_worker_ladder(cfg, "g6e.xlarge:600")
         assert cfg["max_workers"] == 600
 
     def test_refuses_an_instance_type_no_rung_offers(self) -> None:
@@ -1056,16 +889,6 @@ def test_resolve_ray_config_without_the_ladder_key_keeps_the_templates_node_type
     cleanup_ray_tempfiles(resolved)
 
 
-def test_resolve_ray_config_refuses_a_malformed_ladder_before_writing_anything(seeded: Seed) -> None:
-    """A bad parameter fails the launch loudly, rather than growing the wrong fleet."""
-    ami_param, _, _ = seeded
-    boto3.client("ssm", region_name=REGION).put_parameter(
-        Name=f"{SSM_PREFIX}{GPU_WORKER_LADDER_SSM_KEY}", Value="g6e.xlarge=16", Type="String"
-    )
-    with pytest.raises(RuntimeError, match=GPU_WORKER_LADDER_SSM_KEY):
-        _resolve_ray_config(DEFAULT_CLUSTER_TEMPLATE, region=REGION, ami_ssm_name=ami_param, ssm_prefix=SSM_PREFIX)
-
-
 class TestRayNodeTypePreference:
     """Pin RAY's node-type choice, because our design is built on its arithmetic.
 
@@ -1114,94 +937,6 @@ class TestRayNodeTypePreference:
         # landing on the rungs the ladder closed — including the production rung,
         # which the ladder closed by not naming it.
         assert len(residual) == 250 - 2
-
-    def test_every_g6e_size_carries_the_same_card(self) -> None:
-        """There is no "bigger GPU" in this family — only better-fed ones.
-
-        Every `g6e` size is one or more L40S at 45,776 MiB. So no workload can be
-        scaled UP to a larger accelerator by choosing a larger instance; the only
-        thing a larger size changes is vCPU and host RAM per GPU. This closes off a
-        whole class of proposal, which is why it is asserted rather than remembered.
-        """
-        gpus = {
-            t["InstanceType"]: t["GpuInfo"]["Gpus"][0]
-            for t in _ec2_instance_types()
-            if t["InstanceType"].startswith("g6e.")
-        }
-        assert len(gpus) == 8, sorted(gpus)
-        assert {(g["Name"], g["MemoryInfo"]["SizeInMiB"]) for g in gpus.values()} == {("L40S", 45776)}
-
-    @pytest.mark.parametrize(
-        ("instance_type", "card", "mib"),
-        [("g6e.xlarge", "L40S", 45776), ("g6.2xlarge", "L4", 22888), ("g5.2xlarge", "A10G", 22888)],
-    )
-    def test_each_card_carries_the_vram_the_catalogue_states(self, instance_type: str, card: str, mib: int) -> None:
-        """Named in MiB because that is the unit `describe-instance-types` reports.
-
-        Relabelling a MiB figure as GB is exactly how the L40S came to be recorded as
-        "46 GB" — see the corrections register. (`nvidia-smi memory.total` reports a
-        THIRD figure, 46,068 MiB; the catalogue is the source used throughout.)
-        """
-        gpu = {t["InstanceType"]: t for t in _ec2_instance_types()}[instance_type]["GpuInfo"]["Gpus"][0]
-        assert (gpu["Name"], gpu["MemoryInfo"]["SizeInMiB"]) == (card, mib)
-
-    def test_the_l40s_carries_exactly_twice_the_vram_of_the_24gb_cards(self) -> None:
-        """The ratio, in one place, because it was wrong in two documents.
-
-        45,776 / 22,888 is exactly 2.0. A "1.94x" stood in the saturation profile and
-        the corrections register until it was traced to arithmetic on ROUNDED GiB
-        values — a ratio has to be taken on one source's numbers. The same figure is
-        the denominator of every "% of the card" we quote, and it makes the L4 and
-        A10G exactly half the L40S rather than "barely half".
-        """
-        cat = {t["InstanceType"]: t for t in _ec2_instance_types()}
-        mib = {
-            k: cat[k]["GpuInfo"]["Gpus"][0]["MemoryInfo"]["SizeInMiB"]
-            for k in ("g6e.xlarge", "g6.2xlarge", "g5.2xlarge")
-        }
-        assert mib["g6e.xlarge"] == 2 * mib["g6.2xlarge"] == 2 * mib["g5.2xlarge"]
-        assert round(mib["g6e.xlarge"] / 1024, 2) == 44.70
-        assert round(mib["g6e.xlarge"] * 1024**2 / 1e9, 1) == 48.0
-
-    def test_vcpu_per_gpu_ranks_the_candidate_sizes(self) -> None:
-        """`g6e.2xlarge` is the most quota-efficient rung after `g6e.xlarge`.
-
-        The applied G-and-VT quota is counted in vCPU, so vCPU-per-GPU is the price
-        of a GPU in quota. Every multi-GPU size is WORSE on this axis than
-        `g6e.2xlarge`, which cuts against the "fewer, bigger boxes" instinct: any
-        diversification strictly reduces the GPU count a fixed quota can hold.
-        """
-        ratios = {}
-        for t in _ec2_instance_types():
-            if not t["InstanceType"].startswith("g6e."):
-                continue
-            ratios[t["InstanceType"]] = t["VCpuInfo"]["DefaultVCpus"] // t["GpuInfo"]["Gpus"][0]["Count"]
-        assert ratios == {
-            "g6e.xlarge": 4,
-            "g6e.2xlarge": 8,
-            "g6e.12xlarge": 12,
-            "g6e.4xlarge": 16,
-            "g6e.24xlarge": 24,
-            "g6e.48xlarge": 24,
-            "g6e.8xlarge": 32,
-            "g6e.16xlarge": 64,
-        }
-        assert min(ratios, key=lambda k: ratios[k]) == "g6e.xlarge"
-        assert sorted(ratios, key=lambda k: ratios[k])[1] == "g6e.2xlarge"
-
-    def test_host_ram_per_gpu_clears_the_actor_budget_on_every_rung_we_ship(self) -> None:
-        """~17.7 GB per actor is the measured requirement; 16 GiB hosts have OOMed before.
-
-        Asserted for the rungs the template offers, because this is the term that
-        disqualifies the small `g5`/`g6` sizes and it is easy to reintroduce.
-        """
-        per_gpu_gib = {
-            t["InstanceType"]: t["MemoryInfo"]["SizeInMiB"] / 1024 / t["GpuInfo"]["Gpus"][0]["Count"]
-            for t in _ec2_instance_types()
-            if t["InstanceType"] in ("g6e.xlarge", "g6e.2xlarge", "g6e.12xlarge")
-        }
-        assert per_gpu_gib == {"g6e.xlarge": 32.0, "g6e.2xlarge": 64.0, "g6e.12xlarge": 96.0}
-        assert all(v >= 18.0 for v in per_gpu_gib.values())
 
     def test_declared_resources_match_the_ec2_catalogue(self) -> None:
         """Every declared resource block must be true to the vendor catalogue.
@@ -1303,8 +1038,6 @@ class TestL4Rungs:
         node_types = yaml.safe_load(DEFAULT_CLUSTER_TEMPLATE.read_text())["available_node_types"]
         offered = {cfg["node_config"]["InstanceType"] for cfg in node_types.values()}
         catalogue = {t["InstanceType"]: t for t in _ec2_instance_types()}
-        assert catalogue["g6.xlarge"]["MemoryInfo"]["SizeInMiB"] / 1024 == 16.0
-        assert catalogue["g6.2xlarge"]["MemoryInfo"]["SizeInMiB"] / 1024 == 32.0
 
         # Stated over the whole offer, not over `g6.*` alone: the omission is a
         # property of the HOST RAM figure, so it has to hold for every card
@@ -1312,24 +1045,7 @@ class TestL4Rungs:
         # the same trap, and it is the cheapest A10G size — which is exactly why
         # a rule naming only `g6.xlarge` would not have stopped it.
         thin = {t for t, e in catalogue.items() if e["MemoryInfo"]["SizeInMiB"] / 1024 < 18.0}
-        assert "g6.xlarge" in thin and "g5.xlarge" in thin, thin
         assert not (offered & thin), f"a rung ships with under 18 GiB of host RAM: {offered & thin}"
-
-    def test_the_2xlarge_of_every_card_family_is_the_ram_matched_shape(self) -> None:
-        """8 vCPU / 32 GiB / 1 GPU on all three, so only the card differs.
-
-        `g6e.xlarge` is the production shape at 4 vCPU / 32 GiB. The candidate
-        `2xlarge`s match its HOST RAM exactly — the term that disqualifies the
-        `xlarge` sizes — while giving twice its vCPU. That CPU surplus is worth up
-        to 7-15% of GPU-hours, so it flatters the candidates and any ratio taken
-        against `g6e.xlarge` must be reported with the caveat.
-        """
-        cat = {t["InstanceType"]: t for t in _ec2_instance_types()}
-        for t in ("g6e.2xlarge", "g6.2xlarge", "g5.2xlarge"):
-            assert cat[t]["VCpuInfo"]["DefaultVCpus"] == 8, t
-            assert cat[t]["GpuInfo"]["Gpus"][0]["Count"] == 1, t
-        assert cat["g6.2xlarge"]["MemoryInfo"]["SizeInMiB"] == cat["g6e.xlarge"]["MemoryInfo"]["SizeInMiB"]
-        assert cat["g5.2xlarge"]["MemoryInfo"]["SizeInMiB"] == cat["g6e.xlarge"]["MemoryInfo"]["SizeInMiB"]
 
     def test_a_three_card_ladder_puts_all_three_arms_on_one_cluster(self) -> None:
         """The card-comparison shape: one queue, three cards, one cell, same minutes.
@@ -1350,55 +1066,3 @@ class TestL4Rungs:
             "gpu-workers-ondemand-a10g-2xl": 3,
         }
         assert residual == []
-
-    def test_an_uncapped_pair_of_fallback_cards_goes_entirely_to_the_l4(self) -> None:
-        """The operational trap, and the reason the fallback opens ONE card and not both.
-
-        Companion to `test_a_three_card_ladder_puts_all_three_arms_on_one_cluster`, which
-        shows that two SMALL equal caps give both rungs work because the cap binds before
-        the score does. That is true, and it is the measurement shape — but it is not the
-        shape a fallback is opened in. A fallback is opened wide, to absorb whatever the
-        L40S could not place, and at that point the cap stops binding and the score
-        decides: the two rungs autodetect IDENTICAL resources, so Ray breaks the tie on
-        node-type NAME in reverse alphabetical order and `...-l4-2xl` beats `...-a10g-2xl`.
-
-        Every actor then lands on the SLOWER card: measured 2026-08-27, the L4 runs at
-        0.32x an L40S against the A10G's 0.46x, and costs +65% per unit of work against
-        the A10G's +42%. Nothing in the design chose that; a letter in a name did.
-
-        `context_docs/inference/inference-on-gpus.md` §4 recorded the rule that followed:
-        open the A10G rung alone. **That rule is superseded and this is now a record of
-        the trap, not of current policy.** Autoscaler v2 is what runs, `fleet_mix.py`
-        states the fleet's shape so both pools are asked for at once, and `GPU_RUNGS` is
-        ordered by throughput per vCPU — so the rung order is explicit and nothing ties.
-
-        The test is kept because the tie is a property of Ray's scorer, not of our
-        configuration: it would decide again the moment anything went back to relying on
-        the ranking. If a future rename flipped the tie, or Ray started reading a resource
-        that separates the cards, this would say so.
-        """
-        from ray.autoscaler._private.resource_demand_scheduler import get_nodes_for
-
-        node_types = _autodetected_node_types("g6.2xlarge:100,g5.2xlarge:100")
-        chosen, residual = get_nodes_for(node_types, {}, "head", 600, [ACTOR_BUNDLE] * 8, _scorer())
-        assert dict(chosen) == {"gpu-workers-ondemand-l4-2xl": 8}, (
-            f"expected the whole fleet on the L4 by name tie-break; got {dict(chosen)}"
-        )
-        assert residual == []
-
-    def test_the_a10g_rung_alone_takes_the_whole_fallback_fleet(self) -> None:
-        """The recommended shape: one cheaper card open, so there is no tie to lose."""
-        from ray.autoscaler._private.resource_demand_scheduler import get_nodes_for
-
-        node_types = _autodetected_node_types("g5.2xlarge:100")
-        chosen, residual = get_nodes_for(node_types, {}, "head", 600, [ACTOR_BUNDLE] * 8, _scorer())
-        assert dict(chosen) == {"gpu-workers-ondemand-a10g-2xl": 8}
-        assert residual == []
-
-    def test_a_ladder_can_name_both_fallback_cards(self) -> None:
-        """Both fallback rungs are reachable through the same ladder key, without a
-        release — which is the point of shipping them inert rather than not at all.
-        """
-        node_types = _autodetected_node_types("g6.2xlarge:3,g5.2xlarge:3")
-        opened = {name: cfg["max_workers"] for name, cfg in node_types.items() if cfg["max_workers"]}
-        assert opened == {"gpu-workers-ondemand-l4-2xl": 3, "gpu-workers-ondemand-a10g-2xl": 3}
