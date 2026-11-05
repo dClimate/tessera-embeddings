@@ -60,7 +60,7 @@ select = [
 # scripts/ passes the whole rule set as it stands (checked 2026-08-25), and the per-file
 # ignores below already anticipate it being linted, so adding it to lint.yml would be green
 # today. That is a CI-scope decision rather than part of the test-suite work, so it is left.
-extend-select = ["E501", "PLE1205", "PLE1206", "TID251"]
+extend-select = ["E501", "PLE1205", "PLE1206", "TID251", "TID253"]
 
 ignore = [
     "D100",   # Missing docstring in public module
@@ -88,6 +88,12 @@ ignore = [
 # per-site application drifted before (src/tessera_embeddings/ingest/README.md).
 "tessera_embeddings.ingest.solar_days.solar_day_offset_seconds".msg = "Use solar_days.normalize_to_solar_day; the offset is applied only there."
 
+[lint.flake8-tidy-imports]
+# The AWS provider pulls in boto3 (the `aws` extra) and ray (`inference`). Imported only inside
+# the functions that need it, a `tessera_embeddings[prefect]` install can still import, register
+# and run every flow locally or against another provider.
+banned-module-level-imports = ["tessera_embeddings.providers.aws"]
+
 [lint.isort]
 known-first-party = ["tessera_embeddings"]
 
@@ -96,7 +102,7 @@ convention = "google"
 
 [lint.per-file-ignores]
 # Tests exercise the banned names directly (TID251): the bans constrain library code only.
-"tests/**/*.py" = ["TID251", "ANN", "ARG", "RUF059", "F841", "D102", "D103", "N803", "N806", "C408"]
+"tests/**/*.py" = ["TID251", "TID253", "ANN", "ARG", "RUF059", "F841", "D102", "D103", "N803", "N806", "C408"]
 "examples/**/*.py" = ["T201"]
 "scripts/**/*.py" = ["T201"]
 # Scale-test benchmarks use conventional short module aliases (V=variants,

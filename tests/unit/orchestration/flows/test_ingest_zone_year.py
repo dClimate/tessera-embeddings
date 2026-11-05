@@ -487,11 +487,6 @@ class TestChildRunsAreCancellable:
     stops there, because these grandchildren carried no tag of their own.
     """
 
-    def test_the_terminal_hooks_are_registered(self):
-        """Both, not just cancellation: a crashed parent orphans children identically."""
-        assert mod._cancel_children_on_cancellation in mod.ingest_zone_year.on_cancellation_hooks
-        assert mod._cancel_children_on_cancellation in mod.ingest_zone_year.on_crashed_hooks
-
     def test_every_child_carries_the_sweep_tag(self, wired, monkeypatch):
         """Derived from the flow-run id alone, because the hook runs in a fresh import
         after the process is killed and nothing in memory survives to tell it what

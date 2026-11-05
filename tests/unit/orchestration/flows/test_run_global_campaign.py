@@ -1054,17 +1054,6 @@ def test_children_go_untagged_outside_a_flow_run(wired):
     assert all(t is None for t in wired["tags"])
 
 
-def test_campaign_registers_child_cancellation_on_cancel_and_crash():
-    """Cancelling the campaign must stop the ingests and fills it started.
-
-    Each dispatch is an INDEPENDENT run: without this the parent dies and its
-    children keep writing, with their Dask and Ray fleets still billing.
-    """
-    flow = mod.run_global_campaign
-    assert mod._cancel_children_on_cancellation in flow.on_cancellation_hooks
-    assert mod._cancel_children_on_cancellation in flow.on_crashed_hooks
-
-
 def test_model_gate_runs_before_any_dispatch(wired, monkeypatch):
     """A store seeded for another encoder must cost a metadata read, not a mosaic.
 

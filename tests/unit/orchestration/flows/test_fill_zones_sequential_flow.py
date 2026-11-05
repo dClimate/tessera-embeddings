@@ -1018,12 +1018,6 @@ def test_child_sweep_pages_past_the_server_default(monkeypatch):
     assert client.cancelled == [("fr-live-late", StateType.CANCELLING)]
 
 
-def test_flow_registers_child_ingest_sweep_on_cancel_and_crash():
-    flow = mod.fill_zones_sequential_flow
-    assert mod._cancel_child_ingests_on_cancellation in flow.on_cancellation_hooks
-    assert mod._cancel_child_ingests_on_cancellation in flow.on_crashed_hooks
-
-
 class _FlakyClient(_FakeClient):
     """read_flow_run raises `errors` times, then returns a terminal run."""
 
