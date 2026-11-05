@@ -359,6 +359,6 @@ def test_mgrs_tile_to_bbox_covers_the_tile():
     Europe; 55HBE is south of the equator.
     """
     west, south, east, north = mgrs_tile_to_bbox("33UUP")
-    assert 12.0 < west < 14.0 < east < 15.0
-    assert 47.0 < south < 49.0 < north < 50.0
+    assert 12.0 < west < 14.0 and 13.0 < east < 15.0 and west < east
+    assert 47.0 < south < 49.0 and 48.0 < north < 50.0 and south < north
     assert mgrs_tile_to_bbox("55HBE")[1] < 0
