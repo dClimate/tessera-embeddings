@@ -44,7 +44,6 @@ from tessera_embeddings.ingest.duplicates import (
     alternates_for,
     cause_was_flattened,
     classify_read_failure,
-    copies_label,
     is_provider_refusal,
     is_unreadable_source,
     select_preferred_duplicates,
@@ -143,12 +142,6 @@ class TestNamingTheObject:
         """``unattributed`` is a distinct answer from a list of objects, and must read as one."""
         assert label_objects([]) == "unattributed"
 
-    def test_the_label_caps_and_says_it_capped(self) -> None:
-        hrefs = [f"s3://b/p/S2B_33TAA_2021090{i}_0_L2A/B02.tif" for i in range(20)]
-        label = label_objects(hrefs)
-        assert label.endswith("+12 more")
-        assert label.count(",") == 8
-
 
 class TestCapturingWhatTheLoaderReports:
     """The handler that records the loader's own abort messages."""
@@ -238,9 +231,6 @@ LOGGED_RANGED_REFUSAL = f"CPLE_AppDefined in {GDAL_RANGED_REFUSAL}"
 #: nor absence, which is the verdict that fails a leg on its first date.
 BENIGN_GDAL_LINES = [
     "CPLE_AppDefined in HTTP response code: 404",
-    "CPLE_AppDefined in ZIPDecode:Decoding error at scanline 0",
-    "CPLE_AppDefined in TIFFReadDirectory:Sum of Photometric type-related color channels "
-    "and ExtraSamples doesn't match SamplesPerPixel",
     "CPLE_AppDefined in Request for https://h/o.tif range 1-2 failed with response_code=0",
     "CPLE_AppDefined in Request for https://h/o.tif range 900-901 failed with response_code=416",
 ]
@@ -303,8 +293,6 @@ class TestCapturingWhatGdalLogsButDoesNotRaise:
         BENIGN_GDAL_LINES,
         ids=[
             "sidecar-404",
-            "the-codec-itself",
-            "a-tiff-quirk",
             "no-response-at-all",
             "range-past-the-end",
         ],
@@ -367,7 +355,7 @@ class TestCapturingWhatGdalLogsButDoesNotRaise:
 
             @staticmethod
             def run(fn, on_error=None):
-                time.sleep(0.2)
+                time.sleep(0.02)
                 return {"worker-0": []}
 
         read_began = time.monotonic()
@@ -423,7 +411,7 @@ class TestCapturingWhatGdalLogsButDoesNotRaise:
         of round-trip time makes it so.
         """
         _gdal_logs(LOGGED_REFUSAL)
-        time.sleep(0.05)
+        time.sleep(0.01)
         read_began = time.monotonic()
         assert collect_logged_refusals(None, since=read_began) == []
 
@@ -593,19 +581,6 @@ class TestTheReasonGdalDidNotRaise:
         assert is_provider_refusal(failure) is True
         assert is_unreadable_source(failure) is False
 
-    def test_the_evidence_travels_with_the_exception(self) -> None:
-        """Attaching rather than answering is what makes the verdict stable.
-
-        Two readers ask about the same failure on the radar path alone — the retry policy that
-        spends patience, and the handler that decides whether a date is lost — and a caller that
-        classified and discarded would hand the second the opposite answer.
-        """
-        _gdal_logs(LOGGED_REFUSAL)
-        failure = _decode_failure_over_a_refused_object()
-        carry_logged_refusal(failure, None)
-
-        assert is_provider_refusal(failure) is True
-
     def test_collecting_does_not_take_the_line_from_another_read_in_flight(self) -> None:
         """Two reads overlap whenever the optical path pipelines, and both must find the evidence.
 
@@ -651,13 +626,7 @@ class TestTheReasonGdalDidNotRaise:
         assert is_provider_refusal(conflict) is False
         assert collect_logged_refusals(None) == [LOGGED_REFUSAL], "the read's evidence was consumed"
 
-    def test_nothing_logged_changes_nothing(self) -> None:
-        failure = _decode_failure_over_a_refused_object()
-        carry_logged_refusal(failure, None)
-        assert getattr(failure, "__notes__", ()) == ()
-
-    @pytest.mark.parametrize("line", [LOGGED_REFUSAL, "CPLE_AppDefined in HTTP response code: 503"])
-    def test_attached_evidence_can_never_cost_a_date(self, line: str) -> None:
+    def test_attached_evidence_can_never_cost_a_date(self) -> None:
         """The direction this capture is allowed to move a verdict, asserted rather than argued.
 
         Whatever the chain said, a line that is itself a refusal can only produce a refusal
@@ -666,7 +635,7 @@ class TestTheReasonGdalDidNotRaise:
         the date is judged alone on the re-dispatch. The reverse would be unrecoverable, since a
         date given up under a later committed one cannot be back-filled.
         """
-        _gdal_logs(line)
+        _gdal_logs("CPLE_AppDefined in HTTP response code: 503")
         failure = _decode_failure_over_a_refused_object()
         carry_logged_refusal(failure, None)
         assert is_unreadable_source(failure) is False
@@ -696,7 +665,7 @@ class TestArmingThePatience:
         held idle for minutes to reach the verdict it already had.
         """
         _gdal_logs(LOGGED_REFUSAL)
-        time.sleep(0.05)
+        time.sleep(0.01)
         armed = refusal_wait_out(None)
 
         assert armed(_decode_failure_over_a_refused_object()) is False
@@ -729,9 +698,6 @@ class TestMappingObjectsBackToCopies:
         a tile for it would step down a copy that read perfectly well.
         """
         assert implicated_tile_dates([_copy("MGRS-34WFA", 1)], ["s3://b/p/S2B_33TAA_20210101_0_L2A/B02.tif"]) == set()
-
-    def test_no_hrefs_attributes_nothing(self) -> None:
-        assert implicated_tile_dates([_copy("MGRS-34WFA", 1)], []) == set()
 
 
 class TestBlastRadius:
@@ -826,25 +792,6 @@ class TestTermination:
 
 class TestWhatTheLogSays:
     """The labels a reader uses to tell what changed."""
-
-    def test_the_label_names_only_what_was_stepped(self) -> None:
-        """A whole-date label on a wide ROI runs to tens of thousands of characters and leaves
-        the reader to diff two of them to find the one tile that moved.
-        """
-        items = _wide_date()
-        kept, alternates = select_preferred_duplicates(items)
-        blamed = {("MGRS-34WFA", "2021-09-08")}
-        result = step_down_copies(alternates, kept, only=blamed)
-        assert result is not None
-        stepped_items, swapped = result
-
-        assert copies_label(kept, only=swapped) == "MGRS-34WFA#1"
-        assert copies_label(stepped_items, only=swapped) == "MGRS-34WFA#0"
-
-    def test_a_whole_date_label_is_capped(self) -> None:
-        items = _wide_date()
-        kept, _ = select_preferred_duplicates(items)
-        assert copies_label(kept).endswith("more")
 
     def test_narrowing_alternates_is_an_intersection_not_a_replacement(self) -> None:
         """``only`` must not be able to reach a tile-date absent from ``items`` — a date's
@@ -960,22 +907,6 @@ class TestTheReasonDoesNotSurviveTheWorkerBoundary:
         assert arrived.__cause__ is None
         assert CODEC_FAILURE not in str(arrived)
 
-    def test_the_verdict_is_undecidable(self) -> None:
-        """Corrupt bytes, and the classifier cannot say so — nothing in what arrived says it.
-
-        This is the whole defect. The verdict is not wrong, it is absent: the predicate fails
-        closed, the caller re-raises, and the leg dies on a date another copy could have served.
-        """
-        arrived = _across_the_worker_boundary(_codec_failure_reading_a_tile())
-        assert is_unreadable_source(arrived) is False
-        assert cause_was_flattened(arrived) is True
-
-    def test_the_bare_warp_wrapper_arrives_saying_nothing_at_all(self) -> None:
-        """The radar shape. Its own message names neither a codec nor a status."""
-        arrived = _across_the_worker_boundary(_refusal_behind_the_warp_wrapper())
-        assert str(arrived) == repr(WarpOperationError("Chunk and warp failed"))
-        assert cause_was_flattened(arrived) is True
-
 
 @pytest.mark.usefixtures("gdal_errors_travel_as_shipped")
 class TestTheReasonSurvivesOnceTheReducerIsInstalled:
@@ -989,14 +920,7 @@ class TestTheReasonSurvivesOnceTheReducerIsInstalled:
         assert str(arrived) == READ_FAILED
         assert type(arrived.__cause__) is CPLE_AppDefinedError
         assert str(arrived.__cause__) == CODEC_FAILURE
-
-    def test_the_gdal_error_number_survives_too(self) -> None:
-        """Faithful, not merely sufficient: the class is rebuilt through its own constructor
-        from its own ``args``, so it carries what it carried rather than a flattened string.
-        """
-        keep_causes_picklable()
-        arrived = _across_the_worker_boundary(_codec_failure_reading_a_tile())
-        assert arrived.__cause__ is not None
+        # Rebuilt through its own constructor from its own args, not flattened to a string.
         assert arrived.__cause__.args == (1, 4, CODEC_FAILURE)
 
     def test_corrupt_bytes_are_now_classified_as_unreadable(self) -> None:

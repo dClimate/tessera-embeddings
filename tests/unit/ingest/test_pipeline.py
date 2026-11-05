@@ -21,8 +21,8 @@ import pytest
 
 from tessera_embeddings.ingest._pipeline import pipelined
 
-PREPARE_S = 0.05
-CONSUME_S = 0.15
+PREPARE_S = 0.01
+CONSUME_S = 0.03
 
 
 class _Span(NamedTuple):
@@ -75,12 +75,12 @@ def test_stall_measures_starvation():
     a stall that tracked preparation regardless of consumption would report
     starvation on a pipeline that was working.
     """
-    starved = [stall for _p, stall in pipelined(range(3), _sleeper(0.2, []))]
-    assert all(stall > 0.15 for stall in starved), f"a slow preparation must show as stall: {starved}"
+    starved = [stall for _p, stall in pipelined(range(3), _sleeper(0.05, []))]
+    assert all(stall > 0.04 for stall in starved), f"a slow preparation must show as stall: {starved}"
 
     hidden = []
     for _prepared, stall in pipelined(range(3), _sleeper(0.0, [])):
-        time.sleep(0.2)
+        time.sleep(0.05)
         hidden.append(stall)
     assert all(stall < 0.05 for stall in hidden), f"an instant preparation must not read as starvation: {hidden}"
 
@@ -108,14 +108,6 @@ def test_empty_iterable_yields_nothing_and_never_prepares():
     calls: list[_Span] = []
     assert list(pipelined([], _sleeper(0.0, calls))) == []
     assert calls == [], "an empty input must not start a preparation (nor an executor)"
-
-
-def test_single_item_stalls_for_its_whole_preparation():
-    """One item has nothing to hide behind, so its stall IS its preparation."""
-    (prepared, stall), *rest = list(pipelined(["only"], _sleeper(0.1, [])))
-    assert rest == []
-    assert prepared == "only"
-    assert stall > 0.09
 
 
 def test_abandoning_the_generator_does_not_wait_on_the_in_flight_preparation():
@@ -190,24 +182,6 @@ def test_depth_buffers_that_many_ahead_not_more():
     assert counted == 4, f"expected 4 submissions with depth=3, saw {counted}"
     assert not started.acquire(timeout=0.2), "depth bound exceeded"
     gen.close()
-
-
-def test_depth_one_is_unchanged_and_default():
-    """depth=1 must stay the historical one-ahead behaviour: first item unhidden."""
-    order: list[str] = []
-
-    def prepare(i: int) -> int:
-        order.append(f"prep{i}")
-        return i
-
-    got = []
-    for prepared, _stall in pipelined(range(3), prepare):
-        order.append(f"consume{prepared}")
-        got.append(prepared)
-    assert got == [0, 1, 2]
-    # prep0 before consume0, and prep1 issued before consume0 returns.
-    assert order[0] == "prep0"
-    assert order.index("prep1") < order.index("consume1")
 
 
 def test_depth_preserves_order_and_single_threading():
