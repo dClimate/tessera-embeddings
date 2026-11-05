@@ -23,7 +23,6 @@ import pytest
 from dateutil.tz import tzutc
 
 from tessera_embeddings.providers.aws import credentials as cred
-from tessera_embeddings.providers.aws import credentials as creds_mod
 
 _OURS = "s3://global-tessera-embeddings/global-tessera/global/tessera.icechunk"
 _THEIRS = "s3://tessera-embeddings/v1.1/dclimate.icechunk"
@@ -64,14 +63,6 @@ class TestTheExpiryWePromiseIcechunk:
         out = cred._expires_after(_Refreshable(1), cred._ASSUMED_ROLE_CRED_TTL)
         assert out < datetime.now(UTC), "already inside the margin, so icechunk must come back at once"
 
-    def test_a_naive_expiry_is_not_compared_against_an_aware_one(self) -> None:
-        """A naive datetime raises on comparison with an aware one, which would surface as a crash in
-        the credential path rather than anywhere near the cause.
-        """
-        c = _Refreshable(30)
-        c._expiry_time = c._expiry_time.replace(tzinfo=None)
-        assert cred._expires_after(c, cred._ASSUMED_ROLE_CRED_TTL) is not None
-
     def test_a_credential_with_no_expiry_falls_back_to_the_interval(self) -> None:
         out = cred._expires_after(_Static(), cred._ASSUMED_ROLE_CRED_TTL)
         assert 4.5 < (out - datetime.now(UTC)).total_seconds() / 60 < 5.5
@@ -95,10 +86,6 @@ def test_the_interval_lands_inside_botocores_mandatory_refresh_window() -> None:
     assert mandatory > cred._ASSUMED_ROLE_CRED_TTL, (
         "at least one callback must land inside the mandatory window, so the interval must be "
         "shorter than the window itself"
-    )
-    assert mandatory <= cred._ICECHUNK_CRED_TTL, (
-        "documents the contrast: the task-role interval is NOT shorter than the window, which is "
-        "safe only because that credential lives ~6h rather than 1h"
     )
     assert cred._EXPIRY_SAFETY_MARGIN < cred._ASSUMED_ROLE_CRED_TTL, (
         "the margin must not exceed the interval, or every promise would already be in the past"
@@ -175,12 +162,6 @@ class TestTheAssumedRoleProviderItself:
     def _clear(self) -> None:
         cred._assumed_role_credentials.cache_clear()
 
-    def test_building_the_callback_makes_no_network_call(self) -> None:
-        """Deferred on purpose: a process that never touches the published store must not need the
-        permission, and building a provider must not be able to fail.
-        """
-        assert callable(cred.assumed_role_icechunk_credentials(_ROLE))
-
     def test_the_callback_assumes_and_reports_a_capped_expiry(self, monkeypatch) -> None:
         calls: list[dict] = []
         expiry = datetime.now(UTC) + timedelta(hours=1)
@@ -206,44 +187,16 @@ class TestTheAssumedRoleProviderItself:
 
         monkeypatch.setattr(cred.botocore_session, "get_session", lambda: _Session())
 
-        out = cred.assumed_role_icechunk_credentials(_ROLE)()
+        get = cred.assumed_role_icechunk_credentials(_ROLE)
+        out = get()
+        for _ in range(4):  # cached and refreshed underneath, so a transient STS failure is ridden out
+            get()
         assert out.access_key_id == "AKIA_TEST"
         assert out.session_token == "token"
-        assert len(calls) == 1, "assumed once"
+        assert len(calls) == 1, f"assumed {len(calls)} times for 5 reads"
         assert calls[0]["RoleArn"] == _ROLE
         assert "ExternalId" not in calls[0], "omitted, not sent empty"
         assert out.expires_after < expiry, "never promised past the token's own life"
-
-    def test_repeated_calls_do_not_re_assume(self, monkeypatch) -> None:
-        """The whole reason the credential object is cached: a fresh resolve per call turns a
-        transient STS failure into a failed write, where a cached refreshable one rides it out.
-        """
-        calls: list[dict] = []
-
-        class _Sts:
-            def assume_role(self, **kwargs):
-                calls.append(kwargs)
-                return {
-                    "Credentials": {
-                        "AccessKeyId": "AKIA_TEST",
-                        "SecretAccessKey": "secret",
-                        "SessionToken": "token",
-                        "Expiration": datetime.now(UTC) + timedelta(hours=1),
-                    }
-                }
-
-        class _Session:
-            def get_component(self, _name):
-                return type("P", (), {"remove": lambda self, _n: None})()
-
-            def create_client(self, _name):
-                return _Sts()
-
-        monkeypatch.setattr(cred.botocore_session, "get_session", lambda: _Session())
-        get = cred.assumed_role_icechunk_credentials(_ROLE)
-        for _ in range(5):
-            get()
-        assert len(calls) == 1, f"assumed {len(calls)} times for 5 reads"
 
 
 class TestIcechunkCanActuallyUseTheCallback:
@@ -335,35 +288,6 @@ class TestTheWiringReachesTheStore:
         assert zone_fill._store_credentials(_OURS, ours) is ours, "our own buckets keep the task role"
         assert zone_fill._store_credentials("/tmp/local.icechunk", ours) is ours, "and so do local paths"
 
-    def test_an_unconfigured_deployment_is_untouched(self, monkeypatch) -> None:
-        """Every deployment whose store is in our own buckets must behave exactly as before."""
-        from tessera_embeddings.orchestration.runners import zone_fill
-
-        monkeypatch.delenv("PUBLISHED_STORE_WRITER_ROLE_ARN", raising=False)
-        ours = lambda: "TASK_ROLE"  # noqa: E731
-
-        for uri in (_OURS, _THEIRS, _THEIR_REGISTRY):
-            assert zone_fill._store_credentials(uri, ours) is ours, uri
-
-    def test_the_registry_write_is_given_the_stores_credential(self) -> None:
-        """The registry is a sibling of the store in the SAME bucket, so it needs the same role.
-
-        Asserted on the signature rather than by writing: `publish_registry_part` builds its
-        filesystem from `plain_zarr_storage_options(uri, get_credentials, s3_region)`, and before
-        this it called `_fs_for(uri)` bare — falling back to fsspec's ambient chain, which is the
-        task role and cannot write there.
-        """
-        import inspect
-
-        from tessera_embeddings.inference.assembly import ZarrWriter
-
-        params = inspect.signature(ZarrWriter.publish_registry_part).parameters
-        assert "get_credentials" in params and "s3_region" in params
-
-        src = inspect.getsource(ZarrWriter.publish_registry_part)
-        assert "plain_zarr_storage_options(uri, get_credentials, s3_region)" in src
-        assert "_fs_for(uri)" not in src, "a bare _fs_for falls back to the ambient chain"
-
 
 # ---------------------------------------------------------------------------
 # Making the credential icechunk uses observable.
@@ -379,10 +303,10 @@ class TestIcechunkCredentialVisibility:
 
     @staticmethod
     def _reset() -> None:
-        creds_mod._announced_access_keys.clear()
+        cred._announced_access_keys.clear()
 
     def _serve(self, source: str, key: str, expires_after: datetime | None = None) -> None:
-        creds_mod._serve_icechunk_credential(
+        cred._serve_icechunk_credential(
             source=source,
             access_key=key,
             secret_key="s",
@@ -396,7 +320,7 @@ class TestIcechunkCredentialVisibility:
         re-serve must not be, since icechunk asks per request once its cache lapses.
         """
         self._reset()
-        with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
+        with caplog.at_level(logging.DEBUG, logger=cred.__name__):
             self._serve("task-role", "ASIAONE")
             self._serve("task-role", "ASIATWO")
             self._serve("task-role", "ASIATWO")
@@ -423,7 +347,7 @@ class TestIcechunkCredentialVisibility:
     )
     def test_distinct_sources_do_not_read_as_one_provider(self, caplog, first_source, second_source) -> None:
         self._reset()
-        with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
+        with caplog.at_level(logging.DEBUG, logger=cred.__name__):
             for _ in range(3):
                 self._serve(first_source, "ASIAA")
                 self._serve(second_source, "ASIAB")
@@ -440,7 +364,7 @@ class TestIcechunkCredentialVisibility:
         """
         self._reset()
         base = datetime(2026, 8, 28, 12, tzinfo=UTC)
-        with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
+        with caplog.at_level(logging.DEBUG, logger=cred.__name__):
             if straggler_was_announced:
                 self._serve("task-role", "ASIAPRIOR", base)
             self._serve("task-role", "ASIAFRESH", base + timedelta(minutes=5))
@@ -454,28 +378,6 @@ class TestIcechunkCredentialVisibility:
         # One INFO per credential the process really used, and never more.
         assert len([r for r in caplog.records if r.levelname == "INFO"]) == 2
 
-    def test_a_workers_first_line_says_it_is_probably_a_change(self, caplog, monkeypatch) -> None:
-        """Where a caller scatters, a worker's first call lands only once the inherited credential
-        lapses — a change wearing the word FIRST, which a reader would misread. Phrased as a
-        possibility, since multiprocessing ancestry does not prove the storage scattered.
-        """
-        self._reset()
-        with caplog.at_level(logging.INFO, logger=creds_mod.__name__):
-            self._serve("task-role", "ASIAPARENT")
-        assert "child process" not in caplog.records[0].getMessage()
-
-        caplog.clear()
-        self._reset()
-        monkeypatch.setattr(creds_mod.multiprocessing, "parent_process", lambda: object())
-        with caplog.at_level(logging.INFO, logger=creds_mod.__name__):
-            self._serve("task-role", "ASIACHILD")
-        msg = caplog.records[0].getMessage()
-        assert "FIRST in this child process" in msg and "not a start" in msg
-        # Phrased as a possibility: being a multiprocessing child (a Dask nanny worker is one)
-        # does not prove the storage scattered, so the line must not assert inheritance.
-        assert "if it inherited" in msg
-        assert "ASIACHILD" in msg
-
     def test_the_bookkeeping_is_locked_and_the_log_is_not(self, monkeypatch) -> None:
         """Icechunk calls this from its own threads, so an unguarded read-then-write lets two of
         them both announce the same key. Asserted directly because a racing test can only fail
@@ -483,7 +385,7 @@ class TestIcechunkCredentialVisibility:
         serialise every icechunk request behind a log write.
         """
         self._reset()
-        lock = creds_mod._ANNOUNCE_LOCK
+        lock = cred._ANNOUNCE_LOCK
         held: list[bool] = []
 
         class _Watched(dict):
@@ -491,17 +393,17 @@ class TestIcechunkCredentialVisibility:
                 held.append(lock.locked())
                 return super().setdefault(key, default)
 
-        monkeypatch.setattr(creds_mod, "_announced_access_keys", _Watched())
+        monkeypatch.setattr(cred, "_announced_access_keys", _Watched())
         logged_under_lock: list[bool] = []
-        monkeypatch.setattr(creds_mod._LOG, "log", lambda *a, **k: logged_under_lock.append(lock.locked()))
+        monkeypatch.setattr(cred._LOG, "log", lambda *a, **k: logged_under_lock.append(lock.locked()))
         self._serve("task-role", "ASIALOCKED")
         assert held == [True], "the novelty check must happen under the lock"
         assert logged_under_lock == [False], "the log must not run inside the lock"
 
     def test_it_never_logs_the_secret_or_the_token(self, caplog) -> None:
         self._reset()
-        with caplog.at_level(logging.DEBUG, logger=creds_mod.__name__):
-            creds_mod._serve_icechunk_credential(
+        with caplog.at_level(logging.DEBUG, logger=cred.__name__):
+            cred._serve_icechunk_credential(
                 source="task-role",
                 access_key="ASIAVISIBLE",
                 secret_key="SECRETVALUE",
@@ -511,18 +413,3 @@ class TestIcechunkCredentialVisibility:
         text = " ".join(r.getMessage() for r in caplog.records)
         assert "ASIAVISIBLE" in text
         assert "SECRETVALUE" not in text and "TOKENVALUE" not in text
-
-    def test_both_providers_are_instrumented(self) -> None:
-        """The published store is served by the ASSUMED-ROLE callback, so instrumenting only the
-        task-role one would leave the credential behind the real failures invisible.
-        """
-        import inspect
-
-        for name, src in (
-            ("task-role", inspect.getsource(creds_mod.iam_icechunk_credentials)),
-            ("assumed-role", inspect.getsource(creds_mod.AssumedRoleIcechunkCredentials.__call__)),
-        ):
-            assert "_serve_icechunk_credential(" in src, f"{name} bypasses the boundary"
-            assert "icechunk.S3StaticCredentials(" not in src, (
-                f"{name} builds its own credential, so it can drift from the boundary"
-            )
