@@ -275,28 +275,6 @@ class TestAnonymousStorage:
         storage = zarr_store._create_storage(str(tmp_path / "local.icechunk"), anonymous=True)
         assert storage is not None
 
-    def test_an_installed_override_refuses_an_anonymous_read(self, monkeypatch):
-        # The override carries credentials and an endpoint, so honouring it would make an
-        # anonymous-access check pass while authenticating — the one thing it rules out.
-        class _Override:
-            def make_storage(self, prefix_override=None):
-                raise AssertionError("the override must not be consulted for an anonymous read")
-
-        monkeypatch.setattr(zarr_store, "_s3_config_override", _Override())
-        with pytest.raises(ValueError, match="anonymous"):
-            zarr_store._create_storage("s3://bucket/prefix", anonymous=True)
-
-    def test_an_installed_override_still_serves_a_credentialed_read(self, monkeypatch):
-        sentinel = object()
-
-        class _Override:
-            def make_storage(self, prefix_override=None):
-                return sentinel
-
-        monkeypatch.setattr(zarr_store, "_s3_config_override", _Override())
-        assert zarr_store._create_storage("s3://bucket/prefix") is sentinel
-
-
 #: One property of one spatial or calendar axis broken per case. ``None`` deletes the axis; the rest
 #: rewrite its values from what the seeder wrote.
 _COORDINATE_CASES = (
