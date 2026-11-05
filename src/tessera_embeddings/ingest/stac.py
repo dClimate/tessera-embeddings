@@ -1388,7 +1388,6 @@ def has_new_stac_dates(
     end_date: str,
     existing_dates: set[str],
     bbox: tuple[float, float, float, float] | None = None,
-    item_filter_fn: Callable[[list[Any]], list[Any]] | None = None,
     item_provider_fn: Callable[[], list[Any]] | None = None,
     mid_longitude: float | None = None,
 ) -> bool:
@@ -1416,7 +1415,6 @@ def has_new_stac_dates(
         end_date: End date (YYYY-MM-DD).
         existing_dates: ``YYYY-MM-DD`` dates already in the store.
         bbox: Optional bounding box for the spatial query fallback.
-        item_filter_fn: Optional pre-filter (e.g. orbit direction).
         item_provider_fn: Optional callable returning items directly, bypassing CMR-STAC search
             (OPERA native-granule path).
         mid_longitude: ROI geobox centroid longitude. Supply it whenever the store was written in
@@ -1444,12 +1442,6 @@ def has_new_stac_dates(
         logger.debug(f"No items found for {query_label}")
         return False
 
-    if item_filter_fn is not None:
-        items = item_filter_fn(items)
-        if not items:
-            logger.debug(f"No items remaining after filtering for {query_label}")
-            return False
-
     # Solar-day stamp before comparing: the store's dates are solar days, so matching a raw UTC
     # date against them under-reports new data in exactly the high-offset zones where a day
     # straddles midnight. A longitude is REQUIRED — `resolve_grouping_longitude` refuses rather
@@ -1470,14 +1462,13 @@ def query_stac_items(
     end_date: str,
     existing_dates: set[str] | None = None,
     bbox: tuple[float, float, float, float] | None = None,
-    item_filter_fn: Callable[[list[Any]], list[Any]] | None = None,
     item_provider_fn: Callable[[], list[Any]] | None = None,
     extra_bands: list[str] | None = None,
     mid_longitude: float | None = None,
 ) -> tuple[list[Any], dict[str, int]]:
     """Query STAC catalog, filter items, and extract baselines.
 
-    Combines the catalog query, optional item filtering, cloud-cover sorting, baseline extraction
+    Combines the catalog query, cloud-cover sorting, baseline extraction
     and existing-date filtering. The query half of ``ingest_tile``; pair with ``load_stac_items``
     to load data separately.
 
@@ -1489,7 +1480,6 @@ def query_stac_items(
         end_date: End date (YYYY-MM-DD).
         existing_dates: Dates already in the store, to skip. None returns all.
         bbox: Optional bounding box for the spatial query fallback.
-        item_filter_fn: Optional pre-filter (e.g. orbit direction).
         item_provider_fn: Optional callable returning items directly, bypassing CMR-STAC search
             (OPERA native-granule path).
         extra_bands: Additional assets the caller will load. Kept in the pruned items — pruning
@@ -1500,7 +1490,7 @@ def query_stac_items(
 
     Returns:
         ``(items, baselines)``: the filtered items, excluding existing dates, and a date ->
-        baseline map covering every date that passed ``item_filter_fn``, existing ones included.
+        baseline map covering every queried date, existing ones included.
     """
     provider_config = _get_provider_config(provider)
     collection_config = _get_collection_config(provider, collection)
@@ -1520,12 +1510,6 @@ def query_stac_items(
     if not items:
         logger.warning(f"No items found for {query_label} in date range")
         return [], {}
-
-    if item_filter_fn is not None:
-        items = item_filter_fn(items)
-        if not items:
-            logger.info("No items remaining after item_filter_fn")
-            return [], {}
 
     # THE single solar-offset application for this path. Everything below — the cloud sort, the
     # baseline map, the existing-date dedup, and every consumer of the returned items — then reads
@@ -1783,7 +1767,6 @@ def ingest_tile(
     crs: str | None = None,
     resolution: int | None = None,
     post_load_fn: Callable[[xr.Dataset], xr.Dataset] | None = None,
-    item_filter_fn: Callable[[list[Any]], list[Any]] | None = None,
     item_provider_fn: Callable[[], list[Any]] | None = None,
     groupby: str = "solar_day",
     geobox: GeoBox | None = None,
@@ -1791,9 +1774,9 @@ def ingest_tile(
 ) -> tuple[xr.Dataset | None, dict[str, int]]:
     """Query STAC, filter existing dates, load data, and apply corrections.
 
-    The high-level API for ingesting satellite data: catalog query, optional item filtering (e.g.
-    orbit direction), dropping already-processed dates, loading via odc.stac.load, baseline
-    correction for Sentinel-2, and an optional post-load transform (e.g. amplitude to dB).
+    The high-level API for ingesting satellite data: catalog query, dropping already-processed
+    dates, loading via odc.stac.load, baseline correction for Sentinel-2, and an optional
+    post-load transform (e.g. amplitude to dB).
 
     Args:
         provider: Provider name (e.g. "earth-search").
@@ -1813,7 +1796,6 @@ def ingest_tile(
         resolution: Pixel resolution override in metres; None uses the collection's native
               resolution (10m S2, 30m S1). Use it to upsample S1 to a common 10m grid with S2.
         post_load_fn: Optional function applied after loading and baseline correction.
-        item_filter_fn: Optional function applied to items before date filtering.
         item_provider_fn: Optional callable returning ready-to-load items, bypassing CMR-STAC
               search. Used by the OPERA RTC-S1 path, which builds items from the native CMR
               granule API.
@@ -1843,7 +1825,6 @@ def ingest_tile(
         end_date=end_date,
         existing_dates=existing_dates,
         bbox=bbox,
-        item_filter_fn=item_filter_fn,
         item_provider_fn=item_provider_fn,
         # Asset pruning happens inside the query, so a band not forwarded here is gone before
         # load_stac_items below asks odc for it — a valid extra_bands request becomes a

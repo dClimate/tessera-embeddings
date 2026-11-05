@@ -232,16 +232,15 @@ the same export measured ~4 chunk-writes/second from a laptop.
 
 ## Basic Ingestion Process
 
-The high-level entry point is `ingest_tile()` in `stac.py`. It runs five stages in sequence:
+The high-level entry point is `ingest_tile()` in `stac.py`. It runs four stages in sequence:
 
 ```text
 1. Item query        — find items for the tile/bbox + date range (S1: native CMR
                        granule query, orbit-filtered server-side)
-2. Item filtering    — optional item_filter_fn pre-filter hook
-3. Date dedup        — drop items whose dates are already in the Zarr store
-4. odc.stac.load     — lazy-load COGs into a Dask-backed xarray Dataset. The S2
+2. Date dedup        — drop items whose dates are already in the Zarr store
+3. odc.stac.load     — lazy-load COGs into a Dask-backed xarray Dataset. The S2
                        baseline correction happens here, per source, inside the read
-5. Corrections       — dB conversion (S1)
+4. Corrections       — dB conversion (S1)
 ```
 
 `query_stac_items` and `load_stac_items` expose these stages separately so a flow could
