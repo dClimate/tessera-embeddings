@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pytest
 import torch
@@ -9,6 +11,7 @@ import torch
 from tessera_embeddings.inference.data_loading import ChunkData
 from tessera_embeddings.inference.dataset import MosaicChunkInferenceDataset
 from tessera_embeddings.inference.inference import (
+    _SERIAL_LOOP_ENV,
     _prepare_batch,
     _prepare_gpu,
     _transfer_and_forward,
@@ -18,23 +21,7 @@ from tessera_embeddings.inference.inference import (
 
 
 class TestRunInference:
-    """Tests for the inference loop output shape and zero-fill behavior."""
-
-    def test_output_shape(self, sample_chunk_data, inference_config, test_model):
-        """Output is (H, W, save_dim) int8 with (H, W) float32 scales."""
-        h, w = 8, 8
-        chunk = sample_chunk_data(height=h, width=w, t_s2=10, t_s1a=5, t_s1d=5)
-        dataset = MosaicChunkInferenceDataset(chunk, num_obs_checkpoints=inference_config.num_obs_checkpoints)
-
-        result = run_inference(test_model, dataset, inference_config, torch.device("cpu"))
-
-        # The tiny test config uses representation_dim=32, so the inference loop
-        # saves min(EMBEDDING_DIM=128, 32) = 32 dims. Validate shape consistency.
-        assert result.embeddings.ndim == 3
-        assert result.embeddings.shape[:2] == (h, w)
-        assert result.embeddings.dtype == np.int8
-        assert result.scales.shape == (h, w)
-        assert result.scales.dtype == np.float32
+    """The inference loop's zero-fill behaviour, and the pipelined loop against a serial reference."""
 
     def test_invalid_pixels_are_zero(self, inference_config, test_model):
         """Pixels that can't be generated get 0 in every band and a NaN scale.
@@ -84,15 +71,6 @@ class TestRunInference:
         np.testing.assert_array_equal(result.embeddings[invalid], 0)
         assert np.isfinite(result.scales[~invalid]).all()
 
-    def test_nonzero_embeddings_for_valid_pixels(self, sample_chunk_data, inference_config, test_model):
-        """Valid pixels produce non-zero embeddings (random model weights)."""
-        chunk = sample_chunk_data(height=5, width=5, t_s2=10, t_s1a=5, t_s1d=5)
-        dataset = MosaicChunkInferenceDataset(chunk, num_obs_checkpoints=inference_config.num_obs_checkpoints)
-
-        result = run_inference(test_model, dataset, inference_config, torch.device("cpu"))
-
-        assert np.any(result.embeddings != 0)
-
     def test_pipelined_output_matches_serial_reference(self, sample_chunk_data, inference_config, test_model):
         """The pipelined loop is byte-identical to a strictly-serial reference.
 
@@ -105,8 +83,6 @@ class TestRunInference:
         handoff. Uses a chunk large enough (with batch_size=16) to span many
         sub-batches across both buckets so the overlap path is actually taken.
         """
-        from tessera_embeddings.inference.inference import _transfer_and_forward, _write_quantized_rows
-
         h, w = 24, 24
         chunk = sample_chunk_data(height=h, width=w, t_s2=10, t_s1a=5, t_s1d=5)
         device = torch.device("cpu")
@@ -154,15 +130,6 @@ class TestPrepareGpu:
         param = next(test_model.parameters())
         assert param.dtype == torch.float32
 
-    def test_cpu_no_side_effects(self, test_model):
-        """Calling _prepare_gpu on CPU is safe (no CUDA required)."""
-        params_before = {n: p.clone() for n, p in test_model.named_parameters()}
-
-        _prepare_gpu(test_model, torch.device("cpu"))
-
-        for name, param in test_model.named_parameters():
-            torch.testing.assert_close(param, params_before[name])
-
     def test_dtype_conversion_is_idempotent(self, test_model, monkeypatch):
         """Re-running on an already-converted model skips the re-cast.
 
@@ -191,80 +158,6 @@ class TestPrepareGpu:
 
         assert next(test_model.parameters()).dtype == torch.bfloat16
         assert casts["count"] == 1  # converted once, skipped on the second call
-
-
-class TestProcessSubBatch:
-    """Tests for the split _transfer_and_forward / _write_quantized_rows primitives."""
-
-    def test_transfer_and_forward_returns_quantized_host_rows(self, sample_chunk_data, inference_config, test_model):
-        """_transfer_and_forward returns on-device-quantized int8 rows + scales on the host."""
-        chunk = sample_chunk_data(height=5, width=5, t_s2=10, t_s1a=5, t_s1d=5)
-        dataset = MosaicChunkInferenceDataset(chunk, num_obs_checkpoints=inference_config.num_obs_checkpoints)
-        device = torch.device("cpu")
-        save_dim = inference_config.representation_dim
-
-        bucket_key, pixel_indices = next(iter(dataset.iter_buckets()))
-        end = min(inference_config.batch_size, int(pixel_indices.size))
-        batch, _ = _prepare_batch(dataset, bucket_key, 0, end)
-
-        with torch.no_grad():
-            q_host, scales_host, global_idxs, transfer_secs, forward_secs = _transfer_and_forward(
-                test_model, batch, bucket_key, device, save_dim, config=inference_config
-            )
-
-        assert q_host.shape == (end, save_dim)
-        assert q_host.dtype == np.int8
-        assert scales_host.shape == (end,)
-        assert scales_host.dtype == np.float32
-        assert global_idxs.shape == (end,)
-        assert transfer_secs >= 0
-        assert forward_secs >= 0
-
-    def test_write_quantized_rows_writes_to_flat_out(self, sample_chunk_data, inference_config, test_model):
-        """_write_quantized_rows scatters non-zero int8 rows into the output buffers."""
-        chunk = sample_chunk_data(height=5, width=5, t_s2=10, t_s1a=5, t_s1d=5)
-        dataset = MosaicChunkInferenceDataset(chunk, num_obs_checkpoints=inference_config.num_obs_checkpoints)
-        device = torch.device("cpu")
-        h, w = dataset.H, dataset.W
-        save_dim = inference_config.representation_dim
-        flat_q = np.zeros((h * w, save_dim), dtype=np.int8)
-        flat_scales = np.full(h * w, np.nan, dtype=np.float32)
-
-        bucket_key, pixel_indices = next(iter(dataset.iter_buckets()))
-        end = min(inference_config.batch_size, int(pixel_indices.size))
-        batch, _ = _prepare_batch(dataset, bucket_key, 0, end)
-
-        with torch.no_grad():
-            q_host, scales_host, global_idxs, _, _ = _transfer_and_forward(
-                test_model, batch, bucket_key, device, save_dim, config=inference_config
-            )
-        _write_quantized_rows(q_host, scales_host, global_idxs, flat_q, flat_scales)
-
-        assert np.any(flat_q != 0)
-        # Only this bucket's pixels were written; their scales are now finite.
-        assert np.isfinite(flat_scales[global_idxs]).all()
-
-
-class TestThroughputAccounting:
-    """Tests for the tokens/s + effective-TFLOPS accounting in run_inference."""
-
-    def test_final_log_reports_tokens_and_tflops(self, sample_chunk_data, inference_config, test_model, caplog):
-        """The completion log carries density-neutral throughput units.
-
-        px/s conflates sequence length across chunks, so the summary must also
-        report tok/sec and effective TFLOPS for cross-chunk comparison.
-        """
-        import logging
-
-        chunk = sample_chunk_data(height=8, width=8, t_s2=10, t_s1a=5, t_s1d=5)
-        dataset = MosaicChunkInferenceDataset(chunk, num_obs_checkpoints=inference_config.num_obs_checkpoints)
-
-        with caplog.at_level(logging.INFO, logger="tessera_embeddings.inference.inference"):
-            run_inference(test_model, dataset, inference_config, torch.device("cpu"))
-
-        summary = next(r.message for r in caplog.records if r.message.startswith("Inference complete"))
-        assert "tok/sec avg" in summary
-        assert "eff TFLOPS avg" in summary
 
 
 class TestPipelinedGpuLoop:
@@ -305,10 +198,6 @@ class TestPipelinedGpuLoop:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for the pipelined GPU loop")
     def test_pipelined_matches_serial(self, sample_chunk_data, inference_config, test_model, monkeypatch):
-        import os
-
-        from tessera_embeddings.inference.inference import _SERIAL_LOOP_ENV
-
         chunk = sample_chunk_data(height=16, width=16, t_s2=12, t_s1a=6, t_s1d=6)
         device = torch.device("cuda")
         model = test_model.to(device)

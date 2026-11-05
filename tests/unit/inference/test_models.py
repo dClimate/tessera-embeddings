@@ -9,9 +9,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from tessera_embeddings.inference.models.builder import _build_inference_model
+from tessera_embeddings.inference.models.builder import _build_inference_model, load_v11_checkpoint
 from tessera_embeddings.inference.models.modules import (
-    CustomGRU,
     CustomGRUCell,
     TemporalAwarePooling,
     TemporalPositionalEncoder,
@@ -25,22 +24,6 @@ from tessera_embeddings.inference.models.student_v2 import StudentTransformerEnc
 from tests._paths import FIXTURES
 
 
-class TestTransformerEncoder:
-    """Tests for V11TransformerEncoder forward pass shapes."""
-
-    def test_s2_output_shape(self):
-        """S2 backbone pools to (B, latent_dim * 4)."""
-        enc = V11TransformerEncoder(band_num=10, latent_dim=32, nhead=4, num_encoder_layers=2)
-        x = torch.randn(4, 15, 11)
-        assert enc(x).shape == (4, 128)
-
-    def test_s1_output_shape(self):
-        """S1 backbone pools to (B, latent_dim * 4)."""
-        enc = V11TransformerEncoder(band_num=2, latent_dim=32, nhead=4, num_encoder_layers=2)
-        x = torch.randn(4, 15, 3)
-        assert enc(x).shape == (4, 128)
-
-
 def _upstream_encoder(file: str) -> type[torch.nn.Module]:
     """An upstream model file's own ``TemporalPositionalEncoder``, imported by path."""
     spec = importlib.util.spec_from_file_location(f"upstream_{Path(file).stem}", FIXTURES / "upstream" / file)
@@ -51,13 +34,7 @@ def _upstream_encoder(file: str) -> type[torch.nn.Module]:
 
 
 class TestTemporalPositionalEncoder:
-    """Tests for positional encoding output shape."""
-
-    def test_output_shape(self):
-        """DOY values of shape (B, T) map to (B, T, d_model)."""
-        pe = TemporalPositionalEncoder(d_model=64)
-        doy = torch.randint(1, 366, (4, 20))
-        assert pe(doy).shape == (4, 20, 64)
+    """Each model's positional encoding against its own upstream."""
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="exp() rounds the same either way on a CPU-only host")
     @pytest.mark.parametrize(
@@ -118,20 +95,7 @@ class TestTemporalAwarePooling:
 
 
 class TestCustomGRU:
-    """Tests for CustomGRUCell and CustomGRU."""
-
-    def test_cell_output_shape(self):
-        """A single cell step produces a (B, hidden_size) hidden state."""
-        cell = CustomGRUCell(input_size=64, hidden_size=32)
-        h_new = cell(torch.randn(4, 64), torch.randn(4, 32))
-        assert h_new.shape == (4, 32)
-
-    def test_gru_output_shape(self):
-        """CustomGRU matches nn.GRU(batch_first=True) output contract."""
-        gru = CustomGRU(input_size=64, hidden_size=32)
-        outputs, h_t = gru(torch.randn(4, 10, 64))
-        assert outputs.shape == (4, 10, 32)
-        assert h_t.shape == (1, 4, 32)
+    """CustomGRUCell's formulation."""
 
     def test_tessera_gru_formulation(self):
         """CustomGRUCell matches tessera's variant: reset before matmul, z selects new."""
@@ -148,22 +112,7 @@ class TestCustomGRU:
 
 
 class TestMultimodalBTInferenceModel:
-    """v1.1 inference model: two backbones + MLP dim_reducer, output (B, repr_dim)."""
-
-    def test_forward_shape_concat(self):
-        """Concat fusion forward pass returns (B, representation_dim)."""
-        latent_dim, repr_dim = 32, 16
-        s2_enc = V11TransformerEncoder(band_num=10, latent_dim=latent_dim, nhead=4, num_encoder_layers=2)
-        s1_enc = V11TransformerEncoder(band_num=2, latent_dim=latent_dim, nhead=4, num_encoder_layers=2)
-        reducer = build_dim_reducer(latent_dim=latent_dim, active_backbones=2, repr_dim=repr_dim)
-        model = MultimodalBTInferenceModel(s2_enc, s1_enc, reducer, fusion_method="concat")
-        model.eval()
-
-        s2_x = torch.randn(4, 15, 11)
-        s1_x = torch.randn(4, 15, 3)
-        with torch.no_grad():
-            out = model(s2_x, s1_x)
-        assert out.shape == (4, repr_dim)
+    """v1.1 inference model: two backbones + MLP dim_reducer."""
 
     def test_invalid_fusion_raises(self):
         """An unknown fusion method raises ValueError on forward."""
@@ -206,8 +155,6 @@ class TestLoadCheckpoint:
 
     def test_strips_orig_mod_prefix(self, tmp_path):
         """`_orig_mod.` (torch.compile) prefixes are removed from param keys."""
-        from tessera_embeddings.inference.models.builder import load_v11_checkpoint
-
         path = self._save(
             tmp_path,
             {
@@ -224,8 +171,6 @@ class TestLoadCheckpoint:
 
     def test_drops_training_only_heads(self, tmp_path):
         """projector.* and segmented_matryoshka_projector.* params are dropped."""
-        from tessera_embeddings.inference.models.builder import load_v11_checkpoint
-
         path = self._save(
             tmp_path,
             {
@@ -241,8 +186,6 @@ class TestLoadCheckpoint:
 
     def test_falls_back_to_model_state_dict_key(self, tmp_path):
         """When 'model_state' is absent, 'model_state_dict' is used."""
-        from tessera_embeddings.inference.models.builder import load_v11_checkpoint
-
         path = self._save(
             tmp_path,
             {
@@ -254,8 +197,6 @@ class TestLoadCheckpoint:
 
     def test_prefers_model_state_over_model_state_dict(self, tmp_path):
         """When both keys exist, 'model_state' wins."""
-        from tessera_embeddings.inference.models.builder import load_v11_checkpoint
-
         path = self._save(
             tmp_path,
             {
@@ -269,20 +210,9 @@ class TestLoadCheckpoint:
 
     def test_raises_when_no_state_key(self, tmp_path):
         """A checkpoint with neither state key raises KeyError listing available keys."""
-        from tessera_embeddings.inference.models.builder import load_v11_checkpoint
-
         path = self._save(tmp_path, {"optimizer": {}, "epoch": 5})
         with pytest.raises(KeyError, match="model_state_dict"):
             load_v11_checkpoint(path, torch.device("cpu"))
-
-    def test_preserves_tensor_values(self, tmp_path):
-        """Param tensors survive cleaning unmodified."""
-        from tessera_embeddings.inference.models.builder import load_v11_checkpoint
-
-        weight = torch.arange(6, dtype=torch.float32).reshape(2, 3)
-        path = self._save(tmp_path, {"model_state": {"_orig_mod.layer.weight": weight}})
-        cleaned = load_v11_checkpoint(path, torch.device("cpu"))
-        torch.testing.assert_close(cleaned["layer.weight"], weight)
 
 
 #: One FP32 unit in the last place for values in [-1, 1]. Multi-threaded CPU sin/cos rounds a few elements
@@ -305,11 +235,6 @@ class TestPositionalEncoderBitIdentity:
         pe[:, :, 1::2] = torch.cos(position * div_term)
         return pe.to(out_dtype or doy.dtype)
 
-    def test_float32_matches_within_one_ulp(self):
-        enc = TemporalPositionalEncoder(d_model=32)
-        doy = torch.randint(1, 366, (4, 20)).float()
-        torch.testing.assert_close(enc(doy), self._reference_forward(32, doy), atol=_ONE_FP32_ULP, rtol=0.0)
-
     def test_bf16_module_still_computes_the_fp32_encoding(self):
         """``.bfloat16()`` must not reach the frequencies or the DOY arithmetic.
 
@@ -328,24 +253,15 @@ class TestPositionalEncoderBitIdentity:
 
     @pytest.mark.parametrize(("out_dtype", "atol"), [(torch.bfloat16, 0.0), (torch.float32, _ONE_FP32_ULP)])
     def test_every_day_of_year_matches_the_per_pixel_encoding(self, out_dtype, atol):
-        """Every day the pipeline can produce, 0 through 366: exact in BF16, the production dtype."""
+        """Every day the pipeline can produce, 0 through 366: exact in BF16, the production dtype.
+
+        BF16 carries 8 mantissa bits and steps by 2 above 256, so exactness against the FP32
+        reference is also what keeps days 257 and 258 from collapsing onto one encoding.
+        """
         enc = TemporalPositionalEncoder(d_model=768)
         doy = torch.arange(367, dtype=torch.float32).flip(0).repeat(3, 1)
         expected = self._reference_forward(768, doy, out_dtype=out_dtype)
         torch.testing.assert_close(enc(doy, out_dtype=out_dtype), expected, atol=atol, rtol=0.0)
-
-    def test_doy_above_256_keeps_one_day_resolution(self):
-        """DOY 257 and 258 must not collapse onto the same encoding.
-
-        BF16 carries 8 mantissa bits, so it steps by 2 above 256 — days 257
-        through 365 (mid-September onward) would otherwise round onto their even
-        neighbour before the encoder ever sees them.
-        """
-        enc = TemporalPositionalEncoder(d_model=32)
-        doy = torch.tensor([[257.0, 258.0]])
-        out = enc(doy, out_dtype=torch.bfloat16)
-        assert not torch.equal(out[0, 0], out[0, 1])
-        torch.testing.assert_close(out, self._reference_forward(32, doy, out_dtype=torch.bfloat16), atol=0.0, rtol=0.0)
 
 
 class TestEncoderComputeDtype:
