@@ -132,7 +132,6 @@ dev = [
     # pre-1.0 and its diagnostics change between releases. Same version as yield-embeddings.
     "ty==0.0.92",
     "moto[server]",
-    "hypothesis",
     # Enforces the architecture contracts in .importlinter (`uv run lint-imports`).
     "import-linter",
     "vcrpy",
