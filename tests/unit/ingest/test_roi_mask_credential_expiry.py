@@ -15,7 +15,6 @@ the role is reachable only with the ``env`` provider removed.
 from __future__ import annotations
 
 import re
-import sys
 import threading
 import urllib.error
 import urllib.request
@@ -124,23 +123,22 @@ def role_only_s3(moto_server, monkeypatch, tmp_path):
     The role's credentials rotate and expire in seconds, so every resolution is visibly a
     different key: what a read presents says exactly when it resolved.
     """
-    issuer = tmp_path / "issue_role_credential.py"
-    # UNIQUE BY CONSTRUCTION, not by a counter file. This process can run concurrently —
-    # several dask threads reading blocks each ask for a credential — and a shared
-    # read-modify-write counter races: one invocation creates the file, another reads it
-    # empty and dies on `int('')`. A nanosecond clock needs no shared state and is still
-    # monotonic, which is all the rotation assertions want.
+    issuer = tmp_path / "issue_role_credential.sh"
+    # UNIQUE BY CONSTRUCTION, not by a counter file: several dask threads ask for a credential
+    # at once, and a shared read-modify-write counter races. Seconds plus this invocation's PID
+    # are unique across concurrent invocations, which is all the assertions need. A shell script,
+    # not Python: botocore refreshes a credential this close to expiry on every request, and an
+    # interpreter start per request made this file the suite's slowest for its size.
     issuer.write_text(
-        "import json, time\n"
-        "from datetime import UTC, datetime, timedelta\n"
-        "n = time.time_ns() % 10**12\n"
-        "print(json.dumps({'Version': 1, 'AccessKeyId': f'AKIAROLE{n:012d}',\n"
-        "                  'SecretAccessKey': 'role-secret', 'SessionToken': f'role-token-{n}',\n"
-        "                  'Expiration': (datetime.now(UTC) + timedelta(seconds=2))\n"
-        "                                .isoformat().replace('+00:00', 'Z')}))\n"
+        "#!/bin/sh\n"
+        "t=$(date +%s); n=$(( (t * 100000 + $$) % 1000000000000 )); e=$((t + 2))\n"
+        "exp=$(date -u -d \"@$e\" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r \"$e\" +%Y-%m-%dT%H:%M:%SZ)\n"
+        "printf '{\"Version\": 1, \"AccessKeyId\": \"AKIAROLE%012d\", \"SecretAccessKey\": \"role-secret\", "
+        "\"SessionToken\": \"role-token-%d\", \"Expiration\": \"%s\"}\\n' \"$n\" \"$n\" \"$exp\"\n"
     )
+    issuer.chmod(0o755)
     config = tmp_path / "aws-config"
-    config.write_text(f"[default]\ncredential_process = {sys.executable} {issuer}\n")
+    config.write_text(f"[default]\ncredential_process = {issuer}\n")
 
     # The moto server is module-scoped, so this runs against a bucket a sibling test may
     # already have made; both steps are written to be repeatable.

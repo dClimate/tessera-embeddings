@@ -12,6 +12,7 @@ and goes stale in the direction that loses data.
 
 from __future__ import annotations
 
+import functools
 from pathlib import Path
 
 import pytest
@@ -27,8 +28,11 @@ from tests._paths import SRC_ROOT
 _ROOT = SRC_ROOT
 
 
-def _covered() -> set[str]:
-    """Package-relative paths of every file the fingerprint hashes."""
+@functools.cache
+def _covered() -> frozenset[str]:
+    """Package-relative paths of every file the fingerprint hashes. Cached: walking the real
+    tree's import closure is the slowest thing in this file, and the tree does not change.
+    """
     seed: list[Path] = []
     for entry in _STAGED_OUTPUT_SOURCES:
         target = _ROOT / entry
@@ -36,7 +40,14 @@ def _covered() -> set[str]:
             seed.extend(p for p in target.rglob("*.py") if "__pycache__" not in p.parts)
         else:
             seed.append(target)
-    return {str(p.relative_to(_ROOT)) for p in first_party_import_closure(seed, _ROOT)}
+    return frozenset(str(p.relative_to(_ROOT)) for p in first_party_import_closure(seed, _ROOT))
+
+
+@functools.cache
+def _ingest_covered() -> frozenset[str]:
+    """The same for the mosaic (ingest) fingerprint."""
+    seed = [_ROOT / entry for entry in _MOSAIC_CONTENT_SOURCES]
+    return frozenset(p.relative_to(_ROOT).as_posix() for p in first_party_import_closure(seed, _ROOT))
 
 
 @pytest.mark.parametrize(
@@ -171,11 +182,7 @@ def test_the_closure_holds_only_files_that_really_exist(tmp_path: Path) -> None:
 
 def test_the_real_ingest_fingerprint_covers_the_collection_settings() -> None:
     """The case the miniature package stands in for, asserted on the tree that ships."""
-    from tessera_embeddings.config.ingest import _MOSAIC_CONTENT_SOURCES
-
-    seed = [_ROOT / entry for entry in _MOSAIC_CONTENT_SOURCES]
-    reached = {p.relative_to(_ROOT).as_posix() for p in first_party_import_closure(seed, _ROOT)}
-    assert "config/providers.py" in reached
+    assert "config/providers.py" in _ingest_covered()
 
 
 @pytest.mark.parametrize("module", ["storage/update.py", "ingest/land_mask.py", "config/paths.py"])
@@ -185,8 +192,4 @@ def test_targeted_updates_move_neither_fingerprint(module: str) -> None:
     Inside either closure, a change to them would abandon staged tiles or refuse appends to
     interrupted mosaics — so nothing in either closure may import them.
     """
-    ingest = {
-        p.relative_to(_ROOT).as_posix()
-        for p in first_party_import_closure([_ROOT / e for e in _MOSAIC_CONTENT_SOURCES], _ROOT)
-    }
-    assert module not in _covered() and module not in ingest
+    assert module not in _covered() and module not in _ingest_covered()

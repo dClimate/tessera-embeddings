@@ -12,6 +12,9 @@ Conventions:
   Prefect flows, the plain runner, and any future orchestrator.
 """
 
+import importlib
+from typing import TYPE_CHECKING
+
 from tessera_embeddings.config.assembly import AssemblyConfig
 from tessera_embeddings.config.inference import (
     EMBEDDING_DIM,
@@ -26,26 +29,29 @@ from tessera_embeddings.errors import (
     CorruptedStoreError,
     InsufficientCoverageError,
 )
-from tessera_embeddings.ingest.s1_roi import (
-    S1Orbit,
-    SarIngestResult,
-    ingest_s1_roi_sar,
-)
-from tessera_embeddings.ingest.s2_roi import (
-    IngestResult,
-    ingest_s2_roi_reflectance,
-)
+
+if TYPE_CHECKING:
+    from tessera_embeddings.config.inference import run_id_prefix
+    from tessera_embeddings.inference.runner import run_inference
+    from tessera_embeddings.ingest.s1_roi import S1Orbit, SarIngestResult, ingest_s1_roi_sar
+    from tessera_embeddings.ingest.s2_roi import IngestResult, ingest_s2_roi_reflectance
+
+# Loaded on first use, not at import. The ingest modules pull in xarray, rasterio and the STAC
+# stack (~0.7 s); every spawned worker imports this package, and most never ingest.
+_LAZY = {
+    "run_id_prefix": "tessera_embeddings.config.inference",
+    "run_inference": "tessera_embeddings.inference.runner",
+    "S1Orbit": "tessera_embeddings.ingest.s1_roi",
+    "SarIngestResult": "tessera_embeddings.ingest.s1_roi",
+    "ingest_s1_roi_sar": "tessera_embeddings.ingest.s1_roi",
+    "IngestResult": "tessera_embeddings.ingest.s2_roi",
+    "ingest_s2_roi_reflectance": "tessera_embeddings.ingest.s2_roi",
+}
 
 
 def __getattr__(name: str) -> object:
-    if name == "run_id_prefix":
-        from tessera_embeddings.config.inference import run_id_prefix
-
-        return run_id_prefix
-    if name == "run_inference":
-        from tessera_embeddings.inference.runner import run_inference
-
-        return run_inference
+    if name in _LAZY:
+        return getattr(importlib.import_module(_LAZY[name]), name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

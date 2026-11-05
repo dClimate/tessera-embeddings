@@ -100,6 +100,8 @@ def wired(monkeypatch):
     # Pinned AMI id (resolved once, threaded into every fill's provisioning) — mocked
     # so tests make no SSM call.
     monkeypatch.setattr(mod, "_resolve_ami_id", lambda *a, **k: "ami-test-id")
+    # Hashing the real import closure costs ~80 ms per dispatch; no test here is about its value.
+    monkeypatch.setattr(mod, "inference_code_identity", lambda: "infcode-FIXED")
     # Store reads for the staging fingerprint: each mosaic store's branch-tip snapshot
     # (the authoritative term) plus its provenance attrs.
     monkeypatch.setattr(

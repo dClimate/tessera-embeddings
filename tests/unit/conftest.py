@@ -52,7 +52,8 @@ class _InProcessForkPool(ThreadPoolExecutor):
     which re-imports the package (~0.8 s) on every assemble; see ADR 041. The worker function, its
     payload and its result still cross a pickle boundary, so each worker gets its own fork session
     and an unpicklable payload still fails. ``initializer`` is not run: it configures logging,
-    which a thread inherits and pytest's ``caplog`` owns."""
+    which a thread inherits and pytest's ``caplog`` owns.
+    """
 
     def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=()):
         super().__init__(max_workers=max_workers)

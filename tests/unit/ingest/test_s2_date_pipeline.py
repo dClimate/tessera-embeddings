@@ -880,3 +880,16 @@ def test_a_bound_that_is_not_a_date_is_refused(run_ingest, pipeline_dates, bad_e
             start_date="2018-01-01",
             end_date=bad_end,
         )
+
+
+def test_batch_dates_validation_rejects_bad_combinations(tmp_path) -> None:
+    """The refusals fire before any cluster or store work."""
+    kwargs = dict(
+        roi_zarr_path=str(tmp_path / "roi.zarr"),
+        start_date="2024-01-01",
+        end_date="2024-01-02",
+        store_path=str(tmp_path / "s"),
+        client=None,  # never reached: validation refuses first
+    )
+    with pytest.raises(ValueError, match="batch_dates must be >= 1"):
+        s2_roi.ingest_s2_roi_reflectance(**kwargs, batch_dates=0)

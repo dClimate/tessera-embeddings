@@ -216,6 +216,19 @@ def test_construction_reads_metadata_and_never_chunk_bytes(roi_on_s3, s3_chunks)
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(scope="module")
+def process_client():
+    """One single-worker PROCESS cluster for both storage-option forms; starting one costs ~3 s."""
+    distributed = pytest.importorskip("distributed")
+    with (
+        distributed.LocalCluster(
+            n_workers=1, threads_per_worker=1, processes=True, dashboard_address=None, silence_logs=50
+        ) as cluster,
+        distributed.Client(cluster) as client,
+    ):
+        yield client
+
+
 @pytest.mark.parametrize(
     "make_options",
     [
@@ -223,7 +236,7 @@ def test_construction_reads_metadata_and_never_chunk_bytes(roi_on_s3, s3_chunks)
         pytest.param(lambda opts: functools.partial(dict, **opts), id="provider-callable"),
     ],
 )
-def test_the_closure_survives_a_process_based_scheduler(roi_on_s3, s3_chunks, make_options) -> None:
+def test_the_closure_survives_a_process_based_scheduler(process_client, roi_on_s3, s3_chunks, make_options) -> None:
     """PROCESSES, not threads: the only scheduler that actually serializes the graph.
 
     The old graph shipped a zarr array holding a filesystem object. The new one ships a
@@ -235,17 +248,9 @@ def test_the_closure_survives_a_process_based_scheduler(roi_on_s3, s3_chunks, ma
     has to arrive on the worker still callable for the credential to be resolved there
     rather than here.
     """
-    distributed = pytest.importorskip("distributed")
     url, options, truth = roi_on_s3
-
-    with (
-        distributed.LocalCluster(
-            n_workers=2, threads_per_worker=1, processes=True, dashboard_address=None, silence_logs=50
-        ) as cluster,
-        distributed.Client(cluster) as client,
-    ):
-        mask = read_roi_mask(url, s3_chunks, make_options(dict(options)))
-        computed = client.compute(mask, sync=True)
+    mask = read_roi_mask(url, s3_chunks, make_options(dict(options)))
+    computed = process_client.compute(mask, sync=True)
 
     assert np.array_equal(computed, truth), "the mask read on a worker process differs from what was written"
 
