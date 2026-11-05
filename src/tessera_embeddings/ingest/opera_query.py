@@ -10,10 +10,12 @@ from __future__ import annotations
 import logging
 import re
 import time
+import warnings
 from collections import Counter
 from collections.abc import Callable
 from typing import Any, cast
 
+import mgrs
 import requests
 from pystac import Asset, Item
 from pystac.utils import str_to_datetime
@@ -79,6 +81,20 @@ def _cmr_session() -> requests.Session:
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     return session
+
+
+def mgrs_tile_to_bbox(tile_id: str) -> tuple[float, float, float, float]:
+    """WGS84 ``(west, south, east, north)`` of a 100 km MGRS tile (e.g. ``"33UUP"``).
+
+    No caller in this package: yield-embeddings' ``scripts/radar_source_sweep.py`` imports it.
+    """
+    m = mgrs.MGRS()
+    # Tile corners near band boundaries produce a harmless latitude warning.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Warning in.*Convert_MGRS_To_Geodetic")
+        sw_lat, sw_lon = m.toLatLon(f"{tile_id}0000000000")
+        ne_lat, ne_lon = m.toLatLon(f"{tile_id}9999999999")
+    return (sw_lon, sw_lat, ne_lon, ne_lat)
 
 
 def normalize_opera_timestamps(items: list[Any], *, mid_longitude: float | None = None) -> list[Any]:

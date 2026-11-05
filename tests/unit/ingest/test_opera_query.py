@@ -15,6 +15,7 @@ from tessera_embeddings.ingest.opera_query import (
     _granule_to_item,
     _query_cmr_granules,
     make_s1_item_provider,
+    mgrs_tile_to_bbox,
     normalize_opera_timestamps,
 )
 
@@ -351,3 +352,13 @@ class TestUnparseableGranulePage:
             _query_cmr_granules(self.BBOX, "2024-01-01", "2024-01-15", "ascending")
 
         assert mock_get.call_count == 1
+
+
+def test_mgrs_tile_to_bbox_covers_the_tile():
+    """Kept for yield-embeddings' radar source sweep, its only caller. 33UUP is in central
+    Europe; 55HBE is south of the equator.
+    """
+    west, south, east, north = mgrs_tile_to_bbox("33UUP")
+    assert 12.0 < west < 14.0 < east < 15.0
+    assert 47.0 < south < 49.0 < north < 50.0
+    assert mgrs_tile_to_bbox("55HBE")[1] < 0

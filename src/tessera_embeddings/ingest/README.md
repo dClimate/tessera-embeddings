@@ -301,7 +301,7 @@ Six things happen between a region and a written mosaic, and they are the order 
 
 S2 and Landsat are queried by tile ID property (e.g., `grid:code = T33UUP`), which returns
 only items for that specific MGRS tile. OPERA RTC-S1 on CMR-STAC lacks an equivalent
-property, so queries use the ROI's WGS84 bbox.
+property, so queries use the ROI's WGS84 bbox. (`mgrs_tile_to_bbox()` stays only for yield-embeddings' radar source sweep.)
 
 #### Cloud cover decides which scene wins a pixel
 
