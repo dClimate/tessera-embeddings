@@ -256,40 +256,6 @@ def test_the_closure_survives_a_process_based_scheduler(process_client, roi_on_s
 
 
 # ---------------------------------------------------------------------------
-# 4. Pin the fallback shut
-# ---------------------------------------------------------------------------
-
-
-def test_every_caller_of_apply_roi_mask_supplies_the_mask() -> None:
-    """``apply_roi_mask``'s fallback reads the mask with NO credentials at all.
-
-    ``mask_2d = roi_mask if roi_mask is not None else read_roi_mask(roi_zarr_path, spatial_chunks)``
-    — no ``storage_options``, so fsspec resolves the process environment, which on the
-    radar path holds the SOURCE's OPERA-scoped token. That read would be refused on our
-    own bucket. It is unreachable only because every production caller passes
-    ``roi_mask=``, which is a property of the call sites and nothing enforces it.
-
-    This test is the enforcement: a new caller that omits the mask fails here rather
-    than in a leg.
-    """
-    offenders = []
-    for module in sorted(_SRC.rglob("*.py")):
-        for node in ast.walk(ast.parse(module.read_text())):
-            if not isinstance(node, ast.Call):
-                continue
-            name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
-            if name != "apply_roi_mask":
-                continue
-            if not any(keyword.arg == "roi_mask" for keyword in node.keywords):
-                offenders.append(f"{module.relative_to(_SRC)}:{node.lineno}")
-    assert not offenders, (
-        "apply_roi_mask called without roi_mask= at "
-        f"{offenders} — that path reads the mask with no storage_options, resolving the "
-        "environment. Pass the mask, or give the fallback a storage_options parameter."
-    )
-
-
-# ---------------------------------------------------------------------------
 # 5. Both sensors (source-level half; the behavioural half is in the expiry file)
 # ---------------------------------------------------------------------------
 

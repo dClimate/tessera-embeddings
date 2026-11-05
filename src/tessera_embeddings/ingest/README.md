@@ -151,16 +151,8 @@ Ingestion flows call:
 ### Applying the ROI Mask
 
 `roi_processing.apply_roi_mask` broadcasts the 2D mask over the time dimension and sets
-out-of-ROI pixels to `fill_value` (default 0) across all dataset variables.
-
-`roi_processing.filter_low_coverage_dates` then drops time steps where fewer than
-`min_valid_coverage` percent of ROI pixels are valid (default 5%). Only the per-date valid pixel
-counts are computed eagerly — one scalar per time step, from SCL for S2 or VV for S1 — so band
-arrays remain lazy and cloud-covered or off-ROI scenes are dropped before any band data is read.
-
-`identify_low_coverage_ds` is the lazy alternative: instead of dropping dates it attaches a
-`valid_coverage` boolean coordinate. Evaluating it still reads the quality band over the whole
-ROI — it defers that read and skips the imagery bands, rather than answering from metadata.
+out-of-ROI pixels to 0 across all dataset variables. The caller reads the mask once, with its
+credentials, and passes it in; the function never reads the store itself.
 
 ### Zone ingestion (the global campaign) — ADR-011
 

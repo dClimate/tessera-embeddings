@@ -132,9 +132,9 @@ def role_only_s3(moto_server, monkeypatch, tmp_path):
     issuer.write_text(
         "#!/bin/sh\n"
         "t=$(date +%s); n=$(( (t * 100000 + $$) % 1000000000000 )); e=$((t + 2))\n"
-        "exp=$(date -u -d \"@$e\" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r \"$e\" +%Y-%m-%dT%H:%M:%SZ)\n"
-        "printf '{\"Version\": 1, \"AccessKeyId\": \"AKIAROLE%012d\", \"SecretAccessKey\": \"role-secret\", "
-        "\"SessionToken\": \"role-token-%d\", \"Expiration\": \"%s\"}\\n' \"$n\" \"$n\" \"$exp\"\n"
+        'exp=$(date -u -d "@$e" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r "$e" +%Y-%m-%dT%H:%M:%SZ)\n'
+        'printf \'{"Version": 1, "AccessKeyId": "AKIAROLE%012d", "SecretAccessKey": "role-secret", '
+        '"SessionToken": "role-token-%d", "Expiration": "%s"}\\n\' "$n" "$n" "$exp"\n'
     )
     issuer.chmod(0o755)
     config = tmp_path / "aws-config"
@@ -279,7 +279,7 @@ def test_the_radar_masking_step_survives_a_credential_that_expired_after_graph_b
         {"band": (("time", "northing", "easting"), da.full((1, 8, 8), 7, dtype=np.uint16, chunks=(1, 4, 4)))},
         coords={"time": np.array([np.datetime64("2024-06-01", "ns")])},
     )
-    masked = apply_roi_mask(day, "s3://test-bucket/roi.zarr", {"northing": 4, "easting": 4}, roi_mask=mask)
+    masked = apply_roi_mask(day, mask)
 
     _expire_everything_resolved_so_far(door)
     assert int(masked["band"].sum().compute()) == 7 * 64, "the mask read returned the wrong pixels"
