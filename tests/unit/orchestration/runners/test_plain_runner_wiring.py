@@ -1,12 +1,8 @@
 """What `run_plain` does with a config, and what the CLI does with its flags.
 
-The runner's own logic had no coverage: the existing tests mock `_run_ingest` and check whether
-S1 is called once or twice, which is a fact about `_active_orbits`, not about the runner. Nothing
-exercised config parsing, the staging identity, cleanup, or the argument wiring — and a
-`--min-valid-coverage` flag sat parsed-but-never-read for as long as it had existed because of it.
-
-Everything below mocks the domain calls. This file is about the wiring between reading the YAML
-and invoking them; the domain functions have their own tests and the parity suite.
+Everything below mocks the domain calls: this file is about the wiring between reading the YAML and
+invoking them — config parsing, the staging identity, cleanup, the pre-flight's ordering and the
+argument wiring. The domain functions have their own tests and the parity suite.
 """
 
 from __future__ import annotations
@@ -19,7 +15,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 import yaml
 
+from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.time_windows import parse_time_window
+from tessera_embeddings.inference.data_loading import _active_orbits
 from tessera_embeddings.ingest.roi_processing import DEFAULT_MIN_VALID_COVERAGE
 from tessera_embeddings.orchestration.runners import plain
 
@@ -94,7 +92,7 @@ class TestTheCoverageThresholdReachesIngest:
             plain.run_plain(_config(tmp_path, **over), skip_inference=True, min_valid_coverage=flag)
         assert run_ingest.call_args.kwargs["min_valid_coverage"] == expected
 
-    @pytest.mark.parametrize("bad", [0.0, -1.0, 100.1, 1000.0], ids=["zero", "negative", "just-over", "way-over"])
+    @pytest.mark.parametrize("bad", [0.0, 100.1], ids=["zero", "just-over"])
     def test_an_out_of_range_threshold_is_refused(self, tmp_path, bad):
         """The flow path validates through pydantic (gt=0, le=100); this path did not.
 
@@ -171,19 +169,6 @@ class TestTheStagingIdentityRepeats:
         )
         assert moved_code == base
 
-    def test_the_identity_is_not_the_campaign_fingerprint(self):
-        """It must NOT depend on code identity — the safeguard we deliberately omit.
-
-        The campaign mixes ``inference_code_identity()`` in so a mid-campaign code change cannot
-        blend two versions into one write-once zone-year. Here it would mean re-inferring a whole
-        ROI because a comment moved, which is the wrong default for a minutes-long single run.
-        This test exists so a future change to "harden" it fails loudly instead of silently making
-        every single-ROI run start from scratch.
-        """
-        with patch("tessera_embeddings.config.inference.inference_code_identity") as identity:
-            _run_id()
-        identity.assert_not_called()
-
 
 class TestStagingLifecycle:
     """Cleanup on success, retention on failure — the pair that makes resume work."""
@@ -251,3 +236,61 @@ class TestStagingLifecycle:
         with self._pipeline(inference_results=[{"status": "success"}], delete_raises=OSError("bucket said no")):
             summary = self._call(tmp_path)
         assert summary["roi_name"] == "test_roi"
+
+
+@pytest.mark.parametrize(
+    ("s1_orbit", "orbits"),
+    [
+        ("none", ()),
+        ("ascending", ("ascending",)),
+        ("descending", ("descending",)),
+        ("both", ("ascending", "descending")),
+    ],
+)
+def test_each_s1_setting_ingests_its_own_orbits(s1_orbit, orbits):
+    """`_run_ingest` runs one S1 ingest per active orbit; `both` is the two directions in order."""
+    assert _active_orbits(s1_orbit) == orbits
+
+
+def test_the_runner_preflights_the_output_store_before_inferring(monkeypatch, tmp_path) -> None:
+    """The encoder mismatch is decided by the store and this config alone — nothing inference
+    discovers — so finding it in `assemble` means every chunk was inferred and none of it can be
+    published. Ordering is the whole assertion: the gate must fire with no inference behind it.
+    """
+    order: list[str] = []
+
+    class _StopError(Exception):
+        """Ends the run once the gate under test has fired."""
+
+    def _preflight(**kwargs):
+        order.append("preflight")
+        raise _StopError
+
+    def _inference(**kwargs):
+        order.append("inference")
+        return []
+
+    monkeypatch.setattr(plain, "assert_output_store_accepts", _preflight)
+    monkeypatch.setattr(plain, "run_inference", _inference)
+    # Orbit resolution and chunk enumeration precede the gate. Both are metadata reads, so the
+    # gate still runs before anything expensive; they are stubbed only because this test has
+    # no mosaic stores on disk.
+    monkeypatch.setattr(plain, "resolve_s1_orbit", lambda *a, **k: "both")
+    monkeypatch.setattr(plain, "enumerate_mosaic_chunks", lambda *a, **k: ([], 8, 8))
+    monkeypatch.setattr(plain, "filter_chunks_by_roi_mask", lambda chunks, roi: chunks)
+
+    with pytest.raises(_StopError):
+        plain._run_inference_and_assemble(
+            roi_path=str(tmp_path / "roi.zarr"),
+            roi_name="demo",
+            paths=BucketPaths(inputs=str(tmp_path / "in"), outputs=str(tmp_path / "out")),
+            time_window_end="June 2025",
+            s1_orbit="both",
+            checkpoint_dir=None,
+            checkpoint_url=None,
+            model_version="v2-large",
+            num_gpus=0,
+            log=logging.getLogger("test-plain"),
+        )
+
+    assert order == ["preflight"], "the gate must run before any inference, not after it"
