@@ -13,11 +13,13 @@ below with the launch/teardown helpers stubbed out.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import patch
 
@@ -84,10 +86,42 @@ def _seed_ssm_and_vpc() -> tuple[str, list[str], str]:
     return ami_param, subnet_ids, key_pair_id
 
 
-@mock_aws
-def test_resolve_ray_config_writes_a_complete_yaml(tmp_path: Path) -> None:
+Seed = tuple[str, list[str], str]
+
+
+@pytest.fixture(scope="module")
+def _seed_cache() -> Iterator[dict[str, Seed]]:
+    cache: dict[str, Seed] = {}
+    yield cache
+    with mock_aws():  # leave moto's backends empty for the next module
+        pass
+
+
+@pytest.fixture
+def seeded(_seed_cache: dict[str, Seed]) -> Iterator[Seed]:
+    """A mocked AWS holding the SSM + VPC seed, built once per worker rather than per test.
+
+    moto's ``create_vpc`` costs ~0.3 s, so the backends are kept between seeded tests
+    (``stop(remove_data=False)``). A ``@mock_aws`` test in between resets them, so the
+    seed is rebuilt whenever its AMI parameter has gone. The one key tests add, the GPU
+    worker ladder, is removed after each.
+    """
+    mock = mock_aws()
+    mock.start(reset=False)
+    ssm = boto3.client("ssm", region_name=REGION)
+    try:
+        seed = _seed_cache.get("seed")
+        if seed is None or not ssm.get_parameters(Names=[seed[0]])["Parameters"]:
+            seed = _seed_cache["seed"] = _seed_ssm_and_vpc()
+        yield seed
+    finally:
+        ssm.delete_parameters(Names=[f"{SSM_PREFIX}{GPU_WORKER_LADDER_SSM_KEY}"])
+        mock.stop(remove_data=False)
+
+
+def test_resolve_ray_config_writes_a_complete_yaml(tmp_path: Path, seeded: Seed) -> None:
     """End-to-end: SSM + EC2 are consulted and the resolved YAML has injected fields."""
-    ami_param, subnet_ids, _ = _seed_ssm_and_vpc()
+    ami_param, subnet_ids, _ = seeded
 
     resolved = _resolve_ray_config(
         DEFAULT_CLUSTER_TEMPLATE,
@@ -145,16 +179,16 @@ def test_resolve_ray_config_writes_a_complete_yaml(tmp_path: Path) -> None:
         cleanup_ray_tempfiles(resolved)
 
 
-@mock_aws
 @pytest.mark.parametrize("pinned", [None, "s3://my-code-bucket/ray-env-images/env-pinned.img"])
-def test_resolve_ray_config_substitutes_the_code_bucket_when_given(pinned: str | None) -> None:
+def test_resolve_ray_config_substitutes_the_code_bucket_when_given(pinned: str | None, seeded: Seed) -> None:
     """With a bucket, the tarball fetch survives fully substituted, and the environment image's
     URI is written into the setup command: the pinned one when given, else the pointer's,
     read here once so no node reads the pointer itself.
     """
-    ami_param, _, _ = _seed_ssm_and_vpc()
+    ami_param, _, _ = seeded
     s3 = boto3.client("s3", region_name=REGION)
-    s3.create_bucket(Bucket="my-code-bucket", CreateBucketConfiguration={"LocationConstraint": REGION})
+    with contextlib.suppress(s3.exceptions.BucketAlreadyOwnedByYou):  # the seed outlives one test
+        s3.create_bucket(Bucket="my-code-bucket", CreateBucketConfiguration={"LocationConstraint": REGION})
     pointed = "s3://my-code-bucket/ray-env-images/env-pointed.img"
     s3.put_object(Bucket="my-code-bucket", Key="code/env-image-mybranch.uri", Body=pointed.encode())
 
@@ -177,14 +211,13 @@ def test_resolve_ray_config_substitutes_the_code_bucket_when_given(pinned: str |
         cleanup_ray_tempfiles(resolved)
 
 
-@mock_aws
-def test_resolve_ray_config_stamps_project_tag_by_default(tmp_path: Path) -> None:
+def test_resolve_ray_config_stamps_project_tag_by_default(tmp_path: Path, seeded: Seed) -> None:
     """With no instance_tags, every node still gets the Project tag.
 
     The runner IAM role conditions ec2:TerminateInstances on this tag, so a
     missing Project tag makes teardown terminates IAM-denied (instances leak).
     """
-    ami_param, _, _ = _seed_ssm_and_vpc()
+    ami_param, _, _ = seeded
 
     resolved = _resolve_ray_config(
         DEFAULT_CLUSTER_TEMPLATE,
@@ -204,10 +237,9 @@ def test_resolve_ray_config_stamps_project_tag_by_default(tmp_path: Path) -> Non
         cleanup_ray_tempfiles(resolved)
 
 
-@mock_aws
-def test_resolve_ray_config_merges_project_tag_with_extra_tags(tmp_path: Path) -> None:
+def test_resolve_ray_config_merges_project_tag_with_extra_tags(tmp_path: Path, seeded: Seed) -> None:
     """Extra tags coexist with the always-present Project tag."""
-    ami_param, _, _ = _seed_ssm_and_vpc()
+    ami_param, _, _ = seeded
 
     resolved = _resolve_ray_config(
         DEFAULT_CLUSTER_TEMPLATE,
@@ -331,12 +363,11 @@ def test_resolve_code_artifact_identity_uses_pinned_ami_id() -> None:
     assert identity == "ami=ami-pinned-99"
 
 
-@mock_aws
-def test_resolve_ray_config_pins_ami_id_over_ssm(tmp_path: Path) -> None:
+def test_resolve_ray_config_pins_ami_id_over_ssm(tmp_path: Path, seeded: Seed) -> None:
     """When ami_id is given, the cluster boots THAT image, not whatever the SSM
     pointer currently holds — a mid-campaign re-bake can't change the booted image.
     """
-    ami_param, _, _ = _seed_ssm_and_vpc()  # SSM ami-id = ami-0123456789abcdef0
+    ami_param, _, _ = seeded  # SSM ami-id = ami-0123456789abcdef0
     resolved = _resolve_ray_config(
         DEFAULT_CLUSTER_TEMPLATE,
         region=REGION,
@@ -508,15 +539,14 @@ def test_cleanup_ray_tempfiles_removes_yaml_and_ssh_key(tmp_path: Path) -> None:
     assert not ssh_key.exists()
 
 
-@mock_aws
-def test_resolve_ray_config_idle_timeout_override(tmp_path: Path) -> None:
+def test_resolve_ray_config_idle_timeout_override(tmp_path: Path, seeded: Seed) -> None:
     """idle_timeout_minutes overrides the template value; None keeps it.
 
     The template's 2-minute default suits per-cell fills; a multi-zone
     sequential fill holds one cluster across zones and must survive the
     inter-zone seam, so it passes a larger value through ray_cluster.
     """
-    ami_param, _, _ = _seed_ssm_and_vpc()
+    ami_param, _, _ = seeded
     template_default = yaml.safe_load(DEFAULT_CLUSTER_TEMPLATE.read_text())["idle_timeout_minutes"]
 
     kept = _resolve_ray_config(DEFAULT_CLUSTER_TEMPLATE, region=REGION, ami_ssm_name=ami_param, ssm_prefix=SSM_PREFIX)
@@ -566,14 +596,13 @@ def _head_ray_start(resolved: str) -> str:
     return next(cmd for cmd in commands if "ray start" in str(cmd))
 
 
-@mock_aws
-def test_launch_pacing_is_off_by_default() -> None:
+def test_launch_pacing_is_off_by_default(seeded: Seed) -> None:
     """Default resolution must carry no trace of pacing.
 
     The campaign this ships into is already running, so a release that changed how a
     fleet grows would change it without anyone having decided to.
     """
-    ami_param, _, _ = _seed_ssm_and_vpc()
+    ami_param, _, _ = seeded
     resolved = _resolve_ray_config(
         DEFAULT_CLUSTER_TEMPLATE, region=REGION, ami_ssm_name=ami_param, ssm_prefix=SSM_PREFIX
     )
@@ -585,15 +614,14 @@ def test_launch_pacing_is_off_by_default() -> None:
         cleanup_ray_tempfiles(resolved)
 
 
-@mock_aws
-def test_launch_pacing_assigns_the_env_on_the_heads_ray_start() -> None:
+def test_launch_pacing_assigns_the_env_on_the_heads_ray_start(seeded: Seed) -> None:
     """Every name has to land on the command that starts Ray, not beside it.
 
     Ray runs each start command as its own shell over SSH, so an assignment on any
     other entry reaches nothing — and the autoscaler that issues the launch requests
     is a child of this process, which is how the setting reaches it at all.
     """
-    ami_param, _, _ = _seed_ssm_and_vpc()
+    ami_param, _, _ = seeded
     resolved = _resolve_ray_config(
         DEFAULT_CLUSTER_TEMPLATE,
         region=REGION,
@@ -987,10 +1015,9 @@ class TestGpuWorkerLadderApplication:
             _apply_gpu_worker_ladder(cfg, "g6e.xlarge:16")
 
 
-@mock_aws
-def test_resolve_ray_config_reads_the_ladder_from_ssm() -> None:
+def test_resolve_ray_config_reads_the_ladder_from_ssm(seeded: Seed) -> None:
     """The release mechanism end-to-end: one SSM key, no code change, no re-registration."""
-    ami_param, _, _ = _seed_ssm_and_vpc()
+    ami_param, _, _ = seeded
     boto3.client("ssm", region_name=REGION).put_parameter(
         Name=f"{SSM_PREFIX}{GPU_WORKER_LADDER_SSM_KEY}",
         Value="g6e.xlarge:16,g5.2xlarge:4",
@@ -1011,10 +1038,9 @@ def test_resolve_ray_config_reads_the_ladder_from_ssm() -> None:
     cleanup_ray_tempfiles(resolved)
 
 
-@mock_aws
-def test_resolve_ray_config_without_the_ladder_key_keeps_the_templates_node_types() -> None:
+def test_resolve_ray_config_without_the_ladder_key_keeps_the_templates_node_types(seeded: Seed) -> None:
     """No key is the default, and the default must be today's behaviour exactly."""
-    ami_param, _, _ = _seed_ssm_and_vpc()
+    ami_param, _, _ = seeded
     resolved = _resolve_ray_config(
         DEFAULT_CLUSTER_TEMPLATE, region=REGION, ami_ssm_name=ami_param, ssm_prefix=SSM_PREFIX
     )
@@ -1030,10 +1056,9 @@ def test_resolve_ray_config_without_the_ladder_key_keeps_the_templates_node_type
     cleanup_ray_tempfiles(resolved)
 
 
-@mock_aws
-def test_resolve_ray_config_refuses_a_malformed_ladder_before_writing_anything() -> None:
+def test_resolve_ray_config_refuses_a_malformed_ladder_before_writing_anything(seeded: Seed) -> None:
     """A bad parameter fails the launch loudly, rather than growing the wrong fleet."""
-    ami_param, _, _ = _seed_ssm_and_vpc()
+    ami_param, _, _ = seeded
     boto3.client("ssm", region_name=REGION).put_parameter(
         Name=f"{SSM_PREFIX}{GPU_WORKER_LADDER_SSM_KEY}", Value="g6e.xlarge=16", Type="String"
     )
