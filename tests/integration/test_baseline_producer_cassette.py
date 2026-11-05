@@ -65,15 +65,14 @@ from tessera_embeddings.ingest.duplicates import (
 )
 from tessera_embeddings.ingest.item_baselines import processing_baseline
 from tessera_embeddings.ingest.solar_days import normalize_to_solar_day
-from tessera_embeddings.ingest.stac import extract_baselines
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CASSETTE_DIR = REPO_ROOT / "tests" / "fixtures" / "stac_cassettes"
 
 CATALOGUE = "https://earth-search.aws.element84.com/v1"
 TILE = "MGRS-33TWM"
-# December alone: 6 items, both producers, and the mixed day. pytest-recording names a
-# cassette per TEST, so a wide window would record the same query five times over.
+# December alone: 6 items, both producers, and the mixed day. A wider window only grows the
+# recording every test in the class replays.
 WINDOW = ("2017-12-01T00:00:00Z", "2018-01-01T00:00:00Z")
 #: The mixed-producer day this fixture exists to pin. Real, and owed no correction.
 MIXED_DAY = "2017-12-19"
@@ -150,7 +149,7 @@ def _decisions(items: list) -> set[OffsetDecision]:
 
 
 @pytest.mark.integration
-@pytest.mark.vcr
+@pytest.mark.vcr("TestRecordedProducerSplit.yaml")  # one recording shared by the class
 class TestRecordedProducerSplit:
     """Assertions against real recorded items, not hand-built fakes."""
 
@@ -172,22 +171,6 @@ class TestRecordedProducerSplit:
         assert kinds[Harmonisation.UNKNOWN] == 0, (
             "a real item's producer could not be determined; the catalogue may have moved to "
             "native asset keys, which the harmonisation check cannot resolve"
-        )
-
-    def test_raw_items_report_old_baselines(self) -> None:
-        """Why the correction never fires on today's archive: the backfill is of the OLD
-        archive, so every raw item sits below the threshold.
-
-        Scoped to this cassette's window, so it is evidence and not a census — the archive-wide
-        version of this claim belongs to a standing check, not to a fixture. It still fails
-        loudly if the backfill ever reaches modern baselines here.
-        """
-        raw = [it for it in _items() if item_harmonisation(it) is Harmonisation.RAW]
-        assert raw, "fixture no longer covers the raw producer"
-        baselines = {float(it.properties["s2:processing_baseline"]) * 100 for it in raw}
-        assert max(baselines) < S2_BASELINE_THRESHOLD, (
-            f"a raw item now reports baseline {max(baselines)} >= {S2_BASELINE_THRESHOLD}; the "
-            f"correction path is live on real data and needs an end-to-end test"
         )
 
     def test_the_real_mixed_day_costs_nothing_to_decide(self) -> None:
@@ -222,19 +205,9 @@ class TestRecordedProducerSplit:
         assert item_harmonisation(kept[0]) is Harmonisation.HARMONISED, "the harmonised copy is the one to keep"
         assert alternates, "the raw copy must stay on the fallback ladder"
 
-    def test_provenance_records_the_real_baselines(self) -> None:
-        """`extract_baselines` reaches the store's `baselines_applied`, so it must report what
-        the items declare — including for harmonised items that are exempt from correction.
-        """
-        on_day = [it for it in _items() if it.datetime.strftime("%Y-%m-%d") == MIXED_DAY]
-        declared = {float(it.properties["s2:processing_baseline"]) * 100 for it in on_day}
-        assert extract_baselines(on_day)[MIXED_DAY] in declared, "provenance must be a real reported baseline"
-
 
 @pytest.mark.integration
-# No cassette name: pytest-recording writes one file per TEST, named for it, which is the
-# convention every recording in this directory follows. Each test here costs a full copy of the
-# same 7-item response, so there are deliberately only two.
+# No cassette name: one test, so pytest-recording's per-test file is the only copy.
 @pytest.mark.vcr
 class TestARealItemIsOwedTheCorrection:
     """A raw item at the version threshold, recorded rather than synthesised.

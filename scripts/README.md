@@ -24,7 +24,7 @@ Produces artifacts the campaign depends on.
 | script | what it does |
 |---|---|
 | `build_landmask_coverage.py` | Builds, verifies and validates the campaign land-mask coverage store from the partner TIFF delivery ([ADR 010](../context_docs/decisions/010-landmask-registry-coverage.md)). The mask is the campaign's work list. |
-| `record_stac_cassettes.py` | Re-records the VCR cassettes the integration and parity tests replay. Hits the STAC endpoints only, never COG bodies. Needs Earthdata credentials. |
+| `record_stac_cassettes.py` | Re-records the VCR cassette the S2 parity test replays. Hits the STAC endpoint only, never COG bodies. |
 
 ## `maintenance/` — supported tooling that MUTATES something already in service
 
