@@ -134,7 +134,31 @@ class TestTheMarker:
 
 
 class TestTheSummary:
-    """Folding the records into the year's provenance."""
+    """Folding the records into the year's provenance.
+
+    A skipped tile publishes as fill, and so does ocean, so without this summary a consumer of a
+    completed year cannot tell "no valid optical data" from "not land".
+    """
+
+    def test_the_count_and_the_labels_are_both_recorded(self) -> None:
+        """A count answers how much was lost; only the labels answer where, and without
+        where a consumer can neither mask the area nor tell it from ocean.
+        """
+        summary = summarise_optical_skips(staged=["chunk_0_0"], skipped=["chunk_1_0", "chunk_0_1"])
+        assert summary["tiles_skipped"] == 2
+        assert summary["labels"] == ["chunk_0_1", "chunk_1_0"]
+        # Self-describing: a reader interprets the count without fetching the land mask.
+        assert summary["tiles_live"] == 3
+
+    def test_the_labels_are_sorted_so_two_runs_of_one_cell_compare(self) -> None:
+        """Listing order is backend-dependent; a stable order is what makes the field
+        diffable across two fills of the same cell.
+        """
+        assert summarise_optical_skips(staged=[], skipped=["chunk_1_0", "chunk_0_1", "chunk_0_0"])["labels"] == [
+            "chunk_0_0",
+            "chunk_0_1",
+            "chunk_1_0",
+        ]
 
     def test_a_thin_refusal_is_distinguishable_from_land_never_imaged(self) -> None:
         """THE POINT OF THE REGISTRY. Both shards hold no data; only the record separates them."""
