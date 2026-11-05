@@ -225,8 +225,8 @@ Decided; the executor does not re-ask.
 
 - `tests/README.md`: new counts and timings (replace "3,675 tests in about 23 s"), the
   `real_fork_pool` marker, the moved tests, the merged files, the "tests reach one layer" and "no
-  source-text tests" rules from §3. Three links to the deleted `context_docs/test-suite-streamlining.md`
-  (tests/README.md ×2, context_docs/README.md ×1) now point at this directory; keep them pointing here.
+  source-text tests" rules from §3. Links to the deleted `context_docs/test-suite-streamlining.md` now point at this directory
+  (tests/README.md Roadmap, context_docs/README.md tree); two other citations of it were dropped.
 - New ADR `041-unit-tests-run-the-forked-writer-in-threads.md`: the spawn pool is production
   behaviour; unit tests exercise it through an in-process pool with a pickled payload, and three
   tests opt out to cover the real pool. Why: §2a.
