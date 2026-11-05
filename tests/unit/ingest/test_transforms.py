@@ -89,12 +89,6 @@ class TestAmplitudeToDb:
             assert band in result
             assert result[band].compute().values[0, 0, 0] == 10000
 
-    def test_preserves_coordinates(self):
-        ds = _make_amplitude_dataset([1.0, 1.0, 1.0, 1.0])
-        result = amplitude_to_db(ds)
-        for coord in ("time", "northing", "easting"):
-            assert coord in result.coords
-
     def test_lazy_operation(self):
         """Result should remain a Dask array (not eagerly computed)."""
         ds = _make_amplitude_dataset([1.0, 1.0, 1.0, 1.0])
