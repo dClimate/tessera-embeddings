@@ -16,10 +16,12 @@ from tessera_embeddings.config.inference import (
     ModelVersion,
     _normalize_obs_checkpoints,
     ami_ssm_name_for_model,
+    assert_run_id_matches_model,
     band_stats,
     batch_size_for_gpu,
     checkpoint_filename,
     prefetch_depth,
+    run_id_prefix,
 )
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.sampling import _CACHED_RESAMPLERS
@@ -365,3 +367,42 @@ class TestBatchSizeForGpu:
     def test_a_small_configured_batch_is_never_raised(self) -> None:
         """The request is a ceiling: a small batch (a tiny test model) was asked for on purpose."""
         assert batch_size_for_gpu(64, A10G_TOTAL_GIB) == 64
+
+
+# ── assert_run_id_matches_model: the encoder recorded in a run_id, checked at every boundary ──
+#
+# ``inference.runner`` is a documented public entry point, so the flow's ``_resolve_run_id`` is
+# not the only door: a caller arriving with a v2 staging id and a v1.1 config would otherwise
+# reuse those chunks and publish a mix stamped with one encoder.
+
+_V2 = run_id_prefix("v2-large")
+
+
+@pytest.mark.parametrize(
+    ("run_id", "model"),
+    [(f"{_V2}abc123", "v1.1"), ("abc123def456", "v2-large"), (f"{_V2}s2only-abc123", "v1.1")],
+    ids=["v2-id-as-v11", "bare-id-as-v2", "composed-prefix-as-v11"],
+)
+def test_a_run_id_from_the_other_encoder_is_refused(run_id: str, model: str) -> None:
+    """The prefixes compose (``v2-s2only-…``), so the encoder marker is only the FRONT of it."""
+    with pytest.raises(ValueError, match="came from the other encoder"):
+        assert_run_id_matches_model(run_id, model)
+
+
+@pytest.mark.parametrize(
+    ("run_id", "model"),
+    [(f"{_V2}abc123", "v2-large"), (f"{_V2}s2only-abc123", "v2-large"), ("abc123def456", "v1.1"), (None, "v2-large")],
+)
+def test_a_matching_run_id_and_a_fresh_run_both_pass(run_id: str | None, model: str) -> None:
+    assert_run_id_matches_model(run_id, model)
+
+
+@pytest.mark.parametrize("model", ["v1.1", "v2-large"])
+@pytest.mark.parametrize("empty", ["", "   ", "\t"])
+def test_an_empty_run_id_is_refused_rather_than_read_as_absent(empty: str, model: str) -> None:
+    """An empty id still names a staging prefix: ``staging_base//<label>.zarr``, one prefix shared
+    by every run that passes it, whichever model. A v2 run staging there and a later v1.1 run
+    resuming over it publishes v2 pixels stamped v1.1. ``None`` (nothing staged yet) still passes.
+    """
+    with pytest.raises(ValueError, match="is empty"):
+        assert_run_id_matches_model(empty, model)

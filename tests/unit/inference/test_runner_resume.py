@@ -1,4 +1,4 @@
-"""Resuming a zone must report what the previous attempt actually did.
+"""Resuming a zone: the run_id it resumes under, and what the previous attempt actually did.
 
 `run_inference` skips tiles a prior attempt already staged. Two different artifacts mean
 "do not re-infer": a staged Zarr, which produced pixels, and a skip marker, which recorded
@@ -12,7 +12,11 @@ same zone's tally on a fresh run can suppress the radar-coverage summary entirel
 
 from __future__ import annotations
 
-from tessera_embeddings.inference.runner import _resumed_result
+import logging
+
+import pytest
+
+from tessera_embeddings.inference.runner import _resumed_result, run_inference
 
 
 def test_a_restored_skip_reports_as_skipped():
@@ -37,3 +41,20 @@ def test_both_are_marked_resumed_and_carry_no_invented_counters():
         assert r["valid_pixels"] == 0
         assert r["elapsed_sec"] == 0.0
         assert r["chunk"] == "32601/2025/r1_c0"
+
+
+def test_the_public_runner_refuses_an_empty_run_id(inference_config) -> None:
+    """An empty id is a broken staging namespace for v1.1 as much as for v2, so the refusal talks
+    about staging rather than encoders, and lands before Ray is touched.
+    """
+    with pytest.raises(ValueError, match="namespaces the staging prefix"):
+        run_inference(
+            num_actors=1,
+            config=inference_config,
+            chunks=[],
+            mosaic_base="s3://bucket/mosaics",
+            staging_base="s3://bucket/staging",
+            run_id="",
+            t0=0.0,
+            log=logging.getLogger("test"),
+        )
