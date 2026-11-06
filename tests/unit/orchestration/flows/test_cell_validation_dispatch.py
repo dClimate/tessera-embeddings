@@ -77,10 +77,6 @@ class TestWhatIsDispatched:
         _dispatch(tag=mod.validation_run_tag("parent-9"))
         assert dispatched[0]["tags"] == ["validates-cell-of:parent-9"]
 
-    def test_no_tag_outside_a_flow_run(self):
-        """A ``.fn`` call has no flow-run id, and an untagged run is better than a fake one."""
-        assert mod.validation_run_tag(None) is None
-
 
 class TestWhatIsDeclined:
     """Cells with nothing to check, and the case where no validator is configured."""

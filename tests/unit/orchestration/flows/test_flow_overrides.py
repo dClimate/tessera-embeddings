@@ -16,27 +16,16 @@ from __future__ import annotations
 from tessera_embeddings.orchestration.prefect.flows._overrides import set_overrides
 
 
-def test_an_unset_parameter_is_omitted() -> None:
-    """So the child's own registered default decides, rather than being overridden."""
-    assert set_overrides(a=None) == {}
-    assert set_overrides(a=None, b=None) == {}
-
-
-def test_zero_is_a_choice_and_survives() -> None:
-    """The defect this module exists for: 0 is a documented mode, not an absence.
-
-    ``actor_request_batch_size=0`` selects the all-at-once mode. A truthiness guard drops
-    it and leaves the child on its default of 50 — the caller's explicit instruction
-    silently replaced by its opposite, with nothing logged.
-    """
-    assert set_overrides(actor_request_batch_size=0) == {"actor_request_batch_size": 0}
-
-
 def test_the_other_falsy_values_are_choices_too() -> None:
     """False and the empty string are values a caller can mean; only None is an absence."""
     assert set_overrides(flag=False, name="") == {"flag": False, "name": ""}
 
 
 def test_set_and_unset_parameters_are_separated_in_one_call() -> None:
-    """The mixed case is the real one — a caller sets some parameters and not others."""
+    """The mixed case is the real one — a caller sets some parameters and not others.
+
+    ``None`` is omitted, so the child's registered default decides. ``0`` survives: it is a
+    documented mode (``actor_request_batch_size=0`` selects all-at-once), and a truthiness
+    guard dropping it left the child on its default of 50 with nothing logged.
+    """
     assert set_overrides(kept=0, dropped=None, also_kept=25) == {"kept": 0, "also_kept": 25}
