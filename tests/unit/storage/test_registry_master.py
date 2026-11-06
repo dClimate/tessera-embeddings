@@ -211,6 +211,7 @@ class TestProvenance:
         assert (tiles["chunk_0_0"]["filled_at"], tiles["chunk_0_0"]["assembled_at"]) == (FILLED, REBUILT)
         assert tiles["chunk_0_1"]["filled_at"] == FILLED
 
+
 class TestInvariants:
     """The checks that stand between a merge and a silently wrong master."""
 

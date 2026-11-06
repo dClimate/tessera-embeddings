@@ -275,6 +275,7 @@ class TestAnonymousStorage:
         storage = zarr_store._create_storage(str(tmp_path / "local.icechunk"), anonymous=True)
         assert storage is not None
 
+
 #: One property of one spatial or calendar axis broken per case. ``None`` deletes the axis; the rest
 #: rewrite its values from what the seeder wrote.
 _COORDINATE_CASES = (
