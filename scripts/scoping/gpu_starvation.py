@@ -700,7 +700,7 @@ def check_the_dense_end_is_what_keeps_the_fleet_fed(opener_cluster: list[int]) -
 
 
 def report() -> None:
-    """Print the full policy comparison. Run with `-s` to read it.
+    """Print the full policy comparison.
 
     Not an assertion — a diagnostic, so the numbers behind a plan decision can be regenerated
     rather than quoted from a document that may have drifted.
@@ -1397,7 +1397,7 @@ def check_the_measurement_tables_are_internally_consistent() -> None:
 
 
 def cost_report() -> None:
-    """Print the cost line, its interval, and what the unit correction did NOT move. `-s` to read.
+    """Print the cost line, its interval, and what the unit correction did NOT move.
 
     Same contract as :func:`report`: a diagnostic whose output is its product, so the
     numbers behind the campaign's dollar line can be regenerated rather than quoted. The

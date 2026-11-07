@@ -1,7 +1,7 @@
 """tessera_embeddings — distributed satellite ingestion + Tessera inference.
 
 :data:`__all__` is the entire public API; everything else may change without warning. CI
-verifies it stays in sync with ``docs/public-api.md``.
+checks that every name in it resolves.
 
 Conventions:
 

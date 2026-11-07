@@ -1763,18 +1763,6 @@ def write_dataset(
         )
 
 
-# =============================================================================
-# Test Helpers (for verifying Icechunk transactional behavior)
-# =============================================================================
-
-
-def _open_writable_session(store_path: str) -> tuple[icechunk.Session, icechunk.IcechunkStore]:
-    """Open a writable session. Caller must commit."""
-    repo = open_repo(store_path)
-    session = repo.writable_session("main")
-    return session, session.store
-
-
 StorageOptions = dict | Callable[[], "dict | None"] | None
 """fsspec options, or a callable resolving them — see :func:`resolve_storage_options`."""
 
