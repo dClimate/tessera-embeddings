@@ -774,7 +774,12 @@ def test_write_year_shards_asks_for_a_catch_up_on_its_own_repo_session_and_group
         return "current"
 
     monkeypatch.setattr(session_catch_up, "catch_up_to_branch", recording)
-    write_year_shards(repo, "01N", year_index=2, source=_OneInnerChunkSource(), n_workers=1, shard_px=_SHARD)
+    forked: dict = {}
+    real_run_forked = shard_writer.run_forked
+    monkeypatch.setattr(shard_writer, "run_forked", lambda *a, **k: forked.update(k) or real_run_forked(*a, **k))
+    log = logging.getLogger("fill-01N")
+    write_year_shards(repo, "01N", year_index=2, source=_OneInnerChunkSource(), n_workers=1, shard_px=_SHARD, log=log)
+    assert forked["log"] is log, "the fill's logger must reach the fork phase's progress lines"
     assert calls, "write_year_shards never asked for a catch-up"
     seen_repo, seen_session, seen_group = calls[0]
     assert seen_repo is repo

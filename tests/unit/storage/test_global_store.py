@@ -271,7 +271,6 @@ def test_a_store_with_no_rule_carries_no_attr_rather_than_zero(seeded_store):
     Recording zero for the second would let a later reader believe a rule was applied.
     """
     store = seeded_store([_ZA], years=(2025,))
-    repo = global_store.open_global_repo(store)
     root = zarr_store.open_store_as_zarr_group(store)
     assert "optical_min_obs" not in root.attrs
 

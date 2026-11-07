@@ -195,10 +195,6 @@ class TestShardPixelWindow:
         assert published_store.shard_pixel_window(shard, shape) == expected
 
 
-#: Stand-in for the credential callback the AWS provider registers process-wide.
-_PROVIDER = object()
-
-
 class TestSampleLivePixels:
     """Choosing probe pixels that provably hold embeddings."""
 

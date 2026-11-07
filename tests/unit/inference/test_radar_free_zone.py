@@ -91,7 +91,7 @@ class TestTheInferenceConfigAcceptsRadarFreeLand:
     def test_none_is_accepted_with_s2_only_embeddings_enabled(self) -> None:
         assert self._config(s1_orbit=S1_ORBIT_NONE, allow_s2_only=True).s1_orbit == S1_ORBIT_NONE
 
-    def test_none_forces_s2_only_embeddings(self) -> None:
+    def test_none_forces_s2_only_embeddings(self, caplog) -> None:
         """Derived, not demanded from the caller, and NOT left alone.
 
         With no radar store every pixel has zero S1 observations, so the default gate would skip
@@ -99,7 +99,9 @@ class TestTheInferenceConfigAcceptsRadarFreeLand:
         An empty result that reads as success is the one outcome no later run revisits. Refusing
         instead would defeat the decision that radar-free land is acceptable.
         """
-        assert self._config(s1_orbit=S1_ORBIT_NONE).allow_s2_only is True
+        with caplog.at_level("WARNING"):
+            assert self._config(s1_orbit=S1_ORBIT_NONE).allow_s2_only is True
+        assert "forcing allow_s2_only=True" in caplog.text
 
     def test_a_real_orbit_never_has_the_flag_forced(self) -> None:
         """The force must bind only to 'none' — a partial-radar zone keeps the caller's choice."""

@@ -34,6 +34,9 @@ Lazy ingest re-exports cut `import tessera_embeddings` from 0.80 s to 0.06 s, in
 | inference + profiling | 615 → 430 | `shard_record.py`, quantize/dequantize deleted; GPU starvation model moved to `scripts/scoping/` |
 | flows + providers + integration | 764 → 572 | terminal-hook checks in one test; ruff TID253 replaces an AST test; six duplicate cassettes |
 
+The slice counts come from the per-slice reviews, which counted parametrized cases and files shared
+between slices differently, so they do not sum to the headline; the headline is the measured default run.
+
 ## Claims that did not hold
 
 Each was checked before anything was deleted; these did not survive the check.

@@ -344,7 +344,7 @@ def test_the_closure_survives_a_process_based_scheduler(process_client, roi_on_s
 
 
 # ---------------------------------------------------------------------------
-# 4. Both sensors (source-level half; the behavioural half is in section C)
+# 4. Both sensors read through the one reader (section C runs it under expiry once, via radar)
 # ---------------------------------------------------------------------------
 
 
@@ -594,9 +594,9 @@ def test_the_write_signs_as_the_role_never_as_the_environment(role_only_s3, tmp_
 
 
 # ---------------------------------------------------------------------------
-# One test per sensor: both paths read through this function, so both must survive
-# a credential that died after their graph was built. The consumers below are the
-# real ones — the radar path's masking step and the optical path's window total.
+# Both sensors read through this function (section 4 enforces it), so one radar test
+# covers both: the shared reader must survive a credential that died after the graph
+# was built. The consumer below is the real one, the radar path's masking step.
 # ---------------------------------------------------------------------------
 
 

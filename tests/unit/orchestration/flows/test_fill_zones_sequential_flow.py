@@ -735,6 +735,7 @@ def test_the_ingest_adapter_can_run_every_cell_the_flow_primes(wired):
     _run(zones=["01N", "02N", "03N"], look_ahead=2)
     inputs = wired["seq_kwargs"]["inputs"]
     assert inputs._executor._max_workers == 3
+    assert wired["seq_kwargs"]["look_ahead"] == 2
 
 
 # --- the inference pause reaches the runner --------------------------------------------

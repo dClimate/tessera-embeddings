@@ -37,12 +37,11 @@ def _capture_seed(monkeypatch) -> dict:
     return captured
 
 
-@pytest.mark.parametrize("model", ["v2-large"])
-def test_seed_stamps_the_model(monkeypatch, model):
+def test_seed_stamps_the_model(monkeypatch):
     """The seed records the model every later fill follows."""
     captured = _capture_seed(monkeypatch)
-    mod.seed_global_store.fn(paths=_PATHS, model_version=model)
-    assert captured["model_version"] == model
+    mod.seed_global_store.fn(paths=_PATHS, model_version="v2-large")
+    assert captured["model_version"] == "v2-large"
 
 
 def test_seed_creates_on_missing_repo_icechunk_error(monkeypatch):

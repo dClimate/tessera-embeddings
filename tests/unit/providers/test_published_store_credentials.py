@@ -63,6 +63,12 @@ class TestTheExpiryWePromiseIcechunk:
         out = cred._expires_after(_Refreshable(1), cred._ASSUMED_ROLE_CRED_TTL)
         assert out < datetime.now(UTC), "already inside the margin, so icechunk must come back at once"
 
+    def test_a_naive_expiry_is_not_compared_against_an_aware_one(self) -> None:
+        """A naive datetime raises on comparison with an aware one: a crash far from the cause."""
+        c = _Refreshable(30)
+        c._expiry_time = c._expiry_time.replace(tzinfo=None)
+        assert cred._expires_after(c, cred._ASSUMED_ROLE_CRED_TTL) is not None
+
     def test_a_credential_with_no_expiry_falls_back_to_the_interval(self) -> None:
         out = cred._expires_after(_Static(), cred._ASSUMED_ROLE_CRED_TTL)
         assert 4.5 < (out - datetime.now(UTC)).total_seconds() / 60 < 5.5

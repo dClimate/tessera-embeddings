@@ -149,7 +149,8 @@ def _decisions(items: list) -> set[OffsetDecision]:
 
 
 @pytest.mark.integration
-@pytest.mark.vcr("TestRecordedProducerSplit.yaml")  # one recording shared by the class
+@pytest.mark.default_cassette("TestRecordedProducerSplit.yaml")  # one recording shared by the class
+@pytest.mark.vcr
 class TestRecordedProducerSplit:
     """Assertions against real recorded items, not hand-built fakes."""
 

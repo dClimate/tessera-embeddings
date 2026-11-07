@@ -102,9 +102,10 @@ uv sync --all-extras --frozen
 decisions, library tests guard the library. The exceptions are `run_global_campaign`,
 `ingest_zone_year` and `fill_zones_sequential`, whose flows hold logic no runner has.
 
-**No test reads source text.** A rule about how code is written is a lint rule: import-linter
-contracts (`.importlinter`), ruff's banned imports (`ruff.toml`, including TID253 for module-scope
-imports of `providers.aws`), or an AST check in `tests/architecture/test_source_rules.py`.
+**New structural checks do not read source text.** A rule about how code is written is a lint
+rule: import-linter contracts (`.importlinter`), ruff's banned imports (`ruff.toml`, including TID253
+for module-scope imports of `providers.aws`), or an AST check in `tests/architecture/test_source_rules.py`.
+A few older tests still read source (in `test_roi_mask.py` and `test_terminal_hooks.py`).
 
 **The forked shard writer runs in threads.** `tests/unit/conftest.py` replaces
 `run_forked`'s spawn pool with an in-process pool that still pickles every payload, because a

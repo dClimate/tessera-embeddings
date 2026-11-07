@@ -280,11 +280,6 @@ class TestWriteDataset:
         assert doy[1] == 167  # June 15
 
 
-# Single-block spatial chunking: the whole sub-box is one dask chunk, so the
-# RMW pad / region write decides the on-disk layout, not the input chunking.
-ONE_BLOCK = {"time": 1, "northing": -1, "easting": -1}
-
-
 _RESOLVE_DATES = ["2024-01-01", "2024-01-06", "2024-01-11"]
 
 

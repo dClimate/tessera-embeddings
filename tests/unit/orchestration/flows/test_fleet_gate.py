@@ -259,12 +259,11 @@ def test_zero_on_an_active_gate_is_paused() -> None:
     assert mod.pause_signal("g", read_limit=_reading(0))() is True
 
 
-@pytest.mark.parametrize("limit", [1])
-def test_any_positive_limit_means_run(limit: int) -> None:
+def test_any_positive_limit_means_run() -> None:
     """The gate is a flag, not a cap — nothing acquires a slot, so the magnitude is only
     "not zero". A campaign start writes 1.
     """
-    assert mod.pause_signal("g", read_limit=_reading(limit))() is False
+    assert mod.pause_signal("g", read_limit=_reading(1))() is False
 
 
 def test_an_inactive_gate_is_not_a_pause() -> None:

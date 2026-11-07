@@ -36,9 +36,11 @@ test costs its own full copy of the response.
 
 A test or class may instead load a SHARED cassette by name with
 ``@pytest.mark.vcr("<name>")``. ``test_s2_roi_parity.yaml`` is shared this
-way by the S2 parity test, and ``TestRecordedProducerSplit.yaml`` by every
-test in that integration class — one recording rather than one copy per
-test. Only name a cassette that exists: the mark is silently inert against a
+way by the S2 parity test. ``TestRecordedProducerSplit.yaml`` is shared by
+every test in that integration class through
+``@pytest.mark.default_cassette("<name>")`` plus ``@pytest.mark.vcr``, which
+also makes a re-record write to that one file — one recording rather than
+one copy per test. Only name a cassette that exists: the mark is silently inert against a
 missing file, so a stale name reads like coverage and provides none.
 
 Current files:

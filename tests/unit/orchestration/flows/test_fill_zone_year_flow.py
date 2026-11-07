@@ -102,8 +102,7 @@ def test_coverage_gate_fails_before_ray(wired, allow_partial):
     assert captured["creds"] is not None  # credential callback threaded through
 
 
-@pytest.mark.parametrize("flag", [True])
-def test_allow_s2_only_reaches_inference_config(wired, flag):
+def test_allow_s2_only_reaches_inference_config(wired):
     """The flag lands in build_inference_config, the single chokepoint through which it reaches the
     dataset's per-pixel gate. The zone-level gates are NOT relaxed by it (the coverage gate still
     raises here).
@@ -113,8 +112,8 @@ def test_allow_s2_only_reaches_inference_config(wired, flag):
     _stop_before_ray(wired)
 
     with pytest.raises(InsufficientCoverageError):
-        mod.fill_zone_year_flow.fn(zone="33N", year=2025, paths=_PATHS, **_AMI, allow_s2_only=flag)
-    assert captured["allow_s2_only"] is flag
+        mod.fill_zone_year_flow.fn(zone="33N", year=2025, paths=_PATHS, **_AMI, allow_s2_only=True)
+    assert captured["allow_s2_only"] is True
 
 
 def _fake_ray_cluster(captured: dict | None = None):
