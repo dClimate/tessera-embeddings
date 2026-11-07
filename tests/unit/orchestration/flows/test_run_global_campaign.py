@@ -1608,7 +1608,7 @@ class TestTheDispatchDecisionIsAtomic:
         with caplog_at_info() as records:
             asyncio.run(r.drive(max_parallel_clusters=2, immediate_refill=True, max_dispatch_rounds=1))
         assert r.dispatches() == [("01N",), ("02N",)]
-        assert "the round finished while the refill was being planned" in "\n".join(records)
+        assert "so it is the round's to re-dispatch" in "\n".join(records)  # the gate's line, not the drain's
 
     def test_an_unwinding_drain_waits_for_its_dispatches_to_finish_unwinding(self, wired, monkeypatch):
         """`cancel()` is a REQUEST, and returning on it is not the same as waiting.
