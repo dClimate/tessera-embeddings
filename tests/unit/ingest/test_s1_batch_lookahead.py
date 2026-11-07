@@ -29,7 +29,7 @@ import xarray as xr
 
 from tessera_embeddings.ingest import live_windows as live_windows_mod
 from tessera_embeddings.ingest import s1_roi
-from tessera_embeddings.ingest.live_windows import WINDOW_COST_IN_CHUNKS
+from tessera_embeddings.ingest.live_windows import WINDOW_COST_IN_CHUNKS, WINDOW_COST_IN_CHUNKS_OVERLAPPED
 
 # Every S1 leg these tests run is kept off disk and network the same way.
 pytestmark = pytest.mark.usefixtures("s1_leg_offline")
@@ -296,7 +296,10 @@ def test_an_unmatched_timestamp_falls_back_to_every_window(monkeypatch) -> None:
     assert written == [("2024-01-01", 4)], f"unmatched slice must not be narrowed or skipped: {written}"
 
 
-def test_per_date_narrowing_is_priced_like_the_run(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("overlap", "price"), [(True, WINDOW_COST_IN_CHUNKS_OVERLAPPED), (False, WINDOW_COST_IN_CHUNKS)]
+)
+def test_per_date_narrowing_is_priced_like_the_run(monkeypatch, overlap, price) -> None:
     """The run's window price must reach the per-date re-merge, not stop at the run.
 
     Both merges answer the same question — is a window boundary worth the dead area it
@@ -311,9 +314,9 @@ def test_per_date_narrowing_is_priced_like_the_run(monkeypatch) -> None:
         bboxes_by_date={"2024-01-01T00:00:00": [(0, 0, 1, 1)]},
         narrow=True,
         costs=costs,
-        overlap_window_writes=False,
+        overlap_window_writes=overlap,
     )
-    assert costs == {"run": WINDOW_COST_IN_CHUNKS, "date": WINDOW_COST_IN_CHUNKS}
+    assert costs == {"run": price, "date": price}
 
 
 def test_the_assessed_window_is_recorded_when_a_resume_writes_no_new_date(monkeypatch) -> None:

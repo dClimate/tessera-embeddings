@@ -1598,15 +1598,16 @@ class TestTheDispatchDecisionIsAtomic:
         async def wait_that_lets_the_sibling_finish(delay, *a, **k):
             if delay == mod.CANCELLATION_CONFIRM_S:
                 r.release.set()  # 02N's dispatch is parked on this
-                for _ in range(20):
-                    await real_sleep(0)
+                # One turn: 02N finishes but the drain loop has not yet harvested it, so only the
+                # liveness gate after the refill can stop the dispatch.
+                await real_sleep(0)
                 return None
             return await real_sleep(0)
 
         monkeypatch.setattr(mod.asyncio, "sleep", wait_that_lets_the_sibling_finish)
         with caplog_at_info() as records:
             asyncio.run(r.drive(max_parallel_clusters=2, immediate_refill=True, max_dispatch_rounds=1))
-        assert r.dispatched_before(("02N",)) == [("01N",), ("02N",)]
+        assert r.dispatches() == [("01N",), ("02N",)]
         assert "the round finished while the refill was being planned" in "\n".join(records)
 
     def test_an_unwinding_drain_waits_for_its_dispatches_to_finish_unwinding(self, wired, monkeypatch):
