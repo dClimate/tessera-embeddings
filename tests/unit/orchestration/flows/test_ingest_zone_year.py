@@ -328,9 +328,9 @@ class TestChunkScaledWorkers:
     def test_dense_zone_is_capped_by_settings(self, wired, monkeypatch):
 
         tiles = np.ones((40, 40), dtype=bool)  # 400 live chunks -> 200 > cap
-        s1, s2 = self._dispatch(wired, monkeypatch, tile_live=tiles, max_workers=50)
-        assert s2 == 50
-        assert s1 == 11  # round(50 * 0.22)
+        s1, s2 = self._dispatch(wired, monkeypatch, tile_live=tiles, max_workers=37)
+        assert s2 == 37
+        assert s1 == 8  # round(37 * 0.22)
 
     def test_mid_zone_scales_half_worker_per_chunk(self, wired, monkeypatch):
 

@@ -1582,6 +1582,33 @@ class TestTheDispatchDecisionIsAtomic:
             asyncio.run(r.drive(max_parallel_clusters=2, immediate_refill=True))
         assert r.dispatches() == [], f"a fill was dispatched before the build failed: {r.dispatches()}"
 
+    def test_a_round_that_ends_while_the_refill_is_planned_does_not_get_one(self, wired, monkeypatch):
+        """The gate checked before planning is stale by the time the dispatch happens.
+
+        Planning reads the store and queries the orchestrator, and a sibling can finish
+        across those awaits while its task sits in ``live`` unharvested. Dispatching then
+        buys an extra fleet and an extra attempt for no wall clock at all, because the round
+        is already over and would re-dispatch anyway.
+        """
+        r = _round(monkeypatch, wired, _Round(wired, ends={"01N": "FAILED"}, hold="02N"))
+
+        monkeypatch.setattr(mod, "_SETTLE_DELAY_S", mod.CANCELLATION_CONFIRM_S)
+        real_sleep = asyncio.sleep
+
+        async def wait_that_lets_the_sibling_finish(delay, *a, **k):
+            if delay == mod.CANCELLATION_CONFIRM_S:
+                r.release.set()  # 02N's dispatch is parked on this
+                for _ in range(20):
+                    await real_sleep(0)
+                return None
+            return await real_sleep(0)
+
+        monkeypatch.setattr(mod.asyncio, "sleep", wait_that_lets_the_sibling_finish)
+        with caplog_at_info() as records:
+            asyncio.run(r.drive(max_parallel_clusters=2, immediate_refill=True, max_dispatch_rounds=1))
+        assert r.dispatched_before(("02N",)) == [("01N",), ("02N",)]
+        assert "the round finished while the refill was being planned" in "\n".join(records)
+
     def test_an_unwinding_drain_waits_for_its_dispatches_to_finish_unwinding(self, wired, monkeypatch):
         """`cancel()` is a REQUEST, and returning on it is not the same as waiting.
 

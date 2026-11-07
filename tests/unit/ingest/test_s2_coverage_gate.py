@@ -184,14 +184,14 @@ def _sum(mask: np.ndarray, windows) -> int:
 
 def test_window_total_equals_full_extent_total():
     """The property the cropped denominator rests on, on a 03S-like mask."""
-    mask = np.zeros((12, 16), dtype=bool)
+    mask = np.zeros((52, 40), dtype=bool)
     mask[1, 2] = True
-    mask[9, 13] = True
-    mask[9, 14] = True
+    mask[49, 37] = True
+    mask[49, 38] = True
     windows = _windows_for(mask)
-    # The window COUNT is a property of the grouping strategy and deliberately not
-    # asserted — what the denominator rests on is that the windows between them
-    # cover every live pixel exactly once, whatever shape they take.
+    # The exact window count belongs to the grouping strategy; what the denominator rests on
+    # is that several windows between them cover every live pixel exactly once.
+    assert len(windows) >= 2
     assert _sum(mask, windows) == int(mask.sum()) == 3
 
 

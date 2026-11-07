@@ -70,6 +70,7 @@ class TestRunInference:
         # Invalid pixels are zero in every band; valid pixels have finite scales.
         np.testing.assert_array_equal(result.embeddings[invalid], 0)
         assert np.isfinite(result.scales[~invalid]).all()
+        assert np.any(result.embeddings[~invalid] != 0)
 
     def test_pipelined_output_matches_serial_reference(self, sample_chunk_data, inference_config, test_model):
         """The pipelined loop is byte-identical to a strictly-serial reference.

@@ -7,7 +7,7 @@ PR #268. The five per-slice reviews that served as work orders are in git histor
 
 | | before (2026-11-04) | after (2026-11-07) |
 |---|---|---|
-| tests in the default run | 4,177 | 2,799 |
+| tests in the default run | 4,177 | 2,803 |
 | CPU-seconds, default run | 618 | 136 |
 | wall-clock, 8-core laptop, `-n auto` | 90–98 s | 23 s |
 | lines under `tests/` | 64,600 | 51,400 |

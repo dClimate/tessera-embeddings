@@ -29,12 +29,12 @@ adopter notes describe the approach in prose instead.
 one subsystem can be verified without running the whole of it:
 
 ```bash
-uv run pytest tests/unit/ingest -n auto   # 29 files, 809 tests
+uv run pytest tests/unit/ingest -n auto   # 29 files, 810 tests
 uv run pytest tests/unit/config -n auto   # 10 files, 147 tests
 ```
 
-**Measured, so you know what to expect:** the default run is 2,799 tests in about 23 s on an
-8-core laptop (136 CPU-seconds), and the directories hold 69–809 tests each. The saving is real but not dramatic in wall-clock terms —
+**Measured, so you know what to expect:** the default run is 2,803 tests in about 23 s on an
+8-core laptop (136 CPU-seconds), and the directories hold 69–810 tests each. The saving is real but not dramatic in wall-clock terms —
 interpreter start, collection and the `xdist` workers cost roughly three seconds before any test
 runs, so even the smallest directory does not drop below that. What you actually get is a **focused
 failure list**: a red run names something in the subsystem you touched.

@@ -1192,7 +1192,7 @@ class TestCompletenessOutranksTheSequenceWhenABaselineIsUnreadable:
         # Present to put a copy nobody can date into the group alongside the two being compared.
         unreadable = self._copy("unreadable", sequence="0", baseline=None, complete=True)
         incomplete_newer = self._copy("incomplete-newer", sequence="9", baseline="05.00", complete=False)
-        complete_older = self._copy("complete-older", sequence="1", baseline="05.00", complete=True)
+        complete_older = self._copy("complete-older", sequence="1", baseline="04.00", complete=True)
         kept, _ = select_preferred_duplicates([unreadable, incomplete_newer, complete_older])
         assert [it.id for it in kept] == ["complete-older"]
 

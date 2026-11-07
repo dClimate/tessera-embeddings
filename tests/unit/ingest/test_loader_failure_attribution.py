@@ -349,6 +349,8 @@ class TestCapturingWhatGdalLogsButDoesNotRaise:
         discarding it leaves the codec exception classified as unreadable data, which costs the
         date. Here the trip takes far longer than the read did.
         """
+        read_began = time.monotonic()
+        logged = time.monotonic()  # the worker logs its refusal during the read
 
         class _SlowCluster:
             """A cluster whose round trip dwarfs the read being judged."""
@@ -356,10 +358,8 @@ class TestCapturingWhatGdalLogsButDoesNotRaise:
             @staticmethod
             def run(fn, on_error=None):
                 time.sleep(0.02)
-                return {"worker-0": []}
+                return {"worker-0": [(time.monotonic() - logged, LOGGED_REFUSAL)]}
 
-        read_began = time.monotonic()
-        _gdal_logs(LOGGED_REFUSAL)
         assert collect_logged_refusals(_SlowCluster(), since=read_began) == [LOGGED_REFUSAL]
 
     def test_a_worker_that_did_not_answer_is_named(self, caplog) -> None:

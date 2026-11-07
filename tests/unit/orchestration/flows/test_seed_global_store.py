@@ -102,7 +102,8 @@ def test_the_minimum_depth_rule_is_exactly_the_one_requested(monkeypatch, rule):
     afterwards enforcing it.
     """
     captured = _capture_seed(monkeypatch)
-    mod.seed_global_store.fn(paths=_PATHS, optical_min_obs=rule)
+    kw = {} if rule is None else {"optical_min_obs": rule}  # None: the flow's own default
+    mod.seed_global_store.fn(paths=_PATHS, **kw)
     assert captured["optical_min_obs"] == rule
 
 
