@@ -50,6 +50,18 @@ Each was checked before anything was deleted; these did not survive the check.
 - `providers/test_provider_aws_ray.py` (moto seed made per-worker) — "~10 CPU-s saved" — measured 12.2 → 9.7 CPU-s serially: a `@mock_aws` test between two seeded tests resets moto's backends, so the seed is rebuilt after each one.
 - `ingest/opera_query.py::mgrs_tile_to_bbox` — DEAD (no caller in this repo or yield-embeddings `src/`) — yield-embeddings' `scripts/radar_source_sweep.py` imports it; restored, and fixed to take the extent of all four tile edges rather than two corners and to return `west > east` for a tile across the antimeridian.
 
+## End-to-end check
+
+On 2026-11-07 the branch at `6653582d` ran the smallest dev rung on AWS, pinned into a
+yield-embeddings dev branch:
+- S2 ingest of the tiny ROI for July 2024 completed in 2 min 42 s;
+- S1 ascending ingest of the same ROI and month completed in 2 min 18 s;
+- single-area inference on `m10_parity_15S_epsg32715` completed in 6 min 20 s, with one chunk,
+  1,048,576 valid pixels and no failures.
+
+Inference ran on the current dev image (PyTorch 2.14), because the dev account's v1.1 image
+parameter names a deleted image. That proves the code path, not v1.1's numbers.
+
 ## Left as is
 
 - `scripts/scoping/gpu_starvation.py` imports `tests/unit/zone_density.py`, so it runs from the repo root.
