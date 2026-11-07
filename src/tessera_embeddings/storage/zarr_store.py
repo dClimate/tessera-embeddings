@@ -1,18 +1,12 @@
 """Zarr store management utilities for reflectance and cloudmask data.
 
 Creating, reading and writing the Icechunk-backed Zarr stores that hold preprocessed
-Sentinel-2 reflectance and cloud masks. Five write paths, all committing atomically:
+Sentinel-2 reflectance and cloud masks. Four write paths, all committing atomically:
 
 - **create** (:func:`write_dataset` on a fresh store) — ``to_icechunk`` mode ``"w"``
   writes the whole array.
 - **append** (:func:`write_dataset` on an existing store) — mode ``"a"`` with
   ``append_dim="time"`` extends the time axis.
-- **region overwrite** (:func:`write_region`) — mode ``"r+"`` rewrites an existing
-  temporal/spatial slice in place. The region need not be chunk-aligned:
-  :func:`_pad_region_to_chunks` widens unaligned edges to chunk boundaries and backfills
-  the untouched cells from the store (read-modify-write), because ``align_chunks=True``
-  only remaps the producer's dask blocks and ``mode="r+"`` rejects partial-chunk writes.
-  Use :func:`resolve_region` to turn coordinate ranges into the integer slices it wants.
 - **windowed per-date batch** (:func:`write_day_windows`, on
   :func:`batched_region_writes`) — the cropped-ingest counterpart of ``write_dataset``:
   seed an all-fill store with an EMPTY time axis once, then per date append the time slot
@@ -36,7 +30,6 @@ import logging
 import time
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
-from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
 from typing import Any, cast
@@ -62,10 +55,6 @@ from tessera_embeddings.config.ingest import INGEST_COMPRESSORS, mosaic_chunk_la
 from tessera_embeddings.config.store_layout import spatial_dims_of
 from tessera_embeddings.errors import CorruptedStoreError, NonMonotonicDateError
 from tessera_embeddings.storage.manifest import MIXED_CODE_IDENTITIES_ATTR, IngestManifest, extract_manifest
-from tessera_embeddings.storage.region_writes import (
-    _drop_region_coords,
-    _pad_region_to_chunks,
-)
 from tessera_embeddings.storage.time_axis import TIME_ENCODING, compute_doy, read_time_values
 from tessera_embeddings.utils import utcnow_iso
 
@@ -436,18 +425,6 @@ def _create_storage(
         raise ValueError("anonymous=True and get_credentials are mutually exclusive; pass one or the other")
     if store_path.startswith("s3://"):
         bucket, prefix = _parse_s3_url(store_path)
-        if _s3_config_override:
-            # REFUSED, not honoured either way. The override carries its own credentials and
-            # endpoint, so returning it would make an anonymous-access check pass while
-            # authenticating — the one thing that check rules out — while silently dropping it
-            # would point the read at the wrong endpoint.
-            if anonymous:
-                raise ValueError(
-                    "anonymous=True with an installed S3 config override: the override carries "
-                    "credentials and an endpoint, so it cannot serve an anonymous read. Clear the "
-                    "override, or drop anonymous."
-                )
-            return _s3_config_override.make_storage(prefix_override=prefix)
         # Fall back to the globally-registered provider when the caller passed none. This is
         # how the S1 ingest path keeps icechunk on IAM-role creds: set_s3_credentials
         # overwrites the AWS_* env vars with OPERA-scoped STS tokens for GDAL reads, and
@@ -487,7 +464,7 @@ def _create_storage(
 #
 # (a) Region-write MERGE workload — split SPATIALLY (the default below). Manifest entries are
 #     n_dates x northing_chunks x easting_chunks, tens of chunks per spatial axis against
-#     often <256 dates, so it is spatially dominated, and each write_region commits one
+#     often <256 dates, so it is spatially dominated, and each region write commits one
 #     compact scattered ~3x3-chunk block that a 2D split localises. A time split is a no-op
 #     here at <=256 dates (one shard == the whole array).
 #
@@ -781,69 +758,6 @@ def open_or_create_repo(
     ), True
 
 
-def rollback_commits(
-    store_path: str,
-    n: int,
-    *,
-    branch: str = "main",
-    get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
-    region: str | None = None,
-    dry_run: bool = False,
-) -> str:
-    """Roll a branch's HEAD back by ``n`` commits and return the new HEAD id.
-
-    Icechunk has no destructive "undo": a rollback is a non-fast-forward ``reset_branch``
-    re-pointing the branch at an older snapshot. The ``n`` dropped snapshots are not deleted
-    — they stay reachable by id until expiry/garbage collection — so the rollback is itself
-    reversible by resetting back to the old HEAD id.
-
-    Args:
-        store_path: Local path or S3 URI of the store.
-        n: Number of commits to drop from the tip. Must be >= 1 and leave at least one
-            snapshot (you cannot roll back past the root/init commit).
-        branch: Branch to reset. Defaults to ``"main"``.
-        get_credentials: Optional credential callback (see :func:`_create_storage`).
-        region: Optional S3 region override.
-        dry_run: When True, resolve and return the target snapshot id without moving the
-            branch — useful for eyeballing the target first.
-
-    Returns:
-        The id of the snapshot the branch now points at, or *would* point at under
-        ``dry_run``.
-
-    Raises:
-        ValueError: If ``n < 1`` or ``n`` would drop the entire history.
-    """
-    if n < 1:
-        raise ValueError(f"n must be >= 1, got {n}")
-
-    repo = open_repo(store_path, get_credentials=get_credentials, region=region)
-
-    # ancestry is newest-first: history[0] is the current HEAD, history[n] the snapshot n
-    # commits back, and the final entry the repo's root commit.
-    history = list(repo.ancestry(branch=branch))
-    current = history[0]
-    if n >= len(history):
-        raise ValueError(
-            f"Cannot roll back {n} commits: branch {branch!r} has only "
-            f"{len(history)} snapshot(s), including the root commit."
-        )
-
-    target = history[n]
-    logger.info(
-        "Rolling back %s on %r by %d commit(s): %s -> %s%s",
-        store_path,
-        branch,
-        n,
-        current.id,
-        target.id,
-        " (dry run)" if dry_run else "",
-    )
-    if not dry_run:
-        repo.reset_branch(branch, target.id, from_snapshot_id=current.id)
-    return target.id
-
-
 # =============================================================================
 # Session Helpers (used by all read/write operations)
 # =============================================================================
@@ -1018,53 +932,6 @@ def _write_append(
         update_attrs,
     )
     logger.info(f"Appended to {store_path}")
-
-
-# =============================================================================
-# Region Writes (overwrite-in-place of a temporal/spatial slice)
-# =============================================================================
-
-
-def _write_region(
-    store_path: str,
-    data: xr.Dataset,
-    region: dict[str, slice],
-    message: str,
-    update_attrs: dict[str, Any] | None = None,
-    get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
-    region_name: str | None = None,
-) -> None:
-    """Overwrite an existing region of a store in a single atomic commit."""
-    repo = open_repo(store_path, get_credentials=get_credentials, region=region_name)
-    session = repo.writable_session("main")
-
-    # Committed view for padding unaligned regions, read from a *readonly* session rather
-    # than ``session.store``: the lazy pad shell's graph is handed to ``to_icechunk``, which
-    # under a distributed client pickles it to the workers, and a writable session refuses to
-    # pickle. Pinned to the writable session's base snapshot rather than re-resolving
-    # ``branch="main"``, so a concurrent commit between the two opens cannot make the shell
-    # come from a different snapshot than the write base. The write target still uses the
-    # writable session, which ``to_icechunk`` forks internally.
-    read_session = repo.readonly_session(snapshot_id=session.snapshot_id)
-    existing = xr.open_zarr(read_session.store, consolidated=False)
-    # Raw zarr group on the SAME readonly session, for the zarr-direct padding shell (one
-    # read task per overlapping chunk, no whole-store layer). Must be this session — same
-    # pinned snapshot as ``existing``, and pickle-safe to workers.
-    group = zarr.open_group(read_session.store, mode="r")
-    try:
-        padded, widened = _pad_region_to_chunks(existing, data, region, group)
-        to_write = _drop_region_coords(padded, set(widened))
-
-        _commit_preserving_attrs(
-            session,
-            to_write,
-            {"mode": "r+", "region": widened, "align_chunks": True, "split_every": 8},
-            message,
-            update_attrs,
-        )
-    finally:
-        existing.close()
-    logger.info(f"Wrote region {widened} to {store_path}")
 
 
 # =============================================================================
@@ -1271,13 +1138,11 @@ def resolve_region(
     high``) and the returned slices are half-open ``[start, stop)``. The bounds may be given
     in either order — they are sorted before matching — so a descending axis (northing
     typically) can be addressed either way. ``time`` accepts anything ``np.datetime64``
-    understands. ``get_credentials``/``s3_region`` are forwarded to the store opener so a
-    store outside the default S3 region resolves with the same options later passed to
-    :func:`write_region`.
+    understands. ``get_credentials``/``s3_region`` are forwarded to the store opener, so a
+    store outside the default S3 region resolves.
 
-    Returns a dict of integer slices for :func:`write_region`, containing only dims with a
-    non-``None`` range; an empty dict means "the whole array", which the caller should treat
-    as a plain overwrite rather than a region.
+    Returns a dict of integer slices, containing only dims with a non-``None`` range; an
+    empty dict means "the whole array".
 
     Enforces the overwrite-in-place contract. A range matching nothing (a date not in the
     store) raises ``ValueError`` — appending new coordinates is :func:`write_dataset`'s job.
@@ -1320,45 +1185,6 @@ def resolve_region(
         return region
     finally:
         ds.close()
-
-
-def write_region(
-    store_path: str,
-    data: xr.Dataset,
-    *,
-    region: dict[str, slice],
-    update_attrs: dict[str, Any] | None = None,
-    get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
-    s3_region: str | None = None,
-) -> None:
-    """Overwrite a region of an existing store in place, in one atomic commit.
-
-    ``region`` maps dimension names (``time`` and the store's Y and X names) to integer slices,
-    typically from :func:`resolve_region`; dimensions absent from it are written in full.
-    ``data`` must cover exactly the cells the region selects (same shape along each region
-    dim), and its own coordinate values are dropped before writing since the store's coords
-    are authoritative.
-
-    The region need not be chunk-aligned: unaligned edges are padded out to the enclosing
-    chunk boundaries and the untouched cells backfilled from the store (read-modify-write),
-    so the caller never reasons about chunk boundaries. ``update_attrs`` is merged into root
-    attrs after the write, which otherwise preserves them.
-
-    Contract: every region dim must already exist in the store at the given indices. This
-    overwrites committed data — see ``context_docs/ingest/campaign-ingest-measurements.md`` for the
-    consistency caveats when one logical region is split across multiple calls.
-    """
-    if not region:
-        raise ValueError("write_region requires a non-empty region; use write_dataset for full writes.")
-    _write_region(
-        store_path,
-        data,
-        region,
-        message=f"Overwrite region {region}",
-        update_attrs=update_attrs,
-        get_credentials=get_credentials,
-        region_name=s3_region,
-    )
 
 
 class RegionWriteBatch:
@@ -1466,9 +1292,8 @@ def batched_region_writes(
     exception nothing commits — the abandoned session is invisible to readers, so a retry
     starts clean from the last committed state.
 
-    There is no Dask graph here at all. For a single arbitrary (unaligned) region overwrite
-    use :func:`write_region`, which pads to chunk boundaries; this path requires
-    chunk-disjoint windows and one commit is the point.
+    There is no Dask graph here at all. Windows must be chunk-disjoint, and one commit is
+    the point.
     """
     repo = open_repo(store_path, get_credentials=get_credentials, region=s3_region)
     session = repo.writable_session("main")
@@ -1936,62 +1761,6 @@ def write_dataset(
             get_credentials=get_credentials,
             s3_region=s3_region,
         )
-
-
-# =============================================================================
-# Test Helpers (for verifying Icechunk transactional behavior)
-# =============================================================================
-
-
-def _open_writable_session(store_path: str) -> tuple[icechunk.Session, icechunk.IcechunkStore]:
-    """Open a writable session. Caller must commit."""
-    repo = open_repo(store_path)
-    session = repo.writable_session("main")
-    return session, session.store
-
-
-# =============================================================================
-# S3 Configuration (for testing with moto)
-# =============================================================================
-
-
-@dataclass
-class S3Config:
-    """S3 configuration for testing with moto or custom endpoints."""
-
-    bucket: str
-    prefix: str = ""
-    endpoint_url: str | None = None
-    allow_http: bool = False
-    access_key_id: str | None = None
-    secret_access_key: str | None = None
-    region: str | None = None
-
-    def make_storage(self, prefix_override: str | None = None) -> icechunk.Storage:
-        """Create Icechunk Storage from this configuration."""
-        kwargs: dict[str, Any] = {
-            "bucket": self.bucket,
-            "prefix": prefix_override if prefix_override is not None else self.prefix,
-        }
-        if self.endpoint_url:
-            kwargs["endpoint_url"] = self.endpoint_url
-        if self.allow_http:
-            kwargs["allow_http"] = True
-        if self.access_key_id and self.secret_access_key:
-            kwargs["access_key_id"] = self.access_key_id
-            kwargs["secret_access_key"] = self.secret_access_key
-        if self.region:
-            kwargs["region"] = self.region
-        return icechunk.s3_storage(**kwargs)
-
-
-_s3_config_override: S3Config | None = None
-
-
-def set_s3_config(config: S3Config | None) -> None:
-    """Set a global S3 configuration override for testing."""
-    global _s3_config_override
-    _s3_config_override = config
 
 
 StorageOptions = dict | Callable[[], "dict | None"] | None

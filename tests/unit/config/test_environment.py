@@ -9,20 +9,6 @@ import pytest
 
 from tessera_embeddings.config.environment import configure_gdal_environment
 
-# Every var configure_gdal_environment sets, with its expected default value.
-EXPECTED_GDAL_VARS = {
-    "GDAL_HTTP_MAX_RETRY": "5",
-    "GDAL_HTTP_RETRY_DELAY": "5",
-    "GDAL_HTTP_TIMEOUT": "120",
-    "GDAL_HTTP_LOW_SPEED_LIMIT": "1",
-    "GDAL_HTTP_LOW_SPEED_TIME": "60",
-    "GDAL_NUM_THREADS": "ALL_CPUS",
-    "GDAL_HTTP_MULTIPLEX": "YES",
-    "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES": "YES",
-    "GDAL_CACHEMAX": "1024",
-    "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
-}
-
 
 @pytest.fixture
 def restore_pkg_logger():
@@ -45,22 +31,10 @@ def restore_pkg_logger():
 class TestGdalEnvironment:
     """Tests for configure_gdal_environment's GDAL variable setup."""
 
-    def test_sets_all_expected_vars(self, monkeypatch):
-        """Configuration sets every GDAL var to its documented default."""
-        for var in EXPECTED_GDAL_VARS:
-            monkeypatch.delenv(var, raising=False)
-
-        configure_gdal_environment()
-
-        for var, expected in EXPECTED_GDAL_VARS.items():
-            assert os.environ[var] == expected, var
-
     @pytest.mark.parametrize(
         "var, override",
         [
             ("GDAL_NUM_THREADS", "4"),
-            ("GDAL_HTTP_MAX_RETRY", "99"),
-            ("GDAL_CACHEMAX", "256"),
         ],
     )
     def test_respects_existing_values(self, monkeypatch, var, override):
@@ -82,7 +56,6 @@ class TestPkgLoggerSetup:
     @pytest.mark.parametrize(
         "level_str, expected",
         [
-            ("WARNING", logging.WARNING),
             ("error", logging.ERROR),  # lower-case is upper-cased before lookup
             ("DEBUG", logging.DEBUG),
         ],

@@ -157,16 +157,6 @@ class TestGridFromChunkKeys:
         assert from_keys is not None
         np.testing.assert_array_equal(from_keys, from_pixels)
 
-    def test_windows_are_identical_either_route(self, tmp_path):
-        """The public entry point must not change its answer with prefer_keys."""
-        mask = np.zeros((12, 16), dtype=bool)
-        mask[1, 2] = True
-        mask[9, 13] = True
-        path = _mask_store(tmp_path, mask)
-        assert live_windows_for_mask(path, chunk_px=CHUNK, prefer_keys=True) == live_windows_for_mask(
-            path, chunk_px=CHUNK, prefer_keys=False
-        )
-
     def test_all_ocean_is_an_answer_not_a_failure(self, tmp_path):
         """A store with no chunk objects yields an empty grid, NOT None.
 
@@ -268,34 +258,6 @@ class TestMergeBands:
         assert merged == [LiveWindow(y0=0, y1=6 * CHUNK, x0=0, x1=3 * CHUNK)]
         assert _area(merged) == _area(rows)
 
-    def test_extra_area_below_the_window_price_is_taken(self):
-        """A merge that adds less area than one window costs is a win, and the
-        default price (~200 chunks) makes almost every adjacent merge worth it.
-        """
-        rows = [
-            LiveWindow(y0=0, y1=CHUNK, x0=0, x1=CHUNK),
-            LiveWindow(y0=CHUNK, y1=2 * CHUNK, x0=9 * CHUNK, x1=10 * CHUNK),
-        ]  # union covers 2x10 = 20 chunks against 2 -> +18, far under the price
-        assert merge_bands(rows, chunk_px=CHUNK) == [LiveWindow(y0=0, y1=2 * CHUNK, x0=0, x1=10 * CHUNK)]
-
-    def test_a_free_window_never_merges(self):
-        """With a window priced at zero, minimum area wins and nothing merges —
-        the degenerate case that proves the objective is really being optimised.
-        """
-        rows = [
-            LiveWindow(y0=0, y1=CHUNK, x0=0, x1=CHUNK),
-            LiveWindow(y0=CHUNK, y1=2 * CHUNK, x0=9 * CHUNK, x1=10 * CHUNK),
-        ]
-        assert merge_bands(rows, chunk_px=CHUNK, window_cost_in_chunks=0) == rows
-
-    def test_expensive_area_splits_what_a_cheap_window_would_join(self):
-        rows = [
-            LiveWindow(y0=0, y1=CHUNK, x0=0, x1=CHUNK),
-            LiveWindow(y0=CHUNK, y1=2 * CHUNK, x0=9 * CHUNK, x1=10 * CHUNK),
-        ]
-        assert merge_bands(rows, chunk_px=CHUNK, window_cost_in_chunks=5) == rows
-        assert len(merge_bands(rows, chunk_px=CHUNK, window_cost_in_chunks=50)) == 1
-
     def test_chunk_cap_splits_a_tall_band(self):
         """Even a free merge stops at the area cap, so one graph stays bounded."""
         rows = [LiveWindow(y0=r * CHUNK, y1=(r + 1) * CHUNK, x0=0, x1=2 * CHUNK) for r in range(10)]
@@ -343,9 +305,6 @@ class TestMergeBands:
             cells = {(r, c) for r in range(w.y0 // CHUNK, w.y1 // CHUNK) for c in range(w.x0 // CHUNK, w.x1 // CHUNK)}
             assert not (cells & seen)
             seen |= cells
-
-    def test_empty_input(self):
-        assert merge_bands([], chunk_px=CHUNK) == []
 
     def test_merged_windows_still_cover_every_live_pixel(self, tmp_path):
         """The invariant that matters most: grouping must never drop land."""

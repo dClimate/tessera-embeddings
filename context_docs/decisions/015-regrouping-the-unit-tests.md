@@ -2,6 +2,10 @@
 
 **Status:** Executed (2026-09-03). Accepted 2026-08-17.
 
+The tree and file names below are as built on 2026-09-03. The 2026-11 reduction
+(`context_docs/test-suite-reduction/`) deleted or merged several of them; `tests/README.md` has
+the current layout. The subject-directory layout this record decided is unchanged.
+
 ## What executing it corrected in this record
 
 Two statements below were true when written and had stopped being true by the time the move

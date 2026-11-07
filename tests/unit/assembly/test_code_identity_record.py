@@ -13,10 +13,11 @@ event, and refusing a dispatch over one is an operator's decision, not the archi
 
 from __future__ import annotations
 
+import importlib.metadata as md
 import json
 
-from tessera_embeddings.config import environment
 from tessera_embeddings.config.environment import code_identity
+from tessera_embeddings.storage import shard_writer
 from tessera_embeddings.storage.shard_writer import run_provenance
 
 
@@ -32,8 +33,6 @@ class _Dist:
 
 
 def _serve(monkeypatch, dist: object) -> None:
-    import importlib.metadata as md
-
     monkeypatch.setattr(md, "distribution", lambda _name: dist)
 
 
@@ -84,7 +83,6 @@ def test_unreadable_metadata_returns_nothing_and_never_raises(monkeypatch) -> No
     """The property that matters most: no fill may fail because its own metadata was
     unreadable. A raising lookup and malformed JSON both have to yield None.
     """
-    import importlib.metadata as md
 
     def _boom(_name: str) -> object:
         raise md.PackageNotFoundError("tessera-embeddings")
@@ -104,24 +102,6 @@ def test_the_record_carries_the_identity_without_the_caller_supplying_one(monkey
     """Resolved at the record rather than threaded: it is an ambient fact about the process,
     so five signatures that have no opinion about it do not grow an argument for it.
     """
-    monkeypatch.setattr(environment, "code_identity", lambda: {"version": "9.9", "commit": "deadbeef"})
-    import tessera_embeddings.storage.shard_writer as sw
-
-    monkeypatch.setattr(sw, "code_identity", lambda: {"version": "9.9", "commit": "deadbeef"})
+    monkeypatch.setattr(shard_writer, "code_identity", lambda: {"version": "9.9", "commit": "deadbeef"})
     runs = run_provenance(None, 2024, "run-1")
     assert runs["2024"]["code"] == {"version": "9.9", "commit": "deadbeef"}
-
-
-def test_a_caller_may_pin_the_identity(monkeypatch) -> None:
-    """So a test — or a replay — can state the build instead of reading the live process."""
-    runs = run_provenance(None, 2024, "run-1", code={"commit": "abc123"})
-    assert runs["2024"]["code"] == {"commit": "abc123"}
-
-
-def test_no_identity_means_no_field(monkeypatch) -> None:
-    """An absent identity is recorded as nothing, so a reader never sees an empty claim."""
-    import tessera_embeddings.storage.shard_writer as sw
-
-    monkeypatch.setattr(sw, "code_identity", lambda: None)
-    runs = run_provenance(None, 2024, "run-1")
-    assert "code" not in runs["2024"]

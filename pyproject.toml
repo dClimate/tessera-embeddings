@@ -132,7 +132,6 @@ dev = [
     # pre-1.0 and its diagnostics change between releases. Same version as yield-embeddings.
     "ty==0.0.92",
     "moto[server]",
-    "hypothesis",
     # Enforces the architecture contracts in .importlinter (`uv run lint-imports`).
     "import-linter",
     "vcrpy",
@@ -192,6 +191,7 @@ markers = [
     "parity: Prefect vs plain.py output equivalence (slow)",
     "slow: >30s runtime (CPU inference, etc.)",
     "gpu: requires CUDA",
+    "real_fork_pool: run run_forked on the real spawn pool instead of the in-process stand-in",
 ]
 testpaths = ["tests"]
 

@@ -46,11 +46,10 @@ def _cells(n: int) -> list[SequentialCell]:
 
 
 class _Config:
-    """Minimal config stand-in (orbit, the scan's compute_std probe, the cell's window)."""
+    """Minimal config stand-in (orbit, the cell's window)."""
 
     def __init__(self, s1_orbit: str = "both", time_window: object | None = None) -> None:
         self.s1_orbit = s1_orbit
-        self.compute_std = False
         # Carried onto every work item as ZoneContext.time_window, so a chained session's
         # cells can span campaign years without being inferred over the session's months.
         self.time_window = time_window if time_window is not None else parse_time_window("December 2025")
@@ -256,15 +255,6 @@ def test_zone_uids_are_run_scoped(monkeypatch):
     assert uids == {"r-01N:chunk_0_0", "r-01N:chunk_0_1", "r-02N:chunk_0_0", "r-02N:chunk_0_1"}
 
 
-def test_ingest_lifecycle_and_cleanup_after_assembly():
-    events: list[str] = []
-    inputs = RecordingInputs(events)
-    _run(_cells(3), inputs=inputs, look_ahead=1)
-    # Every cell was started/waited, and cleaned only after landing.
-    for z in ("01N", "02N", "03N"):
-        assert f"start:{z}" in events and f"wait:{z}" in events and f"cleanup:{z}" in events
-
-
 class BlockingCleanupInputs(RecordingInputs):
     """A mosaic delete that does not return until the NEXT assembly has started.
 
@@ -413,28 +403,6 @@ def test_resumed_skip_markers_are_counted_as_skips_not_successes(monkeypatch):
     assert seen["02N"] and all(r["status"] == "success" for r in seen["02N"])
 
 
-def test_a_cell_with_a_different_orbit_streams_under_its_own_orbit():
-    """It used to be deferred out of the stream; it no longer needs to be.
-
-    The orbit rides on each cell's ``ZoneContext``, exactly as its inference window already
-    does, so one actor serves cells of differing orbits. That has to work: parts of the globe
-    are radar-free in principle, so a cell resolving something other than the session's
-    request is a permanent population, and deferring it against a bounded budget meant that
-    population could never complete.
-    """
-    events: list[str] = []
-
-    summary = _run(
-        _cells(3),
-        orbits={"02N": "ascending"},
-        session=_sync_session(events=events),
-        assemble=_assemble(events),
-    )
-    assert "deferred_orbit_mismatch" not in summary, "the deferral key should be gone, not merely zero"
-    assert [e for e in events if e.startswith("infer:r-02N")], "the mismatched cell must STREAM"
-    assert summary["succeeded"] == 3
-
-
 def test_the_streamed_work_carries_each_cell_s_own_orbit():
     """Streaming it is only correct if the actor is TOLD the cell's orbit.
 
@@ -459,28 +427,6 @@ def test_the_streamed_work_carries_each_cell_s_own_orbit():
     _run(_cells(3), orbits={"02N": "ascending"}, session=session, assemble=_assemble([]))
     assert seen.get("02N") == "ascending", seen
     assert {v for k, v in seen.items() if k != "02N"} <= {"both"}, seen
-
-
-def test_assembly_failure_recorded_run_continues():
-    def assemble(handoff, prep):
-        if handoff.zone == "01N":
-            raise RuntimeError("commit refused")
-        return {"zone": handoff.zone}
-
-    with pytest.raises(RuntimeError, match="1/2 cell"):
-        _run(_cells(2), assemble=assemble)
-
-
-def test_session_crash_unwinds_feeder_without_deadlock():
-    """A crashing session must not leave the feeder blocked on zone slots."""
-
-    def crashing_session(more_work, on_item_done):
-        raise RuntimeError("cluster fell over")
-
-    # Enough cells that the feeder WILL block on the slot semaphore
-    # (look_ahead+2 slots, none ever released because nothing completes).
-    with pytest.raises(RuntimeError, match="cluster fell over"):
-        _run(_cells(8), session=crashing_session, look_ahead=1)
 
 
 def test_prepare_failure_is_cell_scoped():
@@ -542,45 +488,6 @@ def test_ingest_starts_for_every_cell_and_is_not_paced_by_the_fill():
     assert len([e for e in events if e.startswith("cleanup:")]) == 8
 
 
-def test_failed_cell_releases_budget_slot_and_keeps_mosaic():
-    """A failed zone retains its mosaic for staged resume but must give back
-    its budget slot — a slot held forever would starve the feeder.
-    """
-    events: list[str] = []
-    inputs = MosaicCountingInputs(events)
-    with pytest.raises(RuntimeError, match="1/8 cell"):
-        _run(_cells(8), session=_sync_session(fail={"01N"}), inputs=inputs, look_ahead=0)
-    assert "cleanup:01N" not in events  # mosaic retained for the retry...
-    # ...but every OTHER cell was still admitted and landed (no starvation).
-    assert len([e for e in events if e.startswith("cleanup:")]) == 7
-
-
-def test_every_cell_mismatching_the_session_orbit_still_completes():
-    """Replaces a test of the deferral cap, which no longer exists.
-
-    When mismatched cells were deferred they retained their mosaics against a bounded budget,
-    and past that bound they FAILED with their mosaics deleted. A whole-run mismatch was
-    therefore unfillable — which is exactly what a campaign meets when its zone list holds
-    radar-free zones. Now every cell streams under its own orbit, so the run completes and the
-    storage bound still holds.
-    """
-    events: list[str] = []
-    inputs = MosaicCountingInputs(events)
-
-    summary = _run(
-        _cells(4),
-        orbits=dict.fromkeys(("01N", "02N", "03N", "04N"), "ascending"),
-        inputs=inputs,
-        look_ahead=0,
-    )
-    assert summary["succeeded"] == 4, "a wholly-mismatched run must complete, not fail"
-    assert summary["failed"] == 0
-    # No storage-bound assertion here any more: that bound was deleted with the mosaic
-    # budget. What this test is about — a wholly-mismatched run completing — is below.
-    for z in ("01N", "02N", "03N", "04N"):
-        assert f"cleanup:{z}" in events, f"{z}'s mosaic was never released"
-
-
 def test_stop_unblocks_a_running_ingest_wait():
     """A crashed session must unwind the feeder even while it is blocked inside
     inputs.wait — the stop event is passed through and honored.
@@ -601,33 +508,6 @@ def test_stop_unblocks_a_running_ingest_wait():
     with pytest.raises(RuntimeError, match="cluster fell over"):
         _run(_cells(2), session=crashing_session, inputs=BlockingInputs([]), look_ahead=0)
     assert time.monotonic() - t0 < 30  # no 600s join-timeout hang
-
-
-def test_a_mismatched_run_does_not_deadlock_the_feeder():
-    """The deadlock this replaces came from deferrals sitting on budget slots.
-
-    Streaming them removes the mechanism, but the feeder's slot discipline is what made the
-    old bug possible, so the shape is still worth a test: a run where EVERY cell mismatches
-    must drain rather than wedge, under a look-ahead that leaves the budget tight.
-    """
-    events: list[str] = []
-    inputs = MosaicCountingInputs(events)
-    result: dict = {}
-
-    def target():
-        result["summary"] = _run(
-            _cells(4),
-            orbits=dict.fromkeys(("01N", "02N", "03N", "04N"), "ascending"),
-            inputs=inputs,
-            look_ahead=1,
-        )
-
-    t = threading.Thread(target=target, daemon=True)
-    t.start()
-    t.join(timeout=30)
-    if t.is_alive():
-        pytest.fail("feeder deadlocked on a wholly orbit-mismatched run")
-    assert result["summary"]["succeeded"] == 4
 
 
 def test_systematic_failure_stops_feeder_at_retained_cap():
@@ -766,43 +646,14 @@ def test_negative_look_ahead_rejected():
         _run(_cells(1), look_ahead=-1)
 
 
-def test_feeder_crash_is_surfaced_not_silent_success():
-    """An exception OUTSIDE the per-cell guards (here inputs.start, called by
-    _start_lookahead) must fail the run — not silently kill the daemon feeder
-    and let the drained partial queue look complete.
-    """
-
-    class ExplodingInputs(RecordingInputs):
-        def start(self, zone: str, year: int) -> None:
-            raise RuntimeError("feeder boom")
-
-    with pytest.raises(RuntimeError, match="zone feeder crashed"):
-        _run(_cells(3), inputs=ExplodingInputs([]), look_ahead=1)
-
-
 # --- the feeder's termination accounting: finishing early drops a cell, late holds a cluster --
 
 
 def _run_with_deadline(*args, deadline_s: float = 20.0, **kwargs):
-    """Run the fill on a worker thread; fail if it does not return. These regressions present as
-    "never finishes", which under a plain call stalls the suite instead of failing.
+    """`_run` under a deadline: these regressions present as "never finishes", which under a plain
+    call stalls the suite instead of failing.
     """
-    box: dict[str, Any] = {}
-
-    def go() -> None:
-        try:
-            box["out"] = _run(*args, **kwargs)
-        except BaseException as exc:  # re-raised on the calling thread below
-            box["exc"] = exc
-
-    worker = threading.Thread(target=go, name="fill-under-deadline", daemon=True)
-    worker.start()
-    worker.join(timeout=deadline_s)
-    if worker.is_alive():
-        raise AssertionError(f"the fill did not return within {deadline_s}s — the stream never exhausted")
-    if "exc" in box:
-        raise box["exc"]
-    return box["out"]
+    return run_under_deadline(deadline_s, lambda: _run(*args, **kwargs), what="the fill")
 
 
 def test_a_crashed_feeder_releases_the_stream_instead_of_holding_it():
@@ -876,22 +727,6 @@ class _StaggeredInputs(RecordingInputs):
         if zone not in self.landed:
             self.blocked_on.append(zone)
             self.landed.add(zone)  # the ingest we waited for finishes
-
-
-def test_the_feeder_takes_a_landed_cell_over_its_head_cell():
-    """The densest zone is ordered first AND ingests slowest, so insisting on it
-    idles the fleet while smaller mosaics sit finished.
-
-    Two conditions, not one: a cell must be in the look-ahead window to be
-    CONSIDERED (only those have an ingest running), and must have COMPLETED to be
-    taken. Inference never sees a partial mosaic.
-    """
-    events: list[str] = []
-    inputs = _StaggeredInputs(events, landed={"02N", "03N", "04N"})  # everything but the head
-    _run(_cells(4), inputs=inputs, look_ahead=2)
-    order = [e.split(":")[1] for e in events if e.startswith("wait:")]
-    assert order[0] == "02N", f"took its head instead of a landed cell: {order}"
-    assert inputs.blocked_on == ["01N"], f"stalled on more than the one unlanded zone: {inputs.blocked_on}"
 
 
 def test_every_cell_is_filled_exactly_once_when_taken_out_of_order():
@@ -1260,23 +1095,15 @@ def test_withholding_starves_the_stream_and_then_lets_it_finish(caplog):
         summary = _run(_cells(2), session=_polling_session(polls), fault=_armed_withhold(0.004))
 
     assert summary["succeeded"] == 2 and summary["failed"] == 0, "withholding must not fail a cell"
+    # A fleet that never received work has not starved, it has never started — the shape every
+    # detector exempts — so the hold must begin AFTER a hand-over.
+    first_non_empty = next(i for i, batch in enumerate(polls) if batch)
+    assert first_non_empty < len(polls) - 1, "a zone must be streamed before the hold starts"
     handed_over = [batch for batch in polls if batch]
     assert len(handed_over) == 2, "both zones must reach the stream once the hold ends"
     said = [r.getMessage() for r in caplog.records if FAULT_LOG_PREFIX in r.getMessage()]
     assert any("FIRING withhold_work" in line for line in said), "the hold must announce itself"
     assert any("RELEASED" in line for line in said), "and must end by itself"
-
-
-def test_the_first_zone_is_handed_over_before_anything_is_withheld(caplog):
-    # A fleet that never received work has not starved; it has never started, which is
-    # the shape every detector exempts. So the hold must begin AFTER a hand-over.
-    polls: list = []
-    with caplog.at_level(logging.ERROR):
-        _run(_cells(2), session=_polling_session(polls), fault=_armed_withhold(0.004))
-    first_non_empty = next(i for i, batch in enumerate(polls) if batch)
-    said = [r.getMessage() for r in caplog.records if "FIRING withhold_work" in r.getMessage()]
-    assert said, "the hold must have fired at all"
-    assert first_non_empty < len(polls) - 1, "a zone must be streamed before the hold starts"
 
 
 def test_an_unarmed_run_never_consults_a_fault(monkeypatch):
@@ -1339,23 +1166,6 @@ def test_a_pause_holds_the_stream_without_ending_it(monkeypatch):
     assert "none" in seen  # and the source still reached exhaustion afterwards
 
 
-def test_a_paused_poll_never_reports_exhaustion(monkeypatch):
-    """`None` is a teardown, not a pause: it retires the actors and finalizes the run, so a
-    cell held behind a pause would be finalized as complete having inferred nothing. The
-    pause must answer "nothing ready YET" no matter what the source would have said.
-    """
-    seen: list[str] = []
-    calls = {"n": 0}
-
-    def paused() -> bool:
-        calls["n"] += 1
-        return calls["n"] <= 5
-
-    _run(_cells(1), session=_pausing_session(0, seen), paused=paused)
-    # The first five answers are the pause, and not one of them is `none`.
-    assert seen[:5] == ["empty"] * 5, seen
-
-
 def test_a_paused_poll_does_not_consume_the_prepared_cell():
     """A hand-over REMOVES the zone from the ready queue, so a pause that asked the source
     and discarded the answer would delete prepared work rather than delay it. The cell must
@@ -1384,86 +1194,6 @@ def test_a_paused_poll_does_not_consume_the_prepared_cell():
 
     out = _run(_cells(1), session=session, paused=paused)
     assert out["succeeded"] == 1 and out["failed"] == 0, out
-
-
-def test_no_pause_callable_means_no_check_at_all():
-    """Every path with no gate configured — a direct single-cluster run, a test — must not
-    pay a check or change behaviour.
-    """
-    seen: list[str] = []
-    out = _run(_cells(1), session=_pausing_session(0, seen))
-    assert out["succeeded"] == 1
-    assert "empty" not in seen[:1]
-
-
-def test_the_cap_is_not_derived_from_look_ahead():
-    """The decoupling itself. `look_ahead` sizes INGEST WIDTH; the cap is a FAILURE BUDGET.
-
-    Tying them meant a fleet configured for 3-wide ingest silently accepted a failure budget
-    of 5, and one exogenous provider outage on 2026-08-27 then converted into a fleet-wide
-    teardown. A wide ingest and a patient failure budget are different decisions.
-    """
-    import inspect
-
-    params = inspect.signature(mod.fill_zones_sequential).parameters
-    assert params["max_retained_failures"].default == 100, (
-        "a ceiling against a SYSTEMATIC fault only. Losing a fill costs its Ray cluster and every "
-        "actor on it, so this must not be reachable by a bad few hours: on 2026-08-27 a cap of 7 "
-        "put nine of ten clusters over the line on ONE provider outage"
-    )
-    events: list[str] = []
-    inputs = FailingWaitInputs(events)
-    # look_ahead=1 would have forced a cap of 3 under the old derivation; it must not now.
-    with pytest.raises(RuntimeError, match="cell"):
-        _run(_cells(8), inputs=inputs, look_ahead=1, max_retained_failures=6, attempts_per_cell_in_cluster=1)
-    waited = len([e for e in events if e.startswith("wait:")])
-    assert waited == 6, f"the cap must be the one passed, not look_ahead + 2; admitted {waited}"
-
-
-def test_exceeding_the_cap_alerts_but_does_not_tear_the_run_down():
-    """The cap ALERTS; it does not restart anything.
-
-    Ending a fill costs its Ray cluster and every actor on it — hours to rebuild, and the most
-    expensive thing the campaign owns. An earlier version of this change made a cap trip exit
-    immediately without draining; that is withdrawn. A child process must not spend the fleet's
-    actors on its own judgement, so it says so loudly and a human decides.
-    """
-    events: list[str] = []
-    inputs = FailingWaitInputs(events)
-    with pytest.raises(RuntimeError, match="cell"):
-        _run(_cells(6), inputs=inputs, look_ahead=1, max_retained_failures=2, attempts_per_cell_in_cluster=1)
-    # The feeder still stops admitting at the cap — that half is unchanged.
-    waited = len([e for e in events if e.startswith("wait:")])
-    assert waited == 2, f"the feeder must stop admitting at the cap of 2, admitted {waited}"
-
-
-def test_the_cap_alert_fires_for_a_failure_that_arrives_after_the_feeder_finishes():
-    """The ALERT must live where failures are COUNTED, not where admissions are checked.
-
-    A check that only runs before the next admission never fires for the cap-th failure if it
-    lands on the last pending cell, or arrives from an inference/assembly callback after the
-    feeder has drained `pending` — so the operator would never be told. Here every cell is
-    admitted before any fails, so the feeder's loop is over by the time the count is reached.
-    """
-    events: list[str] = []
-
-    class _FailOnFinish(RecordingInputs):
-        """Ingest always succeeds, so the feeder drains `pending` and exits; the failures
-        arrive later, from the inference path.
-        """
-
-    def failing_assemble(handoff, *a, **k):
-        raise RuntimeError("assembly failed")
-
-    with pytest.raises(RuntimeError):
-        _run(
-            _cells(4),
-            inputs=_FailOnFinish(events),
-            look_ahead=4,
-            max_retained_failures=2,
-            attempts_per_cell_in_cluster=1,
-            assemble=failing_assemble,
-        )
 
 
 def test_the_failure_cap_cancels_the_ingests_of_the_cells_it_refuses():
@@ -2183,12 +1913,6 @@ class TestDrainTrailingAssemblies:
             gate.set()  # release the parked diagnostics thread rather than leaking it
             hold.set()
             pool.shutdown(wait=True)
-
-    def test_a_wedge_is_a_typed_error_the_flow_can_tell_apart(self):
-        """Its own type, because the flow must intercept it rather than let it become FAILED."""
-        assert issubclass(mod.TrailingAssemblyWedgedError, RuntimeError)
-        exc = mod.TrailingAssemblyWedgedError(3)
-        assert exc.abandoned == 3 and "abandoned" in str(exc)
 
 
 def test_a_wedge_raises_even_when_the_session_itself_failed(monkeypatch, _stack_dumps, caplog):

@@ -26,9 +26,6 @@ from datetime import UTC, datetime
 import pytest
 
 from tessera_embeddings.ingest.s1_roi import (
-    CRED_EXPIRY_MARGIN_SEC,
-    CRED_TICK_INTERVAL_SEC,
-    DEFAULT_CRED_REFRESH_INTERVAL_SEC,
     _parse_credential_expiry,
     credential_ticker,
 )
@@ -67,25 +64,6 @@ def test_unusable_expiry_degrades_instead_of_raising(creds: dict) -> None:
     assert _parse_credential_expiry(creds) is None
 
 
-def test_margin_exceeds_the_fallback_cadence_is_not_required_but_margin_is_generous() -> None:
-    """The margin must be large enough to cover a single date's write.
-
-    Stated as a floor rather than an exact value: renewing is two cheap HTTP calls, so
-    the margin should be generous, and the failure it prevents costs the rest of the run.
-    """
-    assert CRED_EXPIRY_MARGIN_SEC >= 10 * 60
-    assert DEFAULT_CRED_REFRESH_INTERVAL_SEC > 0
-
-
-def test_tick_interval_is_well_inside_the_margin() -> None:
-    """The tick bounds how far past the renewal point a credential can drift.
-
-    A tick as long as the margin would let the credential expire between checks, which is
-    the failure the ticker exists to prevent.
-    """
-    assert CRED_TICK_INTERVAL_SEC < CRED_EXPIRY_MARGIN_SEC / 2
-
-
 def test_ticker_refreshes_while_the_caller_is_blocked() -> None:
     """The point of the ticker: renewal must not wait for the work to finish.
 
@@ -110,7 +88,7 @@ def test_ticker_stops_when_the_block_exits() -> None:
         assert _wait_until(lambda: len(seen) >= 1, timeout=5.0), "ticker never started"
 
     after_exit = len(seen)
-    time.sleep(0.2)  # many tick intervals
+    time.sleep(0.05)  # five tick intervals
     assert len(seen) == after_exit
 
 

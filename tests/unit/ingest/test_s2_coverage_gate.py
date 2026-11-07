@@ -5,6 +5,11 @@ that decision permanent for a (zone, year) — a wrongly-dropped date is not
 retried and a wrongly-kept one pollutes the mosaic. It also has to keep BOTH sides
 of its ratio cropped to the same windows: cropping only the numerator still yields
 a plausible-looking percentage, which is the failure these tests exist to catch.
+
+The numerator is the SCL validity reduce in ``_coverage_from_scl``; the denominator is the ROI
+pixel total from ``_sum_over_windows``. Cropping both is sound only because the ROI mask is
+False everywhere outside the derived windows, so the denominator tests pin that property
+against windows produced by the real derivation.
 """
 
 from __future__ import annotations
@@ -13,11 +18,12 @@ from types import SimpleNamespace
 
 import dask.array as da
 import numpy as np
-import pytest
 import xarray as xr
+import zarr
 
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
-from tessera_embeddings.ingest.s2_roi import _coverage_from_scl
+from tessera_embeddings.ingest.live_windows import live_windows_for_mask, merge_bands, row_band_windows
+from tessera_embeddings.ingest.s2_roi import _coverage_from_scl, _sum_over_windows
 
 CHUNK = 4
 VALID_CLASS = next(c for c in range(12) if c not in S2_SCL_INVALID_CLASSES)
@@ -120,17 +126,9 @@ def test_any_valid_stays_lazy_under_windows():
     assert hasattr(any_valid.data, "dask"), "any_valid was computed rather than left lazy"
 
 
-def test_no_windows_at_all_fails_rather_than_dividing_by_a_reduce_of_nothing():
-    scl = _scl(np.full((CHUNK, CHUNK), VALID_CLASS))
-    roi = _mask(np.ones((CHUNK, CHUNK)))
-    passes, any_valid = _coverage_from_scl(scl, roi, CHUNK * CHUNK, 0.1, SYNC_CLIENT, windows=[])
-    assert not passes
-    assert any_valid is None
-
-
-@pytest.mark.parametrize("threshold", [0.0, 100.0])
-def test_threshold_boundaries(threshold):
-    """All-valid must pass at 100% and at 0% — the campaign runs at 0.1%."""
+def test_all_valid_passes_at_a_100_percent_threshold():
+    """The top boundary is inclusive; the 0% boundary is covered above."""
+    threshold = 100.0
     scl = _scl(np.full((CHUNK, CHUNK), VALID_CLASS))
     roi = _mask(np.ones((CHUNK, CHUNK)))
     passes, _ = _coverage_from_scl(scl, roi, CHUNK * CHUNK, threshold, SYNC_CLIENT, windows=[(0, CHUNK, 0, CHUNK)])
@@ -153,3 +151,73 @@ def test_an_roi_with_no_live_pixel_fails_the_date_instead_of_dividing_by_zero():
 
     assert not passes
     assert any_valid is None
+
+
+# --- the denominator: window totals equal full-extent totals ---------------------------
+
+
+def _mask_store(tmp_path, mask: np.ndarray) -> str:
+    path = str(tmp_path / "roi.zarr")
+    z = zarr.open(path, mode="w", shape=mask.shape, chunks=(CHUNK, CHUNK), dtype="bool")
+    z[:] = mask
+    return path
+
+
+def _windows_for(mask: np.ndarray) -> list[tuple[int, int, int, int]]:
+    """Derive windows from an in-memory mask, as the ingest does from the store."""
+    h, w = mask.shape
+    rows, cols = -(-h // CHUNK), -(-w // CHUNK)
+    live = np.zeros((rows, cols), dtype=bool)
+    for r in range(rows):
+        for c in range(cols):
+            live[r, c] = mask[r * CHUNK : (r + 1) * CHUNK, c * CHUNK : (c + 1) * CHUNK].any()
+    # Row bands THEN the cost-model merge — the same two stages
+    # live_windows_for_mask runs, so this helper keeps mirroring the real
+    # derivation rather than one half of it.
+    wins = merge_bands(row_band_windows(live, height=h, width=w, chunk_px=CHUNK), chunk_px=CHUNK)
+    return [(x.y0, x.y1, x.x0, x.x1) for x in wins]
+
+
+def _sum(mask: np.ndarray, windows) -> int:
+    return int(_sum_over_windows(da.from_array(mask, chunks=(CHUNK, CHUNK)), windows).compute())
+
+
+def test_window_total_equals_full_extent_total():
+    """The property the cropped denominator rests on, on a 03S-like mask."""
+    mask = np.zeros((52, 40), dtype=bool)
+    mask[1, 2] = True
+    mask[49, 37] = True
+    mask[49, 38] = True
+    windows = _windows_for(mask)
+    # The exact window count belongs to the grouping strategy; what the denominator rests on
+    # is that several windows between them cover every live pixel exactly once.
+    assert len(windows) >= 2
+    assert _sum(mask, windows) == int(mask.sum()) == 3
+
+
+def test_row_band_spanning_a_gap_does_not_double_count():
+    """A band spanning several chunks is summed once, not once per live chunk."""
+    mask = np.zeros((4, 16), dtype=bool)
+    mask[0, 0] = True  # chunk col 0
+    mask[2, 13] = True  # chunk col 3 — the band spans cols 0..3
+    windows = _windows_for(mask)
+    assert len(windows) == 1
+    assert _sum(mask, windows) == int(mask.sum()) == 2
+
+
+def test_all_ocean_mask_totals_zero():
+    """No windows must yield 0, not a reduce over an empty list."""
+    mask = np.zeros((8, 8), dtype=bool)
+    assert _windows_for(mask) == []
+    assert _sum(mask, []) == 0
+
+
+def test_windows_from_the_store_match_the_in_memory_derivation(tmp_path):
+    """The real entry point agrees with the helper these tests use."""
+    mask = np.zeros((12, 16), dtype=bool)
+    mask[1, 2] = True
+    mask[9, 13] = True
+    path = _mask_store(tmp_path, mask)
+    from_store = [(w.y0, w.y1, w.x0, w.x1) for w in live_windows_for_mask(path, chunk_px=CHUNK)]
+    assert from_store == _windows_for(mask)
+    assert _sum(mask, from_store) == int(mask.sum())

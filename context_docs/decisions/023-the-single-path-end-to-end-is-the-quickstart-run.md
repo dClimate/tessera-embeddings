@@ -19,7 +19,8 @@ that both stated blockers had lapsed and proposed building it.
 > premise its own supporting document has withdrawn.** The single-ROI path had genuinely been
 > measured at about **three and a half minutes** end to end on a CPU laptop, against the "30+
 > minutes" the tier README claimed. But "the upstream per-stage parity tests pass" was read off a
-> `6 passed, 2 skipped` summary line and does not hold: `test_ingest_s1_roi_parity.py` does not run,
+> `6 passed, 2 skipped` summary line and does not hold: `test_ingest_s1_roi_parity.py` (since deleted:
+> `context_docs/test-suite-reduction/`) does not run,
 > for **two independent reasons that are easy to read as one**. It carries a credentials `skipif`
 > that accepts **either** supported Earthdata Login form — `EARTHDATA_TOKEN`, or
 > `EARTHDATA_USERNAME` **and** `EARTHDATA_PASSWORD` together — so it skips only when *neither* is

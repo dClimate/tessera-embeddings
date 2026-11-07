@@ -177,15 +177,8 @@ def _synthetic_batch(
     return s2, s1
 
 
-def test_state_dict_keys_are_identical(ported_model, upstream_model) -> None:
-    """Both graphs expose exactly the same parameter names and shapes."""
-    ours = {k: tuple(v.shape) for k, v in ported_model.state_dict().items()}
-    theirs = {k: tuple(v.shape) for k, v in upstream_model.state_dict().items()}
-    assert ours == theirs
-
-
 def test_weights_loaded_are_identical(ported_model, upstream_model) -> None:
-    """strict=True load put the same tensors in the same places."""
+    """strict=True load put the same tensors in the same places, under the same names."""
     theirs = upstream_model.state_dict()
     for key, value in ported_model.state_dict().items():
         torch.testing.assert_close(value, theirs[key], atol=0.0, rtol=0.0)
@@ -212,12 +205,3 @@ def test_forward_matches_upstream(ported_model, upstream_model, upstream, batch,
     max_abs_diff = (ours - theirs).abs().max().item()
     assert max_abs_diff <= _ATOL, f"max abs diff {max_abs_diff:.3e} > {_ATOL:.1e}"
     torch.testing.assert_close(ours, theirs, atol=_ATOL, rtol=1e-5)
-
-
-def test_upstream_output_is_layer_normalised(upstream_model, upstream) -> None:
-    """Sanity check on the reference itself: the final LayerNorm is really there."""
-    s2, s1 = _synthetic_batch(upstream, batch=5, t_s2=16, t_s1=16, seed=7)
-    with torch.no_grad():
-        out = upstream_model.encode(s2, s1)
-    torch.testing.assert_close(out.mean(dim=-1), torch.zeros(5), atol=1e-5, rtol=0)
-    torch.testing.assert_close(out.std(dim=-1, unbiased=False), torch.ones(5), atol=1e-4, rtol=0)

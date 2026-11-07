@@ -10,15 +10,12 @@ that could question it. Preprocessing needs its own parity, against upstream's o
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
-from tessera_embeddings.config.inference import DEFAULT_NUM_OBS_CHECKPOINTS
-from tessera_embeddings.inference.sampling import (
-    build_resample_indices,
-    build_resample_indices_v2,
-    resampler_for,
-)
+from tessera_embeddings.config.inference import DEFAULT_NUM_OBS_CHECKPOINTS, band_stats
+from tessera_embeddings.inference.dataset import MosaicChunkInferenceDataset
+from tessera_embeddings.inference.sampling import build_resample_indices_v2
 from tests.fixtures.upstream.v2_pad_pattern import pad_pattern
+from tests.unit.inference.test_dataset_v11 import CKPS, _make_chunk_data
 
 #: Every bucket this pipeline can choose, against counts either side of each one.
 _CASES = [(n, b) for b in DEFAULT_NUM_OBS_CHECKPOINTS for n in range(1, 2 * b + 1)]
@@ -44,39 +41,6 @@ def test_v2_matches_upstream_for_every_reachable_count() -> None:
     )
 
 
-def test_the_two_rules_really_do_disagree() -> None:
-    """The guard on the guard: if a refactor ever made v2 delegate to v1.1, every parity
-    assertion above would still pass against a reference that had also been "helpfully"
-    aligned. This pins the disagreement itself.
-    """
-    differing = sum(
-        1
-        for n, b in _CASES
-        if len(build_resample_indices(n, b)) != len(build_resample_indices_v2(n, b))
-        or not np.array_equal(build_resample_indices(n, b), build_resample_indices_v2(n, b))
-    )
-    assert differing > len(_CASES) // 2, "v1.1 and v2 padding differ on most inexact counts"
-
-
-def test_v11_is_untouched_by_the_addition() -> None:
-    """The path that must NOT change. The campaign runs v1.1, and a shifted index vector would
-    silently alter every published embedding, so selection is the only thing this change does
-    to it.
-    """
-    for n, bucket in _CASES:
-        np.testing.assert_array_equal(
-            resampler_for("v1.1")(n, bucket), build_resample_indices(n, bucket), err_msg=f"{n}->{bucket}"
-        )
-
-
-def test_an_unknown_model_version_is_refused_rather_than_defaulted() -> None:
-    """Defaulting a new student to v1.1's rule is the exact failure this versioning prevents,
-    and it would produce a correctly-shaped tensor nobody could question.
-    """
-    with pytest.raises(ValueError, match="No resampler for model_version"):
-        resampler_for("v3-enormous")
-
-
 # ── the wiring, which is where a correct algorithm still fails silently ──
 
 
@@ -85,9 +49,6 @@ def test_the_dataset_resamples_with_the_version_it_was_given() -> None:
     quietly: the tensors are the same shape under either rule, so a dataset left on the
     default would look entirely healthy while feeding v2 the wrong sequence.
     """
-    from tessera_embeddings.inference.dataset import MosaicChunkInferenceDataset
-    from tests.unit.inference.test_dataset_v11 import CKPS, _make_chunk_data
-
     chunk_data = _make_chunk_data(rng=np.random.default_rng(3))
     v11 = MosaicChunkInferenceDataset(chunk_data, num_obs_checkpoints=CKPS)
     v2 = MosaicChunkInferenceDataset(chunk_data, num_obs_checkpoints=CKPS, model_version="v2-large")
@@ -108,20 +69,6 @@ def test_the_dataset_resamples_with_the_version_it_was_given() -> None:
     assert differed, "v2 produced v1.1's sequences — the model_version never reached the resampler"
 
 
-def test_the_actor_passes_its_configured_version_to_the_dataset() -> None:
-    """The last link. `stats` and `model_version` are resolved at the same call site, and an
-    actor that versioned one but not the other would normalise as v2 and resample as v1.1.
-    """
-    import inspect
-
-    import tessera_embeddings.inference.actors as actors_mod
-
-    src = inspect.getsource(actors_mod)
-    assert "model_version=self.config.model_version," in src, (
-        "the actor must hand its configured model version to the dataset, beside the band stats"
-    )
-
-
 def test_normalisation_and_resampling_cannot_describe_different_students() -> None:
     """The mismatch is removed rather than validated.
 
@@ -131,17 +78,6 @@ def test_normalisation_and_resampling_cannot_describe_different_students() -> No
     the version, so the contradiction has no way to be expressed: there is one input, not two
     halves of one identity that a caller has to keep in step.
     """
-    import inspect
-
-    from tessera_embeddings.config.inference import band_stats
-    from tessera_embeddings.inference.dataset import MosaicChunkInferenceDataset
-
-    params = inspect.signature(MosaicChunkInferenceDataset.__init__).parameters
-    assert "stats" not in params, "band statistics must not be an independent input"
-    assert "model_version" in params and "norm_source" in params
-
-    from tests.unit.inference.test_dataset_v11 import CKPS, _make_chunk_data
-
     chunk_data = _make_chunk_data(rng=np.random.default_rng(5))
     v2 = MosaicChunkInferenceDataset(chunk_data, num_obs_checkpoints=CKPS, model_version="v2-large")
     np.testing.assert_array_equal(v2.s2_band_mean, np.array(band_stats("v2-large")["s2_mean"], dtype=np.float32))

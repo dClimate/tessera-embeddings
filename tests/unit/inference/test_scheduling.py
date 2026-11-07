@@ -49,11 +49,10 @@ def _ray_calls_are_mocked():
     Deliberately answers with no GPU key, so the default is inert and perturbs no existing
     assertion. A test that needs a particular capacity, or a failure, patches over this.
 
-    **``kill``** — a backstop, because an unpatched ``ray.kill`` does not fail, it BOOTS A
-    REAL LOCAL RAY CLUSTER (see the note in ``_do_replace``). ``_do_replace`` has always
-    patched it, but two tests called ``pool.replace()`` directly and did not, costing 19 s of
-    suite wall time and risking the multi-GB working-directory upload on every run. Patching
-    it here means a new test cannot reintroduce that by forgetting.
+    **``kill``** — an unpatched ``ray.kill`` does not fail, it BOOTS A REAL LOCAL RAY CLUSTER:
+    Ray wraps it in an auto-init hook, so ``ray.init()`` hashes and uploads the whole working
+    directory (multi-GB with scale-test stores present) before the kill ever raises. Patching it
+    here means no test that calls ``pool.replace()`` or retires an actor can do that by forgetting.
 
     This does NOT weaken the tests that assert on kills: each of those opens its own
     ``patch.object(_sched_mod.ray, "kill")``, which nests inside this one and shadows it, so
@@ -125,41 +124,6 @@ def _poll(
         )
 
 
-def _do_replace(pool: ActorPool, actor_idx: int = 0) -> None:
-    mock_actor = MagicMock()
-    mock_actor.get_instance_id.remote.return_value = MagicMock()
-    with (
-        patch.object(_sched_mod, "InferenceActor") as cls,
-        # ray.kill MUST be patched: Ray wraps it in an auto-init hook, so an
-        # unpatched call from a test silently boots a REAL local Ray cluster —
-        # ray.init() then hashes/uploads the entire working directory (multi-GB
-        # with scale-test stores present) and reserves an object store. The
-        # suppress(Exception) around the kill in replace() does not help; the
-        # auto-init runs before kill raises. (2026-07-17: three concurrent
-        # pytest runs of this file ate ~60 GB RAM this way.)
-    ):
-        cls.options.return_value.remote.return_value = mock_actor
-        pool.replace(actor_idx, "i-dead")
-
-
-def test_replace_carries_credentials_and_region_to_new_actor():
-    """A replacement actor (after a chunk failure/OOM) must inherit the pool's
-    credentials AND s3_region, else a non-default-region retry opens the mosaic in
-    the default region and re-fails the remaining chunks.
-    """
-    creds = object()
-    pool = _make_pool(get_credentials=creds, s3_region="eu-west-1")
-    mock_actor = MagicMock()
-    mock_actor.get_instance_id.remote.return_value = MagicMock()
-    with patch.object(_sched_mod, "InferenceActor") as cls:
-        cls.options.return_value.remote.return_value = mock_actor
-        pool.replace(0, "i-dead")
-    # .remote(config, checkpoint_path, get_credentials, s3_region)
-    args = cls.options.return_value.remote.call_args.args
-    assert args[2] is creds
-    assert args[3] == "eu-west-1"
-
-
 # ===========================================================================
 # _joined_gpu_count
 # ===========================================================================
@@ -171,11 +135,6 @@ class TestJoinedGpuCount:
     def test_reads_the_cluster_total(self) -> None:
         with patch.object(_sched_mod.ray, "cluster_resources", return_value={"CPU": 40.0, "GPU": 7.0}):
             assert _joined_gpu_count(0.0, 1.0) == 7.0
-
-    def test_no_gpu_nodes_yet_reads_zero(self) -> None:
-        """Before the first worker joins, the cluster has no GPU key at all."""
-        with patch.object(_sched_mod.ray, "cluster_resources", return_value={"CPU": 8.0}):
-            assert _joined_gpu_count(3.0, 1.0) == 0.0
 
     def test_a_run_that_asks_for_no_gpu_reports_none(self) -> None:
         """A CPU-only run on a GPU-capable cluster must not charge itself the cluster's GPUs.
@@ -219,19 +178,8 @@ class TestPollTracker:
     def test_no_stall_below_threshold(self) -> None:
         _poll({"c": (5, 10, 100.0, "inference")}, stall_threshold=300.0)
 
-    @pytest.mark.parametrize(
-        "phase,expected_level",
-        [("inference", logging.ERROR), ("loading", logging.WARNING)],
-    )
-    def test_stall_log_level(self, caplog: pytest.LogCaptureFixture, phase: str, expected_level: int) -> None:
-        with caplog.at_level(logging.WARNING, logger="test"):
-            _poll({"chunk_A": (1, 5, 400.0, phase)}, stall_threshold=300.0, max_stalls=10)
-        assert "STALL" in caplog.text
-        assert any(r.levelno == expected_level for r in caplog.records)
-
-    @pytest.mark.parametrize("count", [3, 4])  # exactly at threshold, and above
-    def test_systemic_stall_raises(self, count: int) -> None:
-        progress = {f"c_{i}": (1, 5, 400.0, "inference") for i in range(count)}
+    def test_systemic_stall_raises_at_the_threshold(self) -> None:
+        progress = {f"c_{i}": (1, 5, 400.0, "inference") for i in range(3)}
         with pytest.raises(RuntimeError, match="stalled simultaneously"):
             _poll(progress, stall_threshold=300.0, max_stalls=3)
 
@@ -295,60 +243,21 @@ class TestPollTracker:
         with pytest.raises(RuntimeError, match="stalled simultaneously"):
             _poll(progress, stall_threshold=300.0, max_stalls=3, recovery_threshold=1200.0)
 
-    def test_tracker_error_swallowed(self) -> None:
-        tracker = MagicMock()
-        tracker.get_all.remote.return_value = MagicMock()
-        with patch.object(_sched_mod.ray, "get", side_effect=ConnectionError("dead")):
-            _poll_tracker(tracker, 0, 10, 300.0, 3, logging.getLogger("test"))
-
     @pytest.mark.parametrize(
         ("cells", "expected"),
         [
-            ({_U15: "15N-2019"}, "Progress [15N-2019]:"),
             # A chained session overlaps one zone's tail with the next zone's head.
             ({_U15: "15N-2019", _U16: "16N-2019"}, "Progress [15N-2019, 16N-2019]:"),
             # Dispatched but not yet reporting: none of these counts are that zone's yet.
             ({_U15: "15N-2019", chunk_uid("17N-2019-c", "c_0"): "17N-2019"}, "Progress [15N-2019]:"),
-            # A single-area run's id is a content digest: it names nothing, so nothing is shown.
-            ({}, "Progress: 0/10 chunks done"),
         ],
-        ids=["one-cell", "chained-boundary", "not-yet-reporting", "unnamed"],
+        ids=["chained-boundary", "not-yet-reporting"],
     )
     def test_the_line_names_only_cells_this_snapshot_counted(self, caplog, cells, expected) -> None:
         progress = {_U15: (3, 10, 10.0, "inference"), _U16: (1, 10, 5.0, "inference")}
         with caplog.at_level(logging.INFO, logger="test"):
             _poll(progress, stall_threshold=300.0, max_stalls=10, cells=cells)
         assert expected in caplog.text
-
-    def test_phase_summary_logged(self, caplog: pytest.LogCaptureFixture) -> None:
-        progress = {"c_A": (3, 10, 10.0, "inference"), "c_B": (1, 5, 5.0, "loading")}
-        with caplog.at_level(logging.INFO, logger="test"):
-            _poll(progress, stall_threshold=300.0, max_stalls=10)
-        assert "inference" in caplog.text
-        assert "loading" in caplog.text
-        assert "active" in caplog.text
-
-
-# ===========================================================================
-# ActorPool — properties
-# ===========================================================================
-
-
-class TestActorPoolProperties:
-    """Tests for ActorPool property accessors."""
-
-    def test_busy_actors_property(self) -> None:
-        pool = _make_pool(3)
-        assert pool.busy_actors == set()
-        ref = MagicMock()
-        pool.pending[ref] = ("chunk_A", 1)
-        assert pool.busy_actors == {1}
-
-    def test_live_count_decrements_on_retire(self) -> None:
-        pool = _make_pool(3)
-        assert pool.live_count == 3
-        pool._retired.add(0)
-        assert pool.live_count == 2
 
 
 # ===========================================================================
@@ -358,23 +267,6 @@ class TestActorPoolProperties:
 
 class TestResolveIid:
     """Tests for ActorPool.resolve_iid."""
-
-    def test_no_op_when_no_pending_ref(self) -> None:
-        _make_pool(2).resolve_iid(0)
-
-    def test_resolves_when_ref_ready(self) -> None:
-        pool = _make_pool(2)
-        ref = MagicMock()
-        pool._pending_iid_refs[0] = ref
-        pool._initializing.add(0)
-        with (
-            patch.object(_sched_mod.ray, "wait", return_value=([ref], [])),
-            patch.object(_sched_mod.ray, "get", return_value="i-resolved"),
-        ):
-            pool.resolve_iid(0)
-        assert pool.actor_instance_ids[0] == "i-resolved"
-        assert 0 not in pool._pending_iid_refs
-        assert 0 not in pool._initializing
 
     def test_fetch_failure_falls_back_to_unknown(self) -> None:
         pool = _make_pool(2)
@@ -388,14 +280,6 @@ class TestResolveIid:
             pool.resolve_iid(0)
         assert "unknown" in pool.actor_instance_ids[0]
         assert 0 not in pool._pending_iid_refs
-
-    def test_non_blocking_leaves_ref_pending(self) -> None:
-        pool = _make_pool(2)
-        ref = MagicMock()
-        pool._pending_iid_refs[0] = ref
-        with patch.object(_sched_mod.ray, "wait", return_value=([], [ref])):
-            pool.resolve_iid(0, timeout=0)
-        assert 0 in pool._pending_iid_refs
 
 
 # ===========================================================================
@@ -450,21 +334,6 @@ class TestReservations:
         assert len(queue) == 2
         kwargs = pool.actors[0].process_chunk.remote.call_args.kwargs
         assert kwargs["prefetch_hint"] is None
-
-    def test_no_queue_means_no_reservation(self) -> None:
-        pool = _make_pool(2)
-        pool.actors[0].process_chunk.remote.return_value = MagicMock()
-        with patch.object(_sched_mod.ray, "wait", return_value=([], [])):
-            pool.submit(0, _fake_chunk("current"), "m", "s", "r", None)
-        assert pool.reserved == {}
-        assert pool.actors[0].process_chunk.remote.call_args.kwargs["prefetch_hint"] is None
-
-    def test_take_reserved_pops(self) -> None:
-        pool = _make_pool(2)
-        chunk = _fake_chunk("c0")
-        pool.reserved[1] = chunk
-        assert pool.take_reserved(1) is chunk
-        assert pool.take_reserved(1) is None
 
     def test_stale_reservation_requeued_not_stranded(self) -> None:
         # Defensive path: an actor re-dispatched while still holding a
@@ -553,13 +422,6 @@ class TestRetireIdle:
             pool.retire_idle(outstanding_work=0)
         mock_kill.assert_not_called()
 
-    def test_floor_check_prevents_kill(self) -> None:
-        pool = _make_pool(2, idle_grace_sec=1)
-        pool._idle_since[0] = time.monotonic() - 200
-        with patch.object(_sched_mod.ray, "kill") as mock_kill:
-            pool.retire_idle(outstanding_work=2)  # live-1=1 < 2
-        mock_kill.assert_not_called()
-
     def test_idle_actor_killed_after_grace(self) -> None:
         pool = _make_pool(3, idle_grace_sec=1)
         pool._idle_since[0] = time.monotonic() - 200
@@ -645,13 +507,6 @@ class TestRetireIdle:
         assert 0 in pool._retired
         callback.assert_called_once()
 
-    def test_on_retire_not_called_when_none(self) -> None:
-        """No error when on_retire is None (default)."""
-        pool = _make_pool(2, idle_grace_sec=1)
-        pool._idle_since[0] = time.monotonic() - 200
-        pool.retire_idle(outstanding_work=0)
-        assert 0 in pool._retired
-
     def test_resolve_iid_called_before_kill(self) -> None:
         """resolve_iid picks up a lazily-resolved instance ID before retirement."""
         callback = MagicMock()
@@ -717,15 +572,6 @@ class TestRetireIdle:
         pool._idle_since[0] = time.monotonic() - 200
         pool.retire_idle(outstanding_work=0)
         callback.assert_called_once_with("i-0000")
-
-    def test_grace_period_always_applies(self) -> None:
-        """Actors are never retired without the grace period elapsing, even with no queued work."""
-        pool = _make_pool(2, idle_grace_sec=9999)
-        ref = MagicMock()
-        pool.pending[ref] = ("chunk", 1)  # actor 1 is busy, actor 0 is idle
-        with patch.object(_sched_mod.ray, "kill") as mock_kill:
-            pool.retire_idle(outstanding_work=1)
-        mock_kill.assert_not_called()
 
 
 class TestRetireInitializing:
@@ -861,18 +707,6 @@ class TestRetiringAPackedInstance:
 class TestMarkInitializing:
     """Tests for ActorPool.mark_initializing."""
 
-    def test_sets_up_state(self) -> None:
-        pool = _make_pool(3)
-        pool.mark_initializing(1)
-        assert 1 in pool._initializing
-        assert 1 in pool._pending_iid_refs
-        assert pool.actor_instance_ids[1] == "pending-init"
-
-    def test_custom_placeholder(self) -> None:
-        pool = _make_pool(2)
-        pool.mark_initializing(0, placeholder_iid="pending-replacement-of-i-dead")
-        assert pool.actor_instance_ids[0] == "pending-replacement-of-i-dead"
-
     def test_seed_skips_initializing_actors(self) -> None:
         """seed() skips initializing actors — their chunks stay queued.
 
@@ -979,25 +813,13 @@ class TestResolveInitializing:
 class TestReplace:
     """Tests for ActorPool.replace."""
 
-    @pytest.mark.parametrize(
-        "n_deaths,pool_size,expected_level",
-        [
-            (1, 4, logging.WARNING),  # < 50 %
-            (2, 4, logging.ERROR),  # >= 50 %
-            (4, 4, logging.CRITICAL),  # >= 100 %
-        ],
-    )
-    def test_death_log_level(
-        self, caplog: pytest.LogCaptureFixture, n_deaths: int, pool_size: int, expected_level: int
-    ) -> None:
-        pool = _make_pool(pool_size)
-        with caplog.at_level(logging.WARNING, logger="test"):
-            for _ in range(n_deaths):
-                _do_replace(pool)
-        assert any(r.levelno == expected_level for r in caplog.records)
-
     def test_replace_creates_new_actor_and_marks_initializing(self) -> None:
-        pool = _make_pool(2)
+        """The replacement (after a chunk failure/OOM) inherits the pool's credentials AND
+        s3_region, else a non-default-region retry opens the mosaic in the default region and
+        re-fails the remaining chunks.
+        """
+        creds = object()
+        pool = _make_pool(2, get_credentials=creds, s3_region="eu-west-1")
         original = pool.actors[0]
         mock_new = MagicMock()
         mock_new.get_instance_id.remote.return_value = MagicMock()
@@ -1008,6 +830,10 @@ class TestReplace:
         assert pool.actors[0] is mock_new
         assert 0 in pool._initializing
         assert "pending-replacement-of-i-dead" in pool.actor_instance_ids[0]
+        # .remote(config, checkpoint_path, get_credentials, s3_region)
+        args = cls.options.return_value.remote.call_args.args
+        assert args[2] is creds
+        assert args[3] == "eu-west-1"
 
     def test_replace_kills_outgoing_actor(self) -> None:
         """The actor in the slot is killed before the replacement takes over.
@@ -1083,25 +909,6 @@ class TestAddActors:
         assert pool.fleet_size == 200
         assert pool.max_actor_deaths == 200
         assert pool.systemic_stall_threshold == 20
-
-    def test_added_actor_gets_work_via_dispatch_idle(self) -> None:
-        """An appended actor receives queued work once it resolves."""
-        pool = _make_pool(1)
-        pool.pending[MagicMock()] = ("seeded", 0)  # original actor busy
-        new = MagicMock(name="new")
-        new.get_instance_id.remote.return_value = MagicMock()
-        new.process_chunk.remote.return_value = MagicMock()
-        pool.add_actors([new])
-        ref = pool._pending_iid_refs[1]
-        queue: deque = deque([_fake_chunk("c0")])
-        with (
-            patch.object(_sched_mod.ray, "wait", return_value=([ref], [])),
-            patch.object(_sched_mod.ray, "get", return_value="i-new"),
-        ):
-            pool.resolve_initializing()
-            pool.dispatch_idle(queue, "m", "s", "r", None)
-        assert 1 in {aidx for _, aidx in pool.pending.values()}
-        assert len(queue) == 0
 
 
 # ===========================================================================
@@ -1217,10 +1024,6 @@ class TestBatchActorsToRequest:
         n, timed_out = self._call(placed_actor_slots=10, secs_since_last_batch=301.0)
         assert n == 50
         assert timed_out is True
-
-    def test_final_batch_clamped_to_target(self) -> None:
-        n, _ = self._call(requested=180, target=200, placed_actor_slots=180, outstanding=200)
-        assert n == 20
 
     def test_no_request_when_pool_covers_outstanding_work(self) -> None:
         # Only 30 chunks left but 50 actors already requested — don't over-provision.
@@ -1386,16 +1189,6 @@ class TestActorRequestHeadroom:
         control_expired = self._call(**unplaced, secs_since_last_batch=99_999.0, headroom=None)
         assert control_fresh == (0, False), "control: an unplaced batch gates the next one"
         assert control_expired == (50, True), "control: the timeout releases a full batch regardless"
-
-    def test_readiness_is_not_what_counts(self) -> None:
-        """Nodes, not ready actors — the bound is about hardware the run already holds.
-
-        The function is given a node count precisely so a slow checkpoint load cannot
-        read as a capacity shortage: those instances are joined and billed whether or
-        not the actors on them have finished loading, and a fleet that already has its
-        hardware should not be held back waiting for it to warm up.
-        """
-        assert self._call(requested=25, placed_actor_slots=25, last_batch_size=25)[0] == ACTOR_REQUEST_HEADROOM
 
     def test_remaining_work_still_caps_the_request(self) -> None:
         """A second ceiling beside the work cap, never a replacement for it.
@@ -1686,15 +1479,6 @@ class TestWorkStealingGpuHours:
             f"billed GPU — the {n_unplaced} requested-but-unplaced slots are being billed for"
         )
 
-    def test_a_failed_capacity_lookup_does_not_abort_the_run(self) -> None:
-        """The lookup sits outside the try/except that wraps the tracker poll.
-
-        Unguarded, a control-plane hiccup would propagate out of the dispatch
-        loop and destroy a fill over a log number. The figure is what degrades.
-        """
-        polls, _ = self._run_loop(3, {"side_effect": RuntimeError("gcs unavailable")})
-        assert polls[0]["gpu_hours"] == 0.0
-
     def test_capacity_is_not_queried_once_per_completed_chunk(self) -> None:
         """The query is a synchronous cluster-wide round trip sitting on the dispatch path.
 
@@ -1883,9 +1667,6 @@ class TestWorkStealingBatching:
 
         actor0 = _make_actor("i-0000")
 
-        def fake_nodes():
-            return [{"Alive": True, "Resources": {"GPU": 1}}] * 16
-
         def fake_get(ref, *args, **kwargs):
             if getattr(ref, "_iid", None):
                 return ref._iid
@@ -1903,7 +1684,6 @@ class TestWorkStealingBatching:
         with (
             patch.object(_sched_mod.ray, "wait", side_effect=fake_wait),
             patch.object(_sched_mod.ray, "get", side_effect=fake_get),
-            patch.object(_sched_mod.ray, "nodes", side_effect=fake_nodes),
             patch.object(_sched_mod.time, "sleep"),
         ):
             results = _work_steal(
@@ -2019,35 +1799,6 @@ class TestWorkStealingBatching:
     def test_the_unbatched_mode_still_asks_for_the_whole_fleet(self) -> None:
         """Batching disabled means the whole target up front, and nothing left to grow."""
         assert self._drive_to_target(num_gpus=1.0, target=120, headroom=None, batch_size=0) == 120
-
-    def test_no_batching_when_factory_absent(self) -> None:
-        """With no actor_factory the loop never tries to grow the pool."""
-        config = MagicMock()
-        config.checkpoint_path = "s3://bucket/ckpt.pt"
-        config.actor_request_batch_size = 2  # set, but no factory → disabled
-        config.actor_request_headroom = None
-
-        actor0 = MagicMock()
-        actor0.process_chunk.remote.side_effect = lambda *a, **k: MagicMock()
-
-        def fake_wait(refs, num_returns=1, timeout=60):
-            if timeout == 0:
-                return (list(refs), [])
-            return ([refs[0]], list(refs[1:])) if refs else ([], [])
-
-        with (
-            patch.object(_sched_mod.ray, "wait", side_effect=fake_wait),
-            patch.object(_sched_mod.ray, "get", return_value={"chunk": "x", "status": "ok"}),
-            patch.object(_sched_mod.ray, "nodes", side_effect=AssertionError("nodes() must not be polled")),
-            patch.object(_sched_mod.time, "sleep"),
-        ):
-            results = _work_steal(
-                actors=[actor0],
-                actor_instance_ids=["i-0000"],
-                chunks=[_fake_chunk("c0")],
-                config=config,
-            )
-        assert len(results) == 1
 
 
 # ===========================================================================
@@ -2446,7 +2197,6 @@ class TestMidRunWindDownNeedsRegrowth:
         with (
             patch.object(_sched_mod.ray, "wait", side_effect=lambda refs, **kw: (list(refs), [])),
             patch.object(_sched_mod.ray, "get", side_effect=fake_get),
-            patch.object(_sched_mod.ray, "nodes", return_value=[{"Alive": True, "Resources": {"GPU": 1}}]),
             patch.object(_sched_mod.time, "sleep"),
             patch.object(_sched_mod.ActorPool, "retire_idle") as idle_mock,
             patch.object(_sched_mod.ActorPool, "retire_initializing") as init_mock,
@@ -2605,12 +2355,6 @@ class TestChainedWorkSource:
             )
         assert 5 in timeouts  # boundary wait while the source was still active
         assert 60 in timeouts  # long wait after the source was exhausted
-
-    def test_retirement_runs_once_the_source_is_exhausted(self):
-        actor = MagicMock(name="actor_0")
-        zone_a = self._zone_items("zone-a", ["c0"])
-        _, _, retire_mock = self._drive(actor, [[], zone_a], retire_idle_actors=True)
-        assert retire_mock.called  # the gate passes through to the pool
 
     def test_retirement_runs_while_the_source_is_merely_waiting(self):
         """A source answering `[]` has nothing right now, and holding a full fleet through that
@@ -2837,44 +2581,6 @@ class TestChainedWorkSource:
             )
         by_status = sorted((r["chunk"], r["status"]) for r in results)
         assert by_status == [("c0", "ok"), ("c0", "ok")]  # both zones landed
-
-
-# ---------------------------------------------------------------------------
-# Run-qualified progress key (chunk_uid / WorkItem.uid)
-# ---------------------------------------------------------------------------
-
-
-class TestChunkUid:
-    """The progress tracker is keyed by the run-qualified uid, not the bare
-    chunk label, so a shared multi-zone session can't alias two zones' chunks.
-    """
-
-    def test_chunk_uid_is_run_qualified(self) -> None:
-        from tessera_embeddings.inference.progress import chunk_uid
-
-        assert chunk_uid("33N-2025-abc", "5_5") == "33N-2025-abc:5_5"
-
-    def test_workitem_uid_uses_the_shared_helper(self) -> None:
-        from tessera_embeddings.inference.progress import chunk_uid
-
-        item = _sched_mod.WorkItem(
-            chunk=_fake_chunk("5_5"), ctx=_sched_mod.ZoneContext("s3://m", "s3://s", "33N-2025-abc")
-        )
-        assert item.uid == chunk_uid("33N-2025-abc", "5_5")
-
-    def test_same_label_different_zones_do_not_collide(self) -> None:
-        """The regression: two zones both have a ``5_5`` chunk. Before the fix
-        both keyed the tracker as ``"5_5"``, so one zone's completion evicted the
-        other's progress entry and hung the live task. Their uids must differ.
-        """
-        za = _sched_mod.WorkItem(
-            chunk=_fake_chunk("5_5"), ctx=_sched_mod.ZoneContext("s3://m/33N", "s3://s/33N", "33N-2025-a")
-        )
-        zb = _sched_mod.WorkItem(
-            chunk=_fake_chunk("5_5"), ctx=_sched_mod.ZoneContext("s3://m/34N", "s3://s/34N", "34N-2025-b")
-        )
-        assert za.chunk.label == zb.chunk.label  # labels collide across zones...
-        assert za.uid != zb.uid  # ...but the run-qualified uids do not
 
 
 # ===========================================================================

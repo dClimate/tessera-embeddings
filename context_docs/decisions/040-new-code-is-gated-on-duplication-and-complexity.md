@@ -142,8 +142,7 @@ a run resumed across the change re-infers its staged tiles, and its mosaics need
 - used by `scripts/` operator tools: four `storage/registry_rebuild.py` exports;
 - used by yield-embeddings, which a scan of this repo cannot see: `daily_times`,
   `mgrs_tile_to_bbox`, `quantize_rows`;
-- used only by tests: `inference/shard_record.py`, `quantize_embeddings`,
-  `dequantize_embeddings`, `mgrs_tile_to_utm_epsg`;
+- used only by tests: `mgrs_tile_to_utm_epsg`;
 - wrong: `_equal` in `registry_rebuild.py` is called in its own file, and `ConfigMismatchError`
   is a deliberate re-export.
 

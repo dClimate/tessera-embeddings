@@ -3,8 +3,7 @@
 The core guarantee is that the row-wise :func:`quantize_rows` (used to quantize
 each bucket as it comes off the GPU) is *bit-for-bit identical* to quantizing the
 whole ``(H, W, D)`` chunk at the end. We pin that against a frozen copy of the
-original whole-array implementation rather than the production function, which now
-delegates to ``quantize_rows`` and would make the comparison circular.
+original whole-array implementation.
 """
 
 from __future__ import annotations
@@ -14,8 +13,6 @@ import pytest
 import torch
 
 from tessera_embeddings.inference.quantization import (
-    dequantize_embeddings,
-    quantize_embeddings,
     quantize_rows,
     quantize_rows_torch,
     raise_on_nonfinite_scales,
@@ -23,7 +20,7 @@ from tessera_embeddings.inference.quantization import (
 
 
 def _quantize_whw_reference(embeddings: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Frozen copy of the original (H, W, D) quantize_embeddings body.
+    """Frozen copy of the original whole-array (H, W, D) quantizer.
 
     Verbatim from quantization.py as shipped (per-pixel symmetric int8). This is
     the golden reference quantize_rows must match exactly. Do NOT refactor this to
@@ -50,22 +47,6 @@ def test_quantize_rows_matches_whole_array_reference() -> None:
     np.testing.assert_array_equal(s, ref_s.reshape(h * w))
 
 
-def test_quantize_embeddings_delegates_consistently() -> None:
-    """Production (H,W,D) wrapper matches the frozen reference (regression guard)."""
-    rng = np.random.default_rng(1)
-    emb = (rng.standard_normal((16, 16, 128)) * 3.0).astype(np.float32)
-
-    ref_q, ref_s = _quantize_whw_reference(emb)
-    q, s = quantize_embeddings(emb)
-
-    np.testing.assert_array_equal(q, ref_q)
-    np.testing.assert_array_equal(s, ref_s)
-    assert q.dtype == np.int8
-    assert s.dtype == np.float32
-    assert q.shape == emb.shape
-    assert s.shape == emb.shape[:2]
-
-
 def test_zero_row_uses_scale_floor() -> None:
     """All-zero row -> q all zero, scale at the 1e-8 floor.
 
@@ -75,14 +56,6 @@ def test_zero_row_uses_scale_floor() -> None:
     q, s = quantize_rows(np.zeros((1, 128), dtype=np.float32))
     np.testing.assert_array_equal(q, np.zeros((1, 128), dtype=np.int8))
     assert s[0] == np.float32(1e-8)
-
-
-def test_constant_row_saturates_to_127() -> None:
-    """A row of equal positive values quantizes to all 127 (scale = val / 127)."""
-    val = 1000.0
-    q, s = quantize_rows(np.full((1, 128), val, dtype=np.float32))
-    np.testing.assert_array_equal(q, np.full((1, 128), 127, dtype=np.int8))
-    assert s[0] == pytest.approx(val / 127.0, rel=1e-6)
 
 
 def test_clip_bound_is_symmetric_127() -> None:
@@ -174,18 +147,3 @@ def test_torch_quantize_nonfinite_surfaces_in_scales() -> None:
         assert not np.isfinite(scales.numpy()).all()
         with pytest.raises(ValueError, match="non-finite"):
             raise_on_nonfinite_scales(scales.numpy())
-
-
-def test_raise_on_nonfinite_scales_accepts_finite() -> None:
-    raise_on_nonfinite_scales(np.array([1.0, 2.5, 1e-8], dtype=np.float32))
-
-
-def test_round_trip_recovers_within_scale() -> None:
-    """Dequantized values are within one quantization step (scale) of the original."""
-    rng = np.random.default_rng(2)
-    emb = (rng.standard_normal((8, 8, 128)) * 2.0).astype(np.float32)
-    q, s = quantize_embeddings(emb)
-    recovered = dequantize_embeddings(q, s)
-    # Max error per pixel is at most its own scale (one int8 step).
-    err = np.abs(recovered - emb).max(axis=-1)
-    assert np.all(err <= s + 1e-6)

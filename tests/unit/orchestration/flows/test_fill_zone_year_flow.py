@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-import pathlib
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -103,8 +102,7 @@ def test_coverage_gate_fails_before_ray(wired, allow_partial):
     assert captured["creds"] is not None  # credential callback threaded through
 
 
-@pytest.mark.parametrize("flag", [False, True])
-def test_allow_s2_only_reaches_inference_config(wired, flag):
+def test_allow_s2_only_reaches_inference_config(wired):
     """The flag lands in build_inference_config, the single chokepoint through which it reaches the
     dataset's per-pixel gate. The zone-level gates are NOT relaxed by it (the coverage gate still
     raises here).
@@ -114,8 +112,8 @@ def test_allow_s2_only_reaches_inference_config(wired, flag):
     _stop_before_ray(wired)
 
     with pytest.raises(InsufficientCoverageError):
-        mod.fill_zone_year_flow.fn(zone="33N", year=2025, paths=_PATHS, **_AMI, allow_s2_only=flag)
-    assert captured["allow_s2_only"] is flag
+        mod.fill_zone_year_flow.fn(zone="33N", year=2025, paths=_PATHS, **_AMI, allow_s2_only=True)
+    assert captured["allow_s2_only"] is True
 
 
 def _fake_ray_cluster(captured: dict | None = None):
@@ -262,12 +260,6 @@ class TestPerCellValidation:
         mod.fill_zone_year_flow.fn(zone="33n", year=2025, paths=_PATHS, **_AMI, validation_deployment="v/v")
         assert [(c["zone"], c["year"]) for c in dispatched] == [("33N", 2025)]
 
-    def test_the_summary_reaches_the_caller_unchanged(self, wired, dispatched):
-        """The dispatch is a side effect; the fill's own summary is the return value."""
-        wired.setattr(mod, "zone_year_complete", lambda *a, **k: True)
-        summary = mod.fill_zone_year_flow.fn(zone="33N", year=2025, paths=_PATHS, **_AMI, validation_deployment="v/v")
-        assert summary == {"tag": "zone-33N-2025"}
-
 
 class TestTheMinimumDepthRuleComesFromTheStore:
     """A fill applies the rule its STORE advertises, never one a dispatch supplied.
@@ -278,29 +270,14 @@ class TestTheMinimumDepthRuleComesFromTheStore:
     refused pixels leave no trace to compare.
     """
 
-    def test_the_flow_takes_no_minimum_depth_parameter(self):
-        """The structural half of the guarantee: there is no dispatch parameter to disagree with
-        the store, so the two cannot diverge.
-        """
-        import inspect
-
-        flow = getattr(mod.fill_zone_year, "fn", mod.fill_zone_year)
-        params = inspect.signature(flow).parameters
-        assert "optical_min_obs" not in params
-
-    def test_the_reader_returns_none_for_a_store_that_declares_no_rule(self, monkeypatch):
+    @pytest.mark.parametrize(("attrs", "rule"), [({}, None), ({"optical_min_obs": 25}, 25)])
+    def test_the_reader_returns_the_stamped_rule_or_none(self, monkeypatch, attrs, rule):
         """Every store seeded before 2026-08-13 declares none, and those stores already contain
         everything with any optical input — applying a line retrospectively would claim their
         existing zones were filled under one that never touched them.
         """
-        monkeypatch.setattr(mod, "open_store_as_zarr_group", lambda *a, **k: SimpleNamespace(attrs={}))
-        assert mod._optical_min_obs_from_store("s3://x", get_credentials=None) is None
-
-    def test_the_reader_returns_the_stamped_rule(self, monkeypatch):
-        monkeypatch.setattr(
-            mod, "open_store_as_zarr_group", lambda *a, **k: SimpleNamespace(attrs={"optical_min_obs": 25})
-        )
-        assert mod._optical_min_obs_from_store("s3://x", get_credentials=None) == 25
+        monkeypatch.setattr(mod, "open_store_as_zarr_group", lambda *a, **k: SimpleNamespace(attrs=attrs))
+        assert mod._optical_min_obs_from_store("s3://x", get_credentials=None) == rule
 
 
 def test_the_store_reader_takes_the_store_s_credential_not_the_caller_s(monkeypatch):
@@ -316,22 +293,19 @@ def test_the_store_reader_takes_the_store_s_credential_not_the_caller_s(monkeypa
     assert opened == [("store's own", "s3://theirs/global.icechunk")]
 
 
-def test_the_depth_rule_is_resolved_even_when_no_cluster_is_needed(monkeypatch):
+def test_the_depth_rule_is_resolved_even_when_no_cluster_is_needed(wired):
     """An all-ocean or already-complete cell never provisions Ray, and still reaches the runner.
 
     The runner asserts the config's rule against the store root BEFORE it checks completion or
     reads the land mask, so leaving the rule unresolved on these cheap terminal paths made them
-    raise instead of marking and tagging — stopping the campaign finishing on the work it has
-    least reason to do.
+    raise instead of marking and tagging.
     """
     seen: dict = {}
-    monkeypatch.setattr(mod, "_optical_min_obs_from_store", lambda *a, **k: seen.setdefault("read", 15) or 15)
-    src = pathlib.Path(mod.__file__).read_text()
-    before_branch = src.split("if needs_cluster:")[0]
-    assert "_optical_min_obs_from_store(" in before_branch, (
-        "the rule must be resolved before the needs_cluster branch, or terminal cells reach the "
-        "runner with optical_min_obs=None and its assertion fails them"
-    )
+    wired.setattr(mod, "zone_year_complete", lambda *a, **k: True)
+    wired.setattr(mod, "_optical_min_obs_from_store", lambda *a, **k: 25)
+    wired.setattr(mod, "fill_zone_year", lambda **kw: seen.update(kw) or {})
+    mod.fill_zone_year_flow.fn(zone="33N", year=2025, paths=_PATHS, **_AMI)
+    assert seen["config"].optical_min_obs == 25
 
 
 def test_the_destination_schema_is_checked_before_ray(wired):

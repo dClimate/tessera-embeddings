@@ -179,7 +179,8 @@ archive. That claim only holds now that both polarisations are required server-s
   and `query_stac_items` would double the query cost. Documented at the
   call sites and tracked in
   [issue #47](https://github.com/dClimate/tessera-embeddings/issues/47).
-- **Con (test debt):** `tests/parity/test_ingest_s1_roi_parity.py` replays
+- **Con (test debt):** `tests/parity/test_ingest_s1_roi_parity.py` (deleted in the 2026-11
+  test-suite reduction, never having run green; `context_docs/test-suite-reduction/`) replays
   a VCR cassette recorded against the old CMR-STAC-search path, so it no
   longer matches on replay. Re-recording produces a ~116 MB cassette
   (COG bodies + EDL/ASF auth redirects) that trips the credential-safety
