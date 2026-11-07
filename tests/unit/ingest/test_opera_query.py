@@ -355,13 +355,15 @@ class TestUnparseableGranulePage:
         assert mock_get.call_count == 1
 
 
-@pytest.mark.parametrize("tile", ["33UUP", "55HBE", "31NAA"])
+@pytest.mark.parametrize("tile", ["33UUP", "55HBE", "31NAA", "1WCN"])
 def test_mgrs_tile_to_bbox_contains_all_four_corners(tile):
     """Kept for yield-embeddings' radar source sweep, its only caller. A UTM square's NW and SE
     corners are not on a lat/lon rectangle through its SW and NE ones, so all four are checked.
     """
     west, south, east, north = mgrs_tile_to_bbox(tile)
+    assert (west > east) == (tile == "1WCN")  # only 1WCN crosses the antimeridian
     m = mgrs.MGRS()
     for corner in ("0000000000", "0000099999", "9999900000", "9999999999"):
         lat, lon = m.toLatLon(f"{tile}{corner}")
-        assert west <= lon <= east and south <= lat <= north, (tile, corner)
+        in_lon = west <= lon <= east if west <= east else (lon >= west or lon <= east)
+        assert in_lon and south <= lat <= north, (tile, corner)

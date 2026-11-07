@@ -88,7 +88,8 @@ def mgrs_tile_to_bbox(tile_id: str) -> tuple[float, float, float, float]:
 
     A UTM square is not a lat/lon rectangle: its edges converge toward the pole and rotate away
     from the zone's central meridian, so its south-west and north-east corners alone miss the
-    other two. The box is the extent of points sampled along all four edges.
+    other two. The box is the extent of points sampled along all four edges. A tile that crosses
+    the antimeridian gets ``west > east``, the CMR/STAC convention for such a box.
 
     No caller in this package: yield-embeddings' ``scripts/radar_source_sweep.py`` imports it.
     """
@@ -104,7 +105,11 @@ def mgrs_tile_to_bbox(tile_id: str) -> tuple[float, float, float, float]:
             lat, lon = m.toLatLon(f"{tile_id}{e:05d}{n:05d}")
             lats.append(lat)
             lons.append(lon)
-    return (min(lons), min(lats), max(lons), max(lats))
+    # Unwrap longitudes around the first sample so a tile across ±180° stays contiguous.
+    # Exact arithmetic for every other tile: only a sample more than 180° away moves.
+    unwrapped = [lon + 360 * round((lons[0] - lon) / 360) for lon in lons]
+    west, east = (x - 360 * round(x / 360) for x in (min(unwrapped), max(unwrapped)))
+    return (west, min(lats), east, max(lats))
 
 
 def normalize_opera_timestamps(items: list[Any], *, mid_longitude: float | None = None) -> list[Any]:
