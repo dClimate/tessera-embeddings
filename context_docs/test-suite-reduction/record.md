@@ -48,7 +48,7 @@ Each was checked before anything was deleted; these did not survive the check.
 - `orchestration/flows/test_flow_ray_teardown.py::test_ray_owning_flows_do_not_import_the_aws_provider_at_module_scope` — express the rule as an import-linter `forbidden` contract — import-linter also counts function-level imports, and these flows import the provider inside functions on purpose, so the contract cannot say "module scope only"; ruff's TID253 (`banned-module-level-imports`, in `ruff.toml`) can, and replaced the AST test (verified against a planted violation).
 - `fixtures/stac_cassettes/*` — "byte-identical (same md5)" — the duplicates differ in CDN and date response headers, so their md5s differ; the recorded responses are the same, so they were still deleted as duplicates.
 - `providers/test_provider_aws_ray.py` (moto seed made per-worker) — "~10 CPU-s saved" — measured 12.2 → 9.7 CPU-s serially: a `@mock_aws` test between two seeded tests resets moto's backends, so the seed is rebuilt after each one.
-- `ingest/opera_query.py::mgrs_tile_to_bbox` — DEAD (no caller in this repo or yield-embeddings `src/`) — yield-embeddings' `scripts/radar_source_sweep.py` imports it; restored, and fixed to take the extent of all four tile edges rather than two corners.
+- `ingest/opera_query.py::mgrs_tile_to_bbox` — DEAD (no caller in this repo or yield-embeddings `src/`) — yield-embeddings' `scripts/radar_source_sweep.py` imports it; restored, and fixed to take the extent of all four tile edges rather than two corners and to return `west > east` for a tile across the antimeridian.
 
 ## Left as is
 
