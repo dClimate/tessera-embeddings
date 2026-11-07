@@ -1,6 +1,8 @@
 # Test-suite reduction: assessment and execution plan
 
-**Status:** plan, 2026-11-05. Not yet executed. Written for an executing session that did not see
+**Status:** executed 2026-11-07 in PR #268; the outcome is in [`record.md`](record.md). The per-slice
+reviews this plan cites under `reviews/` were deleted after execution; they are in git history at
+commit `431d4073`. Originally a plan, 2026-11-05. Written for an executing session that did not see
 the review; everything it needs is here or in `reviews/`.
 
 ## 1. Outcome this plan targets
@@ -251,9 +253,9 @@ Decided; the executor does not re-ask.
   measured before/after table, and which review claims did not hold (§7). The reviews themselves
   are then deleted; git keeps them.
 
-## 7. Claims that did not hold (executor fills in)
+## 7. Claims that did not hold
 
-_Empty until execution. One line each: file, test, claim, why it was kept._
+Recorded in [`record.md`](record.md).
 
 ## 8. Method, for the record
 
@@ -263,10 +265,3 @@ Measured on 2026-11-04 with `pytest -n auto --junitxml` (per-file CPU-seconds, t
 without: coverage is not the CI cost). Five Opus reviewers each read one slice of the suite in full,
 grepped `src/` for callers, and wrote the per-file lists in `reviews/`. Every dead-code claim in §2c
 and the pool finding in §2a were re-verified by hand before this plan was written.
-- `assembly/test_assembly.py::TestAssembly::test_same_date_overwrite_resets_untouched_vars_to_fill` — DEAD (only `embedding_std` can be dropped) — the reset also covers the other S1 orbit's obs count on a single-orbit refill; rewritten on that variable instead of deleted.
-- `storage/test_published_store.py::TestSampleLivePixels` (4 tests) — DEAD (`sample_live_pixels` only reached by a bench script; move it there) — `tests/integration/test_published_store_access.py` also calls it to find a live pixel in the published store, so it stays in `published_store` with its unit tests.
-- `inference/test_assessed_window_coverage.py` (whole file) — MERGE into `test_data_loading.py` with the boundary tests in one table — Group 4 had since made it the home of the time-window coverage gate (19 tests, 220 lines, not 8 and 74), and the table saved three lines while adding test ids; left as is.
-- `profiling/test_watch_scheduler.py::test_spill_trips_while_every_scheduler_signal_is_nominal` — DUP of `test_alert_worker_spill` — the survivor asserted only that `worker-spill` fires, not that it fires alone; the exclusivity assert was folded into it before the deletion.
-- `orchestration/flows/test_flow_ray_teardown.py::test_ray_owning_flows_do_not_import_the_aws_provider_at_module_scope` — express the rule as an import-linter `forbidden` contract — import-linter also counts function-level imports, and these flows import the provider inside functions on purpose, so the contract cannot say "module scope only"; ruff's TID253 (`banned-module-level-imports`, in `ruff.toml`) can, and replaced the AST test (verified against a planted violation).
-- `fixtures/stac_cassettes/*` — "byte-identical (same md5)" — the duplicates differ in CDN and date response headers, so their md5s differ; the recorded responses are the same, so they were still deleted as duplicates.
-- `providers/test_provider_aws_ray.py` (moto seed made per-worker) — "~10 CPU-s saved" — measured 12.2 → 9.7 CPU-s serially: a `@mock_aws` test between two seeded tests resets moto's backends, so the seed is rebuilt after each one.
