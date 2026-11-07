@@ -86,15 +86,25 @@ def _cmr_session() -> requests.Session:
 def mgrs_tile_to_bbox(tile_id: str) -> tuple[float, float, float, float]:
     """WGS84 ``(west, south, east, north)`` of a 100 km MGRS tile (e.g. ``"33UUP"``).
 
+    A UTM square is not a lat/lon rectangle: its edges converge toward the pole and rotate away
+    from the zone's central meridian, so its south-west and north-east corners alone miss the
+    other two. The box is the extent of points sampled along all four edges.
+
     No caller in this package: yield-embeddings' ``scripts/radar_source_sweep.py`` imports it.
     """
     m = mgrs.MGRS()
-    # Tile corners near band boundaries produce a harmless latitude warning.
+    steps = range(0, 100_000, 10_000)
+    edge = [(e, n) for e in (*steps, 99_999) for n in (0, 99_999)]
+    edge += [(e, n) for n in steps for e in (0, 99_999)]
+    lats, lons = [], []
+    # Points near band boundaries produce a harmless latitude warning.
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="Warning in.*Convert_MGRS_To_Geodetic")
-        sw_lat, sw_lon = m.toLatLon(f"{tile_id}0000000000")
-        ne_lat, ne_lon = m.toLatLon(f"{tile_id}9999999999")
-    return (sw_lon, sw_lat, ne_lon, ne_lat)
+        for e, n in edge:
+            lat, lon = m.toLatLon(f"{tile_id}{e:05d}{n:05d}")
+            lats.append(lat)
+            lons.append(lon)
+    return (min(lons), min(lats), max(lons), max(lats))
 
 
 def normalize_opera_timestamps(items: list[Any], *, mid_longitude: float | None = None) -> list[Any]:

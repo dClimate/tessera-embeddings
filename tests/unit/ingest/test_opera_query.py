@@ -6,6 +6,7 @@ from collections import Counter
 from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
+import mgrs
 import pytest
 import requests
 
@@ -354,11 +355,13 @@ class TestUnparseableGranulePage:
         assert mock_get.call_count == 1
 
 
-def test_mgrs_tile_to_bbox_covers_the_tile():
-    """Kept for yield-embeddings' radar source sweep, its only caller. 33UUP is in central
-    Europe; 55HBE is south of the equator.
+@pytest.mark.parametrize("tile", ["33UUP", "55HBE", "31NAA"])
+def test_mgrs_tile_to_bbox_contains_all_four_corners(tile):
+    """Kept for yield-embeddings' radar source sweep, its only caller. A UTM square's NW and SE
+    corners are not on a lat/lon rectangle through its SW and NE ones, so all four are checked.
     """
-    west, south, east, north = mgrs_tile_to_bbox("33UUP")
-    assert 12.0 < west < 14.0 and 13.0 < east < 15.0 and west < east
-    assert 47.0 < south < 49.0 and 48.0 < north < 50.0 and south < north
-    assert mgrs_tile_to_bbox("55HBE")[1] < 0
+    west, south, east, north = mgrs_tile_to_bbox(tile)
+    m = mgrs.MGRS()
+    for corner in ("0000000000", "0000099999", "9999900000", "9999999999"):
+        lat, lon = m.toLatLon(f"{tile}{corner}")
+        assert west <= lon <= east and south <= lat <= north, (tile, corner)
