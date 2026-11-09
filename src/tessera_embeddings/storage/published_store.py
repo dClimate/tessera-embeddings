@@ -16,13 +16,8 @@ from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import numpy as np
 
-from tessera_embeddings.config.store_geometry import spatial_dims_of
-from tessera_embeddings.config.store_layout import (
-    GLOBAL,
-    SHARD_PX,
-    StoreLayout,
-    clamp_chunks_and_shards,
-)
+from tessera_embeddings.config.store_geometry import clamp_chunks_and_shards, level0, spatial_dims_of
+from tessera_embeddings.config.store_layout import GLOBAL, GLOBAL_V2, SHARD_PX, StoreLayout
 from tessera_embeddings.storage.global_store import _codec_id, missing_seeded_arrays
 from tessera_embeddings.storage.shard_writer import SHARD_WRITE
 
@@ -38,8 +33,12 @@ if TYPE_CHECKING:
 COVERAGE_VAR = "scales"
 
 
-def layout_departures(group: zarr.Group, layout: StoreLayout = GLOBAL) -> list[str]:
+def layout_departures(group: zarr.Group, layout: StoreLayout | None = None) -> list[str]:
     """Every way ``group`` departs from ``layout``, as one sentence each; empty means it conforms.
+
+    *group* is a zone group. Its arrays are read from its level group ``0`` when it has one, and
+    the layout defaults to the global preset the group's shape says it was seeded with: v2's when
+    it has a level group (ADR 031), v1.1's otherwise.
 
     An array the layout declares and the group lacks is a departure; the reverse is not, because
     the coordinate arrays live beside the data arrays and no layout describes them. Expectations
@@ -48,8 +47,9 @@ def layout_departures(group: zarr.Group, layout: StoreLayout = GLOBAL) -> list[s
     than one nominal shard reports a false departure.
     """
     # Against the Y/X names the group declares: v1.1 stores use northing/easting, later models y/x.
-    layout = layout.with_spatial_dims(spatial_dims_of(group))
-    present = dict(group.arrays())
+    arrays = level0(group)
+    layout = (layout or (GLOBAL if arrays is group else GLOBAL_V2)).with_spatial_dims(spatial_dims_of(group))
+    present = dict(arrays.arrays())
     out: list[str] = []
     # The COORDINATE arrays too: losing a spatial axis, `month` or `time_bnds` would otherwise only
     # skip that dimension's extent check, so the audit reports nothing while a labelled read of the
@@ -154,7 +154,7 @@ def coordinate_departures(group: zarr.Group, spec: ZoneSpec) -> list[str]:
     from tessera_embeddings.storage.zone_grid import easting_coords, northing_coords
 
     out: list[str] = []
-    present = dict(group.arrays())
+    present = dict(level0(group).arrays())
     # `month` by VALUE: 0..11, a reordering or a duplicate has the right rank and extent while
     # `sel(month=7)` selects the wrong plane. Small enough to read whole, unlike the spatial axes.
     month = present.get("month")
@@ -190,12 +190,14 @@ def coordinate_departures(group: zarr.Group, spec: ZoneSpec) -> list[str]:
 def calendar_years(group: zarr.Group) -> list[int]:
     """The calendar year of each time slot, from the group's own ``time`` coordinate.
 
+    *group* is a zone group; the coordinate is read from its level group ``0`` when it has one.
+
     The coordinate is int64 nanoseconds, so it must be VIEWED as ``datetime64[ns]`` before being
     truncated to years; casting the raw integers straight to ``datetime64[Y]`` reads each
     nanosecond count as a year offset. The range check makes a future change of units a loud
     failure rather than a silently wrong time-index-to-year mapping.
     """
-    time_coord = cast("zarr.Array", group["time"])
+    time_coord = cast("zarr.Array", level0(group)["time"])
     stamps = np.asarray(time_coord[:]).astype("datetime64[ns]")
     years = [int(y) for y in stamps.astype("datetime64[Y]").astype(int) + 1970]
     if not all(1970 <= y <= 2200 for y in years):

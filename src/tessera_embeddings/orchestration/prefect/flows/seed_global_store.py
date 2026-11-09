@@ -21,8 +21,8 @@ from prefect import flow, get_run_logger
 
 from tessera_embeddings.config.inference import DEFAULT_MODEL_VERSION, ModelVersion
 from tessera_embeddings.config.paths import BucketPaths
-from tessera_embeddings.config.store_geometry import spatial_dims_of
-from tessera_embeddings.config.store_layout import GLOBAL
+from tessera_embeddings.config.store_geometry import level0, spatial_dims_of
+from tessera_embeddings.config.store_layout import layout_for
 from tessera_embeddings.storage.campaign import campaign_status
 from tessera_embeddings.storage.global_store import (
     _check_layout_matches,
@@ -137,7 +137,7 @@ def seed_global_store(
         root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
         probe_name = sorted(seeded)[0]
         probe = cast("zarr.Group", root[probe_name])
-        existing_years = tuple(year_of(t) for t in read_time_values(probe))
+        existing_years = tuple(year_of(t) for t in read_time_values(level0(probe)))
         if existing_years != tuple(years):
             raise ValueError(
                 f"years {tuple(years)} differ from the store's existing axis {existing_years} "
@@ -151,7 +151,7 @@ def seed_global_store(
         # every group shares one axis and one layout, the same invariant the helper's own
         # single-group check rests on.
         # Against the store's own Y/X names, which a store keeps whatever the model seeding it.
-        layout = GLOBAL.with_spatial_dims(spatial_dims_of(probe))
+        layout = layout_for(model_version, single=False).with_spatial_dims(spatial_dims_of(probe))
         _check_layout_matches(probe, probe_name, layout)
         # And COMPLETENESS, which the layout check does not cover: it iterates `layout.arrays`,
         # the six data arrays, while a seed also writes six coordinates beside them. An older
@@ -193,11 +193,11 @@ def seed_global_store(
         # or minimum-depth rule would report a clean seed, leave the old identity standing and
         # let the campaign follow the OLD rule. Checked here too, on the path that skips the seed.
         root_attrs = dict(zarr.open_group(repo.readonly_session(branch="main").store, mode="r").attrs)
-        # GLOBAL is what the seed below uses (seed_zone_groups' default), so the identity
-        # compared here is the identity that a seed would have written.
+        # The model's layout is what the seed below uses (seed_zone_groups' default), so the
+        # identity compared here is the identity that a seed would have written.
         check_root_identity(
             root_attrs,
-            layout=GLOBAL,
+            layout=layout_for(model_version, single=False),
             model_version=model_version,
             optical_min_obs=optical_min_obs,
         )
@@ -210,7 +210,7 @@ def seed_global_store(
             _refuse_stamping_over_landed_cells(root_attrs, f"all {len(ZONES)} zone groups")
             snapshot = stamp_root_identity(
                 repo,
-                layout=GLOBAL,
+                layout=layout_for(model_version, single=False),
                 model_version=model_version,
                 optical_min_obs=optical_min_obs,
             )

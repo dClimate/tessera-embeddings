@@ -139,6 +139,7 @@ def _fully_seeded(monkeypatch, root_attrs: dict, *, cells_landed: int):
     monkeypatch.setattr(mod, "_check_layout_matches", lambda *a, **k: None)
     monkeypatch.setattr(mod, "missing_seeded_arrays", lambda *a, **k: set())
     monkeypatch.setattr(mod, "spatial_dims_of", lambda grp: ("northing", "easting"))
+    monkeypatch.setattr(mod, "level0", lambda grp: grp)
     monkeypatch.setattr(mod, "read_time_values", lambda grp: list(mod.CAMPAIGN_YEARS))
     monkeypatch.setattr(mod, "year_of", lambda t: t)
     monkeypatch.setattr(mod, "check_root_identity", lambda *a, **k: None)
@@ -250,6 +251,7 @@ def _partially_seeded(monkeypatch, root_attrs: dict, *, cells_landed: int, seede
     monkeypatch.setattr(mod, "_check_layout_matches", lambda *a, **k: None)
     monkeypatch.setattr(mod, "missing_seeded_arrays", lambda *a, **k: set())
     monkeypatch.setattr(mod, "spatial_dims_of", lambda grp: ("northing", "easting"))
+    monkeypatch.setattr(mod, "level0", lambda grp: grp)
     monkeypatch.setattr(mod, "read_time_values", lambda grp: list(mod.CAMPAIGN_YEARS))
     monkeypatch.setattr(mod, "year_of", lambda t: t)
     monkeypatch.setattr(mod, "check_root_identity", lambda *a, **k: None)
@@ -332,6 +334,7 @@ def test_a_fully_seeded_store_still_validates_the_requested_identity(monkeypatch
     monkeypatch.setattr(mod, "_check_layout_matches", lambda *a, **k: None)
     monkeypatch.setattr(mod, "missing_seeded_arrays", lambda *a, **k: set())
     monkeypatch.setattr(mod, "spatial_dims_of", lambda grp: ("northing", "easting"))
+    monkeypatch.setattr(mod, "level0", lambda grp: grp)
     # The year-axis guard runs first and must pass, so the identity check is what raises.
     monkeypatch.setattr(mod, "read_time_values", lambda grp: list(mod.CAMPAIGN_YEARS))
     monkeypatch.setattr(mod, "year_of", lambda t: t)

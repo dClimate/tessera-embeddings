@@ -25,18 +25,42 @@ def _seed(tmp_path):
     return store
 
 
-@pytest.mark.parametrize(("model", "names"), [("v1.1", ("northing", "easting")), ("v2-large", ("y", "x"))])
-def test_each_model_seeds_its_own_spatial_names(tmp_path, model, names):
-    """v1.1 keeps northing/easting, v2 takes y/x, and the published-store audit accepts both."""
+@pytest.mark.parametrize(
+    ("model", "names", "level", "embedding_dims"),
+    [
+        ("v1.1", ("northing", "easting"), "", ("time", "northing", "easting", "band")),
+        ("v2-large", ("y", "x"), "/0", ("time", "band", "y", "x")),
+    ],
+)
+def test_each_model_seeds_its_own_layout(tmp_path, model, names, level, embedding_dims):
+    """v1.1 keeps northing/easting in the zone group; v2 seeds y/x, band-first, in level group 0.
+
+    The zone's attrs stay on the zone group either way, and the published-store audit accepts both.
+    """
     repo = global_store.create_global_repo(str(tmp_path / "global.icechunk"))
     global_store.seed_zone_groups(repo, [_ZA], years=(2025,), model_version=model)
-    g = zarr_store.open_store_as_zarr_group(str(tmp_path / "global.icechunk"), group="01N")
+    zone = zarr_store.open_store_as_zarr_group(str(tmp_path / "global.icechunk"), group="01N")
+    g = zarr_store.open_store_as_zarr_group(str(tmp_path / "global.icechunk"), group=f"01N{level}")
     y, x = names
     assert (g[y].shape, g[x].shape) == ((4096,), (2048,))
-    assert g["embeddings"].metadata.dimension_names == ("time", y, x, "band")
-    assert g.attrs["spatial:dimensions"] == [y, x] and g[y].attrs["axis"] == "Y"
-    assert published_store.layout_departures(g) == []
-    assert published_store.coordinate_departures(g, _ZA) == []
+    assert g["embeddings"].metadata.dimension_names == embedding_dims
+    assert g["embeddings"].attrs["spatial:dimensions"] == [y, x]
+    assert zone.attrs["spatial:dimensions"] == [y, x] and g[y].attrs["axis"] == "Y"
+    assert published_store.layout_departures(zone) == []
+    assert published_store.coordinate_departures(zone, _ZA) == []
+
+
+def test_a_v2_zone_is_a_multiscales_pyramid_of_one_level(tmp_path):
+    """ADR 031 §1: registered by the convention's own registration, with level 0 its only entry."""
+    repo = global_store.create_global_repo(str(tmp_path / "global.icechunk"))
+    global_store.seed_zone_groups(repo, [_ZA], years=(2025,), model_version="v2-large")
+    zone = zarr_store.open_store_as_zarr_group(str(tmp_path / "global.icechunk"), group="01N")
+    registered = {c["uuid"]: c for c in zone.attrs["zarr_conventions"]}
+    assert registered["d35379db-88df-4056-af3a-620245f8e347"]["name"] == "multiscales"
+    assert zone.attrs["multiscales"] == {
+        "layout": [{"asset": "0", "transform": {"scale": [1.0, 1.0], "translation": [0.0, 0.0]}}]
+    }
+    assert set(zone.array_keys()) == set() and set(zone.group_keys()) == {"0"}
 
 
 def test_extending_a_store_keeps_its_names(tmp_path, monkeypatch):
@@ -48,7 +72,7 @@ def test_extending_a_store_keeps_its_names(tmp_path, monkeypatch):
     global_store.seed_zone_groups(repo, [_ZA], years=(2025,), model_version="v2-large")
     MODEL_FAMILIES["v2-large"] = v2
     global_store.seed_zone_groups(repo, [_ZB], years=(2025,), model_version="v2-large")
-    g = zarr_store.open_store_as_zarr_group(store, group="01S")
+    g = zarr_store.open_store_as_zarr_group(store, group="01S/0")
     assert g["scales"].metadata.dimension_names == ("time", "northing", "easting")
     assert "y" not in g
 

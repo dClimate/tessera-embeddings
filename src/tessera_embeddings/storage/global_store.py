@@ -35,7 +35,7 @@ from tessera_embeddings.config.inference import (
     model_family,
     model_version_for_encoder,
 )
-from tessera_embeddings.config.store_geometry import spatial_dims_of
+from tessera_embeddings.config.store_geometry import level0, spatial_dims_of
 from tessera_embeddings.config.store_layout import (
     CARRIED_VARS,
     GLOBAL,
@@ -43,6 +43,7 @@ from tessera_embeddings.config.store_layout import (
     MONTHS_IN_YEAR,
     REQUIRED_VARS,
     StoreLayout,
+    layout_for,
 )
 from tessera_embeddings.storage.conventions import (
     assert_model_matches,
@@ -313,6 +314,7 @@ def _zone_attrs(spec: ZoneSpec, north: np.ndarray, east: np.ndarray, layout: Sto
             y_coords=north,
             x_coords=east,
             include_geoemb=False,  # geoemb: is stated once on the root, not per zone
+            level=layout.level,
         )
     )
     return attrs
@@ -386,9 +388,13 @@ def missing_seeded_arrays(node: zarr.Group, layout: StoreLayout) -> set[str]:
     Split out so the two callers that must agree share one definition: `seed_zone_groups` asks it
     per spec while creating, and `seed_global_store` asks it on the path where nothing is created
     at all, which otherwise applies no completeness check.
+
+    *node* is the zone group; a layout with a level group expects its arrays there, so a zone
+    missing that group is missing every array.
     """
     expected = set(layout.arrays) | {"time", *layout.spatial_dims, "band", "month", "time_bnds"}
-    return expected - set(node.array_keys())
+    holder = node.get(layout.level) if layout.level else node
+    return expected - (set(holder.array_keys()) if isinstance(holder, zarr.Group) else set())
 
 
 def _check_layout_matches(grp: zarr.Group, gname: str, layout: StoreLayout) -> None:
@@ -404,6 +410,7 @@ def _check_layout_matches(grp: zarr.Group, gname: str, layout: StoreLayout) -> N
     shape, so shape-clamping (a zone smaller than one nominal shard) is not mistaken for a layout
     change.
     """
+    grp = level0(grp)
     for var, spec in layout.arrays.items():
         if var not in grp:
             raise ValueError(
@@ -529,7 +536,7 @@ def seed_zone_groups(
     specs: Iterable[ZoneSpec],
     *,
     years: tuple[int, ...] = CAMPAIGN_YEARS,
-    layout: StoreLayout = GLOBAL,
+    layout: StoreLayout | None = None,
     model_version: ModelVersion = DEFAULT_MODEL_VERSION,
     optical_min_obs: int | None = None,
     commit_msg: str | None = None,
@@ -539,8 +546,11 @@ def seed_zone_groups(
     Each group gets the full ``years`` time axis, per-zone coordinate arrays, the
     ``layout``'s sharded array schemas (no chunk data — cost is independent of
     extent, D1), and per-zone attrs (CRS, ``years_complete: []``, zone scheme,
-    conventions). Returns the commit snapshot id.
+    conventions). The layout is the model's (:func:`layout_for`) unless one is given; a v2
+    layout puts the arrays and coordinates in the zone's level group ``0``, and declares the
+    zone a ``multiscales`` pyramid of that one level (ADR 031 §1). Returns the commit snapshot id.
     """
+    layout = layout or layout_for(model_version, single=False)
     specs = list(specs)
     # The time axis is created from `years` verbatim and fixed forever after (ADR-008 D1), so a
     # malformed tuple is not recoverable by reseeding. Duplicates are the dangerous shape:
@@ -588,10 +598,10 @@ def seed_zone_groups(
     layout = layout.with_spatial_dims(model_family(model_version).spatial_dims)
     for gname in root.group_keys():
         grp = cast("zarr.Group", root[gname])
-        if "time" not in grp:
+        if "time" not in level0(grp):
             continue
         layout = layout.with_spatial_dims(spatial_dims_of(grp))
-        existing_years = tuple(year_of(t) for t in read_time_values(grp))
+        existing_years = tuple(year_of(t) for t in read_time_values(level0(grp)))
         if existing_years != tuple(years):
             raise ValueError(
                 f"years {tuple(years)} differ from the store's existing axis {existing_years} — the time axis "
@@ -618,7 +628,8 @@ def seed_zone_groups(
     ).astype("int64")
     created = 0
     for spec in specs:
-        node = root.require_group(spec.group_name)
+        zone = root.require_group(spec.group_name)
+        node = zone.require_group(layout.level) if layout.level else zone
         # A zone already seeded is a NO-OP, not an error. `require_group` returns the existing
         # group and `create_array` would then raise on its first array — contradicting the
         # matching-reseed behaviour the identity and layout checks above deliberately allow, and
@@ -629,7 +640,7 @@ def seed_zone_groups(
         # (`missing_seeded_arrays`, which derives the set from what is produced below). A
         # partially-seeded group is a real defect — a crash mid-seed — and still raises.
         present = set(node.array_keys())
-        missing = missing_seeded_arrays(node, layout)
+        missing = missing_seeded_arrays(zone, layout)
         if not missing:
             continue
         if present:
@@ -666,8 +677,8 @@ def seed_zone_groups(
         bnds = node.create_array("time_bnds", data=default_bnds, chunks=(nt, 2), dimension_names=("time", "bnds"))
         bnds.attrs.update(TIME_ENCODING)  # same int64-ns encoding as `time`
         node["time"].attrs["bounds"] = "time_bnds"  # CF: this coordinate represents an interval
-        node.attrs.update(_zone_attrs(spec, north, east, layout))
-        stamp_array_conventions(node)
+        zone.attrs.update(_zone_attrs(spec, north, east, layout))
+        stamp_array_conventions(zone)
     if not created and not stamped_now:
         # Every requested zone was already complete AND the root already carried its identity, so
         # nothing was written — and icechunk refuses an empty commit unless asked. Committing
