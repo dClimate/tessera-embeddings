@@ -1562,6 +1562,7 @@ def query_stac_items(
     return items, baselines
 
 
+# jscpd:ignore-start: explicit keyword signature and Args, mirroring the per-collection loader it wraps
 def load_stac_items(
     items: list[Any],
     provider: str,
@@ -1620,6 +1621,7 @@ def load_stac_items(
     handed straight to this function forfeits every day in it, sound or not.
 
     """
+    # jscpd:ignore-end
     collection_config = _get_collection_config(provider, collection)
 
     # Gated on there BEING an offset decision, not on the producer varying between items: both are
@@ -1692,7 +1694,7 @@ def load_stac_items(
             # config, and `MDParseConfig.from_dict` does a containment test on it.
             {},
             reflectance_assets,
-            collection_config.baseline_threshold,  # type: ignore[arg-type]
+            collection_config.baseline_threshold,  # ty: ignore[invalid-argument-type]
             collection_config.baseline_offset,
             collection_harmonisation(collection_config),
         )
@@ -1766,6 +1768,7 @@ def group_items_by_date(items: list[Any]) -> dict[str, list[Any]]:
     return groups
 
 
+# jscpd:ignore-start: explicit keyword signature and Args, mirroring the two calls it composes
 def ingest_tile(
     provider: str,
     collection: str,
@@ -1826,6 +1829,7 @@ def ingest_tile(
         ``(dataset, baselines)``: the corrected Dataset, or None if every date already exists,
         and the date -> baseline map, always returned.
     """
+    # jscpd:ignore-end
     # Resolved ONCE here, where both a geobox and a bbox are in scope, and handed down as a
     # concrete longitude — the inner entry points can only see a bbox. Refuses if this call
     # carries no geometry at all: with `_load_from_stac` accepting solar_day alone, there is no
@@ -1981,7 +1985,7 @@ def stream_stac_months(
     # One query in flight, one month in the caller's hands: the depth-1 buffer.
     pending = _prefetch(run, months[0]) if months else None
     for i, mr in enumerate(months):
-        items, baselines = pending()  # type: ignore[misc]
+        items, baselines = pending()  # ty: ignore[call-non-callable]
         if i + 1 < len(months):
             pending = _prefetch(run, months[i + 1])
         # Normalise HERE as well as in query_stac_items: `query_fn` is injectable, so this is the

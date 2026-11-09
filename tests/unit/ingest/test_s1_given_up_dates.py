@@ -22,6 +22,9 @@ from tessera_embeddings.errors import ProviderRefusedReadsError
 from tessera_embeddings.ingest import s1_roi
 from tessera_embeddings.storage.zarr_store import STORE_WRITE_ATTEMPTS, store_write_retrying
 
+# Every S1 leg these tests run is kept off disk and network the same way.
+pytestmark = pytest.mark.usefixtures("s1_leg_offline")
+
 _CATALOGUE = ["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04"]
 
 
@@ -101,18 +104,6 @@ def _run(
     monkeypatch.setattr(s1_roi, "store_write_retrying", no_wait_retrying)
     monkeypatch.setattr(s1_roi, "record_assessed_window", lambda *a, **kw: recorded.append(kw))
     monkeypatch.setattr(s1_roi, "get_existing_dates", lambda _s, **_k: set())
-    monkeypatch.setattr(s1_roi, "apply_roi_mask", lambda data, *a, **k: data)
-    monkeypatch.setattr(s1_roi, "read_roi_mask", lambda *a, **k: object())
-    monkeypatch.setattr(
-        s1_roi,
-        "read_roi_metadata",
-        lambda _p, **_k: type("M", (), {"geobox": object(), "native_crs": "EPSG:32635", "bbox_wgs84": (0, 0, 1, 1)})(),
-    )
-    monkeypatch.setattr(
-        s1_roi, "live_windows_for_mask", lambda *a, **k: [type("W", (), {"y0": 0, "y1": 1, "x0": 0, "x1": 1})()]
-    )
-    monkeypatch.setattr(s1_roi, "make_s1_item_provider", lambda *a, **k: lambda: [])
-    monkeypatch.setattr(s1_roi.IngestManifest, "from_roi_store", classmethod(lambda _c, _p, **_k: object()))
 
     result = s1_roi.ingest_s1_roi_sar(
         roi_zarr_path="s3://bucket/zone_35N.zarr",

@@ -54,8 +54,8 @@ def _config(year: int = 2025) -> InferenceConfig:
     return InferenceConfig(time_window=_window(year), chunk_size=_TILE, num_gpus=0)
 
 
-def _fill(tmp_path, store, **overrides):
-    """Call ``fill_zone_year`` with this module's standard wiring.
+def _wiring(tmp_path, store, **overrides) -> dict:
+    """This module's standard runner arguments, with ``overrides`` applied.
 
     Every test drives the same runner against the same miniature zone, so the
     eight arguments that never vary are defaulted here and each test passes only
@@ -74,7 +74,17 @@ def _fill(tmp_path, store, **overrides):
         "num_actors": 1,
         "log": log,
     }
-    return zone_fill.fill_zone_year(**{**kwargs, **overrides})
+    return {**kwargs, **overrides}
+
+
+def _fill(tmp_path, store, **overrides):
+    """``fill_zone_year`` with the standard wiring."""
+    return zone_fill.fill_zone_year(**_wiring(tmp_path, store, **overrides))
+
+
+def _infer(tmp_path, store, **overrides):
+    """``infer_zone_year`` with the standard wiring."""
+    return zone_fill.infer_zone_year(**_wiring(tmp_path, store, **overrides))
 
 
 def _seed_global(tmp_path) -> str:
@@ -776,23 +786,12 @@ def test_phase_split_matches_composed_fill(tmp_path, monkeypatch):
     as the composed fill_zone_year (which is their back-to-back composition).
     """
     store = _seed_global(tmp_path)
-    mosaic_base = _make_mosaic(tmp_path)
+    _make_mosaic(tmp_path)
     mask = _make_mask(tmp_path, [(0, 0), (1, 1)])
     staged: dict[str, np.ndarray] = {}
     monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub(staged))
 
-    handoff = zone_fill.infer_zone_year(
-        store_path=store,
-        zone=_ZONE,
-        year=2025,
-        land_mask_path=mask,
-        mosaic_base=mosaic_base,
-        staging_base=str(tmp_path / "staging"),
-        config=_config(),
-        num_actors=1,
-        log=log,
-        run_id="runP",
-    )
+    handoff = _infer(tmp_path, store, land_mask_path=mask, run_id="runP")
     assert handoff.done is None
     assert len(handoff.live) == 2 and len(handoff.results) == 2
 
@@ -821,27 +820,15 @@ def test_staging_cleanup_is_handed_to_the_caller_rather_than_run_inline(tmp_path
     callable fired would pass even if the work never happened.
     """
     store = _seed_global(tmp_path)
-    mosaic_base = _make_mosaic(tmp_path)
+    _make_mosaic(tmp_path)
     mask = _make_mask(tmp_path, [(0, 0), (1, 1)])
-    log = logging.getLogger("t")
     staged: dict[str, np.ndarray] = {}
     monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub(staged))
     deleted: list[str] = []
     monkeypatch.setattr(
         ZarrWriter, "cleanup_staging", lambda self, run_id, log=None: deleted.append(run_id), raising=True
     )
-    handoff = zone_fill.infer_zone_year(
-        store_path=store,
-        zone=_ZONE,
-        year=2025,
-        land_mask_path=mask,
-        mosaic_base=mosaic_base,
-        staging_base=str(tmp_path / "staging"),
-        config=_config(),
-        num_actors=1,
-        log=log,
-        run_id="runDefer",
-    )
+    handoff = _infer(tmp_path, store, land_mask_path=mask, run_id="runDefer")
     handed: list = []
     zone_fill.assemble_zone_year(
         handoff,
@@ -859,27 +846,15 @@ def test_staging_cleanup_is_handed_to_the_caller_rather_than_run_inline(tmp_path
 def test_staging_cleanup_still_runs_inline_without_a_deferral(tmp_path, monkeypatch):
     """The default is unchanged for every caller that has no pool."""
     store = _seed_global(tmp_path)
-    mosaic_base = _make_mosaic(tmp_path)
+    _make_mosaic(tmp_path)
     mask = _make_mask(tmp_path, [(0, 0), (1, 1)])
-    log = logging.getLogger("t")
     staged: dict[str, np.ndarray] = {}
     monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub(staged))
     deleted: list[str] = []
     monkeypatch.setattr(
         ZarrWriter, "cleanup_staging", lambda self, run_id, log=None: deleted.append(run_id), raising=True
     )
-    handoff = zone_fill.infer_zone_year(
-        store_path=store,
-        zone=_ZONE,
-        year=2025,
-        land_mask_path=mask,
-        mosaic_base=mosaic_base,
-        staging_base=str(tmp_path / "staging"),
-        config=_config(),
-        num_actors=1,
-        log=log,
-        run_id="runInline",
-    )
+    handoff = _infer(tmp_path, store, land_mask_path=mask, run_id="runInline")
     zone_fill.assemble_zone_year(handoff, store_path=store, staging_base=str(tmp_path / "staging"), log=log)
     assert deleted == ["runInline"]
 

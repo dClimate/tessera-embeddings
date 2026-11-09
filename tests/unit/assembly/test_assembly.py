@@ -67,6 +67,30 @@ from tests.unit.inference_stack import IDENTITY, OTHER_STACK, STACK, identity
 _V2_STACK = {**STACK, "model_version": "v2-large", "checkpoint_id": "v2_student_large"}
 
 
+@pytest.fixture
+def writer(tmp_path) -> ZarrWriter:
+    """A writer staging under ``tmp_path/staging``."""
+    return ZarrWriter(str(tmp_path / "staging"))
+
+
+@pytest.fixture
+def output(tmp_path) -> str:
+    """Where a test assembles its store."""
+    return str(tmp_path / "output.zarr")
+
+
+def _assemble(writer: ZarrWriter, chunks: list[ChunkSpec], **kwargs):
+    """``writer.assemble`` on the grid ``chunks`` cover, with one worker, under the test identity.
+
+    ``assemble`` rejects totals that differ from the chunks' extent, so deriving them is exact;
+    a test of that rejection passes its own.
+    """
+    kwargs.setdefault("total_y", max(c.y_stop for c in chunks))
+    kwargs.setdefault("total_x", max(c.x_stop for c in chunks))
+    kwargs.setdefault("n_workers", 1)
+    return writer.assemble(chunks, **{**IDENTITY, **kwargs})
+
+
 def _dummy_scales(h: int, w: int) -> np.ndarray:
     """Return a dummy float32 scales array for test write_chunk calls."""
     return np.ones((h, w), dtype=np.float32)
@@ -195,14 +219,13 @@ class TestWriteChunk:
         np.testing.assert_array_almost_equal(result, embeddings, decimal=5)
         assert result.shape == (10, 10, EMBEDDING_DIM)
 
-    def test_write_chunk_records_completion_both_ways(self, tmp_path):
+    def test_write_chunk_records_completion_both_ways(self, writer):
         """A finished write is recorded in-store AND in the staging listing.
 
         The two signals serve different readers — the attribute is free for anyone
         holding the group open and cannot be bypassed, the sibling marker is visible
         to a prefix LIST — so both must land, and the listing must key on the marker.
         """
-        writer = ZarrWriter(str(tmp_path / "staging"))
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=10, x_start=0, x_stop=10)
         embeddings = np.random.default_rng(0).random((10, 10, EMBEDDING_DIM)).astype(np.float32)
 
@@ -213,7 +236,7 @@ class TestWriteChunk:
         assert writer._list_staged_labels("run1") == [chunk.label]
 
     @pytest.mark.parametrize("rewrite", [False, True])
-    def test_the_completion_protocol_runs_in_order(self, tmp_path, rewrite):
+    def test_the_completion_protocol_runs_in_order(self, rewrite, writer):
         """The write order every completeness check rests on, pinned end to end.
 
         Two properties, and reordering any step breaks one of them:
@@ -231,7 +254,6 @@ class TestWriteChunk:
           carries real counts and so would have assembly publish a footprint this write
           has just replaced.
         """
-        writer = ZarrWriter(str(tmp_path / "staging"))
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
         emb, scales = _quantized_embeddings(np.random.default_rng(0), 4, 4)
         if rewrite:
@@ -264,9 +286,7 @@ class TestWriteChunk:
 
         assert seen == ["retract:done", "retract:skipped", "retract:zarr", "tile", "attribute", "done"]
 
-    def test_write_chunk_wrong_shape_raises(self, tmp_path):
-        staging = str(tmp_path / "staging")
-        writer = ZarrWriter(staging)
+    def test_write_chunk_wrong_shape_raises(self, writer):
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=10, x_start=0, x_stop=10)
         bad_embeddings = np.zeros((5, 5, EMBEDDING_DIM), dtype=np.float32)
 
@@ -279,10 +299,8 @@ class TestWriteChunk:
                 stack=STACK,
             )
 
-    def test_coordinates_in_output(self, tmp_path):
+    def test_coordinates_in_output(self, writer):
         """Written Zarr has correct northing, easting, band coordinates."""
-        staging = str(tmp_path / "staging")
-        writer = ZarrWriter(staging)
         chunk = ChunkSpec(row=1, col=2, y_start=1500, y_stop=3000, x_start=3000, x_stop=4500)
         embeddings = np.zeros((1500, 1500, EMBEDDING_DIM), dtype=np.float32)
 
@@ -299,10 +317,8 @@ class TestWriteChunk:
         np.testing.assert_array_equal(ds.coords["easting"].values, np.arange(3000, 4500))
         np.testing.assert_array_equal(ds.coords["band"].values, np.arange(EMBEDDING_DIM))
 
-    def test_write_chunk_with_obs_counts(self, tmp_path):
+    def test_write_chunk_with_obs_counts(self, writer):
         """Write chunk with obs counts dict, read back, verify shape/dtype/values."""
-        staging = str(tmp_path / "staging")
-        writer = ZarrWriter(staging)
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=10, x_start=0, x_stop=10)
 
         rng = np.random.default_rng(42)
@@ -336,10 +352,8 @@ class TestWriteChunk:
             assert result.dtype == np.uint16
             np.testing.assert_array_equal(result, expected)
 
-    def test_write_chunk_without_obs_counts_backward_compat(self, tmp_path):
+    def test_write_chunk_without_obs_counts_backward_compat(self, writer):
         """Write without obs counts, verify no obs count vars in zarr."""
-        staging = str(tmp_path / "staging")
-        writer = ZarrWriter(staging)
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=10, x_start=0, x_stop=10)
 
         embeddings = np.zeros((10, 10, EMBEDDING_DIM), dtype=np.float32)
@@ -359,11 +373,8 @@ class TestWriteChunk:
 class TestAssembly:
     """Tests for ZarrWriter.assemble (raw-zarr fork/merge engine)."""
 
-    def test_assemble_multiple_chunks(self, tmp_path):
+    def test_assemble_multiple_chunks(self, tmp_path, writer, output):
         """Assemble 2x2 chunk grid into single output store."""
-        staging = str(tmp_path / "staging")
-        output = str(tmp_path / "output.zarr")
-        writer = ZarrWriter(staging)
         run_id = "assemble_test"
 
         rng = np.random.default_rng(42)
@@ -371,15 +382,12 @@ class TestAssembly:
 
         expected = _stage_chunks(writer, chunks, run_id, rng, (8, 10))
 
-        writer.assemble(
+        _assemble(
+            writer,
             chunks,
-            total_y=8,
-            total_x=10,
             run_id=run_id,
             output_path=output,
             roi_zarr_path=_make_full_roi_mask(tmp_path, 8, 10),
-            n_workers=1,
-            **IDENTITY,
         )
 
         # Read back assembled output (Icechunk store)
@@ -413,9 +421,8 @@ class TestAssembly:
         session.commit("a store from before the record")
         assert self._assemble_on(tmp_path, OTHER_STACK, "second")[STACK_ATTR] == library_stack(OTHER_STACK)
 
-    def test_a_run_is_assembled_only_under_the_identity_it_was_staged_with(self, tmp_path):
+    def test_a_run_is_assembled_only_under_the_identity_it_was_staged_with(self, tmp_path, writer, output):
         """The run id varies with the checkpoint, so only a reused one can disagree; it is refused, never relabelled."""
-        writer, output = ZarrWriter(str(tmp_path / "staging")), str(tmp_path / "output.zarr")
         for chunk in _GRID_1X2:
             emb, scales = _quantized_embeddings(np.random.default_rng(0), chunk.height, chunk.width)
             writer.write_chunk(chunk, emb, "run", scales=scales, stack=STACK)
@@ -424,11 +431,8 @@ class TestAssembly:
         with pytest.raises(ValueError, match="Assemble it with the config that staged it"):
             writer.assemble(_GRID_1X2, 5, 10, "run", output, roi_zarr_path=roi, n_workers=1, **mpc)
 
-    def test_assemble_xarray_readable(self, tmp_path):
+    def test_assemble_xarray_readable(self, tmp_path, writer, output):
         """Assembled output must be readable with correct dims and coords."""
-        staging = str(tmp_path / "staging")
-        output = str(tmp_path / "output.zarr")
-        writer = ZarrWriter(staging)
         run_id = "xr_test"
 
         rng = np.random.default_rng(99)
@@ -436,15 +440,12 @@ class TestAssembly:
 
         expected = _stage_chunks(writer, chunks, run_id, rng, (5, 10))
 
-        writer.assemble(
+        _assemble(
+            writer,
             chunks,
-            total_y=5,
-            total_x=10,
             run_id=run_id,
             output_path=output,
             roi_zarr_path=_make_full_roi_mask(tmp_path, 5, 10),
-            n_workers=1,
-            **IDENTITY,
         )
 
         ds = open_store(output)
@@ -457,28 +458,21 @@ class TestAssembly:
         np.testing.assert_array_equal(ds.coords["easting"].values, np.arange(10))
         np.testing.assert_array_equal(ds.coords["band"].values, np.arange(EMBEDDING_DIM))
 
-    def test_assemble_with_std(self, tmp_path):
+    def test_assemble_with_std(self, tmp_path, writer, output):
         """Assembly includes embedding_std when compute_std=True."""
-        staging = str(tmp_path / "staging")
-        output = str(tmp_path / "output.zarr")
-        writer = ZarrWriter(staging)
-
         rng = np.random.default_rng(42)
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
 
         emb, scales = _quantized_embeddings(rng, 4, 4)
         std = rng.random((4, 4, EMBEDDING_DIM)).astype(np.float32)
         writer.write_chunk(chunk, emb, run_id="run1", scales=scales, embeddings_std=std, stack=STACK)
-        writer.assemble(
+        _assemble(
+            writer,
             [chunk],
-            total_y=4,
-            total_x=4,
             run_id="run1",
             output_path=output,
             compute_std=True,
             roi_zarr_path=_make_full_roi_mask(tmp_path, 4, 4),
-            n_workers=1,
-            **IDENTITY,
         )
 
         ds = open_store(output)
@@ -487,7 +481,7 @@ class TestAssembly:
         np.testing.assert_array_equal(ds["embeddings"].values[0, ...], emb)
         np.testing.assert_array_almost_equal(ds["embedding_std"].values[0, ...], std, decimal=5)
 
-    def test_a_second_encoder_cannot_append_to_a_store_the_first_published(self, tmp_path):
+    def test_a_second_encoder_cannot_append_to_a_store_the_first_published(self, tmp_path, writer, output):
         """The relabelling this refuses is silent and total.
 
         The manifest check cannot catch it: it compares the checkpoint filename STEM, which two
@@ -496,25 +490,19 @@ class TestAssembly:
         then restamps ``geoemb:model`` for the WHOLE store — every v1.1 pixel in it now
         advertising the wrong encoder, with nothing in the store recording that it happened.
         """
-        staging = str(tmp_path / "staging")
-        output = str(tmp_path / "output.zarr")
-        writer = ZarrWriter(staging)
         rng = np.random.default_rng(7)
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=5, x_start=0, x_stop=5)
         roi = _make_full_roi_mask(tmp_path, 5, 5)
 
         emb, scales = _quantized_embeddings(rng, 5, 5)
         writer.write_chunk(chunk, emb, run_id="run1", scales=scales, stack=STACK)
-        writer.assemble(
+        _assemble(
+            writer,
             [chunk],
-            total_y=5,
-            total_x=5,
             run_id="run1",
             output_path=output,
             roi_zarr_path=roi,
             run_started_at=datetime.datetime(2024, 6, 1, tzinfo=datetime.UTC),
-            n_workers=1,
-            **IDENTITY,
         )
 
         emb2, scales2 = _quantized_embeddings(rng, 5, 5)
@@ -538,7 +526,7 @@ class TestAssembly:
                 **identity(_V2_STACK),
             )
 
-    def test_a_store_with_no_recorded_encoder_is_read_as_v11_not_waved_through(self, tmp_path):
+    def test_a_store_with_no_recorded_encoder_is_read_as_v11_not_waved_through(self, tmp_path, writer, output):
         """Absence is not silence, and the permissive reading was the dangerous one.
 
         `geoemb:model` postdates v1.1 and predates v2, so a store without it necessarily holds
@@ -547,25 +535,19 @@ class TestAssembly:
         most likely to lack this attr are also the least likely to carry a `_manifest`, so both
         doors stood open on the same store.
         """
-        staging = str(tmp_path / "staging")
-        output = str(tmp_path / "output.zarr")
-        writer = ZarrWriter(staging)
         rng = np.random.default_rng(11)
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=5, x_start=0, x_stop=5)
         roi = _make_full_roi_mask(tmp_path, 5, 5)
 
         emb, scales = _quantized_embeddings(rng, 5, 5)
         writer.write_chunk(chunk, emb, run_id="legacy", scales=scales, stack=STACK)
-        writer.assemble(
+        _assemble(
+            writer,
             [chunk],
-            total_y=5,
-            total_x=5,
             run_id="legacy",
             output_path=output,
             roi_zarr_path=roi,
             run_started_at=datetime.datetime(2024, 6, 1, tzinfo=datetime.UTC),
-            n_workers=1,
-            **IDENTITY,
         )
 
         # Strip the encoder identity to reproduce a store written before the attr existed.
@@ -599,25 +581,19 @@ class TestAssembly:
         # And the case that must KEEP working: v1.1 still appends to that same legacy store.
         emb3, scales3 = _quantized_embeddings(rng, 5, 5)
         writer.write_chunk(chunk, emb3, run_id="v11run", scales=scales3, stack=STACK)
-        writer.assemble(
+        _assemble(
+            writer,
             [chunk],
-            total_y=5,
-            total_x=5,
             run_id="v11run",
             output_path=output,
             roi_zarr_path=roi,
             run_started_at=datetime.datetime(2026, 6, 1, tzinfo=datetime.UTC),
-            n_workers=1,
-            **IDENTITY,
         )
 
-    def test_the_same_encoder_appends_normally(self, tmp_path):
+    def test_the_same_encoder_appends_normally(self, tmp_path, writer, output):
         """The guard must not cost the ordinary case: a second window from the SAME family
         extends the store as before.
         """
-        staging = str(tmp_path / "staging")
-        output = str(tmp_path / "output.zarr")
-        writer = ZarrWriter(staging)
         rng = np.random.default_rng(8)
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=5, x_start=0, x_stop=5)
         roi = _make_full_roi_mask(tmp_path, 5, 5)
@@ -625,28 +601,21 @@ class TestAssembly:
         for run, day in (("runA", 2024), ("runB", 2025)):
             e, sc = _quantized_embeddings(rng, 5, 5)
             writer.write_chunk(chunk, e, run_id=run, scales=sc, stack=STACK)
-            writer.assemble(
+            _assemble(
+                writer,
                 [chunk],
-                total_y=5,
-                total_x=5,
                 run_id=run,
                 output_path=output,
                 roi_zarr_path=roi,
                 run_started_at=datetime.datetime(day, 6, 1, tzinfo=datetime.UTC),
-                n_workers=1,
-                **IDENTITY,
             )
 
         ds = open_store(output)
         assert ds["embeddings"].shape[0] == 2, "both windows present"
         ds.close()
 
-    def test_assemble_appends_to_existing_store(self, tmp_path):
+    def test_assemble_appends_to_existing_store(self, tmp_path, writer, output):
         """A second assemble at a NEW time value extends the time axis."""
-        staging = str(tmp_path / "staging")
-        output = str(tmp_path / "output.zarr")
-        writer = ZarrWriter(staging)
-
         rng = np.random.default_rng(42)
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=5, x_start=0, x_stop=5)
 
@@ -657,16 +626,13 @@ class TestAssembly:
         # Run 1
         emb1, scales1 = _quantized_embeddings(rng, 5, 5)
         writer.write_chunk(chunk, emb1, run_id="run1", scales=scales1, stack=STACK)
-        writer.assemble(
+        _assemble(
+            writer,
             [chunk],
-            total_y=5,
-            total_x=5,
             run_id="run1",
             output_path=output,
             roi_zarr_path=roi,
             run_started_at=day1,
-            n_workers=1,
-            **IDENTITY,
         )
 
         ds = open_store(output)
@@ -676,16 +642,13 @@ class TestAssembly:
         # Run 2 at a later date — should append
         emb2, scales2 = _quantized_embeddings(rng, 5, 5)
         writer.write_chunk(chunk, emb2, run_id="run2", scales=scales2, stack=STACK)
-        writer.assemble(
+        _assemble(
+            writer,
             [chunk],
-            total_y=5,
-            total_x=5,
             run_id="run2",
             output_path=output,
             roi_zarr_path=roi,
             run_started_at=day2,
-            n_workers=1,
-            **IDENTITY,
         )
 
         ds = open_store(output)
@@ -697,12 +660,8 @@ class TestAssembly:
             ds.coords["time"].values, np.array(["2024-06-01", "2025-06-01"], dtype="datetime64[ns]")
         )
 
-    def test_assemble_same_date_overwrites_in_place(self, tmp_path):
+    def test_assemble_same_date_overwrites_in_place(self, tmp_path, writer, output):
         """Re-assembling an existing time value overwrites that index (idempotent resume)."""
-        staging = str(tmp_path / "staging")
-        output = str(tmp_path / "output.zarr")
-        writer = ZarrWriter(staging)
-
         rng = np.random.default_rng(42)
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=5, x_start=0, x_stop=5)
         roi = _make_full_roi_mask(tmp_path, 5, 5)
@@ -710,30 +669,24 @@ class TestAssembly:
 
         emb1, scales1 = _quantized_embeddings(rng, 5, 5)
         writer.write_chunk(chunk, emb1, run_id="run1", scales=scales1, stack=STACK)
-        writer.assemble(
+        _assemble(
+            writer,
             [chunk],
-            total_y=5,
-            total_x=5,
             run_id="run1",
             output_path=output,
             roi_zarr_path=roi,
             run_started_at=day,
-            n_workers=1,
-            **IDENTITY,
         )
 
         emb2, scales2 = _quantized_embeddings(rng, 5, 5)
         writer.write_chunk(chunk, emb2, run_id="run2", scales=scales2, stack=STACK)
-        writer.assemble(
+        _assemble(
+            writer,
             [chunk],
-            total_y=5,
-            total_x=5,
             run_id="run2",
             output_path=output,
             roi_zarr_path=roi,
             run_started_at=day,
-            n_workers=1,
-            **IDENTITY,
         )
 
         ds = open_store(output)
@@ -741,12 +694,8 @@ class TestAssembly:
         np.testing.assert_array_equal(ds["embeddings"].values[0, ...], emb2)
         assert ds.attrs["run_id"] == "run2"
 
-    def test_same_date_overwrite_clears_skip_marked_footprints(self, tmp_path):
+    def test_same_date_overwrite_clears_skip_marked_footprints(self, tmp_path, writer, output):
         """A rerun's skip marker must reset the chunk to fill, not expose the prior run's data."""
-        staging = str(tmp_path / "staging")
-        output = str(tmp_path / "output.zarr")
-        writer = ZarrWriter(staging)
-
         rng = np.random.default_rng(42)
         chunks = _GRID_1X2
         roi = _make_full_roi_mask(tmp_path, 5, 10)
@@ -756,32 +705,26 @@ class TestAssembly:
         for chunk in chunks:
             emb, scales = _quantized_embeddings(rng, chunk.height, chunk.width)
             writer.write_chunk(chunk, emb, "run1", scales=scales, stack=STACK)
-        writer.assemble(
+        _assemble(
+            writer,
             chunks,
-            total_y=5,
-            total_x=10,
             run_id="run1",
             output_path=output,
             roi_zarr_path=roi,
             run_started_at=day,
-            n_workers=1,
-            **IDENTITY,
         )
 
         # Run 2, same date: chunk_0_1 now has zero valid pixels (skip marker).
         emb2, scales2 = _quantized_embeddings(rng, 5, 5)
         writer.write_chunk(chunks[0], emb2, "run2", scales=scales2, stack=STACK)
         writer.write_skip_marker(chunks[1], "run2")
-        writer.assemble(
+        _assemble(
+            writer,
             chunks,
-            total_y=5,
-            total_x=10,
             run_id="run2",
             output_path=output,
             roi_zarr_path=roi,
             run_started_at=day,
-            n_workers=1,
-            **IDENTITY,
         )
 
         ds = open_store(output)
@@ -791,14 +734,11 @@ class TestAssembly:
         assert np.all(result[:, 5:, :] == 0), "run1's data must not survive under run2's skip marker"
         assert np.all(np.isnan(ds["scales"].values[0, :, 5:])), "scales must reset to NaN fill too"
 
-    def test_same_date_overwrite_with_shrunken_roi_clears_outside(self, tmp_path):
+    def test_same_date_overwrite_with_shrunken_roi_clears_outside(self, tmp_path, writer, output):
         """A same-date overwrite under a SMALLER ROI clears chunks that were live in
         the prior (larger) ROI but fall outside the new one — otherwise run 1's
         embeddings there stay published (stale) under run 2's narrower footprint.
         """
-        staging = str(tmp_path / "staging")
-        output = str(tmp_path / "output.zarr")
-        writer = ZarrWriter(staging)
         rng = np.random.default_rng(42)
         chunks = _GRID_1X2
         day = datetime.datetime(2024, 6, 1, tzinfo=datetime.UTC)
@@ -807,32 +747,26 @@ class TestAssembly:
         for chunk in chunks:
             emb, scales = _quantized_embeddings(rng, chunk.height, chunk.width)
             writer.write_chunk(chunk, emb, "run1", scales=scales, stack=STACK)
-        writer.assemble(
+        _assemble(
+            writer,
             chunks,
-            total_y=5,
-            total_x=10,
             run_id="run1",
             output_path=output,
             roi_zarr_path=_make_full_roi_mask(tmp_path, 5, 10),
             run_started_at=day,
-            n_workers=1,
-            **IDENTITY,
         )
 
         # Run 2, same date: SHRUNKEN ROI (only cols 0-5). Only chunk_0_0 is staged;
         # chunk_0_1 is now OUTSIDE the ROI (not merely skip-marked).
         emb2, scales2 = _quantized_embeddings(rng, 5, 5)
         writer.write_chunk(chunks[0], emb2, "run2", scales=scales2, stack=STACK)
-        writer.assemble(
+        _assemble(
+            writer,
             chunks,
-            total_y=5,
-            total_x=10,
             run_id="run2",
             output_path=output,
             roi_zarr_path=_make_partial_roi_mask(tmp_path, 5, 10, x_true_stop=5),
             run_started_at=day,
-            n_workers=1,
-            **IDENTITY,
         )
 
         ds = open_store(output)
@@ -889,22 +823,18 @@ class TestAssembly:
         np.testing.assert_array_equal(ds_parallel["embeddings"].values, ds_serial["embeddings"].values)
         np.testing.assert_array_equal(ds_parallel["scales"].values, ds_serial["scales"].values)
 
-    def test_emits_one_assembly_summary_record(self, tmp_path, caplog):
+    def test_emits_one_assembly_summary_record(self, tmp_path, caplog, writer):
         """One ASSEMBLY_SUMMARY per assemble — never per tile — whose counts match the staging."""
-        writer = ZarrWriter(str(tmp_path / "staging"))
         rng = np.random.default_rng(23)
         _stage_chunks(writer, _GRID_1X2, "run1", rng, (5, 10))
         roi = _make_full_roi_mask(tmp_path, 5, 10)
         with caplog.at_level(logging.INFO, logger="tessera_embeddings.inference.assembly"):
-            writer.assemble(
+            _assemble(
+                writer,
                 _GRID_1X2,
-                total_y=5,
-                total_x=10,
                 run_id="run1",
                 output_path=str(tmp_path / "out.zarr"),
                 roi_zarr_path=roi,
-                n_workers=1,
-                **IDENTITY,
             )
         (rec,) = _assembly_summary_records(caplog)
         assert rec["run"] == "run1"
@@ -919,12 +849,8 @@ class TestAssembly:
         assert worker["read_s"] >= 0 and worker["write_s"] >= 0
         assert rec["commit_s"] >= 0 and rec["total_s"] > 0
 
-    def test_assemble_append_with_std(self, tmp_path):
+    def test_assemble_append_with_std(self, tmp_path, writer, output):
         """Append preserves both embedding and embedding_std across runs."""
-        staging = str(tmp_path / "staging")
-        output = str(tmp_path / "output.zarr")
-        writer = ZarrWriter(staging)
-
         rng = np.random.default_rng(42)
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
 
@@ -941,17 +867,14 @@ class TestAssembly:
             embeddings_std=std1,
             stack=STACK,
         )
-        writer.assemble(
+        _assemble(
+            writer,
             [chunk],
-            total_y=4,
-            total_x=4,
             run_id="run1",
             output_path=output,
             compute_std=True,
             roi_zarr_path=roi,
             run_started_at=datetime.datetime(2024, 6, 1, tzinfo=datetime.UTC),
-            n_workers=1,
-            **IDENTITY,
         )
 
         # Run 2 with std, at a later date
@@ -965,17 +888,14 @@ class TestAssembly:
             embeddings_std=std2,
             stack=STACK,
         )
-        writer.assemble(
+        _assemble(
+            writer,
             [chunk],
-            total_y=4,
-            total_x=4,
             run_id="run2",
             output_path=output,
             compute_std=True,
             roi_zarr_path=roi,
             run_started_at=datetime.datetime(2025, 6, 1, tzinfo=datetime.UTC),
-            n_workers=1,
-            **IDENTITY,
         )
 
         ds = open_store(output)
@@ -984,13 +904,10 @@ class TestAssembly:
         np.testing.assert_array_almost_equal(ds["embedding_std"].values[0, ...], std1, decimal=5)
         np.testing.assert_array_almost_equal(ds["embedding_std"].values[1, ...], std2, decimal=5)
 
-    def test_same_date_overwrite_resets_untouched_vars_to_fill(self, tmp_path):
+    def test_same_date_overwrite_resets_untouched_vars_to_fill(self, tmp_path, writer, output):
         """A same-date overwrite that drops a variable resets that variable's
         slice to fill, so no stale metadata describes the overwritten data.
         """
-        staging = str(tmp_path / "staging")
-        output = str(tmp_path / "output.zarr")
-        writer = ZarrWriter(staging)
         rng = np.random.default_rng(7)
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
         roi = _make_full_roi_mask(tmp_path, 4, 4)
@@ -1007,33 +924,27 @@ class TestAssembly:
             embeddings_std=std1,
             stack=STACK,
         )
-        writer.assemble(
+        _assemble(
+            writer,
             [chunk],
-            total_y=4,
-            total_x=4,
             run_id="run1",
             output_path=output,
             compute_std=True,
             roi_zarr_path=roi,
             run_started_at=started,
-            n_workers=1,
-            **IDENTITY,
         )
 
         # Run 2: SAME date, WITHOUT std — embedding_std is now untouched and stale.
         emb2, scales2 = _quantized_embeddings(rng, 4, 4)
         writer.write_chunk(chunk, emb2, run_id="run2", scales=scales2, stack=STACK)
-        writer.assemble(
+        _assemble(
+            writer,
             [chunk],
-            total_y=4,
-            total_x=4,
             run_id="run2",
             output_path=output,
             compute_std=False,
             roi_zarr_path=roi,
             run_started_at=started,
-            n_workers=1,
-            **IDENTITY,
         )
 
         ds = open_store(output)
@@ -1043,12 +954,8 @@ class TestAssembly:
         # The atomic-publish work branch is cleaned up after a successful assemble.
         assert "_assemble-wip" not in open_or_create_repo(output)[0].list_branches()
 
-    def test_append_preserves_time_windows_across_runs(self, tmp_path):
+    def test_append_preserves_time_windows_across_runs(self, tmp_path, writer, output):
         """Regression: appending a second time window must merge into existing time_windows, not overwrite."""
-        staging = str(tmp_path / "staging")
-        output = str(tmp_path / "output.zarr")
-        writer = ZarrWriter(staging)
-
         rng = np.random.default_rng(42)
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=5, x_start=0, x_stop=5)
 
@@ -1063,16 +970,13 @@ class TestAssembly:
 
         emb1, scales1 = _quantized_embeddings(rng, 5, 5)
         writer.write_chunk(chunk, emb1, run_id="run1", scales=scales1, stack=STACK)
-        writer.assemble(
+        _assemble(
+            writer,
             [chunk],
-            total_y=5,
-            total_x=5,
             run_id="run1",
             output_path=output,
             roi_zarr_path=roi,
             time_window=tw1,
-            n_workers=1,
-            **IDENTITY,
         )
 
         ds1 = open_store(output)
@@ -1090,16 +994,13 @@ class TestAssembly:
         )
         emb2, scales2 = _quantized_embeddings(rng, 5, 5)
         writer.write_chunk(chunk, emb2, run_id="run2", scales=scales2, stack=STACK)
-        writer.assemble(
+        _assemble(
+            writer,
             [chunk],
-            total_y=5,
-            total_x=5,
             run_id="run2",
             output_path=output,
             roi_zarr_path=roi,
             time_window=tw2,
-            n_workers=1,
-            **IDENTITY,
         )
 
         ds2 = open_store(output)
@@ -1111,11 +1012,8 @@ class TestAssembly:
         assert tw_dict2["2024-12-01"]["range"] == ["2024-01", "2024-12"]
         assert tw_dict2["2025-01-01"]["range"] == ["2024-02", "2025-01"]
 
-    def test_assemble_with_obs_counts(self, tmp_path):
+    def test_assemble_with_obs_counts(self, tmp_path, writer, output):
         """Stage 2x2 grid with obs counts, assemble, verify final zarr has all three vars."""
-        staging = str(tmp_path / "staging")
-        output = str(tmp_path / "output.zarr")
-        writer = ZarrWriter(staging)
         run_id = "obs_assemble"
 
         rng = np.random.default_rng(42)
@@ -1131,15 +1029,12 @@ class TestAssembly:
             for var in OBS_COUNT_VARS:
                 expected_obs[var][chunk.y_start : chunk.y_stop, chunk.x_start : chunk.x_stop] = obs[var]
 
-        writer.assemble(
+        _assemble(
+            writer,
             chunks,
-            total_y=8,
-            total_x=10,
             run_id=run_id,
             output_path=output,
             roi_zarr_path=_make_full_roi_mask(tmp_path, 8, 10),
-            n_workers=1,
-            **IDENTITY,
         )
 
         ds = open_store(output)
@@ -1150,16 +1045,13 @@ class TestAssembly:
             assert ds[var].dtype == np.uint16
             np.testing.assert_array_equal(ds[var].values[0], expected_obs[var])
 
-    def test_assemble_treats_skip_marker_chunks_as_fill(self, tmp_path):
+    def test_assemble_treats_skip_marker_chunks_as_fill(self, tmp_path, writer, output):
         """A live chunk with a skip marker (no staged zarr) falls through to zero-fill.
 
         Regression (originally against the Dask engine): skip-marked chunks must
         never be treated as staged — a worker opening the non-existent zarr
         would raise GroupNotFoundError. Their footprint stays at the fill value.
         """
-        staging = str(tmp_path / "staging")
-        output = str(tmp_path / "output.zarr")
-        writer = ZarrWriter(staging)
         run_id = "skip_marker_test"
 
         rng = np.random.default_rng(7)
@@ -1176,15 +1068,12 @@ class TestAssembly:
             writer.write_chunk(chunk, emb, run_id, scales=scales, stack=STACK)
             expected[chunk.y_start : chunk.y_stop, chunk.x_start : chunk.x_stop, :] = emb
 
-        writer.assemble(
+        _assemble(
+            writer,
             chunks,
-            total_y=8,
-            total_x=10,
             run_id=run_id,
             output_path=output,
             roi_zarr_path=_make_full_roi_mask(tmp_path, 8, 10),
-            n_workers=1,
-            **IDENTITY,
         )
 
         result = _assembled(output)
@@ -1196,38 +1085,29 @@ class TestAssembly:
         assert skipped_region.shape == (skipped_chunk.height, skipped_chunk.width, EMBEDDING_DIM)
         assert np.all(skipped_region == 0)
 
-    def test_assemble_all_skipped_publishes_all_fill(self, tmp_path):
+    def test_assemble_all_skipped_publishes_all_fill(self, tmp_path, writer, output):
         """Every ROI chunk skip-marked (no valid pixels) → publish an all-fill
         timestep, not abort (the old engine could publish an all-fill output).
         """
-        staging = str(tmp_path / "staging")
-        output = str(tmp_path / "output.zarr")
-        writer = ZarrWriter(staging)
         run_id = "all_skipped"
         chunks = _GRID_1X2
         for chunk in chunks:
             writer.write_skip_marker(chunk, run_id)
 
-        writer.assemble(
+        _assemble(
+            writer,
             chunks,
-            total_y=5,
-            total_x=10,
             run_id=run_id,
             output_path=output,
             roi_zarr_path=_make_full_roi_mask(tmp_path, 5, 10),
-            n_workers=1,
-            **IDENTITY,
         )
 
         ds = open_store(output)
         assert ds["embeddings"].shape == (1, 5, 10, EMBEDDING_DIM)
         assert bool(np.all(ds["embeddings"].values[0] == 0))  # all-fill timestep published
 
-    def test_assemble_sparse_roi_non_live_chunks_are_zero_filled(self, tmp_path):
+    def test_assemble_sparse_roi_non_live_chunks_are_zero_filled(self, tmp_path, writer, output):
         """Chunks outside the ROI mask are zero-filled without requiring staged data."""
-        staging = str(tmp_path / "staging")
-        output = str(tmp_path / "output.zarr")
-        writer = ZarrWriter(staging)
         run_id = "sparse_roi_test"
 
         # 3x3 chunk grid; mask excludes the interior chunk (row=1, col=1)
@@ -1259,15 +1139,12 @@ class TestAssembly:
             writer.write_chunk(chunk, emb, run_id, scales=scales, stack=STACK)
             expected[chunk.y_start : chunk.y_stop, chunk.x_start : chunk.x_stop, :] = emb
 
-        writer.assemble(
+        _assemble(
+            writer,
             chunks,
-            total_y=13,
-            total_x=15,
             run_id=run_id,
             output_path=output,
             roi_zarr_path=roi_path,
-            n_workers=1,
-            **IDENTITY,
         )
 
         result = _assembled(output)
@@ -1275,11 +1152,8 @@ class TestAssembly:
         non_live_region = result[non_live.y_start : non_live.y_stop, non_live.x_start : non_live.x_stop]
         assert np.all(non_live_region == 0), "Non-live chunk region must be zero-filled"
 
-    def test_assemble_sparse_roi_scales_nan_filled_for_non_live(self, tmp_path):
+    def test_assemble_sparse_roi_scales_nan_filled_for_non_live(self, tmp_path, writer, output):
         """`scales` variable is NaN-filled for chunks outside the ROI mask."""
-        staging = str(tmp_path / "staging")
-        output = str(tmp_path / "output.zarr")
-        writer = ZarrWriter(staging)
         run_id = "sparse_scales_test"
 
         chunks = [
@@ -1302,15 +1176,12 @@ class TestAssembly:
             emb, scales = _quantized_embeddings(rng, chunk.height, chunk.width)
             writer.write_chunk(chunk, emb, run_id, scales=scales, stack=STACK)
 
-        writer.assemble(
+        _assemble(
+            writer,
             chunks,
-            total_y=9,
-            total_x=10,
             run_id=run_id,
             output_path=output,
             roi_zarr_path=roi_path,
-            n_workers=1,
-            **IDENTITY,
         )
 
         ds = open_store(output)
@@ -1364,9 +1235,8 @@ class TestCleanupStaging:
 class TestDetectStagedChunkSize:
     """Tests for the public detect_staged_chunk_size method."""
 
-    def test_raises_when_no_staged_chunks(self, tmp_path):
+    def test_raises_when_no_staged_chunks(self, writer):
         """FileNotFoundError when the staging directory is empty."""
-        writer = ZarrWriter(str(tmp_path / "staging"))
         with pytest.raises(FileNotFoundError, match="No staged chunks found"):
             writer.detect_staged_chunk_size("run1")
 
@@ -1376,9 +1246,8 @@ class TestDetectStagedChunkSize:
     # 2000 x 2000 x 128 int8, half a gigabyte to generate, quantise and write, which cost 10 s
     # of suite wall time to assert an integer.
 
-    def test_uses_first_available_chunk(self, tmp_path):
+    def test_uses_first_available_chunk(self, writer):
         """Returns chunk_size from first staged label — not chunk_0_0 specifically."""
-        writer = ZarrWriter(str(tmp_path / "staging"))
         # Stage only a non-origin chunk (simulates sparse ROI where chunk_0_0 is empty)
         chunk = ChunkSpec(row=3, col=5, y_start=600, y_stop=800, x_start=1000, x_stop=1200)
         rng = np.random.default_rng(0)
@@ -1388,9 +1257,8 @@ class TestDetectStagedChunkSize:
         result = writer.detect_staged_chunk_size("run1")
         assert result == 200
 
-    def test_returns_max_of_height_width(self, tmp_path):
+    def test_returns_max_of_height_width(self, writer):
         """Edge chunks with non-square extents return max(h, w)."""
-        writer = ZarrWriter(str(tmp_path / "staging"))
         # Non-square edge chunk: height=50, width=200 — the wider side must win
         chunk = ChunkSpec(row=0, col=1, y_start=0, y_stop=50, x_start=200, x_stop=400)
         rng = np.random.default_rng(1)
@@ -1478,9 +1346,8 @@ class TestStagedLayout:
     workers slice whatever chunk grid the staged file has.
     """
 
-    def test_write_chunk_stages_inner_chunks_full_band(self, tmp_path):
+    def test_write_chunk_stages_inner_chunks_full_band(self, writer):
         """write_chunk sub-chunks at INNER_PX spatially and never splits the band."""
-        writer = ZarrWriter(str(tmp_path / "staging"))
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=600, x_start=0, x_stop=600)
         rng = np.random.default_rng(42)
         emb, scales = _quantized_embeddings(rng, 600, 600)
@@ -1492,11 +1359,8 @@ class TestStagedLayout:
         # Raw staging: no compressors, zero codec CPU on the GPU actors.
         assert g["embeddings"].compressors == ()
 
-    def test_assemble_monolithic_roundtrip(self, tmp_path):
+    def test_assemble_monolithic_roundtrip(self, tmp_path, writer, output):
         """Assembly of monolithic-chunked staged files produces correct output."""
-        staging = str(tmp_path / "staging")
-        output = str(tmp_path / "output.zarr")
-        writer = ZarrWriter(staging)
         run_id = "mono_test"
 
         rng = np.random.default_rng(42)
@@ -1514,15 +1378,12 @@ class TestStagedLayout:
             _write_monolithic_staged_zarr(path, emb, chunk.y_start, chunk.x_start)
             expected[chunk.y_start : chunk.y_stop, chunk.x_start : chunk.x_stop, :] = emb
 
-        writer.assemble(
+        _assemble(
+            writer,
             chunks,
-            total_y=14,
-            total_x=16,
             run_id=run_id,
             output_path=output,
             roi_zarr_path=_make_full_roi_mask(tmp_path, 14, 16),
-            n_workers=1,
-            **IDENTITY,
         )
 
         ds = open_store(output)
@@ -1531,18 +1392,15 @@ class TestStagedLayout:
         assert ds["embeddings"].shape == (1, 14, 16, EMBEDDING_DIM)
 
     def _assemble_one_chunk(self, writer, chunk, tmp_path):
-        writer.assemble(
+        _assemble(
+            writer,
             [chunk],
-            total_y=8,
-            total_x=8,
             run_id="run1",
             output_path=str(tmp_path / "output.zarr"),
             roi_zarr_path=_make_full_roi_mask(tmp_path, 8, 8),
-            n_workers=1,
-            **IDENTITY,
         )
 
-    def test_assemble_verifies_staged_completeness_itself(self, tmp_path):
+    def test_assemble_verifies_staged_completeness_itself(self, tmp_path, writer):
         """`assemble` gates on the staging listing without being asked to.
 
         It derives its own live set from the ROI mask, and it is called directly — an
@@ -1550,7 +1408,6 @@ class TestStagedLayout:
         first. So the gate has to live here, or a half-written tile reaches the workers
         and the run fails after the schema commit instead of before any work starts.
         """
-        writer = ZarrWriter(str(tmp_path / "staging"))
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=8, x_start=0, x_stop=8)
         emb, _ = _quantized_embeddings(np.random.default_rng(1), 8, 8)
         _write_monolithic_staged_zarr(writer._staging_path("run1", chunk), emb, 0, 0)
@@ -1559,14 +1416,13 @@ class TestStagedLayout:
         with pytest.raises(IncompleteStageError, match="1 interrupted"):
             self._assemble_one_chunk(writer, chunk, tmp_path)
 
-    def test_assemble_rejects_a_tile_the_listing_calls_complete(self, tmp_path):
+    def test_assemble_rejects_a_tile_the_listing_calls_complete(self, tmp_path, writer):
         """The in-store check, on the one state the listing gate cannot see.
 
         The tile keeps its ``.done`` marker, so verification passes it — exactly the
         position a reader is in when a tile is rewritten after the listing was taken.
         Only the attribute, absent until a write finishes, reports it as partial.
         """
-        writer = ZarrWriter(str(tmp_path / "staging"))
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=8, x_start=0, x_stop=8)
         emb, _ = _quantized_embeddings(np.random.default_rng(1), 8, 8)
         path = writer._staging_path("run1", chunk)
@@ -1647,15 +1503,14 @@ class TestSingleRoiChainIsAligned:
             writer.write_chunk(chunk, emb, "run1", scales=scales, stack=STACK)
             staged[chunk.label] = emb
         output = str(tmp_path / "out.zarr")
-        writer.assemble(
+        _assemble(
+            writer,
             chunks,
             total_y=self.TOTAL,
             total_x=self.TOTAL,
             run_id="run1",
             output_path=output,
             roi_zarr_path=roi_mask,
-            n_workers=1,
-            **IDENTITY,
         )
         return staged, open_store(output)
 
@@ -1800,11 +1655,8 @@ class TestVariablesAddedToAnExistingStore:
 class TestAssemblyValidation:
     """Tests for assembly-time validation and metadata correctness."""
 
-    def test_assemble_validates_grid_extent(self, tmp_path):
+    def test_assemble_validates_grid_extent(self, tmp_path, writer, output):
         """Mismatched total_y/total_x raises ValueError."""
-        staging = str(tmp_path / "staging")
-        output = str(tmp_path / "output.zarr")
-        writer = ZarrWriter(staging)
         run_id = "extent_test"
 
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=5, x_start=0, x_stop=5)
@@ -1812,36 +1664,29 @@ class TestAssemblyValidation:
         writer.write_chunk(chunk, emb, run_id, scales=scales, stack=STACK)
 
         with pytest.raises(ValueError, match="doesn't match chunk grid extent"):
-            writer.assemble(
+            _assemble(
+                writer,
                 [chunk],
                 total_y=10,
                 total_x=10,
                 run_id=run_id,
                 output_path=output,
                 roi_zarr_path=_make_full_roi_mask(tmp_path, 10, 10),
-                n_workers=1,
-                **IDENTITY,
             )
 
-    def test_assemble_root_attrs(self, tmp_path):
+    def test_assemble_root_attrs(self, tmp_path, writer, output):
         """Assembled store has correct root attributes."""
-        staging = str(tmp_path / "staging")
-        output = str(tmp_path / "output.zarr")
-        writer = ZarrWriter(staging)
         run_id = "attrs_test"
 
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
         emb, scales = _quantized_embeddings(np.random.default_rng(42), 4, 4)
         writer.write_chunk(chunk, emb, run_id, scales=scales, stack=STACK)
-        writer.assemble(
+        _assemble(
+            writer,
             [chunk],
-            total_y=4,
-            total_x=4,
             run_id=run_id,
             output_path=output,
             roi_zarr_path=_make_full_roi_mask(tmp_path, 4, 4),
-            n_workers=1,
-            **IDENTITY,
         )
 
         repo, _ = open_or_create_repo(output)
@@ -1856,11 +1701,8 @@ class TestAssemblyValidation:
         assert "run_started_at" in attrs
         assert "run_completed_at" in attrs
 
-    def test_assemble_sets_geozarr_convention_attrs(self, tmp_path):
+    def test_assemble_sets_geozarr_convention_attrs(self, tmp_path, writer, output):
         """Convention attrs are set on the root group; with no mosaic, only geoemb:."""
-        staging = str(tmp_path / "staging")
-        output = str(tmp_path / "output.zarr")
-        writer = ZarrWriter(staging)
         run_id = "conv_test"
 
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
@@ -1931,38 +1773,34 @@ class TestScanExistingStagedChunks:
         result = writer.scan_existing_staged_chunks("run1", self.CHUNKS)
         assert result == set()
 
-    def test_empty_staging_dir(self, tmp_path):
+    def test_empty_staging_dir(self, tmp_path, writer):
         """Returns empty set when staging directory exists but is empty."""
         staging = tmp_path / "staging" / "run1"
         staging.mkdir(parents=True)
-        writer = ZarrWriter(str(tmp_path / "staging"))
         result = writer.scan_existing_staged_chunks("run1", self.CHUNKS)
         assert result == set()
 
-    def test_all_valid(self, tmp_path):
+    def test_all_valid(self, writer):
         """All staged chunks valid — returns their labels."""
-        writer = ZarrWriter(str(tmp_path / "staging"))
         for chunk in self.CHUNKS:
             self._stage_chunk(writer, chunk, "run1")
 
         result = writer.scan_existing_staged_chunks("run1", self.CHUNKS)
         assert result == {c.label for c in self.CHUNKS}
 
-    def test_partial_staged(self, tmp_path):
+    def test_partial_staged(self, writer):
         """Only first chunk staged — returns only that label, not all."""
-        writer = ZarrWriter(str(tmp_path / "staging"))
         self._stage_chunk(writer, self.CHUNKS[0], "run1")
 
         result = writer.scan_existing_staged_chunks("run1", self.CHUNKS)
         assert result == {self.CHUNKS[0].label}
 
-    def test_missing_scales_rejected(self, tmp_path):
+    def test_missing_scales_rejected(self, writer):
         """A crash mid-write_chunk can leave an embeddings-only tile (staged Zarr
         writes are not atomic across arrays). It must be rejected, not counted valid
         and skipped — otherwise run_inference skips it and the fill fails
         permanently at assembly (missing scales) on every retry.
         """
-        writer = ZarrWriter(str(tmp_path / "staging"))
         chunk = self.CHUNKS[0]
         self._stage_chunk(writer, chunk, "run1")
         # Simulate the partial write: keep embeddings, drop scales.
@@ -1971,14 +1809,13 @@ class TestScanExistingStagedChunks:
         with pytest.raises(RuntimeError, match="missing variable 'scales'"):
             writer.scan_existing_staged_chunks("run1", self.CHUNKS)
 
-    def test_missing_done_marker_triggers_reinference(self, tmp_path):
+    def test_missing_done_marker_triggers_reinference(self, writer):
         """A tile whose ``.done`` never landed is not resumed — no tile is opened.
 
         This is the cheap half of the mechanism: the crash is recognised from the
         staging listing alone, so a run with thousands of tiles does not pay a
         metadata read per tile to find the interrupted ones.
         """
-        writer = ZarrWriter(str(tmp_path / "staging"))
         chunk = self.CHUNKS[0]
         self._stage_chunk(writer, chunk, "run1")
         Path(writer._done_marker_path("run1", chunk)).unlink()  # crash before the marker
@@ -1987,13 +1824,12 @@ class TestScanExistingStagedChunks:
         # never finished, so resume must re-run it rather than trust it.
         assert writer.scan_existing_staged_chunks("run1", self.CHUNKS) == set()
 
-    def test_orphan_done_marker_triggers_reinference(self, tmp_path):
+    def test_orphan_done_marker_triggers_reinference(self, writer):
         """A ``.done`` whose tile is gone is a half-landed pair too, with the same fix.
 
         Reached by an interrupted cleanup or manual surgery. Trusting the marker
         would skip the chunk and assemble nothing for its footprint.
         """
-        writer = ZarrWriter(str(tmp_path / "staging"))
         chunk = self.CHUNKS[0]
         self._stage_chunk(writer, chunk, "run1")
         _assembly_mod._fs_for(writer._staging_path("run1", chunk)).rm(
@@ -2002,7 +1838,7 @@ class TestScanExistingStagedChunks:
 
         assert writer.scan_existing_staged_chunks("run1", self.CHUNKS) == set()
 
-    def test_missing_completion_attribute_triggers_reinference(self, tmp_path):
+    def test_missing_completion_attribute_triggers_reinference(self, writer):
         """The in-store half of the check, exercised on its own.
 
         The tile keeps its ``.done`` marker, so the listing hands it over as
@@ -2013,7 +1849,6 @@ class TestScanExistingStagedChunks:
         input-fingerprinted run_id a raise would re-fire on the same artifact every
         retry and wedge the cell until manual deletion.
         """
-        writer = ZarrWriter(str(tmp_path / "staging"))
         chunk = self.CHUNKS[0]
         self._stage_chunk(writer, chunk, "run1")
         # Strip only the in-store attribute — the arrays and the .done marker
@@ -2025,9 +1860,8 @@ class TestScanExistingStagedChunks:
         result = writer.scan_existing_staged_chunks("run1", self.CHUNKS)
         assert chunk.label not in result
 
-    def test_invalid_shape_raises(self, tmp_path):
+    def test_invalid_shape_raises(self, writer):
         """A COMPLETE staged chunk (marker present) with wrong shape raises."""
-        writer = ZarrWriter(str(tmp_path / "staging"))
         chunk = self.CHUNKS[0]
         # Write valid chunk first
         self._stage_chunk(writer, chunk, "run1")
@@ -2045,9 +1879,8 @@ class TestScanExistingStagedChunks:
         with pytest.raises(RuntimeError, match="invalid staged chunk"):
             writer.scan_existing_staged_chunks("run1", self.CHUNKS)
 
-    def test_missing_variable_raises(self, tmp_path):
+    def test_missing_variable_raises(self, writer):
         """Staged chunk missing 'embedding' variable raises RuntimeError."""
-        writer = ZarrWriter(str(tmp_path / "staging"))
         chunk = self.CHUNKS[0]
         path = writer._staging_path("run1", chunk)
         # Write a Zarr with wrong variable name
@@ -2061,9 +1894,8 @@ class TestScanExistingStagedChunks:
         with pytest.raises(RuntimeError, match="missing variable 'embeddings'"):
             writer.scan_existing_staged_chunks("run1", self.CHUNKS)
 
-    def test_stale_chunk_label_raises(self, tmp_path):
+    def test_stale_chunk_label_raises(self, writer):
         """Staged chunk whose label doesn't match any ChunkSpec raises RuntimeError."""
-        writer = ZarrWriter(str(tmp_path / "staging"))
         # Write a chunk with a label not in our chunks list
         stale = ChunkSpec(row=9, col=9, y_start=0, y_stop=10, x_start=0, x_stop=10)
         self._stage_chunk(writer, stale, "run1")
@@ -2071,9 +1903,8 @@ class TestScanExistingStagedChunks:
         with pytest.raises(RuntimeError, match="no matching ChunkSpec"):
             writer.scan_existing_staged_chunks("run1", self.CHUNKS)
 
-    def test_reports_all_invalid(self, tmp_path):
+    def test_reports_all_invalid(self, writer):
         """Error message includes ALL invalid chunks, not just the first."""
-        writer = ZarrWriter(str(tmp_path / "staging"))
         # Write two chunks with wrong shapes
         for chunk in self.CHUNKS[:2]:
             bad = np.zeros((5, 5, EMBEDDING_DIM), dtype=np.float32)
@@ -2106,17 +1937,15 @@ class TestVerifyStagedCompleteness:
         emb, scales = _quantized_embeddings(np.random.default_rng(42), chunk.height, chunk.width)
         writer.write_chunk(chunk, emb, run_id, scales=scales, stack=STACK)
 
-    def test_all_present_passes(self, tmp_path):
+    def test_all_present_passes(self, writer):
         """No error when all expected chunks are staged."""
-        writer = ZarrWriter(str(tmp_path / "staging"))
         for chunk in self.CHUNKS:
             self._stage_chunk(writer, chunk, "run1")
 
         writer.verify_staged_completeness("run1", list(self.CHUNKS))
 
-    def test_missing_chunks_raises(self, tmp_path):
+    def test_missing_chunks_raises(self, writer):
         """Raises IncompleteStageError listing missing chunks."""
-        writer = ZarrWriter(str(tmp_path / "staging"))
         # Only stage the first chunk
         self._stage_chunk(writer, self.CHUNKS[0], "run1")
 
@@ -2124,7 +1953,7 @@ class TestVerifyStagedCompleteness:
             writer.verify_staged_completeness("run1", list(self.CHUNKS))
         assert "Expected 3 chunks, found 1 staged + 0 skipped" in str(exc_info.value)
 
-    def test_interrupted_chunk_is_reported_as_its_own_category(self, tmp_path):
+    def test_interrupted_chunk_is_reported_as_its_own_category(self, writer):
         """A half-written tile fails verification, named for what it is.
 
         Reaching assembly is what makes it anomalous — the resume scan re-infers
@@ -2132,7 +1961,6 @@ class TestVerifyStagedCompleteness:
         run) or it crashed the same way twice. Calling it "missing" would send the
         operator looking for a chunk that was never attempted; the remedy differs.
         """
-        writer = ZarrWriter(str(tmp_path / "staging"))
         for chunk in self.CHUNKS:
             self._stage_chunk(writer, chunk, "run1")
         Path(writer._done_marker_path("run1", self.CHUNKS[1])).unlink()
@@ -2142,16 +1970,15 @@ class TestVerifyStagedCompleteness:
         assert "0 missing" not in str(exc_info.value)
         assert self.CHUNKS[1].label in str(exc_info.value)
 
-    def test_skip_marker_counts_as_resolved(self, tmp_path):
+    def test_skip_marker_counts_as_resolved(self, writer):
         """A chunk with a skip marker instead of a staged zarr passes verification."""
-        writer = ZarrWriter(str(tmp_path / "staging"))
         self._stage_chunk(writer, self.CHUNKS[0], "run1")
         self._stage_chunk(writer, self.CHUNKS[1], "run1")
         writer.write_skip_marker(self.CHUNKS[2], "run1")
 
         writer.verify_staged_completeness("run1", list(self.CHUNKS))
 
-    def test_a_chunk_that_stops_skipping_clears_its_stale_skip_marker(self, tmp_path):
+    def test_a_chunk_that_stops_skipping_clears_its_stale_skip_marker(self, writer):
         """The mirror of the case below: whichever outcome a chunk reaches, no trace
         of the other survives.
 
@@ -2161,7 +1988,6 @@ class TestVerifyStagedCompleteness:
         input-fingerprinted run_id that refusal repeats on every retry, so the cell is
         wedged until someone deletes the marker by hand.
         """
-        writer = ZarrWriter(str(tmp_path / "staging"))
         chunk = self.CHUNKS[0]
         writer.write_skip_marker(chunk, "run1")
         assert Path(writer._skip_marker_path("run1", chunk)).exists()
@@ -2173,7 +1999,7 @@ class TestVerifyStagedCompleteness:
             self._stage_chunk(writer, other, "run1")
         writer.verify_staged_completeness("run1", list(self.CHUNKS))
 
-    def test_skip_marker_clears_a_stale_done_marker(self, tmp_path):
+    def test_skip_marker_clears_a_stale_done_marker(self, writer):
         """A chunk that staged, then skipped on a retry, must not look like both.
 
         ``write_skip_marker`` drops the sibling zarr; it has to drop the completion
@@ -2181,7 +2007,6 @@ class TestVerifyStagedCompleteness:
         on the next verification, which raises — and under the stable run_id it
         raises on every retry, wedging the cell until someone deletes it by hand.
         """
-        writer = ZarrWriter(str(tmp_path / "staging"))
         self._stage_chunk(writer, self.CHUNKS[0], "run1")
         self._stage_chunk(writer, self.CHUNKS[1], "run1")
         self._stage_chunk(writer, self.CHUNKS[2], "run1")
@@ -2191,7 +2016,7 @@ class TestVerifyStagedCompleteness:
         assert not Path(writer._done_marker_path("run1", self.CHUNKS[2])).exists()
         writer.verify_staged_completeness("run1", list(self.CHUNKS))
 
-    def test_both_staged_and_skipped_raises(self, tmp_path):
+    def test_both_staged_and_skipped_raises(self, tmp_path, writer):
         """A chunk with BOTH a staged zarr and a skip marker is inconsistent.
 
         The marker is created directly, not via ``write_skip_marker`` — that clears
@@ -2199,7 +2024,6 @@ class TestVerifyStagedCompleteness:
         guard remains for prefixes we did not author: a half-cleaned directory, two
         processes on one run_id, manual surgery.
         """
-        writer = ZarrWriter(str(tmp_path / "staging"))
         for chunk in self.CHUNKS:
             self._stage_chunk(writer, chunk, "run1")
         (tmp_path / "staging" / "run1" / f"{self.CHUNKS[0].label}.skipped").write_bytes(b"")
@@ -2207,7 +2031,7 @@ class TestVerifyStagedCompleteness:
         with pytest.raises(IncompleteStageError, match="BOTH a staged zarr and a skip marker"):
             writer.verify_staged_completeness("run1", list(self.CHUNKS))
 
-    def test_detect_chunk_size_separates_all_skipped_from_no_such_run(self, tmp_path):
+    def test_detect_chunk_size_separates_all_skipped_from_no_such_run(self, writer):
         """An all-skipped run must stay resumable; a bogus run_id must not.
 
         assemble() publishes an all-fill timestep when every chunk skipped, but the
@@ -2215,7 +2039,6 @@ class TestVerifyStagedCompleteness:
         "real run, nothing to measure" from "no such run", or either the branch is
         unreachable or a mistyped run_id silently becomes a full re-run.
         """
-        writer = ZarrWriter(str(tmp_path / "staging"))
         for chunk in self.CHUNKS:
             writer.write_skip_marker(chunk, "all-skipped")
 
@@ -2224,7 +2047,7 @@ class TestVerifyStagedCompleteness:
         with pytest.raises(FileNotFoundError):
             writer.detect_staged_chunk_size("typo-run")
 
-    def test_skip_marker_clears_a_stale_staged_zarr(self, tmp_path):
+    def test_skip_marker_clears_a_stale_staged_zarr(self, tmp_path, writer):
         """A skipping chunk must not leave a staged zarr behind.
 
         The resume scan excludes an incomplete staged zarr rather than raising (a
@@ -2232,7 +2055,6 @@ class TestVerifyStagedCompleteness:
         skips, the leftover would trip the BOTH check here instead — wedging the
         cell in the very way that exclusion exists to avoid.
         """
-        writer = ZarrWriter(str(tmp_path / "staging"))
         for chunk in self.CHUNKS:
             self._stage_chunk(writer, chunk, "run1")
         assert (tmp_path / "staging" / "run1" / f"{self.CHUNKS[0].label}.zarr").exists()
@@ -2242,16 +2064,13 @@ class TestVerifyStagedCompleteness:
         assert not (tmp_path / "staging" / "run1" / f"{self.CHUNKS[0].label}.zarr").exists()
         writer.verify_staged_completeness("run1", list(self.CHUNKS))
 
-    def test_no_staged_chunks_raises(self, tmp_path):
+    def test_no_staged_chunks_raises(self, writer):
         """Raises IncompleteStageError when staging dir is empty."""
-        writer = ZarrWriter(str(tmp_path / "staging"))
-
         with pytest.raises(IncompleteStageError, match="3 missing"):
             writer.verify_staged_completeness("run1", list(self.CHUNKS))
 
-    def test_extra_chunks_raises(self, tmp_path):
+    def test_extra_chunks_raises(self, writer):
         """Raises IncompleteStageError when staging has chunks not in the grid."""
-        writer = ZarrWriter(str(tmp_path / "staging"))
         for chunk in self.CHUNKS:
             self._stage_chunk(writer, chunk, "run1")
         # Stage an extra chunk not in the expected list
@@ -2993,63 +2812,50 @@ class TestAssembleGuards:
         writer.write_chunk(chunk, emb, run_id, scales=scales, obs_counts=obs, stack=stack)
         return emb
 
-    def test_append_extent_mismatch_raises(self, tmp_path):
+    def test_append_extent_mismatch_raises(self, tmp_path, writer, output):
         """A mosaic grid that doesn't match the existing store is a loud error, not a corner write."""
-        writer = ZarrWriter(str(tmp_path / "staging"))
-        output = str(tmp_path / "out.zarr")
         day = datetime.datetime(2024, 6, 1, tzinfo=datetime.UTC)
         big = ChunkSpec(row=0, col=0, y_start=0, y_stop=8, x_start=0, x_stop=8)
         self._stage_one(writer, big, "run1")
-        writer.assemble(
+        _assemble(
+            writer,
             [big],
-            total_y=8,
-            total_x=8,
             run_id="run1",
             output_path=output,
             roi_zarr_path=_make_full_roi_mask(tmp_path, 8, 8),
             run_started_at=day,
-            n_workers=1,
-            **IDENTITY,
         )
 
         small = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
         self._stage_one(writer, small, "run2")
         with pytest.raises(ValueError, match="does not match existing store"):
-            writer.assemble(
+            _assemble(
+                writer,
                 [small],
-                total_y=4,
-                total_x=4,
                 run_id="run2",
                 output_path=output,
                 roi_zarr_path=_make_full_roi_mask(tmp_path / "roi2", 4, 4),
                 run_started_at=datetime.datetime(2025, 6, 1, tzinfo=datetime.UTC),
-                n_workers=1,
-                **IDENTITY,
             )
 
     @pytest.mark.parametrize(("crs", "tile_id"), [("EPSG:32633", None), (None, "33UWP")])
-    def test_projected_coords_get_cf_axis_attrs(self, tmp_path, monkeypatch, crs, tile_id):
+    def test_projected_coords_get_cf_axis_attrs(self, tmp_path, monkeypatch, crs, tile_id, writer, output):
         """A store over a metre CRS labels northing/easting, whether the CRS came from the mosaic
         or from the MGRS tile fallback.
         """
-        writer = ZarrWriter(str(tmp_path / "staging"))
-        output = str(tmp_path / "out.zarr")
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
         axis = np.arange(4, dtype="float64") * 10.0
         spatial = SpatialCoords(northing=axis[::-1], easting=axis, crs=crs)
         monkeypatch.setattr(_assembly_mod, "read_spatial_coords", lambda *a, **k: spatial)
         self._stage_one(writer, chunk, "run1")
-        writer.assemble(
+        _assemble(
+            writer,
             [chunk],
-            total_y=4,
-            total_x=4,
             run_id="run1",
             output_path=output,
             roi_zarr_path=_make_full_roi_mask(tmp_path, 4, 4),
-            n_workers=1,
             mosaic_base=str(tmp_path / "mosaic"),
             tile_id=tile_id,
-            **IDENTITY,
         )
         root = zarr.open_group(open_or_create_repo(output)[0].readonly_session("main").store, mode="r")
         assert root.attrs["proj:code"] == "EPSG:32633"
@@ -3061,10 +2867,10 @@ class TestAssembleGuards:
         [(("y", "x"), ("y", "x")), (("northing", "easting"), ("northing", "easting"))],
         ids=["new-v2-store", "v2-store-created-before-y-x"],
     )
-    def test_a_store_takes_its_models_names_once_and_keeps_them(self, tmp_path, monkeypatch, created_with, kept):
+    def test_a_store_takes_its_models_names_once_and_keeps_them(
+        self, tmp_path, monkeypatch, created_with, kept, writer, output
+    ):
         """A new v2 store is created with y/x; an append keeps whatever names the store has."""
-        writer = ZarrWriter(str(tmp_path / "staging"))
-        output = str(tmp_path / "out.zarr")
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
         axis = np.arange(4, dtype="float64") * 10.0
         spatial = SpatialCoords(northing=axis[::-1], easting=axis, crs="EPSG:32633")
@@ -3101,7 +2907,7 @@ class TestAssembleGuards:
         assert {"northing", "easting", "y", "x"} - set(root.array_keys()) == {"northing", "easting", "y", "x"} - {y, x}
         assert resolve_region(output, northing=(0, 10)) == {y: slice(2, 4)}  # descending Y axis
 
-    def test_append_refuses_a_reordered_interior_on_matching_endpoints(self, tmp_path, monkeypatch):
+    def test_append_refuses_a_reordered_interior_on_matching_endpoints(self, tmp_path, monkeypatch, writer, output):
         """Extent, CRS and endpoints do not pin an axis, and this phase writes POSITIONALLY.
 
         A mosaic whose interior is reordered — or non-affine — while its first and last
@@ -3112,8 +2918,6 @@ class TestAssembleGuards:
         The zone-fill runner already compares complete vectors for exactly this reason. This
         is the single-ROI path, which is the one that accepts a hand-provided mosaic.
         """
-        writer = ZarrWriter(str(tmp_path / "staging"))
-        output = str(tmp_path / "out.zarr")
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=8, x_start=0, x_stop=8)
         north = np.arange(8, dtype="float64") * 10.0
         east = np.arange(8, dtype="float64") * 10.0
@@ -3123,17 +2927,14 @@ class TestAssembleGuards:
 
         def _run(run_id: str, when: datetime.datetime, roi: str):
             self._stage_one(writer, chunk, run_id)
-            writer.assemble(
+            _assemble(
+                writer,
                 [chunk],
-                total_y=8,
-                total_x=8,
                 run_id=run_id,
                 output_path=output,
                 roi_zarr_path=roi,
                 run_started_at=when,
-                n_workers=1,
                 mosaic_base=str(tmp_path / "mosaic"),
-                **IDENTITY,
             )
 
         _run("run1", datetime.datetime(2024, 6, 1, tzinfo=datetime.UTC), _make_full_roi_mask(tmp_path, 8, 8))
@@ -3151,25 +2952,20 @@ class TestAssembleGuards:
                 _make_full_roi_mask(tmp_path / "roi2", 8, 8),
             )
 
-    def test_append_creates_missing_variables_from_layout(self, tmp_path):
+    def test_append_creates_missing_variables_from_layout(self, tmp_path, writer, output):
         """A run staging vars the store lacks creates them (full time extent) instead of KeyError."""
-        writer = ZarrWriter(str(tmp_path / "staging"))
-        output = str(tmp_path / "out.zarr")
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=6, x_start=0, x_stop=6)
         roi = _make_full_roi_mask(tmp_path, 6, 6)
 
         # Run 1: no obs counts -> store created without obs arrays.
         self._stage_one(writer, chunk, "run1", with_obs=False)
-        writer.assemble(
+        _assemble(
+            writer,
             [chunk],
-            total_y=6,
-            total_x=6,
             run_id="run1",
             output_path=output,
             roi_zarr_path=roi,
             run_started_at=datetime.datetime(2024, 6, 1, tzinfo=datetime.UTC),
-            n_workers=1,
-            **IDENTITY,
         )
         ds = open_store(output)
         assert "s2_obs_count" not in ds
@@ -3177,16 +2973,13 @@ class TestAssembleGuards:
 
         # Run 2 at a later date stages obs counts -> arrays created, prior step reads fill.
         self._stage_one(writer, chunk, "run2", with_obs=True)
-        writer.assemble(
+        _assemble(
+            writer,
             [chunk],
-            total_y=6,
-            total_x=6,
             run_id="run2",
             output_path=output,
             roi_zarr_path=roi,
             run_started_at=datetime.datetime(2025, 6, 1, tzinfo=datetime.UTC),
-            n_workers=1,
-            **IDENTITY,
         )
         ds = open_store(output)
         assert ds["s2_obs_count"].shape == (2, 6, 6)

@@ -26,7 +26,7 @@ your adapter and fill in the body.
        uv run pytest tests/parity/<adapter_name>/ -m parity
 
 5. PR review checklist:
-   - [ ] Architecture rules pass (
-     ``python -m tessera_embeddings.architecture_tests --source src/`` returns 0).
+   - [ ] Architecture contracts pass (``uv run lint-imports`` and
+     ``uv run ruff check src/`` both return 0).
    - [ ] Parity test passes locally.
    - [ ] CI workflow updated to include the new test directory.

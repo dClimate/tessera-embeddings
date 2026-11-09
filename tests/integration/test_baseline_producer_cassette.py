@@ -60,8 +60,7 @@ from tessera_embeddings.ingest.asset_locations import (
 )
 from tessera_embeddings.ingest.boa_offset import OffsetDecision, source_decision
 from tessera_embeddings.ingest.duplicates import (
-    acquisition_identity,
-    acquisition_instant,
+    image_identity,
     select_preferred_duplicates,
 )
 from tessera_embeddings.ingest.item_baselines import processing_baseline
@@ -207,23 +206,16 @@ class TestRecordedProducerSplit:
         assert _decisions(on_day) == {OffsetDecision.EXEMPT}
 
     def test_the_real_reprocessing_pair_reduces_to_one_copy(self) -> None:
-        """The reported MEDIUM, checked against the recorded catalogue rather than a fixture.
+        """Checked against the recorded catalogue rather than a fixture.
 
-        Both items on this day are reprocessings of ONE observation — same sensing time, orbit and
-        tile — but their catalogue timestamps are more than three minutes apart, so clustering on
-        those timestamps kept both and handed both to the loader to mosaic together. They share a
-        datatake, which is what now reduces them.
+        Both items on this day are reprocessings of ONE image, at baselines 02.06 and 05.00, with
+        catalogue timestamps more than three minutes apart. They name the same pass and datastrip,
+        which is what reduces them.
         """
         on_day = [it for it in _normalised() if it.datetime.strftime("%Y-%m-%d") == MIXED_DAY]
-        identities = {acquisition_identity(it) for it in on_day}
-        assert identities and None not in identities, f"the recorded items name no datatake: {identities}"
-        assert len(identities) == 1, f"{MIXED_DAY} is no longer one observation; re-pick the fixture day"
-
-        skew = max(acquisition_instant(it) for it in on_day) - min(acquisition_instant(it) for it in on_day)
-        assert skew.total_seconds() > 120, (
-            f"the recorded copies are only {skew.total_seconds()}s apart, so timestamp clustering "
-            f"would already have reduced them and this asserts nothing"
-        )
+        identities = {image_identity(it) for it in on_day}
+        assert identities and None not in identities, f"the recorded items name no image: {identities}"
+        assert len(identities) == 1, f"{MIXED_DAY} is no longer one image; re-pick the fixture day"
 
         kept, alternates = select_preferred_duplicates(on_day)
         assert len(kept) == 1, f"two reprocessings of one observation were both loaded: {[i.id for i in kept]}"

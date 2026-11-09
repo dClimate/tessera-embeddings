@@ -61,7 +61,7 @@ from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.inference.scheduling import WorkItem
 from tessera_embeddings.ingest.source_coverage import SourceFinding, preflight_optical_source
 from tessera_embeddings.orchestration.prefect.flows._cell_validation import (
-    cell_validation_parameters,
+    ValidationTarget,
     dispatch_cell_validation,
     validation_run_tag,
 )
@@ -680,7 +680,8 @@ _cancel_child_ingests_on_cancellation = make_child_cancel_hook(_INGEST_TAG_PREFI
     # together delivers the transition twice and runs it twice (2026-07-25).
     on_cancellation=[ray_cleanup_on_cancellation, _cancel_child_ingests_on_cancellation],
     on_crashed=[ray_cleanup_on_cancellation, _cancel_child_ingests_on_cancellation],
-)
+)  # ty: ignore[no-matching-overload]  # Prefect's hook-list overloads reject a list of differently typed hooks
+# jscpd:ignore-start: flow parameters and their docs, shared with fill_zone_year_flow; Prefect shows each flow's own
 def fill_zones_sequential_flow(
     *,
     cells: list[tuple[str, int]] | None = None,
@@ -902,6 +903,7 @@ def fill_zones_sequential_flow(
         Summary dict: triage counts (retag / empty / live), the sequential runner's outcome
         summary, and elapsed seconds.
     """
+    # jscpd:ignore-end
     log = get_run_logger()
     t0_flow = time.monotonic()
 
@@ -1099,6 +1101,7 @@ def fill_zones_sequential_flow(
     # Prefect context, so reading the runtime id inside `_validate` would yield None for every
     # cell this cluster fills, and the validations would be untraceable back to the fill.
     validation_tag = validation_run_tag(flow_run_ctx.id)
+    validation_target = ValidationTarget(paths, store_name, mask_name, s3_region)
 
     def _validate(zone: str, year: int, summary: dict[str, Any]) -> dict[str, Any]:
         """Hand one landed cell to its validation deployment, without waiting for it.
@@ -1118,14 +1121,7 @@ def fill_zones_sequential_flow(
             zone=zone,
             year=year,
             summary=summary,
-            parameters=cell_validation_parameters(
-                zone=zone,
-                year=year,
-                paths=paths,
-                store_name=store_name,
-                mask_name=mask_name,
-                s3_region=s3_region,
-            ),
+            target=validation_target,
             log=log,
             tag=validation_tag,
         )
@@ -1500,7 +1496,8 @@ def fill_zones_sequential_flow(
                 cleanup_staging=cleanup_staging,
                 # OFF the assembly thread: measured at ~2 h per cell inline, during which the
                 # next cell's assembly could not start even with its tiles fully staged.
-                defer_cleanup=housekeeping.submit,
+                # Executor.submit takes *args, which ty does not match to a one-argument callable.
+                defer_cleanup=housekeeping.submit,  # ty: ignore[invalid-argument-type]
                 n_assembly_workers=n_assembly_workers,
                 get_credentials=iam_icechunk_credentials,
                 s3_region=s3_region,

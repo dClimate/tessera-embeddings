@@ -27,6 +27,7 @@ import subprocess
 import time
 
 import fsspec
+import fsspec.utils
 
 logger = logging.getLogger(__name__)
 

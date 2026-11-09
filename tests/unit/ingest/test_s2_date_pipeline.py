@@ -17,7 +17,6 @@ from __future__ import annotations
 import logging
 import re
 import time
-from datetime import datetime
 from itertools import pairwise
 from types import SimpleNamespace
 
@@ -27,9 +26,11 @@ import pytest
 import xarray as xr
 
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
+from tessera_embeddings.ingest import live_windows as live_windows_mod
 from tessera_embeddings.ingest import s2_roi
 from tessera_embeddings.ingest.stac import HeterogeneousProducerError
 from tessera_embeddings.storage.zarr_store import store_write_retrying
+from tests.stac_items import fake_stac_item
 
 
 @pytest.fixture(autouse=True)
@@ -120,16 +121,6 @@ class _FakeClient:
         return {"inproc://fake": fn(*args, **kwargs)}
 
 
-def _item(date: str, item_id: str | None = None):
-    # `id` is carried because the ingest sort breaks cloud-cover ties on it, so an item without
-    # one is not a stand-in for a real item.
-    return SimpleNamespace(
-        id=item_id or f"S2A_T13TDE_{date.replace('-', '')}_0_L2A",
-        datetime=datetime.fromisoformat(f"{date}T10:00:00"),
-        properties={"eo:cloud_cover": 0.0},
-    )
-
-
 def _day_ds(date: str, *, valid: bool) -> xr.Dataset:
     """One date's toy mosaic: one reflectance band plus the SCL the gate reads."""
     scl = np.full((1, SIZE, SIZE), VALID_CLASS if valid else INVALID_CLASS, dtype="uint8")
@@ -185,7 +176,7 @@ def run_ingest(monkeypatch):
     # assert on the arguments they receive does so in its own body, which runs after the
     # fixture and before the helper, so setting them here lets that override win.
     whole_roi = SimpleNamespace(y0=0, y1=SIZE, x0=0, x1=SIZE)
-    monkeypatch.setattr(s2_roi, "live_windows_for_mask", lambda *_a, **_k: [whole_roi])
+    monkeypatch.setattr(live_windows_mod, "live_windows_for_mask", lambda *_a, **_k: [whole_roi])
     monkeypatch.setattr(s2_roi, "windows_for_date", lambda run_windows, *_a, **_k: run_windows)
 
     runs: list[_Run] = []
@@ -237,7 +228,7 @@ def run_ingest(monkeypatch):
             for day_ds, _windows in days:
                 _record_write(day_ds)
 
-        monkeypatch.setattr(s2_roi, "query_stac_items", lambda **_kwargs: ([_item(d) for d in dates], {}))
+        monkeypatch.setattr(s2_roi, "query_stac_items", lambda **_kwargs: ([fake_stac_item(d) for d in dates], {}))
         monkeypatch.setattr(s2_roi, "load_stac_items", load_stac_items)
         # What the store already holds. Default empty — a fresh ingest — but a test can
         # populate it to stand a run up over an existing store, which is what a resume is.
@@ -433,7 +424,7 @@ def test_per_date_narrowing_is_priced_like_the_run(run_ingest, monkeypatch, over
         seen["date"] = window_cost_in_chunks
         return run_windows
 
-    monkeypatch.setattr(s2_roi, "live_windows_for_mask", fake_live_windows_for_mask)
+    monkeypatch.setattr(live_windows_mod, "live_windows_for_mask", fake_live_windows_for_mask)
     monkeypatch.setattr(s2_roi, "windows_for_date", fake_windows_for_date)
     monkeypatch.setattr(s2_roi, "write_day_windows", lambda *_a, **_k: None)
     monkeypatch.setattr(s2_roi, "write_days_windows", lambda *_a, **_k: None)
@@ -443,7 +434,9 @@ def test_per_date_narrowing_is_priced_like_the_run(run_ingest, monkeypatch, over
         pipeline_dates=False,
         overlap_window_writes=overlapped,
     )
-    expected = s2_roi.WINDOW_COST_IN_CHUNKS_OVERLAPPED if overlapped else s2_roi.WINDOW_COST_IN_CHUNKS
+    expected = (
+        live_windows_mod.WINDOW_COST_IN_CHUNKS_OVERLAPPED if overlapped else live_windows_mod.WINDOW_COST_IN_CHUNKS
+    )
     assert seen == {"run": expected, "date": expected}
 
 

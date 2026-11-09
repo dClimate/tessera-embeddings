@@ -48,7 +48,10 @@ context_docs/
 │   ├── 029-one-flow-per-ingest.md
 │   ├── 030-forward-pass-reorderings-ship-at-a-store-boundary.md
 │   ├── 031-the-v2-store-chunks-the-band-axis-at-16.md
-│   └── 032-v2-stores-name-their-axes-y-and-x.md
+│   ├── 032-v2-stores-name-their-axes-y-and-x.md
+│   ├── 034-an-acquisition-is-one-datastrip-of-one-pass.md
+│   ├── 039-architecture-rules-run-on-import-linter-and-ruff.md
+│   └── 040-new-code-is-gated-on-duplication-and-complexity.md
 │
 ├── campaign/                      THE GLOBAL CAMPAIGN — start here
 │   ├── campaign-plan.md                        <- START HERE. What runs, with what settings, in
@@ -74,8 +77,10 @@ context_docs/
 │   │                                              budget, live-tile cropping, region writes
 │   ├── source-read-failures.md                 twelve ways a source read fails, the guard each
 │   │                                              earned, and the retry budget they share
-│   └── solar-day-fusion-order.md               which scene wins a contested pixel, and why the
-│                                                  answer was inverted for the life of the code
+│   ├── solar-day-fusion-order.md               which scene wins a contested pixel, and why the
+│   │                                              answer was inverted for the life of the code
+│   └── split-datastrips.md                     why a pass split across datastrips keeps every
+│                                                  granule, and what dropping one cost
 │
 ├── inference/                     RUNNING THE ENCODER
 │   ├── simplifying-the-strip-loader.md         the October 2026 loading experiments: what was

@@ -91,6 +91,7 @@ _RESAMPLERS: dict[str, Callable[[int, int], np.ndarray]] = {
 }
 
 
+# jscpd:ignore-start: same shape as config.inference.model_family; each refuses an unknown version
 def resampler_for(model_version: ModelVersion) -> Callable[[int, int], np.ndarray]:
     """The padding/subsampling rule *model_version* was trained under.
 
@@ -103,6 +104,7 @@ def resampler_for(model_version: ModelVersion) -> Callable[[int, int], np.ndarra
     except KeyError:
         valid = ", ".join(repr(k) for k in _RESAMPLERS)
         raise ValueError(f"No resampler for model_version={model_version!r}. Known: {valid}.") from None
+    # jscpd:ignore-end
 
 
 # build_resample_indices depends only on (valid_len, target), both small ints (valid_len <= T of the chunk, target one
@@ -179,8 +181,9 @@ def compute_bin_keys(
     s2_idx = np.clip(s2_idx, 0, len(ckps_arr) - 1)
     s1_idx = np.clip(s1_idx, 0, len(ckps_arr) - 1)
     keys = np.empty(len(s2_valid), dtype=np.dtype([("s2", np.int32), ("s1", np.int32)]))
-    keys["s2"] = ckps_arr[s2_idx]
-    keys["s1"] = ckps_arr[s1_idx]
+    # numpy's stubs do not model assigning to a structured array's named field.
+    keys["s2"] = ckps_arr[s2_idx]  # ty: ignore[invalid-assignment]
+    keys["s1"] = ckps_arr[s1_idx]  # ty: ignore[invalid-assignment]
     return keys
 
 

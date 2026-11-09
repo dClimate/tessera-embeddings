@@ -94,6 +94,30 @@ class STACProvider:
 # Pre-configured Providers
 # =============================================================================
 
+# Served identically by Earth Search and Planetary Computer, which differ only in what they call
+# the Sentinel-1 collection.
+_LANDSAT_C2_L2 = CollectionConfig(
+    collection_id="landsat-c2-l2",
+    bands=LANDSAT_C2_BANDS,
+    resolution=30,
+    tile_id_property="landsat:wrs_path",
+    tile_id_prefix="",
+)
+
+
+def _s1_grd(collection_id: str) -> CollectionConfig:
+    """Sentinel-1 GRD under the catalogue's own collection name."""
+    return CollectionConfig(
+        collection_id=collection_id,
+        bands=S1_GRD_BANDS,
+        resolution=10,
+        baseline_threshold=S1_BASELINE_THRESHOLD,
+        baseline_offset=S1_BASELINE_OFFSET,
+        tile_id_property="sat:relative_orbit",
+        tile_id_prefix="",
+    )
+
+
 PROVIDERS: dict[str, STACProvider] = {
     "earth-search": STACProvider(
         name="Earth Search (Element 84)",
@@ -125,22 +149,8 @@ PROVIDERS: dict[str, STACProvider] = {
                 tile_id_property="grid:code",
                 tile_id_prefix="MGRS-",
             ),
-            "sentinel-1-grd": CollectionConfig(
-                collection_id="sentinel-1-grd",
-                bands=S1_GRD_BANDS,
-                resolution=10,
-                baseline_threshold=S1_BASELINE_THRESHOLD,
-                baseline_offset=S1_BASELINE_OFFSET,
-                tile_id_property="sat:relative_orbit",
-                tile_id_prefix="",
-            ),
-            "landsat-c2-l2": CollectionConfig(
-                collection_id="landsat-c2-l2",
-                bands=LANDSAT_C2_BANDS,
-                resolution=30,
-                tile_id_property="landsat:wrs_path",
-                tile_id_prefix="",
-            ),
+            "sentinel-1-grd": _s1_grd("sentinel-1-grd"),
+            "landsat-c2-l2": _LANDSAT_C2_L2,
         },
         # BELOW the class default: this catalogue refuses a response over ~6 MB (AWS Lambda's
         # synchronous response limit) and 250 `sentinel-2-l2a` items exceeds it. Per provider,
@@ -194,22 +204,8 @@ PROVIDERS: dict[str, STACProvider] = {
                 tile_id_property="s2:mgrs_tile",
                 tile_id_prefix="",
             ),
-            "sentinel-1-grd": CollectionConfig(
-                collection_id="sentinel-1-rtc",
-                bands=S1_GRD_BANDS,
-                resolution=10,
-                baseline_threshold=S1_BASELINE_THRESHOLD,
-                baseline_offset=S1_BASELINE_OFFSET,
-                tile_id_property="sat:relative_orbit",
-                tile_id_prefix="",
-            ),
-            "landsat-c2-l2": CollectionConfig(
-                collection_id="landsat-c2-l2",
-                bands=LANDSAT_C2_BANDS,
-                resolution=30,
-                tile_id_property="landsat:wrs_path",
-                tile_id_prefix="",
-            ),
+            "sentinel-1-grd": _s1_grd("sentinel-1-rtc"),
+            "landsat-c2-l2": _LANDSAT_C2_L2,
         },
     ),
 }

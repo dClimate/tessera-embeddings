@@ -217,6 +217,7 @@ class StudentTransformerEncoder(nn.Module):
                 [QKNormEncoderLayer(latent_dim * 4, nhead, dim_feedforward, dropout) for _ in range(num_encoder_layers)]
             )
         else:
+            # jscpd:ignore-start: the v1.1 encoder stack (modules.py), as the v2 student was trained
             encoder_layer = nn.TransformerEncoderLayer(
                 d_model=latent_dim * 4,
                 nhead=nhead,
@@ -226,6 +227,7 @@ class StudentTransformerEncoder(nn.Module):
                 batch_first=True,
             )
             self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
+            # jscpd:ignore-end
         self.attn_pool = AttentionPooling(latent_dim * 4)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

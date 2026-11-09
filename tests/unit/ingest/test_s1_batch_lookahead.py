@@ -28,7 +28,11 @@ import time
 
 import pytest
 
+from tessera_embeddings.ingest import live_windows as live_windows_mod
 from tessera_embeddings.ingest._pipeline import pipelined
+
+# Every S1 leg these tests run is kept off disk and network the same way.
+pytestmark = pytest.mark.usefixtures("s1_leg_offline")
 
 
 def _fake_client():
@@ -162,19 +166,6 @@ def _run_ingest(monkeypatch, catalogue: list[str], existing: set[str], **kwargs)
     monkeypatch.setattr(s1_roi, "ingest_tile", fake_ingest_tile)
     monkeypatch.setattr(s1_roi, "write_day_windows", fake_write_day_windows)
     monkeypatch.setattr(s1_roi, "get_existing_dates", lambda _store, **_kw: set(existing))
-    monkeypatch.setattr(s1_roi, "apply_roi_mask", lambda data, *a, **k: data)
-    monkeypatch.setattr(s1_roi, "read_roi_mask", lambda *a, **k: object())
-    monkeypatch.setattr(
-        s1_roi,
-        "read_roi_metadata",
-        lambda _p, **_k: type("M", (), {"geobox": object(), "native_crs": "EPSG:32635", "bbox_wgs84": (0, 0, 1, 1)})(),
-    )
-    monkeypatch.setattr(
-        s1_roi, "live_windows_for_mask", lambda *a, **k: [type("W", (), {"y0": 0, "y1": 1, "x0": 0, "x1": 1})()]
-    )
-    monkeypatch.setattr(s1_roi, "make_s1_item_provider", lambda *a, **k: lambda: [])
-    # Reads the ROI store for provenance; irrelevant here and the only other S3 caller.
-    monkeypatch.setattr(s1_roi.IngestManifest, "from_roi_store", classmethod(lambda _cls, _p, **_k: object()))
 
     s1_roi.ingest_s1_roi_sar(
         roi_zarr_path="s3://bucket/roi.zarr",
@@ -301,16 +292,8 @@ def _run_with_footprints(
         lambda _s, data, w, **_k: written.append((str(data["time"].values[0])[:10], len(w))),
     )
     monkeypatch.setattr(s1_roi, "get_existing_dates", lambda _s, **_kw: set())
-    monkeypatch.setattr(s1_roi, "apply_roi_mask", lambda data, *a, **k: data)
-    monkeypatch.setattr(s1_roi, "read_roi_mask", lambda *a, **k: object())
-    monkeypatch.setattr(s1_roi, "live_windows_for_mask", fake_live_windows_for_mask)
+    monkeypatch.setattr(live_windows_mod, "live_windows_for_mask", fake_live_windows_for_mask)
     monkeypatch.setattr(s1_roi, "solar_grouping_longitude", lambda _roi: 0.0)
-    monkeypatch.setattr(
-        s1_roi,
-        "read_roi_metadata",
-        lambda _p, **_k: type("M", (), {"geobox": object(), "native_crs": "EPSG:32635", "bbox_wgs84": (0, 0, 1, 1)})(),
-    )
-    monkeypatch.setattr(s1_roi.IngestManifest, "from_roi_store", classmethod(lambda _c, _p, **_k: object()))
 
     s1_roi.ingest_s1_roi_sar(
         roi_zarr_path="s3://bucket/roi.zarr",
@@ -490,16 +473,13 @@ def test_an_all_ocean_roi_banks_no_empty_dates(monkeypatch) -> None:
     monkeypatch.setattr(s1_roi, "ingest_tile", fake_ingest_tile)
     monkeypatch.setattr(s1_roi, "write_day_windows", lambda *a, **k: written.append("write"))
     monkeypatch.setattr(s1_roi, "get_existing_dates", lambda _store, **_kw: set())
-    monkeypatch.setattr(s1_roi, "read_roi_mask", lambda *a, **k: object())
     monkeypatch.setattr(
         s1_roi,
         "read_roi_metadata",
         lambda *a, **k: SimpleNamespace(bbox_wgs84=(0.0, 0.0, 1.0, 1.0), geobox=object(), crs="EPSG:32615"),
     )
-    monkeypatch.setattr(s1_roi, "live_windows_for_mask", lambda *a, **k: [])  # all ocean
+    monkeypatch.setattr(live_windows_mod, "live_windows_for_mask", lambda *a, **k: [])  # all ocean
     monkeypatch.setattr(s1_roi, "solar_grouping_longitude", lambda *a, **k: 0.0)
-    monkeypatch.setattr(s1_roi, "make_s1_item_provider", lambda *a, **k: lambda: [])
-    monkeypatch.setattr(s1_roi.IngestManifest, "from_roi_store", classmethod(lambda _cls, _p, **_k: object()))
 
     result = s1_roi.ingest_s1_roi_sar(
         roi_zarr_path="s3://bucket/ocean.zarr",
