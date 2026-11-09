@@ -131,7 +131,11 @@ convention's schema requires. Every spatial array also repeats `spatial:dimensio
 spatial spec requires (the transform and CRS stay on the group), and the Y/X coordinate arrays carry
 CF `standard_name`, `units` and `axis` attributes whenever they hold real coordinates in a metre CRS.
 The model names those axes: `y`/`x` for v2 stores, `northing`/`easting` for v1.1, whose published
-store already uses them ([ADR 032](context_docs/decisions/032-v2-stores-name-their-axes-y-and-x.md)). All of it is built in [`storage/conventions.py`](src/tessera_embeddings/storage/conventions.py);
+store already uses them ([ADR 032](context_docs/decisions/032-v2-stores-name-their-axes-y-and-x.md)).
+A v2 store also keeps its arrays in a level group `0` under each zone (`33N/0`), declared with the
+[`multiscales`](https://github.com/zarr-conventions/multiscales) convention so coarser levels can
+be added beside it, and stores `embeddings` band-first in 16-band shards of 4-band chunks
+([ADR 031](context_docs/decisions/031-the-v2-store-chunks-the-band-axis-at-16.md)). All of it is built in [`storage/conventions.py`](src/tessera_embeddings/storage/conventions.py);
 the versions followed and how conformance is checked are in
 [`context_docs/storage/conforming-to-the-zarr-conventions.md`](context_docs/storage/conforming-to-the-zarr-conventions.md).
 

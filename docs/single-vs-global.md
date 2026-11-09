@@ -481,6 +481,14 @@ Single-area stores use the same geometry — but those are nominal maxima: `crea
 clamps chunks and shards to the array, so a store smaller than one shard has a finer grid and
 a cheaper point read than the figures above.
 
+**v2 stores split the band axis.** `embeddings` is `(time, band, y, x)`, each meta-shard stored as
+eight shards of 16 bands, each cut into 512 × 512-pixel chunks of 4 bands (1.05 MB raw), so a
+reader of the first 16 dimensions fetches an eighth of a full vector and a phone reading 4 fetches
+a thirty-second. Every array, coordinates included, sits in the zone's level group `0` (`33N/0`, or
+`0/` in a single-area store); the zone's attributes stay on `33N`. The other arrays keep the
+geometry above. Why, and what each choice was measured against:
+[ADR 031](../context_docs/decisions/031-the-v2-store-chunks-the-band-axis-at-16.md).
+
 **Manifests are split by year, so a commit costs one year rather than the whole store.** An
 Icechunk **manifest** is the index that maps every chunk to the object holding it. By default
 there is one per array, so every commit rewrites the entire index no matter how little changed.

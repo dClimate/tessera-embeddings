@@ -10,6 +10,7 @@
 - **Accepted 2026-11-09 (repo owner):** each 16-band shard is cut into 4-band chunks, so phones and
   browsers fetch only the bands they read (§4). The alternative, 16-band chunks plus a separate
   preview store, was rejected.
+- **Implemented** on the same PR (§5).
 - **Scope:** for v2 stores only, this supersedes D2 of [ADR 008](008-global-store-architecture.md).
   The v1.1 store keeps D2, and targeted updates go on writing it that way.
 
@@ -369,42 +370,51 @@ chunks, a gentler path 2, were measured only on the laptop.
 
 ## 5. Consequences
 
-- **A v2 preset** in `config/store_layout.py`, selected by model version for the global and
-  single-area paths. Its `embeddings` shard is 1 × 16 × 2,048 × 2,048 and its chunk
-  1 × 4 × 512 × 512, in place before the v2 campaign writes. `INNER_PX` stays 256, so the land
-  mask's `chunk_live_256` stays valid.
-- **The arrays move into level group `0`** (§1).
-  - The seed flow creates each zone's `0` group with the arrays inside it, and writes the zone's
-    `multiscales` attribute, whose `layout` lists only `0`. Nothing builds a coarser level.
-    `storage/conventions.py`, the one place that builds `zarr_conventions` entries, registers the
-    convention.
-  - Code that opens a zone's arrays resolves `utm33/0` through one helper: zone fill, targeted
-    updates and the readers' open functions.
-  - Fill bookkeeping kept as zone-group attributes, such as completed years and update records, can
-    stay on the zone group.
-  - The reading guide gives the new paths.
-- **Inference stages v2 meta-shards band-first.** `ZarrWriter.write_chunk` writes the actor's
-  `(y, x, band)` buffer through a transposed view on the writer thread. Staging validation and
-  `StagedShardSource` read `(band, y, x)`, and the shard writer and the holes merge index band-first
-  arrays as `(time, band, y, x)`.
-- **The chunk-sizing function moves out of `store_layout.py` first**, as its own change at a store
-  boundary. It moves the ingest identity once, and keeps later layout changes from moving it.
-- **`_layout_band` takes the band count from the shard, not the chunk.** Otherwise a v2 store is
-  stamped `geoemb:dimensions=4`.
-- **Reader-facing metadata:** a root attribute naming the valid prefixes (16, 32, 64, 128), and
-  reader-guide advice on zarr ≥ 3.3 and on Dask chunks matched to shards
-  (`chunks={"band": 16, "y": 2048, "x": 2048}`).
+Built on the same PR as this record. Every rule below reads the store, not the model, except the
+choice of preset for a new store, so the band-last v1.1 store and its targeted updates run through
+the same code unchanged.
+
+- **v2 presets.** `GLOBAL_V2` and `SINGLE_V2` in `config/store_layout.py` hold `embeddings` (and a
+  single-area store's `embedding_std`) as `(time, band, y, x)` in 1 × 16 × 2,048 × 2,048 shards of
+  1 × 4 × 512 × 512 chunks. Every other array keeps v1.1's geometry, and `INNER_PX` stays 256, so the
+  land mask's `chunk_live_256` stays valid. `layout_for(model, single=)` gives a new store its
+  model's preset; an existing store keeps the geometry it was created with.
+- **Level group `0`** (§1). Seeding and single-area assembly create every array and coordinate in
+  `0`. The zone group, or a single-area store's root, keeps its attributes and declares the
+  `multiscales` attribute, whose `layout` lists only `0`; `storage/conventions.py` registers the
+  convention. Nothing builds a coarser level.
+  - Every reader and writer reaches the arrays through one helper, `store_geometry.level0`, which
+    returns a v1.1 group unchanged: zone fill, targeted updates, the shard writer, the
+    published-store audit, the registry rebuild and marking a zone-year empty.
+  - `zarr_store.open_store(path, group="33N")` descends into `0` and carries the zone's attributes
+    onto the dataset.
+- **Every axis is found by name.** `store_geometry.axis_roles`, `window` and `reorder` build each
+  index and each layout change from an array's dimension names, matching axes by role (time, band,
+  month, Y, X), so a staged `(northing, easting, band)` tile lands in a `(time, band, y, x)` array.
+  The shard writer, the holes merge, the single-area append, staged-tile validation and
+  `StagedShardSource` all use them. Shard pitch and extent are read from `scales`, which is
+  `(time, Y, X)` in every layout.
+- **Inference stages v2 meta-shards band-first.** `ZarrWriter(band_first=True)` writes the actor's
+  `(y, x, band)` buffer through a transposed view on the writer thread; the actor sets it from its
+  model's preset. A tile staged in either order still assembles into either store.
+- **`config/store_geometry.py` holds what is read from a store**, and the chunk clamp, apart from
+  the presets. The ingest code identity no longer includes `store_layout.py` or `config/inference.py`,
+  so a later layout change or model record does not move it. Both identities move once with this
+  change.
+- **`_layout_band` takes the band count from the layout** (`StoreLayout.bands`, the embedding's
+  width), and refuses band shards that do not tile it. A v2 store is stamped
+  `geoemb:dimensions=128`.
+- **Reader-facing metadata.** The store root lists the model's usable prefixes in
+  `embedding_prefixes` (16, 32, 64, 128, from `ModelFamily.prefixes`). The reader guide
+  ([`docs/global-store.md`](../../docs/global-store.md#stores-built-with-v2)) gives the `33N/0` path,
+  zarr ≥ 3.3, and Dask chunks matched to shards (`chunks={"band": 16, "y": 2048, "x": 2048}`).
 - **Eight shards per meta-shard mean 8× the embeddings shards, index entries and writes.** The
   busiest v1.1 zone-year wrote 9,132 meta-shards, so a v2 zone-year holds at most about 140,000 index
   entries across all eight arrays. That is far below D4's 10⁶ split threshold, and about 56 MB of
   commit memory at 400 bytes per entry.
-- **Band order is read from each array's dimension names**, never inferred from the model or the
-  store. Code that indexes `embeddings` asks where `band` sits in its `dimension_names`, so one path
-  reads both the band-last v1.1 store and a band-first v2 one.
-- **The preset follows the store's model**, chosen the way the checkpoint and the worker image
-  already are: from the model's `ModelFamily` record, and for a global store from the model it was
-  seeded for.
 - **Each shard's own index is about 1 KB**, for 64 chunks, against 260 bytes for 16.
+- **Not in this repository:** the roughly 11 sites in yield-embeddings that read stores (coarsening
+  and validation) still assume v1.1's layout, and must read v2's through the same rules.
 
 ## 6. Narrower and variable-width band chunks
 

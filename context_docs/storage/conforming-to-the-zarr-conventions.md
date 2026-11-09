@@ -12,23 +12,29 @@ PR #218 (2026-10-22).
 |---|---|---|
 | root (global store) | `geoemb` | encoder, source data, quantization, `gsd`; once for all 120 zones |
 | zone group, or root of a single-ROI store | `proj`, `spatial` (+ `geoemb` on a single-ROI root) | CRS as `proj:code`, `proj:wkt2` and `proj:projjson`; the grid as `spatial:dimensions`, `transform`, `shape`, `bbox`, `registration` |
+| zone group, or root of a single-ROI store, of a **v2** store | `multiscales` as well | a `layout` with one entry, `0`: the child group holding the 10 m arrays (ADR 031 §1) |
 | every array spanning both spatial dimensions | `spatial` | `spatial:dimensions` repeated from the group |
 | the Y and X coordinate arrays | none (CF attributes) | `standard_name`, `units: m`, `axis`, only for real coordinates in a metre CRS |
 
 The Y and X dimensions are `northing`/`easting` in a v1.1 store and `y`/`x` from v2 on
 ([ADR 032](../decisions/032-v2-stores-name-their-axes-y-and-x.md)); every attribute above names
-whichever the store has.
+whichever the store has. A v2 store's arrays sit in its level group `0`, while every attribute in
+the table stays on the group above it; the root also names v2's usable prefixes in
+`embedding_prefixes` (16, 32, 64, 128).
 
 | convention | version followed | latest upstream |
 |---|---|---|
 | [proj](https://github.com/zarr-conventions/proj) | v0.1 | v0.1 (`main` is identical) |
 | [spatial](https://github.com/zarr-conventions/spatial) | v0.1 | v0.1 (`main` is identical) |
 | [geoemb](https://github.com/geo-embeddings/embeddings-zarr-convention) | v1, as its schema names it | `main`; no tag has been cut |
+| [multiscales](https://github.com/zarr-conventions/multiscales) (v2 stores) | v0.1 | v0.1, a pilot; v1 expected by the end of 2026 |
 | [zarr-conventions-spec](https://github.com/zarr-conventions/zarr-conventions-spec) | v1 | v1 |
 
 [GeoZarr's own list](https://github.com/zarr-developers/geozarr-spec) is proj, spatial and
-multiscales, with "CF in Zarr" still under consideration. We have no pyramids, so multiscales does
-not apply yet.
+multiscales, with "CF in Zarr" still under consideration. A v2 zone group is a multiscales
+pyramid of one level so far: no coarser level is built, because a mean of embeddings is not a
+sound coarser embedding and the aggregation is still being researched. A later level is a new
+group beside `0` and a new `layout` entry naming the level it derives from.
 
 ## 2. How conformance is checked
 
