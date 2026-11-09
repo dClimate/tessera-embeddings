@@ -180,8 +180,9 @@ class _CapturingWriter:
     last_skip_record: dict | None = None
     discarded: str | None = None
 
-    def __init__(self, staging_base, embedding_dim=128):
+    def __init__(self, staging_base, embedding_dim=128, *, band_first=False):
         self.embedding_dim = embedding_dim
+        self.band_first = band_first
 
     def write_chunk(
         self,

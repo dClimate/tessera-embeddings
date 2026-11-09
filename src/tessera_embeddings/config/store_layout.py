@@ -180,6 +180,11 @@ class StoreLayout:
             raise KeyError(f"{self.name} has no layout for variable {var!r} (known: {sorted(self.arrays)})") from exc
 
     @property
+    def band_first(self) -> bool:
+        """Whether ``embeddings`` puts its band axis before the spatial pair, as v2 does (ADR 031 §3)."""
+        return self.for_var("embeddings").dims[1] == "band"
+
+    @property
     def spatial_dims(self) -> tuple[str, str]:
         """This layout's Y and X dimension names, read off the required ``scales`` array."""
         _, y, x = self.for_var("scales").dims

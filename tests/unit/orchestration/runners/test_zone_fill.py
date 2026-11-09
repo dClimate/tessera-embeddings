@@ -163,16 +163,16 @@ def _make_mask(
     return path
 
 
-def _staging_inference_stub(staged: dict[str, np.ndarray]):
+def _staging_inference_stub(staged: dict[str, np.ndarray], *, band_first: bool = False):
     """A run_inference stand-in that stages every tile and reports success.
 
-    Records what it staged into ``staged`` (label -> embeddings) so tests can
-    compare the assembled store against it.
+    Records what it staged into ``staged`` (label -> embeddings, as ``(y, x, band)``) so tests
+    can compare the assembled store against it. *band_first* stages as a v2 actor does.
     """
 
     def stub(num_actors, config, chunks, mosaic_base, staging_base, run_id, t0, log, **kwargs):
         rng = np.random.default_rng(5)
-        writer = ZarrWriter(staging_base, embedding_dim=_BAND)
+        writer = ZarrWriter(staging_base, embedding_dim=_BAND, band_first=band_first)
         results = []
         for chunk in chunks:
             emb = rng.integers(-100, 100, size=(chunk.height, chunk.width, _BAND)).astype(np.int8)
@@ -261,13 +261,15 @@ def test_a_resumed_fill_records_skips_an_earlier_leg_wrote(tmp_path, monkeypatch
 def test_fill_zone_year_end_to_end(tmp_path, monkeypatch, layout):
     """Live tiles land as shards at the year index; the cell is tagged and cleaned up.
 
-    In either layout: a v2 zone holds its arrays in level group 0, band-first.
+    In either layout: a v2 zone holds its arrays in level group 0, band-first, staged band-first
+    as a v2 actor stages them. (A tile staged in the other order lands too: the update tests
+    stage band-last into a v2 zone.)
     """
     store = _seed_global(tmp_path, layout)
     mosaic_base = _make_mosaic(tmp_path)
     mask = _make_mask(tmp_path, [(0, 0), (0, 1), (1, 1)])
     staged: dict[str, np.ndarray] = {}
-    monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub(staged))
+    monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub(staged, band_first=layout.band_first))
 
     summary = _fill(tmp_path, store, land_mask_path=mask, mosaic_base=mosaic_base, run_id="runZ")
 

@@ -222,6 +222,17 @@ class TestWriteChunk:
         np.testing.assert_array_almost_equal(result, embeddings, decimal=5)
         assert result.shape == (10, 10, EMBEDDING_DIM)
 
+    def test_a_v2_writer_stages_embeddings_band_first(self, tmp_path):
+        """ADR 031 §3: whole image planes, so assembly writes a v2 tile without reordering it."""
+        writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=4, band_first=True)
+        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=10, x_start=0, x_stop=12)
+        embeddings = np.random.default_rng(3).integers(-100, 100, size=(10, 12, 4)).astype(np.int8)
+        path = writer.write_chunk(chunk, embeddings, run_id="v2", scales=_dummy_scales(10, 12), stack=STACK)
+        staged = zarr.open_group(path, mode="r")["embeddings"]
+        assert staged.metadata.dimension_names == ("band", "northing", "easting")
+        np.testing.assert_array_equal(staged[:], embeddings.transpose(2, 0, 1))
+        assert writer._validate_staged_chunk("v2", chunk, ["embeddings", "scales"]) is None
+
     def test_write_chunk_records_completion_both_ways(self, writer):
         """A finished write is recorded in-store AND in the staging listing.
 

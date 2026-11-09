@@ -35,7 +35,7 @@ from tessera_embeddings.config.inference import (
     S1Orbit,
     batch_size_for_gpu,
 )
-from tessera_embeddings.config.store_layout import MONTH_COVERED_VARS, MONTHS_IN_YEAR
+from tessera_embeddings.config.store_layout import MONTH_COVERED_VARS, MONTHS_IN_YEAR, layout_for
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import OBS_COUNT_VARS, ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, read_pixel_mask
@@ -924,7 +924,9 @@ class InferenceActor:
             embeddings = np.zeros((chunk.height, chunk.width, save_dim), dtype=np.int8)
             scales = np.full((chunk.height, chunk.width), np.nan, dtype=np.float32)
 
-            writer = ZarrWriter(staging_base, embedding_dim=save_dim)
+            # Staged in the order the model's stores hold embeddings, so assembly never reorders a tile.
+            band_first = layout_for(self.config.model_version, single=False).band_first
+            writer = ZarrWriter(staging_base, embedding_dim=save_dim, band_first=band_first)
 
             # mask_bundle is an explicit submit() arg rather than a capture, so the loop can `del` the only strong
             # reference once the last strip has loaded (a closure capture cannot be deleted).

@@ -928,7 +928,7 @@ class ZarrWriter:
     stores, :meth:`assemble_global` for a pre-allocated zone group of the global store.
     """
 
-    def __init__(self, staging_base: str, embedding_dim: int = EMBEDDING_DIM) -> None:
+    def __init__(self, staging_base: str, embedding_dim: int = EMBEDDING_DIM, *, band_first: bool = False) -> None:
         """Initialize the writer.
 
         Embeddings are always int8-quantized with per-pixel float32 scale factors.
@@ -937,9 +937,13 @@ class ZarrWriter:
             staging_base: Base path for staging chunk Zarrs
                 (e.g., "s3://bucket/staging" or "/tmp/staging").
             embedding_dim: Number of embedding dimensions (default 128).
+            band_first: Stage ``embeddings`` (and ``embedding_std``) as ``(band, northing, easting)``,
+                the order a v2 store holds them in (ADR 031 §3), so assembly writes them without
+                reordering. Readers of a staged tile take its order from its dimension names.
         """
         self.staging_base = staging_base.rstrip("/")
         self.embedding_dim = embedding_dim
+        self.band_first = band_first
         # This assembly's skip records, read from the markers by `_skip_summary` and consumed by
         # `publish_registry_part` afterwards. Always present rather than appearing only once a
         # summary has run, so a reader can tell "no skips" from "a previous cell's skips";
@@ -1401,11 +1405,18 @@ class ZarrWriter:
         # Sub-chunk staged files at inner-chunk size, full band (ADR-008 D2: the band axis is
         # never split). A staged 2048-px tile is then exactly the 8x8 inner-chunk grid of the shard
         # it becomes, so assembly's banded y-slice reads stay aligned to whole staged pieces.
-        staged_chunks = (min(INNER_PX, chunk.height), min(INNER_PX, chunk.width), self.embedding_dim)
         staged_chunks_2d = (min(INNER_PX, chunk.height), min(INNER_PX, chunk.width))
+        # Band-first is a transposed VIEW of the actor's (y, x, band) buffer, written on the writer
+        # thread: no copy of the whole tile and no GPU time (ADR 031 §3).
+        if self.band_first:
+            band_dims, order = ["band", "northing", "easting"], (2, 0, 1)
+            staged_chunks = (self.embedding_dim, *staged_chunks_2d)
+        else:
+            band_dims, order = ["northing", "easting", "band"], (0, 1, 2)
+            staged_chunks = (*staged_chunks_2d, self.embedding_dim)
 
         data_vars: StagedVars = {
-            "embeddings": (["northing", "easting", "band"], embeddings),
+            "embeddings": (band_dims, embeddings.transpose(order)),
         }
         encoding: dict[str, dict] = {
             "embeddings": {
@@ -1418,7 +1429,7 @@ class ZarrWriter:
             if embeddings_std.shape != expected_shape:
                 msg = f"Expected std shape {expected_shape}, got {embeddings_std.shape}"
                 raise ValueError(msg)
-            data_vars["embedding_std"] = (["northing", "easting", "band"], embeddings_std)
+            data_vars["embedding_std"] = (band_dims, embeddings_std.transpose(order))
             encoding["embedding_std"] = {
                 "chunks": staged_chunks,
                 "compressors": None,
@@ -1549,8 +1560,8 @@ class ZarrWriter:
             group = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
         except Exception as exc:
             raise FileNotFoundError(f"Cannot open {path}: {exc}") from exc
-        arr: zarr.Array = group["embeddings"]  # ty: ignore[invalid-assignment]
-        h, w, _ = arr.shape
+        arr: zarr.Array = group["scales"]  # ty: ignore[invalid-assignment]
+        h, w = arr.shape
         return max(h, w)
 
     def verify_staged_completeness(
@@ -1774,11 +1785,10 @@ class ZarrWriter:
             if var not in group:
                 return ("invalid", f"missing variable '{var}'")
             arr: zarr.Array = group[var]  # ty: ignore[invalid-assignment]
-            # scales is a 2-D per-pixel factor (H, W); embeddings/embedding_std carry the band dim
-            # (H, W, band). Checking scales against the 3-D shape false-rejects every valid tile.
-            expected_shape = (
-                (chunk.height, chunk.width) if var == "scales" else (chunk.height, chunk.width, self.embedding_dim)
-            )
+            # scales is a 2-D per-pixel factor (H, W); embeddings/embedding_std carry the band dim, in
+            # the order the tile's own axis names give, so either staged band order validates.
+            size = {"Y": chunk.height, "X": chunk.width, "band": self.embedding_dim}
+            expected_shape = tuple(size[role] for role in axis_roles(dims_of(arr)))
             if arr.shape != expected_shape:
                 return ("invalid", f"'{var}' shape {arr.shape} != expected {expected_shape}")
             expected_dtype = np.int8 if var == "embeddings" else np.float32
