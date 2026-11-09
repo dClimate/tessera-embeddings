@@ -59,7 +59,7 @@ from tenacity import (
 )
 
 from tessera_embeddings.config.ingest import INGEST_COMPRESSORS, mosaic_chunk_layout
-from tessera_embeddings.config.store_layout import spatial_dims_of
+from tessera_embeddings.config.store_geometry import spatial_dims_of
 from tessera_embeddings.errors import CorruptedStoreError, NonMonotonicDateError
 from tessera_embeddings.storage.manifest import MIXED_CODE_IDENTITIES_ATTR, IngestManifest, extract_manifest
 from tessera_embeddings.storage.region_writes import (

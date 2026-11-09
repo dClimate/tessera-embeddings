@@ -62,7 +62,8 @@ from tessera_embeddings.config.assembly import AssemblyConfig
 from tessera_embeddings.config.fault_injection import ArmedFault
 from tessera_embeddings.config.inference import InferenceConfig, run_id_prefix
 from tessera_embeddings.config.paths import store_key
-from tessera_embeddings.config.store_layout import GLOBAL, REQUIRED_VARS, spatial_dims_of
+from tessera_embeddings.config.store_geometry import spatial_dims_of
+from tessera_embeddings.config.store_layout import GLOBAL, REQUIRED_VARS
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import (
     SpatialCoords,

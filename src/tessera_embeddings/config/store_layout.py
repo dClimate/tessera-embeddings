@@ -30,26 +30,22 @@ from __future__ import annotations
 
 import dataclasses
 import warnings
-from typing import TYPE_CHECKING, cast
 
 import numpy as np
 from zarr.codecs.numcodecs import PCodec as _PCodecZarr3
 
 from tessera_embeddings.config.inference import EMBEDDING_DIM
-
-if TYPE_CHECKING:
-    import xarray as xr
-    import zarr
+from tessera_embeddings.config.store_geometry import PRESET_SPATIAL_DIMS, clamp_chunks_and_shards
 
 # PCodec is intentionally a Zarr v3 *serializer* (array->bytes), not a bytes->bytes compressor; silence the "not in
 # the Zarr v3 spec" warning it emits on construction. This module is the codec's canonical home (inference.assembly
 # and the scale-test harness import it from here).
 warnings.filterwarnings("ignore", message="Numcodecs codecs are not in the Zarr version 3")
 
-DIMS_4D: tuple[str, str, str, str] = ("time", "northing", "easting", "band")
-DIMS_3D: tuple[str, str, str] = ("time", "northing", "easting")
+DIMS_4D: tuple[str, str, str, str] = ("time", *PRESET_SPATIAL_DIMS, "band")
+DIMS_3D: tuple[str, str, str] = ("time", *PRESET_SPATIAL_DIMS)
 #: Trailing axis of :data:`MONTH_COVERED_VARS` — twelve calendar months, not bands.
-DIMS_4D_MONTH: tuple[str, str, str, str] = ("time", "northing", "easting", "month")
+DIMS_4D_MONTH: tuple[str, str, str, str] = ("time", *PRESET_SPATIAL_DIMS, "month")
 
 #: The three observation sources a pixel can be seen by, as the prefix their per-sensor arrays are named from. ONE
 #: list, because every per-sensor array is a pair — a count and a month mask — derived from a single validity mask per
@@ -106,28 +102,6 @@ _RAW = "raw"  # default bytes codec, no compressor
 def pcodec_serializer() -> _PCodecZarr3:
     """Return a fresh PCodec serializer instance (Zarr v3 array->bytes codec)."""
     return _PCodecZarr3()
-
-
-def clamp_chunks_and_shards(
-    shape: tuple[int, ...],
-    chunks: tuple[int, ...],
-    shards: tuple[int, ...] | None,
-) -> tuple[tuple[int, ...], tuple[int, ...] | None]:
-    """Clamp nominal chunk/shard sizes to an array's ``shape``.
-
-    Chunks are clamped to the shape; shards are clamped to the shape and then floored to a whole
-    multiple of the clamped chunks (Zarr v3 requires shards to be exact chunk multiples), never
-    below one chunk, so a store smaller than one nominal chunk/shard still creates cleanly. The
-    single implementation of this geometry math: both :meth:`ArrayLayout.create_kwargs` and the
-    empty-store seeder call it.
-    """
-    # max(..., 1): a zero-extent axis is legal (a mosaic seeded with an EMPTY time axis, appended per date), but a
-    # zero chunk edge is not — keep the nominal chunk so the axis grows into it.
-    clamped = tuple(max(min(c, s), 1) for c, s in zip(chunks, shape, strict=True))
-    if shards is None:
-        return clamped, None
-    clamped_shards = tuple(max(c, (min(sh, s) // c) * c) for sh, s, c in zip(shards, shape, clamped, strict=True))
-    return clamped, clamped_shards
 
 
 @dataclasses.dataclass(frozen=True)
@@ -206,7 +180,8 @@ class StoreLayout:
         """This layout with its Y and X dimensions named *spatial_dims*; geometry unchanged.
 
         The presets spell them ``northing``/``easting``. A new store takes its model's names
-        (``ModelFamily.spatial_dims``) and an existing one keeps its own (:func:`spatial_dims_of`).
+        (``ModelFamily.spatial_dims``) and an existing one keeps its own
+        (:func:`~tessera_embeddings.config.store_geometry.spatial_dims_of`).
         """
         rename = dict(zip(self.spatial_dims, spatial_dims, strict=True))
         arrays = {
@@ -214,23 +189,6 @@ class StoreLayout:
             for var, array in self.arrays.items()
         }
         return dataclasses.replace(self, arrays=arrays)
-
-
-def spatial_dims_of(group: zarr.Group | xr.Dataset) -> tuple[str, str]:
-    """The Y and X dimension names an existing output store uses.
-
-    Its ``spatial:dimensions`` when it declares them, as every georeferenced store does; otherwise
-    its required ``scales`` array, ``(time, Y, X)``, which a store with pixel-index coordinates
-    still has; the presets' names for anything else (a mosaic, a malformed group), so an audit
-    reports it rather than raises. Takes a zarr group or the xarray dataset opened from one.
-    """
-    declared = cast("list[str] | None", group.attrs.get("spatial:dimensions"))
-    if declared and len(declared) == 2:
-        return declared[0], declared[1]
-    scales = group.get("scales")
-    # xarray names a variable's dims on the variable; zarr in the array's metadata.
-    dims = getattr(scales, "dims", None) or getattr(getattr(scales, "metadata", None), "dimension_names", None)
-    return (dims[1], dims[2]) if dims and len(dims) == 3 else (DIMS_3D[1], DIMS_3D[2])
 
 
 def _obs(chunks: tuple[int, ...], shards: tuple[int, ...] | None, codec: str) -> dict[str, ArrayLayout]:

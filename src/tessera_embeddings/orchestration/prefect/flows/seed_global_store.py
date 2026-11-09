@@ -21,7 +21,8 @@ from prefect import flow, get_run_logger
 
 from tessera_embeddings.config.inference import DEFAULT_MODEL_VERSION, ModelVersion
 from tessera_embeddings.config.paths import BucketPaths
-from tessera_embeddings.config.store_layout import GLOBAL, spatial_dims_of
+from tessera_embeddings.config.store_geometry import spatial_dims_of
+from tessera_embeddings.config.store_layout import GLOBAL
 from tessera_embeddings.storage.campaign import campaign_status
 from tessera_embeddings.storage.global_store import (
     _check_layout_matches,

@@ -10,7 +10,8 @@ import zarr
 
 from tessera_embeddings.config.inference import EMBEDDING_DIM, INFERENCE_CHUNK_SIZE
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
-from tessera_embeddings.config.store_layout import GLOBAL, OBS_COUNT_VARS, SHARD_PX, SINGLE, spatial_dims_of
+from tessera_embeddings.config.store_geometry import spatial_dims_of
+from tessera_embeddings.config.store_layout import GLOBAL, OBS_COUNT_VARS, SHARD_PX, SINGLE
 
 
 def test_global_embeddings_geometry():

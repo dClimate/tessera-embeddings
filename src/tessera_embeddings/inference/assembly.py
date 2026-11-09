@@ -62,6 +62,7 @@ from tessera_embeddings.config.inference import (
     TimeWindow,
     model_family,
 )
+from tessera_embeddings.config.store_geometry import spatial_dims_of
 from tessera_embeddings.config.store_layout import (
     CARRIED_VARS,
     INNER_PX,
@@ -72,7 +73,6 @@ from tessera_embeddings.config.store_layout import (
     REQUIRED_VARS,
     SINGLE,
     StoreLayout,
-    spatial_dims_of,
     trailing_extent,
 )
 from tessera_embeddings.inference.chunk_spec import (

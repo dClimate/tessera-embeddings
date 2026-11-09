@@ -18,7 +18,8 @@ import zarr
 from zarr.codecs import BloscCodec, ShardingCodec, TransposeCodec, ZstdCodec
 
 from tessera_embeddings.config.inference import EMBEDDING_DIM
-from tessera_embeddings.config.store_layout import clamp_chunks_and_shards, pcodec_serializer
+from tessera_embeddings.config.store_geometry import clamp_chunks_and_shards
+from tessera_embeddings.config.store_layout import pcodec_serializer
 
 #: Variable-width band shards (a rectilinear chunk grid) are opt-in in zarr, for reading as for writing. Switched on
 #: here because every script and cold subprocess imports this module; regular arrays are unaffected.

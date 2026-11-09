@@ -16,12 +16,12 @@ from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import numpy as np
 
+from tessera_embeddings.config.store_geometry import spatial_dims_of
 from tessera_embeddings.config.store_layout import (
     GLOBAL,
     SHARD_PX,
     StoreLayout,
     clamp_chunks_and_shards,
-    spatial_dims_of,
 )
 from tessera_embeddings.storage.global_store import _codec_id, missing_seeded_arrays
 from tessera_embeddings.storage.shard_writer import SHARD_WRITE
@@ -44,7 +44,7 @@ def layout_departures(group: zarr.Group, layout: StoreLayout = GLOBAL) -> list[s
     An array the layout declares and the group lacks is a departure; the reverse is not, because
     the coordinate arrays live beside the data arrays and no layout describes them. Expectations
     are clamped to each array's own shape by the writer's own
-    :func:`~tessera_embeddings.config.store_layout.clamp_chunks_and_shards`, or every zone narrower
+    :func:`~tessera_embeddings.config.store_geometry.clamp_chunks_and_shards`, or every zone narrower
     than one nominal shard reports a false departure.
     """
     # Against the Y/X names the group declares: v1.1 stores use northing/easting, later models y/x.

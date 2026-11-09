@@ -35,6 +35,7 @@ from tessera_embeddings.config.inference import (
     model_family,
     model_version_for_encoder,
 )
+from tessera_embeddings.config.store_geometry import spatial_dims_of
 from tessera_embeddings.config.store_layout import (
     CARRIED_VARS,
     GLOBAL,
@@ -42,7 +43,6 @@ from tessera_embeddings.config.store_layout import (
     MONTHS_IN_YEAR,
     REQUIRED_VARS,
     StoreLayout,
-    spatial_dims_of,
 )
 from tessera_embeddings.storage.conventions import (
     assert_model_matches,
