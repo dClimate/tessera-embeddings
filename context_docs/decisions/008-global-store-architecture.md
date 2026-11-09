@@ -291,7 +291,7 @@ older than the campaign start (GC's `delete_object_older_than` must predate
 the oldest concurrent session). `expire_snapshots` → `garbage_collect`, always
 `dry_run=True` first; GC is LIST-bound over the whole repo prefix (hours at
 10⁸+ objects — sized in T6). Failed fork sessions orphan chunks until GC;
-budget storage for that. Rollback stays `reset_branch` (`rollback_commits`).
+budget storage for that. Rollback stays `reset_branch`: call `repo.reset_branch` on the store's repository directly (the `rollback_commits` wrapper had no caller and was removed in the test-suite reduction, PR #268).
 
 **Run 1:** expire → GC → rollback all worked on S3 (tagged snapshot protected,
 8.4 MB reclaimed, clean `reset_branch` + re-commit). But the repo was tiny (~100
