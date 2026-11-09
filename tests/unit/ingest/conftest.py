@@ -1,6 +1,8 @@
 """Fixtures shared by the ingest subject's tests."""
 
+import numpy as np
 import pytest
+import zarr
 
 from tessera_embeddings.ingest import live_windows, s1_roi
 
@@ -25,3 +27,16 @@ def s1_leg_offline(monkeypatch):
     )
     monkeypatch.setattr(s1_roi, "make_s1_item_provider", lambda *a, **k: lambda: [])
     monkeypatch.setattr(s1_roi.IngestManifest, "from_roi_store", classmethod(lambda _c, _p, **_k: object()))
+
+
+@pytest.fixture
+def mask_store(tmp_path):
+    """Write a bool mask as a Zarr ROI store in 4-pixel chunks and return its path."""
+
+    def write(mask: np.ndarray) -> str:
+        path = str(tmp_path / "roi.zarr")
+        z = zarr.open(path, mode="w", shape=mask.shape, chunks=(4, 4), dtype="bool")
+        z[:] = mask
+        return path
+
+    return write

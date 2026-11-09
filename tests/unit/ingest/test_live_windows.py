@@ -64,19 +64,12 @@ def _brute_force_best(bands, cap, window_cost, chunk_px) -> int:
     return best
 
 
-def _mask_store(tmp_path, mask: np.ndarray) -> str:
-    path = str(tmp_path / "roi.zarr")
-    z = zarr.open(path, mode="w", shape=mask.shape, chunks=(CHUNK, CHUNK), dtype="bool")
-    z[:] = mask
-    return path
-
-
-def test_scattered_islands_one_window_per_live_row(tmp_path):
+def test_scattered_islands_one_window_per_live_row(mask_store):
     # 03S in miniature: a couple of live pixels in an ocean of False.
     mask = np.zeros((12, 16), dtype=bool)
     mask[1, 2] = True  # chunk row 0, col 0
     mask[9, 13] = True  # chunk row 2, col 3
-    path = _mask_store(tmp_path, mask)
+    path = mask_store(mask)
 
     live = live_chunk_grid(path, chunk_px=CHUNK)
     assert live.shape == (3, 4)
@@ -86,36 +79,36 @@ def test_scattered_islands_one_window_per_live_row(tmp_path):
     assert windows == [LiveWindow(y0=0, y1=4, x0=0, x1=4), LiveWindow(y0=8, y1=12, x0=12, x1=16)]
 
 
-def test_row_span_covers_first_to_last_live_column(tmp_path):
+def test_row_span_covers_first_to_last_live_column(mask_store):
     # Live chunks at columns 0 and 3 of one row: the row-band spans the gap —
     # that is the measured trade (within ~1% of exact, campaign-wide).
     mask = np.zeros((4, 16), dtype=bool)
     mask[0, 0] = True
     mask[0, 15] = True
-    windows = live_windows_for_mask(_mask_store(tmp_path, mask), chunk_px=CHUNK)
+    windows = live_windows_for_mask(mask_store(mask), chunk_px=CHUNK)
     assert windows == [LiveWindow(y0=0, y1=4, x0=0, x1=16)]
 
 
-def test_partial_edge_chunks_clamp_to_extent(tmp_path):
+def test_partial_edge_chunks_clamp_to_extent(mask_store):
     # 10x9 extent with CHUNK=4: last chunk is partial on both axes. A live pixel
     # in the far corner must yield a window clamped to the extent, not the grid.
     mask = np.zeros((10, 9), dtype=bool)
     mask[9, 8] = True
-    windows = live_windows_for_mask(_mask_store(tmp_path, mask), chunk_px=CHUNK)
+    windows = live_windows_for_mask(mask_store(mask), chunk_px=CHUNK)
     assert windows == [LiveWindow(y0=8, y1=10, x0=8, x1=9)]
 
 
-def test_all_ocean_yields_no_windows(tmp_path):
-    windows = live_windows_for_mask(_mask_store(tmp_path, np.zeros((8, 8), dtype=bool)), chunk_px=CHUNK)
+def test_all_ocean_yields_no_windows(mask_store):
+    windows = live_windows_for_mask(mask_store(np.zeros((8, 8), dtype=bool)), chunk_px=CHUNK)
     assert windows == []
 
 
-def test_windows_cover_every_live_pixel_and_are_disjoint(tmp_path):
+def test_windows_cover_every_live_pixel_and_are_disjoint(mask_store):
     # Property check on an irregular mask: coverage is total, windows are
     # chunk-aligned, and no two windows overlap.
     rng = np.random.default_rng(7)
     mask = rng.random((20, 24)) > 0.9
-    path = _mask_store(tmp_path, mask)
+    path = mask_store(mask)
     windows = live_windows_for_mask(path, chunk_px=CHUNK)
 
     covered = np.zeros_like(mask)
@@ -146,10 +139,10 @@ class TestGridFromChunkKeys:
     since it is the behaviour being preserved.
     """
 
-    def test_agrees_with_the_pixel_scan(self, tmp_path):
+    def test_agrees_with_the_pixel_scan(self, mask_store):
         rng = np.random.default_rng(11)
         mask = rng.random((20, 24)) > 0.85
-        path = _mask_store(tmp_path, mask)
+        path = mask_store(mask)
         z = zarr.open(path, mode="r")
 
         from_keys = live_chunk_grid_from_keys(path, z, chunk_px=CHUNK)
@@ -157,35 +150,35 @@ class TestGridFromChunkKeys:
         assert from_keys is not None
         np.testing.assert_array_equal(from_keys, from_pixels)
 
-    def test_all_ocean_is_an_answer_not_a_failure(self, tmp_path):
+    def test_all_ocean_is_an_answer_not_a_failure(self, mask_store):
         """A store with no chunk objects yields an empty grid, NOT None.
 
         Returning None here would silently fall back to a full pixel scan of a mask
         that has nothing in it.
         """
-        path = _mask_store(tmp_path, np.zeros((8, 8), dtype=bool))
+        path = mask_store(np.zeros((8, 8), dtype=bool))
         z = zarr.open(path, mode="r")
         live = live_chunk_grid_from_keys(path, z, chunk_px=CHUNK)
         assert live is not None
         assert live.shape == (2, 2)
         assert not live.any()
 
-    def test_partial_edge_chunks_are_placed_correctly(self, tmp_path):
+    def test_partial_edge_chunks_are_placed_correctly(self, mask_store):
         """A live pixel in a partial trailing chunk maps to that chunk's index."""
         mask = np.zeros((10, 9), dtype=bool)
         mask[9, 8] = True  # chunk row 2, col 2 of a 3x3 grid over 4px chunks
-        path = _mask_store(tmp_path, mask)
+        path = mask_store(mask)
         z = zarr.open(path, mode="r")
         live = live_chunk_grid_from_keys(path, z, chunk_px=CHUNK)
         assert live is not None
         assert live.shape == (3, 3)
         assert live[2, 2] and live.sum() == 1
 
-    def test_multi_digit_chunk_indices_parse(self, tmp_path):
+    def test_multi_digit_chunk_indices_parse(self, mask_store):
         """Indices past single digits must not be truncated or mismatched."""
         mask = np.zeros((60, 60), dtype=bool)
         mask[47, 51] = True  # chunk (11, 12) at 4px chunks
-        path = _mask_store(tmp_path, mask)
+        path = mask_store(mask)
         z = zarr.open(path, mode="r")
         live = live_chunk_grid_from_keys(path, z, chunk_px=CHUNK)
         assert live is not None
@@ -205,7 +198,7 @@ class TestGridFromChunkKeys:
         z[0, 0] = True
         assert live_chunk_grid_from_keys(path, zarr.open(path, mode="r"), chunk_px=CHUNK) is None
 
-    def test_a_chunk_index_outside_the_grid_falls_back(self, tmp_path, monkeypatch):
+    def test_a_chunk_index_outside_the_grid_falls_back(self, mask_store, monkeypatch):
         """A key that cannot belong to this grid means the layout was misread.
 
         Cropping on a misread layout would drop land, so this must refuse rather
@@ -213,7 +206,7 @@ class TestGridFromChunkKeys:
         """
         mask = np.zeros((8, 8), dtype=bool)
         mask[0, 0] = True
-        path = _mask_store(tmp_path, mask)
+        path = mask_store(mask)
         z = zarr.open(path, mode="r")
 
         real = fsspec.core.url_to_fs
@@ -226,11 +219,11 @@ class TestGridFromChunkKeys:
         monkeypatch.setattr(fsspec.core, "url_to_fs", fake)
         assert live_chunk_grid_from_keys(path, z, chunk_px=CHUNK) is None
 
-    def test_a_failed_listing_falls_back(self, tmp_path, monkeypatch):
+    def test_a_failed_listing_falls_back(self, mask_store, monkeypatch):
         """Listing errors degrade to the slow-but-correct scan, never to a crash."""
         mask = np.zeros((8, 8), dtype=bool)
         mask[0, 0] = True
-        path = _mask_store(tmp_path, mask)
+        path = mask_store(mask)
         z = zarr.open(path, mode="r")
 
         monkeypatch.setattr(fsspec.core, "url_to_fs", lambda *a, **k: (_ for _ in ()).throw(OSError("denied")))
@@ -306,21 +299,21 @@ class TestMergeBands:
             assert not (cells & seen)
             seen |= cells
 
-    def test_merged_windows_still_cover_every_live_pixel(self, tmp_path):
+    def test_merged_windows_still_cover_every_live_pixel(self, mask_store):
         """The invariant that matters most: grouping must never drop land."""
         mask = np.zeros((6 * CHUNK, 6 * CHUNK), dtype=bool)
         mask[1, 1] = mask[CHUNK + 2, 3 * CHUNK] = mask[5 * CHUNK, 5 * CHUNK] = True
-        path = _mask_store(tmp_path, mask)
+        path = mask_store(mask)
         merged = live_windows_for_mask(path, chunk_px=CHUNK, merge=True)
         covered = np.zeros_like(mask)
         for w in merged:
             covered[w.y0 : w.y1, w.x0 : w.x1] = True
         assert bool((mask & ~covered).sum() == 0)
 
-    def test_merge_off_returns_the_row_bands(self, tmp_path):
+    def test_merge_off_returns_the_row_bands(self, mask_store):
         mask = np.zeros((4 * CHUNK, 4 * CHUNK), dtype=bool)
         mask[0, 0] = mask[CHUNK, 0] = True
-        path = _mask_store(tmp_path, mask)
+        path = mask_store(mask)
         assert len(live_windows_for_mask(path, chunk_px=CHUNK, merge=False)) == 2
         assert len(live_windows_for_mask(path, chunk_px=CHUNK, merge=True)) == 1
 

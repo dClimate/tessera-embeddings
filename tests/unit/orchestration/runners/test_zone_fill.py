@@ -39,6 +39,14 @@ from tests.unit.orchestration.runners.zone_fixtures import (
 )
 
 
+@pytest.fixture
+def staged(monkeypatch) -> dict[str, np.ndarray]:
+    """Replaces inference with a stand-in that stages every tile; label -> what it staged."""
+    out: dict[str, np.ndarray] = {}
+    monkeypatch.setattr(zone_fill, "run_inference", staging_inference_stub(out))
+    return out
+
+
 def _resuming_inference_stub(staged: dict[str, np.ndarray]):
     """A run_inference stand-in that resumes from staging exactly as the real one does.
 
@@ -111,13 +119,11 @@ def test_a_resumed_fill_records_skips_an_earlier_leg_wrote(tmp_path, monkeypatch
     assert np.all(np.asarray(node["embeddings"][1])[TILE:, TILE:] == 0)
 
 
-def test_fill_zone_year_end_to_end(tmp_path, monkeypatch):
+def test_fill_zone_year_end_to_end(tmp_path, monkeypatch, staged):
     """Live tiles land as shards at the year index; the cell is tagged and cleaned up."""
     store = seed_global(tmp_path)
     mosaic_base = make_mosaic(tmp_path)
     mask = make_mask(tmp_path, [(0, 0), (0, 1), (1, 1)])
-    staged: dict[str, np.ndarray] = {}
-    monkeypatch.setattr(zone_fill, "run_inference", staging_inference_stub(staged))
 
     summary = run_fill(tmp_path, store, land_mask_path=mask, mosaic_base=mosaic_base, run_id="runZ")
 
@@ -267,10 +273,8 @@ def test_wrong_grid_sar_store_raises(tmp_path, monkeypatch):
     # sar_ascending on a SHIFTED easting grid (right shape, wrong coordinates);
     # sar_descending correct, so the failure is unambiguously the ascending store.
     shifted_east = easting_coords(SPEC) + 10_000.0
-    make_mosaic_store(f"{mosaic_base}/sar_ascending.zarr", northing_coords(SPEC), shifted_east, NY, NX, SPEC.crs)
-    make_mosaic_store(
-        f"{mosaic_base}/sar_descending.zarr", northing_coords(SPEC), easting_coords(SPEC), NY, NX, SPEC.crs
-    )
+    make_mosaic_store(f"{mosaic_base}/sar_ascending.zarr", northing_coords(SPEC), shifted_east)
+    make_mosaic_store(f"{mosaic_base}/sar_descending.zarr", northing_coords(SPEC), easting_coords(SPEC))
 
     def fail_if_called(*args, **kwargs):
         raise AssertionError("inference must not run when a SAR grid is invalid")
@@ -300,13 +304,11 @@ def test_inference_failure_aborts_before_assembly(tmp_path, monkeypatch):
     assert "zone-01N-2025" not in repo.list_tags()
 
 
-def test_completed_and_tagged_cell_short_circuits(tmp_path, monkeypatch):
+def test_completed_and_tagged_cell_short_circuits(tmp_path, monkeypatch, staged):
     """A retry of a landed, tagged cell returns its snapshot without re-running anything."""
     store = seed_global(tmp_path)
     mosaic_base = make_mosaic(tmp_path)
     mask = make_mask(tmp_path, [(0, 0)])
-    staged: dict[str, np.ndarray] = {}
-    monkeypatch.setattr(zone_fill, "run_inference", staging_inference_stub(staged))
 
     first = run_fill(tmp_path, store, land_mask_path=mask, mosaic_base=mosaic_base, run_id="run1")
 
@@ -320,7 +322,7 @@ def test_completed_and_tagged_cell_short_circuits(tmp_path, monkeypatch):
     assert retry["tag"] == first["tag"]
 
 
-def test_an_all_skipped_retry_clears_the_previous_attempt_s_shards(tmp_path, monkeypatch):
+def test_an_all_skipped_retry_clears_the_previous_attempt_s_shards(tmp_path, monkeypatch, staged):
     """A year marked empty must not leave an earlier attempt's embeddings readable.
 
     A year lands in two commits — shards, then the completion attrs — so an attempt
@@ -337,8 +339,6 @@ def test_an_all_skipped_retry_clears_the_previous_attempt_s_shards(tmp_path, mon
     # Attempt 1 produces real embeddings and its SHARD commit lands, then the attrs
     # commit fails — the exact gap `write_year_shards` documents. The year is left
     # holding data that nothing has marked and nothing has tagged.
-    staged: dict[str, np.ndarray] = {}
-    monkeypatch.setattr(zone_fill, "run_inference", staging_inference_stub(staged))
 
     def _attrs_commit_fails(*_a, **_k):
         raise RuntimeError("attrs commit exhausted its retries")
@@ -383,9 +383,9 @@ def test_an_all_skipped_retry_clears_the_previous_attempt_s_shards(tmp_path, mon
 @pytest.mark.parametrize(
     ("kwargs", "match"),
     [
-        ({"zone_attr": "02N"}, "read positionally"),
-        ({"crs": "EPSG:99999"}, "read positionally"),
-        ({"grid_shape": [NY // 2, NX // 2]}, "read positionally"),
+        ({"attrs": {"zone": "02N"}}, "read positionally"),
+        ({"attrs": {"crs": "EPSG:99999"}}, "read positionally"),
+        ({"attrs": {"grid_shape": [NY // 2, NX // 2]}}, "read positionally"),
     ],
 )
 def test_wrong_zone_coverage_mask_raises(tmp_path, kwargs, match):
@@ -555,15 +555,13 @@ def test_landed_but_untagged_cell_is_retagged_without_rerun(tmp_path, monkeypatc
 # ===========================================================================
 
 
-def test_phase_split_matches_composed_fill(tmp_path, monkeypatch):
+def test_phase_split_matches_composed_fill(tmp_path, monkeypatch, staged):
     """Infer → handoff → assemble lands the same store state and summary shape
     as the composed fill_zone_year (which is their back-to-back composition).
     """
     store = seed_global(tmp_path)
     make_mosaic(tmp_path)
     mask = make_mask(tmp_path, [(0, 0), (1, 1)])
-    staged: dict[str, np.ndarray] = {}
-    monkeypatch.setattr(zone_fill, "run_inference", staging_inference_stub(staged))
 
     handoff = run_infer(tmp_path, store, land_mask_path=mask, run_id="runP")
     assert handoff.done is None
@@ -581,7 +579,7 @@ def test_phase_split_matches_composed_fill(tmp_path, monkeypatch):
     assert zone_fill.zone_year_complete(store, ZONE, 2025)
 
 
-def test_staging_cleanup_is_handed_to_the_caller_rather_than_run_inline(tmp_path, monkeypatch):
+def test_staging_cleanup_is_handed_to_the_caller_rather_than_run_inline(tmp_path, monkeypatch, staged):
     """THE REGRESSION. The staging delete used to run on the trailing-assembly thread.
 
     Measured in production on 2026-08-31 at roughly TWO HOURS per cell — 34N-2018 published at
@@ -596,8 +594,6 @@ def test_staging_cleanup_is_handed_to_the_caller_rather_than_run_inline(tmp_path
     store = seed_global(tmp_path)
     make_mosaic(tmp_path)
     mask = make_mask(tmp_path, [(0, 0), (1, 1)])
-    staged: dict[str, np.ndarray] = {}
-    monkeypatch.setattr(zone_fill, "run_inference", staging_inference_stub(staged))
     deleted: list[str] = []
     monkeypatch.setattr(
         ZarrWriter, "cleanup_staging", lambda self, run_id, log=None: deleted.append(run_id), raising=True
@@ -638,7 +634,7 @@ def _master_tiles(registry_root: str) -> list[str]:
     return pq.read_table(f"{registry_root}/master/zone={ZONE}/year=2025/part-0.parquet").column("tile").to_pylist()
 
 
-def test_the_registry_records_the_depth_rule_the_cell_was_filled_under(tmp_path, monkeypatch):
+def test_the_registry_records_the_depth_rule_the_cell_was_filled_under(tmp_path, monkeypatch, staged):
     """The runner's config must reach the published row, through three forwarding hops.
 
     Worth a test rather than a reading, because the failure is INVISIBLE: every hop defaults to
@@ -651,8 +647,6 @@ def test_the_registry_records_the_depth_rule_the_cell_was_filled_under(tmp_path,
     mosaic_base = make_mosaic(tmp_path)
     mask = make_mask(tmp_path, [(0, 0), (1, 1)])
     registry_root = str(tmp_path / "registry")
-    staged: dict[str, np.ndarray] = {}
-    monkeypatch.setattr(zone_fill, "run_inference", staging_inference_stub(staged))
 
     summary = run_fill(
         tmp_path,
@@ -870,7 +864,7 @@ def test_a_partly_refused_tile_publishes_what_the_gate_removed(tmp_path, monkeyp
     assert all(cols["optical_min_obs"][i] == 15 for i in rows.values()), "and the line they missed"
 
 
-def test_a_resumed_success_publishes_null_rather_than_zero(tmp_path, monkeypatch):
+def test_a_resumed_success_publishes_null_rather_than_zero(tmp_path, monkeypatch, staged):
     """A resumed tile is a synthetic success carrying no coverage record. It must publish as
     unmeasured, not as a tile the gate refused nothing from — the second is a claim nobody made.
     """
@@ -878,8 +872,6 @@ def test_a_resumed_success_publishes_null_rather_than_zero(tmp_path, monkeypatch
     mosaic_base = make_mosaic(tmp_path)
     mask = make_mask(tmp_path, [(0, 0)])
     registry_root = str(tmp_path / "registry")
-    staged: dict[str, np.ndarray] = {}
-    monkeypatch.setattr(zone_fill, "run_inference", staging_inference_stub(staged))
 
     run_fill(
         tmp_path,
@@ -913,7 +905,7 @@ def test_zone_live_tile_count(tmp_path):
     assert zone_fill.zone_has_live_tiles(empty_mask, ZONE) is False
 
 
-def test_fill_accepts_a_cropped_written_mosaic(tmp_path, monkeypatch):
+def test_fill_accepts_a_cropped_written_mosaic(tmp_path, monkeypatch, staged):
     """The exact-grid validation passes against a write_day_windows mosaic.
 
     The cropped ingest seeds schema-only from the zone ROI's geobox and writes
@@ -965,8 +957,6 @@ def test_fill_accepts_a_cropped_written_mosaic(tmp_path, monkeypatch):
             chunks={"time": 1, "northing": TILE, "easting": TILE},
         )
 
-    staged: dict[str, np.ndarray] = {}
-    monkeypatch.setattr(zone_fill, "run_inference", staging_inference_stub(staged))
     summary = run_fill(tmp_path, store, land_mask_path=mask, mosaic_base=base, run_id="runCropped")
     assert summary["empty"] is False and summary["succeeded"] == 1
 
@@ -1018,11 +1008,9 @@ def test_non_affine_mosaic_axis_raises(tmp_path, monkeypatch):
     # the two bad steps are +/- one pixel, and a wander-and-return pattern would defeat it
     # entirely. Comparing whole vectors against the seeded axis has no such gap.
     scrambled[1], scrambled[2] = scrambled[2], scrambled[1]
-    make_mosaic_store(f"{mosaic_base}/reflectance.zarr", northing_coords(SPEC), scrambled, NY, NX, SPEC.crs)
+    make_mosaic_store(f"{mosaic_base}/reflectance.zarr", northing_coords(SPEC), scrambled)
     for orbit in ("ascending", "descending"):
-        make_mosaic_store(
-            f"{mosaic_base}/sar_{orbit}.zarr", northing_coords(SPEC), easting_coords(SPEC), NY, NX, SPEC.crs
-        )
+        make_mosaic_store(f"{mosaic_base}/sar_{orbit}.zarr", northing_coords(SPEC), easting_coords(SPEC))
 
     def fail_if_called(*args, **kwargs):
         raise AssertionError("inference must not run on a non-affine mosaic grid")

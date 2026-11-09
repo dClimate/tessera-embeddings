@@ -19,7 +19,6 @@ from types import SimpleNamespace
 import dask.array as da
 import numpy as np
 import xarray as xr
-import zarr
 
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
 from tessera_embeddings.ingest.live_windows import live_windows_for_mask, merge_bands, row_band_windows
@@ -156,13 +155,6 @@ def test_an_roi_with_no_live_pixel_fails_the_date_instead_of_dividing_by_zero():
 # --- the denominator: window totals equal full-extent totals ---------------------------
 
 
-def _mask_store(tmp_path, mask: np.ndarray) -> str:
-    path = str(tmp_path / "roi.zarr")
-    z = zarr.open(path, mode="w", shape=mask.shape, chunks=(CHUNK, CHUNK), dtype="bool")
-    z[:] = mask
-    return path
-
-
 def _windows_for(mask: np.ndarray) -> list[tuple[int, int, int, int]]:
     """Derive windows from an in-memory mask, as the ingest does from the store."""
     h, w = mask.shape
@@ -212,12 +204,12 @@ def test_all_ocean_mask_totals_zero():
     assert _sum(mask, []) == 0
 
 
-def test_windows_from_the_store_match_the_in_memory_derivation(tmp_path):
+def test_windows_from_the_store_match_the_in_memory_derivation(mask_store):
     """The real entry point agrees with the helper these tests use."""
     mask = np.zeros((12, 16), dtype=bool)
     mask[1, 2] = True
     mask[9, 13] = True
-    path = _mask_store(tmp_path, mask)
+    path = mask_store(mask)
     from_store = [(w.y0, w.y1, w.x0, w.x1) for w in live_windows_for_mask(path, chunk_px=CHUNK)]
     assert from_store == _windows_for(mask)
     assert _sum(mask, from_store) == int(mask.sum())

@@ -454,12 +454,9 @@ def test_wait_first_skips_a_failed_cell_while_a_sibling_is_still_ingesting():
         adapter.shutdown()
 
 
-def test_cancel_unstarted_drops_queued_ingests_but_not_running_ones():
-    """A retry must not queue behind a cluster's worth of unattempted ingests.
-
-    Future.cancel() succeeds only for a task still queued, so this must drop the queued ones
-    and leave the RUNNING one alone — dropping work, never interrupting it.
-    """
+@contextmanager
+def _one_running_four_queued():
+    """An adapter with one worker busy on 01N while 02N-05N queue behind it."""
     adapter = _adapter(max_parallel=1)
     started = threading.Event()
     release = threading.Event()
@@ -468,12 +465,24 @@ def test_cancel_unstarted_drops_queued_ingests_but_not_running_ones():
         started.set()
         release.wait(timeout=10.0)
 
-    adapter._run = _occupy  # the one worker is busy from here on
+    adapter._run = _occupy
     try:
         for i in range(1, 6):
             adapter.start(f"{i:02d}N", 2024)
         assert started.wait(timeout=5.0), "the first ingest never started"
+        yield adapter
+    finally:
+        release.set()
+        adapter.shutdown()
 
+
+def test_cancel_unstarted_drops_queued_ingests_but_not_running_ones():
+    """A retry must not queue behind a cluster's worth of unattempted ingests.
+
+    Future.cancel() succeeds only for a task still queued, so this must drop the queued ones
+    and leave the RUNNING one alone — dropping work, never interrupting it.
+    """
+    with _one_running_four_queued() as adapter:
         cancelled = adapter.cancel_unstarted()
 
         assert cancelled == 4, f"the four queued ingests must be cancelled, got {cancelled}"
@@ -482,9 +491,6 @@ def test_cancel_unstarted_drops_queued_ingests_but_not_running_ones():
         # Forgotten, so a retry's `start` creates a fresh attempt rather than re-reading a
         # cancelled future.
         assert ("05N", 2024) not in adapter._futures
-    finally:
-        release.set()
-        adapter.shutdown()
 
 
 def test_cancel_unstarted_can_be_restricted_to_named_cells():
@@ -495,20 +501,7 @@ def test_cancel_unstarted_can_be_restricted_to_named_cells():
     fleet exists to serve. A key with nothing queued (a running or already-finished cell, or one
     this adapter never saw) is a no-op rather than an error.
     """
-    adapter = _adapter(max_parallel=1)
-    started = threading.Event()
-    release = threading.Event()
-
-    def _occupy(zone: str, year: int) -> None:
-        started.set()
-        release.wait(timeout=10.0)
-
-    adapter._run = _occupy  # the one worker is busy from here on
-    try:
-        for i in range(1, 6):
-            adapter.start(f"{i:02d}N", 2024)
-        assert started.wait(timeout=5.0), "the first ingest never started"
-
+    with _one_running_four_queued() as adapter:
         cancelled = adapter.cancel_unstarted([("03N", 2024), ("04N", 2024), ("99N", 2024)])
 
         assert cancelled == 2, f"only the two named queued cells may be cancelled, got {cancelled}"
@@ -517,9 +510,6 @@ def test_cancel_unstarted_can_be_restricted_to_named_cells():
             assert not adapter._futures[kept].cancelled()
         assert ("03N", 2024) not in adapter._futures
         assert ("04N", 2024) not in adapter._futures
-    finally:
-        release.set()
-        adapter.shutdown()
 
 
 def test_the_priming_abort_quorum_is_the_first_wave():

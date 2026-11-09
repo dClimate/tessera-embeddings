@@ -6,6 +6,7 @@ for the land mask, the input mosaics and an inference stand-in that stages every
 
 from __future__ import annotations
 
+import inspect
 import logging
 
 import numpy as np
@@ -15,6 +16,7 @@ from tessera_embeddings.config.inference import InferenceConfig
 from tessera_embeddings.config.store_layout import DIMS_3D, DIMS_4D, ArrayLayout, StoreLayout
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import ZarrWriter
+from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.orchestration.runners import zone_fill
 from tessera_embeddings.storage import global_store
 from tessera_embeddings.storage.empty_store import VarSpec, create_empty_store_from_coords
@@ -96,7 +98,7 @@ def seed_global(tmp_path) -> str:
     return store
 
 
-def make_mosaic_store(path: str, north: np.ndarray, east: np.ndarray, ny: int, nx: int, crs: str) -> None:
+def make_mosaic_store(path: str, north: np.ndarray, east: np.ndarray, crs: str = SPEC.crs) -> None:
     """One mosaic child store (reflectance or SAR) on the given grid."""
     create_empty_store_from_coords(
         path,
@@ -105,7 +107,11 @@ def make_mosaic_store(path: str, north: np.ndarray, east: np.ndarray, ny: int, n
             "northing": north,
             "easting": east,
         },
-        var_specs={"red": VarSpec(dims=("time", "northing", "easting"), dtype=np.dtype("uint16"), chunks=(1, ny, nx))},
+        var_specs={
+            "red": VarSpec(
+                dims=("time", "northing", "easting"), dtype=np.dtype("uint16"), chunks=(1, len(north), len(east))
+            )
+        },
         commit_msg="seed test mosaic store",
         attrs={"crs": crs},
     )
@@ -120,10 +126,10 @@ def make_mosaic(tmp_path, ny: int = NY, nx: int = NX, *, sar: bool = True) -> st
     base = str(tmp_path / "mosaics")
     north = northing_coords(SPEC) if ny == NY else np.arange(ny, dtype="float64")
     east = easting_coords(SPEC) if nx == NX else np.arange(nx, dtype="float64")
-    make_mosaic_store(f"{base}/reflectance.zarr", north, east, ny, nx, SPEC.crs)
+    make_mosaic_store(f"{base}/reflectance.zarr", north, east)
     if sar:
         for orbit in ("ascending", "descending"):
-            make_mosaic_store(f"{base}/sar_{orbit}.zarr", north, east, ny, nx, SPEC.crs)
+            make_mosaic_store(f"{base}/sar_{orbit}.zarr", north, east)
     return base
 
 
@@ -131,20 +137,16 @@ def make_mask(
     tmp_path,
     live_tiles: list[tuple[int, int]],
     *,
-    zone_attr: str = ZONE,
-    crs: str | None = None,
-    grid_shape: list[int] | None = None,
+    attrs: dict | None = None,
     tile_shape: tuple[int, int] | None = None,
 ) -> str:
     """A coverage-bitmap Icechunk repo (ADR-010) with the given tiles live.
 
     Mirrors :func:`ingest.land_mask.build_all` for one zone: a ``tile_live_2048``
     bool array on the tile grid plus the zone/crs/grid_shape attrs the runner
-    guards. The overrides let tests construct wrong-zone / wrong-crs /
+    guards. ``attrs`` overrides those attrs, so tests can construct wrong-zone / wrong-crs /
     wrong-shape masks that must be rejected.
     """
-    crs = SPEC.crs if crs is None else crs
-    grid_shape = [NY, NX] if grid_shape is None else grid_shape
     nr, nc = tile_shape if tile_shape is not None else (NY // TILE, NX // TILE)
     path = str(tmp_path / "coverage.icechunk")
     repo, _ = open_or_create_repo(path)
@@ -154,7 +156,7 @@ def make_mask(
     for row, col in live_tiles:
         tile_live[row, col] = True
     node.create_array("tile_live_2048", data=tile_live, chunks=(nr, nc), dimension_names=("tile_row", "tile_col"))
-    node.attrs.update({"zone": zone_attr, "crs": crs, "grid_shape": grid_shape})
+    node.attrs.update({"zone": ZONE, "crs": SPEC.crs, "grid_shape": [NY, NX]} | (attrs or {}))
     session.commit("seed test coverage")
     return path
 
@@ -166,7 +168,10 @@ def staging_inference_stub(staged: dict[str, np.ndarray]):
     compare the assembled store against it.
     """
 
-    def stub(num_actors, config, chunks, mosaic_base, staging_base, run_id, t0, log, **kwargs):
+    def stub(*args, **kwargs):
+        # Bound against the real signature, so the runner's positional call is checked too.
+        call = inspect.signature(run_inference).bind(*args, **kwargs).arguments
+        chunks, staging_base, run_id = call["chunks"], call["staging_base"], call["run_id"]
         rng = np.random.default_rng(5)
         writer = ZarrWriter(staging_base, embedding_dim=BAND)
         results = []

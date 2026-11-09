@@ -23,8 +23,9 @@ def _record(label: str, *, thin: int = 0, eligible: int = 64) -> dict:
     }
 
 
-def _write_part(root: str, zone: str, year: int, run: str, rows: list[dict], *, rule: int | None = None) -> str:
-    """Write one cell's part where the registry keeps it; *rule* is stamped in the key-value block."""
+def _write_part(root: str, cell: tuple[str, int, str], rows: list[dict], *, rule: int | None = None) -> str:
+    """Write one ``(zone, year, run)`` part where the registry keeps it; *rule* is stamped in the key-value block."""
+    zone, year, run = cell
     uri = part_uri(root, zone, year, run)
     Path(uri).parent.mkdir(parents=True, exist_ok=True)
     # The lambda is not a leak: `write_registry_part` consumes it as `with open_output(uri) as f`.
@@ -54,12 +55,10 @@ class TestTheDatasetIsActuallyReadable:
         pa = pytest.importorskip("pyarrow")
         pq = pytest.importorskip("pyarrow.parquet")
         root = str(tmp_path / "reg")
-        clean = _write_part(root, "32S", 2021, "r1", registry_rows("r1", "t", embedded=["chunk_0_0"], refused=[]))
+        clean = _write_part(root, ("32S", 2021, "r1"), registry_rows("r1", "t", embedded=["chunk_0_0"], refused=[]))
         dirty = _write_part(
             root,
-            "09S",
-            2021,
-            "r2",
+            ("09S", 2021, "r2"),
             registry_rows(
                 "r2", "t", embedded=[], refused=["chunk_1_1"], records={"chunk_1_1": _record("chunk_1_1", thin=64)}
             ),
@@ -76,8 +75,8 @@ class TestTheDatasetIsActuallyReadable:
         """
         ds = pytest.importorskip("pyarrow.dataset")
         root = str(tmp_path / "reg")
-        _write_part(root, "32S", 2021, "r1", registry_rows("r1", "t", embedded=["chunk_0_0"], refused=[]))
-        _write_part(root, "09S", 2022, "r2", registry_rows("r2", "t", embedded=["chunk_1_1"], refused=[]))
+        _write_part(root, ("32S", 2021, "r1"), registry_rows("r1", "t", embedded=["chunk_0_0"], refused=[]))
+        _write_part(root, ("09S", 2022, "r2"), registry_rows("r2", "t", embedded=["chunk_1_1"], refused=[]))
 
         table = ds.dataset(f"{root}/parts", partitioning="hive").to_table()
         assert table.num_rows == 2
@@ -88,9 +87,9 @@ class TestTheDatasetIsActuallyReadable:
         """The master keeps each tile's newest row, so this is how a tile says which update its data came from."""
         pq = pytest.importorskip("pyarrow.parquet")
         root = str(tmp_path / "reg")
-        fill = _write_part(root, "32S", 2021, "fill", registry_rows("fill", "t1", embedded=["chunk_0_0"], refused=[]))
+        fill = _write_part(root, ("32S", 2021, "fill"), registry_rows("fill", "t1", embedded=["chunk_0_0"], refused=[]))
         update = _write_part(
-            root, "32S", 2021, "upd", registry_rows("upd", "t2", embedded=["chunk_0_0"], refused=[], update_name="u1")
+            root, ("32S", 2021, "upd"), registry_rows("upd", "t2", embedded=["chunk_0_0"], refused=[], update_name="u1")
         )
         assert pq.read_table(fill).column("update_name").to_pylist() == [None]
         assert pq.read_table(update).column("update_name").to_pylist() == ["u1"]
@@ -101,8 +100,8 @@ class TestTheDatasetIsActuallyReadable:
         """
         ds = pytest.importorskip("pyarrow.dataset")
         root = str(tmp_path / "reg")
-        _write_part(root, "32S", 2021, "first", registry_rows("first", "t1", embedded=["chunk_0_0"], refused=[]))
-        _write_part(root, "32S", 2021, "refill", registry_rows("refill", "t2", embedded=["chunk_0_0"], refused=[]))
+        _write_part(root, ("32S", 2021, "first"), registry_rows("first", "t1", embedded=["chunk_0_0"], refused=[]))
+        _write_part(root, ("32S", 2021, "refill"), registry_rows("refill", "t2", embedded=["chunk_0_0"], refused=[]))
 
         table = ds.dataset(f"{root}/parts", partitioning="hive").to_table()
         assert table.num_rows == 2, "both fills are on the record"
@@ -244,7 +243,7 @@ class TestTheDepthRuleTheRowsWereJudgedAgainst:
         root = str(tmp_path / "reg")
         for zone, rule in (("32S", 15), ("09S", 30)):
             rows = registry_rows("r", "t", embedded=["chunk_0_0"], refused=[], optical_min_obs=rule)
-            _write_part(root, zone, 2021, f"r-{zone}", rows, rule=rule)
+            _write_part(root, (zone, 2021, f"r-{zone}"), rows, rule=rule)
 
         table = ds.dataset(f"{root}/parts", partitioning="hive").to_table()
         assert table.num_rows == 2
@@ -256,7 +255,7 @@ class TestTheDepthRuleTheRowsWereJudgedAgainst:
         pq = pytest.importorskip("pyarrow.parquet")
         root = str(tmp_path / "reg")
         rows = registry_rows("r1", "t", embedded=["chunk_0_0"], refused=[], optical_min_obs=15)
-        uri = _write_part(root, "32S", 2021, "r1", rows, rule=15)
+        uri = _write_part(root, ("32S", 2021, "r1"), rows, rule=15)
         md = {k.decode(): v.decode() for k, v in (pq.read_schema(uri).metadata or {}).items()}
         assert md["optical_min_obs"] == "15"
         assert md["zone"] == "32S" and md["year"] == "2021"
