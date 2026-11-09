@@ -1,4 +1,4 @@
-# 031 — The v2 store layout: a level-0 group, band-first, and 16-band shards
+# 031 — The v2 store layout: a level-0 group, band-first, 16-band shards of 4-band chunks
 
 **Status:**
 
@@ -6,10 +6,10 @@
   eight 16-band shards (§4). Inference makes the reorder to band-first as it stages each meta-shard.
 - **Accepted 2026-10-28 (repo owner):** a v2 store keeps its 10 m arrays in a child group `0` of each
   zone group (`utm33/0/`, or `0/` in a single-area store), so coarser multiscale levels can be added
-  beside it later (§1).
-- **Open:** how phones and browsers are served. There are two equally weighted paths (§4): keep
-  16-band chunks and add a small preview store, or cut each 16-band shard into 4-band chunks. Path 2
-  has to be chosen before the v2 campaign writes; path 1 can be added at any time.
+  beside it later (§1). No coarser level is planned yet.
+- **Accepted 2026-11-09 (repo owner):** each 16-band shard is cut into 4-band chunks, so phones and
+  browsers fetch only the bands they read (§4). The alternative, 16-band chunks plus a separate
+  preview store, was rejected.
 - **Scope:** for v2 stores only, this supersedes D2 of [ADR 008](008-global-store-architecture.md).
   The v1.1 store keeps D2, and targeted updates go on writing it that way.
 
@@ -31,16 +31,10 @@ meta-shard   2,048 × 2,048 px × 128 bands             one inference run
 ├── …
 └── shard 8   bands 112–127
      │
-     ├── path 1: 16-band chunks, 16 per shard
-     │     a 4 × 4 grid of 512 × 512 px, each chunk holding all 16 bands      4.2 MB raw
+     ├── chunks: 64 per shard
+     │     a 4 × 4 grid of 512 × 512 px, each square cut into 4 chunks of 4 bands   1.05 MB raw
      │
-     └── path 2: 4-band chunks, 64 per shard
-           the same 4 × 4 grid, each square cut into 4 chunks of 4 bands      1.05 MB raw
-
-     + a small index at the end of each shard locating every chunk (260 bytes; about 1 KB in path 2)
-
-preview store (path 1 only)   a separate Zarr store: the first 4 or 8 bands of every pixel,
-                              one shard per meta-shard, in 512 × 512 px × 4-band chunks
+     └── a small index at the end of the shard locating every chunk (about 1 KB)
 ```
 
 | term | what it is | names in the library's code |
@@ -62,8 +56,8 @@ band.
 | band-last, one shard | band-last | 1 | 512² × 16 | `v2_c2_zstd1_s256` |
 | band-last, 16-band shards | band-last | 8 | 512² × 16 | `v2_b2_zstd1_s256` |
 | band-first, one shard | band-first | 1 | 512² × 16 | `v2_c2f_bandfirst_zstd1_s256` |
-| **16-band shards, 16-band chunks** (§4, path 1) | band-first | 8 | 512² × 16 | `v2_b2f_bandfirst_zstd1_s256` |
-| **16-band shards, 4-band chunks** (§4, path 2) | band-first | 8 | 512² × 4 | `v2_b2f_i4_bandfirst_zstd1_s256` |
+| 16-band shards, 16-band chunks (§4, path 1) | band-first | 8 | 512² × 16 | `v2_b2f_bandfirst_zstd1_s256` |
+| **16-band shards, 4-band chunks** (§4, path 2: accepted) | band-first | 8 | 512² × 4 | `v2_b2f_i4_bandfirst_zstd1_s256` |
 | 8-band shards; 4-band shards | band-first | 16; 32 | 512² × 8; × 4 | `v2_b2f8_…`, `v2_b2f4_…` |
 | variable 4, 4, 8, 16, 32, 64 | band-first | 6 | 512² × 4 | `v2_m2f_bandfirst_zstd1_s256` |
 | variable 4, 4, 8, 112; variable 8, 8, 112 | band-first | 4; 3 | 512² × 4; × 8 | `v2_m2f_x4_…`, `v2_m2f_x3_…` |
@@ -80,7 +74,7 @@ into shards and chunks changes.
 |---|---|---|
 | shards | 16 bands each, eight per meta-shard | the smallest prefix v2 was trained on; §6 weighs 8-band, 4-band and variable-width shards |
 | chunk, spatially | 512 × 512 px | 256² builds 4× the Dask tasks at default chunks and 204–260 serial requests per 16-band read of 2 × 2 meta-shards on zarr 3.2; 1,024² makes a full vector cost 134 MB |
-| chunk, bands | 16 or 4: open between the two paths of §4 | |
+| chunk, bands | 4 | phones and browsers fetch only the bands they read (§4) |
 | int8 codec | zstd at level 1 | within 3% of the default level's bytes at 0.6× its encode CPU, once bands are split |
 | chunk order within a shard | zarr's default (Morton) | the other orders moved request counts by under 20%, and an order is not persisted, so it would need library code on every write path |
 | `scales` | 256² chunks, as v1.1 | its geometry made no measurable difference; PCodec compresses it about 7× |
@@ -105,14 +99,16 @@ root/          geoemb: attributes                  root/     geoemb:, proj:, spa
 └── … utm60/
 ```
 
-- **Why now.** How to pool embeddings into coarser levels is still open (the draft plan in #222).
-  Where the 10 m arrays sit cannot change once readers depend on their paths. A level group costs
+- **Why now, with no coarser level planned.** A mean of embeddings is not a sound embedding at a
+  coarser scale, and the right way to aggregate them is still being researched at Cambridge. But
+  where the 10 m arrays sit cannot change once readers depend on their paths. A level group costs
   nothing to create now, and a later level is only a new group beside it.
 - **Why inside each zone.** The [multiscales convention](https://github.com/zarr-conventions/multiscales)
   (v0.1) treats the group that carries its `multiscales` attribute as one pyramid in one coordinate
   system. Each level is a child group holding that level's arrays, and the convention's geospatial
   example puts `proj:code` on the pyramid's group. Each UTM zone has its own coordinate system, so
-  each zone group is one pyramid, and its 10 m level is `utm33/0`.
+  each zone group is one pyramid, and its 10 m level is `utm33/0`. A coarser level is computed in
+  its zone's projection like the 10 m one, so it belongs in the same pyramid.
 - **The one pyramid among the peer stores is built the same way.** The Source Coop copy of our v1.1
   store has a `global_rgb` group beside its zones: an RGB preview in EPSG:4326, whose ten levels
   are child groups `0` to `9`, each a 2× mean of the one before. It sidesteps the zones' sixty
@@ -290,12 +286,15 @@ example, labels a meta-shard by chunk coordinates 1 and 2, which in band-first o
 
 ## 4. Decision
 
-**Accepted: band-first, each meta-shard stored as eight 16-band shards.** `embeddings` is
-`(time, band, y, x)`. Each meta-shard's 128 bands are stored as eight shards of
-1 × 16 × 2,048 × 2,048, one for each block of 16 dimensions (zarr's `shards=`), compressed with zstd at
-level 1. `scales` and the other arrays keep their v1.1 geometry.
+**Accepted: band-first, each meta-shard stored as eight 16-band shards of 4-band chunks.**
+`embeddings` is `(time, band, y, x)`. Each meta-shard's 128 bands are stored as eight shards of
+1 × 16 × 2,048 × 2,048, one for each block of 16 dimensions (zarr's `shards=`). Each shard holds
+chunks of 1 × 4 × 512 × 512, compressed with zstd at level 1. `scales` and the other arrays keep
+their v1.1 geometry.
 
-**It is the only layout in the 16-band study that passes every limit, and it leads every read.**
+**Band-first 16-band shards are the only layout in the 16-band study that pass every limit, and
+they lead every read.** These are its figures with 16-band chunks; 4-band chunks change them by the
+amounts in the next subsection.
 
 - **16-band read:** 4.9 s against the v1.1 layout's 20.2 s.
 - **64-band read:** 14.7 s against 24.2 s.
@@ -323,11 +322,12 @@ the v1.1 layout's assembly CPU, above what assembling band-first staged meta-sha
 turned down because band-first all the way through is the cleaner pipeline, and inference's part of
 it costs at most about 1% of inference time.
 
-### Open: serving phones and browsers, two equally weighted paths
+### Accepted: 4-band chunks, for phones and browsers
 
-Phones and browsers read 4 or 8 bands over a slow link, where read time follows the bytes fetched
-(§6). A 16-band chunk makes them fetch four times what a 4-band read needs. Two paths fix that
-equally well. Both keep the eight 16-band shards per meta-shard; they differ in who pays.
+**Accepted 2026-11-09 (repo owner): path 2.** Phones and browsers read 4 or 8 bands over a slow link,
+where read time follows the bytes fetched (§6). A 16-band chunk makes them fetch four times what a
+4-band read needs. Two paths were weighed. Both keep the eight 16-band shards per meta-shard; they
+differ in who pays.
 
 - **Path 1: 16-band chunks, plus a preview store.** `embeddings` keeps chunks of
   1 × 16 × 512 × 512. A separate Zarr store holds only the first 4 or 8 bands of every pixel's
@@ -351,12 +351,11 @@ equally well. Both keep the eight 16-band shards per meta-shard; they differ in 
 | browsers | the preview store can be plain Zarr, which zarrita.js reads over HTTP with no icechunk index | zarrita.js reads the regular grid; the main store is icechunk, so a browser also needs icechunk's JavaScript reader |
 | when it must be decided | any time: the preview store can be built after the campaign from the stored embeddings, with no inference | before the v2 campaign writes; changing chunks afterwards re-compresses every shard |
 
-- **Choose path 1** if bulk-analysis and Dask readers are the main audience and a second store is
-  acceptable. It also defers the phone decision past the campaign.
-- **Choose path 2** if one store that every reader uses as it is matters more, browsers included,
-  and about 9% more assembly CPU, bulk reads up to 13% slower, and Dask reads about 10% slower with
-  matched chunks are acceptable. The repo owner ruled
-  on 2026-10-28 that assembly has the spare capacity for that CPU.
+**Path 2 was chosen because one store serves every reader as it is**, browsers included, with no
+second store for every write and targeted update to keep in step. Its costs are accepted: about 9%
+more assembly CPU, which the repo owner ruled on 2026-10-28 that assembly has the capacity for; bulk
+reads up to 13% slower; and Dask reads about 10% slower with chunks matched to shards. It had to be
+chosen before the v2 campaign writes, since changing chunks afterwards re-compresses every shard.
 
 **Neither path touches ingest or inference.** Inference stages each meta-shard uncompressed in its
 own fixed geometry, 256 × 256 px pieces holding all 128 bands (`ZarrWriter.write_chunk`), so the
@@ -370,14 +369,15 @@ chunks, a gentler path 2, were measured only on the laptop.
 
 ## 5. Consequences
 
-**Either path:**
-
 - **A v2 preset** in `config/store_layout.py`, selected by model version for the global and
-  single-area paths. `INNER_PX` stays 256, so the land mask's `chunk_live_256` stays valid.
+  single-area paths. Its `embeddings` shard is 1 × 16 × 2,048 × 2,048 and its chunk
+  1 × 4 × 512 × 512, in place before the v2 campaign writes. `INNER_PX` stays 256, so the land
+  mask's `chunk_live_256` stays valid.
 - **The arrays move into level group `0`** (§1).
   - The seed flow creates each zone's `0` group with the arrays inside it, and writes the zone's
-    `multiscales` attribute. `storage/conventions.py`, the one place that builds `zarr_conventions`
-    entries, registers the convention.
+    `multiscales` attribute, whose `layout` lists only `0`. Nothing builds a coarser level.
+    `storage/conventions.py`, the one place that builds `zarr_conventions` entries, registers the
+    convention.
   - Code that opens a zone's arrays resolves `utm33/0` through one helper: zone fill, targeted
     updates and the readers' open functions.
   - Fill bookkeeping kept as zone-group attributes, such as completed years and update records, can
@@ -390,7 +390,7 @@ chunks, a gentler path 2, were measured only on the laptop.
 - **The chunk-sizing function moves out of `store_layout.py` first**, as its own change at a store
   boundary. It moves the ingest identity once, and keeps later layout changes from moving it.
 - **`_layout_band` takes the band count from the shard, not the chunk.** Otherwise a v2 store is
-  stamped `geoemb:dimensions=16`, or 4 in path 2.
+  stamped `geoemb:dimensions=4`.
 - **Reader-facing metadata:** a root attribute naming the valid prefixes (16, 32, 64, 128), and
   reader-guide advice on zarr ≥ 3.3 and on Dask chunks matched to shards
   (`chunks={"band": 16, "y": 2048, "x": 2048}`).
@@ -404,27 +404,12 @@ chunks, a gentler path 2, were measured only on the laptop.
 - **The preset follows the store's model**, chosen the way the checkpoint and the worker image
   already are: from the model's `ModelFamily` record, and for a global store from the model it was
   seeded for.
-
-**Path 1 only:**
-
-- **A preview store and its writer.** Assembly, or a separate pass over the stored embeddings, writes
-  each meta-shard's first 4 or 8 bands into it. Its location, band count and format (icechunk or
-  plain Zarr) are fixed before it is first written, and its groups follow the main store's
-  (`utm33/0`).
-- **Targeted updates rewrite a meta-shard's preview with the meta-shard**, or the two stores drift
-  apart.
-- **The reader guide and a root attribute point to the preview store.**
-- **One harness run first**, to measure its assembly cost and phone reads before readers rely on it.
-
-**Path 2 only:**
-
-- **The preset's chunk is 1 × 4 × 512 × 512**, in place before the v2 campaign writes.
-- **Each shard's own index grows** from 260 bytes to about 1 KB: 64 chunks instead of 16.
+- **Each shard's own index is about 1 KB**, for 64 chunks, against 260 bytes for 16.
 
 ## 6. Narrower and variable-width band chunks
 
 **Status:** measured 2026-10-27 and 2026-10-28 at the repo owner's request. It is the evidence behind
-§4's two paths. The runs are archived in
+§4's choice of 4-band chunks. The runs are archived in
 [v2_narrow_band_results.md](../../scripts/scoping/scale_tests/v2_narrow_band_results.md).
 
 **Narrower band chunks make a phone's reads 2–4× faster.** On a phone's link, time follows bytes,
