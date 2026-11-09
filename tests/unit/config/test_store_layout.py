@@ -147,20 +147,22 @@ def test_sharded_roundtrip_and_fill(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("declared", "scales_dims", "expected"),
+    ("declared", "scales_dims", "level", "expected"),
     [
-        (["y", "x"], ("time", "y", "x"), ("y", "x")),
-        (None, ("time", "y", "x"), ("y", "x")),  # pixel-index coordinates declare nothing
-        (None, ("y", "x"), ("northing", "easting")),  # malformed: the audit reports, not raises
+        (["y", "x"], ("time", "y", "x"), "", ("y", "x")),
+        (None, ("time", "y", "x"), "", ("y", "x")),  # pixel-index coordinates declare nothing
+        (None, ("y", "x"), "", ("northing", "easting")),  # malformed: the audit reports, not raises
+        (None, ("time", "y", "x"), "0", ("y", "x")),  # a v2 group: `scales` sits in its level group
     ],
 )
-def test_spatial_dims_of_reads_the_declaration_then_the_scales_array(declared, scales_dims, expected):
+def test_spatial_dims_of_reads_the_declaration_then_the_scales_array(declared, scales_dims, level, expected):
     group = zarr.group(store=zarr.storage.MemoryStore())
-    group.create_array("scales", shape=(1,) * len(scales_dims), dtype="f4", dimension_names=scales_dims)
+    holder = group.require_group(level) if level else group
+    holder.create_array("scales", shape=(1,) * len(scales_dims), dtype="f4", dimension_names=scales_dims)
     if declared:
         group.attrs["spatial:dimensions"] = declared
     assert spatial_dims_of(group) == expected
-    assert spatial_dims_of(xr.open_zarr(group.store, consolidated=False)) == expected
+    assert spatial_dims_of(xr.open_zarr(group.store, consolidated=False, group=level or None)) == expected
 
 
 def test_with_spatial_dims_renames_every_array_and_keeps_the_geometry():

@@ -878,7 +878,9 @@ def _write_shards_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 - retu
                     mask = owned.reshape(
                         [n if role in ("Y", "X") else 1 for role, n in zip(roles, block.shape, strict=True)]
                     )
-                    block = np.where(mask, block, np.asarray(arr[region]))
+                    merged = np.asarray(arr[region])
+                    np.copyto(merged, block, where=mask)
+                    block = merged
             with timer.phase("write"):
                 arr[region] = block
             writes += 1

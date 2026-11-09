@@ -18,8 +18,8 @@ PR #218 (2026-10-22).
 
 The Y and X dimensions are `northing`/`easting` in a v1.1 store and `y`/`x` from v2 on
 ([ADR 032](../decisions/032-v2-stores-name-their-axes-y-and-x.md)); every attribute above names
-whichever the store has. A v2 store's arrays sit in its level group `0`, while every attribute in
-the table stays on the group above it; the root also names v2's usable prefixes in
+whichever the store has. A v2 store's arrays sit in its level group `0`: the group attributes in
+the table stay on the group above it, and each array's own attributes travel with it into `0`; the root also names v2's usable prefixes in
 `embedding_prefixes` (16, 32, 64, 128).
 
 | convention | version followed | latest upstream |
