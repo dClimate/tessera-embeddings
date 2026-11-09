@@ -28,6 +28,7 @@ from typing import cast
 import icechunk
 import zarr
 
+from tessera_embeddings.config.store_geometry import level0
 from tessera_embeddings.storage.shard_writer import commit_year_attrs
 from tessera_embeddings.storage.time_axis import CAMPAIGN_YEARS, time_index_of, year_timestamp
 from tessera_embeddings.storage.zone_grid import ZONES
@@ -190,7 +191,7 @@ def mark_zone_year_empty(
     # Axis check on a read-only view: it must fail before any session is opened, so a rejected
     # year cannot leave a writable session dangling.
     node = cast(zarr.Group, zarr.open_group(repo.readonly_session("main").store, mode="r")[zone])
-    if time_index_of(node, year_timestamp(year)) is None:
+    if time_index_of(level0(node), year_timestamp(year)) is None:
         raise ValueError(
             f"Year {year} is not on {zone}'s pre-allocated time axis — refusing to mark an "
             "off-axis year complete (ADR-008 D1: the axis is fixed at seeding)."

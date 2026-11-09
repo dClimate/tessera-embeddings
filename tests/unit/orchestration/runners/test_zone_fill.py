@@ -9,7 +9,7 @@ import pytest
 import zarr
 
 from tessera_embeddings.config.inference import InferenceConfig
-from tessera_embeddings.config.store_layout import DIMS_3D, DIMS_4D, ArrayLayout, StoreLayout
+from tessera_embeddings.config.store_layout import DIMS_3D, DIMS_4D, DIMS_4D_BAND_FIRST, ArrayLayout, StoreLayout
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.orchestration.runners import zone_fill
@@ -32,6 +32,12 @@ _YEARS = (2024, 2025)
 _EMB = ArrayLayout(DIMS_4D, (1, _INNER, _INNER, _BAND), "int8", 0, "zstd", shards=(1, _TILE, _TILE, _BAND))
 _SCL = ArrayLayout(DIMS_3D, (1, _INNER, _INNER), "float32", float("nan"), "pcodec", shards=(1, _TILE, _TILE))
 SMALL = StoreLayout(name="small", arrays={"embeddings": _EMB, "scales": _SCL}, bands=_BAND)
+# v2's shape in miniature: band-first, two band shards of two-band chunks, in level group 0 (ADR 031).
+_EMB_V2 = ArrayLayout(
+    DIMS_4D_BAND_FIRST, (1, 2, _INNER, _INNER), "int8", 0, "zstd", shards=(1, _BAND // 2, _TILE, _TILE)
+)
+SMALL_V2 = StoreLayout(name="small-v2", arrays={"embeddings": _EMB_V2, "scales": _SCL}, bands=_BAND, level="0")
+LAYOUTS = pytest.mark.parametrize("layout", [SMALL, SMALL_V2], ids=["v1", "v2"])
 
 # 10 m pixels -> metre extents for a _NY x _NX pixel zone.
 _SPEC = ZoneSpec("32601", "N", 1, (0.0, _NX * 10.0), (0.0, _NY * 10.0))
@@ -87,10 +93,10 @@ def _infer(tmp_path, store, **overrides):
     return zone_fill.infer_zone_year(**_wiring(tmp_path, store, **overrides))
 
 
-def _seed_global(tmp_path) -> str:
+def _seed_global(tmp_path, layout: StoreLayout = SMALL) -> str:
     store = str(tmp_path / "global.icechunk")
     repo = global_store.create_global_repo(store)
-    global_store.seed_zone_groups(repo, [_SPEC], years=_YEARS, layout=SMALL)
+    global_store.seed_zone_groups(repo, [_SPEC], years=_YEARS, layout=layout)
     return store
 
 
@@ -290,9 +296,10 @@ def test_fill_zone_year_end_to_end(tmp_path, monkeypatch):
     assert not (tmp_path / "staging" / "runZ").exists()
 
 
-def test_all_ocean_cell_marked_complete_without_inference(tmp_path, monkeypatch):
+@LAYOUTS
+def test_all_ocean_cell_marked_complete_without_inference(tmp_path, monkeypatch, layout):
     """An all-ocean cell lands (years_complete + tag) with no inference at all."""
-    store = _seed_global(tmp_path)
+    store = _seed_global(tmp_path, layout)
     mosaic_base = _make_mosaic(tmp_path)
     mask = _make_mask(tmp_path, [])  # nothing lives
 
@@ -654,11 +661,17 @@ def test_zone_year_complete_reflects_years_complete(tmp_path, monkeypatch):
     assert zone_fill.zone_year_complete(store, _ZONE, 2024) is False
 
 
-def test_zone_year_on_axis(tmp_path):
+@LAYOUTS
+def test_a_seeded_zone_passes_the_fill_preflight(tmp_path, layout):
+    zone_fill.preflight_destination(store_path=_seed_global(tmp_path, layout), zone=_ZONE, year=2025)
+
+
+@LAYOUTS
+def test_zone_year_on_axis(tmp_path, layout):
     """The preflight reports True for a seeded year, False off-axis / unseeded —
     so the flow can decline Ray for a year the runner would reject anyway.
     """
-    store = _seed_global(tmp_path)
+    store = _seed_global(tmp_path, layout)
     assert zone_fill.zone_year_on_axis(store, _ZONE, 2025) is True
     assert zone_fill.zone_year_on_axis(store, _ZONE, 2024) is True
     assert zone_fill.zone_year_on_axis(store, _ZONE, 2026) is False  # off the seeded axis

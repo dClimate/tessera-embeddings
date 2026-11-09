@@ -37,14 +37,20 @@ def level0(group: zarr.Group) -> zarr.Group:
     return child if isinstance(child, zarr.Group) else group
 
 
+def dims_of(array: object) -> tuple[str, ...]:
+    """*array*'s dimension names: xarray's on the variable, zarr's in its metadata; empty if it has none."""
+    names = getattr(array, "dims", None) or getattr(getattr(array, "metadata", None), "dimension_names", None)
+    return tuple(names or ())
+
+
 def band_axis(array: zarr.Array | xr.DataArray) -> int | None:
     """The position of ``band`` among *array*'s dimensions, or ``None`` if it has no band axis.
 
     Read from the array's own dimension names, never inferred from the model or the store, so the
     band-last v1.1 store and a band-first v2 one are indexed by the same code.
     """
-    names = getattr(array, "dims", None) or getattr(array.metadata, "dimension_names", None) or ()
-    return tuple(names).index("band") if "band" in names else None
+    names = dims_of(array)
+    return names.index("band") if "band" in names else None
 
 
 def spatial_dims_of(group: zarr.Group | xr.Dataset) -> tuple[str, str]:
@@ -61,9 +67,8 @@ def spatial_dims_of(group: zarr.Group | xr.Dataset) -> tuple[str, str]:
         return declared[0], declared[1]
     holder = level0(group) if isinstance(group, zarr.Group) else group
     scales = holder.get("scales")
-    # xarray names a variable's dims on the variable; zarr in the array's metadata.
-    dims = getattr(scales, "dims", None) or getattr(getattr(scales, "metadata", None), "dimension_names", None)
-    return (dims[1], dims[2]) if dims and len(dims) == 3 else PRESET_SPATIAL_DIMS
+    dims = dims_of(scales) if scales is not None else ()
+    return (dims[1], dims[2]) if len(dims) == 3 else PRESET_SPATIAL_DIMS
 
 
 def clamp_chunks_and_shards(

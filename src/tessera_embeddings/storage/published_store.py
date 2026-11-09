@@ -15,15 +15,15 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import numpy as np
+import zarr
 
-from tessera_embeddings.config.store_geometry import clamp_chunks_and_shards, level0, spatial_dims_of
+from tessera_embeddings.config.store_geometry import clamp_chunks_and_shards, dims_of, level0, spatial_dims_of
 from tessera_embeddings.config.store_layout import GLOBAL, GLOBAL_V2, SHARD_PX, StoreLayout
 from tessera_embeddings.storage.global_store import _codec_id, missing_seeded_arrays
 from tessera_embeddings.storage.shard_writer import SHARD_WRITE
 
 if TYPE_CHECKING:
     import icechunk
-    import zarr
 
     from tessera_embeddings.storage.zone_grid import ZoneSpec
 
@@ -222,7 +222,8 @@ async def live_shards_async(
 ) -> dict[int, frozenset[tuple[int, int]]]:
     """:func:`live_shards`, for a caller that already has an event loop."""
     by_year: dict[int, set[tuple[int, int]]] = {}
-    async for coord in session.chunk_coordinates(f"/{zone}/{var}"):
+    holder = level0(cast("zarr.Group", zarr.open_group(session.store, mode="r")[zone]))
+    async for coord in session.chunk_coordinates(f"/{holder.path}/{var}"):
         # A 4-D array appends a band/month index that is always 0, one shard spanning the whole
         # non-spatial axis, so take the spatial pair by position rather than a fixed arity.
         time_index, shard_y, shard_x = int(coord[0]), int(coord[1]), int(coord[2])
@@ -310,16 +311,24 @@ def commit_tiles(repo: icechunk.Repository, zone: str, time_index: int, snapshot
     wholly with fill counts too, even where nothing was stored: Zarr deletes the chunk rather than
     storing fill, and the transaction log records the delete. Every such array
     shares the tile grid, one shard per tile in its first three coordinates; the coordinate arrays
-    have fewer.
+    have fewer. Each array's spatial axes are found by name, since a band-first array puts its band
+    axis between time and the spatial pair.
     """
     parent = repo.lookup_snapshot(snapshot).parent_id
     diff = repo.diff(from_snapshot_id=parent, to_snapshot_id=snapshot)
+    group = cast("zarr.Group", zarr.open_group(repo.readonly_session(snapshot_id=snapshot).store, mode="r")[zone])
+    y, x = spatial_dims_of(group)
+    axes = {
+        f"/{array.path}": (names.index(y), names.index(x))
+        for _, array in level0(group).arrays()
+        if {y, x} <= set(names := dims_of(array)) and names[0] == "time"
+    }
     return frozenset(
-        f"chunk_{c[1]}_{c[2]}"
+        f"chunk_{c[axes[path][0]]}_{c[axes[path][1]]}"
         for path, coords in diff.updated_chunks.items()
-        if path.startswith(f"/{zone}/")
+        if path in axes
         for c in coords
-        if len(c) >= 3 and c[0] == time_index
+        if c[0] == time_index
     )
 
 
@@ -382,7 +391,7 @@ def sample_live_pixels(
     if not shards or count <= 0:
         return []
     rng = np.random.default_rng(seed)
-    array = cast("zarr.Array", group[coverage_var])
+    array = cast("zarr.Array", level0(group)[coverage_var])
     candidates: list[tuple[int, int]] = []
     for index in rng.integers(len(shards), size=count * oversample):
         y0, y1, x0, x1 = shard_pixel_window(shards[int(index)], array.shape)

@@ -62,7 +62,7 @@ from tessera_embeddings.config.inference import (
     TimeWindow,
     model_family,
 )
-from tessera_embeddings.config.store_geometry import spatial_dims_of
+from tessera_embeddings.config.store_geometry import dims_of, level0, spatial_dims_of
 from tessera_embeddings.config.store_layout import (
     CARRIED_VARS,
     INNER_PX,
@@ -621,15 +621,19 @@ def assert_on_store_grid(
     """Refuse mosaics whose grid is not the store's: a write into an existing store is positional.
 
     Shared by an append to a single-area store and an update of one, which both write staged pixels
-    into the store's existing coordinate arrays.
+    into the store's existing coordinate arrays. *root* is the store's root; its arrays are read from
+    its level group ``0`` when it has one, and their axes by name, so either band order passes.
     """
     # The store's own grid is authoritative: on a mismatched extent a raw region write
     # would silently land in a corner, or be clamp-truncated.
-    emb = cast(zarr.Array, root["embeddings"])
-    if emb.shape[1] != total_y or emb.shape[2] != total_x or emb.shape[3] != embedding_dim:
+    arrays = level0(root)
+    y_name, x_name = spatial_dims_of(root)
+    emb = cast(zarr.Array, arrays["embeddings"])
+    size = dict(zip(dims_of(emb), emb.shape, strict=True))
+    if (size.get(y_name), size.get(x_name), size.get("band")) != (total_y, total_x, embedding_dim):
         raise ValueError(
             f"Mosaic extent ({total_y} x {total_x} x {embedding_dim} bands) does not match "
-            f"existing store {where} ({emb.shape[1]} x {emb.shape[2]} x {emb.shape[3]} bands) "
+            f"existing store {where} ({size.get(y_name)} x {size.get(x_name)} x {size.get('band')} bands) "
             "— wrong output path, ROI grid, or model width."
         )
     # Shape alone cannot catch a shifted or reversed mosaic on the same grid size (the
@@ -648,9 +652,8 @@ def assert_on_store_grid(
                 f"Mosaic CRS {spatial.crs!r} does not match existing store {where} "
                 f"CRS {stored_crs!r} — appending would misgeoreference the timestep."
             )
-        y_name, x_name = spatial_dims_of(root)
-        z_north = cast(zarr.Array, root[y_name])
-        z_east = cast(zarr.Array, root[x_name])
+        z_north = cast(zarr.Array, arrays[y_name])
+        z_east = cast(zarr.Array, arrays[x_name])
         atol = PIXEL_M / 2
         if not (
             np.isclose(spatial.northing[0], z_north[0], rtol=0.0, atol=atol)
@@ -2644,7 +2647,7 @@ class ZarrWriter:
         )
 
         # One readonly probe of the zone group: year index, shard pitch, variables.
-        node = cast(zarr.Group, zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[zone])
+        node = level0(cast(zarr.Group, zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[zone]))
         year_index = time_index if time_index is not None else time_index_of(node, year_timestamp(year))
         if year_index is None:
             raise ValueError(

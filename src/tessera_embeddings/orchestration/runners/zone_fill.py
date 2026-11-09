@@ -62,7 +62,7 @@ from tessera_embeddings.config.assembly import AssemblyConfig
 from tessera_embeddings.config.fault_injection import ArmedFault
 from tessera_embeddings.config.inference import InferenceConfig, run_id_prefix
 from tessera_embeddings.config.paths import store_key
-from tessera_embeddings.config.store_geometry import spatial_dims_of
+from tessera_embeddings.config.store_geometry import level0, spatial_dims_of
 from tessera_embeddings.config.store_layout import GLOBAL, REQUIRED_VARS
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import (
@@ -269,7 +269,7 @@ def zone_year_on_axis(
     but only after the flow would have stood Ray up. False for an unseeded or off-axis year.
     """
     _, _, node = _open_zone(store_path, zone, get_credentials=get_credentials, s3_region=s3_region)
-    return node is not None and time_index_of(node, year_timestamp(year)) is not None
+    return node is not None and time_index_of(level0(node), year_timestamp(year)) is not None
 
 
 @dataclass
@@ -603,22 +603,23 @@ def preflight_destination(
     # tolerance is right for the optional set and wrong for `embeddings`/`scales` — a zone
     # missing one of those passed this preflight, provisioned a GPU fleet, ran a full inference,
     # and was rejected by assembly afterwards. Absent is a different fault from mistyped.
-    missing = [var for var in REQUIRED_VARS if var not in node]
+    missing = [var for var in REQUIRED_VARS if var not in level0(node)]
     if missing:
         raise ValueError(
             f"{zone} year {year}: the seeded zone group is missing required array(s) {missing} — "
             f"assembly cannot write a cell without them. Re-seed the zone group (D1) before filling."
         )
-    check_destination_types(node, GLOBAL, where=f"{zone} year {year}")
+    check_destination_types(level0(node), GLOBAL, where=f"{zone} year {year}")
 
 
 def _assert_on_zone_grid(node: zarr.Group, zone: str, label: str, store_path: str, coords: SpatialCoords) -> None:
     """Raise unless ``coords`` lie exactly on the seeded zone group's pixel grid."""
-    _, ny, nx, _ = cast(zarr.Array, node["embeddings"]).shape
+    arrays = level0(node)
+    _, ny, nx = cast(zarr.Array, arrays["scales"]).shape
     zone_crs = node.attrs.get("crs")
     y_name, x_name = spatial_dims_of(node)  # the group's own names: v1.1 northing/easting, later y/x
-    z_north = cast(zarr.Array, node[y_name])
-    z_east = cast(zarr.Array, node[x_name])
+    z_north = cast(zarr.Array, arrays[y_name])
+    z_east = cast(zarr.Array, arrays[x_name])
     # Absolute half-pixel tolerance, NOT np.isclose's default relative one: at a ~9.3e6 m
     # northing the default rtol=1e-5 would admit ~93 m (~9 px) of drift. A real shift is
     # >=1 px (10 m); half a pixel (5 m) sits above float32 coordinate roundtrip (~1 m at this
@@ -691,9 +692,9 @@ def _live_tile_bitmap(
     """The zone's ``tile_live_2048`` bitmap, after checking the coverage group matches the seeded
     zone group ``node``: its zone, CRS, pixel grid and tile grid.
     """
-    emb = cast(zarr.Array, node["embeddings"])
-    _, ny, nx, _ = emb.shape
-    shard_px, zone_crs = shard_pitch(emb), node.attrs.get("crs")
+    scales = cast(zarr.Array, level0(node)["scales"])
+    _, ny, nx = scales.shape
+    shard_px, zone_crs = shard_pitch(scales), node.attrs.get("crs")
     cov = open_store_as_zarr_group(land_mask_path, group=zone, get_credentials=get_credentials, region=s3_region)
     cov_zone = cov.attrs.get("zone")
     cov_crs = cov.attrs.get("crs")
@@ -793,7 +794,7 @@ def plan_zone_inference(
         )
     # Validate the year BEFORE any expensive work: assemble_global re-checks,
     # but hitting that check after hours of GPU inference would be brutal.
-    if time_index_of(node, year_timestamp(year)) is None:
+    if time_index_of(level0(node), year_timestamp(year)) is None:
         raise ValueError(
             f"Year {year} is not on {zone}'s pre-allocated time axis — the axis is fixed at seeding (ADR-008 D1)."
         )
@@ -860,9 +861,9 @@ def plan_zone_inference(
         }
         return ZonePlan(zone=zone, year=year, run_id=run_id, t0=t0, summary={}, live=[], done=result)
 
-    emb = cast(zarr.Array, node["embeddings"])
-    _, ny, nx, _ = emb.shape
-    shard_px = shard_pitch(emb)
+    scales = cast(zarr.Array, level0(node)["scales"])
+    _, ny, nx = scales.shape
+    shard_px = shard_pitch(scales)
     if config.chunk_size != shard_px:
         raise ValueError(
             f"config.chunk_size={config.chunk_size} but {zone} shards are {shard_px} px — "
@@ -873,7 +874,7 @@ def plan_zone_inference(
     # the same answer from assembly after the fleet has run: on 2026-08-18 two fills each spent
     # their whole inference before dying on a seeded dtype the staging writer cannot produce.
     # Beside the shard-pitch check above because it is the same kind of gate.
-    check_destination_types(node, GLOBAL, where=f"{zone} year {year}")
+    check_destination_types(level0(node), GLOBAL, where=f"{zone} year {year}")
 
     # Read the coverage mask BEFORE the mosaic: an all-ocean cell, whose ingest mosaic may
     # never have been created, must reach the empty-cell path below rather than fail on a
@@ -923,7 +924,7 @@ def plan_zone_inference(
         if update.mode == "holes":
             holes = stage_hole_masks(
                 node,
-                year_index=cast(int, time_index_of(node, year_timestamp(year))),
+                year_index=cast(int, time_index_of(level0(node), year_timestamp(year))),
                 chunks=live,
                 # Per destination store: a mask describes one store's holes, and one plan may be run
                 # against more than one store sharing the inputs bucket.

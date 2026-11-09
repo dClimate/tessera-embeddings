@@ -43,6 +43,7 @@ from tessera_embeddings.config.inference import (
 )
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
 from tessera_embeddings.config.paths import BucketPaths, check_update_name
+from tessera_embeddings.config.store_geometry import band_axis, level0
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.assembly import SpatialCoords, ZarrWriter, assert_on_store_grid, read_spatial_coords
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, filter_chunks_by_roi_mask
@@ -299,12 +300,13 @@ def _plan_update(
     if mode not in get_args(UpdateMode):
         raise ValueError(f"update mode must be 'holes' or 'shards'; got {mode!r}")
     root = zarr.open_group(open_global_repo(output_path).readonly_session(branch="main").store, mode="r")
-    width = int(cast(zarr.Array, root["embeddings"]).shape[3])
+    embeddings = cast(zarr.Array, level0(root)["embeddings"])
+    width = int(embeddings.shape[cast(int, band_axis(embeddings))])
     assert_on_store_grid(root, spatial, total_y=extent[0], total_x=extent[1], embedding_dim=width, where=output_path)
-    time_index = time_index_of(root, np.datetime64(window, "ns"))
+    time_index = time_index_of(level0(root), np.datetime64(window, "ns"))
     if time_index is None:
         raise ValueError(f"{output_path} holds no {window} window to update; run without `update` first")
-    year = year_of(read_time_values(root)[time_index])
+    year = year_of(read_time_values(level0(root))[time_index])
     if any(record.get("update") == name for record in read_updates(root, year)):
         log.info("Update %s is already recorded on %s for %d — nothing to do", name, output_path, year)
         return None
