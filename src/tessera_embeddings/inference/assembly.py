@@ -62,7 +62,15 @@ from tessera_embeddings.config.inference import (
     TimeWindow,
     model_family,
 )
-from tessera_embeddings.config.store_geometry import dims_of, level0, spatial_dims_of
+from tessera_embeddings.config.store_geometry import (
+    axis_roles,
+    band_axis,
+    dims_of,
+    level0,
+    reorder,
+    spatial_dims_of,
+    window,
+)
 from tessera_embeddings.config.store_layout import (
     CARRIED_VARS,
     INNER_PX,
@@ -73,7 +81,6 @@ from tessera_embeddings.config.store_layout import (
     REQUIRED_VARS,
     SINGLE,
     StoreLayout,
-    trailing_extent,
 )
 from tessera_embeddings.inference.chunk_spec import (
     ChunkSpec,
@@ -464,7 +471,7 @@ def _fill_band_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — retur
     t = int(payload["time_index"])
     y0b, y1b = payload["band"]
     worker_index = payload.get("worker_index", 0)
-    root = zarr.open_group(fork.store, mode="a")
+    root = level0(zarr.open_group(fork.store, mode="a"))
     arrays = {var: cast(zarr.Array, root[var]) for var in payload["variables"]}
     timer = PhaseTimer()
     tiles = writes = nbytes = 0
@@ -472,15 +479,15 @@ def _fill_band_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — retur
     total = len(payload["clear"]) + len(payload["tiles"])
     # The denominator first: the coordinator withholds its figure until every worker has one.
     report_shard_progress(worker_index, 0, total)
-    # Unindexed trailing dims (band) are written in full, so each assignment below covers both
-    # the 3-D and 4-D arrays.
+    # Band and month axes are written whole (`window`), so each assignment below covers the 3-D
+    # and 4-D arrays in either band order.
     for tile in payload["clear"]:
         y0, y1 = max(tile.y_start, y0b), min(tile.y_stop, y1b)
         for arr in arrays.values():
             # Scalar assignment: zarr broadcasts per chunk without materialising the selection,
             # which as a full-band float32 block would be ~2 GB.
             with timer.phase("write"):
-                arr[t : t + 1, y0:y1, tile.x_start : tile.x_stop] = arr.fill_value
+                arr[window(dims_of(arr), t, slice(y0, y1), slice(tile.x_start, tile.x_stop))] = arr.fill_value
             writes += 1
         done += 1
         report_shard_progress(worker_index, done, total)
@@ -500,19 +507,22 @@ def _fill_band_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — retur
                     f"array is {arr.dtype} — a silent cast would corrupt the output."
                 )
             # Shape too: a singleton spatial or band dim would broadcast over the destination
-            # region and commit repeated values. 4-D destination (embeddings/std) takes a
-            # (h, w, band) staged tile; 3-D (scales/obs) takes (h, w).
-            spatial_hw = (tile.y_stop - tile.y_start, tile.x_stop - tile.x_start)
-            expected_shape = (*spatial_hw, arr.shape[3]) if arr.ndim == 4 else spatial_hw
+            # region and commit repeated values. Compared axis by axis by role, so a staged tile
+            # in either band order is held to the destination's band or month width.
+            size = dict(zip(axis_roles(dims_of(arr)), arr.shape, strict=True))
+            size.update(Y=tile.y_stop - tile.y_start, X=tile.x_stop - tile.x_start)
+            staged_dims = dims_of(staged_arr)
+            expected_shape = tuple(size[role] for role in axis_roles(staged_dims))
             if staged_arr.shape != expected_shape:
                 raise ValueError(
                     f"Staged tile {path} variable {var!r} has shape {staged_arr.shape}, expected "
                     f"{expected_shape} — a singleton/off-grid dim would broadcast and corrupt the output."
                 )
             with timer.phase("read"):
-                block = np.asarray(staged_arr[y0 - tile.y_start : y1 - tile.y_start])[np.newaxis]
+                rows = window(staged_dims, t, slice(y0 - tile.y_start, y1 - tile.y_start), slice(None))
+                block = reorder(np.asarray(staged_arr[rows]), staged_dims, dims_of(arr))
             with timer.phase("write"):
-                arr[t : t + 1, y0:y1, tile.x_start : tile.x_stop] = block
+                arr[window(dims_of(arr), t, slice(y0, y1), slice(tile.x_start, tile.x_stop))] = block
             writes += 1
             nbytes += block.nbytes
         # Drop the group reference so its file handles / S3 connections are collectable before
@@ -711,7 +721,9 @@ class StagedShardSource:
 
     The global write path's 1:1 mapping (ADR-008 D3): one staged 2048-px inference tile is
     exactly one output shard, so ``live_shards`` is the staged tile grid positions and ``load``
-    returns each staged variable whole with a leading time axis. Every tile is validated as it is
+    returns each staged variable whole with a leading time axis, in its destination array's axis
+    order (``dest_dims``), so a band-last staged tile lands in a band-first store and either order
+    stages into either. Every tile is validated as it is
     read — each expected variable present, exactly one shard tall and wide, matching the probe's
     dtype — so a truncated, mixed-version or corrupt staged run fails loudly, naming the tile and
     variable, rather than silently casting or leaving fill inside a shard of a year that then
@@ -724,6 +736,7 @@ class StagedShardSource:
     shards: tuple[tuple[int, int], ...]
     variables: tuple[str, ...]
     shard_px: int
+    dest_dims: tuple[tuple[str, tuple[str, ...]], ...]  # (var, the destination array's dimension names)
     dtypes: tuple[tuple[str, str], ...] = ()  # (var, dtype) expectations from the probe
     embedding_dim: int = 0  # band width for 4-D vars; 0 = skip the band check
     # Optional vars present in the DESTINATION. A tile carrying one that is NOT in `variables`
@@ -758,7 +771,7 @@ class StagedShardSource:
         return [*self.shards, *self.cleared]
 
     def load(self, shard: tuple[int, int]) -> dict[str, np.ndarray]:
-        """Read one staged tile whole and return ``{var: (1, h, w[, band]) block}``."""
+        """Read one staged tile whole and return ``{var: block}``, each in its destination's axis order."""
         if shard in self.cleared:
             return self._fill_block(shard)
         sy, sx = shard
@@ -772,29 +785,28 @@ class StagedShardSource:
                     f"Staged tile {path} is missing variable {var!r} (present in the probed tile) — "
                     "heterogeneous staged run; re-stage or fix before assembling."
                 )
-            block = np.asarray(cast(zarr.Array, group[var])[:])[np.newaxis]
+            block = self._in_dest_order(var, cast(zarr.Array, group[var]))
             want = expected_dtypes.get(var)
             if want is not None and str(block.dtype) != want:
                 raise ValueError(
                     f"Staged tile {path} has {var} dtype {block.dtype}, expected {want} — a raw-zarr "
                     "write would silently C-cast (wraparound); mixed-version or corrupt staged run."
                 )
-            h, w = block.shape[1:3]
+            size = dict(zip(axis_roles(dict(self.dest_dims)[var]), block.shape, strict=True))
+            h, w = size["Y"], size["X"]
             if (h, w) != tile_extent(shard, self.shard_px, self.extent):
                 raise ValueError(
                     f"Staged tile {path} has {var} extent {h} x {w} px but shards are {self.shard_px} px — "
                     "truncated or off-grid tile (ADR-008 D3 requires whole tiles)."
                 )
-            # Trailing axis of 4-D vars too: a (1, px, px, 1) block would broadcast across every
-            # destination band/month and commit repeated values under a check that only looked at
-            # [1:3]. The expected width is per-variable (`trailing_extent`) because the two 4-D
-            # axes differ — bands are as wide as the embedding, months are twelve.
-            want_trailing = trailing_extent(var, self.embedding_dim)
-            if want_trailing and block.ndim == 4 and block.shape[3] != want_trailing:
-                raise ValueError(
-                    f"Staged tile {path} has {var} trailing width {block.shape[3]} but expected "
-                    f"{want_trailing} — a singleton axis would broadcast over the output."
-                )
+            # The band or month axis too: a singleton one would broadcast across every destination
+            # band or month and commit repeated values under a check that only looked at the extent.
+            for role, width in self._widths().items():
+                if width and role in size and size[role] != width:
+                    raise ValueError(
+                        f"Staged tile {path} has {var} {role} width {size[role]} but expected "
+                        f"{width} — a singleton axis would broadcast over the output."
+                    )
             blocks[var] = block
         # Heterogeneous-stage check on EVERY tile, not a first/last sample: an optional var
         # present in the destination but absent from the assembled `variables` (the probe tile
@@ -806,6 +818,14 @@ class StagedShardSource:
                 f"{list(self.variables)} — heterogeneous staged run; re-stage with one config before assembling."
             )
         return blocks
+
+    def _widths(self) -> dict[str, int]:
+        """Each non-spatial axis's expected width: bands as wide as the embedding (0 skips it), twelve months."""
+        return {"band": self.embedding_dim, "month": MONTHS_IN_YEAR}
+
+    def _in_dest_order(self, var: str, staged: zarr.Array) -> np.ndarray:
+        """A staged array, read whole, as a block in *var*'s destination axis order."""
+        return reorder(np.asarray(staged[:]), dims_of(staged), dict(self.dest_dims)[var])
 
     def pixels(self, shard: tuple[int, int]) -> np.ndarray | None:
         """The pixels a targeted update owns in ``shard``, or ``None`` when the run owns it whole."""
@@ -832,11 +852,9 @@ class StagedShardSource:
         dtypes = dict(self.dtypes)
         fills = dict(self.fill_values)
         blocks: dict[str, np.ndarray] = {}
+        size = {"time": 1, "Y": self.shard_px, "X": self.shard_px, **self._widths()}
         for var in self.variables:
-            shape: tuple[int, ...] = (1, self.shard_px, self.shard_px)
-            trailing = trailing_extent(var, self.embedding_dim)
-            if trailing:
-                shape = (*shape, trailing)
+            shape = tuple(size[role] for role in axis_roles(dict(self.dest_dims)[var]))
             blocks[var] = np.full(shape, fills.get(var, 0), dtype=np.dtype(dtypes.get(var, "float32")))
         if shard is None:
             return blocks
@@ -854,7 +872,7 @@ class StagedShardSource:
         for var in self.variables:
             if var not in group:
                 continue
-            block = np.asarray(cast(zarr.Array, group[var])[:])[np.newaxis]
+            block = self._in_dest_order(var, cast(zarr.Array, group[var]))
             want = dtypes.get(var)
             if want is not None and str(block.dtype) != want:
                 raise ValueError(
@@ -2449,9 +2467,10 @@ class ZarrWriter:
         must not pass). Every other tile is re-validated by ``StagedShardSource.load`` as it is
         read.
         """
-        embeddings = cast(zarr.Array, node["embeddings"])
-        shard_px = shard_pitch(embeddings)
-        extent = cast("tuple[int, int]", tuple(embeddings.shape[1:3]))
+        # `scales` is (time, Y, X) in every layout, so it gives the pitch and extent whatever the band order.
+        scales = cast(zarr.Array, node["scales"])
+        shard_px = shard_pitch(scales)
+        extent = cast("tuple[int, int]", tuple(scales.shape[1:3]))
         probe_path = f"{self.staging_base}/{run_id}/{label}.zarr"
         staged_group = zarr.open_group(probe_path, mode="r", storage_options=_staged_storage_options(probe_path))
         missing = [v for v in REQUIRED_VARS if v not in staged_group]
@@ -2467,7 +2486,7 @@ class ZarrWriter:
                     f"Staged tile {probe_path} has {var} dtype {got}, expected {np.dtype(want)} — "
                     "a raw-zarr write would silently C-cast (wraparound); re-stage correctly."
                 )
-        staged_shape = tuple(cast(zarr.Array, staged_group["embeddings"]).shape[:2])
+        staged_shape = tuple(cast(zarr.Array, staged_group["scales"]).shape)
         if staged_shape != tile_extent(parse_chunk_label(label), shard_px, extent):
             raise ValueError(
                 f"Staged tiles are {staged_shape[0]} x {staged_shape[1]} px but {zone} shards are "
@@ -2655,11 +2674,13 @@ class ZarrWriter:
                 f"({np.datetime_as_string(read_time_values(node), unit='D').tolist()}) — "
                 "the axis is fixed at seeding (ADR-008 D1)."
             )
-        shard_px = shard_pitch(cast(zarr.Array, node["embeddings"]))
-        extent = cast("tuple[int, int]", tuple(cast(zarr.Array, node["embeddings"]).shape[1:3]))
+        # `scales` is (time, Y, X) in every layout, so it gives the pitch and extent whatever the band order.
+        shard_px = shard_pitch(cast(zarr.Array, node["scales"]))
+        extent = cast("tuple[int, int]", tuple(cast(zarr.Array, node["scales"]).shape[1:3]))
         # Destination band width is the authority for the staged-tile band check, NOT
         # ZarrWriter.embedding_dim, which defaults to 128 and need not match a zone seeded wider.
-        dest_band = int(cast(zarr.Array, node["embeddings"]).shape[-1])
+        embeddings = cast(zarr.Array, node["embeddings"])
+        dest_band = int(embeddings.shape[cast(int, band_axis(embeddings))])
 
         missing_dst = [v for v in ("embeddings", "scales") if v not in node]
         if missing_dst:
@@ -2713,6 +2734,7 @@ class ZarrWriter:
             shards=shards,
             variables=variables,
             shard_px=shard_px,
+            dest_dims=tuple((v, dims_of(node[v])) for v in variables),
             dtypes=probe_dtypes,
             embedding_dim=dest_band,
             optional_present=dest_optional,

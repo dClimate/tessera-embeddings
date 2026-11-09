@@ -64,6 +64,9 @@ from tessera_embeddings.storage.zarr_store import (
 )
 from tests.unit.inference_stack import IDENTITY, OTHER_STACK, STACK, identity
 
+#: How the staging writer names a staged tile's axes.
+STAGED_4D = ("northing", "easting", "band")
+
 _V2_STACK = {**STACK, "model_version": "v2-large", "checkpoint_id": "v2_student_large"}
 
 
@@ -2154,10 +2157,10 @@ class TestAssembleGlobal:
         """Hand-roll a staged tile (embeddings int8 + scales float32, plus *extra*)."""
         path = str(tmp_path / "staging" / run_id / f"{label}.zarr")
         g = zarr.open_group(path, mode="w")
-        g.create_array("embeddings", data=np.ones((self.TILE, self.TILE, dim), dtype="int8"))
-        g.create_array("scales", data=np.ones((self.TILE, self.TILE), dtype="float32"))
+        g.create_array("embeddings", data=np.ones((self.TILE, self.TILE, dim), dtype="int8"), dimension_names=STAGED_4D)
+        g.create_array("scales", data=np.ones((self.TILE, self.TILE), dtype="float32"), dimension_names=STAGED_4D[:2])
         for name, arr in (extra or {}).items():
-            g.create_array(name, data=arr)
+            g.create_array(name, data=arr, dimension_names=GLOBAL.for_var(name).dims[1:])
         _mark_staged_complete(path)  # assembly requires both completion signals
 
     def _fill_on_stack(self, tmp_path, stack=STACK, *, root_attrs=None):

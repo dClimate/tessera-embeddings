@@ -257,9 +257,13 @@ def test_a_resumed_fill_records_skips_an_earlier_leg_wrote(tmp_path, monkeypatch
     assert np.all(np.asarray(node["embeddings"][1])[_TILE:, _TILE:] == 0)
 
 
-def test_fill_zone_year_end_to_end(tmp_path, monkeypatch):
-    """Live tiles land as shards at the year index; the cell is tagged and cleaned up."""
-    store = _seed_global(tmp_path)
+@LAYOUTS
+def test_fill_zone_year_end_to_end(tmp_path, monkeypatch, layout):
+    """Live tiles land as shards at the year index; the cell is tagged and cleaned up.
+
+    In either layout: a v2 zone holds its arrays in level group 0, band-first.
+    """
+    store = _seed_global(tmp_path, layout)
     mosaic_base = _make_mosaic(tmp_path)
     mask = _make_mask(tmp_path, [(0, 0), (0, 1), (1, 1)])
     staged: dict[str, np.ndarray] = {}
@@ -275,9 +279,10 @@ def test_fill_zone_year_end_to_end(tmp_path, monkeypatch):
 
     repo = global_store.open_global_repo(store)
     assert repo.lookup_tag("zone-01N-2025") == summary["snapshot_id"]
-    node = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[_ZONE]
-    assert node.attrs["years_complete"] == [2025]
-    assert node.attrs["runs"]["2025"]["run_id"] == "runZ"
+    zone = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[_ZONE]
+    assert zone.attrs["years_complete"] == [2025]
+    assert zone.attrs["runs"]["2025"]["run_id"] == "runZ"
+    node = zone[layout.level] if layout.level else zone
     # Label accuracy under the calendar-year GUARANTEE: the slot's `time` point is
     # Jan 1 (the window start) and the seeded time_bnds state the slot's true
     # interval, half-open [Jan 1 2025, Jan 1 2026) — the window the strict gate required.
@@ -287,6 +292,8 @@ def test_fill_zone_year_end_to_end(tmp_path, monkeypatch):
     assert np.asarray(node["time"][1]).astype("datetime64[ns]").astype("datetime64[D]").astype(str) == "2025-01-01"
     # 2025 is index 1 on the (2024, 2025) axis; staged tiles match, ocean tile is fill.
     result = np.asarray(node["embeddings"][1])
+    if layout.level:
+        result = result.transpose(1, 2, 0)  # band-first back to the stub's (y, x, band)
     assert np.all(result[_TILE:, :_TILE] == 0), "unmasked tile must stay at fill"
     for label, emb in staged.items():
         row, col = (int(p) for p in label.split("_")[1:])

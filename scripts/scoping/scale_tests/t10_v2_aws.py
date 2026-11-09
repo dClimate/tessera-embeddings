@@ -452,6 +452,7 @@ def phase_assemble(
                 shards=tuple(parse_chunk_label(label) for label in picks),
                 variables=variables,
                 shard_px=TILE,
+                dest_dims=tuple((v, tuple(grp[v].metadata.dimension_names)) for v in variables),
                 dtypes=dtypes,
                 embedding_dim=V.BAND,
                 extent=(ny, nx),

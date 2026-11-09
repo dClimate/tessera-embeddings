@@ -56,7 +56,7 @@ import zarr
 
 from tessera_embeddings.config.environment import code_identity, configure_logging
 from tessera_embeddings.config.fault_injection import ArmedFault
-from tessera_embeddings.config.store_geometry import dims_of, level0
+from tessera_embeddings.config.store_geometry import axis_roles, dims_of, level0, window
 from tessera_embeddings.config.store_layout import SHARD_PX
 from tessera_embeddings.storage.conventions import STACK_ATTR, assert_stack_matches, library_stack
 from tessera_embeddings.storage.icechunk_logging import traced_commit
@@ -173,7 +173,8 @@ class ShardSource(Protocol):
     def load(self, shard: tuple[int, int]) -> dict[str, np.ndarray]:
         """Return ``{var_name: block}`` for a shard - each block covers the whole
         (edge-clamped) shard region with ocean inner chunks at the array fill
-        value. Return ``{}`` to skip a shard entirely.
+        value, with a one-slot time axis and in the destination array's axis order.
+        Return ``{}`` to skip a shard entirely.
         """
         ...
 
@@ -864,16 +865,20 @@ def _write_shards_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 - retu
             if arr is None:
                 arr = arrays[var] = cast(zarr.Array, node[var])
             y0, x0 = sy * shard_px, sx * shard_px
-            h, w = block.shape[1], block.shape[2]
-            # Trailing dims (band) not indexed are written in full, so one
-            # assignment covers both the 3-D and 4-D arrays.
-            region = (slice(year, year + 1), slice(y0, y0 + h), slice(x0, x0 + w))
+            # The block is in the array's own axis order (ShardSource's contract). Band and month
+            # axes are written whole, so one assignment covers the 3-D and 4-D arrays in either
+            # band order.
+            roles = axis_roles(dims_of(arr))
+            h, w = block.shape[roles.index("Y")], block.shape[roles.index("X")]
+            region = window(dims_of(arr), year, slice(y0, y0 + h), slice(x0, x0 + w))
             if owned is not None:
                 # One variable at a time, so the extra memory is one shard of the widest array.
+                # The (h, w) pixel mask is broadcast over every other axis by role.
                 with timer.phase("pixel_merge"):
-                    merged = np.asarray(arr[region])
-                    merged[:, owned] = block[:, owned]
-                    block = merged
+                    mask = owned.reshape(
+                        [n if role in ("Y", "X") else 1 for role, n in zip(roles, block.shape, strict=True)]
+                    )
+                    block = np.where(mask, block, np.asarray(arr[region]))
             with timer.phase("write"):
                 arr[region] = block
             writes += 1

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, cast
 
+import numpy as np
 import zarr
 
 if TYPE_CHECKING:
@@ -51,6 +52,39 @@ def band_axis(array: zarr.Array | xr.DataArray) -> int | None:
     """
     names = dims_of(array)
     return names.index("band") if "band" in names else None
+
+
+#: The axes that are not spatial. Every other axis is Y then X, in that order, whatever it is named: a
+#: staged tile says ``northing``/``easting`` where a v2 store says ``y``/``x``.
+_NAMED_ROLES = ("time", "band", "month")
+
+
+def axis_roles(names: tuple[str, ...]) -> tuple[str, ...]:
+    """Each axis's role: ``time``, ``band`` or ``month`` by name, and ``Y`` then ``X`` for the others."""
+    spatial = iter(("Y", "X"))
+    return tuple(name if name in _NAMED_ROLES else next(spatial) for name in names)
+
+
+def window(names: tuple[str, ...], time_index: int, ys: slice, xs: slice) -> tuple[slice, ...]:
+    """The index of one time slot's ``ys`` by ``xs`` window into an array with axes *names*.
+
+    In the array's own axis order; band and month axes are taken whole. An array with no time
+    axis, such as a staged tile, is indexed by its spatial window alone.
+    """
+    by_role = {"time": slice(time_index, time_index + 1), "Y": ys, "X": xs}
+    return tuple(by_role.get(role, slice(None)) for role in axis_roles(names))
+
+
+def reorder(block: np.ndarray, source: tuple[str, ...], target: tuple[str, ...]) -> np.ndarray:
+    """*block*, laid out with axes *source*, as a view in the axis order of *target*.
+
+    Axes are matched by role, so a staged ``(northing, easting, band)`` tile lands in a
+    ``(time, band, y, x)`` array; a *target* time axis the block lacks is added, one slot long.
+    """
+    roles = axis_roles(source)
+    if "time" in axis_roles(target) and "time" not in roles:
+        block, roles = block[np.newaxis], ("time", *roles)
+    return block.transpose([roles.index(role) for role in axis_roles(target)])
 
 
 def spatial_dims_of(group: zarr.Group | xr.Dataset) -> tuple[str, str]:

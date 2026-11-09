@@ -289,20 +289,6 @@ REQUIRED_VARS: tuple[str, str] = ("embeddings", "scales")
 CARRIED_VARS: tuple[str, ...] = tuple(v for v in SINGLE.arrays if v not in REQUIRED_VARS)
 
 
-def trailing_extent(var: str, embedding_dim: int) -> int | None:
-    """The trailing-axis extent a 4-D *var* must have, or ``None`` if it is 2-D per timestep.
-
-    Read off the layout's own dims rather than a list of variable names, because the two 4-D
-    trailing axes differ in width: ``band`` is as wide as the embedding, ``month`` is twelve. A
-    single "4-D means band" rule rejects a correct month tile and shapes a cleared one wrongly.
-    ``None`` for an unknown var, or for a band axis when *embedding_dim* is 0 (check disabled).
-    """
-    dims = SINGLE.arrays[var].dims if var in SINGLE.arrays else ()
-    if len(dims) != 4:
-        return None
-    return MONTHS_IN_YEAR if dims[3] == "month" else (embedding_dim or None)
-
-
 #: The global campaign (ADR-008 D3). No ``embedding_std``, ever — see :func:`_sharded_arrays`.
 GLOBAL = StoreLayout(name="global", arrays=_sharded_arrays(include_std=False))
 
