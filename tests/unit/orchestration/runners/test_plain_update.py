@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import zarr
 
+from tessera_embeddings.config.store_geometry import band_axis, level0
 from tessera_embeddings.config.store_layout import DIMS_3D, DIMS_4D, ArrayLayout, StoreLayout
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.assembly import SpatialCoords, ZarrWriter
@@ -16,6 +17,7 @@ from tessera_embeddings.orchestration.runners.plain import _plan_update, _write_
 from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.update import base_tag, read_updates
 from tests.unit.inference_stack import IDENTITY, OTHER_STACK, STACK
+from tests.unit.orchestration.runners.test_zone_fill import SMALL_V2
 
 log = logging.getLogger("test_plain_update")
 
@@ -45,16 +47,20 @@ def _stage(writer: ZarrWriter, run_id: str, value: int, *, holes: bool, stack: d
         writer.write_chunk(chunk, emb, run_id, scales=scales, stack=stack)
 
 
-@pytest.fixture()
-def area(tmp_path):
-    """A single-area store holding one window, filled with 1s around its holes."""
+@pytest.fixture(params=[SMALL, SMALL_V2], ids=["v1", "v2"])
+def area(tmp_path, request):
+    """A single-area store holding one window, filled with 1s around its holes.
+
+    In both layouts: a v2 store keeps its arrays band-first in level group 0, staged band-first.
+    """
     roi = str(tmp_path / "roi.zarr")
     zarr.open(roi, mode="w", shape=(_NY, _NX), chunks=(_NY, _NX), dtype="bool")[:] = True
-    writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=_BAND)
+    layout = request.param
+    writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=_BAND, band_first=layout.band_first)
     _stage(writer, "fill", 1, holes=True)
     output = str(tmp_path / "out.zarr")
     writer.assemble(
-        CHUNKS, _NY, _NX, "fill", output, roi_zarr_path=roi, time_window=WINDOW, n_workers=1, layout=SMALL, **IDENTITY
+        CHUNKS, _NY, _NX, "fill", output, roi_zarr_path=roi, time_window=WINDOW, n_workers=1, layout=layout, **IDENTITY
     )
     return {"writer": writer, "output": output, "holes": str(tmp_path / "holes")}
 
@@ -89,6 +95,12 @@ def _update(area, *, stack: dict = STACK, **update):
     return zarr.open_group(open_global_repo(area["output"]).readonly_session(branch="main").store, mode="r")
 
 
+def _band0(root: zarr.Group) -> np.ndarray:
+    """The first band of the store's one window, as a (y, x) plane, in either band order."""
+    embeddings = level0(root)["embeddings"]
+    return np.asarray(embeddings[0, 0] if band_axis(embeddings) == 1 else embeddings[0, :, :, 0])
+
+
 def test_an_update_on_another_stack_is_refused(area):
     with pytest.raises(ValueError, match="Refusing to write"):
         _update(area, stack=OTHER_STACK)
@@ -96,10 +108,10 @@ def test_an_update_on_another_stack_is_refused(area):
 
 def test_a_holes_update_fills_only_the_holes_and_records_itself(area):
     root = _update(area)
-    emb = np.asarray(root["embeddings"][0, :, :, 0])
+    emb = _band0(root)
     assert (emb[:_TILE, : _TILE // 2] == 2).all() and (emb[_TILE:, _TILE:] == 2).all()  # the holes
     assert (emb[:_TILE, _TILE // 2 : _TILE] == 1).all() and (emb[:, :_TILE][_TILE:] == 1).all()  # never touched
-    assert not np.isnan(np.asarray(root["scales"][0])).any()
+    assert not np.isnan(np.asarray(level0(root)["scales"][0])).any()
     [record] = read_updates(root, 2025)
     assert (record["update"], record["mode"], record["written"]) == ("u1", "holes", ["chunk_0_0", "chunk_1_1"])
     assert record["kept"] == ["chunk_0_1", "chunk_1_0"]
@@ -108,7 +120,7 @@ def test_a_holes_update_fills_only_the_holes_and_records_itself(area):
 
 
 def test_a_shards_update_rewrites_only_its_tiles_whole(area):
-    emb = np.asarray(_update(area, mode="shards", tiles=["chunk_1_1"])["embeddings"][0, :, :, 0])
+    emb = _band0(_update(area, mode="shards", tiles=["chunk_1_1"]))
     assert (emb[_TILE:, _TILE:] == 2).all()
     assert (emb[:_TILE, _TILE // 2 :] == 1).all() and (emb[:_TILE, : _TILE // 2] == 0).all()
 

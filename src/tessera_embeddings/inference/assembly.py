@@ -4,7 +4,9 @@ Staged writes (one Zarr per chunk) use raw uncompressed bytes for zero CPU overh
 actors, in inner-chunk-sized pieces (``INNER_PX`` = 256 px, full band), so a staged tile is
 exactly the inner-chunk grid of the output region it becomes. The final Icechunk store's geometry
 (chunks, shards, codecs) comes from a :class:`StoreLayout` preset — ``SINGLE`` for single-ROI
-stores, ``GLOBAL`` for the global campaign's zone groups.
+stores, ``GLOBAL`` for the global campaign's zone groups, or their v2 counterparts, which hold the
+embeddings band-first in a level group ``0`` (ADR 031). Staged tiles are written in the order
+their store holds them, and every reader takes a tile's order from its axis names.
 
 Assembly is raw-zarr, not Dask: the coordinator forks an icechunk session, worker processes write
 staged-tile pixels straight into the output arrays by plain zarr assignment, and the coordinator
@@ -79,8 +81,8 @@ from tessera_embeddings.config.store_layout import (
     MONTHS_IN_YEAR,
     OBS_COUNT_VARS,
     REQUIRED_VARS,
-    SINGLE,
     StoreLayout,
+    layout_for,
 )
 from tessera_embeddings.inference.chunk_spec import (
     ChunkSpec,
@@ -425,21 +427,22 @@ def _layout_matching_store(root: zarr.Group, layout: StoreLayout, variables: Ite
     does not merely make the store mixed — it makes it unassemblable. A store written before a
     preset changed still accepts appends, and gaining a variable must not be what breaks it.
 
-    Geometry comes from an existing array of the same rank; there always is one, since
-    ``embeddings`` and ``scales`` are mandatory and cover 4-D and 3-D. Only chunks and shards are
-    copied — dtype, fill value and codec are properties of the variable, not the store's tiling.
-    A rank nothing in the store shares falls through to the layout unchanged.
+    Geometry comes from an existing array with the same axes, by role (:func:`axis_roles`), so a
+    band-first ``embeddings`` never donates to a month array of the same rank. ``embeddings`` and
+    ``scales`` are mandatory, so ``embedding_std`` and the 3-D arrays always find one. Only chunks
+    and shards are copied — dtype, fill value and codec are properties of the variable, not the
+    store's tiling. Axes nothing in the store shares fall through to the layout unchanged.
     """
-    donors: dict[int, tuple[tuple[int, ...], tuple[int, ...] | None]] = {}
+    donors: dict[tuple[str, ...], tuple[tuple[int, ...], tuple[int, ...] | None]] = {}
     for name, array in root.arrays():
         if name not in layout.arrays:
             continue  # coordinates and time_bnds tile on their own terms
-        donors.setdefault(array.ndim, (array.chunks, array.shards))
+        donors.setdefault(axis_roles(dims_of(array)), (array.chunks, array.shards))
 
     adjusted = dict(layout.arrays)
     for var in variables:
         original = layout.for_var(var)
-        donor = donors.get(len(original.dims))
+        donor = donors.get(axis_roles(original.dims))
         if donor is None:
             continue
         chunks, shards = donor
@@ -1959,11 +1962,13 @@ class ZarrWriter:
         Geometry comes from the :class:`StoreLayout` preset — the single source of truth, shared
         with the global store's seeder — not from the staged files, so the on-disk output is
         identical however inference tiled the mosaic. Cost is independent of extent, since no
-        pixels are written.
+        pixels are written. A layout with a level group puts the arrays and coordinates in it
+        (ADR 031 §1); the store's attrs stay on *root*.
         """
         variables = list(variables)
         y, x = layout.spatial_dims
         sizes = {"time": 1, y: total_y, x: total_x, "band": self.embedding_dim, "month": MONTHS_IN_YEAR}
+        root = root.require_group(layout.level) if layout.level else root
         create_layout_arrays(root, layout, variables, sizes)
         coords: dict[str, np.ndarray] = {
             "time": np.asarray([time_date], dtype="datetime64[ns]"),
@@ -2023,10 +2028,11 @@ class ZarrWriter:
             )
             # Variables staged by this run but absent from the store (a store created before obs
             # counts, or compute_std newly on) are created schema-only at the current time extent;
-            # prior timesteps read back as the layout fill.
-            missing = [v for v in run.variables if v not in root]
+            # prior timesteps read back as the layout fill. In the store's level group, if it has one.
+            arrays = level0(root)
+            missing = [v for v in run.variables if v not in arrays]
             if missing:
-                nt = cast(zarr.Array, root["time"]).shape[0]
+                nt = cast(zarr.Array, arrays["time"]).shape[0]
                 y, x = run.layout.spatial_dims
                 sizes = {
                     "time": nt,
@@ -2035,16 +2041,16 @@ class ZarrWriter:
                     "band": self.embedding_dim,
                     "month": MONTHS_IN_YEAR,
                 }
-                create_layout_arrays(root, _layout_matching_store(root, run.layout, missing), missing, sizes)
-                if any(var in missing for var in MONTH_COVERED_VARS) and "month" not in root:
+                create_layout_arrays(arrays, _layout_matching_store(arrays, run.layout, missing), missing, sizes)
+                if any(var in missing for var in MONTH_COVERED_VARS) and "month" not in arrays:
                     # The axis this array introduces to a store that predates it; without the
                     # coordinate a reader gets a positional month axis and must know it is 0-based
                     # (see `_create_schema`).
-                    _write_coord_arrays(root, {"month": np.asarray(MONTH_COORD, dtype="int16")})
+                    _write_coord_arrays(arrays, {"month": np.asarray(MONTH_COORD, dtype="int16")})
                 _log.info(
                     "Created missing variable(s) %s in %s from layout %s", missing, run.output_path, run.layout.name
                 )
-            time_index_found = time_index_of(root, run.time_date)
+            time_index_found = time_index_of(arrays, run.time_date)
             if time_index_found is not None:
                 time_index = time_index_found
                 overwrite = True
@@ -2055,13 +2061,11 @@ class ZarrWriter:
                 # exists. Reset those slices to fill so the timestep is internally consistent.
                 untouched = [
                     name
-                    for name, arr in root.arrays()
-                    if name != "time"
-                    and name not in run.variables
-                    and (getattr(arr.metadata, "dimension_names", None) or ("",))[0] == "time"
+                    for name, arr in arrays.arrays()
+                    if name != "time" and name not in run.variables and dims_of(arr)[:1] == ("time",)
                 ]
                 for name in untouched:
-                    arr = cast(zarr.Array, root[name])
+                    arr = cast(zarr.Array, arrays[name])
                     arr[time_index] = arr.fill_value if arr.fill_value is not None else 0
                 # Newly created vars and the untouched-reset must be committed before the Phase 2
                 # fork, which opens a fresh session.
@@ -2079,7 +2083,7 @@ class ZarrWriter:
                     f"; untouched vars reset to fill: {untouched}" if untouched else "",
                 )
             else:
-                time_index = _extend_time_axis(root, run.time_date)
+                time_index = _extend_time_axis(arrays, run.time_date)
                 traced_commit(
                     session,
                     f"Run {run.run_id}: extend time axis to {run.time_date}"
@@ -2144,7 +2148,7 @@ class ZarrWriter:
         n_workers: int,
         get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
         s3_region: str | None = None,
-        layout: StoreLayout = SINGLE,
+        layout: StoreLayout | None = None,
     ) -> str:
         """Assemble staged chunk Zarrs into a standalone Icechunk store.
 
@@ -2157,8 +2161,8 @@ class ZarrWriter:
 
         Create-or-extend semantics on the time axis:
 
-        * fresh store → schema and coords from ``layout`` (``SINGLE`` by default: today's
-          single-ROI geometry, D8) in a first metadata-only commit;
+        * fresh store → schema and coords from ``layout`` (the model's preset by default) in a
+          first metadata-only commit;
         * existing store, new time value → every time-dimmed array is explicitly resized by one
           step in a first commit;
         * existing store, time value already present → that index is overwritten in place, so a
@@ -2207,8 +2211,9 @@ class ZarrWriter:
             get_credentials: Optional icechunk credential callback for the output store (see
                 ``zarr_store._create_storage``).
             s3_region: Optional S3 region override for the output store.
-            layout: Output geometry preset. ``SINGLE`` (default) reproduces today's single-ROI
-                stores exactly; only new stores consult it.
+            layout: Output geometry preset, by default the model's (:func:`layout_for`): v1.1's
+                ``SINGLE``, or v2's band-first ``SINGLE_V2`` in level group ``0``. Only new stores
+                consult its geometry.
 
         Returns:
             Path to the assembled output store.
@@ -2338,9 +2343,12 @@ class ZarrWriter:
         root = zarr.open_group(session.store, mode="a")
         # "time" absent means a created-but-never-seeded repo (a crash between repo creation and
         # the schema commit) — treat as fresh.
-        fresh = is_new or "time" not in root
-        # A new store takes its model's Y/X names; an existing one keeps its own, whatever the model.
-        layout = layout.with_spatial_dims(model_family(model_version).spatial_dims if fresh else spatial_dims_of(root))
+        fresh = is_new or "time" not in level0(root)
+        # A new store takes its model's layout and Y/X names; an existing one keeps its own names,
+        # and its arrays' geometry, whatever the model.
+        layout = (layout or layout_for(model_version, single=True)).with_spatial_dims(
+            model_family(model_version).spatial_dims if fresh else spatial_dims_of(root)
+        )
         run = _AssemblyRun(
             run_id=run_id,
             output_path=output_path,
@@ -2360,7 +2368,7 @@ class ZarrWriter:
 
         # --- Phase 2: banded parallel fill (fork/merge) -----------------------
         session = repo.writable_session(work_branch)
-        granularity = _write_granularity(zarr.open_group(session.store, mode="r"), variables)
+        granularity = _write_granularity(level0(zarr.open_group(session.store, mode="r")), variables)
         # On a same-date overwrite, clear EVERY destination chunk this run does not write, not
         # just the ROI-live ones it skip-marked: a prior run under a LARGER or shifted ROI may have
         # written real data outside THIS run's ROI, which would survive as stale published
@@ -2406,6 +2414,7 @@ class ZarrWriter:
             x_coords=spatial.easting if spatial else None,
             checkpoint_id=checkpoint_id,
             model_version=model_version,
+            level=layout.level,
         )
         if conv_attrs:
             attrs.update(conv_attrs)

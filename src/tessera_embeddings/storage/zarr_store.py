@@ -59,7 +59,7 @@ from tenacity import (
 )
 
 from tessera_embeddings.config.ingest import INGEST_COMPRESSORS, mosaic_chunk_layout
-from tessera_embeddings.config.store_geometry import spatial_dims_of
+from tessera_embeddings.config.store_geometry import level0, spatial_dims_of
 from tessera_embeddings.errors import CorruptedStoreError, NonMonotonicDateError
 from tessera_embeddings.storage.manifest import MIXED_CODE_IDENTITIES_ATTR, IngestManifest, extract_manifest
 from tessera_embeddings.storage.region_writes import (
@@ -882,13 +882,22 @@ def _open_readonly(
 
     ``group`` selects a Zarr group within the store (the global store's per-zone layout);
     ``None`` reads the root. Readers should target a single group and never open the whole
-    120-group repo as a datatree (~200x slower — ADR-008 D5).
+    120-group repo as a datatree (~200x slower — ADR-008 D5). A group that keeps its arrays in a
+    level group ``0`` (a v2 store, ADR 031 §1) is read from there, with the group's own attrs —
+    CRS, ``spatial:``, ``geoemb:`` — carried onto the dataset beneath the level's.
     """
     repo = open_repo(store_path, get_credentials=get_credentials, region=region)
     session = repo.readonly_session(branch="main")
+    node = zarr.open_group(session.store, mode="r", path=group or "")
+    level = level0(node)
+    path = level.path or None
     if isinstance(chunks, _ChunksUnset):
-        return xr.open_zarr(session.store, consolidated=False, group=group)
-    return xr.open_zarr(session.store, consolidated=False, chunks=chunks, group=group)
+        ds = xr.open_zarr(session.store, consolidated=False, group=path)
+    else:
+        ds = xr.open_zarr(session.store, consolidated=False, chunks=chunks, group=path)
+    if level is not node:
+        ds.attrs = {**dict(node.attrs), **ds.attrs}
+    return ds
 
 
 def _assert_no_committed_dates(repo: "icechunk.Repository", store_path: str) -> None:

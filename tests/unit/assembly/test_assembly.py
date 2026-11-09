@@ -2913,12 +2913,14 @@ class TestAssembleGuards:
         _run("run2", 7)
 
         root = zarr.open_group(open_or_create_repo(output)[0].readonly_session("main").store, mode="r")
+        arrays = root["0"]  # a v2 store keeps its arrays in level group 0, band-first (ADR 031)
         y, x = kept
-        assert root["time"].shape == (2,)
-        assert root["embeddings"].metadata.dimension_names == ("time", y, x, "band")
-        assert root.attrs["spatial:dimensions"] == [y, x]
-        assert root[y].attrs["axis"] == "Y" and root[x].attrs["axis"] == "X"
-        assert {"northing", "easting", "y", "x"} - set(root.array_keys()) == {"northing", "easting", "y", "x"} - {y, x}
+        assert arrays["time"].shape == (2,)
+        assert arrays["embeddings"].metadata.dimension_names == ("time", "band", y, x)
+        assert root.attrs["spatial:dimensions"] == [y, x] and root.attrs["multiscales"]["layout"][0]["asset"] == "0"
+        assert arrays[y].attrs["axis"] == "Y" and arrays[x].attrs["axis"] == "X"
+        names = {"northing", "easting", "y", "x"}
+        assert names - set(arrays.array_keys()) == names - {y, x} and not set(root.array_keys())
         assert resolve_region(output, northing=(0, 10)) == {y: slice(2, 4)}  # descending Y axis
 
     def test_append_refuses_a_reordered_interior_on_matching_endpoints(self, tmp_path, monkeypatch, writer, output):
