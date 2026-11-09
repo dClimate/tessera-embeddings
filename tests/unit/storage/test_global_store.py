@@ -51,7 +51,9 @@ def test_each_model_seeds_its_own_layout(tmp_path, model, names, level, embeddin
 
 
 def test_a_v2_zone_is_a_multiscales_pyramid_of_one_level(tmp_path):
-    """ADR 031 §1: registered by the convention's own registration, with level 0 its only entry."""
+    """ADR 031: level 0 the pyramid's only entry, under the convention's own registration; the
+    root names v2's usable prefixes.
+    """
     repo = global_store.create_global_repo(str(tmp_path / "global.icechunk"))
     global_store.seed_zone_groups(repo, [_ZA], years=(2025,), model_version="v2-large")
     zone = zarr_store.open_store_as_zarr_group(str(tmp_path / "global.icechunk"), group="01N")
@@ -61,6 +63,8 @@ def test_a_v2_zone_is_a_multiscales_pyramid_of_one_level(tmp_path):
         "layout": [{"asset": "0", "transform": {"scale": [1.0, 1.0], "translation": [0.0, 0.0]}}]
     }
     assert set(zone.array_keys()) == set() and set(zone.group_keys()) == {"0"}
+    root = zarr_store.open_store_as_zarr_group(str(tmp_path / "global.icechunk"))
+    assert root.attrs["embedding_prefixes"] == [16, 32, 64, 128]  # the lengths a reader may truncate to
 
 
 def test_extending_a_store_keeps_its_names(tmp_path, monkeypatch):

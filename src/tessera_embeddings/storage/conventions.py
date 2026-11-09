@@ -450,6 +450,10 @@ def _geoemb_fields(
         attrs["checkpoint_id"] = checkpoint_id
     if gsd is not None:
         attrs["geoemb:gsd"] = gsd
+    # The prefixes a reader may truncate to, so a reader wanting 16 dimensions knows it may read
+    # only the first band shard (ADR 031 §5).
+    if model_version is not None and (prefixes := model_family(model_version).prefixes):
+        attrs["embedding_prefixes"] = list(prefixes)
     return attrs
 
 
