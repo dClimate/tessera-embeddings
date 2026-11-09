@@ -11,7 +11,15 @@ import zarr
 from tessera_embeddings.config.inference import EMBEDDING_DIM, INFERENCE_CHUNK_SIZE
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
 from tessera_embeddings.config.store_geometry import spatial_dims_of
-from tessera_embeddings.config.store_layout import GLOBAL, OBS_COUNT_VARS, SHARD_PX, SINGLE
+from tessera_embeddings.config.store_layout import (
+    GLOBAL,
+    GLOBAL_V2,
+    OBS_COUNT_VARS,
+    SHARD_PX,
+    SINGLE,
+    SINGLE_V2,
+    layout_for,
+)
 
 
 def test_global_embeddings_geometry():
@@ -42,6 +50,29 @@ def test_single_matches_global_geometry():
         single, global_ = SINGLE.for_var(var), GLOBAL.for_var(var)
         assert (single.dims, single.chunks, single.shards) == (global_.dims, global_.chunks, global_.shards), var
         assert (single.dtype, single.codec) == (global_.dtype, global_.codec), var
+
+
+@pytest.mark.parametrize(
+    ("model", "single", "expected"),
+    [("v1.1", False, GLOBAL), ("v1.1", True, SINGLE), ("v2-large", False, GLOBAL_V2), ("v2-large", True, SINGLE_V2)],
+)
+def test_a_new_store_takes_its_models_layout(model, single, expected):
+    assert layout_for(model, single=single) is expected
+
+
+@pytest.mark.parametrize("v2", [GLOBAL_V2, SINGLE_V2])
+def test_v2_stores_embeddings_band_first_in_16_band_shards_of_4_band_chunks(v2):
+    """ADR 031: every other array keeps v1.1's geometry, and every array sits in level group 0."""
+    v1 = SINGLE if "embedding_std" in v2.arrays else GLOBAL
+    band_arrays = {"embeddings", "embedding_std"} & v2.arrays.keys()
+    for var in band_arrays:
+        k = v2.for_var(var).create_kwargs((9, EMBEDDING_DIM, 4096, 4096))
+        assert k["dimension_names"] == ("time", "band", "northing", "easting")
+        assert (k["chunks"], k["shards"]) == ((1, 4, 512, 512), (1, 16, 2048, 2048))
+    geometry = lambda a: (a.dims, a.chunks, a.shards, a.dtype, a.codec, a.attrs)  # noqa: E731 - NaN fills never compare
+    assert v2.arrays.keys() == v1.arrays.keys()
+    assert all(geometry(v2.arrays[var]) == geometry(v1.arrays[var]) for var in v1.arrays.keys() - band_arrays)
+    assert (v2.level, v1.level, v2.bands) == ("0", None, EMBEDDING_DIM)
 
 
 def test_the_global_store_never_declares_embedding_std():

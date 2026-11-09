@@ -24,7 +24,7 @@ _BAND, _TILE, _INNER = 8, 64, 32
 _NY, _NX = _TILE + _TILE // 2, 2 * _TILE
 _EMB = ArrayLayout(DIMS_4D, (1, _INNER, _INNER, _BAND), "int8", 0, "zstd", shards=(1, _TILE, _TILE, _BAND))
 _SCL = ArrayLayout(DIMS_3D, (1, _INNER, _INNER), "float32", float("nan"), "pcodec", shards=(1, _TILE, _TILE))
-SMALL = StoreLayout(name="small", arrays={"embeddings": _EMB, "scales": _SCL})
+SMALL = StoreLayout(name="small", arrays={"embeddings": _EMB, "scales": _SCL}, bands=_BAND)
 WINDOW = parse_time_window("June 2025")
 CHUNKS = enumerate_chunks(_NY, _NX, chunk_size=_TILE)
 #: The grid a store assembled without mosaics is given: pixel indices.

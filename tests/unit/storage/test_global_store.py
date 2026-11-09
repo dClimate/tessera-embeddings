@@ -266,6 +266,13 @@ def test_reseed_with_different_shard_geometry_rejected(tmp_path):
         global_store.seed_zone_groups(repo, [_ZB], years=(2025,), layout=halved)
 
 
+@pytest.mark.parametrize("bands", [EMBEDDING_DIM + 8, 8])
+def test_band_shards_that_do_not_tile_the_band_axis_are_refused(tmp_path, bands):
+    repo = global_store.create_global_repo(str(tmp_path / "g.icechunk"))
+    with pytest.raises(ValueError, match="do not tile"):
+        global_store.seed_zone_groups(repo, [_ZA], years=(2025,), layout=dataclasses.replace(GLOBAL, bands=bands))
+
+
 def test_reseed_with_same_geometry_but_different_dtype_rejected(tmp_path):
     """Geometry alone is not the schema. Matching chunks and shards with a different
     dtype passes a pitch check and then creates zones the int8 staging writer refuses

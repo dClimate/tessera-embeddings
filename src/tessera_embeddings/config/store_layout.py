@@ -34,8 +34,8 @@ import warnings
 import numpy as np
 from zarr.codecs.numcodecs import PCodec as _PCodecZarr3
 
-from tessera_embeddings.config.inference import EMBEDDING_DIM
-from tessera_embeddings.config.store_geometry import PRESET_SPATIAL_DIMS, clamp_chunks_and_shards
+from tessera_embeddings.config.inference import EMBEDDING_DIM, model_family
+from tessera_embeddings.config.store_geometry import LEVEL0, PRESET_SPATIAL_DIMS, clamp_chunks_and_shards
 
 # PCodec is intentionally a Zarr v3 *serializer* (array->bytes), not a bytes->bytes compressor; silence the "not in
 # the Zarr v3 spec" warning it emits on construction. This module is the codec's canonical home (inference.assembly
@@ -46,6 +46,8 @@ DIMS_4D: tuple[str, str, str, str] = ("time", *PRESET_SPATIAL_DIMS, "band")
 DIMS_3D: tuple[str, str, str] = ("time", *PRESET_SPATIAL_DIMS)
 #: Trailing axis of :data:`MONTH_COVERED_VARS` — twelve calendar months, not bands.
 DIMS_4D_MONTH: tuple[str, str, str, str] = ("time", *PRESET_SPATIAL_DIMS, "month")
+#: v2's ``embeddings`` order: each chunk holds whole image planes, one per band (ADR 031 §3).
+DIMS_4D_BAND_FIRST: tuple[str, str, str, str] = ("time", "band", *PRESET_SPATIAL_DIMS)
 
 #: The three observation sources a pixel can be seen by, as the prefix their per-sensor arrays are named from. ONE
 #: list, because every per-sensor array is a pair — a count and a month mask — derived from a single validity mask per
@@ -158,10 +160,17 @@ class ArrayLayout:
 
 @dataclasses.dataclass(frozen=True)
 class StoreLayout:
-    """The geometry of every data variable in a store, keyed by variable name."""
+    """The geometry of every data variable in a store, keyed by variable name.
+
+    ``bands`` is the extent of the band axis, which the band shards must tile exactly. ``level``
+    names the child group the arrays sit in, ``"0"`` for a v2 store (ADR 031 §1), or ``None`` for
+    one that keeps them in the zone group or store root, as v1.1 does.
+    """
 
     name: str
     arrays: dict[str, ArrayLayout]
+    bands: int = EMBEDDING_DIM
+    level: str | None = None
 
     def for_var(self, var: str) -> ArrayLayout:
         """Return the layout for a data variable, or raise if unknown."""
@@ -296,3 +305,42 @@ def trailing_extent(var: str, embedding_dim: int) -> int | None:
 
 #: The global campaign (ADR-008 D3). No ``embedding_std``, ever — see :func:`_sharded_arrays`.
 GLOBAL = StoreLayout(name="global", arrays=_sharded_arrays(include_std=False))
+
+
+#: v2's shards and chunks along the band axis: 16 dimensions to a shard, the shortest prefix v2 was trained on, cut
+#: into chunks of 4, so a phone or browser fetches only the dimensions it reads (ADR 031 §4).
+V2_BANDS_PER_SHARD = 16
+V2_BANDS_PER_CHUNK = 4
+#: v2's chunk edge in pixels. 256² builds four times the Dask tasks at default chunks; 1,024² makes a full vector
+#: cost 134 MB.
+V2_CHUNK_PX = 512
+
+
+def _band_first(arrays: dict[str, ArrayLayout]) -> dict[str, ArrayLayout]:
+    """*arrays* with the band-axis arrays in v2's band-first geometry; every other array unchanged."""
+    band_first = {
+        "chunks": (1, V2_BANDS_PER_CHUNK, V2_CHUNK_PX, V2_CHUNK_PX),
+        "shards": (1, V2_BANDS_PER_SHARD, SHARD_PX, SHARD_PX),
+        "dims": DIMS_4D_BAND_FIRST,
+    }
+    return {
+        var: dataclasses.replace(array, **band_first) if array.dims == DIMS_4D else array
+        for var, array in arrays.items()
+    }
+
+
+#: The v2 stores: ``embeddings`` (and the single-area ``embedding_std``) band-first, in 16-band shards of 4-band
+#: chunks, every array in level group ``0`` (ADR 031).
+SINGLE_V2 = StoreLayout(name="single-v2", arrays=_band_first(_sharded_arrays(include_std=True)), level=LEVEL0)
+GLOBAL_V2 = StoreLayout(name="global-v2", arrays=_band_first(_sharded_arrays(include_std=False)), level=LEVEL0)
+
+
+def layout_for(model_version: str, *, single: bool) -> StoreLayout:
+    """The preset a NEW store takes from its model: v1.1's geometry, or v2's (ADR 031 §5).
+
+    An existing store keeps the geometry it was created with whatever the model, which the write
+    path reads from the store itself.
+    """
+    if model_family(model_version).generation == "v2":
+        return SINGLE_V2 if single else GLOBAL_V2
+    return SINGLE if single else GLOBAL

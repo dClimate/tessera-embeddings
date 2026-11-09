@@ -47,7 +47,7 @@ _CHUNK = 256
 # Small layout: 512^2 shards of 256^2 inner chunks - whole-shard blocks are a few MB.
 _EMB = ArrayLayout(DIMS_4D, (1, _CHUNK, _CHUNK, _BAND), "int8", 0, "zstd", shards=(1, _SHARD, _SHARD, _BAND))
 _SCL = ArrayLayout(DIMS_3D, (1, _CHUNK, _CHUNK), "float32", float("nan"), "pcodec", shards=(1, _SHARD, _SHARD))
-SMALL = StoreLayout(name="small", arrays={"embeddings": _EMB, "scales": _SCL})
+SMALL = StoreLayout(name="small", arrays={"embeddings": _EMB, "scales": _SCL}, bands=_BAND)
 
 # Zone spanning 2 shards tall x 1 wide (1024 x 512 px).
 _ZONE = ZoneSpec("32601", "N", 1, (0.0, 5_120.0), (0.0, 10_240.0))

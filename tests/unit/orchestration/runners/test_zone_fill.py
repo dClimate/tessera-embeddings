@@ -31,7 +31,7 @@ _YEARS = (2024, 2025)
 
 _EMB = ArrayLayout(DIMS_4D, (1, _INNER, _INNER, _BAND), "int8", 0, "zstd", shards=(1, _TILE, _TILE, _BAND))
 _SCL = ArrayLayout(DIMS_3D, (1, _INNER, _INNER), "float32", float("nan"), "pcodec", shards=(1, _TILE, _TILE))
-SMALL = StoreLayout(name="small", arrays={"embeddings": _EMB, "scales": _SCL})
+SMALL = StoreLayout(name="small", arrays={"embeddings": _EMB, "scales": _SCL}, bands=_BAND)
 
 # 10 m pixels -> metre extents for a _NY x _NX pixel zone.
 _SPEC = ZoneSpec("32601", "N", 1, (0.0, _NX * 10.0), (0.0, _NY * 10.0))
