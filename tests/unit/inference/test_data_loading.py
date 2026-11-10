@@ -9,6 +9,7 @@ import zarr
 
 import tessera_embeddings.inference.data_loading as _dl_mod
 from tessera_embeddings.config.inference import S1_ORBIT_NONE, S2_BAND_ORDER, SCL_VALID_CLASSES
+from tessera_embeddings.config.ingest import SOURCE_INDEX_VAR
 from tessera_embeddings.config.store_layout import MONTHS_IN_YEAR
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.errors import InsufficientCoverageError
@@ -24,6 +25,7 @@ from tessera_embeddings.inference.data_loading import (
     make_store_opener,
     resolve_s1_orbit,
 )
+from tessera_embeddings.inference.provenance import SourcePlanes
 from tessera_embeddings.storage.time_axis import compute_doy
 from tests.unit.mosaic_stores import make_s2_group, make_sar_group, store_opener
 
@@ -442,6 +444,19 @@ class TestSharedMaskBundle:
             np.testing.assert_array_equal(inline.s2_bands[d_idx], bundled.s2_bands[b_idx[0]], err_msg=f"doy={doy}")
             np.testing.assert_array_equal(inline.s2_masks[d_idx], bundled.s2_masks[b_idx[0]], err_msg=f"doy={doy}")
         np.testing.assert_array_equal(inline.s2_obs_count, bundled.s2_obs_count)
+
+    def test_a_fully_rejected_date_still_records_its_granules(self):
+        """The prune drops a date the model rejects everywhere; the record keeps it, every pixel negative."""
+        root = make_s2_group(4, self._CHUNK.height, self._CHUNK.width, source_index=True)
+        root["scl"][1] = 8  # cloud over the whole shard
+        with patch.object(_dl_mod, "open_store_as_zarr_group", return_value=root):
+            bundle = load_s2_mask_bundle("s3://b/m", self._CHUNK, _TIME_WINDOW)
+        assert 1 not in bundle.abs_indices
+        planes = SourcePlanes(self._CHUNK.height, self._CHUNK.width)
+        planes.add("s2", bundle.source_pieces)
+        cloudy = next(d for d in planes.dates("s2") if d.time == 1)
+        assert cloudy.valid_px == 0
+        np.testing.assert_array_equal(cloudy.plane < 0, root[SOURCE_INDEX_VAR][1] > 0)
 
 
 class TestResolveS1Orbit:

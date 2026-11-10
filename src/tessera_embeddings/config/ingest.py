@@ -24,8 +24,13 @@ _MOSAIC_CONTENT_SOURCES: tuple[str, ...] = ("ingest/s1_roi.py", "ingest/s2_roi.p
 PROVENANCE_VERSION = 1
 
 #: A provenance mosaic's per-slot granule list: one JSON array per time slot naming the day's
-#: granules in fusion order, written in the same commit as the slot's pixels.
+#: granules in fusion order, then the copies dropped before the fuse, written in the same commit as
+#: the slot's pixels.
 GRANULES_ARRAY = "granules"
+
+#: A granule list entry's ``status``: fused into the slot, or dropped before the fuse as a losing
+#: duplicate or as a copy that would not read and was replaced by another.
+FUSED, DUPLICATE, UNREADABLE = "fused", "duplicate", "unreadable"
 
 #: A provenance mosaic's per-pixel source index: the fusion position plus one of the granule that
 #: supplied the pixel, 0 where none had data. ``uint16`` because a day's fusion order is zone-wide.

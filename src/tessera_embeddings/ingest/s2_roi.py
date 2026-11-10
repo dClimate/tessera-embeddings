@@ -44,7 +44,14 @@ import dask.distributed
 import numpy as np
 import xarray as xr
 
-from tessera_embeddings.config.ingest import AUTO_BATCH_DATES, INGEST_CHUNK_SIZE, INGEST_CHUNKS, SOURCE_INDEX_VAR
+from tessera_embeddings.config.ingest import (
+    AUTO_BATCH_DATES,
+    DUPLICATE,
+    INGEST_CHUNK_SIZE,
+    INGEST_CHUNKS,
+    SOURCE_INDEX_VAR,
+    UNREADABLE,
+)
 from tessera_embeddings.config.providers import PROVIDERS
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
 from tessera_embeddings.ingest._pipeline import pipelined
@@ -70,7 +77,7 @@ from tessera_embeddings.ingest.loader_failures import (
     install_capture_everywhere,
     label_objects,
 )
-from tessera_embeddings.ingest.provenance import STEPPED_DOWN, day_granules
+from tessera_embeddings.ingest.provenance import STEPPED_DOWN, day_granules, mark_dropped
 from tessera_embeddings.ingest.roi import (
     read_roi_mask,
     read_roi_metadata,
@@ -563,6 +570,9 @@ def ingest_s2_roi_reflectance(
     # the coverage counter, whose contract is the SCL gate: a run that lost most of a year to
     # catalogue metadata was reporting it as coverage filtering.
     producer_conflict_dates: list[dict[str, str]] = []
+    #: Per solar day of the current supply, the copies dropped before the fuse: losing duplicates,
+    #: and copies that would not read and were replaced. Their granule list names them too.
+    dropped_by_day: dict[str, list] = {}
 
     def _narrow(day_items: list) -> list:
         """The live windows a date's imagery reaches: pure geometry, no read."""
@@ -770,7 +780,7 @@ def ingest_s2_roi_reflectance(
         # and re-stamps, and its list must describe its own fuse.
         granules = (
             day_granules(
-                day_items,
+                [*day_items, *dropped_by_day.get(date, ())],
                 provider=provider,
                 collection=collection,
                 catalog_url=catalogue.catalog_url,
@@ -947,6 +957,13 @@ def ingest_s2_roi_reflectance(
         items, alternates = select_preferred_duplicates(items, read_keys, known_kind)
         log_duplicate_selection(log, roi_label, alternates, kept=items, read_keys=read_keys, items=supplied)
         date_alternates.update(alternates)
+        # Scoped to this supply like the ladder, whose preparations all finish inside it.
+        kept = {id(item) for item in items}
+        dropped_by_day.clear()
+        for item in supplied:
+            if id(item) not in kept:
+                dropped_by_day.setdefault(item.datetime.strftime("%Y-%m-%d"), []).append(item)
+        mark_dropped((item for day in dropped_by_day.values() for item in day), DUPLICATE)
 
         def _record_skip(prepared: _PreparedDate) -> None:
             """Account for a date that produced nothing, under the reason it actually had.
@@ -1084,11 +1101,14 @@ def ingest_s2_roi_reflectance(
                     total_filtered += 1
                     return
                 stepped_items, swapped = stepped
-                # Marked on the copy for the granule list: it stands in for one that would not read.
-                previous = {id(item) for item in attempt.items}
+                # Marked for the granule list: the copy that would not read, and the one standing in.
+                previous, current = {id(item) for item in attempt.items}, {id(item) for item in stepped_items}
                 for item in stepped_items:
                     if id(item) not in previous:
                         item.properties[STEPPED_DOWN] = True
+                replaced = [item for item in attempt.items if id(item) not in current]
+                mark_dropped(replaced, UNREADABLE)
+                dropped_by_day.setdefault(attempt.date, []).extend(replaced)
                 before = copies_label(attempt.items, only=swapped)
                 after = copies_label(stepped_items, only=swapped)
                 if not tried:

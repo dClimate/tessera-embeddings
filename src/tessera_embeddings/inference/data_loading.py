@@ -666,6 +666,13 @@ def load_s2_mask_bundle(
     obs_count, month_covered = coverage_from_validity(mask_full, months_full)
     logger.info("Loaded full-chunk SCL for %d S2 timesteps", t_full)
 
+    # Read here because this is where optical validity is decided, for the whole shard at once, and
+    # over every date before the prune: a date the model rejects everywhere, a fully cloudy one,
+    # still records which granule it rejected.
+    source_pieces = read_source_pieces(
+        root, window_indices, y_slice, x_slice, mask_full, rows=slice(0, chunk.height), cols=slice(0, chunk.width)
+    )
+
     # Prune timesteps with no valid pixel anywhere in the chunk — the v1.1 per-pixel resampler
     # only draws from valid indices, so no strip would ever read them.
     nonempty_t = mask_full.any(axis=(1, 2))
@@ -681,16 +688,7 @@ def load_s2_mask_bundle(
         abs_indices=window_indices[kept],
         obs_count=obs_count,
         month_covered=month_covered,
-        # Read here because this is where optical validity is decided, for the whole shard at once.
-        source_pieces=read_source_pieces(
-            root,
-            window_indices[kept],
-            y_slice,
-            x_slice,
-            mask,
-            rows=slice(0, chunk.height),
-            cols=slice(0, chunk.width),
-        ),
+        source_pieces=source_pieces,
     )
 
 

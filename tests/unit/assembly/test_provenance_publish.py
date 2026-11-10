@@ -3,7 +3,7 @@
 Built on the real pieces end to end, on local stores: mosaics written by the ingest's own writer
 with the switch on, shards staged by the real staging writer from pieces read off those mosaics,
 publication reading both, and the reader helpers reading what it published. A 2 x 2 grid of 4-pixel
-shards, three sensors, two dates each.
+shards, three sensors, two dates each; the optical lists also name a copy the ingest dropped.
 """
 
 from __future__ import annotations
@@ -76,6 +76,12 @@ def _granule(sensor: str, date: str, k: int) -> dict:
     }
 
 
+def _granule_list(sensor: str, date: str) -> list[dict]:
+    """Two fused granules, and for optical a losing duplicate listed after them."""
+    fused = [_granule(sensor, date, 0), _granule(sensor, date, 1)]
+    return fused + ([_granule(sensor, date, 9) | {"status": "duplicate"}] if sensor == "s2" else [])
+
+
 def _mosaics(base: Path, *, on: bool = True, seed: int = 0) -> dict[str, str]:
     """Three mosaic stores with two dates each; each slot's index uses granules 1 and 2."""
     rng = np.random.default_rng(seed)
@@ -102,7 +108,7 @@ def _mosaics(base: Path, *, on: bool = True, seed: int = 0) -> dict[str, str]:
             tile_id="roi.zarr",
             crs="EPSG:32633",
             chunks={"time": 1, "northing": SHARD, "easting": SHARD},
-            granules=[json.dumps([_granule(sensor, d, 0), _granule(sensor, d, 1)]) for d in DATES] if on else None,
+            granules=[json.dumps(_granule_list(sensor, d)) for d in DATES] if on else None,
         )
         pins[path] = open_repo(path).lookup_branch("main")
     return pins
@@ -114,13 +120,21 @@ def _chunk(row: int, col: int) -> ChunkSpec:
     )
 
 
-def _planes(pins: dict[str, str], chunk: ChunkSpec) -> SourcePlanes:
-    """The actor's record of ``chunk``: every pixel valid, read off the pinned mosaics."""
+#: Every observation valid for the model.
+ALL_VALID = np.ones((len(DATES), SHARD, SHARD), dtype=bool)
+
+#: Half of each shard rejected on the first date, all of it on the second: a fully cloudy date.
+SOME_REJECTED = ALL_VALID.copy()
+SOME_REJECTED[0, :, : SHARD // 2] = False
+SOME_REJECTED[1] = False
+
+
+def _planes(pins: dict[str, str], chunk: ChunkSpec, valid: np.ndarray = ALL_VALID) -> SourcePlanes:
+    """The actor's record of ``chunk``, read off the pinned mosaics; ``valid`` is the model's test."""
     planes = SourcePlanes(SHARD, SHARD)
     for path, pin in pins.items():
         root = open_store_as_zarr_group(path, snapshot_id=pin)
         times = np.arange(len(DATES))
-        valid = np.ones((len(DATES), SHARD, SHARD), dtype=bool)
         ys, xs = slice(chunk.y_start, chunk.y_stop), slice(chunk.x_start, chunk.x_stop)
         planes.add(
             STORES[Path(path).stem],
@@ -130,7 +144,12 @@ def _planes(pins: dict[str, str], chunk: ChunkSpec) -> SourcePlanes:
 
 
 def _stage(
-    staging: Path, pins: dict[str, str], *, pixels: np.ndarray | None = None, run: str = RUN
+    staging: Path,
+    pins: dict[str, str],
+    *,
+    pixels: np.ndarray | None = None,
+    run: str = RUN,
+    valid: np.ndarray = ALL_VALID,
 ) -> tuple[list[str], list[str]]:
     """Three shards embed, one is refused; all stage planes. Returns (embedded, refused).
 
@@ -147,7 +166,7 @@ def _stage(
             scales=np.ones((SHARD, SHARD), dtype=np.float32),
             coverage={"embedded_px": SHARD * SHARD if pixels is None else int(pixels.sum())},
             stack=STACK,
-            planes=_planes(pins, chunk),
+            planes=_planes(pins, chunk, valid),
             pixels=pixels,
         )
         embedded.append(chunk.label)
@@ -157,7 +176,7 @@ def _stage(
         run,
         {"s2_obs_count": np.zeros((SHARD, SHARD), dtype=np.uint16)},
         None,
-        planes=_planes(pins, refused),
+        planes=_planes(pins, refused, valid),
         pixels=None if pixels is None else np.zeros_like(pixels),
     )
     return embedded, [refused.label]
@@ -199,8 +218,10 @@ def _shard_dates(tmp_path: Path, run: str = RUN):
 def test_granules_list_each_snapshots_granules_in_fusion_order(published) -> None:
     tmp_path, pins, summary = published
     tables = {sensor: pq.read_table(_granules_uri(tmp_path, pins, sensor)) for sensor in STORES.values()}
-    assert summary["granules"] == sum(t.num_rows for t in tables.values()) == 3 * len(DATES) * 2
+    assert summary["granules"] == sum(t.num_rows for t in tables.values()) == 3 * len(DATES) * 2 + len(DATES)
     rows = tables["s2"].to_pylist()
+    dropped = [(r["granule_id"], r["fusion_order"], r["status"]) for r in rows if r["status"] != "fused"]
+    assert dropped == [(f"s2-{d}-9", None, "duplicate") for d in DATES]
     first = next(r for r in rows if r["fusion_order"] == 1)
     assert (str(first["solar_day"]), first["granule_id"]) == ("2024-06-01", "s2-2024-06-01-1")
     assert first["snapshot_id"] == pins[str(tmp_path / "mosaics" / "reflectance.zarr")]
@@ -223,9 +244,15 @@ def test_a_snapshots_granules_are_written_once_and_checked_by_every_later_run(pu
         _publish(tmp_path, pins, embedded, refused, run=UPDATE)
 
 
-def test_shard_dates_and_planes_name_the_same_granules(published) -> None:
-    """Every row's sources are what its plane ranks, and the plane is the mosaic's index."""
-    tmp_path, pins, _ = published
+@pytest.mark.parametrize("valid", [ALL_VALID, SOME_REJECTED], ids=["all-valid", "some-rejected"])
+def test_shard_dates_and_planes_name_the_same_granules(tmp_path: Path, valid: np.ndarray) -> None:
+    """Every row's sources are what its plane ranks, and the plane is the mosaic's index.
+
+    Positive where the model used the observation, negative where it rejected it; a fully rejected
+    date keeps its rows.
+    """
+    pins = _mosaics(tmp_path / "mosaics")
+    _publish(tmp_path, pins, *_stage(tmp_path / "staging", pins, valid=valid))
     rows = _shard_dates(tmp_path).to_pylist()
     assert {r["tile"] for r in rows} == {"chunk_0_0", "chunk_0_1", "chunk_1_0", "chunk_1_1"}
     repo = open_repo(pixel_sources_uri(str(tmp_path / "registry")))
@@ -239,10 +266,12 @@ def test_shard_dates_and_planes_name_the_same_granules(published) -> None:
         index = open_store_as_zarr_group(store, snapshot_id=pins[store])[SOURCE_INDEX_VAR][
             t, r * SHARD : (r + 1) * SHARD, c * SHARD : (c + 1) * SHARD
         ]
-        named = np.where(plane > 0, np.asarray(row["sources"] + [0])[plane.astype(int) - 1] + 1, 0)
-        np.testing.assert_array_equal(named, index, err_msg=str(row))
-        assert row["valid_px"] == int(np.count_nonzero(plane))
+        named = np.sign(plane) * (np.asarray(row["sources"])[np.abs(plane.astype(int)) - 1] + 1)
+        expected = np.where(valid[t], index, -index.astype(int))
+        np.testing.assert_array_equal(np.where(plane != 0, named, 0), expected, err_msg=str(row))
+        assert row["valid_px"] == int(np.count_nonzero(plane > 0))
         assert row["embedded_px"] == (0 if row["tile"] == "chunk_1_1" else SHARD * SHARD)
+    assert {str(r["solar_day"]) for r in rows} == set(DATES), "a fully rejected date keeps its rows"
 
 
 def test_publishing_again_rewrites_the_same_record(published) -> None:
@@ -310,11 +339,16 @@ def updated(published):
     tmp_path, pins, _ = published
     embedded, refused = _stage(tmp_path / "staging", pins, pixels=EMBEDDED_BY_UPDATE, run=UPDATE)
     _publish(tmp_path, pins, embedded, refused, run=UPDATE)
-    master = tmp_path / "registry" / "master" / f"zone={ZONE}" / f"year={YEAR}"
-    master.mkdir(parents=True)
-    runs = pa.array([[RUN, UPDATE], [RUN, UPDATE], [RUN, UPDATE], None], pa.list_(pa.string()))
-    pq.write_table(pa.table({"tile": embedded + refused, "source_runs": runs}), master / "part-0.parquet")
+    _master(tmp_path / "registry", embedded + refused, [[RUN, UPDATE]] * 3 + [None])
     return str(tmp_path / "registry"), pins
+
+
+def _master(registry: Path, tiles: list[str], source_runs: list) -> None:
+    """A registry master naming each shard's ``source_runs``."""
+    master = registry / "master" / f"zone={ZONE}" / f"year={YEAR}"
+    master.mkdir(parents=True)
+    runs = pa.array(source_runs, pa.list_(pa.string()))
+    pq.write_table(pa.table({"tile": tiles, "source_runs": runs}), master / "part-0.parquet")
 
 
 @pytest.mark.parametrize(
@@ -338,10 +372,28 @@ def test_a_pixel_is_read_from_the_run_that_claims_it(updated, row: int, col: int
     for path, pin in pins.items():
         sensor = STORES[Path(path).stem]
         index = open_store_as_zarr_group(path, snapshot_id=pin)[SOURCE_INDEX_VAR][:, row, SHARD + col]
-        expected += [(sensor, DATES[t], f"{sensor}-{DATES[t]}-{v - 1}") for t, v in enumerate(index) if v]
+        expected += [(sensor, DATES[t], True, f"{sensor}-{DATES[t]}-{v - 1}") for t, v in enumerate(index) if v]
     assert set(got["run_id"]) == {run}
-    rows = [(r["sensor"], str(r["solar_day"]), r["granule_id"]) for r in got.iter_rows(named=True)]
+    rows = [(r["sensor"], str(r["solar_day"]), r["valid"], r["granule_id"]) for r in got.iter_rows(named=True)]
     assert sorted(rows) == sorted(expected)
+
+
+def test_a_rejected_observation_names_its_granule_and_says_so(tmp_path: Path) -> None:
+    """A pixel the model rejected on both dates still lists each date's granule, as not valid."""
+    pins = _mosaics(tmp_path / "mosaics")
+    embedded, refused = _stage(tmp_path / "staging", pins, valid=SOME_REJECTED)
+    _publish(tmp_path, pins, embedded, refused)
+    _master(tmp_path / "registry", embedded + refused, [[RUN]] * 4)
+    got = pixel_granules_at(str(tmp_path / "registry"), PixelLocation(ZONE, "chunk_0_0", 0, 0), YEAR)
+    index = {
+        STORES[Path(path).stem]: open_store_as_zarr_group(path, snapshot_id=pin)[SOURCE_INDEX_VAR][:, 0, 0]
+        for path, pin in pins.items()
+    }
+    expected = [(s, DATES[t], f"{s}-{DATES[t]}-{v - 1}") for s, idx in index.items() for t, v in enumerate(idx) if v]
+    assert sorted((r["sensor"], str(r["solar_day"]), r["granule_id"]) for r in got.iter_rows(named=True)) == sorted(
+        expected
+    )
+    assert expected and not got["valid"].any()
 
 
 def test_a_shard_with_no_complete_record_has_no_pixel_answer(updated) -> None:
@@ -354,9 +406,11 @@ def test_a_day_and_a_shard_read_through_the_snapshot_each_run_names(updated) -> 
     registry, _ = updated
     day = datetime.date(2024, 6, 1)
     for run in (None, RUN, UPDATE):
-        assert day_granules(registry, ZONE, YEAR, "s2", day, run_id=run)["granule_id"].to_list() == [
-            "s2-2024-06-01-0",
-            "s2-2024-06-01-1",
+        got = day_granules(registry, ZONE, YEAR, "s2", day, run_id=run)
+        assert list(zip(got["granule_id"], got["status"], strict=True)) == [
+            ("s2-2024-06-01-0", "fused"),
+            ("s2-2024-06-01-1", "fused"),
+            ("s2-2024-06-01-9", "duplicate"),
         ]
     shard = shard_granules(registry, ZONE, YEAR, "chunk_0_0", RUN)
     rows = _shard_dates(Path(registry).parent).to_pylist()
