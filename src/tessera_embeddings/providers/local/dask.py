@@ -7,7 +7,7 @@ substrate-agnostic orchestration code can use the same idiom locally as it does 
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Iterator
+from collections.abc import Generator
 
 from dask.distributed import LocalCluster
 
@@ -19,7 +19,7 @@ def local_cluster(
     threads_per_worker: int = 2,
     memory_limit: str = "4GB",
     dashboard_address: str | None = None,
-) -> Iterator[LocalCluster]:
+) -> Generator[LocalCluster]:
     """Start a single-machine Dask cluster.
 
     Args:

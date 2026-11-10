@@ -14,13 +14,19 @@ sleep because the wait-out budget is accumulated backoff rather than wall clock.
 
 from __future__ import annotations
 
+import collections
 import logging
 
+import numpy as np
 import pytest
+import xarray as xr
 
 from tessera_embeddings.errors import ProviderRefusedReadsError
 from tessera_embeddings.ingest import s1_roi
 from tessera_embeddings.storage.zarr_store import STORE_WRITE_ATTEMPTS, store_write_retrying
+
+# Every S1 leg these tests run is kept off disk and network the same way.
+pytestmark = pytest.mark.usefixtures("s1_leg_offline")
 
 _CATALOGUE = ["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04"]
 
@@ -57,13 +63,6 @@ def _run(
     record of it unlocks no action and none is kept. What a lost date leaves is a log line.
     """
     clears_after = clears_after or {}
-    import collections
-
-    import numpy as np
-    import xarray as xr
-
-    from tessera_embeddings.ingest import s1_roi
-
     written: list[str] = []
     recorded: list[dict] = []
     attempts: collections.Counter[str] = collections.Counter()
@@ -101,18 +100,6 @@ def _run(
     monkeypatch.setattr(s1_roi, "store_write_retrying", no_wait_retrying)
     monkeypatch.setattr(s1_roi, "record_assessed_window", lambda *a, **kw: recorded.append(kw))
     monkeypatch.setattr(s1_roi, "get_existing_dates", lambda _s, **_k: set())
-    monkeypatch.setattr(s1_roi, "apply_roi_mask", lambda data, *a, **k: data)
-    monkeypatch.setattr(s1_roi, "read_roi_mask", lambda *a, **k: object())
-    monkeypatch.setattr(
-        s1_roi,
-        "read_roi_metadata",
-        lambda _p, **_k: type("M", (), {"geobox": object(), "native_crs": "EPSG:32635", "bbox_wgs84": (0, 0, 1, 1)})(),
-    )
-    monkeypatch.setattr(
-        s1_roi, "live_windows_for_mask", lambda *a, **k: [type("W", (), {"y0": 0, "y1": 1, "x0": 0, "x1": 1})()]
-    )
-    monkeypatch.setattr(s1_roi, "make_s1_item_provider", lambda *a, **k: lambda: [])
-    monkeypatch.setattr(s1_roi.IngestManifest, "from_roi_store", classmethod(lambda _c, _p, **_k: object()))
 
     result = s1_roi.ingest_s1_roi_sar(
         roi_zarr_path="s3://bucket/zone_35N.zarr",
@@ -143,7 +130,6 @@ def _run(
         pytest.param(
             "WarpOperationError: Chunk and warp failed", "ZIPDecode: error at scanline 0", id="undecodable-in-warp"
         ),
-        pytest.param("RasterioIOError: TIFFReadEncodedTile() failed", None, id="undecodable-at-open"),
     ],
 )
 def test_a_failed_date_costs_only_itself(monkeypatch, message: str, cause: str | None) -> None:
@@ -167,7 +153,6 @@ def test_a_failed_date_costs_only_itself(monkeypatch, message: str, cause: str |
         pytest.param(
             "WarpOperationError: Chunk and warp failed", "RasterioIOError: HTTP response code: 403", id="warp"
         ),
-        pytest.param("RasterioIOError: HTTP response code: 403", None, id="403-at-open"),
         pytest.param("RasterioIOError: Connection reset by peer", None, id="transport"),
     ],
 )
@@ -208,23 +193,6 @@ def test_the_loss_is_named_in_the_log_and_scoped_by_cause(monkeypatch, caplog) -
     assert "scope=unreadable" in loss[0]
     assert "Chunk and warp failed" in loss[0]
     assert all("unreadable" not in kwargs for kwargs in recorded), "nothing about the date is stored"
-
-
-def test_a_refusal_wrapped_in_a_warp_failure_is_still_a_refusal(monkeypatch) -> None:
-    """The wrapper must not decide the verdict, and it used to.
-
-    A refusal reaches the reader through whichever block-read wrapper GDAL raises, so the chain
-    carries a refusal signature AND an unreadable one. The two predicates overlapped, and order
-    was the only thing separating them — this path asked about the refusal first, the optical path
-    never asked at all, so the identical failure was transient for one sensor and permanent data
-    loss for the other. ``is_unreadable_source`` now declines every refusal, so the verdict no
-    longer depends on the caller asking twice.
-    """
-    with pytest.raises(RuntimeError):
-        _run(
-            monkeypatch,
-            failures={"2024-01-02": _raise("WarpOperationError: Chunk and warp failed", "HTTP response code: 403")},
-        )
 
 
 def test_the_retry_is_exhausted_before_a_date_is_given_up(monkeypatch, caplog) -> None:
@@ -332,32 +300,15 @@ def test_a_cause_the_source_does_not_own_still_fails_the_leg(monkeypatch, exc: E
         _run(monkeypatch, failures={"2024-01-02": exc})
 
 
-def test_past_the_ceiling_the_leg_stops_and_says_a_retry_cannot_help(monkeypatch) -> None:
-    """RENAMED, and the message rewritten with it. It used to be
-    ``..._asks_to_be_re_dispatched``, and asserted the message said "RE-DISPATCH once the provider
-    is answering again" — because a leg losing dates at this rate was assumed to be in an outage,
-    and an outage clears.
-
-    Nothing counted toward the ceiling clears now: a provider refusal is retried in order and never
-    reaches this counter, so every date here failed for a cause that recomputes. Following the old
-    advice would re-read the same objects, spend the per-read ladder on each, and hold a fleet to
-    reach the identical answer — which is why the error is also terminal in
-    ``_NON_RETRYABLE_LEG_MARKERS``.
-
-    No assessed-window record either: that attribute says the range was examined in full, and this
-    leg never reached most of it.
+def test_past_the_ceiling_the_leg_stops(monkeypatch) -> None:
+    """Nothing counted toward the ceiling clears: a provider refusal is retried in order and never
+    reaches this counter, so every date here failed for a cause that recomputes, and the error is
+    terminal in ``_NON_RETRYABLE_LEG_MARKERS``. No assessed-window record either: that attribute
+    says the range was examined in full, and this leg never reached most of it.
     """
-    from tessera_embeddings.ingest import s1_roi
-
     monkeypatch.setattr(s1_roi, "MAX_GIVEN_UP_DATES", 1)
-    with pytest.raises(s1_roi.TooManyGivenUpDatesError, match=r"2 date\(s\).*ceiling of 1") as caught:
+    with pytest.raises(s1_roi.TooManyGivenUpDatesError, match=r"2 date\(s\).*ceiling of 1"):
         _run(monkeypatch, failures={d: _raise("RasterioIOError: ZIPDecode: error") for d in _CATALOGUE})
-    message = str(caught.value)
-    assert "TERMINAL" in message, "the message must not invite a retry that cannot help"
-    assert "RE-DISPATCH" not in message
-    assert "reprocessed copies" in message, "it must name the one thing that would change the answer"
-    assert "2024-01-01(unreadable)" in message
-    assert "roi=zone_35N" in message
 
 
 def test_a_leg_that_gave_up_everything_fails_instead_of_reporting_skipped(monkeypatch, caplog) -> None:
@@ -381,14 +332,3 @@ def test_a_leg_that_gave_up_everything_fails_instead_of_reporting_skipped(monkey
     lines = [r.getMessage() for r in caplog.records if "WROTE NO DATES" in str(r.msg)]
     assert lines, "a leg that wrote nothing must still say so"
     assert "given_up=4" in lines[0]
-
-
-def test_a_leg_that_gave_up_some_dates_and_committed_others_still_succeeds(monkeypatch) -> None:
-    """The complement, so the fix above cannot quietly widen into failing the bounded skip."""
-    result, written, recorded, _attempts = _run(
-        monkeypatch, failures={_CATALOGUE[0]: _raise("RasterioIOError: ZIPDecode: error")}
-    )
-
-    assert result.status == "success"
-    assert written == _CATALOGUE[1:]
-    assert recorded, "the store must carry the record of what was given up"

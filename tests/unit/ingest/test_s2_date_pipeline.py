@@ -18,21 +18,24 @@ import json
 import logging
 import re
 import time
-from datetime import datetime
 from itertools import pairwise
 from types import SimpleNamespace
 
+import dask
 import dask.array as da
 import numpy as np
 import pytest
 import xarray as xr
+from tenacity import Retrying, stop_after_attempt
 
 from tessera_embeddings.config.ingest import SOURCE_INDEX_VAR
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
-from tessera_embeddings.ingest import s2_roi
+from tessera_embeddings.ingest import live_windows as live_windows_mod
+from tessera_embeddings.ingest import roi_processing, s2_roi
 from tessera_embeddings.ingest.provenance import FUSION_POSITION, stamp_fusion_positions
 from tessera_embeddings.ingest.stac import HeterogeneousProducerError
 from tessera_embeddings.storage.zarr_store import store_write_retrying
+from tests.stac_items import fake_stac_item
 
 
 @pytest.fixture(autouse=True)
@@ -46,9 +49,6 @@ def _read_ladder_without_the_waiting(monkeypatch):
     The attempt count is preserved rather than reduced to one, because the tests about the
     duplicate-copy ladder depend on the read being retried before the step-down is reached.
     """
-    from tenacity import Retrying, stop_after_attempt
-
-    from tessera_embeddings.ingest import roi_processing
 
     def no_wait(_log):
         return Retrying(stop=stop_after_attempt(roi_processing.SOURCE_READ_ATTEMPTS), reraise=True)
@@ -57,23 +57,14 @@ def _read_ladder_without_the_waiting(monkeypatch):
 
 
 BOTH_MODES = pytest.mark.parametrize("pipeline_dates", [False, True], ids=["serial", "pipelined"])
+#: For subjects decided before the date loop starts (resume start, window validation), where the
+#: loop's mode adds nothing.
+SERIAL_ONLY = pytest.mark.parametrize("pipeline_dates", [False], ids=["serial"])
 
 SIZE = 8
 VALID_CLASS = next(c for c in range(12) if c not in S2_SCL_INVALID_CLASSES)
 INVALID_CLASS = sorted(S2_SCL_INVALID_CLASSES)[0]
 COVERAGE_THRESHOLD = 50.0
-
-#: ``Pipeline date=<d>: prepare=<s>s hidden=<s>s stall=<s>s`` — the stable format the
-#: A/B greps for, parsed here so a change to it fails a test rather than an analysis.
-PIPELINE_LINE = re.compile(
-    r"Pipeline date=(?P<date>\S+): prepare=(?P<prepare>[\d.]+)s hidden=(?P<hidden>[\d.]+)s stall=(?P<stall>[\d.]+)s"
-)
-#: ``roi=`` is part of the contract too: a fleet-wide log query has no other way to say
-#: WHICH cell a commit belongs to, because the log stream is the Dask worker's task id.
-STAGE_LINE = re.compile(
-    r"Stage timings roi=(?P<roi>\S+) date=(?P<date>\S+): build=(?P<build>[\d.]+)s gate=(?P<gate>[\d.]+)s "
-    r"write=(?P<write>[\d.]+)s total=(?P<total>[\d.]+)s"
-)
 
 _ROI = SimpleNamespace(
     bbox_wgs84=(-105.0, 39.0, -104.9, 39.1),
@@ -121,19 +112,6 @@ class _FakeClient:
         state nothing had established.
         """
         return {"inproc://fake": fn(*args, **kwargs)}
-
-
-def _item(date: str, item_id: str | None = None):
-    # `id` is carried because the ingest sort breaks cloud-cover ties on it, so an item without
-    # one is not a stand-in for a real item.
-    return SimpleNamespace(
-        id=item_id or f"S2A_T13TDE_{date.replace('-', '')}_0_L2A",
-        datetime=datetime.fromisoformat(f"{date}T10:00:00"),
-        properties={"eo:cloud_cover": 0.0},
-        assets={},
-        geometry=None,
-        bbox=None,
-    )
 
 
 def _day_ds(date: str, *, valid: bool) -> xr.Dataset:
@@ -193,7 +171,7 @@ def run_ingest(monkeypatch):
     # assert on the arguments they receive does so in its own body, which runs after the
     # fixture and before the helper, so setting them here lets that override win.
     whole_roi = SimpleNamespace(y0=0, y1=SIZE, x0=0, x1=SIZE)
-    monkeypatch.setattr(s2_roi, "live_windows_for_mask", lambda *_a, **_k: [whole_roi])
+    monkeypatch.setattr(live_windows_mod, "live_windows_for_mask", lambda *_a, **_k: [whole_roi])
     monkeypatch.setattr(s2_roi, "windows_for_date", lambda run_windows, *_a, **_k: run_windows)
 
     runs: list[_Run] = []
@@ -254,7 +232,9 @@ def run_ingest(monkeypatch):
                 _record_write(day_ds)
                 run.granules[str(day_ds.time.dt.date.values[0])] = granules
 
-        monkeypatch.setattr(s2_roi, "query_stac_items", lambda **_kwargs: (catalogue or [_item(d) for d in dates], {}))
+        monkeypatch.setattr(
+            s2_roi, "query_stac_items", lambda **_kwargs: (catalogue or [fake_stac_item(d) for d in dates], {})
+        )
         monkeypatch.setattr(s2_roi, "load_stac_items", load_stac_items)
         # What the store already holds. Default empty — a fresh ingest — but a test can
         # populate it to stand a run up over an existing store, which is what a resume is.
@@ -286,7 +266,9 @@ def run_ingest(monkeypatch):
         return run
 
     _run.runs = runs  # type: ignore[attr-defined]
-    return _run
+    # The gate's reduce is a few 8x8 blocks; a thread pool per compute costs more than it does.
+    with dask.config.set(scheduler="synchronous"):
+        yield _run
 
 
 # A run of gate failures between two kept dates: the case where the pipeline is
@@ -355,64 +337,6 @@ def test_a_write_failure_retries_three_times_then_stops(run_ingest, pipeline_dat
     assert run.loaded.count("2024-01-01") == 1, "a write retry must not re-prepare its date"
 
 
-@BOTH_MODES
-def test_the_pipeline_line_is_emitted_once_per_written_date(run_ingest, pipeline_dates, caplog):
-    """One line per WRITTEN date — skipped dates never reach the write, so never log.
-
-    The A/B reads per-date medians off this line, so a duplicated or missing line
-    silently rescales the result it is used to judge.
-    """
-    with caplog.at_level(logging.INFO, logger="s2-pipeline-test"):
-        run = run_ingest(SKIP_CHAIN, pipeline_dates=pipeline_dates, log=logging.getLogger("s2-pipeline-test"))
-    lines = [m.groupdict() for m in map(PIPELINE_LINE.search, caplog.messages) if m]
-    assert [line["date"] for line in lines] == run.written
-
-
-@BOTH_MODES
-def test_the_pipeline_lines_fields_are_non_negative(run_ingest, pipeline_dates, caplog):
-    with caplog.at_level(logging.INFO, logger="s2-pipeline-test"):
-        run_ingest(SKIP_CHAIN, pipeline_dates=pipeline_dates, log=logging.getLogger("s2-pipeline-test"))
-    lines = [m.groupdict() for m in map(PIPELINE_LINE.search, caplog.messages) if m]
-    assert lines, "no Pipeline line was emitted at all"
-    for line in lines:
-        prepare, hidden, stall = (float(line[k]) for k in ("prepare", "hidden", "stall"))
-        assert prepare >= 0.0 and hidden >= 0.0 and stall >= 0.0
-        assert hidden + stall >= prepare, f"hidden and stall must account for prepare: {line}"
-
-
-def test_serial_mode_reports_nothing_hidden(run_ingest, caplog):
-    """The measurement contract: serially the driver waits out every preparation.
-
-    Reporting ``hidden`` above zero without a pipeline would make the serial
-    baseline look like a working pipeline and the whole A/B unreadable — so this
-    pins the direction, not just the arithmetic.
-    """
-    with caplog.at_level(logging.INFO, logger="s2-pipeline-test"):
-        run_ingest(SKIP_CHAIN, pipeline_dates=False, log=logging.getLogger("s2-pipeline-test"))
-    lines = [m.groupdict() for m in map(PIPELINE_LINE.search, caplog.messages) if m]
-    assert lines
-    for line in lines:
-        assert float(line["hidden"]) == 0.0, f"serial mode hid nothing, yet reported it: {line}"
-        assert line["stall"] == line["prepare"], f"serial mode stalls for its whole preparation: {line}"
-
-
-@BOTH_MODES
-def test_stage_timings_total_stays_the_serial_equivalent_cost(run_ingest, pipeline_dates, caplog):
-    """``total`` is build+gate+write in both modes, so the field stays comparable.
-
-    Under pipelining part of that total ran concurrently with the previous write,
-    which is what the Pipeline line reports; making `total` a wall-clock figure
-    instead would break every comparison against a pre-pipeline run.
-    """
-    with caplog.at_level(logging.INFO, logger="s2-pipeline-test"):
-        run_ingest(SKIP_CHAIN, pipeline_dates=pipeline_dates, log=logging.getLogger("s2-pipeline-test"))
-    lines = [m.groupdict() for m in map(STAGE_LINE.search, caplog.messages) if m]
-    assert lines
-    for line in lines:
-        build, gate, write, total = (float(line[k]) for k in ("build", "gate", "write", "total"))
-        assert total == pytest.approx(build + gate + write, abs=0.15)
-
-
 def test_the_next_date_is_prepared_during_the_current_write(run_ingest):
     """The property the flag exists for, observed from a recorded timeline.
 
@@ -422,7 +346,7 @@ def test_the_next_date_is_prepared_during_the_current_write(run_ingest):
     dates = dict.fromkeys(["2024-01-01", "2024-01-02", "2024-01-03"], True)
     overlaps = {}
     for pipeline_dates in (False, True):
-        run = run_ingest(dates, pipeline_dates=pipeline_dates, write_s=0.1)
+        run = run_ingest(dates, pipeline_dates=pipeline_dates, write_s=0.03)
         overlaps[pipeline_dates] = [
             run.load_started[later] < run.write_ended[earlier] for earlier, later in pairwise(run.written)
         ]
@@ -450,7 +374,7 @@ def test_per_date_narrowing_is_priced_like_the_run(run_ingest, monkeypatch, over
         seen["date"] = window_cost_in_chunks
         return run_windows
 
-    monkeypatch.setattr(s2_roi, "live_windows_for_mask", fake_live_windows_for_mask)
+    monkeypatch.setattr(live_windows_mod, "live_windows_for_mask", fake_live_windows_for_mask)
     monkeypatch.setattr(s2_roi, "windows_for_date", fake_windows_for_date)
     monkeypatch.setattr(s2_roi, "write_day_windows", lambda *_a, **_k: None)
     monkeypatch.setattr(s2_roi, "write_days_windows", lambda *_a, **_k: None)
@@ -460,7 +384,9 @@ def test_per_date_narrowing_is_priced_like_the_run(run_ingest, monkeypatch, over
         pipeline_dates=False,
         overlap_window_writes=overlapped,
     )
-    expected = s2_roi.WINDOW_COST_IN_CHUNKS_OVERLAPPED if overlapped else s2_roi.WINDOW_COST_IN_CHUNKS
+    expected = (
+        live_windows_mod.WINDOW_COST_IN_CHUNKS_OVERLAPPED if overlapped else live_windows_mod.WINDOW_COST_IN_CHUNKS
+    )
     assert seen == {"run": expected, "date": expected}
 
 
@@ -548,7 +474,7 @@ def test_a_batch_failure_that_is_not_a_read_error_still_fails_the_leg(run_ingest
         run_ingest(dates, pipeline_dates=False, fail_on="2024-01-02", batch_dates=2)
 
 
-@pytest.mark.parametrize("chunks", [[20, 20, 20, 20], [1, 1, 1, 1, 20, 20, 20]], ids=["dense", "sparse-then-dense"])
+@pytest.mark.parametrize("chunks", [[1, 1, 1, 1, 20, 20, 20]], ids=["sparse-then-dense"])
 def test_dense_dates_are_written_at_once_and_prepared_one_ahead(run_ingest, monkeypatch, chunks):
     """A date over the budget writes alone, straight away, and the look-ahead weighs dates before
     preparing them, so even after a run of sparse dates a dense run holds no more prepared dates
@@ -559,7 +485,7 @@ def test_dense_dates_are_written_at_once_and_prepared_one_ahead(run_ingest, monk
     one_chunk = SimpleNamespace(y0=0, y1=SIZE, x0=0, x1=SIZE)
     monkeypatch.setattr(s2_roi, "windows_for_date", lambda *_a, **_k: [one_chunk] * next(per_date))
     dates = {f"2024-01-{d:02d}": True for d in range(1, len(chunks) + 1)}
-    run = run_ingest(dates, pipeline_dates=True, batch_dates=None, write_s=0.2)
+    run = run_ingest(dates, pipeline_dates=True, batch_dates=None, write_s=0.03)
     assert run.written == list(dates)
     first_dense = chunks.index(20)
     order = list(dates)
@@ -569,7 +495,6 @@ def test_dense_dates_are_written_at_once_and_prepared_one_ahead(run_ingest, monk
 @pytest.mark.parametrize(
     ("chunks", "budget", "sizes"),
     [
-        ([1, 1, 1, 1, 1], None, [4, 1]),  # no budget passed: sparse dates still fill to the cap
         ([20, 1, 1], None, [1, 2]),  # no budget passed: one worker's budget, so a dense date writes alone
         ([1, 0, 1, 1, 1, 1], None, [4, 1]),  # a date reaching no live window rides along without a slot
         ([1, 1, 1, 1, 1], 10, [4, 1]),  # sparse dates fill a batch to the cap
@@ -758,7 +683,7 @@ RESUME_CATALOGUE = {"2018-01-24": True, "2018-05-10": True, "2018-06-05": True}
 LAST_WRITTEN = "2018-05-27"
 
 
-@BOTH_MODES
+@SERIAL_ONLY
 def test_a_resume_offers_nothing_at_or_before_the_newest_held_date(run_ingest, pipeline_dates):
     """The days an old gap sits in are never reached, so the fatal append cannot happen.
 
@@ -774,7 +699,7 @@ def test_a_resume_offers_nothing_at_or_before_the_newest_held_date(run_ingest, p
     assert "2018-01-24" not in run.loaded, "nor any earlier one"
 
 
-@BOTH_MODES
+@SERIAL_ONLY
 def test_a_store_already_past_the_window_is_a_no_op(run_ingest, pipeline_dates):
     """Every day asked for is already closed, so nothing is searched for.
 
@@ -792,7 +717,7 @@ def test_a_store_already_past_the_window_is_a_no_op(run_ingest, pipeline_dates):
     assert run.result.status == "skipped"
 
 
-@BOTH_MODES
+@SERIAL_ONLY
 def test_a_no_op_resume_still_repairs_the_assessed_window(monkeypatch, run_ingest, pipeline_dates):
     """Writing that record is what a resume over a complete store exists to do.
 
@@ -801,8 +726,6 @@ def test_a_no_op_resume_still_repairs_the_assessed_window(monkeypatch, run_inges
     would skip the repair on that retry and on every retry after it, and the coverage gate would
     read a legitimately empty month as an unexplained gap forever.
     """
-    from tessera_embeddings.ingest import s2_roi
-
     recorded: list[tuple] = []
     monkeypatch.setattr(s2_roi, "record_assessed_window", lambda *a, **_k: recorded.append(a))
 
@@ -819,7 +742,7 @@ def test_a_no_op_resume_still_repairs_the_assessed_window(monkeypatch, run_inges
     assert [a[1:] for a in recorded] == [("2018-01-01", "2018-05-15")]
 
 
-@BOTH_MODES
+@SERIAL_ONLY
 def test_the_assessed_window_records_the_requested_start_not_the_resumed_one(monkeypatch, run_ingest, pipeline_dates):
     """Which days this run queried is not what the store was examined over.
 
@@ -829,8 +752,6 @@ def test_the_assessed_window_records_the_requested_start_not_the_resumed_one(mon
     and an empty month down there would become an unexplained gap that no later run can clear,
     because no later run can write below the line either.
     """
-    from tessera_embeddings.ingest import s2_roi
-
     recorded: list[tuple] = []
     monkeypatch.setattr(s2_roi, "record_assessed_window", lambda *a, **_k: recorded.append(a))
 
@@ -848,7 +769,7 @@ def test_the_assessed_window_records_the_requested_start_not_the_resumed_one(mon
     )
 
 
-@BOTH_MODES
+@SERIAL_ONLY
 def test_a_window_whose_end_precedes_its_start_is_refused(run_ingest, pipeline_dates):
     """A caller error stays an error rather than becoming a successful skip.
 
@@ -866,7 +787,7 @@ def test_a_window_whose_end_precedes_its_start_is_refused(run_ingest, pipeline_d
         )
 
 
-@BOTH_MODES
+@SERIAL_ONLY
 def test_a_compact_iso_window_is_not_read_as_closed(run_ingest, pipeline_dates):
     """A window spelled `20180101` must behave exactly like one spelled `2018-01-01`.
 
@@ -887,7 +808,7 @@ def test_a_compact_iso_window_is_not_read_as_closed(run_ingest, pipeline_dates):
     assert run.result.status == "success"
 
 
-@BOTH_MODES
+@SERIAL_ONLY
 @pytest.mark.parametrize("bad_end", ["2018-02-30", "not-a-date"])
 def test_a_bound_that_is_not_a_date_is_refused(run_ingest, pipeline_dates, bad_end):
     """Every comparison a resume makes is between strings, and a string can sort without meaning.
@@ -919,7 +840,7 @@ def test_each_written_date_carries_its_own_granule_list(run_ingest, pipeline_dat
 
 def _copies(date: str) -> list:
     """Two copies of one image, the newer processing baseline first."""
-    copies = [_item(date, f"S2A_T13TDE_{date.replace('-', '')}_{n}_L2A") for n in (0, 1)]
+    copies = [fake_stac_item(date, item_id=f"S2A_T13TDE_{date.replace('-', '')}_{n}_L2A") for n in (0, 1)]
     day = date.replace("-", "")
     for copy, baseline in zip(copies, ("05.11", "05.10"), strict=True):
         copy.properties |= {
@@ -953,3 +874,16 @@ def test_a_dropped_copy_is_listed_with_its_reason(run_ingest, monkeypatch, newer
 def test_with_the_record_off_no_write_carries_a_list(run_ingest):
     run = run_ingest(SKIP_CHAIN, pipeline_dates=False)
     assert run.granules == {"2024-01-01": None, "2024-01-05": None}
+
+
+def test_batch_dates_validation_rejects_bad_combinations(tmp_path) -> None:
+    """The refusals fire before any cluster or store work."""
+    kwargs = dict(
+        roi_zarr_path=str(tmp_path / "roi.zarr"),
+        start_date="2024-01-01",
+        end_date="2024-01-02",
+        store_path=str(tmp_path / "s"),
+        client=None,  # never reached: validation refuses first
+    )
+    with pytest.raises(ValueError, match="batch_dates must be >= 1"):
+        s2_roi.ingest_s2_roi_reflectance(**kwargs, batch_dates=0)

@@ -30,7 +30,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
@@ -45,12 +45,7 @@ from tessera_embeddings.config.providers import PROVIDERS
 from tessera_embeddings.errors import ProviderRefusedReadsError
 from tessera_embeddings.ingest._pipeline import pipelined
 from tessera_embeddings.ingest.duplicates import is_provider_refusal, is_unreadable_source
-from tessera_embeddings.ingest.live_windows import (
-    WINDOW_COST_IN_CHUNKS,
-    WINDOW_COST_IN_CHUNKS_OVERLAPPED,
-    live_windows_for_mask,
-    windows_for_date,
-)
+from tessera_embeddings.ingest.live_windows import run_live_windows, windows_for_date
 from tessera_embeddings.ingest.loader_failures import install_capture_everywhere, refusal_wait_out
 from tessera_embeddings.ingest.opera_query import BURST_CENSUS_ATTR, BurstCensus, make_s1_item_provider
 from tessera_embeddings.ingest.provenance import day_granules
@@ -137,7 +132,7 @@ def credential_ticker(
     orbit: str,
     roi: str,
     interval_sec: float = CRED_TICK_INTERVAL_SEC,
-) -> Iterator[None]:
+) -> Generator[None]:
     """Call ``refresh`` on a timer for the duration of the block, in a daemon thread.
 
     A credential renewed only from the work loop can renew only *between* units of work, so any
@@ -428,14 +423,9 @@ def ingest_s1_roi_sar(
     # windows share one graph, so a boundary is cheap and the DP should stop trading ocean area
     # for fewer windows, while a sequential writer still pays the serial cost per boundary and
     # keeps the high rate. Bound once because per-date narrowing re-merges on the same terms.
-    window_cost = WINDOW_COST_IN_CHUNKS_OVERLAPPED if overlap_window_writes else WINDOW_COST_IN_CHUNKS
-    run_windows = live_windows_for_mask(
-        roi_zarr_path,
-        window_px=INGEST_CHUNK_SIZE,
-        window_cost_in_chunks=window_cost,
-        storage_options=storage_options,
+    window_cost, run_windows, live_windows = run_live_windows(
+        roi_zarr_path, overlapped=overlap_window_writes, storage_options=storage_options
     )
-    live_windows: list[tuple[int, int, int, int]] = [(w.y0, w.y1, w.x0, w.x1) for w in run_windows]
     # roi= and orbit both present: this is the first line a leg emits, and at fleet width a bare
     # count ties to neither a cell nor an orbit — the log stream is the Dask worker's task id,
     # and the two orbits of one zone are separate runs.
@@ -552,7 +542,7 @@ def ingest_s1_roi_sar(
     # (ADR 033). Written with every date's commit (`store_attrs` below).
     recorded_census = get_root_attr(orbit_store, BURST_CENSUS_ATTR, s3_region=s3_region) if written_dates else None
     burst_census = BurstCensus(
-        roi.bbox_wgs84, start_date, end_date, orbit, mid_longitude=mid_longitude, recorded=recorded_census
+        roi.bbox_wgs84, (start_date, end_date), orbit, mid_longitude=mid_longitude, recorded=recorded_census
     )
 
     # Where the CATALOGUE is searched from. Everything at or below the newest held date is closed,
@@ -782,7 +772,7 @@ def ingest_s1_roi_sar(
             query_s,
         )
         if data is not None:
-            data = apply_roi_mask(data, roi_zarr_path, spatial_chunks, roi_mask=batch_mask)
+            data = apply_roi_mask(data, batch_mask)
         return _PreparedBatch(
             batch_start_str,
             batch_end_str,

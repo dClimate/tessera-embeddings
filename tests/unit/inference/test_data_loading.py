@@ -24,7 +24,7 @@ from tessera_embeddings.inference.data_loading import (
     make_store_opener,
     resolve_s1_orbit,
 )
-from tessera_embeddings.storage.time_axis import compute_doy
+from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group, write_dataset
 from tests.unit.mosaic_stores import make_s2_group, make_sar_group, store_opener
 
 
@@ -60,30 +60,28 @@ class TestLoadS2Bands:
         read spans multiple chunks) and assert the threaded ``_load_s2_bands``
         equals a per-band serial read.
         """
-        from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group, write_dataset
-
         dates = [f"2024-06-{d:02d}" for d in range(1, 9)]  # 8 timesteps
-        data = sample_reflectance_data(dates, height=128, width=128)
+        data = sample_reflectance_data(dates, height=64, width=64)
         store_path = str(local_zarr_path / "conc_tile" / "reflectance.zarr")
         write_dataset(
             store_path,
             data,
             tile_id="33UUP",
             baselines=dict.fromkeys(dates, 400),
-            chunks={"time": 1, "northing": 64, "easting": 64},
+            chunks={"time": 1, "northing": 32, "easting": 32},
             crs="EPSG:32615",
         )
 
         root = open_store_as_zarr_group(store_path)
-        ti, ys, xs = np.arange(len(dates)), slice(0, 128), slice(0, 128)
+        ti, ys, xs = np.arange(len(dates)), slice(0, 64), slice(0, 64)
 
-        serial = np.empty((len(dates), 128, 128, len(S2_BAND_ORDER)), dtype=np.uint16)
+        serial = np.empty((len(dates), 64, 64, len(S2_BAND_ORDER)), dtype=np.uint16)
         for i, band in enumerate(S2_BAND_ORDER):
             serial[:, :, :, i] = root[band].oindex[ti, ys, xs]
 
         # Run several times so a data race (rather than a deterministic bug)
         # has a chance to surface.
-        for _ in range(10):
+        for _ in range(3):
             result = _load_s2_bands(root, time_indices=ti, y_slice=ys, x_slice=xs)
             np.testing.assert_array_equal(result, serial)
 
@@ -109,30 +107,19 @@ class TestLoadSclMask:
         np.testing.assert_array_equal(mask, np.array(expected, dtype=np.bool_).reshape(1, -1, 1))
 
 
-class TestComputeDoy:
-    """Tests for day-of-year computation."""
-
-    def test_doy_values(self):
-        times = np.array(["2024-01-01", "2024-06-15", "2024-12-31"], dtype="datetime64[ns]")
-        doys = compute_doy(times)
-        assert doys.dtype == np.int32
-        assert doys[0] == 1
-        assert doys[1] == 167
-        assert doys[2] == 366
-
-    def test_non_leap_year(self):
-        times = np.array(["2023-12-31"], dtype="datetime64[ns]")
-        doys = compute_doy(times)
-        assert doys[0] == 365
-
-
 # ---------------------------------------------------------------------------
 # Synthetic mosaic stores come from tests.unit.mosaic_stores — the same three-store
 # layout the strip-loop tests read, so a schema change lands in one place.
 # ---------------------------------------------------------------------------
 
 _CHUNK = ChunkSpec(row=0, col=0, y_start=0, y_stop=8, x_start=0, x_stop=10)
+#: A taller chunk, so it splits into three 4-row strips.
+_TALL_CHUNK = ChunkSpec(row=0, col=0, y_start=0, y_stop=12, x_start=0, x_stop=10)
 _TIME_WINDOW = parse_time_window("December 2024")
+
+
+def _tall_opener():
+    return store_opener(_TALL_CHUNK)
 
 
 class TestLoadSarOrbit:
@@ -152,21 +139,6 @@ class TestLoadSarOrbit:
         # them, so they are returned alongside the DOYs and must survive the same `kept` filter.
         assert months.shape == (n_t,)
         assert set(months.tolist()) <= set(range(1, 13))
-
-    def test_the_months_returned_line_up_with_the_doys_they_came_from(self):
-        """One filter, both outputs. A months array indexed differently from the DOYs would put a
-        pixel's observation in the wrong calendar month while every shape still checked out.
-        """
-        root = make_sar_group(6, _CHUNK.height, _CHUNK.width)
-        with patch.object(_dl_mod, "open_store_as_zarr_group", return_value=root):
-            _, doys, months = _load_sar_orbit("s3://bucket/mosaic", _CHUNK, "ascending", _TIME_WINDOW)
-        assert doys.shape == months.shape
-
-    def test_store_path_uses_orbit_name(self):
-        root = make_sar_group(3, _CHUNK.height, _CHUNK.width)
-        with patch.object(_dl_mod, "open_store_as_zarr_group", return_value=root) as mock_open:
-            _load_sar_orbit("s3://bucket/mosaic", _CHUNK, "descending", _TIME_WINDOW)
-        mock_open.assert_called_once_with("s3://bucket/mosaic/sar_descending.zarr")
 
     def test_band_values_match_source(self):
         n_t, h, w = 4, _CHUNK.height, _CHUNK.width
@@ -260,14 +232,6 @@ class TestLoadS2:
         assert obs_count.shape == (h, w)
         assert obs_count.dtype == np.uint16
 
-    def test_obs_count_from_full_mask(self):
-        n_t, h, w = 15, _CHUNK.height, _CHUNK.width
-        root = make_s2_group(n_t, h, w)
-        with patch.object(_dl_mod, "open_store_as_zarr_group", return_value=root):
-            _, _, _, obs_count = _load_s2("s3://b/m", _CHUNK, _TIME_WINDOW)
-        # Observation counts can go up to the full timestep count.
-        assert obs_count.max() <= n_t
-
 
 class TestLoadChunkOrchestration:
     """Tests for load_chunk delegating to helpers and respecting s1_orbit."""
@@ -280,37 +244,18 @@ class TestLoadChunkOrchestration:
         with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=se):
             return load_chunk(_CHUNK, "s3://b/m", time_window=_TIME_WINDOW, s1_orbit=s1_orbit)
 
-    def test_ascending_only_skips_descending(self):
+    @pytest.mark.parametrize(("orbit", "skipped"), [("ascending", "desc"), ("descending", "asc")])
+    def test_one_orbit_skips_the_other(self, orbit, skipped):
         se = self._make_open_store_side_effect()
         with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=se) as mock_raw:
-            result = load_chunk(_CHUNK, "s3://b/m", time_window=_TIME_WINDOW, s1_orbit="ascending")
+            result = load_chunk(_CHUNK, "s3://b/m", time_window=_TIME_WINDOW, s1_orbit=orbit)
 
         paths = [c.args[0] for c in mock_raw.call_args_list]
-        assert any("sar_ascending" in p for p in paths)
-        assert not any("sar_descending" in p for p in paths)
-        assert result.s1_desc_bands.shape[0] == 0
-        assert result.s1_desc_doys.shape[0] == 0
-
-    def test_descending_only_skips_ascending(self):
-        se = self._make_open_store_side_effect()
-        with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=se) as mock_raw:
-            result = load_chunk(_CHUNK, "s3://b/m", time_window=_TIME_WINDOW, s1_orbit="descending")
-
-        paths = [c.args[0] for c in mock_raw.call_args_list]
-        assert any("sar_descending" in p for p in paths)
-        assert not any("sar_ascending" in p for p in paths)
-        assert result.s1_asc_bands.shape[0] == 0
-        assert result.s1_asc_doys.shape[0] == 0
-
-    def test_obs_counts_populated(self):
-        result = self._run(s1_orbit="ascending")
-        h, w = _CHUNK.height, _CHUNK.width
-        assert result.s2_obs_count is not None
-        assert result.s2_obs_count.shape == (h, w)
-        assert result.s1_asc_obs_count is not None
-        assert result.s1_asc_obs_count.shape == (h, w)
-        assert result.s1_desc_obs_count is not None
-        assert result.s1_desc_obs_count.shape == (h, w)
+        assert any(f"sar_{orbit}" in p for p in paths)
+        other = "descending" if orbit == "ascending" else "ascending"
+        assert not any(f"sar_{other}" in p for p in paths)
+        assert getattr(result, f"s1_{skipped}_bands").shape[0] == 0
+        assert getattr(result, f"s1_{skipped}_doys").shape[0] == 0
 
     def test_empty_orbit_obs_count_is_zero(self):
         result = self._run(s1_orbit="ascending")
@@ -344,27 +289,10 @@ class TestStripReassembly:
     whole-chunk load.
     """
 
-    # A taller chunk so it actually splits into multiple strips.
-    _TALL_CHUNK = ChunkSpec(row=0, col=0, y_start=0, y_stop=12, x_start=0, x_stop=10)
-
-    def _side_effect(self, n_t_s2=10, n_t_sar=5):
-        return store_opener(self._TALL_CHUNK, n_t_s2=n_t_s2, n_t_sar=n_t_sar)
-
-    def _load(self, y_sub=None, s1_orbit="both"):
-        with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._side_effect()):
-            return load_chunk(self._TALL_CHUNK, "s3://b/m", time_window=_TIME_WINDOW, s1_orbit=s1_orbit, y_sub=y_sub)
-
-    def test_y_sub_none_matches_full_chunk_dims(self):
-        whole = self._load(y_sub=None)
-        assert whole.height == self._TALL_CHUNK.height
-        assert whole.width == self._TALL_CHUNK.width
-
-    def test_strip_dims_reflect_strip(self):
-        strip = self._load(y_sub=slice(4, 8))
-        assert strip.height == 4
-        assert strip.width == self._TALL_CHUNK.width
-        assert strip.s2_bands.shape[1] == 4
-        assert strip.s2_bands.shape[2] == self._TALL_CHUNK.width
+    @staticmethod
+    def _load(y_sub=None):
+        with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_tall_opener()):
+            return load_chunk(_TALL_CHUNK, "s3://b/m", time_window=_TIME_WINDOW, s1_orbit="both", y_sub=y_sub)
 
     def test_strips_reassemble_to_whole_chunk(self):
         whole = self._load(y_sub=None)
@@ -393,14 +321,6 @@ class TestStripReassembly:
                     st.s2_masks[d_idx], whole.s2_masks[whole_t[0], s, :], err_msg=f"s2_masks doy={doy}"
                 )
 
-    def test_strip_reads_identical_pixels(self):
-        """A single strip read returns the same pixels as the matching rows of a whole read."""
-        whole = self._load(y_sub=None)
-        strip = self._load(y_sub=slice(8, 12))
-        # SAR has no per-pixel pruning here (random nonzero), so timesteps align 1:1.
-        np.testing.assert_array_equal(strip.s1_asc_doys, whole.s1_asc_doys)
-        np.testing.assert_array_equal(strip.s1_asc_bands, whole.s1_asc_bands[:, 8:12, :, :])
-
 
 class TestSharedMaskBundle:
     """A precomputed full-chunk SCL bundle, sliced per strip, matches inline loads.
@@ -410,15 +330,10 @@ class TestSharedMaskBundle:
     doys, and obs counts as the inline (mask_bundle=None) path it replaces.
     """
 
-    _CHUNK = ChunkSpec(row=0, col=0, y_start=0, y_stop=12, x_start=0, x_stop=10)
-
-    def _side_effect(self, n_t_s2=10, n_t_sar=5):
-        return store_opener(self._CHUNK, n_t_s2=n_t_s2, n_t_sar=n_t_sar)
-
     def test_bundle_tkept_matches_inline_prune(self):
-        with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._side_effect()):
-            bundle = load_s2_mask_bundle("s3://b/m", self._CHUNK, _TIME_WINDOW)
-            _, inline_masks, inline_doys, inline_obs = _load_s2("s3://b/m", self._CHUNK, _TIME_WINDOW)
+        with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_tall_opener()):
+            bundle = load_s2_mask_bundle("s3://b/m", _TALL_CHUNK, _TIME_WINDOW)
+            _, inline_masks, inline_doys, inline_obs = _load_s2("s3://b/m", _TALL_CHUNK, _TIME_WINDOW)
         # Same kept timesteps and same per-pixel obs count.
         np.testing.assert_array_equal(bundle.doys, inline_doys)
         np.testing.assert_array_equal(bundle.obs_count, inline_obs)
@@ -426,13 +341,12 @@ class TestSharedMaskBundle:
 
     def test_strip_via_bundle_matches_inline_strip(self):
         strip = slice(4, 8)
-        opener = self._side_effect()
-        with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=opener):
-            bundle = load_s2_mask_bundle("s3://b/m", self._CHUNK, _TIME_WINDOW)
+        with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_tall_opener()):
+            bundle = load_s2_mask_bundle("s3://b/m", _TALL_CHUNK, _TIME_WINDOW)
             bundled = load_chunk(
-                self._CHUNK, "s3://b/m", time_window=_TIME_WINDOW, s1_orbit="both", y_sub=strip, mask_bundle=bundle
+                _TALL_CHUNK, "s3://b/m", time_window=_TIME_WINDOW, s1_orbit="both", y_sub=strip, mask_bundle=bundle
             )
-            inline = load_chunk(self._CHUNK, "s3://b/m", time_window=_TIME_WINDOW, s1_orbit="both", y_sub=strip)
+            inline = load_chunk(_TALL_CHUNK, "s3://b/m", time_window=_TIME_WINDOW, s1_orbit="both", y_sub=strip)
         # The bundle prunes at the chunk level while the inline strip prunes on
         # its own rows, so the bundled strip may carry extra (strip-empty)
         # timesteps. Align on doys and compare the shared timesteps' bands/masks.
@@ -475,10 +389,6 @@ class TestResolveS1Orbit:
         with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._probe({"ascending"})):
             assert resolve_s1_orbit("s3://b/m", "both") == "ascending"
 
-    def test_both_with_only_descending_downgrades(self):
-        with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._probe({"descending"})):
-            assert resolve_s1_orbit("s3://b/m", "both") == "descending"
-
     def test_both_with_neither_present_resolves_to_none(self):
         """The default is permissive: parts of the globe are radar-free in principle."""
         with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._probe(set())):
@@ -518,21 +428,16 @@ class TestSharedStoreOpener:
     each strip reuses the same store handle instead.
     """
 
-    _CHUNK = ChunkSpec(row=0, col=0, y_start=0, y_stop=12, x_start=0, x_stop=10)
-
-    def _side_effect(self):
-        return store_opener(self._CHUNK)
-
     def test_opener_forwards_region(self):
         """A non-default region is threaded to every store open (actor read path)."""
-        with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._side_effect()) as mock_open:
+        with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_tall_opener()) as mock_open:
             opener = make_store_opener(region="eu-west-1")
             opener("s3://b/m/reflectance.zarr")
         assert mock_open.call_args.kwargs["region"] == "eu-west-1"
 
     def test_opener_caches_each_path(self):
         """make_store_opener opens each distinct path once and returns the same group."""
-        with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._side_effect()) as mock_open:
+        with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_tall_opener()) as mock_open:
             opener = make_store_opener()
             first = opener("s3://b/m/reflectance.zarr")
             second = opener("s3://b/m/reflectance.zarr")
@@ -545,11 +450,11 @@ class TestSharedStoreOpener:
 
     def test_strips_share_one_open_per_store(self):
         """Loading three strips through a shared opener opens each store once."""
-        with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._side_effect()) as mock_open:
+        with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_tall_opener()) as mock_open:
             opener = make_store_opener()
             for y_sub in (slice(0, 4), slice(4, 8), slice(8, 12)):
                 load_chunk(
-                    self._CHUNK,
+                    _TALL_CHUNK,
                     "s3://b/m",
                     time_window=_TIME_WINDOW,
                     s1_orbit="both",

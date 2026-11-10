@@ -26,6 +26,7 @@ published cells against verdicts on file, and the missing verdict outlives the l
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 from prefect.deployments import run_deployment
@@ -50,7 +51,7 @@ def dispatch_cell_validation(
     zone: str,
     year: int,
     summary: dict[str, Any],
-    parameters: dict[str, Any],
+    target: ValidationTarget,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     tag: str | None = None,
 ) -> str | None:
@@ -66,9 +67,7 @@ def dispatch_cell_validation(
             EMPTY (no pixels to check) and whether it landed — it carries a ``tag``, or is a
             targeted update that ``written`` or ``cleared`` shards in a tagged cell. Without
             either no committed change exists for a validator to judge.
-        parameters: Flow parameters for the validation run. Built by the caller so the
-            fill's own resolved paths are validated, not whatever the validation
-            deployment was registered with.
+        target: The store the fill wrote.
         log: The fill's run logger.
         tag: Trace tag from :func:`validation_run_tag`, resolved by the caller in the
             flow's main thread — the trailing assembly thread has no Prefect context, so
@@ -101,7 +100,9 @@ def dispatch_cell_validation(
         # timeout=0 returns as soon as the run exists; anything else puts a three-minute
         # read in front of the next cell's assembly. run_deployment is @sync_compatible
         # (typed as a union with its coroutine form) and runs synchronously on this thread.
-        run: Any = run_deployment(deployment, parameters=parameters, timeout=0, tags=[tag] if tag else None)
+        run: Any = run_deployment(
+            deployment, parameters=target.parameters(zone, year), timeout=0, tags=[tag] if tag else None
+        )
     except Exception:
         # Swallowed on purpose — see the module docstring. What is lost is the CHECK, and
         # monitoring finds that by reading published cells against verdicts on file.
@@ -118,28 +119,32 @@ def dispatch_cell_validation(
     return str(run.id)
 
 
-def cell_validation_parameters(
-    *,
-    zone: str,
-    year: int,
-    paths: BucketPaths,
-    store_name: str,
-    mask_name: str,
-    s3_region: str | None,
-) -> dict[str, Any]:
-    """The validation flow's parameters for one cell.
+@dataclass(frozen=True)
+class ValidationTarget:
+    """The store a fill wrote, which is what its validation run is pointed at.
 
-    ``paths`` is dumped rather than passed as a model because the value crosses the API as
-    JSON; the validation flow rebuilds its own ``BucketPaths``. It is passed explicitly even
-    though the deployment is registered with the same buckets, so the store THIS fill wrote
-    to is what gets validated — otherwise a hand-overridden ``paths`` would be checked
-    against the registered default and quietly report on a different store.
+    Passed explicitly even though the validation deployment is registered with the same
+    buckets, so the store THIS fill wrote to is what gets validated; otherwise a
+    hand-overridden ``paths`` would be checked against the registered default and quietly
+    report on a different store.
     """
-    return {
-        "zone": zone,
-        "year": year,
-        "paths": paths.model_dump(),
-        "store_name": store_name,
-        "mask_name": mask_name,
-        "s3_region": s3_region,
-    }
+
+    paths: BucketPaths
+    store_name: str
+    mask_name: str
+    s3_region: str | None
+
+    def parameters(self, zone: str, year: int) -> dict[str, Any]:
+        """The validation flow's parameters for one cell.
+
+        ``paths`` is dumped rather than passed as a model because the value crosses the API as
+        JSON; the validation flow rebuilds its own ``BucketPaths``.
+        """
+        return {
+            "zone": zone,
+            "year": year,
+            "paths": self.paths.model_dump(),
+            "store_name": self.store_name,
+            "mask_name": self.mask_name,
+            "s3_region": self.s3_region,
+        }

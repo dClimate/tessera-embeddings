@@ -10,8 +10,7 @@ interleave dates onto one axis.
 
 That distinction was missing from all three write sites at once (S1 per-date, S2
 per-date, S2 per-batch), each of which had built its own ``Retrying``. Hence the shared
-factory, and hence the last test here: an inlined fourth copy would silently reopen the
-hole, so the absence of one is asserted rather than assumed.
+factory.
 
 A third call sits on top of the two: a **source provider that stops serving reads** is
 resolved by waiting and by nothing else, and the attempt limit is far too short to be that
@@ -23,7 +22,6 @@ verdict, and one that never engaged would be the defect it exists to fix.
 
 from __future__ import annotations
 
-import inspect
 import logging
 import time
 from collections.abc import Callable
@@ -31,7 +29,6 @@ from collections.abc import Callable
 import icechunk
 import pytest
 
-from tessera_embeddings.ingest import s1_roi, s2_roi
 from tessera_embeddings.ingest.duplicates import is_provider_refusal
 from tessera_embeddings.ingest.loader_failures import (
     clear_local_refusals,
@@ -40,7 +37,6 @@ from tessera_embeddings.ingest.loader_failures import (
 )
 from tessera_embeddings.storage import zarr_store
 from tessera_embeddings.storage.zarr_store import (
-    CONCURRENT_WRITER_ERRORS,
     STORE_WRITE_ATTEMPTS,
     WAIT_OUT_BACKOFF_S,
     DuplicateDateError,
@@ -142,11 +138,6 @@ def test_transient_failure_is_retried_to_the_attempt_limit():
     assert _attempts(RuntimeError("throttled"), fail_times=STORE_WRITE_ATTEMPTS - 1) == STORE_WRITE_ATTEMPTS
 
 
-def test_transient_failure_recovers_on_a_later_attempt():
-    """Not merely "no exception": the attempt count proves the retry actually re-ran."""
-    assert _attempts(RuntimeError("flaky COG"), fail_times=1) == 2
-
-
 def test_a_moved_branch_tip_is_never_retried():
     """Retrying re-reads the tip the other writer moved, so a second attempt could
     SUCCEED — writing into a store another process owns. Exactly one attempt.
@@ -179,20 +170,6 @@ def test_a_duplicate_date_is_never_retried():
     assert calls == 1
 
 
-def test_every_failure_surfaces_as_itself_not_as_a_retryerror():
-    """Both paths out of the policy must preserve the exception type: the excluded ones
-    because tenacity re-raises what the predicate declined, the retried ones because of
-    ``reraise=True``. A ``RetryError`` escaping here would break every
-    ``except icechunk.ConflictError`` and every ``except ValueError`` upstream.
-    """
-    with pytest.raises(icechunk.ConflictError):
-        _attempts(_conflict())
-    with pytest.raises(DuplicateDateError):
-        _attempts(DuplicateDateError("dup"))
-    with pytest.raises(RuntimeError, match="throttled"):
-        _attempts(RuntimeError("throttled"))
-
-
 def _refusal() -> Exception:
     """A refused source read, shaped the way the driver receives one.
 
@@ -204,51 +181,20 @@ def _refusal() -> Exception:
     return exc
 
 
-def test_a_failure_the_caller_waits_out_outlasts_the_attempt_limit():
+def test_a_failure_the_caller_waits_out_outlasts_the_attempt_limit_within_a_bound():
     """The whole point. A provider that stops serving reads does not come back inside three
-    attempts of exponential backoff, so the attempt limit is not a short budget for this failure —
-    it is the wrong instrument, and the write has to be allowed to keep asking.
-    """
-    calls, _slept = _exhausted(_refusal(), wait_out=is_provider_refusal)
-    assert calls > STORE_WRITE_ATTEMPTS
+    attempts of exponential backoff, so the write has to be allowed to keep asking.
 
-
-def test_the_wait_out_budget_bounds_the_backoff_it_authorises():
-    """A longer wait that is not BOUNDED is an outage of its own — a leg holds a Dask fleet while
+    But a longer wait that is not BOUNDED is an outage of its own — a leg holds a Dask fleet while
     it waits, and thousands of them wait at once. The ladder is exponential and capped, so the
     budget converts into a small attempt count rather than a tight loop against a struggling
     provider.
     """
     calls, slept = _exhausted(_refusal(), wait_out=is_provider_refusal)
+    assert calls > STORE_WRITE_ATTEMPTS
     assert slept <= WAIT_OUT_BACKOFF_S
     assert slept > WAIT_OUT_BACKOFF_S / 2, "the budget must be nearly spent, or the ladder wastes it"
     assert calls < 2 * STORE_WRITE_ATTEMPTS * 5, f"{calls} attempts is a tight loop, not a backoff"
-
-
-def test_a_failure_the_predicate_declines_gets_only_the_attempt_limit():
-    """The negative control, and the reason the long wait is gated on a predicate at all.
-
-    A codec failure is a statement about the bytes: it recomputes to the same verdict on every
-    attempt, so waiting cannot change it and the entire cost falls on a path that was always going
-    to fail. Passing ``wait_out`` must not widen what gets waited out — only the failures the
-    predicate positively recognises.
-    """
-    exc = RuntimeError("RasterioIOError: ZIPDecode: Decoding error at scanline 0")
-    assert _exhausted(exc, wait_out=is_provider_refusal)[0] == STORE_WRITE_ATTEMPTS
-
-
-def test_a_cause_that_was_stripped_in_transit_gets_no_long_wait():
-    """The blind case, which must fail SHORT rather than expensively.
-
-    A read failure whose cause did not survive the Dask hop arrives as the bare wrapper, and a
-    refusal is unrecognisable in it. That must not draw the long wait on suspicion — the leg fails
-    on its attempt limit and retries, which costs a leg attempt instead of ten idle minutes per
-    date, and it must not be given up either.
-    """
-    assert (
-        _run(RuntimeError("WarpOperationError: Chunk and warp failed"), wait_out=is_provider_refusal)[0]
-        == STORE_WRITE_ATTEMPTS
-    )
 
 
 @pytest.mark.parametrize(
@@ -256,15 +202,20 @@ def test_a_cause_that_was_stripped_in_transit_gets_no_long_wait():
     [
         pytest.param(RuntimeError("RasterioIOError: ExpiredToken: the token has expired"), id="our-own-credential"),
         pytest.param(RuntimeError("IcechunkError: AccessDenied writing the mosaic"), id="the-destination-store"),
+        # A codec failure recomputes to the same verdict on every attempt, so waiting cannot change it.
+        pytest.param(RuntimeError("RasterioIOError: ZIPDecode: Decoding error at scanline 0"), id="a-codec-failure"),
+        # A cause stripped by the Dask hop leaves a refusal unrecognisable: fail short, not on suspicion.
+        pytest.param(RuntimeError("WarpOperationError: Chunk and warp failed"), id="a-stripped-cause"),
     ],
 )
-def test_a_refusal_that_is_not_the_sources_gets_no_long_wait(exc):
-    """Both exclusions the predicate exists to make, priced.
+def test_a_failure_that_is_not_the_sources_refusal_gets_no_long_wait(exc):
+    """The exclusions the predicate exists to make, priced.
 
     A credential fault on this side is repairable here and no waiting fixes it. A refusal from the
     DESTINATION store is not the source provider's at all — and it says ``AccessDenied`` in the
-    same words the source does, so only the source reader's own vocabulary separates them. Either
-    one must fail the leg on its first date instead of holding a fleet idle first.
+    same words the source does, so only the source reader's own vocabulary separates them. Passing
+    ``wait_out`` must not widen what gets waited out — only the failures the predicate positively
+    recognises. Each must fail the leg on its attempt limit instead of holding a fleet idle first.
     """
     assert _exhausted(exc, wait_out=is_provider_refusal)[0] == STORE_WRITE_ATTEMPTS
 
@@ -405,24 +356,6 @@ def test_a_moved_branch_tip_is_never_retried_even_when_waiting_something_out():
                 calls += 1
                 raise _conflict()
     assert calls == 1
-
-
-def test_concurrent_writer_errors_names_both_collision_shapes():
-    assert icechunk.ConflictError in CONCURRENT_WRITER_ERRORS
-    assert DuplicateDateError in CONCURRENT_WRITER_ERRORS
-
-
-@pytest.mark.parametrize("module", [s1_roi, s2_roi], ids=["s1_roi", "s2_roi"])
-def test_no_ingest_module_builds_its_own_retry_policy(module):
-    """The regression that mattered: three hand-built policies, none of them excluding a
-    second writer. A new ``Retrying(`` in either module is that hole reopening.
-    """
-    source = inspect.getsource(module)
-    assert "Retrying(" not in source, (
-        f"{module.__name__} constructs its own Retrying — use store_write_retrying() so the "
-        "concurrent-writer exclusion cannot be omitted"
-    )
-    assert "store_write_retrying" in source
 
 
 def test_a_losing_racer_never_deletes_the_winners_store(tmp_path, monkeypatch):

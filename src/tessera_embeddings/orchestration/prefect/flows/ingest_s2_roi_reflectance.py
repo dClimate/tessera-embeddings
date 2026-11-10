@@ -80,6 +80,7 @@ def _pipelines_dates(
     on_cancellation=[dask_cleanup_on_cancellation],
     on_crashed=[dask_cleanup_on_cancellation],
 )
+# jscpd:ignore-start: flow parameter docs shared with the S1 ingest flow; Prefect shows each flow's own
 def ingest_s2_roi_reflectance(
     *,
     roi_zarr_path: str,
@@ -165,6 +166,7 @@ def ingest_s2_roi_reflectance(
         ``IngestResult`` serialised as a dict (see
         :class:`tessera_embeddings.ingest.s2_roi.IngestResult`).
     """
+    # jscpd:ignore-end
     log = get_run_logger()
     log.info("Starting ingest_s2_roi_reflectance for %s", roi_zarr_path)
 

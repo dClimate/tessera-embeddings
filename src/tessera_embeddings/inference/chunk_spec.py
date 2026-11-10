@@ -178,7 +178,7 @@ def filter_chunks_by_roi_mask(
     mask = zarr.open(roi_zarr_path, mode="r", storage_options=storage_options)
 
     def intersects(chunk: ChunkSpec) -> bool:
-        return bool(mask[chunk.y_start : chunk.y_stop, chunk.x_start : chunk.x_stop].any())  # type: ignore[index]
+        return bool(mask[chunk.y_start : chunk.y_stop, chunk.x_start : chunk.x_stop].any())
 
     # Fanned out so wall time scales with the slowest read rather than their sum. `pool.map`
     # preserves order, so the live subset keeps the input's row-major chunk ordering.

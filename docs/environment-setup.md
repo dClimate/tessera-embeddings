@@ -26,7 +26,7 @@ uv sync --all-extras   # resolves uv.lock; all extras + dev tools
 ```
 
 `uv.lock` at repo root is the single lock file. It covers every extra
-(inference, prefect, aws) plus the dev group (pytest, ruff, mypy). Run
+(inference, prefect, aws) plus the dev group (pytest, ruff, ty). Run
 `uv lock` after any change to `pyproject.toml` and commit the updated
 `uv.lock`. CI's `lock-check.yml` catches drift.
 

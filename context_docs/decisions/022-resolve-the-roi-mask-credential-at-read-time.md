@@ -25,7 +25,7 @@ OPERA-scoped token — does not fit 88 successful dates on our own bucket.
 
 ## Reproduction
 
-It reproduces without AWS, in seconds, in `tests/unit/ingest/test_roi_mask_credential_expiry.py`: a moto
+It reproduces without AWS, in seconds, in `tests/unit/ingest/test_roi_mask.py`: a moto
 S3 server behind a front door that records which key signed each request and can refuse a nominated
 one with S3's own `ExpiredToken`, and a role identity issuing a fresh two-second credential per
 resolution. Build the mask graph, mark every key valid at build time as expired, then write. Before
@@ -63,6 +63,5 @@ distributed falls back to cloudpickle and nothing in `src` plain-pickles a graph
 where this array may be sent. Recorded here rather than asserted in a test, because a test
 demanding the graph *cannot* be plain-pickled would fail the day someone made it picklable.
 
-Left standing: `ingest.roi_processing.apply_roi_mask` reads the mask with no `storage_options`, which
-resolves the environment, if a caller passes no `roi_mask`. Every production caller passes one, and
-`tests/unit/ingest/test_roi_mask_construction.py` keeps it that way.
+`ingest.roi_processing.apply_roi_mask` takes the mask as a required argument, so no caller can fall
+back to reading it with no `storage_options` and the environment's credential.
