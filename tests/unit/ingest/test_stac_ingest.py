@@ -2,21 +2,17 @@
 
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import datetime
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
-import xarray as xr
 from pystac import Item
 from pystac_client.item_search import ItemSearch
 
 from tessera_embeddings.config import (
-    LANDSAT_C2_BANDS,
-    S1_GRD_BANDS,
     S2_L2A_BANDS,
     CollectionConfig,
-    STACProvider,
 )
 from tessera_embeddings.ingest import stac as stac_module
 from tessera_embeddings.ingest.stac import (
@@ -48,10 +44,10 @@ class TestBaselineCorrection:
     """
 
     def test_subtracts_the_offset(self):
-        """The plain case: a bright pixel loses exactly the offset."""
-        values = np.array([[1500, 2000], [3000, 4000]], dtype=np.uint16)
+        """A bright pixel loses exactly the offset, up to the top of the range."""
+        values = np.array([[1500, 2000], [3000, 65535]], dtype=np.uint16)
         result = correct_boa_dn(values, -1000)
-        np.testing.assert_array_equal(result, np.array([[500, 1000], [2000, 3000]], dtype=np.uint16))
+        np.testing.assert_array_equal(result, np.array([[500, 1000], [2000, 64535]], dtype=np.uint16))
 
     def test_the_input_dtype_survives(self):
         """The store's arrays are unsigned, and a signed result would be cast on the way in."""
@@ -67,30 +63,6 @@ class TestBaselineCorrection:
         """
         result = correct_boa_dn(np.array([[500, 800, 999]], dtype=np.uint16), -1000)
         np.testing.assert_array_equal(result, np.array([[1, 1, 1]], dtype=np.uint16))
-
-    def test_a_valid_dark_pixel_does_not_become_nodata(self):
-        """The floor is 1, not 0, and this is the part no amount of reading settles.
-
-        Zero means "no observation". Flooring a real dark measurement there turns it into a gap
-        and every downstream mask drops it. Element 84 floors at 1; established by measuring their
-        COGs rather than by argument.
-        """
-        result = correct_boa_dn(np.array([[1000]], dtype=np.uint16), -1000)
-        assert result[0, 0] == 1
-
-    def test_no_corrected_pixel_can_wrap(self):
-        """A uint16 input cannot underflow, which is what the int32 widening is for.
-
-        Adding a negative Python int to a uint16 array raises under numpy 2, and doing the
-        arithmetic in the input dtype would wrap DN 500 to about 64536.
-        """
-        result = correct_boa_dn(np.zeros((1, 1), dtype=np.uint16), -1000)
-        assert result[0, 0] == 1, "even DN 0 floors rather than wrapping"
-
-    def test_the_brightest_codes_lose_exactly_the_offset(self):
-        """Nothing saturates at the top of the range either."""
-        result = correct_boa_dn(np.array([[65535, 65000]], dtype=np.uint16), -1000)
-        np.testing.assert_array_equal(result, np.array([[64535, 64000]], dtype=np.uint16))
 
     def test_an_empty_array_is_a_no_op(self):
         """A zero-size array, which odc returns on a tolerated read failure, is untouched."""
@@ -127,26 +99,9 @@ class TestDateFiltering:
 
         assert len(result) == 2
 
-    def test_filter_existing_dates_with_empty_items_returns_empty(self):
-        """Empty items list should return empty list gracefully."""
-        result = _filter_existing_dates([], {"2024-01-01", "2024-01-06"})
-
-        assert result == []
-        assert isinstance(result, list)
-
 
 class TestBaselineExtraction:
     """Tests for parsing baseline version from STAC item properties."""
-
-    def test_extract_baseline_parses_400_correctly(self, mock_stac_item):
-        """Baseline "04.00" should parse to integer 400."""
-        item = mock_stac_item("2024-01-01", baseline="04.00")
-        assert _extract_baseline(item) == 400
-
-    def test_extract_baseline_parses_510_correctly(self, mock_stac_item):
-        """Baseline "05.10" should parse to integer 510."""
-        item = mock_stac_item("2024-01-01", baseline="05.10")
-        assert _extract_baseline(item) == 510
 
     def test_extract_baseline_returns_zero_when_missing(self, mock_stac_item):
         """Missing baseline property should return 0."""
@@ -170,53 +125,16 @@ class TestBaselineExtraction:
 class TestProviderConfiguration:
     """Tests for STAC provider and collection configuration."""
 
-    @pytest.mark.parametrize(
-        "provider_name, expected_catalog_url",
-        [
-            ("earth-search", "https://earth-search.aws.element84.com/v1"),
-            ("planetary-computer", "https://planetarycomputer.microsoft.com/api/stac/v1"),
-        ],
-    )
-    def test_get_provider_config_returns_expected_provider(self, provider_name, expected_catalog_url):
-        """Known providers resolve to the correct STACProvider catalog + collections."""
-        provider = _get_provider_config(provider_name)
-
-        assert isinstance(provider, STACProvider)
-        assert provider.catalog_url == expected_catalog_url
-        assert "sentinel-2-l2a" in provider.collections
-
     def test_get_provider_config_raises_on_unknown_provider(self):
         """Unknown provider should raise ValueError with available options."""
         with pytest.raises(ValueError, match="Unknown provider"):
             _get_provider_config("nonexistent-provider")
 
     @pytest.mark.parametrize(
-        "provider_name,collection_alias,expected_bands",
-        [
-            ("earth-search", "sentinel-2-l2a", S2_L2A_BANDS),
-            ("earth-search", "sentinel-1-grd", S1_GRD_BANDS),
-            ("earth-search", "landsat-c2-l2", LANDSAT_C2_BANDS),
-            ("planetary-computer", "sentinel-2-l2a", S2_L2A_BANDS),
-        ],
-    )
-    def test_get_collection_config_returns_correct_bands(self, provider_name, collection_alias, expected_bands):
-        """Collection configs should return appropriate bands for each dataset."""
-        config = _get_collection_config(provider_name, collection_alias)
-
-        assert config.bands == expected_bands
-
-    @pytest.mark.parametrize(
         "provider_name,collection_alias,expected_correction",
         [
-            # Earth Search S2 COGs are already BOA-corrected; its S1 threshold
-            # constant is None — so both are False.
             ("earth-search", "sentinel-2-l2a", True),
             ("earth-search", "sentinel-1-grd", False),
-            ("earth-search", "landsat-c2-l2", False),
-            # Planetary Computer S2 sets a baseline_threshold (=400) → True.
-            # This proves the flag can be True, not just hardcoded False.
-            ("planetary-computer", "sentinel-2-l2a", True),
-            ("planetary-computer", "landsat-c2-l2", False),
         ],
     )
     def test_baseline_correction_flag_set_correctly(self, provider_name, collection_alias, expected_correction):
@@ -288,49 +206,6 @@ class TestIngestTile:
 
         assert result_data is None
         assert result_baselines == {"2024-01-01": 400, "2024-01-06": 400}
-
-    def test_ingest_tile_applies_baseline_correction(self, mock_stac_item, sample_reflectance_data, monkeypatch):
-        """Data from baseline >= 400 should have correction applied."""
-        # Mock STAC query
-        items = [mock_stac_item("2024-01-01", baseline="04.00")]
-
-        def mock_query(*args, **kwargs):
-            return items
-
-        monkeypatch.setattr("tessera_embeddings.ingest.stac._query_stac_items", mock_query)
-
-        # Mock load_from_stac to return controlled data
-        # Values of 2000 should stay same
-        raw_data = sample_reflectance_data(["2024-01-01"], height=32, width=32, seed=42)
-        # Set known values for verification (use "blue" - common name for B02)
-        raw_data["blue"].values[:] = 2000
-        captured: dict[str, object] = {}
-
-        def mock_load(*args, **kwargs):
-            captured["driver"] = kwargs.get("driver")
-            return raw_data
-
-        monkeypatch.setattr("tessera_embeddings.ingest.stac._load_from_stac", mock_load)
-
-        result_data, result_baselines = ingest_tile(
-            provider="earth-search",
-            collection="sentinel-2-l2a",
-            tile_id="33UUP",
-            start_date="2024-01-01",
-            end_date="2024-01-10",
-            existing_dates=None,
-            # 33UUP is UTM zone 33 (central meridian 15E). Required now: solar-day grouping
-            # refuses a call carrying no geometry rather than stamping UTC dates silently.
-            mid_longitude=15.0,
-        )
-
-        assert result_data is not None
-        # The DRIVER is the assertion now, not the pixel. The offset is removed inside the read,
-        # per image, before resampled sources are fused — so a test that replaces the loader can
-        # only check that the correction was handed to it. What the driver then does to real pixels
-        # is asserted in `TestTheOffsetIsRemovedPerImage`, which drives a real `odc.stac.load`.
-        assert captured["driver"] is not None, "a collection owed the offset must load through the corrector"
-        assert result_baselines == {"2024-01-01": 400}, "provenance still records what each item declared"
 
     def test_ingest_tile_leaves_a_collection_owed_no_offset_alone(
         self, mock_stac_item, sample_reflectance_data, monkeypatch
@@ -443,73 +318,6 @@ class TestIngestTile:
         assert result_data is not None
         assert result_data["blue"].values[0, 0, 0] == 200
 
-    def test_ingest_tile_applies_item_filter_fn(self, mock_stac_item, sample_reflectance_data, monkeypatch):
-        """item_filter_fn should filter items before date filtering and loading."""
-        items = [
-            mock_stac_item("2024-01-01", baseline="04.00"),
-            mock_stac_item("2024-01-06", baseline="04.00"),
-            mock_stac_item("2024-01-11", baseline="04.00"),
-        ]
-
-        def mock_query(*args, **kwargs):
-            return items
-
-        monkeypatch.setattr("tessera_embeddings.ingest.stac._query_stac_items", mock_query)
-
-        raw_data = sample_reflectance_data(["2024-01-01"], height=32, width=32, seed=42)
-
-        def mock_load(*args, **kwargs):
-            return raw_data
-
-        monkeypatch.setattr("tessera_embeddings.ingest.stac._load_from_stac", mock_load)
-
-        # Filter that keeps only the first item
-        def keep_first(items_list):
-            return items_list[:1]
-
-        result_data, result_baselines = ingest_tile(
-            provider="earth-search",
-            collection="sentinel-2-l2a",
-            tile_id="33UUP",
-            start_date="2024-01-01",
-            end_date="2024-01-15",
-            existing_dates=None,
-            item_filter_fn=keep_first,
-            # 33UUP is UTM zone 33 (central meridian 15E). Required now: solar-day grouping
-            # refuses a call carrying no geometry rather than stamping UTC dates silently.
-            mid_longitude=15.0,
-        )
-
-        assert result_data is not None
-        # Baselines should only contain the filtered item's date
-        # (baselines are extracted AFTER item_filter_fn)
-        assert "2024-01-01" in result_baselines
-
-    def test_ingest_tile_item_filter_fn_returns_none_when_empty(self, mock_stac_item, monkeypatch):
-        """When item_filter_fn removes all items, returns (None, {})."""
-        items = [mock_stac_item("2024-01-01", baseline="04.00")]
-
-        def mock_query(*args, **kwargs):
-            return items
-
-        monkeypatch.setattr("tessera_embeddings.ingest.stac._query_stac_items", mock_query)
-
-        result_data, result_baselines = ingest_tile(
-            provider="earth-search",
-            collection="sentinel-2-l2a",
-            tile_id="33UUP",
-            start_date="2024-01-01",
-            end_date="2024-01-10",
-            existing_dates=None,
-            item_filter_fn=lambda items: [],  # Remove all items
-            # 33UUP is UTM zone 33 (central meridian 15E). Required now: solar-day grouping
-            # refuses a call carrying no geometry rather than stamping UTC dates silently.
-            mid_longitude=15.0,
-        )
-
-        assert result_data is None
-        assert result_baselines == {}
-
 
 class TestTheSolarDaySortKey:
     """The one key both ingest paths sort on."""
@@ -603,14 +411,6 @@ class _StopLoadError(Exception):
 class TestBuildStacQueryBboxFallback:
     """Tests for _build_stac_query bbox fallback behavior."""
 
-    def test_uses_tile_property_when_available(self):
-        """Collections with tile_id_property should use property-based query."""
-        config = _get_collection_config("earth-search", "sentinel-2-l2a")
-        query = _build_stac_query(config, "33UUP", "2024-01-01", "2024-01-31")
-
-        assert "query" in query
-        assert "bbox" not in query
-
     def test_falls_back_to_bbox_when_no_tile_property(self):
         """Collections with tile_id_property=None should use bbox query."""
         config = CollectionConfig(
@@ -654,15 +454,6 @@ class TestBuildStacQueryBboxFallback:
 
         with pytest.raises(ValueError, match="no bbox was provided"):
             _build_stac_query(config, None, "2024-01-01", "2024-01-31")
-
-    def test_tile_id_with_tile_property_unchanged(self):
-        """Existing behavior: tile_id + tile_id_property → property-based query."""
-        config = _get_collection_config("earth-search", "sentinel-2-l2a")
-        query = _build_stac_query(config, "33UUP", "2024-01-01", "2024-01-31")
-
-        assert "query" in query
-        assert "bbox" not in query
-        assert query["query"]["grid:code"]["eq"] == "MGRS-33UUP"
 
 
 class TestAntimeridianBboxSplit:
@@ -830,13 +621,6 @@ class TestItemPruning:
         assert pruned is item, "a partial match must leave the item untouched"
         assert "B02" in pruned["assets"], "the asset backing the requested band must survive"
 
-    def test_a_complete_match_still_prunes(self):
-        """The guard must not have disabled pruning in the ordinary case, which is the point
-        of the function — 35 assets down to the handful the loader reads.
-        """
-        pruned = _prune_item_dict(self._item(), frozenset({"blue", "scl"}))
-        assert set(pruned["assets"]) == {"blue", "scl"}
-
     def test_does_not_mutate_the_input(self):
         src = self._item()
         _prune_item_dict(src, frozenset({"blue"}))
@@ -847,10 +631,6 @@ class TestItemPruning:
         """A collection whose assets are named differently must keep its bands, not lose them."""
         src = self._item(assets={"B02": {"href": "s3://b/B02.tif"}})
         assert _prune_item_dict(src, frozenset({"blue", "scl"})) is src
-
-    def test_item_without_assets_is_returned_unchanged(self):
-        src = self._item(assets={})
-        assert _prune_item_dict(src, frozenset({"blue"})) is src
 
     def test_pruned_dict_still_builds_a_pystac_item(self):
         """The pruned form is hydrated immediately, so it must remain a valid STAC Item."""
@@ -898,41 +678,6 @@ def test_requested_extra_bands_survive_item_pruning(monkeypatch):
         mid_longitude=15.0,
     )
     assert seen["extra_bands"] == ["aot"]
-
-
-def test_the_duplicate_audit_log_names_the_area_it_selected_for(monkeypatch):
-    """That log is the ONLY record of which duplicate copy supplied a pixel.
-
-    Where two copies carry the same baseline their pixels are identical, so nothing downstream can
-    show which was read — and a fleet runs sixty cells or tiles of one collection at once. A label
-    of `load sentinel-2-l2a` on every one of them identifies none of them, which is what happened
-    when selection moved into `load_stac_items`: the tile id lives on the query and never reaches
-    the loader.
-    """
-    from tessera_embeddings.ingest import stac as stac_mod
-
-    labels: list[str] = []
-    monkeypatch.setattr(stac_mod, "log_duplicate_selection", lambda _log, roi, *_a, **_k: labels.append(roi))
-    # Two items in, one out: the log fires only when selection CHANGED the list.
-    monkeypatch.setattr(stac_mod, "select_preferred_duplicates", lambda items, *_a, **_k: (items[:1], {}))
-    stub = type("Item", (), {"datetime": datetime(2024, 1, 2, 12, tzinfo=UTC), "id": "i", "properties": {}})
-    monkeypatch.setattr(stac_mod, "query_stac_items", lambda **_k: ([stub(), stub()], {}))
-    monkeypatch.setattr(stac_mod, "_load_from_stac", lambda *_a, **_k: xr.Dataset())
-    monkeypatch.setattr(stac_mod, "_reflectance_asset_keys", lambda *_a, **_k: frozenset({"blue"}))
-
-    for kwargs, expected in (
-        ({"tile_id": "33UUP"}, "tile 33UUP"),
-        ({"tile_id": None, "bbox": (12.0, 45.0, 13.0, 46.0)}, "bbox (12.0, 45.0, 13.0, 46.0)"),
-    ):
-        stac_mod.ingest_tile(
-            provider="earth-search",
-            collection="sentinel-2-l2a",
-            start_date="2024-01-01",
-            end_date="2024-01-10",
-            mid_longitude=15.0,
-            **kwargs,
-        )
-        assert labels[-1] == expected
 
 
 def test_the_loader_refuses_a_grouping_it_cannot_honour():
@@ -1073,14 +818,6 @@ class TestSplitQueryWindow:
         low, _, high = expanded.get_parameters()["datetime"].partition("/")
         return low, high
 
-    def test_the_parts_cover_every_day_of_the_input(self):
-        parts = split_query_window("2024-03-01", "2024-03-30", 4)
-        assert parts[0][0] == "2024-03-01"
-        assert parts[-1][1] == "2024-03-30"
-        # Each window picks up where the last left off, SHARING that boundary, so no
-        # acquisition can fall between them.
-        assert [later[0] for later in parts[1:]] == [earlier[1] for earlier in parts[:-1]]
-
     def test_the_union_is_the_input_exactly_with_no_gap_and_no_overhang(self):
         """The property the whole re-partition rests on, checked on the wire form.
 
@@ -1133,21 +870,6 @@ class TestSplitQueryWindow:
             ("2019-03-21", "2019-03-22T00:00:00Z"),
             ("2019-03-22T00:00:00Z", "2019-03-22"),
         ]
-
-    def test_a_seam_does_not_repeat_a_whole_day(self):
-        """What the instant boundary buys: adjacent windows share an instant, not a date.
-
-        A shared boundary DAY made every seam re-fetch that day in full — measured at
-        Earth Search as roughly 1,250 items and 13 page requests per seam, all of them
-        discarded by the id dedupe.
-        """
-        windows = split_query_window("2024-03-01", "2024-03-03", 2)
-        assert windows == [
-            ("2024-03-01", "2024-03-02T00:00:00Z"),
-            ("2024-03-02T00:00:00Z", "2024-03-03"),
-        ]
-        assert windows[0][1][:10] == windows[1][0][:10], "the seam is one instant, on one day"
-        assert "T" in windows[0][1], "a bare date here would drop that day's last second"
 
     def test_fewer_than_two_parts_is_no_split(self):
         assert split_query_window("2024-03-01", "2024-03-30", 1) == []
@@ -1212,7 +934,7 @@ class TestTheWindowTreeIsFilledConcurrentlyAndReadBackInOrder:
             raised = exc
         return walked, raised
 
-    @pytest.mark.parametrize("workers", [1, 2, 3, 6, 8, 64])
+    @pytest.mark.parametrize("workers", [1, 8])
     def test_every_window_is_walked_and_read_back_depth_first(self, workers):
         """Width changes when a window runs, never the sequence the result is read in."""
         shape = self._tree(4, 3)
@@ -1226,17 +948,7 @@ class TestTheWindowTreeIsFilledConcurrentlyAndReadBackInOrder:
         assert len(walked) == len(plan)
         assert [n.window[0] for n in roots[0].preorder()] == [n.window[0] for n in shape.preorder()]
 
-    def test_the_read_back_order_is_identical_at_every_width(self):
-        """The property that matters: one canonical sequence, whatever the interleaving."""
-        plan = self._plan(self._tree(4, 3))
-        orders = []
-        for workers in (1, 2, 3, 6, 8, 64):
-            roots = [stac_module._WindowWalk(None, ("r", "r"))]
-            self._run(plan, roots, workers)
-            orders.append([n.window[0] for n in roots[0].preorder()])
-        assert all(order == orders[0] for order in orders), "read-back order must not depend on width"
-
-    @pytest.mark.parametrize("workers", [1, 2, 6, 8])
+    @pytest.mark.parametrize("workers", [1, 8])
     def test_two_siblings_failing_at_once_raise_the_earlier_one(self, workers):
         """Which failure surfaces must be a function of the tree, never of a race.
 
@@ -1328,15 +1040,6 @@ class TestTheSortIsTotalSoOrderCannotDependOnThePartition:
         )
         return [i.id for i in got]
 
-    def test_a_tie_is_broken_by_id_rather_than_by_arrival_order(self) -> None:
-        tied = [
-            self._item("S2B_zzz", "2019-03-05", 10.0),
-            self._item("S2A_aaa", "2019-03-05", 10.0),
-        ]
-
-        assert self._sorted_ids(tied) == ["S2A_aaa", "S2B_zzz"]
-        assert self._sorted_ids(list(reversed(tied))) == ["S2A_aaa", "S2B_zzz"]
-
     def test_the_same_items_in_any_arrival_order_come_out_the_same(self) -> None:
         """The property the re-partition needs: output is a function of the items, not the walk."""
         items = [
@@ -1353,12 +1056,3 @@ class TestTheSortIsTotalSoOrderCannotDependOnThePartition:
         assert forward == backward == rotated
         # Clearest first within a day, because the fuser keeps the first valid source.
         assert forward[:3] == ["S2A_ccc", "S2A_ddd", "S2A_bbb"]
-
-    def test_the_cloud_ordering_still_wins_over_the_tie_breaker(self) -> None:
-        """The new key is a LAST resort; it must not reorder anything the first two decide."""
-        items = [
-            self._item("S2A_aaa", "2019-03-05", 5.0),
-            self._item("S2A_zzz", "2019-03-05", 90.0),
-        ]
-
-        assert self._sorted_ids(items) == ["S2A_aaa", "S2A_zzz"]

@@ -431,6 +431,7 @@ def _bitmap(node: zarr.Group, name: str) -> np.ndarray:
     return np.asarray(cast("zarr.Array", node[name]))
 
 
+# jscpd:ignore-start: explicit keyword signature and Args, mirroring build_coverage
 def validate_coverage(
     dest: str,
     *,
@@ -449,6 +450,7 @@ def validate_coverage(
     * a zone with cells has ≥1 live tile (coverage can't vanish);
     * known-land points are live and a known deep-ocean point is dead.
     """
+    # jscpd:ignore-end
     log = log or logger
     ratio = SHARD_PX // INNER_PX
     target_zones = zones if zones is not None else list(ZONES)

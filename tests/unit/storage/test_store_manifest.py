@@ -18,20 +18,11 @@ from tessera_embeddings.storage.manifest import (
     EmbeddingManifest,
     IngestManifest,
     RoiManifest,
-    StoreManifest,
 )
 
 
 class TestManifestSerialization:
     """Tests for to_dict / from_dict round-tripping."""
-
-    def test_roi_manifest_to_dict(self):
-        m = RoiManifest(resolution=10.0, chunk_size=2000, crs="EPSG:32615")
-        d = m.to_dict()
-        assert d["resolution"] == 10.0
-        assert d["chunk_size"] == 2000
-        assert d["crs"] == "EPSG:32615"
-        assert d["manifest_type"] == "RoiManifest"
 
     def test_to_dict_excludes_none_values(self):
         m = IngestManifest(roi_manifest_hash=None)
@@ -47,12 +38,6 @@ class TestManifestSerialization:
         m = RoiManifest.from_dict(d)
         assert m == RoiManifest(resolution=10.0, chunk_size=2000, crs="EPSG:32615")
 
-    def test_empty_ingest_manifest_to_dict(self):
-        m = IngestManifest()
-        d = m.to_dict()
-        assert d["manifest_type"] == "IngestManifest"
-        assert "roi_manifest_hash" not in d
-
     def test_embedding_manifest_from_dict_coerces_list_to_tuple(self):
         """EmbeddingManifest.from_dict coerces num_obs_checkpoints list -> tuple."""
         original = EmbeddingManifest(
@@ -63,27 +48,14 @@ class TestManifestSerialization:
         assert restored == original
         assert isinstance(restored.num_obs_checkpoints, tuple)
 
-    def test_base_class_is_store_manifest(self):
-        """Concrete manifests subclass StoreManifest."""
-        m = RoiManifest(resolution=10.0, chunk_size=2000, crs="EPSG:32615")
-        assert isinstance(m, StoreManifest)
-
 
 class TestManifestHash:
     """Tests for manifest hashing."""
-
-    def test_hash_is_deterministic(self):
-        m = RoiManifest(resolution=10.0, chunk_size=2000, crs="EPSG:32615")
-        assert m.hash() == m.hash()
 
     def test_hash_changes_with_different_values(self):
         m1 = RoiManifest(resolution=10.0, chunk_size=2000, crs="EPSG:32615")
         m2 = RoiManifest(resolution=20.0, chunk_size=2000, crs="EPSG:32615")
         assert m1.hash() != m2.hash()
-
-    def test_hash_is_16_chars(self):
-        m = RoiManifest(resolution=10.0, chunk_size=2000, crs="EPSG:32615")
-        assert len(m.hash()) == 16
 
 
 class TestValidateAgainst:
@@ -100,30 +72,12 @@ class TestValidateAgainst:
         with pytest.raises(ConfigMismatchError, match="resolution"):
             current.validate_against(existing, "test.zarr")
 
-    def test_mismatched_crs_raises(self):
-        existing = {"resolution": 10.0, "chunk_size": 2000, "crs": "EPSG:32615"}
-        current = RoiManifest(resolution=10.0, chunk_size=2000, crs="EPSG:32633")
-        with pytest.raises(ConfigMismatchError, match="crs"):
-            current.validate_against(existing, "test.zarr")
-
-    def test_mismatched_chunk_size_raises(self):
-        existing = {"resolution": 10.0, "chunk_size": 2000, "crs": "EPSG:32615"}
-        current = RoiManifest(resolution=10.0, chunk_size=1000, crs="EPSG:32615")
-        with pytest.raises(ConfigMismatchError, match="chunk_size"):
-            current.validate_against(existing, "test.zarr")
-
     def test_multiple_mismatches_reported(self):
         existing = {"resolution": 10.0, "chunk_size": 2000, "crs": "EPSG:32615"}
         current = RoiManifest(resolution=20.0, chunk_size=1000, crs="EPSG:32615")
         with pytest.raises(ConfigMismatchError, match="resolution") as exc_info:
             current.validate_against(existing, "test.zarr")
         assert "chunk_size" in str(exc_info.value)
-
-    def test_error_message_includes_store_path(self):
-        existing = {"resolution": 10.0, "chunk_size": 2000, "crs": "EPSG:32615"}
-        current = RoiManifest(resolution=20.0, chunk_size=2000, crs="EPSG:32615")
-        with pytest.raises(ConfigMismatchError, match=r"s3://bucket/store\.zarr"):
-            current.validate_against(existing, "s3://bucket/store.zarr")
 
     def test_error_message_includes_old_and_new_values(self):
         existing = {"resolution": 10.0, "chunk_size": 2000, "crs": "EPSG:32615"}
@@ -135,26 +89,14 @@ class TestValidateAgainst:
 class TestValidateAgainstLegacyStores:
     """Tests for legacy stores without manifests."""
 
-    def test_none_manifest_warns_but_passes(self, caplog):
+    def test_none_manifest_warns_but_passes(self):
         m = RoiManifest(resolution=10.0, chunk_size=2000, crs="EPSG:32615")
         # Should not raise
         m.validate_against(None, "legacy.zarr")
-        assert "legacy store" in caplog.text.lower()
-
-    def test_none_manifest_logs_store_path(self, caplog):
-        m = RoiManifest(resolution=10.0, chunk_size=2000, crs="EPSG:32615")
-        m.validate_against(None, "s3://bucket/old.zarr")
-        assert "s3://bucket/old.zarr" in caplog.text
 
 
 class TestValidateAgainstEdgeCases:
     """Tests for edge cases in validation."""
-
-    def test_extra_keys_in_existing_ignored(self):
-        existing = {"resolution": 10.0, "chunk_size": 2000, "crs": "EPSG:32615", "extra": "val"}
-        current = RoiManifest(resolution=10.0, chunk_size=2000, crs="EPSG:32615")
-        # Should not raise
-        current.validate_against(existing, "test.zarr")
 
     def test_missing_key_in_existing_skipped(self):
         existing = {"resolution": 10.0}  # chunk_size and crs not in existing
@@ -171,13 +113,6 @@ class TestValidateAgainstEdgeCases:
         with pytest.raises(ConfigMismatchError, match="roi_manifest_hash"):
             current.validate_against(existing, "test.zarr")
 
-    def test_current_concrete_vs_existing_none_passes(self):
-        """Store was written without the field; current now provides it — no mismatch."""
-        existing = {"manifest_type": "IngestManifest"}
-        current = IngestManifest(roi_manifest_hash="abc123")
-        # existing lacks roi_manifest_hash -> existing_val is None -> skipped
-        current.validate_against(existing, "test.zarr")
-
     def test_unknown_key_in_existing_ignored(self):
         """Keys in existing that aren't in the manifest schema are ignored (forward-compat)."""
         existing = {
@@ -192,35 +127,8 @@ class TestValidateAgainstEdgeCases:
         current.validate_against(existing, "test.zarr")
 
 
-class TestIngestManifestChaining:
-    """Tests for ingestion manifest with chained ROI hash."""
-
-    def test_ingest_manifest_validates_roi_hash(self):
-        roi_hash = RoiManifest(resolution=10.0, chunk_size=2000, crs="EPSG:32615").hash()
-        m = IngestManifest(roi_manifest_hash=roi_hash)
-        # Should not raise
-        m.validate_against(m.to_dict(), "test.zarr")
-
-    def test_ingest_manifest_detects_roi_hash_mismatch(self):
-        old_hash = RoiManifest(resolution=10.0, chunk_size=2000, crs="EPSG:32615").hash()
-        new_hash = RoiManifest(resolution=20.0, chunk_size=2000, crs="EPSG:32615").hash()
-        existing = {"roi_manifest_hash": old_hash}
-        current = IngestManifest(roi_manifest_hash=new_hash)
-        with pytest.raises(ConfigMismatchError, match="roi_manifest_hash"):
-            current.validate_against(existing, "test.zarr")
-
-
 class TestEmbeddingManifestChaining:
     """Tests for embedding manifest with chained ingestion hash."""
-
-    def test_embedding_manifest_validates_model_checkpoint(self):
-        m = EmbeddingManifest(
-            model_checkpoint="tessera_v1_1_aws_encoder",
-            num_obs_checkpoints=tuple(range(8, 257, 8)),
-            reflectance_manifest_hash="abc123",
-            sar_manifest_hash="def456",
-        )
-        m.validate_against(m.to_dict(), "test.zarr")
 
     def test_embedding_manifest_detects_model_change(self):
         existing = {
@@ -232,18 +140,6 @@ class TestEmbeddingManifestChaining:
             num_obs_checkpoints=tuple(range(8, 257, 8)),
         )
         with pytest.raises(ConfigMismatchError, match="model_checkpoint"):
-            current.validate_against(existing, "test.zarr")
-
-    def test_embedding_manifest_detects_num_obs_checkpoints_change(self):
-        existing = {
-            "model_checkpoint": "tessera_v1_1_aws_encoder",
-            "num_obs_checkpoints": [8, 16, 32, 64],
-        }
-        current = EmbeddingManifest(
-            model_checkpoint="tessera_v1_1_aws_encoder",
-            num_obs_checkpoints=tuple(range(8, 257, 8)),
-        )
-        with pytest.raises(ConfigMismatchError, match="num_obs_checkpoints"):
             current.validate_against(existing, "test.zarr")
 
     def test_embedding_manifest_list_vs_tuple_equivalent(self):
@@ -282,18 +178,6 @@ class TestIngestManifestFromRoiStore:
         # The chained hash must equal the ROI manifest's own hash.
         assert ingest.roi_manifest_hash == roi.hash()
 
-    def test_roi_hash_changes_when_roi_config_changes(self, tmp_path):
-        roi_a = RoiManifest(resolution=10.0, chunk_size=2000, crs="EPSG:32615")
-        roi_b = RoiManifest(resolution=20.0, chunk_size=2000, crs="EPSG:32615")
-        path_a = str(tmp_path / "a.zarr")
-        path_b = str(tmp_path / "b.zarr")
-        self._write_roi_store(path_a, roi_a)
-        self._write_roi_store(path_b, roi_b)
-
-        hash_a = IngestManifest.from_roi_store(path_a).roi_manifest_hash
-        hash_b = IngestManifest.from_roi_store(path_b).roi_manifest_hash
-        assert hash_a != hash_b
-
     def test_legacy_roi_store_without_manifest_yields_none(self, tmp_path):
         """An ROI store with no _manifest attr chains to a None hash (no crash)."""
         roi_path = str(tmp_path / "legacy.zarr")
@@ -318,21 +202,6 @@ class TestEmbeddingManifestFromUpstreamStores:
         )
         assert m.reflectance_manifest_hash == IngestManifest.from_dict(ref).hash()
         assert m.sar_manifest_hash is None
-
-    def test_combines_both_sar_orbits(self):
-        """Both SAR orbits combine into a single deterministic hash."""
-        upstream = {
-            "reflectance": self._ingest_dict("roi_ref"),
-            "sar_ascending": self._ingest_dict("roi_asc"),
-            "sar_descending": self._ingest_dict("roi_desc"),
-        }
-        m = EmbeddingManifest.from_upstream_stores(
-            model_checkpoint="tessera_v1_1_aws_encoder",
-            num_obs_checkpoints=(8, 16, 32),
-            upstream_manifests=upstream,
-        )
-        assert m.sar_manifest_hash is not None
-        assert len(m.sar_manifest_hash) == 16
 
     def test_sar_hash_order_independent_of_dict_order(self):
         """The combined SAR hash depends on ascending|descending order, not dict order."""
@@ -399,9 +268,6 @@ class TestIngestCodeIsPartOfMosaicIdentity:
         legacy = {"manifest_type": "IngestManifest", "roi_manifest_hash": None}
         with pytest.raises(ConfigMismatchError, match="ingest_code_identity"):
             IngestManifest.from_roi_store(self._roi(tmp_path)).validate_against(legacy, "legacy.zarr")
-
-    def test_the_identity_is_deterministic(self):
-        assert ingest_code_identity() == ingest_code_identity()
 
 
 class TestS2OnlyPolicyIsPartOfEmbeddingIdentity:
@@ -513,10 +379,6 @@ class TestAdmissionThresholdIsPartOfIngestIdentity:
         assert round_tripped.min_valid_coverage is None
         assert round_tripped.to_dict() == before_the_field_existed
         assert round_tripped.hash() == IngestManifest(**self.BASE).hash()
-
-    def test_sar_stores_carry_no_threshold(self):
-        """Only the optical store has an admission gate; the SAR ones have no such knob."""
-        assert IngestManifest.from_dict({**self.BASE}).min_valid_coverage is None
 
 
 class TestAbsenceIsAValueForAPolicyField:

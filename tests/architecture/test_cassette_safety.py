@@ -40,18 +40,10 @@ _FORBIDDEN_PATTERNS = (
 )
 
 
-def test_cassettes_directory_exists() -> None:
-    """The cassette directory exists with at minimum a README.
-
-    A missing directory is a setup error. An empty directory (no .yaml)
-    is fine — Phase 10 ships before any cassette is recorded.
-    """
-    assert CASSETTE_DIR.is_dir(), f"Missing cassette dir: {CASSETTE_DIR}"
-    assert (CASSETTE_DIR / "README.md").exists(), "Cassette dir must include README.md"
-
-
 def test_no_credentials_in_cassettes() -> None:
     """Every committed cassette is free of known credential markers."""
+    # A moved directory would otherwise make this pass on an empty glob.
+    assert CASSETTE_DIR.is_dir(), f"Missing cassette dir: {CASSETTE_DIR}"
     cassettes = sorted(CASSETTE_DIR.glob("*.yaml"))
     if not cassettes:
         # No cassettes yet → nothing to check. Test passes trivially.

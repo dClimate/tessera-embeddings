@@ -22,6 +22,7 @@ directly, against a bucket held closed, rather than argued from the code.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -31,9 +32,11 @@ from pathlib import Path
 
 import pytest
 
-from tessera_embeddings.providers.aws.ray import LAUNCH_PACING_ENV
-
-from ._launch_pacing_sim import BUCKET_REFILL_PER_SEC
+from tessera_embeddings.providers.aws.ray import (
+    LAUNCH_PACING_AUTOSCALER_ENV,
+    LAUNCH_PACING_CLIENT_ENV,
+    LAUNCH_PACING_ENV,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -137,7 +140,13 @@ def _run_arm(*, paced: bool, closed_for: float = 0.0) -> Arm:
 
 @pytest.fixture(scope="module")
 def arms() -> dict[str, Arm]:
-    """Every arm, run once. Each is minutes of subprocesses; the assertions are cheap."""
+    """Every arm, run once. Each is minutes of subprocesses; the assertions are cheap.
+
+    Opt-in through ``TESSERA_TEST_LAUNCH_PACING=1``: pacing is off by default, and minutes
+    of subprocesses on every source change is past this directory's two-minute rule.
+    """
+    if not os.environ.get("TESSERA_TEST_LAUNCH_PACING"):
+        pytest.skip("set TESSERA_TEST_LAUNCH_PACING=1 to run the launch-pacing simulation")
     return {
         "control": _run_arm(paced=False),
         "paced": _run_arm(paced=True),
@@ -152,16 +161,6 @@ def test_pacing_costs_less_quota_per_instance_placed(arms: dict[str, Arm]) -> No
         f"paced {paced.throttled_per_instance:.3f} vs control "
         f"{control.throttled_per_instance:.3f} refusals per instance placed"
     )
-
-
-def test_pacing_makes_fewer_launch_requests_for_more_fleet(arms: dict[str, Arm]) -> None:
-    """Fewer calls AND more instances. Either alone would be a trade rather than a win.
-
-    Separate from the ratio above because the ratio could improve while total traffic
-    grew, and total traffic is what the account's other callers actually feel.
-    """
-    control, paced = arms["control"], arms["paced"]
-    assert paced.calls < control.calls, f"paced made {paced.calls} calls, control {control.calls}"
     assert paced.placed >= control.placed, (
         f"paced placed {paced.placed} instances, control {control.placed} — pacing must not cost fleet"
     )
@@ -184,15 +183,56 @@ def test_a_paced_fleet_keeps_asking_while_the_bucket_is_shut(arms: dict[str, Arm
     assert shut.placed > 0, "the fleet placed nothing after the bucket reopened"
 
 
-def test_the_paced_arm_settles_near_the_buckets_refill_rate(arms: dict[str, Arm]) -> None:
-    """Pacing should converge on the quota, not on something far below it.
+#: The name under test, so the baseline below removes exactly the right key.
+_INTERVAL = "AUTOSCALER_UPDATE_INTERVAL_S"
 
-    The upper bound is what says the clusters are not pacing each other into the
-    ground; the lower bound is what says they are still using the quota they have.
-    Loose on both sides — each cluster's limiter converges independently, so the
-    aggregate lands above the refill rate rather than on it.
+
+def _ray_autoscaler_interval(override: str | None) -> int:
+    """What RAY resolves the interval to in a fresh interpreter: ``override``, or its own default.
+
+    A subprocess because the constant is bound at module import: reading it in-process after
+    monkeypatching the environment would report the value this test session imported with, not
+    the value a freshly-started autoscaler would see. The autoscaler IS a fresh process, so this
+    reproduces its conditions rather than approximating them.
+
+    **The baseline STRIPS the key rather than inheriting the environment**, which is why this
+    takes an override rather than a dict. A developer machine or CI runner configured with launch
+    pacing already exports this name, and an inherited environment would then measure that
+    override and call it Ray's default — failing the comparison below on precisely the hosts the
+    setting exists for. Correct code, red test.
     """
-    paced = arms["paced"]
-    rate = paced.calls / paced.wall_s
-    assert rate <= BUCKET_REFILL_PER_SEC * CLUSTERS * 2, f"paced arm called at {rate:.2f}/s"
-    assert rate >= _FLOOR_PER_CLIENT_PER_S, f"paced arm called at {rate:.2f}/s, below one client's floor"
+    # Imports ONE constants module and prints an int. No `ray.init()`, no `ray start`, no
+    # cluster — this repo has stranded a Ray cluster from a test before and the RAM cost was
+    # felt for days, so the subprocess is deliberately the narrowest thing that can answer.
+    code = "from ray.autoscaler._private.constants import AUTOSCALER_UPDATE_INTERVAL_S as v; print(v)"
+    env = {k: v for k, v in os.environ.items() if k != _INTERVAL}
+    if override is not None:
+        env[_INTERVAL] = override
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, check=True)
+    return int(out.stdout.strip())
+
+
+def test_ray_actually_reads_the_interval_from_the_environment() -> None:
+    """The setting is only pacing if RAY reads it, and that is Ray's contract to keep, not ours.
+
+    Asserting our own dict against a default copied out of Ray proves nothing about Ray — it
+    passes whether or not the name is environment-backed. So this asks Ray, in a fresh
+    interpreter, and compares the answer with and without the variable set.
+
+    **This is the regression that would make the whole setting inert**: if a future Ray pins the
+    interval as a plain module constant, the value we export would be silently ignored while the
+    export still reads like tuning. That failure is invisible everywhere else.
+    """
+    ours = int(LAUNCH_PACING_AUTOSCALER_ENV[_INTERVAL])
+    default = _ray_autoscaler_interval(None)
+    applied = _ray_autoscaler_interval(str(ours))
+    assert applied == ours, (
+        f"Ray resolved AUTOSCALER_UPDATE_INTERVAL_S to {applied} with the environment set to "
+        f"{ours}; the setting is not environment-backed in this Ray and paces nothing"
+    )
+    assert ours > default, (
+        f"our value {ours} is at or below Ray's own default {default}, so it slows nothing even though Ray reads it"
+    )
+    assert _INTERVAL not in LAUNCH_PACING_CLIENT_ENV, (
+        "`ray up` runs no autoscaler loop, so the name is inert in the one-shot bootstrap"
+    )

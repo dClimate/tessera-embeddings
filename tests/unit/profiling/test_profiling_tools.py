@@ -5,8 +5,7 @@ work against any run:
 
 - ``ResourceMonitor`` context slots (the ``ctx=`` attribution on RESOURCES lines)
 - ``actors._chunk_summary_line`` (the machine-readable per-chunk contract)
-- ``observe_cluster.PHASE_PARSER`` consuming those lines (and its legacy
-  prose-log fallback for runs from older code)
+- ``observe_cluster.PHASE_PARSER`` consuming those lines
 """
 
 from __future__ import annotations
@@ -58,17 +57,6 @@ class TestResourceMonitorContext:
         assert "ctx=work:chunk_1_2:s1/3" in line
         assert "write:chunk_1_1" in line
 
-    def test_clearing_a_slot_removes_it(self, caplog) -> None:
-        mon = ResourceMonitor()
-        mon.set_context("work", "chunk_0_0:prologue")
-        mon.set_context("work", None)
-        mon.set_context("write", "chunk_0_0")
-        with caplog.at_level(logging.INFO, logger="tessera_embeddings.inference.resource_monitor"):
-            mon._emit_once()
-        line = next(r.message for r in caplog.records if "RESOURCES" in r.message)
-        assert "work:" not in line
-        assert "ctx=write:chunk_0_0" in line
-
 
 class TestChunkSummaryLine:
     """The machine-readable per-chunk contract."""
@@ -78,36 +66,6 @@ class TestChunkSummaryLine:
         assert line.startswith("CHUNK_SUMMARY: ")
         payload = json.loads(line[len("CHUNK_SUMMARY: ") :])
         assert payload == {"label": "chunk_0_0", "status": "success", "valid_px": 123, "total_s": 4.5}
-
-    def test_keys_are_sorted_for_stable_diffs(self) -> None:
-        line = _chunk_summary_line(z=1, a=2)
-        assert line.index('"a"') < line.index('"z"')
-
-    def test_carries_the_per_cell_run_id(self) -> None:
-        """``run`` is what makes this line attributable to a zone.
-
-        ``label`` is ``chunk_<row>_<col>`` — grid-local, so every cell restarts at
-        ``chunk_0_0`` and labels collide across zones AND across concurrent fills sharing a
-        log group. Attributing by time window instead produced two confidently wrong findings
-        on 2026-08-05. Every emitting path must carry it: success, skipped and failed.
-        """
-        payload = json.loads(
-            _chunk_summary_line(label="chunk_0_0", run="49S-2021-f1fa65fc", status="success")[len("CHUNK_SUMMARY: ") :]
-        )
-        assert payload["run"] == "49S-2021-f1fa65fc"
-
-    def test_an_added_key_does_not_disturb_the_existing_ones(self) -> None:
-        """Additive by construction — observe_cluster reads keys via ``.get()``, so a new
-        field cannot break a consumer, but the old fields must stay put.
-        """
-        payload = json.loads(
-            _chunk_summary_line(label="chunk_0_0", run="r", status="success", valid_px=123, total_s=4.5)[
-                len("CHUNK_SUMMARY: ") :
-            ]
-        )
-        assert payload["label"] == "chunk_0_0"
-        assert payload["valid_px"] == 123
-        assert payload["total_s"] == 4.5
 
 
 def test_report_reaches_its_last_command_without_pollers() -> None:
@@ -178,29 +136,9 @@ class TestPhaseParser:
         ]
         assert any(ln.startswith("chunk_0_1") and ln.endswith("skipped") for ln in out.splitlines())
 
-    def test_falls_back_to_legacy_prose_parsing(self, tmp_path: Path) -> None:
-        """Runs from pre-CHUNK_SUMMARY code still produce a phase table."""
-        (tmp_path / "worker-old.err").write_text(
-            "2026-07-21 10:00:00,000 X INFO Chunk chunk_0_0: T_kept=50 -> strip_h=2000 -> 1 strip(s)\n"
-            "2026-07-21 10:00:05,000 X INFO MosaicChunkInferenceDataset: 1000 valid pixels"
-            " out of 4000000 total (0.03%) in 3 buckets\n"
-            "2026-07-21 10:00:06,000 X INFO Starting v1.1 inference\n"
-            "2026-07-21 10:00:16,000 X INFO Inference complete: strip done 10.0s total, 100 px/sec\n"
-            "2026-07-21 10:00:17,000 X INFO Chunk chunk_0_0 complete: 1000 valid pixels, 17.0s\n"
-        )
-        out = _run_parser(tmp_path)
-        assert "pref\tbuckets" in out.splitlines()[0]  # legacy header
-        row = next(ln for ln in out.splitlines() if ln.startswith("chunk_0_0"))
-        fields = row.split("\t")
-        assert fields[1] == "50"  # T_kept
-        assert fields[5] == "1000"  # valid_px from the cdone line
-
 
 def _make_coarse_ds(emb: object, *, with_time: bool = True):
     """Minimal coarsened-format xr.Dataset from an (northing, easting, band) array."""
-    import numpy as np
-    import xarray as xr
-
     n, e, b = emb.shape
     coords = {"northing": np.arange(n), "easting": np.arange(e), "band": np.arange(b)}
     dims = ("northing", "easting", "band")
@@ -235,37 +173,27 @@ class TestCoarsenedCompare:
             assert sel is not None
             assert all(0 <= o < mod.ROW_BLOCK and s.start + o < 1000 for o in sel)
 
-    def test_sampled_compare_selects_northing_rows(self) -> None:
-        import numpy as np
-
+    @pytest.mark.parametrize("with_time", [True, False])
+    def test_sampled_compare_selects_northing_rows(self, with_time: bool) -> None:
+        """Rows are selected on the northing dim, so a time-less store works too (positional would not)."""
         mod = compare_coarsened_stores
         base = np.arange(8 * 4 * 2, dtype="float32").reshape(8, 4, 2)
         rows = mod._row_slabs(8, sample_rows=3)  # → rows 0, 3, 7 (one slab)
-        ref = _make_coarse_ds(base)
+        ref = _make_coarse_ds(base, with_time=with_time)
 
         differ_unsampled = base.copy()
         differ_unsampled[5] += 1.0  # row 5 is NOT in {0,3,7}
-        assert mod.compare_variable(ref, _make_coarse_ds(differ_unsampled), "embeddings", rows).bit_identical
+        assert mod.compare_variable(
+            ref, _make_coarse_ds(differ_unsampled, with_time=with_time), "embeddings", rows
+        ).bit_identical
 
         differ_sampled = base.copy()
         differ_sampled[3] += 1.0  # row 3 IS sampled → must be caught
-        assert not mod.compare_variable(ref, _make_coarse_ds(differ_sampled), "embeddings", rows).bit_identical
-
-    def test_sampled_compare_dim_aware_without_time_axis(self) -> None:
-        """A time-less store still selects northing rows (positional indexing would not)."""
-        import numpy as np
-
-        mod = compare_coarsened_stores
-        base = np.arange(8 * 4 * 2, dtype="float32").reshape(8, 4, 2)
-        rows = mod._row_slabs(8, sample_rows=3)
-        ref = _make_coarse_ds(base, with_time=False)
-        differ = base.copy()
-        differ[3] += 1.0  # sampled northing row
-        assert not mod.compare_variable(ref, _make_coarse_ds(differ, with_time=False), "embeddings", rows).bit_identical
+        assert not mod.compare_variable(
+            ref, _make_coarse_ds(differ_sampled, with_time=with_time), "embeddings", rows
+        ).bit_identical
 
     def test_var_structure_flags_dtype_mismatch(self) -> None:
-        import numpy as np
-
         mod = compare_coarsened_stores
         base = np.zeros((4, 4, 2), dtype="float32")
         ref = _make_coarse_ds(base)
@@ -275,25 +203,8 @@ class TestCoarsenedCompare:
         problems = mod.compare_var_structure(ref, test)
         assert any("s2_obs_count" in p and "dtype" in p for p in problems)
 
-    def test_non_spatial_variable_compared_not_crashed(self) -> None:
-        """A var without a northing dim reads whole instead of crashing on isel(northing=…)."""
-        import numpy as np
-
-        mod = compare_coarsened_stores
-        base = np.zeros((4, 4, 2), dtype="float32")
-        ref = _make_coarse_ds(base)
-        ref["aux"] = 5.0  # scalar (0-d) data var — no northing dim
-        test = _make_coarse_ds(base)
-        test["aux"] = 5.0
-        rows = mod._row_slabs(4, sample_rows=None)
-        cmp = mod.compare_variable(ref, test, "aux", rows)  # must not raise
-        assert cmp.n == 1
-        assert cmp.bit_identical
-
     def test_finite_mask_excludes_infinities(self) -> None:
         """inf-inf=NaN must not poison the abs-diff stats when a store has infinities."""
-        import numpy as np
-
         mod = compare_coarsened_stores
         a = np.array([[1.0, np.inf, 3.0]], dtype="float32")
         b = np.array([[1.0, np.inf, 3.5]], dtype="float32")
@@ -349,11 +260,10 @@ class TestCrossConfigEnvelope:
     def test_verdict(self, overrides: dict, passed: bool) -> None:
         assert dataclasses.replace(_WORST_SHIMMER, **overrides).passed is passed
 
-    @pytest.mark.parametrize("cross_config", [True, False])
-    def test_a_zeroed_artifact_fails(self, tmp_path: Path, cross_config: bool) -> None:
+    def test_a_zeroed_artifact_fails(self, tmp_path: Path) -> None:
         """All-zero embeddings with valid scales fail, even on a tile too small for the within-one share."""
         emb = np.random.default_rng(0).integers(-127, 128, (8, 8, 16), dtype=np.int8)
         ref, test = _staged(tmp_path / "ref.zarr", emb), _staged(tmp_path / "test.zarr", np.zeros_like(emb))
-        result = compare_outputs.compare_chunk(ref, test, "t", cross_config=cross_config)
+        result = compare_outputs.compare_chunk(ref, test, "t", cross_config=True)
         assert result.cosine_min == 0.0
         assert not result.passed

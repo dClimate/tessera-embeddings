@@ -1,0 +1,63 @@
+# Architecture contracts, enforced by import-linter (`uv run lint-imports`) in
+# .github/workflows/architecture.yml. Two rules that are about NAMES rather than modules
+# (Dask's get_client, the solar-day offset) live in ruff.toml as banned APIs instead,
+# because import-linter sees third-party packages only as their top-level module.
+# Why this tool, and how each former rule maps here: context_docs/decisions/039-architecture-rules-run-on-import-linter-and-ruff.md.
+
+[importlinter]
+root_packages =
+    tessera_embeddings
+include_external_packages = True
+
+# The three-layer architecture in the README, top to bottom. A module may import from
+# layers below it, never above. `:` joins packages that may import each other; `|` joins
+# packages that may not. Exhaustive, so a new top-level subpackage fails until placed.
+# profiling/ sits on top: nothing in the library may import it, which keeps the boto3 its
+# operator CLIs load out of an ordinary `import tessera_embeddings`.
+[importlinter:contract:layers]
+name = Layers: profiling > orchestration > providers > domain > config > errors, utils
+type = layers
+containers =
+    tessera_embeddings
+layers =
+    profiling
+    orchestration
+    providers
+    ingest : inference : storage
+    config
+    errors | utils
+exhaustive = True
+
+# Each forbidden contract covers the WHOLE package, root module included, and exempts
+# only the subtree where the import is allowed. Listing covered modules instead would let
+# any module nobody listed (a new adapter, a new provider, a package __init__) escape.
+# Transitive reach is the layers contract's job: domain code cannot import providers/,
+# orchestration/ or profiling/ at all, so it cannot reach their SDKs through them.
+
+# The domain is orchestrator-agnostic: Prefect is quarantined in orchestration/prefect/.
+# orchestration/runners/ and any other orchestrator adapter are its Prefect-free peers.
+[importlinter:contract:prefect]
+name = Prefect only in orchestration.prefect
+type = forbidden
+source_modules =
+    tessera_embeddings
+forbidden_modules =
+    prefect
+ignore_imports =
+    tessera_embeddings.orchestration.prefect.** -> prefect
+
+# The AWS SDK stays in providers/aws/, so other clouds and on-prem deployments never pull
+# it in. profiling/ may import boto3 (operator CLIs reading CloudWatch/ECS/EC2); the layers
+# contract keeps profiling/ unreachable from library code, which is what makes that safe.
+[importlinter:contract:aws]
+name = AWS SDK only in providers.aws and profiling
+type = forbidden
+source_modules =
+    tessera_embeddings
+forbidden_modules =
+    boto3
+    botocore
+ignore_imports =
+    tessera_embeddings.providers.aws.** -> boto3
+    tessera_embeddings.providers.aws.** -> botocore
+    tessera_embeddings.profiling.** -> boto3

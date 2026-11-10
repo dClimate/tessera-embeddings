@@ -142,8 +142,8 @@ to skip dask graphs (library precedent in `_open_readonly`).
 
 ## Library reuse map
 
-**Use as-is:** `_default_repo_config`, `manifest_split()`, `TIME_ENCODING`, `pcodec_serializer()`,
-`rollback_commits`, and `create_empty_store_from_coords` for **single-group cases only**.
+**Use as-is:** `_default_repo_config`, `manifest_split()`, `TIME_ENCODING`, `pcodec_serializer()`
+and `create_empty_store_from_coords` for **single-group cases only**.
 
 **Raw APIs are still needed for:** sibling groups, fork/merge, `shift_array`, GC, tags, and sharded
 arrays.

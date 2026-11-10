@@ -115,6 +115,7 @@ class TestTruncationIsNeverSilent:
     """
 
     def test_untruncated_dossier_has_no_partial_warning(self):
+        """The fixtures carry no ``truncated`` key, as older JSON written before the flag did."""
         md = rep.build_dossier(_args(), _SCHED, _LOGS)
         assert "PARTIAL" not in md
 
@@ -140,10 +141,6 @@ class TestTruncationIsNeverSilent:
         md = rep.build_dossier(_args(scheduler=None), None, logs)
         assert "log query `http_retries_by_service`" in md
         assert "s3_slowdown" in md and "log query `s3_slowdown`" not in md
-
-    def test_missing_truncated_key_is_treated_as_complete(self):
-        """Older JSON (written before the flag existed) must still render."""
-        assert "PARTIAL" not in rep.build_dossier(_args(), _SCHED, _LOGS)
 
 
 class TestFleetMemoryReachesTheDossier:

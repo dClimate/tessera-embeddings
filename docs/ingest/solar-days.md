@@ -56,8 +56,8 @@ Three things enforce this rather than describing it:
   is a plausible-looking wrong answer — right at central longitudes, wrong only where the
   offset crosses midnight — so a path that skips the chokepoint would look correct
   everywhere anyone checks interactively.
-- An **architecture rule** (`solar-offset-applied-only-in-solar-days`) fails CI if
-  `solar_day_offset_seconds` is called outside `solar_days.py`. One application is the
+- A **ruff banned-API rule** (`TID251`, in `ruff.toml`) fails CI if
+  `solar_day_offset_seconds` is used outside `solar_days.py`. One application is the
   invariant; a second is a bug in the opposite direction.
 - Every consumption point **re-normalises defensively** rather than trusting call order, because
   every supplier (`query_fn`, `item_provider_fn`) is injectable and `normalize_to_solar_day` is

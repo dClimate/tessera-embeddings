@@ -164,16 +164,8 @@ Ingestion flows call:
 ### Applying the ROI Mask
 
 `roi_processing.apply_roi_mask` broadcasts the 2D mask over the time dimension and sets
-out-of-ROI pixels to `fill_value` (default 0) across all dataset variables.
-
-`roi_processing.filter_low_coverage_dates` then drops time steps where fewer than
-`min_valid_coverage` percent of ROI pixels are valid (default 5%). Only the per-date valid pixel
-counts are computed eagerly — one scalar per time step, from SCL for S2 or VV for S1 — so band
-arrays remain lazy and cloud-covered or off-ROI scenes are dropped before any band data is read.
-
-`identify_low_coverage_ds` is the lazy alternative: instead of dropping dates it attaches a
-`valid_coverage` boolean coordinate. Evaluating it still reads the quality band over the whole
-ROI — it defers that read and skips the imagery bands, rather than answering from metadata.
+out-of-ROI pixels to 0 across all dataset variables. The caller reads the mask once, with its
+credentials, and passes it in; the function never reads the store itself.
 
 ### Zone ingestion (the global campaign) — ADR-011
 
@@ -190,16 +182,15 @@ campaign. Where a zone's ingest sits in the campaign, and what validation proves
 
 ## Basic Ingestion Process
 
-The high-level entry point is `ingest_tile()` in `stac.py`. It runs five stages in sequence:
+The high-level entry point is `ingest_tile()` in `stac.py`. It runs four stages in sequence:
 
 ```text
 1. Item query        — find items for the tile/bbox + date range (S1: native CMR
                        granule query, orbit-filtered server-side)
-2. Item filtering    — optional item_filter_fn pre-filter hook
-3. Date dedup        — drop items whose dates are already in the Zarr store
-4. odc.stac.load     — lazy-load COGs into a Dask-backed xarray Dataset. The S2
+2. Date dedup        — drop items whose dates are already in the Zarr store
+3. odc.stac.load     — lazy-load COGs into a Dask-backed xarray Dataset. The S2
                        baseline correction happens here, per source, inside the read
-5. Corrections       — dB conversion (S1)
+4. Corrections       — dB conversion (S1)
 ```
 
 `query_stac_items` and `load_stac_items` expose these stages separately so a flow could
@@ -260,7 +251,7 @@ Six things happen between a region and a written mosaic, and they are the order 
 
 S2 and Landsat are queried by tile ID property (e.g., `grid:code = T33UUP`), which returns
 only items for that specific MGRS tile. OPERA RTC-S1 on CMR-STAC lacks an equivalent
-property, so queries use a bbox derived from the MGRS tile via `mgrs_tile_to_bbox()`.
+property, so queries use the ROI's WGS84 bbox. (`mgrs_tile_to_bbox()` stays only for yield-embeddings' radar source sweep.)
 
 #### The fusion order decides which source wins a pixel
 
@@ -328,8 +319,8 @@ of it, with the decibel conversion applied after the load, is in
 A catalogue speaks UTC; a mosaic is indexed by local solar day, and where a zone's offset crosses
 UTC midnight the two disagree. One rule keeps them apart: `normalize_to_solar_day` applies the
 solar offset exactly once, at the catalogue chokepoint, after which an item's `datetime` is noon
-UTC of its solar day and every downstream date is a plain `YYYY-MM-DD` string. An architecture
-rule fails CI if `solar_day_offset_seconds` is called anywhere else. A query can only be bounded
+UTC of its solar day and every downstream date is a plain `YYYY-MM-DD` string. A ruff
+banned-API rule fails CI if `solar_day_offset_seconds` is used anywhere else. A query can only be bounded
 in UTC, so each chunk of a window **owns** a range of solar days and **queries** one UTC day wider
 on each side, and items are filtered to their owner before the loader groups them:
 

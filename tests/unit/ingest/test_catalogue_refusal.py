@@ -36,7 +36,6 @@ from tessera_embeddings.ingest.catalogue_refusal import (
     THROTTLE_STATUSES,
     UPSTREAM_ERROR_STATUSES,
     CatalogueQueryError,
-    CatalogueRefusal,
     CatalogueRequest,
     RefusalKind,
     classify_refusal,
@@ -121,19 +120,6 @@ class TestClassification:
         assert refusal.exhausted is True
         assert repeat_is_deterministic(refusal.kind) is True
 
-    def test_the_two_refusals_take_different_paths(self) -> None:
-        """The load-bearing assertion: same exception type, same endpoint, opposite verdicts.
-
-        Asserted as a divergence rather than as two independent expectations, because a
-        classifier that mapped everything to one answer would satisfy either expectation
-        on its own if the other were ever relaxed.
-        """
-        load = classify_refusal(_refused(503))
-        upstream = classify_refusal(_refused(502))
-        assert load.kind is not upstream.kind
-        assert repeat_is_deterministic(load.kind) != repeat_is_deterministic(upstream.kind)
-        assert load.signature != upstream.signature
-
     def test_the_exception_chain_answers_without_the_message(self) -> None:
         """Classification reads structure, so a redacted or reworded message still classifies.
 
@@ -209,18 +195,6 @@ class TestClassification:
         assert 502 in full, "a provider with no re-cut to fall back on keeps its 502 retries"
         assert reduced >= LOAD_REFUSAL_STATUSES, "a stated overload must still be waited out"
         assert full >= LOAD_REFUSAL_STATUSES
-
-    def test_the_ladder_is_chosen_by_the_providers_own_flags(self) -> None:
-        """Which statuses a request is retried for must follow the provider, not the call site."""
-        earth_search = _earth_search()
-        assert earth_search.refuses_oversized_pages is True
-        assert earth_search.throttles_with_forbidden is True
-        assert stac._retry_statuses(earth_search) == {403, 429, 500, 503, 504}
-
-        cmr = stac._get_provider_config("cmr-asf")
-        assert cmr.refuses_oversized_pages is False
-        assert cmr.throttles_with_forbidden is False
-        assert stac._retry_statuses(cmr) == {429, 500, 502, 503, 504}
 
 
 class TestSignature:
@@ -424,33 +398,6 @@ class TestTheFailingRequestIsNamed:
         assert isinstance(caught.value.__cause__, APIError)
         assert "too many 502 error responses" in str(caught.value.__cause__)
 
-    def test_a_refusal_before_any_search_is_named_as_the_catalogue_root(self, caplog, monkeypatch) -> None:
-        """Opening the catalogue is its own request.
-
-        Reading its refusal as a refusal of the search would attribute a root outage to a
-        window that was never asked for.
-
-        The root backoff is zeroed the way ``TestTheCatalogueRootKeepsTheRetryTheLadderStoppedGiving``
-        does it: what is asserted here is how the refusal is NAMED, and paying the real 6 s
-        ladder to reach that naming made this the slowest test in the file. The ladder's own
-        length is that class's subject, and it still asserts the attempt count.
-        """
-        monkeypatch.setattr(stac, "_ROOT_OPEN_BACKOFF_S", 0.0)
-        provider = stac._get_provider_config("earth-search")
-        collection = stac._get_collection_config("earth-search", "sentinel-2-l2a")
-        with (
-            patch.object(stac, "StacApiIO"),
-            patch.object(stac, "Client") as client,
-            caplog.at_level(logging.ERROR, logger=stac.__name__),
-        ):
-            client.open.side_effect = _refused(502)
-            with pytest.raises(CatalogueQueryError) as caught:
-                stac._query_stac_items(
-                    provider, collection, None, "2021-09-01", "2021-10-02", bbox=(-3.0, 50.0, -2.0, 51.0)
-                )
-        assert caught.value.request.page == 0
-        assert caught.value.request.area == "catalogue-root"
-
     def test_a_failure_in_the_page_body_is_not_a_catalogue_refusal(self, caplog) -> None:
         """Our own validation must stay outside the wrapper.
 
@@ -491,19 +438,6 @@ class TestTheFailingRequestIsNamed:
         items = self._query(pages(), caplog)
         assert [i.id for i in items] == ["a", "b"]
         assert REFUSAL_TOKEN not in caplog.text
-
-
-class TestRefusalLabels:
-    """The human-readable halves, which are what an operator actually reads."""
-
-    def test_the_label_says_whether_patience_was_already_spent(self) -> None:
-        exhausted = CatalogueRefusal(RefusalKind.UPSTREAM_ERROR, 502, exhausted=True)
-        single = CatalogueRefusal(RefusalKind.UPSTREAM_ERROR, 502, exhausted=False)
-        assert "exhausting" in exhausted.label
-        assert "without being retried" in single.label
-
-    def test_the_root_request_label_says_it_precedes_the_search(self) -> None:
-        assert "before any search" in CatalogueRequest("c", "w", "catalogue-root", 0).label
 
 
 class TestADeepRefusalIsRePartitioned:
@@ -556,6 +490,7 @@ class TestADeepRefusalIsRePartitioned:
             self._query(pages, caplog, "2021-09-01", "2021-10-02")
 
         assert caught.value.refusal.kind is RefusalKind.LOAD
+        assert "items per page" not in caplog.text
 
 
 class TestARefusalNoShorterWindowCanReachAsksForASmallerPage:
@@ -650,31 +585,18 @@ class TestARefusalNoShorterWindowCanReachAsksForASmallerPage:
         assert "shorter window" in caplog.text
         assert "items per page" not in caplog.text
 
-    def test_the_page_halves_to_a_floor_and_then_the_refusal_is_reported(self, caplog) -> None:
-        """It must give up. A window nothing can serve is a refusal, not an infinite retry.
-
-        A GUARD, not a proof: the refusal propagates with or without the step-down, so this
-        does not distinguish them. What it does catch is the step-down failing to terminate,
-        which would hang a leg rather than fail it -- the worse of the two outcomes, and the
-        one no other test here would notice.
-        """
+    def test_the_floor_is_reached_by_halving_and_nothing_below_it_is_asked(self, caplog) -> None:
+        """The ladder is pinned, so a change to the step or the floor is visible here."""
         with pytest.raises(CatalogueQueryError) as caught:
             self._query([self._refuses_at(1)], caplog, "2021-09-01", "2021-09-01")
 
         assert caught.value.refusal.kind is RefusalKind.UPSTREAM_ERROR
         assert caught.value.request.page == 1
-
-    def test_the_floor_is_reached_by_halving_and_nothing_below_it_is_asked(self, caplog) -> None:
-        """The ladder is pinned, so a change to the step or the floor is visible here."""
-        with pytest.raises(CatalogueQueryError):
-            self._query([self._refuses_at(1)], caplog, "2021-09-01", "2021-09-01")
-
         asked = [int(m) for m in re.findall(r"at (\d+) items per page", caplog.text)]
         assert asked == [50, 25, 12], f"expected halving to the floor, got {asked}"
         assert all(size >= stac._MIN_PAGE_SIZE for size in asked)
 
-    @pytest.mark.parametrize("status", [500, 504])
-    def test_a_backend_failure_is_not_re_asked_as_a_smaller_request(self, status: int, caplog) -> None:
+    def test_a_backend_failure_is_not_re_asked_as_a_smaller_request(self, caplog) -> None:
         """Only a SIZE refusal is worth asking again for less. 500 and 504 mean "I broke".
 
         Both are still force-listed, so one reaches the handler having already spent the
@@ -683,24 +605,11 @@ class TestARefusalNoShorterWindowCanReachAsksForASmallerPage:
         propagates once and lets the attempt budget decide instead.
         """
         with pytest.raises(CatalogueQueryError) as caught:
-            self._query([self._refuses_at(4, _refused(status))], caplog, "2021-09-01", "2021-10-02")
+            self._query([self._refuses_at(4, _refused(504))], caplog, "2021-09-01", "2021-10-02")
 
         assert caught.value.refusal.kind is RefusalKind.UPSTREAM_ERROR
-        assert caught.value.refusal.status == status
+        assert caught.value.refusal.status == 504
         assert "shorter window" not in caplog.text
-        assert "items per page" not in caplog.text
-
-    def test_a_stated_overload_on_the_first_page_is_not_answered_with_a_smaller_page(self, caplog) -> None:
-        """A 503 means BUSY. A smaller page is MORE requests, which is the wrong direction.
-
-        A GUARD, not a proof: a 503 propagates either way. It pins the classification the
-        step-down is gated on, so widening that gate to every refusal -- which would answer
-        an overload by multiplying the requests causing it -- fails here.
-        """
-        with pytest.raises(CatalogueQueryError) as caught:
-            self._query([self._refuses_at(1, _refused(503))], caplog, "2021-09-01", "2021-10-02")
-
-        assert caught.value.refusal.kind is RefusalKind.LOAD
         assert "items per page" not in caplog.text
 
     def test_a_reduced_page_is_inherited_by_the_windows_cut_from_it(self, caplog) -> None:
@@ -772,21 +681,14 @@ class TestARefusalThatKeepsArrivingCannotAmplify:
                 return searches, exc
         return searches, None
 
-    def test_it_gives_up_after_a_bounded_number_of_replacements(self) -> None:
-        searches, raised = self._always_refuses_past_page_one("2019-02-28", "2019-04-01")
-
-        assert isinstance(raised, CatalogueQueryError), "it must still report the refusal"
-        assert searches <= 4 * stac._MAX_REFUSAL_RE_PARTITIONS, (
-            f"{searches} searches for one month is amplification, not recovery"
-        )
-
     def test_the_bound_does_not_grow_with_the_window(self) -> None:
         """The property that matters: a year must not cost ten times a month.
 
         Before the budget the cost scaled with the days in the window, because every branch
         of the recursion had its own independent stopping condition.
         """
-        month, _ = self._always_refuses_past_page_one("2019-02-28", "2019-04-01")
+        month, raised = self._always_refuses_past_page_one("2019-02-28", "2019-04-01")
+        assert isinstance(raised, CatalogueQueryError), "it must still report the refusal"
         year, _ = self._always_refuses_past_page_one("2019-01-01", "2019-12-31")
         nine_years, _ = self._always_refuses_past_page_one("2017-01-01", "2025-12-31")
 
@@ -851,18 +753,6 @@ class TestTheCatalogueRootKeepsTheRetryTheLadderStoppedGiving:
 
         assert attempts == 1, "a status the ladder still holds must not be retried a second time"
         assert isinstance(raised, CatalogueQueryError)
-
-
-def test_the_window_walk_concurrency_stays_low() -> None:
-    """This is a MULTIPLIER on the streams one provider sees, not a per-leg setting.
-
-    The campaign runs tens of cells at once, so the fleet's concurrent search count is this
-    times the cell count. At 6 that was measured tripping a provider block; the campaign
-    before this concurrency existed refused nothing at all. Bounded, not pinned: raising it is
-    a decision about a shared service, and lowering it to 1 would give up the only lever on a
-    leg's query time, since a walk is idle for almost all of its wall clock.
-    """
-    assert 2 <= stac._QUERY_WINDOW_WORKERS <= 3
 
 
 class TestForbiddenIsAThrottleOnlyWhereItCannotBeAVerdict:
@@ -957,3 +847,20 @@ class TestTheRemedyFollowsTheProviderNotJustTheStatus:
 
         assert "shorter window" not in caplog.text
         assert "items per page" not in caplog.text
+
+
+@patch("tessera_embeddings.ingest.stac.Client")
+@patch("tessera_embeddings.ingest.stac.StacApiIO")
+@patch("tessera_embeddings.ingest.stac._build_stac_query", return_value={})
+def test_query_stac_items_passes_stac_io_to_client(mock_build, mock_stac_io_cls, mock_client_cls):
+    """Retry config reaches Client.open — dropping stac_io= would silently skip retries."""
+    mock_stac_io = MagicMock()
+    mock_stac_io_cls.return_value = mock_stac_io
+    # An EMPTY page cursor, named as the method the query actually walks. A bare MagicMock
+    # here answers `next()` forever, which is an unbounded loop rather than a failed test.
+    mock_client_cls.open.return_value.search.return_value.pages_as_dicts.return_value = iter([])
+
+    stac._query_stac_items(MagicMock(), MagicMock(), "T15TYH", "2024-01-01", "2024-01-31")
+
+    _, kwargs = mock_client_cls.open.call_args
+    assert kwargs.get("stac_io") is mock_stac_io

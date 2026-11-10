@@ -13,23 +13,12 @@ end-to-end path is now verified by running the quickstart by hand
 ([ADR 023](../../context_docs/decisions/023-the-single-path-end-to-end-is-the-quickstart-run.md)).
 So the contract holds per stage; it is not evidence that a full run of the two paths agrees.
 
-**And one of the seven real comparisons is not running, for two unrelated reasons at once.**
-`test_ingest_s1_roi_parity.py` carries a credentials `skipif` that accepts **either** supported
-Earthdata Login form — `EARTHDATA_TOKEN`, or `EARTHDATA_USERNAME` **and** `EARTHDATA_PASSWORD`
-together — so it skips only when none of them is set. (The token is the one to prefer: many
-contributor accounts are SAML- or MFA-linked and cannot basic-auth at all.) Supply either and the
-test starts, and then `xfail`s for a separate reason: its committed cassette predates the native CMR
-granule query ([ADR 009](../../context_docs/decisions/009-native-cmr-granule-query.md), issue #45)
-and no longer matches on replay. **Neither reason is the other's fix**, so what you see depends on
-your environment — a skip with no credentials, an xfail with any of them.
-
-So `-m parity` collects eight — seven comparisons plus `adapter_template/`, which is
-`@pytest.mark.skip`ped on purpose as a template to copy. **With no Earthdata credentials in the
-environment** a clean run reports **`6 passed, 2 skipped` in about 100 seconds** (measured, cassette
-replay) — the template and S1 being the two skips. **With credentials set** the same run reports
-`6 passed, 1 skipped, 1 xfailed` in 101.8 s — the same six comparisons, the same wall clock, and a
-different label on S1, because it fails on the cassette mismatch before doing real work.
-Either way, read it as six of seven comparisons made, not as a full verification.
+`-m parity` collects five comparisons: the ROI flow against its domain function, the S2 ingest
+flow against its domain function (STAC from a cassette, COG pixels read live from Earth Search's
+public bucket), and the S2 date loop in each of its three write modes. There is no S1 comparison:
+the old one could only skip or xfail after the native CMR granule query
+([ADR 009](../../context_docs/decisions/009-native-cmr-granule-query.md), issue #45) invalidated its
+cassette, so it was deleted; re-add it when issue #45 is fixed.
 
 If a parity test fails, one of two things happened:
 
@@ -56,10 +45,10 @@ don't accidentally run the slow ones.
 
 Some parity tests compare two configurations of the *same* path rather than two
 orchestrators. A performance mode meant to change only *when* or *how
-concurrently* work happens — S2 date pipelining in
-`test_ingest_s2_roi_pipeline_parity.py`, date batching in
-`test_ingest_s2_roi_batching_parity.py` — is safe only if the store is identical
-in both modes, which is what lets the flows choose the mode on their own.
+concurrently* work happens — S2 date batching and pipelining, each alone and
+composed, in `test_ingest_s2_roi_date_loop_parity.py` — is safe only if the store
+is identical in every mode, which is what lets the flows choose the mode on their
+own.
 
 Those tests take the same shape (two temp stores, one `assert_zarr_equivalent`)
 and carry the same weight, but a failure means a third thing beyond the two
@@ -87,4 +76,4 @@ data arrays and critical metadata (CRS, chunks, manifest fields).
 Community adapter PRs (Dagster, Airflow, …) must include a parity
 test that runs their adapter against the plain runner on the same
 input. Drop your test in `tests/parity/<adapter_name>/` following the
-template in `adapter_template/`.
+template in `adapter_template/README.md`.

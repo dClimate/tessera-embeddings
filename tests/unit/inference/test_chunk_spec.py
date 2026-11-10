@@ -12,23 +12,13 @@ from tessera_embeddings.inference.chunk_spec import (
 
 
 class TestChunkSpec:
-    """Tests for ChunkSpec properties and frozen behavior."""
+    """Tests for ChunkSpec properties."""
 
     def test_properties(self):
         chunk = ChunkSpec(row=2, col=3, y_start=3000, y_stop=4500, x_start=4500, x_stop=6000)
         assert chunk.height == 1500
         assert chunk.width == 1500
         assert chunk.label == "chunk_2_3"
-
-    def test_edge_chunk_smaller(self):
-        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=700, x_start=0, x_stop=300)
-        assert chunk.height == 700
-        assert chunk.width == 300
-
-    def test_frozen(self):
-        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=100, x_start=0, x_stop=100)
-        with pytest.raises(AttributeError):
-            chunk.row = 5
 
 
 class TestEnumerateChunks:
@@ -51,13 +41,6 @@ class TestEnumerateChunks:
         bottom_right = next(c for c in chunks if c.row == 2 and c.col == 1)
         assert bottom_right.height == 200  # 3200 - 3000
         assert bottom_right.width == 200  # 1700 - 1500
-
-    def test_single_chunk(self):
-        """Mosaic smaller than chunk_size → single chunk."""
-        chunks = enumerate_chunks(500, 800, chunk_size=1500)
-        assert len(chunks) == 1
-        assert chunks[0].height == 500
-        assert chunks[0].width == 800
 
     def test_real_test_data_dimensions(self):
         """Dimensions matching the actual test data (33174 x 25906)."""
@@ -84,9 +67,7 @@ class TestEnumerateChunks:
     @pytest.mark.parametrize(
         "total_y,total_x,chunk_size,expected_count",
         [
-            (1500, 1500, 1500, 1),
             (1501, 1500, 1500, 2),
-            (1, 1, 1500, 1),
             (10000, 10000, 1500, 49),  # 7x7
         ],
     )

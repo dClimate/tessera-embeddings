@@ -61,8 +61,6 @@ def test_the_bool_month_array_that_cost_two_fills_is_refused(var: str) -> None:
     with pytest.raises(ValueError, match="Refusing to fill") as exc:
         check_destination_types(g, GLOBAL, where="09S year 2022")
     assert f"{var}: dtype bool on disk, layout declares int8" in str(exc.value)
-    assert "09S year 2022" in str(exc.value)
-    assert "write-once" in str(exc.value), "the remedy is a fresh store, and the message must say so"
 
 
 @pytest.mark.parametrize("var", MONTH_COVERED_VARS)

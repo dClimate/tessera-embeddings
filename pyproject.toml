@@ -120,9 +120,6 @@ aws = [
 all = [
     "tessera_embeddings[inference,prefect,aws]",
 ]
-# Pure-stdlib package exposing the architecture-test runner so downstream
-# repos can enforce the same layer rules without pulling pytest.
-architecture-tests = []
 
 [dependency-groups]
 dev = [
@@ -131,15 +128,20 @@ dev = [
     "pytest-xdist",
     "pytest-cov",
     "ruff",
-    "mypy",
+    # Type checker (`uv run ty check src`), configured under [tool.ty] below. Pinned: ty is
+    # pre-1.0 and its diagnostics change between releases. Same version as yield-embeddings.
+    "ty==0.0.92",
     "moto[server]",
-    "hypothesis",
+    # Enforces the architecture contracts in .importlinter (`uv run lint-imports`).
+    "import-linter",
     "vcrpy",
     "pytest-recording",
     # Empty-store tests build grids from explicit affine transforms. affine
     # arrives transitively via odc-geo, but the tests import it directly, so
     # declare it.
     "affine",
+    # Duplication measure for the quality ratchet (.jscpd.json; .github/workflows/quality-ratchet.yml).
+    "jscpd",
 ]
 # Standalone scale-test benchmarks under scripts/scale_tests/ (NOT pytest).
 # Kept out of the package deps: only needed to *run* the scale campaign.
@@ -189,5 +191,33 @@ markers = [
     "parity: Prefect vs plain.py output equivalence (slow)",
     "slow: >30s runtime (CPU inference, etc.)",
     "gpu: requires CUDA",
+    "real_fork_pool: run run_forked on the real spawn pool instead of the in-process stand-in",
 ]
 testpaths = ["tests"]
+
+[tool.ty.environment]
+python-version = "3.12"
+
+[tool.ty.analysis]
+# Compiled modules that ship no stubs.
+allowed-unresolved-imports = ["rasterio._base", "rasterio._env", "rasterio._err", "rasterio.crs"]
+# Built at import time (pyarrow registers its compute kernels dynamically), so a static
+# checker cannot see their members.
+replace-imports-with-any = ["pyarrow.compute"]
+
+# Excluded wholesale, as they were under mypy before ty: zarr's Array | Group unions do not narrow in the
+# inference loader, and torch's stubs reject callable-Tensor patterns that are correct.
+[[tool.ty.overrides]]
+include = [
+    "src/tessera_embeddings/inference/data_loading.py",
+    "src/tessera_embeddings/inference/chunk_spec.py",
+    "src/tessera_embeddings/inference/models/modules.py",
+    "src/tessera_embeddings/inference/models/builder.py",
+]
+rules = { all = "ignore" }
+
+# torch's stubs declare `forward` as an attribute, so every module's `forward` method reads as an
+# invalid override of it.
+[[tool.ty.overrides]]
+include = ["src/tessera_embeddings/inference/models/**"]
+rules = { invalid-mutable-override = "ignore" }
