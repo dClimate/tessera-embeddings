@@ -44,7 +44,14 @@ import dask.distributed
 import numpy as np
 import xarray as xr
 
-from tessera_embeddings.config.ingest import AUTO_BATCH_DATES, INGEST_CHUNK_SIZE, INGEST_CHUNKS, SOURCE_INDEX_VAR
+from tessera_embeddings.config.ingest import (
+    AUTO_BATCH_DATES,
+    DUPLICATE,
+    INGEST_CHUNK_SIZE,
+    INGEST_CHUNKS,
+    SOURCE_INDEX_VAR,
+    UNREADABLE,
+)
 from tessera_embeddings.config.providers import PROVIDERS
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
 from tessera_embeddings.ingest._pipeline import pipelined
@@ -70,7 +77,7 @@ from tessera_embeddings.ingest.loader_failures import (
     install_capture_everywhere,
     label_objects,
 )
-from tessera_embeddings.ingest.provenance import DUPLICATE, STEPPED_DOWN, UNREADABLE, day_granules, mark_dropped
+from tessera_embeddings.ingest.provenance import STEPPED_DOWN, day_granules, mark_dropped
 from tessera_embeddings.ingest.roi import (
     read_roi_mask,
     read_roi_metadata,

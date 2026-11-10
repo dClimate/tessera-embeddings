@@ -30,6 +30,7 @@ import dask.array as da
 import numpy as np
 import xarray as xr
 
+from tessera_embeddings.config.ingest import FUSED
 from tessera_embeddings.ingest.duplicates import image_identity
 from tessera_embeddings.ingest.opera_query import BURST_ID
 from tessera_embeddings.ingest.solar_days import solar_day_of
@@ -42,10 +43,6 @@ STEPPED_DOWN = "tessera:stepped_down"
 
 #: Item property: why the ingest dropped this copy before the fuse, its granule row's ``status``.
 DROPPED = "tessera:dropped"
-
-#: A granule row's ``status``: fused into the slot, or dropped as a losing duplicate or as a copy
-#: that would not read and was replaced by another.
-FUSED, DUPLICATE, UNREADABLE = "fused", "duplicate", "unreadable"
 
 #: Bits the packed pixel gives the position. A day's fusion order is zone-wide, so a long land zone
 #: can exceed 255 optical scenes or radar bursts in one day; sixteen bits leave ample room.
