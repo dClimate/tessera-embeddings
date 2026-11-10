@@ -107,7 +107,7 @@ happy path and links each of those subjects to its own document; the failure mod
 | `s2_roi.py` | The Sentinel-2 ingest: queries month by month, keeps one copy of each image, then loads and writes one solar day at a time. |
 | `s1_roi.py` | The OPERA radar ingest: walks the window in `batch_days` batches, builds the burst census once per orbit leg, and renews ASF credentials on a timer. |
 | `stac.py` | STAC querying and loading through `odc.stac.load` — providers, the date-window worklist that keeps Earth Search queries under its response cap, date filtering, and the load-time machinery that applies the Sentinel-2 reflectance offset. [§ Earth Search's response cap](../../../docs/ingest/earth-search-response-cap.md), [§ Sentinel-2 baseline correction](../../../docs/ingest/baseline-correction.md) |
-| `opera_query.py` | OPERA RTC-S1 queries: bounding boxes, items built from CMR's native Granule Search with orbit direction filtered server-side, UTM EPSG derivation, asset preparation, and the burst census and sort that decide which burst wins an overlap. [§ Radar ingest](../../../docs/ingest/radar.md) |
+| `opera_query.py` | OPERA RTC-S1 queries: bounding boxes, items built from CMR's native Granule Search with orbit direction filtered server-side, asset preparation, and the burst census and sort that decide which burst wins an overlap. [§ Radar ingest](../../../docs/ingest/radar.md) |
 | `solar_days.py` | The one place the solar offset is applied: stamps each item with noon UTC of its solar day, and splits a window into chunks that own solar days and query UTC dates. [§ Solar days](../../../docs/ingest/solar-days.md) |
 | `boa_offset.py` | The one place the reflectance-offset question is answered. Asked per ASSET, so an item whose bands come from two producers is corrected band by band rather than refused. [§ Sentinel-2 baseline correction](../../../docs/ingest/baseline-correction.md) |
 | `item_baselines.py` | The one reader of `s2:processing_baseline`. Reports integer hundredths (`04.00` -> `400`) and `None` for every kind of unreadable. |
@@ -309,8 +309,7 @@ by both halves and must be loaded once.
 OPERA RTC-S1 is not queried through a STAC search. `make_s1_item_provider` builds ready-to-load
 items straight from NASA's CMR Granule Search, which filters orbit direction and dual polarisation
 (VV+VH) server-side, where CMR-STAC pages unreliably at this scale and silently ignores the orbit
-filter. Each item's UTM CRS is derived from its MGRS tile, since OPERA items carry no projection
-metadata, and overlapping bursts are ranked by a once-per-leg census of how often each was
+filter. OPERA items carry no projection metadata, so every load uses the ROI's own geobox, and overlapping bursts are ranked by a once-per-leg census of how often each was
 acquired. A zone whose land is ice has granules but no usable dual-pol radar; it resolves to
 `S1_ORBIT_NONE` and is embedded from Sentinel-2 alone, unless the caller passes `require_s1`. All
 of it, with the decibel conversion applied after the load, is in
