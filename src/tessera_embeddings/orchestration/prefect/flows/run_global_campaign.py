@@ -777,7 +777,7 @@ async def run_global_campaign(
             cluster. What makes it safe is not the flag but two things underneath it: each
             cell carries its own inference window to the actors, and the zone-group attribute
             commit is separate and retried, so two years of one zone no longer collide. The
-            partition is over ZONES, so a zone's every year lands in one cluster and its
+            partition is over fill zones, so a fill zone's every year lands in one cluster and its
             assemblies serialize on that cluster's single trailing thread. ``False`` restores
             the barrier, which a repair pass over one year still wants.
         max_dispatch_rounds: How many ROUNDS of re-dispatch the campaign runs — not a

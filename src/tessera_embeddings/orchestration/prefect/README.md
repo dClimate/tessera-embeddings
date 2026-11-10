@@ -320,9 +320,9 @@ Zone-parallelism is safe because inference is independent across zones, and fill
 that share a group write disjoint shards and retry their small attrs commit
 (`commit_year_attrs`). That covers two years of one zone and the two halves of a
 v2 column, which routinely land on different clusters (ADR 038). The partition is
-over ZONES, so all of a zone's years land in one cluster on its single
+over fill zones, so all of a fill zone's years land in one cluster on its single
 trailing-assembly thread. **Commits are ungated.**
-They contend on the branch-tip CAS, since all 120 zone groups share one repo, but
+They contend on the branch-tip CAS, since every zone group shares one repo, but
 run 1 measured that as 2.2 s at 16 committers and 15 s at 120 with zero
 unresolvable conflicts. See `context_docs/storage/writing-to-the-global-store.md`. `build_land_mask` and `seed_global_store` are
 cluster-less (they run on the flow runner like `generate_roi`); only

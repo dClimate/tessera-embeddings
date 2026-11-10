@@ -10,7 +10,7 @@ update merges into the pixels a source owns (:meth:`ShardSource.pixels`).
 Cooperative fork/merge: the coordinator forks the session, workers write into
 their fork, the coordinator merges and makes **one commit per (zone, year)**,
 updating ``years_complete`` in the same commit (D1). Commits are UNGATED. They do
-contend on the branch-tip CAS -- all 120 zone groups share one repo -- but that
+contend on the branch-tip CAS -- every zone group shares one repo -- but that
 was measured at 2.2 s for 16 simultaneous committers and 15 s for 120, with zero
 unresolvable conflicts at every N. See
 ``context_docs/storage/writing-to-the-global-store.md``.
