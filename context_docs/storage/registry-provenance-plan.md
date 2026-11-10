@@ -26,7 +26,7 @@ questions in §10. The appendices are reference material and can be skipped.
   before building each day's mosaic, and why. It sits beside the store's existing registry.
 - **Three questions it answers,** each with a reader helper: what went into this day's mosaic,
   into this 20 km shard, and which granule supplied this pixel on each date?
-- **Cost.** About 4.7 TB of storage over the campaign, a quarter of a percent of the store. Its
+- **Cost.** About 5 TB of storage over the campaign, a quarter of a percent of the store. Its
   ingest time cost is inside run-to-run variation, measured over seven paired runs of a dense zone
   (§6); what it certainly adds is one more chunk write per date for the Dask scheduler.
   Correctness checks run at publication and fail the zone-year if the record is wrong.
@@ -291,7 +291,7 @@ claims every pixel. The first run that claims the pixel holds its record; the he
 
 | piece | measured | campaign |
 |---|---|---|
-| `pixel_sources` | optical 1.1–1.2 MB a shard-year; radar 0.07–0.2 MB per orbit | about 4.7 TB, a quarter of a percent of the store, around $1,300 a year |
+| `pixel_sources` | optical 0.9–1.2 MB a shard-year; radar 0.07–0.5 MB per orbit | about 5 TB, a quarter of a percent of the store, around $1,400 a year |
 | `granules` | about 160 MB for a land-dense zone-year (zone 35N) | at most about 170 GB for the fills, plus a set per update that re-ingests |
 | `shard_dates`, `update_pixels` | about 10 MB a zone-year; kilobytes per updated shard | about 10 GB |
 | the granule lists and index inside the mosaics | about 150 MB and 0.1–0.3% of a mosaic | none: deleted with the mosaics |
