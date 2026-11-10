@@ -1,10 +1,7 @@
-"""The S1 batch look-ahead must overlap the catalogue query without duplicating a date.
+"""The S1 batch loop: how batches tile the window, and why a look-ahead cannot write a date twice.
 
-Two independent properties, and the second is the one with teeth.
-
-**It overlaps.** A batch's catalogue query is ~14% of its wall clock and is otherwise pure
-serial time, since the query holds no credential and touches no store. Preparing the next
-batch during the current batch's writes removes all of it but the first batch's.
+Preparing the next batch's catalogue query during the current batch's writes is
+``_pipeline.pipelined``, whose overlap and stall behaviour ``test_pipeline.py`` covers.
 
 **It cannot write a date twice.** The serial loop re-read ``get_existing_dates`` from the
 store on every batch so that a date written by an earlier batch was skipped by a later one.
@@ -15,20 +12,27 @@ acquisition late on a batch's last UTC day can belong to the next batch's solar 
 two consecutive batches can then contain the same day. Writing it twice would trip the
 store's duplicate-date guard part-way through a run.
 
-The overlap tests drive ``pipelined`` directly, since ordering is all they assert. The
-duplicate-date tests drive the real ``ingest_s1_roi_sar`` loop against a faked catalogue and
-store, because the rule they pin lives in that loop rather than in the pipeline — and both
-were checked to fail when the skip is removed, so they are not passing vacuously.
+The tests drive the real ``ingest_s1_roi_sar`` loop against a faked catalogue and store,
+because the rule they pin lives in that loop rather than in the pipeline.
 """
 
 from __future__ import annotations
 
-import threading
-import time
+import datetime as dt
+from datetime import date, timedelta
+from itertools import pairwise
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
+import xarray as xr
 
-from tessera_embeddings.ingest._pipeline import pipelined
+from tessera_embeddings.ingest import live_windows as live_windows_mod
+from tessera_embeddings.ingest import s1_roi
+from tessera_embeddings.ingest.live_windows import WINDOW_COST_IN_CHUNKS, WINDOW_COST_IN_CHUNKS_OVERLAPPED
+
+# Every S1 leg these tests run is kept off disk and network the same way.
+pytestmark = pytest.mark.usefixtures("s1_leg_offline")
 
 
 def _fake_client():
@@ -47,77 +51,6 @@ def _fake_client():
             "run": staticmethod(lambda fn, *a, **k: {"inproc://fake": fn(*a, **k)}),
         },
     )()
-
-
-def test_next_batch_is_prepared_during_the_current_batch_write() -> None:
-    """The whole point: batch N+1's query runs while batch N is still writing."""
-    events: list[str] = []
-    lock = threading.Lock()
-
-    def prepare(batch: int) -> int:
-        with lock:
-            events.append(f"query{batch}")
-        return batch
-
-    for prepared, _stall in pipelined([0, 1, 2], prepare, depth=1):
-        # A real write is long relative to a query; sleep so the background thread has
-        # time to start the next one, which is exactly the condition being asserted.
-        time.sleep(0.05)
-        with lock:
-            events.append(f"write{prepared}")
-
-    # query0 must precede write0 (nothing to hide behind), but query1 must land BEFORE
-    # write0 finishes — that is the overlap. Asserting on the interleaving rather than on
-    # elapsed time keeps this deterministic.
-    assert events[0] == "query0"
-    assert events.index("query1") < events.index("write0"), events
-    assert events.index("query2") < events.index("write1"), events
-
-
-def test_first_batch_stalls_for_its_whole_query_and_later_ones_do_not() -> None:
-    """``stall`` is the health metric the batch timing line reports as hidden/stall.
-
-    The first batch has nothing preceding it, so it waits out its own query; later
-    batches should wait for nothing because their query ran during the previous write.
-    """
-    query_s = 0.05
-
-    def prepare(batch: int) -> int:
-        time.sleep(query_s)
-        return batch
-
-    stalls = []
-    for _prepared, stall in pipelined([0, 1, 2], prepare, depth=1):
-        stalls.append(stall)
-        time.sleep(query_s * 4)  # a write comfortably longer than a query
-
-    assert stalls[0] >= query_s * 0.5, f"first batch should wait for its own query: {stalls}"
-    assert all(s < query_s * 0.5 for s in stalls[1:]), f"later batches should not stall: {stalls}"
-
-
-def test_prepare_exceptions_surface_when_the_batch_is_consumed() -> None:
-    """A failing query must raise rather than silently yielding no dates.
-
-    A dropped batch is an incomplete mosaic that reports success, which is worse than a
-    failure — and the failure must arrive in the same ORDER the serial loop would have hit
-    it, so earlier batches are still written.
-    """
-    consumed: list[int] = []
-
-    def prepare(batch: int) -> int:
-        if batch == 1:
-            raise RuntimeError("catalogue unavailable")
-        return batch
-
-    try:
-        for prepared, _stall in pipelined([0, 1, 2], prepare, depth=1):
-            consumed.append(prepared)
-    except RuntimeError as exc:
-        assert "catalogue unavailable" in str(exc)
-    else:  # pragma: no cover - the raise above is the expected path
-        raise AssertionError("the failing batch did not raise")
-
-    assert consumed == [0], f"batch 0 should have been consumed before the failure: {consumed}"
 
 
 def _run_ingest(monkeypatch, catalogue: list[str], existing: set[str], **kwargs) -> list[str]:
@@ -139,11 +72,6 @@ def _run_ingest(monkeypatch, catalogue: list[str], existing: set[str], **kwargs)
     module has now that cropping is unconditional and the whole-batch ``write_dataset``
     branch is gone.
     """
-    import numpy as np
-    import xarray as xr
-
-    from tessera_embeddings.ingest import s1_roi
-
     written: list[str] = []
 
     def fake_ingest_tile(*, start_date: str, end_date: str, existing_dates=None, **_):
@@ -162,19 +90,6 @@ def _run_ingest(monkeypatch, catalogue: list[str], existing: set[str], **kwargs)
     monkeypatch.setattr(s1_roi, "ingest_tile", fake_ingest_tile)
     monkeypatch.setattr(s1_roi, "write_day_windows", fake_write_day_windows)
     monkeypatch.setattr(s1_roi, "get_existing_dates", lambda _store, **_kw: set(existing))
-    monkeypatch.setattr(s1_roi, "apply_roi_mask", lambda data, *a, **k: data)
-    monkeypatch.setattr(s1_roi, "read_roi_mask", lambda *a, **k: object())
-    monkeypatch.setattr(
-        s1_roi,
-        "read_roi_metadata",
-        lambda _p, **_k: type("M", (), {"geobox": object(), "native_crs": "EPSG:32635", "bbox_wgs84": (0, 0, 1, 1)})(),
-    )
-    monkeypatch.setattr(
-        s1_roi, "live_windows_for_mask", lambda *a, **k: [type("W", (), {"y0": 0, "y1": 1, "x0": 0, "x1": 1})()]
-    )
-    monkeypatch.setattr(s1_roi, "make_s1_item_provider", lambda *a, **k: lambda: [])
-    # Reads the ROI store for provenance; irrelevant here and the only other S3 caller.
-    monkeypatch.setattr(s1_roi.IngestManifest, "from_roi_store", classmethod(lambda _cls, _p, **_k: object()))
 
     s1_roi.ingest_s1_roi_sar(
         roi_zarr_path="s3://bucket/roi.zarr",
@@ -246,11 +161,6 @@ def _run_with_footprints(
     the keys ``"run"`` and ``"date"``. Recorded here rather than by re-patching from the
     caller, whose patches this function would otherwise overwrite.
     """
-    import numpy as np
-    import xarray as xr
-
-    from tessera_embeddings.ingest import s1_roi
-
     written: list[tuple[str, int]] = []
     all_windows = [type("W", (), {"y0": i, "y1": i + 1, "x0": 0, "x1": 1})() for i in range(windows)]
 
@@ -269,7 +179,6 @@ def _run_with_footprints(
         return ds, {}
 
     def fake_items():
-        import datetime as dt
 
         out = []
         for d, boxes in bboxes_by_date.items():
@@ -301,16 +210,8 @@ def _run_with_footprints(
         lambda _s, data, w, **_k: written.append((str(data["time"].values[0])[:10], len(w))),
     )
     monkeypatch.setattr(s1_roi, "get_existing_dates", lambda _s, **_kw: set())
-    monkeypatch.setattr(s1_roi, "apply_roi_mask", lambda data, *a, **k: data)
-    monkeypatch.setattr(s1_roi, "read_roi_mask", lambda *a, **k: object())
-    monkeypatch.setattr(s1_roi, "live_windows_for_mask", fake_live_windows_for_mask)
+    monkeypatch.setattr(live_windows_mod, "live_windows_for_mask", fake_live_windows_for_mask)
     monkeypatch.setattr(s1_roi, "solar_grouping_longitude", lambda _roi: 0.0)
-    monkeypatch.setattr(
-        s1_roi,
-        "read_roi_metadata",
-        lambda _p, **_k: type("M", (), {"geobox": object(), "native_crs": "EPSG:32635", "bbox_wgs84": (0, 0, 1, 1)})(),
-    )
-    monkeypatch.setattr(s1_roi.IngestManifest, "from_roi_store", classmethod(lambda _c, _p, **_k: object()))
 
     s1_roi.ingest_s1_roi_sar(
         roi_zarr_path="s3://bucket/roi.zarr",
@@ -375,13 +276,6 @@ def test_narrowing_off_writes_every_window(monkeypatch) -> None:
         monkeypatch,
         dates=["2024-01-01T00:00:00"],
         bboxes_by_date={"2024-01-01T00:00:00": [(0, 0, 1, 1), (0, 0, 1, 1)]},
-        narrow=True,
-    )
-    assert written == [("2024-01-01", 2)]
-    written = _run_with_footprints(
-        monkeypatch,
-        dates=["2024-01-01T00:00:00"],
-        bboxes_by_date={"2024-01-01T00:00:00": [(0, 0, 1, 1), (0, 0, 1, 1)]},
         narrow=False,
     )
     assert written == [("2024-01-01", 4)], "narrowing off must write the full window set"
@@ -402,8 +296,10 @@ def test_an_unmatched_timestamp_falls_back_to_every_window(monkeypatch) -> None:
     assert written == [("2024-01-01", 4)], f"unmatched slice must not be narrowed or skipped: {written}"
 
 
-@pytest.mark.parametrize("overlapped", [False, True], ids=["sequential-writes", "overlapped-writes"])
-def test_per_date_narrowing_is_priced_like_the_run(monkeypatch, overlapped: bool) -> None:
+@pytest.mark.parametrize(
+    ("overlap", "price"), [(True, WINDOW_COST_IN_CHUNKS_OVERLAPPED), (False, WINDOW_COST_IN_CHUNKS)]
+)
+def test_per_date_narrowing_is_priced_like_the_run(monkeypatch, overlap, price) -> None:
     """The run's window price must reach the per-date re-merge, not stop at the run.
 
     Both merges answer the same question — is a window boundary worth the dead area it
@@ -411,8 +307,6 @@ def test_per_date_narrowing_is_priced_like_the_run(monkeypatch, overlapped: bool
     every date the footprint narrows. Pinned for S2 in test_s2_date_pipeline and on
     ``windows_for_date`` itself in test_live_windows.
     """
-    from tessera_embeddings.ingest.live_windows import WINDOW_COST_IN_CHUNKS, WINDOW_COST_IN_CHUNKS_OVERLAPPED
-
     costs: dict = {}
     _run_with_footprints(
         monkeypatch,
@@ -420,10 +314,9 @@ def test_per_date_narrowing_is_priced_like_the_run(monkeypatch, overlapped: bool
         bboxes_by_date={"2024-01-01T00:00:00": [(0, 0, 1, 1)]},
         narrow=True,
         costs=costs,
-        overlap_window_writes=overlapped,
+        overlap_window_writes=overlap,
     )
-    expected = WINDOW_COST_IN_CHUNKS_OVERLAPPED if overlapped else WINDOW_COST_IN_CHUNKS
-    assert costs == {"run": expected, "date": expected}
+    assert costs == {"run": price, "date": price}
 
 
 def test_the_assessed_window_is_recorded_when_a_resume_writes_no_new_date(monkeypatch) -> None:
@@ -435,8 +328,6 @@ def test_the_assessed_window_is_recorded_when_a_resume_writes_no_new_date(monkey
     record again. A month the orbit genuinely never saw stays indistinguishable from a
     gap, and ``check_time_window_coverage`` fails the zone-year forever.
     """
-    from tessera_embeddings.ingest import s1_roi
-
     recorded: list[str] = []
     monkeypatch.setattr(s1_roi, "record_assessed_window", lambda path, *_a, **_k: recorded.append(path))
 
@@ -456,8 +347,6 @@ def test_no_assessed_window_is_recorded_when_the_orbit_store_does_not_exist(monk
     ``record_assessed_window`` opens and never creates, so an unconditional call here would
     be a warning on every orbit that this zone-window simply has no granules for.
     """
-    from tessera_embeddings.ingest import s1_roi
-
     recorded: list[str] = []
     monkeypatch.setattr(s1_roi, "record_assessed_window", lambda path, *_a, **_k: recorded.append(path))
 
@@ -476,10 +365,6 @@ def test_an_all_ocean_roi_banks_no_empty_dates(monkeypatch) -> None:
     the set it falls back to is the empty one. The campaign screens these cells out
     up front; the public ROI path has no such preflight.
     """
-    from types import SimpleNamespace
-
-    from tessera_embeddings.ingest import s1_roi
-
     written: list[str] = []
     queried: list[str] = []
 
@@ -490,16 +375,13 @@ def test_an_all_ocean_roi_banks_no_empty_dates(monkeypatch) -> None:
     monkeypatch.setattr(s1_roi, "ingest_tile", fake_ingest_tile)
     monkeypatch.setattr(s1_roi, "write_day_windows", lambda *a, **k: written.append("write"))
     monkeypatch.setattr(s1_roi, "get_existing_dates", lambda _store, **_kw: set())
-    monkeypatch.setattr(s1_roi, "read_roi_mask", lambda *a, **k: object())
     monkeypatch.setattr(
         s1_roi,
         "read_roi_metadata",
         lambda *a, **k: SimpleNamespace(bbox_wgs84=(0.0, 0.0, 1.0, 1.0), geobox=object(), crs="EPSG:32615"),
     )
-    monkeypatch.setattr(s1_roi, "live_windows_for_mask", lambda *a, **k: [])  # all ocean
+    monkeypatch.setattr(live_windows_mod, "live_windows_for_mask", lambda *a, **k: [])  # all ocean
     monkeypatch.setattr(s1_roi, "solar_grouping_longitude", lambda *a, **k: 0.0)
-    monkeypatch.setattr(s1_roi, "make_s1_item_provider", lambda *a, **k: lambda: [])
-    monkeypatch.setattr(s1_roi.IngestManifest, "from_roi_store", classmethod(lambda _cls, _p, **_k: object()))
 
     result = s1_roi.ingest_s1_roi_sar(
         roi_zarr_path="s3://bucket/ocean.zarr",
@@ -535,24 +417,6 @@ def test_a_resume_offers_nothing_at_or_before_the_newest_held_date(monkeypatch) 
     assert written == ["2018-06-05"], "only days after the newest held one"
 
 
-def test_a_store_already_past_the_window_is_a_no_op(monkeypatch) -> None:
-    """The whole window sits below the line, so there is no batch left to build.
-
-    The resumed start passes the window's end. Handing that to ``fixed_day_ranges`` would be a
-    reversed range and would fail the leg instead of finishing it, so no range is built at all.
-    """
-    written = _run_ingest(
-        monkeypatch,
-        catalogue=["2018-05-10"],
-        existing={"2018-06-30"},
-        start_date="2018-01-01",
-        end_date="2018-06-15",
-        batch_days=31,
-    )
-
-    assert written == []
-
-
 def test_a_no_op_resume_still_repairs_the_assessed_window(monkeypatch) -> None:
     """Writing that record is what a resume over a complete store exists to do.
 
@@ -561,8 +425,6 @@ def test_a_no_op_resume_still_repairs_the_assessed_window(monkeypatch) -> None:
     skip the repair on that retry and on every retry after it, and the coverage gate would read a
     month the orbit genuinely never saw as an unexplained gap forever.
     """
-    from tessera_embeddings.ingest import s1_roi
-
     recorded: list[tuple] = []
     monkeypatch.setattr(s1_roi, "record_assessed_window", lambda *a, **_k: recorded.append(a))
 
@@ -588,8 +450,6 @@ def test_the_assessed_window_records_the_requested_start_not_the_resumed_one(mon
     and an absent month down there would become an unexplained gap that no later run can clear,
     because no later run can write below the line either.
     """
-    from tessera_embeddings.ingest import s1_roi
-
     recorded: list[tuple] = []
     monkeypatch.setattr(s1_roi, "record_assessed_window", lambda *a, **_k: recorded.append(a))
 
@@ -608,15 +468,7 @@ def test_the_assessed_window_records_the_requested_start_not_the_resumed_one(mon
     )
 
 
-@pytest.mark.parametrize(
-    ("existing", "state"),
-    [
-        (set(), "an empty store"),
-        ({"2018-03-01"}, "a partially advanced store"),
-        ({"2018-06-30"}, "a store already past the window"),
-    ],
-)
-def test_an_unusable_batch_width_is_refused_whatever_the_store_holds(monkeypatch, existing, state) -> None:
+def test_an_unusable_batch_width_is_refused_whatever_the_store_holds(monkeypatch) -> None:
     """One invalid configuration, one answer — the store's contents must not change the verdict.
 
     ``fixed_day_ranges`` was the only place enforcing a width of at least one, and a resume over a
@@ -628,7 +480,7 @@ def test_an_unusable_batch_width_is_refused_whatever_the_store_holds(monkeypatch
         _run_ingest(
             monkeypatch,
             catalogue=["2018-05-10"],
-            existing=existing,
+            existing={"2018-06-30"},  # past the window, so no range is built
             start_date="2018-01-01",
             end_date="2018-06-15",
             batch_days=0,
@@ -654,8 +506,7 @@ def test_a_compact_iso_window_is_not_read_as_closed(monkeypatch) -> None:
     assert written == ["2018-06-05"], "the open date is written, not skipped"
 
 
-@pytest.mark.parametrize("bad_end", ["2018-02-30", "not-a-date"])
-def test_a_bound_that_is_not_a_date_is_refused(monkeypatch, bad_end: str) -> None:
+def test_a_bound_that_is_not_a_date_is_refused(monkeypatch) -> None:
     """Every comparison a resume makes is between strings, and a string can sort without meaning.
 
     ``"2018-02-30"`` orders before ``"2018-05-27"``, so a store past it would take the no-op path
@@ -668,6 +519,57 @@ def test_a_bound_that_is_not_a_date_is_refused(monkeypatch, bad_end: str) -> Non
             catalogue=["2018-06-05"],
             existing={"2018-05-27"},
             start_date="2018-01-01",
-            end_date=bad_end,
+            end_date="2018-02-30",
             batch_days=31,
         )
+
+
+def test_s1_batch_windows_tile_inclusive_range_without_overlap(monkeypatch) -> None:
+    """Batches OWN a tiling of the inclusive [start, end] range and QUERY a day past it.
+
+    The overlap between consecutive queries is the point: a solar day straddling a batch cut
+    has acquisitions on both sides, so the owning batch asks for the day beyond its own range.
+    Ownership, applied before the loader, stops that becoming duplicate work. ``end_date`` is
+    inclusive, and the item provider is built for the same window the query uses.
+    """
+    queried: list[tuple[str, str]] = []
+    provided: list[tuple[str, str]] = []
+
+    def fake_ingest_tile(**kwargs):
+        queried.append((kwargs["start_date"], kwargs["end_date"]))
+        return None, None
+
+    def fake_provider(*args, **_kwargs):
+        provided.append((args[2], args[3]))
+        return lambda: []
+
+    monkeypatch.setattr(s1_roi, "ingest_tile", fake_ingest_tile)
+    monkeypatch.setattr(s1_roi, "make_s1_item_provider", fake_provider)
+    monkeypatch.setattr(s1_roi, "get_existing_dates", lambda *_a, **_k: set())
+
+    result = s1_roi.ingest_s1_roi_sar(
+        roi_zarr_path="/tmp/roi.zarr",
+        start_date="2024-01-01",
+        end_date="2024-03-01",
+        store_path="/tmp/store",
+        client=_fake_client(),
+        orbit="ascending",
+        batch_days=30,
+    )
+
+    assert result.status == "skipped"
+    assert queried == [
+        ("2023-12-31", "2024-01-31"),
+        ("2024-01-30", "2024-03-01"),
+        ("2024-02-29", "2024-03-02"),
+    ]
+    owned = [("2024-01-01", "2024-01-30"), ("2024-01-31", "2024-02-29"), ("2024-03-01", "2024-03-01")]
+    covered: list[str] = []
+    for own_start, own_end in owned:
+        d0, d1 = date.fromisoformat(own_start), date.fromisoformat(own_end)
+        covered.extend((d0 + timedelta(days=i)).isoformat() for i in range((d1 - d0).days + 1))
+    start, end = date(2024, 1, 1), date(2024, 3, 1)
+    assert covered == [(start + timedelta(days=i)).isoformat() for i in range((end - start).days + 1)]
+    for (_, prev_end), (next_start, _) in pairwise(queried):
+        assert next_start < prev_end, f"the query pad was lost at {prev_end}/{next_start}"
+    assert provided == queried

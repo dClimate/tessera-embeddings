@@ -438,7 +438,7 @@ def keep_causes_picklable() -> None:
     overwrite ours each time.
     """
     for cls in _CAUSES_THAT_DO_NOT_TRAVEL:
-        cls.__reduce__ = _reduce_by_args  # type: ignore[method-assign, assignment]
+        cls.__reduce__ = _reduce_by_args  # ty: ignore[invalid-assignment]
 
 
 def rescues_are_installed() -> bool:
@@ -732,7 +732,7 @@ def implicated_tile_dates(
     since a fleet's workers read many — and attributing it here would step down a tile that read
     perfectly well.
     """
-    return {(item_tile(it), solar_day_of(it)) for it in implicated_items(items, hrefs)}  # type: ignore[misc]
+    return {(item_tile(it), solar_day_of(it)) for it in implicated_items(items, hrefs)}  # ty: ignore[invalid-return-type]
 
 
 def implicated_items(items: Iterable[Any], hrefs: Iterable[str]) -> list[Any]:

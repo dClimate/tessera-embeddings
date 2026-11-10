@@ -6,7 +6,6 @@ Exercised via ``.fn`` with the repo ops mocked, so no Icechunk store is created.
 from __future__ import annotations
 
 import logging
-from typing import ClassVar
 
 import icechunk
 import pytest
@@ -50,7 +49,7 @@ def test_seed_stamps_the_model_and_takes_its_zone_layout(monkeypatch, model, lay
 
 def test_an_existing_store_keeps_its_zone_layout_whatever_the_model(monkeypatch):
     """A v2 seed into a hemisphere store finishes that store's 120 groups, not 60 utm columns."""
-    _partially_seeded(monkeypatch, {"geoemb:model": "tessera-v1.1"}, cells_landed=0)
+    _seeded(monkeypatch, {"geoemb:model": "tessera-v1.1"}, cells_landed=0, seeded_zones=3)
     seen: dict = {}
     monkeypatch.setattr(mod, "seed_zone_groups", lambda repo, todo, **kw: seen.update(todo=todo) or "SNAP")
     mod.seed_global_store.fn(paths=_PATHS, model_version="v2-large")
@@ -104,27 +103,25 @@ def test_seed_treats_rootless_existing_repo_as_unseeded(monkeypatch):
     assert captured["model_version"] == "v1.1"
 
 
-def test_the_minimum_depth_rule_is_not_defaulted_from_the_config_constant(monkeypatch):
-    """The safety property of work item 1: a seed with no explicit rule stamps NO rule.
+@pytest.mark.parametrize("rule", [None, 25])
+def test_the_minimum_depth_rule_is_exactly_the_one_requested(monkeypatch, rule):
+    """A seed with no explicit rule stamps NO rule, and an explicit one reaches the seeder.
 
     The rule decides what the product contains and can never be changed for the store
     afterwards, so a value inherited from whatever the config module happened to hold is not a
-    decision anyone took. Pinned here because the failure is silent in the worst direction — a
-    store stamped with a rule nobody chose, permanently, and every fill afterwards enforcing it.
+    decision anyone took — a store stamped with a rule nobody chose, permanently, and every fill
+    afterwards enforcing it.
     """
     captured = _capture_seed(monkeypatch)
-    mod.seed_global_store.fn(paths=_PATHS)
-    assert captured["optical_min_obs"] is None
+    kw = {} if rule is None else {"optical_min_obs": rule}  # None: the flow's own default
+    mod.seed_global_store.fn(paths=_PATHS, **kw)
+    assert captured["optical_min_obs"] == rule
 
 
-def test_an_explicit_minimum_depth_rule_reaches_the_seeder(monkeypatch):
-    captured = _capture_seed(monkeypatch)
-    mod.seed_global_store.fn(paths=_PATHS, optical_min_obs=25)
-    assert captured["optical_min_obs"] == 25
-
-
-def _fully_seeded(monkeypatch, root_attrs: dict, *, cells_landed: int):
-    """Wire the every-zone-exists path with a given root and a given amount of landed data."""
+def _seeded(monkeypatch, root_attrs: dict, *, cells_landed: int, seeded_zones: int = len(mod.zones("hemispheres"))):
+    """Wire a store with ``seeded_zones`` zone groups present (all by default), a given root and
+    a given amount of landed data. Fewer than all takes the INCREMENTAL path.
+    """
     monkeypatch.setattr(mod, "get_run_logger", lambda: logging.getLogger("test-seed"))
 
     class _Root:
@@ -139,12 +136,11 @@ def _fully_seeded(monkeypatch, root_attrs: dict, *, cells_landed: int):
         "open_global_repo",
         lambda *a, **k: type("R", (), {"readonly_session": lambda s, branch: type("S", (), {"store": object()})()})(),
     )
+    present = list(mod.zones("hemispheres"))[:seeded_zones]
     monkeypatch.setattr(
         mod,
         "campaign_status",
-        lambda repo, years: type(
-            "St", (), {"zones": list(mod.zones("hemispheres")), "zone_years_done": cells_landed}
-        )(),
+        lambda repo, years: type("St", (), {"zones": present, "zone_years_done": cells_landed})(),
     )
     monkeypatch.setattr(mod.zarr, "open_group", lambda *a, **k: _Root())
     # These tests are about the ROOT IDENTITY, and their `_Root` is not a zarr group — the
@@ -170,7 +166,7 @@ def test_a_rerun_over_existing_groups_validates_their_layout(monkeypatch):
     The check's own behaviour is covered against real stores in `test_global_store.py`;
     what this pins is that the flow reaches it on the path that creates nothing.
     """
-    _fully_seeded(monkeypatch, {"geoemb:model": "tessera-v1.1"}, cells_landed=0)
+    _seeded(monkeypatch, {"geoemb:model": "tessera-v1.1"}, cells_landed=0)
     seen: dict = {}
 
     def _refuse(grp, gname, layout):
@@ -194,7 +190,7 @@ def test_a_rerun_over_groups_missing_a_coordinate_is_refused(monkeypatch):
     CF bounds. `seed_zone_groups` has always caught this, but only while creating something,
     and it creates nothing when all 120 zones exist.
     """
-    _fully_seeded(monkeypatch, {"geoemb:model": "tessera-v1.1"}, cells_landed=0)
+    _seeded(monkeypatch, {"geoemb:model": "tessera-v1.1"}, cells_landed=0)
     monkeypatch.setattr(mod, "_check_layout_matches", lambda *a, **k: None)  # the OTHER check passes
     monkeypatch.setattr(mod, "missing_seeded_arrays", lambda *a, **k: {"month", "time_bnds"})
 
@@ -210,7 +206,7 @@ def test_an_unstamped_but_empty_store_gets_its_identity_written(monkeypatch):
     written neither the model nor the depth rule — and the fill gates pass on an
     ABSENT attr, so the store would then accept anything.
     """
-    _fully_seeded(monkeypatch, {}, cells_landed=0)
+    _seeded(monkeypatch, {}, cells_landed=0)
     stamped: dict = {}
     monkeypatch.setattr(
         mod,
@@ -229,43 +225,10 @@ def test_an_unstamped_store_holding_data_is_refused_rather_than_stamped(monkeypa
     under, and claiming one would be a false provenance record — worse than the missing
     attr it fixes. So this raises instead of stamping.
     """
-    _fully_seeded(monkeypatch, {}, cells_landed=7)
+    _seeded(monkeypatch, {}, cells_landed=7)
     monkeypatch.setattr(mod, "stamp_root_identity", lambda *a, **k: pytest.fail("must not stamp over existing data"))
     with pytest.raises(ValueError, match="no root identity"):
         mod.seed_global_store.fn(paths=_PATHS, optical_min_obs=15)
-
-
-def _partially_seeded(monkeypatch, root_attrs: dict, *, cells_landed: int, seeded_zones: int = 3):
-    """Wire the INCREMENTAL path: some zone groups present, the rest still to create."""
-    monkeypatch.setattr(mod, "get_run_logger", lambda: logging.getLogger("test-seed"))
-
-    class _Root:
-        def __init__(self) -> None:
-            self.attrs = root_attrs
-
-        def __getitem__(self, _name):
-            return self
-
-    monkeypatch.setattr(
-        mod,
-        "open_global_repo",
-        lambda *a, **k: type("R", (), {"readonly_session": lambda s, branch: type("S", (), {"store": object()})()})(),
-    )
-    present = list(mod.zones("hemispheres"))[:seeded_zones]
-    monkeypatch.setattr(
-        mod,
-        "campaign_status",
-        lambda repo, years: type("St", (), {"zones": present, "zone_years_done": cells_landed})(),
-    )
-    monkeypatch.setattr(mod.zarr, "open_group", lambda *a, **k: _Root())
-    # These tests are about the ROOT IDENTITY, and their `_Root` is not a zarr group — the
-    # layout check needs real arrays. Covered on its own below.
-    monkeypatch.setattr(mod, "_check_layout_matches", lambda *a, **k: None)
-    monkeypatch.setattr(mod, "missing_seeded_arrays", lambda *a, **k: set())
-    monkeypatch.setattr(mod, "spatial_dims_of", lambda grp: ("northing", "easting"))
-    monkeypatch.setattr(mod, "read_time_values", lambda grp: list(mod.CAMPAIGN_YEARS))
-    monkeypatch.setattr(mod, "year_of", lambda t: t)
-    monkeypatch.setattr(mod, "check_root_identity", lambda *a, **k: None)
 
 
 def test_a_partially_seeded_store_holding_data_is_not_stamped_by_the_incremental_seed(monkeypatch):
@@ -277,7 +240,7 @@ def test_a_partially_seeded_store_holding_data_is_not_stamped_by_the_incremental
     attributed to an encoder and a depth rule nobody verified — and the stamp is write-once and read
     by every later fill to decide what may write, so later fills would then mix under it.
     """
-    _partially_seeded(monkeypatch, {}, cells_landed=4)
+    _seeded(monkeypatch, {}, cells_landed=4, seeded_zones=3)
     monkeypatch.setattr(mod, "seed_zone_groups", lambda *a, **k: pytest.fail("must not seed, because seeding stamps"))
     with pytest.raises(ValueError, match="no root identity"):
         mod.seed_global_store.fn(paths=_PATHS, optical_min_obs=15)
@@ -289,7 +252,7 @@ def test_a_partially_seeded_store_with_no_data_still_seeds_the_remainder(monkeyp
     Without this the guard would break the ordinary resume-a-partial-seed path, which is the
     reason the incremental branch exists.
     """
-    _partially_seeded(monkeypatch, {}, cells_landed=0)
+    _seeded(monkeypatch, {}, cells_landed=0, seeded_zones=3)
     seen: dict = {}
     monkeypatch.setattr(mod, "seed_zone_groups", lambda repo, todo, **kw: seen.update(kw, n=len(todo)) or "SNAP2")
     out = mod.seed_global_store.fn(paths=_PATHS, optical_min_obs=15)
@@ -302,7 +265,7 @@ def test_a_partially_seeded_store_that_is_already_stamped_seeds_the_remainder(mo
     """A store WITH an identity is the normal partial-seed case, landed cells or not: the identity
     is already established, so adding groups attributes nothing new.
     """
-    _partially_seeded(monkeypatch, {"geoemb:model": "tessera-v1.1", "optical_min_obs": 15}, cells_landed=9)
+    _seeded(monkeypatch, {"geoemb:model": "tessera-v1.1", "optical_min_obs": 15}, cells_landed=9, seeded_zones=3)
     seen: dict = {}
     monkeypatch.setattr(mod, "seed_zone_groups", lambda repo, todo, **kw: seen.update(n=len(todo)) or "SNAP3")
     out = mod.seed_global_store.fn(paths=_PATHS, optical_min_obs=15)
@@ -322,34 +285,7 @@ def test_a_fully_seeded_store_still_validates_the_requested_identity(monkeypatch
     The check now runs on exactly that path. A MATCHING request must still be a no-op, so
     both directions are pinned here.
     """
-    monkeypatch.setattr(mod, "get_run_logger", lambda: logging.getLogger("test-seed"))
-
-    class _Root:
-        attrs: ClassVar[dict] = {"geoemb:model": "tessera-v1.1", "optical_min_obs": 25}
-
-        def __getitem__(self, _name):  # the year-axis probe reads one seeded group
-            return self
-
-    class _Repo:
-        def readonly_session(self, branch):
-            return type("S", (), {"store": object()})()
-
-    monkeypatch.setattr(mod, "open_global_repo", lambda *a, **k: _Repo())
-    # Every zone already present → todo is empty → the early return.
-    monkeypatch.setattr(
-        mod,
-        "campaign_status",
-        lambda repo, years: type("St", (), {"zones": list(mod.zones("hemispheres")), "zone_years_done": 0})(),
-    )
-    monkeypatch.setattr(mod.zarr, "open_group", lambda *a, **k: _Root())
-    # These tests are about the ROOT IDENTITY, and their `_Root` is not a zarr group — the
-    # layout check needs real arrays. Covered on its own below.
-    monkeypatch.setattr(mod, "_check_layout_matches", lambda *a, **k: None)
-    monkeypatch.setattr(mod, "missing_seeded_arrays", lambda *a, **k: set())
-    monkeypatch.setattr(mod, "spatial_dims_of", lambda grp: ("northing", "easting"))
-    # The year-axis guard runs first and must pass, so the identity check is what raises.
-    monkeypatch.setattr(mod, "read_time_values", lambda grp: list(mod.CAMPAIGN_YEARS))
-    monkeypatch.setattr(mod, "year_of", lambda t: t)
+    _seeded(monkeypatch, {"geoemb:model": "tessera-v1.1", "optical_min_obs": 25}, cells_landed=0)
     seen: dict = {}
 
     def _check(root_attrs, *, layout, model_version, optical_min_obs):

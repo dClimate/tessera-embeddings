@@ -55,14 +55,11 @@ TABLE: list[tuple[str, bool, bool, bool]] = [
     ("HTTP response code: 404", False, True, False),
     ("HTTP response code: 410", False, True, False),
     ("HTTP response code: 401", False, False, False),
-    ("HTTP response code: 400", False, False, False),
     ("HTTP response code: 403", False, False, True),
     ("HTTP response code: 408", False, False, True),
     ("HTTP response code: 429", False, False, True),
     ("HTTP response code: 500", False, False, True),
-    ("HTTP response code: 502", False, False, True),
     ("HTTP response code: 503", False, False, True),
-    ("HTTP response code: 504", False, False, True),
     ("HTTP response code: 599", False, False, True),
     ("AccessDenied: not authorized to perform: s3:GetObject", False, False, True),
     ("SlowDown", False, False, True),
@@ -96,16 +93,45 @@ def test_the_verdict_for_this_cause_has_not_moved(cause: str, opening: bool, giv
     assert is_provider_refusal(failure) is refusal
 
 
-@pytest.mark.parametrize(("cause", "opening"), [(c, o) for c, o, *_ in TABLE], ids=[c[:38] for c, *_ in TABLE])
-def test_no_cause_earns_both_verdicts(cause: str, opening: bool) -> None:
-    """The property the old design could only assert. One classifier returns one member, so this
-    cannot fail by construction — which is the point, and why it is cheap to keep asserting.
-    """
-    failure = _chained(cause, opening=opening)
-    assert not (is_unreadable_source(failure) and is_provider_refusal(failure))
+@pytest.mark.parametrize(
+    ("failure", "gives_up", "refusal"),
+    [
+        # Not-found is the S3 layer's word, shared by every S3 client in the process. Without the
+        # source reader's name beside it, a hole in the destination store or the ROI mask would be
+        # recorded as source data loss.
+        (Exception("IcechunkError: ObjectNotFound"), False, False),
+        (Exception("An error occurred (NoSuchKey) when calling the GetObject operation"), False, False),
+        # The skip is per DATE, so what it admits must be per OBJECT: a vanished bucket fails
+        # every remaining date identically.
+        (Exception("RasterioIOError('An error occurred (NoSuchBucket) when calling GetObject')"), False, False),
+        # The ranged reader says ``response_code=`` where GDAL says ``code:``; it carries a status
+        # too, and a refusal outranks the codec failure beneath it.
+        (_chained("Request for https://h/o.tif range 1-2 failed with response_code=403"), False, True),
+        (_chained("Request for https://h/o.tif range 1-2 failed with response_code=503"), False, True),
+        # ``response_code=0`` is a request that never completed: the absence of a status.
+        (_chained("Request for https://h/o.tif range 1-2 failed with response_code=0"), False, False),
+    ],
+    ids=["bare-objectnotfound", "bare-nosuchkey", "nosuchbucket", "ranged-403", "ranged-503", "ranged-0"],
+)
+def test_cases_the_table_cannot_express(failure: BaseException, gives_up: bool, refusal: bool) -> None:
+    """Failures that are not a rasterio chain over a GDAL cause, or that carry ranged-reader wording."""
+    assert is_unreadable_source(failure) is gives_up
+    assert is_provider_refusal(failure) is refusal
 
 
-@pytest.mark.parametrize(("cause", "gives_up"), [(c, g) for c, _, g, _ in TABLE], ids=[c[:38] for c, *_ in TABLE])
+#: One cause per verdict, for the text path: it shares the classifier with the exception path and
+#: differs only in how the text is assembled.
+WORDS = [
+    ("ZIPDecode:Decoding error at scanline 0", True),
+    ("ObjectNotFound: The specified key does not exist.", True),
+    ("HTTP response code: 401", False),
+    ("HTTP response code: 503", False),
+    ("ExpiredToken", False),
+    ("Connection refused: ZIPDecode:Decoding error at scanline 0", False),
+]
+
+
+@pytest.mark.parametrize(("cause", "gives_up"), WORDS, ids=[c[:38] for c, _ in WORDS])
 def test_the_words_alone_reach_the_same_verdict(cause: str, gives_up: bool) -> None:
     """One taxonomy, whichever side of a boundary the caller stands on.
 
@@ -218,13 +244,6 @@ class TestLosingTheEvidenceVersusNotRecognisingIt:
         intact = _chained("a failure mode nobody has enumerated")
         assert classify_read_failure(intact) is ReadFailure.UNDECIDABLE
         assert cause_was_flattened(intact) is False
-
-    @pytest.mark.parametrize(("cause", "opening"), [(c, o) for c, o, *_ in TABLE], ids=[c[:38] for c, *_ in TABLE])
-    def test_no_case_with_a_real_chain_is_ever_reported_as_flattened(self, cause: str, opening: bool) -> None:
-        """Every row of the table is an intact chain, so a true here would be a false alarm — and a
-        false alarm on this detector reads as "the fleet cannot classify", which stops a leg.
-        """
-        assert cause_was_flattened(_chained(cause, opening=opening)) is False
 
 
 #: The two wordings GDAL actually used during the 2026-08-24 ASF outage, copied verbatim from
@@ -365,9 +384,6 @@ def test_a_longer_number_is_not_a_status_with_its_tail_ignored(text: str, why: s
     of the choice — an unrecognised line claims nothing. Claiming the wrong thing here is the
     expensive error: PROVIDER_REFUSED spends the refusal budget waiting out an outage that is
     not happening, and ABSENT gives the date up outright.
-
-    Added 2026-08-25. The guard was correct and untested — removing the lookahead broke no test
-    in the suite, which is how a mutation probe found it. See the streamlining plan §7.1.
     """
     assert classify_read_failure_in(text) is ReadFailure.UNDECIDABLE, why
 

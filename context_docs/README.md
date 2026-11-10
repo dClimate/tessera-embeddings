@@ -13,8 +13,8 @@ try that failed?" — one per pipeline stage, so a question about ingest has exa
 ```
 context_docs/
 ├── corrections-register.md        EVERY withdrawn figure, grouped by how it went wrong
-├── test-suite-streamlining.md     this repo's own test suite: what has been done to it, and
-│                                  what is left
+├── test-suite-reduction/          this repo's own test suite: the 2026-11 reduction plan and
+│                                  the record of what it did
 │
 ├── decisions/                     Architecture Decision Records — 1 page each, append-only
 │   ├── 001-thin-prefect-wrapping.md
@@ -50,7 +50,9 @@ context_docs/
 │   ├── 032-v2-stores-name-their-axes-y-and-x.md
 │   ├── 034-an-acquisition-is-one-datastrip-of-one-pass.md
 │   ├── 037-v2-stores-use-the-utm-zones-layout.md
-│   └── 038-the-campaign-fills-a-utm-column-in-two-halves.md
+│   ├── 038-the-campaign-fills-a-utm-column-in-two-halves.md
+│   ├── 039-architecture-rules-run-on-import-linter-and-ruff.md
+│   └── 040-new-code-is-gated-on-duplication-and-complexity.md
 │
 ├── campaign/                      THE GLOBAL CAMPAIGN — start here
 │   ├── campaign-plan.md                        <- START HERE. What runs, with what settings, in

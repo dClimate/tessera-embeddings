@@ -16,6 +16,7 @@ from typing import Any, cast
 
 import icechunk
 import zarr
+import zarr.errors
 from prefect import flow, get_run_logger
 
 from tessera_embeddings.config.inference import DEFAULT_MODEL_VERSION, ModelVersion, model_family

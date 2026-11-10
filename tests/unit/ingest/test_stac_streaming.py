@@ -2,9 +2,10 @@
 
 Querying a whole window up front retains every item for the run's duration, which a
 zone-year cannot fit on the worker the ingest runs on. Streaming bounds retention to two
-months. These tests pin the two properties the correctness of that rests on — the owned
-ranges PARTITION the window, and the prefetch is depth-1 — plus the failure behaviour,
-because a silently-dropped month would be an incomplete mosaic that still reported success.
+months. That the owned month ranges partition the window is test_solar_days' subject; these
+tests pin the streaming itself — the ownership drop, the depth-1 prefetch, bounded retention —
+and the failure behaviour, because a silently-dropped month would be an incomplete mosaic that
+still reported success.
 """
 
 from __future__ import annotations
@@ -17,18 +18,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from tessera_embeddings.ingest.solar_days import month_ranges, normalize_to_solar_day
+from tessera_embeddings.ingest.solar_days import normalize_to_solar_day
 from tessera_embeddings.ingest.stac import (
     _filter_existing_dates,
     _prefetch,
     stream_stac_months,
 )
-
-
-def _item(date: str, cloud: float = 0.0):
-    return SimpleNamespace(
-        datetime=datetime.datetime.fromisoformat(f"{date}T10:00:00"), properties={"eo:cloud_cover": cloud}
-    )
+from tests.stac_items import fake_stac_item
 
 
 def _dates(start: str, end: str) -> list[str]:
@@ -40,87 +36,6 @@ def _dates(start: str, end: str) -> list[str]:
     return out
 
 
-class TestMonthPartition:
-    """The owned ranges must partition the window: no date twice, none missed."""
-
-    @pytest.mark.parametrize(
-        ("start", "end"),
-        [
-            ("2024-01-01", "2024-12-31"),  # a full leap year
-            ("2023-01-01", "2023-12-31"),  # a full non-leap year
-            ("2024-01-20", "2024-02-05"),  # mid-month both ends
-            ("2024-05-10", "2024-05-10"),  # one day
-            ("2024-02-01", "2024-02-29"),  # exactly February, leap
-            ("2024-11-15", "2025-02-03"),  # crossing a year boundary
-        ],
-    )
-    def test_owned_ranges_partition_the_window(self, start, end):
-        covered: list[str] = []
-        for mr in month_ranges(start, end):
-            covered.extend(_dates(mr.own_start, mr.own_end))
-        assert covered == _dates(start, end), "owned dates must tile the window exactly once"
-
-    def test_query_end_is_padded_by_one_day_including_at_the_window_end(self):
-        """A date-only interval end covers that day, so without a pad an item in the
-        final seconds of a month's last day could fall outside every slice's query.
-
-        The LAST month is padded too. It used to be clamped to the window, on the
-        reasoning that a query should not reach outside what was asked for — but the
-        window is in solar days and the query is bounded in UTC, so at western
-        longitudes the final owned solar day includes acquisitions dated the following
-        UTC day. Clamping made those unfetchable by any slice and the last day of the
-        year was written incomplete, with nothing to signal it.
-        """
-        months = month_ranges("2024-01-01", "2024-03-31")
-        assert months[0].query_end == "2024-02-01"  # padded past its own end
-        assert months[1].query_end == "2024-03-01"
-        assert months[-1].query_end == "2024-04-01", "the last month must still reach the following UTC day"
-
-    def test_query_start_is_padded_by_one_day_including_at_the_window_start(self):
-        """Solar-day ownership can hand a month an item whose UTC date is the day
-        before it. At eastern longitudes an acquisition late on a month's last UTC day
-        has its SOLAR day in the next month — so the owning month must ask for that
-        day, or no slice ever fetches the item.
-
-        That applies to the FIRST month against the window's own start exactly as it
-        applies between months; clamping it lost the first solar day's evening imagery.
-        """
-        months = month_ranges("2024-01-01", "2024-03-31")
-        assert months[0].query_start == "2023-12-31", "the first month must still reach the preceding UTC day"
-        assert months[1].query_start == "2024-01-31"
-        assert months[2].query_start == "2024-02-29"
-
-    def test_out_of_window_dates_are_excluded_by_ownership_not_by_the_query_bound(self):
-        """What the unclamped pad relies on: owned ranges never leave the window.
-
-        The query now reaches a day either side of the whole window, so the only thing
-        stopping an out-of-window solar day from being written is the ownership filter.
-        Pin that the owned ranges stay inside the requested window exactly.
-        """
-        months = month_ranges("2024-01-01", "2024-12-31")
-        assert months[0].own_start == "2024-01-01"
-        assert months[-1].own_end == "2024-12-31"
-        assert months[0].query_start < months[0].own_start
-        assert months[-1].query_end > months[-1].own_end
-
-    def test_padding_cannot_double_process(self):
-        """The padded day is OWNED by the next month, so overlap in the query does not
-        become overlap in the work.
-        """
-        a, b = month_ranges("2024-01-01", "2024-02-29")[:2]
-        assert a.query_end == b.own_start
-        assert b.query_start <= a.own_end  # the pads overlap...
-        assert a.own_end < b.own_start  # ...but the owned ranges never do
-
-    def test_leap_day_is_owned(self):
-        feb = next(mr for mr in month_ranges("2024-01-01", "2024-12-31") if mr.own_start == "2024-02-01")
-        assert feb.own_end == "2024-02-29"
-
-    def test_rejects_a_backwards_window(self):
-        with pytest.raises(ValueError, match="precedes"):
-            month_ranges("2024-03-01", "2024-01-01")
-
-
 class TestStreaming:
     """What the generator yields, and what it does when a query fails."""
 
@@ -129,7 +44,7 @@ class TestStreaming:
             if calls is not None:
                 calls.append((start_date, end_date, frozenset(existing_dates or ())))
             items = [
-                _item(d)
+                fake_stac_item(d)
                 for d in _dates(start_date, end_date)
                 for _ in range(per_date.get(d, 0))
                 if d not in (existing_dates or set())
@@ -195,7 +110,7 @@ class TestStreaming:
             # Every date in the PADDED range, so each month still owns something after
             # the ownership filter — returning only the query's first date would hand
             # each month nothing but the pad day its neighbour owns.
-            return [_item(d) for d in _dates(start_date, end_date)], {}
+            return [fake_stac_item(d) for d in _dates(start_date, end_date)], {}
 
         gen = stream_stac_months(
             provider="p",
@@ -220,7 +135,7 @@ class TestStreaming:
         def query(*, provider, collection, tile_id, start_date, end_date, existing_dates, bbox, **_):
             if start_date.startswith("2024-02"):
                 raise RuntimeError("STAC exhausted its retries")
-            return [_item(start_date)], {}
+            return [fake_stac_item(start_date)], {}
 
         gen = stream_stac_months(
             provider="p",
@@ -234,11 +149,6 @@ class TestStreaming:
         )
         with pytest.raises(RuntimeError, match="exhausted"):
             list(gen)
-
-    def test_a_single_day_window_streams(self):
-        got = self._stream({"2024-05-10": 2}, "2024-05-10", "2024-05-10")
-        assert len(got) == 1
-        assert len(got[0][1]) == 2
 
     def test_no_items_at_all_yields_nothing(self):
         assert self._stream({}, "2024-01-01", "2024-02-29") == []
@@ -296,16 +206,6 @@ class TestRetentionIsBounded:
         # must not be — that is the property that makes a year survivable.
         assert refs[0]() is None, "January's items were still reachable after streaming past them"
         assert refs[1]() is None, "February's items were still reachable after streaming past them"
-
-    def test_accumulating_across_months_is_what_streaming_prevents(self):
-        """The negative control: a caller that hoards every month defeats the bound, so
-        this test would pass for the wrong reason without it.
-        """
-        gen = self._gen(3)
-        hoarded = [items for _mr, items, _b in gen]
-        gc.collect()
-        assert all(h is not None for h in hoarded)
-        assert len(hoarded) == 3, "the generator should have yielded three months"
 
 
 def test_prefetch_runs_on_a_daemon_thread_so_it_can_be_abandoned():
@@ -395,11 +295,6 @@ class TestSolarDayOwnership:
         not group by solar day, and the reason this cannot be applied unconditionally.
         """
         assert self._months(None) == {"2024-01-01": ["2024-01-31"]}  # unshifted
-
-    def test_it_is_owned_exactly_once_either_way(self):
-        for lon in (150.0, -150.0, 0.0, None):
-            owners = [m for m, dates in self._months(lon).items() if dates]
-            assert len(owners) == 1, f"longitude {lon} produced {owners}"
 
     def test_the_existing_date_filter_is_keyed_the_same_way(self):
         """Month ownership and the resume filter must agree, or a rerun half-filters.

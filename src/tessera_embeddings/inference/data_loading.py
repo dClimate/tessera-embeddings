@@ -601,27 +601,16 @@ def _empty_sar_arrays(height: int, width: int) -> tuple[np.ndarray, np.ndarray, 
     )
 
 
-def _resolve_y_slice(chunk: ChunkSpec, y_sub: slice | None) -> slice:
-    """Resolve the absolute store-level northing slice for a (sub-)chunk read.
+def _resolve_slice(start: int, stop: int, sub: slice | None) -> slice:
+    """Resolve the absolute store-level slice for a (sub-)chunk read along one axis.
 
-    ``y_sub`` is an offset *relative to the chunk* — it narrows the read within
-    the chunk's existing read-tile to a horizontal strip. When ``None`` the
-    full chunk extent is read, reproducing the unstriped behaviour exactly.
+    ``start``/``stop`` are the chunk's extent on the axis. ``sub`` is an offset *relative to the
+    chunk* that narrows the read within the chunk's existing read-tile to a strip. When ``None``
+    the full chunk extent is read, reproducing the unstriped behaviour exactly.
     """
-    if y_sub is None:
-        return slice(chunk.y_start, chunk.y_stop)
-    return slice(chunk.y_start + y_sub.start, chunk.y_start + y_sub.stop)
-
-
-def _resolve_x_slice(chunk: ChunkSpec, x_sub: slice | None) -> slice:
-    """Resolve the absolute store-level easting slice for a (sub-)chunk read.
-
-    ``x_sub`` is chunk-relative, mirroring ``_resolve_y_slice``. ``None`` reads
-    the full chunk width.
-    """
-    if x_sub is None:
-        return slice(chunk.x_start, chunk.x_stop)
-    return slice(chunk.x_start + x_sub.start, chunk.x_start + x_sub.stop)
+    if sub is None:
+        return slice(start, stop)
+    return slice(start + sub.start, start + sub.stop)
 
 
 def load_s2_mask_bundle(
@@ -700,7 +689,7 @@ def _load_s2(
         store_opener = open_store_as_zarr_group
     store_path = f"{mosaic_base}/reflectance.zarr"
     root = store_opener(store_path)
-    x_slice = _resolve_x_slice(chunk, x_sub)
+    x_slice = _resolve_slice(chunk.x_start, chunk.x_stop, x_sub)
 
     if mask_bundle is not None:
         # Slice the shared full-chunk mask to this strip's rows (and, when
@@ -712,7 +701,7 @@ def _load_s2(
         s2_obs_count = mask_bundle.obs_count[rows, cols]
         s2_doys = mask_bundle.doys
         abs_kept = mask_bundle.abs_indices
-        y_slice = _resolve_y_slice(chunk, y_sub)
+        y_slice = _resolve_slice(chunk.y_start, chunk.y_stop, y_sub)
 
         # obs_count > 0 ⟺ the pruned mask has a valid entry (pruning drops only all-False
         # planes), and the (H, W) scan avoids walking the strided (T_kept, H, W) mask view
@@ -735,7 +724,7 @@ def _load_s2(
         return s2_bands, s2_masks, s2_doys, s2_obs_count
 
     window_indices, s2_doys_full, _months = _filter_times_from_zarr(root, time_window)
-    y_slice = _resolve_y_slice(chunk, y_sub)
+    y_slice = _resolve_slice(chunk.y_start, chunk.y_stop, y_sub)
 
     abs_indices = window_indices
     s2_masks_full = _load_scl_mask(root, abs_indices, y_slice, x_slice)
@@ -830,7 +819,7 @@ def _load_sar_orbit(
         store_opener = open_store_as_zarr_group
     root = store_opener(f"{mosaic_base}/sar_{orbit}.zarr")
     window_indices, doys_full, months_full = _filter_times_from_zarr(root, time_window)
-    y_slice = _resolve_y_slice(chunk, y_sub)
+    y_slice = _resolve_slice(chunk.y_start, chunk.y_stop, y_sub)
     x_slice = slice(chunk.x_start, chunk.x_stop)
     bands, kept = _load_sar_bands_from_zarr(root, window_indices, y_slice, x_slice)
     return bands, doys_full[kept], months_full[kept]

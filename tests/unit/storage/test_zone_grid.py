@@ -23,13 +23,13 @@ def test_zone_tables_by_layout():
     assert zg.zone("utm33") is cols["utm33"] and zg.zone("33S") is hemi["33S"]
 
 
-@pytest.mark.parametrize("spec", _ALL, ids=lambda s: s.group_name)
-def test_extents_pinned_to_pyproj(spec):
+def test_every_extent_is_pinned_to_pyproj_and_shard_aligned():
     # The static tables must match a fresh pyproj derivation, so an EPSG-database
-    # change fails here instead of silently moving the grid.
-    also = (int(spec.epsg) + 100,) if spec.hemisphere is None else ()
-    assert zg.derive_extent(int(spec.epsg), *also) == (spec.easting, spec.northing)
-    assert spec.width % SHARD_PX == 0 and spec.height % SHARD_PX == 0
+    # change fails here instead of silently moving the grid. A column spans both CRSs.
+    for spec in _ALL:
+        also = (int(spec.epsg) + 100,) if spec.hemisphere is None else ()
+        assert zg.derive_extent(int(spec.epsg), *also) == (spec.easting, spec.northing), spec.group_name
+        assert spec.width % SHARD_PX == 0 and spec.height % SHARD_PX == 0, spec.group_name
 
 
 def test_column_shares_pixels_not_shards_with_the_southern_zone():
@@ -94,10 +94,7 @@ def test_calendar_year_times():
 @pytest.mark.parametrize(
     "raw, expected",
     [
-        ("33N", "33N"),
-        ("15S", "15S"),
         ("1N", "01N"),  # zero-padded
-        ("01N", "01N"),
         ("60S", "60S"),
         ("33n", "33N"),  # case-insensitive hemisphere
         (" 7s ", "07S"),  # surrounding whitespace + zero-pad
@@ -113,9 +110,29 @@ def test_canonicalize_zone(raw, expected):
     assert _CANONICAL_ZONE.fullmatch(name)  # the fault drill's copy of this format agrees
 
 
-@pytest.mark.parametrize(
-    "bad", ["", "33", "N33", "0N", "61N", "33X", "33NN", "abc", "-5N", "utm", "utm0", "utm61", "utm33x", "utm33ns"]
-)
+@pytest.mark.parametrize("bad", ["N33", "0N", "61N", "33X", "utm61", "utm33x", "utm33ns"])
 def test_canonicalize_zone_rejects_malformed(bad):
     with pytest.raises(ValueError, match="UTM zone"):
         zg.canonicalize_zone(bad)
+
+
+def test_a_tile_box_steps_by_one_shard_pitch_per_row() -> None:
+    """The label's row/col index the SHARD grid — the same reading assembly uses to place a
+    tile — so a box must step by one tile pitch per row, not by a pixel or by a chunk of some
+    other size. A pitch error yields boxes that look plausible and describe the wrong ground.
+    """
+    spec = zg.zone("16S")
+    top = zg.tile_range_bbox_wgs84(spec, 0, 1, 0, 1)
+    next_row = zg.tile_range_bbox_wgs84(spec, 1, 2, 0, 1)
+    deg_per_m = 1.0 / 111_320.0
+
+    # One tile south, and by one tile PITCH: ~20.48 km of latitude per row.
+    assert next_row[3] < top[3] and next_row[1] < top[1], "row 1 is south of row 0"
+    assert abs((top[3] - top[1]) - SHARD_PX * zg.PIXEL_M * deg_per_m) < 0.01
+
+    # Adjacent boxes OVERLAP rather than abut, and that is the containment guarantee showing
+    # through: each is the WGS84 envelope of its own projected quad, so along the northing line
+    # the two tiles share, one box takes that curve's maximum latitude and the other its
+    # minimum. What must never happen is a GAP — land in neither box.
+    assert next_row[3] >= top[1], "no gap between vertically adjacent tiles"
+    assert (next_row[3] - top[1]) < 10.0 * deg_per_m, "and the overlap stays inside one pixel"

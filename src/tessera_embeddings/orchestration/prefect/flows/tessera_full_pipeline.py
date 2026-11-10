@@ -150,7 +150,7 @@ async def tessera_full_pipeline(
     if roi_name:
         canonical_name = roi_name
     else:
-        parts = [t.strip() for t in tile_names.split(",") if t.strip()]  # type: ignore[union-attr]
+        parts = [t.strip() for t in tile_names.split(",") if t.strip()]  # ty: ignore[unresolved-attribute]
         if not parts:
             raise ValueError("tile_names must contain at least one non-empty tile ID")
         canonical_name = roi_override_name or "_".join(parts)

@@ -862,9 +862,9 @@ a full core 7% of the time, and a bigger batch is a bigger graph. A paired dev t
 at a 6-date cap on narrow fleets, would settle it; watch scheduler CPU and lag first, then worker
 memory.
 
-`config.ingest.auto_batch_dates` and its threshold are no longer called but stay defined:
-`config/ingest.py` is inside the inference code identity's closure, so removing them would move
-that identity. They go with the next change that moves it anyway. The ingest code identity moves
+`config.ingest.auto_batch_dates` and its threshold were no longer called after this change and were
+removed later ([ADR 040](../decisions/040-new-code-is-gated-on-duplication-and-complexity.md)),
+which moved both code identities. The ingest code identity moves
 away from `ingcode-67740a8483141eda` (`ingest/s2_roi.py` changed), so resuming
 mosaics built before this change needs `allow_ingest_code_mismatch=true`. The inference identity
 is unchanged (`infcode-44bbc47265fcb6a8`). Batched stores are byte-identical (batching parity test).

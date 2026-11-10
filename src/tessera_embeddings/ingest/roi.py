@@ -24,6 +24,7 @@ from typing import cast
 
 import dask.array as da
 import fsspec
+import fsspec.utils
 import numpy as np
 import zarr
 from affine import Affine

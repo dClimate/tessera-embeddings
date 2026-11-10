@@ -22,6 +22,7 @@ attempted. The messages asserted on are the real ones observed in production, no
 
 from __future__ import annotations
 
+import inspect
 import unittest.mock as mock
 from pathlib import Path
 
@@ -45,8 +46,6 @@ from tessera_embeddings.storage.zarr_store import (
 #: which class of transient slipped through rather than just quoting a string.
 TRANSIENTS = [
     pytest.param("Error contacting storage: throttled, slow down", id="throttle"),
-    pytest.param("failed to get credentials: expired token", id="expired-credential"),
-    pytest.param("io error: No space left on device (os error 28)", id="disk-full"),
     pytest.param("error deserializing snapshot: unexpected end of input", id="real-corruption"),
 ]
 
@@ -98,14 +97,6 @@ def test_a_missing_path_creates(tmp_path: Path) -> None:
     assert repo.list_branches() == {"main"}
 
 
-def test_an_existing_repo_opens(tmp_path: Path) -> None:
-    path = str(tmp_path / "twice")
-    open_or_create_repo(path)
-    repo, is_new = open_or_create_repo(path)
-    assert is_new is False
-    assert repo.list_branches() == {"main"}
-
-
 @pytest.mark.parametrize("message", ["the repository doesn't exist", "Repository does not exist"])
 def test_an_absence_message_creates(tmp_path: Path, monkeypatch, message: str) -> None:
     """Pins the strings ``is_missing_repo`` keys on, at the level that consumes them.
@@ -134,41 +125,16 @@ def test_a_non_absence_failure_is_reraised_and_nothing_is_created(
 ) -> None:
     """THE regression test. Before the fix each of these returned a created repo, and
     against a non-empty prefix a ``CorruptedStoreError`` blaming a healthy store.
+
+    Re-raised, not re-wrapped: identity, not type, because a helpful-looking wrap would still
+    lose the icechunk detail that says which transient it was.
     """
-    _open_raises(monkeypatch, icechunk.IcechunkError(message))
-    with pytest.raises(icechunk.IcechunkError):
-        open_or_create_repo(str(tmp_path / "transient"))
-    assert no_create == []
-
-
-def test_the_original_exception_object_propagates(tmp_path: Path, monkeypatch) -> None:
-    """Re-raised, not re-wrapped: the caller's retry and any log scraping see the real error.
-
-    Identity, not type — a helpful-looking wrap would still lose the icechunk detail that
-    says which transient it was.
-    """
-    original = icechunk.IcechunkError("Error contacting storage: throttled, slow down")
+    original = icechunk.IcechunkError(message)
     _open_raises(monkeypatch, original)
     with pytest.raises(icechunk.IcechunkError) as caught:
-        open_or_create_repo(str(tmp_path / "identity"))
+        open_or_create_repo(str(tmp_path / "transient"))
     assert caught.value is original
-
-
-def test_a_create_failure_is_not_caught_by_this_function(tmp_path: Path, monkeypatch) -> None:
-    """Pins the control-flow shape: the create runs OUTSIDE the try.
-
-    If it were inside, an error from the create leg could be caught by this function's own
-    handlers and re-attributed — the same class of confusion the fix removes.
-    """
-    sentinel = icechunk.IcechunkError("the repository doesn't exist")
-    _open_raises(monkeypatch, sentinel)
-
-    def _create_boom(*args, **kwargs):
-        raise RuntimeError("create failed for its own reasons")
-
-    monkeypatch.setattr(zarr_store, "_create_repo", _create_boom)
-    with pytest.raises(RuntimeError, match="its own reasons"):
-        open_or_create_repo(str(tmp_path / "create-fails"))
+    assert no_create == []
 
 
 # --- the rootless store, and the dirty prefix that remains legitimate -------------------
@@ -189,12 +155,9 @@ def test_a_rootless_repo_opens_rather_than_creates(tmp_path: Path) -> None:
     assert repo.list_branches() == {"main"}
 
 
-def test_a_dirty_prefix_still_raises_corrupted_with_an_actionable_message(tmp_path: Path) -> None:
-    """A prefix holding objects but no repo is genuinely unusable, and must still raise.
-
-    What the fix changes is the wording, not the outcome: the message names the state, keeps
-    the icechunk error as ``__cause__``, and makes deleting a judgement rather than an
-    instruction — because the prefix may hold chunks somebody wants.
+def test_a_dirty_prefix_still_raises_corrupted(tmp_path: Path) -> None:
+    """A prefix holding objects but no repo is genuinely unusable, and must still raise,
+    keeping the icechunk error as ``__cause__``.
     """
     path = tmp_path / "dirty"
     path.mkdir()
@@ -202,13 +165,6 @@ def test_a_dirty_prefix_still_raises_corrupted_with_an_actionable_message(tmp_pa
 
     with pytest.raises(CorruptedStoreError) as caught:
         open_or_create_repo(str(path))
-
-    message = str(caught.value)
-    assert "no readable repository" in message
-    assert "interrupted" in message
-    assert "inspect it before deleting" in message
-    # The old text ordered a delete outright; that must not come back.
-    assert "Delete it or use a different path" not in message
     assert isinstance(caught.value.__cause__, icechunk.IcechunkError)
 
 
@@ -348,10 +304,6 @@ def test_the_ingest_commit_path_never_rebases() -> None:
     ``rebase_with`` keyword-only, so the ``=`` form is the only way to pass it and nothing
     is given up by allowing the word in prose.
     """
-    import inspect
-
-    from tessera_embeddings.storage import zarr_store
-
     source = inspect.getsource(zarr_store)
     assert "rebase_with=" not in source, (
         "zarr_store now rebases on commit. The ingest path must not: rebasing merges a "

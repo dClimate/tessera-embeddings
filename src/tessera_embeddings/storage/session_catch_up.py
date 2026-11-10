@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Callable, Collection, Iterator
+from collections.abc import Callable, Collection, Generator
 from contextlib import contextmanager
 
 import icechunk
@@ -266,7 +266,7 @@ def ticking(
     tick: Callable[[], None] | None,
     *,
     abort: threading.Event | None = None,
-) -> Iterator[None]:
+) -> Generator[None]:
     """Run ``tick`` every ``interval_s`` for the duration of the block.
 
     ONE timer for the whole fork phase, whichever way the payloads run. Hooking the waiting loop

@@ -24,7 +24,7 @@ Produces artifacts the campaign depends on.
 | script | what it does |
 |---|---|
 | `build_landmask_coverage.py` | Builds, verifies and validates the campaign land-mask coverage store from the partner TIFF delivery ([ADR 010](../context_docs/decisions/010-landmask-registry-coverage.md)). The mask is the campaign's work list. |
-| `record_stac_cassettes.py` | Re-records the VCR cassettes the integration and parity tests replay. Hits the STAC endpoints only, never COG bodies. Needs Earthdata credentials. |
+| `record_stac_cassettes.py` | Re-records the VCR cassette the S2 parity test replays. Hits the STAC endpoint only, never COG bodies. |
 
 ## `maintenance/` — supported tooling that MUTATES something already in service
 
@@ -35,7 +35,6 @@ the state was not what the evidence was gathered against, and be able to undo it
 | script | what it does |
 |---|---|
 | `set_published_store_reader_config.py` | Switches the published store's SAVED manifest preload off, so consumers stop inheriting a setting sized for writing that costs them ~2.5 s of every open and returns nothing. On spec version 2 that rewrites the one object holding every tag and the branch pointers, verified non-destructive against a clone of the real store's reference state first. Dry run unless `--apply`; `--rollback` undoes it. |
-| `fix_published_store_spatial_transform.py` | Moves each zone group's `spatial:transform` origin from the first pixel's centre to its outer corner, which is where the `spatial:` convention puts it, and re-pins the `proj:`/`spatial:` registration URLs to a tag that exists. Metadata only, one commit, 120 groups. Each corrected origin is derived from that group's own coordinate arrays and cross-checked against its own `spatial:bbox`; anything unrecognised is refused and nothing outside those two attrs may change. Idempotent, and dry run unless `--apply`. See [ADR 024](../context_docs/decisions/024-spatial-transform-origin-is-the-pixel-corner.md). |
 | `rebuild_registry_measurements.py` | Repairs the registry's `master/`, which every fill otherwise keeps current itself. `repair` rebuilds cells (all, or `--zones`) from their parts, their existing master rows and a fresh re-derivation, from the store's observation-count arrays, of every row their fills left null, writing each cell conditionally through the fill's own `merge_cell`; a cell whose re-derivation or store check is blocked is left untouched. It visits every cell with a part, a master file or a tagged shard commit, so a master file whose last part was deleted is emptied. `gate` re-checks the identity the re-derivation rests on over every measured row, then reproduces measured rows from the store, and `repair` self-checks each cell the same way. `verify` audits `master/` cell by cell against `parts/`, and `parts/` against the store's record of who wrote each year, including a shard commit whose cell has no part at all (`--parts-only` skips the store; `--zones` narrows it). `parts/` is never touched. Dry run unless `--write`; `--anonymous` plus a local `--registry` rehearses everything without credentials. It repaired v1.1's 1,519,045 unmeasured rows (47%), in 3.4 h and about $7 on one 32-vCPU host in us-west-2. See [registry-master.md](../context_docs/storage/registry-master.md) and [registry-backfill.md](../context_docs/storage/registry-backfill.md). |
 
 ## `update/` — supported tooling for targeted updates
@@ -69,6 +68,7 @@ changed upstream may need repair first, and that is a decision, not a defect.
 |---|---|---|
 | `census_s1_coverage.py` | Global OPERA radar coverage on an equal-area land grid | `context_docs/campaign/campaign-cost-model.md` §6 |
 | `census_s2_coverage.py` | Global Sentinel-2 usable-observation counts on the same grid | `context_docs/inference/minimum-optical-depth.md` |
+| `gpu_starvation.py` | Whether a cluster's GPU fleet starves while ingest feeds it, and which start policy prevents it; also the campaign's inference cost line and its reconciliation against the outturn. Run as `uv run python -m scripts.scoping.gpu_starvation` from the repository root: self-checks, then both reports | `context_docs/campaign/campaign-cost-model.md` §6c and §12, `campaign-plan.md` |
 | `cluster_work_spread.py` | How evenly N Ray clusters divide the work, from the real mask — the campaign ends when the LAST cluster does | `context_docs/campaign/campaign-plan.md` §10, cost model §5b |
 | `campaign_cost_actuals.py` | What a finished campaign cost: measured usage from Cost Explorer priced at list rates from the Pricing API. Not a bill — see its docstring for why this account cannot produce one | `context_docs/campaign/campaign-cost-model.md` §12 |
 | `campaign_delivery_census.py` | What a finished campaign delivered: cells and tile-years published against the roster, reconciled, separating tiles carrying embeddings from tiles written as fill, with the per-day delivery curve | `context_docs/campaign/campaign-cost-model.md` §12 |

@@ -461,6 +461,7 @@ def _target_zones(zones: list[str] | None, zone_layout: ZoneLayout) -> tuple[lis
     return zones, zone_grid.zone_layout_of(zones) or zone_layout
 
 
+# jscpd:ignore-start: explicit keyword signature and Args, mirroring build_coverage
 def validate_coverage(
     dest: str,
     *,
@@ -480,6 +481,7 @@ def validate_coverage(
     * a zone with cells has ≥1 live tile (coverage can't vanish);
     * known-land points are live and a known deep-ocean point is dead.
     """
+    # jscpd:ignore-end
     log = log or logger
     ratio = SHARD_PX // INNER_PX
     target_zones, zone_layout = _target_zones(zones, zone_layout)
