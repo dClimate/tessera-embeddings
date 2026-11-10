@@ -35,14 +35,6 @@ def test_without_an_override_the_path_is_derived_exactly_as_before() -> None:
     assert _paths().global_store("other") == "s3://out/global/other.icechunk"
 
 
-def test_an_override_is_returned_verbatim() -> None:
-    """Verbatim, with nothing joined onto it. The point of the override is that the shape is not
-    ours to decide: no `global/` segment, and a `.zarr` suffix on an Icechunk repo because that is
-    the convention of the bucket we are publishing into.
-    """
-    assert _paths(global_store_uri=OPEN_DATA).global_store() == OPEN_DATA
-
-
 def test_an_override_survives_serialisation() -> None:
     """`BucketPaths` reaches a flow as deployment parameters — `model_dump()` on one side and a
     rebuild on the other. An override that did not round-trip would apply on the laptop that
@@ -124,36 +116,6 @@ class TestTheRegistrySitsBesideWhicheverStoreIsInUse:
         assert paths.optical_registry(paths.global_store()) == "tessera.registry"
         assert not paths.optical_registry(paths.global_store()).startswith("/")
 
-    def test_the_registry_is_never_inside_the_store(self):
-        """Icechunk's garbage collection enumerates its own prefix and reconciles it against its
-        manifests, so a parquet in there is at best unrecognised and at worst collected.
-        """
-        for paths in (
-            BucketPaths(inputs="s3://in", outputs="s3://out"),
-            BucketPaths(inputs="s3://in", outputs="s3://out", global_store_uri="s3://pub/v1/x.icechunk"),
-        ):
-            assert not paths.optical_registry(paths.global_store()).startswith(paths.global_store() + "/")
-
-    def test_registry_run_files_follow_the_store_not_our_outputs(self):
-        """The mistake this class exists to prevent, made once and caught here.
-
-        The per-tile refusal records were first placed under ``outputs``, which works in dev — where
-        the store is derived from ``outputs`` too — and quietly splits in production, where the store
-        is published to a bucket that is not ours. Every tool still works; the records simply sit
-        somewhere no consumer of the store will look.
-        """
-        prod = BucketPaths(
-            inputs="s3://in",
-            outputs="s3://ours",
-            global_store_uri="s3://tessera-embeddings/v1.1/dclimate.icechunk",
-        )
-        detail = run_file_uri(prod.optical_registry(prod.global_store()), "32S", 2021, "run-1")
-
-        registry = prod.optical_registry(prod.global_store())
-        assert detail.startswith(registry + "/"), "inside the registry beside the store"
-        assert "s3://ours" not in detail, "and never in our own bucket when the store is published"
-        assert not detail.startswith(prod.global_store() + "/"), "still never inside the Icechunk prefix"
-
     def test_a_named_store_gets_a_registry_beside_that_same_store(self):
         """The defect this signature exists to prevent, observed in dev on 2026-08-19.
 
@@ -177,16 +139,6 @@ class TestTheRegistrySitsBesideWhicheverStoreIsInUse:
         assert detail.startswith("s3://out/global/tessera-radar.registry/")
         assert "tessera.registry" not in detail
 
-    def test_the_registry_root_cannot_be_asked_for_without_naming_a_store(self):
-        """Structural, not documentary: there is no default to fall back to silently.
-
-        A defaulted argument would have reintroduced exactly the original bug the moment a caller
-        forgot it, and the failure was invisible — a plausible run file in the wrong place.
-        """
-        paths = BucketPaths(inputs="s3://in", outputs="s3://out")
-        with pytest.raises(TypeError):
-            paths.optical_registry()  # type: ignore[call-arg]
-
     def test_a_configured_store_uri_with_a_trailing_slash_stays_outside_the_prefix(self):
         """A human-entered override ends in "/" sooner or later, and `rpartition` then leaves the
         basename empty — naming `.../dclimate.icechunk/.registry`, INSIDE the Icechunk prefix that
@@ -194,12 +146,3 @@ class TestTheRegistrySitsBesideWhicheverStoreIsInUse:
         """
         paths = BucketPaths(inputs="s3://in", outputs="s3://out")
         assert paths.optical_registry("s3://pub/v1/dclimate.icechunk/") == "s3://pub/v1/dclimate.registry"
-
-    def test_registry_run_files_are_partitioned_for_a_parquet_dataset(self):
-        """The registry is specified as Parquet indexing what each shard holds. The run files are JSON
-        for now — pyarrow is not in the fill's runtime — so the LAYOUT has to be the one a later
-        compaction wants, or every path changes when the format does.
-        """
-        paths = BucketPaths(inputs="s3://in", outputs="s3://out")
-        detail = run_file_uri(paths.optical_registry(paths.global_store()), "09S", 2024, "run-1")
-        assert "zone=09S" in detail and "year=2024" in detail

@@ -2,8 +2,8 @@
 
 The reference orchestration for `tessera_embeddings`. Every file
 under this subtree is allowed to `import prefect`; nothing outside
-this subtree is. The architecture-tests in `tests/architecture/`
-enforce that rule.
+this subtree is. The import contracts in `.importlinter` at the
+repository root enforce that rule.
 
 ```
 orchestration/prefect/

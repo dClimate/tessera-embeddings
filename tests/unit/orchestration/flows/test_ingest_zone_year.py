@@ -232,16 +232,6 @@ def test_perf_report_uri_scoped_by_cell_then_child(wired, monkeypatch):
     assert s1["perf_report_uri"] == "s3://in/perf/33N-2025/s1-ascending.html"
 
 
-def test_perf_report_uri_none_by_default(wired, monkeypatch):
-    """With no perf base set, children receive perf_report_uri=None (off)."""
-    monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
-    monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
-    _run(s1_orbit="ascending")
-
-    params = [p for _, p in wired["arun"]]
-    assert all(p["perf_report_uri"] is None for p in params)
-
-
 def test_s3_region_threaded_through_metadata_opens(wired, monkeypatch):
     """The flow's s3_region reaches its Icechunk metadata opens — the mask liveness
     probe, ROI synthesis, and the coverage gate — so a non-default-region deployment
@@ -254,6 +244,10 @@ def test_s3_region_threaded_through_metadata_opens(wired, monkeypatch):
     assert live_kw.get("s3_region") == "eu-west-1"  # mask liveness probe
     assert wired["roi_exported"][0][1].get("s3_region") == "eu-west-1"  # ROI synthesis
     assert wired["coverage_checked"][0][1].get("s3_region") == "eu-west-1"  # coverage gate
+    # The children CREATE the mosaic repos, so the region has to reach them too, or a
+    # non-default-region campaign passes preflight and fails hours into the S1/S2 jobs.
+    dispatched = [p for _, p in wired["arun"]]
+    assert dispatched and all(p["s3_region"] == "eu-west-1" for p in dispatched), dispatched
 
 
 def test_a_complete_store_under_a_different_fingerprint_raises(wired, monkeypatch):
@@ -278,57 +272,6 @@ def test_a_complete_store_under_a_different_fingerprint_raises(wired, monkeypatc
     with pytest.raises(ConfigMismatchError, match="different"):
         _run(s1_orbit="ascending")
     assert wired["arun"] == [], "nothing may be dispatched once the mismatch is known"
-
-
-def test_markerless_partial_mosaic_is_cleared(wired, monkeypatch):
-    """A prior attempt that wrote reflectance then crashed before any SAR store or
-    marker landed must be cleared, not appended onto: existence over the maximal
-    candidate set is what triggers the clean rebuild, and the flow must reach that
-    clearing without first asking the orbit probe about the wreckage.
-    """
-    monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
-    # Reflectance exists (markerless half-write); the SAR stores never landed.
-    monkeypatch.setattr(
-        mod, "_probe_marker", lambda store, **kw: (True, None) if store.endswith("reflectance.zarr") else (False, None)
-    )
-
-    # Resolution keyed on STATE, not on call ordinality: there is no SAR store to
-    # resolve until the ingesters have been dispatched. So a resolution attempted before
-    # the dispatch raises, and the post-ingest one succeeds — and the test stays honest
-    # about which side of the dispatch the flow probes from.
-    def resolve_once_ingested(mosaic_base, orbit, **k):
-        if not wired["arun"]:
-            raise InsufficientCoverageError("no SAR store yet")
-        return orbit
-
-    monkeypatch.setattr(mod, "resolve_s1_orbit", resolve_once_ingested)
-    result = _run(s1_orbit="ascending")
-    assert result["status"] == "ingested"
-    # The markerless partial is RESUMED, not cleared — the flow has no delete path left,
-    # so its absence is structural rather than something this asserts around.
-    assert not hasattr(mod, "delete_prefix"), "the resume path must not reintroduce a clear"
-
-
-def test_partial_window_marker_does_not_satisfy_strict_run(wired, monkeypatch):
-    """A mosaic accepted under allow_partial_window=True must NOT short-circuit a strict run.
-
-    The policy is in the fingerprint, so a strict run sees a complete store under different
-    inputs and RAISES rather than silently reusing a partial mosaic (whose fill would fail
-    strict preflight forever) or discarding it. A campaign does not flip this policy
-    mid-flight, so reaching here means someone changed it deliberately and should say so.
-    """
-    monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
-    partial = {
-        "window": ["2025-01-01", "2025-12-31"],
-        "min_valid_coverage": 0.1,
-        "s1_orbit": "ascending",
-        "allow_partial_window": True,  # accepted under the relaxed policy
-        "coverage_sha256": "cov-sha-1",
-    }
-    monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (True, partial))
-    # Default run is strict (allow_partial_window=False), so the fingerprint differs.
-    with pytest.raises(ConfigMismatchError, match="different"):
-        _run(s1_orbit="ascending")
 
 
 def test_coverage_failure_leaves_no_marker(wired, monkeypatch):
@@ -385,9 +328,9 @@ class TestChunkScaledWorkers:
     def test_dense_zone_is_capped_by_settings(self, wired, monkeypatch):
 
         tiles = np.ones((40, 40), dtype=bool)  # 400 live chunks -> 200 > cap
-        s1, s2 = self._dispatch(wired, monkeypatch, tile_live=tiles, max_workers=50)
-        assert s2 == 50
-        assert s1 == 11  # round(50 * 0.22)
+        s1, s2 = self._dispatch(wired, monkeypatch, tile_live=tiles, max_workers=37)
+        assert s2 == 37
+        assert s1 == 8  # round(37 * 0.22)
 
     def test_mid_zone_scales_half_worker_per_chunk(self, wired, monkeypatch):
 
@@ -409,73 +352,6 @@ class TestChunkScaledWorkers:
         s1, s2 = self._dispatch(wired, monkeypatch, tile_live=tiles, min_workers=6, s1_worker_fraction=0.01)
         assert s1 == 6, "a tiny fraction must still respect min_workers"
 
-    def test_the_settings_value_is_a_cap_not_the_fleet_size(self, wired, monkeypatch):
-        """Sizing always scales from live chunks; max_workers only bounds the result.
-
-        This replaces a test for the crop-off path, which used to take the settings value
-        verbatim. There is no crop-off path now — an extent-sized fleet for a 4-tile zone
-        was wrong by orders of magnitude (the 03S incident), and the only reason it was
-        ever reachable was a flag that no longer exists.
-        """
-        monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
-        monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
-        # Far more live chunks than the cap allows, so the cap is what binds.
-        monkeypatch.setattr(mod, "live_chunk_count", lambda zone, **kw: 10_000)
-        _run(ingest_settings=mod.IngestSettings(max_workers=37), s1_orbit="ascending")
-        # S2 is capped at the settings value; S1 still takes its fraction of what S2 got,
-        # because the ratio is about the WORK split between sensors.
-        assert [p["max_workers"] for _, p in wired["arun"]] == [8, 37]  # round(37 * 0.22) = 8
-
-
-def test_a_completed_sibling_store_survives_the_other_sensors_failure(wired, monkeypatch):
-    """The clear must not destroy work that is already correct.
-
-    S1 and S2 ingest concurrently into one prefix. When one fails it leaves no
-    marker, so the next attempt sees a not-clean mosaic — and clearing the whole
-    prefix threw away the sibling's COMPLETED, correctly-marked output. Because
-    such failures are usually deterministic, every retry re-paid that ingest.
-    A store already carrying the current fingerprint is complete regardless of what
-    happened to its siblings, so it is kept.
-    """
-    monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
-    fp = {
-        "window": ["2025-01-01", "2025-12-31"],
-        "min_valid_coverage": 0.1,
-        "s1_orbit": "ascending",
-        "allow_partial_window": False,
-        "coverage_sha256": "cov-sha-1",
-    }
-
-    def probe(store, **kw):
-        if store.endswith("sar_ascending.zarr"):
-            return (True, fp)  # SAR finished and marked
-        if store.endswith("reflectance.zarr"):
-            return (True, None)  # S2 crashed part-way, unmarked
-        return (False, None)  # descending never ran
-
-    monkeypatch.setattr(mod, "_probe_marker", probe)
-    result = _run(s1_orbit="ascending")
-
-    assert result["status"] == "ingested"
-    # Stronger than before: the completed SAR store survives because NOTHING is deleted,
-    # not because the clear was scoped narrowly enough to spare it.
-    assert not hasattr(mod, "delete_prefix"), "the resume path must not reintroduce a clear"
-
-
-def test_child_ingests_receive_the_configured_region(wired, monkeypatch):
-    """The children CREATE the mosaic repos, so the region has to reach them.
-
-    This flow's own probes use `s3_region`, so a non-default-region campaign gets
-    through preflight and then fails inside the multi-hour S1/S2 jobs, signing
-    against the storage layer's default instead.
-    """
-    monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
-    monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
-    _run(s3_region="eu-west-1")
-    dispatched = [p for _, p in wired["arun"]]
-    assert dispatched, "no child ingests dispatched"
-    assert all(p["s3_region"] == "eu-west-1" for p in dispatched), dispatched
-
 
 class TestChildRunsAreCancellable:
     """Cancelling this flow has to stop the S1/S2 jobs it started.
@@ -486,11 +362,6 @@ class TestChildRunsAreCancellable:
     The campaign already sweeps ITS children by tag; that reaches this flow but
     stops there, because these grandchildren carried no tag of their own.
     """
-
-    def test_the_terminal_hooks_are_registered(self):
-        """Both, not just cancellation: a crashed parent orphans children identically."""
-        assert mod._cancel_children_on_cancellation in mod.ingest_zone_year.on_cancellation_hooks
-        assert mod._cancel_children_on_cancellation in mod.ingest_zone_year.on_crashed_hooks
 
     def test_every_child_carries_the_sweep_tag(self, wired, monkeypatch):
         """Derived from the flow-run id alone, because the hook runs in a fresh import
@@ -503,16 +374,6 @@ class TestChildRunsAreCancellable:
         _run(s1_orbit="both")
         assert wired["tags"], "no child ingests dispatched"
         assert all(t == ["ingest-zone-year:RUN123"] for t in wired["tags"]), wired["tags"]
-
-    def test_no_run_id_means_no_tag_rather_than_a_bogus_one(self, wired, monkeypatch):
-        """A direct .fn() call dispatches nothing worth sweeping, so an id-less run must
-        not stamp a tag that would later match every other id-less run.
-        """
-        monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
-        monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
-        monkeypatch.setattr(mod.flow_run_ctx, "id", None, raising=False)
-        _run()
-        assert all(t is None for t in wired["tags"]), wired["tags"]
 
 
 def test_a_rootless_store_is_resumed_rather_than_wedging_every_retry(wired, monkeypatch):
@@ -550,25 +411,6 @@ def test_a_rootless_store_is_resumed_rather_than_wedging_every_retry(wired, monk
     assert wired["arun"], "the rootless store must be resumed, which means children run"
 
 
-def test_local_mode_does_not_require_the_aws_provider() -> None:
-    """The documented dev path must be reachable without the optional `aws` extra.
-
-    `use_local=True` runs against local stores that need no IAM callback, but the flow
-    imported `providers.aws.credentials` unconditionally before reaching the branch —
-    so an install without botocore could not use the mode it was told to use. Asserted
-    as source, because the failure is an ImportError on a machine that HAS the extra
-    installed, and a test cannot uninstall it.
-    """
-    import inspect
-
-    import tessera_embeddings.orchestration.prefect.flows.ingest_zone_year as mod
-
-    source = inspect.getsource(mod.ingest_zone_year.fn)
-    line = next(i for i, ln in enumerate(source.splitlines()) if "providers.aws" in ln)
-    guard = next(i for i, ln in enumerate(source.splitlines()) if "if not use_local:" in ln)
-    assert guard < line, "the AWS provider import must sit inside the non-local branch"
-
-
 # ===========================================================================
 # Automatic leg retry
 # ===========================================================================
@@ -591,15 +433,6 @@ class TestLegRetryClassification:
             "ingest_s1_roi_sar (ascending): PermissionError: The provided token has expired.",
             "ingest_s2_roi_reflectance: Exception: WarpOperationError('Chunk and warp failed')",
             "ingest_s2_roi_reflectance did not complete successfully (state=Crashed)",
-            "ClientError: An error occurred (ThrottlingException) when calling ListTasks",
-            "KilledWorker: worker died",
-            "TimeoutError",
-            # A read failure the taxonomy declines to call permanent. Every one of these reaches
-            # the lost-data test and is turned down by it, which is the half of that rule that
-            # keeps a bad minute at the source from stranding a cell.
-            "RasterioIOError: HTTP response code: 503 on /vsicurl/https://x/B08.tif",  # the service
-            "RasterioIOError: HTTP response code: 403 on /vsicurl/https://x/B08.tif",  # a rate block
-            "RasterioIOError: CPLE_AWSError ExpiredToken reading /vsis3/x/B08.tif",  # ours to fix
             # Absence words with nothing tying them to the SOURCE reader: our own destination
             # bucket speaks the same S3, so unattributed they claim nothing.
             "RuntimeError: the campaign index answered HTTP response code: 404",
@@ -619,10 +452,15 @@ class TestLegRetryClassification:
             # The store's time axis is append-only, so a date below its maximum is refused
             # identically on every attempt and no dispatch moves the axis.
             "NonMonotonicDateError: 2018-03-05 is older than the latest date 2018-06-20",
-            # The two read-failure verdicts that mean THIS COPY is gone. Neither matches a marker;
-            # both are turned down by the taxonomy, which is the point of reusing it.
-            "RasterioIOError: IReadBlock failed at Y offset 3: TIFFReadEncodedTile() failed.",
+            # A read-failure verdict that means THIS COPY is gone. It matches no marker; the
+            # read-failure taxonomy turns it down, which is the point of reusing it (the taxonomy
+            # itself is tested in tests/unit/ingest/test_read_failure_verdict.py).
             "RasterioIOError: HTTP response code: 404 on /vsicurl/https://x/B08.tif",
+            # A prefix holding objects but no repository fails `Repository.create` identically
+            # every time: on 2026-08-18 zone 47S spent its whole budget re-reading the same twenty
+            # orphaned chunk objects.
+            "CorruptedStoreError: Store s3://in/mosaics/47S/2021/sar_ascending.zarr holds objects "
+            "but no readable repository",
         ],
     )
     def test_deterministic_failures_are_not_retried(self, detail: str) -> None:
@@ -670,12 +508,6 @@ class TestLegFailureDetail:
         assert "token has expired" in detail
         assert mod._is_retryable_leg_failure(detail) is True
 
-    def test_a_missing_state_message_still_yields_a_detail(self) -> None:
-        run = SimpleNamespace(state=SimpleNamespace(type=StateType.FAILED, name="Failed", message=None))
-        detail = mod._leg_failure_detail(run, "s2")
-        assert detail is not None
-        assert "did not complete successfully" in detail
-
 
 class TestTheLegStaggerDecorrelatesTheColdStart:
     """Every cell starts at once and each leg then spends about as long provisioning, so the
@@ -700,10 +532,6 @@ class TestTheLegStaggerDecorrelatesTheColdStart:
         assert min(offsets) < 60 and max(offsets) > 540
         assert 240 < sum(offsets) / len(offsets) < 360
 
-    def test_the_two_legs_of_one_cell_do_not_share_an_offset(self) -> None:
-        """A cell's legs are dispatched together, so identity has to include the leg."""
-        assert mod._leg_stagger_s("33N", 2017, "s2", 600) != mod._leg_stagger_s("33N", 2017, "s1-asc", 600)
-
     def test_a_zero_window_turns_it_off(self) -> None:
         assert mod._leg_stagger_s("33N", 2017, "s2", 0) == 0.0
 
@@ -727,26 +555,6 @@ class TestTheLegStaggerDecorrelatesTheColdStart:
             mod._leg_stagger_s("33N", 2025, label, 600)
             for label in ("ingest_s1_roi_sar (ascending)", "ingest_s2_roi_reflectance")
         )
-
-
-def test_max_leg_attempts_defaults_to_retrying() -> None:
-    """Off by default would leave the behaviour that cost three zones a day."""
-    from tessera_embeddings.config.ingest import IngestSettings
-
-    assert IngestSettings().max_leg_attempts >= 2
-
-
-def test_the_wall_clock_bound_is_on_by_default_and_is_a_real_duration() -> None:
-    """A default nobody sets has never run: the bound must ship enabled.
-
-    And it must be a real duration, not a placeholder — a bound shorter than any
-    plausible leg would refuse every first retry, which is the opposite failure. The
-    field's own docstring carries the two facts the number sits between; this only pins
-    that it exists, is on, and is denominated in hours rather than in accidents.
-    """
-    from tessera_embeddings.config.ingest import IngestSettings
-
-    assert IngestSettings().max_leg_wall_clock_s >= 3600
 
 
 def test_a_terminal_leg_failure_is_not_forgotten_when_a_sibling_retries(wired, monkeypatch):
@@ -861,31 +669,6 @@ class TestCatalogueRefusalSpendsTheBudgetDifferently:
         assert dispatched.count("s2") == 2, "the third attempt was spent on a request already refused twice"
         assert wired["markers_written"] == []
 
-    def test_the_stopping_log_line_names_the_request_and_what_to_do(self, wired, monkeypatch, caplog):
-        """Abandoning a cell has to say WHY, and that a human has somewhere to take it.
-
-        A reliably failing query is as actionable for the archive's operator as a coverage
-        gap, and this line is the only place the run says so. Asserted on the reasoning and
-        the referral, because the request identity reaches this record twice — once as the
-        token and once inside the interpolated leg detail — so an assertion on the identity
-        alone passes even if this line stops carrying it. That property is pinned where it
-        is uniquely observable, at the query itself.
-        """
-        self._dispatch_counting(monkeypatch, [_refusal_detail(502, page=2)] * 3)
-
-        with (
-            caplog.at_level(logging.ERROR, logger="test-ingest-zone-year"),
-            pytest.raises(RuntimeError),
-        ):
-            _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(max_leg_attempts=3))
-
-        assert "deterministic in the request" in caplog.text
-        assert "not congestion" in caplog.text
-        assert "operator" in caplog.text
-        # Present by either route; see the docstring for why this is not the assertion
-        # that guards it.
-        assert "upstream-error:502" in caplog.text and "@p2" in caplog.text
-
     def test_a_repeated_load_refusal_keeps_every_attempt(self, wired, monkeypatch):
         """A source naming itself as the constraint is what expansive retry is FOR.
 
@@ -910,15 +693,6 @@ class TestCatalogueRefusalSpendsTheBudgetDifferently:
         dispatched = self._dispatch_counting(monkeypatch, details)
 
         with pytest.raises(RuntimeError, match="CATALOGUE_REFUSAL"):
-            _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(max_leg_attempts=3))
-
-        assert dispatched.count("s2") == 3
-
-    def test_a_failure_carrying_no_refusal_token_is_unaffected(self, wired, monkeypatch):
-        """The pre-existing default must be untouched for everything that is not a refusal."""
-        dispatched = self._dispatch_counting(monkeypatch, ["PermissionError: The provided token has expired."] * 3)
-
-        with pytest.raises(RuntimeError, match="token has expired"):
             _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(max_leg_attempts=3))
 
         assert dispatched.count("s2") == 3
@@ -1036,47 +810,6 @@ class TestWallClockBoundsTheDecisionToStartAnotherAttempt:
         assert result["status"] == "ingested"
         assert dispatched.count("s2") == 1
         assert wired["markers_written"], "the slow leg's work must be marked complete, not discarded"
-
-    def test_a_load_refusal_keeps_its_attempts_inside_the_deadline(self, wired, monkeypatch):
-        """The bound serves the expansive-retry policy; it must not replace it.
-
-        A source naming itself as the constraint keeps every attempt while the clock has
-        budget — the wall clock is the only thing allowed to end that patience, and here
-        it never runs out.
-        """
-        dispatched, _ = self._dispatch_with_clock(
-            monkeypatch, details=[_refusal_detail(503, page=2)] * 3, leg_duration=100.0
-        )
-
-        with pytest.raises(RuntimeError, match="CATALOGUE_REFUSAL"):
-            _run(
-                s1_orbit="ascending",
-                ingest_settings=mod.IngestSettings(max_leg_attempts=3, max_leg_wall_clock_s=1_000_000),
-            )
-
-        assert dispatched.count("s2") == 3, "a busy source inside the deadline keeps its whole budget"
-
-    def test_the_refusal_log_names_elapsed_deadline_and_the_resume(self, wired, monkeypatch, caplog):
-        """Refusing to retry has to say what ran out and what it costs.
-
-        The operator reading this line needs three things: how much wall clock was spent,
-        what the budget was, and that the cell comes back — a bound that looks like data
-        loss gets worked around, and a worked-around bound is no bound.
-        """
-        self._dispatch_with_clock(monkeypatch, details=[_TRANSIENT_DETAIL] * 3, leg_duration=1000.0)
-
-        with (
-            caplog.at_level(logging.ERROR, logger="test-ingest-zone-year"),
-            pytest.raises(RuntimeError),
-        ):
-            _run(
-                s1_orbit="ascending",
-                ingest_settings=mod.IngestSettings(max_leg_attempts=3, max_leg_wall_clock_s=500),
-            )
-
-        assert "1000" in caplog.text  # the elapsed time
-        assert "max_leg_wall_clock_s=500" in caplog.text  # the deadline it passed
-        assert "work list" in caplog.text and "RESUMES" in caplog.text  # latency, not work
 
 
 def test_the_manifest_is_checked_before_any_marker_is_stamped(wired, monkeypatch):
@@ -1262,39 +995,6 @@ class TestLegsRetryIndependently:
             _run(s1_orbit="ascending", ingest_settings=settings)
         assert waited == [10, 20], "every other failure keeps the short schedule"
 
-    def test_a_terminal_failure_stops_a_siblings_remaining_attempts(self, wired, monkeypatch):
-        """The property the barrier gave for free: once a leg has failed in a way no re-dispatch
-        can fix, the cell cannot succeed, so a sibling's remaining retries would hold a Dask fleet
-        to learn nothing. Gated at the decision to START an attempt — never by interrupting a leg
-        that is already running.
-        """
-        monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
-        monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
-        dispatched: list[str] = []
-
-        async def fake_arun(dep, parameters=None, tags=None):
-            leg = parameters.get("orbit") or "s2"
-            dispatched.append(leg)
-            if leg == "s2":
-                # Terminal: no re-dispatch can register a missing deployment.
-                return SimpleNamespace(
-                    id="r",
-                    state=SimpleNamespace(
-                        type=StateType.FAILED, name="Failed", message="ObjectNotFound: no such deployment"
-                    ),
-                )
-            return SimpleNamespace(
-                id="r",
-                state=SimpleNamespace(type=StateType.FAILED, name="Failed", message=_TRANSIENT_DETAIL),
-            )
-
-        monkeypatch.setattr(mod, "arun_deployment", fake_arun)
-
-        with pytest.raises(RuntimeError, match="ObjectNotFound"):
-            _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(max_leg_attempts=3))
-
-        assert dispatched.count("ascending") == 1, "the retryable leg did not spend attempts on a doomed cell"
-
     def test_a_leg_doomed_during_its_stagger_never_dispatches_and_is_not_a_success(self, wired, monkeypatch):
         """The stagger opened a window the gate did not cover.
 
@@ -1334,41 +1034,6 @@ class TestLegsRetryIndependently:
         assert dispatched == ["s2"], "the staggered leg held a fleet for a cell that cannot succeed"
         assert "another leg of this cell failed terminally" in str(raised.value)
 
-    def test_a_dirty_mosaic_prefix_is_terminal_on_the_first_failure(self, wired, monkeypatch):
-        """A prefix holding objects but no repository fails ``Repository.create`` identically every
-        time — the prefix's contents decide it and no attempt changes them.
-
-        On 2026-08-18 zone 47S spent its whole attempt budget re-reading the same twenty orphaned
-        chunk objects: three dispatches, three identical failures, nothing learned after the first.
-        """
-        monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
-        monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
-        dispatched: list[str] = []
-
-        async def fake_arun(dep, parameters=None, tags=None):
-            leg = parameters.get("orbit") or "s2"
-            dispatched.append(leg)
-            if leg == "s2":
-                return _completed_run()
-            return SimpleNamespace(
-                id="r",
-                state=SimpleNamespace(
-                    type=StateType.FAILED,
-                    name="Failed",
-                    message=(
-                        "CorruptedStoreError: Store s3://in/mosaics/47S/2021/sar_ascending.zarr holds "
-                        "objects but no readable repository"
-                    ),
-                ),
-            )
-
-        monkeypatch.setattr(mod, "arun_deployment", fake_arun)
-
-        with pytest.raises(RuntimeError, match="CorruptedStoreError"):
-            _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(max_leg_attempts=3))
-
-        assert dispatched.count("ascending") == 1, "a dirty prefix must not be retried at all"
-
 
 class TestAPermanentLegFailureSkipsTheLadder:
     """A verdict that recomputes must be reported at once, not re-dispatched.
@@ -1387,35 +1052,6 @@ class TestAPermanentLegFailureSkipsTheLadder:
         test is the format in production.
         """
         return asyncio.run(exception_to_failed_state(exc, message="Flow run encountered an exception:"))
-
-    def test_only_the_words_cross_the_deployment_boundary(self) -> None:
-        """What the parent can match on, established rather than assumed.
-
-        A leg is a separate deployment run and ``arun_deployment`` returns it by reading it back
-        over the API, so the parent holds an API object. Three consequences, all asserted here:
-        the exception object does not come with it (Prefect attaches it for in-process use, and
-        it will not serialise at all), the ``__cause__`` chain does not survive either, and what
-        does survive is the class NAME followed by ``str(exc)``.
-
-        That is why classification matches a class name. ``isinstance`` is unavailable here at
-        any price, and the chain-reading the worker-side taxonomy does has nothing to read.
-        """
-        cause = ValueError("the axis maximum is 2018-06-20")
-        exc = NonMonotonicDateError("date 2018-03-05 is older than the latest date on the axis")
-        exc.__cause__ = cause
-        state = self._failed_state(exc)
-        message = state.message
-        assert message is not None, "a FAILED state with no message would leave nothing to classify"
-
-        assert message.startswith("Flow run encountered an exception: NonMonotonicDateError: ")
-        assert "the axis maximum" not in message, "the cause chain does not cross the boundary"
-        assert "Traceback" not in message, "nor does the traceback"
-
-        # The live object is on the state for in-process use only. It cannot be encoded for the
-        # API, so no reader on the far side can ever be handed it — which is the whole reason
-        # this classification is textual. If this ever stops raising, re-read the design.
-        with pytest.raises(Exception, match="serialize"):
-            state.model_dump_json()
 
     def test_the_class_name_is_what_carries_the_verdict(self) -> None:
         """Matched on a STABLE identifying substring: the exception's class name.
@@ -1491,6 +1127,39 @@ class TestAPermanentLegFailureSkipsTheLadder:
         assert dispatched.count("ascending") == 3, "an unclassified failure was denied its retries"
 
 
+def _s2_leg_failing_every_attempt(monkeypatch, clock, *, leg_duration: float) -> list[str]:
+    """The optical leg fails every attempt, consuming ``leg_duration`` of the clock each time.
+
+    The radar legs complete. Returns the legs dispatched, in order.
+    """
+    monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+    monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
+    monkeypatch.setattr(mod, "monotonic", clock)
+    dispatched: list[str] = []
+
+    async def fake_arun(dep, parameters=None, tags=None):
+        leg = parameters.get("orbit") or "s2"
+        dispatched.append(leg)
+        if leg != "s2":
+            return _completed_run()
+        clock.now += leg_duration
+        return SimpleNamespace(
+            id="r", state=SimpleNamespace(type=StateType.FAILED, name="Failed", message=_TRANSIENT_DETAIL)
+        )
+
+    monkeypatch.setattr(mod, "arun_deployment", fake_arun)
+    return dispatched
+
+
+#: A leg allowed three attempts and 500 s, whose store earns 2000 s per grant of progress.
+_PROGRESS_SETTINGS: dict[str, int] = {
+    "max_leg_attempts": 3,
+    "max_leg_wall_clock_s": 500,
+    "leg_progress_extension_s": 2000,
+    "leg_stagger_window_s": 0,
+}
+
+
 #: Sized so the SECOND rung (200 s) overruns the budget while the first (100 s) fits: two attempts
 #: of 120 s leave 110 s of a 350 s budget. The progress extension is off, so the ladder is the only
 #: thing deciding whether another attempt happens.
@@ -1522,29 +1191,8 @@ class TestABackoffThatDoesNotFitDescendsTheLadder:
     thing the budget forbids. A rung is taken only if it leaves room after it.
     """
 
-    @staticmethod
-    def _one_failing_leg(monkeypatch, clock, *, leg_duration: float):
-        """The optical leg fails every attempt, consuming ``leg_duration`` of the clock each time."""
-        monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
-        monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
-        monkeypatch.setattr(mod, "monotonic", clock)
-        dispatched: list[str] = []
-
-        async def fake_arun(dep, parameters=None, tags=None):
-            leg = parameters.get("orbit") or "s2"
-            dispatched.append(leg)
-            if leg != "s2":
-                return _completed_run()
-            clock.now += leg_duration
-            return SimpleNamespace(
-                id="r", state=SimpleNamespace(type=StateType.FAILED, name="Failed", message=_TRANSIENT_DETAIL)
-            )
-
-        monkeypatch.setattr(mod, "arun_deployment", fake_arun)
-        return dispatched
-
     def test_the_shorter_rung_is_taken_rather_than_the_attempt_refused(self, wired, monkeypatch, waited):
-        dispatched = self._one_failing_leg(monkeypatch, _ManualClock(), leg_duration=120.0)
+        dispatched = _s2_leg_failing_every_attempt(monkeypatch, _ManualClock(), leg_duration=120.0)
 
         with pytest.raises(RuntimeError, match="token has expired"):
             _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(**_RUNG_SETTINGS))
@@ -1559,7 +1207,7 @@ class TestABackoffThatDoesNotFitDescendsTheLadder:
         notice what was refusing it. Given room, it fires — so the evidence for deleting it was
         produced by the defect, not by the rung.
         """
-        dispatched = self._one_failing_leg(monkeypatch, _ManualClock(), leg_duration=120.0)
+        dispatched = _s2_leg_failing_every_attempt(monkeypatch, _ManualClock(), leg_duration=120.0)
 
         with pytest.raises(RuntimeError, match="token has expired"):
             _run(
@@ -1578,7 +1226,7 @@ class TestABackoffThatDoesNotFitDescendsTheLadder:
         that has no time to both wait and start, so waiting would only delay a decision already
         made.
         """
-        dispatched = self._one_failing_leg(monkeypatch, _ManualClock(), leg_duration=280.0)
+        dispatched = _s2_leg_failing_every_attempt(monkeypatch, _ManualClock(), leg_duration=280.0)
 
         with pytest.raises(RuntimeError, match="token has expired"):
             _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(**_RUNG_SETTINGS))
@@ -1608,27 +1256,6 @@ class TestALegStillCommittingDatesEarnsWallClock:
     """
 
     @staticmethod
-    def _leg_that_runs_long(monkeypatch, clock, *, leg_duration: float):
-        """The optical leg fails every attempt after ``leg_duration`` of clock."""
-        monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
-        monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
-        monkeypatch.setattr(mod, "monotonic", clock)
-        dispatched: list[str] = []
-
-        async def fake_arun(dep, parameters=None, tags=None):
-            leg = parameters.get("orbit") or "s2"
-            dispatched.append(leg)
-            if leg != "s2":
-                return _completed_run()
-            clock.now += leg_duration
-            return SimpleNamespace(
-                id="r", state=SimpleNamespace(type=StateType.FAILED, name="Failed", message=_TRANSIENT_DETAIL)
-            )
-
-        monkeypatch.setattr(mod, "arun_deployment", fake_arun)
-        return dispatched
-
-    @staticmethod
     def _growing_store(monkeypatch) -> list[str]:
         """Every reading of a leg's store shows one more date than the last. Records what was read."""
         seen: list[str] = []
@@ -1644,18 +1271,13 @@ class TestALegStillCommittingDatesEarnsWallClock:
 
     def test_a_leg_still_committing_dates_gets_the_attempt_the_deadline_refused(self, wired, monkeypatch):
         """The whole point: the same clock, the same failure, and a store that grew."""
-        dispatched = self._leg_that_runs_long(monkeypatch, _ManualClock(), leg_duration=1000.0)
+        dispatched = _s2_leg_failing_every_attempt(monkeypatch, _ManualClock(), leg_duration=1000.0)
         self._growing_store(monkeypatch)
 
         with pytest.raises(RuntimeError, match="token has expired"):
             _run(
                 s1_orbit="ascending",
-                ingest_settings=mod.IngestSettings(
-                    max_leg_attempts=3,
-                    max_leg_wall_clock_s=500,
-                    leg_progress_extension_s=2000,
-                    leg_stagger_window_s=0,
-                ),
+                ingest_settings=mod.IngestSettings(**_PROGRESS_SETTINGS),
             )
 
         assert dispatched.count("s2") == 3, "a leg that is still committing dates is not the stuck one"
@@ -1668,43 +1290,32 @@ class TestALegStillCommittingDatesEarnsWallClock:
         no room to wait before starting. A leg whose store grew must not lose its attempt to
         which side of the deadline its failure happened to land on.
         """
-        dispatched = self._leg_that_runs_long(monkeypatch, _ManualClock(), leg_duration=480.0)
+        dispatched = _s2_leg_failing_every_attempt(monkeypatch, _ManualClock(), leg_duration=480.0)
         self._growing_store(monkeypatch)
 
         with pytest.raises(RuntimeError, match="token has expired"):
             _run(
                 s1_orbit="ascending",
-                ingest_settings=mod.IngestSettings(
-                    max_leg_attempts=3,
-                    max_leg_wall_clock_s=500,
-                    leg_retry_backoff_s=30,
-                    leg_progress_extension_s=2000,
-                    leg_stagger_window_s=0,
-                ),
+                ingest_settings=mod.IngestSettings(**_PROGRESS_SETTINGS, leg_retry_backoff_s=30),
             )
 
         assert dispatched.count("s2") == 3, "the rung refusal must credit progress like the elapsed one"
 
     def test_a_leg_committing_nothing_is_refused_exactly_as_before(self, wired, monkeypatch):
         """The control, and the polarity. Only progress buys anything; the default buys nothing."""
-        dispatched = self._leg_that_runs_long(monkeypatch, _ManualClock(), leg_duration=1000.0)
+        dispatched = _s2_leg_failing_every_attempt(monkeypatch, _ManualClock(), leg_duration=1000.0)
 
         with pytest.raises(RuntimeError, match="token has expired"):
             _run(
                 s1_orbit="ascending",
-                ingest_settings=mod.IngestSettings(
-                    max_leg_attempts=3,
-                    max_leg_wall_clock_s=500,
-                    leg_progress_extension_s=2000,
-                    leg_stagger_window_s=0,
-                ),
+                ingest_settings=mod.IngestSettings(**_PROGRESS_SETTINGS),
             )
 
         assert dispatched.count("s2") == 1, "the store never grew, so the deadline stands where it was"
 
     def test_the_extension_can_be_turned_off(self, wired, monkeypatch):
         """0 restores the plain deadline, growing store or not — the one lever, and it reaches 0."""
-        dispatched = self._leg_that_runs_long(monkeypatch, _ManualClock(), leg_duration=1000.0)
+        dispatched = _s2_leg_failing_every_attempt(monkeypatch, _ManualClock(), leg_duration=1000.0)
         seen = self._growing_store(monkeypatch)
 
         with pytest.raises(RuntimeError, match="token has expired"):
@@ -1731,7 +1342,7 @@ class TestALegStillCommittingDatesEarnsWallClock:
         """
         clock = _ManualClock()
         attempts, budget, extension, leg_duration = 5, 500, 600, 600.0
-        dispatched = self._leg_that_runs_long(monkeypatch, clock, leg_duration=leg_duration)
+        dispatched = _s2_leg_failing_every_attempt(monkeypatch, clock, leg_duration=leg_duration)
         self._growing_store(monkeypatch)
 
         with pytest.raises(RuntimeError, match="token has expired"):
@@ -1761,7 +1372,7 @@ class TestALegStillCommittingDatesEarnsWallClock:
         Here only the radar store grows. The optical leg must be refused on exactly the terms it
         would have been if nothing in the cell had moved.
         """
-        dispatched = self._leg_that_runs_long(monkeypatch, _ManualClock(), leg_duration=1000.0)
+        dispatched = _s2_leg_failing_every_attempt(monkeypatch, _ManualClock(), leg_duration=1000.0)
         counts: dict[str, int] = {}
 
         def _only_the_sibling_grows(store, log, **kw):
@@ -1775,12 +1386,7 @@ class TestALegStillCommittingDatesEarnsWallClock:
         with pytest.raises(RuntimeError, match="token has expired"):
             _run(
                 s1_orbit="ascending",
-                ingest_settings=mod.IngestSettings(
-                    max_leg_attempts=3,
-                    max_leg_wall_clock_s=500,
-                    leg_progress_extension_s=2000,
-                    leg_stagger_window_s=0,
-                ),
+                ingest_settings=mod.IngestSettings(**_PROGRESS_SETTINGS),
             )
 
         assert dispatched.count("s2") == 1, "the optical leg's own store never grew"

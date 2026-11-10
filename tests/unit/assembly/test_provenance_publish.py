@@ -27,7 +27,7 @@ from tessera_embeddings.config.ingest import PROVENANCE_VERSION, SOURCE_INDEX_VA
 from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.inference.provenance import PROVENANCE_ATTR, SourcePlanes, read_source_pieces
-from tessera_embeddings.inference.provenance_publish import ProvenanceCheckError, publish_provenance
+from tessera_embeddings.inference.provenance_publish import ProvenanceCheckError, ProvenanceRun, publish_provenance
 from tessera_embeddings.storage.manifest import IngestManifest
 from tessera_embeddings.storage.provenance import (
     granules_uri,
@@ -36,13 +36,7 @@ from tessera_embeddings.storage.provenance import (
     shard_dates_uri,
     update_pixels_uri,
 )
-from tessera_embeddings.storage.provenance_reader import (
-    PixelLocation,
-    day_granules,
-    locate,
-    pixel_granules_at,
-    shard_granules,
-)
+from tessera_embeddings.storage.provenance_reader import PixelLocation, ProvenanceRecord, locate
 from tessera_embeddings.storage.zarr_store import open_repo, open_store_as_zarr_group, write_days_windows
 from tests.unit.inference_stack import STACK
 
@@ -138,7 +132,7 @@ def _planes(pins: dict[str, str], chunk: ChunkSpec, valid: np.ndarray = ALL_VALI
         ys, xs = slice(chunk.y_start, chunk.y_stop), slice(chunk.x_start, chunk.x_stop)
         planes.add(
             STORES[Path(path).stem],
-            read_source_pieces(root, times, ys, xs, valid, rows=slice(0, SHARD), cols=slice(0, SHARD)),
+            read_source_pieces(root, times, (ys, xs), valid, (slice(0, SHARD), slice(0, SHARD))),
         )
     return planes
 
@@ -186,16 +180,18 @@ def _publish(
     tmp_path: Path, pins: dict[str, str], embedded: list[str], refused: list[str], run: str = RUN
 ) -> dict | None:
     return publish_provenance(
-        staging_base=str(tmp_path / "staging"),
-        registry_root=str(tmp_path / "registry"),
-        zone=ZONE,
-        year=YEAR,
-        run_id=run,
-        embedded=embedded,
-        refused=refused,
-        mosaic_snapshots=pins,
-        grid_shape=(SIZE, SIZE),
-        shard_px=SHARD,
+        ProvenanceRun(
+            staging_base=str(tmp_path / "staging"),
+            registry_root=str(tmp_path / "registry"),
+            zone=ZONE,
+            year=YEAR,
+            run_id=run,
+            embedded=embedded,
+            refused=refused,
+            mosaic_snapshots=pins,
+            grid_shape=(SIZE, SIZE),
+            shard_px=SHARD,
+        )
     )
 
 
@@ -367,7 +363,7 @@ def test_a_point_is_located_on_the_stores_grid(lat: float, lon: float, where: Pi
 def test_a_pixel_is_read_from_the_run_that_claims_it(updated, row: int, col: int, run: str) -> None:
     """The update claims the pixels its mask marks, the fill the rest; each date names the mosaic's granule."""
     registry, pins = updated
-    got = pixel_granules_at(registry, PixelLocation(ZONE, "chunk_0_1", row, col), YEAR)
+    got = ProvenanceRecord(registry).pixel_granules_at(PixelLocation(ZONE, "chunk_0_1", row, col), YEAR)
     expected = []
     for path, pin in pins.items():
         sensor = STORES[Path(path).stem]
@@ -384,7 +380,7 @@ def test_a_rejected_observation_names_its_granule_and_says_so(tmp_path: Path) ->
     embedded, refused = _stage(tmp_path / "staging", pins, valid=SOME_REJECTED)
     _publish(tmp_path, pins, embedded, refused)
     _master(tmp_path / "registry", embedded + refused, [[RUN]] * 4)
-    got = pixel_granules_at(str(tmp_path / "registry"), PixelLocation(ZONE, "chunk_0_0", 0, 0), YEAR)
+    got = ProvenanceRecord(str(tmp_path / "registry")).pixel_granules_at(PixelLocation(ZONE, "chunk_0_0", 0, 0), YEAR)
     index = {
         STORES[Path(path).stem]: open_store_as_zarr_group(path, snapshot_id=pin)[SOURCE_INDEX_VAR][:, 0, 0]
         for path, pin in pins.items()
@@ -399,20 +395,20 @@ def test_a_rejected_observation_names_its_granule_and_says_so(tmp_path: Path) ->
 def test_a_shard_with_no_complete_record_has_no_pixel_answer(updated) -> None:
     registry, _ = updated
     with pytest.raises(LookupError, match="no complete provenance record"):
-        pixel_granules_at(registry, PixelLocation(ZONE, "chunk_1_1", 0, 0), YEAR)
+        ProvenanceRecord(registry).pixel_granules_at(PixelLocation(ZONE, "chunk_1_1", 0, 0), YEAR)
 
 
 def test_a_day_and_a_shard_read_through_the_snapshot_each_run_names(updated) -> None:
     registry, _ = updated
     day = datetime.date(2024, 6, 1)
     for run in (None, RUN, UPDATE):
-        got = day_granules(registry, ZONE, YEAR, "s2", day, run_id=run)
+        got = ProvenanceRecord(registry).day_granules(ZONE, YEAR, "s2", day, run_id=run)
         assert list(zip(got["granule_id"], got["status"], strict=True)) == [
             ("s2-2024-06-01-0", "fused"),
             ("s2-2024-06-01-1", "fused"),
             ("s2-2024-06-01-9", "duplicate"),
         ]
-    shard = shard_granules(registry, ZONE, YEAR, "chunk_0_0", RUN)
+    shard = ProvenanceRecord(registry).shard_granules(ZONE, YEAR, "chunk_0_0", RUN)
     rows = _shard_dates(Path(registry).parent).to_pylist()
     assert shard.height == sum(len(r["sources"]) for r in rows if r["tile"] == "chunk_0_0")
     assert all(g.startswith(f"{s}-{d}-") for s, d, g in shard.select("sensor", "solar_day", "granule_id").iter_rows())

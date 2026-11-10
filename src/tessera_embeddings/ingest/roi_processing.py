@@ -1,12 +1,8 @@
-"""Sensor-agnostic ROI processing: mask application and coverage filtering.
-
-These operations work on any xarray/Dask Dataset with spatial dimensions (northing, easting)
-and a quality band. They are shared by S2 and S1 ROI ingestion flows.
-"""
+"""Sensor-agnostic ROI processing: the per-date source-read retry, failure context and ROI mask."""
 
 import logging
 import time
-from collections.abc import Iterator, Sequence, Set
+from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from typing import cast
 
@@ -18,9 +14,6 @@ from tenacity import Retrying, before_sleep_log, stop_after_attempt, wait_expone
 
 from tessera_embeddings.ingest.duplicates import cause_was_flattened
 from tessera_embeddings.ingest.loader_failures import carry_logged_refusal
-from tessera_embeddings.ingest.roi import read_roi_mask
-
-logger = logging.getLogger(__name__)
 
 # Default minimum percentage of valid ROI pixels required to keep a date.
 DEFAULT_MIN_VALID_COVERAGE = 5.0
@@ -69,7 +62,7 @@ def read_failure_context(
     date: str,
     items: Sequence[object] = (),
     client: dask.distributed.Client | None = None,
-) -> Iterator[None]:
+) -> Generator[None]:
     """Name the ROI, the date and the granules on any failure raised inside, and complete its reason.
 
     Per-date telemetry is emitted *after* a date commits, so the last date in a log is the last
@@ -121,135 +114,21 @@ def read_failure_context(
         raise
 
 
-def apply_roi_mask(
-    data: xr.Dataset,
-    roi_zarr_path: str,
-    spatial_chunks: dict[str, int],
-    fill_value: int = 0,
-    roi_mask: da.Array | None = None,
-) -> xr.Dataset:
-    """Apply a binary ROI mask to all variables in a dataset, setting outside pixels to
-    ``fill_value``.
+def apply_roi_mask(data: xr.Dataset, roi_mask: da.Array) -> xr.Dataset:
+    """Set every pixel outside the ROI to 0, in every variable of ``data``.
 
-    Lazy by contract: builds the masking graph and returns. Both sensor paths call this once per
-    date over a full zone grid, so nothing here may compute eagerly — callers needing the ROI
-    pixel total compute it themselves, once.
+    Lazy by contract: builds the masking graph and returns. The radar leg calls this once per
+    date over a full zone grid, so nothing here may compute eagerly.
 
     Args:
-        data: Dataset with (time, northing, easting) dimensions and an ``odc.geobox``.
-        roi_zarr_path: Path to the Zarr ROI store (local or s3://).
-        spatial_chunks: Dict with ``"northing"`` and ``"easting"`` chunk sizes for the
-            broadcast dask array (should match the dataset's load chunks).
-        fill_value: Value to assign outside the ROI. Default 0.
-        roi_mask: Pre-computed boolean dask array (northing, easting), already
-            persisted on workers or left lazy. When provided, avoids re-reading
-            from the Zarr store.
+        data: Dataset with (time, northing, easting) dimensions.
+        roi_mask: Boolean dask array (northing, easting), read once by the caller with its
+            credentials and either persisted on workers or left lazy.
 
     Returns:
         The masked dataset.
     """
-    mask_2d = roi_mask if roi_mask is not None else read_roi_mask(roi_zarr_path, spatial_chunks)
-    mask_da = mask_2d[np.newaxis, :, :]
+    mask_da = roi_mask[np.newaxis, :, :]
     for var in data.data_vars:
-        data[var] = data[var].where(mask_da, other=fill_value)
-    return data
-
-
-def filter_low_coverage_dates(
-    data: xr.Dataset,
-    roi_pixel_count: int,
-    quality_band: str,
-    invalid_values: Set[int],
-    min_valid_coverage: float = DEFAULT_MIN_VALID_COVERAGE,
-) -> xr.Dataset:
-    """Drop time steps where valid coverage within the ROI is too low.
-
-    Expects the ROI mask already applied — out-of-ROI pixels set to a value in
-    ``invalid_values`` — so the quality band captures both no-data and outside-ROI. Only the
-    per-date valid-pixel fractions, one scalar per time step, are computed; bands stay lazy.
-
-    Args:
-        data: Dataset with (time, northing, easting) dims and the ROI mask already applied.
-        roi_pixel_count: Number of pixels inside the ROI mask, used as the
-            denominator for coverage percentage.
-        quality_band: Name of the quality/classification variable to check
-            (e.g. ``"scl"`` for S2, ``"0_VV"`` for S1).
-        invalid_values: Set of values in the quality band considered invalid.
-        min_valid_coverage: Minimum percentage of valid pixels to keep a
-            date. Dates below this are dropped.
-
-    Returns:
-        Dataset with low-coverage dates removed. If all dates pass,
-        the original (lazy) dataset is returned unchanged.
-    """
-    if quality_band not in data.data_vars:
-        logger.warning(f"No '{quality_band}' band in dataset — skipping coverage filter")
-        return data
-
-    qb = data[quality_band]  # lazy (time, northing, easting)
-
-    # isin reads qb once in a single fused pass. An OR-chain of equality checks instead fans out
-    # to one qb read per invalid value, which Dask cannot fuse — repeated S3 fetches of SCL.
-    valid_counts = (~qb.isin(list(invalid_values))).sum(dim=("northing", "easting"))  # (time,), lazy
-
-    # Compute only the tiny per-date counts — band arrays stay lazy.
-    valid_counts_np = valid_counts.compute()
-    pcts = 100.0 * valid_counts_np.values / roi_pixel_count
-    dates = [str(t.values)[:10] for t in data.time]
-    keep_mask = pcts >= min_valid_coverage
-
-    dropped = [d for d, keep in zip(dates, keep_mask, strict=True) if not keep]
-    if dropped:
-        logger.info(f"Dropping {len(dropped)} dates with <{min_valid_coverage}% valid coverage: {dropped}")
-        for d, pct in zip(dates, pcts, strict=True):
-            if pct < min_valid_coverage:
-                logger.debug(f"  {d}: {pct:.1f}% valid")
-
-    if not keep_mask.any():
-        return data.isel(time=[])  # empty along time
-
-    if keep_mask.all():
-        return data  # nothing to drop
-
-    return data.isel(time=keep_mask)
-
-
-def identify_low_coverage_ds(
-    data: xr.Dataset,
-    roi_pixel_count: int,
-    quality_band: str,
-    invalid_values: Set[int],
-    min_valid_coverage: float = DEFAULT_MIN_VALID_COVERAGE,
-) -> xr.Dataset:
-    """Lazily flag time steps whose valid coverage within the ROI is below the threshold.
-
-    Unlike :func:`filter_low_coverage_dates`, which eagerly computes coverage to decide which
-    timesteps to drop, this keeps the whole Dask graph lazy and attaches the verdict as a
-    coordinate. Suited to single-timestep datasets, where shrinking the time dimension buys
-    nothing.
-
-    Args:
-        data: Dataset with (time, northing, easting) dims and the ROI mask already applied.
-        roi_pixel_count: Number of pixels inside the ROI mask, used as the
-            denominator for coverage percentage.
-        quality_band: Name of the quality/classification variable to check
-            (e.g. ``"scl"`` for S2, ``"0_VV"`` for S1).
-        invalid_values: Set of values in the quality band considered invalid.
-        min_valid_coverage: Minimum percentage of valid pixels for a date to be flagged valid.
-
-    Returns:
-        The same dataset, bands untouched, with a lazy boolean ``valid_coverage`` coordinate on
-        the time dimension. Downstream code computes that one scalar to decide whether to skip
-        the timestep, without reading any band data.
-    """
-    if quality_band not in data.data_vars:
-        logger.warning(f"No '{quality_band}' band in dataset — skipping coverage filter")
-        return data
-
-    qb = data[quality_band]  # lazy (time, northing, easting)
-    valid_count = (~qb.isin(list(invalid_values))).sum(dim=("northing", "easting"))  # lazy
-    is_valid = (100.0 * valid_count / roi_pixel_count) >= min_valid_coverage  # lazy bool
-
-    data = data.assign_coords(valid_coverage=("time", is_valid.data))
-
+        data[var] = data[var].where(mask_da, other=0)
     return data

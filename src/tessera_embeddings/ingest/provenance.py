@@ -23,14 +23,14 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 import dask.array as da
 import numpy as np
 import xarray as xr
 
-from tessera_embeddings.config.ingest import FUSED
+from tessera_embeddings.config.ingest import DUPLICATE, FUSED, UNREADABLE
 from tessera_embeddings.ingest.duplicates import image_identity
 from tessera_embeddings.ingest.opera_query import BURST_ID
 from tessera_embeddings.ingest.solar_days import solar_day_of
@@ -85,6 +85,32 @@ def mark_dropped(items: Iterable[Any], reason: str) -> None:
     for item in items:
         item.properties.pop(FUSION_POSITION, None)
         item.properties[DROPPED] = reason
+
+
+def mark_duplicates(supplied: Iterable[Any], kept: Iterable[Any]) -> dict[str, list[Any]]:
+    """Mark the copies of ``supplied`` that duplicate selection did not keep; return them by solar day."""
+    kept_ids = {id(item) for item in kept}
+    by_day: dict[str, list[Any]] = {}
+    for item in supplied:
+        if id(item) not in kept_ids:
+            by_day.setdefault(solar_day_of(item), []).append(item)
+    mark_dropped((item for day in by_day.values() for item in day), DUPLICATE)
+    return by_day
+
+
+def mark_stepped_down(previous: Sequence[Any], stepped: Sequence[Any]) -> list[Any]:
+    """Mark one step down the fallback ladder: each copy standing in, and each it replaced. Returns those.
+
+    A copy in ``stepped`` and not in ``previous`` is marked :data:`STEPPED_DOWN`; one in ``previous``
+    and not in ``stepped`` would not read, and is marked dropped as unreadable.
+    """
+    before, after = {id(item) for item in previous}, {id(item) for item in stepped}
+    for item in stepped:
+        if id(item) not in before:
+            item.properties[STEPPED_DOWN] = True
+    replaced = [item for item in previous if id(item) not in after]
+    mark_dropped(replaced, UNREADABLE)
+    return replaced
 
 
 def packed_dtype(native: np.dtype) -> np.dtype:

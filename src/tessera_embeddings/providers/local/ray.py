@@ -13,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Generator
 from pathlib import Path
 
 import ray
@@ -44,7 +44,7 @@ def ray_cluster(
     num_cpus: int | None = None,
     num_gpus: int | None = None,
     include_dashboard: bool = False,
-) -> Iterator[str]:
+) -> Generator[str]:
     """Single-node local Ray for demos, tests, and the plain runner.
 
     ``ignore_reinit_error=True`` makes re-entry into an already-initialized runtime a no-op,

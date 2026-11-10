@@ -39,3 +39,10 @@ in the environment and failing without one would be a finding rather than a flaw
 opt-in twice — the `integration` marker plus `TESSERA_TEST_PUBLISHED_STORE=1`, which
 nothing in CI sets — because a marker alone has previously been enough for a test to run
 where nobody wanted it.
+
+## Opt-in simulation
+
+`test_ec2_launch_pacing.py` drives Ray's real AWS node provider against a local EC2
+stand-in, three arms of minutes of subprocesses each. Launch pacing is off by default, so
+the simulation runs only with `TESSERA_TEST_LAUNCH_PACING=1`; the file's check that Ray
+still reads `AUTOSCALER_UPDATE_INTERVAL_S` from the environment runs with the marker alone.

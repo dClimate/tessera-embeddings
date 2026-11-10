@@ -1,0 +1,18 @@
+{
+  "path": ["."],
+  "pattern": "{src,tests}/**/*.py",
+  "format": ["python"],
+  "ignore": ["tests/fixtures/**"],
+  "maxGapLines": 3,
+  "similarity": 0.8,
+  "reporters": ["console"],
+  "deadCode": {
+    "entry": [
+      "**/orchestration/**",
+      "**/providers/**",
+      "**/profiling/**",
+      "**/__init__.py"
+    ],
+    "minConfidence": 85
+  }
+}

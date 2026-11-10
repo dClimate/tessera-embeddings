@@ -53,7 +53,7 @@ from dataclasses import dataclass
 import boto3
 
 from tessera_embeddings.profiling._cloudwatch import insights_query, iso, parse_ts
-from tessera_embeddings.profiling.ingest import DEFAULT_INGEST_LOG_GROUP
+from tessera_embeddings.profiling.ingest import ingest_log_parser
 
 # dask-cloudprovider names streams ``<prefix>/<container>/<task-id>``; ``ecs_cluster`` sets
 # prefix "dask" and the scheduler container is "dask-scheduler" (providers/aws/dask.py).
@@ -490,12 +490,7 @@ def _build_thresholds(args: argparse.Namespace) -> Thresholds:
 
 def main(argv: list[str] | None = None) -> int:
     """Parse args and run the live or post-hoc scheduler-watch mode."""
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument(
-        "--profile", default=None, help="AWS profile; default uses the ambient credential chain / AWS_PROFILE"
-    )
-    parser.add_argument("--region", default="us-west-2")
-    parser.add_argument("--log-group", default=DEFAULT_INGEST_LOG_GROUP)
+    parser = ingest_log_parser(__doc__)
     parser.add_argument(
         "--stream-prefix",
         default=DEFAULT_SCHEDULER_STREAM_PREFIX,

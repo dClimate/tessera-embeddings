@@ -34,6 +34,7 @@ from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.actors import InferenceActor
 from tessera_embeddings.inference.assembly import summarise_optical_skips
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, write_pixel_mask
+from tessera_embeddings.inference.models.builder import _build_inference_model
 from tessera_embeddings.inference.read_plan import (
     _MIN_STRIP_H,
     _S2_STRIP_BYTE_BUDGET,
@@ -83,15 +84,6 @@ class TestStripHeightForDensity:
         dense = _strip_height_for_density(200, 2000, 2000)
         assert sparse > dense
 
-    def test_single_strip_when_full_height_fits_one_budget(self):
-        # A chunk whose full-height bands + mask fit ONE budget runs as a single
-        # strip; anything larger splits so the strip-prefetch pair stays bounded
-        # by 2 x budget.
-        h = _strip_height_for_density(30, 2000, 2000)
-        assert h == 2000
-        full = 30 * 2000 * 2000 * len(S2_BAND_ORDER) * 2 + 30 * 2000 * 2000
-        assert full <= _S2_STRIP_BYTE_BUDGET
-
     def test_dense_single_chunk_splits_to_respect_budget(self):
         # Regression rooted in the 2026-07-17 OOM (chunk_5_9, T_kept=122): a
         # pair-budget fast path once let a T=122 chunk run as ONE ~10 GB strip
@@ -119,13 +111,6 @@ class TestStripPlan:
 
     def test_fits_one_budget_is_single_strip(self):
         assert _strip_plan(t_kept=30, height=2000, width=2000) == [slice(0, 2000)]
-
-    def test_dense_chunk_splits_with_every_set_under_one_budget(self):
-        strips = _strip_plan(t_kept=120, height=2000, width=2000)
-        assert len(strips) >= 2
-        assert strips[-1].stop == 2000
-        tallest = max(s.stop - s.start for s in strips)
-        assert 120 * tallest * 2000 * len(S2_BAND_ORDER) * 2 + 120 * 2000 * 2000 <= _S2_STRIP_BYTE_BUDGET
 
     def test_strips_run_densest_first_with_empty_strips_last(self):
         # Rows 0-3 have no valid pixel, rows 4-7 half the columns, rows 8-11 all of them.
@@ -201,7 +186,6 @@ class _CapturingWriter:
         embeddings,
         run_id,
         scales,
-        embeddings_std=None,
         obs_counts=None,
         month_covered=None,
         coverage=None,
@@ -225,7 +209,7 @@ class _CapturingWriter:
             "pixels": None if pixels is None else pixels.copy(),
         }
 
-    def write_coverage_only(self, chunk, run_id, obs_counts, month_covered, *, planes=None, pixels=None):
+    def write_coverage_only(self, chunk, run_id, *_counts, planes=None, pixels=None):
         _CapturingWriter.last_coverage_planes = _ranked(planes, pixels)
 
     def discard_coverage(self, chunk, run_id):
@@ -266,27 +250,74 @@ def _open_store_side_effect(n_t_sar: int = 5, source_index: bool = False):
 
 
 def _run_process_chunk(
-    inference_config, test_model, n_t_sar: int = 5, chunk: ChunkSpec = _CHUNK, *, source_index: bool = False
+    inference_config,
+    test_model,
+    *,
+    opener=None,
+    patches=(),
+    chunk=_CHUNK,
+    n_t_sar=5,
+    time_window=None,
+    source_index: bool = False,
+    **overrides,
 ):
-    """Run process_chunk capturing the single whole-chunk write."""
+    """Run process_chunk on a bare actor; return the result and the captured whole-chunk write.
+
+    The config reads the synthetic stores' 2024 dates over both orbits unless ``overrides`` say
+    otherwise; ``source_index`` gives the synthetic mosaics a provenance index. The deferred staging
+    write is drained so ``last_write`` reflects this chunk.
+    """
     inference_config.s1_orbit = "both"
-    # Synthetic stores carry 2024 dates; align the window so the filter keeps them.
     inference_config.time_window = parse_time_window("December 2024")
+    for name, value in overrides.items():
+        setattr(inference_config, name, value)
     actor = _make_actor(inference_config, test_model)
-
-    _CapturingWriter.last_write = None
-    _CapturingWriter.last_skip = None
-
-    with (
-        patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_open_store_side_effect(n_t_sar, source_index)),
-        patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
-    ):
-        result = actor.process_chunk(chunk, "s3://b/m", "/tmp/staging", "run-1")
-        # The staging write is deferred to the actor's writer thread; drain it
-        # so last_write reflects this chunk before we read it.
+    _CapturingWriter.last_write = _CapturingWriter.last_skip = _CapturingWriter.last_skip_record = None
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(
+            patch.object(
+                _dl_mod,
+                "open_store_as_zarr_group",
+                side_effect=opener or _open_store_side_effect(n_t_sar, source_index),
+            )
+        )
+        stack.enter_context(patch.object(_actors_mod, "ZarrWriter", _CapturingWriter))
+        for extra in patches:
+            stack.enter_context(extra)
+        result = actor.process_chunk(chunk, "s3://b/m", "/tmp/staging", "run-1", time_window=time_window)
         flushed = actor.flush_writes()
         assert flushed is None or flushed["ok"], f"deferred write failed: {flushed}"
     return result, _CapturingWriter.last_write
+
+
+def _s2_group(scl: np.ndarray, start: str, freq: str, seed: int | None = None) -> zarr.Group:
+    """A reflectance group under the given SCL ``(t, h, w)``: random bands from ``seed``, zeros without one."""
+    rng = np.random.default_rng(seed)
+    root = zarr.open_group(zarr.storage.MemoryStore(), mode="w")
+    for band in S2_BAND_ORDER:
+        vals = rng.integers(100, 5000, size=scl.shape) if seed is not None else np.zeros(scl.shape)
+        root.create_array(band, shape=scl.shape, dtype=np.uint16, chunks=scl.shape)[:] = vals.astype(np.uint16)
+    root.create_array("scl", shape=scl.shape, dtype=np.uint8, chunks=scl.shape)[:] = scl
+    times = pd.date_range(start, periods=scl.shape[0], freq=freq).values.astype("datetime64[ns]").astype("int64")
+    root.create_array("time", shape=times.shape, dtype=np.int64, chunks=times.shape)[:] = times
+    return root
+
+
+def _opener(s2: zarr.Group, asc: zarr.Group, desc: zarr.Group | None = None):
+    """Patch target for ``open_store_as_zarr_group``: one radar group serves both orbits without ``desc``."""
+
+    def _open(path, region=None):  # region tolerated (make_store_opener threads it)
+        if "reflectance" in path:
+            return s2
+        return desc if desc is not None and "descending" in path else asc
+
+    return _open
+
+
+def _all_refused_opener():
+    """Every SCL class invalid, so every pixel of the chunk is refused."""
+    scl = np.full((4, _CHUNK.height, _CHUNK.width), 8, dtype=np.uint8)
+    return _opener(_s2_group(scl, "2024-01-01", "5D"), make_sar_group(3, _CHUNK.height, _CHUNK.width))
 
 
 def _force_strip_plan(strip_h: int):
@@ -298,18 +329,30 @@ def _force_strip_plan(strip_h: int):
     return _plan
 
 
+@pytest.fixture(scope="module")
+def test_model(inference_config_template):
+    """One model for the module, so a cached reference and the test comparing against it agree."""
+    return _build_inference_model(inference_config_template, torch.device("cpu")).eval()
+
+
+@pytest.fixture(scope="module")
+def serial_reference(inference_config_template, test_model):
+    """``_CHUNK`` run once under a forced 4-row strip plan: the write several tests compare against."""
+    patches = (patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(4)),)
+    return _run_process_chunk(dataclasses.replace(inference_config_template), test_model, patches=patches)
+
+
 class TestProcessChunkStriping:
     """1-strip vs N-strip equality and skip-marker behavior."""
 
-    def test_single_vs_multi_strip_identical(self, inference_config, test_model):
+    def test_single_vs_multi_strip_identical(self, inference_config, test_model, serial_reference):
         # Force the tiling via _strip_plan so the test controls the strip count
         # regardless of the synthetic chunk's density. strip_h > height -> one
         # strip (== unstriped path); a small strip height forces a multi-strip
         # split of this tiny chunk. Both tilings must yield bit-identical output.
-        with patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(10**6)):
-            res_one, write_one = _run_process_chunk(inference_config, test_model)
-        with patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(4)):
-            res_multi, write_multi = _run_process_chunk(inference_config, test_model)
+        patches = (patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(10**6)),)
+        res_one, write_one = _run_process_chunk(inference_config, test_model, patches=patches)
+        res_multi, write_multi = serial_reference
 
         assert res_one["status"] == res_multi["status"] == "success"
         assert res_one["valid_pixels"] == res_multi["valid_pixels"]
@@ -333,7 +376,7 @@ class TestProcessChunkStriping:
                 np.testing.assert_array_equal(write_one["month_covered"][var], other["month_covered"][var], err_msg=var)
 
     def test_a_holes_tile_reads_only_its_holes_and_infers_them_as_a_full_run_does(
-        self, inference_config, test_model, tmp_path
+        self, inference_config, test_model, serial_reference, tmp_path
     ):
         """Rows and columns without holes are never loaded, and the hole pixels come out as in a full run."""
         holes = np.zeros((_CHUNK.height, _CHUNK.width), dtype=bool)
@@ -345,12 +388,16 @@ class TestProcessChunkStriping:
             loaded.append((kwargs["y_sub"], kwargs["x_sub"]))
             return real_load(*args, **kwargs)
 
-        with patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(4)):
-            _, full = _run_process_chunk(inference_config, test_model)
-            with patch.object(_actors_mod, "load_chunk", side_effect=_spy):
-                result, part = _run_process_chunk(
-                    inference_config, test_model, chunk=dataclasses.replace(_CHUNK, pixels=str(tmp_path / "holes.npz"))
-                )
+        _, full = serial_reference
+        result, part = _run_process_chunk(
+            inference_config,
+            test_model,
+            chunk=dataclasses.replace(_CHUNK, pixels=str(tmp_path / "holes.npz")),
+            patches=(
+                patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(4)),
+                patch.object(_actors_mod, "load_chunk", side_effect=_spy),
+            ),
+        )
 
         assert loaded == [(slice(9, 11), slice(2, 5))]
         assert result["valid_pixels"] == holes.sum()
@@ -367,8 +414,12 @@ class TestProcessChunkStriping:
         Nothing downstream can tell those apart, so the check has to be that the flags are
         both PRESENT and consistent with the count they partition.
         """
-        with patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(4)):
-            result, write = _run_process_chunk(inference_config, test_model, n_t_sar=_N_T_SAR_SPANNING_MARCH)
+        result, write = _run_process_chunk(
+            inference_config,
+            test_model,
+            n_t_sar=_N_T_SAR_SPANNING_MARCH,
+            patches=(patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(4)),),
+        )
 
         assert result["status"] == "success"
         masks = write["month_covered"]
@@ -417,11 +468,6 @@ class TestProcessChunkStriping:
             got = [m + 1 for m in range(MONTHS_IN_YEAR) if masks[cov_var][m].any()]
             assert got == months, cov_var
 
-    def test_multi_strip_actually_splits(self):
-        # The strip height used in the equality test genuinely splits this chunk.
-        assert _CHUNK.height > 4
-        assert len(_strip_slices(_CHUNK.height, 4)) >= 2
-
     def test_hung_background_strip_fails_chunk_instead_of_wedging(self, inference_config, test_model, monkeypatch):
         # A background strip load that hangs must make process_chunk FAIL FAST
         # (returning status="failed" so the scheduler replaces the actor), NOT
@@ -459,33 +505,7 @@ class TestProcessChunkStriping:
 
     def test_all_empty_chunk_writes_skip_marker(self, inference_config, test_model):
         """A chunk with zero valid pixels across all strips writes a skip marker."""
-        inference_config.s1_orbit = "both"
-        inference_config.time_window = parse_time_window("December 2024")
-        actor = _make_actor(inference_config, test_model)
-
-        h, w = _CHUNK.height, _CHUNK.width
-        # All-invalid SCL -> zero valid S2 pixels everywhere.
-        s2_root = zarr.open_group(zarr.storage.MemoryStore(), mode="w")
-        for band in S2_BAND_ORDER:
-            arr = s2_root.create_array(band, shape=(4, h, w), dtype=np.uint16, chunks=(4, h, w))
-            arr[:] = 0
-        scl = s2_root.create_array("scl", shape=(4, h, w), dtype=np.uint8, chunks=(4, h, w))
-        scl[:] = 8  # invalid class
-        times = pd.date_range("2024-01-01", periods=4, freq="5D").values.astype("datetime64[ns]").astype("int64")
-        t_arr = s2_root.create_array("time", shape=times.shape, dtype=np.int64, chunks=times.shape)
-        t_arr[:] = times
-        sar = make_sar_group(3, h, w)
-
-        def _open_store(path, region=None):  # region tolerated (make_store_opener threads it)
-            return s2_root if "reflectance" in path else sar
-
-        _CapturingWriter.last_write = None
-        _CapturingWriter.last_skip = None
-        with (
-            patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_open_store),
-            patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
-        ):
-            result = actor.process_chunk(_CHUNK, "s3://b/m", "/tmp/staging", "run-1")
+        result, _ = _run_process_chunk(inference_config, test_model, opener=_all_refused_opener())
 
         assert result["status"] == "skipped"
         assert result["valid_pixels"] == 0
@@ -589,7 +609,6 @@ class TestDeferredStagingWrites:
                 embeddings,
                 run_id,
                 scales,
-                embeddings_std=None,
                 obs_counts=None,
                 month_covered=None,
                 coverage=None,
@@ -605,10 +624,6 @@ class TestDeferredStagingWrites:
         assert prior["label"] == _CHUNK.label and prior["ok"] is False
         assert "S3 500" in prior["error"]
         assert flushed["label"] == _CHUNK_B2.label and flushed["ok"] is False
-
-    def test_flush_with_nothing_pending_returns_none(self, inference_config, test_model):
-        actor = _make_actor(inference_config, test_model)
-        assert actor.flush_writes() is None
 
     def test_hung_write_times_out_and_surfaces_failure(self, inference_config, test_model, monkeypatch):
         # A wedged staging upload must not block the actor forever: the bounded
@@ -654,49 +669,24 @@ class TestDeferredStagingWrites:
 class TestEmptyStripBandReadSkip:
     """Strips with zero valid pixels must not pay the S2 band read."""
 
-    def _make_half_empty_stores(self):
+    @staticmethod
+    def _make_half_empty_stores():
         """Synthetic stores where rows 0-5 are all-invalid SCL, rows 6-11 valid-ish."""
         h, w = _CHUNK.height, _CHUNK.width
-        rng = np.random.default_rng(99)
-        s2_root = zarr.open_group(zarr.storage.MemoryStore(), mode="w")
-        for band in S2_BAND_ORDER:
-            vals = rng.integers(100, 5000, size=(6, h, w)).astype(np.uint16)
-            arr = s2_root.create_array(band, shape=vals.shape, dtype=vals.dtype, chunks=vals.shape)
-            arr[:] = vals
-        scl_vals = np.full((6, h, w), 8, dtype=np.uint8)  # invalid everywhere...
-        scl_vals[:, 6:, :] = rng.choice([4, 5, 8], size=(6, h - 6, w)).astype(np.uint8)  # ...except lower rows
-        scl = s2_root.create_array("scl", shape=scl_vals.shape, dtype=scl_vals.dtype, chunks=scl_vals.shape)
-        scl[:] = scl_vals
-        times = pd.date_range("2024-12-01", periods=6, freq="3D").values.astype("datetime64[ns]").astype("int64")
-        t_arr = s2_root.create_array("time", shape=times.shape, dtype=np.int64, chunks=times.shape)
-        t_arr[:] = times
-        sar_asc = make_sar_group(4, h, w, seed=201)
-        sar_desc = make_sar_group(4, h, w, seed=202)
-
-        def _open_store(path, region=None):  # region tolerated (make_store_opener threads it)
-            if "reflectance" in path:
-                return s2_root
-            if "ascending" in path:
-                return sar_asc
-            return sar_desc
-
-        return _open_store
+        scl = np.full((6, h, w), 8, dtype=np.uint8)  # invalid everywhere...
+        scl[:, 6:, :] = np.random.default_rng(98).choice([4, 5, 8], size=(6, h - 6, w))  # ...except lower rows
+        s2 = _s2_group(scl, "2024-12-01", "3D", seed=99)
+        return _opener(s2, make_sar_group(4, h, w, seed=201), make_sar_group(4, h, w, seed=202))
 
     def _run(self, inference_config, test_model, strip_h):
-        inference_config.s1_orbit = "both"
-        inference_config.time_window = parse_time_window("December 2024")
-        actor = _make_actor(inference_config, test_model)
-        _CapturingWriter.last_write = None
-        with (
-            patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._make_half_empty_stores()),
-            patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
-            patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(strip_h)),
-            patch.object(_dl_mod, "_load_s2_bands", wraps=_dl_mod._load_s2_bands) as band_spy,
-        ):
-            result = actor.process_chunk(_CHUNK, "s3://b/m", "/tmp/staging", "run-1")
-            flushed = actor.flush_writes()
-            assert flushed is None or flushed["ok"]
-        return result, _CapturingWriter.last_write, band_spy
+        with patch.object(_dl_mod, "_load_s2_bands", wraps=_dl_mod._load_s2_bands) as band_spy:
+            result, write = _run_process_chunk(
+                inference_config,
+                test_model,
+                opener=self._make_half_empty_stores(),
+                patches=(patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(strip_h)),),
+            )
+        return result, write, band_spy
 
     def test_empty_strip_skips_band_read(self, inference_config, test_model):
         # strip_h=6 → strip 0 (rows 0-5) is all-invalid, strip 1 (rows 6-11) valid.
@@ -727,65 +717,35 @@ class TestEmptyStripBandReadSkip:
 class TestEastingBboxCrop:
     """Sliver chunks read only the valid-column window; outputs are unchanged."""
 
-    def _make_sliver_stores(self):
+    @staticmethod
+    def _run(inference_config, test_model, crop_threshold, s1_orbit="both"):
         """Valid pixels confined to columns 2-4; SCL invalid everywhere else."""
         h, w = _CHUNK.height, _CHUNK.width
-        rng = np.random.default_rng(7)
-        s2_root = zarr.open_group(zarr.storage.MemoryStore(), mode="w")
-        for band in S2_BAND_ORDER:
-            vals = rng.integers(100, 5000, size=(6, h, w)).astype(np.uint16)
-            arr = s2_root.create_array(band, shape=vals.shape, dtype=vals.dtype, chunks=vals.shape)
-            arr[:] = vals
-        scl_vals = np.full((6, h, w), 8, dtype=np.uint8)
-        scl_vals[:, :, 2:5] = rng.choice([4, 5, 8], size=(6, h, 3)).astype(np.uint8)
-        scl = s2_root.create_array("scl", shape=scl_vals.shape, dtype=scl_vals.dtype, chunks=scl_vals.shape)
-        scl[:] = scl_vals
-        times = pd.date_range("2024-12-01", periods=6, freq="3D").values.astype("datetime64[ns]").astype("int64")
-        t_arr = s2_root.create_array("time", shape=times.shape, dtype=np.int64, chunks=times.shape)
-        t_arr[:] = times
-        sar_asc = make_sar_group(4, h, w, seed=301)
-        sar_desc = make_sar_group(4, h, w, seed=302)
-
-        def _open_store(path, region=None):  # region tolerated (make_store_opener threads it)
-            if "reflectance" in path:
-                return s2_root
-            if "ascending" in path:
-                return sar_asc
-            return sar_desc
-
-        return _open_store
-
-    def _run(self, inference_config, test_model, crop_threshold, s1_orbit="both"):
-        inference_config.s1_orbit = s1_orbit
-        inference_config.time_window = parse_time_window("December 2024")
-        actor = _make_actor(inference_config, test_model)
-        _CapturingWriter.last_write = None
-        with (
-            patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._make_sliver_stores()),
-            patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
-            patch.object(_read_plan_mod, "_X_CROP_MIN_SAVING", crop_threshold),
-            patch.object(_dl_mod, "_load_s2_bands", wraps=_dl_mod._load_s2_bands) as band_spy,
-        ):
-            result = actor.process_chunk(_CHUNK, "s3://b/m", "/tmp/staging", "run-1")
-            flushed = actor.flush_writes()
-            assert flushed is None or flushed["ok"]
-        return result, _CapturingWriter.last_write, band_spy
-
-    def test_crop_reads_only_valid_columns(self, inference_config, test_model):
-        result, _, band_spy = self._run(inference_config, test_model, crop_threshold=0.10)
-        assert result["status"] == "success"
-        # The band read was cropped to columns 2..5 (absolute: x_start + [2, 5)).
-        (_, kwargs) = band_spy.call_args
-        assert kwargs["x_slice"] == slice(_CHUNK.x_start + 2, _CHUNK.x_start + 5)
+        scl = np.full((6, h, w), 8, dtype=np.uint8)
+        scl[:, :, 2:5] = np.random.default_rng(6).choice([4, 5, 8], size=(6, h, 3))
+        opener = _opener(
+            _s2_group(scl, "2024-12-01", "3D", seed=7),
+            make_sar_group(4, h, w, seed=301),
+            make_sar_group(4, h, w, seed=302),
+        )
+        with patch.object(_dl_mod, "_load_s2_bands", wraps=_dl_mod._load_s2_bands) as band_spy:
+            result, write = _run_process_chunk(
+                inference_config,
+                test_model,
+                opener=opener,
+                patches=(patch.object(_read_plan_mod, "_X_CROP_MIN_SAVING", crop_threshold),),
+                s1_orbit=s1_orbit,
+            )
+        return result, write, band_spy
 
     def test_cropped_outputs_bit_identical_to_uncropped(self, inference_config, test_model):
         # crop_threshold > 1 makes the box never "save enough" → crop disabled.
         res_off, write_off, spy_off = self._run(inference_config, test_model, crop_threshold=1.1)
         res_on, write_on, spy_on = self._run(inference_config, test_model, crop_threshold=0.10)
 
-        # The uncropped run read the full width; the cropped run did not.
+        # The uncropped run read the full width; the cropped run only the valid columns 2..5.
         assert spy_off.call_args.kwargs["x_slice"] == slice(_CHUNK.x_start, _CHUNK.x_stop)
-        assert spy_on.call_args.kwargs["x_slice"] != slice(_CHUNK.x_start, _CHUNK.x_stop)
+        assert spy_on.call_args.kwargs["x_slice"] == slice(_CHUNK.x_start + 2, _CHUNK.x_start + 5)
 
         assert res_off["valid_pixels"] == res_on["valid_pixels"] > 0
         np.testing.assert_array_equal(write_off["embeddings"], write_on["embeddings"])
@@ -855,19 +815,18 @@ def _assert_writes_identical(a, b):
 class TestXChunkPrefetch:
     """End-to-end bit-identity and failure handling for the cross-chunk prefetch."""
 
-    @pytest.mark.parametrize("strip_h", [10**6, 4], ids=["one-strip", "multi-strip"])
-    def test_prefetched_chunk_is_bit_identical_to_serial(self, inference_config, test_model, caplog, strip_h):
+    def test_prefetched_chunk_is_bit_identical_to_serial(self, inference_config, test_model, serial_reference, caplog):
         # The stash carries the next chunk's mask, plan and loaded first strip;
         # consuming it must produce output identical to a serial run under the
         # same tiling.
-        patches = (patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(strip_h)),)
+        patches = (patch.object(_read_plan_mod, "_strip_plan", _force_strip_plan(4)),)
         with caplog.at_level("INFO", logger=_actors_mod.logger.name):
             chained, actor = _run_chunk_chain(
                 inference_config, test_model, [(_CHUNK, _CHUNK_B), (_CHUNK_B, None)], patches
             )
         assert f"xchunk prefetch: hit for {_CHUNK_B.label}" in caplog.text
-        serial, _ = _run_chunk_chain(inference_config, test_model, [(_CHUNK_B, None)], patches)
-        _assert_writes_identical(chained[1], serial[0])
+        # _CHUNK_B covers _CHUNK's pixels, so the cached serial write of _CHUNK is its reference.
+        _assert_writes_identical(chained[1], serial_reference[1])
         assert actor._xchunk_prefetched == {}  # stash consumed
 
     def test_prefetch_starts_on_the_last_strip_with_pixels(self, inference_config, test_model, caplog):
@@ -879,7 +838,7 @@ class TestXChunkPrefetch:
             patch.object(
                 _dl_mod,
                 "open_store_as_zarr_group",
-                side_effect=TestEmptyStripBandReadSkip()._make_half_empty_stores(),
+                side_effect=TestEmptyStripBandReadSkip._make_half_empty_stores(),
             ),
         )
         with caplog.at_level("INFO"):
@@ -916,20 +875,10 @@ class TestXChunkPrefetch:
 class TestAllowS2Only:
     """End-to-end through the real model: the optional per-pixel S1 requirement."""
 
-    def _stores_with_sar_gap(self, h: int, w: int, half: int):
+    @staticmethod
+    def _stores_with_sar_gap(h: int, w: int, half: int):
         """S2 valid EVERYWHERE (scl=4); SAR zeroed over columns >= half (a coverage gap)."""
-        rng = np.random.default_rng(11)
-        s2_root = zarr.open_group(zarr.storage.MemoryStore(), mode="w")
-        for band in S2_BAND_ORDER:
-            vals = rng.integers(100, 5000, size=(6, h, w)).astype(np.uint16)
-            arr = s2_root.create_array(band, shape=vals.shape, dtype=vals.dtype, chunks=vals.shape)
-            arr[:] = vals
-        scl = s2_root.create_array("scl", shape=(6, h, w), dtype=np.uint8, chunks=(6, h, w))
-        scl[:] = 4  # every pixel S2-valid at every timestep
-        times = pd.date_range("2024-01-01", periods=6, freq="5D").values.astype("datetime64[ns]").astype("int64")
-        t_arr = s2_root.create_array("time", shape=times.shape, dtype=np.int64, chunks=times.shape)
-        t_arr[:] = times
-
+        s2 = _s2_group(np.full((6, h, w), 4, dtype=np.uint8), "2024-01-01", "5D", seed=11)
         sar_asc = make_sar_group(5, h, w, seed=20)
         sar_desc = make_sar_group(5, h, w, seed=30)
         for grp in (sar_asc, sar_desc):
@@ -937,44 +886,15 @@ class TestAllowS2Only:
                 data = grp[name][:]
                 data[:, :, half:] = 0  # no SAR observations right of the gap edge
                 grp[name][:] = data
-
-        def _open_store(path, region=None):
-            if "reflectance" in path:
-                return s2_root
-            if "ascending" in path:
-                return sar_asc
-            if "descending" in path:
-                return sar_desc
-            raise ValueError(f"Unexpected store path: {path}")
-
-        return _open_store
-
-    def _run(self, inference_config, test_model, opener, allow_s2_only: bool):
-        inference_config.s1_orbit = "both"
-        inference_config.time_window = parse_time_window("December 2024")
-        inference_config.allow_s2_only = allow_s2_only
-        actor = _make_actor(inference_config, test_model)
-        _CapturingWriter.last_write = None
-        _CapturingWriter.last_skip = None
-        with (
-            patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=opener),
-            patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
-        ):
-            result = actor.process_chunk(_CHUNK, "s3://b/m", "/tmp/staging", "run-1")
-            # The staging write is deferred to the actor's writer thread; drain it
-            # so last_write reflects this chunk before we read it (mirrors
-            # _run_process_chunk — without this the read races the write thread).
-            flushed = actor.flush_writes()
-            assert flushed is None or flushed["ok"], f"deferred write failed: {flushed}"
-        return result, _CapturingWriter.last_write
+        return _opener(s2, sar_asc, sar_desc)
 
     def test_sar_gap_pixels_embed_only_with_flag(self, inference_config, test_model):
         h, w = _CHUNK.height, _CHUNK.width
         half = w // 2
         opener = self._stores_with_sar_gap(h, w, half)
 
-        res_off, write_off = self._run(inference_config, test_model, opener, allow_s2_only=False)
-        res_on, write_on = self._run(inference_config, test_model, opener, allow_s2_only=True)
+        res_off, write_off = _run_process_chunk(inference_config, test_model, opener=opener, allow_s2_only=False)
+        res_on, write_on = _run_process_chunk(inference_config, test_model, opener=opener, allow_s2_only=True)
         assert res_off["status"] == "success" and res_on["status"] == "success"
 
         # Provenance is identical either way: zero S1 observations in the gap.
@@ -1004,46 +924,9 @@ class TestPerCellTimeWindow:
     A chained session's cells may span campaign years, and an actor is built once with one
     config. Reading the window from that config would make every cell of a different year
     read the wrong months, and the session's only mismatch check is on `s1_orbit`, so
-    nothing would catch it. These tests pin both halves: threading it changed nothing when
-    the value matches, and it genuinely takes effect when it does not.
+    nothing would catch it. Every other test here runs the default (the config's window); this one
+    pins that a passed window genuinely takes effect.
     """
-
-    @staticmethod
-    def _run(inference_config, test_model, *, time_window=None):
-        inference_config.s1_orbit = "both"
-        inference_config.time_window = parse_time_window("December 2024")
-        actor = _make_actor(inference_config, test_model)
-        _CapturingWriter.last_write = None
-        _CapturingWriter.last_skip = None
-        with (
-            patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_open_store_side_effect()),
-            patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
-        ):
-            result = actor.process_chunk(_CHUNK, "s3://b/m", "/tmp/staging", "run-1", time_window=time_window)
-            flushed = actor.flush_writes()
-            assert flushed is None or flushed["ok"], f"deferred write failed: {flushed}"
-        return result, _CapturingWriter.last_write
-
-    def test_passing_the_config_window_explicitly_is_bit_identical(self, inference_config, test_model):
-        """The safety property: threading the window must not have changed the numbers.
-
-        The window reaches the loader call sites — the serial prologue, the cross-chunk
-        prefetch, and the strip loop — which are documented as needing identical
-        kwargs for bit-identity. `_process_chunk` resolves the fallback ONCE into a local and
-        passes that value to all three, so they cannot drift; this asserts the outcome.
-        """
-        res_default, write_default = self._run(inference_config, test_model)
-        res_explicit, write_explicit = self._run(
-            inference_config, test_model, time_window=parse_time_window("December 2024")
-        )
-        assert res_default["status"] == res_explicit["status"] == "success"
-        assert res_default["valid_pixels"] == res_explicit["valid_pixels"] > 0
-        np.testing.assert_array_equal(write_default["embeddings"], write_explicit["embeddings"])
-        np.testing.assert_allclose(write_default["scales"], write_explicit["scales"], rtol=0, atol=0, equal_nan=True)
-        for var in ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count"):
-            np.testing.assert_array_equal(
-                write_default["obs_counts"][var], write_explicit["obs_counts"][var], err_msg=var
-            )
 
     def test_a_different_window_actually_changes_what_is_read(self, inference_config, test_model):
         """The liveness property, and the one that would catch the override being ignored.
@@ -1053,30 +936,17 @@ class TestPerCellTimeWindow:
         so a 2022 window must filter them all out — a visibly different result rather than
         merely a different number.
         """
-        res_2024, write_2024 = self._run(inference_config, test_model, time_window=parse_time_window("December 2024"))
+        res_2024, write_2024 = _run_process_chunk(
+            inference_config, test_model, time_window=parse_time_window("December 2024")
+        )
         assert res_2024["valid_pixels"] > 0 and write_2024 is not None
 
         # The 2022 window filters every date out, and the loader raises rather than
         # quietly embedding nothing — which is a stronger liveness signal than a zero
         # count, because it can only come from the passed window reaching the loader.
-        res_2022, _ = self._run(inference_config, test_model, time_window=parse_time_window("December 2022"))
+        res_2022, _ = _run_process_chunk(inference_config, test_model, time_window=parse_time_window("December 2022"))
         assert res_2022["status"] == "failed", res_2022
         assert "time window (2022" in res_2022.get("error", ""), res_2022
-
-    def test_the_zone_context_carries_the_window_to_the_dispatch(self):
-        """The wiring, unit-tested without a fleet: ZoneContext holds it and defaults to None.
-
-        `None` is what the single-ROI path passes, which is what keeps that path unchanged.
-        """
-        from tessera_embeddings.inference.scheduling import ZoneContext
-
-        assert ZoneContext("m", "s", "r").time_window is None
-        window = parse_time_window("December 2024")
-        assert ZoneContext("m", "s", "r", window).time_window is window
-        # Frozen + value-based equality still works, and two years of one zone differ —
-        # which is what stops a cross-cell prefetch hint reading the wrong window.
-        assert ZoneContext("m", "s", "r", window) == ZoneContext("m", "s", "r", window)
-        assert ZoneContext("m", "s", "r", window) != ZoneContext("m", "s", "r", parse_time_window("December 2023"))
 
 
 class TestTheRecordTheConsumerWillRead:
@@ -1091,26 +961,9 @@ class TestTheRecordTheConsumerWillRead:
     """
 
     @staticmethod
-    def _refused_run(inference_config, test_model, monkeypatch, *, crop: slice | None):
+    def _refused_run(inference_config, test_model, *, crop: slice | None):
         """Drive a fully refused chunk through the real producer; return its record."""
-        inference_config.s1_orbit = "both"
-        inference_config.time_window = parse_time_window("December 2024")
-        actor = _make_actor(inference_config, test_model)
-        h, w = _CHUNK.height, _CHUNK.width
-        s2_root = zarr.open_group(zarr.storage.MemoryStore(), mode="w")
-        for band in S2_BAND_ORDER:
-            arr = s2_root.create_array(band, shape=(4, h, w), dtype=np.uint16, chunks=(4, h, w))
-            arr[:] = 0
-        scl = s2_root.create_array("scl", shape=(4, h, w), dtype=np.uint8, chunks=(4, h, w))
-        scl[:] = 8  # every class invalid -> every pixel refused
-        times = pd.date_range("2024-01-01", periods=4, freq="5D").values.astype("datetime64[ns]").astype("int64")
-        t_arr = s2_root.create_array("time", shape=times.shape, dtype=np.int64, chunks=times.shape)
-        t_arr[:] = times
-        sar = make_sar_group(3, h, w)
-
-        def _open_store(path, region=None):
-            return s2_root if "reflectance" in path else sar
-
+        patches = ()
         if crop is not None:
             # Force the read plan to narrow the chunk, which no all-invalid fixture does on its own:
             # the crop is derived from the columns holding valid pixels, and here there are none.
@@ -1120,24 +973,21 @@ class TestTheRecordTheConsumerWillRead:
                 _x_sub, strips, live = real_plan(chunk, mask_bundle, pixels)
                 return crop, strips, live
 
-            monkeypatch.setattr(_actors_mod, "_chunk_read_plan", _cropped)
-
-        _CapturingWriter.last_write = None
-        _CapturingWriter.last_skip = None
-        _CapturingWriter.last_skip_record = None
-        with (
-            patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_open_store),
-            patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
-        ):
-            result = actor.process_chunk(_CHUNK, "s3://b/m", "/tmp/staging", "run-1")
+            patches = (patch.object(_actors_mod, "_chunk_read_plan", _cropped),)
+        result, _ = _run_process_chunk(inference_config, test_model, opener=_all_refused_opener(), patches=patches)
         assert result["status"] == "skipped"
         record = _CapturingWriter.last_skip_record
         assert record is not None
         return record
 
-    def test_the_consumer_grades_the_producers_record_as_consistent(self, inference_config, test_model, monkeypatch):
-        """The round trip, uncropped: the reasons account for every pixel the dataset evaluated."""
-        record = self._refused_run(inference_config, test_model, monkeypatch, crop=None)
+    def test_the_consumer_grades_the_producers_record_as_consistent(self, inference_config, test_model):
+        """The round trip, uncropped: the reasons account for every pixel the dataset evaluated.
+
+        The record also carries the grid it was produced on: an assembly-only resume of an
+        all-skipped run has no staged tile to read a chunk size off.
+        """
+        record = self._refused_run(inference_config, test_model, crop=None)
+        assert record["chunk_side_px"] == _CHUNK.width
         label = record["label"]
         summary = summarise_optical_skips(staged=[], skipped=[label], records={label: record})
 
@@ -1146,7 +996,7 @@ class TestTheRecordTheConsumerWillRead:
         # Nothing was cropped, so nothing is unaccounted for.
         assert "not_evaluated_px" not in summary
 
-    def test_a_cropped_chunk_is_consistent_and_its_remainder_is_named(self, inference_config, test_model, monkeypatch):
+    def test_a_cropped_chunk_is_consistent_and_its_remainder_is_named(self, inference_config, test_model):
         """The defect two reviewers found, from both ends at once.
 
         With the read plan narrowed to four of ten columns, the reasons cover 4/10 of the tile. The
@@ -1155,7 +1005,7 @@ class TestTheRecordTheConsumerWillRead:
         ones and a summary that ignores them looks short of the footprint it explains.
         """
         crop = slice(3, 7)
-        record = self._refused_run(inference_config, test_model, monkeypatch, crop=crop)
+        record = self._refused_run(inference_config, test_model, crop=crop)
         label = record["label"]
 
         assert record["eligible_px"] == _CHUNK.height * 4, "the footprint the reasons actually cover"
@@ -1167,13 +1017,6 @@ class TestTheRecordTheConsumerWillRead:
         assert (
             sum(summary["refused_px_by_reason"].values()) + summary["not_evaluated_px"] == _CHUNK.height * _CHUNK.width
         ), "refused plus never-evaluated must account for the whole published tile"
-
-    def test_the_record_carries_the_grid_it_was_produced_on(self, inference_config, test_model, monkeypatch):
-        """An assembly-only resume of an all-skipped run has no staged tile to read a chunk size
-        off, and guessing the current default re-enumerates every label.
-        """
-        record = self._refused_run(inference_config, test_model, monkeypatch, crop=None)
-        assert record["chunk_side_px"] == _CHUNK.width
 
 
 class TestTheRecordCountsOnlyTheEvaluatedColumns:

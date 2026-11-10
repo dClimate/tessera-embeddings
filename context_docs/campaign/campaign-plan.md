@@ -333,7 +333,7 @@ is in this table because it is the most consequential value in it.
 > pool raises the crossover on every basis — that one mechanically, since more workers cannot slow
 > a fixed cell down, but NOT by a measured factor: the 16- and 32-worker assembly rates are
 > themselves from different cells. Arithmetic in `campaign-cost-model.md` §6c and
-> `tests/unit/inference/test_gpu_starvation.py`; outturn in §12.
+> `scripts/scoping/gpu_starvation.py`; outturn in §12.
 
 | parameter | value | why |
 |---|---|---|

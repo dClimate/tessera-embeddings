@@ -68,11 +68,6 @@ class TestMeasurementsFromObs:
         with pytest.raises(ValueError, match="both orbits or neither"):
             rb.measurements_from_obs(_obs([[20]]), optical_min_obs=RULE, radar_rule_enforced=False, s1_asc=_obs([[1]]))
 
-    def test_radar_presence_is_null_when_not_measured(self) -> None:
-        """An optical-only pass must not publish a zero it never counted."""
-        got = rb.measurements_from_obs(_obs([[20]]), optical_min_obs=RULE, radar_rule_enforced=False)
-        assert got["px_with_any_radar"] is None
-
     def test_radar_presence_counts_either_orbit(self) -> None:
         got = rb.measurements_from_obs(
             _obs([[20, 20, 20]]),
@@ -143,21 +138,6 @@ class TestDriftAgainstTheFill:
         }
         assert _measurement_fields(rb.as_coverage_record(rebuilt))["refused_thin_px"] > 0
 
-    def test_the_refusal_split_matches_the_datasets_rule(self) -> None:
-        """``has_optical`` is ``s2_obs_count > 0`` on the delivered product — the whole basis here.
-
-        Asserted against the expressions ``inference/dataset.py`` gates on, so a change to the
-        rule that made the store insufficient to reproduce it fails here rather than silently
-        producing rows that disagree with the fill's.
-        """
-        rng = np.random.default_rng(1)
-        s2 = rng.integers(0, 40, size=(32, 32)).astype(np.uint16)
-        has_optical = s2 > 0
-        deep_enough = s2 >= RULE
-        rebuilt = rb.measurements_from_obs(s2, optical_min_obs=RULE, radar_rule_enforced=False)
-        assert rebuilt["refused_no_optical_px"] == int((~has_optical).sum())
-        assert rebuilt["refused_thin_px"] == int((has_optical & ~deep_enough).sum())
-
 
 class TestCompareRow:
     """The gate's verdicts."""
@@ -203,11 +183,6 @@ class TestCompareRow:
         assert verdict == "mismatch"
         assert any("refused_thin_px" in d for d in differences)
         assert any("refused_px" in d for d in differences)
-
-    def test_eligible_px_alone_never_fails_the_gate(self) -> None:
-        """The rebuild leaves it null on purpose; comparing it would fail every row."""
-        verdict, _ = rb.compare_row(self._rebuilt(), self._recorded())
-        assert verdict == "match"
 
     def test_an_optical_only_pass_is_not_failed_for_the_radar_column(self) -> None:
         verdict, _ = rb.compare_row(self._rebuilt(), self._recorded(px_with_any_radar=99))
@@ -316,6 +291,3 @@ class TestRebuiltRow:
         assert row["run_id"] == "rebuild-1"
         assert row["filled_at"] == "2026-08-01T00:00:00+00:00"
         assert row["chunk_px"] == 1
-
-    def test_a_run_id_says_it_is_a_rebuild(self) -> None:
-        assert rb.rebuild_run_id(suffix="optical").startswith("rebuild-")

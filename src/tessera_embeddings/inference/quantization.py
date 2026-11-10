@@ -64,10 +64,10 @@ def raise_on_nonfinite_scales(scales_host: np.ndarray) -> None:
 def quantize_rows(rows: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Quantize float32 embedding rows to int8 using symmetric per-row quantization.
 
-    Row-wise variant of :func:`quantize_embeddings` for ``(N, D)`` inputs, so a
-    bucket's rows can be quantized as they come off the GPU instead of buffering
-    the whole chunk in float32. Each row's scale comes from its own channels, so it
-    is numerically identical to quantizing the full ``(H, W, D)`` array.
+    Takes ``(N, D)`` rows, so a bucket's rows can be quantized as they come off the
+    GPU instead of buffering the whole chunk in float32. Each row's scale comes from
+    its own channels, so it is numerically identical to quantizing the full
+    ``(H, W, D)`` array.
 
     Args:
         rows: Array of shape ``(N, D)``, dtype float32.
@@ -87,33 +87,3 @@ def quantize_rows(rows: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
     quantized = np.clip(np.round(rows / scales[:, np.newaxis]), -127, 127).astype(np.int8)
     return quantized, scales
-
-
-def quantize_embeddings(embeddings: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Quantize float32 embeddings to int8 using symmetric per-pixel quantization.
-
-    Args:
-        embeddings: Array of shape ``(H, W, D)``, dtype float32.
-
-    Returns:
-        Tuple of (quantized, scales):
-        - quantized: ``(H, W, D)`` int8 array.
-        - scales: ``(H, W)`` float32 array — multiply ``quantized * scales[..., None]``
-          to recover approximate float32 values.
-    """
-    h, w, d = embeddings.shape
-    quantized, scales = quantize_rows(embeddings.reshape(h * w, d))
-    return quantized.reshape(h, w, d), scales.reshape(h, w)
-
-
-def dequantize_embeddings(quantized: np.ndarray, scales: np.ndarray) -> np.ndarray:
-    """Dequantize int8 embeddings back to float32.
-
-    Args:
-        quantized: ``(H, W, D)`` int8 array.
-        scales: ``(H, W)`` float32 array (from :func:`quantize_embeddings`).
-
-    Returns:
-        ``(H, W, D)`` float32 array.
-    """
-    return quantized.astype(np.float32) * scales[..., np.newaxis]

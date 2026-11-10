@@ -9,11 +9,15 @@ Spawned workers are the point. A spawned interpreter cannot inherit a patched cl
 driver, which is the condition of a production container — under ``fork`` the rescue would appear
 to work while proving nothing about whether it is installed where reads happen.
 
-Marked ``integration``: each test builds a cluster, so they cost seconds rather than milliseconds
+Marked ``integration``: the clusters cost seconds rather than milliseconds
 and are excluded from the default run.
 """
 
 from __future__ import annotations
+
+import contextlib
+from collections.abc import Iterator
+from typing import Any
 
 import pytest
 
@@ -45,8 +49,8 @@ def _chain_text(exc: BaseException) -> str:
     return " | ".join(parts)
 
 
-@pytest.fixture
-def spawned_cluster():
+@contextlib.contextmanager
+def _spawned_client() -> Iterator[Any]:
     """A cluster whose workers are fresh processes, so nothing is inherited from this one."""
     from dask.distributed import Client, LocalCluster
 
@@ -59,6 +63,23 @@ def spawned_cluster():
         assert set(client.run(lambda: __import__("multiprocessing").get_start_method()).values()) == {"spawn"}, (
             "workers must be spawned, or an inherited patch makes these tests vacuous"
         )
+        yield client
+
+
+@pytest.fixture
+def spawned_cluster() -> Iterator[Any]:
+    """A fresh cluster with no rescue installed, for the A/B."""
+    with _spawned_client() as client:
+        yield client
+
+
+@pytest.fixture(scope="module")
+def rescued_cluster() -> Iterator[Any]:
+    """One spawned cluster with the rescue installed, shared by the verdict cases."""
+    from tessera_embeddings.ingest.loader_failures import install_capture_everywhere
+
+    with _spawned_client() as client:
+        install_capture_everywhere(client)
         yield client
 
 
@@ -94,29 +115,23 @@ def test_the_cause_is_destroyed_without_the_rescue_and_survives_with_it(spawned_
     ("text", "gives_up_the_date"),
     [
         ("ZIPDecode:Decoding error at scanline 0, unknown compression method", True),
-        ("TIFFReadEncodedTile() failed", True),
         (ASF_DENIED, False),
-        ("HTTP response code: 503", False),
-        ("HTTP response code: 429", False),
-        ("HTTP response code: 401", False),
-        ("Connection reset by peer", False),
     ],
 )
 def test_restoring_the_cause_does_not_widen_what_gets_skipped(
-    spawned_cluster, text: str, gives_up_the_date: bool
+    rescued_cluster, text: str, gives_up_the_date: bool
 ) -> None:
     """The control that matters, because this change inverts the risk.
 
     A missing cause used to BLOCK the destructive verdict: too conservative, cells stranded, but
     nothing lost. Restoring it means a skip can fire, so the question is not whether corrupt bytes
     now skip — it is whether a transient still refuses to. ``ASF_DENIED`` is the verbatim refusal
-    seen in production, which arrived as an undecidable wrapper at the time.
+    seen in production, which arrived as an undecidable wrapper at the time. The verdict for each
+    message is tested in ``tests/unit/ingest/test_read_failure_verdict.py``; here the cluster only
+    has to deliver the cause for one skip and one refusal.
     """
     from tessera_embeddings.ingest.duplicates import is_unreadable_source
-    from tessera_embeddings.ingest.loader_failures import install_capture_everywhere
-
-    install_capture_everywhere(spawned_cluster)
 
     with pytest.raises(BaseException) as raised:
-        spawned_cluster.submit(_raise_with, text, pure=False).result()
+        rescued_cluster.submit(_raise_with, text, pure=False).result()
     assert is_unreadable_source(raised.value) is gives_up_the_date, _chain_text(raised.value)

@@ -37,7 +37,7 @@ single trailing assembly thread — which keeps same-zone fills apart without a 
 concurrently, where distinct zones make same-zone overlap impossible by construction. Either
 way ``max_parallel_clusters`` bounds concurrency. Commits are UNGATED: at 10 clusters the
 committer ceiling is ~2N=20 on a single branch tip, measured at ~2.2 s commits
-(``context_docs/storage/writing-to-the-global-store.md``). ``pending()`` is year-major, the
+(``context_docs/storage/writing-to-the-global-store.md``). ``campaign_work_list`` is year-major, the
 drain pattern the barrier path relies on.
 """
 
@@ -52,6 +52,7 @@ from typing import Any
 
 import icechunk
 import zarr
+import zarr.errors
 from prefect import flow, get_run_logger
 from prefect.client.orchestration import get_client
 from prefect.deployments import arun_deployment
@@ -565,7 +566,7 @@ def _resolve_ami_id(ami_ssm_name: str, region: str | None) -> str:
     name="run-global-campaign",
     on_cancellation=[_cancel_children_on_cancellation],
     on_crashed=[_cancel_children_on_cancellation],
-)
+)  # ty: ignore[no-matching-overload]  # Prefect's hook-list overloads reject a list of differently typed hooks
 async def run_global_campaign(
     *,
     paths: BucketPaths,

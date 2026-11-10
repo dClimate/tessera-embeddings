@@ -7,7 +7,7 @@ records what it would take to light it up.
 | Directory | Marker | Runs in | Goal |
 |---|---|---|---|
 | `unit/` | (default) | `unit.yml` — PRs to `main` and pushes to `main`, on Python 3.12 and 3.13, with coverage | Fast, isolated. No test should exceed 30 s. |
-| `architecture/` | (default) | `architecture.yml` — PRs to `main` and pushes to `main` | Layer-rule enforcement (no Prefect outside `orchestration/prefect/`, etc.). |
+| `architecture/` | (default) | `architecture.yml` — PRs to `main` and pushes to `main` | Layer-rule enforcement (no Prefect outside `orchestration/prefect/`, etc.), and the quality ratchet's duplication rule. |
 | `integration/` | `integration` | `integration.yml` — PRs to `main`, filtered to `src/`, `tests/integration/`, `tests/parity/`, `tests/fixtures/`, `pyproject.toml`, `uv.lock` | Hit moto / VCR cassettes / LocalCluster. Minutes. |
 | `parity/` | `parity` | `integration.yml`, same trigger, as `-m "parity and not slow"` | Prefect flow ↔ plain runner output equivalence. 5–30 min. |
 | `slow/` | `slow` | **nothing — the directory is empty and no occupant is planned** ([ADR 023](../context_docs/decisions/023-the-single-path-end-to-end-is-the-quickstart-run.md)). | A home for a genuinely slow test, if one ever needs it. |
@@ -29,12 +29,12 @@ adopter notes describe the approach in prose instead.
 one subsystem can be verified without running the whole of it:
 
 ```bash
-uv run pytest tests/unit/ingest -n auto   # 36 files, 1,387 tests, ~9 s
-uv run pytest tests/unit/config -n auto   # 10 files, 170 tests, ~4 s
+uv run pytest tests/unit/ingest -n auto   # 29 files, 810 tests
+uv run pytest tests/unit/config -n auto   # 10 files, 147 tests
 ```
 
-**Measured, so you know what to expect:** the full unit suite is 3,675 tests in about 23 s, and the
-directories run 84–1,387 tests in 3–9 s. The saving is real but not dramatic in wall-clock terms —
+**Measured, so you know what to expect:** the default run is 2,804 tests in about 23 s on an
+8-core laptop (136 CPU-seconds), and the directories hold 69–810 tests each. The saving is real but not dramatic in wall-clock terms —
 interpreter start, collection and the `xdist` workers cost roughly three seconds before any test
 runs, so even the smallest directory does not drop below that. What you actually get is a **focused
 failure list**: a red run names something in the subsystem you touched.
@@ -57,11 +57,18 @@ theme and mirroring would split it. **`orchestration/flows/` vs `runners/`** kee
 away from its runner's — `test_fill_zone_year_flow.py` and `test_zone_fill.py` are different
 subjects with confusingly similar names.
 
-**Ten things stay at `unit/` root** and nothing else should join them: `__init__.py` and
-`conftest.py`; the three shared helpers `zone_density.py`, `mosaic_stores.py` and
-`coverage_repo.py`, which other tests import by absolute path and which therefore must not move;
-and five tests with no single subject — `test_imports`, `test_public_api`,
-`test_architecture_rules`, `test_prefect_layer`, `test_properties`.
+**Eight things stay at `unit/` root** and nothing else should join them: `__init__.py` and
+`conftest.py`; the five shared helpers `zone_density.py`, `mosaic_stores.py`, `coverage_repo.py`,
+`inference_stack.py` and `deadline.py`, which other tests import by absolute path and which
+therefore must not move; and `test_public_api`, which has no single subject.
+
+**A helper lives at the narrowest scope with two users:** the test file, then its subject
+directory's `conftest.py` (or a helper module beside it, such as `runners/zone_fixtures.py`, when
+tests import the helpers by name), then a module at `unit/` root, then `tests/` root for one shared
+across tiers (`stac_items.py`, used by unit and parity tests, beside `_paths.py`). A shared
+builder takes a few keyword arguments with defaults; one that grows flags for its callers'
+differences is two builders. Setup every test in a module needs but none asserts on (inert
+patches, a logger) belongs in an autouse fixture, so each test shows only what it is about.
 
 **Do not locate files by counting directories up from `__file__`.** Import `REPO_ROOT`, `SRC_ROOT`
 or `FIXTURES` from `tests/_paths.py`, which anchors on the directory holding `pyproject.toml` and
@@ -89,13 +96,22 @@ CI installs `--all-extras`, so it never sees this. To reproduce a CI run exactly
 uv sync --all-extras --frozen
 ```
 
-## Hypothesis
+## What the suite does not do
 
-Property-based tests live alongside example-based tests in `unit/`.
-Profiles are configured in `tests/conftest.py`:
+**Each guarantee is tested at one layer.** Flow tests guard flow wiring, runner tests guard runner
+decisions, library tests guard the library. The exceptions are `run_global_campaign`,
+`ingest_zone_year` and `fill_zones_sequential`, whose flows hold logic no runner has.
 
-- `local` (default): 20 examples, 500 ms deadline.
-- `ci` (when `CI` env var is set): 200 examples, 2 s deadline.
+**New structural checks do not read source text.** A rule about how code is written is a lint
+rule: import-linter contracts (`.importlinter`), ruff's banned imports (`ruff.toml`, including TID253
+for module-scope imports of `providers.aws`), or an AST check in `tests/architecture/test_source_rules.py`.
+A few older tests still read source (in `test_roi_mask.py` and `test_terminal_hooks.py`).
+
+**The forked shard writer runs in threads.** `tests/unit/conftest.py` replaces
+`run_forked`'s spawn pool with an in-process pool that still pickles every payload, because a
+spawned child re-imports the package on every assemble ([ADR 041](../context_docs/decisions/041-unit-tests-run-the-forked-writer-in-threads.md)).
+Mark a test `@pytest.mark.real_fork_pool` when its subject is the process boundary itself; two
+tests carry it today.
 
 ## Fixtures
 
@@ -132,9 +148,6 @@ want a debugger to stop somewhere useful.
 # Default (unit + architecture):
 uv run pytest
 
-# Property-based tests only:
-uv run pytest -k property
-
 # Integration suite (hits VCR cassettes / moto):
 uv run pytest -m integration
 
@@ -157,7 +170,7 @@ the quickstart by hand ([ADR 023](../context_docs/decisions/023-the-single-path-
 
 Things this suite is *designed* to have and does not yet. Each is a deliberate gap with a
 known shape, not an oversight — recorded here so they can be picked up rather than
-rediscovered. Full analysis in `context_docs/test-suite-streamlining.md`.
+rediscovered. Full analysis in `context_docs/test-suite-reduction/README.md`.
 
 ### 1. ~~The `slow/` tier and the full-pipeline end-to-end~~ — CLOSED, and not by building it
 
@@ -235,8 +248,7 @@ remain valid.
 
 ### Closed, for reference
 
-Items that were on this list and are now closed, so they do not read as open work. Detail in
-`context_docs/test-suite-streamlining.md`.
+Items that were on this list and are now closed, so they do not read as open work.
 
 - Two tests no CI job ran — one deleted, one moved to `tests/integration/`.
 - A unit test that broke the 30-second bound; it now asserts the retry ladder's shape rather

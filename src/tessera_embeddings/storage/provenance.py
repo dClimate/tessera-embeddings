@@ -195,25 +195,20 @@ def _instant(value: object) -> datetime.datetime | None:
 
 
 def shard_date_rows(
-    run_id: str,
-    tile: str,
-    sensor: str,
-    snapshot_id: str,
+    ids: Mapping[str, str],
     summary: Mapping[str, Sequence[Any]],
     days: Sequence[datetime.date],
     embedded_px: int,
 ) -> list[dict[str, Any]]:
     """The ``shard_dates`` rows of one shard and sensor from its staged summary.
 
+    ``ids`` is the ``run_id``, ``tile``, ``sensor`` and ``snapshot_id`` every row carries.
     ``summary`` is ``{"time", "sources", "valid_px"}`` as the actor staged it; ``days`` maps a
     mosaic time index to its solar day.
     """
     return [
         {
-            "run_id": run_id,
-            "tile": tile,
-            "sensor": sensor,
-            "snapshot_id": snapshot_id,
+            **ids,
             "solar_day": days[int(time)],
             "valid_px": int(valid),
             "embedded_px": int(embedded_px),
@@ -230,20 +225,19 @@ def write_table(
     *,
     open_output: Callable[[str], AbstractContextManager[Any]],
     metadata: Mapping[str, str],
-    geometry: bool = False,
 ) -> int:
     """Write ``rows`` as one zstd Parquet file at ``uri``; returns the rows written.
 
     Buffered and written in one shot, as registry run files are: a partial Parquet file is unreadable.
-    ``metadata`` lands in the file's key-value block; ``geometry`` adds GeoParquet's ``geo`` entry
-    for the WKB ``geometry`` column.
+    ``metadata`` lands in the file's key-value block, and a schema with a WKB ``geometry`` column
+    gets GeoParquet's ``geo`` entry for it.
     """
     import pyarrow as pa
     import pyarrow.parquet as pq
 
     table = pa.Table.from_pylist(list(rows), schema=schema)
     meta = {k.encode(): v.encode() for k, v in metadata.items()}
-    if geometry:
+    if "geometry" in schema.names:
         meta[b"geo"] = json.dumps(
             {
                 "version": "1.1.0",

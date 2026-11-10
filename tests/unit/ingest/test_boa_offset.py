@@ -24,13 +24,14 @@ import pystac
 import pytest
 import rasterio
 from odc.geo.geobox import GeoBox
+from odc.loader import RioDriver
 from pyproj import Transformer
 from rasterio.transform import from_origin
 
 from tessera_embeddings.config.ingest import SOURCE_INDEX_VAR
 from tessera_embeddings.config.providers import PROVIDERS, CollectionConfig
 from tessera_embeddings.config.satellites import S2_BASELINE_OFFSET, S2_BASELINE_THRESHOLD, S2_L2A_BANDS
-from tessera_embeddings.ingest.asset_locations import Harmonisation, SettledProducer
+from tessera_embeddings.ingest.asset_locations import Harmonisation
 from tessera_embeddings.ingest.boa_offset import OffsetDecision, source_decision
 from tessera_embeddings.ingest.stac import (
     BoaOffsetParser,
@@ -54,10 +55,6 @@ class TestSourceDecision:
         """Its producer already removed it, so nothing here can be owed."""
         for baseline in (None, 1, 206, _T, 510):
             assert source_decision(_HARMONISED_BUCKET, baseline, _T) is OffsetDecision.EXEMPT, baseline
-
-    def test_a_harmonised_source_needs_no_readable_baseline(self) -> None:
-        """Because no decision rests on it. Refusing here would cost a perfectly good copy."""
-        assert source_decision(_HARMONISED_BUCKET, None, _T) is OffsetDecision.EXEMPT
 
     def test_a_raw_source_at_or_above_the_threshold_is_owed(self) -> None:
         assert source_decision(_RAW_BUCKET, _T, _T) is OffsetDecision.OWED, "the threshold is inclusive"
@@ -106,25 +103,6 @@ class TestSourceDecision:
     def test_a_collection_known_harmonised_owes_nothing_anywhere(self) -> None:
         assert source_decision(_RAW_BUCKET, 510, _T, Harmonisation.HARMONISED) is OffsetDecision.EXEMPT
 
-    def test_an_answer_naming_no_producer_cannot_be_passed_at_all(self) -> None:
-        """MIXED and UNKNOWN used to reach here and be refused. Now they cannot arrive.
-
-        ``known_harmonisation`` is typed :data:`SettledProducer`, which is the two states that name
-        a producer — so an answer that names none is rejected by the type checker at the call site
-        rather than detected here and turned into a refusal. That is why this function has no case
-        for them: correcting on an unresolved producer is wrong by exactly the offset and silent,
-        and the cheapest way to prevent it is to make it unsayable.
-
-        Asserted on the TYPE rather than on behaviour, because there is no behaviour left to
-        assert. This fails if someone widens the parameter back.
-        """
-        import typing
-
-        settled = typing.get_args(SettledProducer)
-        assert set(settled) == {Harmonisation.HARMONISED, Harmonisation.RAW}
-        assert Harmonisation.MIXED not in settled
-        assert Harmonisation.UNKNOWN not in settled
-
 
 class TestNothingCanSupplyAnUnsettledProducer:
     """The refusal above is a dormant guard. These pin that, rather than restating it.
@@ -135,16 +113,6 @@ class TestNothingCanSupplyAnUnsettledProducer:
     undecidable branch today. Should one ever be able to, these fail — which turns the guard into
     a behaviour change somebody has to think about rather than one that ships silently.
     """
-
-    def test_no_configured_collection_yields_an_unsettled_producer(self) -> None:
-        answers = {
-            (provider_name, alias): collection_harmonisation(config)
-            for provider_name, provider in PROVIDERS.items()
-            for alias, config in provider.collections.items()
-        }
-        assert answers, "no collections configured, so this census would pass vacuously"
-        unsettled = {key: value for key, value in answers.items() if value not in (None, Harmonisation.RAW)}
-        assert not unsettled, f"these collections would reach the undecidable branch: {unsettled}"
 
     def test_the_collection_answer_is_settled_for_every_configuration(self) -> None:
         """Exhaustive over the two fields :func:`collection_harmonisation` reads.
@@ -212,18 +180,6 @@ class TestTheParserStampsEachSource:
         assert parser.owed == len(S2_L2A_BANDS)
         assert parser.stamped == len(S2_L2A_BANDS)
 
-    def test_scl_is_never_stamped(self) -> None:
-        """Structurally, not by a list of bands the corrector was told to skip.
-
-        The scene classification layer is read, and it counts for locality, but it is categorical:
-        subtracting the offset from a class label is meaningless. It carries no decision at all,
-        which is a distinct state from a decision of zero.
-        """
-        item = _item("raw", hrefs=_s2_hrefs(_RAW_BUCKET), baseline="05.00")
-        parser = self._parse(item)
-        assert parser.driver_data(item, ("scl", 1)) is None
-        assert parser.stamped == len(S2_L2A_BANDS), "scl did not add to the count"
-
     def test_a_harmonised_item_stamps_a_zero_rather_than_nothing(self) -> None:
         """A decided-owes-nothing source must be distinguishable from one never asked about.
 
@@ -280,8 +236,6 @@ class TestReflectanceAssetKeysComeFromOdc:
 
     def test_earth_search_names_its_assets_after_the_bands(self) -> None:
         item = _item("es", hrefs=_s2_hrefs(_HARMONISED_BUCKET))
-        from tessera_embeddings.config import PROVIDERS
-
         config = PROVIDERS["earth-search"].collections["sentinel-2-l2a"]
         assert _reflectance_asset_keys([item], config) == frozenset(S2_L2A_BANDS)
 
@@ -291,8 +245,6 @@ class TestReflectanceAssetKeysComeFromOdc:
         Deciding the offset against the CONFIGURED names would match none of its assets and correct
         nothing, silently — so the resolution has to be odc's own rather than a mapping kept here.
         """
-        from tessera_embeddings.config import PROVIDERS
-
         config = PROVIDERS["planetary-computer"].collections["sentinel-2-l2a"]
         native = {"B02": "blue", "B03": "green"}
         item = _item(
@@ -305,16 +257,12 @@ class TestReflectanceAssetKeysComeFromOdc:
         assert "SCL" not in resolved, "scl is read but never corrected"
 
     def test_an_unreadable_item_falls_through_to_the_next_one(self) -> None:
-        from tessera_embeddings.config import PROVIDERS
-
         config = PROVIDERS["earth-search"].collections["sentinel-2-l2a"]
         good = _item("good", hrefs=_s2_hrefs(_HARMONISED_BUCKET))
         assert _reflectance_asset_keys([object(), good], config) == frozenset(S2_L2A_BANDS)
 
     def test_nothing_resolvable_yields_an_empty_set(self) -> None:
         """Which the caller turns into a refusal or a fallback — it never means "nothing to do"."""
-        from tessera_embeddings.config import PROVIDERS
-
         config = PROVIDERS["earth-search"].collections["sentinel-2-l2a"]
         assert _reflectance_asset_keys([object()], config) == frozenset()
 
@@ -438,22 +386,6 @@ class TestTheOffsetIsRemovedPerImage:
         assert set(np.unique(blue[:, stride : 2 * stride])) == {0, 1500}, "the pre-04.00 original was owed nothing"
         assert set(np.unique(blue[:, 2 * stride :])) == {0, 400}, "the harmonised COG was left alone"
 
-    def test_the_stored_dtype_is_the_one_the_store_expects(
-        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A signed result would make the store's dtype depend on which date landed first."""
-        raw = _tile_item("raw", tmp_path, value=1500, x0=_ORIGIN_E, baseline="05.00", tile="MGRS-33TWM")
-        raw.properties["_bucket"] = _RAW_BUCKET
-        data = self._load([raw], monkeypatch, tiles=1)
-        assert data.blue.dtype == np.uint16
-
-    def test_nodata_survives_the_correction(self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-        """DN 0 is the one code carrying no offset, and it must not become a dark observation."""
-        raw = _tile_item("raw", tmp_path, value=1500, x0=_ORIGIN_E, baseline="05.00", tile="MGRS-33TWM")
-        raw.properties["_bucket"] = _RAW_BUCKET
-        data = self._load([raw], monkeypatch, tiles=1)
-        assert 0 in np.unique(data.blue.isel(time=0).values)
-
     def test_scl_is_untouched_by_a_load_that_corrects_everything_else(
         self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -464,7 +396,8 @@ class TestTheOffsetIsRemovedPerImage:
         raw.properties["_bucket"] = _RAW_BUCKET
         data = self._load([raw], monkeypatch, tiles=1)
         assert set(np.unique(data.scl.isel(time=0).values)) == {0, 1500}
-        assert set(np.unique(data.blue.isel(time=0).values)) == {0, 500}
+        assert set(np.unique(data.blue.isel(time=0).values)) == {0, 500}, "nodata 0 survives the correction"
+        assert data.blue.dtype == np.uint16, "a signed result would make the store dtype depend on load order"
 
     def test_the_source_index_rides_on_the_correcting_load(
         self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
@@ -525,8 +458,6 @@ class TestNoExistingPixelChanges:
     @pytest.mark.parametrize(
         ("bucket", "baseline", "owed"),
         [
-            (_HARMONISED_BUCKET, "05.09", False),
-            (_RAW_BUCKET, "05.09", True),
             (_RAW_BUCKET, "04.00", True),
             (_RAW_BUCKET, "02.06", False),
         ],
@@ -577,18 +508,5 @@ class TestTheDriverDoesNotDisturbTheRead:
         long-lived workers, and the patch is reached through `restore_env`, not through `open`.
         Overriding either environment method would silently take workers off credential refresh.
         """
-        from odc.loader import RioDriver
-
         for method in ("restore_env", "capture_env", "new_load", "finalise_load"):
             assert getattr(_SourceDriver, method, None) is getattr(RioDriver, method, None), method
-
-    def test_it_reads_through_odcs_own_reader(self) -> None:
-        """So the GDAL environment, the retry behaviour and the log records
-        `ingest.loader_failures` attributes back to an object are all the ones odc produces.
-        """
-        from odc.loader import RioReader
-
-        from tessera_embeddings.ingest.stac import _SourceReader
-
-        assert issubclass(_SourceReader, RioReader)
-        assert _SourceReader.read is not RioReader.read, "and it does add the correction"

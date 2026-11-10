@@ -1,0 +1,45 @@
+name: Quality ratchet
+
+# Fails a pull request that writes a copy of existing code, raises any function's complexity
+# above the base it merges into, or adds a function over the argument or return limits. Only what
+# the PR writes or changes is judged, so existing debt needs no suppression and a change that
+# reduces it always passes. Every PR, including one
+# stacked on another branch. Settings in .jscpd.json; rules in .github/scripts/quality_ratchet.py;
+# rationale in ADR 040.
+
+on:
+  pull_request:
+    # `edited` so a PR retargeted onto a new base (a stacked PR whose parent merged) is
+    # measured against it. Every edit reruns the job, not only a base change: a skipped job
+    # reports as passing, so skipping a title edit would replace a failure with a pass.
+    types: [opened, synchronize, reopened, edited]
+
+jobs:
+  ratchet:
+    # A newer run for the same PR replaces an older one; both measure the PR's current merge.
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The base is checked out beside this one and diffed against it, so its commit must be here.
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          cache-dependency-glob: "uv.lock"
+          prune-cache: true
+
+      - name: Install jscpd and ruff
+        run: uv sync --frozen --only-group dev
+
+      # The checkout is GitHub's merge commit; its first parent is the base it was built on.
+      # Not the base branch, which can move while this job is queued.
+      - name: Check out the base
+        run: git worktree add "$RUNNER_TEMP/base" HEAD^1
+
+      - name: Compare with the base
+        run: uv run --no-sync python .github/scripts/quality_ratchet.py "$RUNNER_TEMP/base" .

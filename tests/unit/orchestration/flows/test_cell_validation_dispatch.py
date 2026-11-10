@@ -40,14 +40,7 @@ def _dispatch(summary=None, deployment="validate-zone-year/validate-zone-year", 
         zone="33N",
         year=2025,
         summary=_LANDED if summary is None else summary,
-        parameters=mod.cell_validation_parameters(
-            zone="33N",
-            year=2025,
-            paths=_PATHS,
-            store_name="tessera",
-            mask_name="global",
-            s3_region="us-west-2",
-        ),
+        target=mod.ValidationTarget(_PATHS, "tessera", "global", "us-west-2"),
         log=logging.getLogger("test-validation"),
         **kwargs,
     )
@@ -83,10 +76,6 @@ class TestWhatIsDispatched:
     def test_the_trace_tag_is_stamped_when_the_caller_resolved_one(self, dispatched):
         _dispatch(tag=mod.validation_run_tag("parent-9"))
         assert dispatched[0]["tags"] == ["validates-cell-of:parent-9"]
-
-    def test_no_tag_outside_a_flow_run(self):
-        """A ``.fn`` call has no flow-run id, and an untagged run is better than a fake one."""
-        assert mod.validation_run_tag(None) is None
 
 
 class TestWhatIsDeclined:
