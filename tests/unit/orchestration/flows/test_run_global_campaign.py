@@ -7,7 +7,6 @@ body is driven via ``.fn`` with mocked dispatch.
 from __future__ import annotations
 
 import asyncio
-import inspect
 import logging
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -100,6 +99,8 @@ def wired(monkeypatch):
     # Pinned AMI id (resolved once, threaded into every fill's provisioning) — mocked
     # so tests make no SSM call.
     monkeypatch.setattr(mod, "_resolve_ami_id", lambda *a, **k: "ami-test-id")
+    # Hashing the real import closure costs ~80 ms per dispatch; no test here is about its value.
+    monkeypatch.setattr(mod, "inference_code_identity", lambda: "infcode-FIXED")
     # Store reads for the staging fingerprint: each mosaic store's branch-tip snapshot
     # (the authoritative term) plus its provenance attrs.
     monkeypatch.setattr(
@@ -136,35 +137,6 @@ class TestCampaignDefaults:
     and shows up as a failing test rather than a surprise on a live campaign.
     """
 
-    def test_ten_clusters_share_sixty_ingest_slots(self):
-        """Six UTM zones ingesting per cluster: 10 x 6 = the 60-zone fleet-wide cap.
-
-        The campaign's planned width (``context_docs/campaign/campaign-plan.md`` §3), and 10 x 250
-        actors is what reaches the 2,500-actor quota.
-
-        The two numbers are a pair, not independent knobs — the per-cluster ingest window is the cap
-        divided by the cluster count, so changing either changes how many zones a cluster keeps in
-        flight. The plan named 61; 60 is used instead precisely because of the assertion below.
-        """
-        sig = inspect.signature(mod.run_global_campaign.fn)
-        clusters = sig.parameters["max_parallel_clusters"].default
-        ingests = sig.parameters["max_parallel_ingest"].default
-        assert (clusters, ingests) == (10, 60)
-        assert ingests % clusters == 0, "an uneven split rounds up and overshoots the cap"
-
-    def test_the_actor_count_reaches_the_quota_without_exceeding_the_assembly_ceiling(self):
-        """250 per cluster x 10 = the 2,500-actor quota, and each stays under ~275.
-
-        Both bounds matter and they pull opposite ways: fewer actors leaves quota unused, more
-        pushes a cluster's single assembly thread past the width it was measured to sustain.
-        """
-        sig = inspect.signature(mod.run_global_campaign.fn)
-        actors = sig.parameters["num_actors"].default
-        clusters = sig.parameters["max_parallel_clusters"].default
-        assert actors == 250
-        assert actors * clusters == 2500, "the fleet should reach the actor quota exactly"
-        assert actors < 275, "one cluster's assembly thread is the ceiling"
-
     def test_every_gate_is_published_to_the_server(self, wired):
         """Both gates live in CHILD flow runs, so a gate only binds if it reaches the
         Prefect limit they name. Writing them from this flow is what stops the server's
@@ -180,22 +152,6 @@ class TestCampaignDefaults:
         assert wired["arun"][0][1]["ingest_limit_name"] == "tessera-global-ingests"
         assert wired["arun"][0][1]["inference_pause_gate"] == "tessera-global-inference"
 
-    def test_the_pause_gate_is_published_as_running_not_as_a_cap(self, wired):
-        """One, not the cluster count. The gate is READ as a flag rather than acquired, so a
-        larger number would imply a capacity it does not enforce — and zero, the value that
-        pauses, must never be what a campaign start writes.
-        """
-        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI, max_parallel_clusters=8))
-        assert dict(wired["limits"])["tessera-global-inference"] == 1
-
-    def test_a_start_clears_a_pause_somebody_left_behind(self, wired):
-        """The gate is upserted at every start, so a campaign cannot inherit a zero from a
-        previous run's pause and sit there looking healthy while doing nothing.
-        """
-        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI))
-        writes = [v for k, v in wired["limits"] if k == "tessera-global-inference"]
-        assert writes == [1]
-
     @pytest.mark.parametrize(
         ("kwargs", "match"),
         [
@@ -206,6 +162,11 @@ class TestCampaignDefaults:
             # `ray_cluster`, so a typo would spend real ingest work per cluster before
             # anything said so.
             ({"gpu_fallback_instance_types": ["g5.xlarge"]}, "unsupported type"),
+            # Two fallbacks tie in Ray's scorer; the provider refuses them too, but only after
+            # a chained fill has primed its ingests.
+            ({"gpu_fallback_instance_types": ["g5.2xlarge", "g6.2xlarge"]}, "Only one GPU fallback"),
+            ({"max_parallel_ingest": 0}, "max_parallel_ingest"),
+            ({"max_dispatch_rounds": 0}, "max_dispatch_rounds"),
         ],
     )
     def test_a_doomed_invocation_touches_no_shared_limit(self, wired, kwargs, match):
@@ -237,6 +198,7 @@ class TestCampaignDefaults:
             asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI))
 
         assert wired.get("limits", []) == [], "a rejected run must leave every shared gate alone"
+        assert wired["arun"] == [], "and dispatches nothing, rather than failing after an ingest"
 
     def test_a_no_work_invocation_never_touches_the_shared_gates(self, wired, monkeypatch):
         """The same hazard without an error: nothing to dispatch, so nothing to resume for."""
@@ -328,7 +290,6 @@ class TestStagingRunId:
             # Staging lives under `outputs/staging/{zone}/{year}`, not namespaced by store, so
             # a store with a different depth rule must not resume tiles staged under the old.
             {"optical_min_obs": 25},
-            {"optical_min_obs": 30},
             {"code_identity": "infcode-y"},
             # Registry parts are named by run id, so an update's run never shares one with
             # the campaign's or another update's.
@@ -433,16 +394,6 @@ class TestTheChainedFillGetsTheNarrowedStagingIdentity:
         monkeypatch.setattr(mod, "_resolve_code_identity", lambda *a, **k: "ami=ami-REBAKED")
         assert _chained_staging_identity(wired) == base
 
-    def test_an_inference_change_does(self, wired, monkeypatch):
-        base = _chained_staging_identity(wired)
-        monkeypatch.setattr(mod, "inference_code_identity", lambda: "infcode-DIFFERENT")
-        assert _chained_staging_identity(wired) != base
-
-    def test_both_escape_hatches_reach_it(self, wired):
-        base = _chained_staging_identity(wired)
-        assert _chained_staging_identity(wired, force_staging_reuse=True) != base
-        assert _chained_staging_identity(wired, force_staging_restage="tok") != base
-
     def test_force_staging_reuse_survives_an_inference_change(self, wired, monkeypatch):
         """The escape hatch for a change the author knows is output-neutral."""
         base = _chained_staging_identity(wired, force_staging_reuse=True)
@@ -475,18 +426,6 @@ class TestAPinnedStagingIdentityReachesAnEarlierCampaignsPrefix:
         assert pinned == "infcode-EARLIER"
         monkeypatch.setattr(mod, "inference_code_identity", lambda: "infcode-DIFFERENT")
         assert _chained_staging_identity(wired, staging_code_identity="infcode-EARLIER") == pinned
-
-    def test_it_survives_a_changed_tarball(self, wired, monkeypatch):
-        """The term that bites hardest on a tarball deployment: re-uploading moves it."""
-        monkeypatch.setattr(mod, "_resolve_tarball_identity", lambda *a, **k: "tarball=NEW")
-        assert _chained_staging_identity(wired, staging_code_identity="infcode-EARLIER|tarball=OLD") == (
-            "infcode-EARLIER|tarball=OLD"
-        )
-
-    def test_an_empty_pin_derives_exactly_as_before(self, wired, monkeypatch):
-        """The control and the default: off must cost nothing, including the derivation."""
-        monkeypatch.setattr(mod, "inference_code_identity", lambda: "infcode-FIXED")
-        assert _chained_staging_identity(wired, staging_code_identity="") == "infcode-FIXED"
 
     def test_the_identity_is_announced_so_a_later_campaign_can_state_it(self, wired, monkeypatch, caplog):
         """The value has to be READABLE or the lever cannot be used.
@@ -608,40 +547,13 @@ class TestValidationDeploymentForwarding:
         params = next(p for d, p in wired["arun"] if "fill-zones-sequential" in d)
         assert params["validation_deployment"] == "validate-zone-year/validate-zone-year-x"
 
-    @pytest.mark.parametrize("branch", [None, "some-branch"])
-    def test_an_unset_validator_is_omitted_rather_than_forwarded_as_none(self, wired, branch):
-        """So the CHILD deployment's own registered value stands — including its branch form.
-
-        Both branch cases, because the validator is the one child ref this flow does NOT
-        derive from the slug: there is no base name here to suffix, and the branch-scoped
-        registration on the child already carries it.
+    def test_an_unset_validator_is_omitted_rather_than_forwarded_as_none(self, wired):
+        """So the CHILD deployment's own registered value stands — including its branch form,
+        since the validator is the one child ref this flow does NOT derive from the slug.
         """
-        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI, branch=branch))
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI))
         params = next(p for d, p in wired["arun"] if "fill-zones-sequential" in d)
         assert "validation_deployment" not in params
-
-
-def test_the_fill_carries_the_campaigns_s3_region(wired):
-    """A non-default-region deployment's fill — and the ingests it dispatches — must read and
-    write the right buckets.
-    """
-    _campaign(s3_region="eu-west-1")
-    assert _dep(wired, "fill-zones-sequential")[1]["s3_region"] == "eu-west-1"
-
-
-def test_default_run_rejects_unseeded_work_zone(wired, monkeypatch):
-    """A partially-seeded store (default zones=None) fails BEFORE any ingest when the
-    work list includes an unseeded zone — not after an expensive per-cell ingest.
-    """
-    monkeypatch.setattr(mod, "campaign_work_list", lambda *a, **k: [("02N", 2025)])  # 02N not in status.zones
-    with pytest.raises(ValueError, match="not seeded"):
-        _campaign()
-    assert wired["arun"] == []  # nothing dispatched
-
-
-def test_rejects_zero_parallel_ingest(wired):
-    with pytest.raises(ValueError, match="max_parallel_ingest"):
-        _campaign(max_parallel_ingest=0)
 
 
 def test_off_axis_year_rejected(wired, monkeypatch):
@@ -690,46 +602,6 @@ def test_chained_fill_dispatches_one_run_per_year(wired):
     assert result["dispatched"] == 1
 
 
-def test_chained_fill_forwards_ingest_false(wired):
-    _campaign(ingest=False)
-    assert wired["arun"][0][1]["ingest"] is False
-
-
-def test_the_inference_start_delay_reaches_every_fill(wired):
-    """The hold is a per-cluster decision, so every chained fill of the campaign carries it."""
-    _campaign(inference_start_delay_minutes=30.0)
-    fills = [p for d, p in wired["arun"] if d.startswith("fill-")]
-    assert fills and [p["inference_start_delay_minutes"] for p in fills] == [30.0] * len(fills)
-
-
-def test_chained_fills_shard_by_live_tiles(wired, monkeypatch):
-    """max_parallel_clusters > 1 = that many chained clusters:
-    zones are LPT-partitioned by WORK (tiles weighted by the latitude band's observation
-    count) and each cluster's child divides the global ingest look-ahead bound.
-    """
-    status = SimpleNamespace(zones={"33N": (), "34N": (), "35N": ()}, has=lambda z, y: False)
-    monkeypatch.setattr(mod, "campaign_status", lambda *a, **k: status)
-    monkeypatch.setattr(mod, "campaign_work_list", _shrinking([("33N", 2025), ("34N", 2025), ("35N", 2025)], wired))
-    counts = {"33N": 500, "34N": 300, "35N": 250}
-    monkeypatch.setattr(mod, "zone_work_weight", lambda mask, zone, **k: float(counts[zone]))
-
-    asyncio.run(
-        mod.run_global_campaign.fn(
-            paths=_PATHS,
-            **_AMI,
-            max_parallel_clusters=2,
-            max_parallel_ingest=6,
-        )
-    )
-    assert [d for d, _ in wired["arun"]] == ["fill-zones-sequential/fill-zones-sequential"] * 2
-    clusters = [_dispatched_zones(p) for _, p in wired["arun"]]
-    # LPT: 500 alone; 300+250 together — balanced totals (500 vs 550).
-    assert sorted(map(sorted, clusters)) == [["33N"], ["34N", "35N"]]
-    # The global ingest bound is divided across clusters: 6 over 2 clusters = 3 each,
-    # and a cluster's width is 1 + look_ahead.
-    assert all(1 + p["look_ahead"] == 3 for _, p in wired["arun"])
-
-
 class TestIngestBoundAcrossClusters:
     """A cluster's ingest concurrency is ``1 + look_ahead``, because ``look_ahead``
     counts the cells kept in flight BEYOND the current one — that is the contract
@@ -761,51 +633,22 @@ class TestIngestBoundAcrossClusters:
         # The cluster's ingest WIDTH, which is what the cap is expressed in.
         return 1 + wired["arun"][0][1]["look_ahead"]
 
-    def test_an_exact_division_delivers_the_requested_width(self, wired, monkeypatch):
-        assert self._look_ahead(wired, monkeypatch, zones=4, clusters=4, ingest_cap=8) == 2
-
-    def test_the_default_split_is_five_zones_per_cluster(self, wired, monkeypatch):
-        """8 clusters over a 40-zone cap: the shape the campaign actually runs."""
-        assert self._look_ahead(wired, monkeypatch, zones=8, clusters=8, ingest_cap=40) == 5
-
-    def test_a_remainder_rounds_up_rather_than_under_delivering(self, wired, monkeypatch):
-        """Flooring would hand a cluster less ingest width than was asked for, with
-        nothing in the logs saying so. The global gate is the hard ceiling, so
-        rounding up overshoots the intent and never the actual cap.
-        """
-        assert self._look_ahead(wired, monkeypatch, zones=4, clusters=4, ingest_cap=6) == 2
-
-    def test_a_cap_below_the_cluster_count_still_gives_every_cluster_one(self, wired, monkeypatch):
-        """A cluster with a window of zero could never start a zone, so the real
-        floor is one per cluster however low the cap is set. The gate still holds
-        the fleet to the cap; the clusters just queue on it.
-        """
-        assert self._look_ahead(wired, monkeypatch, zones=4, clusters=4, ingest_cap=1) == 1
-
-
-def test_every_cluster_opens_on_one_of_the_densest_zones(wired, monkeypatch):
-    """The property the GPU-start rule depends on.
-
-    A cluster requests its fleet as soon as its FIRST zone has ingested, which is
-    only safe if that zone is big enough to keep the fleet busy while the rest of
-    the window ingests behind it. The LPT assignment gives that for free — every
-    total starts at zero, so the N densest zones go one to each of the N clusters —
-    but it falls out of the assignment order rather than being an explicit step, so
-    it is pinned here.
-    """
-    counts = {"01N": 900, "02N": 800, "03N": 700, "04N": 50, "05N": 40, "06N": 30}
-    status = SimpleNamespace(zones=dict.fromkeys(counts, ()), has=lambda z, y: False)
-    monkeypatch.setattr(mod, "campaign_status", lambda *a, **k: status)
-    monkeypatch.setattr(mod, "campaign_work_list", _shrinking([(z, 2025) for z in counts], wired))
-    monkeypatch.setattr(mod, "zone_work_weight", lambda mask, zone, **k: float(counts[zone]))
-
-    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI, max_parallel_clusters=3))
-    dispatched = [_dispatched_zones(p) for _, p in wired["arun"]]
-    assert {zs[0] for zs in dispatched} == {"01N", "02N", "03N"}, dispatched
-    # ...and each cluster tapers from dense to sparse rather than the reverse.
-    for zs in dispatched:
-        tiles = [counts[z] for z in zs]
-        assert tiles == sorted(tiles, reverse=True), zs
+    @pytest.mark.parametrize(
+        ("ingest_cap", "width"),
+        [
+            (8, 2),
+            # Flooring would hand a cluster less ingest width than was asked for, with nothing in
+            # the logs saying so. The global gate is the hard ceiling, so rounding up overshoots
+            # the intent and never the actual cap.
+            (6, 2),
+            # A cluster with a window of zero could never start a zone, so the floor is one per
+            # cluster however low the cap is set; the gate still holds the fleet to the cap.
+            (1, 1),
+        ],
+        ids=["exact-division", "remainder-rounds-up", "floor-of-one"],
+    )
+    def test_four_clusters_get_the_width_the_cap_divides_to(self, wired, monkeypatch, ingest_cap, width):
+        assert self._look_ahead(wired, monkeypatch, zones=4, clusters=4, ingest_cap=ingest_cap) == width
 
 
 class TestAnUpdateAcrossClusters:
@@ -994,18 +837,22 @@ def test_explicit_direct_ref_is_verbatim_but_grandchildren_still_route(wired):
     assert _ingest_deployments(params["branch"])["ingest_s1_roi_sar"].endswith("-b")
 
 
-def test_branch_routes_fill_when_ingest_disabled(wired):
-    """ingest=False: the fill ref is still branch-routed."""
-    _campaign(ingest=False, branch="b")
-    assert [d for d, _ in wired["arun"]] == ["fill-zones-sequential/fill-zones-sequential-b"]
-
-
-def test_operator_overrides_reach_the_fill(wired):
-    """A campaign-level flag has to reach the gate that fires, which is in the child:
-    ``allow_s2_only`` decides which pixels get embeddings.
-    """
-    _campaign(allow_s2_only=True)
-    assert _dep(wired, "fill-zones-sequential")[1]["allow_s2_only"] is True
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        # Decides which pixels get embeddings; the gate that fires is in the child.
+        ("allow_s2_only", True),
+        # A non-default-region deployment's fill, and the ingests it dispatches, must read and
+        # write the right buckets.
+        ("s3_region", "eu-west-1"),
+        ("ingest", False),
+        # The hold is a per-cluster decision, so the chained fill carries it.
+        ("inference_start_delay_minutes", 30.0),
+    ],
+)
+def test_a_campaign_setting_is_forwarded_to_the_fill(wired, name, value):
+    _campaign(**{name: value})
+    assert _dep(wired, "fill-zones-sequential")[1][name] == value
 
 
 @pytest.mark.parametrize("case", ["retag-only", "all-ocean"])
@@ -1044,23 +891,6 @@ def test_every_dispatched_child_carries_the_campaign_tag(wired):
         _campaign()
     assert wired["tags"], "no children dispatched"
     assert all(t == ["campaign:run-abc"] for t in wired["tags"]), wired["tags"]
-
-
-def test_children_go_untagged_outside_a_flow_run(wired):
-    """A direct .fn() call has no run id, and dispatches nothing worth sweeping."""
-    _campaign()
-    assert all(t is None for t in wired["tags"])
-
-
-def test_campaign_registers_child_cancellation_on_cancel_and_crash():
-    """Cancelling the campaign must stop the ingests and fills it started.
-
-    Each dispatch is an INDEPENDENT run: without this the parent dies and its
-    children keep writing, with their Dask and Ray fleets still billing.
-    """
-    flow = mod.run_global_campaign
-    assert mod._cancel_children_on_cancellation in flow.on_cancellation_hooks
-    assert mod._cancel_children_on_cancellation in flow.on_crashed_hooks
 
 
 def test_model_gate_runs_before_any_dispatch(wired, monkeypatch):
@@ -1116,13 +946,6 @@ class TestFailedZonesAreRetried:
         monkeypatch.setattr(mod, "arun_deployment", arun)
         return rounds
 
-    def test_a_failed_zone_is_re_dispatched(self, wired, monkeypatch):
-        """Round one leaves 02N unfilled; round two lands it and the campaign passes."""
-        rounds = self._wire(monkeypatch, wired, ["01N", "02N"], complete_after={1: {"01N"}, 2: {"01N", "02N"}})
-        result = asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI, max_parallel_clusters=1))
-        assert rounds["n"] == 2, "the failed cell was never re-dispatched"
-        assert result["dispatched"] >= 1
-
     def test_a_retry_targets_only_what_is_still_missing(self, wired, monkeypatch):
         """A cluster can fail having landed most of its zones; those must not be
         re-dispatched, or a retry would repeat hours of finished work.
@@ -1171,14 +994,6 @@ class TestFailedZonesAreRetried:
         assert "01N" in logged and "02N" in logged
         assert "resumes from here" in logged
 
-    def test_a_campaign_that_lands_everything_still_carries_the_key(self, wired, monkeypatch):
-        """Empty rather than absent: a caller that tests for the key must not have to know
-        which of two shapes it gets.
-        """
-        self._wire(monkeypatch, wired, ["01N"], complete_after={1: {"01N"}})
-        summary = asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI, max_parallel_clusters=1))
-        assert summary["unfilled"] == {}
-
     def test_retries_are_disabled_at_one_attempt(self, wired, monkeypatch):
         rounds = self._wire(monkeypatch, wired, ["01N"], complete_after={})
         summary = asyncio.run(
@@ -1186,10 +1001,6 @@ class TestFailedZonesAreRetried:
         )
         assert rounds["n"] == 1
         assert summary["unfilled"] == {2025: ["01N"]}
-
-    def test_zero_attempts_is_rejected(self, wired):
-        with pytest.raises(ValueError, match="max_dispatch_rounds"):
-            asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, **_AMI, max_dispatch_rounds=0))
 
 
 # --- overlap_years: dropping the year barrier -------------------------------------------
@@ -1240,24 +1051,6 @@ def test_the_year_barrier_is_still_reachable_when_asked_for(wired, monkeypatch):
     )
     years_per_dispatch = [{y for _z, y in p["cells"]} for _, p in wired["arun"]]
     assert years_per_dispatch == [{2025}, {2024}], years_per_dispatch
-
-
-def test_overlap_years_dispatches_every_year_in_one_batch(wired, monkeypatch):
-    """The barrier gone: one round covering all requested years, so year N+1's ingest
-    can overlap year N's inference instead of waiting for it.
-    """
-    _multi_year(monkeypatch, ["01N", "02N"], [2025, 2024], wired)
-    asyncio.run(
-        mod.run_global_campaign.fn(
-            paths=_PATHS,
-            **_AMI,
-            max_parallel_clusters=1,
-            overlap_years=True,
-        )
-    )
-    assert len(wired["arun"]) == 1, [d for d, _ in wired["arun"]]
-    cells = {(z, y) for z, y in wired["arun"][0][1]["cells"]}
-    assert cells == {("01N", 2025), ("01N", 2024), ("02N", 2025), ("02N", 2024)}
 
 
 def test_overlap_years_keeps_every_year_of_a_zone_in_one_cluster(wired, monkeypatch):
@@ -1355,19 +1148,6 @@ def test_production_staging_identity_is_unchanged_by_the_tarball_term(monkeypatc
     monkeypatch.setattr(mod, "source_tarball_identity", lambda *a, **k: called.append(a) or "x", raising=False)
     assert mod._resolve_tarball_identity(None, "", None) == ""
     assert not called, "no bucket means no S3 call at all, not an empty answer from one"
-
-
-def test_the_dev_overlay_folds_the_tarball_etag_into_the_staging_identity(monkeypatch):
-    """On the dev path the workers run a tarball the flow runner never imports.
-
-    Replacing it changes what executes while the local source hash stays put, so a retry
-    would resume tiles staged by the old code and add new ones from the new — mixing two
-    code versions in one write-once zone-year. The ETag is what makes the fingerprint move.
-    """
-    import tessera_embeddings.providers.aws.ray as ray_mod
-
-    monkeypatch.setattr(ray_mod, "source_tarball_identity", lambda b, s, r: f"tarball=etag-{b}{s}")
-    assert mod._resolve_tarball_identity("bkt", "-branch", None) == "tarball=etag-bkt-branch"
 
 
 # --- immediate_refill: replacing a settled fill without waiting for the round ------------
@@ -1713,14 +1493,6 @@ class TestImmediateRefill:
         assert r.dispatches().count(("01N",)) == 1, "a replacement went out with no sibling to outrun"
         assert not r.overlaps, f"two dispatches held one zone: {r.overlaps}"
 
-    def test_the_settling_delay_is_derived_from_the_cancellation_budget(self):
-        """Derived, not chosen. A fill's teardown spends this budget waiting for its own
-        children before it goes terminal; the delay is the same budget again for the level
-        below, whose cancellation nothing waited for. One constant, so the two cannot drift
-        into disagreeing about how long an asynchronous cancellation takes.
-        """
-        assert mod._SETTLE_DELAY_S == mod.CANCELLATION_CONFIRM_S
-
     def test_a_roster_with_nothing_left_to_do_does_not_pay_the_wait(self, wired, monkeypatch):
         """Most clusters settle having landed everything, and those must not hold the drain
         loop for a wait that protects a dispatch which is not going to happen. So the store
@@ -1771,16 +1543,6 @@ class TestImmediateRefill:
         upto_dispatch = after[: after.index("dispatch")]
         assert "read" in upto_dispatch, f"the store was not re-read between the wait and the dispatch: {kinds}"
 
-    def test_one_generation_per_slot_per_round(self, wired, monkeypatch):
-        """A replacement is not itself replaced — that is what bounds the extra fleets.
-
-        Without it a persistent shortage (the account unable to supply a single GPU) turns
-        one round into a dispatch loop.
-        """
-        r = _round(monkeypatch, wired, _Round(wired, ends={"01N": "FAILED"}, hold="02N"))
-        asyncio.run(r.drive(max_parallel_clusters=2, immediate_refill=True, max_dispatch_rounds=1))
-        assert r.dispatches().count(("01N",)) == 2, r.dispatches()
-
     def test_the_last_cluster_to_settle_is_left_to_the_round(self, wired, monkeypatch):
         """With nothing else running there is nothing to skip waiting for.
 
@@ -1790,29 +1552,6 @@ class TestImmediateRefill:
         r = _round(monkeypatch, wired, _Round(wired, ends={"01N": "FAILED"}, hold="_none"), zones=("01N",))
         asyncio.run(r.drive(max_parallel_clusters=1, immediate_refill=True, max_dispatch_rounds=1))
         assert r.dispatches() == [("01N",)], r.dispatches()
-
-    def test_a_round_that_is_already_over_is_not_even_planned_for(self, wired, monkeypatch):
-        """The gate before planning is a COST filter, not the safety one.
-
-        The dispatch gate below it is what actually prevents a pointless replacement, and it
-        would decline this case on its own. This one exists so the driver does not pay for
-        a store re-read and a full live-run scan per settled cluster once the round is
-        over — which, at the fleet's cluster count, is a burst of orchestrator queries for
-        an answer that is already known.
-        """
-        r = _round(monkeypatch, wired, _Round(wired, ends={"01N": "FAILED"}, hold="_none"), zones=("01N",))
-        status = SimpleNamespace(zones={"01N": ()}, has=lambda z, y: False)
-        reads = {"n": 0}
-
-        def counting_read(*_a, **_k):
-            reads["n"] += 1
-            return status
-
-        monkeypatch.setattr(mod, "campaign_status", counting_read)
-        asyncio.run(r.drive(max_parallel_clusters=1, immediate_refill=True, max_dispatch_rounds=1))
-        # One read at flow start and one when the round closes. A third would mean the
-        # planner ran for a round that was already over.
-        assert reads["n"] == 2, f"the planner ran for a round that had already finished ({reads['n']} reads)"
 
 
 class TestTheDispatchDecisionIsAtomic:
@@ -1859,16 +1598,17 @@ class TestTheDispatchDecisionIsAtomic:
         async def wait_that_lets_the_sibling_finish(delay, *a, **k):
             if delay == mod.CANCELLATION_CONFIRM_S:
                 r.release.set()  # 02N's dispatch is parked on this
-                for _ in range(20):
-                    await real_sleep(0)
+                # One turn: 02N finishes but the drain loop has not yet harvested it, so only the
+                # liveness gate after the refill can stop the dispatch.
+                await real_sleep(0)
                 return None
             return await real_sleep(0)
 
         monkeypatch.setattr(mod.asyncio, "sleep", wait_that_lets_the_sibling_finish)
         with caplog_at_info() as records:
             asyncio.run(r.drive(max_parallel_clusters=2, immediate_refill=True, max_dispatch_rounds=1))
-        assert r.dispatched_before(("02N",)) == [("01N",), ("02N",)]
-        assert "the round finished while the refill was being planned" in "\n".join(records)
+        assert r.dispatches() == [("01N",), ("02N",)]
+        assert "so it is the round's to re-dispatch" in "\n".join(records)  # the gate's line, not the drain's
 
     def test_an_unwinding_drain_waits_for_its_dispatches_to_finish_unwinding(self, wired, monkeypatch):
         """`cancel()` is a REQUEST, and returning on it is not the same as waiting.

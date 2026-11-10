@@ -1079,7 +1079,7 @@ def fill_zones_sequential(
                         # Per-zone staged-resume scan (the single-zone path does this inside
                         # run_inference; the stream pre-filters here).
                         restored = ZarrWriter(prep.staging_base).scan_existing_staged_artifacts(
-                            prep.run_id, zplan.live, compute_std=prep.config.compute_std, log=log
+                            prep.run_id, zplan.live, log=log
                         )
                         already = restored.done
                 except Exception as exc:

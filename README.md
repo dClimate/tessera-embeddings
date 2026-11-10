@@ -486,7 +486,6 @@ src/tessera_embeddings/
   storage/               Zarr and Icechunk stores, manifests, zone grids,
                          empty-store seeding, shard writer, campaign tags
   orchestration/
-    concurrency.py       sliding_window_submit — shared by flows and runners
     prefect/             Prefect — 100% quarantined here
       flows/             @flow-decorated orchestration (Layer 3)
       tasks/             thin @task wrappers (Layer 2)

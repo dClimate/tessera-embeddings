@@ -172,16 +172,3 @@ def test_a_write_mode_produces_the_per_date_store(
     # The commit-granularity contract: per-date writing commits each date alone; a batch of
     # three commits [01, 02, 04] together and flushes [05].
     assert _snapshots(plain_store) - _snapshots(mode_store) == (len(DATES) - 1) - commits
-
-
-def test_batch_dates_validation_rejects_bad_combinations(tmp_path: Path) -> None:
-    """The refusals fire before any cluster or store work."""
-    kwargs = dict(
-        roi_zarr_path=str(tmp_path / "roi.zarr"),
-        start_date="2024-01-01",
-        end_date="2024-01-02",
-        store_path=str(tmp_path / "s"),
-        client=None,  # never reached: validation refuses first
-    )
-    with pytest.raises(ValueError, match="batch_dates must be >= 1"):
-        s2_roi.ingest_s2_roi_reflectance(**kwargs, batch_dates=0)

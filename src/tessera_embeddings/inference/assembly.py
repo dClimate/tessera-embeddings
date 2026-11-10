@@ -950,7 +950,7 @@ class ZarrWriter:
             staging_base: Base path for staging chunk Zarrs
                 (e.g., "s3://bucket/staging" or "/tmp/staging").
             embedding_dim: Number of embedding dimensions (default 128).
-            band_first: Stage ``embeddings`` (and ``embedding_std``) as ``(band, northing, easting)``,
+            band_first: Stage ``embeddings`` as ``(band, northing, easting)``,
                 the order a v2 store holds them in (ADR 031 §3), so assembly writes them without
                 reordering. Readers of a staged tile take its order from its dimension names.
         """
@@ -1364,7 +1364,6 @@ class ZarrWriter:
         embeddings: np.ndarray,
         run_id: str,
         scales: np.ndarray,
-        embeddings_std: np.ndarray | None = None,
         obs_counts: Mapping[str, np.ndarray | None] | None = None,
         month_covered: Mapping[str, np.ndarray | None] | None = None,
         coverage: Mapping[str, Any] | None = None,
@@ -1387,7 +1386,6 @@ class ZarrWriter:
             run_id: Unique run identifier.
             scales: Per-pixel float32 scale factors of shape (H, W), used to dequantize int8
                 embeddings.
-            embeddings_std: Optional std array, same shape as embeddings, float32.
             month_covered: Optional dict of month-mask variable names to (12, H, W) bool arrays —
                 which calendar months each pixel was seen in per sensor, month 0 = January. Keys
                 from ``MONTH_COVERED_VARS``. Staged transposed to (H, W, month) so each lands in
@@ -1437,16 +1435,6 @@ class ZarrWriter:
                 "compressors": None,
             },
         }
-
-        if embeddings_std is not None:
-            if embeddings_std.shape != expected_shape:
-                msg = f"Expected std shape {expected_shape}, got {embeddings_std.shape}"
-                raise ValueError(msg)
-            data_vars["embedding_std"] = (band_dims, embeddings_std.transpose(order))
-            encoding["embedding_std"] = {
-                "chunks": staged_chunks,
-                "compressors": None,
-            }
 
         expected_scale_shape = (chunk.height, chunk.width)
         if scales.shape != expected_scale_shape:
@@ -1798,7 +1786,7 @@ class ZarrWriter:
             if var not in group:
                 return ("invalid", f"missing variable '{var}'")
             arr: zarr.Array = group[var]  # ty: ignore[invalid-assignment]
-            # scales is a 2-D per-pixel factor (H, W); embeddings/embedding_std carry the band dim, in
+            # scales is a 2-D per-pixel factor (H, W); embeddings carries the band dim, in
             # the order the tile's own axis names give, so either staged band order validates.
             size = {"Y": chunk.height, "X": chunk.width, "band": self.embedding_dim}
             expected_shape = tuple(size[role] for role in axis_roles(dims_of(arr)))
@@ -1814,7 +1802,6 @@ class ZarrWriter:
         run_id: str,
         chunks: list[ChunkSpec],
         *,
-        compute_std: bool = False,
         log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     ) -> set[str]:
         """Scan staging for already-written chunks, validate each, return valid labels.
@@ -1822,7 +1809,6 @@ class ZarrWriter:
         Args:
             run_id: Run identifier (locates the staging directory).
             chunks: Full list of chunk specs for this ROI.
-            compute_std: If True, also require ``embedding_std`` in each staged Zarr.
             log: Optional logger.
 
         Returns:
@@ -1833,14 +1819,13 @@ class ZarrWriter:
             RuntimeError: If any staged Zarrs are invalid, listing every invalid path so they can
                 be removed before retrying.
         """
-        return self.scan_existing_staged_artifacts(run_id, chunks, compute_std=compute_std, log=log).done
+        return self.scan_existing_staged_artifacts(run_id, chunks, log=log).done
 
     def scan_existing_staged_artifacts(
         self,
         run_id: str,
         chunks: list[ChunkSpec],
         *,
-        compute_std: bool = False,
         log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     ) -> StagedResume:
         """:meth:`scan_existing_staged_chunks`, keeping skip markers distinguishable.
@@ -1880,7 +1865,7 @@ class ZarrWriter:
         # across arrays, so a crash mid-write_chunk can leave an embeddings-only tile. Requiring
         # scales rejects that up front; otherwise the resume scan counts it valid, run_inference
         # skips it, and the fill fails permanently at assembly on every retry.
-        required_vars = ["embeddings", "scales"] + (["embedding_std"] if compute_std else [])
+        required_vars = ["embeddings", "scales"]
         valid: set[str] = set()
         invalid_paths: list[tuple[str, str]] = []
 
@@ -2037,8 +2022,8 @@ class ZarrWriter:
                 where=run.output_path,
             )
             # Variables staged by this run but absent from the store (a store created before obs
-            # counts, or compute_std newly on) are created schema-only at the current time extent;
-            # prior timesteps read back as the layout fill. In the store's level group, if it has one.
+            # counts) are created schema-only at the current time extent; prior timesteps read back as
+            # the layout fill. In the store's level group, if it has one.
             arrays = level0(root)
             missing = [v for v in run.variables if v not in arrays]
             if missing:
@@ -2151,7 +2136,6 @@ class ZarrWriter:
         log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
         time_window: TimeWindow | None = None,
         tile_id: str | None = None,
-        compute_std: bool = False,
         checkpoint_id: str,
         model_version: ModelVersion,
         manifest: EmbeddingManifest | None = None,
@@ -2200,7 +2184,6 @@ class ZarrWriter:
             output_path: Final output Icechunk store path.
             roi_zarr_path: Path to the ROI boolean zarr. Assembly re-enumerates live chunks from
                 this rather than marshaling the list through Prefect.
-            compute_std: Whether staged chunks contain embedding_std data.
             run_started_at: Flow trigger time for the time coordinate; defaults to now, and is
                 ignored when *time_window* is given.
             mosaic_base: Base path for the input mosaic stores. When given, the reflectance store
@@ -2308,13 +2291,9 @@ class ZarrWriter:
         else:
             time_date = np.datetime64(started.date(), "ns")
 
-        # `embedding_std` follows the caller's `compute_std`, not what the tiles happen to hold;
-        # every other carried var is included when the tiles staged it.
+        # Every carried var is included when the tiles staged it.
         staged_extra = self._staged_vars_present(run_id, live_chunks, CARRIED_VARS)
-        variables = [*REQUIRED_VARS]
-        if compute_std:
-            variables.append("embedding_std")
-        variables += [v for v in CARRIED_VARS if v != "embedding_std" and v in staged_extra]
+        variables = [*REQUIRED_VARS, *(v for v in CARRIED_VARS if v in staged_extra)]
 
         # Time-only, matching the global store (zarr_store.global_store_config) and the rule
         # documented there: split the axis along which a single commit is NARROW. An assemble

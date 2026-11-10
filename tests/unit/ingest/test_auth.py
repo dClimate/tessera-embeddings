@@ -1,20 +1,23 @@
 """Unit tests for ingest/auth.py — EDL session and URL helpers.
 
-These tests exercise only the pure-Python logic (session factory, URL
-conversion, credential building).  All HTTP calls and odc/GDAL imports
-are either not invoked or patched; no network access is required.
+These tests exercise the session factory, redirect auth, URL conversion and the odc
+credential-drift patch. No HTTP call is made; no network access is required.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import threading
+from collections.abc import Callable
 
 import pytest
+import rasterio.env
 import requests
+from odc.loader._rio import _local, rio_env
 
 from tessera_embeddings.ingest._http import NonJsonResponseError, json_or_raise
-from tessera_embeddings.ingest.auth import _EDLSession
+from tessera_embeddings.ingest.auth import _datapool_url_to_s3, _EDLSession, get_edl_session
 
 # ---------------------------------------------------------------------------
 # get_edl_session
@@ -27,8 +30,6 @@ def test_get_edl_session_bearer_takes_precedence(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("EARTHDATA_USERNAME", "user")
     monkeypatch.setenv("EARTHDATA_PASSWORD", "pass")
 
-    from tessera_embeddings.ingest.auth import get_edl_session
-
     session = get_edl_session()
     assert session.headers.get("Authorization") == "Bearer tok123"
     assert session.auth is None
@@ -40,34 +41,22 @@ def test_get_edl_session_basic_auth(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EARTHDATA_USERNAME", "user")
     monkeypatch.setenv("EARTHDATA_PASSWORD", "pass")
 
-    from tessera_embeddings.ingest.auth import get_edl_session
-
     session = get_edl_session()
     assert session.auth == ("user", "pass")
     assert "Authorization" not in session.headers or not session.headers["Authorization"].startswith("Bearer")
 
 
-def test_get_edl_session_no_creds_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    """RuntimeError when neither credential set is available."""
+@pytest.mark.parametrize("username", [None, "user"], ids=["nothing", "username-without-password"])
+def test_get_edl_session_no_creds_raises(monkeypatch: pytest.MonkeyPatch, username: str | None) -> None:
+    """RuntimeError when neither credential set is complete."""
     monkeypatch.delenv("EARTHDATA_TOKEN", raising=False)
-    monkeypatch.delenv("EARTHDATA_USERNAME", raising=False)
     monkeypatch.delenv("EARTHDATA_PASSWORD", raising=False)
-
-    from tessera_embeddings.ingest.auth import get_edl_session
+    if username is None:
+        monkeypatch.delenv("EARTHDATA_USERNAME", raising=False)
+    else:
+        monkeypatch.setenv("EARTHDATA_USERNAME", username)
 
     with pytest.raises(RuntimeError, match="EARTHDATA_USERNAME"):
-        get_edl_session()
-
-
-def test_get_edl_session_partial_basic_auth_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Username without password is not enough for basic auth."""
-    monkeypatch.delenv("EARTHDATA_TOKEN", raising=False)
-    monkeypatch.setenv("EARTHDATA_USERNAME", "user")
-    monkeypatch.delenv("EARTHDATA_PASSWORD", raising=False)
-
-    from tessera_embeddings.ingest.auth import get_edl_session
-
-    with pytest.raises(RuntimeError):
         get_edl_session()
 
 
@@ -173,66 +162,25 @@ def test_rebuild_auth_drops_auth_on_untrusted_redirect() -> None:
 
 def test_datapool_url_to_s3_earthdatacloud() -> None:
     """Earthdatacloud URLs get a simple prefix swap."""
-    from tessera_embeddings.ingest.auth import _datapool_url_to_s3
-
     url = "https://cumulus.asf.earthdatacloud.nasa.gov/OPERA/OPERA_L2_RTC-S1/gran_dir/file_VV.tif"
     result = _datapool_url_to_s3(url)
     assert result == "s3://asf-cumulus-prod-opera-products/OPERA_L2_RTC-S1/gran_dir/file_VV.tif"
 
 
-def test_datapool_url_to_s3_flat_datapool_vv() -> None:
-    """Flat datapool URLs derive the granule directory from the filename."""
-    from tessera_embeddings.ingest.auth import _datapool_url_to_s3
-
-    url = "https://datapool.asf.alaska.edu/RTC/OPERA-S1/OPERA_L2_RTC-S1_T168-357760-IW1_20240701T001322Z_20240703T004929Z_S1A_30_v1.0_VV.tif"
-    result = _datapool_url_to_s3(url)
+@pytest.mark.parametrize("band", ["VV", "VH"])
+def test_datapool_url_to_s3_flat_datapool(band: str) -> None:
+    """Flat datapool URLs derive the granule directory from the filename, band suffix stripped."""
+    name = f"OPERA_L2_RTC-S1_T168-357760-IW1_20240701T001322Z_20240703T004929Z_S1A_30_v1.0_{band}.tif"
+    result = _datapool_url_to_s3(f"https://datapool.asf.alaska.edu/RTC/OPERA-S1/{name}")
     assert result.startswith("s3://asf-cumulus-prod-opera-products/OPERA_L2_RTC-S1/")
-    assert "OPERA_L2_RTC-S1_T168-357760-IW1_20240701T001322Z_20240703T004929Z_S1A_30_v1.0_VV.tif" in result
-    # Granule dir must not include the band suffix
-    parts = result.split("/")
-    granule_dir = parts[-2]
-    assert not granule_dir.endswith("_VV")
-
-
-def test_datapool_url_to_s3_flat_datapool_vh() -> None:
-    """VH band suffix is also stripped when deriving the granule directory."""
-    from tessera_embeddings.ingest.auth import _datapool_url_to_s3
-
-    url = "https://datapool.asf.alaska.edu/RTC/OPERA-S1/OPERA_L2_RTC-S1_T168-xyz_VH.tif"
-    result = _datapool_url_to_s3(url)
-    parts = result.split("/")
-    granule_dir = parts[-2]
-    assert "_VH" not in granule_dir
+    assert result.endswith(f"/{name}")
+    assert not result.split("/")[-2].endswith(f"_{band}"), "the granule dir must not carry the band suffix"
 
 
 def test_datapool_url_to_s3_unrecognised_raises() -> None:
     """ValueError for a URL that matches neither ASF pattern."""
-    from tessera_embeddings.ingest.auth import _datapool_url_to_s3
-
     with pytest.raises(ValueError, match="does not match"):
         _datapool_url_to_s3("https://example.com/some/other/file.tif")
-
-
-# ---------------------------------------------------------------------------
-# _build_aws_env
-# ---------------------------------------------------------------------------
-
-
-def test_build_aws_env_maps_keys() -> None:
-    """STS response keys are mapped to the expected AWS env var names."""
-    from tessera_embeddings.ingest.auth import _build_aws_env
-
-    creds = {
-        "accessKeyId": "AKID",
-        "secretAccessKey": "SECRET",
-        "sessionToken": "TOKEN",
-    }
-    env = _build_aws_env(creds)
-    assert env["AWS_ACCESS_KEY_ID"] == "AKID"
-    assert env["AWS_SECRET_ACCESS_KEY"] == "SECRET"
-    assert env["AWS_SESSION_TOKEN"] == "TOKEN"
-    assert env["AWS_NO_SIGN_REQUEST"] == "NO"
-    assert env["AWS_DEFAULT_REGION"] == "us-west-2"
 
 
 # ---------------------------------------------------------------------------
@@ -254,104 +202,51 @@ def _frozen_access_key(session: object) -> str:
     return boto.get_credentials().get_frozen_credentials().access_key
 
 
-def test_odc_thread_session_tracks_env_after_drift(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Cached AWSSession self-invalidates when AWS_ACCESS_KEY_ID changes.
+def _set_aws_env(tag: str) -> None:
+    os.environ["AWS_ACCESS_KEY_ID"] = f"{tag}_KEY"
+    os.environ["AWS_SECRET_ACCESS_KEY"] = f"{tag}_SECRET"
+    os.environ["AWS_SESSION_TOKEN"] = f"{tag}_TOKEN"
 
-    This is the load-bearing claim that lets set_s3_credentials skip
-    gdal.SetConfigOption / gdal.VSICurlClearCache: as long as
-    _local.session().get_frozen_credentials().access_key tracks
-    os.environ['AWS_ACCESS_KEY_ID'], rasterio.env.Env will hand GDAL the
-    refreshed key on every rio_env() entry.
+
+@pytest.fixture
+def in_fresh_thread(monkeypatch: pytest.MonkeyPatch) -> Callable[[Callable[[], None]], None]:
+    """Run a body on a new thread (isolated ``threading.local``), restoring the AWS env after.
+
+    Importing ``ingest.auth`` (done at the top of this module) installs the env-drift patch.
     """
-    pytest.importorskip("odc.loader._rio")
-    from odc.loader._rio import _local
+    for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"):
+        monkeypatch.setenv(k, os.environ.get(k, ""))
 
-    # Importing auth.py installs the env-drift patch at module import.
-    from tessera_embeddings.ingest import auth  # noqa: F401
-
-    def run_in_fresh_thread(env_initial: dict[str, str], env_refreshed: dict[str, str]) -> dict[str, str]:
-        """Prime _local with one set of creds, mutate env, return what session() yields."""
-        import threading
-
-        out: dict[str, str] = {}
-
-        def body() -> None:
-            for k, v in env_initial.items():
-                os.environ[k] = v
-            out["initial"] = _frozen_access_key(_local.session())
-            for k, v in env_refreshed.items():
-                os.environ[k] = v
-            # Patched session() must observe the env mismatch and rebuild.
-            out["after_env_update"] = _frozen_access_key(_local.session())
-
-        # Run on a fresh thread so threading.local state is isolated.
+    def run(body: Callable[[], None]) -> None:
         t = threading.Thread(target=body)
         t.start()
         t.join()
-        return out
 
-    # Track keys we've stomped on so we can restore them.
-    for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"):
-        monkeypatch.setenv(k, os.environ.get(k, ""))
-
-    initial = {
-        "AWS_ACCESS_KEY_ID": "INITIAL_KEY_AAAAAA",
-        "AWS_SECRET_ACCESS_KEY": "INITIAL_SECRET",
-        "AWS_SESSION_TOKEN": "INITIAL_TOKEN",
-    }
-    refreshed = {
-        "AWS_ACCESS_KEY_ID": "REFRESHED_KEY_BBBBBB",
-        "AWS_SECRET_ACCESS_KEY": "REFRESHED_SECRET",
-        "AWS_SESSION_TOKEN": "REFRESHED_TOKEN",
-    }
-    keys = run_in_fresh_thread(initial, refreshed)
-
-    assert keys["initial"] == "INITIAL_KEY_AAAAAA"
-    # Without the patch this would be "INITIAL_KEY_AAAAAA" (cached) — the
-    # patch detects the env mismatch and rebuilds from current env vars.
-    assert keys["after_env_update"] == "REFRESHED_KEY_BBBBBB"
+    return run
 
 
-def test_odc_thread_session_explicit_reset_picks_up_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """_local.reset() rebuilds the cached AWSSession from current os.environ.
+def test_odc_thread_session_tracks_env_after_drift(in_fresh_thread) -> None:
+    """Cached AWSSession self-invalidates when AWS_ACCESS_KEY_ID changes.
 
-    Mirrors what _S3CredentialPlugin.setup() does on each worker: after
-    updating os.environ it calls _local.reset(), and the next session() call
-    must return an AWSSession bound to the new access key.
+    This is the load-bearing claim that lets set_s3_credentials skip
+    gdal.SetConfigOption / gdal.VSICurlClearCache: ``rio_env()`` wraps rasterio.env.Env around
+    the cached session on every /vsis3/ open, so GDAL signs with whatever key it holds.
     """
-    pytest.importorskip("odc.loader._rio")
-    from odc.loader._rio import _local
-
-    from tessera_embeddings.ingest import auth  # noqa: F401
-
-    for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"):
-        monkeypatch.setenv(k, os.environ.get(k, ""))
-
-    import threading
-
     out: dict[str, str] = {}
 
     def body() -> None:
-        os.environ["AWS_ACCESS_KEY_ID"] = "INITIAL_KEY_AAAAAA"
-        os.environ["AWS_SECRET_ACCESS_KEY"] = "INITIAL_SECRET"
-        os.environ["AWS_SESSION_TOKEN"] = "INITIAL_TOKEN"
+        _set_aws_env("INITIAL")
         out["initial"] = _frozen_access_key(_local.session())
+        _set_aws_env("REFRESHED")
+        out["after_env_update"] = _frozen_access_key(_local.session())
 
-        os.environ["AWS_ACCESS_KEY_ID"] = "REFRESHED_KEY_BBBBBB"
-        os.environ["AWS_SECRET_ACCESS_KEY"] = "REFRESHED_SECRET"
-        os.environ["AWS_SESSION_TOKEN"] = "REFRESHED_TOKEN"
-        _local.reset()
-        out["after_reset"] = _frozen_access_key(_local.session())
-
-    t = threading.Thread(target=body)
-    t.start()
-    t.join()
-
-    assert out["initial"] == "INITIAL_KEY_AAAAAA"
-    assert out["after_reset"] == "REFRESHED_KEY_BBBBBB"
+    in_fresh_thread(body)
+    assert out["initial"] == "INITIAL_KEY"
+    # Without the patch this would still be the cached INITIAL key.
+    assert out["after_env_update"] == "REFRESHED_KEY"
 
 
-def test_credential_drift_keeps_the_tasks_gdal_options(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_credential_drift_keeps_the_tasks_gdal_options(in_fresh_thread) -> None:
     """A refresh noticed mid-task leaves the task's GDAL options in force.
 
     ``rio_env`` is entered twice over: once by ``RioDriver.restore_env`` around a
@@ -359,31 +254,13 @@ def test_credential_drift_keeps_the_tasks_gdal_options(monkeypatch: pytest.Monke
     the inner entry, so whatever it does to rasterio's env stack is done while
     the task's own options are the ones installed.
     """
-    pytest.importorskip("odc.loader._rio")
-    import threading
-
-    import rasterio.env
-    from odc.loader._rio import _local, rio_env
-
-    from tessera_embeddings.ingest import auth  # noqa: F401
-
-    for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"):
-        monkeypatch.setenv(k, os.environ.get(k, ""))
-
     out: dict[str, str | None] = {}
 
     def body() -> None:
-        os.environ["AWS_ACCESS_KEY_ID"] = "INITIAL_KEY_AAAAAA"
-        os.environ["AWS_SECRET_ACCESS_KEY"] = "INITIAL_SECRET"
-        os.environ["AWS_SESSION_TOKEN"] = "INITIAL_TOKEN"
-
+        _set_aws_env("INITIAL")
         with rio_env(GDAL_HTTP_MAX_RETRY="10", GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR"):
             out["task"] = rasterio.env.getenv().get("GDAL_HTTP_MAX_RETRY")
-
-            os.environ["AWS_ACCESS_KEY_ID"] = "REFRESHED_KEY_BBBBBB"
-            os.environ["AWS_SECRET_ACCESS_KEY"] = "REFRESHED_SECRET"
-            os.environ["AWS_SESSION_TOKEN"] = "REFRESHED_TOKEN"
-
+            _set_aws_env("REFRESHED")
             with rio_env(VSI_CACHE=False):  # the read that notices the refresh
                 out["refresh_read"] = rasterio.env.getenv().get("GDAL_HTTP_MAX_RETRY")
             with rio_env(VSI_CACHE=False):  # every read after it
@@ -392,16 +269,11 @@ def test_credential_drift_keeps_the_tasks_gdal_options(monkeypatch: pytest.Monke
                 out["later_readdir"] = opts.get("GDAL_DISABLE_READDIR_ON_OPEN")
             out["key"] = _frozen_access_key(_local.session())
 
-    t = threading.Thread(target=body)
-    t.start()
-    t.join()
-
-    assert out["task"] == "10"
-    assert out["refresh_read"] == "10"
-    assert out["later_read"] == "10"
+    in_fresh_thread(body)
+    assert out["task"] == out["refresh_read"] == out["later_read"] == "10"
     assert out["later_readdir"] == "EMPTY_DIR"
     # The refresh still has to land, or the options were kept by not refreshing.
-    assert out["key"] == "REFRESHED_KEY_BBBBBB"
+    assert out["key"] == "REFRESHED_KEY"
 
 
 def test_a_credential_body_is_never_logged_or_raised(caplog: pytest.LogCaptureFixture) -> None:

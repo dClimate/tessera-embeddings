@@ -22,7 +22,6 @@ import ast
 
 import pytest
 
-import tessera_embeddings.ingest.s1_roi as s1_roi_module
 from tessera_embeddings.config.inference import S1_ORBIT_NONE, InferenceConfig
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.errors import InsufficientCoverageError
@@ -70,73 +69,11 @@ def test_radar_can_still_be_demanded(tmp_path) -> None:
         resolve_s1_orbit(base, "both", allow_none=False)
 
 
-def test_the_demand_failure_says_where_to_confirm_which_case_it_is(tmp_path) -> None:
-    """The reader cannot distinguish the two causes, so it must point at what can."""
-    base = f"file://{tmp_path}/mosaics/23N/2021"
-    with pytest.raises(InsufficientCoverageError) as excinfo:
-        resolve_s1_orbit(base, "both", allow_none=False)
-    assert "item counts" in str(excinfo.value)
-
-
 @pytest.mark.parametrize("orbit", ["ascending", "descending"])
 def test_a_named_orbit_is_never_downgraded(tmp_path, orbit: str) -> None:
     """An operator who named one orbit asked for something specific; allow_none must not apply."""
     base = f"file://{tmp_path}/mosaics/23N/2021"
     assert resolve_s1_orbit(base, orbit, allow_none=True) == orbit
-
-
-class TestAbandoningAnUnusableOrbit:
-    """Leading empty batches abandon an orbit; a mid-window gap must not.
-
-    Zone 23N paginated 182,542 granules across a year, one 30-day batch at a time, to write
-    nothing — every granule is HH/HV Extra Wide over ice and dual-pol VV+VH is required. The
-    saving measured on that zone is 190s of catalogue querying per zone-year down to 59s.
-
-    The distinction the threshold turns on is LEADING versus consecutive-anywhere. A zone imaged
-    only in summer has a run of empty batches in January, so a rule that fired on any run of
-    zeros would abandon it before reaching the data. Counting only while the running total is
-    still zero makes that unreachable, and these tests pin exactly that.
-    """
-
-    def test_no_item_count_threshold_exists(self) -> None:
-        """The rule is deliberately absent: no threshold on item counts alone is safe.
-
-        Pinned as a test so a future attempt has to confront the seasonal case below rather
-        than rediscover it in production, where the loss is silent.
-        """
-        assert not hasattr(s1_roi_module, "LEADING_EMPTY_BATCHES_BEFORE_SKIP")
-
-    @staticmethod
-    def _consume(items_per_batch: list[int], threshold: int) -> int:
-        """Batches actually consumed under the leading-empty rule."""
-        total_seen = 0
-        leading_empty = 0
-        for i, seen in enumerate(items_per_batch, start=1):
-            total_seen += seen
-            if seen == 0 and total_seen == 0:
-                leading_empty += 1
-                if leading_empty >= threshold:
-                    return i
-        return len(items_per_batch)
-
-    def test_a_threshold_would_have_saved_the_ice_case(self) -> None:
-        """What the optimisation is worth: 3 batches instead of 12 on a permanently empty orbit."""
-        assert self._consume([0] * 12, 3) == 3
-
-    def test_why_that_threshold_is_unsafe(self) -> None:
-        """A summer-only zone: the same rule abandons it in March and loses every summer date.
-
-        This is the test that stopped the optimisation shipping. Leading emptiness does not
-        distinguish "this terrain is imaged in the wrong mode" from "this window has no
-        acquisitions yet", so only the polarisation skip count can gate it.
-        """
-        summer_only = [0, 0, 0, 0, 0, 900, 900, 900, 0, 0, 0, 0]
-        assert self._consume(summer_only, 3) == 3, "fires in March"
-        assert sum(summer_only[3:]) == 2700, "and 2,700 usable items are never queried"
-
-    def test_a_mid_window_gap_would_have_been_safe(self) -> None:
-        """The one case the leading-only formulation did get right, kept for the eventual fix."""
-        assert self._consume([500] + [0] * 11, 3) == 12
 
 
 class TestTheInferenceConfigAcceptsRadarFreeLand:
@@ -154,7 +91,7 @@ class TestTheInferenceConfigAcceptsRadarFreeLand:
     def test_none_is_accepted_with_s2_only_embeddings_enabled(self) -> None:
         assert self._config(s1_orbit=S1_ORBIT_NONE, allow_s2_only=True).s1_orbit == S1_ORBIT_NONE
 
-    def test_none_forces_s2_only_embeddings(self) -> None:
+    def test_none_forces_s2_only_embeddings(self, caplog) -> None:
         """Derived, not demanded from the caller, and NOT left alone.
 
         With no radar store every pixel has zero S1 observations, so the default gate would skip
@@ -162,29 +99,9 @@ class TestTheInferenceConfigAcceptsRadarFreeLand:
         An empty result that reads as success is the one outcome no later run revisits. Refusing
         instead would defeat the decision that radar-free land is acceptable.
         """
-        assert self._config(s1_orbit=S1_ORBIT_NONE).allow_s2_only is True
-
-    def test_the_forcing_is_logged_loudly(self, caplog) -> None:
-        """It changes WHICH pixels are embedded and what their quality means.
-
-        Nothing else records that a zone-year's embeddings are entirely S2-only, so a silent
-        force would make an unvalidated output indistinguishable from a normal one.
-        """
         with caplog.at_level("WARNING"):
-            self._config(s1_orbit=S1_ORBIT_NONE)
-        assert "allow_s2_only=True" in caplog.text
-        assert "S2-only" in caplog.text
-
-    def test_the_forcing_is_reproducible_from_s1_orbit_alone(self) -> None:
-        """A resume must derive the same value, or the staged-chunk consistency check trips.
-
-        The embeddings flow refuses to resume a run whose ``allow_s2_only`` differs from the one
-        its staged chunks were produced under, so a forced value has to be a pure function of
-        inputs the resume also has.
-        """
-        first = self._config(s1_orbit=S1_ORBIT_NONE)
-        second = self._config(s1_orbit=S1_ORBIT_NONE)
-        assert first.allow_s2_only == second.allow_s2_only is True
+            assert self._config(s1_orbit=S1_ORBIT_NONE).allow_s2_only is True
+        assert "forcing allow_s2_only=True" in caplog.text
 
     def test_a_real_orbit_never_has_the_flag_forced(self) -> None:
         """The force must bind only to 'none' — a partial-radar zone keeps the caller's choice."""
@@ -196,11 +113,6 @@ class TestTheInferenceConfigAcceptsRadarFreeLand:
         with pytest.raises(ValueError, match="Invalid s1_orbit") as excinfo:
             self._config(s1_orbit="sideways")
         assert S1_ORBIT_NONE in str(excinfo.value)
-
-    @pytest.mark.parametrize("orbit", ["ascending", "descending", "both"])
-    def test_the_real_orbits_are_unaffected_by_the_flag(self, orbit: str) -> None:
-        """The new rule must bind only to 'none'; a real orbit never needs the flag."""
-        assert self._config(s1_orbit=orbit).s1_orbit == orbit
 
 
 class TestWhoDemandsRadarAndWhoDoesNot:

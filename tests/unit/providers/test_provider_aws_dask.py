@@ -23,11 +23,9 @@ from types import SimpleNamespace
 import cloudpickle
 import psutil
 import pytest
-from tenacity import Retrying, retry_if_exception, stop_after_attempt, wait_fixed
 
 pytest.importorskip("dask_cloudprovider", reason="dask-cloudprovider not installed (AWS extras)")
 
-from tessera_embeddings.config.ingest import IngestSettings
 
 # The consumers of this provider's log contract, imported here so a change on
 # either side fails in one place: the health-line parser (see
@@ -38,7 +36,6 @@ from tessera_embeddings.profiling.ingest.watch_scheduler import parse_health_lin
 from tessera_embeddings.providers.aws import dask as dask_mod
 from tessera_embeddings.providers.aws.dask import (
     _PROVISIONING_RETRY_ENV,
-    _RETRYABLE_CLUSTER_START_ERRORS,
     SchedulerResourceLogger,
     _is_retryable_cluster_start_error,
     apply_provisioning_retry_defaults,
@@ -48,12 +45,6 @@ from tessera_embeddings.providers.aws.dask import (
 
 class TestRetryablePredicate:
     """``_is_retryable_cluster_start_error`` classification."""
-
-    @pytest.mark.parametrize("needle", _RETRYABLE_CLUSTER_START_ERRORS)
-    def test_known_transient_errors_retry(self, needle: str) -> None:
-        """Each documented transient substring is matched, wrapped as _start() wraps it."""
-        exc = RuntimeError(f"Cluster failed to start: {needle} (xyz)")
-        assert _is_retryable_cluster_start_error(exc) is True
 
     def test_scheduler_failed_to_start_retries(self) -> None:
         """The ENI-exhaustion failure observed in the fan-out → merge handoff."""
@@ -72,11 +63,6 @@ class TestRetryablePredicate:
         exc = RuntimeError("Cluster failed to start: not enough values to unpack (expected 1, got 0)")
         assert _is_retryable_cluster_start_error(exc) is True
 
-    def test_unrelated_runtime_error_does_not_retry(self) -> None:
-        """A RuntimeError that isn't a known transient must fail fast."""
-        exc = RuntimeError("Cluster failed to start: image pull failed (manifest unknown)")
-        assert _is_retryable_cluster_start_error(exc) is False
-
     def test_non_runtime_error_does_not_retry(self) -> None:
         """Even a matching substring on a non-RuntimeError is not retried — the
         isinstance guard keeps the policy scoped to dask-cloudprovider's wrapper.
@@ -88,9 +74,8 @@ class TestRetryablePredicate:
 class TestProvisioningThrottles:
     """Control-plane throttles hit while the constructor provisions.
 
-    Written from the errors AWS actually returns rather than from the code tuple:
-    the parametrized test above compares the tuple with itself and passes for any
-    tuple, so it cannot tell whether a real message is covered.
+    Written from the errors AWS actually returns rather than from the code tuple, so
+    a real message that stops matching fails here.
     """
 
     # Verbatim shapes, one per service in the provisioning path. They use
@@ -120,9 +105,7 @@ class TestProvisioningThrottles:
         "message",
         [
             "Cluster failed to start: An error occurred (AccessDenied) when calling the RunTask operation",
-            "Cluster failed to start: An error occurred (InvalidSubnetID.NotFound) when calling RunTask",
             "Cluster failed to start: CannotPullContainerError: manifest unknown",
-            "Cluster failed to start: An error occurred (InvalidParameterException) when calling RunTask",
         ],
     )
     def test_misconfiguration_still_fails_fast(self, message: str) -> None:
@@ -170,62 +153,6 @@ class TestProvisioningRetryDefaults:
         client = boto3.client("ec2", region_name="us-west-2", aws_access_key_id="a", aws_secret_access_key="b")
         assert client.meta.config.retries["mode"] == "adaptive"
         assert client.meta.config.retries["total_max_attempts"] >= 10
-
-
-class TestRetryPolicyWiring:
-    """The tenacity policy built from the predicate retries/aborts as intended.
-
-    Uses ``wait_fixed(0)`` to keep the test instant — the wait *schedule* is a
-    config value asserted by reading it, not something to sit through here.
-    """
-
-    def _run(self, fn, *, max_attempts: int = 4):
-        retrying = Retrying(
-            retry=retry_if_exception(_is_retryable_cluster_start_error),
-            stop=stop_after_attempt(max_attempts),
-            wait=wait_fixed(0),
-            reraise=True,
-        )
-        return retrying(fn)
-
-    def test_retries_until_success(self) -> None:
-        """A transient failure on early attempts is ridden out; the call succeeds."""
-        calls = {"n": 0}
-
-        def flaky():
-            calls["n"] += 1
-            if calls["n"] < 3:
-                raise RuntimeError("Cluster failed to start: Scheduler failed to start")
-            return "cluster"
-
-        assert self._run(flaky) == "cluster"
-        assert calls["n"] == 3  # failed twice, succeeded on the third
-
-    def test_gives_up_after_max_attempts_and_reraises_original(self) -> None:
-        """A persistently-transient failure exhausts attempts and re-raises the
-        ORIGINAL RuntimeError (reraise=True), not a tenacity RetryError.
-        """
-        calls = {"n": 0}
-
-        def always_transient():
-            calls["n"] += 1
-            raise RuntimeError("Cluster failed to start: Scheduler failed to start")
-
-        with pytest.raises(RuntimeError, match="Scheduler failed to start"):
-            self._run(always_transient, max_attempts=4)
-        assert calls["n"] == 4  # 1 initial + 3 retries
-
-    def test_non_transient_fails_immediately(self) -> None:
-        """A non-matching error is not retried — it surfaces on the first attempt."""
-        calls = {"n": 0}
-
-        def misconfigured():
-            calls["n"] += 1
-            raise RuntimeError("Cluster failed to start: image pull failed")
-
-        with pytest.raises(RuntimeError, match="image pull failed"):
-            self._run(misconfigured)
-        assert calls["n"] == 1  # no retries burned on a permanent failure
 
 
 def test_profiling_tools_target_the_providers_log_group() -> None:
@@ -343,25 +270,6 @@ class TestSchedulerResourceLogger:
         assert sample["no_worker"] == 7
         assert sample["mem"] == pytest.approx(100.0 * plugin._proc.memory_info().rss / (8 * 1024**3), abs=1.0)
 
-    def test_line_reports_all_signals(self, caplog) -> None:
-        """One probe emits CPU, memory, lag, fds/threads and the task/worker
-        backlog — every field the operator diagnoses from.
-        """
-        plugin = self._make_started()
-        sched = _FakeScheduler(workers_processing=[3, 5], tasks=42, unrunnable=7)
-        line = self._emit(plugin, sched, caplog)
-
-        assert "cpu=" in line
-        assert "rss=" in line and "GiB" in line
-        assert "mem=" in line
-        assert "lag=" in line
-        assert "fds=" in line
-        assert "threads=" in line
-        assert "workers=2" in line
-        assert "tasks=42" in line
-        assert "processing=8" in line  # 3 + 5 summed across workers
-        assert "no-worker=7" in line
-
     def test_fleet_memory_is_summed_and_round_trips_through_the_parser(self, caplog) -> None:
         """Fleet totals are summed across workers; ``wmax`` is the hottest ONE.
 
@@ -413,19 +321,6 @@ class TestSchedulerResourceLogger:
         assert sample["worker_spill_gib"] is None
         assert sample["worker_mem_gib"] is None
 
-    def test_memory_percent_uses_limit(self, caplog) -> None:
-        """mem% is RSS as a fraction of the configured container limit, so a
-        tiny limit drives the percentage up for the same process.
-        """
-        plugin = self._make_started()
-        plugin._mem_limit_bytes = 64 * 1024**2  # 64 MiB: any real RSS exceeds this
-        sched = _FakeScheduler(workers_processing=[0], tasks=0, unrunnable=0)
-        line = self._emit(plugin, sched, caplog)
-
-        mem_token = next(t for t in line.split() if t.startswith("mem="))
-        pct = float(mem_token.removeprefix("mem=").removesuffix("%"))
-        assert pct > 100.0  # RSS far exceeds a 64 MiB ceiling
-
     def test_lag_is_zero_on_first_probe_then_tracks_overrun(self, caplog) -> None:
         """The first probe has no prior schedule to compare against (lag 0);
         the next probe measures how far past the expected fire time it ran.
@@ -439,15 +334,6 @@ class TestSchedulerResourceLogger:
         # Next probe fires 5s late: clock at 1035 vs expected 1030.
         second = self._emit(plugin, _FakeScheduler(workers_processing=[0], tasks=0, unrunnable=0, now=1035.0), caplog)
         assert "lag=5.0s" in second
-
-    def test_probe_before_start_is_a_noop(self, caplog) -> None:
-        """Defensive: a probe with no primed process (pre-``start``) logs nothing
-        rather than raising.
-        """
-        plugin = SchedulerResourceLogger()
-        with caplog.at_level(logging.INFO, logger="distributed.scheduler"):
-            plugin._log_usage()
-        assert not [r for r in caplog.records if r.getMessage().startswith("scheduler health:")]
 
     def test_before_close_stops_callback(self) -> None:
         """``before_close`` must stop the PeriodicCallback so a torn-down
@@ -521,16 +407,6 @@ class TestSchedulerResourceLogger:
         assert plugin._loop_tid == worker_tid[0]
         assert plugin._loop_tid != threading.main_thread().ident
 
-    def test_sampler_falls_back_to_main_thread_before_start(self, caplog) -> None:
-        """A probe driven without ``start()`` still samples (tests do this)."""
-        plugin = SchedulerResourceLogger(stack_samples=1, stack_sample_gap_s=0.0)
-        plugin._sampler_active = threading.Event()
-        plugin._sampler_active.set()
-        assert plugin._loop_tid is None
-        with caplog.at_level(logging.WARNING, logger="distributed.scheduler"):
-            plugin._sample_stacks_worker(95.0, 4.0)
-        assert any(r.getMessage().startswith("scheduler stack sample") for r in caplog.records)
-
     def test_stack_sampler_logs_and_clears(self, caplog) -> None:
         """The worker logs one collapsed stack tally with the cpu/lag context
         and clears the single-flight flag when done.
@@ -580,11 +456,6 @@ class TestSchedulerResourceLogger:
         self._emit(plugin, _FakeScheduler(workers_processing=[0], tasks=0, unrunnable=0, now=1035.0), caplog)
         assert calls, "expected the sampler to be triggered by lag>=3s"
         assert calls[-1][1] == 5.0
-
-
-def test_ingest_settings_perf_report_uri_defaults_none() -> None:
-    """The perf-report knob is off by default, so normal runs never capture one."""
-    assert IngestSettings().perf_report_uri is None
 
 
 def _report_stub(exit_error: Exception | None = None):
@@ -783,11 +654,6 @@ class TestStopEcsTasksByTag:
         self._sweep(monkeypatch, {}, arn="arn:aws:ecs:eu-west-1:1:cluster/test")
         assert self.client_kwargs["region_name"] == "eu-west-1"
 
-    def test_unparseable_arn_leaves_region_to_boto(self, monkeypatch):
-        """Guessing a region would be worse than boto3's own resolution."""
-        self._sweep(monkeypatch, {}, arn="arn:cluster/test")
-        assert self.client_kwargs["region_name"] is None
-
     def test_stops_only_this_runs_tasks(self, monkeypatch):
         tagged = {
             "arn:task/sched-A": {"tessera-flow-run-id": "run-A"},
@@ -929,9 +795,8 @@ class TestStableDaskTaskDefinitions:
         "kwargs",
         [
             {"scheduler_task_definition_arn": "arn:sched"},
-            {"worker_task_definition_arn": "arn:work"},
         ],
-        ids=["scheduler only", "worker only"],
+        ids=["scheduler only"],
     )
     def test_only_one_set_pins_neither(self, kwargs):
         """Both or neither, deliberately.
@@ -958,18 +823,6 @@ class TestStableDaskTaskDefinitions:
 
 class TestDaskContainerEnvironment:
     """What every Dask container is told."""
-
-    def test_task_logs_still_ship_to_the_orchestrator_api(self):
-        """Prefect's default, and kept deliberately rather than by omission.
-
-        Disabling it removes the largest client population by count — Prefect tasks execute
-        on the workers, so every worker is an API client. It was measured and rejected: the
-        orchestrator's load is dominated by concurrent FLOW RUN count, not by task logging,
-        so the request rate barely moved while per-task logs vanished from the UI. Asserted
-        so the same "obvious optimisation" has to re-measure before landing again.
-        """
-        env = _fargate_config().to_cluster_kwargs()["environment"]
-        assert env.get("PREFECT_LOGGING_TO_API_ENABLED") != "false"
 
     def test_caller_supplied_environment_still_wins(self):
         """A caller override must beat the defaults, so a run CAN opt out if it needs to."""

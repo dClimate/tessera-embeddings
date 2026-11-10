@@ -179,7 +179,7 @@ def mark_zone_year_empty(
 
     Some of the 120 zones (and some zone-years under the partner land mask) contain no land at
     all, so there is nothing to stage or shard-write — but the campaign work list
-    (:meth:`CampaignStatus.pending`) must still see them land. This advances ``years_complete``
+    (:func:`campaign_work_list`) must still see them land. This advances ``years_complete``
     (and ``runs`` provenance when ``run_id`` is given) in one commit, exactly as
     :func:`~tessera_embeddings.storage.shard_writer.write_year_shards` would, minus the shards.
     ``year`` must be on the group's pre-allocated time axis (D1) — an off-axis year must never
@@ -272,29 +272,6 @@ class CampaignStatus:
         """Whether ``zone`` has landed ``year``."""
         return year in self.zones.get(zone, ())
 
-    def pending(
-        self,
-        *,
-        expected_zones: Iterable[str] | None = None,
-        years: Iterable[int] | None = None,
-    ) -> list[tuple[str, int]]:
-        """The ``(zone, year)`` cells still to fill, for the orchestrator's work list.
-
-        Defaults to all 120 zones x the campaign years; a zone not yet seeded counts every year
-        as pending. Ordered year-major (all zones of one year before the next) so a scheduler
-        draining the list concurrently never queues two years of the SAME zone back to back —
-        same-zone fills must be serial, since their attr commits conflict (see
-        :func:`~tessera_embeddings.storage.shard_writer.write_year_shards`).
-        """
-        zone_names = tuple(expected_zones) if expected_zones is not None else tuple(ZONES)
-        yrs = tuple(years) if years is not None else self.years
-        return [(z, y) for y in yrs for z in zone_names if not self.has(z, y)]
-
-    def years_fully_complete(self, *, expected_zones: Iterable[str] | None = None) -> list[int]:
-        """Years landed in *every* expected zone (default: all 120)."""
-        zone_names = tuple(expected_zones) if expected_zones is not None else tuple(ZONES)
-        return [y for y in self.years if all(self.has(z, y) for z in zone_names)]
-
 
 def campaign_status(
     repo: icechunk.Repository,
@@ -331,9 +308,9 @@ def campaign_work_list(
 ) -> list[tuple[str, int]]:
     """The ``(zone, year)`` cells a campaign run should dispatch, tag-aware.
 
-    Like :meth:`CampaignStatus.pending` (same zones filter + year-major order) but a cell counts
-    DONE only when it is BOTH in ``years_complete`` AND has its zone-year tag. Two consequences
-    the plain ``pending`` can't express:
+    Ordered year-major (all zones of one year before the next), so a scheduler draining the list
+    concurrently never queues two years of the SAME zone back to back. A cell counts DONE only
+    when it is BOTH in ``years_complete`` AND has its zone-year tag. Two consequences:
 
     - **Skip finished zones on a default re-run.** With ``expected_zones=None`` (all 120), a year
       that partially completed and is re-driven only dispatches the zones still missing — a

@@ -14,9 +14,8 @@ regardless of naming scheme.
 2. ``--report`` — fetch a fleet report from live workers: per-worker GPU-poll summary
    (avg/max util, avg power, busy fraction), a 1 s RAM summary (peak, time ≥55%/60%, top
    spikes), a staging-write concurrency histogram, OOM forensics (kernel OOM-killer + Ray
-   memory monitor events), and a per-chunk phase-split table. The table prefers the actors'
-   machine-readable ``CHUNK_SUMMARY`` JSON lines and falls back to legacy prose-log regex
-   parsing for runs from older code.
+   memory monitor events), and a per-chunk phase-split table built from the actors'
+   machine-readable ``CHUNK_SUMMARY`` JSON lines.
 
    The concurrency histogram answers what the phase table cannot: when a staging write
    costs more wall time than its byte volume explains, is the writer's concurrency cap
@@ -248,13 +247,11 @@ S3_SUMMARY_CMD = (
     'else echo "no s3_poll data (pollers not started?)"; fi'
 )
 
-# Runs on the worker: build the per-chunk phase table. Preferred source is the actors'
-# machine-readable CHUNK_SUMMARY JSON lines (see actors.py _chunk_summary_line — stable keys,
-# immune to prose-wording drift); the legacy prose-regex path is the fallback for runs from
-# code predating them.
+# Runs on the worker: build the per-chunk phase table from the actors' machine-readable
+# CHUNK_SUMMARY JSON lines (see actors.py _chunk_summary_line — stable keys, immune to
+# prose-wording drift).
 PHASE_PARSER = r"""
-import glob, json, os, re
-from datetime import datetime
+import glob, json, os
 
 LOGS = os.environ.get("TESSERA_RAY_LOGS", "/tmp/ray/session_latest/logs")
 
@@ -280,76 +277,7 @@ if summaries:
             s.get("total_s", "?"), f"{pxs:.0f}", s.get("status"),
         )))
 else:
-    # ------- legacy prose-log parsing (pre-CHUNK_SUMMARY code) -------
-    PAT = {
-     "pref": re.compile(r"^(\S+ \S+) \S+ INFO xchunk prefetch: hit \([^)]+\) for (\S+)"),
-     "tkept": re.compile(r"^(\S+ \S+) \S+ INFO Chunk (\S+): T_kept=(\d+) -> strip_h=(\d+) -> (\d+) strip"),
-     "ds": re.compile(r"^(\S+ \S+) \S+ INFO MosaicChunkInferenceDataset: (\d+) valid pixels"
-                      r" out of \d+ total \(([\d.]+)%\) in (\d+) buckets"),
-     "start": re.compile(r"^(\S+ \S+) \S+ INFO Starting v1.1 inference"),
-     "idone": re.compile(r"^(\S+ \S+) \S+ INFO Inference complete: .* ([\d.]+)s total, (\d+) px/sec"),
-     "cdone": re.compile(r"^(\S+ \S+) \S+ INFO Chunk (\S+) complete: (\d+) valid pixels, ([\d.]+)s"),
-    }
-    def ts(s): return datetime.strptime(s, "%Y-%m-%d %H:%M:%S,%f")
-    events = []
-    for f in glob.glob(f"{LOGS}/worker-*.err"):
-        for line in open(f, errors="replace"):
-            for kind, pat in PAT.items():
-                m = pat.match(line.strip())
-                if m: events.append((ts(m.group(1)), kind, m.groups()[1:]))
-    events.sort(key=lambda e: e[0])
-    # Overhead accounting: overhead_s = total_s - infer_s - write_s is the honest
-    # per-chunk non-inference cost in BOTH modes — it's derived from the wall-clock
-    # total (measured from the top of _process_chunk, before any prologue work) minus
-    # the two GPU-adjacent phases, so it captures cold load regardless of where the
-    # load lines fall. prologue_s (T_kept-log -> inference-start) is main-thread-only
-    # and UNDERSTATES cold chunks: the "Chunk T_kept" line is emitted after the
-    # prologue's SCL/band read, and with cross-chunk prefetch (Phase 1) the band/SAR
-    # loads log during the PREVIOUS chunk's window entirely. Read overhead_s for the
-    # real figure; prologue_s only isolates main-thread build. pref=Y marks chunks
-    # that consumed a prefetched stash (expect their overhead_s ~= write_s).
-    # A split chunk calls run_inference once per strip, so ds/start/idone lines
-    # repeat within one chunk. Accumulate: t_start = FIRST strip's inference start,
-    # infer_s = SUM of every strip's reported inference seconds, t_idone = LAST
-    # strip's completion. valid_px comes from the actor's chunk-total "complete: N
-    # valid pixels" (cdone) line — NOT the per-strip ds sum, which under-counts
-    # multi-strip chunks (a strip with no valid pixels emits no ds line, and the ds
-    # count is per-strip-within-crop); px/s is the honest END-TO-END rate
-    # valid_px / total_s. ds lines are still summed as a fallback if cdone is absent.
-    rows, cur, prev_done, pending_pref = [], None, None, set()
-    for t, kind, g in events:
-        if kind == "pref":
-            pending_pref.add(g[0])
-        elif kind == "tkept":
-            gap = (t - prev_done).total_seconds() if prev_done else None
-            cur = {"label": g[0], "tkept": g[1], "strips": g[3], "gap_s": gap, "t_mask": t,
-                   "pref": "Y" if g[0] in pending_pref else "N", "infer_s": 0.0, "px": 0}
-            pending_pref.discard(g[0])
-        elif cur is None: continue
-        elif kind == "ds":
-            if "buckets" not in cur: cur["buckets"] = g[2]  # first strip's bucket count
-            cur["px"] += int(g[0])
-        elif kind == "start":
-            if "t_start" not in cur: cur["t_start"] = t
-        elif kind == "idone":
-            cur["t_idone"] = t  # last strip wins
-            cur["infer_s"] += float(g[0])
-        elif kind == "cdone":
-            cur["t_cdone"], cur["cdone_px"], cur["total_s"] = t, int(g[1]), g[2]
-            rows.append(cur); prev_done = t; cur = None
-    print("label\tTkept\tstrips\tpref\tbuckets\tvalid_px\tprologue_s\tinfer_s\twrite_s\toverhead_s\ttotal_s\tpx/s")
-    for r in rows:
-        try:
-            prologue = (r["t_start"] - r["t_mask"]).total_seconds()
-            write = (r["t_cdone"] - r["t_idone"]).total_seconds()
-            infer = r["infer_s"]
-            total = float(r["total_s"])
-            overhead = total - infer - write
-            vpx = r.get("cdone_px", r["px"])  # authoritative chunk-total; ds-sum fallback
-            pxs = (vpx / total) if total > 0 else 0  # honest END-TO-END px/s
-            print(f"{r['label']}\t{r['tkept']}\t{r['strips']}\t{r['pref']}\t{r.get('buckets','?')}\t{vpx}\t{prologue:.1f}\t{infer:.1f}\t{write:.1f}\t{overhead:.1f}\t{r['total_s']}\t{pxs:.0f}")
-        except KeyError as e:
-            print(f"{r['label']}\tINCOMPLETE({e})")
+    print("no CHUNK_SUMMARY lines in the worker logs (no chunk has finished yet?)")
 """
 
 REPORT_COMMANDS = [

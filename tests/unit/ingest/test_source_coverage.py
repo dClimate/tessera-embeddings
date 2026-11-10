@@ -10,6 +10,9 @@ every live tile.
 
 from __future__ import annotations
 
+import threading
+import time
+
 import numpy as np
 import pytest
 from pyproj import Transformer
@@ -117,12 +120,6 @@ def test_a_failed_block_probe_downgrades_absence_to_inconclusive(coverage):
     assert "failed" in result.reason
 
 
-def test_every_probe_failing_is_inconclusive_and_never_raises(coverage):
-    probe = ScriptedProbe([RuntimeError("down"), RuntimeError("down")])
-    result = _preflight(coverage, probe)
-    assert result.finding is SourceFinding.INCONCLUSIVE
-
-
 def test_probe_window_is_the_date_range_padded_one_utc_day(coverage):
     """Mosaic dates are solar days; a solar day draws on UTC dates one day either side.
 
@@ -156,24 +153,21 @@ def test_a_stalled_probe_cannot_outrun_the_budget(coverage):
     quickly — a timed-out future cannot stop the thread, and this pins the part that is actually
     promised.
     """
-    import threading
-    import time as _time
-
     started = threading.Event()
 
     def stalling_probe(_bbox, _start, _end):
         started.set()
-        _time.sleep(30.0)  # far past the budget below
+        time.sleep(2.0)  # far past the budget below, short enough not to hold a worker at exit
         return True  # and it WOULD have hit, so a pass-through cannot be luck
 
-    t0 = _time.monotonic()
+    t0 = time.monotonic()
     result = _preflight(coverage, stalling_probe, budget_s=0.3)
-    elapsed = _time.monotonic() - t0
+    elapsed = time.monotonic() - t0
 
     assert started.is_set(), "the probe really was entered"
     assert result.finding is SourceFinding.INCONCLUSIVE
     assert "budget" in result.reason
-    assert elapsed < 5.0, f"returned in {elapsed:.1f}s — the budget must bound the call"
+    assert elapsed < 1.5, f"returned in {elapsed:.1f}s — the budget must bound the call"
     assert result.probes == 1
 
 

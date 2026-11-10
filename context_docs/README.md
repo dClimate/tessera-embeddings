@@ -13,8 +13,8 @@ try that failed?" — one per pipeline stage, so a question about ingest has exa
 ```
 context_docs/
 ├── corrections-register.md        EVERY withdrawn figure, grouped by how it went wrong
-├── test-suite-streamlining.md     this repo's own test suite: what has been done to it, and
-│                                  what is left
+├── test-suite-reduction/          this repo's own test suite: the 2026-11 reduction plan and
+│                                  the record of what it did
 │
 ├── decisions/                     Architecture Decision Records — 1 page each, append-only
 │   ├── 001-thin-prefect-wrapping.md

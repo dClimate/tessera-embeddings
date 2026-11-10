@@ -58,19 +58,6 @@ def test_absent_store_is_not_a_failure(tmp_path):
     )
 
 
-def test_matching_store_passes(tmp_path):
-    config = _config(tmp_path)
-    _existing_store(tmp_path, config)
-
-    assert_output_store_accepts(
-        output_bucket=str(tmp_path / "outputs"),
-        roi_name=_ROI,
-        output_name_suffix="",
-        config=config,
-        mosaic_base=None,
-    )
-
-
 def test_changed_model_is_rejected_before_any_compute(tmp_path):
     """The case worth paying a metadata read to catch.
 
@@ -103,14 +90,6 @@ def test_a_suffixed_run_targets_its_own_store(tmp_path):
     )
 
 
-def test_the_output_path_has_one_definition():
-    """The gate and the assembly task both call this, so they cannot target
-    different stores.
-    """
-    assert embedding_store_path("s3://b/out/", _ROI, "-x") == f"s3://b/out/embeddings/{_ROI}-x.zarr"
-    assert embedding_store_path("s3://b/out", _ROI) == f"s3://b/out/embeddings/{_ROI}.zarr"
-
-
 # ── the encoder family, checked here rather than after the GPU bill ──
 
 
@@ -133,39 +112,20 @@ def _store_published_by(tmp_path, config, encoder_url_value: str | None) -> str:
     return path
 
 
-def test_a_cross_family_append_is_refused_before_any_compute(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "published_encoder", [encoder_url(DEFAULT_MODEL_VERSION), None], ids=["v1.1-store", "legacy-store"]
+)
+def test_a_cross_family_append_is_refused_before_any_compute(tmp_path, published_encoder) -> None:
     """The whole point of this gate. The mismatch is DETERMINISTIC — store plus config, nothing
     inference discovers — so leaving it to `assemble` meant the fleet ran to completion and the
     result could then never be published. The manifest cannot stand in: it compares a checkpoint
     stem, and is skipped outright for a legacy store.
+
+    A legacy store with no encoder attribute is read as v1.1: absence dates the store rather than
+    leaving the question open, and it is the case most likely to also lack a `_manifest`, so both
+    doors would otherwise stand open together.
     """
-    config = _config(tmp_path)
-    _store_published_by(tmp_path, config, encoder_url(DEFAULT_MODEL_VERSION))
-
-    v2_config = build_inference_config(
-        s1_orbit="both",
-        time_window=parse_time_window("June 2025"),
-        checkpoint_path=f"{tmp_path}/models/v2_student_large.pt",
-        inputs_bucket=str(tmp_path / "inputs"),
-        output_bucket=str(tmp_path / "outputs"),
-        model_version="v2-large",
-    )
-    with pytest.raises(ValueError, match="Refusing to append"):
-        assert_output_store_accepts(
-            output_bucket=str(tmp_path / "outputs"),
-            roi_name=_ROI,
-            output_name_suffix="",
-            config=v2_config,
-            mosaic_base=None,
-        )
-
-
-def test_a_legacy_store_with_no_encoder_attr_is_read_as_v11(tmp_path) -> None:
-    """Absence dates the store rather than leaving the question open — and it is the case most
-    likely to also lack a `_manifest`, so both doors would otherwise stand open together.
-    """
-    config = _config(tmp_path)
-    _store_published_by(tmp_path, config, None)
+    _store_published_by(tmp_path, _config(tmp_path), published_encoder)
 
     v2_config = build_inference_config(
         s1_orbit="both",

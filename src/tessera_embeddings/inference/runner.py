@@ -170,7 +170,6 @@ def run_inference(
         staged = writer.scan_existing_staged_artifacts(
             run_id,
             chunks,
-            compute_std=config.compute_std,
             log=log,
         )
         already_done, resumed_skips = staged.done, staged.skipped

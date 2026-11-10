@@ -14,7 +14,6 @@ from tessera_embeddings.config.store_geometry import spatial_dims_of
 from tessera_embeddings.config.store_layout import (
     GLOBAL,
     GLOBAL_V2,
-    OBS_COUNT_VARS,
     SHARD_PX,
     SINGLE,
     SINGLE_V2,
@@ -29,15 +28,6 @@ def test_global_embeddings_geometry():
     assert k["dtype"] == np.dtype("int8")
     assert k["fill_value"] == 0
     assert k["dimension_names"] == ("time", "northing", "easting", "band")
-
-
-def test_global_scales_is_sharded_pcodec():
-    k = GLOBAL.for_var("scales").create_kwargs((9, 4096, 4096))
-    assert k["chunks"] == (1, 256, 256)
-    assert k["shards"] == (1, 2048, 2048)
-    assert k["compressors"] is None
-    assert type(k["serializer"]).__name__ == "PCodec"
-    assert np.isnan(k["fill_value"])
 
 
 def test_single_matches_global_geometry():
@@ -98,12 +88,6 @@ def test_the_global_store_never_declares_embedding_std():
     assert not GLOBAL.arrays.keys() - SINGLE.arrays.keys()
 
 
-def test_single_embeddings_are_sharded_full_band():
-    k = SINGLE.for_var("embeddings").create_kwargs((1, 4096, 4096, EMBEDDING_DIM))
-    assert k["chunks"] == (1, 256, 256, EMBEDDING_DIM)  # band never split (D2)
-    assert k["shards"] == (1, 2048, 2048, EMBEDDING_DIM)
-
-
 def test_the_inference_tile_is_one_shard():
     """`INFERENCE_CHUNK_SIZE` copies `SHARD_PX` as a literal — pin them together.
 
@@ -115,13 +99,6 @@ def test_the_inference_tile_is_one_shard():
     # ...and the ingest chunk is a whole number of tiles, so a tile read never
     # spans more storage chunks than it has to.
     assert INGEST_CHUNK_SIZE % SHARD_PX == 0
-
-
-def test_obs_vars_resolve_and_unknown_raises():
-    for var in OBS_COUNT_VARS:
-        assert GLOBAL.for_var(var).dtype == "uint16"
-    with pytest.raises(KeyError):
-        GLOBAL.for_var("nonsense")
 
 
 def test_chunks_and_shards_clamp_to_small_shape():

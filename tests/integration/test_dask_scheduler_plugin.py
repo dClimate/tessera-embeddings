@@ -8,8 +8,7 @@ the plugin starts on the scheduler's own event loop — and it is not observable
 Lives here rather than beside the unit tests because it stands up a ``LocalCluster``. It was
 in ``tests/unit/providers/test_provider_aws_dask.py`` carrying ``@pytest.mark.integration``, where the
 root ``addopts`` deselected it and no workflow ran ``tests/unit`` with the marker enabled —
-so it had never executed in CI. Moved 2026-08-25, unchanged apart from this docstring; see
-``context_docs/test-suite-streamlining.md``, Phase 2 item 2.5.
+so it had never executed in CI. Moved 2026-08-25, unchanged apart from this docstring.
 """
 
 from __future__ import annotations
