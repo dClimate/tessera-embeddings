@@ -748,7 +748,7 @@ def ingest_s1_roi_sar(
             query_s,
         )
         if data is not None:
-            data = apply_roi_mask(data, roi_zarr_path, spatial_chunks, roi_mask=batch_mask)
+            data = apply_roi_mask(data, batch_mask)
         return _PreparedBatch(
             batch_start_str,
             batch_end_str,

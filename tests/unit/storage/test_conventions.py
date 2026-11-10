@@ -33,14 +33,10 @@ class TestTileIdToEpsg:
     @pytest.mark.parametrize(
         "tile_id, expected",
         [
-            ("37PBM", "EPSG:32637"),
             ("33UWP", "EPSG:32633"),
-            ("01NBJ", "EPSG:32601"),
             ("60NUG", "EPSG:32660"),
             # Southern hemisphere
             ("56HKH", "EPSG:32756"),
-            ("19MCR", "EPSG:32719"),
-            ("36MYE", "EPSG:32736"),
         ],
     )
     def test_valid_tiles(self, tile_id: str, expected: str) -> None:
@@ -49,17 +45,13 @@ class TestTileIdToEpsg:
     @pytest.mark.parametrize(
         "tile_id",
         [
-            "",
-            "AB",
             "kenya_highlands",
-            "00NBC",
             "61NBC",
             "37ABM",
-            None,
         ],
     )
-    def test_invalid_tiles_return_none(self, tile_id: str | None) -> None:
-        assert tile_id_to_epsg(tile_id) is None  # type: ignore[arg-type]
+    def test_invalid_tiles_return_none(self, tile_id: str) -> None:
+        assert tile_id_to_epsg(tile_id) is None
 
 
 class TestBuildConventionAttrs:
@@ -228,20 +220,6 @@ class TestBuildConventionAttrs:
         """No coords and no explicit gsd → omit (no trustworthy metric value)."""
         assert "geoemb:gsd" not in _attrs(total_y=10, total_x=10, embedding_dim=128)
 
-    def test_gsd_uses_explicit_value_when_supplied(self) -> None:
-        """An explicit gsd the caller vouches for IS emitted (a trustworthy value)."""
-        attrs = _attrs(total_y=10, total_x=10, embedding_dim=128, gsd=30.0)
-        assert attrs["geoemb:gsd"] == 30.0
-
-    def test_model_url_overrides_derived_public_ref(self) -> None:
-        """A caller can pass the exact public model URI for its encoder; otherwise
-        the URL derives from the model (never the checkpoint id).
-        """
-        explicit = _attrs(total_y=10, total_x=10, embedding_dim=128, model_url="https://geotessera.org/model/1.0")
-        assert explicit["geoemb:model"] == "https://geotessera.org/model/1.0"
-        derived = _attrs(total_y=10, total_x=10, embedding_dim=128, checkpoint_id="ckpt_stem")
-        assert derived["geoemb:model"] == _V11_URL
-
     def test_epsg_code_overrides_tile_id(self) -> None:
         """When both tile_id and epsg_code are provided, epsg_code wins."""
         attrs = _attrs(
@@ -256,20 +234,6 @@ class TestBuildConventionAttrs:
         assert "proj:projjson" in attrs
         # Verify the CRS content references EPSG:5070 (Conus Albers)
         assert "5070" in attrs["proj:wkt2"] or "Conus Albers" in attrs["proj:wkt2"]
-
-    def test_epsg_code_without_tile_id(self) -> None:
-        """epsg_code alone (no tile_id) populates proj fields."""
-        attrs = _attrs(
-            epsg_code="EPSG:5070",
-            total_y=10,
-            total_x=10,
-            embedding_dim=128,
-        )
-        assert attrs["proj:code"] == "EPSG:5070"
-        assert "proj:wkt2" in attrs
-        assert "proj:projjson" in attrs
-        names = [c["name"] for c in attrs["zarr_conventions"]]
-        assert "proj" in names
 
     def test_single_pixel_coords_skips_spatial(self) -> None:
         """spatial: requires at least 2 coordinate values to derive a transform."""

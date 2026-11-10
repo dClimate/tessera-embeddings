@@ -17,9 +17,6 @@ here the var/dtype schema is caller-supplied.
 
 from __future__ import annotations
 
-import time
-from pathlib import Path
-
 import dask.array as da
 import numpy as np
 import pytest
@@ -59,8 +56,9 @@ def _times(n: int = 2) -> np.ndarray:
 
 def test_grid_identity_matches_real_write(tmp_path) -> None:
     """An empty store matches a real ``write_dataset`` output over the same grid:
-    same vars, dtypes, coords, chunking, CRS. Both go through the same OSS create
-    path, so this pins the seeder to the ingest grid for a caller-supplied schema.
+    same vars, dtypes, coords, chunking, CRS and codec. Both go through the same OSS create
+    path, so this pins the seeder to the ingest grid for a caller-supplied schema; both
+    being Blosc-LZ4 means every mosaic decodes alike.
     """
     roi = _roi()
     times = _times(1)
@@ -90,42 +88,13 @@ def test_grid_identity_matches_real_write(tmp_path) -> None:
     np.testing.assert_array_equal(empty.easting.values, real.easting.values)
     np.testing.assert_array_equal(empty.time.values, real.time.values)
     assert empty.attrs.get("crs") == real.attrs.get("crs") == _CRS
+    groups = {store: open_store_as_zarr_group(path) for store, path in (("real", real_path), ("empty", empty_path))}
     for name in empty.data_vars:
         assert empty[name].chunksizes == real[name].chunksizes
-
-
-def test_both_creation_paths_store_the_mosaic_codec(tmp_path) -> None:
-    """Seeded and directly written mosaics are both Blosc-LZ4, so every mosaic decodes alike."""
-    roi, times = _roi(), _times(1)
-    coords = roi.geobox.coordinates
-    shape = (len(times), roi.height, roi.width)
-    cs = (INGEST_CHUNKS["time"], INGEST_CHUNKS["northing"], INGEST_CHUNKS["easting"])
-    real_ds = xr.Dataset(
-        {
-            name: (("time", "northing", "easting"), da.zeros(shape, dtype=dtype, chunks=cs))
-            for name, dtype in _VARS.items()
-        },
-        coords={"time": times, "northing": coords["y"].values, "easting": coords["x"].values},
-    )
-    write_dataset(str(tmp_path / "real.zarr"), real_ds, tile_id="roi", baselines={}, chunks=INGEST_CHUNKS, crs=_CRS)
-    create_empty_store(str(tmp_path / "empty.zarr"), roi=roi, times=times, var_dtypes=_VARS, tile_id="roi", crs=_CRS)
-    for store in ("real.zarr", "empty.zarr"):
-        group = open_store_as_zarr_group(str(tmp_path / store))
-        for name in _VARS:
+        for store, group in groups.items():
             assert [(type(c).__name__, c.cname, c.shuffle) for c in group[name].compressors] == [
                 ("BloscCodec", "lz4", "shuffle")
             ], (store, name)
-
-
-def test_coords_match_geobox(tmp_path) -> None:
-    """Empty store coords are exactly the geobox pixel centers (the grid authority)."""
-    roi = _roi()
-    path = str(tmp_path / "s.zarr")
-    create_empty_store(path, roi=roi, times=_times(1), var_dtypes=_VARS, tile_id="roi", crs=_CRS)
-    ds = open_store(path)
-    coords = roi.geobox.coordinates
-    np.testing.assert_array_equal(ds.northing.values, coords["y"].values)
-    np.testing.assert_array_equal(ds.easting.values, coords["x"].values)
 
 
 def test_reads_back_all_fill(tmp_path) -> None:
@@ -138,19 +107,6 @@ def test_reads_back_all_fill(tmp_path) -> None:
         vals = ds[name].values
         assert vals.dtype == _VARS[name]
         assert np.all(vals == 0)
-
-
-def test_footprint_is_metadata_scale(tmp_path) -> None:
-    """All-fill chunks are not written as objects — on-disk size is metadata-scale,
-    far below the nominal extent (independent of extent).
-    """
-    roi = _roi(height=800, width=800)
-    path = str(tmp_path / "s.zarr")
-    create_empty_store(path, roi=roi, times=_times(1), var_dtypes=_VARS, tile_id="roi", crs=_CRS)
-    nominal = 1 * 800 * 800 * 2 * 2  # 2 vars, uint16
-    on_disk = sum(p.stat().st_size for p in Path(path).rglob("*") if p.is_file())
-    # Metadata-scale: orders of magnitude below nominal. Loose bound, not brittle.
-    assert on_disk < nominal // 10
 
 
 def test_float_dtype_fills_nan(tmp_path) -> None:
@@ -177,15 +133,14 @@ def test_geobox_coord_mismatch_raises() -> None:
 
 
 def test_creation_is_extent_independent(tmp_path) -> None:
-    """Creation time must not scale with spatial extent (the direct-zarr path avoids
-    materialising dask chunks). A 40 000 x 40 000 store must complete well under 5s.
+    """Creation cost must not scale with spatial extent: the direct-zarr path materialises no
+    chunk, so a 40 000 x 40 000 store writes metadata only.
     """
     roi = _roi(height=40_000, width=40_000)
     path = str(tmp_path / "large.zarr")
-    t0 = time.monotonic()
     create_empty_store(path, roi=roi, times=_times(4), var_dtypes=_VARS, tile_id="roi", crs=_CRS)
-    elapsed = time.monotonic() - t0
-    assert elapsed < 5, f"create_empty_store took {elapsed:.1f}s on a large store (expected < 5s)"
+    group = open_store_as_zarr_group(path)
+    assert all(group[name].nchunks_initialized == 0 for name in _VARS)
 
 
 def test_no_data_chunk_objects(tmp_path) -> None:

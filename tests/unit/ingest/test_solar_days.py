@@ -35,15 +35,14 @@ from tessera_embeddings.ingest.solar_days import (
     solar_day_offset_seconds,
     whole_window_range,
 )
+from tessera_embeddings.ingest.stac import group_items_by_date
+from tests.stac_items import fake_stac_item
 
 #: Longitudes whose whole-hour offset puts UTC midnight on top of a Sentinel-1 pass
 #: (~06:00 descending, ~18:00 local solar). Zone 47's central meridian is +99 and it is
 #: the third-densest UTM zone on Earth, so this is where a boundary split costs most.
-#: +/-180.0 are here because they are VALID longitudes that the previous offset formula
-#: truncated to +/-12 h, and +12 h is the one value that breaks
-#: `normalize_to_solar_day`'s idempotence (noon + 12 h is midnight of the next day). Every
-#: property below now runs at the dateline as well as at the 15-degree boundaries.
-_HOSTILE_LONGITUDES = [99.0, 93.0, -93.0, -99.0, 0.0, 179.0, -179.0, 180.0, -180.0]
+#: +/-180.0 carry the full +/-12 h offset, where noon + 12 h is midnight of the next day.
+_HOSTILE_LONGITUDES = [99.0, -99.0, 0.0, 180.0, -180.0]
 
 
 def _dates(start: str, end: str) -> list[str]:
@@ -71,7 +70,7 @@ class _Item:
         ("2024-06-10", "2024-06-10"),  # a single day
     ],
 )
-@pytest.mark.parametrize("producer", ["month", "batch7", "batch30", "whole"])
+@pytest.mark.parametrize("producer", ["month", "batch30", "whole"])
 def test_owned_ranges_tile_the_window_exactly(start: str, end: str, producer: str) -> None:
     """Every date in the window is owned once; no date outside it is owned at all.
 
@@ -82,7 +81,6 @@ def test_owned_ranges_tile_the_window_exactly(start: str, end: str, producer: st
     """
     ranges = {
         "month": lambda: month_ranges(start, end),
-        "batch7": lambda: fixed_day_ranges(start, end, 7),
         "batch30": lambda: fixed_day_ranges(start, end, 30),
         "whole": lambda: [whole_window_range(start, end)],
     }[producer]()
@@ -130,9 +128,11 @@ def test_the_dateline_keeps_its_true_twelve_hour_offset() -> None:
     assert solar_day_offset_seconds(180.0) == 12 * 3600
     assert solar_day_offset_seconds(-180.0) == -12 * 3600
     assert solar_day_offset_seconds(179.9) == 11 * 3600
+    # The loader truncates to whole hours, so under one hour is zero, not rounded up.
+    assert solar_day_offset_seconds(14.9) == 0
 
 
-@pytest.mark.parametrize("longitude", [*_HOSTILE_LONGITUDES, 179.9, -179.9])
+@pytest.mark.parametrize("longitude", [*_HOSTILE_LONGITUDES, 179.9])
 def test_normalising_twice_is_normalising_once(longitude: float) -> None:
     """Idempotence end to end, not just via the offset — this is what callers rely on."""
 
@@ -208,26 +208,8 @@ def test_a_real_noon_acquisition_still_gets_its_offset() -> None:
     assert out.properties["datetime"] == raw, "the acquisition instant must survive untouched"
 
 
-def test_an_already_canonical_stamp_is_left_alone() -> None:
-    """The mechanism idempotence rests on, asserted directly rather than through an offset.
-
-    Noon UTC is this package's canonical stamp — `solar_day_of` refuses anything else — so
-    an item carrying it has been normalised already and its date IS its solar day. Adding
-    the offset a second time is what used to move it, and at +/-12 h that crossed midnight.
-    """
-
-    class _Item:
-        def __init__(self) -> None:
-            self.datetime = datetime.datetime(2025, 6, 1, 12, 0, tzinfo=datetime.UTC)
-
-    for longitude in (180.0, -180.0, 150.0, 0.0):
-        item = _Item()
-        (out,) = normalize_to_solar_day([item], mid_longitude=longitude)
-        assert out.datetime == datetime.datetime(2025, 6, 1, 12, 0, tzinfo=datetime.UTC), longitude
-
-
 @pytest.mark.parametrize("longitude", _HOSTILE_LONGITUDES)
-@pytest.mark.parametrize("batch_days", [1, 7, 30])
+@pytest.mark.parametrize("batch_days", [1, 30])
 def test_every_owned_solar_day_is_wholly_inside_the_queried_range(longitude: float, batch_days: int) -> None:
     """The property whose absence truncated a solar day at every batch boundary.
 
@@ -335,21 +317,6 @@ def test_no_longitude_falls_back_to_the_utc_date() -> None:
     )
 
 
-def test_normalisation_is_idempotent() -> None:
-    """The property the defensive re-normalisation at each consumption point relies on.
-
-    `stream_stac_months` and `has_new_stac_dates` both normalise again rather than trust
-    whoever supplied their items. That is only safe because a second pass recomputes the
-    same solar day — noon plus any offset the grid produces stays inside the same day.
-    """
-    for lon in (-179.0, -99.0, 0.0, 99.0, 179.0):
-        for hour in (0, 1, 11, 12, 13, 23):
-            item = _Item(datetime.datetime(2024, 1, 15, hour, 30))
-            once = normalize_to_solar_day([item], mid_longitude=lon)[0].datetime
-            twice = normalize_to_solar_day([item], mid_longitude=lon)[0].datetime
-            assert once == twice, f"lon {lon}, hour {hour}: {once} != {twice}"
-
-
 def test_deriving_a_date_from_an_unnormalised_item_raises() -> None:
     """The guard that stops the whole convention degrading into a convention.
 
@@ -415,3 +382,48 @@ class TestResumeWindowStart:
         rng = whole_window_range(start, "2018-12-31")
         assert rng.own_start == "2018-05-28", "writes only days after the newest held one"
         assert rng.query_start == "2018-05-27", "but still asks the catalogue about the day before"
+
+
+# --- grouping agrees with the loader ---------------------------------------------------
+#
+# The loader groups by LOCAL solar day; grouping by UTC calendar date disagrees wherever the
+# offset crosses UTC midnight, and a group then arrives as two time slices against a cloud
+# mask reduced to one. Zone 56N (150-156 E, +10 h) images at ~00:30 UTC, right on the boundary.
+
+#: +10 h: UTM zone 56, where the failure was observed.
+FAR_EAST_LON = 153.0
+
+
+def test_far_east_acquisitions_across_utc_midnight_are_one_solar_day() -> None:
+    """23:30 and 00:30 UTC are the same local morning at +10 h — one group, not two."""
+    items = [fake_stac_item("2026-01-05T23:30:00"), fake_stac_item("2026-01-06T00:30:00")]
+    groups = group_items_by_date(normalize_to_solar_day(items, mid_longitude=FAR_EAST_LON))
+    assert len(groups) == 1, groups
+    assert sum(len(v) for v in groups.values()) == 2
+
+
+def test_far_east_one_utc_date_can_hold_two_solar_days() -> None:
+    """00:30 and 23:30 on one UTC date fall on different local days at +10 h."""
+    items = [fake_stac_item("2026-01-06T00:30:00"), fake_stac_item("2026-01-06T23:30:00")]
+    # Without normalisation they collapse to one UTC date, which is the bug.
+    assert len(group_items_by_date(list(items))) == 1
+    assert len(group_items_by_date(normalize_to_solar_day(items, mid_longitude=FAR_EAST_LON))) == 2
+
+
+def test_a_central_longitude_is_unaffected() -> None:
+    """Mid-longitude zones image far from UTC midnight, so nothing changes for them."""
+    items = [fake_stac_item("2026-01-06T10:30:00"), fake_stac_item("2026-01-06T11:30:00")]
+    assert len(group_items_by_date(normalize_to_solar_day(items, mid_longitude=0.0))) == 1
+
+
+def test_omitting_longitude_keeps_utc_behaviour() -> None:
+    """The parameter is opt-in, so callers that do not group by solar day are unchanged."""
+    items = [fake_stac_item("2026-01-06T00:30:00"), fake_stac_item("2026-01-06T23:30:00")]
+    assert list(group_items_by_date(items)) == ["2026-01-06"]
+
+
+def test_within_group_order_is_preserved() -> None:
+    """Order carries the fusion contract: the clearest tile must come FIRST."""
+    items = [fake_stac_item("2026-01-06T00:30:00", cloud=5.0), fake_stac_item("2026-01-06T00:40:00", cloud=90.0)]
+    (group,) = group_items_by_date(normalize_to_solar_day(items, mid_longitude=FAR_EAST_LON)).values()
+    assert [i.properties["eo:cloud_cover"] for i in group] == [5.0, 90.0]

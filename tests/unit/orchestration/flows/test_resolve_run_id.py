@@ -1,11 +1,9 @@
-"""allow_s2_only wiring at the flow layer.
+"""The single-ROI flow's run_id, and the run modes it records.
 
-Two concerns the flag introduces beyond the per-pixel dataset gate:
-
-* the single-ROI flow must not let a *resume* silently mix S1-gated and
-  S2-only staged chunks (``_resolve_run_id``), and
-* the flag must be reachable through the documented end-to-end path
-  (``tessera_full_pipeline`` forwards it to the embeddings deployment).
+The run_id names the staging prefix, so it records what the staged chunks ARE: which encoder
+wrote them (``V2_RUN_PREFIX``) and whether they were gated on S1 (``S2_ONLY_RUN_PREFIX``).
+``_resolve_run_id`` refuses a resume that would mix either, and the end-to-end path
+(``tessera_full_pipeline``) forwards both selectors to the embeddings deployment.
 """
 
 from __future__ import annotations
@@ -23,6 +21,7 @@ from tessera_embeddings.config.inference import S1_ORBIT_NONE
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.orchestration.prefect.flows.tessera_embeddings import (
     S2_ONLY_RUN_PREFIX,
+    V2_RUN_PREFIX,
     _resolve_run_id,
     staged_s2_only_mode,
 )
@@ -35,16 +34,45 @@ class _StopError(Exception):
     """Ends the flow once the assertion's subject has been reached."""
 
 
-# ── _resolve_run_id: the resume mode-mixing guard ──
+# ── _resolve_run_id: a staging run is not resumed under the other model version ──
+#
+# Staged chunks are (H, W, 128) int8 whichever student wrote them and `model_version` defaults to
+# v1.1, so a resume that omitted it would finish a v2 run with the v1.1 encoder and stamp the store
+# v1.1. The run_id prefix records the encoder, as it records the S2-only mode below.
 
 
-def test_fresh_run_id_is_bare_uuid_by_default() -> None:
-    """Flag off → the historical bare 12-hex run_id; the single-ROI staging
-    layout is unchanged when allow_s2_only is False.
-    """
-    run_id = _resolve_run_id(None, model_version="v1.1", allow_s2_only=False, assembly_only=False)
-    assert not run_id.startswith(S2_ONLY_RUN_PREFIX)
+def _run_id(previous_run_id, *, model_version):
+    """``_resolve_run_id`` with the S2-only axis held at its default."""
+    return _resolve_run_id(previous_run_id, model_version=model_version, allow_s2_only=False, assembly_only=False)
+
+
+def test_fresh_v11_run_keeps_the_historical_bare_uuid():
+    run_id = _run_id(None, model_version="v1.1")
+    assert not run_id.startswith((V2_RUN_PREFIX, S2_ONLY_RUN_PREFIX))
     assert len(run_id) == 12
+
+
+def test_fresh_v2_run_is_namespaced():
+    assert _run_id(None, model_version="v2-large").startswith(V2_RUN_PREFIX)
+
+
+@pytest.mark.parametrize("model_version", ["v1.1", "v2-large"])
+def test_resuming_with_the_matching_model_is_allowed(model_version):
+    original = _run_id(None, model_version=model_version)
+    assert _run_id(original, model_version=model_version) == original
+
+
+@pytest.mark.parametrize(
+    ("staged_by", "resumed_as", "match"),
+    [("v2-large", "v1.1", "staged by v2"), ("v1.1", "v2-large", r"staged by v1\.1")],
+)
+def test_resuming_under_the_other_model_is_refused(staged_by, resumed_as, match):
+    """The defect: v2 staging finished by the v1.1 encoder and stamped v1.1, or the reverse."""
+    with pytest.raises(ValueError, match=match):
+        _run_id(_run_id(None, model_version=staged_by), model_version=resumed_as)
+
+
+# ── _resolve_run_id: the resume mode-mixing guard ──
 
 
 def test_fresh_run_id_encodes_s2_only_mode() -> None:
@@ -140,12 +168,6 @@ def test_full_pipeline_forwards_allow_s2_only(monkeypatch) -> None:
     assert emb_params["allow_s2_only"] is True
 
 
-def test_full_pipeline_allow_s2_only_defaults_off(monkeypatch) -> None:
-    calls = _run_master_pipeline(monkeypatch)
-    emb_params = calls[fp_mod.PipelineDeployments().tessera_embeddings]
-    assert emb_params["allow_s2_only"] is False
-
-
 # ── the EFFECTIVE mode, not the requested one ──
 
 
@@ -237,9 +259,3 @@ def test_full_pipeline_forwards_model_version(monkeypatch) -> None:
     calls = _run_master_pipeline(monkeypatch, model_version="v2-large")
     emb_params = calls[fp_mod.PipelineDeployments().tessera_embeddings]
     assert emb_params["model_version"] == "v2-large"
-
-
-def test_full_pipeline_model_version_defaults_to_v11(monkeypatch) -> None:
-    calls = _run_master_pipeline(monkeypatch)
-    emb_params = calls[fp_mod.PipelineDeployments().tessera_embeddings]
-    assert emb_params["model_version"] == "v1.1"

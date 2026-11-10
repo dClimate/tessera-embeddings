@@ -4,7 +4,7 @@ This is the canonical list of names that the `tessera_embeddings`
 package commits to. Anything not on this list is implementation
 detail and may change in any release without warning.
 
-CI verifies that the names listed here match `tessera_embeddings.__all__`.
+CI checks that every name in `tessera_embeddings.__all__` resolves; keeping this page in step with `__all__` is a review duty, not a test.
 
 ## Configuration
 
@@ -103,7 +103,7 @@ rather than re-exported from the top-level package:
   `python -m tessera_embeddings.profiling.<stage>.<tool>`. The AWS-facing
   ones need the `aws` extra. See `profiling/README.md`.
 - `tessera_embeddings.storage` — Icechunk/Zarr store management:
-  `zarr_store` (open / create / append / region-write / windowed
+  `zarr_store` (open / create / append / batched region-write / windowed
   per-date batch — `write_day_windows`, the cropped-ingest write path) and
   `empty_store` (all-fill store seeding — `create_empty_store`,
   `create_empty_store_from_coords`, `VarSpec`) and `time_axis` (how a store

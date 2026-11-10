@@ -30,22 +30,26 @@ is reprocessed upstream.
 
 ## File naming
 
-**pytest-recording names the file for the test that recorded it**, so most
-files here are ``<ClassName>.<test_name>.yaml`` and there is nothing to
-choose. That is the naming to expect, and it means each test costs its own
-full copy of the response — a reason to keep the number of tests sharing a
-window small.
+**pytest-recording names the file for the test that recorded it**, so a
+plain ``@pytest.mark.vcr`` writes ``<ClassName>.<test_name>.yaml`` and each
+test costs its own full copy of the response.
 
-A test may additionally load a SHARED cassette by name with
-``@pytest.mark.vcr("<name>")``, which is how the parity tests reuse
-``test_s1_roi_parity.yaml`` and ``test_s2_roi_parity.yaml``. Only name a
-cassette that exists: the mark is silently inert against a missing file, so a
-stale name reads like coverage and provides none.
+A test or class may instead load a SHARED cassette by name with
+``@pytest.mark.vcr("<name>")``. ``test_s2_roi_parity.yaml`` is shared this
+way by the S2 parity test. ``TestRecordedProducerSplit.yaml`` is shared by
+every test in that integration class through
+``@pytest.mark.default_cassette("<name>")`` plus ``@pytest.mark.vcr``, which
+also makes a re-record write to that one file — one recording rather than
+one copy per test. Only name a cassette that exists: the mark is silently inert against a
+missing file, so a stale name reads like coverage and provides none.
 
-The examples this section used to list — ``s2_l2a_story_county_jul2024.yaml``
-and two siblings — were never recorded, and the ``<provider>_<collection>_
-<aoi-tag>_<date-range>`` convention they illustrated is not what any file here
-uses.
+Current files:
+
+| Cassette | Replayed by |
+| --- | --- |
+| `test_s2_roi_parity.yaml` | `tests/parity/test_ingest_s2_roi_parity.py` (recorded by `scripts/build/record_stac_cassettes.py`) |
+| `TestRecordedProducerSplit.yaml` | `tests/integration/test_baseline_producer_cassette.py::TestRecordedProducerSplit` |
+| `TestARealItemIsOwedTheCorrection.test_the_version_does_not_decide_which_images_keep_the_offset.yaml` | the same file's `TestARealItemIsOwedTheCorrection` |
 
 ## Filtering credentials
 
@@ -63,14 +67,3 @@ out before VCR commits to disk::
 Cassettes are committed to git, so any leaked token would persist in
 history forever. Always inspect a freshly recorded cassette by hand
 before committing.
-
-## Why this directory is empty at v0.1.0
-
-Cassettes are recorded against live STAC and add ~50–500 KB of YAML
-per scenario. The OSS contract is to land them in a dedicated PR with
-a reviewer who can verify (a) the recorded URLs are sensible, (b) no
-credentials leaked, (c) the cassette replays deterministically.
-
-The parity-test skeletons (``test_ingest_s*_roi_parity.py``) reference
-the cassette filenames they will use; recording is a Phase 10
-follow-up.

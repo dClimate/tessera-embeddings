@@ -151,16 +151,8 @@ Ingestion flows call:
 ### Applying the ROI Mask
 
 `roi_processing.apply_roi_mask` broadcasts the 2D mask over the time dimension and sets
-out-of-ROI pixels to `fill_value` (default 0) across all dataset variables.
-
-`roi_processing.filter_low_coverage_dates` then drops time steps where fewer than
-`min_valid_coverage` percent of ROI pixels are valid (default 5%). Only the per-date valid pixel
-counts are computed eagerly — one scalar per time step, from SCL for S2 or VV for S1 — so band
-arrays remain lazy and cloud-covered or off-ROI scenes are dropped before any band data is read.
-
-`identify_low_coverage_ds` is the lazy alternative: instead of dropping dates it attaches a
-`valid_coverage` boolean coordinate. Evaluating it still reads the quality band over the whole
-ROI — it defers that read and skips the imagery bands, rather than answering from metadata.
+out-of-ROI pixels to 0 across all dataset variables. The caller reads the mask once, with its
+credentials, and passes it in; the function never reads the store itself.
 
 ### Zone ingestion (the global campaign) — ADR-011
 
@@ -240,16 +232,15 @@ the same export measured ~4 chunk-writes/second from a laptop.
 
 ## Basic Ingestion Process
 
-The high-level entry point is `ingest_tile()` in `stac.py`. It runs five stages in sequence:
+The high-level entry point is `ingest_tile()` in `stac.py`. It runs four stages in sequence:
 
 ```text
 1. Item query        — find items for the tile/bbox + date range (S1: native CMR
                        granule query, orbit-filtered server-side)
-2. Item filtering    — optional item_filter_fn pre-filter hook
-3. Date dedup        — drop items whose dates are already in the Zarr store
-4. odc.stac.load     — lazy-load COGs into a Dask-backed xarray Dataset. The S2
+2. Date dedup        — drop items whose dates are already in the Zarr store
+3. odc.stac.load     — lazy-load COGs into a Dask-backed xarray Dataset. The S2
                        baseline correction happens here, per source, inside the read
-5. Corrections       — dB conversion (S1)
+4. Corrections       — dB conversion (S1)
 ```
 
 `query_stac_items` and `load_stac_items` expose these stages separately so a flow could
@@ -310,7 +301,7 @@ Six things happen between a region and a written mosaic, and they are the order 
 
 S2 and Landsat are queried by tile ID property (e.g., `grid:code = T33UUP`), which returns
 only items for that specific MGRS tile. OPERA RTC-S1 on CMR-STAC lacks an equivalent
-property, so queries use a bbox derived from the MGRS tile via `mgrs_tile_to_bbox()`.
+property, so queries use the ROI's WGS84 bbox. (`mgrs_tile_to_bbox()` stays only for yield-embeddings' radar source sweep.)
 
 #### Cloud cover decides which scene wins a pixel
 
@@ -636,11 +627,11 @@ radar-free ROI necessarily means embedding S2-only pixels, and `InferenceConfig`
 `allow_s2_only` for that case rather than asking the caller, because the alternative is a fill
 that writes nothing and reports success.
 
-#### UTM CRS derivation
+#### Output CRS
 
 CMR-STAC OPERA items lack the `proj:` extension, so `odc.stac.load` cannot infer the output
-CRS. `mgrs_tile_to_utm_epsg` derives the correct UTM EPSG from the tile's zone number and
-latitude band (C–M = southern hemisphere, N–X = northern hemisphere), e.g. `33UUP` → EPSG:32633.
+CRS. The radar leg never asks it to: every load passes the ROI's own `geobox` (CRS, transform and
+shape from `read_roi_metadata`), so the output grid is the ROI's.
 
 ### Date deduplication before loading
 

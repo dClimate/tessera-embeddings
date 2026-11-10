@@ -63,8 +63,7 @@ write down.
 |---|---|
 | the origin steps half a pixel back along each axis's own **signed** resolution | `storage/conventions.py`, `_compute_affine_transform` |
 | an invariant test: `c == bbox[0]`, `f == bbox[3]`, and `shape × resolution` lands on the far edges, over three resolutions and a south-up grid | `tests/unit/storage/test_conventions.py`, `TestTransformAndBboxAgree` |
-| the published store repaired in place, 120 groups, one commit | `scripts/maintenance/fix_published_store_spatial_transform.py` |
-| the repair script exercised against a real Icechunk store regressed to the broken shape | `tests/unit/storage/test_fix_published_store_spatial_transform.py` |
+| the published store repaired in place, 120 groups, one commit | a one-shot maintenance script, deleted once the repair was confirmed (git history: `scripts/maintenance/fix_published_store_spatial_transform.py`) |
 | consumer-facing georeferencing section | `context_docs/storage/reading-the-published-store.md` §2a |
 
 **Signed, not absolute.** A north-up grid has a negative `e`, so subtracting `e/2` moves the Y

@@ -1,9 +1,8 @@
 """Repo paths for tests that read the source tree or the fixtures directory.
 
 A handful of tests assert on the SHAPE of the source — that no module outside one place applies
-the solar-day offset, that every caller of ``apply_roi_mask`` supplies the mask, that the docs
-index names nothing that is gone. Those read ``.py`` and ``.md`` files off disk, so they need to
-know where the repo is.
+the solar-day offset, that the docs index names nothing that is gone. Those read ``.py`` and
+``.md`` files off disk, so they need to know where the repo is.
 
 Each of them used to work that out by counting directory levels up from its own file
 (``Path(__file__).resolve().parents[2]``), which silently means something different the moment a
