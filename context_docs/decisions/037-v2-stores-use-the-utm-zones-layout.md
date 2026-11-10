@@ -1,4 +1,4 @@
-# 034 — v2 stores use the geoembeddings `utm_zones` layout
+# 037 — v2 stores use the geoembeddings `utm_zones` layout
 
 **Status:** Proposed 2026-10-27. Follows the pattern of
 [ADR 032](032-v2-stores-name-their-axes-y-and-x.md): one more per-model field, and a store keeps
@@ -6,11 +6,12 @@ what it was created with. The campaign fills each column as two halves:
 [ADR 038](038-the-campaign-fills-a-utm-column-in-two-halves.md).
 
 A global store has so far been 120 zone groups, `01N` to `60S`, each in its hemisphere's own EPSG
-code. Other global embedding datasets use a different layout: the Source Coop copy of our v1.1
-store, AlphaEarth and OlmoEarth. They have 60 groups, `utm01` to `utm60`. Each group covers a
-whole six-degree column in its northern EPSG code, with the southern hemisphere as negative
-northings. That is the geoembeddings convention's `utm_zones` layout. From v2 on, our stores use
-it too.
+code. Other global embedding stores use a different layout: OlmoEarth and the Source Coop copy
+of our v1.1 store have 60 groups, `utm01` to `utm60`. Each group covers a whole six-degree column
+in its northern EPSG code, with the southern hemisphere as negative northings. That is the
+geoembeddings convention's `utm_zones` layout, as its own TESSERA example shows it. From v2 on,
+our stores use it too. (AlphaEarth is no precedent either way: its Source Coop tiles sit in
+hemisphere folders, each in its hemisphere's own EPSG code, and its mosaic is one EPSG:4326 array.)
 
 ---
 
