@@ -1,4 +1,4 @@
-# 036 — The campaign fills a `utm` column in two halves
+# 038 — The campaign fills a `utm` column in two halves
 
 **Status:** Proposed 2026-10-28. Builds on [ADR 037](037-v2-stores-use-the-utm-zones-layout.md),
 which made a v2 store 60 full-column groups, `utm01` to `utm60`.
