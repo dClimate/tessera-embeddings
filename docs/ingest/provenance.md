@@ -57,8 +57,30 @@ of a burst, but the catalogue query sets aside a granule whose entry lacks its V
 marks it `missing_bands`; the provider hands those back on a list of their own, so the loader never
 sees them. All of these are listed after the fused granules, sorted by id. The marks live on the
 catalogue items (`provenance.mark_dropped`, and `opera_query._granule_to_item` for radar) and are
-cleared when a load reads the copy after all. A day that writes no slot, because it failed the
-coverage gate or every copy of an image failed to read, has no list to hold its granules.
+cleared when a load reads the copy after all.
+
+## Days skipped whole
+
+A day the ingest considered and skipped writes no slot, so its list has nowhere to go beside its
+pixels. The mosaic holds it instead in two one-dimensional arrays along `skipped_day`: the
+`skipped_days` themselves and their `skipped_granules` lists, in the same shape as a slot's list.
+Every copy is listed with the day's reason as its `status`, unless it was already dropped for its
+own:
+
+| why the day was skipped | `status` |
+|---|---|
+| too little clear ground for the coverage gate (optical) | `low_coverage` |
+| no single offset correction fits the day's images (optical) | `producer_conflict` |
+| every copy of some image failed to read (both sensors) | `unreadable` |
+
+A day whose imagery reaches no live window is not recorded: none of it covered a pixel the store
+embeds. The record is kept whether or not the `provenance` switch is on.
+
+`provenance.SkippedDays` commits each day in a commit of its own as it is skipped
+(`zarr_store.record_skipped_days`). The mosaic is created by a leg's first write, so a day skipped
+before that waits in memory and is committed right after it. A skipped day never moves where a
+resumed ingest restarts, so a crash before its commit is recovered when the retry reaches the day
+again, and a day recorded twice keeps the latest list.
 
 The list for a date is appended in the same Icechunk commit as the date's pixels, under both the
 per-date and the batched write. A date that did not commit has no slot and no list, and a resumed
