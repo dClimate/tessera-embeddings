@@ -100,9 +100,9 @@ class ProvenanceRecord:
 
         A dropped copy has no ``fusion_order`` and says why in ``status``: a losing duplicate, a copy
         that would not read and was replaced, or a radar granule missing a polarisation. A day the
-        ingest skipped whole has no fused granules, only its copies under the day's reason. One list per mosaic snapshot that holds the day, since
-        each run that re-ingests builds its own mosaics; ``run_id`` keeps the list of the snapshot that
-        run read.
+        ingest skipped whole has no fused granules, only its copies under the day's reason. One list
+        per mosaic snapshot that holds the day, since each run that re-ingests builds its own mosaics;
+        ``run_id`` keeps the list of the snapshot that run read.
         """
         rows = self._table(zone, year, GRANULES).filter(pl.col("sensor") == sensor, pl.col("solar_day") == day)
         if run_id is not None:
