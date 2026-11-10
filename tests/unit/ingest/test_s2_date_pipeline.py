@@ -30,7 +30,7 @@ import xarray as xr
 from tessera_embeddings.config.ingest import SOURCE_INDEX_VAR
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
 from tessera_embeddings.ingest import s2_roi
-from tessera_embeddings.ingest.provenance import stamp_fusion_positions
+from tessera_embeddings.ingest.provenance import FUSION_POSITION, stamp_fusion_positions
 from tessera_embeddings.ingest.stac import HeterogeneousProducerError
 from tessera_embeddings.storage.zarr_store import store_write_retrying
 
@@ -208,6 +208,7 @@ def run_ingest(monkeypatch):
         write_s: float = 0.0,
         log: logging.Logger | None = None,
         existing_dates: set[str] | None = None,
+        catalogue: list | None = None,
         **ingest_kwargs,
     ) -> _Run:
         run = _Run()
@@ -253,7 +254,7 @@ def run_ingest(monkeypatch):
                 _record_write(day_ds)
                 run.granules[str(day_ds.time.dt.date.values[0])] = granules
 
-        monkeypatch.setattr(s2_roi, "query_stac_items", lambda **_kwargs: ([_item(d) for d in dates], {}))
+        monkeypatch.setattr(s2_roi, "query_stac_items", lambda **_kwargs: (catalogue or [_item(d) for d in dates], {}))
         monkeypatch.setattr(s2_roi, "load_stac_items", load_stac_items)
         # What the store already holds. Default empty — a fresh ingest — but a test can
         # populate it to stand a run up over an existing store, which is what a resume is.
@@ -914,6 +915,39 @@ def test_each_written_date_carries_its_own_granule_list(run_ingest, pipeline_dat
     for date, granules in run.granules.items():
         assert granules is not None
         assert [g["granule_id"] for g in json.loads(granules)] == [f"S2A_T13TDE_{date.replace('-', '')}_0_L2A"]
+
+
+def _copies(date: str) -> list:
+    """Two copies of one image, the newer processing baseline first."""
+    copies = [_item(date, f"S2A_T13TDE_{date.replace('-', '')}_{n}_L2A") for n in (0, 1)]
+    day = date.replace("-", "")
+    for copy, baseline in zip(copies, ("05.11", "05.10"), strict=True):
+        copy.properties |= {
+            "grid:code": "MGRS-13TDE",
+            "s2:processing_baseline": baseline,
+            "s2:datatake_id": f"GS2A_{day}T100000_000001_N{baseline}",
+            "s2:datastrip_id": f"S2A_OPER_MSI_L2A_DS_TEST_{day}T120000_S{day}T100001_N{baseline}",
+        }
+    return copies
+
+
+@pytest.mark.parametrize("newer_unreadable", [False, True], ids=["duplicate", "unreadable"])
+def test_a_dropped_copy_is_listed_with_its_reason(run_ingest, monkeypatch, newer_unreadable):
+    """The losing duplicate, or the copy that would not read and was replaced, follows the fused one."""
+    newer, older = _copies("2024-01-01")
+    if newer_unreadable:
+        real = s2_roi._coverage_from_scl
+
+        def newer_will_not_read(*args, **kwargs):
+            return _missing_object_gate() if FUSION_POSITION in newer.properties else real(*args, **kwargs)
+
+        monkeypatch.setattr(s2_roi, "_coverage_from_scl", newer_will_not_read)
+    run = run_ingest({"2024-01-01": True}, pipeline_dates=False, provenance=True, catalogue=[newer, older])
+    listed = [(g["granule_id"], g["status"], g["stepped_down"]) for g in json.loads(run.granules["2024-01-01"])]
+    if newer_unreadable:
+        assert listed == [(older.id, "fused", True), (newer.id, "unreadable", False)]
+    else:
+        assert listed == [(newer.id, "fused", False), (older.id, "duplicate", False)]
 
 
 def test_with_the_record_off_no_write_carries_a_list(run_ingest):
