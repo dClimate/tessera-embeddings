@@ -171,7 +171,8 @@ class TestLiveShards:
 
     def test_band_first_embeddings_report_meta_shards_not_band_shards(self, seeded_store):
         """A v2 `embeddings` is `(time, band, y, x)` in eight band shards per meta-shard: the band
-        index is not a row, and two band shards of one meta-shard are one entry."""
+        index is not a row, and two band shards of one meta-shard are one entry.
+        """
         store = seeded_store([_ZONE], years=_YEARS, model_version="v2-large")
         session = global_store.open_global_repo(store).writable_session("main")
         embeddings = zarr.open_group(session.store, mode="r+")["01N/0/embeddings"]
