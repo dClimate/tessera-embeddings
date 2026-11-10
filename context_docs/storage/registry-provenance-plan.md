@@ -148,7 +148,8 @@ day's fused granules come the copies the ingest dropped before fusing it, with n
 their reason in `status`: `duplicate`, a losing copy of an image it fused; `unreadable`, a copy that
 would not read and was replaced by another, which `stepped_down` marks; or `missing_bands`, a radar
 granule whose catalogue entry lacks its VV or VH file. A day the ingest skipped whole has no mosaic
-and no fused granules, only its copies, all dropped for the day's reason: `low_coverage`, too little
+and no fused granules, only its copies, each dropped for the day's reason unless already dropped for
+its own: `low_coverage`, too little
 clear ground for the coverage gate; `producer_conflict`, no single offset correction fitting the
 day's images; or `unreadable`, every copy of some image failed to read.
 
