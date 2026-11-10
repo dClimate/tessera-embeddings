@@ -233,9 +233,10 @@ way. The sensors are `s2` (optical), `s1_asc` and `s1_desc` (radar by orbit dire
   run that read that snapshot. Each row carries the image's catalogue ID and link, acquisition
   time, cloud cover, footprint (GeoParquet) and the exact object URLs that were read. A URL that no
   longer resolves is itself information: the catalogue entry has moved since. After a day's fused
-  images come the Sentinel-2 copies the ingest set aside before building the mosaic, with no
-  `fusion_order` and a `status` saying why: `duplicate`, another copy of an image it used, or
-  `unreadable`, a copy that would not read and was replaced. Fused rows have `status` `fused`.
+  images come the copies the ingest set aside before building the mosaic, with no `fusion_order`
+  and a `status` saying why: `duplicate`, another copy of an image it used; `unreadable`, a copy
+  that would not read and was replaced; or `missing_bands`, a radar image whose catalogue entry
+  lacks its VV or VH file. Fused rows have `status` `fused`.
 - **`shard_dates`**: one row per tile, sensor and date on which an image had data at the tile, with
   `valid_px`, the tile's pixels whose observation the model used that day; `sources`, the
   `fusion_order` of every image with data at at least one of its pixels, used or not; and `snapshot_id`, the mosaic the run read, which

@@ -43,7 +43,8 @@ provenance beyond its registry, and none can be reconstructed.
    twice. `sources` is derived from the planes, so it names granules that had data at the shard's
    pixels rather than those whose footprints touch. Copies the ingest dropped follow a day's fused
    granules with no fusion order and a `status`: `duplicate` for a losing copy of an image it
-   fused, `unreadable` for a copy that would not read and was replaced.
+   fused, `unreadable` for a copy that would not read and was replaced, `missing_bands` for a
+   radar granule whose catalogue entry lacks its VV or VH file.
 6. **Publication failure fails the zone-year, before the tag and the cleanup.** It is retried as
    store writes are, and a retry of a landed but untagged cell republishes from its staging before
    tagging. No marker, gate or held state.
@@ -75,8 +76,6 @@ provenance beyond its registry, and none can be reconstructed.
 - **Radar quality layers** (layover, shadow, looks): a separate decision, ADR 033.
 - **Days the ingest drops whole**, for failing the coverage gate or because every copy of an image
   failed to read. They write no mosaic slot, so there is no list to hold their granules.
-- **Radar granules whose catalogue entry lacks the VV and VH files it claims.** The query drops
-  them before any item is built; they are rare and could not have been read.
 - **Attribution.** The record says what went in, not how much any of it mattered.
 
 ## Consequences
