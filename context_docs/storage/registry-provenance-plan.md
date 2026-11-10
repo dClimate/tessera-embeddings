@@ -299,8 +299,9 @@ claims every pixel. The first run that claims the pixel holds its record; the he
 The ~150 MB inside the mosaics and the ~160 MB `granules` table are the same lists in two
 encodings; the mosaics' copy is deleted at publication. Recording rejected observations, so
 that cloudy pixels are non-zero and fully cloudy shard-dates keep their planes, makes the planes
-about 4% larger on optical and 0–5% on radar. The planes are chunked one date by one shard,
-so reading one pixel's year fetches one object per date, 28–130 per sensor (§10).
+about 4% larger on optical and 0–5% on radar. The planes are chunked like the v2 store, 512 × 512
+pixels in shards of 2048 × 2048, each chunk holding every date of the run, so reading one pixel's
+year is one fetch (§8).
 
 **Ingest time.** Measured on zone 35N, 1–7 January 2024, over two days, each pair's two arms run
 side by side on their own clusters. Per-date write time with the record on, divided by off:
@@ -362,6 +363,7 @@ The last column is the first draft's choice, where reviews of the plan or the bu
 | a rejected observation keeps its granule, as the rank negated | zero for anything the model did not use | a reader can tell "no image had data" from "the model rejected this image here", and see which granule was cloudy; a fully cloudy date keeps its plane | zero |
 | the copies the ingest dropped listed after the fused granules, with a `status` | the fused granules only | a reader sees the duplicates, unreadable copies and incomplete radar granules the ingest set aside, beside what it used | the fused only |
 | a day skipped whole committed off the time axis, alone, when it is skipped | carried on the next day's commit | no state held back between days and nothing to flush when the year ends; the time axis the model reads is untouched | not recorded |
+| planes chunked every date × 512 × 512, in 2048 × 2048 shards | one date × one shard | one pixel's year is one fetch instead of 28–130 (0.2 s against 1.9 s, measured at 256 × 256), 7–12% smaller, and a plane chunk covers the same pixels as a v2 store chunk | one date × one shard |
 | a per-shard granule list derived from the pixels | every granule whose footprint touches the shard | names only granules that supplied a pixel | |
 | the index written by the ingest while it fuses | reading the mask band a second time, or once per granule | one read, one definition of "valid"; per granule would multiply the load by the day's granules, hundreds of radar bursts | each granule loaded separately |
 | the granule list inside the mosaic, in the day's own commit | a file written beside the mosaic before the commit | a file written first can describe a day that never committed | the file beside |
@@ -387,16 +389,11 @@ The last column is the first draft's choice, where reviews of the plan or the bu
 
 ## 10. Open questions
 
-1. **Plane chunking.** A one-pixel read fetches one object per date, 28–130 per sensor. On two
-   real shard-years, chunks of all dates × 256 × 256 were 7–12% smaller than one date × one shard,
-   and reading one pixel's optical year from outside the region took 0.2 s against 1.9 s. Chunks
-   of all dates × 128 × 128 saved 1–13%, less than 256 × 256 on five of the six. Changing to all dates × 256 × 256 is recommended
-   and not yet decided.
-2. **Publication time at zone scale,** about an hour and a half per zone-year at the measured rate
+1. **Publication time at zone scale,** about an hour and a half per zone-year at the measured rate
    (§6), to be examined separately.
-3. **Radar file URLs need Earthdata credentials to fetch.** Is it enough to record them, or should
+2. **Radar file URLs need Earthdata credentials to fetch.** Is it enough to record them, or should
    the record also point to a public mirror where one exists?
-4. **Is anything missing** that a user would need to trust or reproduce an embedding?
+3. **Is anything missing** that a user would need to trust or reproduce an embedding?
 
 ## Appendix A. Table schemas
 
@@ -430,7 +427,7 @@ of its rows) and `sources` (list of int16 fusion orders of the granules with dat
 each mosaic read, and the refused shards that staged no record.
 
 **`pixel_sources`**: one group per run, `<zone>/<year>/<run_id>`, holding per sensor a
-`(date, northing, easting)` int8 array on the zone's grid, chunked one date by one shard, and a
+`(date, northing, easting)` int8 array on the zone's grid, chunked every date of the run by 512 × 512 pixels (the v2 store's chunk) in 2048 × 2048 shards, and a
 `<sensor>_date` array of its dates; the group records the grid shape and shard size. A value k
 names `sources[|k| - 1]`, positive when the model used the observation and negative when it
 rejected it; 0 means no granule had data. The codec was chosen, before the sign was added, on one

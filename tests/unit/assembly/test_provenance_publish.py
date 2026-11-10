@@ -259,6 +259,11 @@ def test_shard_dates_and_planes_name_the_same_granules(tmp_path: Path, valid: np
     assert {r["tile"] for r in rows} == {"chunk_0_0", "chunk_0_1", "chunk_1_0", "chunk_1_1"}
     repo = open_repo(pixel_sources_uri(str(tmp_path / "registry")))
     group = zarr.open_group(repo.readonly_session("main").store, path=pixel_sources_group(ZONE, YEAR, RUN), mode="r")
+    for sensor in STORES.values():
+        dates = group[sensor].shape[0]
+        assert (group[sensor].chunks, group[sensor].shards) == ((dates, SHARD, SHARD), (dates, SHARD, SHARD)), (
+            "a chunk holds every date"
+        )
     for row in rows:
         r, c = (int(x) for x in row["tile"].removeprefix("chunk_").split("_"))
         t = DATES.index(str(row["solar_day"]))

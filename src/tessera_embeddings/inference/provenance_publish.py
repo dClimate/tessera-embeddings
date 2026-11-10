@@ -40,6 +40,7 @@ from tessera_embeddings.config.store_layout import SENSORS
 from tessera_embeddings.inference.assembly import _COVERAGE_SUFFIX, _fs_for, _open_staged_tile
 from tessera_embeddings.inference.chunk_spec import parse_chunk_label
 from tessera_embeddings.inference.provenance import (
+    PLANE_CHUNK_PX,
     PLANE_COMPRESSORS,
     STAGED_UPDATE_PIXELS,
     provenance_summary,
@@ -73,7 +74,7 @@ logger = logging.getLogger(__name__)
 #: Mosaic store name to the sensor its record is published under.
 _STORES = {"reflectance": "s2", "sar_ascending": "s1_asc", "sar_descending": "s1_desc"}
 
-#: Dates copied per write when moving a shard's staged planes into the run's group.
+#: Staged dates read and checked per batch when moving a shard's planes into the run's group.
 _COPY_BATCH = 16
 
 #: Shards copied at once. The writes go to one session, which takes concurrent chunk writes.
@@ -188,17 +189,20 @@ def publish_provenance(
     run_group.attrs.update(
         {"zone": zone, "year": year, "run_id": run_id, "grid_shape": list(run.grid_shape), "shard_px": run.shard_px}
     )
+    edge = min(PLANE_CHUNK_PX, run.shard_px)
     for sensor, days in axes.items():
+        dates = max(len(days), 1)
         run_group.create_array(
             sensor,
             shape=(len(days), *run.grid_shape),
-            chunks=(1, run.shard_px, run.shard_px),
+            chunks=(dates, edge, edge),
+            shards=(dates, run.shard_px, run.shard_px),
             dtype=np.int8,
             fill_value=0,
             compressors=PLANE_COMPRESSORS,
             dimension_names=("date", "northing", "easting"),
         )
-        date = run_group.create_array(f"{sensor}_date", shape=(len(days),), chunks=(max(len(days), 1),), dtype=np.int64)
+        date = run_group.create_array(f"{sensor}_date", shape=(len(days),), chunks=(dates,), dtype=np.int64)
         date[:] = read_array(mosaics[sensor], "time").astype("datetime64[ns]").astype("int64")
         date.attrs.update(TIME_ENCODING)
 
@@ -361,6 +365,8 @@ def _copy_shard(copy: _Copy, label: str, group: zarr.Group, embedded_px: int) ->
         times, planes = cast("tuple[np.ndarray, zarr.Array]", staged_planes(group, sensor))
         target, counts, record = cast(zarr.Array, copy.run_group[sensor]), copy.counts[sensor], summary[sensor]
         window = (slice(row * px, row * px + planes.shape[1]), slice(col * px, col * px + planes.shape[2]))
+        # The shard's whole year in memory, so each chunk, which holds every date, is written once.
+        year = np.zeros((target.shape[0], *planes.shape[1:]), dtype=np.int8)
         for start in range(0, len(times), _COPY_BATCH):
             batch = np.asarray(planes[start : start + _COPY_BATCH])
             for i, plane in enumerate(batch, start):
@@ -368,7 +374,8 @@ def _copy_shard(copy: _Copy, label: str, group: zarr.Group, embedded_px: int) ->
                 if time >= len(counts):
                     raise ProvenanceCheckError(f"{where}: no such slot on the mosaic's time axis ({len(counts)} slots)")
                 _check_plane(where, plane, record["sources"][i], record["valid_px"][i], counts[time])
-            target.oindex[(times[start : start + len(batch)], *window)] = batch
+            year[times[start : start + len(batch)]] = batch
+        target[(slice(None), *window)] = year
         ids = {"run_id": copy.run.run_id, "tile": label, "sensor": sensor, "snapshot_id": copy.pins[sensor]}
         rows += shard_date_rows(ids, record, copy.axes[sensor], embedded_px)
     return rows
