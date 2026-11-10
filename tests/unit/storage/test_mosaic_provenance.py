@@ -1,7 +1,9 @@
-"""The ingest half of provenance at the store: the granule list and the switch.
+"""The ingest half of provenance at the store: the granule lists and the switch.
 
 * Each date's granule list lands at its own slot in the same commit as its pixels, under both
   write paths, and a failed batch leaves no list behind.
+* A day the ingest skipped whole is listed off the time axis, once the mosaic exists, and a retry
+  replaces its list.
 * The ``provenance`` switch is a manifest term whose absence means off: a store keeps the setting
   it was seeded with, and a store from before the term resumes with the switch off.
 """
@@ -18,10 +20,19 @@ from affine import Affine
 from odc.geo.geobox import GeoBox
 
 import tessera_embeddings.storage.zarr_store as zs
-from tessera_embeddings.config.ingest import GRANULES_ARRAY, PROVENANCE_VERSION, SOURCE_INDEX_VAR
+from tessera_embeddings.config.ingest import (
+    GRANULES_ARRAY,
+    PROVENANCE_VERSION,
+    SKIPPED_DAYS_ARRAY,
+    SKIPPED_GRANULES_ARRAY,
+    SOURCE_INDEX_VAR,
+)
 from tessera_embeddings.errors import ConfigMismatchError
+from tessera_embeddings.ingest.provenance import SkippedDays
+from tessera_embeddings.ingest.solar_days import normalize_to_solar_day
 from tessera_embeddings.storage.manifest import IngestManifest
 from tessera_embeddings.storage.zarr_store import open_store, open_store_as_zarr_group, write_days_windows
+from tests.stac_items import fake_stac_item
 
 CHUNKS = {"time": 1, "northing": 4, "easting": 4}
 WINDOWS = [(0, 4, 0, 8), (4, 8, 0, 4)]
@@ -141,3 +152,27 @@ def test_the_granule_lists_must_match_the_dates(tmp_path) -> None:
             chunks=CHUNKS,
             granules=[],
         )
+
+
+def test_a_skipped_day_waits_for_the_mosaic_and_a_retry_replaces_its_list(tmp_path) -> None:
+    """Skipped before the first write, a day is committed once that write creates the mosaic, off
+    the time axis; a day reaching no live window is not listed; listing a day again replaces it.
+    """
+    store = str(tmp_path / "s.zarr")
+    source = {"provider": "p", "collection": "c", "catalog_url": "https://cat", "collection_id": "c"}
+    recorder = SkippedDays(store, source, exists=False, s3_region=None)
+
+    def copies(day: str, granule: str) -> list:
+        return normalize_to_solar_day([fake_stac_item(day, item_id=granule)], mid_longitude=0.0)
+
+    recorder.record("2024-01-01", copies("2024-01-01", "first-attempt"), "coverage")
+    recorder.record("2024-01-02", copies("2024-01-02", "over-the-sea"), "no-live-window")
+    _write(store, ["2024-01-03"], ON)
+    recorder.written()
+    recorder.record("2024-01-01", copies("2024-01-01", "retry"), "unreadable")
+
+    root = open_store_as_zarr_group(store)
+    assert root["time"].shape == (1,), "the time axis holds only the written day"
+    assert root[SKIPPED_DAYS_ARRAY][:].tolist() == ["2024-01-01"]
+    (listed,) = json.loads(str(root[SKIPPED_GRANULES_ARRAY][0]))
+    assert (listed["granule_id"], listed["status"]) == ("retry", "unreadable")

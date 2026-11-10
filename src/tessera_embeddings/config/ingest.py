@@ -33,6 +33,14 @@ GRANULES_ARRAY = "granules"
 #: catalogue entry lacks its VV or VH file.
 FUSED, DUPLICATE, UNREADABLE, MISSING_BANDS = "fused", "duplicate", "unreadable", "missing_bands"
 
+#: The status of every copy of a day the ingest skipped whole, beyond ``UNREADABLE``: too little clear
+#: ground for the coverage gate, or no single offset correction fitting the day's images.
+LOW_COVERAGE, PRODUCER_CONFLICT = "low_coverage", "producer_conflict"
+
+#: A mosaic's record of the days its ingest skipped whole: the solar days, and each one's granule
+#: list in the shape ``GRANULES_ARRAY`` holds for a written day. Neither is on the time axis.
+SKIPPED_DAYS_ARRAY, SKIPPED_GRANULES_ARRAY = "skipped_days", "skipped_granules"
+
 #: Item property: why the ingest dropped this copy before the fuse, its granule list entry's ``status``.
 DROPPED = "tessera:dropped"
 

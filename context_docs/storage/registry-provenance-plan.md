@@ -147,7 +147,10 @@ each of the 11 files read, such as `…/S2A_33TVL_20240102_0_L2A/B04.tif` (Appen
 day's fused granules come the copies the ingest dropped before fusing it, with no fusion order and
 their reason in `status`: `duplicate`, a losing copy of an image it fused; `unreadable`, a copy that
 would not read and was replaced by another, which `stepped_down` marks; or `missing_bands`, a radar
-granule whose catalogue entry lacks its VV or VH file.
+granule whose catalogue entry lacks its VV or VH file. A day the ingest skipped whole has no mosaic
+and no fused granules, only its copies, all dropped for the day's reason: `low_coverage`, too little
+clear ground for the coverage gate; `producer_conflict`, no single offset correction fitting the
+day's images; or `unreadable`, every copy of some image failed to read.
 
 **`shard_dates`: what went into each shard.** Per run, one row per shard, sensor and date on which
 a granule had data at at least one of the shard's pixels:
@@ -228,6 +231,14 @@ copy it holds back as a duplicate, and a kept copy that fails to read and is swa
 back as unreadable. Radar fuses every copy of a burst, but its catalogue query sets aside a granule
 whose entry lacks its VV or VH file, and marks it missing bands. The day's granule list names all
 of these after the fused granules.
+
+**How the ingest records a day it skipped whole.** A skipped day has no slot, so no list beside its
+pixels. The ingest commits its list to two arrays of the mosaic off the time axis, the skipped days
+and their lists, in a commit of its own when it skips the day; while the mosaic does not exist yet,
+the day waits for the leg's first write to create it. Skipped days never move where a resumed
+ingest restarts, so a crash before the commit is recovered by the retry, which reaches the day
+again, and a list recorded twice is replaced by the latest. Days whose imagery reaches no land in
+the zone are not recorded: none of it covered a pixel the store embeds.
 
 **Three rules keep the record and the embeddings consistent.**
 
@@ -347,6 +358,7 @@ The last column is the first draft's choice, where reviews of the plan or the bu
 | a granule per pixel per date | a yes/no bit per pixel per date, with the granule guessed from footprints | 4% more storage, and exact: guessing named the wrong granule for 0.10% of one shard's pixel-dates, wherever footprints overlap | nothing per pixel, ruled out at an estimated 20–45 TB (measured: 3.7 TB for optical); the granule guessed from footprint order |
 | a rejected observation keeps its granule, as the rank negated | zero for anything the model did not use | a reader can tell "no image had data" from "the model rejected this image here", and see which granule was cloudy; a fully cloudy date keeps its plane | zero |
 | the copies the ingest dropped listed after the fused granules, with a `status` | the fused granules only | a reader sees the duplicates, unreadable copies and incomplete radar granules the ingest set aside, beside what it used | the fused only |
+| a day skipped whole committed off the time axis, alone, when it is skipped | carried on the next day's commit | no state held back between days and nothing to flush when the year ends; the time axis the model reads is untouched | not recorded |
 | a per-shard granule list derived from the pixels | every granule whose footprint touches the shard | names only granules that supplied a pixel | |
 | the index written by the ingest while it fuses | reading the mask band a second time, or once per granule | one read, one definition of "valid"; per granule would multiply the load by the day's granules, hundreds of radar bursts | each granule loaded separately |
 | the granule list inside the mosaic, in the day's own commit | a file written beside the mosaic before the commit | a file written first can describe a day that never committed | the file beside |
@@ -368,10 +380,7 @@ The last column is the first draft's choice, where reviews of the plan or the bu
   produce one, and the dev test's pixel checks found none.
 - **v1.1**, whose mosaics are gone.
 - **Radar quality layers** such as layover and shadow, a separate decision (ADR 033).
-- **Days the ingest drops whole.** A day whose clear coverage of the zone is below the ingest's
-  minimum (0.1% of its land), or whose every copy of an image fails to read, writes no mosaic slot,
-  so there is no list to put its granules in. Recording them would need a list of skipped days and
-  their granules beside the mosaic.
+- **Days whose imagery reaches no land in the zone.** None of it covered a pixel the store embeds.
 
 ## 10. Open questions
 
@@ -404,7 +413,7 @@ sensor, snapshot and the run that first published it.
 | `solar_day` | date | the mosaic slot |
 | `fusion_order` | int16 | position in the day's fusion order, 0 first; null for a dropped copy |
 | `granule_id` | string | the catalogue id of the copy |
-| `status` | string | `fused`; or, for a copy dropped before the fuse, `duplicate`, `unreadable` or `missing_bands` |
+| `status` | string | `fused`; for a copy dropped before the fuse, `duplicate`, `unreadable` or `missing_bands`; for every copy of a day skipped whole, `low_coverage`, `producer_conflict` or `unreadable` |
 | `image_key` | string | which image it is a copy of: Sentinel-2 datatake and datastrip (#240), Sentinel-1 burst id (#250) |
 | `platform` | string | `S2A`, `S1C` and so on |
 | `acquired_at` | timestamp, UTC | the acquisition instant |

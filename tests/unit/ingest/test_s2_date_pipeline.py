@@ -31,7 +31,7 @@ from tenacity import Retrying, stop_after_attempt
 from tessera_embeddings.config.ingest import SOURCE_INDEX_VAR
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
 from tessera_embeddings.ingest import live_windows as live_windows_mod
-from tessera_embeddings.ingest import roi_processing, s2_roi
+from tessera_embeddings.ingest import provenance, roi_processing, s2_roi
 from tessera_embeddings.ingest.provenance import FUSION_POSITION, stamp_fusion_positions
 from tessera_embeddings.ingest.stac import HeterogeneousProducerError
 from tessera_embeddings.storage.zarr_store import store_write_retrying
@@ -161,6 +161,8 @@ def run_ingest(monkeypatch):
         return retrying
 
     monkeypatch.setattr(s2_roi, "store_write_retrying", _no_sleep)
+    # The store is faked, so the record of skipped days is too; a test asserting on it patches it.
+    monkeypatch.setattr(provenance, "record_skipped_days", lambda *_a, **_k: None)
 
     # Cropping is unconditional, so window derivation runs on every path and needs a mask
     # these tests do not have. One window covering the whole ROI keeps the date pipeline —
@@ -869,6 +871,20 @@ def test_a_dropped_copy_is_listed_with_its_reason(run_ingest, monkeypatch, newer
         assert listed == [(older.id, "fused", True), (newer.id, "unreadable", False)]
     else:
         assert listed == [(newer.id, "fused", False), (older.id, "duplicate", False)]
+
+
+@BOTH_MODES
+def test_a_day_the_gate_drops_is_listed_once_the_mosaic_exists(run_ingest, monkeypatch, pipeline_dates):
+    """Each gate-failed day is committed with its granules marked low coverage; none waits past the first write."""
+    committed: dict[str, list] = {}
+    monkeypatch.setattr(
+        provenance,
+        "record_skipped_days",
+        lambda _store, lists, **_k: committed.update({d: json.loads(g) for d, g in lists.items()}),
+    )
+    run_ingest(SKIP_CHAIN, pipeline_dates=pipeline_dates, provenance=True)
+    assert sorted(committed) == ["2024-01-02", "2024-01-03", "2024-01-04"]
+    assert all([g["status"] for g in listed] == ["low_coverage"] for listed in committed.values())
 
 
 def test_with_the_record_off_no_write_carries_a_list(run_ingest):
