@@ -15,6 +15,7 @@ sleep because the wait-out budget is accumulated backoff rather than wall clock.
 from __future__ import annotations
 
 import collections
+import json
 import logging
 
 import numpy as np
@@ -22,8 +23,9 @@ import pytest
 import xarray as xr
 
 from tessera_embeddings.errors import ProviderRefusedReadsError
-from tessera_embeddings.ingest import s1_roi
+from tessera_embeddings.ingest import provenance, s1_roi
 from tessera_embeddings.storage.zarr_store import STORE_WRITE_ATTEMPTS, store_write_retrying
+from tests.stac_items import fake_stac_item
 
 # Every S1 leg these tests run is kept off disk and network the same way.
 pytestmark = pytest.mark.usefixtures("s1_leg_offline")
@@ -67,7 +69,8 @@ def _run(
     recorded: list[dict] = []
     attempts: collections.Counter[str] = collections.Counter()
 
-    def fake_ingest_tile(*, start_date: str, end_date: str, **_):
+    def fake_ingest_tile(*, start_date: str, end_date: str, item_provider_fn=None, **_):
+        item_provider_fn()  # the catalogue query, whose items a given-up date is listed from
         dates = [d for d in catalogue if start_date <= d <= end_date]
         if not dates:
             return None, {}
@@ -145,6 +148,21 @@ def test_a_failed_date_costs_only_itself(monkeypatch, message: str, cause: str |
     assert written == ["2024-01-01", "2024-01-03", "2024-01-04"]
     assert result.status == "success"
     assert result.dates_processed == {"ascending": 3}
+
+
+def test_a_given_up_date_lists_its_bursts_as_unreadable(monkeypatch) -> None:
+    """The date has no slot, so its bursts are recorded off the time axis, each marked unreadable."""
+    committed: dict[str, list] = {}
+    monkeypatch.setattr(provenance, "record_skipped_days", lambda _s, lists, **_k: committed.update(lists))
+    monkeypatch.setattr(
+        s1_roi,
+        "make_s1_item_provider",
+        lambda *_a, **_k: lambda: [fake_stac_item(day, item_id=f"burst-{day}") for day in _CATALOGUE],
+    )
+    _run(monkeypatch, failures={"2024-01-02": _raise("WarpOperationError: Chunk and warp failed", "ZIPDecode: error")})
+    assert {day: [(g["granule_id"], g["status"]) for g in json.loads(listed)] for day, listed in committed.items()} == {
+        "2024-01-02": [("burst-2024-01-02", "unreadable")]
+    }
 
 
 @pytest.mark.parametrize(

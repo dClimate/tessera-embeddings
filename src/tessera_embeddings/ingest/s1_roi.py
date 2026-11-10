@@ -48,7 +48,7 @@ from tessera_embeddings.ingest.duplicates import is_provider_refusal, is_unreada
 from tessera_embeddings.ingest.live_windows import run_live_windows, windows_for_date
 from tessera_embeddings.ingest.loader_failures import install_capture_everywhere, refusal_wait_out
 from tessera_embeddings.ingest.opera_query import BURST_CENSUS_ATTR, BurstCensus, make_s1_item_provider
-from tessera_embeddings.ingest.provenance import day_granules
+from tessera_embeddings.ingest.provenance import SkippedDays, day_granules
 from tessera_embeddings.ingest.roi import (
     read_roi_mask,
     read_roi_metadata,
@@ -81,6 +81,14 @@ logger = logging.getLogger(__name__)
 
 #: The catalogue the radar leg reads: OPERA RTC-S1 bursts through CMR.
 _RADAR_PROVIDER, _RADAR_COLLECTION = "cmr-asf", "opera-rtc-s1"
+
+#: Where every radar granule list says its items came from.
+_RADAR_SOURCE = {
+    "provider": _RADAR_PROVIDER,
+    "collection": _RADAR_COLLECTION,
+    "catalog_url": PROVIDERS[_RADAR_PROVIDER].catalog_url,
+    "collection_id": PROVIDERS[_RADAR_PROVIDER].collections[_RADAR_COLLECTION].collection_id,
+}
 
 DEFAULT_CRED_REFRESH_INTERVAL_SEC = 30 * 60
 """Fallback refresh cadence, used only when the credential advertises no expiry."""
@@ -238,6 +246,8 @@ class _PreparedBatch:
     date_windows: dict[str, tuple[str, list[tuple[int, int, int, int]]]]
     #: Solar day -> the provenance granule list for that day's slot. Empty with provenance off.
     granules: dict[str, str] = field(default_factory=dict)
+    #: Every granule the query returned, the set-aside ones included, for a day given up whole.
+    items: list = field(default_factory=list)
 
 
 def _baselines_for(baselines: dict[str, int], dates: Iterable[str]) -> dict[str, int]:
@@ -517,6 +527,7 @@ def ingest_s1_roi_sar(
     # for the same reason — every accepted cause is DETERMINISTIC — so re-offering costs one
     # re-evaluation and a record of the skip would only matter if the verdict could change.
     written_dates: set[str] = get_existing_dates(orbit_store, s3_region=s3_region)
+    skipped = SkippedDays(orbit_store, _RADAR_SOURCE, exists=bool(written_dates), s3_region=s3_region)
     #: The newest date this store holds. Everything at or below it is closed for good: a Zarr
     #: store's chunks sit at fixed positions, so a day cannot be slotted in behind one already
     #: written. Each of a cell's three child stores advances independently, so this is read per
@@ -785,15 +796,8 @@ def ingest_s1_roi_sar(
             len(seen_items),
             _date_footprints(seen_items),
             # The items the load stamped are the ones it fused, in each day's burst order.
-            day_granules(
-                [*seen_items, *dropped_items],
-                provider=_RADAR_PROVIDER,
-                collection=_RADAR_COLLECTION,
-                catalog_url=PROVIDERS[_RADAR_PROVIDER].catalog_url,
-                collection_id=PROVIDERS[_RADAR_PROVIDER].collections[_RADAR_COLLECTION].collection_id,
-            )
-            if provenance and data is not None
-            else {},
+            day_granules([*seen_items, *dropped_items], **_RADAR_SOURCE) if provenance and data is not None else {},
+            [*seen_items, *dropped_items],
         )
 
     # depth=1: one batch prepared ahead. A batch's write is one long consume, so a single
@@ -964,7 +968,9 @@ def ingest_s1_roi_sar(
                         ) from exc
                     if not _give_up_date(date_str, exc):
                         raise
+                    skipped.record(date_str, prepared.items, "unreadable")
                     continue
+                skipped.written()
                 date_s = time.monotonic() - date_started
                 write_total_s += date_s
                 written_dates.add(date_str)

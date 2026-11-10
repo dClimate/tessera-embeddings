@@ -469,7 +469,9 @@ and every pixel carries a `source_index`: the position plus one of the
 granule that supplied it. The index costs no extra read and no extra fuser. The mask band (SCL,
 or VV) is read through a reader that packs each granule's position above its pixels, so odc's own
 first-wins fuse carries the winner through and a split afterwards returns the band unchanged. The
-mosaic's manifest records the switch, and a resume under the other setting is refused. Its ingest
+mosaic's manifest records the switch, and a resume under the other setting is refused. Whatever the
+switch, a day the ingest skips whole is listed off the time axis with its granules and the reason
+(`provenance.SkippedDays`). Its ingest
 time cost is inside run-to-run variation; it adds one chunk write per date, the index's.
 [docs/ingest/provenance.md](../../../docs/ingest/provenance.md) has the fields, the mechanism and
 what it costs.
