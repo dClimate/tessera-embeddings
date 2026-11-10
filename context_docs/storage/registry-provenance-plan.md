@@ -298,10 +298,10 @@ claims every pixel. The first run that claims the pixel holds its record; the he
 | the granule lists and index inside the mosaics | about 150 MB and 0.1–0.3% of a mosaic | none: deleted with the mosaics |
 
 The ~150 MB inside the mosaics and the ~160 MB `granules` table are the same lists in two
-encodings; the mosaics' copy is deleted at publication. The plane sizes were measured before
-rejected observations were recorded. Cloudy pixels are now non-zero and fully cloudy shard-dates
-now have planes, so the planes will be larger, by an amount the next dev run measures (§10). The planes are chunked one date by one
-shard, so reading one pixel's year fetches one object per date, 40–130 per sensor (§10).
+encodings; the mosaics' copy is deleted at publication. Recording rejected observations, so
+that cloudy pixels are non-zero and fully cloudy shard-dates keep their planes, makes the planes
+about 4% larger on optical and 0–5% on radar. The planes are chunked one date by one shard,
+so reading one pixel's year fetches one object per date, 28–130 per sensor (§10).
 
 **Ingest time.** Measured on zone 35N, 1–7 January 2024, over two days, each pair's two arms run
 side by side on their own clusters. Per-date write time with the record on, divided by off:
@@ -331,9 +331,10 @@ boundary. It is not shipped. Fusing the write graph before the compute, which di
 otherwise skips, folds the index's cast into its write and is shipped: 7% fewer tasks on a recorded
 radar graph, none on a plain one. Measurements: [`provenance-dev-verification.md`](provenance-dev-verification.md).
 
-**Publication** took about 16 seconds for two shards, including the registry run file. It copies
-planes eight shards at a time, for three sensors; if a batch of eight takes as long as that pair, a
-zone-year of about 3,000 shards takes of the order of an hour or two, a risk to examine separately.
+**Publication** took 16 seconds for two shards and 31 seconds for twelve, including the registry
+run file. It copies planes eight shards at a time, for three sensors, so twelve shards are two batches
+of about 15 seconds each; at that rate a zone-year of about 3,000 shards takes about an hour and a
+half, a risk to examine separately (§10).
 
 ## 7. How it was tested
 
@@ -345,10 +346,12 @@ zone-year of about 3,000 shards takes of the order of an hour or two, a risk to 
 | a fill killed between its commit and publication, then retried | the retry's record equals an uninterrupted one |
 | a mosaic changed mid-fill | the record and embeddings read the snapshot planned |
 | a holes update, a registry rebuild and a shards update | each run's record correct; `source_runs` follows |
+| signed planes, fully rejected shard-dates and days skipped for coverage, on twelve shards | every sampled plane equals the mosaic's index under the validity test, sign included; each skipped day is published with its copies, and only days off the time axis are |
 
-The dev test ran an earlier layout: a `granules` file per run, and an `update_pixels` of the
-pixels a holes update was asked to fill. Today's layout and meaning have unit tests and wait for
-the next dev run. Numbers: [`provenance-dev-verification.md`](provenance-dev-verification.md).
+The holes update, the crash and the mid-fill commit ran on an earlier layout (a `granules` file
+per run; an `update_pixels` of the pixels asked for); the twelve-shard run tested today's. Copies
+set aside as duplicate, unreadable or missing bands, and days skipped for a producer conflict or a
+failed read, did not occur in that area and year, so those paths have unit tests only. Numbers: [`provenance-dev-verification.md`](provenance-dev-verification.md).
 
 ## 8. Choices worth questioning
 
@@ -385,18 +388,16 @@ The last column is the first draft's choice, where reviews of the plan or the bu
 
 ## 10. Open questions
 
-1. **Plane chunking.** A one-pixel read fetches 40–130 objects per sensor. The next dev run will
-   compare chunks of all dates × 256 × 256 and all dates × 128 × 128 against the current one date
-   × one shard on a real shard-year, for size and for the time to read one pixel. It will also
-   measure what keeping rejected observations adds, since cloudy pixels are now non-zero.
-2. **Rank or fusion order in the plane.** The rank (plane value k → `sources[k − 1]` → fusion
-   order) exists to fit a byte. Storing the signed fusion order itself as `int16` with bit-shuffled zstd
-   would remove `sources` and one hop; the next dev run will measure its size on a real shard-year.
-3. **Publication time at zone scale,** of the order of an hour or two per zone-year if it grows
-   linearly (§6), to be examined separately.
-4. **Radar file URLs need Earthdata credentials to fetch.** Is it enough to record them, or should
+1. **Plane chunking.** A one-pixel read fetches one object per date, 28–130 per sensor. On two
+   real shard-years, chunks of all dates × 256 × 256 were 7–12% smaller than one date × one shard,
+   and reading one pixel's optical year from outside the region took 0.2 s against 1.9 s. Chunks
+   of all dates × 128 × 128 saved 1–13%, less than 256 × 256 on five of the six. Changing to all dates × 256 × 256 is recommended
+   and not yet decided.
+2. **Publication time at zone scale,** about an hour and a half per zone-year at the measured rate
+   (§6), to be examined separately.
+3. **Radar file URLs need Earthdata credentials to fetch.** Is it enough to record them, or should
    the record also point to a public mirror where one exists?
-5. **Is anything missing** that a user would need to trust or reproduce an embedding?
+4. **Is anything missing** that a user would need to trust or reproduce an embedding?
 
 ## Appendix A. Table schemas
 
@@ -437,7 +438,9 @@ rejected it; 0 means no granule had data. The codec was chosen, before the sign 
 real optical shard-year (33N `chunk_209_14`, 2024): Blosc zstd level 3 with bit
 shuffle, 1.17 MB, against 1.38 MB for two bits a pixel (which would cap a shard-date at three
 granules), 2.83 MB for zstd without the shuffle, which then misses the mostly constant planes' runs,
-and 1.12 MB for a bare validity bit. Bits packed along time and XOR-delta planes also lost.
+and 1.12 MB for a bare validity bit. Bits packed along time and XOR-delta planes also lost. The
+sign adds about 4% on optical and 0–5% on radar. Storing the signed fusion order as `int16` instead of the rank, which
+would remove `sources` and one hop, was 19–83% larger on the same shards, so the rank stays.
 
 **`update_pixels`**: one boolean `(2048, 2048)` array per shard, named for the shard: the pixels
 the holes update embedded.
