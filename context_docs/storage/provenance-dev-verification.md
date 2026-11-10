@@ -1,10 +1,13 @@
-# The provenance record: dev verification (2026-10-27)
+# The provenance record: dev verification
 
-The end-to-end check of the provenance record ([ADR 035](../decisions/035-a-provenance-record-for-the-published-store.md);
-PRs #253, #255 and #256) on global-tessera-dev.
+The end-to-end checks of the provenance record ([ADR 035](../decisions/035-a-provenance-record-for-the-published-store.md);
+PRs #253, #255 and #256) on global-tessera-dev, over three days: the first layout on 2026-10-27,
+its ingest cost on 2026-10-28, and on 2026-11-10 the signed planes, the copies set aside with a
+status, and the days skipped whole, on twelve shards.
 **Every correctness check passed.** The first run's one radar pair suggested the record costs
-ingest time at zone scale; a second day of paired runs (below) put that inside run-to-run variation.
-The plan's size for the `granules` table was low by about half. Both are in the plan and the ingest docs.
+ingest time at zone scale; the second day's paired runs put that inside run-to-run variation.
+The plan's size for the `granules` table was low by about half. The third day measured the plane
+layouts: chunking all dates together would make one-pixel reads ten times faster (finding 8).
 
 ## Setup
 
@@ -23,6 +26,11 @@ The plan's size for the `granules` table was low by about half. Both are in the 
   prefix would share it. All three read the same mosaics.
 - **Isolation.** Everything under `_prov-test*/` in the two dev buckets. Neither campaign watcher
   was scheduled, so the deliberate failures below paged no one.
+- **Third day.** The stack with `main` merged, tested at #259's head (`5630851e`), deployed from
+  the yield-embeddings branch `dev/global-tessera-prov-signed`, on the standing v1.1 image for the
+  same reason as above. A mask of 20 cells, `prov-signed`, lighting twelve shards of zone 33N,
+  `chunk_208`–`211` by `13`–`15`, around the first area. Year 2024, store `prov-signed` with no
+  optical line, under `_prov-signed/`.
 
 ## Results
 
@@ -41,10 +49,11 @@ and `ingest-s1-roi-sar`, ascending):
 
 ### The published record
 
-The record tested here had the first layout: one `granules` file per run, holding every list that
-run read, and an `update_pixels` mask of the pixels a holes update was asked to fill. The plan has
-since keyed `granules` by mosaic snapshot, with a `snapshot_id` on every `shard_dates` row, and made
-the mask the pixels the update embedded; those changes have unit tests and await the next dev run.
+The record tested in this section and the next four had the first layout: one `granules` file per
+run, holding every list that run read, and an `update_pixels` mask of the pixels a holes update was
+asked to fill. The plan has since keyed `granules` by mosaic snapshot, with a `snapshot_id` on every
+`shard_dates` row, and made the mask the pixels the update embedded. The third day's run, the
+section after them, tested today's layout; the update mask's new meaning has unit tests only.
 
 `fill-zones-sequential` filled 33N/2024 with the switch on (run `33N-2024-9a1fc94c`, 13 min), and
 publication wrote 575 `granules` rows and 386 `shard_dates` rows over the two shards. The cell
@@ -113,6 +122,29 @@ re-ingesting the year), then a registry rebuild, then a `shards` update of `chun
 | after `repair --write` | unchanged, `[fill, update]` |
 | the `shards` update of `chunk_209_14` (run `33N-2024-0d0f2647`) | only that shard in the diff, rewritten whole (4,194,304 pixels); its own record, 404 `granules` and 150 `shard_dates` rows for the one shard, and no `update_pixels`; `source_runs` restarted at `[shards]`, while `chunk_209_15` kept `[fill, update]`; `verify` passes |
 
+### Signed planes, set-aside copies and skipped days
+
+`fill-zones-sequential` filled 33N/2024 on twelve shards with the switch on (run
+`33N-2024-4d08ceff`, 47 min: 22 of ingest, 11 waiting for GPUs, 38 of inference on up to two
+GPUs, then 70 s of assembly).
+Publication wrote 1,579 `granules` rows and 2,148 `shard_dates` rows. The cell validation passed
+18 checks; its two findings, seams in the optical observation count at shard boundaries, are
+non-blocking and come from where the swaths fall, not from the record. A check script read the
+published record against the mosaics; nothing failed:
+
+| check | result |
+|---|---|
+| `granules` statuses | optical: 255 `fused`, 50 `low_coverage`; ascending 667 and descending 607, all `fused` |
+| `fusion_order` | set on every `fused` row and on no other |
+| days skipped whole | 24 optical days skipped by the coverage gate, held in the mosaic; the days the record publishes off the mosaic's time axis are exactly those 24, and none lists a `fused` copy |
+| slots | 119 optical, 61 ascending and 88 descending, every one with a granule list |
+| fully rejected shard-dates | 43, all optical: rows with `valid_px` 0 whose planes are wholly negative |
+| planes, 33 sampled shard-dates over two shards and three sensors, the rejected ones included | each equals the mosaic's `source_index` signed by the model's validity test and ranked into `sources`; its positive count equals `valid_px` |
+| the reader | `ProvenanceRecord.pixel_granules_at` on a pixel of `chunk_209_14`: 121 used dates and 32 rejected ones, each with its granule |
+
+No copy was set aside as `duplicate`, `unreadable` or `missing_bands`, and no day was skipped for a
+producer conflict or a failed read, in this area and year; those paths have unit tests only.
+
 ## What it costs
 
 ### Ingest time
@@ -165,10 +197,29 @@ its code is gone.
 
 A zone-day's radar list runs past 255 bursts, which is why the mosaic's index is `uint16`.
 
+The third day measured the published signed planes of two shard-years, `chunk_209_14` and
+`chunk_210_13`, in MB, compressed with the published codec (Blosc zstd 3, bit shuffle):
+
+| shard, sensor | dates | signed, one date × one shard (published) | unsigned, as before | all dates × 256² | all dates × 128² | `int16` fusion order |
+|---|---|---|---|---|---|---|
+| 209_14 optical | 64 | 1.188 | 1.142 | 1.097 | 1.113 | 1.412 |
+| 209_14 ascending | 61 | 0.164 | 0.164 | 0.152 | 0.160 | 0.279 |
+| 209_14 descending | 28 | 0.073 | 0.073 | 0.066 | 0.072 | 0.105 |
+| 210_13 optical | 64 | 0.900 | 0.867 | 0.817 | 0.837 | 1.130 |
+| 210_13 ascending | 61 | 0.490 | 0.476 | 0.430 | 0.465 | 0.858 |
+| 210_13 descending | 28 | 0.195 | 0.185 | 0.171 | 0.169 | 0.356 |
+
+The sign adds about 4% on optical and 0–5% on radar. All dates × 256² is 7–12% smaller than the
+published layout. The `int16` fusion order is 19–83% larger than the rank. Written to S3 both ways,
+the optical planes of `chunk_209_14` gave one pixel's year in a median 1.92 s from the published
+layout (64 objects) and 0.20 s from all dates × 256² (one object), over three pixels, read from a
+laptop outside the region.
+
 ### Publication
 
-The publication step took about 16 s for two shards, including the registry part. It copies
-planes eight shards at a time, so a zone-year of about 3,000 shards is unmeasured.
+The publication step took about 16 s for two shards and 31 s for twelve, including the registry
+part. It copies planes eight shards at a time, so twelve shards are two batches of about 15 s; at
+that rate a zone-year of about 3,000 shards takes about an hour and a half.
 
 ## Findings
 
@@ -195,6 +246,12 @@ planes eight shards at a time, so a zone-year of about 3,000 shards is unmeasure
    rebaked.
 7. **Outside this stack: ADR 034 has two claimants**, #240 (an acquisition is one datastrip) and
    #254 (UTM zone layout). This record's ADR moved to 035.
+8. **Chunking all dates together reads a pixel ten times faster and is smaller.** All dates ×
+   256² beat the published one date × one shard on every shard-year measured, by 7–12% in size,
+   and fetched a pixel's year in one object instead of 64. It is the plan's open question 1 and
+   not yet decided.
+9. **The rank stays.** The signed fusion order as `int16` would drop `sources` and one hop, but
+   was 19–83% larger.
 
 ## Teardown
 
@@ -204,4 +261,6 @@ mosaics and the performance reports, and on the second day `_prov-cost/` with it
 stores and reports. The optical mosaic changed in the mid-fill test was reset to
 its earlier snapshot first. The shared ROI stores were only read. The branch's 11 deployments were
 unregistered, and the yield-embeddings branch `dev/global-tessera-provenance` and the TE branch
-`dev-test/provenance-on-main` were deleted.
+`dev-test/provenance-on-main` were deleted. On the third day, `_prov-signed/` in both dev buckets,
+including the layout test's planes, the 11 deployments of `dev/global-tessera-prov-signed`, and
+that branch.
