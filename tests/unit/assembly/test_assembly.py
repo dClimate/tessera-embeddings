@@ -27,6 +27,7 @@ import zarr
 
 import tessera_embeddings.inference.assembly as _assembly_mod
 from tessera_embeddings.config.inference import EMBEDDING_DIM, INFERENCE_CHUNK_SIZE, MODEL_FAMILIES, encoder_url
+from tessera_embeddings.config.store_geometry import level0
 from tessera_embeddings.config.store_layout import (
     CARRIED_VARS,
     GLOBAL,
@@ -35,6 +36,8 @@ from tessera_embeddings.config.store_layout import (
     MONTHS_IN_YEAR,
     SHARD_PX,
     SINGLE,
+    SINGLE_V2,
+    StoreLayout,
 )
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import (
@@ -2877,24 +2880,25 @@ class TestAssembleGuards:
         assert root["easting"].attrs["standard_name"] == "projection_x_coordinate"
 
     @pytest.mark.parametrize(
-        ("created_with", "kept"),
-        [(("y", "x"), ("y", "x")), (("northing", "easting"), ("northing", "easting"))],
-        ids=["new-v2-store", "v2-store-created-before-y-x"],
+        ("created_with", "level"),
+        [(("y", "x"), "0"), (("northing", "easting"), None)],
+        ids=["new-v2-store", "v2-store-created-before-y-x-and-level-0"],
     )
     def test_a_store_takes_its_models_names_once_and_keeps_them(
-        self, tmp_path, monkeypatch, created_with, kept, writer, output
+        self, tmp_path, monkeypatch, created_with, level, writer, output
     ):
-        """A new v2 store is created with y/x; an append keeps whatever names the store has."""
+        """A new v2 store is created with y/x in level group 0; an append keeps the names and level the store has."""
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
         axis = np.arange(4, dtype="float64") * 10.0
         spatial = SpatialCoords(northing=axis[::-1], easting=axis, crs="EPSG:32633")
         monkeypatch.setattr(_assembly_mod, "read_spatial_coords", lambda *a, **k: spatial)
         roi = _make_full_roi_mask(tmp_path, 4, 4)
 
-        def _run(run_id: str, month: int) -> None:
+        def _run(run_id: str, month: int, layout: StoreLayout | None = None) -> None:
             self._stage_one(writer, chunk, run_id, stack=_V2_STACK)
             writer.assemble(
                 [chunk],
+                layout=layout,
                 total_y=4,
                 total_x=4,
                 run_id=run_id,
@@ -2908,19 +2912,20 @@ class TestAssembleGuards:
 
         v2 = MODEL_FAMILIES["v2-large"]
         monkeypatch.setitem(MODEL_FAMILIES, "v2-large", dataclasses.replace(v2, spatial_dims=created_with))
-        _run("run1", 6)
+        _run("run1", 6, dataclasses.replace(SINGLE_V2, level=level))
         MODEL_FAMILIES["v2-large"] = v2  # the append runs under today's record
         _run("run2", 7)
 
         root = zarr.open_group(open_or_create_repo(output)[0].readonly_session("main").store, mode="r")
-        arrays = root["0"]  # a v2 store keeps its arrays in level group 0, band-first (ADR 031)
-        y, x = kept
+        arrays = level0(root)  # a v2 store keeps its arrays in level group 0, band-first (ADR 031)
+        y, x = created_with
         assert arrays["time"].shape == (2,)
         assert arrays["embeddings"].metadata.dimension_names == ("time", "band", y, x)
-        assert root.attrs["spatial:dimensions"] == [y, x] and root.attrs["multiscales"]["layout"][0]["asset"] == "0"
+        assert root.attrs["spatial:dimensions"] == [y, x]
+        assert [e["asset"] for e in root.attrs.get("multiscales", {}).get("layout", [])] == ([level] if level else [])
         assert arrays[y].attrs["axis"] == "Y" and arrays[x].attrs["axis"] == "X"
         names = {"northing", "easting", "y", "x"}
-        assert names - set(arrays.array_keys()) == names - {y, x} and not set(root.array_keys())
+        assert names - set(arrays.array_keys()) == names - {y, x} and bool(set(root.array_keys())) == (level is None)
         assert resolve_region(output, northing=(0, 10)) == {y: slice(2, 4)}  # descending Y axis
 
     def test_append_refuses_a_reordered_interior_on_matching_endpoints(self, tmp_path, monkeypatch, writer, output):

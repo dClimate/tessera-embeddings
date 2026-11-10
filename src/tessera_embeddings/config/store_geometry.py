@@ -27,6 +27,11 @@ PRESET_SPATIAL_DIMS: tuple[str, str] = ("northing", "easting")
 LEVEL0 = "0"
 
 
+def level_of(group: zarr.Group) -> str | None:
+    """The level group *group* keeps its 10 m arrays in, :data:`LEVEL0`, or ``None`` if it keeps them itself."""
+    return LEVEL0 if isinstance(group.get(LEVEL0), zarr.Group) else None
+
+
 def level0(group: zarr.Group) -> zarr.Group:
     """The group holding *group*'s 10 m arrays: its ``0`` child group if it has one, else itself.
 
@@ -34,8 +39,7 @@ def level0(group: zarr.Group) -> zarr.Group:
     (CRS, completed years, update records, ``proj:``, ``spatial:``, ``multiscales``) stay on
     *group*; only the arrays and their coordinates are reached through this.
     """
-    child = group.get(LEVEL0)
-    return child if isinstance(child, zarr.Group) else group
+    return cast("zarr.Group", group[LEVEL0]) if level_of(group) else group
 
 
 def dims_of(array: object) -> tuple[str, ...]:

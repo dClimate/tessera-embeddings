@@ -69,6 +69,7 @@ from tessera_embeddings.config.store_geometry import (
     band_axis,
     dims_of,
     level0,
+    level_of,
     reorder,
     spatial_dims_of,
     window,
@@ -415,6 +416,15 @@ def _write_granularity(node: zarr.Group, variables: Iterable[str]) -> int:
     if len(set(sizes.values())) != 1:
         raise ValueError(f"Data variables disagree on northing write granularity: {sizes}")
     return next(iter(sizes.values()))
+
+
+def _run_layout(layout: StoreLayout, model_version: str, root: zarr.Group, *, fresh: bool) -> StoreLayout:
+    """*layout* as this run applies it: a new store takes its model's Y/X names and the layout's level
+    group; an existing one keeps its own names and level group, whatever the model.
+    """
+    if fresh:
+        return layout.with_spatial_dims(model_family(model_version).spatial_dims)
+    return dataclasses.replace(layout.with_spatial_dims(spatial_dims_of(root)), level=level_of(root))
 
 
 def _layout_matching_store(root: zarr.Group, layout: StoreLayout, variables: Iterable[str]) -> StoreLayout:
@@ -2344,11 +2354,7 @@ class ZarrWriter:
         # "time" absent means a created-but-never-seeded repo (a crash between repo creation and
         # the schema commit) — treat as fresh.
         fresh = is_new or "time" not in level0(root)
-        # A new store takes its model's layout and Y/X names; an existing one keeps its own names,
-        # and its arrays' geometry, whatever the model.
-        layout = (layout or layout_for(model_version, single=True)).with_spatial_dims(
-            model_family(model_version).spatial_dims if fresh else spatial_dims_of(root)
-        )
+        layout = _run_layout(layout or layout_for(model_version, single=True), model_version, root, fresh=fresh)
         run = _AssemblyRun(
             run_id=run_id,
             output_path=output_path,
