@@ -79,9 +79,8 @@ provenance beyond its registry, and none can be reconstructed.
 - The mosaic gains a `granules` array and a `source_index` band while the switch is on; the
   ingest's code fingerprint moves, so the ingest half deploys while nothing is mid-ingest or under
   `allow_ingest_code_mismatch`.
-- About 4.7 TB of planes and under 200 GB of tables are added beside the store over the whole
-  campaign, about a quarter of a percent of it, before the cost of keeping rejected observations,
-  which is still to be measured.
+- About 5 TB of planes and under 200 GB of tables are added beside the store over the whole
+  campaign, about a quarter of a percent of it.
 - The ingest's time cost is inside run-to-run variation over seven paired runs of a dense zone;
   what the record adds for certain is one more chunk write per date, the index's, for the Dask
   scheduler, accepted (plan §6).
