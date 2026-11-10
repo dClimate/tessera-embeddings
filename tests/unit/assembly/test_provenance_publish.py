@@ -113,9 +113,11 @@ def _mosaics(base: Path, *, on: bool = True, seed: int = 0) -> dict[str, str]:
             granules=[json.dumps(_granule_list(sensor, d)) for d in DATES] if on else None,
         )
         if on and sensor == "s2":
-            record_skipped_days(
-                path, {SKIPPED: json.dumps([_granule(sensor, SKIPPED, 0) | {"status": "low_coverage"}])}
-            )
+            # A skipped day, and one an earlier attempt skipped and a later one wrote, whose slot wins.
+            skipped = {
+                day: json.dumps([_granule(sensor, day, 0) | {"status": "low_coverage"}]) for day in (SKIPPED, DATES[0])
+            }
+            record_skipped_days(path, skipped)
         pins[path] = open_repo(path).lookup_branch("main")
     return pins
 
