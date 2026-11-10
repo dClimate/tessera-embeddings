@@ -33,9 +33,7 @@ def _write_run_file(root: str, cell: tuple[str, int, str], rows: list[dict], *, 
         uri,
         rows,
         open_output=lambda u: Path(u).open("wb"),  # noqa: SIM115
-        zone=zone,
-        year=year,
-        extra_metadata=None if rule is None else {"optical_min_obs": str(rule)},
+        metadata={"zone": zone, "year": str(year)} | ({} if rule is None else {"optical_min_obs": str(rule)}),
     )
     return uri
 

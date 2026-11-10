@@ -85,6 +85,7 @@ import io
 import logging
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import AbstractContextManager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -238,6 +239,27 @@ def _blank_measurements() -> dict[str, Any]:
     }
 
 
+@dataclass(frozen=True)
+class RegistryRun:
+    """What one run's registry file states about a cell, before its records and footprints are attached.
+
+    ``committed_at`` is the shard commit's own timestamp, stamped on every row as ``assembled_at``.
+    ``embedded`` and ``refused`` partition the live shards. ``source_runs`` maps a shard to the runs
+    its pixels came from, as the store records them.
+    """
+
+    zone: str
+    year: int
+    run_id: str
+    committed_at: str
+    embedded: list[str]
+    refused: list[str]
+    optical_min_obs: int | None = None
+    embedded_records: Mapping[str, dict] | None = None
+    update_name: str | None = None
+    source_runs: Callable[[str], list[str] | None] | None = None
+
+
 def registry_rows(
     run_id: str,
     assembled_at: str,
@@ -360,19 +382,17 @@ def write_run_file(
     rows: list[dict[str, Any]],
     *,
     open_output: Callable[[str], AbstractContextManager[Any]],
-    zone: str = "",
-    year: int = 0,
-    extra_metadata: Mapping[str, str] | None = None,
+    metadata: Mapping[str, str],
 ) -> int:
     """Write ``rows`` as one run file at ``uri``; returns the rows written.
 
     ``open_output`` returns a binary writable for the URI — the caller's filesystem, so nothing here
     knows whether the registry is local or in somebody else's bucket.
 
-    ``zone``/``year`` go into the file's key-value metadata rather than a column, so a file opened on
-    its own still says what it describes while the dataset's partition keys stay the single
-    authority. ``extra_metadata`` adds to that key-value block — for provenance describing the whole
-    file rather than any one tile, that a reader may want without decoding a row.
+    ``metadata`` is the file's key-value block, beside the ``run_id`` taken from the rows. It carries
+    the ``zone`` and ``year`` rather than a column, so a file opened on its own still says what it
+    describes while the dataset's partition keys stay the single authority, and any provenance
+    describing the whole file rather than one tile, that a reader may want without decoding a row.
 
     Buffered and written in one shot rather than streamed: a run file is at most a few hundred rows and a
     partial Parquet file is unreadable, so one write is both cheap and the only version that fails
@@ -384,9 +404,7 @@ def write_run_file(
     if not rows:
         return 0
     table = pa.Table.from_pylist(rows, schema=registry_schema())
-    table = table.replace_schema_metadata(
-        {"zone": zone, "year": str(year), "run_id": str(rows[0]["run_id"]), **dict(extra_metadata or {})}
-    )
+    table = table.replace_schema_metadata({"run_id": str(rows[0]["run_id"]), **dict(metadata)})
     buf = io.BytesIO()
     pq.write_table(table, buf, compression="zstd")
     with open_output(uri) as f:

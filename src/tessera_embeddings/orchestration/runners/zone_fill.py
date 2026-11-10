@@ -88,6 +88,7 @@ from tessera_embeddings.storage.campaign import mark_zone_year_empty, pin_tag, t
 from tessera_embeddings.storage.global_store import check_destination_types, open_global_repo
 from tessera_embeddings.storage.published_store import calendar_years, live_shards, shard_writes, store_year
 from tessera_embeddings.storage.published_store import source_runs as published_source_runs
+from tessera_embeddings.storage.registry import RegistryRun
 from tessera_embeddings.storage.registry_master import merge_cell
 from tessera_embeddings.storage.registry_rebuild import as_coverage_record, rebuild_tile
 from tessera_embeddings.storage.shard_writer import read_years_complete, shard_pitch
@@ -1725,18 +1726,16 @@ def _publish_merged_rows(
             year,
             zone,
         )
-    writer.publish_registry_run_file(
-        registry_root,
+    run = RegistryRun(
         zone,
         year,
         run_id,
-        committed_at=committed_at,
+        committed_at,
         embedded=labels,
         refused=[],
         optical_min_obs=optical_min_obs,
         embedded_records=records,
         update_name=update_name,
         source_runs=lambda tile: published_source_runs(attrs, year, tile) if attrs else None,
-        get_credentials=get_credentials,
-        s3_region=s3_region,
     )
+    writer.publish_registry_run_file(registry_root, run, get_credentials=get_credentials, s3_region=s3_region)

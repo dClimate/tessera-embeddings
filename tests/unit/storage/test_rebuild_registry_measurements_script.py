@@ -186,7 +186,6 @@ class TestVerify:
         script: Any,
         store: zarr.Group,
         tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
         capsys: Any,
         zones: list[str],
     ) -> None:
@@ -197,9 +196,10 @@ class TestVerify:
         zone.create_array("time", data=store["time"][:])
         writes = {("35N", 2017): [Commit("first-fill", FILLED, "s-a")]}
         root = {"33N": store, "35N": zone}
-        monkeypatch.setattr(script, "_open_store", lambda *_args, **_kwargs: (None, root, lambda: writes))
-        monkeypatch.setattr(published_store, "commit_tiles", lambda *_args: frozenset({"chunk_0_0"}))
-        assert script.main(["verify", "--registry", str(tmp_path), *zones]) == 1
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(script, "_open_store", lambda *_args, **_kwargs: (None, root, lambda: writes))
+            patch.setattr(published_store, "commit_tiles", lambda *_args: frozenset({"chunk_0_0"}))
+            assert script.main(["verify", "--registry", str(tmp_path), *zones]) == 1
         assert "35N/2017: the store cannot stand behind its run files: run 'first-fill'" in capsys.readouterr().out
 
     def test_zones_narrow_what_is_checked(self, script: Any, store: zarr.Group, tmp_path: Path) -> None:

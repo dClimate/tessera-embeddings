@@ -44,7 +44,7 @@ from tessera_embeddings.inference.assembly import (
     summarise_optical_skips,
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
-from tessera_embeddings.storage.registry import run_file_uri
+from tessera_embeddings.storage.registry import RegistryRun, run_file_uri
 from tests.unit.inference_stack import STACK
 
 #: A shard commit's timestamp, as `write_year_shards` reports it.
@@ -519,12 +519,7 @@ class TestThePartIsPublishedOnlyAfterTheCellCommits:
 
         uri = writer.publish_registry_run_file(
             root,
-            "32S",
-            2021,
-            "run1",
-            committed_at=COMMITTED,
-            embedded=["chunk_9_9"],
-            refused=["chunk_0_0", "chunk_0_1"],
+            RegistryRun("32S", 2021, "run1", COMMITTED, embedded=["chunk_9_9"], refused=["chunk_0_0", "chunk_0_1"]),
         )
 
         assert uri == run_file_uri(root, "32S", 2021, "run1")
@@ -555,7 +550,7 @@ class TestThePartIsPublishedOnlyAfterTheCellCommits:
         monkeypatch.setattr(_assembly_mod, "_fs_for", _boom)
         assert (
             writer.publish_registry_run_file(
-                str(tmp_path / "reg"), "32S", 2021, "run1", committed_at=COMMITTED, embedded=[], refused=[chunk.label]
+                str(tmp_path / "reg"), RegistryRun("32S", 2021, "run1", COMMITTED, embedded=[], refused=[chunk.label])
             )
             is None
         ), "reported as not published rather than raised"

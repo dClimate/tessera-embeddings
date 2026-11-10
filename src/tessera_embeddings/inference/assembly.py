@@ -99,7 +99,7 @@ from tessera_embeddings.storage.icechunk_logging import traced_commit
 from tessera_embeddings.storage.manifest import EmbeddingManifest, extract_manifest
 from tessera_embeddings.storage.object_store import delete_prefix
 from tessera_embeddings.storage.published_store import source_runs as published_source_runs
-from tessera_embeddings.storage.registry import registry_rows, run_file_uri, write_run_file
+from tessera_embeddings.storage.registry import RegistryRun, registry_rows, run_file_uri, write_run_file
 from tessera_embeddings.storage.shard_writer import (
     PhaseTimer,
     claim_root_stack,
@@ -1164,17 +1164,7 @@ class ZarrWriter:
     def publish_registry_run_file(
         self,
         registry_root: str,
-        zone: str,
-        year: int,
-        run_id: str,
-        *,
-        committed_at: str,
-        embedded: list[str],
-        refused: list[str],
-        optical_min_obs: int | None = None,
-        embedded_records: Mapping[str, dict] | None = None,
-        update_name: str | None = None,
-        source_runs: Callable[[str], list[str] | None] | None = None,
+        run: RegistryRun,
         get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
         s3_region: str | None = None,
     ) -> str | None:
@@ -1185,7 +1175,7 @@ class ZarrWriter:
         embedded and refused tiles for a zone-year that may never land, permanently. Publishing
         after the commit makes the run file's existence mean the cell exists.
 
-        ``committed_at`` is the shard commit's own timestamp, stamped on every row as
+        ``run.committed_at`` is the shard commit's own timestamp, stamped on every row as
         ``assembled_at``. The master keeps each tile's newest row, so the stamp must order runs as
         the store wrote their pixels; the clock at publication would not, when one run commits
         first and publishes last.
@@ -1199,9 +1189,10 @@ class ZarrWriter:
         # results. Merged because a row's measurements mean the same thing either way (see
         # `_coverage_record`); the marker side wins on a label in both, since a marker is written
         # at the end of a shard that refused everything.
-        records = {**(embedded_records or {}), **self._last_skip_records}
+        records = {**(run.embedded_records or {}), **self._last_skip_records}
+        zone, year, run_id = run.zone, run.year, run.run_id
         uri = run_file_uri(registry_root, zone, year, run_id)
-        boxes = _tile_bboxes_wgs84(zone, [*embedded, *refused])
+        boxes = _tile_bboxes_wgs84(zone, [*run.embedded, *run.refused])
         # The build publishing this run file IS the build that produced the cell — same process.
         # Returns None rather than raising, so a wheel install with no VCS information just leaves
         # the columns null.
@@ -1219,23 +1210,23 @@ class ZarrWriter:
                 uri,
                 registry_rows(
                     run_id,
-                    committed_at,
-                    embedded=embedded,
-                    refused=refused,
+                    run.committed_at,
+                    embedded=run.embedded,
+                    refused=run.refused,
                     records=records,
-                    optical_min_obs=optical_min_obs,
+                    optical_min_obs=run.optical_min_obs,
                     bboxes=boxes,
                     code=build,
-                    update_name=update_name,
-                    source_runs=source_runs,
+                    update_name=run.update_name,
+                    source_runs=run.source_runs,
                 ),
                 open_output=lambda target: fs.open(target, "wb"),
-                zone=zone,
-                year=year,
-                # Also in the key-value block, so a run file read on its own, without the dataset's
-                # partitioning, still states the rule its rows were judged against.
-                extra_metadata={
-                    "optical_min_obs": "" if optical_min_obs is None else str(optical_min_obs),
+                # The rule is in the key-value block too, so a run file read on its own, without the
+                # dataset's partitioning, still states the rule its rows were judged against.
+                metadata={
+                    "zone": zone,
+                    "year": str(year),
+                    "optical_min_obs": "" if run.optical_min_obs is None else str(run.optical_min_obs),
                     "code_commit": str(build.get("commit") or ""),
                     "code_version": str(build.get("version") or ""),
                 },
@@ -2766,16 +2757,18 @@ class ZarrWriter:
             attrs = dict(zarr.open_group(repo.readonly_session(snapshot_id=snapshot).store, mode="r")[zone].attrs)
             self.publish_registry_run_file(
                 registry_root,
-                zone,
-                year,
-                run_id,
-                source_runs=lambda tile: published_source_runs(attrs, year, tile),
-                committed_at=telemetry["commit"]["committed_at"],
-                embedded=registry_embedded,
-                refused=registry_refused,
-                optical_min_obs=optical_min_obs,
-                embedded_records=embedded_records,
-                update_name=update_name,
+                RegistryRun(
+                    zone,
+                    year,
+                    run_id,
+                    telemetry["commit"]["committed_at"],
+                    embedded=registry_embedded,
+                    refused=registry_refused,
+                    optical_min_obs=optical_min_obs,
+                    embedded_records=embedded_records,
+                    update_name=update_name,
+                    source_runs=lambda tile: published_source_runs(attrs, year, tile),
+                ),
                 # The store's own callback: the registry is its sibling in the same bucket, so the
                 # credential that opened the store is the one that can write beside it.
                 get_credentials=get_credentials,
