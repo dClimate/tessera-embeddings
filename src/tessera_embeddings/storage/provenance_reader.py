@@ -92,17 +92,6 @@ class ProvenanceRecord:
     def __init__(self, registry_root: str, get_credentials: _Creds = None, region: str | None = None) -> None:
         """A reader of the record beside ``registry_root``."""
         self.root, self.get_credentials, self.region = registry_root.rstrip("/"), get_credentials, region
-        self._options: dict[str, str] | None = None
-        if self.root.startswith("s3://"):
-            options: dict[str, str | None] = {"aws_region": region}
-            if get_credentials is not None:
-                creds = get_credentials()
-                options |= {
-                    "aws_access_key_id": creds.access_key_id,
-                    "aws_secret_access_key": creds.secret_access_key,
-                    "aws_session_token": creds.session_token,
-                }
-            self._options = {k: v for k, v in options.items() if v is not None} or None
 
     def day_granules(
         self, zone: str, year: int, sensor: str, day: datetime.date, run_id: str | None = None
@@ -207,4 +196,18 @@ class ProvenanceRecord:
         return self._scan(f"{table_dir(self.root, table, zone, year)}/*.parquet")
 
     def _scan(self, pattern: str) -> pl.LazyFrame:
-        return pl.scan_parquet(pattern, hive_partitioning=False, storage_options=self._options)
+        """A lazy scan of ``pattern``, with credentials asked for afresh, so a long-lived record outlives a token."""
+        return pl.scan_parquet(pattern, hive_partitioning=False, storage_options=self._storage_options())
+
+    def _storage_options(self) -> dict[str, str] | None:
+        if not self.root.startswith("s3://"):
+            return None
+        options: dict[str, str | None] = {"aws_region": self.region}
+        if self.get_credentials is not None:
+            creds = self.get_credentials()
+            options |= {
+                "aws_access_key_id": creds.access_key_id,
+                "aws_secret_access_key": creds.secret_access_key,
+                "aws_session_token": creds.session_token,
+            }
+        return {k: v for k, v in options.items() if v is not None} or None

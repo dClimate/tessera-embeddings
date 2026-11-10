@@ -234,7 +234,9 @@ way. The sensors are `s2` (optical), `s1_asc` and `s1_desc` (radar by orbit dire
   images come the copies the ingest set aside before building the mosaic, with no `fusion_order`
   and a `status` saying why: `duplicate`, another copy of an image it used; `unreadable`, a copy
   that would not read and was replaced; or `missing_bands`, a radar image whose catalogue entry
-  lacks its VV or VH file. Fused rows have `status` `fused`.
+  lacks its VV or VH file. Fused rows have `status` `fused`. A day the ingest skipped whole has
+  no fused rows, only its images, each marked with the day's reason: `low_coverage`,
+  `producer_conflict` or `unreadable`.
 - **`shard_dates`**: one row per tile, sensor and date on which an image had data at the tile, with
   `valid_px`, the tile's pixels whose observation the model used that day; `sources`, the
   `fusion_order` of every image with data at at least one of its pixels, used or not; and `snapshot_id`, the mosaic the run read, which
