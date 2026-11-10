@@ -1257,6 +1257,7 @@ def _expected_planes(n_t_sar: int = 5) -> dict[str, list[tuple[int, list[int], i
     """``{sensor: [(time, sources, valid_px)]}`` for the synthetic mosaics, computed by hand.
 
     The model's validity tests: SCL in the valid classes for optical, a non-zero VV or VH for radar.
+    Optical is read on every date, a fully rejected one included; radar on the dates with data.
     """
     h, w = _CHUNK.height, _CHUNK.width
     stores = {
@@ -1270,11 +1271,12 @@ def _expected_planes(n_t_sar: int = 5) -> dict[str, list[tuple[int, list[int], i
             valid = np.isin(root["scl"][:], list(SCL_VALID_CLASSES))
         else:
             valid = (root["0_VV"][:] != 0) | (root["0_VH"][:] != 0)
-        positions = np.where(valid, root[SOURCE_INDEX_VAR][:], 0)
+        index = root[SOURCE_INDEX_VAR][:].astype(int)
+        read = np.ones(len(index), dtype=bool) if sensor == "s2" else valid.any(axis=(1, 2))
         out[sensor] = [
-            (t, sorted(int(v) - 1 for v in np.unique(plane) if v), int(np.count_nonzero(plane)))
-            for t, plane in enumerate(positions)
-            if valid[t].any()
+            (t, sorted(int(v) - 1 for v in np.unique(index[t]) if v), int(np.count_nonzero(valid[t] & (index[t] > 0))))
+            for t in range(len(index))
+            if read[t] and index[t].any()
         ]
     return out
 
@@ -1286,16 +1288,16 @@ class TestProvenancePlanes:
         _, write = _run_process_chunk(inference_config, test_model)
         assert write["planes"] is None
 
-    def test_each_plane_ranks_the_granules_the_input_was_valid_for(self, inference_config, test_model):
-        """Ranks point into the shard-date's sources, and the counts are the model's own validity."""
+    def test_each_plane_ranks_every_granule_and_signs_the_models_verdict(self, inference_config, test_model):
+        """Ranks point into the shard-date's sources, negative where the model rejected the observation."""
         _, write = _run_process_chunk(inference_config, test_model, source_index=True)
         expected = _expected_planes()
         assert set(write["planes"]) == {"s2", "s1_asc", "s1_desc"}
         for sensor, dates in write["planes"].items():
             assert [(t, sources, valid) for t, _, sources, valid in dates] == expected[sensor], sensor
             for _, plane, sources, valid in dates:
-                assert plane.dtype == np.uint8 and int(np.count_nonzero(plane)) == valid
-                assert sorted(np.unique(plane[plane > 0]).tolist()) == list(range(1, len(sources) + 1))
+                assert plane.dtype == np.int8 and int(np.count_nonzero(plane > 0)) == valid
+                assert np.unique(np.abs(plane[plane != 0])).tolist() == list(range(1, len(sources) + 1))
 
     def test_a_holes_update_records_the_pixels_it_embedded_not_the_holes_it_was_given(
         self, inference_config, test_model, tmp_path

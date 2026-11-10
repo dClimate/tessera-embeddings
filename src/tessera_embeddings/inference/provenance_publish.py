@@ -33,7 +33,7 @@ import pyarrow.parquet as pq
 import zarr
 from fsspec import AbstractFileSystem
 
-from tessera_embeddings.config.ingest import GRANULES_ARRAY
+from tessera_embeddings.config.ingest import FUSED, GRANULES_ARRAY
 from tessera_embeddings.config.store_layout import SENSORS
 from tessera_embeddings.inference.assembly import _COVERAGE_SUFFIX, _fs_for, _open_staged_tile
 from tessera_embeddings.inference.chunk_spec import parse_chunk_label
@@ -162,7 +162,7 @@ def publish_provenance(
             sensor,
             shape=(len(days), *grid_shape),
             chunks=(1, shard_px, shard_px),
-            dtype=np.uint8,
+            dtype=np.int8,
             fill_value=0,
             compressors=PLANE_COMPRESSORS,
             dimension_names=("date", "northing", "easting"),
@@ -223,7 +223,7 @@ def _publish_granules(
     the lists read now, day by day, so every run that names the snapshot reads the same lists.
     """
     if fs.exists(uri):
-        key = ("solar_day", "fusion_order", "granule_id")
+        key = ("solar_day", "fusion_order", "granule_id", "status")
         with fs.open(uri, "rb") as f:
             have = pq.read_table(f, columns=list(key)).to_pylist()
         if [tuple(r[k] for k in key) for r in have] != [tuple(r[k] for k in key) for r in rows]:
@@ -259,8 +259,11 @@ def _provenance_mosaics(
 
 
 def _granule_counts(sensor: str, root: zarr.Group) -> list[int]:
-    """Granules per slot. Every slot must have a list: the ingest writes it in the slot's commit."""
-    counts = [len(_json_list(raw)) for raw in read_array(root, GRANULES_ARRAY).tolist()]
+    """Fused granules per slot. Every slot must have some: the ingest writes its list in the slot's commit."""
+    counts = [
+        sum(g.get("status", FUSED) == FUSED for g in _json_list(raw))
+        for raw in read_array(root, GRANULES_ARRAY).tolist()
+    ]
     slots = len(read_array(root, "time"))
     if len(counts) != slots or not all(counts):
         empty = [i for i, n in enumerate(counts) if not n]
@@ -339,18 +342,18 @@ def _copy_shard(
 def _check_plane(
     label: str, sensor: str, time: int, plane: np.ndarray, record: Mapping[str, Any], i: int, counts: Sequence[int]
 ) -> None:
-    """A plane's count is its row's ``valid_px``, its values rank its ``sources``, and they exist.
+    """A plane's positive count is its row's ``valid_px``, its values rank its ``sources``, and they exist.
 
-    ``counts`` are the day lengths of the snapshot the row names, which is what its ``granules``
-    file holds, so a source below the count is a granule of that day in that file.
+    ``counts`` are the fused granules of each day of the snapshot the row names, which its
+    ``granules`` file holds, so a source below the count is a fused granule of that day in that file.
     """
     sources, valid = record["sources"][i], record["valid_px"][i]
     where = f"{label} {sensor} slot {time}"
     if time >= len(counts):
         raise ProvenanceCheckError(f"{where}: no such slot on the mosaic's time axis ({len(counts)} slots)")
-    if int(np.count_nonzero(plane)) != valid:
-        raise ProvenanceCheckError(f"{where}: plane has {np.count_nonzero(plane)} pixels, its row says {valid}")
-    if sorted(np.unique(plane[plane > 0]).tolist()) != list(range(1, len(sources) + 1)):
+    if (positive := int(np.count_nonzero(plane > 0))) != valid:
+        raise ProvenanceCheckError(f"{where}: plane has {positive} valid pixels, its row says {valid}")
+    if np.unique(np.abs(plane[plane != 0])).tolist() != list(range(1, len(sources) + 1)):
         raise ProvenanceCheckError(f"{where}: plane values do not rank its {len(sources)} source(s)")
     if sources and max(sources) >= counts[time]:
         raise ProvenanceCheckError(f"{where}: source {max(sources)} beyond the day's {counts[time]} granule(s)")

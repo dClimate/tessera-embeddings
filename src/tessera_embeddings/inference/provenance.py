@@ -1,4 +1,4 @@
-"""The model half of the provenance record: which granule supplied each observation valid for the model.
+"""The model half of the provenance record: which granule supplied each observation, and whether the model used it.
 
 A mosaic built with the provenance switch on carries a ``source_index`` band beside its imagery
 (``ingest/provenance.py``): per pixel and slot, the fusion position plus one of the granule the
@@ -7,24 +7,27 @@ fuser took the pixel from. The actor turns that into the per-shard record the re
 
 * **Pieces, read where the mask is read.** Wherever a loader reads a sensor's validity — the
   whole-shard SCL mask for optical, each strip's VV and VH for radar — it also reads the source
-  index over the same dates and window, zeroes it wherever the model's own validity test fails,
+  index over the same dates and window, negates it wherever the model's own validity test fails,
   and keeps it compressed per date (:func:`read_source_pieces`). Nothing is read twice, and a
   shard holds kilobytes per date rather than a full plane.
 * **Planes, ranked at the staging write.** :class:`SourcePlanes` collects a shard's pieces across
   strips. At the write, on the actor's background writer, each date's pieces are stitched into one
-  plane, cut for a holes update to the pixels it embedded, and its values replaced by their rank in
-  the shard-date's ``sources``: the distinct fusion positions that supplied a pixel, ascending. A day's
-  fusion order is zone-wide and can exceed 255, while a shard has a handful of contributing
-  granules on a date, so the rank keeps the published plane ``uint8``. The plane and its
+  plane, cut for a holes update to the pixels it embedded, and its values replaced by their signed
+  rank in the shard-date's ``sources``: the distinct fusion positions that covered a pixel,
+  ascending. A day's fusion order is zone-wide and can exceed 255, while a shard has a handful of
+  granules on a date, so the rank keeps the published plane ``int8``. The plane and its
   ``sources`` and valid-pixel count are staged with the shard.
 
-A non-zero value means the observation was valid for the model, by its own test, and names the
-granule that supplied it. For a pixel with an embedding those are the observations its input drew
-on; a pixel deeper than the deepest bucket is resampled to a deterministic subset of them
-(``inference/sampling.py``). A fill or a shards update records every pixel it was asked to embed,
-refused ones included, which is how a refused shard still has rows. A holes update records only the
-pixels it embedded, and stages them as its ``update_pixels`` mask: a reader takes those pixels from
-the update and every other pixel from the run before it (plan §5).
+A value k names ``sources[|k| - 1]``. Positive means the observation was valid for the model, by
+its own test; negative means that granule had data there and the test rejected it, a cloud for
+instance; zero means no granule had data. For a pixel with an embedding the positive values are the
+observations its input drew on; a pixel deeper than the deepest bucket is resampled to a
+deterministic subset of them (``inference/sampling.py``).
+
+A fill or a shards update records every pixel it was asked to embed, refused ones included, which is
+how a refused shard still has rows. A holes update records only the pixels it embedded, and stages
+them as its ``update_pixels`` mask: a reader takes those pixels from the update and every other
+pixel from the run before it (plan §5).
 """
 
 from __future__ import annotations
@@ -46,7 +49,7 @@ from tessera_embeddings.config.store_layout import SENSORS
 #: shard-year where plain zstd took 2.83 MB (the plan's Appendix A).
 PLANE_COMPRESSORS = (BloscCodec(cname="zstd", clevel=3, shuffle="bitshuffle"),)
 
-#: The same codec for the in-memory pieces, which are 16-bit positions rather than 8-bit ranks.
+#: The same codec for the in-memory pieces, which are signed 32-bit positions rather than 8-bit ranks.
 _PIECE_CODEC = numcodecs.Blosc(cname="zstd", clevel=3, shuffle=numcodecs.Blosc.BITSHUFFLE)
 
 #: Dates read per batch when building pieces: a whole shard's index for every kept date at once
@@ -70,7 +73,8 @@ class SourcePiece:
     """One date's source positions over one window of a shard, compressed.
 
     ``time`` is the mosaic time index; ``rows`` and ``cols`` are shard-relative. Values are the
-    fusion position plus one, and zero wherever the model's validity test failed.
+    fusion position plus one, negated wherever the model's validity test failed, and zero where no
+    granule had data.
     """
 
     time: int
@@ -96,7 +100,7 @@ def read_source_pieces(
     rows: slice,
     cols: slice,
 ) -> list[SourcePiece]:
-    """The source index at ``times`` over the window, zeroed where ``valid`` is False, per date.
+    """The source index at ``times`` over the window, negated where ``valid`` is False, per date.
 
     ``valid`` is ``(len(times), h, w)``, the test the model applies to the same reads. Empty when
     the mosaic carries no source index, which is how the record follows the mosaics: a store built
@@ -109,11 +113,12 @@ def read_source_pieces(
     pieces: list[SourcePiece] = []
     for start in range(0, len(times), _READ_BATCH):
         batch = np.asarray(times[start : start + _READ_BATCH])
-        positions = np.asarray(index.oindex[batch, y_slice, x_slice])
-        positions[~valid[start : start + len(batch)]] = 0
+        positions = np.asarray(index.oindex[batch, y_slice, x_slice]).astype(np.int32)
+        np.negative(positions, out=positions, where=~valid[start : start + len(batch)])
         pieces.extend(
             SourcePiece(int(t), rows, cols, _PIECE_CODEC.encode(np.ascontiguousarray(plane)))
             for t, plane in zip(batch, positions, strict=True)
+            if plane.any()
         )
     return pieces
 
@@ -124,7 +129,7 @@ class ShardDate:
 
     time: int
     plane: np.ndarray
-    #: The fusion positions (0-based) that supplied at least one pixel, ascending.
+    #: The fusion positions (0-based) that covered at least one pixel, valid or not, ascending.
     sources: list[int]
     valid_px: int
 
@@ -157,30 +162,34 @@ class SourcePlanes:
         return [sensor for sensor in SENSORS if self._pieces[sensor]]
 
     def dates(self, sensor: str, pixels: np.ndarray | None = None) -> Iterator[ShardDate]:
-        """Each date's ranked plane for ``sensor``, in time order, cut to ``pixels`` when given.
+        """Each date's signed ranked plane for ``sensor``, in time order, cut to ``pixels`` when given.
 
-        A date with no valid pixel left after the cut is dropped: the shard has no record for it.
+        A date where no granule had data at any pixel left after the cut is dropped: the shard has
+        no record for it. A date the model rejected everywhere, a fully cloudy one, is kept.
 
         Raises:
-            ValueError: a shard-date with more than 255 contributing granules, which the ``uint8``
-                plane cannot rank. Refused rather than wrapped.
+            ValueError: a shard-date with more than 127 granules, which the ``int8`` plane cannot
+                rank. Refused rather than wrapped.
         """
+        cap = np.iinfo(np.int8).max
         for time in sorted(self._pieces[sensor]):
-            full = np.zeros((self.height, self.width), dtype=np.uint16)
+            full = np.zeros((self.height, self.width), dtype=np.int32)
             for piece in self._pieces[sensor][time]:
                 shape = (piece.rows.stop - piece.rows.start, piece.cols.stop - piece.cols.start)
-                full[piece.rows, piece.cols] = np.frombuffer(_PIECE_CODEC.decode(piece.data), np.uint16).reshape(shape)
+                full[piece.rows, piece.cols] = np.frombuffer(_PIECE_CODEC.decode(piece.data), np.int32).reshape(shape)
             if pixels is not None:
                 full[~pixels] = 0
-            present = np.flatnonzero(np.bincount(full.ravel(), minlength=1))
+            magnitude = np.abs(full)
+            present = np.flatnonzero(np.bincount(magnitude.ravel(), minlength=1))
             present = present[present > 0]
             if not len(present):
                 continue
-            if len(present) > np.iinfo(np.uint8).max:
-                raise ValueError(f"{sensor} time {time}: {len(present)} granules supplied one shard; the cap is 255")
-            rank = np.zeros(int(present[-1]) + 1, dtype=np.uint8)
-            rank[present] = np.arange(1, len(present) + 1, dtype=np.uint8)
-            yield ShardDate(time, rank[full], [int(p) - 1 for p in present], int(np.count_nonzero(full)))
+            if len(present) > cap:
+                raise ValueError(f"{sensor} time {time}: {len(present)} granules covered one shard; the cap is {cap}")
+            rank = np.zeros(int(present[-1]) + 1, dtype=np.int8)
+            rank[present] = np.arange(1, len(present) + 1, dtype=np.int8)
+            plane = np.where(full < 0, -rank[magnitude], rank[magnitude])
+            yield ShardDate(time, plane, [int(p) - 1 for p in present], int(np.count_nonzero(full > 0)))
 
 
 def stage_planes(group: zarr.Group, planes: SourcePlanes, pixels: np.ndarray | None) -> dict[str, Any]:
@@ -204,7 +213,7 @@ def stage_planes(group: zarr.Group, planes: SourcePlanes, pixels: np.ndarray | N
             STAGED_PLANES.format(sensor=sensor),
             shape=(len(dates), planes.height, planes.width),
             chunks=(1, planes.height, planes.width),
-            dtype=np.uint8,
+            dtype=np.int8,
             fill_value=0,
             compressors=PLANE_COMPRESSORS,
             dimension_names=("time", "northing", "easting"),
