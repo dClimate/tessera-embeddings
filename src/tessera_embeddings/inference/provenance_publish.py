@@ -304,11 +304,17 @@ def _granule_counts(sensor: str, root: zarr.Group) -> list[int]:
 
 
 def _day_lists(root: zarr.Group, axis: Sequence[datetime.date]) -> tuple[list[datetime.date], list[str]]:
-    """Each slot's day and granule list, then each day the ingest skipped whole and its list."""
+    """Each slot's day and granule list, then each day the ingest skipped whole and its list.
+
+    A skipped day a later attempt wrote after all keeps only its slot's list.
+    """
     days, lists = list(axis), read_array(root, GRANULES_ARRAY).tolist()
     if SKIPPED_DAYS_ARRAY in root:
-        days += [datetime.date.fromisoformat(str(day)) for day in read_array(root, SKIPPED_DAYS_ARRAY)]
-        lists += read_array(root, SKIPPED_GRANULES_ARRAY).tolist()
+        skipped = [datetime.date.fromisoformat(str(day)) for day in read_array(root, SKIPPED_DAYS_ARRAY)]
+        for day, listed in zip(skipped, read_array(root, SKIPPED_GRANULES_ARRAY).tolist(), strict=True):
+            if day not in axis:
+                days.append(day)
+                lists.append(listed)
     return days, lists
 
 
