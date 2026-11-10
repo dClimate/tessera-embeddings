@@ -29,8 +29,12 @@ PROVENANCE_VERSION = 1
 GRANULES_ARRAY = "granules"
 
 #: A granule list entry's ``status``: fused into the slot, or dropped before the fuse as a losing
-#: duplicate or as a copy that would not read and was replaced by another.
-FUSED, DUPLICATE, UNREADABLE = "fused", "duplicate", "unreadable"
+#: duplicate, as a copy that would not read and was replaced by another, or as a radar granule whose
+#: catalogue entry lacks its VV or VH file.
+FUSED, DUPLICATE, UNREADABLE, MISSING_BANDS = "fused", "duplicate", "unreadable", "missing_bands"
+
+#: Item property: why the ingest dropped this copy before the fuse, its granule list entry's ``status``.
+DROPPED = "tessera:dropped"
 
 #: A provenance mosaic's per-pixel source index: the fusion position plus one of the granule that
 #: supplied the pixel, 0 where none had data. ``uint16`` because a day's fusion order is zone-wide.

@@ -143,9 +143,10 @@ instead. A run that re-ingests builds new mosaics and writes new files. A real r
 fill's optical snapshot: 2 January 2024, fusion order 0, `S2A_33TVL_20240102_0_L2A`, Sentinel-2A,
 09:58:07 UTC, 94.9% cloud, with its catalogue link, its footprint as GeoParquet, and the URL of
 each of the 11 files read, such as `…/S2A_33TVL_20240102_0_L2A/B04.tif` (Appendix A). After a
-day's fused granules come the Sentinel-2 copies the ingest dropped before fusing it, with no fusion
-order and their reason in `status`: `duplicate`, a losing copy of an image it fused, or
-`unreadable`, a copy that would not read and was replaced by another, which `stepped_down` marks.
+day's fused granules come the copies the ingest dropped before fusing it, with no fusion order and
+their reason in `status`: `duplicate`, a losing copy of an image it fused; `unreadable`, a copy that
+would not read and was replaced by another, which `stepped_down` marks; or `missing_bands`, a radar
+granule whose catalogue entry lacks its VV or VH file.
 
 **`shard_dates`: what went into each shard.** Per run, one row per shard, sensor and date on which
 a granule had data at at least one of the shard's pixels:
@@ -223,8 +224,9 @@ is 127.
 **How the ingest records what it dropped.** Before fusing a day, the Sentinel-2 ingest keeps one
 copy of each image and holds the others back, in case the kept copy will not read. It marks each
 copy it holds back as a duplicate, and a kept copy that fails to read and is swapped for one held
-back as unreadable. The day's granule list names those copies after the fused ones. Radar fuses
-every copy of a burst, so it drops none this way.
+back as unreadable. Radar fuses every copy of a burst, but its catalogue query sets aside a granule
+whose entry lacks its VV or VH file, and marks it missing bands. The day's granule list names all
+of these after the fused granules.
 
 **Three rules keep the record and the embeddings consistent.**
 
@@ -343,7 +345,7 @@ The last column is the first draft's choice, where reviews of the plan or the bu
 |---|---|---|---|
 | a granule per pixel per date | a yes/no bit per pixel per date, with the granule guessed from footprints | 4% more storage, and exact: guessing named the wrong granule for 0.10% of one shard's pixel-dates, wherever footprints overlap | nothing per pixel, ruled out at an estimated 20–45 TB (measured: 3.7 TB for optical); the granule guessed from footprint order |
 | a rejected observation keeps its granule, as the rank negated | zero for anything the model did not use | a reader can tell "no image had data" from "the model rejected this image here", and see which granule was cloudy; a fully cloudy date keeps its plane | zero |
-| the copies the ingest dropped listed after the fused granules, with a `status` | the fused granules only | a reader sees the duplicates and unreadable copies the ingest set aside, beside what it used | the fused only |
+| the copies the ingest dropped listed after the fused granules, with a `status` | the fused granules only | a reader sees the duplicates, unreadable copies and incomplete radar granules the ingest set aside, beside what it used | the fused only |
 | a per-shard granule list derived from the pixels | every granule whose footprint touches the shard | names only granules that supplied a pixel | |
 | the index written by the ingest while it fuses | reading the mask band a second time, or once per granule | one read, one definition of "valid"; per granule would multiply the load by the day's granules, hundreds of radar bursts | each granule loaded separately |
 | the granule list inside the mosaic, in the day's own commit | a file written beside the mosaic before the commit | a file written first can describe a day that never committed | the file beside |
@@ -369,8 +371,6 @@ The last column is the first draft's choice, where reviews of the plan or the bu
   minimum (0.1% of its land), or whose every copy of an image fails to read, writes no mosaic slot,
   so there is no list to put its granules in. Recording them would need a list of skipped days and
   their granules beside the mosaic.
-- **Radar granules whose catalogue entry lacks the VV and VH files it claims.** The catalogue query
-  drops these before anything else sees them; they are rare, logged, and could not have been read.
 
 ## 10. Open questions
 
@@ -403,7 +403,7 @@ sensor, snapshot and the run that first published it.
 | `solar_day` | date | the mosaic slot |
 | `fusion_order` | int16 | position in the day's fusion order, 0 first; null for a dropped copy |
 | `granule_id` | string | the catalogue id of the copy |
-| `status` | string | `fused`; or, for a copy dropped before the fuse, `duplicate` or `unreadable` |
+| `status` | string | `fused`; or, for a copy dropped before the fuse, `duplicate`, `unreadable` or `missing_bands` |
 | `image_key` | string | which image it is a copy of: Sentinel-2 datatake and datastrip (#240), Sentinel-1 burst id (#250) |
 | `platform` | string | `S2A`, `S1C` and so on |
 | `acquired_at` | timestamp, UTC | the acquisition instant |
