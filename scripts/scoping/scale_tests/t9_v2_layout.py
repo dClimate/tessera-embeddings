@@ -46,6 +46,7 @@ from zarr.storage import LocalStore, WrapperStore
 
 from scripts.scoping.scale_tests import harness, synth
 from scripts.scoping.scale_tests import variants as V
+from tessera_embeddings.config.store_geometry import level0
 
 logger = logging.getLogger("scale_tests.t9")
 
@@ -216,7 +217,7 @@ def phase_fetch(source: str, profile: str, tiles: Path, n_tiles: int) -> None:
         secret_access_key=creds.secret_key,
         session_token=creds.token,
     )
-    root = zarr.open_group(icechunk.Repository.open(storage).readonly_session(branch="main").store, mode="r")
+    root = level0(zarr.open_group(icechunk.Repository.open(storage).readonly_session(branch="main").store, mode="r"))
     scales, emb = root["scales"], root["embeddings"]
     _, ny, nx = scales.shape
     windows = [(y, x) for y in range(0, ny - TILE + 1, TILE) for x in range(0, nx - TILE + 1, TILE)]

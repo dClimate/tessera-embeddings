@@ -376,9 +376,9 @@ the same code unchanged.
 
 - **v2 presets.** `GLOBAL_V2` and `SINGLE_V2` in `config/store_layout.py` hold `embeddings` (and a
   single-area store's `embedding_std`) as `(time, band, y, x)` in 1 × 16 × 2,048 × 2,048 shards of
-  1 × 4 × 512 × 512 chunks. Every other array keeps v1.1's shards in 512² chunks: with one chunk edge
-  for every array, an area under 2,048 px that is not a multiple of 512 still clamps every array to
-  the same shard height. `INNER_PX` stays 256, so the land mask's `chunk_live_256` and the staged
+  1 × 4 × 512 × 512 chunks, `embeddings` compressed with zstd at level 1. Every other array keeps
+  v1.1's shards and codecs, in 512² chunks: with one chunk edge for every array, an area under
+  2,048 px that is not a multiple of 512 still clamps every array to the same shard height. `INNER_PX` stays 256, so the land mask's `chunk_live_256` and the staged
   tiles' geometry are unchanged. `layout_for(model, single=)` gives a new store its
   model's preset; an existing store keeps the geometry it was created with.
 - **Level group `0`** (§1). Seeding and single-area assembly create every array and coordinate in

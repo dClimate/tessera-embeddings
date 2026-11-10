@@ -26,14 +26,14 @@ def seeded(seeded_store):
 
 
 @pytest.mark.parametrize(
-    ("model", "names", "level", "embedding_dims"),
+    ("model", "names", "level", "embedding_dims", "zstd_level"),
     [
-        ("v1.1", ("northing", "easting"), "", ("time", "northing", "easting", "band")),
-        ("v2-large", ("y", "x"), "/0", ("time", "band", "y", "x")),
+        ("v1.1", ("northing", "easting"), "", ("time", "northing", "easting", "band"), 0),
+        ("v2-large", ("y", "x"), "/0", ("time", "band", "y", "x"), 1),
     ],
 )
-def test_each_model_seeds_its_own_layout(tmp_path, model, names, level, embedding_dims):
-    """v1.1 keeps northing/easting in the zone group; v2 seeds y/x, band-first, in level group 0.
+def test_each_model_seeds_its_own_layout(tmp_path, model, names, level, embedding_dims, zstd_level):
+    """v1.1 keeps northing/easting in the zone group; v2 seeds y/x, band-first, zstd at level 1, in level group 0.
 
     The zone's attrs stay on the zone group either way, and the published-store audit accepts both.
     """
@@ -44,6 +44,7 @@ def test_each_model_seeds_its_own_layout(tmp_path, model, names, level, embeddin
     y, x = names
     assert (g[y].shape, g[x].shape) == ((4096,), (2048,))
     assert g["embeddings"].metadata.dimension_names == embedding_dims
+    assert g["embeddings"].compressors[0].level == zstd_level  # ADR 031 accepted level 1, as measured
     assert g["embeddings"].attrs["spatial:dimensions"] == [y, x]
     assert zone.attrs["spatial:dimensions"] == [y, x] and g[y].attrs["axis"] == "Y"
     assert published_store.layout_departures(zone) == []

@@ -368,13 +368,15 @@ def _fill_equal(have: object, want: object) -> bool:
 def _codec_id(arr: zarr.Array) -> str:
     """The layout ``codec`` key an existing array corresponds to.
 
-    Mirrors :meth:`ArrayLayout.create_kwargs`'s three cases: a PCodec serializer is
-    ``"pcodec"``; otherwise ``"zstd"`` when a compressor is configured and ``"raw"``
-    when none is.
+    Mirrors :meth:`ArrayLayout.create_kwargs`'s cases: a PCodec serializer is ``"pcodec"``;
+    otherwise ``"raw"`` when no compressor is configured, ``"zstd1"`` for zstd at level 1 and
+    ``"zstd"`` for any other.
     """
     if type(getattr(arr, "serializer", None)).__name__ == "PCodec":
         return "pcodec"
-    return "zstd" if arr.compressors else "raw"
+    if not arr.compressors:
+        return "raw"
+    return "zstd1" if getattr(arr.compressors[0], "level", None) == 1 else "zstd"
 
 
 def missing_seeded_arrays(node: zarr.Group, layout: StoreLayout) -> set[str]:

@@ -17,7 +17,13 @@ from typing import TYPE_CHECKING, Any, NamedTuple, cast
 import numpy as np
 import zarr
 
-from tessera_embeddings.config.store_geometry import clamp_chunks_and_shards, dims_of, level0, spatial_dims_of
+from tessera_embeddings.config.store_geometry import (
+    axis_roles,
+    clamp_chunks_and_shards,
+    dims_of,
+    level0,
+    spatial_dims_of,
+)
 from tessera_embeddings.config.store_layout import GLOBAL, GLOBAL_V2, SHARD_PX, StoreLayout
 from tessera_embeddings.storage.global_store import _codec_id, missing_seeded_arrays
 from tessera_embeddings.storage.shard_writer import SHARD_WRITE
@@ -223,11 +229,12 @@ async def live_shards_async(
     """:func:`live_shards`, for a caller that already has an event loop."""
     by_year: dict[int, set[tuple[int, int]]] = {}
     holder = level0(cast("zarr.Group", zarr.open_group(session.store, mode="r")[zone]))
+    # Axes by name: a band-first v2 `embeddings` holds eight band shards per meta-shard, at positions
+    # (time, band, y, x); the set folds them into one (shard_y, shard_x) entry.
+    roles = axis_roles(dims_of(holder[var]))
+    t, y, x = (roles.index(role) for role in ("time", "Y", "X"))
     async for coord in session.chunk_coordinates(f"/{holder.path}/{var}"):
-        # A 4-D array appends a band/month index that is always 0, one shard spanning the whole
-        # non-spatial axis, so take the spatial pair by position rather than a fixed arity.
-        time_index, shard_y, shard_x = int(coord[0]), int(coord[1]), int(coord[2])
-        by_year.setdefault(time_index, set()).add((shard_y, shard_x))
+        by_year.setdefault(int(coord[t]), set()).add((int(coord[y]), int(coord[x])))
     return {year: frozenset(shards) for year, shards in sorted(by_year.items())}
 
 

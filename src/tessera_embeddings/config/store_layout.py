@@ -32,6 +32,7 @@ import dataclasses
 import warnings
 
 import numpy as np
+from zarr.codecs import ZstdCodec
 from zarr.codecs.numcodecs import PCodec as _PCodecZarr3
 
 from tessera_embeddings.config.inference import EMBEDDING_DIM, model_family
@@ -97,6 +98,7 @@ MONTH_COVERED_FOR_OBS: dict[str, str] = dict(zip(OBS_COUNT_VARS, MONTH_COVERED_V
 
 # codec keys
 _ZSTD = "zstd"  # default bytes codec + default (zstd) compressor
+_ZSTD1 = "zstd1"  # default bytes codec + zstd at level 1 (v2 embeddings, ADR 031 §1)
 _PCODEC = "pcodec"  # PCodec serializer, no bytes-compressor
 _RAW = "raw"  # default bytes codec, no compressor
 
@@ -111,8 +113,8 @@ class ArrayLayout:
     """On-disk geometry for one data variable.
 
     ``chunks``/``shards`` are element counts over ``dims``. ``codec`` is one of ``"zstd"``
-    (default serializer + zstd), ``"pcodec"`` (PCodec serializer, no compressor — floats only),
-    or ``"raw"`` (default serializer, no compressor).
+    (default serializer + zstd at its default level), ``"zstd1"`` (the same at level 1), ``"pcodec"``
+    (PCodec serializer, no compressor — floats only), or ``"raw"`` (default serializer, no compressor).
 
     ``attrs`` are array attributes written at creation, as pairs so the layout stays hashable and
     two presets cannot share a mutable dict. Needed because a dtype is not always the whole story:
@@ -152,9 +154,9 @@ class ArrayLayout:
         elif self.codec == _RAW:
             kwargs["serializer"] = "auto"
             kwargs["compressors"] = None
-        else:  # _ZSTD
+        else:  # _ZSTD, _ZSTD1
             kwargs["serializer"] = "auto"
-            kwargs["compressors"] = "auto"
+            kwargs["compressors"] = ZstdCodec(level=1) if self.codec == _ZSTD1 else "auto"
         return kwargs
 
 
@@ -308,8 +310,8 @@ V2_CHUNK_PX = 512
 
 
 def _v2(array: ArrayLayout) -> ArrayLayout:
-    """*array* in v2's geometry: band-first in 16-band shards of 4-band chunks if it has a band axis, and
-    512² chunks spatially either way.
+    """*array* in v2's geometry: band-first in 16-band shards of 4-band chunks, zstd at level 1, if it has a
+    band axis, and 512² chunks spatially either way.
 
     One spatial chunk edge for every array is what lets a store smaller than one shard clamp every array
     to the same shard height, which assembly requires (ADR 031 §5).
@@ -318,6 +320,7 @@ def _v2(array: ArrayLayout) -> ArrayLayout:
         return dataclasses.replace(
             array,
             dims=DIMS_4D_BAND_FIRST,
+            codec=_ZSTD1 if array.codec == _ZSTD else array.codec,
             chunks=(1, V2_BANDS_PER_CHUNK, V2_CHUNK_PX, V2_CHUNK_PX),
             shards=(1, V2_BANDS_PER_SHARD, SHARD_PX, SHARD_PX),
         )
