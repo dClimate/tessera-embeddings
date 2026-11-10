@@ -1,7 +1,8 @@
 """What an ingest records about the granules behind each mosaic slot: the ingest half of provenance.
 
 Two records, both written in the slot's own commit and only when the ingest runs with
-``provenance`` on (``context_docs/storage/registry-provenance-plan.md`` §4):
+``provenance`` on (``context_docs/storage/registry-provenance-plan.md`` §4), and a third for the
+days it skipped whole (:class:`SkippedDays`):
 
 * **The granule list.** One JSON array per slot naming the day's granules in fusion order, with
   the identifiers, acquisition time, footprint and exact object URLs read, then the copies the
@@ -23,17 +24,25 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 import dask.array as da
 import numpy as np
 import xarray as xr
 
-from tessera_embeddings.config.ingest import DROPPED, DUPLICATE, FUSED, UNREADABLE
+from tessera_embeddings.config.ingest import (
+    DROPPED,
+    DUPLICATE,
+    FUSED,
+    LOW_COVERAGE,
+    PRODUCER_CONFLICT,
+    UNREADABLE,
+)
 from tessera_embeddings.ingest.duplicates import image_identity
 from tessera_embeddings.ingest.opera_query import BURST_ID
 from tessera_embeddings.ingest.solar_days import solar_day_of
+from tessera_embeddings.storage.zarr_store import record_skipped_days
 
 #: Item property: the item's position in its solar day's fusion order, stamped just before a load.
 FUSION_POSITION = "tessera:fusion_position"
@@ -219,3 +228,43 @@ def day_granules(
         records += [_record(it, it.properties[DROPPED], **source) for it in dropped]
         out[day] = json.dumps(records, separators=(",", ":"), default=str)
     return out
+
+
+#: The ingest's reasons for skipping a whole day, as the status its copies are listed under. A day
+#: whose imagery reached no live window is absent: none of it covered a pixel the store embeds.
+_SKIP_STATUS = {"coverage": LOW_COVERAGE, "producer-conflict": PRODUCER_CONFLICT, "unreadable": UNREADABLE}
+
+
+class SkippedDays:
+    """The granule lists of the days one ingest leg skipped whole, committed to its mosaic.
+
+    A skipped day has no slot, so no list beside its pixels; it is listed off the time axis instead
+    (plan §3), every copy dropped for the day's reason unless already dropped for its own. Each day
+    is committed when it is skipped, or, while the mosaic does not exist yet, right after the leg's
+    first write creates it. A retry rebuilds and overwrites it.
+    """
+
+    def __init__(self, store_path: str, source: Mapping[str, str], *, exists: bool, s3_region: str | None) -> None:
+        """A recorder for the mosaic at ``store_path``; ``source`` is :func:`day_granules`'s keywords."""
+        self.store_path, self.source, self.exists, self.s3_region = store_path, source, exists, s3_region
+        self._pending: dict[str, str] = {}
+
+    def record(self, day: str, items: Iterable[Any], reason: str | None) -> None:
+        """List ``day``'s copies among ``items`` under the status for ``reason``, and commit them."""
+        status = _SKIP_STATUS.get(reason or "")
+        day_items = [item for item in items if solar_day_of(item) == day]
+        if status is None or not day_items:
+            return
+        mark_dropped((item for item in day_items if DROPPED not in item.properties), status)
+        self._pending[day] = day_granules(day_items, **self.source)[day]
+        self._commit()
+
+    def written(self) -> None:
+        """The leg committed a date, so the mosaic exists: commit any day held until it did."""
+        self.exists = True
+        self._commit()
+
+    def _commit(self) -> None:
+        if self.exists and self._pending:
+            record_skipped_days(self.store_path, self._pending, s3_region=self.s3_region)
+            self._pending = {}

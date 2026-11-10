@@ -21,6 +21,7 @@ made by hand, and is refused.
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 from collections.abc import Callable, Mapping, Sequence
@@ -34,7 +35,7 @@ import pyarrow.parquet as pq
 import zarr
 from fsspec import AbstractFileSystem
 
-from tessera_embeddings.config.ingest import FUSED, GRANULES_ARRAY
+from tessera_embeddings.config.ingest import FUSED, GRANULES_ARRAY, SKIPPED_DAYS_ARRAY, SKIPPED_GRANULES_ARRAY
 from tessera_embeddings.config.store_layout import SENSORS
 from tessera_embeddings.inference.assembly import _COVERAGE_SUFFIX, _fs_for, _open_staged_tile
 from tessera_embeddings.inference.chunk_spec import parse_chunk_label
@@ -159,7 +160,7 @@ def publish_provenance(
     granules = sum(
         _publish_granules(
             granules_uri(registry_root, zone, year, sensor, pins[sensor]),
-            granule_rows(pins[sensor], sensor, axes[sensor], read_array(root, GRANULES_ARRAY).tolist()),
+            granule_rows(pins[sensor], sensor, *_day_lists(root, axes[sensor])),
             fs,
             _open_output,
             {
@@ -307,6 +308,15 @@ def _granule_counts(sensor: str, root: zarr.Group) -> list[int]:
             f"{sensor}: {len(counts)} granule list(s) for {slots} slot(s), empty at {empty[:10]}"
         )
     return counts
+
+
+def _day_lists(root: zarr.Group, axis: Sequence[datetime.date]) -> tuple[list[datetime.date], list[str]]:
+    """Each slot's day and granule list, then each day the ingest skipped whole and its list."""
+    days, lists = list(axis), read_array(root, GRANULES_ARRAY).tolist()
+    if SKIPPED_DAYS_ARRAY in root:
+        days += [datetime.date.fromisoformat(str(day)) for day in read_array(root, SKIPPED_DAYS_ARRAY)]
+        lists += read_array(root, SKIPPED_GRANULES_ARRAY).tolist()
+    return days, lists
 
 
 def _json_list(raw: str) -> list[Any]:
