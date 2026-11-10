@@ -416,7 +416,7 @@ job this size possible at all, and because two of the choices are visible to a c
 
 **Zones come in two layouts, and the model picks one for a new store**
 ([ADR 037](../context_docs/decisions/037-v2-stores-use-the-utm-zones-layout.md)). From v2 on, a
-store uses the geoembeddings `utm_zones` layout, as the Source Coop copy, AlphaEarth and OlmoEarth
+store uses the geoembeddings `utm_zones` layout, as OlmoEarth and the Source Coop copy of v1.1
 do: 60 groups, `utm01` to `utm60`, each a full column in its northern EPSG code (326xx), with the
 southern hemisphere as negative northings. Such a store says so in `geoemb:spatial_layout`. v1.1
 stores, the published one included, are 120 groups named by hemisphere, `01N` to `60S`, each in
