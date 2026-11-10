@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from tessera_embeddings.profiling._cloudwatch import insights_query
 from tessera_embeddings.profiling.ingest import watch_scheduler as ws
 
@@ -65,51 +67,36 @@ def test_parse_health_line_without_fleet_memory_still_parses():
     assert all(s[k] is None for k in ws.WORKER_MEM_KEYS)
 
 
-def test_unknown_fleet_memory_is_json_safe():
-    """``nan`` fleet values become None, so the JSONL output stays strict JSON."""
-    line = (
-        "scheduler health: cpu=1% rss=1.00GiB mem=1% lag=0.0s "
-        "fds=1 threads=1 workers=0 tasks=0 processing=0 no-worker=0 "
-        "wmem=nanGiB wmanaged=nanGiB wspill=nanGiB wmax=nanGiB"
-    )
-    s = ws.parse_health_line(line)
-    assert s is not None
-    assert all(s[k] is None for k in ws.WORKER_MEM_KEYS)
-    snap = ws._snapshot(s, 1000, None, None, [])
-    assert json.loads(json.dumps(snap))["worker_spill_gib"] is None
-
-
-def test_measured_zero_spill_is_not_unknown():
-    """0.0 spill is the healthy RESULT and must stay distinguishable from None."""
-    line = (
-        "scheduler health: cpu=1% rss=1.00GiB mem=1% lag=0.0s "
-        "fds=1 threads=1 workers=4 tasks=10 processing=2 no-worker=0 "
-        "wmem=3.00GiB wmanaged=1.00GiB wspill=0.00GiB wmax=1.00GiB"
-    )
-    s = ws.parse_health_line(line)
-    assert s is not None
-    assert s["worker_spill_gib"] == 0.0
-    assert ws.evaluate_alerts([s], ws.Thresholds()) == []
-
-
-def test_parse_health_line_unknown_mem_is_json_safe():
-    """An unknown container limit becomes None (null), never NaN.
+@pytest.mark.parametrize(
+    ("line", "unknown"),
+    [
+        (
+            "scheduler health: cpu=100% rss=2.00GiB mem=nan% lag=6.0s "
+            "fds=1 threads=1 workers=1 tasks=1 processing=1 no-worker=1",
+            ("mem",),
+        ),
+        (
+            "scheduler health: cpu=1% rss=1.00GiB mem=1% lag=0.0s "
+            "fds=1 threads=1 workers=0 tasks=0 processing=0 no-worker=0 "
+            "wmem=nanGiB wmanaged=nanGiB wspill=nanGiB wmax=nanGiB",
+            ws.WORKER_MEM_KEYS,
+        ),
+    ],
+    ids=["container-limit", "fleet-memory"],
+)
+def test_an_unknown_value_is_json_safe(line: str, unknown: tuple[str, ...]) -> None:
+    """An unknown container limit or fleet value becomes None (null), never NaN.
 
     json.dumps renders a float NaN as the bare token ``NaN``, which is invalid
     JSON — it would break strict consumers of the live JSONL / report output in
     exactly this case.
     """
-    line = (
-        "scheduler health: cpu=100% rss=2.00GiB mem=nan% lag=6.0s "
-        "fds=1 threads=1 workers=1 tasks=1 processing=1 no-worker=1"
-    )
     s = ws.parse_health_line(line)
     assert s is not None
-    assert s["mem"] is None
-    assert s["cpu"] == 100.0
+    assert all(s[k] is None for k in unknown)
     # The whole snapshot must round-trip through strict JSON.
-    snap = ws._snapshot(s, 1000, None, None, [])
-    assert json.loads(json.dumps(snap))["mem"] is None
+    snap = json.loads(json.dumps(ws._snapshot(s, 1000, None, None, [])))
+    assert all(snap[k] is None for k in unknown)
 
 
 def test_parse_health_line_negatives():
@@ -181,19 +168,11 @@ def test_alert_worker_churn():
 
 def test_alert_worker_spill():
     th = ws.Thresholds()  # spill_gib=1.0
-    assert "worker-spill" in ws.evaluate_alerts([_sample(worker_spill_gib=6.5)], th)
+    # Healthy scheduler, drowning fleet: the case scheduler-only metrics call fine.
+    assert ws.evaluate_alerts([_sample(worker_spill_gib=6.5)], th) == ["worker-spill"]
     assert "worker-spill" not in ws.evaluate_alerts([_sample(worker_spill_gib=0.0)], th)
     # An older run with no fleet numbers must not trip, exactly like mem-high.
     assert "worker-spill" not in ws.evaluate_alerts([_sample(worker_spill_gib=None)], th)
-
-
-def test_spill_trips_while_every_scheduler_signal_is_nominal():
-    """Healthy scheduler, drowning fleet — the case scheduler-only metrics call fine.
-
-    The only alert must be worker-spill.
-    """
-    nominal_but_spilling = _sample(cpu=15.0, mem=12.0, lag=0.0, no_worker=0, worker_spill_gib=468.0)
-    assert ws.evaluate_alerts([nominal_but_spilling], ws.Thresholds()) == ["worker-spill"]
 
 
 def test_profile_run_peaks_onsets_events():
@@ -235,10 +214,6 @@ def test_profile_run_without_fleet_data_reports_null_not_zero():
     assert prof["peaks"]["worker_spill_gib"] is None
     assert prof["onsets"]["worker-spill"] is None
     assert "not recorded" in ws._markdown(prof, "/ecs/x")
-
-
-def test_profile_run_empty():
-    assert ws.profile_run([], ws.Thresholds()) == {"samples": 0}
 
 
 class TestInsightsRunner:

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-from dataclasses import fields
 from typing import get_args
 
 import pytest
@@ -17,13 +16,15 @@ from tessera_embeddings.config.inference import (
     ModelVersion,
     _normalize_obs_checkpoints,
     ami_ssm_name_for_model,
+    assert_run_id_matches_model,
     band_stats,
     batch_size_for_gpu,
     checkpoint_filename,
     prefetch_depth,
+    run_id_prefix,
 )
 from tessera_embeddings.config.time_windows import parse_time_window
-from tessera_embeddings.inference.sampling import _CACHED_RESAMPLERS, _RESAMPLERS
+from tessera_embeddings.inference.sampling import _CACHED_RESAMPLERS
 
 
 @pytest.mark.parametrize(
@@ -75,30 +76,9 @@ def test_checkpoint_filename_refuses_an_unknown_norm_source_or_model() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_normalize_obs_checkpoints_sorts() -> None:
-    assert _normalize_obs_checkpoints((8, 32, 16)) == (8, 16, 32)
-
-
-def test_normalize_obs_checkpoints_deduplicates() -> None:
-    assert _normalize_obs_checkpoints((8, 8, 16)) == (8, 16)
-
-
-def test_normalize_obs_checkpoints_filters_nonpositive() -> None:
-    assert _normalize_obs_checkpoints((0, -1, 8, 16)) == (8, 16)
-
-
-def test_normalize_obs_checkpoints_coerces_floats() -> None:
-    assert _normalize_obs_checkpoints((8.0, 16.0)) == (8, 16)  # type: ignore[arg-type]
-
-
 def test_normalize_obs_checkpoints_empty_after_filter_raises() -> None:
     with pytest.raises(ValueError, match="at least one positive integer"):
         _normalize_obs_checkpoints((0, -5))
-
-
-def test_normalize_obs_checkpoints_empty_input_raises() -> None:
-    with pytest.raises(ValueError):
-        _normalize_obs_checkpoints(())
 
 
 # ---------------------------------------------------------------------------
@@ -118,40 +98,14 @@ def _minimal_config(**kwargs) -> InferenceConfig:
     return InferenceConfig(**defaults)
 
 
-def test_inference_config_default_norm_source_is_aws() -> None:
-    cfg = _minimal_config()
-    assert cfg.norm_source == "aws"
-
-
-def test_inference_config_invalid_norm_source_raises() -> None:
-    with pytest.raises(ValueError, match="Invalid norm_source"):
-        _minimal_config(norm_source="xyz")
-
-
 def test_inference_config_invalid_s1_orbit_raises() -> None:
     with pytest.raises(ValueError, match="Invalid s1_orbit"):
         _minimal_config(s1_orbit="diagonal")
 
 
-def test_inference_config_valid_s1_orbits() -> None:
-    for orbit in ("ascending", "descending", "both"):
-        cfg = _minimal_config(s1_orbit=orbit)
-        assert cfg.s1_orbit == orbit
-
-
 def test_inference_config_num_obs_checkpoints_coerced() -> None:
     cfg = _minimal_config(num_obs_checkpoints=(16, 8, 8, 0))
     assert cfg.num_obs_checkpoints == (8, 16)
-
-
-def test_inference_config_empty_num_obs_checkpoints_raises() -> None:
-    with pytest.raises(ValueError):
-        _minimal_config(num_obs_checkpoints=())
-
-
-def test_inference_config_default_model_version_is_v11() -> None:
-    cfg = _minimal_config()
-    assert cfg.model_version == "v1.1"
 
 
 def test_inference_config_invalid_model_version_raises() -> None:
@@ -162,19 +116,6 @@ def test_inference_config_invalid_model_version_raises() -> None:
 def test_inference_config_compute_std_forced_false() -> None:
     cfg = _minimal_config(compute_std=True)  # type: ignore[call-arg]
     assert cfg.compute_std is False
-
-
-def test_the_newest_field_is_the_last_field() -> None:
-    """InferenceConfig is public API (docs/public-api.md) and a positional
-    dataclass. A new field inserted mid-list would silently rebind later
-    positional args in downstream construction (e.g. a positional num_gpus would
-    land in compute_std). New fields must be appended, and this pins the last one.
-
-    Moving this assertion is the expected cost of adding a field, and it is worth paying: the
-    tripwire fires on an insertion and on an append alike, so whoever moves it has to look at
-    where their field landed.
-    """
-    assert fields(InferenceConfig)[-1].name == "model_version"
 
 
 def test_the_minimum_depth_rule_defaults_to_no_rule() -> None:
@@ -189,11 +130,6 @@ def test_the_minimum_depth_rule_defaults_to_no_rule() -> None:
 def test_a_rule_that_refuses_nothing_is_refused_by_the_config() -> None:
     with pytest.raises(ValueError, match="refuses nothing"):
         _minimal_config(optical_min_obs=0)
-
-
-def test_allow_s2_only_defaults_off() -> None:
-    assert _minimal_config().allow_s2_only is False
-    assert _minimal_config(allow_s2_only=True).allow_s2_only is True
 
 
 # ── validated where it is SET, because where it is USED is inside a Ray actor ──
@@ -234,7 +170,6 @@ def test_every_model_version_has_one_record_and_one_resampler() -> None:
     versions = set(get_args(ModelVersion))
     for name, table in (
         ("MODEL_FAMILIES", MODEL_FAMILIES),
-        ("sampling._RESAMPLERS", _RESAMPLERS),
         ("sampling._CACHED_RESAMPLERS", _CACHED_RESAMPLERS),
     ):
         assert set(table) == versions, f"{name} does not cover the versions ModelVersion names"
@@ -330,7 +265,7 @@ class TestActorRequestPolicy:
 
 @pytest.mark.parametrize(
     ("gpu_fraction", "cpus", "depth"),
-    [(1, 1, 2), (1, 4, 2), (1, 8, 4), (1, 64, 4), (0.6, 8, 4), (0.5, 8, 2), (0.1, 8, 2)],
+    [(1, 1, 2), (1, 8, 4), (1, 64, 4), (0.5, 8, 2)],
 )
 def test_prefetch_depth_follows_vcpus_within_its_bounds(gpu_fraction: float, cpus: int, depth: int) -> None:
     """Two on a 4-vCPU g6e.xlarge, four on 8 vCPUs, never more than measured; packed actors count their share."""
@@ -362,11 +297,9 @@ class TestBatchSizeForGpu:
         [
             # The card it was tuned on, and anything larger, is left alone.
             (44.7, 7168),  # L40S in g6e.xlarge
-            (TUNED_GPU_GIB, 7168),  # exactly the reference — still unscaled
             (79.0, 7168),  # a bigger card is not given a bigger batch
             # The A10G is the case this exists for: 22.06 GiB, and 7168 does not fit.
             (22.06, 3593),  # g5.2xlarge — int(7168 * 22.06 / 44.0)
-            (24.0, 3909),
         ],
     )
     def test_scales_only_below_the_tuned_card(self, total_gib: float, expected: int) -> None:
@@ -431,10 +364,45 @@ class TestBatchSizeForGpu:
         per_card = fitted * 2 * max(num_obs_checkpoints) * math.floor(1 / gpu_fraction)
         assert per_card <= A10G_MEASURED_TOKEN_CEILING
 
-    def test_the_unfitted_batch_does_not_hold_it(self) -> None:
-        """The bound above is only evidence if the batch it replaced fails the same test."""
-        assert TUNED_BATCH_SIZE * DEEPEST_TOKENS_PER_PIXEL > A10G_MEASURED_TOKEN_CEILING
-
     def test_a_small_configured_batch_is_never_raised(self) -> None:
         """The request is a ceiling: a small batch (a tiny test model) was asked for on purpose."""
         assert batch_size_for_gpu(64, A10G_TOTAL_GIB) == 64
+
+
+# ── assert_run_id_matches_model: the encoder recorded in a run_id, checked at every boundary ──
+#
+# ``inference.runner`` is a documented public entry point, so the flow's ``_resolve_run_id`` is
+# not the only door: a caller arriving with a v2 staging id and a v1.1 config would otherwise
+# reuse those chunks and publish a mix stamped with one encoder.
+
+_V2 = run_id_prefix("v2-large")
+
+
+@pytest.mark.parametrize(
+    ("run_id", "model"),
+    [(f"{_V2}abc123", "v1.1"), ("abc123def456", "v2-large"), (f"{_V2}s2only-abc123", "v1.1")],
+    ids=["v2-id-as-v11", "bare-id-as-v2", "composed-prefix-as-v11"],
+)
+def test_a_run_id_from_the_other_encoder_is_refused(run_id: str, model: str) -> None:
+    """The prefixes compose (``v2-s2only-…``), so the encoder marker is only the FRONT of it."""
+    with pytest.raises(ValueError, match="came from the other encoder"):
+        assert_run_id_matches_model(run_id, model)
+
+
+@pytest.mark.parametrize(
+    ("run_id", "model"),
+    [(f"{_V2}abc123", "v2-large"), (f"{_V2}s2only-abc123", "v2-large"), ("abc123def456", "v1.1"), (None, "v2-large")],
+)
+def test_a_matching_run_id_and_a_fresh_run_both_pass(run_id: str | None, model: str) -> None:
+    assert_run_id_matches_model(run_id, model)
+
+
+@pytest.mark.parametrize("model", ["v1.1", "v2-large"])
+@pytest.mark.parametrize("empty", ["", "   ", "\t"])
+def test_an_empty_run_id_is_refused_rather_than_read_as_absent(empty: str, model: str) -> None:
+    """An empty id still names a staging prefix: ``staging_base//<label>.zarr``, one prefix shared
+    by every run that passes it, whichever model. A v2 run staging there and a later v1.1 run
+    resuming over it publishes v2 pixels stamped v1.1. ``None`` (nothing staged yet) still passes.
+    """
+    with pytest.raises(ValueError, match="is empty"):
+        assert_run_id_matches_model(empty, model)

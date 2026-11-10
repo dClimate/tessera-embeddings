@@ -46,7 +46,7 @@ from tessera_embeddings.inference.data_loading import (
     make_store_opener,
 )
 from tessera_embeddings.inference.progress import chunk_uid
-from tessera_embeddings.inference.provenance import SourcePlanes
+from tessera_embeddings.inference.provenance import SourcePlanes, staging_kwargs
 from tessera_embeddings.inference.read_plan import _chunk_read_plan
 from tessera_embeddings.inference.resource_monitor import ResourceMonitor
 from tessera_embeddings.storage.conventions import checkpoint_stem
@@ -86,6 +86,62 @@ class _ChunkPrologue:
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _ChunkCoverage:
+    """One chunk's observation-count and month-coverage buffers, filled strip by strip.
+
+    ``x_sub`` is the chunk's crop, if any: the saved layers keep full width either way.
+    """
+
+    obs: dict[str, np.ndarray]
+    month: dict[str, np.ndarray]
+    x_sub: slice | None
+
+    def record(self, chunk_data: ChunkData, mask_bundle: S2MaskBundle, strip: slice) -> None:
+        """Copy one strip's observation counts and month coverage into the buffers."""
+        # SAR month masks: the strip's own when the grid is uncropped, the full-width side channel when it
+        # is — the same choice the SAR obs counts make, so the saved provenance layers keep full extent
+        # even where the inferred grid is narrower. Either way the array is (month, strip rows, full
+        # width), so both assign through the same slice below.
+        sar_months = (
+            (chunk_data.s1_asc_month_covered, chunk_data.s1_desc_month_covered)
+            if self.x_sub is None
+            else (chunk_data.s1_asc_month_covered_full, chunk_data.s1_desc_month_covered_full)
+        )
+        if self.x_sub is None:
+            for var in OBS_COUNT_VARS:
+                arr = getattr(chunk_data, var)
+                if arr is not None:
+                    self.obs[var][strip] = arr
+            if mask_bundle is not None:
+                # Sliced, not assigned whole: the bundle is a WHOLE-CHUNK array loaded once and shared by
+                # every strip, unlike the strip-shaped SAR arrays.
+                self.month["s2_month_covered"][:, strip, :] = mask_bundle.month_covered[:, strip, :]
+        else:
+            # Cropped grid: the saved obs layers keep full extent — S2 counts from the (full-width) mask
+            # bundle, SAR counts from the full-width side channel (SAR is read full-width regardless; see
+            # load_chunk).
+            self.obs["s2_obs_count"][strip] = mask_bundle.obs_count[strip, :]
+            self.month["s2_month_covered"][:, strip, :] = mask_bundle.month_covered[:, strip, :]
+            for var, full in (
+                ("s1_asc_obs_count", chunk_data.s1_asc_obs_count_full),
+                ("s1_desc_obs_count", chunk_data.s1_desc_obs_count_full),
+            ):
+                if full is not None:
+                    self.obs[var][strip] = full
+
+        for var, arr in zip(("s1_asc_month_covered", "s1_desc_month_covered"), sar_months, strict=True):
+            if arr is not None:
+                self.month[var][:, strip, :] = arr
+
+
+def _tally_refusals(refused: dict[str, int], dataset: MosaicChunkInferenceDataset) -> None:
+    """Add one strip's refused-pixel counts, by reason, to the chunk's."""
+    refused["thin"] += dataset.refused_thin
+    refused["no_optical"] += dataset.refused_no_optical
+    refused["no_radar"] += dataset.refused_no_radar
 
 
 def _chunk_summary_line(**fields: Any) -> str:  # noqa: ANN401 — heterogeneous JSON payload
@@ -811,6 +867,7 @@ class InferenceActor:
                 mosaic_snapshots,
             )
 
+    # jscpd:ignore-start: explicit keyword signature and Args, mirroring the public process_chunk it backs
     def _process_chunk(
         self,
         chunk: ChunkSpec,
@@ -828,6 +885,7 @@ class InferenceActor:
         Always invoked through :meth:`process_chunk`, which establishes the scoped icechunk
         credential provider this body's S3 opens depend on.
         """
+        # jscpd:ignore-end
         # Resolved ONCE and passed down. The three loader call sites (serial prologue, cross-chunk prefetch, strip
         # loop) must receive identical kwargs for bit-identity, so neither fallback may be re-evaluated at each of
         # them.
@@ -849,7 +907,7 @@ class InferenceActor:
 
         # Report loading phase so stall detection has visibility before batch 50
         if tracker:
-            tracker.report.remote(uid, 0, 0, "loading")  # type: ignore[union-attr]
+            tracker.report.remote(uid, 0, 0, "loading")
 
         try:
             # The prologue — repo handles, full-chunk SCL mask (which sizes the density-based strips), and the first
@@ -887,9 +945,6 @@ class InferenceActor:
             # mosaics carry a source index (``inference/provenance.py``).
             planes = SourcePlanes(chunk.height, chunk.width)
             planes.add("s2", mask_bundle.source_pieces)
-            # Passed to the writer only when there is something to stage, so a run whose mosaics carry
-            # no index writes exactly what it always has.
-            staged_planes: dict[str, Any] = {}
             logger.info("Chunk %s: T_kept=%d -> strip_h=%d -> %d strip(s)", chunk.label, t_kept, strip_h, len(strips))
             del prologue
 
@@ -916,11 +971,7 @@ class InferenceActor:
                     x_sub=x_sub,
                 )
 
-            on_batch = (
-                (lambda b, t: tracker.report.remote(uid, b, t, "inference"))  # type: ignore[union-attr]
-                if tracker
-                else None
-            )
+            on_batch = (lambda b, t: tracker.report.remote(uid, b, t, "inference")) if tracker else None
 
             # Obs counts accumulate per strip into whole-chunk buffers so the single write_chunk carries the
             # full-chunk obs maps.
@@ -935,6 +986,7 @@ class InferenceActor:
             month_buffers: dict[str, np.ndarray] = {
                 var: np.zeros((MONTHS_IN_YEAR, chunk.height, chunk.width), dtype=bool) for var in MONTH_COVERED_VARS
             }
+            buffers = _ChunkCoverage(obs_buffers, month_buffers, x_sub)
 
             total_valid = 0
             # Refusals accumulate across STRIPS: one dataset is built per strip, so its counters describe a slice
@@ -971,7 +1023,7 @@ class InferenceActor:
                     # read so _poll_tracker does not misclassify a slow multi-strip load as an inference stall. (Strip
                     # 0's was reported above.)
                     if tracker and i > 0:
-                        tracker.report.remote(uid, 0, 0, "loading")  # type: ignore[union-attr]
+                        tracker.report.remote(uid, 0, 0, "loading")
 
                     # Release the previous strip's input arrays BEFORE blocking on this strip's load and submitting
                     # the next prefetch. The dataset retains chunk_data.s2_bands (dataset.py), so without this drop
@@ -1013,40 +1065,7 @@ class InferenceActor:
                     for sensor, pieces in chunk_data.source_pieces.items():
                         planes.add(sensor, pieces)
 
-                    # SAR month masks: the strip's own when the grid is uncropped, the full-width side channel when it
-                    # is — the same choice the SAR obs counts make, so the saved provenance layers keep full extent
-                    # even where the inferred grid is narrower. Either way the array is (month, strip rows, full
-                    # width), so both assign through the same slice below.
-                    sar_months = (
-                        (chunk_data.s1_asc_month_covered, chunk_data.s1_desc_month_covered)
-                        if x_sub is None
-                        else (chunk_data.s1_asc_month_covered_full, chunk_data.s1_desc_month_covered_full)
-                    )
-                    if x_sub is None:
-                        for var in OBS_COUNT_VARS:
-                            arr = getattr(chunk_data, var)
-                            if arr is not None:
-                                obs_buffers[var][strip] = arr
-                        if mask_bundle is not None:
-                            # Sliced, not assigned whole: the bundle is a WHOLE-CHUNK array loaded once and shared by
-                            # every strip, unlike the strip-shaped SAR arrays.
-                            month_buffers["s2_month_covered"][:, strip, :] = mask_bundle.month_covered[:, strip, :]
-                    else:
-                        # Cropped grid: the saved obs layers keep full extent — S2 counts from the (full-width) mask
-                        # bundle, SAR counts from the full-width side channel (SAR is read full-width regardless; see
-                        # load_chunk).
-                        obs_buffers["s2_obs_count"][strip] = mask_bundle.obs_count[strip, :]
-                        month_buffers["s2_month_covered"][:, strip, :] = mask_bundle.month_covered[:, strip, :]
-                        for var, full in (
-                            ("s1_asc_obs_count", chunk_data.s1_asc_obs_count_full),
-                            ("s1_desc_obs_count", chunk_data.s1_desc_obs_count_full),
-                        ):
-                            if full is not None:
-                                obs_buffers[var][strip] = full
-
-                    for var, arr in zip(("s1_asc_month_covered", "s1_desc_month_covered"), sar_months, strict=True):
-                        if arr is not None:
-                            month_buffers[var][:, strip, :] = arr
+                    buffers.record(chunk_data, mask_bundle, strip)
 
                     if len(dataset) == 0:
                         # Empty strip: leave its output rows at the initialised zero embeddings / NaN scale, mirroring
@@ -1054,9 +1073,7 @@ class InferenceActor:
                         # here" (see #39). The strip still contributes its (zero) obs counts, written above. Its
                         # refusals still count too: an empty strip is the case the record most needs to explain, and
                         # skipping the tally here would make a fully refused shard report zero refusals.
-                        refused["thin"] += dataset.refused_thin
-                        refused["no_optical"] += dataset.refused_no_optical
-                        refused["no_radar"] += dataset.refused_no_radar
+                        _tally_refusals(refused, dataset)
                         radar_rule_enforced = not dataset.allow_s2_only
                         logger.info("Chunk %s strip %s: no valid pixels, leaving zero-filled", chunk.label, strip)
                         continue
@@ -1070,18 +1087,14 @@ class InferenceActor:
                     embeddings[strip, cols] = result.embeddings
                     scales[strip, cols] = result.scales
                     total_valid += len(dataset)
-                    refused["thin"] += dataset.refused_thin
-                    refused["no_optical"] += dataset.refused_no_optical
-                    refused["no_radar"] += dataset.refused_no_radar
+                    _tally_refusals(refused, dataset)
                     radar_rule_enforced = not dataset.allow_s2_only
             finally:
                 pool.shutdown(wait=False, cancel_futures=True)
 
-            if planes:
-                # A holes update records the pixels it EMBEDDED, not the holes it was asked to fill:
-                # `scales` is NaN wherever no embedding was written, so it is that mask. A reader then
-                # takes exactly these pixels from the update and the rest from the run before it.
-                staged_planes = {"planes": planes, "pixels": None if chunk.pixels is None else ~np.isnan(scales)}
+            # Passed to the writer only when there is something to stage, so a run whose mosaics carry
+            # no index writes exactly what it always has.
+            staged_planes = staging_kwargs(planes, scales, holes=chunk.pixels is not None)
 
             # All strips done: the last strip's inputs and the full-chunk SCL mask are no longer needed (obs counts
             # and embeddings already live in the whole-chunk output buffers). Freed before the S3 write so peak RAM

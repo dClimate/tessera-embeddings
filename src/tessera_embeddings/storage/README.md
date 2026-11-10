@@ -40,8 +40,7 @@ dataset's.
 stamps the store's minimum optical depth rule on the root at seeding, where it never moves; a
 targeted update may apply a looser line to its own cells and records it there (`update.py`,
 [ADR 028](../../../context_docs/decisions/028-embed-every-pixel-with-an-optical-observation.md)).
-`shard_writer.py` then fills one group-year in parallel and `region_writes.py` works out where a
-block of data belongs. What stops two writers overwriting each other is the conflict check at
+`shard_writer.py` then fills one group-year in parallel. What stops two writers overwriting each other is the conflict check at
 commit time; `session_catch_up.py` only shortens the work that check has to do.
 
 **`update.py`** is how a group-year that is already filled gets some of its tiles redone: a named,

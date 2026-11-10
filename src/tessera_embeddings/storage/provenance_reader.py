@@ -232,14 +232,15 @@ class _Scanner:
         self.root, self.zone, self.year = registry_root.rstrip("/"), zone, year
         self.options: dict[str, str] | None = None
         if self.root.startswith("s3://"):
-            creds = get_credentials() if get_credentials is not None else None
-            options = {
-                "aws_region": region,
-                "aws_access_key_id": creds and creds.access_key_id,
-                "aws_secret_access_key": creds and creds.secret_access_key,
-                "aws_session_token": creds and creds.session_token,
-            }
-            self.options = {k: v for k, v in options.items() if v} or None
+            options: dict[str, str | None] = {"aws_region": region}
+            if get_credentials is not None:
+                creds = get_credentials()
+                options |= {
+                    "aws_access_key_id": creds.access_key_id,
+                    "aws_secret_access_key": creds.secret_access_key,
+                    "aws_session_token": creds.session_token,
+                }
+            self.options = {k: v for k, v in options.items() if v is not None} or None
 
     def __call__(self, table: str) -> pl.LazyFrame:
         return self._scan(f"{table_dir(self.root, table, self.zone, self.year)}/*.parquet")

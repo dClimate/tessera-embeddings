@@ -128,7 +128,7 @@ def resolve_grouping_longitude(mid_longitude: float | None, bbox: object, geobox
     # construction.
     if geobox is not None:
         try:
-            ((lon, _),) = geobox.extent.centroid.to_crs("epsg:4326").points  # type: ignore[attr-defined]
+            ((lon, _),) = geobox.extent.centroid.to_crs("epsg:4326").points  # ty: ignore[unresolved-attribute]
             return float(lon)
         except (AttributeError, TypeError, ValueError):
             pass

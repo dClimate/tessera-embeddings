@@ -77,11 +77,12 @@ def _master(tmp_path, rows_by_cell: dict[tuple[str, int], list[dict]]) -> str:
     return str(root)
 
 
-def _row(tile: str, refused: int, box: tuple[float, float, float, float]) -> dict:
+def _row(tile: str, refused: int, box: tuple[float, float, float, float], *, thin: int | None = None) -> dict:
+    """A master row refusing ``refused`` pixels, ``thin`` of them (default: all) for thin optical depth."""
     west, south, east, north = box
     return {
         "tile": tile,
-        "refused_thin_px": refused,
+        "refused_thin_px": refused if thin is None else thin,
         "refused_px": refused,
         "bbox_west": west,
         "bbox_south": south,
@@ -94,7 +95,7 @@ def _row(tile: str, refused: int, box: tuple[float, float, float, float]) -> dic
     ("refused", "aoi", "cells"),
     [
         ("thin", None, {"14N/2019": ("chunk_0_1",), "60N/2019": ("chunk_0_0",)}),
-        ("any", None, {"14N/2019": ("chunk_0_1",), "60N/2019": ("chunk_0_0",)}),
+        ("any", None, {"14N/2019": ("chunk_0_0", "chunk_0_1"), "60N/2019": ("chunk_0_0",)}),
         (None, (-100.0, 40.0, -99.0, 41.0), {"14N/2019": ("chunk_0_0", "chunk_0_1")}),
         # Zone 60's antimeridian row (west > east) intersects a box on either side of it.
         (None, (-179.9, 10.0, -179.0, 11.0), {"60N/2019": ("chunk_0_0",)}),
@@ -106,7 +107,8 @@ def test_a_plan_can_come_from_the_registry(tmp_path, refused, aoi, cells):
         tmp_path,
         {
             ("14N", 2019): [
-                _row("chunk_0_0", 0, (-99.8, 40.2, -99.6, 40.4)),
+                # Refuses pixels, none of them thin: "any" selects it and "thin" does not.
+                _row("chunk_0_0", 4, (-99.8, 40.2, -99.6, 40.4), thin=0),
                 _row("chunk_0_1", 5, (-99.6, 40.2, -99.4, 40.4)),
             ],
             # A cell file written after a column was added: the scan must still read the others.

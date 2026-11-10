@@ -44,8 +44,8 @@ paths = BucketPaths(
 
 Every domain function that touches storage takes `paths` (or one of
 its derived URIs) as a keyword. There's no `os.environ.get(...)`
-anywhere in the domain layer — the architecture-tests check enforces
-this.
+anywhere in the domain layer. Review holds this rule; no CI check
+does.
 
 ```
                  ┌─────────────────────────────┐

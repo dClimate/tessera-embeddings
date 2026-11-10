@@ -497,10 +497,11 @@ def _put_if(fs: AbstractFileSystem, path: str, data: bytes, version: str | None)
     if not _on_s3(fs) and "file" not in fs.protocol:
         raise ValueError(f"no conditional write for a {fs.protocol} filesystem; the master needs S3 or local")
     if _on_s3(fs):
-        bucket, key, _ = fs.split_path(path)
+        # s3fs-only methods on a generic fsspec handle; this branch is S3 only.
+        bucket, key, _ = fs.split_path(path)  # ty: ignore[unresolved-attribute]
         condition = {"IfMatch": version} if version else {"IfNoneMatch": "*"}
         try:
-            fs.call_s3("put_object", Bucket=bucket, Key=key, Body=data, **condition)
+            fs.call_s3("put_object", Bucket=bucket, Key=key, Body=data, **condition)  # ty: ignore[unresolved-attribute]
         except OSError as error:
             code = getattr(error.__cause__, "response", {}).get("Error", {}).get("Code")
             if isinstance(error, FileExistsError) or code in ("PreconditionFailed", "ConditionalRequestConflict"):

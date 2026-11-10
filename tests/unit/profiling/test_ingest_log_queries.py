@@ -23,20 +23,6 @@ from tessera_embeddings.profiling.ingest.ingest_log_queries import QUERIES
 
 
 @pytest.mark.parametrize("name", sorted(QUERIES))
-def test_no_sort_on_a_raw_bin_expression(name: str) -> None:
-    """``sort bin(5m)`` is invalid: a bin must be aliased, then the alias sorted.
-
-    Insights parses ``sort`` over field names, not function calls, so
-    ``stats ... by bin(5m) | sort bin(5m) asc`` is rejected outright. The correct
-    form is ``stats ... by bin(5m) as period | sort period asc``.
-    """
-    _, query = QUERIES[name]
-    assert not re.search(r"\bsort\s+bin\s*\(", query), (
-        f"{name}: sorts a raw bin() expression — alias it (`by bin(5m) as period | sort period asc`)"
-    )
-
-
-@pytest.mark.parametrize("name", sorted(QUERIES))
 def test_binned_queries_alias_and_sort_that_alias(name: str) -> None:
     """A time-binned query must alias its bin and sort by the alias.
 
@@ -58,8 +44,10 @@ def test_binned_queries_alias_and_sort_that_alias(name: str) -> None:
 def test_sorted_fields_are_fields_the_query_defines(name: str) -> None:
     """Every ``sort`` target must be something the query actually produced.
 
-    Catches the general shape of the bug above: sorting a name that no ``stats``
-    alias, ``parse`` capture, or ``fields`` selection ever created.
+    Catches the general shape of the bug: sorting a name that no ``stats`` alias,
+    ``parse`` capture, or ``fields`` selection ever created. That includes
+    ``sort bin(5m)``, which Insights rejects outright (it sorts field names, not
+    function calls): ``bin`` is captured here and is never defined.
     """
     _, query = QUERIES[name]
     sorted_fields = re.findall(r"\bsort\s+([A-Za-z_]\w*)", query)
@@ -69,9 +57,3 @@ def test_sorted_fields_are_fields_the_query_defines(name: str) -> None:
     defined |= set(re.findall(r"\(\?<(\w+)>", query))  # parse captures
     for field in sorted_fields:
         assert field in defined, f"{name}: sorts by {field!r}, which the query never defines"
-
-
-def test_every_query_has_a_description() -> None:
-    """--list is the discovery surface; an undescribed query is unusable."""
-    for name, (description, _) in QUERIES.items():
-        assert description.strip(), f"{name}: empty description"

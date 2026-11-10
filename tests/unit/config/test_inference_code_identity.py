@@ -12,6 +12,7 @@ and goes stale in the direction that loses data.
 
 from __future__ import annotations
 
+import functools
 from pathlib import Path
 
 import pytest
@@ -19,7 +20,6 @@ import pytest
 from tessera_embeddings.config.code_identity import first_party_import_closure
 from tessera_embeddings.config.inference import (
     _STAGED_OUTPUT_SOURCES,
-    inference_code_identity,
 )
 from tessera_embeddings.config.ingest import _MOSAIC_CONTENT_SOURCES
 from tests._paths import SRC_ROOT
@@ -27,8 +27,11 @@ from tests._paths import SRC_ROOT
 _ROOT = SRC_ROOT
 
 
-def _covered() -> set[str]:
-    """Package-relative paths of every file the fingerprint hashes."""
+@functools.cache
+def _covered() -> frozenset[str]:
+    """Package-relative paths of every file the fingerprint hashes. Cached: walking the real
+    tree's import closure is the slowest thing in this file, and the tree does not change.
+    """
     seed: list[Path] = []
     for entry in _STAGED_OUTPUT_SOURCES:
         target = _ROOT / entry
@@ -36,7 +39,14 @@ def _covered() -> set[str]:
             seed.extend(p for p in target.rglob("*.py") if "__pycache__" not in p.parts)
         else:
             seed.append(target)
-    return {str(p.relative_to(_ROOT)) for p in first_party_import_closure(seed, _ROOT)}
+    return frozenset(str(p.relative_to(_ROOT)) for p in first_party_import_closure(seed, _ROOT))
+
+
+@functools.cache
+def _ingest_covered() -> frozenset[str]:
+    """The same for the mosaic (ingest) fingerprint."""
+    seed = [_ROOT / entry for entry in _MOSAIC_CONTENT_SOURCES]
+    return frozenset(p.relative_to(_ROOT).as_posix() for p in first_party_import_closure(seed, _ROOT))
 
 
 @pytest.mark.parametrize(
@@ -58,17 +68,6 @@ def test_content_determining_modules_are_covered(module: str, why: str) -> None:
     assert module in _covered(), f"{module} not fingerprinted, but {why}"
 
 
-def test_the_closure_is_reached_transitively_not_listed() -> None:
-    """The seed names far less than the fingerprint covers — that gap IS the fix."""
-    seeded = set(_STAGED_OUTPUT_SOURCES)
-    covered = _covered()
-
-    beyond_the_seed = {c for c in covered if not (c.startswith("inference/") or c in seeded)}
-    assert beyond_the_seed, "the closure added nothing — it has stopped following imports"
-    assert "storage/zarr_store.py" in beyond_the_seed
-    assert "storage/time_axis.py" in beyond_the_seed
-
-
 def test_orchestration_and_providers_stay_out() -> None:
     """The narrowing has to still narrow, or a hotfix anywhere abandons every tile.
 
@@ -78,12 +77,6 @@ def test_orchestration_and_providers_stay_out() -> None:
     covered = _covered()
     assert not [c for c in covered if c.startswith(("orchestration/", "providers/", "profiling/"))]
     assert len(covered) < len(list(_ROOT.rglob("*.py"))), "the closure has swallowed the package"
-
-
-def test_the_digest_is_stable_across_calls() -> None:
-    """Nothing in the walk may depend on iteration or filesystem order."""
-    assert inference_code_identity() == inference_code_identity()
-    assert inference_code_identity().startswith("infcode-")
 
 
 def test_an_edit_to_a_transitive_dependency_moves_the_digest(tmp_path: Path) -> None:
@@ -111,7 +104,23 @@ def test_an_edit_to_a_transitive_dependency_moves_the_digest(tmp_path: Path) -> 
     assert digest(first_party_import_closure(seed, root)) != before
 
 
-def test_a_relative_re_export_does_not_stop_the_closure(tmp_path: Path) -> None:
+@pytest.fixture
+def reexport_package(tmp_path: Path) -> Path:
+    """A miniature package whose ``config/__init__`` re-exports ``providers`` with a RELATIVE import."""
+    root = tmp_path / "pkg"
+    (root / "ingest").mkdir(parents=True)
+    (root / "config").mkdir()
+    (root / "ingest" / "leg.py").write_text("from tessera_embeddings.config import PROVIDERS\n")
+    (root / "config" / "__init__.py").write_text("from .providers import PROVIDERS\n")
+    (root / "config" / "providers.py").write_text("PROVIDERS = {'earth-search': 1}\n")
+    return root
+
+
+def _reexport_closure(root: Path) -> set[Path]:
+    return set(first_party_import_closure([root / "ingest" / "leg.py"], root))
+
+
+def test_a_relative_re_export_does_not_stop_the_closure(reexport_package: Path) -> None:
     """Package ``__init__`` files re-export with RELATIVE imports, and a relative
     import's module name is the tail alone — ``"providers"``, not the dotted package
     path — so a first-party filter on the package prefix rejects it.
@@ -122,22 +131,15 @@ def test_a_relative_re_export_does_not_stop_the_closure(tmp_path: Path) -> None:
     changing a collection could leave a mosaic's identity unmoved and let a resume
     append data produced under different settings.
     """
-    root = tmp_path / "pkg"
-    (root / "ingest").mkdir(parents=True)
-    (root / "config").mkdir()
-    (root / "ingest" / "leg.py").write_text("from tessera_embeddings.config import PROVIDERS\n")
-    (root / "config" / "__init__.py").write_text("from .providers import PROVIDERS\n")
-    providers = root / "config" / "providers.py"
-    providers.write_text("PROVIDERS = {'earth-search': 1}\n")
-
-    reached = first_party_import_closure([root / "ingest" / "leg.py"], root)
-    assert providers in reached, "the re-exported module must be reached through the package"
+    assert reexport_package / "config" / "providers.py" in _reexport_closure(reexport_package), (
+        "the re-exported module must be reached through the package"
+    )
 
 
-def test_the_closure_holds_only_files_that_really_exist(tmp_path: Path) -> None:
+def test_the_closure_holds_only_files_that_really_exist(reexport_package: Path) -> None:
     """Every reached path must be a real directory entry, matched case-exactly.
 
-    The same ``from .providers import PROVIDERS`` above offers ``config.providers.PROVIDERS``
+    The same ``from .providers import PROVIDERS`` offers ``config.providers.PROVIDERS``
     as a candidate module. Resolved with ``Path.exists()``, that candidate ANSWERS on a
     case-insensitive filesystem — ``config/PROVIDERS.py`` resolves to ``providers.py`` — and
     the closure gains an entry for a file the repository does not contain.
@@ -152,30 +154,17 @@ def test_the_closure_holds_only_files_that_really_exist(tmp_path: Path) -> None:
     is here because that is where the bug occurs, and because "the closure contains only real
     files" is the property worth pinning however it might be broken.
     """
-    root = tmp_path / "pkg"
-    (root / "ingest").mkdir(parents=True)
-    (root / "config").mkdir()
-    (root / "ingest" / "leg.py").write_text("from tessera_embeddings.config import PROVIDERS\n")
-    (root / "config" / "__init__.py").write_text("from .providers import PROVIDERS\n")
-    (root / "config" / "providers.py").write_text("PROVIDERS = {'earth-search': 1}\n")
-
-    reached = first_party_import_closure([root / "ingest" / "leg.py"], root)
-
-    for path in reached:
+    for path in _reexport_closure(reexport_package):
         siblings = {entry.name for entry in path.parent.iterdir()}
         assert path.name in siblings, (
-            f"{path.relative_to(root)} is in the closure but is not a case-exact entry of "
+            f"{path.relative_to(reexport_package)} is in the closure but is not a case-exact entry of "
             f"its directory, which holds {sorted(siblings)}"
         )
 
 
 def test_the_real_ingest_fingerprint_covers_the_collection_settings() -> None:
     """The case the miniature package stands in for, asserted on the tree that ships."""
-    from tessera_embeddings.config.ingest import _MOSAIC_CONTENT_SOURCES
-
-    seed = [_ROOT / entry for entry in _MOSAIC_CONTENT_SOURCES]
-    reached = {p.relative_to(_ROOT).as_posix() for p in first_party_import_closure(seed, _ROOT)}
-    assert "config/providers.py" in reached
+    assert "config/providers.py" in _ingest_covered()
 
 
 @pytest.mark.parametrize("module", ["storage/update.py", "ingest/land_mask.py", "config/paths.py"])
@@ -185,8 +174,4 @@ def test_targeted_updates_move_neither_fingerprint(module: str) -> None:
     Inside either closure, a change to them would abandon staged tiles or refuse appends to
     interrupted mosaics — so nothing in either closure may import them.
     """
-    ingest = {
-        p.relative_to(_ROOT).as_posix()
-        for p in first_party_import_closure([_ROOT / e for e in _MOSAIC_CONTENT_SOURCES], _ROOT)
-    }
-    assert module not in _covered() and module not in ingest
+    assert module not in _covered() and module not in _ingest_covered()

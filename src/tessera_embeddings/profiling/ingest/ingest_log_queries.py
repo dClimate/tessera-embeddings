@@ -48,13 +48,12 @@ others.
 
 from __future__ import annotations
 
-import argparse
 import json
 
 import boto3
 
 from tessera_embeddings.profiling._cloudwatch import insights_query, iso, parse_ts
-from tessera_embeddings.profiling.ingest import DEFAULT_INGEST_LOG_GROUP
+from tessera_embeddings.profiling.ingest import ingest_log_parser
 
 # name -> (description, Insights query string). The run window + log group are passed to
 # start_query separately, so the query strings carry no per-run state.
@@ -216,12 +215,7 @@ def run_queries(
 
 def main(argv: list[str] | None = None) -> int:
     """Parse args and run the requested Insights queries (or --list)."""
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument(
-        "--profile", default=None, help="AWS profile; default uses the ambient credential chain / AWS_PROFILE"
-    )
-    parser.add_argument("--region", default="us-west-2")
-    parser.add_argument("--log-group", default=DEFAULT_INGEST_LOG_GROUP)
+    parser = ingest_log_parser(__doc__)
     parser.add_argument("--since", help="run start (ISO8601 UTC)")
     parser.add_argument("--until", help="run end (ISO8601 UTC)")
     parser.add_argument("--query", action="append", choices=sorted(QUERIES), help="run only this query (repeatable)")

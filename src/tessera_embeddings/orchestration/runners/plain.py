@@ -21,7 +21,7 @@ import hashlib
 import json
 import logging
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
@@ -104,7 +104,7 @@ def _resolve_num_gpus(device: str) -> int:
 
 
 @contextmanager
-def _dask_client(n_workers: int) -> Iterator[Client]:
+def _dask_client(n_workers: int) -> Generator[Client]:
     """Create a local Dask cluster + connected client."""
     with local_cluster(n_workers=n_workers) as cluster, Client(cluster) as client:
         yield client
@@ -253,7 +253,7 @@ def _run_ingest(
                 end_date=end_date,
                 store_path=mosaic_base,
                 client=client,
-                orbit=orbit,  # type: ignore[arg-type]
+                orbit=orbit,  # ty: ignore[invalid-argument-type]
                 use_s3_direct=s1_use_s3_direct,
                 edl_credentials_fn=get_s3_credentials if s1_use_s3_direct else None,
                 apply_credentials_fn=set_s3_credentials if s1_use_s3_direct else None,

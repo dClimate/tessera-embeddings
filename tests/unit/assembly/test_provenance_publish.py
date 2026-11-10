@@ -27,7 +27,7 @@ from tessera_embeddings.config.ingest import PROVENANCE_VERSION, SOURCE_INDEX_VA
 from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.inference.provenance import PROVENANCE_ATTR, SourcePlanes, read_source_pieces
-from tessera_embeddings.inference.provenance_publish import ProvenanceCheckError, publish_provenance
+from tessera_embeddings.inference.provenance_publish import ProvenanceCheckError, ProvenanceRun, publish_provenance
 from tessera_embeddings.storage.manifest import IngestManifest
 from tessera_embeddings.storage.provenance import (
     granules_uri,
@@ -138,7 +138,7 @@ def _planes(pins: dict[str, str], chunk: ChunkSpec, valid: np.ndarray = ALL_VALI
         ys, xs = slice(chunk.y_start, chunk.y_stop), slice(chunk.x_start, chunk.x_stop)
         planes.add(
             STORES[Path(path).stem],
-            read_source_pieces(root, times, ys, xs, valid, rows=slice(0, SHARD), cols=slice(0, SHARD)),
+            read_source_pieces(root, times, (ys, xs), valid, (slice(0, SHARD), slice(0, SHARD))),
         )
     return planes
 
@@ -186,16 +186,18 @@ def _publish(
     tmp_path: Path, pins: dict[str, str], embedded: list[str], refused: list[str], run: str = RUN
 ) -> dict | None:
     return publish_provenance(
-        staging_base=str(tmp_path / "staging"),
-        registry_root=str(tmp_path / "registry"),
-        zone=ZONE,
-        year=YEAR,
-        run_id=run,
-        embedded=embedded,
-        refused=refused,
-        mosaic_snapshots=pins,
-        grid_shape=(SIZE, SIZE),
-        shard_px=SHARD,
+        ProvenanceRun(
+            staging_base=str(tmp_path / "staging"),
+            registry_root=str(tmp_path / "registry"),
+            zone=ZONE,
+            year=YEAR,
+            run_id=run,
+            embedded=embedded,
+            refused=refused,
+            mosaic_snapshots=pins,
+            grid_shape=(SIZE, SIZE),
+            shard_px=SHARD,
+        )
     )
 
 

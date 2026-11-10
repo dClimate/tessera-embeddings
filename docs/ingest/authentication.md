@@ -91,7 +91,7 @@ credentials, bypassing the env vars. The mechanism:
   open lacking an explicit one, for the duration of the block — scoped rather than permanent, so a
   reused Dask worker is not left pinned to it, and the previous provider is restored even if the
   body raises. The storage layer ships this as `None` and never imports botocore, per the
-  `no-botocore-outside-aws-provider` architecture rule; only the AWS provider supplies it.
+  `aws` import contract in `.importlinter`; only the AWS provider supplies it.
 - The `process_roi_sar` Prefect task registers `iam_icechunk_credentials` through that hook when
   `use_s3_direct=True`. **In the task shell, not the flow body** — under the Dask task runner the
   domain function and its store writes execute in a *worker* process, so a provider registered in

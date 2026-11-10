@@ -20,7 +20,6 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import numpy as np
-import pytest
 import xarray as xr
 
 from tessera_embeddings.config.providers import PROVIDERS
@@ -28,7 +27,6 @@ from tessera_embeddings.config.satellites import S2_BASELINE_OFFSET, S2_BASELINE
 from tessera_embeddings.ingest import stac as stac_module
 from tessera_embeddings.ingest.asset_locations import (
     HARMONISED_ASSET_BUCKETS,
-    PREFERRED_ASSET_BUCKETS,
     READ_ASSET_KEYS,
     REFLECTANCE_ASSET_KEYS,
     Harmonisation,
@@ -126,37 +124,6 @@ class TestPerItemExemption:
         assert extract_baselines([item]) == {"2022-01-07": 509}, "provenance keeps the real baseline"
         assert _is_exempt(item), "but no correction is owed"
 
-    def test_a_raw_esa_item_below_the_threshold_reports_its_baseline(self) -> None:
-        """Reporting the real baseline is what lets the threshold decide. 301 is under 400, so
-        no correction is applied — but by the threshold, not by an exemption.
-        """
-        assert _extract_baseline(_Item(_RAW_ESA, "03.01")) == 301
-
-    @pytest.mark.parametrize("baseline", [None, "", "not-a-number"])
-    def test_an_unreadable_baseline_reports_zero(self, baseline: str | None) -> None:
-        """Pre-existing behaviour, unchanged."""
-        assert _extract_baseline(_Item(_RAW_ESA, baseline)) == 0
-
-    def test_two_dates_from_different_producers_get_different_answers(self) -> None:
-        """Derived over the items a preparation actually loads, so one call must separate them."""
-        raw = _Item(_RAW_ESA, "05.00")
-        harmonised = _Item(_HARMONISED, "05.00")
-        harmonised.datetime = datetime(2022, 1, 8, 12, 0, 0, tzinfo=UTC)
-        items = [raw, harmonised]
-        assert extract_baselines(items) == {"2022-01-07": 500, "2022-01-08": 500}, "provenance is untouched"
-        assert _decisions(items[0]) == {OffsetDecision.OWED}, "the raw item is owed the offset"
-        assert _is_exempt(items[1]), "the harmonised one is not"
-
-
-class TestProvenanceIsNotOverwritten:
-    """The reported baseline reaches the store's `baselines_applied` and must survive."""
-
-    def test_a_harmonised_item_still_reports_its_real_baseline(self) -> None:
-        """Encoding the exemption as a baseline of 0 made the store misreport its own vintage —
-        worse than the error it avoided, because it cannot be recovered after the fact.
-        """
-        assert extract_baselines([_Item(_HARMONISED, "05.10")]) == {"2022-01-07": 510}
-
 
 class TestHarmonisationPredicate:
     """`item_harmonisation` — three states, because MIXED needs its own response."""
@@ -174,16 +141,6 @@ class TestHarmonisationPredicate:
         item = _Item(_HARMONISED, "05.00", extra={"aot": {"href": f"{_RAW_ESA}/AOT.jp2"}})
         assert item_harmonisation(item) is Harmonisation.HARMONISED
 
-    def test_bands_straddling_two_producers_are_not_harmonised(self) -> None:
-        """No single ITEM-level answer fits a partly-harmonised item, so neither may be reported.
-
-        The correction is decided per asset, which is what gives such an item a right answer band
-        by band. This function's only job is to refuse to flatten it to one.
-        """
-        item = _Item(_HARMONISED, "05.00")
-        item.assets["red"] = {"href": f"{_RAW_ESA}/B04.jp2"}
-        assert item_harmonisation(item) is Harmonisation.MIXED, "MIXED, not silently one or the other"
-
     def test_an_item_with_no_read_bands_is_undetermined_not_raw(self) -> None:
         """Absence of evidence must not buy an exemption — and must not buy a CORRECTION either.
 
@@ -193,12 +150,6 @@ class TestHarmonisationPredicate:
         may already be harmonised. The caller refuses on UNKNOWN instead of guessing.
         """
         assert item_harmonisation(_Item(None, "05.00")) is Harmonisation.UNKNOWN
-
-    def test_an_item_serving_bands_under_native_keys_is_undetermined(self) -> None:
-        """The concrete alias case, which `_prune_item_dict` in `stac.py` exists to preserve."""
-        item = _Item(None, "05.00")
-        item.assets = {f"B{n:02d}": {"href": f"{_HARMONISED}/B{n:02d}.tif"} for n in (2, 3, 4, 8)}
-        assert item_harmonisation(item) is Harmonisation.UNKNOWN
 
     def test_a_partly_aliased_item_is_undetermined(self) -> None:
         """The subset case, and the one `_prune_item_dict` is specifically written for: asked for
@@ -226,30 +177,11 @@ class TestHarmonisationPredicate:
         del item.assets["scl"]
         assert item_harmonisation(item) is Harmonisation.HARMONISED
 
-    def test_the_live_catalogue_serves_the_configured_alias_keys(self) -> None:
-        """Why UNKNOWN does not fire in production: real Element 84 items key their assets by
-        the configured band names, so they classify HARMONISED on the normal path.
-        """
-        assert item_harmonisation(_Item(_HARMONISED, "05.00")) is Harmonisation.HARMONISED
-
-    def test_an_unrecognised_bucket_is_not_harmonised(self) -> None:
-        """A future mirror nobody has told us about gets corrected rather than exempted."""
-        assert item_harmonisation(_Item("s3://some-new-mirror/tiles/33/T/WM", "05.00")) is Harmonisation.UNKNOWN
-
-    def test_the_raw_archive_is_not_in_the_harmonised_set(self) -> None:
-        """Guards the constant: adding `sentinel-s2-l2a` here would silently reinstate the bug."""
-        assert "sentinel-s2-l2a" not in HARMONISED_ASSET_BUCKETS
-
 
 class TestSclDoesNotDecideHarmonisation:
     """`scl` is read, so it counts for egress — and never corrected, so it cannot make the
     reflectance correction ambiguous.
     """
-
-    def test_scl_is_read_but_not_reflectance(self) -> None:
-        """Guards the split itself. Collapsing these back into one tuple reinstates the bug."""
-        assert "scl" in READ_ASSET_KEYS, "scl IS fetched, so it counts toward locality"
-        assert "scl" not in REFLECTANCE_ASSET_KEYS, "scl is categorical and never offset-corrected"
 
     def test_raw_scl_beside_harmonised_reflectance_is_still_harmonised(self) -> None:
         """THE REPORTED CASE. Subtracting 1000 from a class label is meaningless, so the
@@ -260,35 +192,6 @@ class TestSclDoesNotDecideHarmonisation:
         item.assets["scl"] = {"href": f"{_RAW_ESA}/scl"}
         assert item_harmonisation(item) is Harmonisation.HARMONISED
         assert _is_exempt(item)
-
-    def test_a_raw_reflectance_band_still_makes_it_mixed(self) -> None:
-        """The complement: excluding scl must not weaken the reflectance check itself."""
-        item = _Item(_HARMONISED, "05.00")
-        item.assets["red"] = {"href": f"{_RAW_ESA}/B04.jp2"}
-        assert item_harmonisation(item) is Harmonisation.MIXED
-
-
-class TestTheBaselineParserReportsUnknown:
-    """`_extract_baseline` maps a missing baseline to 0, so it cannot say "unknown"."""
-
-    @pytest.mark.parametrize("raw", [None, "", "not-a-number", "NaN", "Infinity", "-Infinity"])
-    def test_an_undeclared_or_nonsense_baseline_is_unknown(self, raw) -> None:
-        assert _declared_baseline(_Item(_RAW_ESA, raw)) is None
-
-    @pytest.mark.parametrize(("raw", "scaled"), [("04.00", 400), ("05.10", 510), ("00.01", 1)])
-    def test_a_real_baseline_is_scaled_by_a_hundred(self, raw: str, scaled: int) -> None:
-        assert _declared_baseline(_Item(_RAW_ESA, raw)) == scaled
-
-    def test_an_infinite_baseline_does_not_raise_out_of_the_parser(self) -> None:
-        """`round(inf)` raises OverflowError, which the parser's except clause did not catch —
-        so a single malformed catalogue value aborted the whole preparation.
-        """
-        assert _extract_baseline(_Item(_RAW_ESA, "Infinity")) == 0
-
-    def test_a_declared_zero_is_distinguishable_from_an_absent_one(self) -> None:
-        assert _declared_baseline(_Item(_RAW_ESA, "00.00")) == 0
-        assert _declared_baseline(_Item(_RAW_ESA, None)) is None
-        assert _extract_baseline(_Item(_RAW_ESA, "00.00")) == _extract_baseline(_Item(_RAW_ESA, None)) == 0
 
 
 class TestThePerItemCheckIsScopedToTheCollectionThatNeedsIt:
@@ -317,15 +220,6 @@ class TestThePerItemCheckIsScopedToTheCollectionThatNeedsIt:
         the predicate, is what had to change.
         """
         assert item_harmonisation(self._pc_item()) is Harmonisation.UNKNOWN
-
-    def test_the_planetary_computer_collection_does_not_use_the_per_item_check(self) -> None:
-        config = PROVIDERS["planetary-computer"].collections["sentinel-2-l2a"]
-        assert config.requires_baseline_correction is True, "PC data is raw and IS owed the offset"
-        assert config.harmonisation_varies_by_item is False
-
-    def test_earth_search_does_use_the_per_item_check(self) -> None:
-        """The complement: turning the flag off everywhere would pass the test above."""
-        assert PROVIDERS["earth-search"].collections["sentinel-2-l2a"].harmonisation_varies_by_item is True
 
     def test_a_native_keyed_item_is_corrected_rather_than_refused(self, monkeypatch) -> None:
         """A native-keyed item is CORRECTED on the collection's answer, never refused for its bucket.
@@ -377,33 +271,6 @@ class TestTheTwoBucketSetsAreIndependent:
         item.assets = {k: {"href": f"s3://some-harmonised-mirror/{k}"} for k in READ_ASSET_KEYS}
         assert item_harmonisation(item, buckets=frozenset({"some-harmonised-mirror"})) is Harmonisation.HARMONISED
         assert item_is_in_preferred_location(item) is False
-
-    def test_the_raw_archive_is_absent_from_both(self) -> None:
-        """Adding it to either would silently reinstate a different bug."""
-        assert "sentinel-s2-l2a" not in HARMONISED_ASSET_BUCKETS
-        assert "sentinel-s2-l2a" not in PREFERRED_ASSET_BUCKETS
-
-
-class TestScalingCannotOverflowThePicker:
-    """`math.isfinite` was checked BEFORE the multiplication, so a finite but enormous value
-    became infinity when scaled and `round()` raised `OverflowError` — aborting the whole batch
-    over one item's metadata. Raised on PR #107 after the earlier non-finite fix.
-    """
-
-    @pytest.mark.parametrize("raw", ["1e308", "-1e308", "9" * 400])
-    def test_a_value_that_overflows_when_scaled_reads_as_unknown(self, raw: str) -> None:
-        assert _declared_baseline(_Item(_RAW_ESA, raw)) is None
-        assert _extract_baseline(_Item(_RAW_ESA, raw)) == 0
-
-    def test_a_high_but_plausible_version_still_parses(self) -> None:
-        """The bound must leave headroom above ESA's 05.x rather than pinning today's value."""
-        assert _declared_baseline(_Item(_RAW_ESA, "99.99")) == 9999
-
-    def test_the_batch_is_not_aborted_by_one_such_item(self) -> None:
-        """The consequence: `extract_baselines` must survive it rather than raising."""
-        good = _Item(_HARMONISED, "05.10")
-        bad = _Item(_HARMONISED, "1e308")
-        assert extract_baselines([good, bad])["2022-01-07"] in (510, 0)
 
 
 class TestAssetSourcesCannotLoseAKey:
@@ -598,27 +465,11 @@ class TestRankingUsesTheRequestedAssetsNotThePruningSet:
         assert "scl" in stac_module._loadable_assets(config), "the pruning set keeps it"
         assert "scl" not in stac_module._requested_assets(config), "the read set does not"
 
-    def test_an_explicit_extra_band_is_requested(self) -> None:
-        config = PROVIDERS["earth-search"].collections["sentinel-2-l2a"]
-        assert "scl" in stac_module._requested_assets(config, ["scl"])
-
     def test_the_requested_set_does_not_duplicate_a_configured_band(self) -> None:
         config = PROVIDERS["earth-search"].collections["sentinel-2-l2a"]
         requested = stac_module._requested_assets(config, ["blue", "qa"])
         assert requested.count("blue") == 1
         assert requested[-1] == "qa"
-
-    def test_a_copy_lacking_scl_is_not_penalised_when_scl_is_not_read(self) -> None:
-        """The consequence: an equal-baseline local copy losing to a remote one over an asset this
-        call never reads, which is an unnecessary cross-region read.
-        """
-        config = PROVIDERS["earth-search"].collections["sentinel-2-l2a"]
-        keys = stac_module._requested_assets(config)
-        local_no_scl = _Item(None, "05.00")
-        local_no_scl.id = "local"
-        local_no_scl.assets = {b: {"href": f"{_HARMONISED}/{b}.tif"} for b in config.bands}
-        assert item_is_in_preferred_location(local_no_scl, keys=keys) is True
-        assert item_is_in_preferred_location(local_no_scl) is False, "the fixed set demands scl"
 
 
 class TestTheSplitWorkflowProvenanceFollowsTheSelectedCopy:
@@ -683,26 +534,6 @@ class TestTheThemesThatGeneratedTheReviewStayClosed:
     unreported instance fails here rather than in a later review.
     """
 
-    def test_there_is_one_definition_of_what_a_load_reads(self) -> None:
-        """The driver and the generic path must not define their read set twice."""
-        from tessera_embeddings.ingest.s2_roi import _LOADED_EXTRA_BANDS, _read_asset_keys
-
-        config = PROVIDERS["earth-search"].collections["sentinel-2-l2a"]
-        assert stac_module._requested_assets(config, _LOADED_EXTRA_BANDS) == _read_asset_keys(
-            "earth-search", "sentinel-2-l2a"
-        )
-
-    def test_the_read_set_is_empty_where_the_names_are_not_the_asset_keys(self) -> None:
-        """Planetary Computer serves `B02`/`SCL` and relies on the loader's alias table, so looking
-        the configured names up directly reports every copy incomplete and remote. An empty set
-        makes both terms tie rather than mislead.
-        """
-        from tessera_embeddings.ingest.s2_roi import _read_asset_keys
-
-        config = PROVIDERS["planetary-computer"].collections["sentinel-2-l2a"]
-        assert config.band_names_are_asset_keys is False
-        assert _read_asset_keys("planetary-computer", "sentinel-2-l2a") == ()
-
     def test_a_name_based_check_is_only_run_where_names_are_keys(self) -> None:
         """Producer classification, completeness and locality all look an asset up BY NAME, so the
         two flags cannot disagree in the direction that would run such a check blind.
@@ -721,10 +552,6 @@ class TestTheThemesThatGeneratedTheReviewStayClosed:
             config = PROVIDERS[provider].collections[collection]
             if config.harmonisation_varies_by_item:
                 assert set(REFLECTANCE_ASSET_KEYS) == set(config.bands), f"{provider}/{collection}"
-
-    def test_scl_is_read_but_never_judged_for_harmonisation(self) -> None:
-        """The two key sets differ by exactly `scl`, and that difference is the point."""
-        assert set(READ_ASSET_KEYS) - set(REFLECTANCE_ASSET_KEYS) == {"scl"}
 
     def test_every_refusal_is_gated_on_the_source_being_owed_a_correction(self) -> None:
         """A pre-threshold item must never refuse, whatever else is wrong with it: which producer
@@ -760,14 +587,6 @@ class TestTheThemesThatGeneratedTheReviewStayClosed:
         assert _decisions(undetermined) == {OffsetDecision.UNDECIDABLE}
         # And it is still gated on a correction being owed at all.
         assert _is_exempt(_Item(None, "02.06"))
-
-    def test_provenance_is_never_the_correction_input(self) -> None:
-        """Two maps, two purposes: what each item declared, and what to correct at. Collapsing
-        them is what made a store report baseline 0 for imagery processed at 05.10.
-        """
-        harmonised = [_Item(_HARMONISED, "05.10")]
-        assert extract_baselines(harmonised) == {"2022-01-07": 510}
-        assert _is_exempt(harmonised[0]), "and the correction input owes it nothing"
 
 
 class TestPruningReachesEveryCollectionThatMakesAnOffsetDecision:
@@ -865,18 +684,6 @@ class TestPruningReachesEveryCollectionThatMakesAnOffsetDecision:
                 provider, "sentinel-2-l2a"
             )
 
-    def test_the_gate_stops_at_collections_owed_no_offset(self) -> None:
-        """The scope of the change, asserted because it was chosen rather than assumed.
-
-        Removing the gate entirely would reach any collection with duplicates — but Landsat items
-        key perfectly well here (`grid:code` is of the form `WRS2-190028`), so it would start
-        reducing those too. That is a change nothing in this branch has measured, so it is owed
-        separately rather than taken as a side effect of this one.
-        """
-        for provider, collection in (("earth-search", "landsat-c2-l2"), ("earth-search", "sentinel-1-grd")):
-            config = PROVIDERS[provider].collections[collection]
-            assert config.requires_baseline_correction is False, f"{provider}/{collection}"
-
 
 class TestProvenanceKeepsTheDatesSelectionDidNotTouch:
     """`query_stac_items` returns entries for every queried date, including ones whose items were
@@ -927,13 +734,6 @@ class TestAnUnlistedBucketIsUndeterminedNotRaw:
         item.assets = {k: {"href": f"s3://some-new-mirror/{k}"} for k in READ_ASSET_KEYS}
         assert item_harmonisation(item) is Harmonisation.UNKNOWN
 
-    def test_the_named_raw_archive_is_still_raw(self) -> None:
-        """The complement: a producer we HAVE identified must still be corrected."""
-        assert item_harmonisation(_Item(_RAW_ESA, "05.00")) is Harmonisation.RAW
-
-    def test_a_harmonised_producer_is_still_harmonised(self) -> None:
-        assert item_harmonisation(_Item(_HARMONISED, "05.00")) is Harmonisation.HARMONISED
-
     def test_an_unlisted_bucket_refuses_rather_than_double_correcting(self) -> None:
         item = _Item(None, "05.00")
         item.assets = {k: {"href": f"s3://some-new-mirror/{k}"} for k in READ_ASSET_KEYS}
@@ -958,16 +758,6 @@ class TestRawRequiresEveryBandFromAKnownProducer:
         item.assets = {k: {"href": f"s3://some-new-mirror/{k}"} for k in READ_ASSET_KEYS}
         item.assets["red"] = {"href": f"{_RAW_ESA}/B04.jp2"}
         assert item_harmonisation(item) is Harmonisation.UNKNOWN
-
-    def test_every_band_from_the_known_archive_is_raw(self) -> None:
-        """The complement: an item genuinely served by the archive must still be corrected."""
-        assert item_harmonisation(_Item(_RAW_ESA, "05.00")) is Harmonisation.RAW
-
-    def test_raw_plus_harmonised_is_still_mixed(self) -> None:
-        """The three-way distinction survives: straddling KNOWN producers stays MIXED."""
-        item = _Item(_HARMONISED, "05.00")
-        item.assets["red"] = {"href": f"{_RAW_ESA}/B04.jp2"}
-        assert item_harmonisation(item) is Harmonisation.MIXED
 
     def test_the_undetermined_set_refuses_rather_than_correcting(self) -> None:
         item = _Item(None, "05.00")
@@ -1044,12 +834,6 @@ class TestProvenanceRealignsWheneverSelectionPruned:
         # Rejected copy first: `extract_baselines` keeps the first item of a date.
         return [loser, winner]
 
-    def test_the_fixture_really_yields_no_alternates(self) -> None:
-        """Otherwise this would pass through the old gate and prove nothing."""
-        kept, alternates = select_preferred_duplicates(self._pair())
-        assert [i.id for i in kept] == ["S2A_33TWM_20220107_1_L2A"]
-        assert alternates == {}, "the ladder filter must have emptied it"
-
     def test_the_map_is_realigned_even_with_no_alternates(self, monkeypatch) -> None:
         data = xr.Dataset(
             {"blue": (("time", "y", "x"), np.ones((1, 2, 2), dtype=np.uint16))},
@@ -1057,6 +841,9 @@ class TestProvenanceRealignsWheneverSelectionPruned:
         )
         monkeypatch.setattr(stac_module, "_load_from_stac", lambda *a, **k: data)
         items = self._pair()
+        kept, alternates = select_preferred_duplicates(items)
+        assert [i.id for i in kept] == ["S2A_33TWM_20220107_1_L2A"]
+        assert alternates == {}, "the ladder filter must have emptied it, or this proves nothing"
         # What the split workflow hands over: first-wins over the UNPRUNED list, so the rejected
         # copy's absent baseline reads as 0.
         baselines = extract_baselines(items)

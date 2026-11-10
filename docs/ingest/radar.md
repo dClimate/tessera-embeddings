@@ -106,11 +106,11 @@ refused; a different window goes into its own store.
 [ADR 033](../../context_docs/decisions/033-radar-overlaps-go-to-the-most-acquired-burst.md) has
 the reasoning, the measured cost, and what was left out, such as layover and shadow masks.
 
-## UTM CRS derivation
+## Output CRS
 
 CMR-STAC OPERA items lack the `proj:` extension, so `odc.stac.load` cannot infer the output
-CRS. `mgrs_tile_to_utm_epsg` derives the correct UTM EPSG from the tile's zone number and
-latitude band (C–M = southern hemisphere, N–X = northern hemisphere), e.g. `33UUP` → EPSG:32633.
+CRS. The radar leg never asks it to: every load passes the ROI's own `geobox` (CRS, transform and
+shape from `read_roi_metadata`), so the output grid is the ROI's.
 
 ## Amplitude to decibels
 

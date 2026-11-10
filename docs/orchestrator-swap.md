@@ -223,8 +223,8 @@ Community-maintained orchestrator adapters land in
 test under `tests/parity/<adapter_name>/`. Maintenance commitment is
 required — see the README's "Contributing" section.
 
-The architecture-tests check
-([`docs/public-api.md`](public-api.md)) auto-generates an allowlist
-entry for any future orchestrator subdirectory, so adapter PRs don't
-trip the "no orchestrator imports outside the orchestration layer"
-rule.
+An adapter under `orchestration/<adapter_name>/` sits in the
+`orchestration` layer of [`.importlinter`](../.importlinter), so it may
+import the domain and providers and nothing may import it. Its own
+framework imports trip nothing; Prefect stays forbidden outside
+`orchestration/prefect/`, so the adapter must not reach Prefect either.

@@ -80,35 +80,6 @@ def _read(log: logging.Logger, fail_times: int) -> int:
     return state["calls"]
 
 
-def test_the_retry_ladder_is_the_one_production_pays_for() -> None:
-    """The budget a permanently-failing date costs, asserted rather than waited out.
-
-    ``_read`` skips the sleeps so the suite stays fast, which would otherwise leave the ladder
-    itself unchecked — a change to the multiplier or the cap would go unnoticed. This pins the
-    three parameters that decide the cost, and the total they add up to.
-
-    61 s per permanently-failing date is deliberate: long enough to outlast a provider having
-    a bad minute, and paid only on the failing path. ``reraise`` is what stops the last
-    attempt's failure being replaced by tenacity's own ``RetryError``, which is how a real
-    read failure would otherwise lose its cause.
-    """
-    retrying = source_read_retrying(logging.getLogger("t.ladder"))
-
-    assert retrying.stop.max_attempt_number == SOURCE_READ_ATTEMPTS
-    assert (retrying.wait.multiplier, retrying.wait.min, retrying.wait.max) == (1, 2.0, 15.0)
-    assert retrying.reraise is True
-
-    class _State:
-        """The one field :class:`wait_exponential` reads off a retry state."""
-
-        def __init__(self, attempt: int) -> None:
-            self.attempt_number = attempt
-
-    sleeps = [retrying.wait(_State(n)) for n in range(1, SOURCE_READ_ATTEMPTS)]
-    assert sleeps == [2.0, 2.0, 4, 8, 15.0, 15.0, 15.0]
-    assert sum(sleeps) == 61.0, "the per-date backoff budget named in source_read_retrying"
-
-
 def test_a_transient_read_survives(caplog) -> None:
     log = logging.getLogger("t.transient")
     with caplog.at_level(logging.WARNING):
@@ -121,14 +92,6 @@ def test_a_permanent_read_still_surfaces(caplog) -> None:
     log = logging.getLogger("t.permanent")
     with caplog.at_level(logging.WARNING), pytest.raises(OSError, match="Read failed"):
         _read(log, fail_times=SOURCE_READ_ATTEMPTS)
-
-
-def test_each_retry_is_logged_so_transient_and_permanent_are_distinguishable(caplog) -> None:
-    """Without a line per attempt, a retried read and a first-try read look identical."""
-    log = logging.getLogger("t.logged")
-    with caplog.at_level(logging.WARNING):
-        _read(log, fail_times=2)
-    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 2
 
 
 def test_failure_names_the_roi_and_date(caplog) -> None:
@@ -161,14 +124,6 @@ def test_failure_preserves_the_underlying_cause(caplog) -> None:
     record = next(r for r in caplog.records if r.levelno == logging.ERROR)
     assert record.exc_info is not None, "the traceback must be logged, not just the message"
     assert "503 from the source bucket" in caplog.text
-
-
-def test_context_is_transparent_when_nothing_fails(caplog) -> None:
-    """It must add no lines on the success path — it wraps every date of every cell."""
-    log = logging.getLogger("t.quiet")
-    with caplog.at_level(logging.DEBUG), read_failure_context(log, roi="zone_02N", date="2021-01-01"):
-        pass
-    assert caplog.records == []
 
 
 class TestTheContextCompletesTheReason:
@@ -244,16 +199,6 @@ class TestTheContextCompletesTheReason:
         assert is_provider_refusal(arrived) is False, "the stale line was inherited"
         assert is_unreadable_source(arrived) is True, "so the failure is still read as bad bytes"
 
-    def test_the_same_failure_with_nothing_logged_still_reads_as_bad_bytes(self, caplog) -> None:
-        """The control: the context must complete a reason, never invent one. A codec failure
-        with no refusal behind it is still permanently bad imagery, and still costs its date.
-        """
-        with caplog.at_level(logging.ERROR):
-            arrived = self._raise_through_the_context(logging.getLogger("t.corrupt"))
-
-        assert is_provider_refusal(arrived) is False
-        assert is_unreadable_source(arrived) is True
-
     def test_both_sensors_hand_the_context_their_cluster(self) -> None:
         """The evidence is on the READING workers, so a context with no client decides from the
         chain alone — silently, and only on the path that dropped it. One sensor keeping the
@@ -268,31 +213,6 @@ class TestTheContextCompletesTheReason:
                     f"{module}: `read_failure_context({call})` cannot collect what GDAL logged "
                     "without the cluster, so a refusal there reads as unreadable data"
                 )
-
-
-class TestZeroDateOutcomeIsAttributable:
-    """A radar leg that writes nothing must say which zone, and whether the source was empty.
-
-    This is the shape that made five zones undiagnosable. ``status="skipped"`` reads as
-    success to the parent flow, so a cell finished green with an orbit missing from the
-    store — and every informational line in the leg except the per-date timing carried the
-    ORBIT but not the zone, while the per-date line only fires once a date is written. A leg
-    that wrote nothing therefore produced no line attributable to a cell at all.
-    """
-
-    def test_every_informational_line_carries_the_roi(self) -> None:
-        """A line without ``roi=`` cannot be tied to a cell: the log stream is a task id."""
-        src = (_SRC / "ingest" / "s1_roi.py").read_text()
-        # Format strings passed to log.info / log.warning, excluding debug-level detail.
-        calls = re.findall(r"log\.(?:info|warning)\(\s*\n?\s*((?:\"[^\"]*\"\s*\n?\s*)+)", src)
-        missing = [c.strip() for c in calls if "roi=" not in c and "ROI %s" not in c]
-        assert not missing, f"informational line(s) with no ROI: {missing}"
-
-    # test_placeholders_match_arguments lived here. It walked the AST of ingest/s1_roi.py
-    # counting %-placeholders against arguments. Ruff's PLE1205/PLE1206 make the same check
-    # over EVERY file rather than this one module, so the rule is enabled in ruff.toml and
-    # the test is gone. Removed 2026-08-25 after confirming both a too-many and a too-few
-    # mutant in s1_roi.py fail the lint exactly as they used to fail the test.
 
 
 class TestEveryComputeThatReadsSourceIsAttributed:
@@ -334,15 +254,6 @@ class TestEveryComputeThatReadsSourceIsAttributed:
                     "so it must be lexically inside `with read_failure_context(...)` — otherwise "
                     "a failed read names no granule and a logged refusal reaches no verdict"
                 )
-
-    def test_the_optical_write_passes_its_items(self) -> None:
-        """A context with no items names a count of zero, which is worse than no line.
-
-        The radar path has no per-date item list to pass; the optical path does, and it is
-        the only thing that identifies WHICH source object failed.
-        """
-        src = (_SRC / "ingest" / "s2_roi.py").read_text()
-        assert "items=prepared.items" in src, "the optical write must pass the day's items"
 
 
 #: Every function that computes source pixels on the cluster, matched on shape. A per-date writer

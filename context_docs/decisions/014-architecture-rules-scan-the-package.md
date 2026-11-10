@@ -1,6 +1,8 @@
 # 014 — The architecture rules scan the package, not the repository
 
-**Status:** Accepted (2026-08-17)
+**Status:** Accepted (2026-08-17). The checker it describes was replaced by import-linter and
+ruff in [ADR 039](039-architecture-rules-run-on-import-linter-and-ruff.md); the scope decision
+stands, now set by `root_packages` in `.importlinter` and by `ruff check src/`.
 
 ## Context
 
@@ -86,5 +88,5 @@ the assumption that CI would have caught it.
 
 - [ADR 016](016-scripts-layout-and-shared-modules.md) — the move that reduces the unscanned
   tree
-- [`src/tessera_embeddings/architecture_tests/`](../../src/tessera_embeddings/architecture_tests/)
-  — the rules and the allowlist parser
+- [ADR 039](039-architecture-rules-run-on-import-linter-and-ruff.md) — the tools that now
+  enforce the rules

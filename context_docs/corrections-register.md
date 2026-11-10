@@ -72,7 +72,7 @@ that was entirely an artefact.
   ratio uses are themselves from different cells. **The correction for an unmatched comparison is not a different unmatched
   comparison.**
   ([`campaign/campaign-cost-model.md`](campaign/campaign-cost-model.md) §6c,
-  `tests/unit/inference/test_gpu_starvation.py`)
+  `scripts/scoping/gpu_starvation.py`)
 - **The assembly pool's "2.92 GiB per worker at both sizes", and the peaks it was built from.**
   Read from the CloudWatch metric `Maximum` over `{ClusterName, TaskDefinitionFamily}`, where
   **each statistic is aggregated across tasks independently** — so the unlisted condition was

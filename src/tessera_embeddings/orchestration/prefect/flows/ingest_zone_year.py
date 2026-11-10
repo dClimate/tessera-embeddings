@@ -58,6 +58,7 @@ from typing import Any, cast
 
 import icechunk
 import zarr
+import zarr.errors
 from prefect import flow, get_run_logger
 from prefect.deployments import arun_deployment
 from prefect.runtime import flow_run as flow_run_ctx
@@ -363,6 +364,91 @@ def _leg_failure_detail(run: object, label: str) -> str | None:
     return None
 
 
+class _LegBudget:
+    """The wall-clock deadline one ingest leg is held to before starting another attempt.
+
+    The setting, until the leg EARNS more by committing dates: see :meth:`credit`. Created when
+    the leg is about to dispatch, which is when its store's committed-date count is first read.
+    """
+
+    def __init__(
+        self,
+        *,
+        count_dates: Callable[[], int | None],
+        where: str,
+        settings: IngestSettings,
+        log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+    ) -> None:
+        """``count_dates`` reads how many dates the leg's store has committed (``None`` if unreadable);
+        ``where`` names the leg in log lines, e.g. ``"Zone 33N year 2025: s2"``.
+        """
+        self._count, self._where, self._log = count_dates, where, log
+        self._extension_s = settings.leg_progress_extension_s
+        self.budget_s = float(settings.max_leg_wall_clock_s)
+        # Skipped entirely when the extension is off, so turning it off costs no reads.
+        self.committed = self._count() if self._extension_s > 0 else None
+
+    def overdue(self, elapsed: float, *, backoff_base_s: float | None = None) -> bool:
+        """Whether a leg ``elapsed`` seconds in is past its deadline, after asking for credit.
+
+        Credit is asked for wherever the deadline is about to refuse: past it, or, with a
+        ``backoff_base_s``, without room to wait even that long first. The deadline is re-read
+        after a grant, which is fixed and not owed to be enough.
+        """
+        if elapsed >= self.budget_s or (backoff_base_s is not None and backoff_base_s >= self.budget_s - elapsed):
+            self.credit()
+        return elapsed >= self.budget_s
+
+    def credit(self) -> bool:
+        """Grow this leg's deadline, if its store has gained dates since the last look.
+
+        The deadline bounds PATIENCE — wall clock a leg spends not getting anywhere. Counted
+        from the first dispatch it cannot tell that from wall clock spent WORKING: a leg
+        that committed steadily for hours and then hit a transient failure is charged for
+        every productive hour and refused the attempt that would have resumed from them. A
+        store that has grown is not the cell the deadline was written for; it resumes from
+        what it committed, so its next attempt starts further along than its last.
+
+        Bounded by construction, and both bounds are needed: a grant costs a FIXED
+        extension, and each must be PAID FOR by dates committed since the previous grant,
+        so a store that stops growing stops earning them.
+
+        Payment is what limits the payout rate, which is why this may be asked wherever the
+        deadline is about to refuse rather than at one chosen gate. Only a RUNNING leg
+        commits and every ask sits after a failed attempt, so the asks within one attempt
+        compete for the same growth and at most one is paid. Grants are therefore bounded
+        by a leg's re-dispatch decisions, one fewer than its attempts, giving a ceiling of
+        ``max_leg_wall_clock_s + (max_leg_attempts - 1) * leg_progress_extension_s``. A leg
+        that commits nothing never leaves ``max_leg_wall_clock_s``.
+
+        The extension is FIXED, so the caller re-reads the deadline after a grant rather
+        than assuming one sufficed. An attempt that overran by more than a whole extension
+        is past what progress buys: sizing the grant to the overrun would make the ceiling
+        a function of how long the leg ran, the very thing the deadline bounds.
+
+        A store that cannot be read earns nothing, the same answer as no progress.
+        """
+        if self._extension_s <= 0:
+            return False
+        grown = self._count()
+        if self.committed is None or grown is None or grown <= self.committed:
+            return False
+        before, self.committed = self.committed, grown
+        self.budget_s += self._extension_s
+        self._log.warning(
+            "%s reached its wall-clock budget while still committing dates — "
+            "its store now holds %d, up from %d — so the budget is extended by %d s to %.0f s "
+            "and the attempt it was about to be refused goes ahead. A leg that stops committing "
+            "stops earning this.",
+            self._where,
+            grown,
+            before,
+            self._extension_s,
+            self.budget_s,
+        )
+        return True
+
+
 def _leg_stagger_s(zone: str, year: int, label: str, window_s: int) -> float:
     """Seconds this leg delays its FIRST dispatch by, to decorrelate the fleet's cold start.
 
@@ -419,7 +505,7 @@ _cancel_children_on_cancellation = make_child_cancel_hook(_CHILD_TAG_PREFIX, "ch
     name="ingest-zone-year",
     on_cancellation=[_cancel_children_on_cancellation],
     on_crashed=[_cancel_children_on_cancellation],
-)
+)  # ty: ignore[no-matching-overload]  # Prefect's hook-list overloads reject a list of differently typed hooks
 async def ingest_zone_year(
     *,
     zone: str,
@@ -791,12 +877,8 @@ async def ingest_zone_year(
             wait /= 2
         return wait if wait < remaining_s else None
 
-    async def _run_leg(label: str, dep: str, params: dict, store: str) -> str | None:
-        """Dispatch one leg, retrying on its own schedule; its failure detail, or None if it ran.
-
-        Classifies per leg: a deterministic repeat from the source catalogue, a marker meaning
-        a re-dispatch cannot help, or a load refusal that is evidence FOR patience.
-        """
+    async def _wait_out_stagger(label: str) -> str | None:
+        """Hold one leg's first dispatch for its stagger: ``None`` to go ahead, else why not."""
         # Before the wall-clock anchor, so a leg's stagger is not charged to the budget that
         # decides whether it may attempt again.
         if (stagger := _leg_stagger_s(zone, year, label, ingest_settings.leg_stagger_window_s)) > 0:
@@ -839,73 +921,29 @@ async def ingest_zone_year(
                     never_started,
                 )
                 return never_started
+        return None
+
+    async def _run_leg(label: str, dep: str, params: dict, store: str) -> str | None:
+        """Dispatch one leg, retrying on its own schedule; its failure detail, or None if it ran.
+
+        Classifies per leg: a deterministic repeat from the source catalogue, a marker meaning
+        a re-dispatch cannot help, or a load refusal that is evidence FOR patience.
+        """
+        if (never_started := await _wait_out_stagger(label)) is not None:
+            return never_started
         # Where this leg's store stood before it ran, so "has it committed anything since" has
         # an answer at the FIRST re-dispatch decision as well as the last. Taken before the
         # wall-clock anchor, for the reason the stagger is: a reading is not patience, and
         # charging it to the budget would let the measurement shorten what it measures.
-        # Skipped entirely when the extension is off, so turning it off costs no reads.
-        committed = (
-            _committed_date_count(store, log, get_credentials=iam_icechunk_credentials, s3_region=s3_region)
-            if ingest_settings.leg_progress_extension_s > 0
-            else None
+        budget = _LegBudget(
+            count_dates=lambda: _committed_date_count(
+                store, log, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+            ),
+            where=f"Zone {zone} year {year}: {label}",
+            settings=ingest_settings,
+            log=log,
         )
         started = monotonic()
-        # The deadline this leg is held to: the setting until the leg EARNS more. A local
-        # rather than a recomputation, so every gate below reads one number and a grant cannot
-        # be silently undone by the next gate re-reading the setting.
-        budget_s = float(ingest_settings.max_leg_wall_clock_s)
-
-        def _credit_progress() -> bool:
-            """Grow this leg's deadline, if its store has gained dates since the last look.
-
-            The deadline bounds PATIENCE — wall clock a leg spends not getting anywhere. Counted
-            from the first dispatch it cannot tell that from wall clock spent WORKING: a leg
-            that committed steadily for hours and then hit a transient failure is charged for
-            every productive hour and refused the attempt that would have resumed from them. A
-            store that has grown is not the cell the deadline was written for; it resumes from
-            what it committed, so its next attempt starts further along than its last.
-
-            Bounded by construction, and both bounds are needed: a grant costs a FIXED
-            extension, and each must be PAID FOR by dates committed since the previous grant,
-            so a store that stops growing stops earning them.
-
-            Payment is what limits the payout rate, which is why this may be asked wherever the
-            deadline is about to refuse rather than at one chosen gate. Only a RUNNING leg
-            commits and every ask sits after a failed attempt, so the asks within one attempt
-            compete for the same growth and at most one is paid. Grants are therefore bounded
-            by a leg's re-dispatch decisions, one fewer than its attempts, giving a ceiling of
-            ``max_leg_wall_clock_s + (max_leg_attempts - 1) * leg_progress_extension_s``. A leg
-            that commits nothing never leaves ``max_leg_wall_clock_s``.
-
-            The extension is FIXED, so the caller re-reads the deadline after a grant rather
-            than assuming one sufficed. An attempt that overran by more than a whole extension
-            is past what progress buys: sizing the grant to the overrun would make the ceiling
-            a function of how long the leg ran, the very thing the deadline bounds.
-
-            A store that cannot be read earns nothing, the same answer as no progress.
-            """
-            nonlocal budget_s, committed
-            if ingest_settings.leg_progress_extension_s <= 0:
-                return False
-            grown = _committed_date_count(store, log, get_credentials=iam_icechunk_credentials, s3_region=s3_region)
-            if committed is None or grown is None or grown <= committed:
-                return False
-            before, committed = committed, grown
-            budget_s += ingest_settings.leg_progress_extension_s
-            log.warning(
-                "Zone %s year %s: %s reached its wall-clock budget while still committing dates — "
-                "its store now holds %d, up from %d — so the budget is extended by %d s to %.0f s "
-                "and the attempt it was about to be refused goes ahead. A leg that stops committing "
-                "stops earning this.",
-                zone,
-                year,
-                label,
-                grown,
-                before,
-                ingest_settings.leg_progress_extension_s,
-                budget_s,
-            )
-            return True
 
         last_token: str | None = None
         detail: str | None = None
@@ -921,8 +959,7 @@ async def ingest_zone_year(
                 return None
             refusal = refusal_in(detail)
             previous = last_token
-            if refusal is not None:
-                last_token = refusal.token
+            last_token = refusal.token if refusal is not None else last_token
             if refusal is not None and refusal.token == previous and repeat_is_deterministic(refusal.kind):
                 log.error(
                     "Zone %s year %s: %s — the source catalogue refused the SAME request the SAME "
@@ -993,9 +1030,7 @@ async def ingest_zone_year(
             # "no time left to wait first" — so asking at only one would recognise a leg's
             # progress according to which side of the deadline its attempt happened to land
             # on. The deadline is re-read after: a grant is fixed, and not owed to be enough.
-            if elapsed >= budget_s or _leg_backoff_base_s(detail) >= budget_s - elapsed:
-                _credit_progress()
-            if elapsed >= budget_s:
+            if budget.overdue(elapsed, backoff_base_s=_leg_backoff_base_s(detail)):
                 log.error(
                     "Zone %s year %s: %s — %.0f s elapsed since this leg's first attempt, past its "
                     "%.0f s wall-clock budget for starting another (max_leg_wall_clock_s=%d), so "
@@ -1007,7 +1042,7 @@ async def ingest_zone_year(
                     year,
                     label,
                     elapsed,
-                    budget_s,
+                    budget.budget_s,
                     ingest_settings.max_leg_wall_clock_s,
                     attempt + 1,
                     ingest_settings.max_leg_attempts,
@@ -1021,7 +1056,7 @@ async def ingest_zone_year(
             # even the base rung is refused. Refusing outright would be a verdict from the
             # ESCALATION rather than the budget — denying a leg with a quarter of an hour left
             # because the next wait is twenty minutes, when the rung beneath it fits easily.
-            wait = _leg_backoff_s(attempt, detail, budget_s - elapsed)
+            wait = _leg_backoff_s(attempt, detail, budget.budget_s - elapsed)
             if wait is None:
                 log.error(
                     "Zone %s year %s: %s — %.0f s elapsed and not even the shortest backoff for "
@@ -1035,7 +1070,7 @@ async def ingest_zone_year(
                     label,
                     elapsed,
                     _leg_backoff_base_s(detail),
-                    budget_s,
+                    budget.budget_s,
                     ingest_settings.max_leg_wall_clock_s,
                     attempt + 1,
                     ingest_settings.max_leg_attempts,
@@ -1074,9 +1109,7 @@ async def ingest_zone_year(
             # can only be paid for by progress the gates above had no reason to ask about —
             # which is the case this gate exists for, a wait that landed outside the budget
             # because the event loop overran.
-            if elapsed >= budget_s:
-                _credit_progress()
-            if elapsed >= budget_s:
+            if budget.overdue(elapsed):
                 log.error(
                     "Zone %s year %s: %s — the backoff ended %.0f s after this leg's first "
                     "attempt, at or past its %.0f s wall-clock budget for starting another "
@@ -1087,7 +1120,7 @@ async def ingest_zone_year(
                     year,
                     label,
                     elapsed,
-                    budget_s,
+                    budget.budget_s,
                     ingest_settings.max_leg_wall_clock_s,
                     attempt + 1,
                     ingest_settings.max_leg_attempts,

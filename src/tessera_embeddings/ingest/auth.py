@@ -21,9 +21,9 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 import requests
-from dask.distributed import WorkerPlugin, get_client
-from odc.loader._rio import ThreadSession as _OdcThreadSession  # type: ignore[attr-defined]
-from odc.loader._rio import _local as _odc_thread_session  # type: ignore[attr-defined]
+from dask.distributed import WorkerPlugin, get_client  # noqa: TID251 — registers a worker plugin cluster-wide
+from odc.loader._rio import ThreadSession as _OdcThreadSession
+from odc.loader._rio import _local as _odc_thread_session
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -371,17 +371,17 @@ def _patch_odc_thread_session_for_env_drift() -> None:
         if cached is not None and session is None:
             current_key = os.environ.get("AWS_ACCESS_KEY_ID")
             try:
-                cached_key = cached._session.get_credentials().access_key  # type: ignore[attr-defined]
+                cached_key = cached._session.get_credentials().access_key
             except Exception:
                 cached_key = None
             if current_key and cached_key and current_key != cached_key:
                 # Drop the session only; leave rasterio's env stack alone.
-                self._session = None  # type: ignore[attr-defined]
-                self._aws = None  # type: ignore[attr-defined]
-        return original_session(self, session)  # type: ignore[arg-type]
+                self._session = None  # ty: ignore[unresolved-attribute]
+                self._aws = None  # ty: ignore[unresolved-attribute]
+        return original_session(self, session)  # ty: ignore[invalid-argument-type]
 
-    session_with_env_check._env_drift_patched = True  # type: ignore[attr-defined]
-    _OdcThreadSession.session = session_with_env_check  # type: ignore[method-assign]
+    session_with_env_check._env_drift_patched = True  # ty: ignore[unresolved-attribute]
+    _OdcThreadSession.session = session_with_env_check  # ty: ignore[invalid-assignment]
 
 
 # Installed at module import, before any thread can call ThreadSession.session() and cache a session without the drift

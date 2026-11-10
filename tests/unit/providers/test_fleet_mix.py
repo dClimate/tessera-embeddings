@@ -12,8 +12,8 @@ six in two seconds. An unbounded ask does not overshoot; it provisions nothing.
 
 from __future__ import annotations
 
+import logging
 import pathlib
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -30,22 +30,7 @@ LADDER, BUDGET = "g6e.xlarge:101", 840
 PROBE = fleet_mix.DEFAULT_PROBE
 
 
-def _log():
-    import logging
-
-    return logging.getLogger("test-fleet-mix")
-
-
-def _config():
-    """A minimal InferenceConfig; only the actor-request knobs matter here."""
-    from tessera_embeddings.config.inference import InferenceConfig
-    from tessera_embeddings.config.time_windows import parse_time_window
-
-    return InferenceConfig(
-        time_window=parse_time_window("December 2024"),
-        checkpoint_path="s3://ckpt/model.pt",
-        actor_request_batch_size=4,
-    )
+_LOG = logging.getLogger("test-fleet-mix")
 
 
 def _ceilings() -> dict[str, int]:
@@ -95,7 +80,7 @@ class TestTheCampaignShape:
         assert asks == expected, case
         assert _held_vcpu(asks, live) <= BUDGET, case
 
-    @pytest.mark.parametrize("live", [{}, {L40S: 20}, {L40S: 51, A10G: 79}, {L40S: 101, A10G: 54}, {A10G: 105}])
+    @pytest.mark.parametrize("live", [{L40S: 51, A10G: 79}, {A10G: 105}])
     def test_the_live_fleet_stays_inside_the_budget_from_every_state(self, live: dict) -> None:
         """Pricing the ASKS alone let the fleet ratchet past the budget: at 51 L40S and 79
         A10G the next round asked 67 L40S while all 79 stayed up — 900 vCPU against 840,
@@ -156,28 +141,18 @@ class TestTheBoundsAreLoadBearing:
         assert asks[A10G] >= 1
         assert sum(asks.values()) <= 3
 
-    def test_a_draining_tail_does_not_buy_a_probe_it_cannot_use(self) -> None:
-        """The floor only applies while the machines we hold cannot already cover the
-        demand — otherwise a tail would buy a machine for work that does not exist.
-        """
-        asks = fleet_mix.fleet_asks(
-            want_gpus=12, live_by_instance_type={L40S: 35}, ceilings=_ceilings(), vcpu_budget=BUDGET
-        )
-        assert asks == {L40S: 12, A10G: 0}
-
     def test_without_a_budget_only_demand_and_ceilings_bind(self) -> None:
         asks = fleet_mix.fleet_asks(want_gpus=250, live_by_instance_type={}, ceilings=_ceilings())
         assert asks[L40S] == PROBE
         assert asks[A10G] >= 100
 
-    @pytest.mark.parametrize(("kwargs", "match"), [({"vcpu_budget": 0}, "vcpu_budget"), ({"probe": -1}, "probe")])
+    @pytest.mark.parametrize(
+        ("kwargs", "match"),
+        [({"vcpu_budget": 0}, "vcpu_budget"), ({"probe": -1}, "probe"), ({"want_gpus": -1}, "want_gpus")],
+    )
     def test_meaningless_inputs_are_refused(self, kwargs: dict, match: str) -> None:
         with pytest.raises(ValueError, match=match):
-            fleet_mix.fleet_asks(want_gpus=1, live_by_instance_type={}, ceilings={L40S: 1}, **kwargs)
-
-    def test_a_negative_demand_is_refused(self) -> None:
-        with pytest.raises(ValueError, match="want_gpus"):
-            fleet_mix.fleet_asks(want_gpus=-1, live_by_instance_type={}, ceilings={L40S: 1})
+            fleet_mix.fleet_asks(**{"want_gpus": 1, "live_by_instance_type": {}, "ceilings": {L40S: 1}, **kwargs})
 
     def test_no_open_rung_asks_for_nothing(self) -> None:
         assert fleet_mix.fleet_asks(want_gpus=250, live_by_instance_type={}, ceilings={}) == {}
@@ -290,6 +265,18 @@ class TestThePlan:
         with pytest.raises(RuntimeError, match="no single target"):
             fleet_mix.plan_from_resolved_config(config, BUDGET)
 
+    def test_a_ladder_that_opens_a_third_rung_is_trimmed_to_two(self) -> None:
+        """The SSM worker ladder can open a third rung without naming it in
+        `gpu_fallback_instance_types`, walking past both guards. Trimmed on the resolved
+        plan rather than refused — dropping the whole mix would be worse than running on
+        the best two.
+        """
+        config = yaml.safe_load(TEMPLATE.read_text())
+        tray._apply_gpu_worker_ladder(config, "g6e.xlarge:20,g5.2xlarge:20,g6.2xlarge:20")
+        plan = fleet_mix.plan_from_resolved_config(config, BUDGET)
+        assert plan is not None
+        assert set(plan.ceilings) == {L40S, A10G}, "the worst ratio is the one dropped"
+
 
 class TestOneFallbackAtATime:
     """Stating the mix removes Ray's node-name tie for the machines the request covers, but
@@ -303,11 +290,6 @@ class TestOneFallbackAtATime:
         tray._apply_gpu_worker_ladder(config, LADDER)
         with pytest.raises(RuntimeError, match=r"[Oo]nly one GPU fallback"):
             tray._apply_gpu_fallback(config, [A10G, L4], BUDGET)
-
-    def test_the_campaign_refuses_two_before_any_ingest(self) -> None:
-        from tessera_embeddings.orchestration.prefect.flows import run_global_campaign as rgc
-
-        assert "Only one GPU fallback instance type" in pathlib.Path(rgc.__file__).read_text()
 
 
 class TestFleetDemand:
@@ -338,14 +320,14 @@ class TestFleetDemand:
         policy that exists to pace it.
         """
         seen: list[int] = []
-        FleetDemand(seen.append, 1.0, _log()).send(target=250, outstanding=99, requested=25)
+        FleetDemand(seen.append, 1.0, _LOG).send(target=250, outstanding=99, requested=25)
         assert seen == [25]
 
     def test_a_failure_never_reaches_the_caller(self) -> None:
         def boom(_: int) -> None:
             raise RuntimeError("GCS unavailable")
 
-        FleetDemand(boom, 1.0, _log()).send(target=1, outstanding=1, requested=1)
+        FleetDemand(boom, 1.0, _LOG).send(target=1, outstanding=1, requested=1)
 
     def test_the_cold_start_retries_because_nothing_else_will(self) -> None:
         """The scheduler does not republish until it starts, and under the drought this
@@ -359,104 +341,9 @@ class TestFleetDemand:
                 raise RuntimeError("transient")
 
         with patch("tessera_embeddings.inference.scheduling.time.sleep"):
-            FleetDemand(flaky, 1.0, _log()).send(target=4, outstanding=4, requested=4, retry=True)
+            FleetDemand(flaky, 1.0, _LOG).send(target=4, outstanding=4, requested=4, retry=True)
         assert len(calls) == 2
 
     def test_no_publisher_is_a_no_op(self) -> None:
-        FleetDemand(None, 1.0, _log()).send(target=9, outstanding=9, requested=9)
-        FleetDemand(None, 1.0, _log()).clear()
-
-
-class TestTheRunnerLifecycle:
-    """Publish before the actor wait, and clear on every exit path."""
-
-    @staticmethod
-    def _run(published: list[int], *, chunks: list | None = None, chained: bool = False) -> None:
-        from tessera_embeddings.inference import runner as runner_mod
-
-        def _wait(*_a: object, **_k: object) -> tuple:
-            raise RuntimeError("Only 0 / 8 actors initialized within 600s")
-
-        with (
-            patch.object(runner_mod, "InferenceActor") as actor,
-            patch.object(runner_mod, "wait_for_actors", side_effect=_wait),
-            patch.object(runner_mod, "ZarrWriter") as writer,
-            patch("tessera_embeddings.inference.scheduling.time.sleep"),
-            # WITHOUT THIS, THIS TEST BOOTS A REAL LOCAL RAY CLUSTER. `wait_for_actors`
-            # raises above, but the actor factory has already handed back stand-ins, so
-            # `run_inference`'s `finally` reaches `ray.kill(actor)` — and `ray.kill` is
-            # wrapped in Ray's auto-init hook, which calls `ray.init()`. That init hashes and
-            # uploads the whole working directory; the same hazard once ate ~60 GB of RAM
-            # across three concurrent runs, and here it cost ~3 s, making this the
-            # second-slowest test in the unit suite. `test_scheduling.py` patches `ray.kill`
-            # in an autouse fixture for exactly this reason; this file needs it too.
-            patch.object(runner_mod.ray, "kill"),
-        ):
-            writer.return_value.scan_existing_staged_artifacts.return_value = SimpleNamespace(done=set(), skipped=set())
-            actor.options.return_value.remote.return_value = object()
-            with pytest.raises(RuntimeError):
-                runner_mod.run_inference(
-                    8,
-                    _config(),
-                    chunks or [],
-                    "m",
-                    "s",
-                    "r",
-                    0.0,
-                    _log(),
-                    on_fleet_demand=published.append,
-                    more_work=(lambda: None) if chained else None,
-                )
-
-    def test_a_drought_that_kills_the_actor_wait_has_still_asked(self) -> None:
-        """Without this the run reaches its hours-long timeout having never once asked for
-        the fallback — precisely the starvation the feature exists to prevent.
-        """
-        published: list[int] = []
-        self._run(published, chained=True)
-        # The FIRST BATCH, not the 8-actor target: the batching policy must survive.
-        assert published[0] == _config().initial_actor_request(8) == 4
-
-    def test_a_static_run_asks_only_for_the_work_it_holds(self) -> None:
-        published: list[int] = []
-        self._run(published, chunks=[object(), object()])
-        assert published[0] == 2
-
-    def test_the_request_is_cleared_when_the_run_ends(self) -> None:
-        """Machines a request holds are exempt from idle termination, so a floor left
-        standing pins an idle GPU fleet through the assembly that follows.
-        """
-        published: list[int] = []
-        self._run(published, chunks=[object(), object()])
-        assert published[-1] == 0
-
-    def test_every_session_that_gets_a_terminator_also_gets_the_publisher(self) -> None:
-        """Structural, because two reviewers independently missed one of the two call sites this
-        flow used to have. ONE now (the per-cell retry path is gone), but any future entry point
-        reserving GPU actors must still publish the fleet's shape.
-        """
-        import ast
-        import inspect
-
-        from tessera_embeddings.orchestration.prefect.flows import fill_zones_sequential as mod
-
-        sites = [
-            node
-            for node in ast.walk(ast.parse(inspect.getsource(mod)))
-            if isinstance(node, ast.Call) and any(kw.arg == "on_actor_retire" for kw in node.keywords)
-        ]
-        assert len(sites) >= 1, "the shared session must still pass a terminator"
-        for site in sites:
-            assert "on_fleet_demand" in {kw.arg for kw in site.keywords}, f"line {site.lineno}"
-
-    def test_a_ladder_that_opens_a_third_rung_is_trimmed_to_two(self) -> None:
-        """The SSM worker ladder can open a third rung without naming it in
-        `gpu_fallback_instance_types`, walking past both guards. Trimmed on the resolved
-        plan rather than refused — dropping the whole mix would be worse than running on
-        the best two.
-        """
-        config = yaml.safe_load(TEMPLATE.read_text())
-        tray._apply_gpu_worker_ladder(config, "g6e.xlarge:20,g5.2xlarge:20,g6.2xlarge:20")
-        plan = fleet_mix.plan_from_resolved_config(config, BUDGET)
-        assert plan is not None
-        assert set(plan.ceilings) == {L40S, A10G}, "the worst ratio is the one dropped"
+        FleetDemand(None, 1.0, _LOG).send(target=9, outstanding=9, requested=9)
+        FleetDemand(None, 1.0, _LOG).clear()

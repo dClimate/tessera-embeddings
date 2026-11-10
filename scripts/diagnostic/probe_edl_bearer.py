@@ -6,11 +6,11 @@ Run from the repo root::
     EARTHDATA_TOKEN=<token> uv run python scripts/diagnostic/probe_edl_bearer.py
 
 Prints the final HTTP status code and the full redirect chain. Used
-to debug ``tests/parity/test_ingest_s1_roi_parity.py`` failures where
-the Bearer-token monkeypatch reaches EDL but EDL still returns 401:
+to debug S1 reads where the Bearer token reaches EDL but EDL still
+returns 401:
 
-* Final status 200 → the Bearer header survived; the test failure is
-  somewhere else (monkeypatch not in effect, GDAL config, etc.).
+* Final status 200 → the Bearer header survived; the failure is
+  somewhere else (token not in the reader's environment, GDAL config, etc.).
 * Final status 401 → the Bearer header got stripped during one of
   the cross-domain hops. The chain output identifies which hop, so
   the fix can re-add the header for exactly that host.
@@ -67,17 +67,15 @@ def main() -> int:
 
         if resp.status_code == 200:
             print("SUCCESS: Bearer header survived the redirect chain.")
-            print("If the S1 parity test still 401s, the monkeypatch is not")
-            print("being applied. Check tests/parity/test_ingest_s1_roi_parity.py")
-            print("and confirm EARTHDATA_TOKEN is set when pytest starts.")
+            print("If S1 reads still 401, the token is not reaching the reader:")
+            print("confirm EARTHDATA_TOKEN is set in the reading process.")
             return 0
 
         if resp.status_code == 401:
             print("FAIL: Bearer header got stripped somewhere in the chain.")
             print("Look at the chain above. The hop that 401s is the one that")
-            print("dropped the header. Fix the monkeypatch in")
-            print("tests/parity/test_ingest_s1_roi_parity.py to re-add the")
-            print("Authorization header for that specific host.")
+            print("dropped the header. Fix tessera_embeddings.ingest.auth to")
+            print("re-add the Authorization header for that specific host.")
             return 2
 
         print(f"UNEXPECTED status {resp.status_code}.")
