@@ -22,6 +22,7 @@ _SMALL = StoreLayout(
         "embeddings": ArrayLayout(DIMS_4D, (1, _CHUNK, _CHUNK, 8), "int8", 0, "zstd", shards=(1, 512, 512, 8)),
         "scales": ArrayLayout(DIMS_3D, (1, _CHUNK, _CHUNK), "float32", float("nan"), "pcodec", shards=(1, 512, 512)),
     },
+    bands=8,
 )
 _ZONES = (
     ZoneSpec("32601", "N", 1, (0.0, 5_120.0), (0.0, 10_240.0)),

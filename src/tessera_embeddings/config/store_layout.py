@@ -164,14 +164,15 @@ class ArrayLayout:
 class StoreLayout:
     """The geometry of every data variable in a store, keyed by variable name.
 
-    ``bands`` is the extent of the band axis, which the band shards must tile exactly. ``level``
+    ``bands`` is the extent of the band axis, which the band shards must tile exactly. Required, with
+    no default, because the band shards no longer state it: a v2 shard holds 16 of 128. ``level``
     names the child group the arrays sit in, ``"0"`` for a v2 store (ADR 031 §1), or ``None`` for
     one that keeps them in the zone group or store root, as v1.1 does.
     """
 
     name: str
     arrays: dict[str, ArrayLayout]
-    bands: int = EMBEDDING_DIM
+    bands: int
     level: str | None = None
 
     def for_var(self, var: str) -> ArrayLayout:
@@ -280,7 +281,7 @@ def _sharded_arrays(*, include_std: bool) -> dict[str, ArrayLayout]:
 
 #: Single-ROI output. Its own name because callers pass a preset explicitly and the name lands in the store's creating
 #: commit message.
-SINGLE = StoreLayout(name="single", arrays=_sharded_arrays(include_std=True))
+SINGLE = StoreLayout(name="single", arrays=_sharded_arrays(include_std=True), bands=EMBEDDING_DIM)
 
 #: The arrays every staged tile must carry and every destination must hold.
 REQUIRED_VARS: tuple[str, str] = ("embeddings", "scales")
@@ -297,7 +298,7 @@ CARRIED_VARS: tuple[str, ...] = tuple(v for v in SINGLE.arrays if v not in REQUI
 
 
 #: The global campaign (ADR-008 D3). No ``embedding_std``, ever — see :func:`_sharded_arrays`.
-GLOBAL = StoreLayout(name="global", arrays=_sharded_arrays(include_std=False))
+GLOBAL = StoreLayout(name="global", arrays=_sharded_arrays(include_std=False), bands=EMBEDDING_DIM)
 
 
 #: v2's shards and chunks along the band axis: 16 dimensions to a shard, the shortest prefix v2 was trained on, cut
@@ -337,8 +338,12 @@ def _band_first(arrays: dict[str, ArrayLayout]) -> dict[str, ArrayLayout]:
 
 #: The v2 stores: ``embeddings`` (and the single-area ``embedding_std``) band-first, in 16-band shards of 4-band
 #: chunks, every array at 512² chunks and in level group ``0`` (ADR 031).
-SINGLE_V2 = StoreLayout(name="single-v2", arrays=_band_first(_sharded_arrays(include_std=True)), level=LEVEL0)
-GLOBAL_V2 = StoreLayout(name="global-v2", arrays=_band_first(_sharded_arrays(include_std=False)), level=LEVEL0)
+SINGLE_V2 = StoreLayout(
+    name="single-v2", arrays=_band_first(_sharded_arrays(include_std=True)), bands=EMBEDDING_DIM, level=LEVEL0
+)
+GLOBAL_V2 = StoreLayout(
+    name="global-v2", arrays=_band_first(_sharded_arrays(include_std=False)), bands=EMBEDDING_DIM, level=LEVEL0
+)
 
 
 def layout_for(model_version: str, *, single: bool) -> StoreLayout:
