@@ -530,7 +530,7 @@ def ingest_s1_roi_sar(
     # (ADR 033). Written with every date's commit (`store_attrs` below).
     recorded_census = get_root_attr(orbit_store, BURST_CENSUS_ATTR, s3_region=s3_region) if written_dates else None
     burst_census = BurstCensus(
-        roi.bbox_wgs84, start_date, end_date, orbit, mid_longitude=mid_longitude, recorded=recorded_census
+        roi.bbox_wgs84, (start_date, end_date), orbit, mid_longitude=mid_longitude, recorded=recorded_census
     )
 
     # Where the CATALOGUE is searched from. Everything at or below the newest held date is closed,

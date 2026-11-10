@@ -510,14 +510,14 @@ class BurstCensus:
     def __init__(
         self,
         bbox: tuple[float, float, float, float],
-        start_date: str,
-        end_date: str,
+        window: tuple[str, str],
         orbit_direction: str,
         *,
         mid_longitude: float | None = None,
         recorded: Mapping[str, Any] | None = None,
     ) -> None:
-        self._args = (bbox, start_date, end_date, orbit_direction)
+        """A census of ``bbox`` over the inclusive ``(start, end)`` dates of ``window``."""
+        self._args = (bbox, *window, orbit_direction)
         self._mid_longitude = mid_longitude
         self._waiter: Callable[..., dict[str, int]] | None = None
         if recorded is not None:

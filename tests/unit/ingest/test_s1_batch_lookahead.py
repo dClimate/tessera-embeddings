@@ -575,7 +575,7 @@ def test_one_burst_census_ranks_every_batch_over_the_requested_window(monkeypatc
     )
 
     assert built == [
-        (((0, 0, 1, 1), "2024-01-01", "2024-01-06", "ascending"), {"mid_longitude": 0.5, "recorded": None})
+        (((0, 0, 1, 1), ("2024-01-01", "2024-01-06"), "ascending"), {"mid_longitude": 0.5, "recorded": None})
     ]
     assert len(providers) > 1, "needs several batches to show they share one census"
     assert all(k["burst_census"] is providers[0]["burst_census"] for k in providers)

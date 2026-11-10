@@ -432,7 +432,7 @@ class TestBurstAcquisitions:
             return {_LOW: 3}
 
         with patch("tessera_embeddings.ingest.opera_query.burst_acquisitions", side_effect=fake):
-            census = BurstCensus(self.BBOX, "2024-01-01", "2024-12-31", "ascending", mid_longitude=27.0)
+            census = BurstCensus(self.BBOX, ("2024-01-01", "2024-12-31"), "ascending", mid_longitude=27.0)
             assert calls == []
             census.start()
             assert census.counts() == census.counts() == {_LOW: 3}
@@ -443,7 +443,7 @@ class TestBurstAcquisitions:
         """A resumed leg ranks by the census its store recorded, whatever the catalogue says now."""
         with patch("tessera_embeddings.ingest.opera_query.burst_acquisitions") as query:
             census = BurstCensus(
-                self.BBOX, "2024-01-01", "2024-12-31", "ascending", mid_longitude=27.0, recorded=_RECORD
+                self.BBOX, ("2024-01-01", "2024-12-31"), "ascending", mid_longitude=27.0, recorded=_RECORD
             )
             assert census.counts() == {_HIGH: 31}
             assert census.record() == _RECORD
@@ -457,7 +457,7 @@ class TestBurstAcquisitions:
         new days differently from those already written.
         """
         with pytest.raises(ConfigMismatchError, match="Ingest this window into its own store"):
-            BurstCensus(self.BBOX, "2024-01-01", end, "ascending", mid_longitude=longitude, recorded=_RECORD)
+            BurstCensus(self.BBOX, ("2024-01-01", end), "ascending", mid_longitude=longitude, recorded=_RECORD)
 
 
 # ---------------------------------------------------------------------------
