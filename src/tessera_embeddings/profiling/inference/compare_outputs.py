@@ -124,14 +124,18 @@ class ChunkComparison:
 
 
 def compare_chunk(ref_path: str, test_path: str, label: str, *, cross_config: bool = False) -> ChunkComparison:
-    """Stream-compare one staged chunk zarr pair in row slabs."""
+    """Stream-compare one staged chunk zarr pair in row slabs.
+
+    Axes are read by name, so a band-first v2 tile compares with a band-last one.
+    """
     ref = xr.open_zarr(ref_path)
     test = xr.open_zarr(test_path)
-    if ref["embeddings"].shape != test["embeddings"].shape:
-        msg = f"{label}: shape mismatch {ref['embeddings'].shape} vs {test['embeddings'].shape}"
+    if dict(ref["embeddings"].sizes) != dict(test["embeddings"].sizes):
+        msg = f"{label}: shape mismatch {dict(ref['embeddings'].sizes)} vs {dict(test['embeddings'].sizes)}"
         raise ValueError(msg)
 
-    h = ref["embeddings"].shape[0]
+    h = ref.sizes["northing"]
+    pixel_major = ("northing", "easting", "band")
     n_values = 0
     n_pixels = 0
     n_exact = 0
@@ -146,8 +150,8 @@ def compare_chunk(ref_path: str, test_path: str, label: str, *, cross_config: bo
 
     for row0 in range(0, h, ROW_BLOCK):
         rows = slice(row0, min(row0 + ROW_BLOCK, h))
-        e_ref = ref["embeddings"].isel(northing=rows).values.astype(np.int16)
-        e_test = test["embeddings"].isel(northing=rows).values.astype(np.int16)
+        e_ref = ref["embeddings"].isel(northing=rows).transpose(*pixel_major).values.astype(np.int16)
+        e_test = test["embeddings"].isel(northing=rows).transpose(*pixel_major).values.astype(np.int16)
         s_ref = ref["scales"].isel(northing=rows).values
         s_test = test["scales"].isel(northing=rows).values
 

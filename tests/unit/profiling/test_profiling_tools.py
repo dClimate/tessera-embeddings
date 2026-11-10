@@ -305,14 +305,15 @@ class TestCoarsenedCompare:
         assert cmp.n_finite_pairs == 2  # the two finite pairs only
 
 
-def _staged(path: Path, emb: np.ndarray) -> str:
+def _staged(path: Path, emb: np.ndarray, *, band_first: bool = False) -> str:
     """A minimal staged tile: embeddings, positive scales and the three observation-count layers."""
     yx = ("northing", "easting")
     counts = {
         v: (yx, np.ones(emb.shape[:2], "uint16")) for v in ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count")
     }
     scales = np.full(emb.shape[:2], 0.01, "float32")
-    xr.Dataset({"embeddings": ((*yx, "band"), emb), "scales": (yx, scales), **counts}).to_zarr(path)
+    embeddings = (("band", *yx), emb.transpose(2, 0, 1)) if band_first else ((*yx, "band"), emb)
+    xr.Dataset({"embeddings": embeddings, "scales": (yx, scales), **counts}).to_zarr(path)
     return str(path)
 
 
@@ -357,3 +358,10 @@ class TestCrossConfigEnvelope:
         result = compare_outputs.compare_chunk(ref, test, "t", cross_config=cross_config)
         assert result.cosine_min == 0.0
         assert not result.passed
+
+    def test_a_band_first_tile_matches_its_band_last_twin(self, tmp_path: Path) -> None:
+        """A v2 run stages band-first; the comparison reads axes by name."""
+        emb = np.random.default_rng(0).integers(-127, 128, (8, 8, 16), dtype=np.int8)
+        ref, test = _staged(tmp_path / "ref.zarr", emb), _staged(tmp_path / "test.zarr", emb, band_first=True)
+        result = compare_outputs.compare_chunk(ref, test, "t")
+        assert (result.exact_frac, result.n_pixels, result.passed) == (1.0, 64, True)

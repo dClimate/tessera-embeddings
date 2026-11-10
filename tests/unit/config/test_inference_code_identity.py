@@ -169,13 +169,25 @@ def test_the_closure_holds_only_files_that_really_exist(tmp_path: Path) -> None:
         )
 
 
+def _ingest() -> set[str]:
+    """Package-relative paths of every file the ingest (mosaic) fingerprint hashes."""
+    seed = [_ROOT / entry for entry in _MOSAIC_CONTENT_SOURCES]
+    return {p.relative_to(_ROOT).as_posix() for p in first_party_import_closure(seed, _ROOT)}
+
+
 def test_the_real_ingest_fingerprint_covers_the_collection_settings() -> None:
     """The case the miniature package stands in for, asserted on the tree that ships."""
-    from tessera_embeddings.config.ingest import _MOSAIC_CONTENT_SOURCES
+    assert "config/providers.py" in _ingest()
 
-    seed = [_ROOT / entry for entry in _MOSAIC_CONTENT_SOURCES]
-    reached = {p.relative_to(_ROOT).as_posix() for p in first_party_import_closure(seed, _ROOT)}
-    assert "config/providers.py" in reached
+
+def test_store_presets_and_model_settings_stay_out_of_the_ingest_fingerprint() -> None:
+    """The mosaic writer reads its geometry from ``store_geometry``, never the presets or the model record.
+
+    A new preset or model must not move the ingest identity and so block every mosaic resume (ADR 031 §5).
+    """
+    ingest = _ingest()
+    assert "config/store_geometry.py" in ingest
+    assert not {"config/store_layout.py", "config/inference.py"} & ingest
 
 
 @pytest.mark.parametrize("module", ["storage/update.py", "ingest/land_mask.py", "config/paths.py"])
@@ -185,8 +197,4 @@ def test_targeted_updates_move_neither_fingerprint(module: str) -> None:
     Inside either closure, a change to them would abandon staged tiles or refuse appends to
     interrupted mosaics — so nothing in either closure may import them.
     """
-    ingest = {
-        p.relative_to(_ROOT).as_posix()
-        for p in first_party_import_closure([_ROOT / e for e in _MOSAIC_CONTENT_SOURCES], _ROOT)
-    }
-    assert module not in _covered() and module not in ingest
+    assert module not in _covered() and module not in _ingest()
