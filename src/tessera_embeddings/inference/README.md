@@ -1023,7 +1023,7 @@ writer emits in one go is much larger than what a reader has to fetch.
 split, not the objects. Both use `(1, 256, 256, 128)` inner chunks — full band depth, so the
 band axis is never split — inside `(1, 2048, 2048, 128)` shards. That is v1.1's geometry. A v2
 store (`SINGLE_V2`, `GLOBAL_V2`) holds `embeddings` band-first, `(1, 16, 2048, 2048)` shards of
-`(1, 4, 512, 512)` chunks, in level group `0`; inference stages its tiles band-first to match, and
+`(1, 4, 512, 512)` chunks, with every other array in 512² chunks, all in level group `0`; inference stages its tiles band-first to match, and
 assembly reads every axis by name, so neither path reorders a tile
 ([ADR 031](../../../context_docs/decisions/031-the-v2-store-chunks-the-band-axis-at-16.md)).
 

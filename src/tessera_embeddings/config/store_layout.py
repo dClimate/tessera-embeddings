@@ -35,7 +35,7 @@ import numpy as np
 from zarr.codecs.numcodecs import PCodec as _PCodecZarr3
 
 from tessera_embeddings.config.inference import EMBEDDING_DIM, model_family
-from tessera_embeddings.config.store_geometry import LEVEL0, PRESET_SPATIAL_DIMS, clamp_chunks_and_shards
+from tessera_embeddings.config.store_geometry import LEVEL0, PRESET_SPATIAL_DIMS, axis_roles, clamp_chunks_and_shards
 
 # PCodec is intentionally a Zarr v3 *serializer* (array->bytes), not a bytes->bytes compressor; silence the "not in
 # the Zarr v3 spec" warning it emits on construction. This module is the codec's canonical home (inference.assembly
@@ -307,21 +307,33 @@ V2_BANDS_PER_CHUNK = 4
 V2_CHUNK_PX = 512
 
 
+def _v2(array: ArrayLayout) -> ArrayLayout:
+    """*array* in v2's geometry: band-first in 16-band shards of 4-band chunks if it has a band axis, and
+    512² chunks spatially either way.
+
+    One spatial chunk edge for every array is what lets a store smaller than one shard clamp every array
+    to the same shard height, which assembly requires (ADR 031 §5).
+    """
+    if array.dims == DIMS_4D:
+        return dataclasses.replace(
+            array,
+            dims=DIMS_4D_BAND_FIRST,
+            chunks=(1, V2_BANDS_PER_CHUNK, V2_CHUNK_PX, V2_CHUNK_PX),
+            shards=(1, V2_BANDS_PER_SHARD, SHARD_PX, SHARD_PX),
+        )
+    chunks = tuple(
+        V2_CHUNK_PX if role in ("Y", "X") else c for role, c in zip(axis_roles(array.dims), array.chunks, strict=True)
+    )
+    return dataclasses.replace(array, chunks=chunks)
+
+
 def _band_first(arrays: dict[str, ArrayLayout]) -> dict[str, ArrayLayout]:
-    """*arrays* with the band-axis arrays in v2's band-first geometry; every other array unchanged."""
-    band_first = {
-        "chunks": (1, V2_BANDS_PER_CHUNK, V2_CHUNK_PX, V2_CHUNK_PX),
-        "shards": (1, V2_BANDS_PER_SHARD, SHARD_PX, SHARD_PX),
-        "dims": DIMS_4D_BAND_FIRST,
-    }
-    return {
-        var: dataclasses.replace(array, **band_first) if array.dims == DIMS_4D else array
-        for var, array in arrays.items()
-    }
+    """*arrays* in v2's geometry (:func:`_v2`)."""
+    return {var: _v2(array) for var, array in arrays.items()}
 
 
 #: The v2 stores: ``embeddings`` (and the single-area ``embedding_std``) band-first, in 16-band shards of 4-band
-#: chunks, every array in level group ``0`` (ADR 031).
+#: chunks, every array at 512² chunks and in level group ``0`` (ADR 031).
 SINGLE_V2 = StoreLayout(name="single-v2", arrays=_band_first(_sharded_arrays(include_std=True)), level=LEVEL0)
 GLOBAL_V2 = StoreLayout(name="global-v2", arrays=_band_first(_sharded_arrays(include_std=False)), level=LEVEL0)
 

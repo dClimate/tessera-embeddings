@@ -62,16 +62,26 @@ def test_a_new_store_takes_its_models_layout(model, single, expected):
 
 @pytest.mark.parametrize("v2", [GLOBAL_V2, SINGLE_V2])
 def test_v2_stores_embeddings_band_first_in_16_band_shards_of_4_band_chunks(v2):
-    """ADR 031: every other array keeps v1.1's geometry, and every array sits in level group 0."""
+    """ADR 031: every other array keeps v1.1's geometry but for 512² chunks, and every array sits in level group 0.
+
+    One spatial chunk edge is what clamps every array of an area under one shard (768 px here) to the
+    same shard height, which assembly requires.
+    """
     v1 = SINGLE if "embedding_std" in v2.arrays else GLOBAL
     band_arrays = {"embeddings", "embedding_std"} & v2.arrays.keys()
     for var in band_arrays:
         k = v2.for_var(var).create_kwargs((9, EMBEDDING_DIM, 4096, 4096))
         assert k["dimension_names"] == ("time", "band", "northing", "easting")
         assert (k["chunks"], k["shards"]) == ((1, 4, 512, 512), (1, 16, 2048, 2048))
-    geometry = lambda a: (a.dims, a.chunks, a.shards, a.dtype, a.codec, a.attrs)  # noqa: E731 - NaN fills never compare
+    geometry = lambda a: (a.dims, a.shards, a.dtype, a.codec, a.attrs)  # noqa: E731 - NaN fills never compare
     assert v2.arrays.keys() == v1.arrays.keys()
     assert all(geometry(v2.arrays[var]) == geometry(v1.arrays[var]) for var in v1.arrays.keys() - band_arrays)
+    assert {v2.arrays[var].chunks[1:3] for var in v2.arrays.keys() - band_arrays} == {(512, 512)}
+    shape = {"time": 1, "band": EMBEDDING_DIM, "month": 12, "northing": 768, "easting": 768}
+    pitches = {
+        v2.for_var(var).create_kwargs(tuple(shape[d] for d in a.dims))["shards"][-2] for var, a in v2.arrays.items()
+    }
+    assert pitches == {512}
     assert (v2.level, v1.level, v2.bands) == ("0", None, EMBEDDING_DIM)
 
 

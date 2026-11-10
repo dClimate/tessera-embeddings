@@ -190,7 +190,8 @@ three ways ([ADR 031](../context_docs/decisions/031-the-v2-store-chunks-the-band
 - **`embeddings` is `(time, band, y, x)`**, in shards of 16 dimensions cut into 512 × 512-pixel
   chunks of 4. v2's first 16, 32 and 64 dimensions each work as a shorter embedding, listed in the
   root's `embedding_prefixes`, and a read of the first 16 fetches an eighth of what all 128 cost.
-  `embeddings * scales` still broadcasts by name.
+  `embeddings * scales` still broadcasts by name. `scales` and the other arrays keep their 2,048²
+  shards, in 512 × 512-pixel chunks.
 - **Spatial coordinates are `y` and `x`.**
 
 Read with zarr 3.3 or later, which fetches a shard's neighbouring chunks in a few merged requests.

@@ -78,7 +78,7 @@ into shards and chunks changes.
 | chunk, bands | 4 | phones and browsers fetch only the bands they read (§4) |
 | int8 codec | zstd at level 1 | within 3% of the default level's bytes at 0.6× its encode CPU, once bands are split |
 | chunk order within a shard | zarr's default (Morton) | the other orders moved request counts by under 20%, and an order is not persisted, so it would need library code on every write path |
-| `scales` | 256² chunks, as v1.1 | its geometry made no measurable difference; PCodec compresses it about 7× |
+| `scales` and the other arrays | 512² chunks in 2,048² shards | one chunk edge for every array, so an area smaller than a shard clamps every array to the same shard height, which assembly requires (§5); `scales`' geometry made no measurable difference in the study (256² there), and PCodec compresses it about 7× |
 | float arrays | PCodec | unchanged |
 | readers | zarr ≥ 3.3, Dask chunks matched to shards | zarr 3.3 merges a shard's ranges into concurrent requests; Dask's default makes one task per chunk, each refetching the shard's index (§6) |
 
@@ -291,7 +291,7 @@ example, labels a meta-shard by chunk coordinates 1 and 2, which in band-first o
 `embeddings` is `(time, band, y, x)`. Each meta-shard's 128 bands are stored as eight shards of
 1 × 16 × 2,048 × 2,048, one for each block of 16 dimensions (zarr's `shards=`). Each shard holds
 chunks of 1 × 4 × 512 × 512, compressed with zstd at level 1. `scales` and the other arrays keep
-their v1.1 geometry.
+their v1.1 shards, in 512² chunks.
 
 **Band-first 16-band shards are the only layout in the 16-band study that pass every limit, and
 they lead every read.** These are its figures with 16-band chunks; 4-band chunks change them by the
@@ -376,8 +376,10 @@ the same code unchanged.
 
 - **v2 presets.** `GLOBAL_V2` and `SINGLE_V2` in `config/store_layout.py` hold `embeddings` (and a
   single-area store's `embedding_std`) as `(time, band, y, x)` in 1 × 16 × 2,048 × 2,048 shards of
-  1 × 4 × 512 × 512 chunks. Every other array keeps v1.1's geometry, and `INNER_PX` stays 256, so the
-  land mask's `chunk_live_256` stays valid. `layout_for(model, single=)` gives a new store its
+  1 × 4 × 512 × 512 chunks. Every other array keeps v1.1's shards in 512² chunks: with one chunk edge
+  for every array, an area under 2,048 px that is not a multiple of 512 still clamps every array to
+  the same shard height. `INNER_PX` stays 256, so the land mask's `chunk_live_256` and the staged
+  tiles' geometry are unchanged. `layout_for(model, single=)` gives a new store its
   model's preset; an existing store keeps the geometry it was created with.
 - **Level group `0`** (§1). Seeding and single-area assembly create every array and coordinate in
   `0`. The zone group, or a single-area store's root, keeps its attributes and declares the

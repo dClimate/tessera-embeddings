@@ -486,7 +486,7 @@ eight shards of 16 bands, each cut into 512 × 512-pixel chunks of 4 bands (1.05
 reader of the first 16 dimensions fetches an eighth of a full vector and a phone reading 4 fetches
 a thirty-second. Every array, coordinates included, sits in the zone's level group `0` (`33N/0`, or
 `0/` in a single-area store); the zone's attributes stay on `33N`. The other arrays keep the
-geometry above. Why, and what each choice was measured against:
+shards above, in 512 × 512-pixel chunks. Why, and what each choice was measured against:
 [ADR 031](../context_docs/decisions/031-the-v2-store-chunks-the-band-axis-at-16.md).
 
 **Manifests are split by year, so a commit costs one year rather than the whole store.** An
