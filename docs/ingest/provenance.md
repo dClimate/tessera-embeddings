@@ -1,8 +1,8 @@
 # What the ingest records about its granules
 
 When the `provenance` switch is on, the ingest writes two records into every mosaic it builds:
-the list of granules fused into each day's slot, and, for every pixel of the slot, which of
-those granules supplied it. Assembly later publishes them beside the registry, so a reader of the
+the list of granules fused into each day's slot, with the copies it dropped before the fuse, and,
+for every pixel of the slot, which of the fused granules supplied it. Assembly later publishes them beside the registry, so a reader of the
 store can answer "what imagery is behind this embedding" after the mosaics are deleted. This
 document covers the ingest's half. The whole record, and why it is shaped as it is, is in
 [`context_docs/storage/registry-provenance-plan.md`](../../context_docs/storage/registry-provenance-plan.md).
@@ -33,11 +33,13 @@ mosaic marked without the record is refused by a run that wants it rather than e
 ## The granule list
 
 The mosaic gains a one-dimensional `granules` array along `time`, holding one JSON string per
-slot. Each string is the day's granules in fusion order, one object per granule:
+slot. Each string is the day's granules in fusion order, then the copies the ingest dropped before
+the fuse, one object per granule:
 
 | field | meaning |
 |---|---|
-| `granule_id` | the catalogue id of the copy read |
+| `granule_id` | the catalogue id of the copy |
+| `status` | `fused`; or `duplicate` or `unreadable` for a copy dropped before the fuse (below) |
 | `image_key` | which image it is a copy of: Sentinel-2 `<datatake>/<datastrip sensing start>`, Sentinel-1 the burst id |
 | `platform` | `S2A`, `S1C` and so on, from the id |
 | `acquired_at` | the acquisition instant, which solar-day normalisation never overwrites |
@@ -46,6 +48,15 @@ slot. Each string is the day's granules in fusion order, one object per granule:
 | `assets` | asset key to the exact URL the loader read, after any bucket rewrite |
 | `stepped_down` | this copy replaced one that would not read ([the fallback ladder](duplicate-copies.md#the-fallback-ladder)) |
 | `geometry`, `bbox` | the footprint as the catalogue published it |
+
+**Dropped copies.** The Sentinel-2 ingest keeps one copy of each image of a tile-date and holds
+the others back as a [fallback ladder](duplicate-copies.md#the-fallback-ladder). Each copy held
+back is marked `duplicate`. When a kept copy will not read and the ladder swaps in another, the
+copy that failed is marked `unreadable` and its replacement `stepped_down`. Both kinds are listed
+after the fused granules, sorted by id. The marks live on the catalogue items
+(`provenance.mark_dropped`) and are cleared when a load reads the copy after all. Radar fuses every
+copy of a burst, so it drops none this way. A day that writes no slot, because it failed the
+coverage gate or every copy of an image failed to read, has no list to hold its granules.
 
 The list for a date is appended in the same Icechunk commit as the date's pixels, under both the
 per-date and the batched write. A date that did not commit has no slot and no list, and a resumed
@@ -85,13 +96,14 @@ items just before the load (`provenance.stamp_fusion_positions`), so the granule
 them afterwards (`provenance.day_granules`) numbers the granules exactly as the index does.
 
 On the optical path the index is masked to the ROI only, like SCL: it names the granule behind
-every pixel, cloudy or clear, and the model's own validity test decides later which of those
-observations were valid. On the radar path the dB transform runs over the bands before the index
+every pixel, cloudy or clear. The model's stage later negates it wherever its own validity test
+rejects the observation, so the published record keeps the granule behind a cloudy pixel and marks
+it as not used. On the radar path the dB transform runs over the bands before the index
 is added, so the index is never rescaled. The index follows the granule's own data, not the stored
 value: an amplitude too faint for the dB scale is stored as VV zero, the store's nodata, yet the
 index still names the granule that supplied it. About one radar pixel in ten thousand does this. The model's
-validity test drops such a pixel unless its VH holds data, so the published record never names a
-granule for an observation that was not valid for the model.
+validity test rejects such a pixel unless its VH holds data, and the published record then names
+the granule as rejected.
 
 ## What it costs
 

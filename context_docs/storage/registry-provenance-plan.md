@@ -19,10 +19,11 @@ questions in §10. The appendices are reference material and can be skipped.
 - **The gap.** An embedding is built from a year of satellite images, but the images are fused
   into daily mosaics and the mosaics are deleted once the embeddings are written. Today nobody can
   say which images went into a given embedding, and for the v1.1 store nobody ever will.
-- **The record.** For every pixel, and every date on which its observation was valid for the
-  model, the record names the one satellite image (the *granule*) that supplied that pixel, with
-  the granule's id, acquisition time, cloud cover, footprint and the exact file URLs that were read.
-  It sits beside the store's existing registry.
+- **The record.** For every pixel, and every date on which a satellite image had data there, the
+  record names that image (the *granule*) and says whether the model used the observation or
+  rejected it, a cloud for instance, with the granule's id, acquisition time, cloud cover,
+  footprint and the exact file URLs that were read. It also lists the copies the ingest dropped
+  before building each day's mosaic, and why. It sits beside the store's existing registry.
 - **Three questions it answers,** each with a reader helper: what went into this day's mosaic,
   into this 20 km shard, and which granule supplied this pixel on each date?
 - **Cost.** About 4.7 TB of storage over the campaign, a quarter of a percent of the store. Its
@@ -45,6 +46,8 @@ questions in §10. The appendices are reference material and can be skipped.
 | solar day | the local calendar day a granule belongs to; the mosaic has one slot per solar day |
 | fusion order | the order a day's granules are handed to the mosaic builder: optical clearest first, radar most-often-acquired burst first (#250). Where granules overlap, the first one with data supplies the pixel |
 | valid for the model | an observation that passes the model's own test: a clear scene class for optical, data in VV or VH for radar |
+| rejected | an observation a granule supplied that fails the model's test, a cloudy pixel for instance. The record keeps its granule |
+| dropped | a catalogue copy the ingest left out of a day's mosaic: a losing duplicate of an image it fused, or a copy that would not read and was replaced by another |
 | refused | a pixel a run was asked to embed but did not, for example because it had fewer clear optical observations than the minimum. A refused pixel has no embedding |
 | run | one pass that writes pixels into a zone-year: the first fill; a *holes update*, which re-runs the model on refused pixels only; or a *shards update*, which rewrites whole shards |
 | registry | the Parquet tables published beside the store, one row per shard per year, saying what each shard holds |
@@ -72,9 +75,9 @@ v1.1 store. This plan closes the gap from the first v2 zone-year onward.
 
 | question | answer | helper | read from |
 |---|---|---|---|
-| What went into one day's mosaic? | every granule fused that day, in fusion order, with ids, acquisition time, cloud cover, footprint, catalogue link and file URLs | `day_granules` | `granules` |
-| What went into one shard? | per sensor, the dates on which any of its pixels had a valid observation, how many did, and which granules supplied them | `shard_granules` | `shard_dates`, then `granules` |
-| What is behind one pixel? | per sensor, every date its observation was valid for the model, and the one granule that supplied it on each | `pixel_granules` | `pixel_sources`, then `shard_dates` and `granules` |
+| What went into one day's mosaic? | every granule fused that day, in fusion order, with ids, acquisition time, cloud cover, footprint, catalogue link and file URLs; then the copies dropped, and why | `day_granules` | `granules` |
+| What went into one shard? | per sensor, the dates on which any granule had data at its pixels, how many observations the model used, and which granules covered them | `shard_granules` | `shard_dates`, then `granules` |
+| What is behind one pixel? | per sensor, every date a granule had data at it, that granule, and whether the model used the observation or rejected it | `pixel_granules` | `pixel_sources`, then `shard_dates` and `granules` |
 
 The helpers are in `storage/provenance_reader.py` and return polars tables (Appendix B).
 
@@ -85,16 +88,16 @@ the Slovenia–Croatia border, as `pixel_granules` finds it:
   45.5071°N 14.3761°E ──▶ zone 33N, shard chunk_209_14, row 1908, column 70
   registry row, 2024:    source_runs = [fill 33N-2024-9a1fc94c, update 33N-2024-e892e33b]
   newest run first:      the update's update_pixels marks the pixel, so the update's record answers (§5)
-  that record's planes:  one small number per date, non-zero on 27 optical, 61 ascending and 28
-                         descending radar dates
+  that record's planes:  one small number per date, positive (used by the model) on 27 optical,
+                         61 ascending and 28 descending radar dates
 ```
 
-Each non-zero number leads to one granule. The dev test traced those steps on a second pixel of
+Each non-zero number leads to one granule; its sign says whether the model used it. The dev test traced those steps on a second pixel of
 the same shard, row 1822, column 96 (45.5149°N, 14.3794°E), which the fill embedded:
 
 ```text
-  pixel_sources (fill, s2), 2024-01-20:  1     (a 0 would mean the observation was not valid for
-        │                                       the model: no granule had data, or cloud masked it)
+  pixel_sources (fill, s2), 2024-01-20:  1     (−1 would mean the same granule covered the pixel
+        │                                       and the model rejected it; 0, that no granule had data)
         ▼
   shard_dates (fill, chunk_209_14, s2, 2024-01-20):  sources = [0], so 1 means fusion order 0
         ▼
@@ -106,7 +109,8 @@ the same shard, row 1822, column 96 (45.5149°N, 14.3794°E), which the fill emb
 That pixel has 40 such dates for optical. Radar shows why the extra step through `sources`
 exists. On 1 January its ascending number is 2 and the shard's `sources` is `[0, 2, 4]`, so it came
 from fusion order 2, burst `T044-092628-IW3`: three bursts covered parts of the shard that day, and
-the record names the one that covered this pixel.
+the record names the one that covered this pixel. The dev test ran before rejected observations
+were recorded, so its planes hold 0 on the cloudy dates where a run now records a negative.
 
 **How this compares.** OlmoEarth publishes provenance per 2048-pixel window and 30-day period,
 listing the candidate scenes rather than the one used, and its model mixes neighbouring pixels.
@@ -138,23 +142,27 @@ run that reads the snapshot; a later run reading the same snapshot, such as a re
 instead. A run that re-ingests builds new mosaics and writes new files. A real row, from the
 fill's optical snapshot: 2 January 2024, fusion order 0, `S2A_33TVL_20240102_0_L2A`, Sentinel-2A,
 09:58:07 UTC, 94.9% cloud, with its catalogue link, its footprint as GeoParquet, and the URL of
-each of the 11 files read, such as `…/S2A_33TVL_20240102_0_L2A/B04.tif` (Appendix A).
+each of the 11 files read, such as `…/S2A_33TVL_20240102_0_L2A/B04.tif` (Appendix A). After a
+day's fused granules come the Sentinel-2 copies the ingest dropped before fusing it, with no fusion
+order and their reason in `status`: `duplicate`, a losing copy of an image it fused, or
+`unreadable`, a copy that would not read and was replaced by another, which `stepped_down` marks.
 
 **`shard_dates`: what went into each shard.** Per run, one row per shard, sensor and date on which
-at least one of the shard's pixels had a valid observation:
+a granule had data at at least one of the shard's pixels:
 
 | run_id | tile | sensor | snapshot_id | solar_day | valid_px | embedded_px | sources |
 |---|---|---|---|---|---|---|---|
 | 33N-2024-9a1fc94c | chunk_209_14 | s1_desc | the fill's descending snapshot | 2024-01-12 | 4,194,294 | 15,668 | [0, 1, 2] |
 
-`valid_px` counts the shard's pixels with a valid observation that date; `embedded_px` the pixels
-the run embedded in the whole shard, repeated on each of its rows; `sources` the fusion orders of
-the granules that supplied at least one pixel, so footprints that merely touch the shard are not in
-it. `snapshot_id` names the mosaic the run read, and is how a row finds its granules.
+`valid_px` counts the shard's pixels whose observation the model used that date; `embedded_px` the
+pixels the run embedded in the whole shard, repeated on each of its rows; `sources` the fusion orders
+of the granules that had data at at least one pixel, used or rejected, so footprints that merely
+touch the shard are not in it. `snapshot_id` names the mosaic the run read, and is how a row finds its granules.
 
-**`pixel_sources`: which granule supplied each pixel.** Per run and sensor, an array of one byte
-per pixel per date. Zero means the observation was not valid for the model that date; k means the
-k-th entry of that shard-date's `sources`. The planes compress to about a megabyte per shard-year
+**`pixel_sources`: which granule supplied each pixel.** Per run and sensor, an array of one signed
+byte per pixel per date. A value k names entry |k| of that shard-date's `sources`: positive when
+the model used the observation, negative when it rejected it, a cloud for instance, and 0 when no
+granule had data. A fully cloudy date keeps its plane. The planes compress to about a megabyte per shard-year
 (§6). They live in an Icechunk store of their own because each run has its own dates, while the
 published store's arrays all share one grid.
 
@@ -181,7 +189,7 @@ The pipeline already has three stages; each gains one job.
   for each day and sensor:              read the mosaics, run the       commit the shards to the store
    fuse the granules into the mosaic     model, stage the shard          publish the registry rows
    + NEW: write the day's granule list   + NEW: stage, per date, the   + NEW: publish the record,
-   + NEW: write a source_index band        index, zeroed where the         check it, and fail the
+   + NEW: write a source_index band        index, negated where the        check it, and fail the
      (which granule supplied each          observation was not valid       zone-year if it is wrong
      pixel), in the same commit            for the model, with counts    then tag, delete staging and mosaics
 ```
@@ -204,10 +212,19 @@ classification (SCL) for optical and VV for radar, is read through a reader that
 granule's position into the high bits of every pixel it returns. The fuser runs unchanged and
 still keeps the first granule with data; afterwards the value splits back into the band, bit for
 bit what a plain read gives, and the index. No band is read twice and the fuse is unchanged; the
-index is one more array to write. The model's stage zeroes the index wherever its own cloud and
-validity test rejects the observation, so a published non-zero means the observation was valid for
-the model, and renumbers each shard-date's granules 1, 2, 3 so a byte suffices (a day's zone-wide
-fusion order runs past 255; a shard rarely has more than a handful on one date).
+index is one more array to write. The model's stage negates the index wherever its own cloud and
+validity test rejects the observation, so a published positive value means the model used the
+observation and a negative one that the granule had data there and was rejected. It reads the
+optical index on every date, a fully cloudy one included, although the model itself skips those.
+It then renumbers each shard-date's granules 1, 2, 3 so a signed byte suffices: a day's zone-wide
+fusion order runs past 255, while a shard rarely has more than a handful on one date, and the cap
+is 127.
+
+**How the ingest records what it dropped.** Before fusing a day, the Sentinel-2 ingest keeps one
+copy of each image and holds the others back, in case the kept copy will not read. It marks each
+copy it holds back as a duplicate, and a kept copy that fails to read and is swapped for one held
+back as unreadable. The day's granule list names those copies after the fused ones. Radar fuses
+every copy of a burst, so it drops none this way.
 
 **Three rules keep the record and the embeddings consistent.**
 
@@ -266,7 +283,9 @@ claims every pixel. The first run that claims the pixel holds its record; the he
 | the granule lists and index inside the mosaics | about 150 MB and 0.1–0.3% of a mosaic | none: deleted with the mosaics |
 
 The ~150 MB inside the mosaics and the ~160 MB `granules` table are the same lists in two
-encodings; the mosaics' copy is deleted at publication. The planes are chunked one date by one
+encodings; the mosaics' copy is deleted at publication. The plane sizes were measured before
+rejected observations were recorded. Cloudy pixels are now non-zero and fully cloudy shard-dates
+now have planes, so the planes will be larger, by an amount the next dev run measures (§10). The planes are chunked one date by one
 shard, so reading one pixel's year fetches one object per date, 40–130 per sensor (§10).
 
 **Ingest time.** Measured on zone 35N, 1–7 January 2024, over two days, each pair's two arms run
@@ -323,6 +342,8 @@ The last column is the first draft's choice, where reviews of the plan or the bu
 | choice | alternative | why this one | first draft |
 |---|---|---|---|
 | a granule per pixel per date | a yes/no bit per pixel per date, with the granule guessed from footprints | 4% more storage, and exact: guessing named the wrong granule for 0.10% of one shard's pixel-dates, wherever footprints overlap | nothing per pixel, ruled out at an estimated 20–45 TB (measured: 3.7 TB for optical); the granule guessed from footprint order |
+| a rejected observation keeps its granule, as the rank negated | zero for anything the model did not use | a reader can tell "no image had data" from "the model rejected this image here", and see which granule was cloudy; a fully cloudy date keeps its plane | zero |
+| the copies the ingest dropped listed after the fused granules, with a `status` | the fused granules only | a reader sees the duplicates and unreadable copies the ingest set aside, beside what it used | the fused only |
 | a per-shard granule list derived from the pixels | every granule whose footprint touches the shard | names only granules that supplied a pixel | |
 | the index written by the ingest while it fuses | reading the mask band a second time, or once per granule | one read, one definition of "valid"; per granule would multiply the load by the day's granules, hundreds of radar bursts | each granule loaded separately |
 | the granule list inside the mosaic, in the day's own commit | a file written beside the mosaic before the commit | a file written first can describe a day that never committed | the file beside |
@@ -339,23 +360,26 @@ The last column is the first draft's choice, where reviews of the plan or the bu
 
 - **Attribution.** The model has none, so the record says what went in, not how much it weighed.
 - **The pixel values.** The mosaics are gone; a reader who wants the imagery re-reads the URLs.
-- **The granule behind an invalid observation,** a cloudy pixel for instance. The mosaic knows,
-  but only observations valid for the model are published.
 - **A separate index per band.** The index follows the band the validity test reads. A granule with
   data in one band and none in another at the same pixel would break this; the products do not
   produce one, and the dev test's pixel checks found none.
 - **v1.1**, whose mosaics are gone.
 - **Radar quality layers** such as layover and shadow, a separate decision (ADR 033).
-- **Copies of an image the ingest rejected** after a failed read. They could be added later as
-  rows that supplied no pixel, without changing the schema.
+- **Days the ingest drops whole.** A day whose clear coverage of the zone is below the ingest's
+  minimum (0.1% of its land), or whose every copy of an image fails to read, writes no mosaic slot,
+  so there is no list to put its granules in. Recording them would need a list of skipped days and
+  their granules beside the mosaic.
+- **Radar granules whose catalogue entry lacks the VV and VH files it claims.** The catalogue query
+  drops these before anything else sees them; they are rare, logged, and could not have been read.
 
 ## 10. Open questions
 
 1. **Plane chunking.** A one-pixel read fetches 40–130 objects per sensor. The next dev run will
    compare chunks of all dates × 256 × 256 and all dates × 128 × 128 against the current one date
-   × one shard on a real shard-year, for size and for the time to read one pixel.
+   × one shard on a real shard-year, for size and for the time to read one pixel. It will also
+   measure what keeping rejected observations adds, since cloudy pixels are now non-zero.
 2. **Rank or fusion order in the plane.** The rank (plane value k → `sources[k − 1]` → fusion
-   order) exists to fit a byte. Storing the fusion order itself as `uint16` with bit-shuffled zstd
+   order) exists to fit a byte. Storing the signed fusion order itself as `int16` with bit-shuffled zstd
    would remove `sources` and one hop; the next dev run will measure its size on a real shard-year.
 3. **Publication time at zone scale,** of the order of an hour or two per zone-year if it grows
    linearly (§6), to be examined separately.
@@ -377,8 +401,9 @@ sensor, snapshot and the run that first published it.
 | `snapshot_id` | string | the mosaic snapshot the lists were read from |
 | `sensor` | string | `s2`, `s1_asc` or `s1_desc` |
 | `solar_day` | date | the mosaic slot |
-| `fusion_order` | int16 | position in the day's fusion order, 0 first |
-| `granule_id` | string | the catalogue id of the copy read |
+| `fusion_order` | int16 | position in the day's fusion order, 0 first; null for a dropped copy |
+| `granule_id` | string | the catalogue id of the copy |
+| `status` | string | `fused`; or, for a copy dropped before the fuse, `duplicate` or `unreadable` |
 | `image_key` | string | which image it is a copy of: Sentinel-2 datatake and datastrip (#240), Sentinel-1 burst id (#250) |
 | `platform` | string | `S2A`, `S1C` and so on |
 | `acquired_at` | timestamp, UTC | the acquisition instant |
@@ -389,14 +414,16 @@ sensor, snapshot and the run that first published it.
 | `geometry`, `bbox_west` … `bbox_north` | WKB (GeoParquet 1.1), float64 | the footprint as published, WGS84 |
 
 **`shard_dates`**, one file per run: `run_id`, `tile`, `sensor`, `snapshot_id`, `solar_day`,
-`valid_px` (int32), `embedded_px` (int32, per shard, repeated on each of its rows) and `sources`
-(list of int16 fusion orders, ascending). Its metadata names the zone, year, run, the snapshot of
+`valid_px` (int32, observations the model used), `embedded_px` (int32, per shard, repeated on each
+of its rows) and `sources` (list of int16 fusion orders of the granules with data, ascending). Its metadata names the zone, year, run, the snapshot of
 each mosaic read, and the refused shards that staged no record.
 
 **`pixel_sources`**: one group per run, `<zone>/<year>/<run_id>`, holding per sensor a
-`(date, northing, easting)` uint8 array on the zone's grid, chunked one date by one shard, and a
-`<sensor>_date` array of its dates; the group records the grid shape and shard size. The codec was
-chosen on one real optical shard-year (33N `chunk_209_14`, 2024): Blosc zstd level 3 with bit
+`(date, northing, easting)` int8 array on the zone's grid, chunked one date by one shard, and a
+`<sensor>_date` array of its dates; the group records the grid shape and shard size. A value k
+names `sources[|k| - 1]`, positive when the model used the observation and negative when it
+rejected it; 0 means no granule had data. The codec was chosen, before the sign was added, on one
+real optical shard-year (33N `chunk_209_14`, 2024): Blosc zstd level 3 with bit
 shuffle, 1.17 MB, against 1.38 MB for two bits a pixel (which would cap a shard-date at three
 granules), 2.83 MB for zstd without the shuffle, which then misses the mostly constant planes' runs,
 and 1.12 MB for a bare validity bit. Bits packed along time and XOR-delta planes also lost.
@@ -416,12 +443,14 @@ from tessera_embeddings.storage.provenance_reader import day_granules, locate, p
 
 FILL, UPDATE = "33N-2024-9a1fc94c", "33N-2024-e892e33b"
 
-# A day: the optical granules of 9 May 2024 in the mosaic the fill read, in fusion order.
+# A day: the optical granules of 9 May 2024 in the mosaic the fill read, in fusion order, then the
+# copies the ingest dropped, with their reason in `status`.
 day_granules(REGISTRY, "33N", 2024, "s2", dt.date(2024, 5, 9), run_id=FILL)
-# A shard: per sensor and date the fill recorded, every granule that supplied a pixel.
+# A shard: per sensor and date the fill recorded, every granule that had data at a pixel.
 shard_granules(REGISTRY, "33N", 2024, "chunk_209_14", FILL)
-# A pixel: §2's, from the update that claims it; a row per sensor and date (27 optical, 61 and 28
-# radar) with run_id, granule_id, platform, acquired_at, cloud_cover and the asset URLs.
+# A pixel: §2's, from the update that claims it; a row per sensor and date a granule had data
+# there, with run_id, valid (whether the model used it), granule_id, platform, acquired_at,
+# cloud_cover and the asset URLs.
 locate(45.5071, 14.3761)              # PixelLocation(zone='33N', tile='chunk_209_14', row=1908, col=70)
 pixel_granules(REGISTRY, 45.5071, 14.3761, 2024)
 ```
@@ -443,22 +472,24 @@ from tessera_embeddings.storage.zarr_store import open_repo
 table = f"{REGISTRY}/provenance/{{}}/zone=33N/year=2024/*.parquet"
 granules, key = pl.scan_parquet(table.format("granules")), ["sensor", "snapshot_id", "solar_day", "fusion_order"]
 # The shard: the rows one run wrote for it, one per sensor and date; `sources` lists the fusion
-# orders of the granules that supplied at least one of its pixels, so exploding it and joining
+# orders of the granules with data at at least one of its pixels, so exploding it and joining
 # through the snapshot gives the shard's exact granule list.
 rows = pl.scan_parquet(table.format("shard_dates")).filter(pl.col("run_id") == UPDATE, pl.col("tile") == "chunk_209_14")
 rows.explode("sources").rename({"sources": "fusion_order"}).join(granules, on=key).collect()      # the shard
 
-# The pixel: its plane values are ranks, one per date on the run's time axis; 0 means the date
-# was not valid for the model there, and k > 0 names `sources[k - 1]` of that shard-date's row.
+# The pixel: its plane values are signed ranks, one per date on the run's time axis. 0 means no
+# granule had data there; k names `sources[|k| - 1]` of that shard-date's row, and its sign says
+# whether the model used the observation (k > 0) or rejected it, a cloud for instance (k < 0).
 run = zarr.open_group(open_repo(f"{REGISTRY}/provenance/pixel_sources.icechunk").readonly_session("main").store,
                       path=f"33N/2024/{UPDATE}", mode="r")
-k = np.asarray(run["s2"][:, 209 * 2048 + 1908, 14 * 2048 + 70])     # the pixel's ranks, one per date
+k = np.asarray(run["s2"][:, 209 * 2048 + 1908, 14 * 2048 + 70]).astype(np.int64)   # one per date
 days = np.asarray(run["s2_date"][:]).astype("datetime64[ns]").astype("datetime64[D]")
-(pl.LazyFrame({"solar_day": days[k > 0], "rank": k[k > 0].astype(np.int64) - 1, "sensor": "s2"})
+seen = pl.DataFrame({"sensor": "s2", "solar_day": days[k != 0], "valid": k[k != 0] > 0, "rank": np.abs(k[k != 0]) - 1})
+(seen.lazy()
  .join(rows, on=["sensor", "solar_day"])
  .with_columns(fusion_order=pl.col("sources").list.get(pl.col("rank")))
  .join(granules, on=key)
- .collect())                                                         # the pixel: 27 optical rows
+ .collect())                                      # the pixel: a row per date with data, `valid` on 27
 ```
 
 For a shard with several `source_runs`, pick the run by §5's rule first, as `pixel_granules` does.
@@ -472,16 +503,17 @@ import duckdb
 
 con = duckdb.connect()
 con.sql(f"""
--- A day: every granule fused into 9 May's optical mosaic, in fusion order. One row set per
--- mosaic snapshot that recorded the day; a fill and an update that read the same mosaic share it.
-SELECT snapshot_id, fusion_order, granule_id, platform, acquired_at, cloud_cover
+-- A day: every granule fused into 9 May's optical mosaic, in fusion order, then the copies the
+-- ingest dropped (no fusion order; `status` says why). One row set per mosaic snapshot that
+-- recorded the day; a fill and an update that read the same mosaic share it.
+SELECT snapshot_id, fusion_order, status, granule_id, platform, acquired_at, cloud_cover
 FROM read_parquet('{table.format("granules")}')
 WHERE sensor = 's2' AND solar_day = DATE '2024-05-09'
-ORDER BY snapshot_id, fusion_order""")
+ORDER BY snapshot_id, fusion_order NULLS LAST, granule_id""")
 
 con.sql(f"""
--- The shard: each sensor and date the update used in chunk_209_14 and every granule that supplied
--- a pixel of it. `sources` holds fusion orders; UNNEST it and join through the snapshot the run read.
+-- The shard: each sensor and date the update recorded in chunk_209_14 and every granule that had
+-- data at a pixel of it. `sources` holds fusion orders; UNNEST it and join through the snapshot the run read.
 SELECT d.sensor, d.solar_day, d.valid_px, g.fusion_order, g.granule_id, g.platform, g.acquired_at, g.cloud_cover
 FROM read_parquet('{table.format("shard_dates")}') AS d, UNNEST(d.sources) AS s(fusion_order)
 JOIN read_parquet('{table.format("granules")}') AS g
@@ -489,11 +521,11 @@ JOIN read_parquet('{table.format("granules")}') AS g
 WHERE d.run_id = '{UPDATE}' AND d.tile = 'chunk_209_14'
 ORDER BY d.sensor, d.solar_day, g.fusion_order""")
 
-con.register("seen", seen)  # the pixel's (sensor, solar_day, rank) from the planes, as above
+con.register("seen", seen)  # the pixel's (sensor, solar_day, valid, rank) from the planes, as above
 con.sql(f"""
--- The pixel: rank k names the k-th entry of that shard-date's `sources` (DuckDB lists are 1-based,
--- so rank + 1), which is the fusion order of the granule that supplied the pixel.
-SELECT p.sensor, p.solar_day, g.fusion_order, g.granule_id, g.platform, g.acquired_at, g.cloud_cover, g.assets
+-- The pixel: rank names an entry of that shard-date's `sources` (DuckDB lists are 1-based, so
+-- rank + 1), the fusion order of the granule with data there; `valid` says whether the model used it.
+SELECT p.sensor, p.solar_day, p.valid, g.fusion_order, g.granule_id, g.platform, g.acquired_at, g.cloud_cover, g.assets
 FROM seen AS p
 JOIN read_parquet('{table.format("shard_dates")}') AS d
   ON d.run_id = '{UPDATE}' AND d.tile = 'chunk_209_14' AND d.sensor = p.sensor AND d.solar_day = p.solar_day
@@ -508,16 +540,17 @@ Both forms were run against the record the unit tests build and return the same 
 ## Appendix C. For implementers
 
 **Where the code is.** The switch and the ingest half: `docs/ingest/provenance.md`, with
-`ingest/provenance.py` and the per-source reader hook in `stac.py`. The actor's planes:
+`ingest/provenance.py`, the per-source reader hook in `stac.py`, and the marks on dropped copies in
+`s2_roi.py`. The actor's planes:
 `inference/provenance.py`. Publication and its checks: `inference/provenance_publish.py`, called
 from `runners/zone_fill.py` on the fill and update paths and on retry of a landed but untagged
 cell. Tables and layout: `storage/provenance.py`. `source_runs`: `published_store.source_runs`,
 applied by every registry merge and rebuild. The reader helpers: `storage/provenance_reader.py`.
 
 **Checks at publication**, each failing the zone-year: every mosaic slot has a granule list; the
-three mosaics agree on the switch; every embedded shard staged a record; each plane's non-zero
-count equals its row's `valid_px` and its values are exactly 1 to the length of `sources`; every
-`sources` entry is a granule of that day in the snapshot the row names; a snapshot's `granules`
+three mosaics agree on the switch; every embedded shard staged a record; each plane's positive
+count equals its row's `valid_px` and its absolute values are exactly 1 to the length of `sources`;
+every `sources` entry is a fused granule of that day in the snapshot the row names; a snapshot's `granules`
 file, if an earlier run published it, holds the lists read now; a holes update's mask counts
 exactly its `embedded_px` and its planes are zero outside it. Re-running these checks from the
 registry census, so a later repair can find a broken zone-year, is not built yet.
