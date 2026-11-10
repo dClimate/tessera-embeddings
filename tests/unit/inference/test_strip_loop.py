@@ -209,7 +209,7 @@ class _CapturingWriter:
             "pixels": None if pixels is None else pixels.copy(),
         }
 
-    def write_coverage_only(self, chunk, run_id, obs_counts, month_covered, *, planes=None, pixels=None):
+    def write_coverage_only(self, chunk, run_id, *_counts, planes=None, pixels=None):
         _CapturingWriter.last_coverage_planes = _ranked(planes, pixels)
 
     def discard_coverage(self, chunk, run_id):

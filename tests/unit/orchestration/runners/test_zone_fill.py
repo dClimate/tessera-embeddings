@@ -1023,8 +1023,9 @@ def test_non_affine_mosaic_axis_raises(tmp_path, monkeypatch):
 def _recording_publish(calls: list[dict], store: str, *, fail: bool = False):
     """A stand-in for ``publish_provenance`` recording what it was given and whether the cell was tagged."""
 
-    def publish(**kwargs):
-        calls.append({**kwargs, "tagged": "zone-01N-2025" in global_store.open_global_repo(store).list_tags()})
+    def publish(run, *_args):
+        tagged = "zone-01N-2025" in global_store.open_global_repo(store).list_tags()
+        calls.append({**vars(run), "tagged": tagged})
         if fail:
             raise zone_fill.ProvenanceCheckError("a plane disagrees with its row")
         return {}

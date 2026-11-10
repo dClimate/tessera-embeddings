@@ -93,16 +93,14 @@ def read_array(group: zarr.Group, name: str) -> np.ndarray:
 def read_source_pieces(
     root: zarr.Group,
     times: np.ndarray,
-    y_slice: slice,
-    x_slice: slice,
+    window: tuple[slice, slice],
     valid: np.ndarray,
-    *,
-    rows: slice,
-    cols: slice,
+    at: tuple[slice, slice],
 ) -> list[SourcePiece]:
-    """The source index at ``times`` over the window, negated where ``valid`` is False, per date.
+    """The source index at ``times`` over ``window``, negated where ``valid`` is False, per date.
 
-    ``valid`` is ``(len(times), h, w)``, the test the model applies to the same reads. Empty when
+    ``window`` is the store's ``(northing, easting)`` slices and ``at`` the same pixels' shard-relative
+    ``(rows, cols)``. ``valid`` is ``(len(times), h, w)``, the test the model applies to the same reads. Empty when
     the mosaic carries no source index, which is how the record follows the mosaics: a store built
     with provenance off gives the actor nothing to stage.
     """
@@ -113,10 +111,10 @@ def read_source_pieces(
     pieces: list[SourcePiece] = []
     for start in range(0, len(times), _READ_BATCH):
         batch = np.asarray(times[start : start + _READ_BATCH])
-        positions = np.asarray(index.oindex[batch, y_slice, x_slice]).astype(np.int32)
+        positions = np.asarray(index.oindex[batch, *window]).astype(np.int32)
         np.negative(positions, out=positions, where=~valid[start : start + len(batch)])
         pieces.extend(
-            SourcePiece(int(t), rows, cols, _PIECE_CODEC.encode(np.ascontiguousarray(plane)))
+            SourcePiece(int(t), *at, _PIECE_CODEC.encode(np.ascontiguousarray(plane)))
             for t, plane in zip(batch, positions, strict=True)
             if plane.any()
         )
@@ -190,6 +188,18 @@ class SourcePlanes:
             rank[present] = np.arange(1, len(present) + 1, dtype=np.int8)
             plane = np.where(full < 0, -rank[magnitude], rank[magnitude])
             yield ShardDate(time, plane, [int(p) - 1 for p in present], int(np.count_nonzero(full > 0)))
+
+
+def staging_kwargs(planes: SourcePlanes, scales: np.ndarray, *, holes: bool) -> dict[str, Any]:
+    """The staging writer's keyword arguments for a shard's planes; none when its mosaics carry no index.
+
+    A holes update records the pixels it EMBEDDED, not the holes it was asked to fill: ``scales`` is
+    NaN wherever no embedding was written, so it is that mask. A reader then takes exactly these
+    pixels from the update and the rest from the run before it.
+    """
+    if not planes:
+        return {}
+    return {"planes": planes, "pixels": ~np.isnan(scales) if holes else None}
 
 
 def stage_planes(group: zarr.Group, planes: SourcePlanes, pixels: np.ndarray | None) -> dict[str, Any]:

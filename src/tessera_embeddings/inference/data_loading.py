@@ -659,7 +659,7 @@ def load_s2_mask_bundle(
     # over every date before the prune: a date the model rejects everywhere, a fully cloudy one,
     # still records which granule it rejected.
     source_pieces = read_source_pieces(
-        root, window_indices, y_slice, x_slice, mask_full, rows=slice(0, chunk.height), cols=slice(0, chunk.width)
+        root, window_indices, (y_slice, x_slice), mask_full, (slice(0, chunk.height), slice(0, chunk.width))
     )
 
     # Prune timesteps with no valid pixel anywhere in the chunk — the v1.1 per-pixel resampler
@@ -846,14 +846,9 @@ def _load_sar_orbit(
     y_slice = _resolve_slice(chunk.y_start, chunk.y_stop, y_sub)
     x_slice = slice(chunk.x_start, chunk.x_stop)
     bands, kept = _load_sar_bands_from_zarr(root, window_indices, y_slice, x_slice)
+    rows = y_sub if y_sub is not None else slice(0, chunk.height)
     pieces = read_source_pieces(
-        root,
-        window_indices[kept],
-        y_slice,
-        x_slice,
-        np.any(bands != 0, axis=-1),
-        rows=y_sub if y_sub is not None else slice(0, chunk.height),
-        cols=slice(0, chunk.width),
+        root, window_indices[kept], (y_slice, x_slice), np.any(bands != 0, axis=-1), (rows, slice(0, chunk.width))
     )
     return bands, doys_full[kept], months_full[kept], pieces
 

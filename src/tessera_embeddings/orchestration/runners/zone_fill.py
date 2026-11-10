@@ -74,7 +74,12 @@ from tessera_embeddings.inference.assembly import (
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, enumerate_chunks
 from tessera_embeddings.inference.data_loading import _active_orbits
-from tessera_embeddings.inference.provenance_publish import ProvenanceCheckError, publish_provenance
+from tessera_embeddings.inference.provenance_publish import (
+    ProvenanceAccess,
+    ProvenanceCheckError,
+    ProvenanceRun,
+    publish_provenance,
+)
 from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.ingest.land_mask import narrow_tile_live
 from tessera_embeddings.storage.campaign import mark_zone_year_empty, pin_tag, tag_zone_year, zone_year_tag
@@ -452,19 +457,25 @@ def _merge_registry_master(
     log.info("Zone %s year %d: registry master merged", zone, year)
 
 
+@dataclass(frozen=True)
+class _ProvenanceCell:
+    """Where one cell's provenance record goes, and how its stores are reached."""
+
+    store_path: str
+    staging_base: str | None
+    registry_root: str | None
+    zone: str
+    year: int
+    run_id: str
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None
+    s3_region: str | None
+
+
 def _publish_provenance(
-    *,
-    store_path: str,
-    staging_base: str | None,
-    registry_root: str | None,
-    zone: str,
-    year: int,
-    run_id: str,
+    cell: _ProvenanceCell,
     embedded: Collection[str],
     refused: Collection[str],
     mosaic_snapshots: Mapping[str, str] | None,
-    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None,
-    s3_region: str | None,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
 ) -> None:
     """Publish the run's provenance record beside the registry. Raises, so the cell is not tagged.
@@ -475,49 +486,35 @@ def _publish_provenance(
     are retried as store writes are; a failed check is not, since it would fail the same way.
     Nothing is published without a registry, or when the mosaics carry no record.
     """
-    if not registry_root or not staging_base or not mosaic_snapshots:
+    if not cell.registry_root or not cell.staging_base or not mosaic_snapshots:
         return
-    store_credentials = _store_credentials(store_path, get_credentials)
-    session = open_global_repo(store_path, get_credentials=store_credentials, region=s3_region).readonly_session(
-        branch="main"
+    store_credentials = _store_credentials(cell.store_path, cell.get_credentials)
+    repo = open_global_repo(cell.store_path, get_credentials=store_credentials, region=cell.s3_region)
+    group = cast(zarr.Group, zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[cell.zone])
+    emb = cast(zarr.Array, group["embeddings"])
+    run = ProvenanceRun(
+        staging_base=cell.staging_base,
+        registry_root=cell.registry_root,
+        zone=cell.zone,
+        year=cell.year,
+        run_id=cell.run_id,
+        embedded=sorted(embedded),
+        refused=sorted(refused),
+        mosaic_snapshots=mosaic_snapshots,
+        grid_shape=(int(emb.shape[1]), int(emb.shape[2])),
+        shard_px=shard_pitch(emb),
     )
-    emb = cast(zarr.Array, cast(zarr.Group, zarr.open_group(session.store, mode="r")[zone])["embeddings"])
+    access = ProvenanceAccess(cell.get_credentials, store_credentials, cell.s3_region)
     retrying = store_write_retrying(log).copy(
         retry=retry_if_not_exception_type((*CONCURRENT_WRITER_ERRORS, ProvenanceCheckError))
     )
     for attempt in retrying:
         with attempt:
-            publish_provenance(
-                staging_base=staging_base,
-                registry_root=registry_root,
-                zone=zone,
-                year=year,
-                run_id=run_id,
-                embedded=sorted(embedded),
-                refused=sorted(refused),
-                mosaic_snapshots=mosaic_snapshots,
-                grid_shape=(int(emb.shape[1]), int(emb.shape[2])),
-                shard_px=shard_pitch(emb),
-                mosaic_credentials=get_credentials,
-                registry_credentials=store_credentials,
-                s3_region=s3_region,
-                log=log,
-            )
+            publish_provenance(run, access, log)
 
 
 def _republish_provenance(
-    *,
-    store_path: str,
-    staging_base: str | None,
-    registry_root: str | None,
-    zone: str,
-    year: int,
-    run_id: str,
-    mosaic_base: str,
-    s1_orbit: str,
-    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None,
-    s3_region: str | None,
-    log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+    cell: _ProvenanceCell, mosaic_base: str, s1_orbit: str, log: logging.Logger | logging.LoggerAdapter[logging.Logger]
 ) -> None:
     """Publish again for a run that landed but whose cell was not finished, from its staging.
 
@@ -525,26 +522,16 @@ def _republish_provenance(
     embedded and which it refused. A run with nothing staged under this id landed under other inputs
     and has nothing of its own to describe.
     """
-    if not registry_root or not staging_base:
+    if not cell.registry_root or not cell.staging_base:
         return
-    listing = ZarrWriter(staging_base)._list_staged(run_id)
+    listing = ZarrWriter(cell.staging_base)._list_staged(cell.run_id)
     if not listing.complete and not listing.skipped:
-        log.warning("Zone %s year %d: no staging for run %s, so no provenance to republish", zone, year, run_id)
+        log.warning(
+            "Zone %s year %d: no staging for run %s, so no provenance to republish", cell.zone, cell.year, cell.run_id
+        )
         return
-    _publish_provenance(
-        store_path=store_path,
-        staging_base=staging_base,
-        registry_root=registry_root,
-        zone=zone,
-        year=year,
-        run_id=run_id,
-        embedded=listing.complete,
-        refused=listing.skipped,
-        mosaic_snapshots=mosaic_snapshots(mosaic_base, s1_orbit, get_credentials=get_credentials, s3_region=s3_region),
-        get_credentials=get_credentials,
-        s3_region=s3_region,
-        log=log,
-    )
+    snapshots = mosaic_snapshots(mosaic_base, s1_orbit, get_credentials=cell.get_credentials, s3_region=cell.s3_region)
+    _publish_provenance(cell, listing.complete, listing.skipped, snapshots, log)
 
 
 # jscpd:ignore-start: Args shared with assemble_zone_year
@@ -960,6 +947,7 @@ def plan_zone_inference(
     # retention holds; see mark_zone_year_empty's attribution note) instead of re-inferring.
     # Zone-year tags are write-once forever — icechunk forbids tag-name reuse even after
     # deletion — so deliberate refills need a fresh tag name.
+    cell = _ProvenanceCell(store_path, staging_base, registry_root, zone, year, run_id, get_credentials, s3_region)
     if update is not None:
         check_radar_policy(update, allow_s2_only=config.allow_s2_only)
         state = update_state(node, year, update.name)
@@ -970,19 +958,7 @@ def plan_zone_inference(
             )
         if state == "done":
             log.info("Zone %s year %d: update %s already recorded — nothing to do", zone, year, update.name)
-            _republish_provenance(
-                store_path=store_path,
-                staging_base=staging_base,
-                registry_root=registry_root,
-                zone=zone,
-                year=year,
-                run_id=run_id,
-                mosaic_base=mosaic_base,
-                s1_orbit=config.s1_orbit,
-                get_credentials=get_credentials,
-                s3_region=s3_region,
-                log=log,
-            )
+            _republish_provenance(cell, mosaic_base, config.s1_orbit, log)
             _merge_registry_master(
                 registry_root,
                 store_path,
@@ -1008,19 +984,7 @@ def plan_zone_inference(
             tag,
             log,
             # Publication fails a cell before its tag, so an untagged landed cell may lack its record.
-            before_tag=lambda: _republish_provenance(
-                store_path=store_path,
-                staging_base=staging_base,
-                registry_root=registry_root,
-                zone=zone,
-                year=year,
-                run_id=run_id,
-                mosaic_base=mosaic_base,
-                s1_orbit=config.s1_orbit,
-                get_credentials=get_credentials,
-                s3_region=s3_region,
-                log=log,
-            ),
+            before_tag=lambda: _republish_provenance(cell, mosaic_base, config.s1_orbit, log),
         )
         _merge_registry_master(
             registry_root, store_path, zone, year, None, get_credentials=get_credentials, s3_region=s3_region, log=log
@@ -1368,6 +1332,7 @@ def assemble_zone_year(
     if handoff.done is not None:
         return handoff.done
     zone, year, run_id, t0 = handoff.zone, handoff.year, handoff.run_id, handoff.t0
+    cell = _ProvenanceCell(store_path, staging_base, registry_root, zone, year, run_id, get_credentials, s3_region)
     summary, live, results = handoff.summary, handoff.live, handoff.results
     writer = ZarrWriter(staging_base)
 
@@ -1446,20 +1411,7 @@ def assemble_zone_year(
                 fault=fault,
                 input_coverage=input_coverage,
             )
-            _publish_provenance(
-                store_path=store_path,
-                staging_base=staging_base,
-                registry_root=registry_root,
-                zone=zone,
-                year=year,
-                run_id=run_id,
-                embedded=[],
-                refused=[c.label for c in live],
-                mosaic_snapshots=handoff.mosaic_snapshots,
-                get_credentials=get_credentials,
-                s3_region=s3_region,
-                log=log,
-            )
+            _publish_provenance(cell, [], [c.label for c in live], handoff.mosaic_snapshots, log)
             # Before the tag, not after it: a deliberate refill FAILS at the tag step by design,
             # once its data and part have landed, and the master must still learn of it.
             _merge_registry_master(
@@ -1561,20 +1513,7 @@ def assemble_zone_year(
         fault=fault,
         input_coverage=input_coverage,
     )
-    _publish_provenance(
-        store_path=store_path,
-        staging_base=staging_base,
-        registry_root=registry_root,
-        zone=zone,
-        year=year,
-        run_id=run_id,
-        embedded=staged_labels,
-        refused=skipped_labels,
-        mosaic_snapshots=handoff.mosaic_snapshots,
-        get_credentials=get_credentials,
-        s3_region=s3_region,
-        log=log,
-    )
+    _publish_provenance(cell, staged_labels, skipped_labels, handoff.mosaic_snapshots, log)
     # Before the tag, as on the all-refused branch: a deliberate refill fails at the tag step.
     _merge_registry_master(
         registry_root, store_path, zone, year, run_id, get_credentials=get_credentials, s3_region=s3_region, log=log
@@ -1626,6 +1565,9 @@ def _assemble_update(
     """
     update = cast(UpdateTarget, handoff.update)
     zone, year, run_id, live, results = handoff.zone, handoff.year, handoff.run_id, handoff.live, handoff.results
+    cell = _ProvenanceCell(
+        store_path, writer.staging_base, registry_root, zone, year, run_id, get_credentials, s3_region
+    )
     staged = writer.verify_staged_completeness(run_id, live, log=log)
     skipped = sorted({c.label for c in live} - staged)
     cleared = skipped if update.on_skip == "clear" else []
@@ -1678,20 +1620,7 @@ def _assemble_update(
             input_coverage=input_coverage,
         )
         # The update's own record: its shards' dates and planes, cut to the pixels it wrote.
-        _publish_provenance(
-            store_path=store_path,
-            staging_base=writer.staging_base,
-            registry_root=registry_root,
-            zone=zone,
-            year=year,
-            run_id=run_id,
-            embedded=staged,
-            refused=skipped,
-            mosaic_snapshots=handoff.mosaic_snapshots,
-            get_credentials=get_credentials,
-            s3_region=s3_region,
-            log=log,
-        )
+        _publish_provenance(cell, staged, skipped, handoff.mosaic_snapshots, log)
         if merged and registry_root:
             _publish_merged_rows(
                 writer,

@@ -46,7 +46,7 @@ from tessera_embeddings.inference.data_loading import (
     make_store_opener,
 )
 from tessera_embeddings.inference.progress import chunk_uid
-from tessera_embeddings.inference.provenance import SourcePlanes
+from tessera_embeddings.inference.provenance import SourcePlanes, staging_kwargs
 from tessera_embeddings.inference.read_plan import _chunk_read_plan
 from tessera_embeddings.inference.resource_monitor import ResourceMonitor
 from tessera_embeddings.storage.conventions import checkpoint_stem
@@ -945,9 +945,6 @@ class InferenceActor:
             # mosaics carry a source index (``inference/provenance.py``).
             planes = SourcePlanes(chunk.height, chunk.width)
             planes.add("s2", mask_bundle.source_pieces)
-            # Passed to the writer only when there is something to stage, so a run whose mosaics carry
-            # no index writes exactly what it always has.
-            staged_planes: dict[str, Any] = {}
             logger.info("Chunk %s: T_kept=%d -> strip_h=%d -> %d strip(s)", chunk.label, t_kept, strip_h, len(strips))
             del prologue
 
@@ -1095,11 +1092,9 @@ class InferenceActor:
             finally:
                 pool.shutdown(wait=False, cancel_futures=True)
 
-            if planes:
-                # A holes update records the pixels it EMBEDDED, not the holes it was asked to fill:
-                # `scales` is NaN wherever no embedding was written, so it is that mask. A reader then
-                # takes exactly these pixels from the update and the rest from the run before it.
-                staged_planes = {"planes": planes, "pixels": None if chunk.pixels is None else ~np.isnan(scales)}
+            # Passed to the writer only when there is something to stage, so a run whose mosaics carry
+            # no index writes exactly what it always has.
+            staged_planes = staging_kwargs(planes, scales, holes=chunk.pixels is not None)
 
             # All strips done: the last strip's inputs and the full-chunk SCL mask are no longer needed (obs counts
             # and embeddings already live in the whole-chunk output buffers). Freed before the S3 write so peak RAM

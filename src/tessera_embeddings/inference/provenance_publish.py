@@ -25,6 +25,7 @@ import json
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Any, cast
 
 import icechunk
@@ -84,46 +85,75 @@ class ProvenanceCheckError(RuntimeError):
     """The record disagrees with itself or with the mosaics; the zone-year must not be tagged."""
 
 
-def publish_provenance(
-    *,
-    staging_base: str,
-    registry_root: str,
-    zone: str,
-    year: int,
-    run_id: str,
-    embedded: Sequence[str],
-    refused: Sequence[str],
-    mosaic_snapshots: Mapping[str, str],
-    grid_shape: tuple[int, int],
-    shard_px: int,
-    mosaic_credentials: _Creds = None,
-    registry_credentials: _Creds = None,
-    s3_region: str | None = None,
-    log: logging.Logger | logging.LoggerAdapter[logging.Logger] = logger,
-) -> dict[str, Any] | None:
-    """Publish ``run_id``'s record for one zone-year; ``None`` when its mosaics carry none.
+@dataclass(frozen=True)
+class ProvenanceRun:
+    """One run's record to publish for one zone-year: whose it is, what it evaluated and what it read.
 
     ``embedded`` and ``refused`` partition the live shards the run evaluated, as the registry part
     does. ``mosaic_snapshots`` maps each mosaic store the run read to the snapshot the plan sampled,
     so the export describes exactly what the model read. ``grid_shape`` and ``shard_px`` are the
-    zone group's. The mosaics and the registry may sit in different buckets, hence two credentials.
+    zone group's.
+    """
+
+    staging_base: str
+    registry_root: str
+    zone: str
+    year: int
+    run_id: str
+    embedded: Sequence[str]
+    refused: Sequence[str]
+    mosaic_snapshots: Mapping[str, str]
+    grid_shape: tuple[int, int]
+    shard_px: int
+
+
+@dataclass(frozen=True)
+class ProvenanceAccess:
+    """Credentials for the mosaics and for the registry, which may sit in different buckets, and the region."""
+
+    mosaic_credentials: _Creds = None
+    registry_credentials: _Creds = None
+    s3_region: str | None = None
+
+
+@dataclass(frozen=True)
+class _Copy:
+    """What copying any one shard's staged planes needs from its run: the target, the mosaics' days and lists."""
+
+    run: ProvenanceRun
+    run_group: zarr.Group
+    axes: Mapping[str, Sequence[Any]]
+    counts: Mapping[str, Sequence[int]]
+    pins: Mapping[str, str]
+
+
+def publish_provenance(
+    run: ProvenanceRun,
+    access: ProvenanceAccess | None = None,
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger] = logger,
+) -> dict[str, Any] | None:
+    """Publish ``run``'s record; ``None`` when its mosaics carry none.
 
     Raises:
         ProvenanceCheckError: the record fails a publication check, or the mosaics disagree about whether
             they carry one.
     """
-    mosaics = _provenance_mosaics(mosaic_snapshots, mosaic_credentials, s3_region)
+    access = access or ProvenanceAccess()
+    zone, year, run_id, registry_root = run.zone, run.year, run.run_id, run.registry_root
+    mosaics = _provenance_mosaics(run.mosaic_snapshots, access.mosaic_credentials, access.s3_region)
     if mosaics is None:
         return None
     axes = {sensor: days_of(read_array(root, "time")) for sensor, root in mosaics.items()}
     counts = {sensor: _granule_counts(sensor, root) for sensor, root in mosaics.items()}
-    fs = _fs_for(registry_root, plain_zarr_storage_options(registry_root, registry_credentials, s3_region))
+    fs = _fs_for(
+        registry_root, plain_zarr_storage_options(registry_root, access.registry_credentials, access.s3_region)
+    )
 
     def _open_output(uri: str) -> Any:  # noqa: ANN401 — an fsspec file
         fs.makedirs(uri.rsplit("/", 1)[0], exist_ok=True)
         return fs.open(uri, "wb")
 
-    pins = _pins(mosaic_snapshots)
+    pins = _pins(run.mosaic_snapshots)
     metadata = {"zone": zone, "year": str(year), "run_id": run_id, **{f"snapshot_{s}": p for s, p in pins.items()}}
 
     granules = sum(
@@ -143,25 +173,25 @@ def publish_provenance(
         for sensor, root in mosaics.items()
     )
 
-    shards = _staged_shards(staging_base, run_id, embedded, refused)
+    shards = _staged_shards(run.staging_base, run_id, run.embedded, run.refused)
     unrecorded = sorted(label for label, staged in shards.items() if staged is None)
-    if missing := sorted(set(unrecorded) & set(embedded)):
+    if missing := sorted(set(unrecorded) & set(run.embedded)):
         raise ProvenanceCheckError(f"{zone}/{year} run {run_id}: embedded shard(s) staged no provenance: {missing}")
 
     repo, _ = open_or_create_repo(
-        pixel_sources_uri(registry_root), get_credentials=registry_credentials, region=s3_region
+        pixel_sources_uri(registry_root), get_credentials=access.registry_credentials, region=access.s3_region
     )
     _ensure_group(repo, f"{zone}/{year}")
     session = repo.writable_session("main")
     run_group = zarr.open_group(session.store, path=pixel_sources_group(zone, year, run_id), mode="w")
     run_group.attrs.update(
-        {"zone": zone, "year": year, "run_id": run_id, "grid_shape": list(grid_shape), "shard_px": shard_px}
+        {"zone": zone, "year": year, "run_id": run_id, "grid_shape": list(run.grid_shape), "shard_px": run.shard_px}
     )
     for sensor, days in axes.items():
         run_group.create_array(
             sensor,
-            shape=(len(days), *grid_shape),
-            chunks=(1, shard_px, shard_px),
+            shape=(len(days), *run.grid_shape),
+            chunks=(1, run.shard_px, run.shard_px),
             dtype=np.int8,
             fill_value=0,
             compressors=PLANE_COMPRESSORS,
@@ -171,12 +201,11 @@ def publish_provenance(
         date[:] = read_array(mosaics[sensor], "time").astype("datetime64[ns]").astype("int64")
         date.attrs.update(TIME_ENCODING)
 
+    target = _Copy(run, run_group, axes, counts, pins)
+
     def _copy(label: str) -> list[dict[str, Any]]:
         staged = shards[label]
-        if staged is None:
-            return []
-        group, embedded_px = staged
-        return _copy_shard(label, group, run_group, mosaics, axes, counts, pins, embedded_px, shard_px, run_id)
+        return [] if staged is None else _copy_shard(target, label, *staged)
 
     with ThreadPoolExecutor(max_workers=_COPY_WORKERS) as pool:
         rows = [row for shard_rows in pool.map(_copy, sorted(shards)) for row in shard_rows]
@@ -189,7 +218,7 @@ def publish_provenance(
         open_output=_open_output,
         metadata=metadata | {"unrecorded_tiles": ",".join(unrecorded)},
     )
-    holes = _publish_update_pixels(shards, registry_root, zone, year, run_id, registry_credentials, s3_region)
+    holes = _publish_update_pixels(shards, run, access)
     summary = {"granules": granules, "shard_dates": shard_dates, "shards": len(shards), "unrecorded": unrecorded}
     log.info(
         "Provenance %s/%d run %s: %d granule row(s), %d shard-date row(s) over %d shard(s), %d holes mask(s)%s",
@@ -229,7 +258,7 @@ def _publish_granules(
         if [tuple(r[k] for k in key) for r in have] != [tuple(r[k] for k in key) for r in rows]:
             raise ProvenanceCheckError(f"{uri}: already published with granule lists other than its snapshot's")
         return len(rows)
-    return write_table(uri, rows, granules_schema(), open_output=open_output, metadata=metadata, geometry=True)
+    return write_table(uri, rows, granules_schema(), open_output=open_output, metadata=metadata)
 
 
 def _sensor_of(path: str) -> str:
@@ -304,59 +333,43 @@ def _staged_shards(
     }
 
 
-def _copy_shard(
-    label: str,
-    group: zarr.Group,
-    run_group: zarr.Group,
-    mosaics: Mapping[str, zarr.Group],
-    axes: Mapping[str, Sequence[Any]],
-    counts: Mapping[str, Sequence[int]],
-    pins: Mapping[str, str],
-    embedded_px: int,
-    shard_px: int,
-    run_id: str,
-) -> list[dict[str, Any]]:
+def _copy_shard(copy: _Copy, label: str, group: zarr.Group, embedded_px: int) -> list[dict[str, Any]]:
     """Copy one shard's staged planes into the run's group, checking them; return its rows."""
     row, col = parse_chunk_label(label)
-    ys, xs = slice(row * shard_px, (row + 1) * shard_px), slice(col * shard_px, (col + 1) * shard_px)
+    px = copy.run.shard_px
     summary = cast(dict[str, Any], provenance_summary(dict(group.attrs)))
-    if missing := sorted(set(mosaics) - set(summary)):
+    if missing := sorted(set(copy.counts) - set(summary)):
         raise ProvenanceCheckError(f"{label}: no staged record for {missing}, whose mosaics carry one")
     rows: list[dict[str, Any]] = []
     for sensor in sorted(summary):
         times, planes = cast("tuple[np.ndarray, zarr.Array]", staged_planes(group, sensor))
-        target = cast(zarr.Array, run_group[sensor])
-        h, w = planes.shape[1:]
-        record = summary[sensor]
+        target, counts, record = cast(zarr.Array, copy.run_group[sensor]), copy.counts[sensor], summary[sensor]
+        window = (slice(row * px, row * px + planes.shape[1]), slice(col * px, col * px + planes.shape[2]))
         for start in range(0, len(times), _COPY_BATCH):
             batch = np.asarray(planes[start : start + _COPY_BATCH])
             for i, plane in enumerate(batch, start):
-                _check_plane(label, sensor, int(times[i]), plane, record, i, counts[sensor])
-            target.oindex[
-                times[start : start + len(batch)], slice(ys.start, ys.start + h), slice(xs.start, xs.start + w)
-            ] = batch
-        rows += shard_date_rows(run_id, label, sensor, pins[sensor], record, axes[sensor], embedded_px)
+                where, time = f"{label} {sensor} slot {times[i]}", int(times[i])
+                if time >= len(counts):
+                    raise ProvenanceCheckError(f"{where}: no such slot on the mosaic's time axis ({len(counts)} slots)")
+                _check_plane(where, plane, record["sources"][i], record["valid_px"][i], counts[time])
+            target.oindex[(times[start : start + len(batch)], *window)] = batch
+        ids = {"run_id": copy.run.run_id, "tile": label, "sensor": sensor, "snapshot_id": copy.pins[sensor]}
+        rows += shard_date_rows(ids, record, copy.axes[sensor], embedded_px)
     return rows
 
 
-def _check_plane(
-    label: str, sensor: str, time: int, plane: np.ndarray, record: Mapping[str, Any], i: int, counts: Sequence[int]
-) -> None:
+def _check_plane(where: str, plane: np.ndarray, sources: Sequence[int], valid: int, fused: int) -> None:
     """A plane's positive count is its row's ``valid_px``, its values rank its ``sources``, and they exist.
 
-    ``counts`` are the fused granules of each day of the snapshot the row names, which its
-    ``granules`` file holds, so a source below the count is a fused granule of that day in that file.
+    ``fused`` is how many granules the snapshot the row names fused that day, which its ``granules``
+    file holds, so a source below it is a fused granule of that day in that file.
     """
-    sources, valid = record["sources"][i], record["valid_px"][i]
-    where = f"{label} {sensor} slot {time}"
-    if time >= len(counts):
-        raise ProvenanceCheckError(f"{where}: no such slot on the mosaic's time axis ({len(counts)} slots)")
     if (positive := int(np.count_nonzero(plane > 0))) != valid:
         raise ProvenanceCheckError(f"{where}: plane has {positive} valid pixels, its row says {valid}")
     if np.unique(np.abs(plane[plane != 0])).tolist() != list(range(1, len(sources) + 1)):
         raise ProvenanceCheckError(f"{where}: plane values do not rank its {len(sources)} source(s)")
-    if sources and max(sources) >= counts[time]:
-        raise ProvenanceCheckError(f"{where}: source {max(sources)} beyond the day's {counts[time]} granule(s)")
+    if sources and max(sources) >= fused:
+        raise ProvenanceCheckError(f"{where}: source {max(sources)} beyond the day's {fused} granule(s)")
 
 
 def _ensure_group(repo: icechunk.Repository, path: str, tries: int = 8) -> None:
@@ -381,13 +394,7 @@ def _ensure_group(repo: icechunk.Repository, path: str, tries: int = 8) -> None:
 
 
 def _publish_update_pixels(
-    shards: Mapping[str, tuple[zarr.Group, int] | None],
-    registry_root: str,
-    zone: str,
-    year: int,
-    run_id: str,
-    get_credentials: _Creds,
-    s3_region: str | None,
+    shards: Mapping[str, tuple[zarr.Group, int] | None], run: ProvenanceRun, access: ProvenanceAccess
 ) -> int:
     """A holes update's per-shard masks of the pixels it embedded, one boolean array per shard.
 
@@ -409,9 +416,10 @@ def _publish_update_pixels(
             planes = staged_planes(group, sensor)
             if planes is not None and any(np.asarray(planes[1][i])[~mask].any() for i in range(planes[1].shape[0])):
                 raise ProvenanceCheckError(f"{label} {sensor}: a plane names a pixel the update did not embed")
-    uri = update_pixels_uri(registry_root, zone, year, run_id)
-    out = zarr.open_group(uri, mode="w", storage_options=plain_zarr_storage_options(uri, get_credentials, s3_region))
-    out.attrs.update({"zone": zone, "year": year, "run_id": run_id})
+    uri = update_pixels_uri(run.registry_root, run.zone, run.year, run.run_id)
+    options = plain_zarr_storage_options(uri, access.registry_credentials, access.s3_region)
+    out = zarr.open_group(uri, mode="w", storage_options=options)
+    out.attrs.update({"zone": run.zone, "year": run.year, "run_id": run.run_id})
     for label, mask in masks.items():
         out.create_array(label, shape=mask.shape, chunks=mask.shape, dtype=bool)[:] = mask
     return len(masks)
