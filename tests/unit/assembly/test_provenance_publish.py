@@ -3,7 +3,7 @@
 Built on the real pieces end to end, on local stores: mosaics written by the ingest's own writer
 with the switch on, shards staged by the real staging writer from pieces read off those mosaics, and
 publication reading both. A 2 x 2 grid of 4-pixel shards, three sensors, two dates each; the
-optical lists also name a copy the ingest dropped.
+optical lists also name a copy the ingest dropped, and a day it skipped whole.
 """
 
 from __future__ import annotations
@@ -34,11 +34,18 @@ from tessera_embeddings.storage.provenance import (
     shard_dates_uri,
     update_pixels_uri,
 )
-from tessera_embeddings.storage.zarr_store import open_repo, open_store_as_zarr_group, write_days_windows
+from tessera_embeddings.storage.zarr_store import (
+    open_repo,
+    open_store_as_zarr_group,
+    record_skipped_days,
+    write_days_windows,
+)
 from tests.unit.inference_stack import STACK
 
 SIZE, SHARD = 8, 4
 DATES = ["2024-06-01", "2024-06-13"]
+#: A day the optical ingest skipped whole, so off the time axis.
+SKIPPED = "2024-06-07"
 STORES = {"reflectance": "s2", "sar_ascending": "s1_asc", "sar_descending": "s1_desc"}
 ZONE, YEAR, RUN, UPDATE = "33N", 2024, "33N-2024-abcd1234", "33N-2024-holes123"
 
@@ -97,6 +104,10 @@ def _mosaics(base: Path, *, on: bool = True, seed: int = 0) -> dict[str, str]:
             chunks={"time": 1, "northing": SHARD, "easting": SHARD},
             granules=[json.dumps(_granule_list(sensor, d)) for d in DATES] if on else None,
         )
+        if on and sensor == "s2":
+            record_skipped_days(
+                path, {SKIPPED: json.dumps([_granule(sensor, SKIPPED, 0) | {"status": "low_coverage"}])}
+            )
         pins[path] = open_repo(path).lookup_branch("main")
     return pins
 
@@ -207,10 +218,10 @@ def _shard_dates(tmp_path: Path, run: str = RUN):
 def test_granules_list_each_snapshots_granules_in_fusion_order(published) -> None:
     tmp_path, pins, summary = published
     tables = {sensor: pq.read_table(_granules_uri(tmp_path, pins, sensor)) for sensor in STORES.values()}
-    assert summary["granules"] == sum(t.num_rows for t in tables.values()) == 3 * len(DATES) * 2 + len(DATES)
+    assert summary["granules"] == sum(t.num_rows for t in tables.values()) == 3 * len(DATES) * 2 + len(DATES) + 1
     rows = tables["s2"].to_pylist()
     dropped = [(r["granule_id"], r["fusion_order"], r["status"]) for r in rows if r["status"] != "fused"]
-    assert dropped == [(f"s2-{d}-9", None, "duplicate") for d in DATES]
+    assert dropped == [(f"s2-{d}-9", None, "duplicate") for d in DATES] + [(f"s2-{SKIPPED}-0", None, "low_coverage")]
     first = next(r for r in rows if r["fusion_order"] == 1)
     assert (str(first["solar_day"]), first["granule_id"]) == ("2024-06-01", "s2-2024-06-01-1")
     assert first["snapshot_id"] == pins[str(tmp_path / "mosaics" / "reflectance.zarr")]
