@@ -707,7 +707,9 @@ def ingest_s1_roi_sar(
 
         # Wrap the provider to keep the items odc was given. Wrapping rather than querying twice
         # matters: these must be the SAME objects odc grouped, after any timestamp normalisation,
-        # or the footprints would describe a different set of acquisitions.
+        # or the footprints would describe a different set of acquisitions. The granules it sets
+        # aside, missing a polarisation, are kept apart for the granule list.
+        dropped_items: list = []
         base_provider = make_s1_item_provider(
             orbit,
             roi.bbox_wgs84,
@@ -716,6 +718,7 @@ def ingest_s1_roi_sar(
             use_s3_direct=use_s3_direct,
             burst_census=burst_census,
             mid_longitude=mid_longitude,
+            dropped=dropped_items,
         )
         seen_items: list = []
 
@@ -783,7 +786,7 @@ def ingest_s1_roi_sar(
             _date_footprints(seen_items),
             # The items the load stamped are the ones it fused, in each day's burst order.
             day_granules(
-                seen_items,
+                [*seen_items, *dropped_items],
                 provider=_RADAR_PROVIDER,
                 collection=_RADAR_COLLECTION,
                 catalog_url=PROVIDERS[_RADAR_PROVIDER].catalog_url,

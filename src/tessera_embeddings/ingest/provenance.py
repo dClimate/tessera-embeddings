@@ -30,7 +30,7 @@ import dask.array as da
 import numpy as np
 import xarray as xr
 
-from tessera_embeddings.config.ingest import DUPLICATE, FUSED, UNREADABLE
+from tessera_embeddings.config.ingest import DROPPED, DUPLICATE, FUSED, UNREADABLE
 from tessera_embeddings.ingest.duplicates import image_identity
 from tessera_embeddings.ingest.opera_query import BURST_ID
 from tessera_embeddings.ingest.solar_days import solar_day_of
@@ -40,9 +40,6 @@ FUSION_POSITION = "tessera:fusion_position"
 
 #: Item property: this copy replaced one that would not read (the duplicate-copy fallback ladder).
 STEPPED_DOWN = "tessera:stepped_down"
-
-#: Item property: why the ingest dropped this copy before the fuse, its granule row's ``status``.
-DROPPED = "tessera:dropped"
 
 #: Bits the packed pixel gives the position. A day's fusion order is zone-wide, so a long land zone
 #: can exceed 255 optical scenes or radar bursts in one day; sixteen bits leave ample room.

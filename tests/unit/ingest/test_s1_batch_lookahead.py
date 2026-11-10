@@ -28,11 +28,13 @@ import numpy as np
 import pytest
 import xarray as xr
 
+from tessera_embeddings.config.ingest import DROPPED, MISSING_BANDS
 from tessera_embeddings.ingest import live_windows as live_windows_mod
 from tessera_embeddings.ingest import s1_roi
 from tessera_embeddings.ingest.live_windows import WINDOW_COST_IN_CHUNKS, WINDOW_COST_IN_CHUNKS_OVERLAPPED
 from tessera_embeddings.ingest.opera_query import BURST_CENSUS_ATTR, BURST_ID
 from tessera_embeddings.ingest.provenance import stamp_fusion_positions
+from tessera_embeddings.ingest.solar_days import normalize_to_solar_day
 
 # Every S1 leg these tests run is kept off disk and network the same way.
 pytestmark = pytest.mark.usefixtures("s1_leg_offline")
@@ -56,12 +58,17 @@ def _fake_client():
     )()
 
 
-def _burst(day: str) -> SimpleNamespace:
-    """One radar granule acquired mid-morning UTC on ``day``, as the provider would hand it over."""
+def _burst(day: str, *, missing_bands: bool = False) -> SimpleNamespace:
+    """One radar granule acquired mid-morning UTC on ``day``, as the provider would hand it over.
+
+    ``missing_bands`` makes it one the provider sets aside, as the catalogue query marks it.
+    """
+    burst = "T001-000002-IW1" if missing_bands else "T001-000001-IW1"
     return SimpleNamespace(
-        id=f"OPERA_L2_RTC-S1_T001-000001-IW1_{day.replace('-', '')}T100000Z_X_S1A_30_v1.0",
+        id=f"OPERA_L2_RTC-S1_{burst}_{day.replace('-', '')}T100000Z_X_S1A_30_v1.0",
         datetime=datetime.fromisoformat(f"{day}T10:00:00+00:00"),
-        properties={"datetime": f"{day}T10:00:00Z", BURST_ID: "T001-000001-IW1"},
+        properties={"datetime": f"{day}T10:00:00Z", BURST_ID: burst}
+        | ({DROPPED: MISSING_BANDS} if missing_bands else {}),
         assets={},
         geometry=None,
         bbox=None,
@@ -128,7 +135,16 @@ def _run_ingest(
     def fake_provider(_orbit, _bbox, query_start, query_end, **kwargs):
         if providers is not None:
             providers.append(kwargs)
-        return lambda: [_burst(d) for d in catalogue if query_start <= d <= query_end]
+        days = [d for d in catalogue if query_start <= d <= query_end]
+
+        def provide() -> list:
+            # Each day also has a granule missing a polarisation, which the provider sets aside,
+            # stamped with its solar day as the real one does.
+            set_aside = [_burst(d, missing_bands=True) for d in days]
+            kwargs["dropped"].extend(normalize_to_solar_day(set_aside, mid_longitude=kwargs["mid_longitude"]))
+            return [_burst(d) for d in days]
+
+        return provide
 
     monkeypatch.setattr(s1_roi, "make_s1_item_provider", fake_provider)
 
@@ -687,7 +703,7 @@ def test_s1_batch_windows_tile_inclusive_range_without_overlap(monkeypatch) -> N
 
 @pytest.mark.parametrize("pipe", _WRITE_PATHS)
 def test_each_written_date_carries_its_own_burst_list(monkeypatch, pipe: bool) -> None:
-    """With the record on, a date's write carries the list of the bursts its load fused."""
+    """With the record on, a date's write lists the bursts its load fused, then those set aside."""
     writes: list = []
     written = _run_ingest(
         monkeypatch,
@@ -699,9 +715,10 @@ def test_each_written_date_carries_its_own_burst_list(monkeypatch, pipe: bool) -
     )
     assert written == ["2024-01-01", "2024-01-02", "2024-01-04"]
     for day, kwargs in zip(written, writes, strict=True):
-        (granule,) = json.loads(kwargs["granules"])
-        assert granule["granule_id"] == _burst(day).id
-        assert (granule["image_key"], granule["platform"]) == ("T001-000001-IW1", "S1A")
+        fused, set_aside = json.loads(kwargs["granules"])
+        assert (fused["granule_id"], fused["status"]) == (_burst(day).id, "fused")
+        assert (fused["image_key"], fused["platform"]) == ("T001-000001-IW1", "S1A")
+        assert (set_aside["granule_id"], set_aside["status"]) == (_burst(day, missing_bands=True).id, "missing_bands")
 
 
 def test_with_the_record_off_no_radar_write_carries_a_list(monkeypatch) -> None:
