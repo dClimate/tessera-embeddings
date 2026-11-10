@@ -194,6 +194,24 @@ def _burst(tmp_path: pathlib.Path, burst: str, *, holed: bool = False) -> Item:
     return item
 
 
+def _ingest_bursts(items: list[Item], **kwargs):
+    """The two bursts' solar day through `ingest_tile`, which sorts on the fusion order and keeps it."""
+    ds, _ = ingest_tile(
+        provider="cmr-asf",
+        collection="opera-rtc-s1",
+        tile_id=None,
+        start_date="2024-06-14",
+        end_date="2024-06-16",
+        bbox=(14.9, 45.0, 15.2, 45.3),
+        geobox=GBOX,
+        chunks=CHUNKS,
+        item_provider_fn=lambda: items,
+        mid_longitude=15.0,
+        **kwargs,
+    )
+    return ds
+
+
 @pytest.mark.parametrize("favoured", [LOW_TRACK, HIGH_TRACK])
 def test_the_most_acquired_burst_wins_a_contested_radar_pixel(tmp_path, favoured) -> None:
     """Swap which burst the census favours and the winner swaps, whatever the supply order or ids.
@@ -207,18 +225,7 @@ def test_the_most_acquired_burst_wins_a_contested_radar_pixel(tmp_path, favoured
         # What the item provider stamps from the window's census.
         item.properties[BURST_ACQUISITIONS] = 31 if item.properties[BURST_ID] == favoured else 29
 
-    ds, _ = ingest_tile(
-        provider="cmr-asf",
-        collection="opera-rtc-s1",
-        tile_id=None,
-        start_date="2024-06-14",
-        end_date="2024-06-16",
-        bbox=(14.9, 45.0, 15.2, 45.3),
-        geobox=GBOX,
-        chunks=CHUNKS,
-        item_provider_fn=lambda: items,
-        mid_longitude=15.0,
-    )
+    ds = _ingest_bursts(items)
 
     assert ds is not None and ds.sizes["time"] == 1, "both bursts must land in ONE solar-day slice"
     np.testing.assert_allclose(ds["0_VV"].compute().values[0], AMPLITUDE[favoured])
@@ -282,20 +289,7 @@ def test_the_radar_source_index_follows_the_burst_order(tmp_path) -> None:
         item.properties[BURST_ACQUISITIONS] = 31 if item.properties[BURST_ID] == LOW_TRACK else 29
 
     def load(source_index: bool):
-        ds, _ = ingest_tile(
-            provider="cmr-asf",
-            collection="opera-rtc-s1",
-            tile_id=None,
-            start_date="2024-06-14",
-            end_date="2024-06-16",
-            bbox=(14.9, 45.0, 15.2, 45.3),
-            geobox=GBOX,
-            chunks=CHUNKS,
-            item_provider_fn=lambda: items,
-            mid_longitude=15.0,
-            post_load_fn=amplitude_to_db,
-            source_index=source_index,
-        )
+        ds = _ingest_bursts(items, post_load_fn=amplitude_to_db, source_index=source_index)
         assert ds is not None
         return ds.compute()
 

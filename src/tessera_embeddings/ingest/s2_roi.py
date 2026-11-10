@@ -46,11 +46,9 @@ import xarray as xr
 
 from tessera_embeddings.config.ingest import (
     AUTO_BATCH_DATES,
-    DUPLICATE,
     INGEST_CHUNK_SIZE,
     INGEST_CHUNKS,
     SOURCE_INDEX_VAR,
-    UNREADABLE,
 )
 from tessera_embeddings.config.providers import PROVIDERS
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
@@ -72,7 +70,7 @@ from tessera_embeddings.ingest.loader_failures import (
     install_capture_everywhere,
     label_objects,
 )
-from tessera_embeddings.ingest.provenance import STEPPED_DOWN, day_granules, mark_dropped
+from tessera_embeddings.ingest.provenance import day_granules, mark_duplicates, mark_stepped_down
 from tessera_embeddings.ingest.roi import (
     read_roi_mask,
     read_roi_metadata,
@@ -948,12 +946,8 @@ def ingest_s2_roi_reflectance(
         log_duplicate_selection(log, roi_label, alternates, kept=items, read_keys=read_keys, items=supplied)
         date_alternates.update(alternates)
         # Scoped to this supply like the ladder, whose preparations all finish inside it.
-        kept = {id(item) for item in items}
         dropped_by_day.clear()
-        for item in supplied:
-            if id(item) not in kept:
-                dropped_by_day.setdefault(item.datetime.strftime("%Y-%m-%d"), []).append(item)
-        mark_dropped((item for day in dropped_by_day.values() for item in day), DUPLICATE)
+        dropped_by_day.update(mark_duplicates(supplied, items))
 
         def _record_skip(prepared: _PreparedDate) -> None:
             """Account for a date that produced nothing, under the reason it actually had.
@@ -1092,13 +1086,7 @@ def ingest_s2_roi_reflectance(
                     return
                 stepped_items, swapped = stepped
                 # Marked for the granule list: the copy that would not read, and the one standing in.
-                previous, current = {id(item) for item in attempt.items}, {id(item) for item in stepped_items}
-                for item in stepped_items:
-                    if id(item) not in previous:
-                        item.properties[STEPPED_DOWN] = True
-                replaced = [item for item in attempt.items if id(item) not in current]
-                mark_dropped(replaced, UNREADABLE)
-                dropped_by_day.setdefault(attempt.date, []).extend(replaced)
+                dropped_by_day.setdefault(attempt.date, []).extend(mark_stepped_down(attempt.items, stepped_items))
                 before = copies_label(attempt.items, only=swapped)
                 after = copies_label(stepped_items, only=swapped)
                 if not tried:
