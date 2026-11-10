@@ -70,7 +70,7 @@ from tessera_embeddings.ingest.loader_failures import (
     install_capture_everywhere,
     label_objects,
 )
-from tessera_embeddings.ingest.provenance import day_granules, mark_duplicates, mark_stepped_down
+from tessera_embeddings.ingest.provenance import SkippedDays, day_granules, mark_duplicates, mark_stepped_down
 from tessera_embeddings.ingest.roi import (
     read_roi_mask,
     read_roi_metadata,
@@ -443,6 +443,13 @@ def ingest_s2_roi_reflectance(
         provenance=provenance,
     )
     catalogue = PROVIDERS[provider]
+    #: Where every granule list says its items came from.
+    source = {
+        "provider": provider,
+        "collection": collection,
+        "catalog_url": catalogue.catalog_url,
+        "collection_id": catalogue.collections[collection].collection_id,
+    }
 
     mid_longitude = solar_grouping_longitude(roi)
 
@@ -514,6 +521,7 @@ def ingest_s2_roi_reflectance(
     #: move the line under decisions already made against it.
     _committed_at_start = get_existing_dates(reflectance_store, s3_region=s3_region)
     last_written_date: str | None = max(_committed_at_start, default=None)
+    skipped = SkippedDays(reflectance_store, source, exists=bool(_committed_at_start), s3_region=s3_region)
 
     # Where the CATALOGUE is searched from. Everything at or below the newest held date is closed
     # for good, so searching back there cannot write anything — and searching is most of what a
@@ -712,7 +720,7 @@ def ingest_s2_roi_reflectance(
             )
         build_s, gate_s = built_at - stage_started, time.monotonic() - built_at
         if not passes:
-            return _PreparedDate(date, None, [], build_s, gate_s, "coverage")
+            return _PreparedDate(date, None, [], build_s, gate_s, "coverage", items=day_items)
 
         # Stamp the slice with its SOLAR DAY. The axis is day-granular either way; taking the
         # value from the grouping rather than from odc's label is what makes it identify the day
@@ -766,17 +774,7 @@ def ingest_s2_roi_reflectance(
 
         # Listed now, from the positions THIS load stamped: a fallback copy re-prepares the date
         # and re-stamps, and its list must describe its own fuse.
-        granules = (
-            day_granules(
-                [*day_items, *dropped_by_day.get(date, ())],
-                provider=provider,
-                collection=collection,
-                catalog_url=catalogue.catalog_url,
-                collection_id=catalogue.collections[collection].collection_id,
-            )[date]
-            if provenance
-            else None
-        )
+        granules = day_granules([*day_items, *dropped_by_day.get(date, ())], **source)[date] if provenance else None
         return _PreparedDate(
             date, day_ds, date_windows, build_s, gate_s, items=day_items, baselines=baselines, granules=granules
         )
@@ -818,6 +816,7 @@ def ingest_s2_roi_reflectance(
                         s3_region=s3_region,
                         granules=prepared.granules,
                     )
+        skipped.written()
         # One line per kept date, partitioning its wall clock into the graph build in the driver,
         # the coverage-gate compute and the write (windows + commit). Stable format: CloudWatch
         # queries and the pipeline analysis key off it. `total` is build+gate+write, the date's
@@ -889,6 +888,7 @@ def ingest_s2_roi_reflectance(
                         s3_region=s3_region,
                         granules=[p.granules for p in batch if p.granules is not None] if provenance else None,
                     )
+        skipped.written()
         # The batch's write is ONE compute, so a per-date write time does not exist as a
         # measurement: this line is the batched counterpart of `Stage timings` and analysis
         # divides by n. build/gate are sums of the real per-date values.
@@ -958,6 +958,9 @@ def ingest_s2_roi_reflectance(
             end-of-run summary, which names the remedy the coverage counter cannot.
             """
             nonlocal total_filtered, total_refused
+            skipped.record(
+                prepared.date, [*prepared.items, *dropped_by_day.get(prepared.date, ())], prepared.skip_reason
+            )
             if prepared.skip_reason != "producer-conflict":
                 total_filtered += 1
                 # A COVERAGE rejection, counted and not otherwise recorded, which is enough: the
@@ -996,6 +999,7 @@ def ingest_s2_roi_reflectance(
             the tiles listed are every tile in the date, of which an unknown few lost pixels. The
             second cannot be acted on the way the first can.
             """
+            skipped.record(prepared.date, [*prepared.items, *dropped_by_day.get(prepared.date, ())], "unreadable")
             all_tiles = sorted({t for it in prepared.items if (t := item_tile(it)) is not None})
             attributed = bool(blamed)
             tiles = sorted({tile for tile, _ in blamed}) if blamed else all_tiles

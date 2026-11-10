@@ -28,7 +28,7 @@ Sentinel-2 reflectance and cloud masks. Four write paths, all committing atomica
 import itertools
 import logging
 import time
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
@@ -52,7 +52,13 @@ from tenacity import (
     wait_random,
 )
 
-from tessera_embeddings.config.ingest import GRANULES_ARRAY, INGEST_COMPRESSORS, mosaic_chunk_layout
+from tessera_embeddings.config.ingest import (
+    GRANULES_ARRAY,
+    INGEST_COMPRESSORS,
+    SKIPPED_DAYS_ARRAY,
+    SKIPPED_GRANULES_ARRAY,
+    mosaic_chunk_layout,
+)
 from tessera_embeddings.config.store_layout import spatial_dims_of
 from tessera_embeddings.errors import CorruptedStoreError, NonMonotonicDateError
 from tessera_embeddings.storage.manifest import MIXED_CODE_IDENTITIES_ATTR, IngestManifest, extract_manifest
@@ -1030,6 +1036,43 @@ indistinguishable. The coverage gate must fail on the second and not on the firs
 Written by the ingest paths themselves rather than by the completion marker, because the
 gate runs BEFORE the marker on a first ingest, and again later from the fill.
 """
+
+
+def record_skipped_days(store_path: str, lists: Mapping[str, str], *, s3_region: str | None = None) -> None:
+    """Commit the granule lists of days the ingest skipped whole, keyed by solar day, in one commit.
+
+    A day already recorded is overwritten, so a retried ingest leaves the list its latest attempt
+    built. The two arrays are created on first use and sit off the time axis, which they never
+    touch (``context_docs/storage/registry-provenance-plan.md`` §3).
+    """
+    repo = open_repo(store_path, region=s3_region)
+    for attempt in store_write_retrying(logger):
+        with attempt:
+            session = repo.writable_session("main")
+            root = zarr.open_group(session.store, mode="a")
+            days, granules = (_skipped_array(root, name) for name in (SKIPPED_DAYS_ARRAY, SKIPPED_GRANULES_ARRAY))
+            held = [str(day) for day in np.asarray(days[:])]
+            for day, listed in sorted(lists.items()):
+                if day not in held:
+                    held.append(day)
+                    days.resize((len(held),))
+                    granules.resize((len(held),))
+                days[held.index(day)], granules[held.index(day)] = day, listed
+            session.commit(f"skipped day(s) {', '.join(sorted(lists))}")
+
+
+def _skipped_array(root: zarr.Group, name: str) -> zarr.Array:
+    """``root[name]``, a one-dimensional string array along ``skipped_day``, created empty if absent."""
+    if name not in root:
+        root.create_array(
+            name,
+            shape=(0,),
+            chunks=(1,),
+            dtype=np.dtypes.StringDType(),
+            fill_value="",
+            dimension_names=("skipped_day",),
+        )
+    return cast(zarr.Array, root[name])
 
 
 def record_assessed_window(
