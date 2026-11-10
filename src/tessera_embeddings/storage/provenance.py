@@ -8,7 +8,7 @@ Everything sits under ``<registry>/provenance/`` (``context_docs/storage/registr
     ├── shard_dates/   zone=<Z>/year=<Y>/<run_id>.parquet   one row per shard, sensor and date a run used
     ├── update_pixels/ zone=<Z>/year=<Y>/<run_id>.zarr      holes updates only: the pixels the run embedded
     └── pixel_sources.icechunk/                          one Icechunk repository, a group per run
-        └── <Z>/<Y>/<run_id>/{s2,s1_asc,s1_desc}         (date, northing, easting) uint8 ranks
+        └── <Z>/<Y>/<run_id>/{s2,s1_asc,s1_desc}         (date, northing, easting) int8 signed ranks
 
 A granule list belongs to the mosaic it was fused into, so ``granules`` is keyed by the mosaic
 snapshot a run read and written once per snapshot; each ``shard_dates`` row names its snapshot, and
@@ -31,6 +31,8 @@ from contextlib import AbstractContextManager
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+
+from tessera_embeddings.config.ingest import FUSED
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -74,11 +76,13 @@ def pixel_sources_group(zone: str, year: int, run_id: str) -> str:
 
 
 def granules_schema() -> pa.Schema:
-    """One row per granule per solar day of one mosaic snapshot, in the day's fusion order (Appendix A).
+    """One row per granule per solar day of one mosaic snapshot (Appendix A).
 
-    ``snapshot_id`` names the mosaic version the lists were read from, the key ``shard_dates`` joins
-    on. ``geometry`` is the footprint as the catalogue published it, WKB in WGS84 (GeoParquet 1.1); the
-    four ``bbox_*`` columns let any Parquet reader filter without decoding it.
+    The fused granules come first, in the day's fusion order; then the copies the ingest dropped
+    before the fuse, with no ``fusion_order`` and their reason as ``status``. ``snapshot_id`` names
+    the mosaic version the lists were read from, the key ``shard_dates`` joins on. ``geometry`` is the
+    footprint as the catalogue published it, WKB in WGS84 (GeoParquet 1.1); the four ``bbox_*``
+    columns let any Parquet reader filter without decoding it.
     """
     import pyarrow as pa
 
@@ -87,8 +91,9 @@ def granules_schema() -> pa.Schema:
             pa.field("snapshot_id", pa.string(), nullable=False),
             pa.field("sensor", pa.string(), nullable=False),
             pa.field("solar_day", pa.date32(), nullable=False),
-            pa.field("fusion_order", pa.int16(), nullable=False),
+            pa.field("fusion_order", pa.int16()),
             pa.field("granule_id", pa.string(), nullable=False),
+            pa.field("status", pa.string(), nullable=False),
             pa.field("image_key", pa.string()),
             pa.field("platform", pa.string()),
             pa.field("acquired_at", pa.timestamp("us", tz="UTC")),
@@ -114,8 +119,9 @@ def shard_dates_schema() -> pa.Schema:
 
     ``tile`` names the shard as the registry does (``chunk_<row>_<col>``). ``snapshot_id`` is the
     mosaic snapshot the run read for this sensor, the key into ``granules``. ``sources`` are the
-    ``fusion_order`` values that supplied at least one of the shard's pixels that date, ascending;
-    a pixel's ``pixel_sources`` value k means ``sources[k - 1]``. ``embedded_px`` is the run's count
+    ``fusion_order`` values that covered at least one of the shard's pixels that date, valid for
+    the model or not, ascending; a pixel's ``pixel_sources`` value k means ``sources[|k| - 1]``.
+    ``valid_px`` counts the pixels whose observation was valid. ``embedded_px`` is the run's count
     for the whole shard, repeated on each of its rows.
     """
     import pyarrow as pa
@@ -139,13 +145,18 @@ def granule_rows(
 ) -> list[dict[str, Any]]:
     """The ``granules`` rows for one mosaic snapshot: one per entry of each slot's JSON list.
 
-    ``days`` is the snapshot's time axis and ``lists`` its ``granules`` array, slot for slot.
+    ``days`` is the snapshot's time axis and ``lists`` its ``granules`` array, slot for slot. A fused
+    entry's ``fusion_order`` is its place among the slot's fused entries; a dropped one has none.
     """
     import shapely
 
     rows: list[dict[str, Any]] = []
     for day, raw in zip(days, lists, strict=True):
-        for order, granule in enumerate(json.loads(raw)):
+        fused = 0
+        for granule in json.loads(raw):
+            status = granule.get("status", FUSED)
+            order = fused if status == FUSED else None
+            fused += status == FUSED
             bbox = granule.get("bbox") or [None] * 4
             geometry = granule.get("geometry")
             rows.append(
@@ -155,6 +166,7 @@ def granule_rows(
                     "solar_day": day,
                     "fusion_order": order,
                     "granule_id": granule["granule_id"],
+                    "status": status,
                     "image_key": granule.get("image_key"),
                     "platform": granule.get("platform"),
                     "acquired_at": _instant(granule.get("acquired_at")),

@@ -39,11 +39,13 @@ from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group, plai
 
 _Creds = Callable[[], icechunk.S3StaticCredentials] | None
 
-#: What a pixel's answer says about each date it was observed on.
+#: What a pixel's answer says about each date a granule had data there: whether the model used it,
+#: and which granule it was.
 PIXEL_COLUMNS = (
     "run_id",
     "sensor",
     "solar_day",
+    "valid",
     "fusion_order",
     "granule_id",
     "platform",
@@ -91,17 +93,19 @@ def day_granules(
     get_credentials: _Creds = None,
     region: str | None = None,
 ) -> pl.DataFrame:
-    """Every granule fused into one sensor's mosaic of ``day``, in fusion order.
+    """Every granule fused into one sensor's mosaic of ``day``, in fusion order, then the copies dropped.
 
-    One list per mosaic snapshot that holds the day, since each run that re-ingests builds its own
-    mosaics; ``run_id`` keeps the list of the snapshot that run read.
+    A dropped copy has no ``fusion_order`` and says why in ``status``: a losing duplicate, or a copy
+    that would not read and was replaced. One list per mosaic snapshot that holds the day, since
+    each run that re-ingests builds its own mosaics; ``run_id`` keeps the list of the snapshot that
+    run read.
     """
     scan = _Scanner(registry_root, zone, year, get_credentials, region)
     rows = scan(GRANULES).filter(pl.col("sensor") == sensor, pl.col("solar_day") == day)
     if run_id is not None:
         read = scan(SHARD_DATES).filter(pl.col("run_id") == run_id, pl.col("sensor") == sensor).select("snapshot_id")
         rows = rows.join(read.unique(), on="snapshot_id", how="semi")
-    return rows.sort("snapshot_id", "fusion_order").collect()
+    return rows.sort("snapshot_id", "fusion_order", "granule_id", nulls_last=True).collect()
 
 
 def shard_granules(
@@ -114,7 +118,7 @@ def shard_granules(
     get_credentials: _Creds = None,
     region: str | None = None,
 ) -> pl.DataFrame:
-    """Per sensor and date ``run_id`` used in shard ``tile``: its valid pixels, and each granule that supplied any."""
+    """Per sensor and date ``run_id`` used in shard ``tile``: its valid pixels, and each granule that covered any."""
     scan = _Scanner(registry_root, zone, year, get_credentials, region)
     return (
         scan(SHARD_DATES)
@@ -136,7 +140,7 @@ def pixel_granules(
     get_credentials: _Creds = None,
     region: str | None = None,
 ) -> pl.DataFrame:
-    """Per sensor and date in ``year``, the granule that supplied the store pixel at a WGS84 point."""
+    """Per sensor and date in ``year``, the granule that covered the store pixel at a WGS84 point."""
     return pixel_granules_at(registry_root, locate(lat, lon), year, get_credentials=get_credentials, region=region)
 
 
@@ -148,10 +152,12 @@ def pixel_granules_at(
     get_credentials: _Creds = None,
     region: str | None = None,
 ) -> pl.DataFrame:
-    """Per sensor and date in ``year``, the granule that supplied the pixel ``where``, as :data:`PIXEL_COLUMNS`.
+    """Per sensor and date in ``year``, the granule that covered the pixel ``where``, as :data:`PIXEL_COLUMNS`.
 
     Read from the run that claims the pixel among the shard's ``source_runs``. A date is listed when
-    the pixel's observation was valid for the model; refused pixels have them too.
+    a granule had data at the pixel; ``valid`` says whether the model used the observation or
+    rejected it, a cloud for instance. A date not listed had no data there. Refused pixels have
+    their dates too.
 
     Raises:
         LookupError: the registry holds no complete record for the shard (its ``source_runs`` is null).
@@ -167,13 +173,15 @@ def pixel_granules_at(
     shard_px = cast(int, group.attrs["shard_px"])
     shard_row, shard_col = parse_chunk_label(where.tile)
     y, x = shard_row * shard_px + where.row, shard_col * shard_px + where.col
-    seen: list[tuple[str, datetime.date, int]] = []
+    # A plane value k names `sources[|k| - 1]`; positive means the model used the observation.
+    seen: list[tuple[str, datetime.date, bool, int]] = []
     for sensor in (s for s in SENSORS if s in group):
-        ranks = np.asarray(cast(zarr.Array, group[sensor])[:, y, x])
+        ranks = np.asarray(cast(zarr.Array, group[sensor])[:, y, x]).astype(int)
         days = days_of(np.asarray(cast(zarr.Array, group[f"{sensor}_date"])[:]))
-        seen += [(sensor, days[i], int(ranks[i]) - 1) for i in np.flatnonzero(ranks)]
+        seen += [(sensor, days[i], bool(ranks[i] > 0), abs(int(ranks[i])) - 1) for i in np.flatnonzero(ranks)]
+    schema = {"sensor": pl.String, "solar_day": pl.Date, "valid": pl.Boolean, "rank": pl.Int64}
     return (
-        pl.LazyFrame(seen, schema={"sensor": pl.String, "solar_day": pl.Date, "rank": pl.Int64}, orient="row")
+        pl.LazyFrame(seen, schema=schema, orient="row")
         .join(
             scan(SHARD_DATES).filter(pl.col("run_id") == run, pl.col("tile") == where.tile), on=["sensor", "solar_day"]
         )

@@ -4,7 +4,8 @@ Two records, both written in the slot's own commit and only when the ingest runs
 ``provenance`` on (``context_docs/storage/registry-provenance-plan.md`` §4):
 
 * **The granule list.** One JSON array per slot naming the day's granules in fusion order, with
-  the identifiers, acquisition time, footprint and exact object URLs read (:func:`day_granules`).
+  the identifiers, acquisition time, footprint and exact object URLs read, then the copies the
+  ingest dropped before the fuse and why (:func:`day_granules`, :func:`mark_dropped`).
 * **The source index.** Per pixel, the fusion position plus one of the granule that supplied it,
   0 where none had data.
 
@@ -29,6 +30,7 @@ import dask.array as da
 import numpy as np
 import xarray as xr
 
+from tessera_embeddings.config.ingest import FUSED
 from tessera_embeddings.ingest.duplicates import image_identity
 from tessera_embeddings.ingest.opera_query import BURST_ID
 from tessera_embeddings.ingest.solar_days import solar_day_of
@@ -38,6 +40,9 @@ FUSION_POSITION = "tessera:fusion_position"
 
 #: Item property: this copy replaced one that would not read (the duplicate-copy fallback ladder).
 STEPPED_DOWN = "tessera:stepped_down"
+
+#: Item property: why the ingest dropped this copy before the fuse, its granule row's ``status``.
+DROPPED = "tessera:dropped"
 
 #: Bits the packed pixel gives the position. A day's fusion order is zone-wide, so a long land zone
 #: can exceed 255 optical scenes or radar bursts in one day; sixteen bits leave ample room.
@@ -61,12 +66,25 @@ def stamp_fusion_positions(items: Iterable[Any], loaded: list[Any]) -> None:
         item.properties.pop(FUSION_POSITION, None)
     counts: dict[str, int] = {}
     for item in loaded:
+        item.properties.pop(DROPPED, None)
         day = solar_day_of(item)
         position = counts.get(day, 0)
         if position >= MAX_GRANULES_PER_DAY:
             raise ValueError(f"{day}: more than {MAX_GRANULES_PER_DAY} granules in one solar day")
         item.properties[FUSION_POSITION] = position
         counts[day] = position + 1
+
+
+def mark_dropped(items: Iterable[Any], reason: str) -> None:
+    """Mark ``items`` as dropped before the fuse for ``reason``, in place.
+
+    Clears any fusion position an earlier load stamped, so a copy that read once and was then
+    replaced is listed as dropped, not fused. A dropped copy that a later load reads is fused again
+    (:func:`stamp_fusion_positions` clears the mark).
+    """
+    for item in items:
+        item.properties.pop(FUSION_POSITION, None)
+        item.properties[DROPPED] = reason
 
 
 def packed_dtype(native: np.dtype) -> np.dtype:
@@ -117,21 +135,22 @@ def _href(asset: Any) -> str | None:  # noqa: ANN401
     return asset.get("href") if isinstance(asset, dict) else getattr(asset, "href", None)
 
 
-def _record(item: Any, *, provider: str, collection: str, catalog_url: str, collection_id: str) -> dict[str, Any]:  # noqa: ANN401
+def _record(item: Any, status: str, **source: str) -> dict[str, Any]:  # noqa: ANN401
     """One granule's row, less the columns assembly adds (zone, year, run, sensor, day, order)."""
     properties = item.properties
     return {
         "granule_id": item.id,
+        "status": status,
         "image_key": _image_key(item),
         "platform": _platform(item),
         "acquired_at": properties.get("datetime"),
         "cloud_cover": properties.get("eo:cloud_cover"),
         "processing_baseline": properties.get("s2:processing_baseline"),
         "product_uri": properties.get("s2:product_uri"),
-        "provider": provider,
-        "collection": collection,
+        "provider": source["provider"],
+        "collection": source["collection"],
         # Rebuilt rather than kept: the query prunes links to bound the driver's memory.
-        "stac_item_url": f"{catalog_url.rstrip('/')}/collections/{collection_id}/items/{item.id}",
+        "stac_item_url": f"{source['catalog_url'].rstrip('/')}/collections/{source['collection_id']}/items/{item.id}",
         "assets": {key: _href(asset) for key, asset in sorted(item.assets.items())},
         "stepped_down": bool(properties.get(STEPPED_DOWN, False)),
         "geometry": item.geometry,
@@ -147,21 +166,33 @@ def day_granules(
     catalog_url: str,
     collection_id: str,
 ) -> dict[str, str]:
-    """Per solar day, the JSON granule list of the stamped ``items``, in fusion order.
+    """Per solar day, the JSON granule list of ``items``: the fused ones, then the dropped ones.
 
-    Only items the last load stamped are listed (:func:`stamp_fusion_positions`), so the list is
-    the granules the fused slot was built from and its positions are the source index's numbering.
+    The fused are the items the last load stamped (:func:`stamp_fusion_positions`), in fusion
+    order, so their positions are the source index's numbering. The dropped are those marked by
+    :func:`mark_dropped`, by id, each with its reason as ``status``. An item passed twice is listed
+    once, and any other item not at all.
     """
-    by_day: dict[str, list[Any]] = {}
+    source = {
+        "provider": provider,
+        "collection": collection,
+        "catalog_url": catalog_url,
+        "collection_id": collection_id,
+    }
+    by_day: dict[str, dict[int, Any]] = {}
     for item in items:
-        if FUSION_POSITION in item.properties:
-            by_day.setdefault(solar_day_of(item), []).append(item)
+        if FUSION_POSITION in item.properties or DROPPED in item.properties:
+            by_day.setdefault(solar_day_of(item), {})[id(item)] = item
     out: dict[str, str] = {}
-    for day, day_items in by_day.items():
-        day_items.sort(key=lambda it: it.properties[FUSION_POSITION])
-        records = [
-            _record(it, provider=provider, collection=collection, catalog_url=catalog_url, collection_id=collection_id)
-            for it in day_items
-        ]
+    for day, unique in by_day.items():
+        fused = sorted(
+            (it for it in unique.values() if FUSION_POSITION in it.properties),
+            key=lambda it: it.properties[FUSION_POSITION],
+        )
+        dropped = sorted(
+            (it for it in unique.values() if FUSION_POSITION not in it.properties), key=lambda it: str(it.id)
+        )
+        records = [_record(it, FUSED, **source) for it in fused]
+        records += [_record(it, it.properties[DROPPED], **source) for it in dropped]
         out[day] = json.dumps(records, separators=(",", ":"), default=str)
     return out
