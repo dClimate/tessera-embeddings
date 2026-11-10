@@ -26,6 +26,7 @@ from pystac.utils import str_to_datetime
 from requests.adapters import HTTPAdapter
 
 from tessera_embeddings.config import S1_OPERA_BANDS
+from tessera_embeddings.config.ingest import DROPPED, MISSING_BANDS
 from tessera_embeddings.errors import ConfigMismatchError
 from tessera_embeddings.ingest._http import (
     NonJsonResponseError,
@@ -154,7 +155,7 @@ def normalize_opera_timestamps(items: list[Any], *, mid_longitude: float | None 
     return normalize_to_solar_day(items, mid_longitude=mid_longitude)
 
 
-def _granule_to_item(entry: dict[str, Any], skip_counts: Counter[str] | None = None) -> Item | None:
+def _granule_to_item(entry: dict[str, Any], skip_counts: Counter[str] | None = None) -> Item:
     """Build a pystac ``Item`` from one CMR granule search entry.
 
     Maps the granule's data download links onto the ``S1_OPERA_BANDS`` asset keys (``0_VV``,
@@ -176,9 +177,9 @@ def _granule_to_item(entry: dict[str, Any], skip_counts: Counter[str] | None = N
         skip_counts: Optional counter of skip categories, incremented on skip.
 
     Returns:
-        A pystac ``Item``, or ``None`` if the entry lacks BOTH VV and VH data
-        links (single-pol granule, EW-mode HH/HV granule, or a non-RTC product
-        that slipped through the query).
+        A pystac ``Item``. One lacking a VV or VH data link (single-pol granule, EW-mode HH/HV
+        granule, or a non-RTC product that slipped through the query) is marked
+        :data:`~tessera_embeddings.config.ingest.DROPPED`, and the provider keeps it from the loader.
     """
     # Map band suffix (VV/VH/HH/HV) -> datapool HTTPS href from the data links.
     band_hrefs: dict[str, str] = {}
@@ -222,7 +223,6 @@ def _granule_to_item(entry: dict[str, Any], skip_counts: Counter[str] | None = N
             pols or "none",
             "+".join(_REQUIRED_POLARIZATIONS),
         )
-        return None
 
     # OPERA polygons are space-separated "lat lon lat lon ..." rings; pystac /
     # odc only need a valid GeoJSON geometry + bbox for spatial bookkeeping.
@@ -231,6 +231,9 @@ def _granule_to_item(entry: dict[str, Any], skip_counts: Counter[str] | None = N
     bbox = _geometry_bbox(geometry) if geometry else None
 
     properties: dict[str, Any] = {"datetime": entry["time_start"]}
+    if len(assets) < len(S1_OPERA_BANDS):
+        # Built all the same, so the provenance record can name the granule it set aside.
+        properties[DROPPED] = MISSING_BANDS
     if burst := _TITLE_RE.match(entry["title"]):
         properties[BURST_ID] = burst["burst"]
 
@@ -426,7 +429,7 @@ def _query_cmr_granules_one(
     t0 = time.monotonic()
     page = 0
     for page, entries in enumerate(_granule_pages(params, url=_CMR_GRANULE_URL, parse=_json_entries), start=1):
-        items.extend(item for item in (_granule_to_item(e, skip_counts) for e in entries) if item is not None)
+        items.extend(_granule_to_item(e, skip_counts) for e in entries)
         logger.info(
             f"CMR granule query ({orbit_direction}): page {page} returned {len(entries)} entries "
             f"({len(items)} items so far, {time.monotonic() - t0:.1f}s)"
@@ -583,6 +586,7 @@ def make_s1_item_provider(
     *,
     burst_census: BurstCensus,
     mid_longitude: float | None = None,
+    dropped: list[Item] | None = None,
 ) -> Callable[[], list[Item]]:
     """Create an item_provider_fn that builds OPERA items from the native CMR granule API.
 
@@ -612,6 +616,8 @@ def make_s1_item_provider(
         mid_longitude: ROI geobox centroid longitude, used to stamp each granule with
             the SOLAR day it belongs to. Supply it whenever the loader groups by solar
             day — which the campaign always does. Omitting it groups by UTC date.
+        dropped: Receives, on each call, the granules the query found but cannot load: those
+            missing a VV or VH file, marked as such, for the provenance record's granule list.
 
     Returns:
         Zero-argument callable that returns a list of ready-to-load pystac Items.
@@ -627,7 +633,11 @@ def make_s1_item_provider(
 
     def provide_items() -> list[Item]:
         burst_census.start()
-        items = _query_cmr_granules(bbox, start_date, end_date, orbit_direction)
+        found = _query_cmr_granules(bbox, start_date, end_date, orbit_direction)
+        items = [item for item in found if DROPPED not in item.properties]
+        if dropped is not None:
+            set_aside = [item for item in found if DROPPED in item.properties]
+            dropped.extend(normalize_opera_timestamps(set_aside, mid_longitude=mid_longitude))
 
         if use_s3_direct:
             for item in items:

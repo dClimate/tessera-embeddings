@@ -39,7 +39,7 @@ the fuse, one object per granule:
 | field | meaning |
 |---|---|
 | `granule_id` | the catalogue id of the copy |
-| `status` | `fused`; or `duplicate` or `unreadable` for a copy dropped before the fuse (below) |
+| `status` | `fused`; or `duplicate`, `unreadable` or `missing_bands` for a copy dropped before the fuse (below) |
 | `image_key` | which image it is a copy of: Sentinel-2 `<datatake>/<datastrip sensing start>`, Sentinel-1 the burst id |
 | `platform` | `S2A`, `S1C` and so on, from the id |
 | `acquired_at` | the acquisition instant, which solar-day normalisation never overwrites |
@@ -52,10 +52,12 @@ the fuse, one object per granule:
 **Dropped copies.** The Sentinel-2 ingest keeps one copy of each image of a tile-date and holds
 the others back as a [fallback ladder](duplicate-copies.md#the-fallback-ladder). Each copy held
 back is marked `duplicate`. When a kept copy will not read and the ladder swaps in another, the
-copy that failed is marked `unreadable` and its replacement `stepped_down`. Both kinds are listed
-after the fused granules, sorted by id. The marks live on the catalogue items
-(`provenance.mark_dropped`) and are cleared when a load reads the copy after all. Radar fuses every
-copy of a burst, so it drops none this way. A day that writes no slot, because it failed the
+copy that failed is marked `unreadable` and its replacement `stepped_down`. Radar fuses every copy
+of a burst, but the catalogue query sets aside a granule whose entry lacks its VV or VH file and
+marks it `missing_bands`; the provider hands those back on a list of their own, so the loader never
+sees them. All of these are listed after the fused granules, sorted by id. The marks live on the
+catalogue items (`provenance.mark_dropped`, and `opera_query._granule_to_item` for radar) and are
+cleared when a load reads the copy after all. A day that writes no slot, because it failed the
 coverage gate or every copy of an image failed to read, has no list to hold its granules.
 
 The list for a date is appended in the same Icechunk commit as the date's pixels, under both the
