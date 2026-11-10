@@ -49,6 +49,12 @@ from tessera_embeddings.config.store_layout import SENSORS
 #: shard-year where plain zstd took 2.83 MB (the plan's Appendix A).
 PLANE_COMPRESSORS = (BloscCodec(cname="zstd", clevel=3, shuffle="bitshuffle"),)
 
+#: The published planes' spatial chunk edge: the v2 store's (ADR 031), so a plane chunk covers the
+#: same pixels as a store chunk. Each chunk holds every date of the run, so one pixel's year is one
+#: read; that layout was 7-12% smaller than a chunk per date (context_docs/storage/
+#: provenance-dev-verification.md).
+PLANE_CHUNK_PX = 512
+
 #: The same codec for the in-memory pieces, which are signed 32-bit positions rather than 8-bit ranks.
 _PIECE_CODEC = numcodecs.Blosc(cname="zstd", clevel=3, shuffle=numcodecs.Blosc.BITSHUFFLE)
 
