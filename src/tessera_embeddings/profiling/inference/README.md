@@ -54,9 +54,8 @@ te-observe-cluster \
   launches 1 s nvidia-smi + DCGM (SMACT/TENSO/DRAMA) + host-RAM + outbound-:443
   socket captures on every GPU worker via SSM; `--report` fetches per-worker
   GPU/RAM summaries, a staging-write concurrency histogram, OOM events, and a
-  per-chunk phase-split table (preferring the actors' `CHUNK_SUMMARY` JSON
-  lines; legacy prose-log parsing remains as a fallback for runs from older
-  code); `--ram-report` reconstructs RAM/GPU rollups and 1 s spike analysis
+  per-chunk phase-split table built from the actors' `CHUNK_SUMMARY` JSON
+  lines; `--ram-report` reconstructs RAM/GPU rollups and 1 s spike analysis
   from CloudWatch after teardown.
 
   **Staging-write concurrency.** The phase table reports what a write cost, not

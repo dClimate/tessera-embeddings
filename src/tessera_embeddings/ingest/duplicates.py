@@ -686,7 +686,7 @@ def _means_the_copy_is_lost(verdict: ReadFailure) -> bool:
     """Whether ``verdict`` says THIS COPY will not yield its bytes.
 
     An exhaustive match rather than a set, so the type checker enforces what the closed set is for:
-    add a member and mypy reports this function as reachable past its cases, naming the one it does
+    add a member and the type checker reports this function as reachable past its cases, naming the one it does
     not handle. A set would silently answer ``False`` for anything new — the quiet wrong answer
     this design exists to remove, and the direction that costs a store.
     """

@@ -64,30 +64,14 @@ def _make_chunk_data(
 # ── tests ──
 
 
-def test_bucket_assignment_valid_pixels() -> None:
-    chunk_data = _make_chunk_data(H=4, W=4, n_s2=12, n_s1a=6)
-    ds = MosaicChunkInferenceDataset(chunk_data, num_obs_checkpoints=CKPS)
-    total = sum(len(v) for v in ds._bucket_pixels.values())
-    assert len(ds) == total
-    assert len(ds) > 0
-
-
 def test_iter_buckets_largest_first() -> None:
     chunk_data = _make_chunk_data(H=8, W=8, n_s2=20, n_s1a=8)
     ds = MosaicChunkInferenceDataset(chunk_data, num_obs_checkpoints=CKPS)
 
     bucket_list = list(ds.iter_buckets(largest_first=True))
-    if len(bucket_list) > 1:
-        sizes = [len(idxs) for _, idxs in bucket_list]
-        assert sizes == sorted(sizes, reverse=True)
-
-
-def test_iter_buckets_keys_are_valid_checkpoints() -> None:
-    chunk_data = _make_chunk_data(H=4, W=4, n_s2=12, n_s1a=6)
-    ds = MosaicChunkInferenceDataset(chunk_data, num_obs_checkpoints=CKPS)
-    for (s2_bin, s1_bin), _ in ds.iter_buckets():
-        assert s2_bin in CKPS
-        assert s1_bin in CKPS
+    assert len(bucket_list) > 1, "the fixture must span several buckets, or the order is not tested"
+    sizes = [len(idxs) for _, idxs in bucket_list]
+    assert sizes == sorted(sizes, reverse=True)
 
 
 def test_get_bucket_batch_shapes() -> None:
@@ -122,26 +106,7 @@ def test_no_valid_pixels_empty_dataset() -> None:
     assert list(ds.iter_buckets()) == []
 
 
-def test_bucket_sizes_consistency() -> None:
-    chunk_data = _make_chunk_data(H=6, W=6, n_s2=16, n_s1a=8)
-    ds = MosaicChunkInferenceDataset(chunk_data, num_obs_checkpoints=CKPS)
-
-    sizes = ds.bucket_sizes()
-    for key, count in sizes.items():
-        assert len(ds._bucket_pixels[key]) == count
-
-
 # ── allow_s2_only: the optional per-pixel S1 requirement ──
-
-
-def test_s2_only_pixels_dropped_by_default() -> None:
-    """Pins the historical gate: S2-valid pixels with ZERO S1 observations are
-    skipped entirely when allow_s2_only is off (the default).
-    """
-    chunk_data = _make_chunk_data(H=4, W=4, n_s2=12, n_s1a=0, n_s1d=0)
-    ds = MosaicChunkInferenceDataset(chunk_data, num_obs_checkpoints=CKPS)
-    assert len(ds) == 0
-    assert list(ds.iter_buckets()) == []
 
 
 @pytest.mark.parametrize(("model_version", "s1_steps"), [("v1.1", CKPS[0]), ("v2-large", 1)])

@@ -83,35 +83,13 @@ def build_resample_indices_v2(valid_len: int, target_size: int) -> np.ndarray:
     return np.concatenate([np.arange(valid_len, dtype=np.int64), fill])
 
 
-#: Resampler per model family. v1.1's entry is the ORIGINAL function, untouched, so no existing
-#: run's output can shift: selecting a resampler is the only thing this change does to that path.
-_RESAMPLERS: dict[str, Callable[[int, int], np.ndarray]] = {
-    "v1.1": build_resample_indices,
-    "v2-large": build_resample_indices_v2,
-}
-
-
-def resampler_for(model_version: ModelVersion) -> Callable[[int, int], np.ndarray]:
-    """The padding/subsampling rule *model_version* was trained under.
-
-    Raises on an unknown version rather than defaulting to v1.1: silently resampling a new
-    student by the old rules is the failure this function exists to prevent, and it produces a
-    correctly-shaped tensor that no downstream check can question.
-    """
-    try:
-        return _RESAMPLERS[model_version]
-    except KeyError:
-        valid = ", ".join(repr(k) for k in _RESAMPLERS)
-        raise ValueError(f"No resampler for model_version={model_version!r}. Known: {valid}.") from None
-
-
 # build_resample_indices depends only on (valid_len, target), both small ints (valid_len <= T of the chunk, target one
 # of ~32 checkpoints), so the index vectors are memoised. Callers must treat the returned arrays as READ-ONLY: they
 # are shared across every pixel with the same pair.
 _resample_indices_cached = functools.lru_cache(maxsize=None)(build_resample_indices)
 _resample_indices_cached_v2 = functools.lru_cache(maxsize=None)(build_resample_indices_v2)
-#: Cached counterpart of :data:`_RESAMPLERS`, keyed the same way. Separate caches rather than one
-#: keyed by version, so a v1.1 lookup is exactly the call it always was.
+#: The padding/subsampling rule each model family was trained under, cached. Separate caches rather
+#: than one keyed by version, so a v1.1 lookup is exactly the call it always was.
 _CACHED_RESAMPLERS: dict[str, Callable[[int, int], np.ndarray]] = {
     "v1.1": _resample_indices_cached,
     "v2-large": _resample_indices_cached_v2,
@@ -147,17 +125,6 @@ def _row_starts(counts: np.ndarray) -> np.ndarray:
     return starts[:-1]
 
 
-def bucket_for_count(n: int, ckps: tuple[int, ...]) -> int:
-    """Return the smallest checkpoint >= *n*, clamped to the largest checkpoint.
-
-    ``ckps`` must be sorted ascending. ``n <= 0`` also returns ``ckps[0]``.
-    """
-    for c in ckps:
-        if n <= c:
-            return c
-    return ckps[-1]
-
-
 def compute_bin_keys(
     s2_valid: np.ndarray,
     s1_valid: np.ndarray,
@@ -179,8 +146,9 @@ def compute_bin_keys(
     s2_idx = np.clip(s2_idx, 0, len(ckps_arr) - 1)
     s1_idx = np.clip(s1_idx, 0, len(ckps_arr) - 1)
     keys = np.empty(len(s2_valid), dtype=np.dtype([("s2", np.int32), ("s1", np.int32)]))
-    keys["s2"] = ckps_arr[s2_idx]
-    keys["s1"] = ckps_arr[s1_idx]
+    # numpy's stubs do not model assigning to a structured array's named field.
+    keys["s2"] = ckps_arr[s2_idx]  # ty: ignore[invalid-assignment]
+    keys["s1"] = ckps_arr[s1_idx]  # ty: ignore[invalid-assignment]
     return keys
 
 

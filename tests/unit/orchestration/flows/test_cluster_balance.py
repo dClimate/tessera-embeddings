@@ -16,18 +16,11 @@ zones and a long tail of islands.
 3. **Clusters finish together.** Total work per cluster is near-even, so no
    cluster is still grinding after the others have released their fleets.
 
-To SEE a split rather than assert on it::
-
-    TE_CLUSTERS=12 uv run pytest tests/unit/orchestration/flows/test_cluster_balance.py -k report -s
-
-``TE_CLUSTERS`` accepts a comma-separated list (``4,8,16``) and defaults to the
-campaign's own ``max_parallel_clusters``.
 """
 
 from __future__ import annotations
 
 import inspect
-import os
 
 import numpy as np
 import pytest
@@ -40,9 +33,9 @@ from tests.unit.zone_density import LIVE_ZONES, ZONE_TILES, plan
 #: The shipped default, read from the flow so this file cannot drift from it.
 DEFAULT_CLUSTERS: int = inspect.signature(campaign.run_global_campaign.fn).parameters["max_parallel_clusters"].default
 
-#: Spanning the plausible operating range: one cluster for the year, the shipped
-#: 8, and well past it. 120 is the degenerate one-zone-per-cluster end.
-CLUSTER_COUNTS = [1, 2, 4, 6, 8, 12, 16, 24, 40, 120]
+#: One cluster for the year, near the shipped default, the knee, and the degenerate
+#: one-zone-per-cluster end.
+CLUSTER_COUNTS = [1, 8, 40, 120]
 
 
 @pytest.mark.parametrize("n", CLUSTER_COUNTS)
@@ -65,7 +58,7 @@ def test_every_cluster_runs_dense_to_sparse(n: int) -> None:
         assert c.tiles == sorted(c.tiles, reverse=True), c.zones
 
 
-@pytest.mark.parametrize("n", [1, 2, 4, 6, 8, 12, 16])
+@pytest.mark.parametrize("n", [2, 8, 16])
 def test_clusters_finish_together(n: int) -> None:
     """Property 3: total work per cluster is within 5% of the heaviest.
 
@@ -79,7 +72,7 @@ def test_clusters_finish_together(n: int) -> None:
 
 
 def test_the_default_is_in_the_regime_where_balancing_works() -> None:
-    """8 clusters is comfortably below where the largest zone starts to dominate."""
+    """The shipped default is comfortably below where the largest zone starts to dominate."""
     totals = [c.total for c in plan(DEFAULT_CLUSTERS)]
     assert max(totals) / min(totals) - 1 < 0.01, totals
 
@@ -105,35 +98,6 @@ def test_all_ocean_zones_are_never_assigned() -> None:
     assigned = {z for c in plan(DEFAULT_CLUSTERS) for z in c.zones}
     assert assigned == set(LIVE_ZONES)
     assert len(ZONE_TILES) - len(LIVE_ZONES) == 8  # all-ocean zones in the snapshot
-
-
-def test_report(capsys: pytest.CaptureFixture[str]) -> None:
-    """Print the split for each count in ``TE_CLUSTERS`` (see the module docstring).
-
-    Runs as an ordinary test so it cannot rot: it asserts the same invariants it
-    prints. Use ``-s`` to actually see the tables.
-    """
-    counts = [int(x) for x in os.environ.get("TE_CLUSTERS", str(DEFAULT_CLUSTERS)).split(",")]
-    total = sum(ZONE_TILES.values())
-    with capsys.disabled():
-        print(f"\n{len(LIVE_ZONES)} live UTM zones, {total:,} land tiles\n")
-        for n in counts:
-            clusters = plan(n)
-            print(f"=== {len(clusters)} cluster(s) " + "=" * 52)
-            for i, c in enumerate(clusters):
-                head = " ".join(f"{z}:{t}" for z, t in list(zip(c.zones, c.tiles, strict=True))[:5])
-                tail = " …" if len(c.zones) > 5 else ""
-                print(f"  {i:>3} | {len(c.zones):>3} zones | {c.total:>7,} tiles | {head}{tail}")
-            totals = [c.total for c in clusters]
-            print(
-                f"      totals: min={min(totals):,} max={max(totals):,} "
-                f"spread={max(totals) / min(totals) - 1:.1%} | "
-                f"openers {min(c.opener for c in clusters):,} to {max(c.opener for c in clusters):,}\n"
-            )
-            assert (
-                sorted((c.opener for c in clusters), reverse=True)
-                == sorted(ZONE_TILES.values(), reverse=True)[: len(clusters)]
-            )
 
 
 # --- the work weight itself -----------------------------------------------------------

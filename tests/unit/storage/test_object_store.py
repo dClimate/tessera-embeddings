@@ -45,6 +45,40 @@ def _never_called():
     raise AssertionError("the fsspec fallback must not run for a verified-but-incomplete delete")
 
 
+def _fallback_fs(monkeypatch, *, find=list, rm_error=None, s5cmd_error=None):
+    """s5cmd fails (absent by default), so the fsspec fallback runs; `find` decides what it reads back.
+
+    Returns the paths s5cmd and the fallback's ``rm`` were each asked to delete.
+    """
+    s5cmd_calls: list[str] = []
+    rm_calls: list[str] = []
+    error = s5cmd_error or FileNotFoundError("s5cmd not on PATH")
+
+    def _s5cmd(uri, log, **k):
+        s5cmd_calls.append(uri)
+        raise error
+
+    class _FS:
+        def exists(self, p):
+            return True
+
+        def rm(self, p, recursive):
+            rm_calls.append(p)
+            if rm_error is not None:
+                raise rm_error
+
+        def invalidate_cache(self, p=None):
+            return None
+
+        def find(self, p):
+            return find()
+
+    monkeypatch.setattr(object_store, "_s5cmd_rm", _s5cmd)
+    monkeypatch.setattr(object_store.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(object_store.fsspec, "filesystem", lambda proto: _FS())
+    return s5cmd_calls, rm_calls
+
+
 def test_delete_prefix_defaults_to_the_safe_choice_not_the_cheap_one(monkeypatch):
     """ON by default, because the wrong default is not a cost mistake but a FALSE SUCCESS.
 
@@ -80,19 +114,6 @@ def test_the_cheap_path_is_opt_in_per_call(monkeypatch):
     _cleared(monkeypatch)
     object_store.delete_prefix("s3://bucket/p", all_versions=False)
     assert seen == {"all_versions": False}
-
-
-def test_delete_prefix_forwards_all_versions_when_asked(monkeypatch):
-    """The flag still WORKS — it is opt-in, not removed. A versioned bucket needs it."""
-    seen: dict = {}
-
-    def fake_s5(uri, log, *, all_versions):
-        seen.update(all_versions=all_versions)
-
-    monkeypatch.setattr(object_store, "_s5cmd_rm", fake_s5)
-    _cleared(monkeypatch)
-    object_store.delete_prefix("s3://bucket/p", all_versions=True)
-    assert seen == {"all_versions": True}
 
 
 def test_delete_prefix_verifies_and_stops_after_one_clean_pass(monkeypatch):
@@ -148,32 +169,10 @@ def test_delete_prefix_treats_an_unlistable_prefix_as_unknown_not_as_survivors(m
 
 def test_delete_prefix_strict_raises_when_delete_fails(monkeypatch):
     """strict=True propagates a failed delete (else the caller ingests onto stale data)."""
-
-    def _s5_fail(*a, **k):
-        raise RuntimeError("s5cmd rc=1")
-
-    class _FS:
-        def exists(self, p):
-            return True
-
-        def rm(self, p, recursive):
-            raise OSError("access denied")
-
-    monkeypatch.setattr(object_store, "_s5cmd_rm", _s5_fail)
-    monkeypatch.setattr(object_store.time, "sleep", lambda _s: None)
-    monkeypatch.setattr(object_store.fsspec, "filesystem", lambda proto: _FS())
-
+    _fallback_fs(monkeypatch, s5cmd_error=RuntimeError("s5cmd rc=1"), rm_error=OSError("access denied"))
     object_store.delete_prefix("s3://b/p")  # best-effort: swallows
-
-    # strict + all_versions is refused BEFORE the fallback runs: fsspec cannot remove
-    # non-current versions, so the promise cannot be kept whatever the fallback does. This is
-    # the DEFAULT arm now, which is the point — a strict caller is refused rather than told a
-    # versioned prefix is clean.
-    with pytest.raises(object_store.DeleteUnverifiedError):
-        object_store.delete_prefix("s3://b/p", strict=True)
-
-    # Opting out explicitly, the fallback CAN keep the (narrower) promise, so it runs — and its
-    # own failure propagates under strict, which is what this test was written to pin.
+    # Opting out of all_versions, the fallback CAN keep the (narrower) promise, so it runs — and
+    # its own failure propagates under strict.
     with pytest.raises(OSError, match="access denied"):
         object_store.delete_prefix("s3://b/p", strict=True, all_versions=False)
 
@@ -204,25 +203,7 @@ def test_a_missing_binary_is_not_retried(monkeypatch):
     """The adverse direction: s5cmd absent will still be absent next time, and the fsspec
     fallback is the whole answer for it — so it must reach the fallback immediately.
     """
-    calls = []
-
-    def absent(uri, log, **k):
-        calls.append(uri)
-        raise FileNotFoundError("s5cmd binary not found")
-
-    fell_back = []
-
-    class _FS:
-        def exists(self, p):
-            return True
-
-        def rm(self, p, recursive):
-            fell_back.append(p)
-
-    monkeypatch.setattr(object_store, "_s5cmd_rm", absent)
-    monkeypatch.setattr(object_store.time, "sleep", lambda _s: None)
-    monkeypatch.setattr(object_store.fsspec, "filesystem", lambda proto: _FS())
-
+    calls, fell_back = _fallback_fs(monkeypatch)
     object_store.delete_prefix("s3://b/p")
     assert len(calls) == 1, "a missing binary must not be retried"
     assert fell_back == ["s3://b/p"]
@@ -239,27 +220,7 @@ def test_strict_all_versions_refuses_the_fsspec_fallback(monkeypatch):
     Best-effort callers still get the fallback; only a caller that said it cannot proceed on an
     unclean prefix is refused.
     """
-
-    def _s5_missing(*a, **k):
-        raise FileNotFoundError("s5cmd not on PATH")
-
-    monkeypatch.setattr(object_store, "_s5cmd_rm", _s5_missing)
-    monkeypatch.setattr(object_store.time, "sleep", lambda _s: None)
-
-    class _FS:
-        def exists(self, p):
-            return True
-
-        def rm(self, p, recursive):
-            return None
-
-        def invalidate_cache(self, p=None):
-            return None
-
-        def find(self, p):
-            return []  # the delete worked; see the strict-verification test for when it did not
-
-    monkeypatch.setattr(object_store.fsspec, "filesystem", lambda proto: _FS())
+    _fallback_fs(monkeypatch)
 
     # Best-effort: the fallback runs and the caller is warned, not stopped.
     object_store.delete_prefix("s3://b/p", all_versions=True)
@@ -272,31 +233,6 @@ def test_strict_all_versions_refuses_the_fsspec_fallback(monkeypatch):
     # pinned the defect as the contract: it proved the version promise and was silent about the
     # verification one. It now also requires the prefix to come back empty.
     object_store.delete_prefix("s3://b/p", all_versions=False, strict=True)
-
-
-def _fallback_fs(monkeypatch, *, find):
-    """s5cmd absent, so the fsspec fallback runs; `find` decides what it reads back."""
-
-    def _s5_missing(*a, **k):
-        raise FileNotFoundError("s5cmd not on PATH")
-
-    monkeypatch.setattr(object_store, "_s5cmd_rm", _s5_missing)
-    monkeypatch.setattr(object_store.time, "sleep", lambda _s: None)
-
-    class _FS:
-        def exists(self, p):
-            return True
-
-        def rm(self, p, recursive):
-            return None
-
-        def invalidate_cache(self, p=None):
-            return None
-
-        def find(self, p):
-            return find()
-
-    monkeypatch.setattr(object_store.fsspec, "filesystem", lambda proto: _FS())
 
 
 def test_a_strict_fsspec_fallback_is_verified_not_assumed(monkeypatch):

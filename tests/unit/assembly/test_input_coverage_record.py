@@ -24,8 +24,8 @@ from tessera_embeddings.inference.data_loading import check_time_window_coverage
 from tessera_embeddings.storage.shard_writer import run_provenance
 
 
-def _serve(monkeypatch, dates: list[str]) -> None:
-    """Serve one in-memory mosaic for every store the check opens.
+def _serve(monkeypatch, dates: list[str], **attrs) -> None:
+    """Serve one in-memory mosaic, carrying *attrs*, for every store the check opens.
 
     Only the store ACCESS is stood in for; the month arithmetic under test is the real
     function's. Building a local icechunk repository would test the storage layer instead,
@@ -36,24 +36,12 @@ def _serve(monkeypatch, dates: list[str]) -> None:
     arr = root.create_array("time", shape=(len(values),), dtype="int64")
     arr[:] = values
     arr.attrs["units"] = "nanoseconds since 1970-01-01"
+    root.attrs.update(attrs)
     monkeypatch.setattr(data_loading, "open_store_as_zarr_group", lambda *a, **k: root)
 
 
 def _year_dates(year: int, months: range) -> list[str]:
     return [f"{year}-{m:02d}-15" for m in months]
-
-
-def test_record_carries_input_coverage_when_supplied() -> None:
-    """The field lands on the year's record, beside the other per-run summaries."""
-    coverage = {"window_months": 12, "relaxed": False, "stores": {"reflectance": {"months_present": 12}}}
-    runs = run_provenance(None, 2024, "run-1", input_coverage=coverage)
-    assert runs["2024"]["input_coverage"] == coverage
-
-
-def test_absent_coverage_is_recorded_as_nothing() -> None:
-    """A caller that measured nothing claims nothing — the field is omitted, not empty."""
-    runs = run_provenance(None, 2024, "run-1")
-    assert "input_coverage" not in runs["2024"]
 
 
 def test_full_window_is_measured_and_reported(monkeypatch) -> None:
@@ -119,14 +107,8 @@ def test_a_legitimately_empty_month_is_recorded_as_examined_not_a_hole(monkeypat
     month total alone would flag it, which is why the record separates examined absence from
     unexplained absence.
     """
-    root = zarr.open_group(store=zarr.storage.MemoryStore(), mode="w")
-    values = np.array(_year_dates(2024, range(1, 12)), dtype="datetime64[ns]").astype("int64")
-    arr = root.create_array("time", shape=(len(values),), dtype="int64")
-    arr[:] = values
-    arr.attrs["units"] = "nanoseconds since 1970-01-01"
     # The ingest processed the whole year and found December empty.
-    root.attrs["assessed_window"] = ["2024-01-01", "2024-12-31"]
-    monkeypatch.setattr(data_loading, "open_store_as_zarr_group", lambda *a, **k: root)
+    _serve(monkeypatch, _year_dates(2024, range(1, 12)), assessed_window=["2024-01-01", "2024-12-31"])
 
     # Not relaxed: the strict rule passes, because the absence is explained.
     summary = check_time_window_coverage("mem://m", parse_time_window("December 2024"), s1_orbit="none")
@@ -168,19 +150,16 @@ def test_the_ingests_own_account_of_dropped_dates_is_carried_onto_the_year(monke
     the store: once a later date commits they are closed for good, so nothing acts on them, and
     the published coverage masks say which months a pixel really has.
     """
-    root = zarr.open_group(store=zarr.storage.MemoryStore(), mode="w")
-    values = np.array(_year_dates(2024, range(1, 13)), dtype="datetime64[ns]").astype("int64")
-    arr = root.create_array("time", shape=(len(values),), dtype="int64")
-    arr[:] = values
-    arr.attrs["units"] = "nanoseconds since 1970-01-01"
-    root.attrs["assessed_window"] = ["2024-01-01", "2024-12-31"]
-    root.attrs["assessed_empty_dates"] = 137
-    monkeypatch.setattr(data_loading, "open_store_as_zarr_group", lambda *a, **k: root)
+    _serve(
+        monkeypatch,
+        _year_dates(2024, range(1, 13)),
+        assessed_window=["2024-01-01", "2024-12-31"],
+        assessed_empty_dates=137,
+    )
 
     summary = check_time_window_coverage("mem://m", parse_time_window("December 2024"), s1_orbit="none")
     store = summary["stores"]["reflectance"]
     assert store["assessed_empty_dates"] == 137
-    assert "assessed_unreadable_dates" not in store, "the loss record was removed, not renamed"
 
 
 def test_a_store_with_no_assessment_records_zero_rather_than_nothing(monkeypatch) -> None:

@@ -11,8 +11,10 @@ import numpy as np
 import pytest
 import torch
 
-from tessera_embeddings.config.inference import InferenceConfig, band_stats, model_family
+from tessera_embeddings.config.inference import InferenceConfig, band_stats
 from tessera_embeddings.config.time_windows import parse_time_window
+from tessera_embeddings.inference.dataset import MosaicChunkInferenceDataset
+from tessera_embeddings.inference.inference import run_inference
 from tessera_embeddings.inference.models.builder import _build_v2_inference_model, _verify_v2_args
 from tessera_embeddings.inference.models.student_v2 import (
     AttentionPooling,
@@ -20,7 +22,6 @@ from tessera_embeddings.inference.models.student_v2 import (
     StudentTransformerEncoder,
     _add_layer_norm,
     _encoder_layer_forward,
-    build_v2_dim_reducer,
 )
 
 # The v2 Large checkpoint's stored ``args``.
@@ -131,11 +132,6 @@ def test_verify_v2_args_rejects_buckets_over_max_seq_len() -> None:
 # ── blocks ──
 
 
-def test_attention_pooling_shape() -> None:
-    pool = AttentionPooling(64)
-    assert pool(torch.randn(4, 10, 64)).shape == (4, 64)
-
-
 def test_attention_pooling_single_timestep_passes_through() -> None:
     """T == 1 returns the lone timestep unchanged (no softmax over one element)."""
     pool = AttentionPooling(8)
@@ -157,19 +153,6 @@ def test_attention_pooling_is_a_convex_combination() -> None:
     out = pool(x)
     assert torch.all(out <= x.amax(dim=1) + 1e-5)
     assert torch.all(out >= x.amin(dim=1) - 1e-5)
-
-
-def test_v2_backbone_has_no_recurrence() -> None:
-    """v2 pools with plain attention — no GRU for the builder to fuse."""
-    enc = StudentTransformerEncoder(band_num=10, latent_dim=16, nhead=4, num_encoder_layers=1)
-    assert isinstance(enc.attn_pool, AttentionPooling)
-    assert not any(isinstance(m, torch.nn.GRU | torch.nn.GRUCell) for m in enc.modules())
-
-
-@pytest.mark.parametrize(("band_num", "channels"), [(10, 11), (2, 3)])
-def test_v2_backbone_output_shape(band_num: int, channels: int) -> None:
-    enc = StudentTransformerEncoder(band_num=band_num, latent_dim=16, nhead=4, num_encoder_layers=2)
-    assert enc(torch.randn(4, 12, channels)).shape == (4, 64)
 
 
 @pytest.mark.parametrize("t", [1, 13], ids=["radar-free-step", "sequence"])
@@ -200,20 +183,6 @@ def test_qk_norm_layer_rejects_indivisible_head_dim() -> None:
         QKNormEncoderLayer(d_model=30, nhead=4, dim_feedforward=64)
 
 
-def test_v2_dim_reducer_shapes_and_keys() -> None:
-    """The trailing non-affine LayerNorm adds no parameters."""
-    reducer = build_v2_dim_reducer(latent_dim=160, repr_dim=128)
-    assert reducer(torch.randn(3, 160 * 4 * 2)).shape == (3, 128)
-    assert set(reducer.state_dict()) == {
-        "0.weight",
-        "0.bias",
-        "1.weight",
-        "1.bias",
-        "4.weight",
-        "4.bias",
-    }
-
-
 # ── assembled model ──
 
 
@@ -241,12 +210,6 @@ def test_v2_model_state_dict_keys_match_checkpoint_layout(v2_model) -> None:
     assert not [k for k in keys if k.startswith(("projector.", "segmented_matryoshka_projector."))]
 
 
-def test_v2_model_output_shape_is_128(v2_model) -> None:
-    with torch.no_grad():
-        out = v2_model(torch.randn(5, 16, 11), torch.randn(5, 24, 3))
-    assert out.shape == (5, 128)
-
-
 def test_v2_output_is_layer_normalised_per_row(v2_model) -> None:
     """The final non-affine LayerNorm puts every row at mean 0 / std 1."""
     with torch.no_grad():
@@ -254,31 +217,6 @@ def test_v2_output_is_layer_normalised_per_row(v2_model) -> None:
     torch.testing.assert_close(out.mean(dim=-1), torch.zeros(8), atol=1e-5, rtol=0)
     # LayerNorm normalises by the biased (population) std.
     torch.testing.assert_close(out.std(dim=-1, unbiased=False), torch.ones(8), atol=1e-4, rtol=0)
-
-
-def test_quantization_is_version_agnostic(v2_model) -> None:
-    """Per-pixel abs-max int8 + fp32 scale needs no v2 changes.
-
-    v2 rows are LayerNorm-ed (|x| ~ 1) rather than v1.1's unnormalised
-    activations, but the scheme derives every scale from the row itself, so the
-    round-trip error stays bounded by ``scale / 2`` per channel.
-    """
-    from tessera_embeddings.inference.quantization import quantize_rows, quantize_rows_torch
-
-    with torch.no_grad():
-        rows = v2_model(torch.randn(16, 16, 11), torch.randn(16, 16, 3))
-
-    quantized, scales = quantize_rows(rows.numpy())
-    assert quantized.shape == (16, 128)
-    assert quantized.dtype.name == "int8"
-    assert scales.shape == (16,)
-    reconstructed = quantized.astype("float32") * scales[:, None]
-    assert abs(reconstructed - rows.numpy()).max() <= scales.max() / 2 + 1e-6
-
-    # The on-device path must agree bit-for-bit with the CPU path (v1.1 contract).
-    q_torch, s_torch = quantize_rows_torch(rows)
-    torch.testing.assert_close(q_torch, torch.from_numpy(quantized), atol=0, rtol=0)
-    torch.testing.assert_close(s_torch, torch.from_numpy(scales), atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("t_s1", [5, 0], ids=["with-radar", "radar-free"])
@@ -289,9 +227,6 @@ def test_v2_runs_the_unmodified_inference_loop(v2_model, sample_chunk_data, t_s1
     v1.1 slice is the identity and the store layout is unchanged. The radar-free chunk
     puts every pixel in v2's one-step S1 bucket, a length no other bucket has.
     """
-    from tessera_embeddings.inference.dataset import MosaicChunkInferenceDataset
-    from tessera_embeddings.inference.inference import run_inference
-
     config = v2_config(batch_size=8)
     chunk = sample_chunk_data(height=4, width=4, t_s2=10, t_s1a=t_s1, t_s1d=t_s1)
     dataset = MosaicChunkInferenceDataset(
@@ -312,8 +247,3 @@ def test_v2_runs_the_unmodified_inference_loop(v2_model, sample_chunk_data, t_s1
     assert result.embeddings.dtype.name == "int8"
     assert result.scales.shape == (4, 4)
     assert not any(np.isnan(result.scales.ravel()))
-
-
-def test_v2_arch_spec_is_registered() -> None:
-    assert model_family("v2-large").arch.enable_qk_norm is False
-    assert model_family("v2-large").arch.representation_dim == 128

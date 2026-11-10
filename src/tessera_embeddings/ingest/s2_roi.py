@@ -46,11 +46,9 @@ import xarray as xr
 
 from tessera_embeddings.config.ingest import (
     AUTO_BATCH_DATES,
-    DUPLICATE,
     INGEST_CHUNK_SIZE,
     INGEST_CHUNKS,
     SOURCE_INDEX_VAR,
-    UNREADABLE,
 )
 from tessera_embeddings.config.providers import PROVIDERS
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
@@ -64,12 +62,7 @@ from tessera_embeddings.ingest.duplicates import (
     select_preferred_duplicates,
     step_down_copies,
 )
-from tessera_embeddings.ingest.live_windows import (
-    WINDOW_COST_IN_CHUNKS,
-    WINDOW_COST_IN_CHUNKS_OVERLAPPED,
-    live_windows_for_mask,
-    windows_for_date,
-)
+from tessera_embeddings.ingest.live_windows import run_live_windows, windows_for_date
 from tessera_embeddings.ingest.loader_failures import (
     collect_aborted_hrefs,
     implicated_items,
@@ -77,7 +70,7 @@ from tessera_embeddings.ingest.loader_failures import (
     install_capture_everywhere,
     label_objects,
 )
-from tessera_embeddings.ingest.provenance import STEPPED_DOWN, day_granules, mark_dropped
+from tessera_embeddings.ingest.provenance import day_granules, mark_duplicates, mark_stepped_down
 from tessera_embeddings.ingest.roi import (
     read_roi_mask,
     read_roi_metadata,
@@ -463,14 +456,9 @@ def ingest_s2_roi_reflectance(
     # a boundary is cheap and the DP should stop trading ocean area for fewer windows; sequential
     # writes still pay the serial cost. Bound once because per-date narrowing re-merges on the
     # same terms, and a second differing rate there would undo this for every narrowed date.
-    window_cost = WINDOW_COST_IN_CHUNKS_OVERLAPPED if overlap_window_writes else WINDOW_COST_IN_CHUNKS
-    run_windows = live_windows_for_mask(
-        roi_zarr_path,
-        window_px=INGEST_CHUNK_SIZE,
-        window_cost_in_chunks=window_cost,
-        storage_options=storage_options,
+    window_cost, run_windows, live_windows = run_live_windows(
+        roi_zarr_path, overlapped=overlap_window_writes, storage_options=storage_options
     )
-    live_windows: list[tuple[int, int, int, int]] = [(w.y0, w.y1, w.x0, w.x1) for w in run_windows]
     log.info("Writing %d live window(s)", len(run_windows))
 
     if batch_dates is None:
@@ -578,7 +566,7 @@ def ingest_s2_roi_reflectance(
         """The live windows a date's imagery reaches: pure geometry, no read."""
         return windows_for_date(
             run_windows,
-            [getattr(item, "bbox", None) for item in day_items],  # type: ignore[misc]
+            [getattr(item, "bbox", None) for item in day_items],  # ty: ignore[invalid-argument-type]
             roi.geobox,
             chunk_px=INGEST_CHUNK_SIZE,
             window_cost_in_chunks=window_cost,
@@ -958,12 +946,8 @@ def ingest_s2_roi_reflectance(
         log_duplicate_selection(log, roi_label, alternates, kept=items, read_keys=read_keys, items=supplied)
         date_alternates.update(alternates)
         # Scoped to this supply like the ladder, whose preparations all finish inside it.
-        kept = {id(item) for item in items}
         dropped_by_day.clear()
-        for item in supplied:
-            if id(item) not in kept:
-                dropped_by_day.setdefault(item.datetime.strftime("%Y-%m-%d"), []).append(item)
-        mark_dropped((item for day in dropped_by_day.values() for item in day), DUPLICATE)
+        dropped_by_day.update(mark_duplicates(supplied, items))
 
         def _record_skip(prepared: _PreparedDate) -> None:
             """Account for a date that produced nothing, under the reason it actually had.
@@ -1102,13 +1086,7 @@ def ingest_s2_roi_reflectance(
                     return
                 stepped_items, swapped = stepped
                 # Marked for the granule list: the copy that would not read, and the one standing in.
-                previous, current = {id(item) for item in attempt.items}, {id(item) for item in stepped_items}
-                for item in stepped_items:
-                    if id(item) not in previous:
-                        item.properties[STEPPED_DOWN] = True
-                replaced = [item for item in attempt.items if id(item) not in current]
-                mark_dropped(replaced, UNREADABLE)
-                dropped_by_day.setdefault(attempt.date, []).extend(replaced)
+                dropped_by_day.setdefault(attempt.date, []).extend(mark_stepped_down(attempt.items, stepped_items))
                 before = copies_label(attempt.items, only=swapped)
                 after = copies_label(stepped_items, only=swapped)
                 if not tried:

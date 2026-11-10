@@ -324,6 +324,55 @@ def _row_slabs(height: int, sample_rows: int | None) -> list[tuple[slice, list[i
     return [(slice(r0, min(r0 + ROW_BLOCK, height)), None) for r0 in range(0, height, ROW_BLOCK)]
 
 
+def _schema_ok(ref: xr.Dataset, test: xr.Dataset, ref_vars: set[str], test_vars: set[str]) -> bool:
+    """Whether both stores carry the same, valid coarsened schema; prints the verdict when not."""
+    # Format contract: without it, two identically-malformed stores (both missing
+    # `embeddings`, say) would vacuously "pass" on whatever variables remain in common.
+    missing = [v for v in REQUIRED_VARS if v not in ref_vars]
+    forbidden = [v for v in FORBIDDEN_VARS if v in ref_vars]
+    if ref_vars != test_vars:
+        verdict = (
+            f"NOT bit-identical — variable sets differ: "
+            f"only-ref={ref_vars - test_vars} only-test={test_vars - ref_vars}"
+        )
+    elif missing:
+        verdict = f"INVALID coarsened store(s) — required variable(s) absent from both: {missing}"
+    elif forbidden:
+        verdict = (
+            f"NOT a coarsened store — {forbidden} present (full-resolution int8 "
+            "format; compare those runs with compare_outputs.py instead)."
+        )
+    else:
+        verdict = None
+    if verdict:
+        print(f"\nVERDICT: {verdict}")
+        return False
+
+    # Pin dtypes in BOTH stores; compare_var_structure only checks the two AGREE, and two
+    # identically-wrong stores agree.
+    dtype_problems = [
+        f"{tag} '{v}' is {ds[v].dtype} (expected {EXPECTED_DTYPES[v]})"
+        for v in REQUIRED_VARS
+        for tag, ds in (("ref", ref), ("test", test))
+        if str(ds[v].dtype) != EXPECTED_DTYPES[v]
+    ]
+
+    # Same for the dims layout: a wrong-but-agreeing axis order passes the dtype and
+    # agreement checks yet breaks the slab reader. A leading `time` axis is allowed.
+    dim_problems = [
+        f"{tag} '{v}' dims {tuple(ds[v].dims)} (expected {EXPECTED_DIMS[v]}, optionally led by time)"
+        for v in REQUIRED_VARS
+        for tag, ds in (("ref", ref), ("test", test))
+        if tuple(d for d in ds[v].dims if d != "time") != EXPECTED_DIMS[v]
+    ]
+    for what, problems in (("dtype", dtype_problems), ("dims", dim_problems)):
+        if problems:
+            print(f"\nVERDICT: INVALID coarsened store — required variable(s) have unexpected {what}:")
+            for p in problems:
+                print(f"  - {p}")
+    return not (dtype_problems or dim_problems)
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point; returns process exit code (0 = bit-identical)."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -361,55 +410,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # str(): see compare_coords — xarray keys are typed Hashable, ours are strings.
     ref_vars, test_vars = {str(v) for v in ref.data_vars}, {str(v) for v in test.data_vars}
-    if ref_vars != test_vars:
-        print(
-            f"\nVERDICT: NOT bit-identical — variable sets differ: "
-            f"only-ref={ref_vars - test_vars} only-test={test_vars - ref_vars}"
-        )
+    if not _schema_ok(ref, test, ref_vars, test_vars):
         return 1
-
-    # Format contract: without it, two identically-malformed stores (both missing
-    # `embeddings`, say) would vacuously "pass" on whatever variables remain in common.
-    missing = [v for v in REQUIRED_VARS if v not in ref_vars]
-    if missing:
-        print(f"\nVERDICT: INVALID coarsened store(s) — required variable(s) absent from both: {missing}")
-        return 1
-    forbidden = [v for v in FORBIDDEN_VARS if v in ref_vars]
-    if forbidden:
-        print(
-            f"\nVERDICT: NOT a coarsened store — {forbidden} present (full-resolution int8 "
-            "format; compare those runs with compare_outputs.py instead)."
-        )
-        return 1
-
-    # Pin dtypes in BOTH stores; compare_var_structure only checks the two AGREE, and two
-    # identically-wrong stores agree.
-    dtype_problems = [
-        f"{tag} '{v}' is {ds[v].dtype} (expected {EXPECTED_DTYPES[v]})"
-        for v in REQUIRED_VARS
-        for tag, ds in (("ref", ref), ("test", test))
-        if str(ds[v].dtype) != EXPECTED_DTYPES[v]
-    ]
-    if dtype_problems:
-        print("\nVERDICT: INVALID coarsened store — required variable(s) have unexpected dtype:")
-        for p in dtype_problems:
-            print(f"  - {p}")
-        return 1
-
-    # Same for the dims layout: a wrong-but-agreeing axis order passes the dtype and
-    # agreement checks yet breaks the slab reader. A leading `time` axis is allowed.
-    dim_problems = [
-        f"{tag} '{v}' dims {tuple(ds[v].dims)} (expected {EXPECTED_DIMS[v]}, optionally led by time)"
-        for v in REQUIRED_VARS
-        for tag, ds in (("ref", ref), ("test", test))
-        if tuple(d for d in ds[v].dims if d != "time") != EXPECTED_DIMS[v]
-    ]
-    if dim_problems:
-        print("\nVERDICT: INVALID coarsened store — required variable(s) have unexpected dims:")
-        for p in dim_problems:
-            print(f"  - {p}")
-        return 1
-
     var_problems = compare_var_structure(ref, test)
     if var_problems:
         print("\nDATA-VARIABLE STRUCTURE — NOT identical:")

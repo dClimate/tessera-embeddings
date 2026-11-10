@@ -82,7 +82,7 @@ import logging
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -201,7 +201,7 @@ class _FeederInputs:
         self._on_exit = on_exit
 
     @contextlib.contextmanager
-    def _parked(self) -> Iterator[None]:
+    def _parked(self) -> Generator[None]:
         self._on_enter()
         try:
             yield
@@ -1079,7 +1079,7 @@ def fill_zones_sequential(
                         # Per-zone staged-resume scan (the single-zone path does this inside
                         # run_inference; the stream pre-filters here).
                         restored = ZarrWriter(prep.staging_base).scan_existing_staged_artifacts(
-                            prep.run_id, zplan.live, compute_std=prep.config.compute_std, log=log
+                            prep.run_id, zplan.live, log=log
                         )
                         already = restored.done
                 except Exception as exc:
@@ -1300,7 +1300,7 @@ def fill_zones_sequential(
     #: two-argument contract every caller and fake already implements is untouched. The flow's
     #: session reads it back with ``getattr(more_work, "has_work", None)`` and hands it to
     #: ``run_inference``; a caller that ignores it simply gets ``[]`` taken at face value.
-    _more_work.has_work = _source_has_work  # type: ignore[attr-defined]
+    _more_work.has_work = _source_has_work  # ty: ignore[unresolved-attribute]
 
     feeder = threading.Thread(target=_feed, name="zone-feeder", daemon=True)
     feeder.start()

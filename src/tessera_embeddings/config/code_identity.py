@@ -27,6 +27,32 @@ from pathlib import Path
 _PACKAGE = __name__.split(".")[0]
 
 
+def _absolute_module(node: ast.ImportFrom, path: Path, root: Path) -> str | None:
+    """The dotted name ``node`` imports from, resolved against ``path`` if relative.
+
+    A relative import's ``node.module`` is the tail alone — ``"providers"`` for
+    ``from .providers import PROVIDERS`` — so a first-party filter on the package prefix
+    rejects it. That mattered: package ``__init__`` files re-export with relative
+    imports, so the closure stopped at every one of them, reaching ``config`` but not
+    ``config/providers.py`` and leaving the STAC collections, band lists, resolutions
+    and baseline settings outside the fingerprint of the code that ingests with them.
+    """
+    if not node.level:
+        return node.module if node.module and node.module.startswith(_PACKAGE) else None
+    # `level` counts dots. One means the importing module's own package — which is the
+    # containing directory for a plain module AND for an ``__init__.py``, since a
+    # package's ``__init__`` IS that package. Each further dot climbs one more.
+    base = path.parent
+    for _ in range(node.level - 1):
+        base = base.parent
+    try:
+        rel = base.relative_to(root)
+    except ValueError:  # pragma: no cover - a level that climbs out of the package
+        return None
+    parts = [_PACKAGE, *rel.parts, *([node.module] if node.module else [])]
+    return ".".join(parts)
+
+
 def first_party_import_closure(seed: list[Path], root: Path) -> set[Path]:
     """Every in-package module reachable from *seed*, following imports transitively.
 
@@ -83,37 +109,12 @@ def first_party_import_closure(seed: list[Path], root: Path) -> set[Path]:
         rel = dotted.removeprefix(_PACKAGE + ".").replace(".", "/")
         return resolve_case_exactly(f"{rel}.py") or resolve_case_exactly(f"{rel}/__init__.py")
 
-    def absolute_module(node: ast.ImportFrom, path: Path) -> str | None:
-        """The dotted name ``node`` imports from, resolved against ``path`` if relative.
-
-        A relative import's ``node.module`` is the tail alone — ``"providers"`` for
-        ``from .providers import PROVIDERS`` — so a first-party filter on the package prefix
-        rejects it. That mattered: package ``__init__`` files re-export with relative
-        imports, so the closure stopped at every one of them, reaching ``config`` but not
-        ``config/providers.py`` and leaving the STAC collections, band lists, resolutions
-        and baseline settings outside the fingerprint of the code that ingests with them.
-        """
-        if not node.level:
-            return node.module if node.module and node.module.startswith(_PACKAGE) else None
-        # `level` counts dots. One means the importing module's own package — which is the
-        # containing directory for a plain module AND for an ``__init__.py``, since a
-        # package's ``__init__`` IS that package. Each further dot climbs one more.
-        base = path.parent
-        for _ in range(node.level - 1):
-            base = base.parent
-        try:
-            rel = base.relative_to(root)
-        except ValueError:  # pragma: no cover - a level that climbs out of the package
-            return None
-        parts = [_PACKAGE, *rel.parts, *([node.module] if node.module else [])]
-        return ".".join(parts)
-
     def imported_modules(path: Path) -> set[str]:
         found: set[str] = set()
         for node in ast.walk(ast.parse(path.read_bytes())):
             if isinstance(node, ast.Import):
                 found.update(a.name for a in node.names if a.name.startswith(_PACKAGE))
-            elif isinstance(node, ast.ImportFrom) and (dotted := absolute_module(node, path)):
+            elif isinstance(node, ast.ImportFrom) and (dotted := _absolute_module(node, path, root)):
                 found.add(dotted)
                 found.update(f"{dotted}.{a.name}" for a in node.names)
         return found

@@ -297,7 +297,7 @@ def _staged_shards(
         if provenance_summary(dict(group.attrs)) is None:
             return None
         coverage = group.attrs.get("coverage")
-        return group, int((coverage or {}).get("embedded_px", 0)) if isinstance(coverage, dict) else 0
+        return group, int(cast(int, coverage.get("embedded_px", 0))) if isinstance(coverage, dict) else 0
 
     return {label: _one(label, ".zarr") for label in embedded} | {
         label: _one(label, _COVERAGE_SUFFIX) for label in refused
