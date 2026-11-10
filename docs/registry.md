@@ -230,28 +230,34 @@ way. The sensors are `s2` (optical), `s1_asc` and `s1_desc` (radar by orbit dire
   mosaic snapshot's lists, named on every row as `snapshot_id`, and is written once, by the first
   run that read that snapshot. Each row carries the image's catalogue ID and link, acquisition
   time, cloud cover, footprint (GeoParquet) and the exact object URLs that were read. A URL that no
-  longer resolves is itself information: the catalogue entry has moved since.
-- **`shard_dates`**: one row per tile, sensor and date on which a run's record has a valid
-  observation, with `valid_px`, the tile's pixels valid that day; `sources`, the `fusion_order` of
-  every image that supplied at least one of them; and `snapshot_id`, the mosaic the run read, which
+  longer resolves is itself information: the catalogue entry has moved since. After a day's fused
+  images come the Sentinel-2 copies the ingest set aside before building the mosaic, with no
+  `fusion_order` and a `status` saying why: `duplicate`, another copy of an image it used, or
+  `unreadable`, a copy that would not read and was replaced. Fused rows have `status` `fused`.
+- **`shard_dates`**: one row per tile, sensor and date on which an image had data at the tile, with
+  `valid_px`, the tile's pixels whose observation the model used that day; `sources`, the
+  `fusion_order` of every image with data at at least one of its pixels, used or not; and `snapshot_id`, the mosaic the run read, which
   is the key into `granules`.
 - **`pixel_sources`**: one Icechunk repository with a group `<ZONE>/<YEAR>/<run_id>`, holding a
   `(date, northing, easting)` array per sensor on the zone group's grid, and its dates as
-  `<sensor>_date`. A value `k > 0` means the pixel had a valid observation that date and the image
-  at `fusion_order = sources[k - 1]` of the tile's `shard_dates` row supplied it; `0` means none did.
+  `<sensor>_date`. A value `k` names the image at `fusion_order = sources[|k| - 1]` of the tile's
+  `shard_dates` row. Positive means the model used that observation; negative means the image had
+  data there and the model rejected it, a cloud for instance; `0` means no image had data.
 
 The helpers in `storage/provenance_reader.py` answer the usual questions as polars tables:
 `day_granules` for a day's mosaic, `shard_granules` for a tile and one run, and
 `pixel_granules(registry_root, lat, lon, year)`, which finds the pixel's zone, tile, row and column
 on the store's grid and picks the run by the rule below. By hand, to trace one pixel, open the
 run's group, read the pixel's column of values, and join each non-zero value through the tile's
-`shard_dates` row to `granules`, on the row's `snapshot_id`, its day and `sources[k - 1]`:
+`shard_dates` row to `granules`, on the row's `snapshot_id`, its day and `sources[|k| - 1]`:
 
 ```python
-k = run["s2"][:, row, col]                                 # one value per date of the optical axis
+k = run["s2"][:, row, col].astype(int)                     # one value per date of the optical axis
 dates = run["s2_date"][:]                                  # int64 nanoseconds, CF time encoding
-picks = [(d, v - 1) for d, v in zip(dates, k) if v]        # (date, rank in that date's `sources`)
+picks = [(d, abs(v) - 1, v > 0) for d, v in zip(dates, k) if v]   # (date, rank in `sources`, used)
 ```
+
+`pixel_granules` returns the same as a `valid` column.
 
 Open the group of the run that holds the pixel, from the master row's `source_runs`: the runs
 whose pixels the tile holds, oldest first. Walk them from the newest: a holes update holds the
