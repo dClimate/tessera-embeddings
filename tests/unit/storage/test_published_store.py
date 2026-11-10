@@ -473,6 +473,21 @@ class TestWhoWroteAYear:
             Commit("refill", refill["committed_at"], None),
         ]
 
+    def test_each_half_of_a_column_year_is_its_own_run(self):
+        """ADR 038: a column's halves record one run each, and a half's refill keeps its own history."""
+        north, south, refill = (
+            {"snapshot": s, "committed_at": f"2026-0{m}-01T00:00:00+00:00"} for s, m in (("n", 7), ("s", 8), ("r", 9))
+        )
+        runs = shard_writer.run_provenance(None, 2024, "north", commit=north, code={}, half="n")
+        runs = shard_writer.run_provenance(runs, 2024, "south", commit=south, code={}, half="s")
+        runs = shard_writer.run_provenance(runs, 2024, "refill", commit=refill, code={}, half="s")
+        assert [r["run_id"] for r in shard_writer.year_runs(runs, 2024)] == ["north", "refill"]
+        assert published_store.committed_runs({"runs": runs}, 2024, []) == [
+            Commit("north", north["committed_at"], None),
+            Commit("south", south["committed_at"], None, empty=True),
+            Commit("refill", refill["committed_at"], None),
+        ]
+
     def test_a_year_marked_without_shards_contributes_no_run(self):
         marked = shard_writer.run_provenance(None, 2024, "ocean", empty=True, code={})
         assert published_store.committed_runs({"runs": marked}, 2024, []) == []

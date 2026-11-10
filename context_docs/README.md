@@ -49,7 +49,8 @@ context_docs/
 │   ├── 030-forward-pass-reorderings-ship-at-a-store-boundary.md
 │   ├── 032-v2-stores-name-their-axes-y-and-x.md
 │   ├── 034-an-acquisition-is-one-datastrip-of-one-pass.md
-│   └── 037-v2-stores-use-the-utm-zones-layout.md
+│   ├── 037-v2-stores-use-the-utm-zones-layout.md
+│   └── 038-the-campaign-fills-a-utm-column-in-two-halves.md
 │
 ├── campaign/                      THE GLOBAL CAMPAIGN — start here
 │   ├── campaign-plan.md                        <- START HERE. What runs, with what settings, in
