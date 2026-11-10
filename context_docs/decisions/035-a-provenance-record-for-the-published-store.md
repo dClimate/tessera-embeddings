@@ -14,19 +14,23 @@ provenance beyond its registry, and none can be reconstructed.
 
 ## Decision
 
-1. **Record, beside the registry, every granule fused into each mosaic slot, on which dates a
-   shard's pixels had observations valid for the model, and per pixel and date which granule
-   supplied the observation.** Four pieces under `provenance/`: `granules`, `shard_dates`,
+1. **Record, beside the registry, every granule fused into each mosaic slot and every copy the
+   ingest dropped before the fuse, on which dates a shard's pixels had data, and per pixel and date
+   which granule supplied the observation and whether the model used it.** Four pieces under `provenance/`: `granules`, `shard_dates`,
    `pixel_sources` and, for holes updates, `update_pixels`. A run writes its own `shard_dates`,
    planes and mask and never another run's; `granules` belongs to the mosaic (5).
 2. **Per pixel, an integer, not a bit.** Measured on a real shard-year, the integer naming the
    winning granule costs 4% more than a validity bit (1.17 MB against 1.12 MB a shard-year, about
    3.7 TB for the campaign) and is exact where footprints overlap, where a bit would leave a list of
    candidates.
-3. **The published plane is `uint8`, a rank into the shard-date's `sources`; the mosaic's index is
-   `uint16`, the zone-wide fusion position.** A day's fusion order is zone-wide and can exceed 255;
-   a shard has a handful of contributing granules on a date, and the size above was measured on
-   per-shard ranks.
+3. **The published plane is `int8`, a signed rank into the shard-date's `sources`; the mosaic's
+   index is `uint16`, the zone-wide fusion position.** A value k names `sources[|k| - 1]`: positive
+   when the model used the observation, negative when its validity test rejected it, a cloud for
+   instance, and 0 when no granule had data. A reader can therefore tell "no image" from "image
+   rejected", and see which granule was cloudy. A day's fusion order is zone-wide and can exceed
+   255; a shard has a handful of granules on a date, so 127 per shard-date is ample. The size above
+   was measured on unsigned per-shard ranks before rejected observations were kept, which makes
+   cloudy pixels non-zero; the next dev run measures the difference.
 4. **The index rides on the loader's own per-source hook.** The mask band (SCL, VV) is read through
    a reader that packs each granule's position above its pixels, so odc's unchanged first-wins fuser
    picks the winner and a split returns the band bit-identical. One read and an unchanged fuse; the
@@ -36,8 +40,10 @@ provenance beyond its registry, and none can be reconstructed.
    per-shard list is `shard_dates.sources`.** A granule list belongs to its mosaic, so it is
    written once per snapshot, a later run reading the same snapshot checks it instead, and each
    `shard_dates` row names its snapshot: a reader joining through it never counts one mosaic's list
-   twice. `sources` is derived from the planes, so it names granules that supplied pixels rather
-   than those whose footprints touch.
+   twice. `sources` is derived from the planes, so it names granules that had data at the shard's
+   pixels rather than those whose footprints touch. Copies the ingest dropped follow a day's fused
+   granules with no fusion order and a `status`: `duplicate` for a losing copy of an image it
+   fused, `unreadable` for a copy that would not read and was replaced.
 6. **Publication failure fails the zone-year, before the tag and the cleanup.** It is retried as
    store writes are, and a retry of a landed but untagged cell republishes from its staging before
    tagging. No marker, gate or held state.
@@ -63,14 +69,14 @@ provenance beyond its registry, and none can be reconstructed.
 
 ## Left out
 
-- **The granule behind a cloudy pixel.** The mosaic's index names it, but only the planes masked to
-  the model's validity test are published.
 - **A source index per band.** It follows the mask band. A granule with data in one band and nodata
   in another at the same pixel would break that; the products do not produce one.
 - **v1.1.** Its mosaics are gone.
 - **Radar quality layers** (layover, shadow, looks): a separate decision, ADR 033.
-- **The copies the fallback ladder rejected.** They could be added later as rows that supplied no
-  pixel without changing the schema.
+- **Days the ingest drops whole**, for failing the coverage gate or because every copy of an image
+  failed to read. They write no mosaic slot, so there is no list to hold their granules.
+- **Radar granules whose catalogue entry lacks the VV and VH files it claims.** The query drops
+  them before any item is built; they are rare and could not have been read.
 - **Attribution.** The record says what went in, not how much any of it mattered.
 
 ## Consequences
@@ -79,7 +85,8 @@ provenance beyond its registry, and none can be reconstructed.
   ingest's code fingerprint moves, so the ingest half deploys while nothing is mid-ingest or under
   `allow_ingest_code_mismatch`.
 - About 4.7 TB of planes and under 200 GB of tables are added beside the store over the whole
-  campaign, about a quarter of a percent of it.
+  campaign, about a quarter of a percent of it, before the cost of keeping rejected observations,
+  which is still to be measured.
 - The ingest's time cost is inside run-to-run variation over seven paired runs of a dense zone;
   what the record adds for certain is one more chunk write per date, the index's, for the Dask
   scheduler, accepted (plan §6).

@@ -881,9 +881,11 @@ null rows of the v1.1 campaign, which ran before the embedded path persisted its
 When the mosaics were ingested with the `provenance` switch on, they carry a per-pixel
 `source_index`, and the actor turns it into the shard's share of the provenance record. Wherever the
 loader reads a sensor's validity (the whole-shard SCL mask for optical, each strip's VV and VH for
-radar) it reads the index over the same window, zeroes it where the model's test fails, and keeps it
-compressed per date. At the staging write, on the background writer, each date becomes one `uint8`
-plane of ranks into that date's `sources`, staged as `pixel_sources_<sensor>` with the summary as the
+radar) it reads the index over the same window, negates it where the model's test fails, and keeps
+it compressed per date. Optical reads it on every date, a fully cloudy one included, although the
+model skips those. At the staging write, on the background writer, each date becomes one `int8`
+plane of signed ranks into that date's `sources`: positive where the model used the observation,
+negative where it rejected it, zero where no granule had data. It is staged as `pixel_sources_<sensor>` with the summary as the
 tile's `provenance` attribute. A holes update cuts its planes to the pixels it embedded and stages
 that mask beside them, which becomes its `update_pixels`. Assembly then
 publishes the record before tagging the cell (`provenance_publish.py`,
