@@ -79,7 +79,7 @@ v1.1 store. This plan closes the gap from the first v2 zone-year onward.
 | What went into one shard? | per sensor, the dates on which any granule had data at its pixels, how many observations the model used, and which granules covered them | `shard_granules` | `shard_dates`, then `granules` |
 | What is behind one pixel? | per sensor, every date a granule had data at it, that granule, and whether the model used the observation or rejected it | `pixel_granules` | `pixel_sources`, then `shard_dates` and `granules` |
 
-The helpers are in `storage/provenance_reader.py` and return polars tables (Appendix B).
+The helpers are the methods of `ProvenanceRecord` in `storage/provenance_reader.py`, and return polars tables (Appendix B).
 
 **A worked example, with real values from the dev test.** The pixel at 45.5071°N, 14.3761°E, on
 the Slovenia–Croatia border, as `pixel_granules` finds it:
@@ -433,26 +433,28 @@ the holes update embedded.
 
 ## Appendix B. Reading the record
 
-The helpers in `storage/provenance_reader.py` answer §2's questions and apply §5's rule; OlmoEarth's
-documented helpers for its own provenance are the bar they are meant to clear. `REGISTRY` is the
-registry's root, a local path or an `s3://` URI.
+The helpers, methods of `ProvenanceRecord` in `storage/provenance_reader.py`, answer §2's questions
+and apply §5's rule; OlmoEarth's documented helpers for its own provenance are the bar they are
+meant to clear. `REGISTRY` is the registry's root, a local path or an `s3://` URI; credentials and a
+region are optional arguments of the record, as for the store's other readers.
 
 ```python
 import datetime as dt
-from tessera_embeddings.storage.provenance_reader import day_granules, locate, pixel_granules, shard_granules
+from tessera_embeddings.storage.provenance_reader import ProvenanceRecord, locate
 
 FILL, UPDATE = "33N-2024-9a1fc94c", "33N-2024-e892e33b"
+record = ProvenanceRecord(REGISTRY)
 
 # A day: the optical granules of 9 May 2024 in the mosaic the fill read, in fusion order, then the
 # copies the ingest dropped, with their reason in `status`.
-day_granules(REGISTRY, "33N", 2024, "s2", dt.date(2024, 5, 9), run_id=FILL)
+record.day_granules("33N", 2024, "s2", dt.date(2024, 5, 9), run_id=FILL)
 # A shard: per sensor and date the fill recorded, every granule that had data at a pixel.
-shard_granules(REGISTRY, "33N", 2024, "chunk_209_14", FILL)
+record.shard_granules("33N", 2024, "chunk_209_14", FILL)
 # A pixel: §2's, from the update that claims it; a row per sensor and date a granule had data
 # there, with run_id, valid (whether the model used it), granule_id, platform, acquired_at,
 # cloud_cover and the asset URLs.
 locate(45.5071, 14.3761)              # PixelLocation(zone='33N', tile='chunk_209_14', row=1908, col=70)
-pixel_granules(REGISTRY, 45.5071, 14.3761, 2024)
+record.pixel_granules(45.5071, 14.3761, 2024)
 ```
 
 The same in raw polars, for one run, here the update. Two rules from the helpers apply to any

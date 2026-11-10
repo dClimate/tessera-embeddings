@@ -244,10 +244,10 @@ way. The sensors are `s2` (optical), `s1_asc` and `s1_desc` (radar by orbit dire
   `shard_dates` row. Positive means the model used that observation; negative means the image had
   data there and the model rejected it, a cloud for instance; `0` means no image had data.
 
-The helpers in `storage/provenance_reader.py` answer the usual questions as polars tables:
-`day_granules` for a day's mosaic, `shard_granules` for a tile and one run, and
-`pixel_granules(registry_root, lat, lon, year)`, which finds the pixel's zone, tile, row and column
-on the store's grid and picks the run by the rule below. By hand, to trace one pixel, open the
+`ProvenanceRecord(registry_root)`, in `storage/provenance_reader.py`, answers the usual questions as
+polars tables: `day_granules` for a day's mosaic, `shard_granules` for a tile and one run, and
+`pixel_granules(lat, lon, year)`, which finds the pixel's zone, tile, row and column on the store's
+grid and picks the run by the rule below. By hand, to trace one pixel, open the
 run's group, read the pixel's column of values, and join each non-zero value through the tile's
 `shard_dates` row to `granules`, on the row's `snapshot_id`, its day and `sources[|k| - 1]`:
 
