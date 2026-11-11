@@ -59,10 +59,11 @@ restricting the run to the patches would save almost nothing; the whole image ti
   points (about 185). The box costs about $1,000 more for all nine years. In return, every area is
   a plain box that anyone can reproduce from the coordinates in the steps, and the highlands are
   covered without gaps, which helps when looking at maps and when measuring year-to-year change.
-- **Each version is first run in one year per area**, the year the area's labels mostly fall in.
-  Only a version that passes is run in all nine years. France has crop labels only for 2019 and
-  LUCAS points for 2017 and 2018, and nearly all of Ethiopia's labels are for 2020, so most of the
-  nine years can show only how much embeddings change, not whether they are right.
+- **Each version is run in one year per area**, the year the area's labels mostly fall in. Running
+  all nine years is optional and not expected as normal practice: France has crop labels only for
+  2019 and LUCAS points for 2017 and 2018, and nearly all of Ethiopia's labels are for 2020, so most
+  of the nine years can show only how much embeddings change, not whether they are right, at nine
+  times the cost.
 - **Each version gets its own store, laid out like the global dataset.** Three layouts were
   considered:
   - *One store holding every version, each under its own name:* the flows that write the global

@@ -54,7 +54,7 @@ Each area is a box of longitude and latitude. The land cells whose centres fall 
 the ones processed. The four French boxes enclose the four Sentinel-2 image tiles that the PASTIS
 labels were cut from.
 
-| area | box: west, south, east, north | zone | land cells | tiles | years with labels | year for the first check |
+| area | box: west, south, east, north | zone | land cells | tiles | years with labels | year tested |
 |---|---|---|---|---|---|---|
 | Normandy (PASTIS T30UXV) | −1.7, 48.6, −0.1, 49.7 | `utm30n` | 144 | 38 | PASTIS 2019; LUCAS 2017–2018 | 2019 |
 | Provence (PASTIS T31TFJ) | 4.2, 43.2, 5.7, 44.3 | `utm31n` | 151 | 44 | the same | 2019 |
@@ -64,12 +64,9 @@ labels were cut from.
 | Southwestern Ontario | −81.0, 43.0, −79.5, 44.0 | `utm17n` | 150 | 42 | every year 2017–2022 | 2018 |
 | **all six** | | 5 zones | 3,592 | 1,099 | | |
 
-A version is tested in two steps:
-
-1. **The first check** runs each area for one year, the one in the last column, and compares
-   predictions. That is 1,099 tiles. Every version gets this check.
-2. **The full check** runs every area for every year from 2017 to 2025, about 9,900 tiles in
-   all. Only a version that passes the first check gets it.
+A version is tested by running each area for one year, the one in the last column: 1,099 tiles in
+all. You can also run every year from 2017 to 2025 (about 9,900 tiles) to see how the embeddings
+change over time, but that is not part of the normal test.
 
 ## Where everything is kept
 
@@ -160,7 +157,7 @@ A version that changes the code but keeps the model's weights still uses `model_
 New weights first need their own `model_version` in this library, as any new model does before a
 global run.
 
-**2. Run the first check** from the Prefect deployment of the version's code branch.
+**2. Run it** from the Prefect deployment of the version's code branch.
 `allow_s2_only=true` embeds pixels that have Sentinel-2 observations but no Sentinel-1 radar, as
 the global dataset does:
 
@@ -170,11 +167,11 @@ prefect deployment run 'fill-zones-sequential/<deployment>' -p paths='<paths>' \
     -p cells='[["utm30n", 2019], ["utm31n", 2019], ["utm32n", 2019], ["utm37n", 2020], ["utm17n", 2018]]'
 ```
 
-**3. Score it** against the baseline, as described below. The first time, the baseline needs this
-check run on its own store too.
+**3. Score it** against the baseline, as described below. The first time, run the baseline through
+steps 1 and 2 as well.
 
-**4. If it passes, run the full check:** the same command, with `cells` listing each of the five
-zones with every year from 2017 to 2025. Then score again.
+**To run all nine years**, use the same command with `cells` listing each of the five zones with
+every year from 2017 to 2025, for both versions.
 
 **Test one version at a time.** Versions share the downloaded imagery, and each run deletes a zone's
 imagery for a year once that zone and year are finished (the `cleanup_mosaics` setting, on by
@@ -202,19 +199,19 @@ embeddings and measuring it on the test points. Report the balanced accuracy, wh
 over classes of the share of each class's test points predicted correctly. Leave out any class with
 fewer than 10 training points inside the areas.
 
-**A version passes the first check** if, for every set of labels, its balanced accuracy is not
-clearly lower than the baseline's. To decide "clearly", repeat the comparison 1,000 times, each
-time on test points drawn at random with replacement, scoring both versions on the same draw. Sort
-the 1,000 differences (new version minus baseline). If the 25th smallest is below zero, the drop is
-within chance and the version passes.
+**A version passes** if, for every set of labels, its balanced accuracy is not clearly lower than
+the baseline's. To decide "clearly", repeat the comparison 1,000 times, each time on test points
+drawn at random with replacement, scoring both versions on the same draw. Sort the 1,000
+differences (new version minus baseline). If even the 975th smallest is below zero, the version is
+worse on nearly every draw and fails; otherwise it passes.
 
 **Check how many pixels have embeddings.** For each area and year, report the share of pixels
 inside the mask that hold an embedding, in both stores. If a version embeds more than one
 percentage point fewer pixels than the baseline, find out why before adopting it, even if its
 accuracy passes.
 
-**The full check adds two things.** Score every set of labels in every year it has labels. And for
-each area, report how similar each pixel's embedding is from one year to the next (the median
+**If you ran all nine years**, score every set of labels in every year it has labels. And for each
+area, report how similar each pixel's embedding is from one year to the next (the median
 cosine similarity between consecutive years), for both versions. A large difference from the
 baseline is worth explaining, but it is not by itself a failure.
 
@@ -225,8 +222,8 @@ coordinates as the stores made here.
 
 ## What it costs
 
-For the v2 Large model, the first check costs about $190 and the full check about $1,700, mostly
-for GPU time. These are estimates from the global run's measured cost per tile and year, not from
+For the v2 Large model, testing a version costs about $190, and running all nine years about
+$1,700, mostly for GPU time. These are estimates from the global run's measured cost per tile and year, not from
 running these areas; the context document shows the working.
 
 ## What this does not tell you
@@ -237,5 +234,7 @@ running these areas; the context document shows the working.
   every version scores lower in 2017. Compare 2017 only with 2017.
 - **Most years have no labels in France and Ethiopia.** France has crop labels only for 2019 and
   LUCAS points for 2017 and 2018; nearly all of Ethiopia's labels are for 2020. In the other years,
-  the full check can show only how much the embeddings change, not whether they are right.
+  a nine-year run can show only how much the embeddings change, not whether they are right.
+- **The normal test covers one year per area**, so a change that harms only some years, such as
+  2017's thinner imagery, can pass unnoticed.
 - **It does not test the single-area runner**, which these steps do not use.
