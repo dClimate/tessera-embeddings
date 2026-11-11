@@ -189,8 +189,8 @@ implementation computes the same thing.
 **Read each label's embedding** from the pixel that contains its point, in the year the label
 applies to, from both stores. [`global-store.md`](global-store.md) shows how to open a store and turn
 its stored integers back into embedding values. Zone `utm31n` is in the store's group `utm31`, with
-`x` and `y` in the map projection EPSG:32631. Leave out any label whose pixel has no embedding in
-either store, and report how many were left out.
+`x` and `y` in the map projection EPSG:32631. If a label's pixel has no embedding in one store or
+the other, leave that label out for both versions, and report how many were left out.
 
 - **PASTIS:** use pixels from each patch's `TARGET` file, leaving out class 0 (background) and
   class 19 (unlabelled). Take at most 50 pixels per patch, chosen at random with a fixed seed.
