@@ -1,24 +1,26 @@
-# Choosing the evaluation suite's areas
+# Choosing the areas for testing changes
 
-**The suite is six boxes in France, Ethiopia and Ontario, chosen because they hold the densest
-public crop labels that small areas can carry; a gate run costs about $190 and a full nine-year
-run about $1,700 per variant on v2 Large.** The procedure is in
-[`docs/evaluation.md`](../../docs/evaluation.md). This page records why these areas, why the suite
-is shaped as it is, and how the costs were estimated, as decided on 2026-11-11.
+**Changes are tested on six boxes in France, Ethiopia and Ontario, chosen because they hold the
+most public crop labels for the least area. For the v2 Large model, testing a version in one year
+per area costs about $190, and in all nine years about $1,700.** The steps are in
+[`docs/evaluation.md`](../../docs/evaluation.md). This page records why these areas, why the
+results are stored as they are, and how the costs were estimated. The decisions were made on
+2026-11-11.
 
-## The constraint that decided everything
+## Why label density decides everything
 
-Cost scales with 2048-pixel tiles (about 20 km square), not with labelled points: a tile holding
-one label costs the same as a tile holding a thousand. A useful evaluation area is therefore one
-where labels are **dense per tile**, and most published benchmarks are built the other way, spread
-thinly over a continent or the globe so that a model is tested everywhere.
+The cost of a run is set by how many 2048-pixel tiles (about 20 km square) it covers, not by how
+many labelled points they hold: a tile with one label costs the same as a tile with a thousand.
+A good test area therefore has many labels per tile. Most published benchmarks are built the other
+way, with labels spread thinly over a continent or the world, so that a model is tested everywhere.
 
-## Candidates
+## The labels considered
 
-**The AlphaEarth evaluation set** ([Zenodo 16585402](https://zenodo.org/records/16585402), fifteen
-label sets) was measured by binning each set's points into squares of 0.185° (about one tile):
+**The AlphaEarth evaluation data** ([Zenodo 16585402](https://zenodo.org/records/16585402)) holds
+fifteen sets of labels. To compare them, each set's points were counted in squares of 0.185°,
+about the size of one tile:
 
-| label set | points | squares holding points | points per square | squares holding half the points |
+| labels | points | squares holding points | points per square | squares holding half the points |
 |---|---|---|---|---|
 | `ethiopia_crops` | 2,530 | 185 | 13.7 | 17 |
 | `lucas_lu` | 226,858 | 16,937 | 13.4 | 4,550 |
@@ -32,94 +34,97 @@ label sets) was measured by binning each set's points into squares of 0.185° (a
 | `glance` | 34,885 | 28,056 | 1.2 | 10,614 |
 | `aster_ged`, `africa_crop_mask`, `lcmap_lcc`, `lcmap_luc` | 991–17,636 | — | 1.0–1.1 | — |
 
-Only three are usable at small-area cost:
+Only three of these can be tested cheaply:
 
-- **`ethiopia_crops`** is compact: half its points sit in 17 squares, all in UTM zone 37. It is
-  82% wheat, and maize and teff lie mostly outside the dense core.
-- **`canada_crops_coarse`** has one dense pocket: 1,314 points in 81–79.5°W, 43–44°N
-  (southwestern Ontario), nine classes, labelled in every year from 2017 to 2022. It is the only
-  label set with labels in six different years of one small area.
-- **LUCAS** is too thin to choose an area by, but it falls inside the PASTIS boxes for free: 2,473
-  land-cover and 2,692 land-use points.
+- **`ethiopia_crops`** is compact: half its points lie in 17 squares, all in UTM zone 37. It is
+  82% wheat, and most of the maize and teff points lie away from the densest squares.
+- **`canada_crops_coarse`** has one dense patch: 1,314 points in 81–79.5°W, 43–44°N, in
+  southwestern Ontario, across nine classes and every year from 2017 to 2022. It is the only set
+  with labels in six different years within one small area.
+- **LUCAS** is too spread out to choose an area by, but 2,473 of its land-cover points and 2,692 of
+  its land-use points fall inside the French boxes, which are run anyway.
 
-**PASTIS-R**, supplied as `pastis_r_roi.geojson`, holds 2,433 patches of 128 × 128 pixels with
-crop types for every pixel, all from 2019, cut from four Sentinel-2 tiles (T30UXV, T31TFJ, T31TFM,
-T32ULU). The patches touch 135 of the 144 tiles under those four Sentinel-2 tiles, so cutting the
-area down to the patches saves nothing; the suite takes the whole Sentinel-2 tiles.
+**PASTIS-R**, supplied as `pastis_r_roi.geojson`, holds 2,433 patches of 128 × 128 pixels with the
+crop type of every pixel, all for 2019. They were cut from four Sentinel-2 image tiles (T30UXV,
+T31TFJ, T31TFM and T32ULU). The patches touch 135 of the 144 tiles under those image tiles, so
+restricting the run to the patches would save almost nothing; the whole image tiles are used.
 
 ## Decisions
 
-- **v2 only.** v1.1 already exists for every area and year in the published store, so the suite
-  generates v2 and later models only.
-- **French Guiana is held out.** No labels came with it, so it could only test the cloudy tropics
-  by inspection. It returns if a reference such as a land-cover or canopy-height map is chosen.
-- **Ethiopia is one bounding box around every point** (882 tiles), rather than only the tiles
-  holding points (about 185). The box costs about $1,000 more per full run, and in exchange every
-  area is a plain box that anyone can reproduce from the coordinates in the runbook, with
-  continuous coverage across the highlands for maps and the stability check.
-- **Label years first.** Every candidate gets a gate run of each area's one label year; only a
-  candidate that passes gets the full nine years. France and Ethiopia have labels in only one year,
-  so the other years test stability, not accuracy.
-- **One store per variant, laid out like the global store.** Three layouts were considered:
-  - *One store holding all variants as named groups:* the global flows write only UTM-zone groups,
-    so this needs code changes, ruled out for a need this narrow.
-  - *Separate single-area stores per area:* six per variant, each needing a grid hand-snapped to the zone's pixel
-    lattice to line up with the reference. Worse, the single-area runner drops pixels without radar
-    and keeps dates at 5% rather than 0.1% valid coverage by default, and it has no flow-level
-    tests, so it would validate a path a global run does not use.
-  - *A global-layout store per variant (chosen):* tiles the mask does not reach are never written,
-    so a store covering six small boxes is small. The fill path is the one a global run uses, and
-    a reader finds both models by the same `utmNN` group and coordinates.
-- **The store is addressed with `global_store_uri`**, which drops the `global/` directory from its
-  path with no code change.
-- **Checkpoints are copied** into the suite's `inputs` root, because the fill flows read
-  `<inputs>/models/<filename>` and nothing else. Adding a separate models location to the path
-  settings was turned down as code for a narrow need.
-- **The suite waits for the `utm01`–`utm60` zone layout** ([ADR 037](../decisions/037-v2-stores-use-the-utm-zones-layout.md)),
-  which every model from v2 onward uses. A store seeded before that layout ships would test a
-  layout no global v2 run will use.
+- **Only v2 and later models are run.** The published dataset already holds v1.1 for every area and
+  year.
+- **French Guiana is left out for now.** It came with no labels, so it could only be judged by eye.
+  It can return if a reference map, such as land cover or canopy height, is chosen for it.
+- **Ethiopia is one box around every point** (882 tiles), rather than only the tiles that hold
+  points (about 185). The box costs about $1,000 more for all nine years. In return, every area is
+  a plain box that anyone can reproduce from the coordinates in the steps, and the highlands are
+  covered without gaps, which helps when looking at maps and when measuring year-to-year change.
+- **Each version is first run in one year per area**, the year the area's labels mostly fall in.
+  Only a version that passes is run in all nine years. France has crop labels only for 2019 and
+  LUCAS points for 2017 and 2018, and nearly all of Ethiopia's labels are for 2020, so most of the
+  nine years can show only how much embeddings change, not whether they are right.
+- **Each version gets its own store, laid out like the global dataset.** Three layouts were
+  considered:
+  - *One store holding every version, each under its own name:* the flows that write the global
+    dataset name groups only by UTM zone, so this would need code changes. Turned down as too much
+    code for a narrow need.
+  - *A separate single-area store for each area:* six stores per version, each needing a grid
+    aligned by hand to the zone's pixels so that it lines up with the baseline. The single-area
+    runner also skips pixels without radar and drops more cloudy dates by default (it keeps a date
+    only if 5% of the area is clear, against 0.1% for the global run), and its end-to-end path has
+    no automated tests. It would test a path a global run does not use.
+  - *One store per version, laid out like the global dataset (chosen):* tiles outside the mask are
+    never written, so a store holding six small boxes stays small. The runs use the same flows as a
+    global run, and both models' embeddings are read from the same zone groups and coordinates.
+- **Each store's location is set with `global_store_uri`**, which keeps the `global/` directory out
+  of its path without any code change.
+- **Model weights are copied** into the areas' own input location, because the flows look for them
+  only under `<inputs>/models/`. Adding a separate setting for where models live was turned down as
+  code for a narrow need.
+- **These runs wait for the `utm01`–`utm60` zone names**
+  ([ADR 037](../decisions/037-v2-stores-use-the-utm-zones-layout.md)), which every model from v2
+  onward uses. A store created with the older zone names would test a layout no global v2 run will
+  use.
 
 ## How the costs were estimated
 
-No part of the suite has been run, so every figure scales a measured campaign rate.
+None of these areas has been run yet, so every figure scales a cost measured on the global run.
 
-**Embeddings.** The v2 campaign estimate
-([cost model §13](../campaign/campaign-cost-model.md)) is about $560,000 for 3.25 million
-tile-years, all lines included: $0.172 per tile-year.
+**Producing embeddings.** The estimate for a nine-year v2 global run
+([cost model §13](../campaign/campaign-cost-model.md)) is about $560,000 for 3.25 million tiles
+counted once per year, everything included: $0.172 per tile per year.
 
-| run | tile-years | cost |
+| run | tiles × years | cost |
 |---|---|---|
-| gate (one label year per area) | 1,099 | ~$190 |
-| full (2017–2025) | 9,891 | ~$1,700 |
-| Ethiopia alone, full, as a box | 7,938 | ~$1,370 |
-| Ethiopia alone, full, tiles with points only | ~1,665 | ~$290 |
+| one year per area | 1,099 | ~$190 |
+| all nine years | 9,891 | ~$1,700 |
+| Ethiopia alone, nine years, as one box | 7,938 | ~$1,370 |
+| Ethiopia alone, nine years, only tiles holding points | ~1,665 | ~$290 |
 
-Tile counts come from the land registry: each box's land cells, projected into the fill zone's
-UTM grid, counting every 20,480 m tile a cell touches. The campaign rate averages over the whole
-globe, and the suite departs from that average in ways that push both directions: five zones each
-pay a fixed start-up cost, while all six areas are fully land. Treat the figures as ±30%.
+The tile counts come from the published land-cell list: each box's land cells, placed on the UTM
+zone's grid, counting every 20,480 m tile a cell touches. The global rate is an average over the
+whole world, and these areas differ from it in both directions: each of the five zones pays a fixed
+cost to start, while every area is entirely land. Treat the figures as accurate to about ±30%.
 
-**Keeping mosaics between runs.** The campaign ingested 14.04 PB of mosaics for 3.25 million
-tile-years ([§12c](../campaign/campaign-cost-model.md)), about 4.3 GB per tile-year, and ingest
-(containers and requests) came to about $0.038 per tile-year.
+**Keeping the downloaded imagery between runs.** The global run downloaded 14.04 PB of imagery for
+its 3.25 million tile-years ([§12c](../campaign/campaign-cost-model.md)), about 4.3 GB each, and
+downloading it cost about $0.038 per tile per year.
 
-| | gate | full |
+| | one year per area | all nine years |
 |---|---|---|
-| mosaics | ~4.7 TB | ~42 TB |
-| storing them, per month | ~$110 | ~$980 |
-| rebuilding them, per run | ~$42 | ~$375 |
+| imagery | ~4.7 TB | ~42 TB |
+| keeping it, per month | ~$110 | ~$980 |
+| downloading it again, per run | ~$42 | ~$375 |
 
-Rebuilding is cheaper unless more than two or three candidates are evaluated a month, and a
-candidate that changes ingest needs fresh mosaics anyway. The runbook keeps the default of
-deleting them.
+Downloading again is cheaper unless more than two or three versions are tested a month, and a
+version that changes how imagery is downloaded needs a fresh download anyway. The steps therefore
+keep the flows' default of deleting imagery after each run.
 
 ## Not yet settled
 
-- **Scoring has no implementation.** The runbook defines the procedure; the TESSERA team's
-  implementation will live with its deployment code.
-- **Licences of the label sets** were not checked; the suite links to them rather than copying
-  them.
-- **Radar coverage of the areas** was not checked. An area without Sentinel-1 in some year scores
-  on optical-only pixels there.
-- **159 Ethiopian points are labelled in 2021**, outside the gate year. They are scored only in a
-  full run.
+- **No code computes the scores yet.** The steps describe what to compute; the TESSERA team's
+  code will live with its deployment code.
+- **The labels' licences** were not checked. The steps link to the labels rather than copying them.
+- **Radar coverage of the areas** was not checked. Where an area has no Sentinel-1 images in a
+  year, its embeddings there are made from Sentinel-2 alone.
+- **159 Ethiopian points are labelled for 2021**, not 2020, so only the nine-year run scores them.
