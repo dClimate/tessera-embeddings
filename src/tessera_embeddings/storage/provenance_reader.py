@@ -149,13 +149,14 @@ class ProvenanceRecord:
             ValueError: ``where`` names no pixel of its shard.
         """
         runs = self._source_runs(where, year)
-        shard_px = cast(int, self._run_group(where.zone, year, runs[-1]).attrs["shard_px"])
+        newest = self._run_group(where.zone, year, runs[-1])
+        shard_px = cast(int, newest.attrs["shard_px"])
         if not (0 <= where.row < shard_px and 0 <= where.col < shard_px):
             raise ValueError(f"{where}: row and column must lie in [0, {shard_px})")
         run = self._claiming_run(where, year, runs)
         if where.tile in self._run_metadata(where.zone, year, run).get("unrecorded_tiles", "").split(","):
             raise LookupError(f"{where.zone}/{year} {where.tile}: run {run} staged no provenance record for it")
-        group = self._run_group(where.zone, year, run)
+        group = newest if run == runs[-1] else self._run_group(where.zone, year, run)
         shard_row, shard_col = parse_chunk_label(where.tile)
         y, x = shard_row * shard_px + where.row, shard_col * shard_px + where.col
         # A plane value k names `sources[|k| - 1]`; positive means the model used the observation.
