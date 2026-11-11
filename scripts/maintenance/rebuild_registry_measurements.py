@@ -1,4 +1,4 @@
-"""Repair the registry's ``master/``: rebuild cells from their parts and re-derive what fills left null.
+"""Repair the registry's ``master/``: rebuild cells from their run files and re-derive what fills left null.
 
 Every fill merges its own cell into ``master/`` (``registry_master.merge_cell``, called by the
 zone-fill runner). This script is for what that cannot do: re-deriving rows a fill published null,
@@ -11,14 +11,14 @@ Every column is derivable from the store, so this is a re-derivation rather than
 reduces to ``s2_obs_count > 0`` on the delivered product, and for the one column
 (``eligible_px``) deliberately left null.
 
-**``repair`` rebuilds a cell from three inputs**: its parts, its existing master rows, and a fresh
-re-derivation of every row its fills left null, merged tile by tile. The parts supply every tile and
-every measurement a fill took, which the merge never overrides; the existing master keeps a radar
-column an optical-only pass would not re-measure. ``parts/`` is never touched, and a cell whose
-re-derivation or store check is blocked is not written at all. Every cell with a part, a master
-file or a shard commit is visited: a master file whose last part was deleted is emptied, and a
-commit with no part is reported. Each cell is written through the
-fill's own ``registry_master.merge_cell``, conditionally, so a fill landing mid-repair is merged in
+**``repair`` rebuilds a cell from three inputs**: its run files, its existing master rows, and a
+fresh re-derivation of every row its fills left null, merged tile by tile. The run files supply every
+tile and every measurement a fill took, which the merge never overrides; the existing master keeps a
+radar column an optical-only pass would not re-measure. ``runs/`` is never touched, and a cell whose
+re-derivation or store check is blocked is not written at all. Every cell with a run file, a master
+file or a shard commit is visited: a master file whose last run file was deleted is emptied, and a
+commit with no run file is reported. Each cell is written through the fill's own
+``registry_master.merge_cell``, conditionally, so a fill landing mid-repair is merged in
 rather than overwritten. Every writing subcommand is a DRY RUN unless given ``--write``.
 
 Run from the REPOSITORY ROOT::
@@ -29,7 +29,7 @@ Run from the REPOSITORY ROOT::
     # 2. rebuild master/ (every cell, or --zones). --skip-radar is the cheap optical-only pass.
     uv run python scripts/maintenance/rebuild_registry_measurements.py repair --write
 
-    # 3. check master/ itself, cell by cell, against parts/, and parts/ against the store
+    # 3. check master/ itself, cell by cell, against runs/, and runs/ against the store
     uv run python scripts/maintenance/rebuild_registry_measurements.py verify
 
 **An ``s3://`` registry needs ``s3fs``**, from the ``aws`` extra (``uv sync --all-extras`` installs it):
@@ -131,7 +131,7 @@ def _registry_table(
 
     Only an ``optional`` prefix may be absent — ``master/`` before the first repair of a fresh
     registry — and then it reads as an empty table. Anything else that cannot be read raises: an
-    empty ``parts/`` from a mistyped ``--registry`` or a failed read would let every subcommand pass
+    empty ``runs/`` from a mistyped ``--registry`` or a failed read would let every subcommand pass
     having checked nothing.
     """
     path = root.removeprefix("s3://").rstrip("/") + "/" + prefix
@@ -180,20 +180,20 @@ def _only_zones(table: pa.Table, zones: list[str]) -> pa.Table:
     return table
 
 
-def _cells(parts: pa.Table, zones: list[str]) -> dict[tuple[str, int], pa.Table]:
-    """Each ``(zone, year)``'s parts, every run's rows: the unit a fill and a repair work in."""
-    parts = _only_zones(parts, zones).sort_by([("zone", "ascending"), ("year", "ascending")])
-    return {(zone, year): rows for zone, year, rows in cell_tables(parts)}
+def _cells(run_rows: pa.Table, zones: list[str]) -> dict[tuple[str, int], pa.Table]:
+    """Each ``(zone, year)``'s run files, every run's rows: the unit a fill and a repair work in."""
+    run_rows = _only_zones(run_rows, zones).sort_by([("zone", "ascending"), ("year", "ascending")])
+    return {(zone, year): rows for zone, year, rows in cell_tables(run_rows)}
 
 
 def _every_cell(
     fs: AbstractFileSystem, root: str, store: _Store, cells: dict[tuple[str, int], pa.Table], zones: list[str]
 ) -> dict[tuple[str, int], pa.Table]:
-    """``cells`` plus every cell with a master file or a shard commit but no part, narrowed to ``zones``.
+    """``cells`` plus every cell with a master file or a shard commit but no run file, narrowed to ``zones``.
 
-    A cell with no part has no rows. A master file outlives its last part when that run is
-    withdrawn, and a fill whose part never published leaves only its commit; neither is in
-    ``parts/`` for a pass over it to find, so a zone named in ``zones`` need only be in one of them.
+    A cell with no run file has no rows. A master file outlives its last run file when that run is
+    withdrawn, and a fill whose run file never published leaves only its commit; neither is in
+    ``runs/`` for a pass over it to find, so a zone named in ``zones`` need only be in one of them.
     """
     base = root.removeprefix("s3://").rstrip("/")
     held = {
@@ -210,24 +210,24 @@ def _every_cell(
     return every
 
 
-def _current(parts: pa.Table) -> pa.Table:
+def _current(run_rows: pa.Table) -> pa.Table:
     """Each tile's current fill row: from the newest run that wrote it, the run the store holds there.
 
     So a refilled tile is neither gated against an older run's numbers nor re-derived under its rule.
     """
-    return merge(as_master_rows(parts, MEASURED_BY_FILL))
+    return merge(as_master_rows(run_rows, MEASURED_BY_FILL))
 
 
 def _store_slot(
-    store: _Store, zone: str, year: int, parts: pa.Table
+    store: _Store, zone: str, year: int, run_rows: pa.Table
 ) -> tuple[int, Callable[[], published_store.StoreYear]] | str:
-    """The cell's time index and a read of its store record, or why the store cannot stand behind its parts.
+    """The cell's time index and a read of its store record, or why the store cannot stand behind its run files.
 
-    The store's record of the year must account for every part, and a part for every tile a run
-    last wrote (``registry_master.store_disagreements``). Then every current row's tile holds the
+    The store's record of the year must account for every run file, and a run file for every tile a
+    run last wrote (``registry_master.store_disagreements``). Then every current row's tile holds the
     pixels of the run that row names, because a run writes only its own tiles — so a cell built
     from several runs, an update over a first fill, is re-derivable tile by tile. A run that committed
-    but never published its part breaks that, and re-deriving rows from its pixels would publish a
+    but never published its run file breaks that, and re-deriving rows from its pixels would publish a
     mixture neither run produced.
     """
     repo, root, writes = store
@@ -241,7 +241,7 @@ def _store_slot(
     def record() -> published_store.StoreYear:
         return published_store.store_year(repo, group, zone, year, writes())
 
-    if found := store_disagreements(parts, record()):
+    if found := store_disagreements(run_rows, record()):
         return "; ".join(found)
     return years.index(year), record
 
@@ -297,7 +297,7 @@ def _gate_rows(
 def cmd_gate(args: argparse.Namespace) -> int:
     """Prove the rebuild reproduces measurements the fill already took. Writes nothing."""
     fs = _filesystem(args.registry, args.region, anonymous=args.anonymous)
-    table = _registry_table(fs, args.registry, "parts", dataset_schema())
+    table = _registry_table(fs, args.registry, "runs", dataset_schema())
     violating, checked_rows = registry_rebuild.basis_violations(table)
     print(
         f"basis: {checked_rows - violating:,} of {checked_rows:,} measured rows satisfy "
@@ -307,7 +307,7 @@ def cmd_gate(args: argparse.Namespace) -> int:
         print(f"\nFAILED — {violating:,} measured rows break the identity every re-derivation rests on")
         return 1
     cells = _cells(table, args.zones)
-    current = {cell: _current(parts) for cell, parts in sorted(cells.items())}
+    current = {cell: _current(rows) for cell, rows in sorted(cells.items())}
     measured = [
         (cell, rows.filter(pc.is_valid(rows.column(MEASURED_SENTINEL))).to_pylist()) for cell, rows in current.items()
     ]
@@ -404,7 +404,7 @@ def _repair_cell(
     store: _Store,
     zone: str,
     year: int,
-    parts: pa.Table,
+    run_rows: pa.Table,
     args: argparse.Namespace,
     rng: random.Random,
     run_id: str,
@@ -414,11 +414,11 @@ def _repair_cell(
     Raises ``ValueError`` with the reason when the cell is blocked, writing nothing.
     """
     # Checked for EVERY cell, not only one with rows to re-derive: a run the store committed that
-    # the parts do not account for means they no longer describe the cell, whatever they hold.
-    slot = _store_slot(store, zone, year, parts)
+    # the run files do not account for means they no longer describe the cell, whatever they hold.
+    slot = _store_slot(store, zone, year, run_rows)
     if isinstance(slot, str):
         raise ValueError(slot)
-    current = _current(parts)
+    current = _current(run_rows)
     extra = []
     if pc.any(pc.is_null(current.column(MEASURED_SENTINEL))).as_py():
         fresh = _rederive(store[1][zone], slot[0], current.to_pylist(), args, rng, run_id)
@@ -426,24 +426,24 @@ def _repair_cell(
             raise ValueError(fresh)
         extra.append(fresh)
     # The cell's one writer, conditional on its file as it is now: a fill landing mid-repair is
-    # merged in, not overwritten, and the parts and master rows are re-read for this cell alone.
+    # merged in, not overwritten, and the run files and master rows are re-read for this cell alone.
     merge_cell(fs, args.registry, zone, year, store=slot[1], extra=extra, write=args.write)
     return sum(table.num_rows for table in extra)
 
 
 def cmd_repair(args: argparse.Namespace) -> int:
-    """Rebuild each cell's master file from its parts, its master rows and a fresh re-derivation."""
+    """Rebuild each cell's master file from its run files, its master rows and a fresh re-derivation."""
     fs = _filesystem(args.registry, args.region, anonymous=args.anonymous)
-    parts = _cells(_registry_table(fs, args.registry, "parts", dataset_schema()), [])
+    run_rows = _cells(_registry_table(fs, args.registry, "runs", dataset_schema()), [])
     store = _open_store(args.store, args.region, anonymous=args.anonymous)
-    cells = _every_cell(fs, args.registry, store, parts, args.zones)
+    cells = _every_cell(fs, args.registry, store, run_rows, args.zones)
     run_id = args.run_id or rebuild_run_id(suffix="optical" if args.skip_radar else "full")
     rng = random.Random(args.seed)
 
     written = rederived = blocked = 0
-    for (zone, year), parts in sorted(cells.items()):
+    for (zone, year), rows in sorted(cells.items()):
         try:
-            rederived += _repair_cell(fs, store, zone, year, parts, args, rng, run_id)
+            rederived += _repair_cell(fs, store, zone, year, rows, args, rng, run_id)
         except ValueError as error:
             blocked += 1
             print(f"  {zone}/{year}: BLOCKED, left as it is — {error}", file=sys.stderr)
@@ -455,31 +455,31 @@ def cmd_repair(args: argparse.Namespace) -> int:
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
-    """Check ``master/`` itself: its invariants, and every cell against its parts."""
+    """Check ``master/`` itself: its invariants, and every cell against its run files."""
     fs = _filesystem(args.registry, args.region, anonymous=args.anonymous)
-    parts = _registry_table(fs, args.registry, "parts", dataset_schema())
+    run_rows = _registry_table(fs, args.registry, "runs", dataset_schema())
     master = _registry_table(fs, args.registry, "master", master_schema())
     if args.zones:
         # With the store checked, `_every_cell` checks the zones against its commits too, below.
-        held = set(parts.column("zone").to_pylist()) | set(master.column("zone").to_pylist())
-        if args.parts_only and (absent := sorted(set(args.zones) - held)):
+        held = set(run_rows.column("zone").to_pylist()) | set(master.column("zone").to_pylist())
+        if args.runs_only and (absent := sorted(set(args.zones) - held)):
             raise SystemExit(f"--zones names zones the registry does not hold: {', '.join(absent)}")
-        parts, master = (
-            table.filter(pc.is_in(table.column("zone"), pa.array(args.zones))) for table in (parts, master)
+        run_rows, master = (
+            table.filter(pc.is_in(table.column("zone"), pa.array(args.zones))) for table in (run_rows, master)
         )
-    expected = tile_years(parts)
+    expected = tile_years(run_rows)
     failures = invariant_failures(master, expected_rows=expected)
-    problems = audit(master, parts)
-    if not args.parts_only:
-        # The parts themselves against the store's record of who wrote each year: a run with no
-        # part leaves the parts, and so the master, describing its tiles by the run before it.
+    problems = audit(master, run_rows)
+    if not args.runs_only:
+        # The run files themselves against the store's record of who wrote each year: a run with no
+        # file leaves the run files, and so the master, describing its tiles by the run before it.
         store = _one_read(_open_store(args.store, args.region, anonymous=args.anonymous))
-        for (zone, year), cell in _every_cell(fs, args.registry, store, _cells(parts, []), args.zones).items():
+        for (zone, year), cell in _every_cell(fs, args.registry, store, _cells(run_rows, []), args.zones).items():
             if isinstance(slot := _store_slot(store, zone, year, cell), str):
-                problems.setdefault(f"{zone}/{year}", []).append(f"the store cannot stand behind its parts: {slot}")
+                problems.setdefault(f"{zone}/{year}", []).append(f"the store cannot stand behind its run files: {slot}")
         problems = dict(sorted(problems.items()))
     origins = master.column("measured_by").to_pylist()
-    print(f"master {master.num_rows} rows against {expected} distinct tile-years in parts/")
+    print(f"master {master.num_rows} rows against {expected} distinct tile-years in runs/")
     print(f"  measured by fill {origins.count(MEASURED_BY_FILL)}, by rebuild {origins.count(MEASURED_BY_REBUILD)}")
     for failure in failures:
         print(f"  INVARIANT: {failure}")
@@ -527,10 +527,10 @@ def main(argv: list[str] | None = None) -> int:
     repair.set_defaults(func=cmd_repair)
 
     verify = sub.add_parser(
-        "verify", parents=[common], help="check master/ against parts/, and parts/ against the store's run record"
+        "verify", parents=[common], help="check master/ against runs/, and runs/ against the store's run record"
     )
     verify.add_argument(
-        "--parts-only", action="store_true", help="skip the store check, for a registry copy with no store to read"
+        "--runs-only", action="store_true", help="skip the store check, for a registry copy with no store to read"
     )
     verify.set_defaults(func=cmd_verify)
 

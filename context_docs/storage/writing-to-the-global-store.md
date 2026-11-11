@@ -950,10 +950,10 @@ year**, written by the same assembly as each cell lands. It exists so two questi
 without opening a petabyte-scale store: a user's *"is my area covered, and how well"*, and a later
 infill campaign's *"which tiles were short of imagery, and would more of it help"*.
 
-Location and layout: `<store-stem>.registry/parts/zone=<Z>/year=<Y>/<run_id>.parquet`, a **sibling**
+Location and layout: `<store-stem>.registry/runs/zone=<Z>/year=<Y>/<run_id>.parquet`, a **sibling**
 of the store rather than a path inside it, because Icechunk owns every key under its own prefix and
-its garbage collection reconciles that prefix against its own manifests. Those parts are the fills'
-raw record; once a cell's part is published, the runner merges its parts into the cell's file under
+its garbage collection reconciles that prefix against its own manifests. Those run files are the fills'
+raw record; once a cell's run file is published, the runner merges its run files into the cell's file under
 `master/`, the one registry consumers read ([`registry-master.md`](registry-master.md)).
 
 **Status: the schema and the producer are built and exercised against live campaign runs. The
@@ -962,15 +962,15 @@ consumer side — a pipeline that can act on the work list this produces — is 
 ### What the first live run found
 
 Dispatched 2026-08-19 against `tessera-radar` in `global-tessera-dev`: zone 16S, years 2022 then
-2021, 17 live tiles each. Both cells landed and both published a part. The run exposed four defects,
+2021, 17 live tiles each. Both cells landed and both published a run file. The run exposed four defects,
 and the most serious was invisible in every log except the one naming the path it wrote to.
 
-**The registry was published beside the wrong store.** Parts landed at
+**The registry was published beside the wrong store.** Run files landed at
 `.../global/tessera.registry/...` while the run was filling `tessera-radar.icechunk`.
 `BucketPaths.optical_registry()` called `global_store()` with no argument, so it derived from the
-*default* repo basename whatever store the run was writing. The part was valid, 17 rows, and the log
+*default* repo basename whatever store the run was writing. The run file was valid, 17 rows, and the log
 said it had been published — it simply described a zone-year that the store beside it does not
-contain. **That is worse than an overwrite:** two stores' parts merge into one dataset under the same
+contain. **That is worse than an overwrite:** two stores' run files merge into one dataset under the same
 `zone=`/`year=` keys, and no column can tell them apart, so the error is unfalsifiable from the
 artifact a consumer was told to read *instead of* the store. Fixed by making the method take the
 resolved store URI as a **required** argument — a default would reintroduce the same silent failure
@@ -993,7 +993,7 @@ produced.
 
 ### What the same run confirmed works
 
-- The dataset opens and reads **across parts** with hive partitioning; `zone` (string) and `year`
+- The dataset opens and reads **across run files** with hive partitioning; `zone` (string) and `year`
   (int32) come from the path with no type collision.
 - One row per live tile, 17 of 17, with `run_id` and `assembled_at` present on every row.
 - Every consistency invariant held: reasons summing to `refused_px`, `eligible_px <= chunk_px`,
@@ -1011,7 +1011,7 @@ measured zero is written as `0`, and only a tile whose coverage record never arr
 ### The second run: verified, and it found one more thing
 
 09S/2021 (10 tiles, western Amazon) and 03S/2024 (4 tiles) landed against the fixed code, chosen as
-small fresh cells over persistently cloudy land. The dataset now reads as one table across both parts
+small fresh cells over persistently cloudy land. The dataset now reads as one table across both run files
 — 14 rows, two zones, two years, partition keys typed from the path, and **zero consistency
 violations**. Four of the fourteen tiles carry refused pixels while being embedded — the case that
 previously recorded nothing — and the worst is 03S/2024 `chunk_59_11`: 42,212 refused of 4,194,304
@@ -1024,10 +1024,10 @@ that PASSED. Its `median_obs_where_thin` is 5.0 — the refused pixels are about
 short. Ranked by footprint median it would have sat below tiles with no refusals at all; ranked by
 thin median it is correctly first.
 
-**And it confirmed the schema-evolution hazard on live data.** The two parts were written by
+**And it confirmed the schema-evolution hazard on live data.** The two run files were written by
 different builds — 09S by `10f31a1`, 03S by `22b2352` — and `median_obs_where_thin` exists in only
 the newer one. The merged read shows the column *because* `zone=03S` sorts before `zone=09S`, so the
-newer part's schema is the one inferred. **Had the older zone sorted first the column would have
+newer run file's schema is the one inferred. **Had the older zone sorted first the column would have
 vanished from the read with no error.** That is why `dataset_schema()` exists and why any
 whole-dataset read must pass it. The `code_commit` column is what made the diagnosis possible, which
 is its first real use.
@@ -1053,7 +1053,7 @@ covered" is `embedded` together with `refused_px`, and a reader using the first 
 coverage.
 
 **The schema is declared, never inferred**, and `zone`/`year` are partition keys only — both because
-the failures live in the merge, not in any one part.
+the failures live in the merge, not in any one run file.
 
 **One `_coverage_record`, two call sites.** A refused shard's marker and an embedded shard's result
 are built by the same function, because comparing the two rows is the entire point and two copies of
@@ -1064,9 +1064,9 @@ those expressions is how they stop meaning the same thing.
 true envelope to within one pixel and which handles the antimeridian. Rows for zones 01 and 60 carry
 `west > east` per GeoJSON and STAC — a consumer filtering `west <= lon <= east` silently drops them.
 
-**A part is published only after its cell commits**, and the write is quiet on failure. Before the
+**A run file is published only after its cell commits**, and the write is quiet on failure. Before the
 commit, failing loudly costs nothing; after it, raising would fail complete work over its index. Every
-column is derivable from the store, which is what makes a lost part recoverable and that trade correct
+column is derivable from the store, which is what makes a lost run file recoverable and that trade correct
 rather than lazy.
 
 ### Partial runs and repeated fills
@@ -1077,7 +1077,7 @@ rather than lazy.
 - **A cell's provenance accumulates.** An update appends its contribution — run id, timestamp, code
   identity, input coverage, and the tiles it wrote, kept and cleared — to the group's `updates`
   attr, beside the original fill's `runs[year]`, which it never replaces.
-- **The registry keeps each tile's newest row.** Parts stay keyed by run, so a cell filled twice
+- **The registry keeps each tile's newest row.** Run files stay keyed by run, so a cell filled twice
   has two; `master/` merges them per `(zone, year, tile)`, newest wins
   ([`registry-master.md`](registry-master.md)).
 
@@ -1100,7 +1100,7 @@ rather than lazy.
 | the existing storage retry allowance | `storage/zarr_store.py`, `StorageRetriesSettings` |
 | the registry's path, and its required store argument | `config/paths.py`, `optical_registry()` |
 | the one record builder, on both the refused and embedded paths | `inference/actors.py`, `_coverage_record` |
-| publishing a cell's part once its commit lands | `inference/assembly.py`, `publish_registry_part` |
+| publishing a cell's run file once its commit lands | `inference/assembly.py`, `publish_registry_run_file` |
 | an embedded shard's record, persisted on its staged tile and read back on resume | `inference/assembly.py`, `write_chunk`, `read_staged_coverage` |
 | merging the landed cell into `master/` | `orchestration/runners/zone_fill.py`, `_merge_registry_master`; `storage/registry_master.py`, `merge_cell` |
-| the registry's declared schema, its rows and its part writer | `storage/registry.py`, `dataset_schema`, `registry_rows`, `write_registry_part` |
+| the registry's declared schema, its rows and its run file writer | `storage/registry.py`, `dataset_schema`, `registry_rows`, `write_run_file` |

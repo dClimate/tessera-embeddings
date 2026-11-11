@@ -91,7 +91,7 @@ class ProvenanceCheckError(RuntimeError):
 class ProvenanceRun:
     """One run's record to publish for one zone-year: whose it is, what it evaluated and what it read.
 
-    ``embedded`` and ``refused`` partition the live shards the run evaluated, as the registry part
+    ``embedded`` and ``refused`` partition the live shards the run evaluated, as the registry run file
     does. ``mosaic_snapshots`` maps each mosaic store the run read to the snapshot the plan sampled,
     so the export describes exactly what the model read. ``grid_shape`` and ``shard_px`` are the
     zone group's.

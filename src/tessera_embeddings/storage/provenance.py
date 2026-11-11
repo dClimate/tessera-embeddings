@@ -228,7 +228,7 @@ def write_table(
 ) -> int:
     """Write ``rows`` as one zstd Parquet file at ``uri``; returns the rows written.
 
-    Buffered and written in one shot, as registry parts are: a partial Parquet file is unreadable.
+    Buffered and written in one shot, as registry run files are: a partial Parquet file is unreadable.
     ``metadata`` lands in the file's key-value block, and a schema with a WKB ``geometry`` column
     gets GeoParquet's ``geo`` entry for it.
     """

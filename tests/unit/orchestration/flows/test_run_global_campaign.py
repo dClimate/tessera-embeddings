@@ -291,7 +291,7 @@ class TestStagingRunId:
             # a store with a different depth rule must not resume tiles staged under the old.
             {"optical_min_obs": 25},
             {"code_identity": "infcode-y"},
-            # Registry parts are named by run id, so an update's run never shares one with
+            # Registry run files are named by run id, so an update's run never shares one with
             # the campaign's or another update's.
             {"update": "u1"},
         ],

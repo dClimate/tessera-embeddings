@@ -163,7 +163,7 @@ def measurements_from_obs(
 def as_coverage_record(measurements: Mapping[str, Any]) -> dict[str, Any]:
     """:func:`measurements_from_obs`'s columns in the shape of an actor's coverage record.
 
-    The fill's part writer reads coverage records (``registry._measurement_fields``), and a targeted
+    The fill's run file writer reads coverage records (``registry._measurement_fields``), and a targeted
     update that merged a shard publishes re-derived measurements through it, so they travel in that
     shape. The inverse of that writer, field for field.
     """
@@ -234,8 +234,8 @@ def compare_row(rebuilt: Mapping[str, Any], recorded: Mapping[str, Any]) -> tupl
             continue
         if got is None and want is None:
             continue
-        # A recorded null against a re-derived value is a mismatch on purpose, even if a part predates
-        # the column: every published part carries every column, and a false stop is loud and cheap.
+        # A recorded null against a re-derived value is a mismatch on purpose, even if a run file predates
+        # the column: every published run file carries every column, and a false stop is loud and cheap.
         if got is None or want is None or not _equal(got, want):
             differences.append(f"{column}: rebuilt {got!r} != recorded {want!r}")
     return ("match" if not differences else "mismatch"), differences

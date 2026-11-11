@@ -51,6 +51,7 @@ context_docs/
 │   ├── 033-radar-overlaps-go-to-the-most-acquired-burst.md
 │   ├── 034-an-acquisition-is-one-datastrip-of-one-pass.md
 │   ├── 035-a-provenance-record-for-the-published-store.md
+│   ├── 036-the-registry-folder-is-runs.md
 │   ├── 039-architecture-rules-run-on-import-linter-and-ruff.md
 │   └── 040-new-code-is-gated-on-duplication-and-complexity.md
 │

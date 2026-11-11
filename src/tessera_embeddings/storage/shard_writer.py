@@ -935,7 +935,7 @@ def write_year_shards(
     facts — the per-worker stats and ``wall_s``/``merge_s`` from
     :func:`run_forked`, its ``catch_ups`` tally, plus ``commit_s`` and
     ``attrs_commit_s`` (each measured around its commit) — and ``commit``, the shard
-    commit's ``snapshot`` and ``committed_at``, which the registry part is stamped with.
+    commit's ``snapshot`` and ``committed_at``, which the registry run file is stamped with.
     An out-parameter rather than a changed return, so the snapshot id the callers and
     tags key on stays a plain string; the caller that wants a summary record owns emitting it.
 
