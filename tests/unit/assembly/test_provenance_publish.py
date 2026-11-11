@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import shutil
 from pathlib import Path
 
 import dask.array as da
@@ -415,6 +416,32 @@ def test_a_shard_with_no_complete_record_has_no_pixel_answer(updated) -> None:
     registry, _ = updated
     with pytest.raises(LookupError, match="no complete provenance record"):
         ProvenanceRecord(registry).pixel_granules_at(PixelLocation(ZONE, "chunk_1_1", 0, 0), YEAR)
+
+
+@pytest.mark.parametrize("row", [-1, SHARD])
+def test_a_location_outside_its_shard_is_refused(updated, row: int) -> None:
+    registry, _ = updated
+    with pytest.raises(ValueError, match="must lie in"):
+        ProvenanceRecord(registry).pixel_granules_at(PixelLocation(ZONE, "chunk_0_1", row, 0), YEAR)
+
+
+def test_a_refused_shard_that_staged_no_record_has_no_pixel_answer(tmp_path: Path) -> None:
+    """Its run lists it as unrecorded, so a master naming the run still gives no answer for it."""
+    pins = _mosaics(tmp_path / "mosaics")
+    embedded, refused = _stage(tmp_path / "staging", pins)
+    shutil.rmtree(next((tmp_path / "staging" / RUN).glob(f"{refused[0]}*")))
+    _publish(tmp_path, pins, embedded, refused)
+    _master(tmp_path / "registry", embedded + refused, [[RUN]] * 4)
+    with pytest.raises(LookupError, match="staged no provenance record"):
+        ProvenanceRecord(str(tmp_path / "registry")).pixel_granules_at(PixelLocation(ZONE, refused[0], 0, 0), YEAR)
+
+
+def test_a_master_written_before_source_runs_has_no_pixel_answer(tmp_path: Path) -> None:
+    master = tmp_path / "master" / f"zone={ZONE}" / f"year={YEAR}"
+    master.mkdir(parents=True)
+    pq.write_table(pa.table({"tile": ["chunk_0_0"]}), master / "part-0.parquet")
+    with pytest.raises(LookupError, match="no complete provenance record"):
+        ProvenanceRecord(str(tmp_path)).pixel_granules_at(PixelLocation(ZONE, "chunk_0_0", 0, 0), YEAR)
 
 
 def test_a_day_and_a_shard_read_through_the_snapshot_each_run_names(updated) -> None:

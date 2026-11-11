@@ -15,7 +15,7 @@ from __future__ import annotations
 import datetime
 import math
 from collections.abc import Callable
-from typing import NamedTuple, cast
+from typing import Any, NamedTuple, cast
 
 import icechunk
 import numpy as np
@@ -26,16 +26,18 @@ from tessera_embeddings.config.store_layout import SENSORS, SHARD_PX
 from tessera_embeddings.inference.chunk_spec import chunk_label, parse_chunk_label
 from tessera_embeddings.ingest.land_mask import zone_for_cell
 from tessera_embeddings.storage import zone_grid
+from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.provenance import (
     GRANULES,
     SHARD_DATES,
     days_of,
     pixel_sources_group,
     pixel_sources_uri,
+    shard_dates_uri,
     table_dir,
     update_pixels_uri,
 )
-from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group, plain_zarr_storage_options
+from tessera_embeddings.storage.zarr_store import plain_zarr_storage_options
 
 _Creds = Callable[[], icechunk.S3StaticCredentials] | None
 
@@ -86,12 +88,18 @@ class ProvenanceRecord:
     """The record beside one registry, read as polars frames.
 
     ``registry_root`` is a local path or an ``s3://`` URI; ``get_credentials`` and ``region`` are the
-    credential callback and region the rest of the store's readers take.
+    credential callback and region the rest of the store's readers take. ``anonymous`` reads unsigned,
+    as a consumer without an AWS account reads the published registry.
     """
 
-    def __init__(self, registry_root: str, get_credentials: _Creds = None, region: str | None = None) -> None:
+    def __init__(
+        self, registry_root: str, get_credentials: _Creds = None, region: str | None = None, anonymous: bool = False
+    ) -> None:
         """A reader of the record beside ``registry_root``."""
+        if anonymous and get_credentials is not None:
+            raise ValueError("anonymous and get_credentials are mutually exclusive")
         self.root, self.get_credentials, self.region = registry_root.rstrip("/"), get_credentials, region
+        self.anonymous = anonymous
 
     def day_granules(
         self, zone: str, year: int, sensor: str, day: datetime.date, run_id: str | None = None
@@ -106,8 +114,9 @@ class ProvenanceRecord:
         """
         rows = self._table(zone, year, GRANULES).filter(pl.col("sensor") == sensor, pl.col("solar_day") == day)
         if run_id is not None:
-            read = self._table(zone, year, SHARD_DATES).filter(pl.col("run_id") == run_id, pl.col("sensor") == sensor)
-            rows = rows.join(read.select("snapshot_id").unique(), on="snapshot_id", how="semi")
+            rows = rows.filter(
+                pl.col("snapshot_id") == self._run_metadata(zone, year, run_id).get(f"snapshot_{sensor}")
+            )
         return rows.sort("snapshot_id", "fusion_order", "granule_id", nulls_last=True).collect()
 
     def shard_granules(self, zone: str, year: int, tile: str, run_id: str) -> pl.DataFrame:
@@ -135,16 +144,18 @@ class ProvenanceRecord:
         their dates too.
 
         Raises:
-            LookupError: the registry holds no complete record for the shard (its ``source_runs`` is null).
+            LookupError: the registry holds no complete record for the shard: its ``source_runs`` is
+                null, or the run that claims the pixel staged none for it (``unrecorded_tiles``).
+            ValueError: ``where`` names no pixel of its shard.
         """
-        run = self._claiming_run(where, year, self._source_runs(where, year))
-        group = open_store_as_zarr_group(
-            pixel_sources_uri(self.root),
-            group=pixel_sources_group(where.zone, year, run),
-            get_credentials=self.get_credentials,
-            region=self.region,
-        )
-        shard_px = cast(int, group.attrs["shard_px"])
+        runs = self._source_runs(where, year)
+        shard_px = cast(int, self._run_group(where.zone, year, runs[-1]).attrs["shard_px"])
+        if not (0 <= where.row < shard_px and 0 <= where.col < shard_px):
+            raise ValueError(f"{where}: row and column must lie in [0, {shard_px})")
+        run = self._claiming_run(where, year, runs)
+        if where.tile in self._run_metadata(where.zone, year, run).get("unrecorded_tiles", "").split(","):
+            raise LookupError(f"{where.zone}/{year} {where.tile}: run {run} staged no provenance record for it")
+        group = self._run_group(where.zone, year, run)
         shard_row, shard_col = parse_chunk_label(where.tile)
         y, x = shard_row * shard_px + where.row, shard_col * shard_px + where.col
         # A plane value k names `sources[|k| - 1]`; positive means the model used the observation.
@@ -172,6 +183,8 @@ class ProvenanceRecord:
             LookupError: the registry has no complete record for the shard, or no row for it.
         """
         master = self._scan(f"{self.root}/master/zone={where.zone}/year={year}/*.parquet")
+        if "source_runs" not in master.collect_schema():  # a master written before the column
+            raise LookupError(f"{where.zone}/{year} {where.tile}: the registry holds no complete provenance record")
         rows = master.filter(pl.col("tile") == where.tile).select("source_runs").collect()
         if rows.height != 1 or rows.item() is None:
             raise LookupError(f"{where.zone}/{year} {where.tile}: the registry holds no complete provenance record")
@@ -184,7 +197,7 @@ class ProvenanceRecord:
         """
         for run in reversed(runs):
             uri = update_pixels_uri(self.root, where.zone, year, run)
-            options = plain_zarr_storage_options(uri, self.get_credentials, self.region)
+            options = self._zarr_options(uri)
             try:
                 masks = zarr.open_group(uri, mode="r", storage_options=options)
             except FileNotFoundError:
@@ -192,6 +205,28 @@ class ProvenanceRecord:
             if where.tile in masks and bool(cast(zarr.Array, masks[where.tile])[where.row, where.col]):
                 return run
         raise LookupError(f"{where}: none of {runs} wrote this pixel")
+
+    def _run_group(self, zone: str, year: int, run_id: str) -> zarr.Group:
+        """``run_id``'s group in the ``pixel_sources`` store: its planes, one per sensor."""
+        repo = open_global_repo(
+            pixel_sources_uri(self.root),
+            get_credentials=self.get_credentials,
+            region=self.region,
+            anonymous=self.anonymous,
+        )
+        store = repo.readonly_session(branch="main").store
+        return zarr.open_group(store, path=pixel_sources_group(zone, year, run_id), mode="r")
+
+    def _run_metadata(self, zone: str, year: int, run_id: str) -> dict[str, str]:
+        """What ``run_id``'s ``shard_dates`` file states about the run: its snapshots and unrecorded tiles."""
+        return pl.read_parquet_metadata(
+            shard_dates_uri(self.root, zone, year, run_id), storage_options=self._storage_options()
+        )
+
+    def _zarr_options(self, uri: str) -> dict[str, Any] | None:
+        if self.anonymous and uri.startswith("s3://"):
+            return {"anon": True} | ({"client_kwargs": {"region_name": self.region}} if self.region else {})
+        return plain_zarr_storage_options(uri, self.get_credentials, self.region)
 
     def _table(self, zone: str, year: int, table: str) -> pl.LazyFrame:
         return self._scan(f"{table_dir(self.root, table, zone, year)}/*.parquet")
@@ -204,6 +239,8 @@ class ProvenanceRecord:
         if not self.root.startswith("s3://"):
             return None
         options: dict[str, str | None] = {"aws_region": self.region}
+        if self.anonymous:
+            options["skip_signature"] = "true"
         if self.get_credentials is not None:
             creds = self.get_credentials()
             options |= {

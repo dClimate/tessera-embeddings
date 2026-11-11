@@ -252,7 +252,8 @@ way. The sensors are `s2` (optical), `s1_asc` and `s1_desc` (radar by orbit dire
 `ProvenanceRecord(registry_root)`, in `storage/provenance_reader.py`, answers the usual questions as
 polars tables: `day_granules` for a day's mosaic, `shard_granules` for a tile and one run, and
 `pixel_granules(lat, lon, year)`, which finds the pixel's zone, tile, row and column on the store's
-grid and picks the run by the rule below. By hand, to trace one pixel, open the
+grid and picks the run by the rule below. Pass `anonymous=True` to read the public registry without
+AWS credentials. By hand, to trace one pixel, open the
 run's group, read the pixel's column of values, and join each non-zero value through the tile's
 `shard_dates` row to `granules`, on the row's `snapshot_id`, its day and `sources[|k| - 1]`:
 
@@ -268,7 +269,9 @@ Open the group of the run that holds the pixel, from the master row's `source_ru
 whose pixels the tile holds, oldest first. Walk them from the newest: a holes update holds the
 pixels its `update_pixels` mask marks, the pixels it embedded, and a fill or a shards update holds
 every pixel; the first run that holds the pixel has its record. `source_runs` is null where the tile
-has no complete record, and is derived from the store's own record of who wrote the tile at every
+has no complete record. One more case has none: a refused tile whose run staged no record for it,
+which that run's `shard_dates` file lists in its `unrecorded_tiles` metadata; `pixel_granules`
+raises `LookupError` for both. `source_runs` is derived from the store's own record of who wrote the tile at every
 merge, never copied from an older row. The record says what went in, not how much each image
 mattered: the model has no attribution. For a pixel observed more often than the model's longest
 sequence, the model reads a fixed subset of these dates, chosen by a deterministic rule from the
