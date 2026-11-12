@@ -325,6 +325,8 @@ for run_id in reversed(runs):
         break
     if TILE in mask and mask[TILE][ROW, COL]:
         break
+meta = pl.read_parquet_metadata(f"{prov}/shard_dates/zone={ZONE}/year={YEAR}/{run_id}.parquet", storage_options=S3)
+assert TILE not in meta.get("unrecorded_tiles", "").split(","), "a refused tile its run recorded nothing for"
 
 # 3. The pixel's value on each date, per sensor, from that run's group.
 bucket, key = prov.removeprefix("s3://").split("/", 1)
