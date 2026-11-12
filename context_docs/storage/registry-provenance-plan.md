@@ -453,107 +453,19 @@ the holes update embedded.
 
 ## Appendix B. Reading the record
 
-The helpers, methods of `ProvenanceRecord` in `storage/provenance_reader.py`, answer §2's questions
-and apply §5's rule; OlmoEarth's documented helpers for its own provenance are the bar they are
-meant to clear. `REGISTRY` is the registry's root, a local path or an `s3://` URI; credentials and a
-region are optional arguments of the record, as for the store's other readers.
+The reading guide for users is [`docs/registry.md`](../../docs/registry.md), "Which imagery is
+behind an embedding": the helpers, the rule for which run holds a pixel, and the same lookups by
+hand in polars and in DuckDB. It is uploaded as the published registry's README, so this plan
+does not repeat it.
 
-```python
-import datetime as dt
-from tessera_embeddings.storage.provenance_reader import ProvenanceRecord, locate
-
-FILL, UPDATE = "33N-2024-9a1fc94c", "33N-2024-e892e33b"
-record = ProvenanceRecord(REGISTRY)
-
-# A day: the optical granules of 9 May 2024 in the mosaic the fill read, in fusion order, then the
-# copies the ingest dropped, with their reason in `status`.
-record.day_granules("33N", 2024, "s2", dt.date(2024, 5, 9), run_id=FILL)
-# A shard: per sensor and date the fill recorded, every granule that had data at a pixel.
-record.shard_granules("33N", 2024, "chunk_209_14", FILL)
-# A pixel: §2's, from the update that claims it; a row per sensor and date a granule had data
-# there, with run_id, valid (whether the model used it), granule_id, platform, acquired_at,
-# cloud_cover and the asset URLs.
-locate(45.5071, 14.3761)              # PixelLocation(zone='33N', tile='chunk_209_14', row=1908, col=70)
-record.pixel_granules(45.5071, 14.3761, 2024)
-```
-
-The same in raw polars, for one run, here the update. Two rules from the helpers apply to any
-reader: a shard's pixels may come from several runs, listed oldest first in the registry's
-`source_runs`, and a pixel belongs to the newest run that claims it, where a holes update claims a
-pixel only where its `update_pixels` mask marks it and a fill or a shards update claims every
-pixel (§5); and every join to `granules` goes through the snapshot the run read, never through
-`run_id`, because a granule list is written once per mosaic snapshot and shared by every run that
-read it:
-
-```python
-import numpy as np
-import polars as pl
-import zarr
-from tessera_embeddings.storage.zarr_store import open_repo
-
-table = f"{REGISTRY}/provenance/{{}}/zone=33N/year=2024/*.parquet"
-granules, key = pl.scan_parquet(table.format("granules")), ["sensor", "snapshot_id", "solar_day", "fusion_order"]
-# The shard: the rows one run wrote for it, one per sensor and date; `sources` lists the fusion
-# orders of the granules with data at at least one of its pixels, so exploding it and joining
-# through the snapshot gives the shard's exact granule list.
-rows = pl.scan_parquet(table.format("shard_dates")).filter(pl.col("run_id") == UPDATE, pl.col("tile") == "chunk_209_14")
-rows.explode("sources").rename({"sources": "fusion_order"}).join(granules, on=key).collect()      # the shard
-
-# The pixel: its plane values are signed fusion orders plus one, one per date on the run's time
-# axis. 0 means no granule had data there; |k| - 1 is the granule's `fusion_order` in the snapshot
-# the run's group names, and the sign says whether the model used the observation (k > 0) or
-# rejected it, a cloud for instance (k < 0).
-run = zarr.open_group(open_repo(f"{REGISTRY}/provenance/pixel_sources.icechunk").readonly_session("main").store,
-                      path=f"33N/2024/{UPDATE}", mode="r")
-k = np.asarray(run["s2"][:, 209 * 2048 + 1908, 14 * 2048 + 70]).astype(np.int64)   # one per date
-days = np.asarray(run["s2_date"][:]).astype("datetime64[ns]").astype("datetime64[D]")
-seen = pl.DataFrame({"sensor": "s2", "snapshot_id": run.attrs["snapshot_s2"], "solar_day": days[k != 0],
-                     "valid": k[k != 0] > 0, "fusion_order": (np.abs(k[k != 0]) - 1).astype(np.int16)})
-seen.lazy().join(granules, on=key).collect()      # the pixel: a row per date with data, `valid` on 27
-```
-
-For a shard with several `source_runs`, pick the run by §5's rule first, as `pixel_granules` does.
-
-The same in DuckDB, for readers who prefer SQL. The tables are plain Parquet, so `read_parquet`
-takes the same paths (add `INSTALL httpfs; LOAD httpfs` for `s3://`). The pixel's values still come
-from the Icechunk planes, read as above and handed to DuckDB as the small `seen` frame:
-
-```python
-import duckdb
-
-con = duckdb.connect()
-con.sql(f"""
--- A day: every granule fused into 9 May's optical mosaic, in fusion order, then the copies the
--- ingest dropped (no fusion order; `status` says why). One row set per mosaic snapshot that
--- recorded the day; a fill and an update that read the same mosaic share it.
-SELECT snapshot_id, fusion_order, status, granule_id, platform, acquired_at, cloud_cover
-FROM read_parquet('{table.format("granules")}')
-WHERE sensor = 's2' AND solar_day = DATE '2024-05-09'
-ORDER BY snapshot_id, fusion_order NULLS LAST, granule_id""")
-
-con.sql(f"""
--- The shard: each sensor and date the update recorded in chunk_209_14 and every granule that had
--- data at a pixel of it. `sources` holds fusion orders; UNNEST it and join through the snapshot the run read.
-SELECT d.sensor, d.solar_day, d.valid_px, g.fusion_order, g.granule_id, g.platform, g.acquired_at, g.cloud_cover
-FROM read_parquet('{table.format("shard_dates")}') AS d, UNNEST(d.sources) AS s(fusion_order)
-JOIN read_parquet('{table.format("granules")}') AS g
-  ON g.sensor = d.sensor AND g.snapshot_id = d.snapshot_id AND g.solar_day = d.solar_day AND g.fusion_order = s.fusion_order
-WHERE d.run_id = '{UPDATE}' AND d.tile = 'chunk_209_14'
-ORDER BY d.sensor, d.solar_day, g.fusion_order""")
-
-con.register("seen", seen)  # the pixel's (sensor, snapshot_id, solar_day, valid, fusion_order), as above
-con.sql(f"""
--- The pixel: each date's fusion order, in the snapshot the run read, is the granule with data
--- there; `valid` says whether the model used it.
-SELECT p.sensor, p.solar_day, p.valid, g.fusion_order, g.granule_id, g.platform, g.acquired_at, g.cloud_cover, g.assets
-FROM seen AS p
-JOIN read_parquet('{table.format("granules")}') AS g
-  ON g.sensor = p.sensor AND g.snapshot_id = p.snapshot_id AND g.solar_day = p.solar_day
- AND g.fusion_order = p.fusion_order
-ORDER BY p.solar_day""")
-```
-
-Both forms were run against the record the unit tests build and return the same rows.
+The helpers are methods of `ProvenanceRecord` in `storage/provenance_reader.py`, plus `locate`;
+they answer §2's questions and apply §5's rule. OlmoEarth's documented helpers for its own
+provenance are the bar they are meant to clear. A pixel's lookup reads the plane, takes each
+value's fusion order and the snapshot its run's group names, and joins `granules` on
+`(sensor, snapshot_id, solar_day, fusion_order)`; `shard_dates` serves only the per-shard
+question. The guide's polars and DuckDB examples were run against the record the unit tests build,
+a fill and a holes update over it, and return the same rows as the helpers for a pixel each run
+holds.
 
 ## Appendix C. For implementers
 

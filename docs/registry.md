@@ -252,35 +252,148 @@ way. The sensors are `s2` (optical), `s1_asc` and `s1_desc` (radar by orbit dire
   image had data there and the model rejected it, a cloud for instance; `0` means no image had
   data.
 
-`ProvenanceRecord(registry_root)`, in `storage/provenance_reader.py`, answers the usual questions as
-polars tables: `day_granules` for a day's mosaic, `shard_granules` for a tile and one run, and
-`pixel_granules(lat, lon, year)`, which finds the pixel's zone, tile, row and column on the store's
-grid and picks the run by the rule below. Pass `anonymous=True` to read the public registry without
-AWS credentials. By hand, to trace one pixel, open the
-run's group, read the pixel's column of values, and join each non-zero value to `granules` on the
-sensor, the group's `snapshot_<sensor>`, the day and `fusion_order = |k| - 1`:
+### Reading the record with the helpers
+
+`tessera_embeddings.storage.provenance_reader` answers the three usual questions as polars tables.
+`REGISTRY` is the registry's root, beside the store it describes; `anonymous=True` reads a public
+registry without an AWS account.
 
 ```python
-k = run["s2"][:, row, col].astype(int)                     # one value per date of the optical axis
-dates = run["s2_date"][:]                                  # int64 nanoseconds, CF time encoding
-picks = [(d, abs(v) - 1, v > 0) for d, v in zip(dates, k) if v]   # (date, fusion_order, used)
-snapshot = run.attrs["snapshot_s2"]                        # the `snapshot_id` to join `granules` on
+import datetime as dt
+from tessera_embeddings.storage.provenance_reader import ProvenanceRecord, locate
+
+record = ProvenanceRecord(REGISTRY, region="us-west-2", anonymous=True)
+
+# A pixel: one row per sensor and date an image had data there, from the run that holds the pixel.
+record.pixel_granules(45.5071, 14.3761, 2024)
+locate(45.5071, 14.3761)   # PixelLocation(zone='33N', tile='chunk_209_14', row=1908, col=70)
+
+# A tile: per sensor and date one run recorded, its valid pixels and every image with data there.
+record.shard_granules("33N", 2024, "chunk_209_14", run_id)
+
+# A day: every image in the optical mosaic of 9 May, in fusion order, then the copies set aside.
+record.day_granules("33N", 2024, "s2", dt.date(2024, 5, 9))
 ```
 
-`pixel_granules` returns the same as a `valid` column.
+| call | one row per | columns |
+|---|---|---|
+| `pixel_granules(lat, lon, year)`, or `pixel_granules_at(locate(...), year)` | sensor and date with data at the pixel | `run_id`, `sensor`, `solar_day`, `valid` (did the model use it), `fusion_order`, `granule_id`, `platform`, `acquired_at`, `cloud_cover`, `assets` (the URLs read) |
+| `shard_granules(zone, year, tile, run_id)` | sensor, date and image with data in the tile | `shard_dates`' columns and the image's `granules` row |
+| `day_granules(zone, year, sensor, day, run_id=None)` | image in the day's mosaic, then each copy set aside | the `granules` row; `run_id` keeps the mosaic that run read |
 
-Open the group of the run that holds the pixel, from the master row's `source_runs`: the runs
-whose pixels the tile holds, oldest first. Walk them from the newest: a holes update holds the
-pixels its `update_pixels` mask marks, the pixels it embedded, and a fill or a shards update holds
-every pixel; the first run that holds the pixel has its record. `source_runs` is null where the tile
-has no complete record. One more case has none: a refused tile whose run staged no record for it,
-which that run's `shard_dates` file lists in its `unrecorded_tiles` metadata; `pixel_granules`
-raises `LookupError` for both. Every merge derives `source_runs` afresh from the store's shard
+The pixel calls raise `LookupError` where the tile has no complete record (below), and
+`ValueError` for a point outside its zone's grid.
+
+### Which run holds a pixel
+
+A tile's pixels can come from more than one run: a holes update fills only the pixels the run
+before it left empty. The master row's `source_runs` lists the runs whose pixels the tile holds,
+oldest first. Walk it from the newest: a holes update holds the pixels its `update_pixels` mask
+marks, the pixels it embedded, and a fill or a shards update holds every pixel; the first run that
+holds the pixel has its record. Every merge derives `source_runs` afresh from the store's shard
 commits, in the order they landed: a fill or a shards update starts the list again, and a holes
-update adds itself. It is never copied from an older row. The record says what went in, not how much each image
-mattered: the model has no attribution. For a pixel observed more often than the model's longest
-sequence, the model reads a fixed subset of these dates, chosen by a deterministic rule from the
-dates alone.
+update adds itself.
+
+`source_runs` is null where the tile has no complete record, such as a run from before the record
+existed. One more case has none: a refused tile whose run staged no record for it, which that
+run's `shard_dates` file lists in its `unrecorded_tiles` metadata.
+
+### Reading the record by hand
+
+Without the package, with polars, zarr and icechunk. `TILE`, `ROW` and `COL` are what `locate`
+returns; the store's [reading guide][store] converts a point to a pixel without it.
+
+```python
+import icechunk, numpy as np, polars as pl, zarr
+
+REGISTRY = "s3://<bucket>/<store>.registry"
+ZONE, YEAR, TILE, ROW, COL = "33N", 2024, "chunk_209_14", 1908, 70
+S3 = {"aws_region": "us-west-2", "skip_signature": "true"}   # anonymous reads
+prov = f"{REGISTRY}/provenance"
+
+# 1. The runs whose pixels the tile holds, oldest first. None: the tile has no complete record.
+master = pl.read_parquet(f"{REGISTRY}/master/zone={ZONE}/year={YEAR}/part-0.parquet", storage_options=S3)
+runs = master.filter(pl.col("tile") == TILE)["source_runs"].item()
+
+# 2. The run that holds the pixel: newest first, a holes update where its mask marks the pixel,
+#    else a fill or a shards update, which has no mask.
+for run_id in reversed(runs):
+    try:
+        mask = zarr.open_group(f"{prov}/update_pixels/zone={ZONE}/year={YEAR}/{run_id}.zarr",
+                               mode="r", storage_options={"anon": True})
+    except FileNotFoundError:
+        break
+    if TILE in mask and mask[TILE][ROW, COL]:
+        break
+
+# 3. The pixel's value on each date, per sensor, from that run's group.
+bucket, key = prov.removeprefix("s3://").split("/", 1)
+repo = icechunk.Repository.open(icechunk.s3_storage(
+    bucket=bucket, prefix=f"{key}/pixel_sources.icechunk", region="us-west-2", anonymous=True))
+run = zarr.open_group(repo.readonly_session("main").store, path=f"{ZONE}/{YEAR}/{run_id}", mode="r")
+r, c = (int(n) for n in TILE.removeprefix("chunk_").split("_"))
+y, x = r * run.attrs["shard_px"] + ROW, c * run.attrs["shard_px"] + COL   # on the zone's grid
+seen = []
+for sensor in ("s2", "s1_asc", "s1_desc"):
+    if sensor not in run:
+        continue
+    k = run[sensor][:, y, x].astype(np.int64)        # 0: no image; > 0 used; < 0 rejected
+    days = run[f"{sensor}_date"][:].astype("datetime64[ns]").astype("datetime64[D]")
+    seen.append(pl.DataFrame({
+        "sensor": sensor, "snapshot_id": run.attrs[f"snapshot_{sensor}"], "solar_day": days[k != 0],
+        "valid": k[k != 0] > 0, "fusion_order": (np.abs(k[k != 0]) - 1).astype(np.int16),
+    }))
+seen = pl.concat(seen)
+
+# 4. Each value, its date and the run's snapshot are a `granules` key: the image itself.
+granules = pl.read_parquet(f"{prov}/granules/zone={ZONE}/year={YEAR}/*.parquet", storage_options=S3)
+pixel = seen.join(granules, on=["sensor", "snapshot_id", "solar_day", "fusion_order"]).sort("sensor", "solar_day")
+```
+
+`pixel` holds the same rows as `pixel_granules`. The tables are plain Parquet, so SQL reads them
+too; with [DuckDB](https://duckdb.org), the pixel joins the `seen` frame from step 3:
+
+```python
+import duckdb
+
+con = duckdb.connect()
+con.sql("INSTALL httpfs; LOAD httpfs; SET s3_region = 'us-west-2'")
+table = f"{prov}/{{}}/zone={ZONE}/year={YEAR}/*.parquet"
+
+# A day: the optical mosaic of 9 May, its images in fusion order, then the copies set aside.
+# One set per mosaic snapshot that holds the day.
+con.sql(f"""
+SELECT snapshot_id, fusion_order, status, granule_id, platform, acquired_at, cloud_cover
+FROM read_parquet('{table.format("granules")}')
+WHERE sensor = 's2' AND solar_day = DATE '2024-05-09'
+ORDER BY snapshot_id, fusion_order NULLS LAST, granule_id""")
+
+# A tile: per sensor and date the run recorded, every image with data at one of its pixels.
+con.sql(f"""
+SELECT d.sensor, d.solar_day, d.valid_px, g.fusion_order, g.granule_id, g.acquired_at, g.cloud_cover
+FROM read_parquet('{table.format("shard_dates")}') AS d, UNNEST(d.sources) AS s(fusion_order)
+JOIN read_parquet('{table.format("granules")}') AS g
+  ON g.sensor = d.sensor AND g.snapshot_id = d.snapshot_id AND g.solar_day = d.solar_day
+ AND g.fusion_order = s.fusion_order
+WHERE d.run_id = '{run_id}' AND d.tile = '{TILE}'
+ORDER BY d.sensor, d.solar_day, g.fusion_order""")
+
+# The pixel.
+con.sql(f"""
+SELECT p.sensor, p.solar_day, p.valid, g.fusion_order, g.granule_id, g.acquired_at, g.cloud_cover, g.assets
+FROM seen AS p
+JOIN read_parquet('{table.format("granules")}') AS g
+  ON g.sensor = p.sensor AND g.snapshot_id = p.snapshot_id AND g.solar_day = p.solar_day
+ AND g.fusion_order = p.fusion_order
+ORDER BY p.sensor, p.solar_day""")
+```
+
+Join `granules` through a snapshot, never through `run_id`: a mosaic's list is written once and
+shared by every run that read that mosaic.
+
+The record says what went in, not how much each image mattered: the model has no attribution. For
+a pixel observed more often than the model's longest sequence, the model reads a fixed subset of
+these dates, chosen by a deterministic rule from the dates alone.
 
 ## Going deeper
 
