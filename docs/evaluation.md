@@ -198,8 +198,11 @@ the other, leave that label out for both versions, and report how many were left
   class 19 (unlabelled). Take at most 50 pixels per patch, chosen at random with a fixed seed.
   PASTIS splits its patches into five groups (`Fold`): train on groups 1–3 and test on group 5.
   Each patch's outline in `metadata.geojson` is in the Lambert-93 projection (EPSG:2154).
-  Reprojecting its corners to the patch's UTM zone gives the patch's edges on the 10 m grid,
-  and row `i`, column `j` of its `TARGET` file is the pixel whose centre is `(i + 0.5) × 10` m
+  The patches were cut from Sentinel-2 images, so each is a square on its UTM zone's 10 m grid.
+  Reproject the outline's corners to that zone and round them to the nearest 10 m to get the
+  patch's edges: the reprojected corners land up to 3.5 m off the grid, by the same amount for
+  every patch in one Sentinel-2 tile. Each `TARGET` file holds three 128 × 128 layers, and the
+  first holds the crop types: `TARGET[0, i, j]` is the pixel whose centre is `(i + 0.5) × 10` m
   below the top edge and `(j + 0.5) × 10` m right of the left edge.
 - **The AlphaEarth files:** use every point inside the areas, with the `split` it comes with. A
   point counts in the year its `valid_time_start` falls in, so the French LUCAS points, all from
