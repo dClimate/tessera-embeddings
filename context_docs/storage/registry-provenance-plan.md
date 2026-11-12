@@ -26,7 +26,7 @@ questions in §10. The appendices are reference material and can be skipped.
   before building each day's mosaic, and why. It sits beside the store's existing registry.
 - **Three questions it answers,** each with a reader helper: what went into this day's mosaic,
   into this 20 km shard, and which granule supplied this pixel on each date?
-- **Cost.** About 5 TB of storage over the campaign, a quarter of a percent of the store. Its
+- **Cost.** About 6.3–7.4 TB of storage over the campaign, a third of a percent of the store. Its
   ingest time cost is inside run-to-run variation, measured over seven paired runs of a dense zone
   (§6); what it certainly adds is one more chunk write per date for the Dask scheduler.
   Correctness checks run at publication and fail the zone-year if the record is wrong.
@@ -166,10 +166,12 @@ of the granules that had data at at least one pixel, used or rejected, so footpr
 touch the shard are not in it. `snapshot_id` names the mosaic the run read, and is how a row finds its granules.
 
 **`pixel_sources`: which granule supplied each pixel.** Per run and sensor, an array of one signed
-byte per pixel per date. A value k names entry |k| of that shard-date's `sources`: positive when
-the model used the observation, negative when it rejected it, a cloud for instance, and 0 when no
-granule had data. A fully cloudy date keeps its plane. The planes compress to about a megabyte per shard-year
-(§6). They live in an Icechunk store of their own because each run has its own dates, while the
+16-bit integer per pixel per date. A value k is the granule's fusion order plus one, `|k| - 1`:
+positive when the model used the observation, negative when it rejected it, a cloud for instance,
+and 0 when no granule had data. The run's group names each sensor's mosaic snapshot, so the value
+and its date find the granule in `granules` without going through `shard_dates`. A fully cloudy
+date keeps its plane. The planes compress to about one to one and a half megabytes per optical
+shard-year (§6). They live in an Icechunk store of their own because each run has its own dates, while the
 published store's arrays all share one grid.
 
 **`update_pixels`, and which pixels the record covers.** A fill or a shards update records every
@@ -225,9 +227,9 @@ index is one more array to write. The model's stage negates the index wherever i
 validity test rejects the observation, so a published positive value means the model used the
 observation and a negative one that the granule had data there and was rejected. It reads the
 optical index on every date, a fully cloudy one included, although the model itself skips those.
-It then renumbers each shard-date's granules 1, 2, 3 so a signed byte suffices: a day's zone-wide
-fusion order runs past 255, while a shard rarely has more than a handful on one date, and the cap
-is 127.
+The published value is that signed index as `int16`: a day's zone-wide fusion order runs past
+255, so a byte would not hold it, and keeping the fusion order itself lets a pixel join `granules`
+directly.
 
 **How the ingest records what it dropped.** Before fusing a day, the Sentinel-2 ingest keeps one
 copy of each image and holds the others back, in case the kept copy will not read. It marks each
@@ -295,7 +297,7 @@ claims every pixel. The first run that claims the pixel holds its record; the he
 
 | piece | measured | campaign |
 |---|---|---|
-| `pixel_sources` | optical 0.9–1.2 MB a shard-year; radar 0.07–0.5 MB per orbit | about 5 TB, a quarter of a percent of the store, around $1,400 a year |
+| `pixel_sources` | optical 1.1–1.4 MB a shard-year; radar 0.1–0.9 MB per orbit | about 6.3–7.4 TB, a third of a percent of the store, around $1,750–2,100 a year |
 | `granules` | about 160 MB for a land-dense zone-year (zone 35N) | at most about 170 GB for the fills, plus a set per update that re-ingests |
 | `shard_dates`, `update_pixels` | about 10 MB a zone-year; kilobytes per updated shard | about 10 GB |
 | the granule lists and index inside the mosaics | about 150 MB and 0.1–0.3% of a mosaic | none: deleted with the mosaics |
@@ -363,8 +365,9 @@ The last column is the first draft's choice, where reviews of the plan or the bu
 
 | choice | alternative | why this one | first draft |
 |---|---|---|---|
-| a granule per pixel per date | a yes/no bit per pixel per date, with the granule guessed from footprints | 4% more storage, and exact: guessing named the wrong granule for 0.10% of one shard's pixel-dates, wherever footprints overlap | nothing per pixel, ruled out at an estimated 20–45 TB (measured: 3.7 TB for optical); the granule guessed from footprint order |
-| a rejected observation keeps its granule, as the rank negated | zero for anything the model did not use | a reader can tell "no image had data" from "the model rejected this image here", and see which granule was cloudy; a fully cloudy date keeps its plane | zero |
+| a granule per pixel per date | a yes/no bit per pixel per date, with the granule guessed from footprints | about 26% more storage on optical as the fusion order, and exact: guessing named the wrong granule for 0.10% of one shard's pixel-dates, wherever footprints overlap | nothing per pixel, ruled out at an estimated 20–45 TB (measured: 3.7 TB for optical); the granule guessed from footprint order |
+| a rejected observation keeps its granule, as its fusion order negated | zero for anything the model did not use | a reader can tell "no image had data" from "the model rejected this image here", and see which granule was cloudy; a fully cloudy date keeps its plane | zero |
+| planes hold the granule's signed fusion order, `int16` | a signed `int8` rank into each shard-date's `sources` | a pixel joins `granules` directly, with no second table that must agree with the plane on ordering and no cap of 127 granules per shard-date; 19–83% larger, about 1.3–2.4 TB over the campaign, accepted | the rank |
 | the copies the ingest dropped listed after the fused granules, with a `status` | the fused granules only | a reader sees the duplicates, unreadable copies and incomplete radar granules the ingest set aside, beside what it used | the fused only |
 | a day skipped whole committed off the time axis, alone, when it is skipped | carried on the next day's commit | no state held back between days and nothing to flush when the year ends; the time axis the model reads is untouched | not recorded |
 | planes chunked every date × 512 × 512, in 2048 × 2048 shards | one date × one shard | one pixel's year is one fetch instead of 28–130 (0.2 s against 1.9 s, measured at 256 × 256), 7–12% smaller, and a plane chunk covers the same pixels as a v2 store chunk | one date × one shard |
@@ -431,16 +434,18 @@ of its rows) and `sources` (list of int16 fusion orders of the granules with dat
 each mosaic read, and the refused shards that staged no record.
 
 **`pixel_sources`**: one group per run, `<zone>/<year>/<run_id>`, holding per sensor a
-`(date, northing, easting)` int8 array on the zone's grid, chunked every date of the run by 512 × 512 pixels (the v2 store's chunk) in 2048 × 2048 shards, and a
-`<sensor>_date` array of its dates; the group records the grid shape and shard size. A value k
-names `sources[|k| - 1]`, positive when the model used the observation and negative when it
-rejected it; 0 means no granule had data. The codec was chosen, before the sign was added, on one
+`(date, northing, easting)` int16 array on the zone's grid, chunked every date of the run by 512 × 512 pixels (the v2 store's chunk) in 2048 × 2048 shards, and a
+`<sensor>_date` array of its dates; the group records the grid shape, the shard size and, as
+`snapshot_<sensor>`, the mosaic snapshot each sensor's planes describe. A value k is the
+granule's `fusion_order` plus one, positive when the model used the observation and negative when
+it rejected it; 0 means no granule had data. The codec was chosen, before the sign was added, on one
 real optical shard-year (33N `chunk_209_14`, 2024): Blosc zstd level 3 with bit
 shuffle, 1.17 MB, against 1.38 MB for two bits a pixel (which would cap a shard-date at three
 granules), 2.83 MB for zstd without the shuffle, which then misses the mostly constant planes' runs,
 and 1.12 MB for a bare validity bit. Bits packed along time and XOR-delta planes also lost. The
-sign adds about 4% on optical and 0–5% on radar. Storing the signed fusion order as `int16` instead of the rank, which
-would remove `sources` and one hop, was 19–83% larger on the same shards, so the rank stays.
+sign adds about 4% on optical and 0–5% on radar. The signed fusion order as `int16` is 19–83%
+larger than a signed `int8` rank into each shard-date's `sources`, on the same shards; it was
+chosen anyway, for one join fewer on every pixel query (ADR 035, decision 3).
 
 **`update_pixels`**: one boolean `(2048, 2048)` array per shard, named for the shard: the pixels
 the holes update embedded.
@@ -475,9 +480,9 @@ The same in raw polars, for one run, here the update. Two rules from the helpers
 reader: a shard's pixels may come from several runs, listed oldest first in the registry's
 `source_runs`, and a pixel belongs to the newest run that claims it, where a holes update claims a
 pixel only where its `update_pixels` mask marks it and a fill or a shards update claims every
-pixel (§5); and every join from `shard_dates` to `granules` goes through the snapshot the run
-read, `snapshot_id`, never through `run_id`, because a granule list is written once per mosaic
-snapshot and shared by every run that read it:
+pixel (§5); and every join to `granules` goes through the snapshot the run read, never through
+`run_id`, because a granule list is written once per mosaic snapshot and shared by every run that
+read it:
 
 ```python
 import numpy as np
@@ -493,25 +498,23 @@ granules, key = pl.scan_parquet(table.format("granules")), ["sensor", "snapshot_
 rows = pl.scan_parquet(table.format("shard_dates")).filter(pl.col("run_id") == UPDATE, pl.col("tile") == "chunk_209_14")
 rows.explode("sources").rename({"sources": "fusion_order"}).join(granules, on=key).collect()      # the shard
 
-# The pixel: its plane values are signed ranks, one per date on the run's time axis. 0 means no
-# granule had data there; k names `sources[|k| - 1]` of that shard-date's row, and its sign says
-# whether the model used the observation (k > 0) or rejected it, a cloud for instance (k < 0).
+# The pixel: its plane values are signed fusion orders plus one, one per date on the run's time
+# axis. 0 means no granule had data there; |k| - 1 is the granule's `fusion_order` in the snapshot
+# the run's group names, and the sign says whether the model used the observation (k > 0) or
+# rejected it, a cloud for instance (k < 0).
 run = zarr.open_group(open_repo(f"{REGISTRY}/provenance/pixel_sources.icechunk").readonly_session("main").store,
                       path=f"33N/2024/{UPDATE}", mode="r")
 k = np.asarray(run["s2"][:, 209 * 2048 + 1908, 14 * 2048 + 70]).astype(np.int64)   # one per date
 days = np.asarray(run["s2_date"][:]).astype("datetime64[ns]").astype("datetime64[D]")
-seen = pl.DataFrame({"sensor": "s2", "solar_day": days[k != 0], "valid": k[k != 0] > 0, "rank": np.abs(k[k != 0]) - 1})
-(seen.lazy()
- .join(rows, on=["sensor", "solar_day"])
- .with_columns(fusion_order=pl.col("sources").list.get(pl.col("rank")))
- .join(granules, on=key)
- .collect())                                      # the pixel: a row per date with data, `valid` on 27
+seen = pl.DataFrame({"sensor": "s2", "snapshot_id": run.attrs["snapshot_s2"], "solar_day": days[k != 0],
+                     "valid": k[k != 0] > 0, "fusion_order": (np.abs(k[k != 0]) - 1).astype(np.int16)})
+seen.lazy().join(granules, on=key).collect()      # the pixel: a row per date with data, `valid` on 27
 ```
 
 For a shard with several `source_runs`, pick the run by §5's rule first, as `pixel_granules` does.
 
 The same in DuckDB, for readers who prefer SQL. The tables are plain Parquet, so `read_parquet`
-takes the same paths (add `INSTALL httpfs; LOAD httpfs` for `s3://`). The pixel's ranks still come
+takes the same paths (add `INSTALL httpfs; LOAD httpfs` for `s3://`). The pixel's values still come
 from the Icechunk planes, read as above and handed to DuckDB as the small `seen` frame:
 
 ```python
@@ -537,17 +540,15 @@ JOIN read_parquet('{table.format("granules")}') AS g
 WHERE d.run_id = '{UPDATE}' AND d.tile = 'chunk_209_14'
 ORDER BY d.sensor, d.solar_day, g.fusion_order""")
 
-con.register("seen", seen)  # the pixel's (sensor, solar_day, valid, rank) from the planes, as above
+con.register("seen", seen)  # the pixel's (sensor, snapshot_id, solar_day, valid, fusion_order), as above
 con.sql(f"""
--- The pixel: rank names an entry of that shard-date's `sources` (DuckDB lists are 1-based, so
--- rank + 1), the fusion order of the granule with data there; `valid` says whether the model used it.
+-- The pixel: each date's fusion order, in the snapshot the run read, is the granule with data
+-- there; `valid` says whether the model used it.
 SELECT p.sensor, p.solar_day, p.valid, g.fusion_order, g.granule_id, g.platform, g.acquired_at, g.cloud_cover, g.assets
 FROM seen AS p
-JOIN read_parquet('{table.format("shard_dates")}') AS d
-  ON d.run_id = '{UPDATE}' AND d.tile = 'chunk_209_14' AND d.sensor = p.sensor AND d.solar_day = p.solar_day
 JOIN read_parquet('{table.format("granules")}') AS g
-  ON g.sensor = d.sensor AND g.snapshot_id = d.snapshot_id AND g.solar_day = d.solar_day
- AND g.fusion_order = list_extract(d.sources, p.rank + 1)
+  ON g.sensor = p.sensor AND g.snapshot_id = p.snapshot_id AND g.solar_day = p.solar_day
+ AND g.fusion_order = p.fusion_order
 ORDER BY p.solar_day""")
 ```
 

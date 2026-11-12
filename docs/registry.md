@@ -241,26 +241,30 @@ way. The sensors are `s2` (optical), `s1_asc` and `s1_desc` (radar by orbit dire
   `producer_conflict` or `unreadable`.
 - **`shard_dates`**: one row per tile, sensor and date on which an image had data at the tile, with
   `valid_px`, the tile's pixels whose observation the model used that day; `sources`, the
-  `fusion_order` of every image with data at at least one of its pixels, used or not; and `snapshot_id`, the mosaic the run read, which
-  is the key into `granules`.
+  `fusion_order` of every image with data at at least one of its pixels, used or not; and
+  `snapshot_id`, the mosaic the run read, which is the key into `granules`. It answers questions
+  about a whole tile; a pixel's lookup does not need it.
 - **`pixel_sources`**: one Icechunk repository with a group `<ZONE>/<YEAR>/<run_id>`, holding a
-  `(date, northing, easting)` array per sensor on the zone group's grid, and its dates as
-  `<sensor>_date`. A value `k` names the image at `fusion_order = sources[|k| - 1]` of the tile's
-  `shard_dates` row. Positive means the model used that observation; negative means the image had
-  data there and the model rejected it, a cloud for instance; `0` means no image had data.
+  `(date, northing, easting)` `int16` array per sensor on the zone group's grid, and its dates as
+  `<sensor>_date`. The group's attributes name the mosaic each sensor's array describes, as
+  `snapshot_<sensor>`. A value `k` names the image at `fusion_order = |k| - 1` in that mosaic's
+  `granules` list for the date. Positive means the model used that observation; negative means the
+  image had data there and the model rejected it, a cloud for instance; `0` means no image had
+  data.
 
 `ProvenanceRecord(registry_root)`, in `storage/provenance_reader.py`, answers the usual questions as
 polars tables: `day_granules` for a day's mosaic, `shard_granules` for a tile and one run, and
 `pixel_granules(lat, lon, year)`, which finds the pixel's zone, tile, row and column on the store's
 grid and picks the run by the rule below. Pass `anonymous=True` to read the public registry without
 AWS credentials. By hand, to trace one pixel, open the
-run's group, read the pixel's column of values, and join each non-zero value through the tile's
-`shard_dates` row to `granules`, on the row's `snapshot_id`, its day and `sources[|k| - 1]`:
+run's group, read the pixel's column of values, and join each non-zero value to `granules` on the
+sensor, the group's `snapshot_<sensor>`, the day and `fusion_order = |k| - 1`:
 
 ```python
 k = run["s2"][:, row, col].astype(int)                     # one value per date of the optical axis
 dates = run["s2_date"][:]                                  # int64 nanoseconds, CF time encoding
-picks = [(d, abs(v) - 1, v > 0) for d, v in zip(dates, k) if v]   # (date, rank in `sources`, used)
+picks = [(d, abs(v) - 1, v > 0) for d, v in zip(dates, k) if v]   # (date, fusion_order, used)
+snapshot = run.attrs["snapshot_s2"]                        # the `snapshot_id` to join `granules` on
 ```
 
 `pixel_granules` returns the same as a `valid` column.

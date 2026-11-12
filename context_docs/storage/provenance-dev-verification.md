@@ -281,8 +281,10 @@ that rate a zone-year of about 3,000 shards takes about an hour and a half.
    of 512 × 512 in 2048 × 2048 shards, so a plane chunk covers the same pixels as a store chunk.
    512 × 512 itself was not measured; 128 × 128 against 256 × 256 suggests a larger chunk is
    no bigger, and a one-pixel read decompresses four times the bytes of 256 × 256 in one fetch.
-9. **The rank stays.** The signed fusion order as `int16` would drop `sources` and one hop, but
-   was 19–83% larger.
+9. **The signed fusion order is 19–83% larger than the rank.** Storing it as `int16` takes
+   `sources` off the pixel path, one join fewer. On this measurement the rank was kept at first;
+   after review the fusion order was adopted with its size accepted (ADR 035, decision 3), and
+   re-measured under the published layout below.
 
 ## Teardown
 

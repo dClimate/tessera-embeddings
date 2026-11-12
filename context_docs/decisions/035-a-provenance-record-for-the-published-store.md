@@ -19,18 +19,21 @@ provenance beyond its registry, and none can be reconstructed.
    which granule supplied the observation and whether the model used it.** Four pieces under `provenance/`: `granules`, `shard_dates`,
    `pixel_sources` and, for holes updates, `update_pixels`. A run writes its own `shard_dates`,
    planes and mask and never another run's; `granules` belongs to the mosaic (5).
-2. **Per pixel, an integer, not a bit.** Measured on a real shard-year, the integer naming the
-   winning granule costs 4% more than a validity bit (1.17 MB against 1.12 MB a shard-year, about
-   3.7 TB for the campaign) and is exact where footprints overlap, where a bit would leave a list of
-   candidates.
-3. **The published plane is `int8`, a signed rank into the shard-date's `sources`; the mosaic's
-   index is `uint16`, the zone-wide fusion position.** A value k names `sources[|k| - 1]`: positive
-   when the model used the observation, negative when its validity test rejected it, a cloud for
-   instance, and 0 when no granule had data. A reader can therefore tell "no image" from "image
-   rejected", and see which granule was cloudy. A day's fusion order is zone-wide and can exceed
-   255; a shard has a handful of granules on a date, so 127 per shard-date is ample. The size above
-   was measured on unsigned per-shard ranks before rejected observations were kept, which makes
-   cloudy pixels non-zero; the next dev run measures the difference.
+2. **Per pixel, an integer, not a bit.** Measured on a real optical shard-year, a per-shard rank
+   naming the winning granule cost 4% more than a validity bit (1.17 MB against 1.12 MB), and the
+   published fusion order (3) about 26% more (1.41 MB). Either is exact where footprints overlap,
+   where a bit would leave a list of candidates.
+3. **The published plane is `int16`, the granule's signed fusion order; the mosaic's index is
+   `uint16`, the same zone-wide fusion position.** A value k means `fusion_order = |k| - 1`:
+   positive when the model used the observation, negative when its validity test rejected it, a
+   cloud for instance, and 0 when no granule had data. A reader can therefore tell "no image" from
+   "image rejected", and see which granule was cloudy. The run's group names each sensor's mosaic
+   snapshot in its attributes, so a plane value and its date are a full `granules` key: a pixel
+   query joins the plane to `granules` and nothing else, and the plane does not depend on a second,
+   separately written table agreeing with it on ordering. The alternative, an `int8` rank into
+   each shard-date's `sources`, was 19–83% smaller on two dev shard-years (radar grows more than
+   optical) but costs every reader a join and capped a shard-date at 127 granules. The larger
+   planes were accepted: about 1.3–2.4 TB more over the campaign.
 4. **The index rides on the loader's own per-source hook.** The mask band (SCL, VV) is read through
    a reader that packs each granule's position above its pixels, so odc's unchanged first-wins fuser
    picks the winner and a split returns the band bit-identical. One read and an unchanged fuse; the
@@ -84,10 +87,11 @@ provenance beyond its registry, and none can be reconstructed.
 - The mosaic gains a `granules` array and a `source_index` band while the switch is on; the
   ingest's code fingerprint moves, so the ingest half deploys while nothing is mid-ingest or under
   `allow_ingest_code_mismatch`.
-- About 5 TB of planes and under 200 GB of tables are added beside the store over the whole
-  campaign, about a quarter of a percent of it.
+- About 6.3–7.4 TB of planes and under 200 GB of tables are added beside the store over the whole
+  campaign, about a third of a percent of it.
 - The ingest's time cost is inside run-to-run variation over seven paired runs of a dense zone;
   what the record adds for certain is one more chunk write per date, the index's, for the Dask
   scheduler, accepted (plan §6).
-- A pixel query joins three things: the plane, the shard-date's `sources`, and `granules` through
-  the row's `snapshot_id`; `pixel_granules` does it, after picking the run.
+- A pixel query joins two things: the plane, and `granules` through the snapshot the run's group
+  names; `pixel_granules` does it, after picking the run. `shard_dates` answers per-shard
+  questions and is off the pixel path.
