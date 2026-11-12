@@ -159,19 +159,26 @@ class ProvenanceRecord:
         group = newest if run == runs[-1] else self._run_group(where.zone, year, run)
         shard_row, shard_col = parse_chunk_label(where.tile)
         y, x = shard_row * shard_px + where.row, shard_col * shard_px + where.col
-        # A plane value k names `sources[|k| - 1]`; positive means the model used the observation.
-        seen: list[tuple[str, datetime.date, bool, int]] = []
+        # A plane value k is the granule's signed fusion order plus one; positive means the model used it.
+        seen: list[tuple[str, str, datetime.date, bool, int]] = []
         for sensor in (s for s in SENSORS if s in group):
-            ranks = np.asarray(cast(zarr.Array, group[sensor])[:, y, x]).astype(int)
+            orders = np.asarray(cast(zarr.Array, group[sensor])[:, y, x]).astype(int)
             days = days_of(np.asarray(cast(zarr.Array, group[f"{sensor}_date"])[:]))
-            seen += [(sensor, days[i], bool(ranks[i] > 0), abs(int(ranks[i])) - 1) for i in np.flatnonzero(ranks)]
-        schema = {"sensor": pl.String, "solar_day": pl.Date, "valid": pl.Boolean, "rank": pl.Int64}
-        rows = self._table(where.zone, year, SHARD_DATES).filter(pl.col("run_id") == run, pl.col("tile") == where.tile)
+            snapshot = cast(str, group.attrs[f"snapshot_{sensor}"])
+            seen += [
+                (sensor, snapshot, days[i], bool(orders[i] > 0), abs(orders[i]) - 1) for i in np.flatnonzero(orders)
+            ]
+        schema = {
+            "sensor": pl.String,
+            "snapshot_id": pl.String,
+            "solar_day": pl.Date,
+            "valid": pl.Boolean,
+            "fusion_order": pl.Int16,
+        }
         return (
             pl.LazyFrame(seen, schema=schema, orient="row")
-            .join(rows, on=["sensor", "solar_day"])
-            .with_columns(fusion_order=pl.col("sources").list.get(pl.col("rank")))
             .join(self._table(where.zone, year, GRANULES), on=_GRANULE_KEY)
+            .with_columns(run_id=pl.lit(run))
             .select(PIXEL_COLUMNS)
             .sort("sensor", "solar_day")
             .collect()

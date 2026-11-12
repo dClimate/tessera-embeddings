@@ -8,11 +8,13 @@ Everything sits under ``<registry>/provenance/`` (``context_docs/storage/registr
     ├── shard_dates/   zone=<Z>/year=<Y>/<run_id>.parquet   one row per shard, sensor and date a run used
     ├── update_pixels/ zone=<Z>/year=<Y>/<run_id>.zarr      holes updates only: the pixels the run embedded
     └── pixel_sources.icechunk/                          one Icechunk repository, a group per run
-        └── <Z>/<Y>/<run_id>/{s2,s1_asc,s1_desc}         (date, northing, easting) int8 signed ranks
+        └── <Z>/<Y>/<run_id>/{s2,s1_asc,s1_desc}         (date, northing, easting) int16 signed fusion order + 1
 
 A granule list belongs to the mosaic it was fused into, so ``granules`` is keyed by the mosaic
-snapshot a run read and written once per snapshot; each ``shard_dates`` row names its snapshot, and
-that is the join. Everything else is written per run and never rewritten by another run.
+snapshot a run read and written once per snapshot. A run's ``pixel_sources`` group names each
+sensor's snapshot in its attributes (``snapshot_<sensor>``), so a plane value ``k`` at a date is a
+``granules`` key on its own: ``fusion_order = |k| - 1``. ``shard_dates`` rows name the snapshot too,
+for per-shard questions. Everything else is written per run and never rewritten by another run.
 
 As in ``registry``, ``zone`` and ``year`` are the hive partition keys and not columns: carrying them
 as columns too makes pyarrow refuse the dataset (see that module's docstring). Every reader that
@@ -120,7 +122,7 @@ def shard_dates_schema() -> pa.Schema:
     ``tile`` names the shard as the registry does (``chunk_<row>_<col>``). ``snapshot_id`` is the
     mosaic snapshot the run read for this sensor, the key into ``granules``. ``sources`` are the
     ``fusion_order`` values that covered at least one of the shard's pixels that date, valid for
-    the model or not, ascending; a pixel's ``pixel_sources`` value k means ``sources[|k| - 1]``.
+    the model or not, ascending: the distinct ``|k| - 1`` of the shard's ``pixel_sources`` values.
     ``valid_px`` counts the pixels whose observation was valid. ``embedded_px`` is the run's count
     for the whole shard, repeated on each of its rows.
     """

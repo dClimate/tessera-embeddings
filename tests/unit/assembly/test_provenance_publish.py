@@ -257,7 +257,7 @@ def test_a_snapshots_granules_are_written_once_and_checked_by_every_later_run(pu
 
 @pytest.mark.parametrize("valid", [ALL_VALID, SOME_REJECTED], ids=["all-valid", "some-rejected"])
 def test_shard_dates_and_planes_name_the_same_granules(tmp_path: Path, valid: np.ndarray) -> None:
-    """Every row's sources are what its plane ranks, and the plane is the mosaic's index.
+    """The plane is the mosaic's index, signed, every row's sources are its values, and the group names each snapshot.
 
     Positive where the model used the observation, negative where it rejected it; a fully rejected
     date keeps its rows.
@@ -278,13 +278,12 @@ def test_shard_dates_and_planes_name_the_same_granules(tmp_path: Path, valid: np
         t = DATES.index(str(row["solar_day"]))
         plane = group[row["sensor"]][t, r * SHARD : (r + 1) * SHARD, c * SHARD : (c + 1) * SHARD]
         store = next(p for p in pins if STORES[Path(p).stem] == row["sensor"])
-        assert row["snapshot_id"] == pins[store]
+        assert row["snapshot_id"] == pins[store] == group.attrs[f"snapshot_{row['sensor']}"]
         index = open_store_as_zarr_group(store, snapshot_id=pins[store])[SOURCE_INDEX_VAR][
             t, r * SHARD : (r + 1) * SHARD, c * SHARD : (c + 1) * SHARD
         ]
-        named = np.sign(plane) * (np.asarray(row["sources"])[np.abs(plane.astype(int)) - 1] + 1)
-        expected = np.where(valid[t], index, -index.astype(int))
-        np.testing.assert_array_equal(np.where(plane != 0, named, 0), expected, err_msg=str(row))
+        np.testing.assert_array_equal(plane, np.where(valid[t], index, -index.astype(int)), err_msg=str(row))
+        assert row["sources"] == sorted(set(np.abs(plane[plane != 0]).astype(int) - 1))
         assert row["valid_px"] == int(np.count_nonzero(plane > 0))
         assert row["embedded_px"] == (0 if row["tile"] == "chunk_1_1" else SHARD * SHARD)
     assert {str(r["solar_day"]) for r in rows} == set(DATES), "a fully rejected date keeps its rows"

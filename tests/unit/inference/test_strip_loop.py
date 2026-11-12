@@ -1131,16 +1131,16 @@ class TestProvenancePlanes:
         _, write = _run_process_chunk(inference_config, test_model)
         assert write["planes"] is None
 
-    def test_each_plane_ranks_every_granule_and_signs_the_models_verdict(self, inference_config, test_model):
-        """Ranks point into the shard-date's sources, negative where the model rejected the observation."""
+    def test_each_plane_names_every_granule_and_signs_the_models_verdict(self, inference_config, test_model):
+        """Values are fusion orders plus one, as in the sources, negative where the model rejected it."""
         _, write = _run_process_chunk(inference_config, test_model, source_index=True)
         expected = _expected_planes()
         assert set(write["planes"]) == {"s2", "s1_asc", "s1_desc"}
         for sensor, dates in write["planes"].items():
             assert [(t, sources, valid) for t, _, sources, valid in dates] == expected[sensor], sensor
             for _, plane, sources, valid in dates:
-                assert plane.dtype == np.int8 and int(np.count_nonzero(plane > 0)) == valid
-                assert np.unique(np.abs(plane[plane != 0])).tolist() == list(range(1, len(sources) + 1))
+                assert plane.dtype == np.int16 and int(np.count_nonzero(plane > 0)) == valid
+                assert (np.unique(np.abs(plane[plane != 0])) - 1).tolist() == sources
 
     def test_a_holes_update_records_the_pixels_it_embedded_not_the_holes_it_was_given(
         self, inference_config, test_model, tmp_path

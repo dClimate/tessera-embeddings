@@ -3,10 +3,11 @@
 Assembly's last data step (``context_docs/storage/registry-provenance-plan.md`` §4, Appendix C). From the
 mosaics, read at the snapshots the actors read, it exports each slot's granule list as that
 snapshot's ``granules`` file, unless an earlier run already did, in which case it checks the file
-holds the same lists. From the staged shards it writes the run's ``shard_dates`` table, whose rows
-name the snapshot, the run's group in the ``pixel_sources`` store and, for a holes update,
-``update_pixels``, the pixels it embedded. It checks that they agree with each other and with the
-mosaics as it goes. The layout is drawn in ``storage/provenance.py``.
+holds the same lists. From the staged shards it writes the run's group in the ``pixel_sources``
+store, whose planes hold each granule's signed fusion order and whose attributes name each sensor's
+snapshot, so a plane value and its date are a ``granules`` key; the run's ``shard_dates`` table, the
+per-shard summary; and, for a holes update, ``update_pixels``, the pixels it embedded. It checks
+that they agree with each other and with the mosaics as it goes. The layout is drawn in ``storage/provenance.py``.
 
 **A failure fails the zone-year.** :func:`publish_provenance` raises rather than logging: the caller
 runs it before the tag and the staging cleanup, so a failed publication leaves the zone-year
@@ -187,7 +188,14 @@ def publish_provenance(
     session = repo.writable_session("main")
     run_group = zarr.open_group(session.store, path=pixel_sources_group(zone, year, run_id), mode="w")
     run_group.attrs.update(
-        {"zone": zone, "year": year, "run_id": run_id, "grid_shape": list(run.grid_shape), "shard_px": run.shard_px}
+        {
+            "zone": zone,
+            "year": year,
+            "run_id": run_id,
+            "grid_shape": list(run.grid_shape),
+            "shard_px": run.shard_px,
+            **{f"snapshot_{s}": p for s, p in pins.items()},
+        }
     )
     edge = min(PLANE_CHUNK_PX, run.shard_px)
     for sensor, days in axes.items():
@@ -197,7 +205,7 @@ def publish_provenance(
             shape=(len(days), *run.grid_shape),
             chunks=(dates, edge, edge),
             shards=(dates, run.shard_px, run.shard_px),
-            dtype=np.int8,
+            dtype=np.int16,
             fill_value=0,
             compressors=PLANE_COMPRESSORS,
             dimension_names=("date", "northing", "easting"),
@@ -373,7 +381,7 @@ def _copy_shard(copy: _Copy, label: str, group: zarr.Group, embedded_px: int) ->
         target, counts, record = cast(zarr.Array, copy.run_group[sensor]), copy.counts[sensor], summary[sensor]
         window = (slice(row * px, row * px + planes.shape[1]), slice(col * px, col * px + planes.shape[2]))
         # The shard's whole year in memory, so each chunk, which holds every date, is written once.
-        year = np.zeros((target.shape[0], *planes.shape[1:]), dtype=np.int8)
+        year = np.zeros((target.shape[0], *planes.shape[1:]), dtype=np.int16)
         for start in range(0, len(times), _COPY_BATCH):
             batch = np.asarray(planes[start : start + _COPY_BATCH])
             for i, plane in enumerate(batch, start):
@@ -389,15 +397,15 @@ def _copy_shard(copy: _Copy, label: str, group: zarr.Group, embedded_px: int) ->
 
 
 def _check_plane(where: str, plane: np.ndarray, sources: Sequence[int], valid: int, fused: int) -> None:
-    """A plane's positive count is its row's ``valid_px``, its values rank its ``sources``, and they exist.
+    """A plane's positive count is its row's ``valid_px``, its values are its ``sources``, and they exist.
 
-    ``fused`` is how many granules the snapshot the row names fused that day, which its ``granules``
-    file holds, so a source below it is a fused granule of that day in that file.
+    ``fused`` is how many granules the snapshot the run's group names fused that day, which its
+    ``granules`` file holds, so a fusion order below it is a fused granule of that day in that file.
     """
     if (positive := int(np.count_nonzero(plane > 0))) != valid:
         raise ProvenanceCheckError(f"{where}: plane has {positive} valid pixels, its row says {valid}")
-    if np.unique(np.abs(plane[plane != 0])).tolist() != list(range(1, len(sources) + 1)):
-        raise ProvenanceCheckError(f"{where}: plane values do not rank its {len(sources)} source(s)")
+    if (np.unique(np.abs(plane[plane != 0])) - 1).tolist() != list(sources):
+        raise ProvenanceCheckError(f"{where}: plane values are not its {len(sources)} source(s)")
     if sources and max(sources) >= fused:
         raise ProvenanceCheckError(f"{where}: source {max(sources)} beyond the day's {fused} granule(s)")
 

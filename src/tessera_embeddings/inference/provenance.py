@@ -10,19 +10,18 @@ fuser took the pixel from. The actor turns that into the per-shard record the re
   index over the same dates and window, negates it wherever the model's own validity test fails,
   and keeps it compressed per date (:func:`read_source_pieces`). Nothing is read twice, and a
   shard holds kilobytes per date rather than a full plane.
-* **Planes, ranked at the staging write.** :class:`SourcePlanes` collects a shard's pieces across
+* **Planes, stitched at the staging write.** :class:`SourcePlanes` collects a shard's pieces across
   strips. At the write, on the actor's background writer, each date's pieces are stitched into one
-  plane, cut for a holes update to the pixels it embedded, and its values replaced by their signed
-  rank in the shard-date's ``sources``: the distinct fusion positions that covered a pixel,
-  ascending. A day's fusion order is zone-wide and can exceed 255, while a shard has a handful of
-  granules on a date, so the rank keeps the published plane ``int8``. The plane and its
-  ``sources`` and valid-pixel count are staged with the shard.
+  ``int16`` plane and cut, for a holes update, to the pixels it embedded. The plane is staged with
+  the shard's ``sources`` for the date, the distinct fusion positions that covered a pixel, and its
+  valid-pixel count.
 
-A value k names ``sources[|k| - 1]``. Positive means the observation was valid for the model, by
-its own test; negative means that granule had data there and the test rejected it, a cloud for
-instance; zero means no granule had data. For a pixel with an embedding the positive values are the
-observations its input drew on; a pixel deeper than the deepest bucket is resampled to a
-deterministic subset of them (``inference/sampling.py``).
+A value k is the granule's signed fusion order plus one: ``|k| - 1`` is its ``fusion_order`` in the
+day's ``granules`` list, so a plane joins ``granules`` directly. Positive means the observation was
+valid for the model, by its own test; negative means that granule had data there and the test
+rejected it, a cloud for instance; zero means no granule had data. For a pixel with an embedding the
+positive values are the observations its input drew on; a pixel deeper than the deepest bucket is
+resampled to a deterministic subset of them (``inference/sampling.py``).
 
 A fill or a shards update records every pixel it was asked to embed, refused ones included, which is
 how a refused shard still has rows. A holes update records only the pixels it embedded, and stages
@@ -55,7 +54,7 @@ PLANE_COMPRESSORS = (BloscCodec(cname="zstd", clevel=3, shuffle="bitshuffle"),)
 #: provenance-dev-verification.md).
 PLANE_CHUNK_PX = 512
 
-#: The same codec for the in-memory pieces, which are signed 32-bit positions rather than 8-bit ranks.
+#: The same codec for the in-memory pieces, kept as signed 32-bit positions until the staging write.
 _PIECE_CODEC = numcodecs.Blosc(cname="zstd", clevel=3, shuffle=numcodecs.Blosc.BITSHUFFLE)
 
 #: Dates read per batch when building pieces: a whole shard's index for every kept date at once
@@ -139,7 +138,7 @@ class ShardDate:
 
 
 class SourcePlanes:
-    """One shard's pieces for every sensor, collected across strips, ranked at the staging write.
+    """One shard's pieces for every sensor, collected across strips, stitched at the staging write.
 
     Pieces arrive from the loader's thread and are read on the writer's, so ``add`` is locked even
     though a shard's strips load one at a time.
@@ -166,16 +165,15 @@ class SourcePlanes:
         return [sensor for sensor in SENSORS if self._pieces[sensor]]
 
     def dates(self, sensor: str, pixels: np.ndarray | None = None) -> Iterator[ShardDate]:
-        """Each date's signed ranked plane for ``sensor``, in time order, cut to ``pixels`` when given.
+        """Each date's signed ``int16`` plane for ``sensor``, in time order, cut to ``pixels`` when given.
 
         A date where no granule had data at any pixel left after the cut is dropped: the shard has
         no record for it. A date the model rejected everywhere, a fully cloudy one, is kept.
 
         Raises:
-            ValueError: a shard-date with more than 127 granules, which the ``int8`` plane cannot
-                rank. Refused rather than wrapped.
+            ValueError: a fusion position beyond ``int16``. Refused rather than wrapped.
         """
-        cap = np.iinfo(np.int8).max
+        cap = np.iinfo(np.int16).max
         for time in sorted(self._pieces[sensor]):
             full = np.zeros((self.height, self.width), dtype=np.int32)
             for piece in self._pieces[sensor][time]:
@@ -183,17 +181,13 @@ class SourcePlanes:
                 full[piece.rows, piece.cols] = np.frombuffer(_PIECE_CODEC.decode(piece.data), np.int32).reshape(shape)
             if pixels is not None:
                 full[~pixels] = 0
-            magnitude = np.abs(full)
-            present = np.flatnonzero(np.bincount(magnitude.ravel(), minlength=1))
+            present = np.flatnonzero(np.bincount(np.abs(full).ravel(), minlength=1))
             present = present[present > 0]
             if not len(present):
                 continue
-            if len(present) > cap:
-                raise ValueError(f"{sensor} time {time}: {len(present)} granules covered one shard; the cap is {cap}")
-            rank = np.zeros(int(present[-1]) + 1, dtype=np.int8)
-            rank[present] = np.arange(1, len(present) + 1, dtype=np.int8)
-            plane = np.where(full < 0, -rank[magnitude], rank[magnitude])
-            yield ShardDate(time, plane, [int(p) - 1 for p in present], int(np.count_nonzero(full > 0)))
+            if present[-1] > cap:
+                raise ValueError(f"{sensor} time {time}: fusion position {present[-1] - 1} is beyond int16")
+            yield ShardDate(time, full.astype(np.int16), [int(p) - 1 for p in present], int(np.count_nonzero(full > 0)))
 
 
 def staging_kwargs(planes: SourcePlanes, scales: np.ndarray, *, holes: bool) -> dict[str, Any]:
@@ -209,7 +203,7 @@ def staging_kwargs(planes: SourcePlanes, scales: np.ndarray, *, holes: bool) -> 
 
 
 def stage_planes(group: zarr.Group, planes: SourcePlanes, pixels: np.ndarray | None) -> dict[str, Any]:
-    """Write each sensor's ranked planes into a staged shard; return its ``shard_dates`` summary.
+    """Write each sensor's planes into a staged shard; return its ``shard_dates`` summary.
 
     The planes go in as ``(time, northing, easting)`` arrays chunked one date by the shard, with
     their mosaic time indices beside them. The summary is ``{sensor: {"time", "sources",
@@ -229,7 +223,7 @@ def stage_planes(group: zarr.Group, planes: SourcePlanes, pixels: np.ndarray | N
             STAGED_PLANES.format(sensor=sensor),
             shape=(len(dates), planes.height, planes.width),
             chunks=(1, planes.height, planes.width),
-            dtype=np.int8,
+            dtype=np.int16,
             fill_value=0,
             compressors=PLANE_COMPRESSORS,
             dimension_names=("time", "northing", "easting"),
