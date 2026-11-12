@@ -45,7 +45,7 @@ from __future__ import annotations
 
 import json
 import zipfile
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -304,7 +304,7 @@ def plan_from_registry(
     name: str,
     mode: UpdateMode,
     refused: Refused | None = None,
-    zones: Iterable[str] | None = None,
+    zones: Collection[str] | None = None,
     years: Iterable[int] | None = None,
     aoi: tuple[float, float, float, float] | None = None,
     storage_options: Mapping[str, Any] | None = None,
@@ -321,7 +321,6 @@ def plan_from_registry(
     """
     # THE SCHEMA IS STATED, as every whole-registry read must (`registry.py`): inferred, it comes from
     # the first file, and cell files written before and after a column was added then fail to scan.
-    zones = None if zones is None else tuple(zones)  # read twice below: by group, then by half
     columns = pa.schema([f for f in master_schema() if f.name not in _PARTITION_KEYS])
     rows = pl.scan_parquet(
         f"{registry_root.rstrip('/')}/master/**/*.parquet",

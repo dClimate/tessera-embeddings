@@ -23,7 +23,7 @@ A ``utm_zones`` store's root also declares ``geoemb:spatial_layout: "utm_zones"`
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from typing import cast
 
 import icechunk
@@ -554,7 +554,7 @@ def _stamp_identity(
 
 def seed_zone_groups(
     repo: icechunk.Repository,
-    specs: Iterable[ZoneSpec],
+    specs: Collection[ZoneSpec],
     *,
     years: tuple[int, ...] = CAMPAIGN_YEARS,
     layout: StoreLayout = GLOBAL,

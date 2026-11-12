@@ -21,7 +21,7 @@ zone-fill *runner* (inference -> assemble -> tag) lives in
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import cast
@@ -107,7 +107,7 @@ def missing_zones_for_year(
     repo: icechunk.Repository,
     year: int,
     *,
-    expected_zones: Iterable[str] | None = None,
+    expected_zones: Collection[str] | None = None,
     snapshot_id: str | None = None,
     branch: str = "main",
 ) -> tuple[str, ...]:
@@ -122,8 +122,7 @@ def missing_zones_for_year(
     else ``branch``'s tip — so the answer describes that snapshot rather than a branch that may
     have advanced since.
     """
-    scope = tuple(expected_zones) if expected_zones is not None else None  # a generator is read once
-    if scope == ():
+    if expected_zones is not None and not expected_zones:
         # An empty scope makes the check vacuous: every zone in scope has landed, having verified
         # nothing. `None` means "the whole campaign"; an empty list means the caller computed a
         # scope and got nothing, which is a bug in the caller, not a completed year.
@@ -136,7 +135,7 @@ def missing_zones_for_year(
         if snapshot_id is not None
         else campaign_status(repo, branch=branch)
     )
-    expected = scope if scope is not None else status.campaign_zones()
+    expected = expected_zones if expected_zones is not None else status.campaign_zones()
     return tuple(z for z in expected if not status.has(z, year))
 
 
