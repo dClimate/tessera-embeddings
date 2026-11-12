@@ -48,6 +48,7 @@ context_docs/
 │   ├── 029-one-flow-per-ingest.md
 │   ├── 030-forward-pass-reorderings-ship-at-a-store-boundary.md
 │   ├── 032-v2-stores-name-their-axes-y-and-x.md
+│   ├── 033-radar-overlaps-go-to-the-most-acquired-burst.md
 │   ├── 034-an-acquisition-is-one-datastrip-of-one-pass.md
 │   ├── 037-v2-stores-use-the-utm-zones-layout.md
 │   ├── 038-the-campaign-fills-a-utm-column-in-two-halves.md
@@ -78,8 +79,9 @@ context_docs/
 │   │                                              budget, live-tile cropping, region writes
 │   ├── source-read-failures.md                 twelve ways a source read fails, the guard each
 │   │                                              earned, and the retry budget they share
-│   ├── solar-day-fusion-order.md               which scene wins a contested pixel, and why the
-│   │                                              answer was inverted for the life of the code
+│   ├── solar-day-fusion-order.md               which scene or burst wins a contested pixel, and
+│   │                                              why the optical answer was inverted for the
+│   │                                              life of the code
 │   └── split-datastrips.md                     why a pass split across datastrips keeps every
 │                                                  granule, and what dropping one cost
 │

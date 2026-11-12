@@ -1,13 +1,13 @@
-"""Which of two overlapping scenes of one solar day actually supplies a pixel.
+"""Which of two overlapping sources of one solar day actually supplies a pixel.
 
 Asserting the ORDER handed to `odc.stac.load` is only half the question. The other half is what odc
 does with that order: its default fuser is `nodata_fuser`, which writes only where the destination
 is still empty, so the FIRST valid source of a group supplies a pixel and later ones fill its gaps.
 
-**This test therefore refuses to mock the loader**, because a mock would assert the half that was
-never in doubt. Two real single-band GeoTIFFs on one grid, two real STAC items on one solar day,
-through the production `_load_from_stac` with the production load kwargs. The assertion is on the
-PIXELS that come out.
+**These tests therefore refuse to mock the loader**, because a mock would assert the half that was
+never in doubt. Real GeoTIFFs on one grid, real items on one solar day, through the production load
+path. The assertion is on the PIXELS that come out: the clearest optical scene, and the radar burst
+acquired most often over the window (ADR 033).
 """
 
 from __future__ import annotations
@@ -23,7 +23,8 @@ from pystac import Item
 from rasterio.transform import from_origin
 
 from tessera_embeddings.config.providers import CollectionConfig
-from tessera_embeddings.ingest.stac import _load_from_stac
+from tessera_embeddings.ingest.opera_query import BURST_ACQUISITIONS, BURST_ID, _granule_to_item
+from tessera_embeddings.ingest.stac import _load_from_stac, ingest_tile
 
 CLOUDY_DN = 100
 CLEAR_DN = 200
@@ -34,11 +35,13 @@ EAST0, NORTH1 = 500000.0, 5000000.0
 EPSG = 32633
 
 
-def _write(path: pathlib.Path, value: int, *, left_half_only: bool = False) -> None:
-    pixels = np.full((SIZE, SIZE), value, dtype="uint16")
+def _write(
+    path: pathlib.Path, value: float, *, left_half_only: bool = False, dtype: str = "uint16", nodata: float = NODATA
+) -> None:
+    pixels = np.full((SIZE, SIZE), value, dtype=dtype)
     if left_half_only:
         # A hole on the right: what an off-swath or masked region looks like to the fuser.
-        pixels[:, SIZE // 2 :] = NODATA
+        pixels[:, SIZE // 2 :] = nodata
     with rasterio.open(
         path,
         "w",
@@ -46,10 +49,10 @@ def _write(path: pathlib.Path, value: int, *, left_half_only: bool = False) -> N
         width=SIZE,
         height=SIZE,
         count=1,
-        dtype="uint16",
+        dtype=dtype,
         crs=f"EPSG:{EPSG}",
         transform=from_origin(EAST0, NORTH1, RES, RES),
-        nodata=NODATA,
+        nodata=nodata,
     ) as dst:
         dst.write(pixels, 1)
 
@@ -90,15 +93,18 @@ def _item(item_id: str, href: str, cloud: float) -> Item:
     )
 
 
-def _load(items: list[Item], *, has_scl: bool = True) -> np.ndarray:
-    gbox = GeoBox.from_bbox(
-        BoundingBox(EAST0, NORTH1 - SIZE * RES, EAST0 + SIZE * RES, NORTH1, crs=f"EPSG:{EPSG}"),
-        resolution=RES,
-    )
-    # `has_scl` marks the collection whose order THIS package decides, which is what
+GBOX = GeoBox.from_bbox(
+    BoundingBox(EAST0, NORTH1 - SIZE * RES, EAST0 + SIZE * RES, NORTH1, crs=f"EPSG:{EPSG}"),
+    resolution=RES,
+)
+CHUNKS = {"northing": SIZE, "easting": SIZE}
+
+
+def _load(items: list[Item], *, fusion_order: str | None = "clearest_scene") -> np.ndarray:
+    # A collection naming a fusion order is one whose order THIS package decides, which is what
     # `_load_from_stac` keys `preserve_original_order` on.
-    cfg = CollectionConfig(collection_id="test", bands=["blue"], resolution=int(RES), has_scl=has_scl)
-    ds = _load_from_stac(items, cfg, geobox=gbox, chunks={"northing": SIZE, "easting": SIZE})
+    cfg = CollectionConfig(collection_id="test", bands=["blue"], resolution=int(RES), fusion_order=fusion_order)
+    ds = _load_from_stac(items, cfg, geobox=GBOX, chunks=CHUNKS)
     assert ds.sizes["time"] == 1, "both items must land in ONE solar-day slice or this proves nothing"
     return np.asarray(ds["blue"].compute().values[0])
 
@@ -142,12 +148,67 @@ def test_a_hole_in_the_clearest_scene_falls_through_to_the_next(scenes, tmp_path
 
 
 def test_a_collection_this_package_does_not_sort_fuses_the_same_either_way(scenes) -> None:
-    """Where no sort is imposed, odc's own `(time, id)` order decides — and that is the point.
+    """Where no fusion order is named, odc's own `(time, id)` order decides — and that is the point.
 
-    Radar is that case: nothing here orders those items, so without odc's default the provider's
-    return order would pick the winner of every overlap.
+    Without odc's default, the order the provider returned would pick the winner of every overlap.
     """
     cloudy, clear = scenes
-    assert np.array_equal(_load([cloudy, clear], has_scl=False), _load([clear, cloudy], has_scl=False)), (
+    assert np.array_equal(_load([cloudy, clear], fusion_order=None), _load([clear, cloudy], fusion_order=None)), (
         "the fused result must not depend on the order the items were supplied in"
     )
+
+
+#: Two bursts of adjacent ascending tracks, as overlap at high latitude: different look geometries.
+#: The lower burst id is the one a title-ordered load would pick.
+LOW_TRACK, HIGH_TRACK = "T029-061234-IW2", "T131-279876-IW1"
+AMPLITUDE = {LOW_TRACK: 0.1, HIGH_TRACK: 0.2}
+
+
+def _burst(tmp_path: pathlib.Path, burst: str) -> Item:
+    """One OPERA granule over the test ground, built from a CMR entry exactly as the query builds it."""
+    title = f"OPERA_L2_RTC-S1_{burst}_20240615T163000Z_20240616T000000Z_S1A_30_v1.0"
+    links = []
+    for band in ("VV", "VH"):
+        _write(tmp_path / f"{title}_{band}.tif", AMPLITUDE[burst], dtype="float32", nodata=np.nan)
+        links.append(
+            {"rel": "http://esipfed.org/ns/fedsearch/1.1/data#", "href": str(tmp_path / f"{title}_{band}.tif")}
+        )
+    entry = {
+        "title": title,
+        "time_start": "2024-06-15T16:30:00.000Z",
+        "links": links,
+        "polygons": [["45.0 14.9 45.0 15.2 45.3 15.2 45.3 14.9 45.0 14.9"]],
+    }
+    item = _granule_to_item(entry)
+    assert item is not None
+    return item
+
+
+@pytest.mark.parametrize("favoured", [LOW_TRACK, HIGH_TRACK])
+def test_the_most_acquired_burst_wins_a_contested_radar_pixel(tmp_path, favoured) -> None:
+    """Swap which burst the census favours and the winner swaps, whatever the supply order or ids.
+
+    Supplied high track first, so the low track winning shows the sort moved it, and the high
+    track winning shows the count outranks the burst id. Through `ingest_tile`, which sorts on the
+    collection's fusion order and loads with the order kept.
+    """
+    items = [_burst(tmp_path, HIGH_TRACK), _burst(tmp_path, LOW_TRACK)]
+    for item in items:
+        # What the item provider stamps from the window's census.
+        item.properties[BURST_ACQUISITIONS] = 31 if item.properties[BURST_ID] == favoured else 29
+
+    ds, _ = ingest_tile(
+        provider="cmr-asf",
+        collection="opera-rtc-s1",
+        tile_id=None,
+        start_date="2024-06-14",
+        end_date="2024-06-16",
+        bbox=(14.9, 45.0, 15.2, 45.3),
+        geobox=GBOX,
+        chunks=CHUNKS,
+        item_provider_fn=lambda: items,
+        mid_longitude=15.0,
+    )
+
+    assert ds is not None and ds.sizes["time"] == 1, "both bursts must land in ONE solar-day slice"
+    np.testing.assert_allclose(ds["0_VV"].compute().values[0], AMPLITUDE[favoured])

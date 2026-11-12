@@ -281,5 +281,5 @@ survive. Demoted, not removed.
 
 - [ADR 020](020-boa-offset-applies-to-every-valid-dn.md) — the arithmetic, how the two sources are
   told apart, and the limits this closes
-- [`ingest/README.md`](../../src/tessera_embeddings/ingest/README.md) — how the code implements it
+- [`docs/ingest/baseline-correction.md`](../../docs/ingest/baseline-correction.md) — how the code implements it
 - [ADR 004](004-duck-typed-providers.md) — the per-provider configuration this relies on
