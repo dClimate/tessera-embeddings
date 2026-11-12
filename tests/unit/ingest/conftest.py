@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import zarr
 
-from tessera_embeddings.ingest import live_windows, s1_roi
+from tessera_embeddings.ingest import live_windows, opera_query, s1_roi
 
 
 @pytest.fixture
@@ -26,6 +26,9 @@ def s1_leg_offline(monkeypatch):
         live_windows, "live_windows_for_mask", lambda *a, **k: [type("W", (), {"y0": 0, "y1": 1, "x0": 0, "x1": 1})()]
     )
     monkeypatch.setattr(s1_roi, "make_s1_item_provider", lambda *a, **k: lambda: [])
+    # The burst census: nothing recorded on the store, and the catalogue's counts answered at once.
+    monkeypatch.setattr(s1_roi, "get_root_attr", lambda _store, _key, **_kw: None)
+    monkeypatch.setattr(opera_query, "burst_acquisitions", lambda *_a, **_k: {"T001-000001-IW1": 2})
     monkeypatch.setattr(s1_roi.IngestManifest, "from_roi_store", classmethod(lambda _c, _p, **_k: object()))
 
 

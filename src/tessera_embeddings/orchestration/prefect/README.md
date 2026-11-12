@@ -446,7 +446,7 @@ hooks then clean up after.
 > (see [One flow per ingest](#one-flow-per-ingest)). The flows are kept thin — task-graph discipline
 > (per-date iteration for S2, batched windows for S1, ChunkSpec-granularity
 > assembly) lives in the domain modules. See
-> [`docs/ingest-performance.md`](../../../../docs/ingest-performance.md#background-how-dask-task-graphs-consume-scheduler-ram)
+> [`docs/ingest/performance.md`](../../../../docs/ingest/performance.md#background-how-dask-task-graphs-consume-scheduler-ram)
 > for the scheduler-RAM cost model that drives those choices, and
 > [`inference/README.md`](../../inference/README.md#1-deciding-which-tiles-to-run)
 > for the assembly-side equivalent.
