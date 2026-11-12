@@ -1,7 +1,9 @@
 """Read the provenance record: a day's granules, a shard's dates and granules, a pixel's granules.
 
 The three questions of ``context_docs/storage/registry-provenance-plan.md`` §2, each answered as a
-polars frame from the record beside a registry (layout in ``storage/provenance.py``). A shard's
+polars frame from the record beside a registry (layout in ``storage/provenance.py``). A pixel's
+answer joins its plane values straight to ``granules``: each value is a fusion order, and the run's
+group names the snapshot. ``shard_dates`` answers the per-shard question. A shard's
 pixels may come from several runs, listed oldest first in the registry's ``source_runs``. The pixel
 readers walk them newest first: a holes update claims a pixel only where its ``update_pixels`` mask
 marks it, and a fill or a shards update claims every pixel (plan §5).
@@ -56,7 +58,7 @@ PIXEL_COLUMNS = (
     "assets",
 )
 
-#: The columns ``shard_dates`` and ``granules`` join on.
+#: A ``granules`` row's key: a plane value, its date and its run's snapshot give all four.
 _GRANULE_KEY = ["sensor", "snapshot_id", "solar_day", "fusion_order"]
 
 
@@ -190,8 +192,12 @@ class ProvenanceRecord:
         Raises:
             LookupError: the registry has no complete record for the shard, or no row for it.
         """
-        master = self._scan(f"{self.root}/master/zone={where.zone}/year={year}/*.parquet")
-        if "source_runs" not in master.collect_schema():  # a master written before the column
+        master = self._scan(f"{self.root}/master/zone={where.zone}/year={year}/part-0.parquet")
+        try:
+            schema = master.collect_schema()
+        except FileNotFoundError:  # a zone-year with no master: never filled
+            schema = pl.Schema()
+        if "source_runs" not in schema:  # or a master written before the column
             raise LookupError(f"{where.zone}/{year} {where.tile}: the registry holds no complete provenance record")
         rows = master.filter(pl.col("tile") == where.tile).select("source_runs").collect()
         if rows.height != 1 or rows.item() is None:

@@ -435,10 +435,12 @@ def test_a_refused_shard_that_staged_no_record_has_no_pixel_answer(tmp_path: Pat
         ProvenanceRecord(str(tmp_path / "registry")).pixel_granules_at(PixelLocation(ZONE, refused[0], 0, 0), YEAR)
 
 
-def test_a_master_written_before_source_runs_has_no_pixel_answer(tmp_path: Path) -> None:
+@pytest.mark.parametrize("written", [True, False], ids=["before-source-runs", "never-filled"])
+def test_a_master_without_source_runs_has_no_pixel_answer(tmp_path: Path, written: bool) -> None:
     master = tmp_path / "master" / f"zone={ZONE}" / f"year={YEAR}"
     master.mkdir(parents=True)
-    pq.write_table(pa.table({"tile": ["chunk_0_0"]}), master / "part-0.parquet")
+    if written:
+        pq.write_table(pa.table({"tile": ["chunk_0_0"]}), master / "part-0.parquet")
     with pytest.raises(LookupError, match="no complete provenance record"):
         ProvenanceRecord(str(tmp_path)).pixel_granules_at(PixelLocation(ZONE, "chunk_0_0", 0, 0), YEAR)
 
