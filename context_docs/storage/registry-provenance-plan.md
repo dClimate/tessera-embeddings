@@ -26,7 +26,7 @@ questions in §10. The appendices are reference material and can be skipped.
   before building each day's mosaic, and why. It sits beside the store's existing registry.
 - **Three questions it answers,** each with a reader helper: what went into this day's mosaic,
   into this 20 km shard, and which granule supplied this pixel on each date?
-- **Cost.** About 6.3–7.4 TB of storage over the campaign, a third of a percent of the store. Its
+- **Cost.** About 6.7–7 TB of storage over the campaign, a third of a percent of the store. Its
   ingest time cost is inside run-to-run variation, measured over seven paired runs of a dense zone
   (§6); what it certainly adds is one more chunk write per date for the Dask scheduler.
   Correctness checks run at publication and fail the zone-year if the record is wrong.
@@ -297,7 +297,7 @@ claims every pixel. The first run that claims the pixel holds its record; the he
 
 | piece | measured | campaign |
 |---|---|---|
-| `pixel_sources` | optical 1.1–1.4 MB a shard-year; radar 0.1–0.9 MB per orbit | about 6.3–7.4 TB, a third of a percent of the store, around $1,750–2,100 a year |
+| `pixel_sources` | optical 0.8–1.3 MB a shard-year; radar 0.16–0.73 MB per orbit, and up to 4.6 MB on one of the three measured | about 6.7–7 TB, a third of a percent of the store, around $1,900 a year |
 | `granules` | about 160 MB for a land-dense zone-year (zone 35N) | at most about 170 GB for the fills, plus a set per update that re-ingests |
 | `shard_dates`, `update_pixels` | about 10 MB a zone-year; kilobytes per updated shard | about 10 GB |
 | the granule lists and index inside the mosaics | about 150 MB and 0.1–0.3% of a mosaic | none: deleted with the mosaics |
@@ -365,9 +365,9 @@ The last column is the first draft's choice, where reviews of the plan or the bu
 
 | choice | alternative | why this one | first draft |
 |---|---|---|---|
-| a granule per pixel per date | a yes/no bit per pixel per date, with the granule guessed from footprints | about 26% more storage on optical as the fusion order, and exact: guessing named the wrong granule for 0.10% of one shard's pixel-dates, wherever footprints overlap | nothing per pixel, ruled out at an estimated 20–45 TB (measured: 3.7 TB for optical); the granule guessed from footprint order |
+| a granule per pixel per date | a yes/no bit per pixel per date, with the granule guessed from footprints | 4% more storage as a per-shard rank and 16–23% more again on optical as the fusion order, and exact: guessing named the wrong granule for 0.10% of one shard's pixel-dates, wherever footprints overlap | nothing per pixel, ruled out at an estimated 20–45 TB (measured: 3.7 TB for optical); the granule guessed from footprint order |
 | a rejected observation keeps its granule, as its fusion order negated | zero for anything the model did not use | a reader can tell "no image had data" from "the model rejected this image here", and see which granule was cloudy; a fully cloudy date keeps its plane | zero |
-| planes hold the granule's signed fusion order, `int16` | a signed `int8` rank into each shard-date's `sources` | a pixel joins `granules` directly, with no second table that must agree with the plane on ordering and no cap of 127 granules per shard-date; 19–83% larger, about 1.3–2.4 TB over the campaign, accepted | the rank |
+| planes hold the granule's signed fusion order, `int16` | a signed `int8` rank into each shard-date's `sources` | a pixel joins `granules` directly, with no second table that must agree with the plane on ordering and no cap of 127 granules per shard-date; 33–41% larger overall, about 1.7–2 TB over the campaign, accepted | the rank |
 | the copies the ingest dropped listed after the fused granules, with a `status` | the fused granules only | a reader sees the duplicates, unreadable copies and incomplete radar granules the ingest set aside, beside what it used | the fused only |
 | a day skipped whole committed off the time axis, alone, when it is skipped | carried on the next day's commit | no state held back between days and nothing to flush when the year ends; the time axis the model reads is untouched | not recorded |
 | planes chunked every date × 512 × 512, in 2048 × 2048 shards | one date × one shard | one pixel's year is one fetch instead of 28–130 (0.2 s against 1.9 s, measured at 256 × 256), 7–12% smaller, and a plane chunk covers the same pixels as a v2 store chunk | one date × one shard |
@@ -443,9 +443,10 @@ real optical shard-year (33N `chunk_209_14`, 2024): Blosc zstd level 3 with bit
 shuffle, 1.17 MB, against 1.38 MB for two bits a pixel (which would cap a shard-date at three
 granules), 2.83 MB for zstd without the shuffle, which then misses the mostly constant planes' runs,
 and 1.12 MB for a bare validity bit. Bits packed along time and XOR-delta planes also lost. The
-sign adds about 4% on optical and 0–5% on radar. The signed fusion order as `int16` is 19–83%
-larger than a signed `int8` rank into each shard-date's `sources`, on the same shards; it was
-chosen anyway, for one join fewer on every pixel query (ADR 035, decision 3).
+sign adds about 4% on optical and 0–5% on radar. In the published layout, the signed fusion
+order as `int16` is 16–23% larger than a signed `int8` rank into each shard-date's `sources` on
+optical and 34–73% on radar, 33–41% overall, over three shard-years; it was chosen anyway, for one
+join fewer on every pixel query (ADR 035, decision 3).
 
 **`update_pixels`**: one boolean `(2048, 2048)` array per shard, named for the shard: the pixels
 the holes update embedded.

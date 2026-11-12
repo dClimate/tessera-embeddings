@@ -1,14 +1,16 @@
 # The provenance record: dev verification
 
 The end-to-end checks of the provenance record ([ADR 035](../decisions/035-a-provenance-record-for-the-published-store.md);
-PRs #253, #255 and #256) on global-tessera-dev, over four days: the first layout on 2026-10-27,
+PRs #253, #255 and #256) on global-tessera-dev, over five runs: the first layout on 2026-10-27,
 its ingest cost on 2026-10-28, on 2026-11-10 the signed planes, the copies set aside with a
 status, and the days skipped whole, on twelve shards, and on 2026-11-12 `source_runs` derived from
-the store's shard commits.
+the store's shard commits, then planes holding the signed fusion order.
 **Every correctness check passed.** The first run's one radar pair suggested the record costs
 ingest time at zone scale; the second day's paired runs put that inside run-to-run variation.
 The plan's size for the `granules` table was low by about half. The third day measured the plane
 layouts: chunking all dates together would make one-pixel reads ten times faster (finding 8).
+The fifth run measured the fusion-order planes in the published layout: 33–41% larger than the
+rank they replace (finding 9).
 
 ## Setup
 
@@ -38,6 +40,11 @@ layouts: chunking all dates together would make one-pixel reads ten times faster
   A mask of four cells, `prov-lineage`, lighting `chunk_209_14` and `chunk_209_15` of zone 33N, the
   first day's two shards. Year 2024, store `prov-lineage` seeded at `optical_min_obs` 40, under
   `_prov-lineage/`.
+- **Fifth run.** #256 at `50677181`, whose planes hold the signed fusion order as `int16`, deployed
+  from the yield-embeddings branch `dev/global-tessera-prov-fusion`, v1.1 on the standing image. A
+  mask of two cells, `prov-fusion` (`grid_14.45_45.55`, `grid_14.25_45.35`), lighting
+  `chunk_209_14`, `chunk_210_13` (the third day's two measured shard-years) and `chunk_211_13`.
+  Year 2024, store `prov-fusion` with no optical line, under `_prov-fusion/`.
 
 ## Results
 
@@ -244,6 +251,30 @@ the optical planes of `chunk_209_14` gave one pixel's year in a median 1.92 s fr
 layout (64 objects) and 0.20 s from all dates × 256² (one object), over three pixels, read from a
 laptop outside the region.
 
+The fifth run (`33N-2024-57172477`, a 46-minute fill) measured the fusion-order planes in the
+published layout: each shard-year's planes re-encoded exactly as publication writes them, every
+date × 512² chunks in one 2048² shard with the published codec, and the same planes converted to
+the former signed `int8` rank and encoded the same way. MB:
+
+| shard, sensor | dates | `int16` fusion order (published) | `int8` rank | larger by | highest fusion order |
+|---|---|---|---|---|---|
+| 209_14 optical | 64 | 1.274 | 1.100 | 16% | 3 |
+| 209_14 ascending | 61 | 0.238 | 0.147 | 62% | 24 |
+| 209_14 descending | 58 | 0.159 | 0.095 | 67% | 6 |
+| 210_13 optical | 64 | 1.001 | 0.817 | 23% | 3 |
+| 210_13 ascending | 61 | 0.725 | 0.420 | 73% | 18 |
+| 210_13 descending | 58 | 0.307 | 0.204 | 50% | 9 |
+| 211_13 optical | 64 | 0.819 | 0.669 | 23% | 3 |
+| 211_13 ascending | 61 | 4.625 | 2.939 | 57% | 12 |
+| 211_13 descending | 58 | 2.335 | 1.748 | 34% | 12 |
+
+Overall the fusion order is 33% larger on the third day's two shard-years and 41% larger over
+all three, about 1.7–2 TB more than the rank over the campaign. The worked pixel (45.5071°N,
+14.3761°E; `chunk_209_14`, row 1908, column 70) traced through `pixel_granules` straight to
+`granules`: 153 dates with data (64 optical, 61 ascending, 28 descending), 116 of them used by
+the model, and every image it named is in its shard-date's `sources`. Publication's checks and
+the cell validation passed.
+
 ### Publication
 
 The publication step took about 16 s for two shards and 31 s for twelve, including the registry
@@ -281,10 +312,11 @@ that rate a zone-year of about 3,000 shards takes about an hour and a half.
    of 512 × 512 in 2048 × 2048 shards, so a plane chunk covers the same pixels as a store chunk.
    512 × 512 itself was not measured; 128 × 128 against 256 × 256 suggests a larger chunk is
    no bigger, and a one-pixel read decompresses four times the bytes of 256 × 256 in one fetch.
-9. **The signed fusion order is 19–83% larger than the rank.** Storing it as `int16` takes
-   `sources` off the pixel path, one join fewer. On this measurement the rank was kept at first;
-   after review the fusion order was adopted with its size accepted (ADR 035, decision 3). These
-   sizes are for one date × one shard; the published layout's is not yet measured.
+9. **The signed fusion order is 33–41% larger than the rank.** Storing it as `int16` takes
+   `sources` off the pixel path, one join fewer. On the third day's measurement (one date × one
+   shard, 19–83% larger) the rank was kept at first; after review the fusion order was adopted
+   with its size accepted (ADR 035, decision 3), and the fifth run measured it in the published
+   layout: 16–23% larger on optical, 34–73% on radar.
 
 ## Teardown
 
@@ -297,4 +329,5 @@ unregistered, and the yield-embeddings branch `dev/global-tessera-provenance` an
 `dev-test/provenance-on-main` were deleted. On the third day, `_prov-signed/` in both dev buckets,
 including the layout test's planes, the 11 deployments of `dev/global-tessera-prov-signed`, and
 that branch. On the fourth day, `_prov-lineage/` in both dev buckets, the 11 deployments of
-`dev/global-tessera-prov-lineage`, and that branch.
+`dev/global-tessera-prov-lineage`, and that branch. After the fifth run, `_prov-fusion/` in both
+dev buckets, the 11 deployments of `dev/global-tessera-prov-fusion`, and that branch.
