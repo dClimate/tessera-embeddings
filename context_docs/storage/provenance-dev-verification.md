@@ -1,9 +1,10 @@
 # The provenance record: dev verification
 
 The end-to-end checks of the provenance record ([ADR 035](../decisions/035-a-provenance-record-for-the-published-store.md);
-PRs #253, #255 and #256) on global-tessera-dev, over three days: the first layout on 2026-10-27,
-its ingest cost on 2026-10-28, and on 2026-11-10 the signed planes, the copies set aside with a
-status, and the days skipped whole, on twelve shards.
+PRs #253, #255 and #256) on global-tessera-dev, over four days: the first layout on 2026-10-27,
+its ingest cost on 2026-10-28, on 2026-11-10 the signed planes, the copies set aside with a
+status, and the days skipped whole, on twelve shards, and on 2026-11-12 `source_runs` derived from
+the store's shard commits.
 **Every correctness check passed.** The first run's one radar pair suggested the record costs
 ingest time at zone scale; the second day's paired runs put that inside run-to-run variation.
 The plan's size for the `granules` table was low by about half. The third day measured the plane
@@ -31,6 +32,12 @@ layouts: chunking all dates together would make one-pixel reads ten times faster
   same reason as above. A mask of 20 cells, `prov-signed`, lighting twelve shards of zone 33N,
   `chunk_208`–`211` by `13`–`15`, around the first area. Year 2024, store `prov-signed` with no
   optical line, under `_prov-signed/`.
+- **Fourth day.** #256 at `867e50fd`, where `source_runs` is derived from the store's shard commits
+  in the order they landed and lives on the master only, deployed from the yield-embeddings branch
+  `dev/global-tessera-prov-lineage` (yield-embeddings main plus the pin), v1.1 on the standing image.
+  A mask of four cells, `prov-lineage`, lighting `chunk_209_14` and `chunk_209_15` of zone 33N, the
+  first day's two shards. Year 2024, store `prov-lineage` seeded at `optical_min_obs` 40, under
+  `_prov-lineage/`.
 
 ## Results
 
@@ -66,7 +73,7 @@ validation passed (14 checks, 4 seam checks undecidable on two shards). 109 chec
 | planes, 36 sampled shard-dates over three sensors | each plane equals the mosaic's `source_index` under the model's validity test, ranked into `sources`; its non-zero count equals `valid_px` |
 | imagery, 48 sampled optical pixels | the mosaic's red value equals the named granule's own file at that point, every one |
 | asset URLs, 10 sampled optical | HTTP 200. Radar URLs are `s3://asf-cumulus-prod-…` and need Earthdata credentials, so were not fetched |
-| registry | `source_runs` = the run, on the part and the master |
+| registry | `source_runs` = the run, on the run file and the master (the first derivation; see the fourth day below) |
 
 ### The switch
 
@@ -118,9 +125,31 @@ re-ingesting the year), then a registry rebuild, then a `shards` update of `chun
 | store | every zone-year `done`, base and complete tags, the diff touches only the two planned shards; the 15,668 and 653,412 pixels embedded before the update unchanged in every array; 4,178,636 and 3,540,892 holes filled; `rebuild_registry_measurements verify` passes |
 | the update's record | its own `granules` (577 rows: it re-ingested with a lower coverage floor and found 120 optical dates to the fill's 118) and `shard_dates` (339 rows) |
 | `update_pixels` | one mask per shard; its count equals the update's `embedded_px`, and the update's planes are zero outside it |
-| `source_runs` after the update's merge | `[fill, update]` on the master and on the update's part rows; the fill's parts keep `[fill]` |
+| `source_runs` after the update's merge | `[fill, update]` on the master and on the update's run file rows; the fill's run file keeps `[fill]` |
 | after `repair --write` | unchanged, `[fill, update]` |
 | the `shards` update of `chunk_209_14` (run `33N-2024-0d0f2647`) | only that shard in the diff, rewritten whole (4,194,304 pixels); its own record, 404 `granules` and 150 `shard_dates` rows for the one shard, and no `update_pixels`; `source_runs` restarted at `[shards]`, while `chunk_209_15` kept `[fill, update]`; `verify` passes |
+
+That `source_runs` came from the zone group's run records. Review of #256 found two orders those
+records cannot express: a refill keeps the updates before it in `updates[year]`, so they would be
+stacked on the new fill, and of two concurrent refills the `runs` record names whichever recorded
+itself last, not whichever's shards landed last. #256 now derives the list from the year's tagged
+shard commits, oldest first, and keeps it on the master only. The fourth day repeated the sequence
+on that code (fill `33N-2024-4769823f`, 35 min; holes update `prov-lineage-holes` at a line of one,
+`33N-2024-a6d4b9af`, 43 min; `shards` update `prov-lineage-shards` of `chunk_209_14`,
+`33N-2024-df5eaa09`, 40 min):
+
+| step | `chunk_209_14` | `chunk_209_15` | `verify` |
+|---|---|---|---|
+| fill | `[fill]` | `[fill]` | |
+| holes update (4,178,636 and 3,540,984 holes filled) | `[fill, holes]` | `[fill, holes]` | passes |
+| `repair --write` | unchanged | unchanged | passes |
+| `shards` update | `[shards]` | `[fill, holes]` | passes |
+
+No run file carries a `source_runs` column at any step. `ProvenanceRecord.pixel_granules` at each
+step named the run the rule picks: after the holes update, the update for a pixel inside its
+`update_pixels` mask and the fill for one outside it, in each shard; after the `shards` update, the
+`shards` run in `chunk_209_14` and the holes update in `chunk_209_15`. A refill after updates and
+concurrent refills, the two orders review found, have unit tests only.
 
 ### Signed planes, set-aside copies and skipped days
 
@@ -265,4 +294,5 @@ its earlier snapshot first. The shared ROI stores were only read. The branch's 1
 unregistered, and the yield-embeddings branch `dev/global-tessera-provenance` and the TE branch
 `dev-test/provenance-on-main` were deleted. On the third day, `_prov-signed/` in both dev buckets,
 including the layout test's planes, the 11 deployments of `dev/global-tessera-prov-signed`, and
-that branch.
+that branch. On the fourth day, `_prov-lineage/` in both dev buckets, the 11 deployments of
+`dev/global-tessera-prov-lineage`, and that branch.
