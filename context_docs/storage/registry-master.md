@@ -234,6 +234,7 @@ its cell has no run file at all. `--runs-only` skips the store for a registry co
 | no unmeasured rows | a fill that published nulls |
 | the master's embedded tiles against the store's live shards (census `--verify-zones` only) | a shard cleared by hand, which no run file records |
 | `runs/` against the store's run record (`verify` only) | a run with no run file that holds a tile, a run file out of commit order, a withdrawn run's file |
+| each row's `source_runs` against the store's shard commits (`verify` only) | a stale or corrupted lineage, which would send the provenance reader to the wrong run's record |
 
 Both name every failing cell. `repair --zones <Z,...> --write` rebuilds those cells from three
 inputs, merged by the rule above: the cell's run files, its existing master rows, and a fresh

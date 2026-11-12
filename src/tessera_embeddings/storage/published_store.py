@@ -335,15 +335,21 @@ def source_runs(
     whose shards landed last owns the tile.
 
     ``None`` unless every run in a tile's list carries a provenance record, which a run notes as
-    ``input_coverage.provenance_version`` in its ``runs`` or ``updates`` entry, so a reader can tell a
+    ``input_coverage.provenance_version`` in its ``runs`` or ``updates`` entry, and a fill a refill
+    replaced keeps as ``provenance_version`` in ``previous``, so a reader can tell a
     tile with no complete record (all of v1.1, anything filled with the switch off) from one that has
     it (``context_docs/storage/registry-provenance-plan.md`` §5). ``None`` for every tile when a
     non-empty commit's tiles cannot be read (a run from before tags, or an expired commit), since
     the order is then unknown. The diffs are read once, on the first call.
     """
     head = (attrs.get("runs") or {}).get(str(year))
-    entries = [*([head] if isinstance(head, Mapping) else []), *(attrs.get("updates") or {}).get(str(year), [])]
-    carried = {e["run_id"] for e in entries if (e.get("input_coverage") or {}).get("provenance_version")}
+    fills = [head, *head.get("previous", [])] if isinstance(head, Mapping) else []
+    entries = [*fills, *(attrs.get("updates") or {}).get(str(year), [])]
+    carried = {
+        e["run_id"]
+        for e in entries
+        if e.get("provenance_version") or (e.get("input_coverage") or {}).get("provenance_version")
+    }
     holes = {e["run_id"] for e in entries if e.get("mode") == "holes"}
 
     @cache
@@ -360,6 +366,8 @@ def source_runs(
         return runs
 
     def of(tile: str) -> list[str] | None:
+        if not carried:  # no run recorded provenance, as for all of v1.1: no diffs to read
+            return None
         found = (lineage() or {}).get(tile)
         return found if found and carried.issuperset(found) else None
 

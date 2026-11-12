@@ -620,6 +620,17 @@ def with_source_runs(master: pa.Table, source_runs: Callable[[str], list[str] | 
     return master.set_column(index, master.schema.field(index), pa.array(values, type=master.schema.field(index).type))
 
 
+def stale_source_runs(master: pa.Table, source_runs: Callable[[str], list[str] | None]) -> list[str]:
+    """The tiles of one cell's ``master`` rows whose ``source_runs`` is not the store's, sorted.
+
+    The provenance reader opens the runs this column names, so a stale value reads the wrong run's
+    record. :func:`audit` cannot see it, since the column is derived from the store and not from
+    the run files; a repair rewrites it.
+    """
+    held = master.column("source_runs").to_pylist()
+    return sorted(t for t, runs in zip(master.column("tile").to_pylist(), held, strict=True) if runs != source_runs(t))
+
+
 def _live_disagreements(master: pa.Table, live: Collection[tuple[int, int]] | None) -> list[str]:
     """Where the master's embedded tiles and the store's ``live`` shards disagree; empty if unchecked."""
     if live is None:

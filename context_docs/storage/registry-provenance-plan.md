@@ -185,10 +185,12 @@ embedding is in the store and the registry.
 listing them oldest first, from the store's shard commits that wrote or cleared the shard, in the
 order they landed. A fill or a shards update restarts the list at itself; a holes update appends
 itself. So a refill drops the updates before it, and of two concurrent refills the one whose shards
-landed last owns the shard. It is null unless every run in the list carries a record, or when a
-commit's shards can no longer be read (a run from before commits were tagged, or an expired
-commit). It is recomputed from the store every time the master is merged or rebuilt, never copied
-from an old row.
+landed last owns the shard. A shard a refill left untouched keeps the fill before it: the zone
+group's `runs` record keeps a replaced fill in `previous`, with its `provenance_version` when it
+carried a record. It is null unless every run in the list carries a record, or when a commit's
+shards can no longer be read (a run from before commits were tagged, or an expired commit). It is
+recomputed from the store every time the master is merged or rebuilt, never copied from an old
+row, and `rebuild_registry_measurements.py verify` checks every row of it against the store.
 
 ## 4. How it is made
 

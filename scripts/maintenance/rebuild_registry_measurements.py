@@ -86,6 +86,7 @@ from tessera_embeddings.storage.registry_master import (
     master_schema,
     merge,
     merge_cell,
+    stale_source_runs,
     store_disagreements,
     tile_years,
 )
@@ -238,6 +239,7 @@ def _store_slot(
     if year not in years:
         return "no time slot in the store"
 
+    @functools.cache
     def record() -> published_store.StoreYear:
         return published_store.store_year(repo, group, zone, year, writes())
 
@@ -473,10 +475,21 @@ def cmd_verify(args: argparse.Namespace) -> int:
     if not args.runs_only:
         # The run files themselves against the store's record of who wrote each year: a run with no
         # file leaves the run files, and so the master, describing its tiles by the run before it.
+        # And each master row's source_runs against the store's lineage, which the run files cannot check.
         store = _one_read(_open_store(args.store, args.region, anonymous=args.anonymous))
+        held = {
+            (zone, year): rows
+            for zone, year, rows in cell_tables(master.sort_by([("zone", "ascending"), ("year", "ascending")]))
+        }
         for (zone, year), cell in _every_cell(fs, args.registry, store, _cells(run_rows, []), args.zones).items():
             if isinstance(slot := _store_slot(store, zone, year, cell), str):
                 problems.setdefault(f"{zone}/{year}", []).append(f"the store cannot stand behind its run files: {slot}")
+            elif (rows := held.get((zone, year))) is not None and (
+                stale := stale_source_runs(rows, slot[1]().source_runs)
+            ):
+                problems.setdefault(f"{zone}/{year}", []).append(
+                    f"{len(stale)} tile(s) whose source_runs is not the store's: {stale[:5]}"
+                )
         problems = dict(sorted(problems.items()))
     origins = master.column("measured_by").to_pylist()
     print(f"master {master.num_rows} rows against {expected} distinct tile-years in runs/")

@@ -442,6 +442,15 @@ class TestSourceRuns:
         writes = [("old", None, ["chunk_0_0"]), ("h", "holes", ["chunk_0_0"]), ("s", "shards", ["chunk_0_0"])]
         assert _lineage(*writes, ("fill", None, ["chunk_0_0"])) == ["fill"]
 
+    def test_a_tile_a_refill_left_untouched_keeps_the_earlier_fill(self) -> None:
+        """The replaced fill's provenance marker survives in ``previous``, so its tiles keep their record."""
+        runs = shard_writer.run_provenance(None, 2025, "old", input_coverage={"provenance_version": 1}, code={})
+        runs = shard_writer.run_provenance(runs, 2025, "fill", input_coverage={"provenance_version": 1}, code={})
+        commits = [Commit("old", "2025-01-01", "snap0"), Commit("fill", "2025-01-02", "snap1")]
+        tiles = {"snap0": frozenset({"chunk_0_0", "chunk_9_9"}), "snap1": frozenset({"chunk_9_9"})}
+        of = published_store.source_runs({"runs": runs}, 2025, commits, tiles.__getitem__)
+        assert (of("chunk_0_0"), of("chunk_9_9")) == (["old"], ["fill"])
+
     def test_of_two_concurrent_refills_the_head_record_is_not_credited_with_the_later_shards(self) -> None:
         """``late``'s shards landed last but ``fill``'s record did, so ``late`` is known only from ``previous``."""
         assert _lineage(_FILL, ("late", None, ["chunk_0_0"]), head="fill") is None

@@ -202,6 +202,20 @@ class TestVerify:
             assert script.main(["verify", "--registry", str(tmp_path), *zones]) == 1
         assert "35N/2017: the store cannot stand behind its run files: run 'first-fill'" in capsys.readouterr().out
 
+    def test_a_source_runs_the_store_does_not_give_fails(
+        self, script: Any, store: zarr.Group, tmp_path: Path, capsys: Any
+    ) -> None:
+        """The provenance reader trusts the column, and the run files cannot check it, so the store does."""
+        _seed(tmp_path)
+        _seed_master(tmp_path, radar=None)
+        path = tmp_path / "master" / "zone=33N" / "year=2017" / "part-0.parquet"
+        table = pq.read_table(path)
+        i = table.schema.get_field_index("source_runs")
+        stale = pa.array([["fill-1"], *[None] * (table.num_rows - 1)], table.schema.field(i).type)
+        pq.write_table(table.set_column(i, table.schema.field(i), stale), path)
+        assert script.main(["verify", "--registry", str(tmp_path)]) == 1
+        assert "1 tile(s) whose source_runs is not the store's" in capsys.readouterr().out
+
     def test_zones_narrow_what_is_checked(self, script: Any, store: zarr.Group, tmp_path: Path) -> None:
         """A zone-split verification must pass or fail on its own zones, and a mistyped one must not pass."""
         _seed(tmp_path)

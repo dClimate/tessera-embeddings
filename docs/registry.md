@@ -205,7 +205,8 @@ reaches the registry right after its pixels are committed to the store:
   their measurements across a resume.
 - **The registry is checked against the store.** Each merge compares the master's embedded
   tiles with the shards the store actually holds, and a census checks `master/` against `runs/`
-  zone-year by zone-year. Either names any zone-year that fails, for repair from `runs/` and the
+  zone-year by zone-year. A verification pass also checks each row's `source_runs` against the
+  store's shard commits. Either names any zone-year that fails, for repair from `runs/` and the
   store. Every column can be derived from the store, so the registry is a convenience, never a
   second source of truth.
 

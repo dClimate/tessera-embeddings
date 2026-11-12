@@ -593,7 +593,8 @@ def run_provenance(
     store's authority on who wrote a year: this record lands in a second commit, which a dying
     process can miss. **A refill keeps the runs before it** in ``previous``, as ``run_id``,
     ``assembled_at``, ``commit`` and ``empty`` alone, which is all that is known of a run from
-    before tags.
+    before tags, plus ``provenance_version`` when the run carried the provenance record: a tile the
+    refill leaves untouched is still that run's, and its ``source_runs`` needs the marker.
 
     ``input_coverage`` answers the question the calendar-year guarantee below does NOT: not
     what window was *requested*, but **how much of it the input actually held** — per source
@@ -659,7 +660,10 @@ def run_provenance(
     prior = runs.get(str(year))
     if isinstance(prior, dict):
         # A re-run under the same id replaces its own entry; any other run joins the history.
-        replaced = [] if prior.get("run_id") == run_id else [{k: prior[k] for k in _HISTORY if k in prior}]
+        kept = {k: prior[k] for k in _HISTORY if k in prior}
+        if version := (prior.get("input_coverage") or {}).get("provenance_version"):
+            kept["provenance_version"] = version
+        replaced = [] if prior.get("run_id") == run_id else [kept]
         previous = [p for p in [*prior.get("previous", []), *replaced] if p.get("run_id") != run_id]
         if previous:
             record["previous"] = previous
