@@ -53,7 +53,8 @@ year, so a pixel's time series could switch angle on every day both tracks flew.
    are acquired on the same 12-day cycle. A tie still picks the same burst on every contested day,
    which is the consistency that matters.
 4. **The count is a census of the whole window, taken once per leg.** `opera_query.burst_acquisitions`
-   counts distinct acquisitions per burst id from granule titles, through CMR's reference format.
+   counts distinct acquisitions per burst id from granule titles and download links, through CMR's
+   CSV format.
    `s1_roi` builds one `BurstCensus` per orbit leg over the requested window, before any batch runs.
    - It counts acquisitions rather than granules, because a reprocessed acquisition is published
      again under a new production time, and counting granules would rank a burst by how often it
@@ -69,6 +70,11 @@ year, so a pixel's time series could switch angle on every day both tracks flew.
      since and would rank a tied burst the other way, fusing later days by a different geometry
      than the days already written. A leg asking for another window is refused, since neither the
      stored census nor a recount ranks its new days consistently with the old ones.
+   - It counts only granules the batches can load: one whose metadata claims VV and VH but whose
+     download links lack one is dropped by the batch path (`_granule_to_item`), so the census drops
+     it too, through the same rule (`_opera_assets`). Counted, it would add an acquisition that can
+     never supply a pixel, and a count off by one flips a tie. This is why the census reads the CSV
+     format, which carries the links, rather than the reference format, which carries titles only.
    - A burst's count does not depend on the query box, as long as the burst touches it. So a run
      over a few tiles of a zone ranks the bursts it shares with the whole zone the same way.
 5. **A title that does not parse sorts after every named burst of its day**, so it can only fill
@@ -80,16 +86,20 @@ Measured against CMR from a laptop, zone 35N (24–30°E, 0–72°N), 2024:
 
 | query | granules | bursts | pages | bytes | time |
 |---|---|---|---|---|---|
-| census, ascending, whole year | 100,179 | 2,780 | 51 | 25.5 MB | 49 s |
-| census, descending, whole year | 115,142 | 3,284 | 58 | 29.3 MB | 50 s |
-| the batch query's format, ascending, January only | 10,853 | 2,774 | 6 | 157.9 MB | 41 s |
-| census format, ascending, January only | 10,853 | 2,774 | 6 | 2.8 MB | 6 s |
+| census (CSV), ascending, whole year | 100,987 | 2,780 | 51 | 189.0 MB | 71 s |
+| titles only (reference format), ascending, whole year | 100,179 | 2,780 | 51 | 25.5 MB | 49 s |
+| titles only (reference format), descending, whole year | 115,142 | 3,284 | 58 | 29.3 MB | 50 s |
+| the batch query's format (JSON), ascending, January only | 10,853 | 2,774 | 6 | 157.9 MB | 41 s |
 
-A year of batch queries is about twelve months like that one. The census therefore adds roughly a
-tenth to a leg's catalogue time and about 1.4% to its catalogue bytes. The first batch's provider
-starts the census before its own query and waits for it afterwards, so the two overlap. The time
-the census adds to a leg is therefore what it runs beyond the first batch's query, about 10 s at
-35N.
+A year of batch queries is about twelve months like that January. The census therefore adds about
+a seventh to a leg's catalogue time and about a tenth to its catalogue bytes. The first batch's
+provider starts the census before its own query and waits for it afterwards, so the two overlap.
+The time the census adds to a leg is therefore what it runs beyond the first batch's query, about
+30 s at 35N. The titles-only format cost a seventh of the bytes and 20 s less, but cannot see
+whether a granule's links carry both polarisations; the CSV census at 35N found no such granule in
+2024, so the extra cost buys agreement with the batch path rather than a measured change in
+counts. The granule count differs slightly between the two runs because the catalogue changed in
+between. The descending leg was not remeasured in CSV; at the same ratio it is about 215 MB.
 
 The same query over the high-latitude part of that zone (55–72°N, ascending) found 1,181 of 1,192
 bursts acquired 29 to 31 times, which is why the tie order matters. It also found 8,039 granules

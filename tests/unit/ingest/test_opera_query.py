@@ -357,11 +357,19 @@ def test_the_most_acquired_burst_is_loaded_first(counts, order) -> None:
     assert [item.properties.get(BURST_ACQUISITIONS) for item in items[:2]] == [counts.get(b, 0) for b in order[:2]]
 
 
-def _reference_page(titles, search_after=None):
-    """A REAL reference-format response, as CMR's granules.xml answers."""
-    refs = "".join(f"<reference><name>{t}</name><id>G{i}-ASF</id></reference>" for i, t in enumerate(titles))
-    body = f'<?xml version="1.0"?><results><hits>{len(titles)}</hits><references>{refs}</references></results>'
-    return _raw_response(body.encode(), content_type="application/xml", search_after=search_after)
+def _csv_page(titles, search_after=None, bands=None):
+    """A REAL CSV response, as CMR's granules.csv answers: the links column is one quoted field.
+
+    ``bands`` maps a title to the bands it links; every other title links VH, VV and mask.
+    """
+    header = (
+        "Granule UR,Producer Granule ID,Start Time,End Time,Online Access URLs,Browse URLs,Cloud Cover,Day/Night,Size"
+    )
+    links = {
+        t: ",".join(f"https://datapool/{t}_{b}.tif" for b in (bands or {}).get(t, ("VH", "VV", "mask"))) for t in titles
+    }
+    rows = [header] + [f'{t},{t},,,"{links[t]}",,,,1' for t in titles]
+    return _raw_response("\n".join(rows).encode(), content_type="text/csv", search_after=search_after)
 
 
 #: A census as a store records it: the window and grouping longitude it was counted over, and the counts.
@@ -382,13 +390,21 @@ class TestBurstAcquisitions:
             _title(_HIGH, acquired="20240105T010000Z"),
             "not-an-opera-title",
         ]
-        patcher, mock_get = _patch_cmr_session(side_effect=[_reference_page(titles)])
+        patcher, mock_get = _patch_cmr_session(side_effect=[_csv_page(titles)])
         with patcher, caplog.at_level(logging.INFO):
             counts = burst_acquisitions(self.BBOX, "2024-01-01", "2024-12-31", "ascending")
 
         assert counts == {_LOW: 2, _HIGH: 1}
-        assert mock_get.call_args.args[0].endswith("granules.xml"), "titles only: the light format"
+        assert mock_get.call_args.args[0].endswith("granules.csv"), "titles and links: the light format"
         assert "1 unnamed" in caplog.text
+
+    def test_a_granule_the_batches_cannot_load_is_not_counted(self, caplog):
+        """Metadata claiming VV+VH with a link missing: ``_granule_to_item`` drops it, so must the census."""
+        page = _csv_page([_title(_LOW), _title(_HIGH)], bands={_title(_HIGH): ("VV", "mask")})
+        patcher, _ = _patch_cmr_session(side_effect=[page])
+        with patcher, caplog.at_level(logging.INFO):
+            assert burst_acquisitions(self.BBOX, "2024-01-01", "2024-12-31", "ascending") == {_LOW: 1}
+        assert "1 unloadable" in caplog.text
 
     def test_counts_the_solar_day_window_at_the_zone_longitude(self):
         """The window is solar days: the catalogue is asked a UTC day either side and each
@@ -400,7 +416,7 @@ class TestBurstAcquisitions:
             _title(_LOW, acquired="20240601T000000Z"),  # in
             _title(_LOW, acquired="20241231T150000Z"),  # 2025-01-01 solar: out
         ]
-        patcher, mock_get = _patch_cmr_session(side_effect=[_reference_page(titles)])
+        patcher, mock_get = _patch_cmr_session(side_effect=[_csv_page(titles)])
         with patcher:
             counts = burst_acquisitions(self.BBOX, "2024-01-01", "2024-12-31", "ascending", mid_longitude=150.0)
 
@@ -408,7 +424,7 @@ class TestBurstAcquisitions:
         assert mock_get.call_args.kwargs["params"]["temporal"] == "2023-12-31T00:00:00Z,2025-01-01T23:59:59Z"
 
     def test_a_burst_returned_by_both_antimeridian_halves_counts_once(self):
-        patcher, mock_get = _patch_cmr_session(side_effect=[_reference_page([_title(_LOW)]) for _ in range(2)])
+        patcher, mock_get = _patch_cmr_session(side_effect=[_csv_page([_title(_LOW)]) for _ in range(2)])
         with patcher:
             assert burst_acquisitions((170.0, -10.0, -170.0, 10.0), "2024-01-01", "2024-12-31", "ascending") == {
                 _LOW: 1
@@ -416,9 +432,9 @@ class TestBurstAcquisitions:
         assert mock_get.call_count == 2
 
     def test_a_page_that_is_not_a_cmr_result_is_re_asked(self):
-        """Well-formed XML is not enough: a page that is not a result must not read as the last one."""
+        """A 2xx page that is not a CMR result must not read as the last one."""
         busy = _raw_response(b"<html><body>busy</body></html>", content_type="text/html")
-        patcher, mock_get = _patch_cmr_session(side_effect=[busy, _reference_page([_title(_LOW)])])
+        patcher, mock_get = _patch_cmr_session(side_effect=[busy, _csv_page([_title(_LOW)])])
         with patcher, patch("tessera_embeddings.ingest.opera_query.time.sleep"):
             assert burst_acquisitions(self.BBOX, "2024-01-01", "2024-12-31", "ascending") == {_LOW: 1}
         assert mock_get.call_count == 2

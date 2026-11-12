@@ -9,15 +9,16 @@ over the window, the radar fusion order
 
 from __future__ import annotations
 
+import csv
+import io
 import logging
 import re
 import time
 import warnings
 from collections import Counter
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from datetime import UTC, datetime
 from typing import Any, cast
-from xml.etree import ElementTree
 
 import mgrs
 import requests
@@ -44,9 +45,10 @@ logger = logging.getLogger(__name__)
 # host and honours ``attribute[]`` filtering, which CMR-STAC silently ignores — so orbit direction
 # is filtered server-side rather than by intersecting a separate STAC result.
 _CMR_GRANULE_URL = "https://cmr.earthdata.nasa.gov/search/granules.json"
-#: The same search in CMR's reference format: each granule's title and concept id and nothing else,
-#: a small fraction of the JSON's bytes. All the burst census needs.
-_CMR_REFERENCE_URL = "https://cmr.earthdata.nasa.gov/search/granules.xml"
+#: The same search as CSV: each granule's title and download links, about an eighth of the JSON's
+#: bytes. All the burst census needs to count only what :func:`_granule_to_item` would accept.
+_CMR_CSV_URL = "https://cmr.earthdata.nasa.gov/search/granules.csv"
+_CSV_HEADER = ["Granule UR", "Producer Granule ID", "Start Time", "End Time", "Online Access URLs"]
 _CMR_OPERA_SHORT_NAME = "OPERA_L2_RTC-S1_V1"
 _CMR_PROVIDER = "ASF"
 _CMR_PAGE_SIZE = 2000
@@ -154,6 +156,18 @@ def normalize_opera_timestamps(items: list[Any], *, mid_longitude: float | None 
     return normalize_to_solar_day(items, mid_longitude=mid_longitude)
 
 
+def _opera_assets(hrefs: Iterable[str]) -> tuple[dict[str, str], dict[str, str]]:
+    """Every band link among ``hrefs`` by suffix, and the ``S1_OPERA_BANDS`` asset keys they fill.
+
+    One rule for what a granule can be loaded from, shared by :func:`_granule_to_item` and the
+    burst census: loadable exactly when the second mapping holds every band.
+    """
+    band_hrefs = {m.group(1): href for href in hrefs if (m := _BAND_HREF_RE.search(href))}
+    # Asset keys follow the CMR-STAC convention: band index 0, suffix VV/VH ("0_VV" -> "VV").
+    assets = {key: band_hrefs[key.split("_", 1)[1]] for key in S1_OPERA_BANDS if key.split("_", 1)[1] in band_hrefs}
+    return band_hrefs, assets
+
+
 def _granule_to_item(entry: dict[str, Any], skip_counts: Counter[str] | None = None) -> Item | None:
     """Build a pystac ``Item`` from one CMR granule search entry.
 
@@ -180,24 +194,10 @@ def _granule_to_item(entry: dict[str, Any], skip_counts: Counter[str] | None = N
         links (single-pol granule, EW-mode HH/HV granule, or a non-RTC product
         that slipped through the query).
     """
-    # Map band suffix (VV/VH/HH/HV) -> datapool HTTPS href from the data links.
-    band_hrefs: dict[str, str] = {}
-    for link in entry.get("links", []):
-        if not link.get("rel", "").endswith(_CMR_DATA_REL_SUFFIX):
-            continue
-        match = _BAND_HREF_RE.search(link.get("href", ""))
-        if match:
-            band_hrefs[match.group(1)] = link["href"]
-
-    # Asset keys follow the CMR-STAC convention: band index 0, suffix VV/VH.
-    assets: dict[str, Asset] = {}
-    for band_key in S1_OPERA_BANDS:
-        suffix = band_key.split("_", 1)[1]  # "0_VV" -> "VV"
-        href = band_hrefs.get(suffix)
-        if href is not None:
-            assets[band_key] = Asset(href=href, roles=["data"])
-
-    if len(assets) < len(S1_OPERA_BANDS):
+    band_hrefs, asset_hrefs = _opera_assets(
+        link.get("href", "") for link in entry.get("links", []) if link.get("rel", "").endswith(_CMR_DATA_REL_SUFFIX)
+    )
+    if len(asset_hrefs) < len(S1_OPERA_BANDS):
         pols = sorted(k for k in band_hrefs if k != "mask")
         if {"HH", "HV"} & set(pols):
             # Name only the polarisations observed, never a swath mode: the Greenland granules
@@ -240,7 +240,7 @@ def _granule_to_item(entry: dict[str, Any], skip_counts: Counter[str] | None = N
         bbox=bbox,
         datetime=str_to_datetime(entry["time_start"]),
         properties=properties,
-        assets=assets,
+        assets={key: Asset(href=href, roles=["data"]) for key, href in asset_hrefs.items()},
     )
 
 
@@ -332,17 +332,15 @@ def _json_entries(resp: requests.Response) -> list[dict[str, Any]]:
     return cast(list[dict[str, Any]], body.get("feed", {}).get("entry", []))
 
 
-def _reference_titles(resp: requests.Response) -> list[str]:
-    """The granule titles of one reference-format page; raises ``ParseError`` for any other body.
+def _csv_granules(resp: requests.Response) -> list[tuple[str, list[str]]]:
+    """Each granule's title and download links on one CSV page; raises ``csv.Error`` for any other body.
 
     The message never quotes the body, for the reason :func:`json_or_raise` gives.
     """
-    root = ElementTree.fromstring(resp.content)
-    if root.tag != "results":
-        raise ElementTree.ParseError(
-            f"{resp.url} answered HTTP {resp.status_code} with a body that is not a CMR result"
-        )
-    return [name.text or "" for name in root.iterfind("references/reference/name")]
+    rows = csv.reader(io.StringIO(resp.text))
+    if next(rows, [])[: len(_CSV_HEADER)] != _CSV_HEADER:
+        raise csv.Error(f"{resp.url} answered HTTP {resp.status_code} with a body that is not a CMR result")
+    return [(row[0], row[4].split(",")) for row in rows if row]
 
 
 def _fetch_granule_page[T](
@@ -368,7 +366,7 @@ def _fetch_granule_page[T](
         resp.raise_for_status()
         try:
             body = parse(resp)
-        except (NonJsonResponseError, ElementTree.ParseError) as exc:
+        except (NonJsonResponseError, csv.Error) as exc:
             if attempt == _UNPARSEABLE_PAGE_ATTEMPTS:
                 raise
             logger.warning(
@@ -461,28 +459,31 @@ def burst_acquisitions(
 ) -> dict[str, int]:
     """How many times each burst touching ``bbox`` was acquired in the window, by burst id.
 
-    From titles alone, through CMR's light reference format. Counts distinct ACQUISITIONS, so a
-    reprocessed one counts once. ``start_date..end_date`` are solar days at ``mid_longitude``, as
-    the batches own them: the query reaches a UTC day either side and each acquisition is placed on
-    its solar day before it counts. Rationale and cost: ADR 033.
+    From titles and download links, through CMR's CSV format. Counts distinct ACQUISITIONS, so a
+    reprocessed one counts once, and only granules the batches can load (:func:`_opera_assets`), so
+    one whose metadata claims VV+VH and whose links lack one ranks nothing. ``start_date..end_date``
+    are solar days at ``mid_longitude``, as the batches own them: the query reaches a UTC day either
+    side and each acquisition is placed on its solar day before it counts. Rationale and cost: ADR 033.
     """
     window = whole_window_range(start_date, end_date)
     acquired: dict[str, set[str]] = {}
-    titles = unnamed = 0
+    titles = unnamed = unloadable = 0
     t0 = time.monotonic()
     for box in _cmr_boxes(bbox):
         params = _granule_params(box, window.query_start, window.query_end, orbit_direction)
-        for page in _granule_pages(params, url=_CMR_REFERENCE_URL, parse=_reference_titles):
+        for page in _granule_pages(params, url=_CMR_CSV_URL, parse=_csv_granules):
             titles += len(page)
-            for title in page:
-                if burst := _TITLE_RE.match(title):
+            for title, hrefs in page:
+                if len(_opera_assets(hrefs)[1]) < len(S1_OPERA_BANDS):
+                    unloadable += 1
+                elif burst := _TITLE_RE.match(title):
                     instant = datetime.strptime(burst["acquired"], "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
                     if window.owns(solar_day_of_instant(instant, mid_longitude=mid_longitude).isoformat()):
                         acquired.setdefault(burst["burst"], set()).add(burst["acquired"])
                 else:
                     unnamed += 1
     logger.info(
-        "Burst census (%s) %s..%s: %d granule(s), %d burst(s), %d acquisition(s), %d unnamed, in %.1fs",
+        "Burst census (%s) %s..%s: %d granule(s), %d burst(s), %d acquisition(s), %d unnamed, %d unloadable, in %.1fs",
         orbit_direction,
         start_date,
         end_date,
@@ -490,6 +491,7 @@ def burst_acquisitions(
         len(acquired),
         sum(len(times) for times in acquired.values()),
         unnamed,
+        unloadable,
         time.monotonic() - t0,
     )
     return {burst: len(times) for burst, times in acquired.items()}
