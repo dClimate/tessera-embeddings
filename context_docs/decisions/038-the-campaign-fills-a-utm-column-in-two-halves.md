@@ -67,7 +67,9 @@ utm33.attrs
 ```
 
 `years_complete` keeps its meaning, "the whole group has this year", so every reader of it is
-unchanged: the published-store checks, the year-complete tag, and `cell_optical_min_obs`.
+unchanged: the published-store checks and the year-complete tag. `update.cell_optical_min_obs`
+reads only the update records of the half it is asked about, since an update's looser depth rule
+reaches only that half's pixels; asked about the whole column, it reads both.
 `shard_writer.cell_complete(node, year, half)` answers for one half, and `year_runs` reads
 either shape of `runs[year]`. The shard commit's `shard_write` metadata adds `half`.
 

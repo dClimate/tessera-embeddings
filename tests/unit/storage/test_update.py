@@ -211,6 +211,13 @@ def test_a_cells_line_is_the_loosest_any_write_to_it_applied(zone_repo):
     assert [upd.cell_optical_min_obs(root(), "01N", year) for year in (2024, 2025)] == [1, 15]
 
 
+def test_a_halfs_line_ignores_the_other_halfs_updates():
+    """ADR 038: the halves share the group's records, not its pixels; the whole column is the loosest of both."""
+    root = zarr.group(store=zarr.storage.MemoryStore(), attributes={"optical_min_obs": 15})
+    root.create_group("utm33").attrs[upd.UPDATES_ATTR] = {"2024": [{"update": "a", "half": "n", "optical_min_obs": 1}]}
+    assert [upd.cell_optical_min_obs(root, z, 2024) for z in ("utm33n", "utm33s", "utm33")] == [1, 15, 1]
+
+
 def test_an_update_whose_shard_commit_expired_is_still_known_to_the_store_check(zone_repo):
     """An update records itself in ``updates[year]``, not ``runs``, so after snapshot expiry that record is
     the store's only account of the write; without it the update's registry part names a run the store lacks.
