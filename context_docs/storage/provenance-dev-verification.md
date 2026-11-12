@@ -9,7 +9,7 @@ the store's shard commits, then planes holding the signed fusion order.
 ingest time at zone scale; the second day's paired runs put that inside run-to-run variation.
 The plan's size for the `granules` table was low by about half. The third day measured the plane
 layouts: chunking all dates together would make one-pixel reads ten times faster (finding 8).
-The fifth run measured the fusion-order planes in the published layout: 33–41% larger than the
+The fifth run measured the fusion-order planes in the adopted layout, every date × 512²: 33–41% larger than the
 rank they replace (finding 9).
 
 ## Setup
@@ -236,7 +236,7 @@ A zone-day's radar list runs past 255 bursts, which is why the mosaic's index is
 The third day measured the published signed planes of two shard-years, `chunk_209_14` and
 `chunk_210_13`, in MB, compressed with the published codec (Blosc zstd 3, bit shuffle):
 
-| shard, sensor | dates | signed, one date × one shard (published) | unsigned, as before | all dates × 256² | all dates × 128² | `int16` fusion order |
+| shard, sensor | dates | signed, one date × one shard (published then) | unsigned, as before | all dates × 256² | all dates × 128² | `int16` fusion order |
 |---|---|---|---|---|---|---|
 | 209_14 optical | 64 | 1.188 | 1.142 | 1.097 | 1.113 | 1.412 |
 | 209_14 ascending | 61 | 0.164 | 0.164 | 0.152 | 0.160 | 0.279 |
@@ -245,18 +245,18 @@ The third day measured the published signed planes of two shard-years, `chunk_20
 | 210_13 ascending | 61 | 0.490 | 0.476 | 0.430 | 0.465 | 0.858 |
 | 210_13 descending | 28 | 0.195 | 0.185 | 0.171 | 0.169 | 0.356 |
 
-The sign adds about 4% on optical and 0–5% on radar. All dates × 256² is 7–12% smaller than the
-published layout. The `int16` fusion order is 19–83% larger than the rank. Written to S3 both ways,
-the optical planes of `chunk_209_14` gave one pixel's year in a median 1.92 s from the published
-layout (64 objects) and 0.20 s from all dates × 256² (one object), over three pixels, read from a
+The sign adds about 4% on optical and 0–5% on radar. All dates × 256² is 7–12% smaller than
+one date × one shard. The `int16` fusion order is 19–83% larger than the rank. Written to S3 both ways,
+the optical planes of `chunk_209_14` gave one pixel's year in a median 1.92 s from one date ×
+one shard (64 objects) and 0.20 s from all dates × 256² (one object), over three pixels, read from a
 laptop outside the region.
 
 The fifth run (`33N-2024-57172477`, a 46-minute fill) measured the fusion-order planes in the
-published layout: each shard-year's planes re-encoded exactly as publication writes them, every
+adopted layout: each shard-year's planes re-encoded exactly as publication writes them, every
 date × 512² chunks in one 2048² shard with the published codec, and the same planes converted to
 the former signed `int8` rank and encoded the same way. MB:
 
-| shard, sensor | dates | `int16` fusion order (published) | `int8` rank | larger by | highest fusion order |
+| shard, sensor | dates | `int16` fusion order (as published) | `int8` rank | larger by | highest fusion order |
 |---|---|---|---|---|---|
 | 209_14 optical | 64 | 1.274 | 1.100 | 16% | 3 |
 | 209_14 ascending | 61 | 0.238 | 0.147 | 62% | 24 |
@@ -307,7 +307,7 @@ that rate a zone-year of about 3,000 shards takes about an hour and a half.
 7. **Outside this stack: ADR 034 has two claimants**, #240 (an acquisition is one datastrip) and
    #254 (UTM zone layout). This record's ADR moved to 035.
 8. **Chunking all dates together reads a pixel ten times faster and is smaller.** All dates ×
-   256² beat the published one date × one shard on every shard-year measured, by 7–12% in size,
+   256² beat the then-published one date × one shard on every shard-year measured, by 7–12% in size,
    and fetched a pixel's year in one object instead of 64. Adopted, at the v2 store's chunk edge
    of 512 × 512 in 2048 × 2048 shards, so a plane chunk covers the same pixels as a store chunk.
    512 × 512 itself was not measured; 128 × 128 against 256 × 256 suggests a larger chunk is
@@ -315,8 +315,8 @@ that rate a zone-year of about 3,000 shards takes about an hour and a half.
 9. **The signed fusion order is 33–41% larger than the rank.** Storing it as `int16` takes
    `sources` off the pixel path, one join fewer. On the third day's measurement (one date × one
    shard, 19–83% larger) the rank was kept at first; after review the fusion order was adopted
-   with its size accepted (ADR 035, decision 3), and the fifth run measured it in the published
-   layout: 16–23% larger on optical, 34–73% on radar.
+   with its size accepted (ADR 035, decision 3), and the fifth run measured it in the adopted
+   layout, every date × 512²: 16–23% larger on optical, 34–73% on radar.
 
 ## Teardown
 
