@@ -174,7 +174,7 @@ class TestCatchUpToBranch:
         repo = _seed(tmp_path)
         session = repo.writable_session("main")
         _commit_to(repo, "01N", 7)
-        commit_year_attrs(repo, "01N", 2025, run_id="other", half="n")
+        commit_year_attrs(repo, "01N", 2025, run_id="other")
         assert session_catch_up.catch_up_to_branch(repo, session, "01N", shards={(0, 0, 0)}) == "blocked"
         assert session_catch_up.catch_up_to_branch(repo, session, "01N", shards={(0, 1, 0)}) == "advanced"
         zarr.open_group(session.store, mode="a")["01N"]["embeddings"][0, _SHARD : _SHARD + _CHUNK, 0:_CHUNK, :] = 3

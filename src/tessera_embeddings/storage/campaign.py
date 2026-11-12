@@ -194,7 +194,7 @@ def mark_zone_year_empty(
     """
     # Axis check on a read-only view: it must fail before any session is opened, so a rejected
     # year cannot leave a writable session dangling.
-    group, half = group_and_half(zone)
+    group = group_and_half(zone)[0]
     node = cast(zarr.Group, zarr.open_group(repo.readonly_session("main").store, mode="r")[group])
     if time_index_of(node, year_timestamp(year)) is None:
         raise ValueError(
@@ -203,7 +203,7 @@ def mark_zone_year_empty(
         )
     # Delegated so there is exactly ONE writer of years_complete/runs, with one retry-on-conflict
     # policy — what makes a no-land mark safe to run concurrently with another year of the zone.
-    return commit_year_attrs(repo, group, year, run_id=run_id, empty=True, skip_if_marked=True, half=half)
+    return commit_year_attrs(repo, zone, year, run_id=run_id, empty=True, skip_if_marked=True)
 
 
 @dataclass(frozen=True)

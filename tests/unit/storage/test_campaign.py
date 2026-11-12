@@ -142,7 +142,7 @@ def test_work_list_defaults_to_every_zone_of_the_store_layout(seed, hemisphere, 
 def test_a_column_year_completes_with_its_second_half(seed):
     """ADR 038: each half marks only itself; the year enters ``years_complete`` with the second."""
     _, repo = seed(zones=(ZoneSpec("32601", None, 1, (0.0, 5_120.0), (-10_240.0, 10_240.0)),))
-    write_year_shards(repo, "utm01", 0, _OneInnerChunkSource(), n_workers=1, shard_px=_SHARD, run_id="north", half="n")
+    write_year_shards(repo, "utm01n", 0, _OneInnerChunkSource(), n_workers=1, shard_px=_SHARD, run_id="north")
     status = campaign.campaign_status(repo, years=_YEARS)
     assert (status.has("utm01n", 2023), status.has("utm01s", 2023), status.zones["utm01"]) == (True, False, ())
     assert status.zone_years_done == 1, "a landed half is data the seed must not stamp over"

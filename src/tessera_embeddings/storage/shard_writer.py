@@ -66,7 +66,7 @@ from tessera_embeddings.storage.session_catch_up import (
     ticking,
 )
 from tessera_embeddings.storage.time_axis import read_time_values, year_of
-from tessera_embeddings.storage.zone_grid import Half
+from tessera_embeddings.storage.zone_grid import Half, group_and_half
 
 _log = logging.getLogger(__name__)
 
@@ -587,7 +587,7 @@ def read_halves_complete(node: zarr.Group, year: int) -> set[str]:
     return set(raw.get(str(year), [])) if isinstance(raw, dict) else set()
 
 
-def cell_complete(node: zarr.Group, year: int, half: Half | None = None) -> bool:
+def cell_complete(node: zarr.Group, year: int, half: Half | None) -> bool:
     """Whether a fill zone has landed ``year``: its group's ``years_complete``, or the half's own mark."""
     return year in read_years_complete(node) or (half is not None and half in read_halves_complete(node, year))
 
@@ -714,7 +714,7 @@ def _or_none(value: Mapping[str, Any] | None) -> dict | None:
 
 def commit_year_attrs(
     repo: icechunk.Repository,
-    group: str,
+    zone: str,
     year_label: int,
     *,
     run_id: str | None = None,
@@ -725,9 +725,8 @@ def commit_year_attrs(
     commit: Mapping[str, str] | None = None,
     tries: int = 8,
     skip_if_marked: bool = False,
-    half: Half | None = None,
 ) -> str:
-    """Advance one year's ``years_complete``/``runs`` in its own small commit, retrying.
+    """Advance one fill zone's year in ``years_complete``/``runs``, in its own small commit, retrying.
 
     The single writer of those attrs, and the reason concurrent fills of the SAME
     zone group are safe.
@@ -764,6 +763,7 @@ def commit_year_attrs(
     the new run, which is what a genuine refill through :func:`write_year_shards` means:
     shards were rewritten, so the provenance should say by which run.
     """
+    group, half = group_and_half(zone)
     for attempt in range(1, tries + 1):
         session = repo.writable_session("main")
         node = _group_node(session.store, group)
@@ -790,7 +790,7 @@ def commit_year_attrs(
                 half=half,
             )
         try:
-            return commit_with_rebase(session, f"mark {group}{half or ''} year {year_label} complete")
+            return commit_with_rebase(session, f"mark {zone} year {year_label} complete")
         except icechunk.RebaseFailedError:
             if attempt == tries:
                 raise
@@ -929,7 +929,7 @@ def _write_shards_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 - retu
 
 def write_year_shards(
     repo: icechunk.Repository,
-    group: str,
+    zone: str,
     year_index: int,
     source: ShardSource,
     *,
@@ -945,7 +945,6 @@ def write_year_shards(
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     fault: ArmedFault | None = None,
     commit_attrs: Callable[[icechunk.Repository, str, int, Mapping[str, str]], str] | None = None,
-    half: Half | None = None,
 ) -> str:
     """Fill one (zone, year) with whole shards from ``source``, then mark it complete in a second commit.
 
@@ -1002,10 +1001,10 @@ def write_year_shards(
     one function, there is nothing outside the process to aim a kill at, and a state
     documented as benign but never observed is an assumption.
 
-    ``half`` is the column half being filled (ADR 038): ``source`` holds only its shards, and the
-    attrs commit marks only that half.
+    ``zone`` is the fill zone: a group, or a column half (ADR 038), whose ``source`` holds only its
+    own shards of the shared group and whose attrs commit marks only that half.
 
-    ``commit_attrs(repo, group, year, commit)`` replaces the second commit, given the shard commit
+    ``commit_attrs(repo, zone, year, commit)`` replaces the second commit, given the shard commit
     as ``commit_year_attrs`` is. A targeted update passes its own record writer here, so writing
     shards into a year that is already complete records the update and leaves ``years_complete``
     and ``runs`` exactly as the original fill left them.
@@ -1013,6 +1012,7 @@ def write_year_shards(
     Returns the ATTR commit's snapshot id — a tag must point at a state where the
     year is both written and marked.
     """
+    group, half = group_and_half(zone)
     session = repo.writable_session("main")
     shards = list(source.live_shards())
     if not shards:
@@ -1062,18 +1062,18 @@ def write_year_shards(
     if fault is not None:
         # The drill's death lands HERE, between the two commits, and nowhere else can
         # produce this state on purpose. Inert for any other fault or any other cell.
-        fault.die_between_commits(group + (half or ""), year_label, log=log or _log)
+        fault.die_between_commits(zone, year_label, log=log or _log)
     t_attrs = time.monotonic()
     # The per-year attrs go in their OWN commit (see `commit_year_attrs`), so a same-zone
     # collision costs a sub-second retry instead of this whole assembly. Return that
     # snapshot rather than the shard one: a tag must point at a state where the year is
     # both written AND marked.
     snapshot = (
-        commit_attrs(repo, group, year_label, commit)
+        commit_attrs(repo, zone, year_label, commit)
         if commit_attrs is not None
         else commit_year_attrs(
             repo,
-            group,
+            zone,
             year_label,
             run_id=run_id,
             radar_coverage=radar_coverage,
@@ -1081,7 +1081,6 @@ def write_year_shards(
             input_coverage=input_coverage,
             empty=empty,
             commit=commit,
-            half=half,
         )
     )
     if telemetry is not None:

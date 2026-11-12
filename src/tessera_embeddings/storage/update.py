@@ -71,6 +71,7 @@ from tessera_embeddings.storage.campaign import pin_tag
 from tessera_embeddings.storage.registry_master import master_schema
 from tessera_embeddings.storage.shard_writer import cell_complete, commit_with_rebase
 from tessera_embeddings.storage.zone_grid import Half, canonicalize_zone, fill_zones_of, group_and_half
+from tessera_embeddings.storage.zone_grid import zone as zone_spec
 
 UpdateMode = Literal["holes", "shards"]
 OnSkip = Literal["keep", "clear"]
@@ -332,7 +333,7 @@ def plan_from_registry(
         storage_options=dict(storage_options) if storage_options else None,
     )
     if zones is not None:  # the registry is partitioned by group; a half is cut out below
-        rows = rows.filter(pl.col("zone").is_in([group_and_half(canonicalize_zone(z))[0] for z in zones]))
+        rows = rows.filter(pl.col("zone").is_in([zone_spec(canonicalize_zone(z)).group_name for z in zones]))
     if years is not None:
         rows = rows.filter(pl.col("year").is_in([int(y) for y in years]))
     if refused is not None:
@@ -352,7 +353,7 @@ def plan_from_registry(
     source = f"registry {registry_root} refused={refused} aoi={aoi} zones={zones} years={years}"
     tiles = _by_fill_zone(rows.select("zone", "year", "tile").collect())
     if zones is not None:
-        tiles = tiles.filter(pl.col("zone").is_in([h for z in zones for h in fill_zones_of(canonicalize_zone(z))]))
+        tiles = tiles.filter(pl.col("zone").is_in([h for z in zones for h in fill_zones_of(z)]))
     return plan_from_tiles(
         tiles,
         name=name,
@@ -385,15 +386,19 @@ def _by_fill_zone(tiles: pl.DataFrame) -> pl.DataFrame:
     rows = [
         (half, year, tile)
         for zone, year, tile in tiles.select("zone", "year", "tile").iter_rows()
-        for half in fill_zones_of(canonicalize_zone(zone), None if tile is None else parse_chunk_label(tile)[0])
+        for half in fill_zones_of(zone, None if tile is None else parse_chunk_label(tile)[0])
     ]
     return pl.DataFrame(rows, schema={"zone": pl.String, "year": pl.Int64, "tile": pl.String}, orient="row")
 
 
-def read_updates(node: zarr.Group, year: int) -> list[dict[str, Any]]:
-    """The update records on ``year`` of a zone group, oldest first."""
+def read_updates(node: zarr.Group, year: int, half: Half | None) -> list[dict[str, Any]]:
+    """The update records on ``year`` of one fill zone, oldest first: a group's, or one column half's.
+
+    A column's halves share the group's records (ADR 038) but not their pixels, so each reads only
+    its own; ``None`` is a group that is its own fill zone, whose records carry no half.
+    """
     raw = node.attrs.get(UPDATES_ATTR) or {}
-    return list(cast("dict[str, list[dict[str, Any]]]", raw).get(str(year), []))
+    return [r for r in cast("dict[str, list[dict[str, Any]]]", raw).get(str(year), []) if r.get("half") == half]
 
 
 def applied_optical_min_obs(store_rule: int | None, line: int | None) -> int | None:
@@ -421,8 +426,7 @@ def cell_optical_min_obs(root: zarr.Group, zone: str, year: int) -> int | None:
     if rule is None:
         return None
     group, half = group_and_half(zone)
-    # A half's floor is its own: the other half of the column shares the group, not its pixels.
-    records = [r for r in read_updates(cast(zarr.Group, root[group]), year) if half is None or r.get("half") == half]
+    records = read_updates(cast(zarr.Group, root[group]), year, half)
     return min([int(cast("int", rule)), *(int(r["optical_min_obs"]) for r in records if r.get("optical_min_obs"))])
 
 
@@ -446,14 +450,14 @@ def check_no_tightening(
             )
 
 
-def update_state(node: zarr.Group, year: int, name: str, half: Half | None = None) -> UpdateState:
+def update_state(node: zarr.Group, year: int, name: str, half: Half | None) -> UpdateState:
     """Where update ``name`` stands on one cell: a group's year, or one column half of it (ADR 038).
 
     ``not_complete`` when the year was never filled: an update is an insert into existing data,
     and an unfilled year is the campaign's to fill. A half's update records carry its ``half``,
     so the other half of the column still has it to do.
     """
-    if any(r.get("update") == name and r.get("half") == half for r in read_updates(node, year)):
+    if any(r.get("update") == name for r in read_updates(node, year, half)):
         return "done"
     return "pending" if cell_complete(node, year, half) else "not_complete"
 
@@ -497,11 +501,8 @@ def update_record(
     cleared: Sequence[str] = (),
     radar_coverage: Mapping[str, Any] | None = None,
     input_coverage: Mapping[str, Any] | None = None,
-    half: Half | None = None,
 ) -> dict[str, Any]:
     """One cell's record of an update: what it wrote, what it kept, under which depth rule and with which code.
-
-    ``half`` is the column half the cell is, in a ``utm_zones`` store (ADR 038).
 
     ``optical_min_obs`` is the line the update judged its pixels against (``None``: no rule), which
     differs from the original fill's when the plan set a looser one.
@@ -517,8 +518,6 @@ def update_record(
         "kept": sorted(kept),
         "cleared": sorted(cleared),
     }
-    if half:
-        record["half"] = half
     if radar_coverage:
         record["radar_coverage"] = dict(radar_coverage)
     if input_coverage:
@@ -530,7 +529,7 @@ def update_record(
 
 def commit_update_record(
     repo: icechunk.Repository,
-    group: str,
+    zone: str,
     year: int,
     commit: Mapping[str, str] | None = None,
     *,
@@ -544,18 +543,20 @@ def commit_update_record(
     :func:`~tessera_embeddings.storage.shard_writer.commit_year_attrs`, for the same reason: attrs
     cannot be merged by icechunk's conflict detector, and each writer only appends its own record,
     so re-reading and re-applying is exact. Idempotent per update: a record already present for this
-    update and year is left as it is.
+    update and year is left as it is. A column half's record (ADR 038) is stamped with its ``half``.
     """
+    group, half = group_and_half(zone)
+    record = {**record, "commit": dict(commit) if commit else None} | ({"half": half} if half else {})
     for attempt in range(1, tries + 1):
         session = repo.writable_session("main")
         node = cast(zarr.Group, zarr.open_group(session.store, mode="a")[group])
-        if update_state(node, year, str(record["update"]), record.get("half")) == "done":
+        if update_state(node, year, str(record["update"]), half) == "done":
             return repo.lookup_branch("main")
         updates = dict(cast("dict[str, list[dict[str, Any]]]", node.attrs.get(UPDATES_ATTR) or {}))
-        updates[str(year)] = [*updates.get(str(year), []), {**record, "commit": dict(commit) if commit else None}]
+        updates[str(year)] = [*updates.get(str(year), []), record]
         node.attrs[UPDATES_ATTR] = updates
         try:
-            return commit_with_rebase(session, f"update {record['update']}: record {group} year {year}")
+            return commit_with_rebase(session, f"update {record['update']}: record {zone} year {year}")
         except icechunk.RebaseFailedError:
             if attempt == tries:
                 raise

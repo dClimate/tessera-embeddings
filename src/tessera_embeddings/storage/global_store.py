@@ -64,6 +64,7 @@ from tessera_embeddings.storage.zarr_store import _create_storage, global_store_
 from tessera_embeddings.storage.zone_grid import (
     PIXEL_M,
     ZONE_SCHEME,
+    ZoneLayout,
     ZoneSpec,
     easting_coords,
     northing_coords,
@@ -530,8 +531,25 @@ def stamp_root_identity(
     root = zarr.open_group(session.store, mode="a")
     if "geoemb:model" in root.attrs:
         return None
-    root.attrs.update(_root_attrs(layout, model_version=model_version, optical_min_obs=optical_min_obs))
+    _stamp_identity(root, layout, model_version, optical_min_obs, zone_layout_of(root.group_keys()))
     return session.commit(commit_msg or "stamp root identity on an already-seeded store")
+
+
+def _stamp_identity(
+    root: zarr.Group,
+    layout: StoreLayout,
+    model_version: ModelVersion,
+    optical_min_obs: int | None,
+    zone_layout: ZoneLayout | None,
+) -> None:
+    """Write the root's write-once identity: the one writer, however the store came to be stamped.
+
+    A ``utm_zones`` store also declares its layout. The value is true only of that layout: the
+    hemisphere groups are not the 60 it names (ADR 037).
+    """
+    root.attrs.update(_root_attrs(layout, model_version=model_version, optical_min_obs=optical_min_obs))
+    if zone_layout == "utm_zones":
+        root.attrs["geoemb:spatial_layout"] = "utm_zones"
 
 
 def seed_zone_groups(
@@ -588,10 +606,7 @@ def seed_zone_groups(
         # sit beside zones filled under another, under a root advertising only the second. The
         # consequence to know is that the root's rule never moves. A targeted update may apply a
         # looser line to its own cells (ADR 028), and its update records, not the root, say so.
-        root.attrs.update(_root_attrs(layout, model_version=model_version, optical_min_obs=optical_min_obs))
-        if zone_layout == "utm_zones":
-            # True only of this layout: the hemisphere groups are not the 60 the value names.
-            root.attrs["geoemb:spatial_layout"] = "utm_zones"
+        _stamp_identity(root, layout, model_version, optical_min_obs, zone_layout)
     # The time axis is fixed and UNIFORM across all zone groups (ADR-008 D1): campaign status and
     # fill code assume every group shares one axis. An incremental seed passing a different
     # `years` than the groups already present would silently leave a mixed-axis store, so validate

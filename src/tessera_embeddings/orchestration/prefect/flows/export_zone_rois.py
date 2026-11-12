@@ -32,7 +32,7 @@ from prefect.task_runners import ThreadPoolTaskRunner
 from tessera_embeddings.config.inference import ZoneLayout
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.ingest.land_mask import export_zone_roi, live_chunk_count, validate_zone_roi
-from tessera_embeddings.storage.zone_grid import canonicalize_zone, fill_zones
+from tessera_embeddings.storage.zone_grid import fill_zones, fill_zones_of
 
 #: Zone-level fan-out width. The work is S3 request latency rather than CPU, so the useful
 #: ceiling is well above the runner's core count; 12 keeps peak memory modest (each in-flight
@@ -165,7 +165,8 @@ def export_zone_rois(
             makes a green run usable as the campaign's entry gate.
     """
     log = get_run_logger()
-    todo = [canonicalize_zone(z) for z in (zones if zones is not None else list(fill_zones(zone_layout)))]
+    # A column named whole is its two halves, the only ROIs a fill reads (ADR 038).
+    todo = [h for z in zones for h in fill_zones_of(z)] if zones is not None else list(fill_zones(zone_layout))
     log.info(
         "%s ROI masks for %d zone(s), %d in flight",
         "Validating" if validate_only else "Exporting",

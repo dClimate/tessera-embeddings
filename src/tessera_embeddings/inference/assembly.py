@@ -114,7 +114,7 @@ from tessera_embeddings.storage.zarr_store import (
     open_store_as_zarr_group,
     plain_zarr_storage_options,
 )
-from tessera_embeddings.storage.zone_grid import PIXEL_M, Half
+from tessera_embeddings.storage.zone_grid import PIXEL_M
 
 logger = logging.getLogger(__name__)
 
@@ -2488,7 +2488,6 @@ class ZarrWriter:
         commit_attrs: Callable[[icechunk.Repository, str, int, Mapping[str, str]], str] | None = None,
         update_name: str | None = None,
         time_index: int | None = None,
-        half: Half | None = None,
     ) -> str:
         """Assemble a run's staged tiles into one (zone, year) of the global store.
 
@@ -2516,9 +2515,8 @@ class ZarrWriter:
 
         Args:
             store_path: URI of the global Icechunk repo (``BucketPaths.global_store()``).
-            zone: Zone group name, e.g. ``"utm33"`` or ``"01N"`` (ADR 037).
-            half: The column half this run fills, when ``zone`` is a ``utm_zones`` column filled
-                in halves (ADR 038): only that half is marked complete.
+            zone: The fill zone, e.g. ``"utm33s"`` (a column half, of group ``utm33``) or ``"01N"``
+                (ADRs 037, 038). A half is marked complete on its own; its registry rows go to the group.
             year: Campaign calendar year to fill; must be on the group's pre-allocated time axis.
             run_id: Run identifier (locates staged files).
             registry_root: Root of the published registry dataset
@@ -2620,7 +2618,8 @@ class ZarrWriter:
         )
 
         # One readonly probe of the zone group: year index, shard pitch, variables.
-        node = cast(zarr.Group, zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[zone])
+        group = zone_grid.group_and_half(zone)[0]
+        node = cast(zarr.Group, zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[group])
         year_index = time_index if time_index is not None else time_index_of(node, year_timestamp(year))
         if year_index is None:
             raise ValueError(
@@ -2733,7 +2732,6 @@ class ZarrWriter:
             fault=fault,
             input_coverage=input_coverage,
             commit_attrs=commit_attrs,
-            half=half,
         )
         # THE CELL IS COMMITTED. Only now may the registry say so: nothing reconciles it against
         # the store, and consumers are told they need not open the store, so a part written any
@@ -2741,7 +2739,7 @@ class ZarrWriter:
         if registry_root:
             self.publish_registry_part(
                 registry_root,
-                zone,
+                group,
                 year,
                 run_id,
                 committed_at=telemetry["commit"]["committed_at"],

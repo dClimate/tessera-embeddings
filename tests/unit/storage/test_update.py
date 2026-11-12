@@ -174,7 +174,7 @@ def test_an_update_record_appends_and_leaves_the_fill_alone(zone_repo):
 
     node = _node(zone_repo)
     assert zone_repo.lookup_branch("main") == tip
-    assert [(r["update"], r["commit"], r["optical_min_obs"]) for r in upd.read_updates(node, 2024)] == [
+    assert [(r["update"], r["commit"], r["optical_min_obs"]) for r in upd.read_updates(node, 2024, None)] == [
         ("fix-1", commit, 1)
     ]
     assert node.attrs["years_complete"] == [2024] and node.attrs["runs"]["2024"]["run_id"] == "fill"
@@ -212,10 +212,10 @@ def test_a_cells_line_is_the_loosest_any_write_to_it_applied(zone_repo):
 
 
 def test_a_halfs_line_ignores_the_other_halfs_updates():
-    """ADR 038: the halves share the group's records, not its pixels; the whole column is the loosest of both."""
+    """ADR 038: the halves share the group's records, not their pixels."""
     root = zarr.group(store=zarr.storage.MemoryStore(), attributes={"optical_min_obs": 15})
     root.create_group("utm33").attrs[upd.UPDATES_ATTR] = {"2024": [{"update": "a", "half": "n", "optical_min_obs": 1}]}
-    assert [upd.cell_optical_min_obs(root, z, 2024) for z in ("utm33n", "utm33s", "utm33")] == [1, 15, 1]
+    assert [upd.cell_optical_min_obs(root, z, 2024) for z in ("utm33n", "utm33s")] == [1, 15]
 
 
 def test_an_update_whose_shard_commit_expired_is_still_known_to_the_store_check(zone_repo):
@@ -248,7 +248,7 @@ def test_an_update_record_retries_a_concurrent_attr_commit(zone_repo, monkeypatc
     upd.commit_update_record(
         zone_repo, "01N", 2024, record=upd.update_record(_target(), run_id="r", written=[], kept=[], optical_min_obs=1)
     )
-    assert calls["n"] == 2 and len(upd.read_updates(_node(zone_repo), 2024)) == 1
+    assert calls["n"] == 2 and len(upd.read_updates(_node(zone_repo), 2024, None)) == 1
 
 
 def test_the_complete_tag_waits_for_every_planned_cell(zone_repo):

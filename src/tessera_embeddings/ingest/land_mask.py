@@ -455,10 +455,14 @@ def _bitmap(node: zarr.Group, name: str) -> np.ndarray:
 
 
 def _target_zones(zones: list[str] | None, zone_layout: ZoneLayout) -> tuple[list[str], ZoneLayout]:
-    """The fill zones a build or validation covers, and their layout: named zones carry their own."""
+    """The fill zones a build or validation covers, and their layout: named zones carry their own.
+
+    A column named whole is its two halves, the only masks a fill reads (ADR 038).
+    """
     if zones is None:
         return list(zone_grid.fill_zones(zone_layout)), zone_layout
-    return zones, zone_grid.zone_layout_of(zones) or zone_layout
+    halves = [h for z in zones for h in zone_grid.fill_zones_of(z)]
+    return halves, zone_grid.zone_layout_of(halves) or zone_layout
 
 
 # jscpd:ignore-start: explicit keyword signature and Args, mirroring build_coverage

@@ -205,24 +205,35 @@ def zone(name: str) -> ZoneSpec:
 def group_and_half(name: str) -> tuple[str, Half | None]:
     """The store group a fill zone writes, and the column half it owns there.
 
-    ``"utm33s"`` → ``("utm33", "s")``; any other name — a group, or a single-area store's ``""``
-    — is its own group, whole. The one mapping from a fill zone to what it addresses in the store,
-    where a column's two halves share one group (ADR 038).
+    ``"utm33s"`` → ``("utm33", "s")``; a v1.1 group, or a single-area store's ``""``, is its own
+    group, whole. The one mapping from a fill zone to what it addresses in the store, where a
+    column's two halves share one group (ADR 038), so every cell-level path passes it before it
+    writes. A whole column is never a cell: name it to :func:`fill_zones_of`, or to :func:`zone`
+    for its group.
+
+    Raises:
+        ValueError: If *name* is a whole ``utm_zones`` column.
     """
+    if name in _ZONES_BY_LAYOUT["utm_zones"]:
+        raise ValueError(f"{name} is a whole column; it is filled as its halves {name}n and {name}s (ADR 038)")
     spec = _FILL_ZONES_BY_LAYOUT["utm_zones"].get(name)
     return (spec.group_name, spec.half) if spec else (name, None)
 
 
 def fill_zones_of(name: str, row: int | None = None) -> tuple[str, ...]:
-    """The fill zones that write *name*: a column's two halves, or the one holding shard *row*; else *name*.
+    """The canonical fill zones that write *name*: a column's two halves, or the one on shard *row*'s side.
 
-    How a column named whole (``"utm33"``, as the registry partitions it) becomes the units the
-    campaign fills, ``"utm33n"`` and ``"utm33s"`` (ADR 038). Any other name is already a fill zone.
+    How a column named whole (``"utm33"``, as the registry partitions it and an operator may name
+    it) becomes the units the campaign fills, ``"utm33n"`` and ``"utm33s"`` (ADR 038). Any other
+    name is already a fill zone. A row off the grid still gets a half; the shard check downstream
+    (``land_mask.narrow_tile_live``) is what refuses it.
     """
+    name = canonicalize_zone(name)
     if name not in _ZONES_BY_LAYOUT["utm_zones"]:
         return (name,)
-    halves = [_FILL_ZONES_BY_LAYOUT["utm_zones"][name + h] for h in ("n", "s")]
-    return tuple(h.name for h in halves if row is None or h.tile_rows[0] <= row < h.tile_rows[1])
+    if row is None:
+        return (name + "n", name + "s")
+    return (name + ("n" if row < _FILL_ZONES_BY_LAYOUT["utm_zones"][name + "n"].tile_rows[1] else "s"),)
 
 
 def zone_layout_of(names: Iterable[str]) -> ZoneLayout | None:

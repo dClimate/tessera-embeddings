@@ -98,7 +98,6 @@ from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group, plai
 from tessera_embeddings.storage.zone_grid import (
     PIXEL_M,
     canonicalize_zone,
-    fill_zones_of,
     group_and_half,
     tile_row_latitudes,
 )
@@ -314,14 +313,14 @@ def _open_zone(
 ) -> tuple[icechunk.Repository, zarr.Group, zarr.Group | None]:
     """Open the global store read-only at ``main``: the repo, its root group and ``zone``'s group.
 
-    ``zone`` is a fill zone, so a column half opens its column's group (ADR 038). The group is
-    ``None`` when it is not seeded; :func:`_require_zone` raises instead.
+    ``zone`` is a group or a fill zone, so a column half opens its column's group (ADR 038). The
+    group is ``None`` when it is not seeded; :func:`_require_zone` raises instead.
     """
     repo = open_global_repo(
         store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
     )
     root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
-    group = group_and_half(zone)[0]
+    group = zone_spec(zone).group_name
     return repo, root, (cast(zarr.Group, root[group]) if group in root else None)
 
 
@@ -335,7 +334,7 @@ def _require_zone(
     """:func:`_open_zone` for a zone that must already be seeded."""
     repo, root, node = _open_zone(store_path, zone, get_credentials=get_credentials, s3_region=s3_region)
     if node is None:
-        group = group_and_half(zone)[0]
+        group = zone_spec(zone).group_name
         raise ValueError(f"Zone group {group!r} is not seeded in {store_path} — run seed_zone_groups first (D1).")
     return repo, root, node
 
@@ -779,12 +778,9 @@ def plan_zone_inference(
     t0 = time.monotonic()
     run_id = run_id or run_id_prefix(config.model_version) + uuid.uuid4().hex[:12]
 
-    # A column is filled as its halves; named whole it has no mask or mosaic, and would mark its year whole.
-    if (halves := fill_zones_of(zone)) != (zone,):
-        raise ValueError(f"{zone} is a whole column; fill its halves {halves} (ADR 038)")
     # The seeded zone group is the grid authority.
     repo, root, node = _require_zone(store_path, zone, get_credentials=get_credentials, s3_region=s3_region)
-    group, half = group_and_half(zone)
+    half = group_and_half(zone)[1]
 
     # The store's minimum-depth rule is part of its write-once root identity, so the store —
     # not this call's config — is the authority on what rule its zones are filled under. A fill
@@ -960,15 +956,10 @@ def plan_zone_inference(
             # dispatched again. Never marked empty: the cell keeps everything it held.
             snapshot = commit_update_record(
                 repo,
-                group,
+                zone,
                 year,
                 record=update_record(
-                    update,
-                    run_id=run_id,
-                    written=[],
-                    kept=update.kept,
-                    optical_min_obs=config.optical_min_obs,
-                    half=half,
+                    update, run_id=run_id, written=[], kept=update.kept, optical_min_obs=config.optical_min_obs
                 ),
             )
             result = {**summary, "snapshot_id": snapshot, "elapsed_sec": time.monotonic() - t0}
@@ -1206,7 +1197,6 @@ def assemble_zone_year(
     if handoff.done is not None:
         return handoff.done
     zone, year, run_id, t0 = handoff.zone, handoff.year, handoff.run_id, handoff.t0
-    group, half = group_and_half(zone)
     summary, live, results = handoff.summary, handoff.live, handoff.results
     writer = ZarrWriter(staging_base)
 
@@ -1263,8 +1253,7 @@ def assemble_zone_year(
             # can never be marked empty over shards this run did not clear.
             snapshot = writer.assemble_global(
                 store_path,
-                group,
-                half=half,
+                zone,
                 year=year,
                 run_id=run_id,
                 n_workers=n_assembly_workers or AssemblyConfig().compute_n_workers(len(live)),
@@ -1369,8 +1358,7 @@ def assemble_zone_year(
         )
     snapshot = writer.assemble_global(
         store_path,
-        group,
-        half=half,
+        zone,
         year=year,
         registry_root=registry_root,
         optical_min_obs=optical_min_obs,
@@ -1439,7 +1427,7 @@ def _assemble_update(
     """
     update = cast(UpdateTarget, handoff.update)
     zone, year, run_id, live, results = handoff.zone, handoff.year, handoff.run_id, handoff.live, handoff.results
-    group, half = group_and_half(zone)
+    group = group_and_half(zone)[0]
     staged = writer.verify_staged_completeness(run_id, live, log=log)
     skipped = sorted({c.label for c in live} - staged)
     cleared = skipped if update.on_skip == "clear" else []
@@ -1453,20 +1441,19 @@ def _assemble_update(
         cleared=cleared,
         radar_coverage=radar_coverage,
         input_coverage=input_coverage,
-        half=half,
     )
     store_credentials = _store_credentials(store_path, get_credentials)
     merged = update.mode == "holes"
     committed: dict[str, str] = {}
 
-    def _record(repo: icechunk.Repository, group: str, year_label: int, commit: Mapping[str, str]) -> str:
+    def _record(repo: icechunk.Repository, zone: str, year_label: int, commit: Mapping[str, str]) -> str:
         committed.update(commit)  # the shard commit, which stamps the merged tiles' part
-        return commit_update_record(repo, group, year_label, commit, record=record)
+        return commit_update_record(repo, zone, year_label, commit, record=record)
 
     if staged or cleared:
         snapshot = writer.assemble_global(
             store_path,
-            group,
+            zone,
             year=year,
             run_id=run_id,
             n_workers=n_assembly_workers or AssemblyConfig().compute_n_workers(len(staged) + len(cleared)),
@@ -1514,7 +1501,7 @@ def _assemble_update(
     else:
         snapshot = commit_update_record(
             open_global_repo(store_path, get_credentials=store_credentials, region=s3_region),
-            group,
+            zone,
             year,
             record=record,
         )

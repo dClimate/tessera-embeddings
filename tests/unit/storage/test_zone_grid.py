@@ -56,19 +56,16 @@ def test_a_column_is_filled_as_two_halves_split_on_a_shard_row():
     )
     assert sorted(zg.fill_zones("utm_zones")) == sorted(f"utm{u:02d}{h}" for u in range(1, 61) for h in "ns")
     assert zg.fill_zones("hemispheres") is zg.zones("hemispheres")
-    assert [zg.group_and_half(n) for n in ("utm10s", "utm10", "10S", "")] == [
-        ("utm10", "s"),
-        ("utm10", None),
-        ("10S", None),
-        ("", None),
-    ]
+    assert [zg.group_and_half(n) for n in ("utm10s", "10S", "")] == [("utm10", "s"), ("10S", None), ("", None)]
+    with pytest.raises(ValueError, match="filled as its halves"):
+        zg.group_and_half("utm10")
     equator = north.tile_rows[1]
     assert [zg.fill_zones_of("utm10", r) for r in (None, equator - 1, equator)] == [
         ("utm10n", "utm10s"),
         ("utm10n",),
         ("utm10s",),
     ]
-    assert zg.fill_zones_of("utm10s") == ("utm10s",) and zg.fill_zones_of("10S", 0) == ("10S",)
+    assert zg.fill_zones_of("UTM10S") == ("utm10s",) and zg.fill_zones_of("10s", 0) == ("10S",)
 
 
 def test_zone_layout_of():

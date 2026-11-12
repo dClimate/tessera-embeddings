@@ -40,13 +40,19 @@ a spec with the column's full grid, `name` `utm33s`, `group_name` `utm33`, and `
 (456, 890). `zones(layout)` still lists the store's groups (what seeding creates);
 `fill_zones(layout)` lists what the campaign fills: each column's two halves, or in the
 `hemispheres` layout the groups themselves. `group_and_half(name)` is the single mapping from a
-fill zone to what it addresses in the store, `("utm33", "s")`, and leaves every other name whole.
-`canonicalize_zone` accepts `UTM33S`.
+fill zone to what it addresses in the store, `("utm33", "s")`; a v1.1 group is its own fill zone,
+`("33N", None)`. A whole column is never a cell, so `group_and_half("utm33")` raises.
+`fill_zones_of(name)` turns a column named whole into its halves, which is how the campaign's
+`zones`, the land-mask build and the ROI export accept `utm33`, and `fill_zones_of(name, row)` gives
+the half holding a shard row, which is how an update planned from the registry, partitioned by
+group, splits its tiles. `canonicalize_zone` accepts `UTM33S`.
 
 **Everything keyed by the work uses the half's name.** That is the land mask's groups, the ingest
 ROIs and mosaic folders, staging run ids, flow parameters and the zone-year tags
-(`zone-utm33s-2024`). **Everything that addresses the store uses the group**: the fill runner, the
-update path and the campaign's seeded checks all go through `group_and_half`.
+(`zone-utm33s-2024`). **Everything that addresses the store uses the group**, and works it out
+from the fill zone itself: the writers (`write_year_shards`, `commit_year_attrs`,
+`assemble_global`, `commit_update_record`) take the fill zone's name, not a group and a separate
+half, so no caller can drop the half. Registry rows go to the group.
 
 **The mask has one group per half, built from the whole column.** `build_land_mask` with
 `zone_layout="utm_zones"` builds each half from all of its column's registry cells, so a cell's
@@ -67,11 +73,11 @@ utm33.attrs
 ```
 
 `years_complete` keeps its meaning, "the whole group has this year", so every reader of it is
-unchanged: the published-store checks and the year-complete tag. `update.cell_optical_min_obs`
-reads only the update records of the half it is asked about, since an update's looser depth rule
-reaches only that half's pixels; asked about the whole column, it reads both.
-`shard_writer.cell_complete(node, year, half)` answers for one half, and `year_runs` reads
-either shape of `runs[year]`. The shard commit's `shard_write` metadata adds `half`.
+unchanged: the published-store checks and the year-complete tag. Readers given a group node take
+the half as a required argument: `shard_writer.cell_complete(node, year, half)` answers for one
+half, and `update.read_updates(node, year, half)` returns only that half's records, since an
+update's looser depth rule reaches only its own half's pixels. `year_runs` reads either shape of
+`runs[year]`. The shard commit's `shard_write` metadata adds `half`.
 
 **The campaign's status reads halves.** `CampaignStatus.campaign_zones()` is every fill zone of
 the store's layout; `has("utm33s", 2024)` reads the half's mark. The year-complete tag still
