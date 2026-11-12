@@ -114,10 +114,10 @@ Install the extra deps once: `uv sync --group scale-tests`.
 ### T9 — the v2 layout, measured without AWS
 
 v2's 128 dimensions are Matryoshka-ordered, so its store chunks the band axis inside the same 2048²
-meta-shard, the block one inference run produces (ADR 031's vocabulary). T9 builds every arm as a
-local store of 2×2 meta-shards from real v2 meta-shards, and records:
+processing shard, the block one inference run produces (ADR 031's vocabulary). T9 builds every arm as a
+local store of 2×2 processing shards from real v2 processing shards, and records:
 
-- what the writer pays: stored bytes, and encode CPU per meta-shard
+- what the writer pays: stored bytes, and encode CPU per processing shard
 - what every read asks for: requests and bytes for each workload at each prefix width
 - the Dask tasks and requests of a 16-d pull, at Dask's default chunks and at shard-aligned ones
 
@@ -167,9 +167,9 @@ Each phase runs on its own in-region EC2 box, writing throwaway repos under the 
 `--study` picks the finalists and workloads, as in T9.
 
 - **`build` then `read`** (x86, r7i.4xlarge). Each finalist is built as a repo of 10 × 10
-  meta-shards cycled from the real ones T9 fetched, so no cache holds the working set. Every workload runs cold
+  processing shards cycled from the real ones T9 fetched, so no cache holds the working set. Every workload runs cold
   in a fresh process, arms interleaved, in two passes of opposite order: points at 16 and 128 dims,
-  a 128-d read of 2 × 2 meta-shards, an 8 × 8-meta-shard pull at 16, 64 and 128 dims, and Dask at its default
+  a 128-d read of 2 × 2 processing shards, a pull of 8 × 8 processing shards at 16, 64 and 128 dims, and Dask at its default
   chunks. `read` runs once per client. `points` repeats only the point reads, with bootstrap
   intervals on their medians. `tune` re-runs reads under reader settings: in the band-16 study the
   full-vector pulls with wider fetch concurrency and band-aligned Dask chunks; in the narrow study
@@ -184,14 +184,14 @@ Each phase runs on its own in-region EC2 box, writing throwaway repos under the 
   does not inflate) and the downlink, and refuses to run unless both are within a factor of two of
   the profile's. Each cold read fetches one distant pixel first, timed apart as the first read,
   since that is where the manifest download lands.
-- **`assemble`** (Graviton, like the assembly runner). Staged v2 meta-shards are written into each
+- **`assemble`** (Graviton, like the assembly runner). Staged v2 processing shards are written into each
   finalist by the library's own `shard_writer.write_year_shards` over a `StagedShardSource`, every
   array included. Band-first arms are written only where the shard writer says it can
   (`WRITES_BAND_FIRST`, set by ADR 031's band-first prototype); otherwise their encode cost comes from
   `build` on a Graviton box instead.
 - **`verify`**. Every arm holds exactly C0's values in every array, band-first ones reordered first.
   It checks the built stores; given `--staging`, it checks the assembled ones, over the
-  meta-shards assembly wrote. The set chooses its own stores and arms, so there is no prefix to pass.
+  processing shards assembly wrote. The set chooses its own stores and arms, so there is no prefix to pass.
 
 ### Common flags (every `tN` script)
 

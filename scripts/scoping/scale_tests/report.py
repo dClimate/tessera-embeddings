@@ -301,7 +301,7 @@ _T9_READS = (
     ("point 16", "point", 16),
     ("point 128", "point", 128),
     ("window 16", "tile", 16),
-    ("meta-shard 16", "shard", 16),
+    ("processing shard 16", "shard", 16),
     ("bulk 16", "bulk", 16),
     ("bulk 64", "bulk", 64),
     ("bulk 128", "bulk", 128),
@@ -333,7 +333,7 @@ def _t9_tables(rows: list[dict]) -> list[str]:
     if arms:
         out += [
             "",
-            "| arm | " + " | ".join([*cols, "encode CPU s/meta-shard"]) + " |",
+            "| arm | " + " | ".join([*cols, "encode CPU s/processing shard"]) + " |",
             "|---|" + "---|" * (len(cols) + 1),
         ]
     for a in arms:
@@ -445,7 +445,7 @@ def _t10_tables(rows: list[dict]) -> list[str]:
         manifests = bool(_sel(rows, test="t10", phase="build", metric="manifest_bytes"))
         extra = " S3 objects | manifest bytes per S3 object |" if manifests else ""
         out += [
-            "## T10 — bench store build, encode CPU per meta-shard",
+            "## T10 — bench store build, encode CPU per processing shard",
             "",
             "| arm | encode CPU s | vs C0 | stored GB | vs C0 |" + extra,
             "|---|---|---|---|---|" + "---|---|" * manifests,
@@ -465,7 +465,7 @@ def _t10_tables(rows: list[dict]) -> list[str]:
     if arms:
         base = {k: _t10_value(rows, "encode_cpu_s", "v2_c0", phase="assemble", kind=k) for k in ("worker", "write")}
         out += [
-            "## T10 — assembly code: CPU per staged meta-shard, wall per run (median of passes)",
+            "## T10 — assembly code: CPU per staged processing shard, wall per run (median of passes)",
             "",
             "| arm | worker CPU s | vs C0 | write CPU s | vs C0 | wall s, whole run | stored GB |",
             "|---|---|---|---|---|---|---|",
@@ -546,7 +546,7 @@ def _t10_tables(rows: list[dict]) -> list[str]:
         out += [
             "## T10 — lossless check against C0",
             "",
-            "| arm | stores | meta-shards | mismatched (array, meta-shard) pairs |",
+            "| arm | stores | processing shards | mismatched (array, processing shard) pairs |",
         ]
         out.append("|---|---|---|---|")
         for r in sorted(verified, key=lambda r: (r["params"]["prefix"], r["variant"])):

@@ -92,7 +92,7 @@ VARIANTS: dict[str, Variant] = {
         Variant("c256_full", (1, 256, 256, 128), None),  # 8.4 MB, AlphaEarth-like
         Variant("c256_sharded", (1, 256, 256, 128), (1, 2048, 2048, 128)),  # ~0.5 GB shards
         # v2 (T9): the v1.1 geometry as control, then band-16 inner chunks in the same shard, and
-        # band-split shards (8 per meta-shard) as the fallback rung.
+        # band-split shards (8 per processing shard) as the fallback rung.
         Variant("v2_c0", (1, 256, 256, 128), _V2_SHARD),
         Variant("v2_c1", (1, 256, 256, 16), _V2_SHARD),
         Variant("v2_c2", (1, 512, 512, 16), _V2_SHARD),

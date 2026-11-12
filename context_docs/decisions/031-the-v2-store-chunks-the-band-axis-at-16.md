@@ -2,8 +2,8 @@
 
 **Status:**
 
-- **Accepted 2026-10-22 (repo owner):** `embeddings` is band-first, and each meta-shard is stored as
-  eight 16-band shards (§4). Inference makes the reorder to band-first as it stages each meta-shard.
+- **Accepted 2026-10-22 (repo owner):** `embeddings` is band-first, and each processing shard is stored as
+  eight 16-band shards (§4). Inference makes the reorder to band-first as it stages each processing shard.
 - **Accepted 2026-10-28 (repo owner):** a v2 store keeps its 10 m arrays in a child group `0` of each
   zone group (`utm33/0/`, or `0/` in a single-area store), so coarser multiscale levels can be added
   beside it later (§1). No coarser level is planned yet.
@@ -22,11 +22,11 @@ test on AWS (T10): the 16-band study
 ([results](../../scripts/scoping/scale_tests/v2_layout_results.md)) and the narrow-band study
 ([results](../../scripts/scoping/scale_tests/v2_narrow_band_results.md)).
 
-**Meta-shards, shards and chunks.** An array divides into three nested pieces. *Shard* and *chunk* mean what zarr
-means by them; the 2,048² block above them is a *meta-shard*:
+**Processing shards, shards and chunks.** An array divides into three nested pieces. *Shard* and *chunk* mean what zarr
+means by them; the 2,048² block above them is a *processing shard*:
 
 ```
-meta-shard   2,048 × 2,048 px × 128 bands             one inference run
+processing shard   2,048 × 2,048 px × 128 bands             one inference run
 │
 ├── shard 1   bands 0–15                       one object in S3 (zarr's `shards=`)
 ├── …
@@ -40,7 +40,7 @@ meta-shard   2,048 × 2,048 px × 128 bands             one inference run
 
 | term | what it is | names in the library's code |
 |---|---|---|
-| meta-shard | the 2,048 × 2,048 px block that one inference run produces, and the unit that is staged, assembled, registered and updated; every shard of every array covers exactly one meta-shard's footprint, so a v1.1 meta-shard holds one embeddings shard and a v2 meta-shard eight | `SHARD_PX` and "2048-px shard", `ChunkSpec`, `chunk_<row>_<col>`, the registry's `tile` column |
+| processing shard | the 2,048 × 2,048 px block that one inference run produces, and the unit that is staged, assembled, registered and updated; every shard of every array covers exactly one processing shard's footprint, so a v1.1 processing shard holds one embeddings shard and a v2 processing shard eight | `SHARD_PX` and "2048-px shard", `ChunkSpec`, `chunk_<row>_<col>`, the registry's `tile` column |
 | shard | zarr's shard: one stored object holding a grid of chunks and their index | `shards=` |
 | chunk | the smallest piece a reader can fetch: one byte-range request within a shard | `chunks=` |
 
@@ -51,7 +51,7 @@ band.
 
 **The layouts measured, by name.** The archives use the names in the last column.
 
-| name here | band order | shards per meta-shard | chunk | archive name |
+| name here | band order | shards per processing shard | chunk | archive name |
 |---|---|---|---|---|
 | v1.1 layout (the control) | band-last | 1 | 256² × 128 bands | `v2_c0` |
 | band-last, one shard | band-last | 1 | 512² × 16 | `v2_c2_zstd1_s256` |
@@ -67,14 +67,14 @@ band.
 
 ## 1. Settled in either band order
 
-**The 2,048² meta-shard stays.** One inference run is one meta-shard, and the 4,096-px ingest chunk
-is set by Dask's scheduler, so nothing upstream of assembly moves. Only how a meta-shard is split
+**The 2,048² processing shard stays.** One inference run is one processing shard, and the 4,096-px ingest chunk
+is set by Dask's scheduler, so nothing upstream of assembly moves. Only how a processing shard is split
 into shards and chunks changes.
 
 | choice | value | why |
 |---|---|---|
-| shards | 16 bands each, eight per meta-shard | the smallest prefix v2 was trained on; §6 weighs 8-band, 4-band and variable-width shards |
-| chunk, spatially | 512 × 512 px | 256² builds 4× the Dask tasks at default chunks and 204–260 serial requests per 16-band read of 2 × 2 meta-shards on zarr 3.2; 1,024² makes a full vector cost 134 MB |
+| shards | 16 bands each, eight per processing shard | the smallest prefix v2 was trained on; §6 weighs 8-band, 4-band and variable-width shards |
+| chunk, spatially | 512 × 512 px | 256² builds 4× the Dask tasks at default chunks and 204–260 serial requests per 16-band read of 2 × 2 processing shards on zarr 3.2; 1,024² makes a full vector cost 134 MB |
 | chunk, bands | 4 | phones and browsers fetch only the bands they read (§4) |
 | int8 codec | zstd at level 1 | within 3% of the default level's bytes at 0.6× its encode CPU, once bands are split |
 | chunk order within a shard | zarr's default (Morton) | the other orders moved request counts by under 20%, and an order is not persisted, so it would need library code on every write path |
@@ -150,16 +150,16 @@ root/          geoemb: attributes                  root/     geoemb:, proj:, spa
 
 ## 2. What was measured in the 16-band study
 
-Eight real v2 meta-shards: four from Iowa (cropland, including a 52%-valid edge meta-shard) and four
+Eight real v2 processing shards: four from Iowa (cropland, including a 52%-valid edge processing shard) and four
 from Puget Sound (city, open water, coast and conifer forest). T10 repeated them into a
-100-meta-shard store on S3 and read it cold from an r7i.4xlarge in the same region, two passes in
-opposite order, every layout in one session. Encode CPU is per meta-shard on a Graviton m7g.4xlarge,
+store of 100 processing shards on S3 and read it cold from an r7i.4xlarge in the same region, two passes in
+opposite order, every layout in one session. Encode CPU is per processing shard on a Graviton m7g.4xlarge,
 the assembly runner's architecture. All four candidates use 512 × 512 × 16 chunks and zstd at
-level 1. An "8 × 8 area" is 8 × 8 meta-shards.
+level 1. An "8 × 8 area" is 8 × 8 processing shards.
 
 | | v1.1 layout | band-last, one shard | band-last, 16-band shards | band-first, one shard | band-first, 16-band shards |
 |---|---|---|---|---|---|
-| encode CPU per meta-shard | 3.36 s | 0.83× | 0.81× | 0.75× | 0.74× |
+| encode CPU per processing shard | 3.36 s | 0.83× | 0.81× | 0.75× | 0.74× |
 | stored | 38.9 GB | −3% | −3% | **−23%** | **−23%** |
 | 16-band read, 8 × 8 area | 20.2 s | 5.4 s | 5.0 s | 5.5 s | **4.9 s** |
 | 64-band read, 8 × 8 area | 24.2 s | 20.1 s | 18.0 s | 16.7 s | **14.7 s** |
@@ -175,8 +175,8 @@ level 1. An "8 × 8 area" is 8 × 8 meta-shards.
 
 | limit | threshold | plan's label |
 |---|---|---|
-| assembly CPU and wall time per meta-shard | ≤ 1.20× | W1 |
-| shards per meta-shard | ≤ 8× (≤ 32× in the narrow-band study) | W2 |
+| assembly CPU and wall time per processing shard | ≤ 1.20× | W1 |
+| shards per processing shard | ≤ 8× (≤ 32× in the narrow-band study) | W2 |
 | single-pixel read of all 128 bands | ≤ 1.25× | R1 |
 | bulk read speed at 128 bands | ≥ 0.9× | R2 |
 | old client (zarr 3.2), slowest read | ≤ 2× | R3 |
@@ -185,17 +185,17 @@ level 1. An "8 × 8 area" is 8 × 8 meta-shards.
 too.
 
 **Every layout passes the assembly limit.** The library's own assembly code wrote 64 staged Iowa
-meta-shards into each layout on Graviton.
+processing shards into each layout on Graviton.
 
-- **Band-last:** 0.90–0.91× the v1.1 layout's worker CPU per meta-shard.
+- **Band-last:** 0.90–0.91× the v1.1 layout's worker CPU per processing shard.
 - **Band-first:** 1.17×, at 0.94–1.00× its wall time. This was measured with a prototype writer
-  that reorders each band-last staged meta-shard as it writes it.
+  that reorders each band-last staged processing shard as it writes it.
 - **Why 1.17× is an upper bound:** a band-first pipeline does that reorder earlier, in inference
   (§3), so assembly will not pay it. How far below 1.17× it lands is unmeasured: encoding alone costs
-  0.74× in band-first order, but assembly also reads and checks the staged meta-shards and writes the
+  0.74× in band-first order, but assembly also reads and checks the staged processing shards and writes the
   other arrays, none of which the reorder changes.
 
-**Every layout is lossless.** Read back, every array of all 64 assembled meta-shards is identical to
+**Every layout is lossless.** Read back, every array of all 64 assembled processing shards is identical to
 the v1.1 layout's, band-first arrays after reordering.
 
 **In band-last order a 128-band bulk read is 1.5–1.7× slower than the v1.1 layout**, across both
@@ -206,9 +206,9 @@ slower, the v1.1 layout included.
 
 **In band-first order the same read is level with the v1.1 layout**, and it moves 23% fewer bytes.
 Each piece is a set of whole planes, so putting it back is a few large copies: 0.06 s per 128-band
-meta-shard against 0.15 s band-last, on one laptop core.
+processing shard against 0.15 s band-last, on one laptop core.
 
-**One shard per meta-shard fails the old-client limit on full vectors, in either order.** zarr 3.2
+**One shard per processing shard fails the old-client limit on full vectors, in either order.** zarr 3.2
 fetches a shard's pieces one after another, so a single-pixel read of 128 bands takes 2.4× the
 v1.1 layout's time in band-first order and 3.1× in band-last. Eight 16-band shards pass, because
 even zarr 3.2 fetches separate shards concurrently. On zarr 3.2, band-first 16-band shards are
@@ -234,10 +234,10 @@ clients.
 |---|---|---|
 | **ingest** | unchanged | unchanged: the same code and settings, so the same performance (below) |
 | **inference, inputs** | unchanged | unchanged: the model reads pixels, assembled from per-band mosaics as today |
-| **inference, outputs** | unchanged | reordered once per meta-shard on the actor's background writer thread (below) |
+| **inference, outputs** | unchanged | reordered once per processing shard on the actor's background writer thread (below) |
 | **appending a year** | an end-append on the time axis (ADR 008 D1) | the same: time stays the leading axis, chunked at 1, so a new year's chunks are new keys and no existing chunk moves |
 | **encode CPU** | 0.81–0.83× v1.1 | 0.74–0.75× v1.1 |
-| **assembly worker CPU** | 0.90–0.91× v1.1 | 1.17× v1.1 with assembly reordering band-last staged meta-shards: an upper bound once inference stages them band-first |
+| **assembly worker CPU** | 0.90–0.91× v1.1 | 1.17× v1.1 with assembly reordering band-last staged processing shards: an upper bound once inference stages them band-first |
 | **storage** | −3% | −23%, band-planar compression for free |
 | **reads** | 16 bands about 4× faster than v1.1; 128-band bulk 1.5–1.7× slower | 16 bands about 4× faster; 64 bands 1.4–1.6× faster; 128 bands level with v1.1 |
 | **readers' tools** | per-pixel readers (scikit-learn) get `(…, band)` directly | rioxarray refuses `(y, x, band)`; PyTorch convolutions take channels first; AlphaEarth's Source Coop copy is `(time, band, y, x)` |
@@ -253,27 +253,27 @@ identity: `config/store_layout.py` sits inside ingest's identity closure, so *an
 the ingest identity once. Moving the chunk-sizing function into its own module ends that. The
 prototype's ingest identity was then the same with and without a preset.
 
-**The inference cost of band-first is about a second of background CPU per meta-shard.** The model
-emits one row of 128 values per pixel, so a band-first meta-shard has to be reordered once, after the
+**The inference cost of band-first is about a second of background CPU per processing shard.** The model
+emits one row of 128 values per pixel, so a band-first processing shard has to be reordered once, after the
 model runs. Ingest cannot do it: its mosaics are already one array per spectral band, and the
 embeddings do not exist until inference. The cheapest place is the staged write, which already runs
-on the actor's single-slot writer thread and overlaps the next meta-shard's work. Writing the
+on the actor's single-slot writer thread and overlaps the next processing shard's work. Writing the
 existing `(y, x, band)` buffer through a transposed view costs 0.6–1.0 s of one laptop core per
-meta-shard. It needs no copy of the whole meta-shard and no GPU time. Reordering on the GPU or on the
-main thread instead added 2.5–7.4 s per meta-shard on an L4 host.
+processing shard. It needs no copy of the whole processing shard and no GPU time. Reordering on the GPU or on the
+main thread instead added 2.5–7.4 s per processing shard on an L4 host.
 
-**That writer has room, by the Iowa v2 runs' own logs (786 meta-shards).**
+**That writer has room, by the Iowa v2 runs' own logs (786 processing shards).**
 
 - **Upload against inference time:** the staged upload takes 16.6 s (median), against 164–166 s of
-  inference per meta-shard, with the GPU at 100% (median).
-- **Where it already waits:** the next meta-shard waits on the upload only on the 5.6% of
-  meta-shards that finish fast, adding 0.5 s per meta-shard on average.
-- **What the reorder adds:** another 1–2 s on each upload. The next meta-shard can wait at most that
-  much longer, so the reorder costs at most 1–2 s per meta-shard, about 1% of its inference time. A
-  meta-shard waits only when the next one finishes before its upload does, which today is the 5.6%
+  inference per processing shard, with the GPU at 100% (median).
+- **Where it already waits:** the next processing shard waits on the upload only on the 5.6% of
+  processing shards that finish fast, adding 0.5 s per processing shard on average.
+- **What the reorder adds:** another 1–2 s on each upload. The next processing shard can wait at most that
+  much longer, so the reorder costs at most 1–2 s per processing shard, about 1% of its inference time. A
+  processing shard waits only when the next one finishes before its upload does, which today is the 5.6%
   above.
 
-**A reader who wants the other order pays a transpose either way.** Turning one 128-band meta-shard
+**A reader who wants the other order pays a transpose either way.** Turning one 128-band processing shard
 from `(band, y, x)` into `(y, x, band)` takes 0.17 s with torch on 10 threads, or 1.2 s with numpy on
 one. At 16 bands it takes 0.05 s. A channel-first reader of a band-last store pays the same in
 reverse.
@@ -282,13 +282,13 @@ reverse.
 staging validation, the shard writer and the update merge, the layout helpers, validation and the
 registry, and about 11 sites in yield-embeddings (coarsening and validation). Each must handle both
 orders, because the v1.1 store stays band-last. Some failures would be silent. `commit_tiles`, for
-example, labels a meta-shard by chunk coordinates 1 and 2, which in band-first order are band and
+example, labels a processing shard by chunk coordinates 1 and 2, which in band-first order are band and
 `y`.
 
 ## 4. Decision
 
-**Accepted: band-first, each meta-shard stored as eight 16-band shards of 4-band chunks.**
-`embeddings` is `(time, band, y, x)`. Each meta-shard's 128 bands are stored as eight shards of
+**Accepted: band-first, each processing shard stored as eight 16-band shards of 4-band chunks.**
+`embeddings` is `(time, band, y, x)`. Each processing shard's 128 bands are stored as eight shards of
 1 × 16 × 2,048 × 2,048, one for each block of 16 dimensions (zarr's `shards=`). Each shard holds
 chunks of 1 × 4 × 512 × 512, compressed with zstd at level 1. `scales` and the other arrays keep
 their v1.1 shards, in 512² chunks.
@@ -304,22 +304,22 @@ amounts in the next subsection.
 - **Storage:** 23% smaller, at 0.74× the encode CPU.
 
 Each alternative fails a limit. Band-last fails the bulk-read limit in either shard form.
-Band-first in one shard per meta-shard fails the old-client limit on a single-pixel read.
+Band-first in one shard per processing shard fails the old-client limit on a single-pixel read.
 
 **What it costs:**
 
 - **Library code:** the changes after inference listed in §3, kept order-aware for as long as the
   v1.1 store is updated.
-- **Inference:** one reorder per meta-shard on the staging writer thread, at most about 1% of its
+- **Inference:** one reorder per processing shard on the staging writer thread, at most about 1% of its
   inference time.
-- **Shards:** eight embeddings shards and writes per meta-shard instead of one.
+- **Shards:** eight embeddings shards and writes per processing shard instead of one.
 - **Readers:** a transpose for per-pixel readers who want `(…, band)`.
 
-**The reorder is inference's, as it stages each meta-shard.** Staged meta-shards, the shard writer,
+**The reorder is inference's, as it stages each processing shard.** Staged processing shards, the shard writer,
 updates and readers all see band-first, so no stage after inference reorders anything.
 
 **Rejected: reordering in assembly instead.** It would leave inference's code untouched, at 1.17×
-the v1.1 layout's assembly CPU, above what assembling band-first staged meta-shards will cost. It was
+the v1.1 layout's assembly CPU, above what assembling band-first staged processing shards will cost. It was
 turned down because band-first all the way through is the cleaner pipeline, and inference's part of
 it costs at most about 1% of inference time.
 
@@ -327,12 +327,12 @@ it costs at most about 1% of inference time.
 
 **Accepted 2026-11-09 (repo owner): path 2.** Phones and browsers read 4 or 8 bands over a slow link,
 where read time follows the bytes fetched (§6). A 16-band chunk makes them fetch four times what a
-4-band read needs. Two paths were weighed. Both keep the eight 16-band shards per meta-shard; they
+4-band read needs. Two paths were weighed. Both keep the eight 16-band shards per processing shard; they
 differ in who pays.
 
 - **Path 1: 16-band chunks, plus a preview store.** `embeddings` keeps chunks of
   1 × 16 × 512 × 512. A separate Zarr store holds only the first 4 or 8 bands of every pixel's
-  codes, one shard per meta-shard, in 512 × 512 × 4-band chunks. It needs no `scales`: a preview
+  codes, one shard per processing shard, in 512 × 512 × 4-band chunks. It needs no `scales`: a preview
   renders codes, and cosine similarity ignores the per-pixel scale.
 - **Path 2: 4-band chunks.** `embeddings` gets chunks of 1 × 4 × 512 × 512 inside the same
   16-band shards. One store, which every reader uses as it is.
@@ -346,7 +346,7 @@ differ in who pays.
 | Dask with chunks matched to shards | unchanged, and twice as fast as at default chunks | 1.10× 16-band chunks' time at 16 bands, 1.12× at 128, measured |
 | storage | +3% (4-band preview) or +6% (8-band) | unchanged |
 | stores to write and keep in step | two: every write and targeted update writes both | one |
-| assembly CPU | a few percent more for the preview; not measured | +9% over 16-band chunks, measured; about $30 across a campaign of v1.1's 3.23 million meta-shards |
+| assembly CPU | a few percent more for the preview; not measured | +9% over 16-band chunks, measured; about $30 across a campaign of v1.1's 3.23 million processing shards |
 | ingest and inference | unchanged | unchanged |
 | what a reader must know | where the preview store is | nothing |
 | browsers | the preview store can be plain Zarr, which zarrita.js reads over HTTP with no icechunk index | zarrita.js reads the regular grid; the main store is icechunk, so a browser also needs icechunk's JavaScript reader |
@@ -358,7 +358,7 @@ more assembly CPU, which the repo owner ruled on 2026-10-28 that assembly has th
 reads up to 13% slower; and Dask reads about 10% slower with chunks matched to shards. It had to be
 chosen before the v2 campaign writes, since changing chunks afterwards re-compresses every shard.
 
-**Neither path touches ingest or inference.** Inference stages each meta-shard uncompressed in its
+**Neither path touches ingest or inference.** Inference stages each processing shard uncompressed in its
 own fixed geometry, 256 × 256 px pieces holding all 128 bands (`ZarrWriter.write_chunk`), so the
 store's chunk width never reaches it. Assembly is where chunks are made and compressed, so it carries
 path 2's extra CPU, and path 1's preview store if assembly writes it.
@@ -378,7 +378,9 @@ the same code unchanged.
   single-area store's `embedding_std`) as `(time, band, y, x)` in 1 × 16 × 2,048 × 2,048 shards of
   1 × 4 × 512 × 512 chunks, `embeddings` compressed with zstd at level 1. Every other array keeps
   v1.1's shards and codecs, in 512² chunks: with one chunk edge for every array, an area under
-  2,048 px that is not a multiple of 512 still clamps every array to the same shard height. `INNER_PX` stays 256, so the land mask's `chunk_live_256` and the staged
+  2,048 px clamps every array to the same shard height. That height is the area rounded up to
+  whole chunks (768 px gives one 1,024-px shard), so the area's one inference tile is one shard on
+  the first fill and on every update. `INNER_PX` stays 256, so the land mask's `chunk_live_256` and the staged
   tiles' geometry are unchanged. `layout_for(model, single=)` gives a new store its
   model's preset; an existing store keeps the geometry it was created with.
 - **Level group `0`** (§1). Seeding and single-area assembly create every array and coordinate in
@@ -396,7 +398,7 @@ the same code unchanged.
   The shard writer, the holes merge, the single-area append, staged-tile validation and
   `StagedShardSource` all use them. Shard pitch and extent are read from `scales`, which is
   `(time, Y, X)` in every layout.
-- **Inference stages v2 meta-shards band-first.** `ZarrWriter(band_first=True)` writes the actor's
+- **Inference stages v2 processing shards band-first.** `ZarrWriter(band_first=True)` writes the actor's
   `(y, x, band)` buffer through a transposed view on the writer thread; the actor sets it from its
   model's preset. A tile staged in either order still assembles into either store.
 - **`config/store_geometry.py` holds what is read from a store**, and the chunk clamp, apart from
@@ -410,8 +412,8 @@ the same code unchanged.
   `embedding_prefixes` (16, 32, 64, 128, from `ModelFamily.prefixes`). The reader guide
   ([`docs/global-store.md`](../../docs/global-store.md#stores-built-with-v2)) gives the `33N/0` path,
   zarr ≥ 3.3, and Dask chunks matched to shards (`chunks={"band": 16, "y": 2048, "x": 2048}`).
-- **Eight shards per meta-shard mean 8× the embeddings shards, index entries and writes.** The
-  busiest v1.1 zone-year wrote 9,132 meta-shards, so a v2 zone-year holds at most about 140,000 index
+- **Eight shards per processing shard mean 8× the embeddings shards, index entries and writes.** The
+  busiest v1.1 zone-year wrote 9,132 processing shards, so a v2 zone-year holds at most about 140,000 index
   entries across all eight arrays. That is far below D4's 10⁶ split threshold, and about 56 MB of
   commit memory at 400 bytes per entry.
 - **Each shard's own index is about 1 KB**, for 64 chunks, against 260 bytes for 16.
@@ -441,7 +443,7 @@ Some also slow full-vector reads, and a browser's Zarr client cannot read the va
 layout and 16-band shards with 16-band chunks in the same sessions. The shard limit was raised to
 32× so that 4-band shards could compete.
 
-| | bands per shard | chunk | shards per meta-shard | chunk grid |
+| | bands per shard | chunk | shards per processing shard | chunk grid |
 |---|---|---|---|---|
 | 16-band shards, 16-band chunks | 16 | 512² × 16 | 8 | regular |
 | 8-band shards | 8 | 512² × 8 | 16 | regular |
@@ -486,7 +488,7 @@ Each cell is good-link seconds / poor-link seconds, with the MB fetched in brack
   should read like them.
 - **4-band chunks help a 4-band reader twice as much as 8-band ones.** At 8 bands the two are
   level.
-- **The first read** of a session loads the store index. On these 100-meta-shard test stores it took
+- **The first read** of a session loads the store index. On these test stores of 100 processing shards it took
   0.2–0.3 s on the good link and 0.5–0.8 s on the poor one. At full scale the index is larger (the
   next table).
 
@@ -502,7 +504,7 @@ the v1.1 layout.
 | 16-band read through Dask, default chunks | 1.45 | 2.45 | 2.09 | 2.47 | 2.32 | 1.48 |
 | zarr 3.2, slowest read vs v1.1 (16-band chunks: 0.97) | 1.19 | 1.52 | 1.23 | 2.81 | 4.74 | 3.14 |
 | assembly worker CPU vs v1.1 (16-band chunks: 1.19) | 1.23 | 1.31 | 1.30 | 1.30 | 1.31 | 1.23 |
-| encode CPU per meta-shard vs v1.1, Graviton (16-band chunks: 0.78) | 0.80 | 0.86 | 0.82 | 0.82 | 0.82 | 0.79 |
+| encode CPU per processing shard vs v1.1, Graviton (16-band chunks: 0.78) | 0.80 | 0.86 | 0.82 | 0.82 | 0.82 | 0.79 |
 | embeddings store index, busiest zone-year | 3.1 MB | 6.1 MB | 1.5 MB | 1.2 MB | 0.8 MB | 0.6 MB |
 
 - **Storage is unchanged.** Every candidate stores exactly the bytes of 16-band chunks.
@@ -561,9 +563,9 @@ parentheses.
 | variable 8, 8, 112 | 1.23 | 3× | pass | pass | (3.14×) |
 
 **Assembly is read against 16-band chunks, not the threshold.** Assembly ran through the band-first
-prototype writer, which reorders each band-last staged meta-shard as it writes it (§2). That inflates
+prototype writer, which reorders each band-last staged processing shard as it writes it (§2). That inflates
 every layout alike, and puts 16-band chunks themselves at 1.19×. Against them, 8-band chunks add
-about 3% of worker CPU and 4-band chunks 9–10%: for path 2, 10.10 s per meta-shard against 9.30 s.
+about 3% of worker CPU and 4-band chunks 9–10%: for path 2, 10.10 s per processing shard against 9.30 s.
 That extra is encoding more, smaller pieces, and moving the reorder into inference does not remove
 it. Wall time per run was level for every layout.
 
@@ -582,7 +584,7 @@ it. Wall time per run was level for every layout.
   the group ("conflicting sizes for dimension").
 - **The library's shard writer reads `.shards`**, which raises on these arrays
   (`shard_writer.shard_pitch`). It would have to read `write_chunk_sizes` instead.
-- **On zarr 3.2, a wide variable-width shard behaves like one shard per meta-shard.** Its pieces are
+- **On zarr 3.2, a wide variable-width shard behaves like one shard per processing shard.** Its pieces are
   fetched one after another, which is why a single-pixel read of 128 bands takes 2.8–4.7× the v1.1
   layout's time.
 - **For readers who opt in, they read like the regular layout with the same chunk width.** On a

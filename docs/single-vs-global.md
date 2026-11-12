@@ -481,7 +481,7 @@ Single-area stores use the same geometry — but those are nominal maxima: `crea
 clamps chunks and shards to the array, so a store smaller than one shard has a finer grid and
 a cheaper point read than the figures above.
 
-**v2 stores split the band axis.** `embeddings` is `(time, band, y, x)`, each meta-shard stored as
+**v2 stores split the band axis.** `embeddings` is `(time, band, y, x)`, each processing shard stored as
 eight shards of 16 bands, each cut into 512 × 512-pixel chunks of 4 bands (1.05 MB raw), so a
 reader of the first 16 dimensions fetches an eighth of a full vector and a phone reading 4 fetches
 a thirty-second. Every array, coordinates included, sits in the zone's level group `0` (`33N/0`, or

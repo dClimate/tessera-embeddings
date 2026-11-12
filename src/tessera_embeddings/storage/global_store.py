@@ -264,7 +264,7 @@ def _layout_band(layout: StoreLayout) -> int:
     """The band extent of a layout's ``embeddings``, checked against its band shards.
 
     Zone seeding requires a *sharded* layout (D3: the whole global write path is shard-aligned)
-    whose band shards tile the band axis exactly, so every meta-shard's bands fill whole shards.
+    whose band shards tile the band axis exactly, so every processing shard's bands fill whole shards.
     v1.1 keeps all 128 bands in one shard (D2); v2 splits them into 16-band shards (ADR 031).
     Both are enforced here, loudly: an unsharded layout, or band shards that do not tile the band
     axis, would seed zones the fill cannot write.

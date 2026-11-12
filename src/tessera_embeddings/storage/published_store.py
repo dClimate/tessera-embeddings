@@ -229,7 +229,7 @@ async def live_shards_async(
     """:func:`live_shards`, for a caller that already has an event loop."""
     by_year: dict[int, set[tuple[int, int]]] = {}
     holder = level0(cast("zarr.Group", zarr.open_group(session.store, mode="r")[zone]))
-    # Axes by name: a band-first v2 `embeddings` holds eight band shards per meta-shard, at positions
+    # Axes by name: a band-first v2 `embeddings` holds eight band shards per processing shard, at positions
     # (time, band, y, x); the set folds them into one (shard_y, shard_x) entry.
     roles = axis_roles(dims_of(holder[var]))
     t, y, x = (roles.index(role) for role in ("time", "Y", "X"))

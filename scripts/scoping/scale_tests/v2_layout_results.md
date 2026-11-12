@@ -19,18 +19,18 @@ microbenchmarks behind the ADR's inference and reader figures.
 
 The T10 boxes ran a tarball of the branch, so their records say `git unknown`. The code column comes
 from matching each box's start time and shipped files to the branch's commits. `v2d` ran a prototype
-whose shard writer accepts a band-first `embeddings` array: it writes each band-last staged meta-shard
+whose shard writer accepts a band-first `embeddings` array: it writes each band-last staged processing shard
 through a transposed view, a reorder a band-first pipeline would make in inference instead.
 
-**The meta-shards** are v2 Large outputs from dev runs: four Iowa meta-shards from the paired run that
-verified the library upgrade in PR #242 (cropland, including a 52%-valid edge meta-shard), and four
-Puget Sound meta-shards (city, open water, coast and conifer forest). A meta-shard is the 2,048²
-block one inference run produces. T9 builds 2 × 2 meta-shards per area. T10 cycles all eight into
-10 × 10 meta-shards.
+**The processing shards** are v2 Large outputs from dev runs: four Iowa processing shards from the paired run that
+verified the library upgrade in PR #242 (cropland, including a 52%-valid edge processing shard), and four
+Puget Sound processing shards (city, open water, coast and conifer forest). A processing shard is the 2,048²
+block one inference run produces. T9 builds 2 × 2 processing shards per area. T10 cycles all eight into
+10 × 10 processing shards.
 
 **Arm names.** `v2_c0` is v1.1's geometry (256² × 128 inner chunks, default zstd). `c1` and `c2` are
-256² × 16 and 512² × 16 inner chunks in one 2,048² × 128 shard per meta-shard; `b2` splits the
-meta-shard into eight 2,048² × 16 shards. `zstd1` is zstd at level 1, `T` the transpose codec, `s256` the `scales` inner
+256² × 16 and 512² × 16 inner chunks in one 2,048² × 128 shard per processing shard; `b2` splits the
+processing shard into eight 2,048² × 16 shards. `zstd1` is zstd at level 1, `T` the transpose codec, `s256` the `scales` inner
 chunk, and `bandfirst` the `(time, band, northing, easting)` dimension order.
 
 ## T9 — Iowa (`t9iowa`)
@@ -44,7 +44,7 @@ chunk, and `bandfirst` the `(time, band, northing, easting)` dimension order.
 
 ### T9 — v2 layout arms
 
-| arm | embeddings MB | ratio | encode CPU s/meta-shard |
+| arm | embeddings MB | ratio | encode CPU s/processing shard |
 |---|---|---|---|
 | v2_b2 | 1270 | 1.45 | 1.755 |
 | v2_b2_blosc_bitshuffle | 1200 | 1.54 | 2.102 |
@@ -79,7 +79,7 @@ chunk, and `bandfirst` the `(time, band, northing, easting)` dimension order.
 
 #### Requests / MB fetched, zarr3.2
 
-| arm | point 16 | point 128 | window 16 | meta-shard 16 | bulk 16 | bulk 64 | bulk 128 |
+| arm | point 16 | point 128 | window 16 | processing shard 16 | bulk 16 | bulk 64 | bulk 128 |
 |---|---|---|---|---|---|---|---|
 | v2_b2 | 2 / 2.8 | 15 / 19.2 | 7 / 13.3 | 1 / 25.7 | 4 / 186.1 | 16 / 648.1 | 32 / 1269.8 |
 | v2_b2_blosc_bitshuffle | 2 / 2.4 | 15 / 18.0 | 7 / 11.4 | 1 / 21.9 | 4 / 159.5 | 16 / 602.1 | 32 / 1200.3 |
@@ -114,7 +114,7 @@ chunk, and `bandfirst` the `(time, band, northing, easting)` dimension order.
 
 #### Requests / MB fetched, zarr3.4
 
-| arm | point 16 | point 128 | window 16 | meta-shard 16 | bulk 16 | bulk 64 | bulk 128 |
+| arm | point 16 | point 128 | window 16 | processing shard 16 | bulk 16 | bulk 64 | bulk 128 |
 |---|---|---|---|---|---|---|---|
 | v2_b2 | 2 / 2.8 | 15 / 19.2 | 4 / 14.2 | 1 / 25.7 | 4 / 186.1 | 16 / 648.1 | 32 / 1269.8 |
 | v2_b2_blosc_bitshuffle | 2 / 2.4 | 15 / 18.0 | 4 / 12.2 | 1 / 21.9 | 4 / 159.5 | 16 / 602.1 | 32 / 1200.3 |
@@ -175,7 +175,7 @@ chunk, and `bandfirst` the `(time, band, northing, easting)` dimension order.
 
 ### T9 — v2 layout arms
 
-| arm | embeddings MB | ratio | encode CPU s/meta-shard |
+| arm | embeddings MB | ratio | encode CPU s/processing shard |
 |---|---|---|---|
 | v2_b2 | 1672 | 1.28 | 1.959 |
 | v2_b2_blosc_bitshuffle | 1776 | 1.21 | 2.257 |
@@ -210,7 +210,7 @@ chunk, and `bandfirst` the `(time, band, northing, easting)` dimension order.
 
 #### Requests / MB fetched, zarr3.2
 
-| arm | point 16 | point 128 | window 16 | meta-shard 16 | bulk 16 | bulk 64 | bulk 128 |
+| arm | point 16 | point 128 | window 16 | processing shard 16 | bulk 16 | bulk 64 | bulk 128 |
 |---|---|---|---|---|---|---|---|
 | v2_b2 | 2 / 3.8 | 16 / 26.2 | 10 / 31.7 | 1 / 57.8 | 4 / 244.8 | 16 / 839.3 | 32 / 1672.0 |
 | v2_b2_blosc_bitshuffle | 2 / 3.6 | 16 / 27.8 | 10 / 27.7 | 1 / 50.4 | 4 / 233.1 | 16 / 877.8 | 32 / 1775.6 |
@@ -245,7 +245,7 @@ chunk, and `bandfirst` the `(time, band, northing, easting)` dimension order.
 
 #### Requests / MB fetched, zarr3.4
 
-| arm | point 16 | point 128 | window 16 | meta-shard 16 | bulk 16 | bulk 64 | bulk 128 |
+| arm | point 16 | point 128 | window 16 | processing shard 16 | bulk 16 | bulk 64 | bulk 128 |
 |---|---|---|---|---|---|---|---|
 | v2_b2 | 2 / 3.8 | 16 / 26.2 | 5 / 31.7 | 1 / 57.8 | 4 / 244.8 | 16 / 839.3 | 32 / 1672.0 |
 | v2_b2_blosc_bitshuffle | 2 / 3.6 | 16 / 27.8 | 5 / 27.7 | 1 / 50.4 | 4 / 233.1 | 16 / 877.8 | 32 / 1775.6 |
@@ -304,7 +304,7 @@ chunk, and `bandfirst` the `(time, band, northing, easting)` dimension order.
 
 > Contention/latency numbers are only load-bearing on `--backend s3`.
 
-### T10 — assembly code: CPU per staged meta-shard, wall per run (median of passes)
+### T10 — assembly code: CPU per staged processing shard, wall per run (median of passes)
 
 | arm | worker CPU s | vs C0 | write CPU s | vs C0 | wall s, whole run | stored GB |
 |---|---|---|---|---|---|---|
@@ -353,7 +353,7 @@ Wall seconds; two values are passes 0 and 1.
 
 > Contention/latency numbers are only load-bearing on `--backend s3`.
 
-### T10 — bench store build, encode CPU per meta-shard
+### T10 — bench store build, encode CPU per processing shard
 
 | arm | encode CPU s | vs C0 | stored GB | vs C0 |
 |---|---|---|---|---|
@@ -373,7 +373,7 @@ Wall seconds; two values are passes 0 and 1.
 
 > Contention/latency numbers are only load-bearing on `--backend s3`.
 
-### T10 — bench store build, encode CPU per meta-shard
+### T10 — bench store build, encode CPU per processing shard
 
 | arm | encode CPU s | vs C0 | stored GB | vs C0 |
 |---|---|---|---|---|
@@ -430,7 +430,7 @@ Wall seconds; two values are passes 0 and 1.
 
 ### T10 — lossless check against C0
 
-| arm | stores | meta-shards | mismatched (array, meta-shard) pairs |
+| arm | stores | processing shards | mismatched (array, processing shard) pairs |
 |---|---|---|---|
 | v2_b2_zstd1_s256 | t10 | 16 | 0 |
 | v2_b2f_bandfirst_zstd1_s256 | t10 | 16 | 0 |
@@ -446,7 +446,7 @@ Wall seconds; two values are passes 0 and 1.
 
 > Contention/latency numbers are only load-bearing on `--backend s3`.
 
-### T10 — assembly code: CPU per staged meta-shard, wall per run (median of passes)
+### T10 — assembly code: CPU per staged processing shard, wall per run (median of passes)
 
 | arm | worker CPU s | vs C0 | write CPU s | vs C0 | wall s, whole run | stored GB |
 |---|---|---|---|---|---|---|
@@ -458,7 +458,7 @@ Wall seconds; two values are passes 0 and 1.
 
 ### T10 — lossless check against C0
 
-| arm | stores | meta-shards | mismatched (array, meta-shard) pairs |
+| arm | stores | processing shards | mismatched (array, processing shard) pairs |
 |---|---|---|---|
 | v2_b2_zstd1_s256 | t10asm/p0 | 64 | 0 |
 | v2_b2f_bandfirst_zstd1_s256 | t10asm/p0 | 64 | 0 |
@@ -467,7 +467,7 @@ Wall seconds; two values are passes 0 and 1.
 
 ## The request counter against S3's own count (`v2c`, from the verification box's log)
 
-One cold 16-d 8 × 8-meta-shard pull per arm ran alone on the prefix a temporary S3 request-metrics filter
+One cold 16-d pull of 8 × 8 processing shards per arm ran alone on the prefix a temporary S3 request-metrics filter
 covered, three minutes apart. CloudWatch's `GetRequests` (1-minute sums) against the counter:
 
 | arm | counter | S3 GETs | icechunk's split, predicted |
@@ -500,7 +500,7 @@ speeds up.
 ## Microbenchmarks
 
 **The Dask graph of a lazy whole-zone open** (laptop, metadata-only local stores the size of the
-largest v1.1 zone: 456 × 33 meta-shards, nine years). Opening is free in every layout; the task count is
+largest v1.1 zone: 456 × 33 processing shards, nine years). Opening is free in every layout; the task count is
 what a read builds at xarray's default chunks, one per inner chunk.
 
 | layout | inner chunk | chunks, whole zone | tasks for one year at 16 dims, after culling | graph build |
@@ -510,33 +510,33 @@ what a read builds at xarray's default chunks, one per inner chunk.
 
 A 16-d reader builds a quarter of C0's tasks; a 128-d reader builds twice C0's.
 
-**Producing a band-first meta-shard in inference.** Each arm mirrors the inference write path for
-one 2,048² meta-shard (585 batches of 7,168 pixels, int8 quantisation on the GPU). It ran on a g6.xlarge
+**Producing a band-first processing shard in inference.** Each arm mirrors the inference write path for
+one 2,048² processing shard (585 batches of 7,168 pixels, int8 quantisation on the GPU). It ran on a g6.xlarge
 (NVIDIA L4, torch 2.14.1+cu130), median of three repeats. Pixel order was random, which is
 pessimistic for the column scatter; the dataset's bucketed order cut it about 20% on a laptop.
 
-| arm | per meta-shard |
+| arm | per processing shard |
 |---|---|
 | today's row slot and row scatter, band-last | 0.39 s |
-| transpose on the GPU, then a column scatter into a band-first meta-shard | 7.75 s |
-| today's path, then one CPU transpose of the finished meta-shard | 2.92 s |
+| transpose on the GPU, then a column scatter into a band-first processing shard | 7.75 s |
+| today's path, then one CPU transpose of the finished processing shard | 2.92 s |
 
 **The staging writer's headroom, from the Iowa v2 inference runs' actor logs** (both arms of the
-#242 pair, 786 meta-shards, band-last staging; `Staging write … completed` and `Deferred write … blocked
+#242 pair, 786 processing shards, band-last staging; `Staging write … completed` and `Deferred write … blocked
 collection` lines in `/ec2/global-tessera-dev/ray`, each counted once):
 
 | | |
 |---|---|
-| time per meta-shard, median | 164–166 s (157–158 s of it inference), GPU 100% (median) |
+| time per processing shard, median | 164–166 s (157–158 s of it inference), GPU 100% (median) |
 | staged upload on the writer thread, median / p95 / max | 16.6 / 21.8 / 24.8 s |
-| meta-shards whose next meta-shard waited on the upload | 44 of 786 (5.6%), 408 s in all, median 8.4 s |
-| average wait per meta-shard | 0.5 s, about 0.3% of its time |
+| processing shards whose next processing shard waited on the upload | 44 of 786 (5.6%), 408 s in all, median 8.4 s |
+| average wait per processing shard | 0.5 s, about 0.3% of its time |
 
-**Writing the staged meta-shard band-first instead** (laptop, zarr 3.4.1, memory store, no compression,
-one 2,048² × 128 meta-shard): 0.05 s band-last; 0.63 s band-first at 128 × 256² chunks and 1.00 s at
-16 × 512² chunks, through a transposed view of the band-last buffer, with no copy of the whole meta-shard.
+**Writing the staged processing shard band-first instead** (laptop, zarr 3.4.1, memory store, no compression,
+one 2,048² × 128 processing shard): 0.05 s band-last; 0.63 s band-first at 128 × 256² chunks and 1.00 s at
+16 × 512² chunks, through a transposed view of the band-last buffer, with no copy of the whole processing shard.
 
-**Reader-side costs per 2,048² meta-shard** (laptop, one core unless noted):
+**Reader-side costs per 2,048² processing shard** (laptop, one core unless noted):
 
 | | 16-d | 128-d |
 |---|---|---|
@@ -545,7 +545,7 @@ one 2,048² × 128 meta-shard): 0.05 s band-last; 0.63 s band-first at 128 × 25
 | transpose band-first → `(y, x, band)`, numpy | 0.050 s | 1.24 s |
 | same, torch on 10 threads | | 0.17 s |
 
-**Why band-first compresses better**, on fully valid 512² × 16 chunks of the four Iowa meta-shards:
+**Why band-first compresses better**, on fully valid 512² × 16 chunks of the four Iowa processing shards:
 
 | | band-last | band-first |
 |---|---|---|
