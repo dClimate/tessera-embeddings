@@ -320,6 +320,7 @@ def plan_from_registry(
     """
     # THE SCHEMA IS STATED, as every whole-registry read must (`registry.py`): inferred, it comes from
     # the first file, and cell files written before and after a column was added then fail to scan.
+    zones = None if zones is None else tuple(zones)  # read twice below: by group, then by half
     columns = pa.schema([f for f in master_schema() if f.name not in _PARTITION_KEYS])
     rows = pl.scan_parquet(
         f"{registry_root.rstrip('/')}/master/**/*.parquet",

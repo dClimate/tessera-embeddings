@@ -178,6 +178,8 @@ def test_a_columns_two_halves_fill_one_group(tmp_path, staged):
     node = _node()
     assert (south["tag"], node.attrs["years_complete"]) == ("zone-utm01s-2025", [2025])
     assert {h: r["run_id"] for h, r in node.attrs["runs"]["2025"].items()} == {"n": "runN", "s": "runS"}
+    with pytest.raises(ValueError, match="fill its halves"):
+        run_fill(tmp_path, store, zone="utm01", land_mask_path=mask, mosaic_base=mosaic_base)
     result = np.asarray(node["embeddings"][1])
     for label, emb in staged.items():
         row, col = (int(p) for p in label.split("_")[1:])

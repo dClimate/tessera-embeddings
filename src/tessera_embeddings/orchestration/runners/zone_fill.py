@@ -95,7 +95,13 @@ from tessera_embeddings.storage.update import (
     update_state,
 )
 from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group, plain_zarr_storage_options
-from tessera_embeddings.storage.zone_grid import PIXEL_M, canonicalize_zone, group_and_half, tile_row_latitudes
+from tessera_embeddings.storage.zone_grid import (
+    PIXEL_M,
+    canonicalize_zone,
+    fill_zones_of,
+    group_and_half,
+    tile_row_latitudes,
+)
 from tessera_embeddings.storage.zone_grid import zone as zone_spec
 
 
@@ -481,7 +487,7 @@ def fill_zone_year(
 
     Args:
         store_path: URI of the global Icechunk repo (``BucketPaths.global_store()``).
-        zone: Zone group name, e.g. ``"utm33"`` or ``"01N"`` (ADR 037).
+        zone: Fill zone, e.g. ``"utm33s"`` (a column half) or ``"01N"`` (ADRs 037, 038).
         year: Campaign calendar year — must be on the group's pre-allocated axis.
         land_mask_path: Partner-supplied boolean zarr on the zone pixel grid.
         mosaic_base: Base path of the zone's ingest mosaic stores.
@@ -773,6 +779,9 @@ def plan_zone_inference(
     t0 = time.monotonic()
     run_id = run_id or run_id_prefix(config.model_version) + uuid.uuid4().hex[:12]
 
+    # A column is filled as its halves; named whole it has no mask or mosaic, and would mark its year whole.
+    if (halves := fill_zones_of(zone)) != (zone,):
+        raise ValueError(f"{zone} is a whole column; fill its halves {halves} (ADR 038)")
     # The seeded zone group is the grid authority.
     repo, root, node = _require_zone(store_path, zone, get_credentials=get_credentials, s3_region=s3_region)
     group, half = group_and_half(zone)
