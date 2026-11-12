@@ -171,20 +171,14 @@ def _schema_audit(fs: pyarrow.fs.FileSystem, run_files: list[dict[str, Any]]) ->
     # `assembled_at` or `embedded` as nullable, and a null identity there breaks latest-wins.
     declared = {field.name: (str(field.type), field.nullable) for field in registry_schema()}
     missing: dict[str, list[str]] = {}
-    predating: dict[str, list[str]] = {}
     extra: dict[str, list[str]] = {}
     retyped: dict[str, list[str]] = {}
     without_identity: list[str] = []
     for run_file in run_files:
         schema = pq.read_schema(run_file["path"], filesystem=fs)
         present = {field.name: (str(field.type), field.nullable) for field in schema}
-        absent = set(declared) - set(present)
-        # A nullable column added after the file was written reads back null, as designed; only a
-        # missing non-nullable column is a fault.
-        if required := sorted(n for n in absent if not declared[n][1]):
-            missing[run_file["path"]] = required
-        if later := sorted(n for n in absent if declared[n][1]):
-            predating[run_file["path"]] = later
+        if absent := sorted(set(declared) - set(present)):
+            missing[run_file["path"]] = absent
         if surplus := sorted(set(present) - set(declared)):
             extra[run_file["path"]] = surplus
         if wrong := sorted(n for n in set(declared) & set(present) if declared[n] != present[n]):
@@ -201,7 +195,6 @@ def _schema_audit(fs: pyarrow.fs.FileSystem, run_files: list[dict[str, Any]]) ->
             without_identity.append(run_file["path"])
     return {
         "run_files_missing_declared_columns": missing,
-        "run_files_predating_nullable_columns": predating,
         "run_files_with_undeclared_columns": extra,
         "run_files_with_wrong_column_types": retyped,
         "run_files_whose_metadata_disagrees_with_its_path": without_identity,
@@ -582,7 +575,7 @@ def main(argv: list[str] | None = None) -> int:
         report["schema_audit"]["wall_s"] = round(time.monotonic() - started, 2)
         audit = report["schema_audit"]
         print(f"\nschema audit ({audit['wall_s']}s over {len(run_files)} footers):")
-        for key in (*_SCHEMA_FINDINGS, "run_files_predating_nullable_columns"):
+        for key in _SCHEMA_FINDINGS:
             print(f"  {key}: {len(audit[key])}")
 
     # BOTH ways, to see which columns an inferring reader loses. The two wall times are NOT a

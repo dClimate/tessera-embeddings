@@ -122,7 +122,7 @@ Four new pieces under `provenance/` beside the registry, and one new registry co
 
 ```text
   <store>.registry/
-  ├── master/  runs/           the existing registry; both gain a `source_runs` column
+  ├── master/  runs/           the existing registry; `master/` gains a `source_runs` column
   └── provenance/
       ├── granules/      zone=33N/year=2024/<sensor>-<snapshot>.parquet   per mosaic snapshot: its granules
       ├── shard_dates/   zone=33N/year=2024/<run>.parquet    per run: one row per shard, sensor and date
@@ -179,11 +179,14 @@ its `update_pixels` marks them, one boolean mask per shard, and its planes are c
 mask. Every other pixel keeps the record of the run before it (§5). Whether a pixel has an
 embedding is in the store and the registry.
 
-**`source_runs`: which runs a shard's pixels came from.** A new registry column listing them
-oldest first: the fill, then each update that wrote or cleared the shard, in order. A holes update
-appends itself; a shards update restarts the list at itself. It is null unless every run in the
-list carries a record, and it is recomputed from the store every time the registry is merged or
-rebuilt, never copied from an old row.
+**`source_runs`: which runs a shard's pixels came from.** A new column on the registry's master
+listing them oldest first, from the store's shard commits that wrote or cleared the shard, in the
+order they landed. A fill or a shards update restarts the list at itself; a holes update appends
+itself. So a refill drops the updates before it, and of two concurrent refills the one whose shards
+landed last owns the shard. It is null unless every run in the list carries a record, or when a
+commit's shards can no longer be read (a run from before commits were tagged, or an expired
+commit). It is recomputed from the store every time the master is merged or rebuilt, never copied
+from an old row.
 
 ## 4. How it is made
 
@@ -372,7 +375,7 @@ The last column is the first draft's choice, where reviews of the plan or the bu
 | a record per run, with `update_pixels` and `source_runs` | one record per shard-year | a holes update mixes two runs in one shard | one per shard-year |
 | `update_pixels` marks what a holes update embedded, and its planes are cut to it | the pixels it was asked to embed | one meaning: exactly where a reader takes the update's record; its refused pixels keep the earlier run's record, which covers them | the pixels asked for |
 | a fill or shards update records refused pixels too | only embedded pixels | a refused shard still says what imagery it had; the store says what was embedded | |
-| `source_runs` recomputed from the store at every merge and rebuild, on run file rows too | kept on the master only | a rebuild replaces the master's run id and rebuilds the master from run files | the master only |
+| `source_runs` on the master only, recomputed at every merge and rebuild from the store's shard commits in the order they landed | also on run file rows, derived from the zone group's `runs` and `updates` records | the records keep a refill's earlier updates and name whichever refill recorded itself last, so they do not say which runs' shards a tile holds; a run file's copy would be a second account, and every merge rewrites the master's anyway | the master only |
 | a separate Icechunk store for the planes | arrays inside the published store | each run has its own dates; the published store and its conventions stay untouched | |
 | failure to publish fails the zone-year | publish best-effort and log | a zone-year can never be published without its record, and the retry repairs it | best-effort, then a gate |
 | one switch, off by default, recorded in the mosaic, mismatches refused | always on | internal and dev stores neither need it nor pay its ingest cost, and dev stores from before the change stay usable | always on, no ingest cost expected |
@@ -558,7 +561,7 @@ Both forms were run against the record the unit tests build and return the same 
 `inference/provenance.py`. Publication and its checks: `inference/provenance_publish.py`, called
 from `runners/zone_fill.py` on the fill and update paths and on retry of a landed but untagged
 cell. Tables and layout: `storage/provenance.py`. `source_runs`: `published_store.source_runs`,
-applied by every registry merge and rebuild. The reader helpers: `storage/provenance_reader.py`.
+applied to the master by every registry merge and rebuild. The reader helpers: `storage/provenance_reader.py`.
 
 **Checks at publication**, each failing the zone-year: every mosaic slot has a granule list; the
 three mosaics agree on the switch; every embedded shard staged a record; each plane's positive

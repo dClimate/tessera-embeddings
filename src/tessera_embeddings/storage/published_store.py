@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime
+from functools import cache
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import numpy as np
@@ -321,26 +322,48 @@ def commit_tiles(repo: icechunk.Repository, zone: str, time_index: int, snapshot
     )
 
 
-def source_runs(attrs: Mapping[str, Any], year: int, tile: str) -> list[str] | None:
-    """The runs whose pixels ``tile`` holds in ``year``, oldest first, each with a provenance record.
+def source_runs(
+    attrs: Mapping[str, Any], year: int, commits: Sequence[Commit], tiles_of: Callable[[str], frozenset[str]]
+) -> Callable[[str], list[str] | None]:
+    """Each tile's runs in ``year``, oldest first, from the year's shard commits in the order they landed.
 
-    From the zone group's own records, never from an older registry row: the fill in ``runs[year]``,
-    then each entry of ``updates[year]`` that wrote or cleared the tile, in order. A ``holes`` update
-    adds itself, since the tile keeps the earlier run's other pixels; a ``shards`` update replaces
-    the whole tile and restarts the list at itself. A run carries a record when its input mosaics
-    did, which it notes as ``input_coverage.provenance_version``.
+    ``commits`` and ``tiles_of`` are :class:`StoreYear`'s: the store's own account of who wrote the year
+    and what each commit wrote, never an older registry row or the order run records landed in. For each
+    commit that wrote or cleared a tile: a ``holes`` update adds itself, since the tile keeps the
+    earlier runs' other pixels; a fill or a ``shards`` update replaces the whole tile and restarts the
+    list at itself. So a refill drops every update before it, and of two concurrent refills the one
+    whose shards landed last owns the tile.
 
-    ``None`` unless every run in the list carries one, so a reader can tell a tile with no complete
-    record — all of v1.1, and anything filled with the switch off — from one that has it
-    (``context_docs/storage/registry-provenance-plan.md`` §5).
+    ``None`` unless every run in a tile's list carries a provenance record, which a run notes as
+    ``input_coverage.provenance_version`` in its ``runs`` or ``updates`` entry, so a reader can tell a
+    tile with no complete record (all of v1.1, anything filled with the switch off) from one that has
+    it (``context_docs/storage/registry-provenance-plan.md`` §5). ``None`` for every tile when a
+    non-empty commit's tiles cannot be read (a run from before tags, or an expired commit), since
+    the order is then unknown. The diffs are read once, on the first call.
     """
     head = (attrs.get("runs") or {}).get(str(year))
-    lineage: list[Mapping[str, Any]] = [head] if isinstance(head, Mapping) else []
-    for update in (attrs.get("updates") or {}).get(str(year), []):
-        if tile in (*update.get("written", ()), *update.get("cleared", ())):
-            lineage = [*lineage, update] if update.get("mode") == "holes" else [update]
-    carried = [entry for entry in lineage if (entry.get("input_coverage") or {}).get("provenance_version")]
-    return [str(entry["run_id"]) for entry in lineage] if lineage and len(carried) == len(lineage) else None
+    entries = [*([head] if isinstance(head, Mapping) else []), *(attrs.get("updates") or {}).get(str(year), [])]
+    carried = {e["run_id"] for e in entries if (e.get("input_coverage") or {}).get("provenance_version")}
+    holes = {e["run_id"] for e in entries if e.get("mode") == "holes"}
+
+    @cache
+    def lineage() -> dict[str, list[str]] | None:
+        runs: dict[str, list[str]] = {}
+        for commit in commits:
+            if commit.snapshot is None:
+                if commit.empty:
+                    continue
+                return None
+            for tile in tiles_of(commit.snapshot):
+                kept = runs.get(tile, []) if commit.run_id in holes else []
+                runs[tile] = [*kept, commit.run_id] if kept[-1:] != [commit.run_id] else kept
+        return runs
+
+    def of(tile: str) -> list[str] | None:
+        found = (lineage() or {}).get(tile)
+        return found if found and carried.issuperset(found) else None
+
+    return of
 
 
 def _no_source_runs(_tile: str) -> list[str] | None:
@@ -372,12 +395,8 @@ def store_year(
     """
     time_index = calendar_years(group).index(year)
     runs = committed_runs(group.attrs, year, writes.get((zone, year), ()))
-    attrs = dict(group.attrs)
-    return StoreYear(
-        runs,
-        lambda snapshot: commit_tiles(repo, zone, time_index, snapshot),
-        lambda tile: source_runs(attrs, year, tile),
-    )
+    tiles_of = cache(lambda snapshot: commit_tiles(repo, zone, time_index, snapshot))
+    return StoreYear(runs, tiles_of, source_runs(dict(group.attrs), year, runs, tiles_of))
 
 
 def shard_pixel_window(

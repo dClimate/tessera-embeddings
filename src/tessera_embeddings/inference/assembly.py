@@ -98,7 +98,6 @@ from tessera_embeddings.storage.global_store import create_layout_arrays, open_g
 from tessera_embeddings.storage.icechunk_logging import traced_commit
 from tessera_embeddings.storage.manifest import EmbeddingManifest, extract_manifest
 from tessera_embeddings.storage.object_store import delete_prefix
-from tessera_embeddings.storage.published_store import source_runs as published_source_runs
 from tessera_embeddings.storage.registry import RegistryRun, registry_rows, run_file_uri, write_run_file
 from tessera_embeddings.storage.shard_writer import (
     PhaseTimer,
@@ -1218,7 +1217,6 @@ class ZarrWriter:
                     bboxes=boxes,
                     code=build,
                     update_name=run.update_name,
-                    source_runs=run.source_runs,
                 ),
                 open_output=lambda target: fs.open(target, "wb"),
                 # The rule is in the key-value block too, so a run file read on its own, without the
@@ -2753,8 +2751,6 @@ class ZarrWriter:
         # the store, and consumers are told they need not open the store, so a run file written any
         # earlier could advertise a cell that never landed.
         if registry_root:
-            # The tiles' runs as the store records them now, this run's record included.
-            attrs = dict(zarr.open_group(repo.readonly_session(snapshot_id=snapshot).store, mode="r")[zone].attrs)
             self.publish_registry_run_file(
                 registry_root,
                 RegistryRun(
@@ -2767,7 +2763,6 @@ class ZarrWriter:
                     optical_min_obs=optical_min_obs,
                     embedded_records=embedded_records,
                     update_name=update_name,
-                    source_runs=lambda tile: published_source_runs(attrs, year, tile),
                 ),
                 # The store's own callback: the registry is its sibling in the same bucket, so the
                 # credential that opened the store is the one that can write beside it.

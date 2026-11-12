@@ -112,12 +112,16 @@ def master_schema() -> pa.Schema:
     ``measured_by`` is ``"fill"``, ``"rebuild"`` or null, never inferred from the presence of a
     value. ``filled_at`` is the fill stamp of the run the row describes: a fill row's own
     ``assembled_at``, which on a re-derived row would otherwise be lost to the re-derivation's.
+    ``source_runs`` is the runs whose pixels the tile holds, oldest first, for finding it in the
+    provenance record; master-only, since every merge derives it afresh from the store's shard
+    commits (:func:`~.published_store.source_runs`). Null where the tile has no complete record.
     """
     return pa.schema(
         [
             *dataset_schema(),
             pa.field("measured_by", pa.string()),
             pa.field("filled_at", pa.string()),
+            pa.field("source_runs", pa.list_(pa.string())),
         ]
     )
 

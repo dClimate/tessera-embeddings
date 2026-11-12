@@ -87,7 +87,6 @@ from tessera_embeddings.ingest.land_mask import narrow_tile_live
 from tessera_embeddings.storage.campaign import mark_zone_year_empty, pin_tag, tag_zone_year, zone_year_tag
 from tessera_embeddings.storage.global_store import check_destination_types, open_global_repo
 from tessera_embeddings.storage.published_store import calendar_years, live_shards, shard_writes, store_year
-from tessera_embeddings.storage.published_store import source_runs as published_source_runs
 from tessera_embeddings.storage.registry import RegistryRun
 from tessera_embeddings.storage.registry_master import merge_cell
 from tessera_embeddings.storage.registry_rebuild import as_coverage_record, rebuild_tile
@@ -1700,7 +1699,6 @@ def _publish_merged_rows(
     registry write after a commit: the cell has landed.
     """
     records: dict[str, dict] = {}
-    attrs: dict[str, Any] = {}
     # A store with no depth rule refused no pixel as thin, so none may be counted below a line.
     thin_below = optical_min_obs or 0
     try:
@@ -1708,7 +1706,6 @@ def _publish_merged_rows(
             branch="main"
         )
         node = cast(zarr.Group, zarr.open_group(session.store, mode="r")[zone])
-        attrs = dict(node.attrs)
         year_index = calendar_years(node).index(year)
         with ThreadPoolExecutor(max_workers=16) as pool:
             rows = pool.map(
@@ -1736,6 +1733,5 @@ def _publish_merged_rows(
         optical_min_obs=optical_min_obs,
         embedded_records=records,
         update_name=update_name,
-        source_runs=lambda tile: published_source_runs(attrs, year, tile) if attrs else None,
     )
     writer.publish_registry_run_file(registry_root, run, get_credentials=get_credentials, s3_region=s3_region)

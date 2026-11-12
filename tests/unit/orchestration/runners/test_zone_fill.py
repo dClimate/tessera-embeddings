@@ -1106,7 +1106,6 @@ def test_a_fill_names_its_run_in_source_runs_only_when_its_mosaics_carried_the_r
         run_id="runP",
     )
     expected = [["runP"]] if carried else [None]
-    assert _published_part(registry_root)["source_runs"] == expected
     master = pytest.importorskip("pyarrow.parquet").read_table(
         f"{registry_root}/master/zone={ZONE}/year=2025/part-0.parquet"
     )

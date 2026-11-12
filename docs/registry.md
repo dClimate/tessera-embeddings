@@ -148,7 +148,7 @@ where `store_group` is the zone's group opened with xarray, as in the store's
 | `run_id`, `assembled_at` | the run the row came from, and when it was written: the fill, or for a re-derived row the re-derivation |
 | `code_version`, `code_commit` | the build of the tessera-embeddings repository that ran the fill |
 | `update_name` | the targeted update that last rewrote the tile ([ADR 027](../context_docs/decisions/027-targeted-updates.md)), null where the tile is still the campaign's fill |
-| `source_runs` | the runs whose pixels the tile holds, oldest first, for finding them in the provenance record below; null for v1.1 and wherever the tile has no complete record |
+| `source_runs` | on `master/` only: the runs whose pixels the tile holds, oldest first, for finding them in the provenance record below; null for v1.1 and wherever the tile has no complete record |
 
 The quality rule is the store's: a pixel is embedded only if it had at least `optical_min_obs`
 usable optical observations in the year: the store root's value, or a lower one a targeted update
@@ -271,8 +271,9 @@ pixels its `update_pixels` mask marks, the pixels it embedded, and a fill or a s
 every pixel; the first run that holds the pixel has its record. `source_runs` is null where the tile
 has no complete record. One more case has none: a refused tile whose run staged no record for it,
 which that run's `shard_dates` file lists in its `unrecorded_tiles` metadata; `pixel_granules`
-raises `LookupError` for both. `source_runs` is derived from the store's own record of who wrote the tile at every
-merge, never copied from an older row. The record says what went in, not how much each image
+raises `LookupError` for both. Every merge derives `source_runs` afresh from the store's shard
+commits, in the order they landed: a fill or a shards update starts the list again, and a holes
+update adds itself. It is never copied from an older row. The record says what went in, not how much each image
 mattered: the model has no attribution. For a pixel observed more often than the model's longest
 sequence, the model reads a fixed subset of these dates, chosen by a deterministic rule from the
 dates alone.
