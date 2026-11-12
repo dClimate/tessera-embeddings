@@ -55,7 +55,7 @@ def test_v2_stores_embeddings_band_first_in_16_band_shards_of_4_band_chunks(v2):
     """ADR 031: every other array keeps v1.1's geometry but for 512² chunks, and every array sits in level group 0.
 
     One spatial chunk edge is what clamps every array of an area under one shard (768 px here) to the
-    same shard height, which assembly requires.
+    same shard height, which assembly requires: one shard per axis, the size of its one inference tile.
     """
     v1 = SINGLE if "embedding_std" in v2.arrays else GLOBAL
     band_arrays = {"embeddings", "embedding_std"} & v2.arrays.keys()
@@ -71,7 +71,7 @@ def test_v2_stores_embeddings_band_first_in_16_band_shards_of_4_band_chunks(v2):
     pitches = {
         v2.for_var(var).create_kwargs(tuple(shape[d] for d in a.dims))["shards"][-2] for var, a in v2.arrays.items()
     }
-    assert pitches == {512}
+    assert pitches == {1024}
     assert (v2.level, v1.level, v2.bands) == ("0", None, EMBEDDING_DIM)
 
 
@@ -102,12 +102,12 @@ def test_the_inference_tile_is_one_shard():
 
 
 def test_chunks_and_shards_clamp_to_small_shape():
-    # A store smaller than one nominal shard must still create cleanly.
+    """An area smaller than one nominal shard is one shard, rounded up to whole chunks, as its one inference tile is."""
     k = GLOBAL.for_var("embeddings").create_kwargs((1, 300, 300, EMBEDDING_DIM))
-    assert k["chunks"] == (1, 256, 256, EMBEDDING_DIM)
-    # shard clamped to a whole multiple of the (clamped) chunk within shape
-    assert k["shards"][1] % k["chunks"][1] == 0
-    assert k["shards"][1] <= 300
+    assert (k["chunks"], k["shards"]) == ((1, 256, 256, EMBEDDING_DIM), (1, 512, 512, EMBEDDING_DIM))
+    arr = zarr.create_array(zarr.storage.MemoryStore(), **k)
+    arr[:] = np.ones(arr.shape, dtype=arr.dtype)
+    assert arr[:].all()
 
 
 def test_sharded_roundtrip_and_fill(tmp_path):

@@ -133,8 +133,9 @@ class ArrayLayout:
     def create_kwargs(self, shape: tuple[int, ...]) -> dict:
         """Build ``zarr.Group.create_array`` kwargs for an array of ``shape``.
 
-        Chunks (and shards, kept a whole multiple of the clamped chunks) are clamped to ``shape``
-        so a store smaller than one nominal chunk/shard still creates cleanly.
+        Chunks and shards are clamped to ``shape`` by
+        :func:`~tessera_embeddings.config.store_geometry.clamp_chunks_and_shards`, so a store smaller
+        than one nominal chunk/shard still creates cleanly.
         """
         if len(shape) != len(self.dims):
             raise ValueError(f"shape {shape} has {len(shape)} dims, layout expects {len(self.dims)} ({self.dims})")
