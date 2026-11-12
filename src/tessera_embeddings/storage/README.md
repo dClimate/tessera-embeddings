@@ -12,8 +12,10 @@ that dies part way leaves nothing half-written.
 **`zone_grid.py`** defines the groups a global store is divided into, and each one's map
 projection, extent and name. A v1.1 store has 120 groups, `01N` to `60S`: 60 longitude bands,
 split north and south. A v2 store has 60, `utm01` to `utm60`, one whole band each, which the
-campaign fills as two halves, `utm01n` and `utm01s` (ADRs 037, 038). Changing the world's
-coverage means changing this.
+campaign fills as two halves, `utm01n` and `utm01s` (ADRs 037, 038). Two functions translate
+between them: `group_and_half` gives the group and half a fill zone writes, and `fill_zones_of`
+gives the halves that make up a band named whole, as the registry and an operator may name it.
+Changing the world's coverage means changing this.
 
 **`conventions.py`** writes the labels that travel with the data, so someone opening it can
 tell what the numbers mean without asking us. A new metadata standard goes here.

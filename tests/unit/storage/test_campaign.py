@@ -145,6 +145,7 @@ def test_a_column_year_completes_with_its_second_half(seed):
     write_year_shards(repo, "utm01", 0, _OneInnerChunkSource(), n_workers=1, shard_px=_SHARD, run_id="north", half="n")
     status = campaign.campaign_status(repo, years=_YEARS)
     assert (status.has("utm01n", 2023), status.has("utm01s", 2023), status.zones["utm01"]) == (True, False, ())
+    assert status.zone_years_done == 1, "a landed half is data the seed must not stamp over"
     assert campaign.campaign_work_list(status, set(), years=(2023,))[:2] == [("utm01n", 2023), ("utm01s", 2023)]
 
     campaign.mark_zone_year_empty(repo, "utm01s", 2023, run_id="south")

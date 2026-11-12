@@ -92,9 +92,10 @@ DRILL_EXIT_STATUS = 93
 #: rather than a way to study it.
 MAX_HOLD_MINUTES = 45.0
 
-#: The canonical zone name, i.e. exactly what ``zone_grid.canonicalize_zone`` emits:
-#: zero-padded zone number 01-60, prefixed ``utm`` or followed by the hemisphere.
-_CANONICAL_ZONE = re.compile(r"utm(0[1-9]|[1-5][0-9]|60)[ns]?|(0[1-9]|[1-5][0-9]|60)[NS]")
+#: A canonical fill zone, as ``zone_grid.canonicalize_zone`` emits it: zero-padded zone number
+#: 01-60, followed by the hemisphere or prefixed ``utm`` with its column half. A whole column is
+#: never a cell, so it could never fire.
+_CANONICAL_ZONE = re.compile(r"utm(0[1-9]|[1-5][0-9]|60)[ns]|(0[1-9]|[1-5][0-9]|60)[NS]")
 
 #: How long the announcement gets before the armed timer ends the process without it. A healthy
 #: flush is milliseconds, so this is three orders of magnitude of headroom; and it is small

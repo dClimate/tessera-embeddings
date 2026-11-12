@@ -120,6 +120,20 @@ def test_a_plan_can_come_from_the_registry(tmp_path, refused, aoi, cells):
 
 
 @pytest.mark.parametrize(
+    ("zones", "cells"),
+    [
+        (None, {"utm33n/2019": ("chunk_455_3",), "utm33s/2019": ("chunk_456_3",)}),
+        (["utm33s"], {"utm33s/2019": ("chunk_456_3",)}),
+    ],
+)
+def test_a_registry_column_is_planned_as_the_halves_its_tiles_lie_in(tmp_path, zones, cells):
+    """ADR 038: the registry keys a v2 column whole; each tile goes to the half holding its row."""
+    box = (0.0, 0.0, 1.0, 1.0)
+    root = _master(tmp_path, {("utm33", 2019): [_row("chunk_455_3", 1, box), _row("chunk_456_3", 1, box)]})
+    assert upd.plan_from_registry(root, name="halves", mode="shards", zones=zones).cells == cells
+
+
+@pytest.mark.parametrize(
     ("query", "match"),
     [({"refused": "thin"}, "selects no tiles"), ({"aoi": (179.0, 0.0, -179.0, 1.0)}, "crosses the antimeridian")],
 )

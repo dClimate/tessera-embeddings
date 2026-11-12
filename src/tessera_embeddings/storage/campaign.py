@@ -271,8 +271,8 @@ class CampaignStatus:
 
     @property
     def zone_years_done(self) -> int:
-        """Total ``(zone, year)`` cells landed across all seeded zones."""
-        return sum(len(v) for v in self.zones.values())
+        """Total fill-zone cells landed: a column's halves count as they land, before the year completes."""
+        return sum(len(v) for v in (self.halves or self.zones).values())
 
     def campaign_zones(self) -> tuple[str, ...]:
         """The full campaign: every fill zone of the layout this store's groups use (ADR 037, 038)."""

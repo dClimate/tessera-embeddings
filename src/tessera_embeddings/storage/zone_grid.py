@@ -213,6 +213,18 @@ def group_and_half(name: str) -> tuple[str, Half | None]:
     return (spec.group_name, spec.half) if spec else (name, None)
 
 
+def fill_zones_of(name: str, row: int | None = None) -> tuple[str, ...]:
+    """The fill zones that write *name*: a column's two halves, or the one holding shard *row*; else *name*.
+
+    How a column named whole (``"utm33"``, as the registry partitions it) becomes the units the
+    campaign fills, ``"utm33n"`` and ``"utm33s"`` (ADR 038). Any other name is already a fill zone.
+    """
+    if name not in _ZONES_BY_LAYOUT["utm_zones"]:
+        return (name,)
+    halves = [_FILL_ZONES_BY_LAYOUT["utm_zones"][name + h] for h in ("n", "s")]
+    return tuple(h.name for h in halves if row is None or h.tile_rows[0] <= row < h.tile_rows[1])
+
+
 def zone_layout_of(names: Iterable[str]) -> ZoneLayout | None:
     """The layout the zone *names* belong to, or ``None`` when none is a zone.
 

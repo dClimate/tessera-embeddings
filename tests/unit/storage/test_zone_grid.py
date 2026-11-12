@@ -62,6 +62,13 @@ def test_a_column_is_filled_as_two_halves_split_on_a_shard_row():
         ("10S", None),
         ("", None),
     ]
+    equator = north.tile_rows[1]
+    assert [zg.fill_zones_of("utm10", r) for r in (None, equator - 1, equator)] == [
+        ("utm10n", "utm10s"),
+        ("utm10n",),
+        ("utm10s",),
+    ]
+    assert zg.fill_zones_of("utm10s") == ("utm10s",) and zg.fill_zones_of("10S", 0) == ("10S",)
 
 
 def test_zone_layout_of():
@@ -107,7 +114,8 @@ def test_canonicalize_zone(raw, expected):
     name = zg.canonicalize_zone(raw)
     assert name == expected
     zg.zone(name)  # every parse maps to a real zone
-    assert _CANONICAL_ZONE.fullmatch(name)  # the fault drill's copy of this format agrees
+    # The fault drill's copy of this format agrees, for the fill zones it can fire on (not a whole column).
+    assert bool(_CANONICAL_ZONE.fullmatch(name)) == (zg.fill_zones_of(name) == (name,))
 
 
 @pytest.mark.parametrize("bad", ["N33", "0N", "61N", "33X", "utm61", "utm33x", "utm33ns"])

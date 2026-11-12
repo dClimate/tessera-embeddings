@@ -172,7 +172,7 @@ python scripts/update/plan_update.py from-registry \
 |---|---|
 | `--inputs` | the deployment's `paths.inputs`. The plan is written under it, where the flows look for it |
 | `--refused` | keep tiles that left pixels empty for this reason: `thin` (too few optical observations), `no_optical` (none at all), `no_radar` (no radar observation), or `any`. Without it, every tile is kept |
-| `--zones`, `--years` | keep only these zones and years, comma-separated |
+| `--zones`, `--years` | keep only these zones and years, comma-separated. In a v2 store, name a half (`utm19s`) or a whole band (`utm19`); the registry lists a band whole, and the plan splits its tiles into the half each lies in, since an update fills halves |
 | `--aoi=W,S,E,N` | keep tiles that overlap this box of longitudes and latitudes. Write it with `=`, or a negative first number is read as an option. It may not cross the 180° meridian; plan each side separately |
 | `--registry` | the registry's location: the folder that holds `master/` |
 | `--region` | the S3 region of the registry and the land mask (default `us-west-2`) |

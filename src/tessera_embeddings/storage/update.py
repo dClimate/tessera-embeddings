@@ -70,7 +70,7 @@ from tessera_embeddings.inference.chunk_spec import (
 from tessera_embeddings.storage.campaign import pin_tag
 from tessera_embeddings.storage.registry_master import master_schema
 from tessera_embeddings.storage.shard_writer import cell_complete, commit_with_rebase
-from tessera_embeddings.storage.zone_grid import Half, canonicalize_zone, group_and_half
+from tessera_embeddings.storage.zone_grid import Half, canonicalize_zone, fill_zones_of, group_and_half
 
 UpdateMode = Literal["holes", "shards"]
 OnSkip = Literal["keep", "clear"]
@@ -330,8 +330,8 @@ def plan_from_registry(
         extra_columns="ignore",
         storage_options=dict(storage_options) if storage_options else None,
     )
-    if zones is not None:
-        rows = rows.filter(pl.col("zone").is_in([canonicalize_zone(z) for z in zones]))
+    if zones is not None:  # the registry is partitioned by group; a half is cut out below
+        rows = rows.filter(pl.col("zone").is_in([group_and_half(canonicalize_zone(z))[0] for z in zones]))
     if years is not None:
         rows = rows.filter(pl.col("year").is_in([int(y) for y in years]))
     if refused is not None:
@@ -349,8 +349,11 @@ def plan_from_registry(
         overlaps = ((tile_west <= east) & (tile_east >= west)) | ((tile_west - 360 <= east) & (tile_east - 360 >= west))
         rows = rows.filter(overlaps & (pl.col("bbox_south") <= north) & (pl.col("bbox_north") >= south))
     source = f"registry {registry_root} refused={refused} aoi={aoi} zones={zones} years={years}"
+    tiles = _by_fill_zone(rows.select("zone", "year", "tile").collect())
+    if zones is not None:
+        tiles = tiles.filter(pl.col("zone").is_in([h for z in zones for h in fill_zones_of(canonicalize_zone(z))]))
     return plan_from_tiles(
-        rows.select("zone", "year", "tile").collect(),
+        tiles,
         name=name,
         mode=mode,
         **({"source": source} | plan_fields),
@@ -360,19 +363,30 @@ def plan_from_registry(
 def plan_from_tiles(tiles: pl.DataFrame, *, name: str, mode: UpdateMode, **plan_fields: Any) -> UpdatePlan:  # noqa: ANN401
     """Build a plan from ``zone, year, tile`` rows; a null tile asks for every live shard of its cell.
 
-    Zones are canonicalised before grouping, so ``7S`` and ``07S`` rows land in one cell.
+    Zones are canonicalised before grouping, so ``7S`` and ``07S`` rows land in one cell, and a whole
+    ``utm_zones`` column becomes the half each tile's row lies in (both, for a null tile).
 
     Raises:
         ValueError: If there are no rows.
     """
     if tiles.is_empty():
         raise ValueError(f"Update {name!r} selects no tiles")
-    zoned = tiles.with_columns(pl.col("zone").map_elements(canonicalize_zone, return_dtype=pl.String))
+    zoned = _by_fill_zone(tiles)
     cells: dict[str, tuple[str, ...] | None] = {
         cell_key(zone, year): None if any(t is None for t in group) else tuple(sorted(group))
         for zone, year, group in zoned.group_by("zone", "year").agg("tile").iter_rows()
     }
     return UpdatePlan(name=name, mode=mode, cells=cells, **plan_fields)
+
+
+def _by_fill_zone(tiles: pl.DataFrame) -> pl.DataFrame:
+    """``zone, year, tile`` rows keyed by canonical fill zone: a column's tiles go to the half holding their row."""
+    rows = [
+        (half, year, tile)
+        for zone, year, tile in tiles.select("zone", "year", "tile").iter_rows()
+        for half in fill_zones_of(canonicalize_zone(zone), None if tile is None else parse_chunk_label(tile)[0])
+    ]
+    return pl.DataFrame(rows, schema={"zone": pl.String, "year": pl.Int64, "tile": pl.String}, orient="row")
 
 
 def read_updates(node: zarr.Group, year: int) -> list[dict[str, Any]]:
@@ -405,7 +419,9 @@ def cell_optical_min_obs(root: zarr.Group, zone: str, year: int) -> int | None:
     rule = root.attrs.get("optical_min_obs")
     if rule is None:
         return None
-    records = read_updates(cast(zarr.Group, root[group_and_half(zone)[0]]), year)
+    group, half = group_and_half(zone)
+    # A half's floor is its own: the other half of the column shares the group, not its pixels.
+    records = [r for r in read_updates(cast(zarr.Group, root[group]), year) if half is None or r.get("half") == half]
     return min([int(cast("int", rule)), *(int(r["optical_min_obs"]) for r in records if r.get("optical_min_obs"))])
 
 

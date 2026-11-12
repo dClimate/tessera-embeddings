@@ -1062,7 +1062,7 @@ def write_year_shards(
     if fault is not None:
         # The drill's death lands HERE, between the two commits, and nowhere else can
         # produce this state on purpose. Inert for any other fault or any other cell.
-        fault.die_between_commits(group, year_label, log=log or _log)
+        fault.die_between_commits(group + (half or ""), year_label, log=log or _log)
     t_attrs = time.monotonic()
     # The per-year attrs go in their OWN commit (see `commit_year_attrs`), so a same-zone
     # collision costs a sub-second retry instead of this whole assembly. Return that

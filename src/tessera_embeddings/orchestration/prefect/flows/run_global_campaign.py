@@ -101,7 +101,7 @@ from tessera_embeddings.storage.update import (
     update_states,
 )
 from tessera_embeddings.storage.zarr_store import is_missing_repo, open_store_group_and_tip
-from tessera_embeddings.storage.zone_grid import canonicalize_zone, group_and_half
+from tessera_embeddings.storage.zone_grid import canonicalize_zone, fill_zones_of, group_and_half
 
 # S1/S2 grandchild ingest refs derive from this single source rather than duplicated string
 # literals, so a rename of the ingest deployments stays in ingest_zone_year.IngestDeployments.
@@ -636,9 +636,10 @@ async def run_global_campaign(
             rather than deployment names.
         store_name: Global-store repo basename.
         years: Campaign years to drive (default: all campaign years).
-        zones: Restrict the fill chain (inference + assembly) to these UTM zones, named as
-            the store's groups are (``"utm33"``, or ``"33N"`` in a hemisphere store; any case,
-            leading zero optional); ``None`` (default) drives every zone of the store's layout.
+        zones: Restrict the fill chain (inference + assembly) to these UTM zones: a column half
+            (``"utm33s"``), a whole column (``"utm33"``, filled as both halves), or ``"33N"`` in
+            a hemisphere store; any case, leading zero optional. ``None`` (default) drives every
+            zone of the store's layout.
             Either way only cells still needing work are dispatched, so a re-run of a
             partially-complete year fills only the unfinished zones (see
             :func:`campaign_work_list`).
@@ -1057,9 +1058,9 @@ async def run_global_campaign(
                 f"(fixed at seeding, ADR-008 D1) — reseed the store or drop them from `years`."
             )
 
-    # Canonical zone names ("utm33", "07S"), so a bad id fails loudly here and the rest match
-    # the store's group names exactly.
-    expected_zones = [canonicalize_zone(z) for z in zones] if zones is not None else None
+    # Canonical fill-zone names ("utm33s", "07S"), so a bad id fails loudly here; a whole column
+    # ("utm33") is its two halves, the only units a v2 mask, ROI and mosaic exist for (ADR 038).
+    expected_zones = [h for z in zones for h in fill_zones_of(canonicalize_zone(z))] if zones is not None else None
     # An explicit zones subset must be seeded: a typo that canonicalizes to a valid but
     # unseeded zone would otherwise count as pending and be ingested + filled only for the
     # fill to reject an unseeded group. (The default None spans every zone; a not-fully-seeded
@@ -1145,7 +1146,7 @@ async def run_global_campaign(
         else:
             mosaic_root = paths.inputs
             work_set = set(work)
-            sweep_zones = expected_zones if expected_zones is not None else sorted(status.zones)
+            sweep_zones = expected_zones if expected_zones is not None else status.campaign_zones()
             finished = [
                 (z, y)
                 for y in set(campaign_years)
