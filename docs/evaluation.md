@@ -39,10 +39,15 @@ Why these areas were chosen, what each costs, and what was considered and turned
 
 | labels | where to get them | files used |
 |---|---|---|
-| PASTIS-R crop types, France | the [PASTIS benchmark](https://github.com/VSainteuf/pastis-benchmark), on Zenodo | `metadata.geojson` (where each patch is, and which group it belongs to) and `ANNOTATIONS/TARGET_<id_patch>.npy` (the crop type of every pixel) |
+| PASTIS-R crop types, France | the [PASTIS benchmark](https://github.com/VSainteuf/pastis-benchmark), [Zenodo record 5735646](https://zenodo.org/records/5735646) | `metadata.geojson` (where each patch is, and which group it belongs to) and `ANNOTATIONS/TARGET_<id_patch>.npy` (the crop type of every pixel) |
 | Ethiopian crop types | the AlphaEarth evaluation data, [Zenodo record 16585402](https://zenodo.org/records/16585402) | `ethiopia_crops/ethiopia_crops.csv` |
 | Canadian crop types | the same record | `canada_crops/canada_crops_coarse/canada_crops_coarse.csv` |
 | European land cover and land use (LUCAS) | the same record | `lucas/lucas_lc/lucas_lc.csv`, `lucas/lucas_lu/lucas_lu.csv` |
+
+PASTIS-R comes as a single 54 GB zip, almost all of it satellite imagery. The two kinds of file
+above come to about 143 MB, and can be taken out of the zip on Zenodo without downloading the
+rest, since a zip file can be read in parts over HTTP (for example with Python's `zipfile` on a
+file opened with `fsspec`).
 
 Each AlphaEarth file has one row per labelled point: its longitude `x` and latitude `y`, its
 `label`, whether it is for training or testing (`split`), and the dates the label applies to. Only
@@ -191,8 +196,14 @@ the other, leave that label out for both versions, and report how many were left
 
 - **PASTIS:** use pixels from each patch's `TARGET` file, leaving out class 0 (background) and
   class 19 (unlabelled). Take at most 50 pixels per patch, chosen at random with a fixed seed.
-  PASTIS splits its patches into five groups (`fold`): train on groups 1–3 and test on group 5.
-- **The AlphaEarth files:** use every point inside the areas, with the `split` it comes with.
+  PASTIS splits its patches into five groups (`Fold`): train on groups 1–3 and test on group 5.
+  Each patch's outline in `metadata.geojson` is in the Lambert-93 projection (EPSG:2154).
+  Reprojecting its corners to the patch's UTM zone gives the patch's edges on the 10 m grid,
+  and row `i`, column `j` of its `TARGET` file is the pixel whose centre is `(i + 0.5) × 10` m
+  below the top edge and `(j + 0.5) × 10` m right of the left edge.
+- **The AlphaEarth files:** use every point inside the areas, with the `split` it comes with. A
+  point counts in the year its `valid_time_start` falls in, so the French LUCAS points, all from
+  2017 and 2018, are scored only when those years are run.
 
 **Score each set of labels** by training a logistic-regression classifier on the training points'
 embeddings and measuring it on the test points. Report the balanced accuracy, which is the average
