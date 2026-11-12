@@ -26,7 +26,7 @@ test on AWS (T10): the 16-band study
 means by them; the 2,048² block above them is a *processing shard*:
 
 ```
-processing shard   2,048 × 2,048 px × 128 bands             one inference run
+processing shard: 2,048 × 2,048 px × 128 bands, one inference run
 │
 ├── shard 1   bands 0–15                       one object in S3 (zarr's `shards=`)
 ├── …
