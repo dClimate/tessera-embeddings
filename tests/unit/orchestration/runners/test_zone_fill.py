@@ -1018,3 +1018,72 @@ def test_non_affine_mosaic_axis_raises(tmp_path, monkeypatch):
     monkeypatch.setattr(zone_fill, "run_inference", fail_if_called)
     with pytest.raises(ValueError, match=r"does not match zone .* seeded axis"):
         run_fill(tmp_path, store, land_mask_path=make_mask(tmp_path, [(0, 0)]), mosaic_base=mosaic_base)
+
+
+def _recording_publish(calls: list[dict], store: str, *, fail: bool = False):
+    """A stand-in for ``publish_provenance`` recording what it was given and whether the cell was tagged."""
+
+    def publish(run, *_args):
+        tagged = "zone-01N-2025" in global_store.open_global_repo(store).list_tags()
+        calls.append({**vars(run), "tagged": tagged})
+        if fail:
+            raise zone_fill.ProvenanceCheckError("a plane disagrees with its row")
+        return {}
+
+    return publish
+
+
+def test_provenance_is_published_before_the_tag_from_the_runs_shards(tmp_path, monkeypatch):
+    store = seed_global(tmp_path)
+    monkeypatch.setattr(zone_fill, "run_inference", staging_inference_stub({}))
+    calls: list[dict] = []
+    monkeypatch.setattr(zone_fill, "publish_provenance", _recording_publish(calls, store))
+    summary = run_fill(
+        tmp_path,
+        store,
+        land_mask_path=make_mask(tmp_path, [(0, 0), (1, 1)]),
+        mosaic_base=make_mosaic(tmp_path),
+        registry_root=str(tmp_path / "registry"),
+    )
+    assert summary["tag"]
+    [call] = calls
+    assert call["tagged"] is False, "published before the tag"
+    assert call["embedded"] == ["chunk_0_0", "chunk_1_1"] and call["refused"] == []
+    assert sorted(path.rsplit("/", 1)[-1] for path in call["mosaic_snapshots"]) == [
+        "reflectance.zarr",
+        "sar_ascending.zarr",
+        "sar_descending.zarr",
+    ]
+
+
+def test_a_failed_publication_leaves_the_cell_untagged_and_its_retry_republishes(tmp_path, monkeypatch):
+    """The cell has landed, so the retry takes the landed branch; that branch must publish before it tags."""
+    store = seed_global(tmp_path)
+    mask, mosaic_base = make_mask(tmp_path, [(0, 0)]), make_mosaic(tmp_path)
+    monkeypatch.setattr(zone_fill, "run_inference", staging_inference_stub({}))
+    calls: list[dict] = []
+    monkeypatch.setattr(zone_fill, "publish_provenance", _recording_publish(calls, store, fail=True))
+    with pytest.raises(zone_fill.ProvenanceCheckError):
+        run_fill(
+            tmp_path,
+            store,
+            land_mask_path=mask,
+            mosaic_base=mosaic_base,
+            registry_root=str(tmp_path / "registry"),
+            run_id="r1",
+        )
+    assert len(calls) == 1, "a failed check is not retried"
+    assert "zone-01N-2025" not in global_store.open_global_repo(store).list_tags()
+
+    monkeypatch.setattr(zone_fill, "publish_provenance", _recording_publish(calls, store))
+    retry = run_fill(
+        tmp_path,
+        store,
+        land_mask_path=mask,
+        mosaic_base=mosaic_base,
+        registry_root=str(tmp_path / "registry"),
+        run_id="r1",
+    )
+    assert retry["already_complete"] is True
+    assert calls[-1]["tagged"] is False and calls[-1]["embedded"] == ["chunk_0_0"]
+    assert "zone-01N-2025" in global_store.open_global_repo(store).list_tags()

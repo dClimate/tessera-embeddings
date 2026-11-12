@@ -1,0 +1,341 @@
+"""Publishing a run's provenance record: tables, pixel planes and the checks between them.
+
+Built on the real pieces end to end, on local stores: mosaics written by the ingest's own writer
+with the switch on, shards staged by the real staging writer from pieces read off those mosaics, and
+publication reading both. A 2 x 2 grid of 4-pixel shards, three sensors, two dates each; the
+optical lists also name a copy the ingest dropped, and a day it skipped whole.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import dask.array as da
+import numpy as np
+import pyarrow.parquet as pq
+import pytest
+import shapely
+import xarray as xr
+import zarr
+from affine import Affine
+from odc.geo.geobox import GeoBox
+
+from tessera_embeddings.config.ingest import PROVENANCE_VERSION, SOURCE_INDEX_VAR
+from tessera_embeddings.inference.assembly import ZarrWriter
+from tessera_embeddings.inference.chunk_spec import ChunkSpec
+from tessera_embeddings.inference.provenance import PROVENANCE_ATTR, SourcePlanes, read_source_pieces
+from tessera_embeddings.inference.provenance_publish import ProvenanceCheckError, ProvenanceRun, publish_provenance
+from tessera_embeddings.storage.manifest import IngestManifest
+from tessera_embeddings.storage.provenance import (
+    granules_uri,
+    pixel_sources_group,
+    pixel_sources_uri,
+    shard_dates_uri,
+    update_pixels_uri,
+)
+from tessera_embeddings.storage.zarr_store import (
+    open_repo,
+    open_store_as_zarr_group,
+    record_skipped_days,
+    write_days_windows,
+)
+from tests.unit.inference_stack import STACK
+
+SIZE, SHARD = 8, 4
+DATES = ["2024-06-01", "2024-06-13"]
+#: A day the optical ingest skipped whole, so off the time axis.
+SKIPPED = "2024-06-07"
+STORES = {"reflectance": "s2", "sar_ascending": "s1_asc", "sar_descending": "s1_desc"}
+ZONE, YEAR, RUN, UPDATE = "33N", 2024, "33N-2024-abcd1234", "33N-2024-holes123"
+
+
+class _Roi:
+    geobox = GeoBox((SIZE, SIZE), Affine(10.0, 0.0, 0.0, 0.0, -10.0, 80.0), "EPSG:32633")
+    height = SIZE
+    width = SIZE
+
+
+def _granule(sensor: str, date: str, k: int) -> dict:
+    return {
+        "granule_id": f"{sensor}-{date}-{k}",
+        "image_key": f"key-{k}",
+        "platform": "S2A" if sensor == "s2" else "S1A",
+        "acquired_at": f"{date}T10:0{k}:00Z",
+        "cloud_cover": 3.0 if sensor == "s2" else None,
+        "assets": {"band": f"https://example.com/{sensor}/{date}/{k}.tif"},
+        "stepped_down": False,
+        "geometry": {"type": "Polygon", "coordinates": [[[14, 45], [15, 45], [15, 46], [14, 46], [14, 45]]]},
+        "bbox": [14, 45, 15, 46],
+    }
+
+
+def _granule_list(sensor: str, date: str) -> list[dict]:
+    """Two fused granules, and for optical a losing duplicate listed after them."""
+    fused = [_granule(sensor, date, 0), _granule(sensor, date, 1)]
+    return fused + ([_granule(sensor, date, 9) | {"status": "duplicate"}] if sensor == "s2" else [])
+
+
+def _mosaics(base: Path, *, on: bool = True, seed: int = 0) -> dict[str, str]:
+    """Three mosaic stores with two dates each; each slot's index uses granules 1 and 2."""
+    rng = np.random.default_rng(seed)
+    pins = {}
+    for store, sensor in STORES.items():
+        path = str(base / f"{store}.zarr")
+        days = []
+        for date in DATES:
+            data = {"band": da.full((1, SIZE, SIZE), 7, dtype=np.uint16, chunks=(1, SHARD, SHARD))}
+            if on:
+                index = rng.integers(0, 3, size=(1, SIZE, SIZE)).astype(np.uint16)
+                data[SOURCE_INDEX_VAR] = da.from_array(index, chunks=(1, SHARD, SHARD))
+            ds = xr.Dataset(
+                {k: (("time", "northing", "easting"), v) for k, v in data.items()},
+                coords={"time": [np.datetime64(date, "ns")]},
+            )
+            days.append(ds)
+        write_days_windows(
+            path,
+            [(d, [(0, SIZE, 0, SIZE)]) for d in days],
+            roi=_Roi(),
+            manifest=IngestManifest(roi_manifest_hash="abc", provenance_version=PROVENANCE_VERSION if on else None),
+            baselines={},
+            tile_id="roi.zarr",
+            crs="EPSG:32633",
+            chunks={"time": 1, "northing": SHARD, "easting": SHARD},
+            granules=[json.dumps(_granule_list(sensor, d)) for d in DATES] if on else None,
+        )
+        if on and sensor == "s2":
+            # A skipped day, and one an earlier attempt skipped and a later one wrote, whose slot wins.
+            skipped = {
+                day: json.dumps([_granule(sensor, day, 0) | {"status": "low_coverage"}]) for day in (SKIPPED, DATES[0])
+            }
+            record_skipped_days(path, skipped)
+        pins[path] = open_repo(path).lookup_branch("main")
+    return pins
+
+
+def _chunk(row: int, col: int) -> ChunkSpec:
+    return ChunkSpec(
+        row=row, col=col, y_start=row * SHARD, y_stop=(row + 1) * SHARD, x_start=col * SHARD, x_stop=(col + 1) * SHARD
+    )
+
+
+#: Every observation valid for the model.
+ALL_VALID = np.ones((len(DATES), SHARD, SHARD), dtype=bool)
+
+#: Half of each shard rejected on the first date, all of it on the second: a fully cloudy date.
+SOME_REJECTED = ALL_VALID.copy()
+SOME_REJECTED[0, :, : SHARD // 2] = False
+SOME_REJECTED[1] = False
+
+
+def _planes(pins: dict[str, str], chunk: ChunkSpec, valid: np.ndarray = ALL_VALID) -> SourcePlanes:
+    """The actor's record of ``chunk``, read off the pinned mosaics; ``valid`` is the model's test."""
+    planes = SourcePlanes(SHARD, SHARD)
+    for path, pin in pins.items():
+        root = open_store_as_zarr_group(path, snapshot_id=pin)
+        times = np.arange(len(DATES))
+        ys, xs = slice(chunk.y_start, chunk.y_stop), slice(chunk.x_start, chunk.x_stop)
+        planes.add(
+            STORES[Path(path).stem],
+            read_source_pieces(root, times, (ys, xs), valid, (slice(0, SHARD), slice(0, SHARD))),
+        )
+    return planes
+
+
+def _stage(
+    staging: Path,
+    pins: dict[str, str],
+    *,
+    pixels: np.ndarray | None = None,
+    run: str = RUN,
+    valid: np.ndarray = ALL_VALID,
+) -> tuple[list[str], list[str]]:
+    """Three shards embed, one is refused; all stage planes. Returns (embedded, refused).
+
+    ``pixels`` makes the run a holes update that embedded those pixels of each embedding shard.
+    """
+    writer = ZarrWriter(str(staging))
+    embedded = []
+    for row, col in ((0, 0), (0, 1), (1, 0)):
+        chunk = _chunk(row, col)
+        writer.write_chunk(
+            chunk,
+            np.zeros((SHARD, SHARD, 128), dtype=np.int8),
+            run,
+            scales=np.ones((SHARD, SHARD), dtype=np.float32),
+            coverage={"embedded_px": SHARD * SHARD if pixels is None else int(pixels.sum())},
+            stack=STACK,
+            planes=_planes(pins, chunk, valid),
+            pixels=pixels,
+        )
+        embedded.append(chunk.label)
+    refused = _chunk(1, 1)
+    writer.write_coverage_only(
+        refused,
+        run,
+        {"s2_obs_count": np.zeros((SHARD, SHARD), dtype=np.uint16)},
+        None,
+        planes=_planes(pins, refused, valid),
+        pixels=None if pixels is None else np.zeros_like(pixels),
+    )
+    return embedded, [refused.label]
+
+
+def _publish(
+    tmp_path: Path, pins: dict[str, str], embedded: list[str], refused: list[str], run: str = RUN
+) -> dict | None:
+    return publish_provenance(
+        ProvenanceRun(
+            staging_base=str(tmp_path / "staging"),
+            registry_root=str(tmp_path / "registry"),
+            zone=ZONE,
+            year=YEAR,
+            run_id=run,
+            embedded=embedded,
+            refused=refused,
+            mosaic_snapshots=pins,
+            grid_shape=(SIZE, SIZE),
+            shard_px=SHARD,
+        )
+    )
+
+
+@pytest.fixture
+def published(tmp_path: Path):
+    pins = _mosaics(tmp_path / "mosaics")
+    embedded, refused = _stage(tmp_path / "staging", pins)
+    return tmp_path, pins, _publish(tmp_path, pins, embedded, refused)
+
+
+def _granules_uri(tmp_path: Path, pins: dict[str, str], sensor: str) -> str:
+    pin = next(pin for path, pin in pins.items() if STORES[Path(path).stem] == sensor)
+    return granules_uri(str(tmp_path / "registry"), ZONE, YEAR, sensor, pin)
+
+
+def _shard_dates(tmp_path: Path, run: str = RUN):
+    return pq.read_table(shard_dates_uri(str(tmp_path / "registry"), ZONE, YEAR, run))
+
+
+def test_granules_list_each_snapshots_granules_in_fusion_order(published) -> None:
+    tmp_path, pins, summary = published
+    tables = {sensor: pq.read_table(_granules_uri(tmp_path, pins, sensor)) for sensor in STORES.values()}
+    assert summary["granules"] == sum(t.num_rows for t in tables.values()) == 3 * len(DATES) * 2 + len(DATES) + 1
+    rows = tables["s2"].to_pylist()
+    dropped = [(r["granule_id"], r["fusion_order"], r["status"]) for r in rows if r["status"] != "fused"]
+    assert dropped == [(f"s2-{d}-9", None, "duplicate") for d in DATES] + [(f"s2-{SKIPPED}-0", None, "low_coverage")]
+    first = next(r for r in rows if r["fusion_order"] == 1)
+    assert (str(first["solar_day"]), first["granule_id"]) == ("2024-06-01", "s2-2024-06-01-1")
+    assert first["snapshot_id"] == pins[str(tmp_path / "mosaics" / "reflectance.zarr")]
+    assert shapely.from_wkb(first["geometry"]).bounds == (14.0, 45.0, 15.0, 46.0)
+    assert b"geo" in tables["s2"].schema.metadata
+    assert tables["s2"].schema.metadata[b"first_published_by"] == RUN.encode()
+
+
+def test_a_snapshots_granules_are_written_once_and_checked_by_every_later_run(published) -> None:
+    """A second run reading the same mosaics keeps the first run's file, and refuses one that differs."""
+    tmp_path, pins, _ = published
+    uri = _granules_uri(tmp_path, pins, "s2")
+    embedded, refused = _stage(tmp_path / "staging", pins, run=UPDATE)
+    _publish(tmp_path, pins, embedded, refused, run=UPDATE)
+    table = pq.read_table(uri)
+    assert table.schema.metadata[b"first_published_by"] == RUN.encode()
+    assert set(_shard_dates(tmp_path, UPDATE).column("snapshot_id").to_pylist()) == set(pins.values())
+    pq.write_table(table.slice(1), uri)
+    with pytest.raises(ProvenanceCheckError, match="already published"):
+        _publish(tmp_path, pins, embedded, refused, run=UPDATE)
+
+
+@pytest.mark.parametrize("valid", [ALL_VALID, SOME_REJECTED], ids=["all-valid", "some-rejected"])
+def test_shard_dates_and_planes_name_the_same_granules(tmp_path: Path, valid: np.ndarray) -> None:
+    """Every row's sources are what its plane ranks, and the plane is the mosaic's index.
+
+    Positive where the model used the observation, negative where it rejected it; a fully rejected
+    date keeps its rows.
+    """
+    pins = _mosaics(tmp_path / "mosaics")
+    _publish(tmp_path, pins, *_stage(tmp_path / "staging", pins, valid=valid))
+    rows = _shard_dates(tmp_path).to_pylist()
+    assert {r["tile"] for r in rows} == {"chunk_0_0", "chunk_0_1", "chunk_1_0", "chunk_1_1"}
+    repo = open_repo(pixel_sources_uri(str(tmp_path / "registry")))
+    group = zarr.open_group(repo.readonly_session("main").store, path=pixel_sources_group(ZONE, YEAR, RUN), mode="r")
+    for sensor in STORES.values():
+        dates = group[sensor].shape[0]
+        assert (group[sensor].chunks, group[sensor].shards) == ((dates, SHARD, SHARD), (dates, SHARD, SHARD)), (
+            "a chunk holds every date"
+        )
+    for row in rows:
+        r, c = (int(x) for x in row["tile"].removeprefix("chunk_").split("_"))
+        t = DATES.index(str(row["solar_day"]))
+        plane = group[row["sensor"]][t, r * SHARD : (r + 1) * SHARD, c * SHARD : (c + 1) * SHARD]
+        store = next(p for p in pins if STORES[Path(p).stem] == row["sensor"])
+        assert row["snapshot_id"] == pins[store]
+        index = open_store_as_zarr_group(store, snapshot_id=pins[store])[SOURCE_INDEX_VAR][
+            t, r * SHARD : (r + 1) * SHARD, c * SHARD : (c + 1) * SHARD
+        ]
+        named = np.sign(plane) * (np.asarray(row["sources"])[np.abs(plane.astype(int)) - 1] + 1)
+        expected = np.where(valid[t], index, -index.astype(int))
+        np.testing.assert_array_equal(np.where(plane != 0, named, 0), expected, err_msg=str(row))
+        assert row["valid_px"] == int(np.count_nonzero(plane > 0))
+        assert row["embedded_px"] == (0 if row["tile"] == "chunk_1_1" else SHARD * SHARD)
+    assert {str(r["solar_day"]) for r in rows} == set(DATES), "a fully rejected date keeps its rows"
+
+
+def test_publishing_again_rewrites_the_same_record(published) -> None:
+    tmp_path, pins, _ = published
+    before = _shard_dates(tmp_path)
+    _publish(tmp_path, pins, ["chunk_0_0", "chunk_0_1", "chunk_1_0"], ["chunk_1_1"])
+    assert _shard_dates(tmp_path).equals(before)
+
+
+def test_mosaics_without_the_record_publish_nothing(tmp_path: Path) -> None:
+    pins = _mosaics(tmp_path / "mosaics", on=False)
+    assert _publish(tmp_path, pins, [], []) is None
+    assert not (tmp_path / "registry").exists()
+
+
+def test_a_plane_that_disagrees_with_its_row_fails_the_publication(tmp_path: Path) -> None:
+    pins = _mosaics(tmp_path / "mosaics")
+    embedded, refused = _stage(tmp_path / "staging", pins)
+    group = zarr.open_group(str(tmp_path / "staging" / RUN / "chunk_0_0.zarr"), mode="a")
+    record = dict(group.attrs[PROVENANCE_ATTR])
+    record["s2"] = dict(record["s2"], valid_px=[v + 1 for v in record["s2"]["valid_px"]])
+    group.attrs[PROVENANCE_ATTR] = record
+    with pytest.raises(ProvenanceCheckError, match="its row says"):
+        _publish(tmp_path, pins, embedded, refused)
+
+
+def test_an_embedded_shard_with_no_record_fails_the_publication(tmp_path: Path) -> None:
+    pins = _mosaics(tmp_path / "mosaics")
+    embedded, refused = _stage(tmp_path / "staging", pins)
+    group = zarr.open_group(str(tmp_path / "staging" / RUN / "chunk_0_0.zarr"), mode="a")
+    del group.attrs[PROVENANCE_ATTR]
+    with pytest.raises(ProvenanceCheckError, match="staged no provenance"):
+        _publish(tmp_path, pins, embedded, refused)
+
+
+#: The pixels a holes update embedded in each of its embedding shards: the top two rows.
+EMBEDDED_BY_UPDATE = np.zeros((SHARD, SHARD), dtype=bool)
+EMBEDDED_BY_UPDATE[:2] = True
+
+
+def test_a_holes_update_publishes_the_pixels_it_embedded_and_planes_inside_them(tmp_path: Path) -> None:
+    pins = _mosaics(tmp_path / "mosaics")
+    embedded, refused = _stage(tmp_path / "staging", pins, pixels=EMBEDDED_BY_UPDATE)
+    _publish(tmp_path, pins, embedded, refused)
+    masks = zarr.open_group(update_pixels_uri(str(tmp_path / "registry"), ZONE, YEAR, RUN), mode="r")
+    assert sorted(masks.array_keys()) == ["chunk_0_0", "chunk_0_1", "chunk_1_0", "chunk_1_1"]
+    np.testing.assert_array_equal(masks["chunk_0_0"][:], EMBEDDED_BY_UPDATE)
+    assert not masks["chunk_1_1"][:].any()
+    rows = _shard_dates(tmp_path).to_pylist()
+    assert rows and all(r["valid_px"] <= int(EMBEDDED_BY_UPDATE.sum()) for r in rows)
+    assert {r["tile"] for r in rows} == set(embedded)
+
+
+def test_a_holes_mask_that_is_not_what_the_update_embedded_fails_the_publication(tmp_path: Path) -> None:
+    pins = _mosaics(tmp_path / "mosaics")
+    embedded, refused = _stage(tmp_path / "staging", pins, pixels=EMBEDDED_BY_UPDATE)
+    group = zarr.open_group(str(tmp_path / "staging" / RUN / "chunk_0_0.zarr"), mode="a")
+    group.attrs["coverage"] = {"embedded_px": int(EMBEDDED_BY_UPDATE.sum()) + 1}
+    with pytest.raises(ProvenanceCheckError, match="in its mask"):
+        _publish(tmp_path, pins, embedded, refused)

@@ -248,8 +248,10 @@ that rate a zone-year of about 3,000 shards takes about an hour and a half.
    #254 (UTM zone layout). This record's ADR moved to 035.
 8. **Chunking all dates together reads a pixel ten times faster and is smaller.** All dates ×
    256² beat the published one date × one shard on every shard-year measured, by 7–12% in size,
-   and fetched a pixel's year in one object instead of 64. It is the plan's open question 1 and
-   not yet decided.
+   and fetched a pixel's year in one object instead of 64. Adopted, at the v2 store's chunk edge
+   of 512 × 512 in 2048 × 2048 shards, so a plane chunk covers the same pixels as a store chunk.
+   512 × 512 itself was not measured; 128 × 128 against 256 × 256 suggests a larger chunk is
+   no bigger, and a one-pixel read decompresses four times the bytes of 256 × 256 in one fetch.
 9. **The rank stays.** The signed fusion order as `int16` would drop `sources` and one hop, but
    was 19–83% larger.
 

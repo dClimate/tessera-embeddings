@@ -1,0 +1,273 @@
+"""The model half of the provenance record: which granule supplied each observation, and whether the model used it.
+
+A mosaic built with the provenance switch on carries a ``source_index`` band beside its imagery
+(``ingest/provenance.py``): per pixel and slot, the fusion position plus one of the granule the
+fuser took the pixel from. The actor turns that into the per-shard record the registry publishes
+(``context_docs/storage/registry-provenance-plan.md`` §3, §4):
+
+* **Pieces, read where the mask is read.** Wherever a loader reads a sensor's validity — the
+  whole-shard SCL mask for optical, each strip's VV and VH for radar — it also reads the source
+  index over the same dates and window, negates it wherever the model's own validity test fails,
+  and keeps it compressed per date (:func:`read_source_pieces`). Nothing is read twice, and a
+  shard holds kilobytes per date rather than a full plane.
+* **Planes, ranked at the staging write.** :class:`SourcePlanes` collects a shard's pieces across
+  strips. At the write, on the actor's background writer, each date's pieces are stitched into one
+  plane, cut for a holes update to the pixels it embedded, and its values replaced by their signed
+  rank in the shard-date's ``sources``: the distinct fusion positions that covered a pixel,
+  ascending. A day's fusion order is zone-wide and can exceed 255, while a shard has a handful of
+  granules on a date, so the rank keeps the published plane ``int8``. The plane and its
+  ``sources`` and valid-pixel count are staged with the shard.
+
+A value k names ``sources[|k| - 1]``. Positive means the observation was valid for the model, by
+its own test; negative means that granule had data there and the test rejected it, a cloud for
+instance; zero means no granule had data. For a pixel with an embedding the positive values are the
+observations its input drew on; a pixel deeper than the deepest bucket is resampled to a
+deterministic subset of them (``inference/sampling.py``).
+
+A fill or a shards update records every pixel it was asked to embed, refused ones included, which is
+how a refused shard still has rows. A holes update records only the pixels it embedded, and stages
+them as its ``update_pixels`` mask: a reader takes those pixels from the update and every other
+pixel from the run before it (plan §5).
+"""
+
+from __future__ import annotations
+
+import threading
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
+from typing import Any
+
+import numcodecs
+import numpy as np
+import zarr
+from zarr.codecs import BloscCodec
+
+from tessera_embeddings.config.ingest import SOURCE_INDEX_VAR
+from tessera_embeddings.config.store_layout import SENSORS
+
+#: The staged and published planes' codec: Blosc zstd 3 with bit shuffle, measured at 1.17 MB a
+#: shard-year where plain zstd took 2.83 MB (the plan's Appendix A).
+PLANE_COMPRESSORS = (BloscCodec(cname="zstd", clevel=3, shuffle="bitshuffle"),)
+
+#: The published planes' spatial chunk edge: the v2 store's (ADR 031), so a plane chunk covers the
+#: same pixels as a store chunk. Each chunk holds every date of the run, so one pixel's year is one
+#: read; that layout was 7-12% smaller than a chunk per date (context_docs/storage/
+#: provenance-dev-verification.md).
+PLANE_CHUNK_PX = 512
+
+#: The same codec for the in-memory pieces, which are signed 32-bit positions rather than 8-bit ranks.
+_PIECE_CODEC = numcodecs.Blosc(cname="zstd", clevel=3, shuffle=numcodecs.Blosc.BITSHUFFLE)
+
+#: Dates read per batch when building pieces: a whole shard's index for every kept date at once
+#: would be gigabytes, one date at a time is a request each.
+_READ_BATCH = 8
+
+#: The staged arrays, per sensor: the planes, and the mosaic time index of each.
+STAGED_PLANES = "pixel_sources_{sensor}"
+STAGED_TIMES = "pixel_sources_{sensor}_time"
+
+#: The staged shard's attribute holding its ``shard_dates`` summary, beside the planes it describes.
+PROVENANCE_ATTR = "provenance"
+
+#: A holes update's staged pixel mask: the pixels the run embedded, which the planes are cut to and
+#: which publication copies to ``update_pixels``.
+STAGED_UPDATE_PIXELS = "update_pixels"
+
+
+@dataclass(frozen=True)
+class SourcePiece:
+    """One date's source positions over one window of a shard, compressed.
+
+    ``time`` is the mosaic time index; ``rows`` and ``cols`` are shard-relative. Values are the
+    fusion position plus one, negated wherever the model's validity test failed, and zero where no
+    granule had data.
+    """
+
+    time: int
+    rows: slice
+    cols: slice
+    data: bytes
+
+
+def read_array(group: zarr.Group, name: str) -> np.ndarray:
+    """``group[name]`` read whole, as numpy."""
+    arr = group[name]
+    assert isinstance(arr, zarr.Array)
+    return np.asarray(arr[...])
+
+
+def read_source_pieces(
+    root: zarr.Group,
+    times: np.ndarray,
+    window: tuple[slice, slice],
+    valid: np.ndarray,
+    at: tuple[slice, slice],
+) -> list[SourcePiece]:
+    """The source index at ``times`` over ``window``, negated where ``valid`` is False, per date.
+
+    ``window`` is the store's ``(northing, easting)`` slices and ``at`` the same pixels' shard-relative
+    ``(rows, cols)``. ``valid`` is ``(len(times), h, w)``, the test the model applies to the same reads. Empty when
+    the mosaic carries no source index, which is how the record follows the mosaics: a store built
+    with provenance off gives the actor nothing to stage.
+    """
+    if SOURCE_INDEX_VAR not in root or len(times) == 0:
+        return []
+    index = root[SOURCE_INDEX_VAR]
+    assert isinstance(index, zarr.Array)
+    pieces: list[SourcePiece] = []
+    for start in range(0, len(times), _READ_BATCH):
+        batch = np.asarray(times[start : start + _READ_BATCH])
+        positions = np.asarray(index.oindex[batch, *window]).astype(np.int32)
+        np.negative(positions, out=positions, where=~valid[start : start + len(batch)])
+        pieces.extend(
+            SourcePiece(int(t), *at, _PIECE_CODEC.encode(np.ascontiguousarray(plane)))
+            for t, plane in zip(batch, positions, strict=True)
+            if plane.any()
+        )
+    return pieces
+
+
+@dataclass(frozen=True)
+class ShardDate:
+    """One shard, sensor and date: what the record publishes about it."""
+
+    time: int
+    plane: np.ndarray
+    #: The fusion positions (0-based) that covered at least one pixel, valid or not, ascending.
+    sources: list[int]
+    valid_px: int
+
+
+class SourcePlanes:
+    """One shard's pieces for every sensor, collected across strips, ranked at the staging write.
+
+    Pieces arrive from the loader's thread and are read on the writer's, so ``add`` is locked even
+    though a shard's strips load one at a time.
+    """
+
+    def __init__(self, height: int, width: int) -> None:
+        """An empty record for a ``height`` by ``width`` shard."""
+        self.height, self.width = height, width
+        self._pieces: dict[str, dict[int, list[SourcePiece]]] = {sensor: {} for sensor in SENSORS}
+        self._lock = threading.Lock()
+
+    def add(self, sensor: str, pieces: list[SourcePiece]) -> None:
+        """Keep ``pieces`` for ``sensor``."""
+        with self._lock:
+            for piece in pieces:
+                self._pieces[sensor].setdefault(piece.time, []).append(piece)
+
+    def __bool__(self) -> bool:
+        """Whether any sensor's mosaic carried a source index."""
+        return any(self._pieces.values())
+
+    def sensors(self) -> list[str]:
+        """The sensors whose mosaic carried a source index, in :data:`SENSORS` order."""
+        return [sensor for sensor in SENSORS if self._pieces[sensor]]
+
+    def dates(self, sensor: str, pixels: np.ndarray | None = None) -> Iterator[ShardDate]:
+        """Each date's signed ranked plane for ``sensor``, in time order, cut to ``pixels`` when given.
+
+        A date where no granule had data at any pixel left after the cut is dropped: the shard has
+        no record for it. A date the model rejected everywhere, a fully cloudy one, is kept.
+
+        Raises:
+            ValueError: a shard-date with more than 127 granules, which the ``int8`` plane cannot
+                rank. Refused rather than wrapped.
+        """
+        cap = np.iinfo(np.int8).max
+        for time in sorted(self._pieces[sensor]):
+            full = np.zeros((self.height, self.width), dtype=np.int32)
+            for piece in self._pieces[sensor][time]:
+                shape = (piece.rows.stop - piece.rows.start, piece.cols.stop - piece.cols.start)
+                full[piece.rows, piece.cols] = np.frombuffer(_PIECE_CODEC.decode(piece.data), np.int32).reshape(shape)
+            if pixels is not None:
+                full[~pixels] = 0
+            magnitude = np.abs(full)
+            present = np.flatnonzero(np.bincount(magnitude.ravel(), minlength=1))
+            present = present[present > 0]
+            if not len(present):
+                continue
+            if len(present) > cap:
+                raise ValueError(f"{sensor} time {time}: {len(present)} granules covered one shard; the cap is {cap}")
+            rank = np.zeros(int(present[-1]) + 1, dtype=np.int8)
+            rank[present] = np.arange(1, len(present) + 1, dtype=np.int8)
+            plane = np.where(full < 0, -rank[magnitude], rank[magnitude])
+            yield ShardDate(time, plane, [int(p) - 1 for p in present], int(np.count_nonzero(full > 0)))
+
+
+def staging_kwargs(planes: SourcePlanes, scales: np.ndarray, *, holes: bool) -> dict[str, Any]:
+    """The staging writer's keyword arguments for a shard's planes; none when its mosaics carry no index.
+
+    A holes update records the pixels it EMBEDDED, not the holes it was asked to fill: ``scales`` is
+    NaN wherever no embedding was written, so it is that mask. A reader then takes exactly these
+    pixels from the update and the rest from the run before it.
+    """
+    if not planes:
+        return {}
+    return {"planes": planes, "pixels": ~np.isnan(scales) if holes else None}
+
+
+def stage_planes(group: zarr.Group, planes: SourcePlanes, pixels: np.ndarray | None) -> dict[str, Any]:
+    """Write each sensor's ranked planes into a staged shard; return its ``shard_dates`` summary.
+
+    The planes go in as ``(time, northing, easting)`` arrays chunked one date by the shard, with
+    their mosaic time indices beside them. The summary is ``{sensor: {"time", "sources",
+    "valid_px"}}``; the caller stores it as the shard's ``provenance`` attribute. A sensor whose
+    mosaic had no index is absent from both, so the record follows the mosaics sensor by sensor.
+    ``pixels``, given only for a holes update, is the pixels the run embedded; the planes are cut to
+    it and it is staged too, as the update's ``update_pixels`` mask.
+    """
+    summary: dict[str, Any] = {}
+    if pixels is not None:
+        group.create_array(STAGED_UPDATE_PIXELS, shape=pixels.shape, chunks=pixels.shape, dtype=bool, overwrite=True)[
+            :
+        ] = pixels
+    for sensor in planes.sensors():
+        dates = list(planes.dates(sensor, pixels))
+        arr = group.create_array(
+            STAGED_PLANES.format(sensor=sensor),
+            shape=(len(dates), planes.height, planes.width),
+            chunks=(1, planes.height, planes.width),
+            dtype=np.int8,
+            fill_value=0,
+            compressors=PLANE_COMPRESSORS,
+            dimension_names=("time", "northing", "easting"),
+            overwrite=True,
+        )
+        for i, date in enumerate(dates):
+            arr[i] = date.plane
+        times = np.array([d.time for d in dates], dtype=np.int32)
+        group.create_array(
+            STAGED_TIMES.format(sensor=sensor),
+            shape=times.shape,
+            chunks=(max(len(times), 1),),
+            dtype=np.int32,
+            overwrite=True,
+        )[:] = times
+        summary[sensor] = {
+            "time": times.tolist(),
+            "sources": [d.sources for d in dates],
+            "valid_px": [d.valid_px for d in dates],
+        }
+    return summary
+
+
+def staged_planes(group: zarr.Group, sensor: str) -> tuple[np.ndarray, zarr.Array] | None:
+    """A staged shard's ``(time indices, planes)`` for ``sensor``, or ``None`` if it staged none.
+
+    ``group`` must be opened without consolidated metadata: the tile's listing was consolidated when
+    its embeddings were written, before these arrays existed.
+    """
+    name = STAGED_PLANES.format(sensor=sensor)
+    if name not in group:
+        return None
+    arr = group[name]
+    assert isinstance(arr, zarr.Array)
+    return read_array(group, STAGED_TIMES.format(sensor=sensor)), arr
+
+
+def provenance_summary(attrs: Mapping[str, Any]) -> dict[str, Any] | None:
+    """A staged shard's ``shard_dates`` summary, or ``None`` if it staged no planes."""
+    summary = attrs.get(PROVENANCE_ATTR)
+    return summary if isinstance(summary, dict) else None
