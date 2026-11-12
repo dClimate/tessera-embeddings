@@ -121,11 +121,45 @@ Downloading again is cheaper unless more than two or three versions are tested a
 version that changes how imagery is downloaded needs a fresh download anyway. The steps therefore
 keep the flows' default of deleting imagery after each run.
 
+## The labels' licences
+
+Every set of labels may be used, changed and shared, including commercially, as long as its source
+is credited. Checked on 2026-11-12 against the Zenodo records and the licence section of each
+AlphaEarth label set's README.
+
+| labels | licence |
+|---|---|
+| PASTIS-R ([Zenodo 5735646](https://zenodo.org/records/5735646)) | CC BY 4.0 |
+| The AlphaEarth evaluation data as a whole ([Zenodo 16585402](https://zenodo.org/records/16585402)) | CC BY 4.0 (its code: Apache 2.0) |
+| `ethiopia_crops` (Ethiopian Crop Type 2020) | CC BY 4.0 |
+| `canada_crops_coarse` (AAFC Annual Crop Inventory ground truth) | Open Government Licence – Canada |
+| `lucas_lc`, `lucas_lu` (LUCAS Harmonised, JRC) | CC BY 4.0 |
+
+The steps link to the labels rather than copying them, so this repository redistributes none of
+them. The LUCAS points are the survey's planned locations, not where the surveyor stood; at 10 m
+a few of them will fall in the neighbouring field.
+
+## Radar over the areas
+
+Every area has Sentinel-1 radar in every year from 2017 to 2025, but only France has it from both
+orbit directions. Checked on 2026-11-12 by asking NASA's catalogue (CMR) for OPERA RTC-S1
+granules the way the ingest does: the same collection, orbit filter and VV polarisation
+requirement. Each area was split into 1° squares, and an orbit was counted only with at least 12
+granules in the year, about one a month.
+
+| area | 2017–2025 |
+|---|---|
+| Normandy, Provence, Burgundy, Alsace | both orbits in every square and year |
+| Ethiopia | in 2018–2023, only descending passes in about 28 of 35 squares, both orbits in the rest; most squares have both in 2017, 2024 and 2025 |
+| Ontario | ascending passes only, every year (about 1,300 granules a year, no descending) |
+
+So the six areas also test how a version handles radar from one orbit direction, which is common
+across the world: Ontario has only ascending passes, and most of the Ethiopian box has only
+descending ones in its tested year, 2020. None of the areas tests embeddings made from Sentinel-2
+alone.
+
 ## Not yet settled
 
-- **No code computes the scores yet.** The steps describe what to compute; the TESSERA team's
-  code will live with its deployment code.
-- **The labels' licences** were not checked. The steps link to the labels rather than copying them.
-- **Radar coverage of the areas** was not checked. Where an area has no Sentinel-1 images in a
-  year, its embeddings there are made from Sentinel-2 alone.
+- **No public code computes the scores.** The steps describe what to compute; the TESSERA team's
+  implementation lives with its private deployment code and has not yet been run on a store.
 - **159 Ethiopian points are labelled for 2021**, not 2020, so only the nine-year run scores them.
