@@ -283,8 +283,8 @@ that rate a zone-year of about 3,000 shards takes about an hour and a half.
    no bigger, and a one-pixel read decompresses four times the bytes of 256 × 256 in one fetch.
 9. **The signed fusion order is 19–83% larger than the rank.** Storing it as `int16` takes
    `sources` off the pixel path, one join fewer. On this measurement the rank was kept at first;
-   after review the fusion order was adopted with its size accepted (ADR 035, decision 3), and
-   re-measured under the published layout below.
+   after review the fusion order was adopted with its size accepted (ADR 035, decision 3). These
+   sizes are for one date × one shard; the published layout's is not yet measured.
 
 ## Teardown
 
