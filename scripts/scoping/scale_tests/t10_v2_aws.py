@@ -571,11 +571,9 @@ def main() -> int:
     phase, cfg = cfg.phase, dataclasses.replace(cfg, phase=None)  # run_phase filters on the name it is given
     study = STUDIES[args.study]
     harness.bind_study(cfg, TEST, args.study)
-    # Each phase runs the arms it can. The library's assembly writes zarr's default order, and writes a band-first
-    # array only where its shard writer says it can (the band-first prototype of ADR 031 sets WRITES_BAND_FIRST);
-    # the other arms' write cost comes from `build`.
-    band_first_ok = getattr(shard_writer, "WRITES_BAND_FIRST", False)
-    assembled = [a for a in study.arms if a.write_order == "morton" and (band_first_ok or not a.band_first)]
+    # The library's assembly writes zarr's default order, so only those arms are assembled; the other write orders'
+    # cost comes from `build`. It writes every axis by name, so band-first arms assemble like band-last ones.
+    assembled = [a for a in study.arms if a.write_order == "morton"]
     if phase == "build":
         harness.run_phase(cfg, TEST, "build", lambda: phase_build(cfg, study.arms, args.tiles, args.workers))
     elif phase == "read":

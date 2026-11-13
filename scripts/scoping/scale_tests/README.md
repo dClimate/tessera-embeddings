@@ -186,9 +186,8 @@ Each phase runs on its own in-region EC2 box, writing throwaway repos under the 
   since that is where the manifest download lands.
 - **`assemble`** (Graviton, like the assembly runner). Staged v2 processing shards are written into each
   finalist by the library's own `shard_writer.write_year_shards` over a `StagedShardSource`, every
-  array included. Band-first arms are written only where the shard writer says it can
-  (`WRITES_BAND_FIRST`, set by ADR 031's band-first prototype); otherwise their encode cost comes from
-  `build` on a Graviton box instead.
+  array included, band-first arms too, since the writer finds every axis by name. Arms in another
+  write order are not assembled; their encode cost comes from `build` on a Graviton box instead.
 - **`verify`**. Every arm holds exactly C0's values in every array, band-first ones reordered first.
   It checks the built stores; given `--staging`, it checks the assembled ones, over the
   processing shards assembly wrote. The set chooses its own stores and arms, so there is no prefix to pass.
