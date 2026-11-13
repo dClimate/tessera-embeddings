@@ -23,7 +23,7 @@ import pytest
 import zarr
 
 from tessera_embeddings.storage import published_store
-from tessera_embeddings.storage.published_store import Commit, store_runs_stamp
+from tessera_embeddings.storage.published_store import Commit, committed_runs, lineage_stamp
 from tessera_embeddings.storage.registry import registry_schema
 from tessera_embeddings.storage.registry_master import (
     MEASURED_BY_FILL,
@@ -99,7 +99,9 @@ def _seed_master(root: Path, *, radar: int | None) -> None:
     fill = as_master_rows(pa.Table.from_pylist(FILL_ROWS, schema=master_schema()), MEASURED_BY_FILL)
     # Stamped with the store's runs for the year, as every merge stamps it.
     master = merge(fill, as_master_rows(table, MEASURED_BY_REBUILD))
-    master = master.replace_schema_metadata({STORE_RUNS_KEY: store_runs_stamp({"runs": V11_RUNS}, 2017)})
+    master = master.replace_schema_metadata(
+        {STORE_RUNS_KEY: lineage_stamp(committed_runs({"runs": V11_RUNS}, 2017, []))}
+    )
     write_cell(LOCAL, str(root), "33N", 2017, master, version=None)
 
 

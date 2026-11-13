@@ -305,10 +305,12 @@ commits, in the order they landed: a fill or a shards update starts the list aga
 update adds itself.
 
 A merge follows each run's commit, but it can lag or fail, and until it lands a run that has just
-written the tile is missing from `source_runs`. So each merge stamps the master file with the runs
-the store had recorded as writing shards that year, as `store_runs` in its key-value metadata, and the pixel calls
-compare it with the store's run records now: a mismatch raises `LookupError` rather than naming an
-older run's images. A by-hand reader makes the same check, step 1 below.
+written the tile is missing from `source_runs`. So each merge stamps the master file with every
+commit that had written shards into the year, each as its run and its time, as `store_runs` in its
+key-value metadata. The pixel calls build the same list from the store now, from its commit history
+and its run records, and a difference raises `LookupError` rather than naming an older run's
+images. That catches a run whose shards have committed but whose run record has not, and a retry
+under the same run id. A by-hand reader makes the same check, step 1 below.
 
 `source_runs` is null where the tile has no complete record, such as a run from before the record
 existed. One more case has none: a refused tile whose run staged no record for it, which that
@@ -330,18 +332,16 @@ prov = f"{REGISTRY}/provenance"
 # 1. The runs whose pixels the tile holds, oldest first. None: the tile has no complete record.
 master_uri = f"{REGISTRY}/master/zone={ZONE}/year={YEAR}/part-0.parquet"
 runs = pl.read_parquet(master_uri, storage_options=S3).filter(pl.col("tile") == TILE)["source_runs"].item()
-#    Trust it only if the master was merged after the store's latest run for the year: compare its
-#    stamp with the runs the store's zone group records as writing shards (fills, one per column
-#    half, the fills they replaced, and updates).
+#    Trust it only if the master was merged after every commit that wrote shards into the year: its
+#    stamp lists them, oldest first, as [run, time]. Each shard commit names its run, zone and year
+#    in its metadata. (This reads the store's history; once the store's old snapshots are expired,
+#    the package's reader also counts the expired commits, from the zone group's run records.)
 s_bucket, s_key = (REGISTRY.removesuffix(".registry") + ".icechunk").removeprefix("s3://").split("/", 1)
 s_repo = icechunk.Repository.open(icechunk.s3_storage(bucket=s_bucket, prefix=s_key, region="us-west-2", anonymous=True))
-attrs = zarr.open_group(s_repo.readonly_session("main").store, path=ZONE, mode="r").attrs
-fills = attrs["runs"][str(YEAR)]
-fills = [fills] if "run_id" in fills else list(fills.values())
-recorded = [e for f in fills for e in [f, *f.get("previous", [])]] + attrs.get("updates", {}).get(str(YEAR), [])
-recorded = {e["run_id"] for e in recorded if e.get("commit", True)}   # a null commit wrote no shards
+writes = [[m["run_id"], s.written_at.isoformat()] for s in s_repo.ancestry(branch="main")
+          if (m := (s.metadata or {}).get("shard_write")) and m["zone"] == ZONE and m["year"] == YEAR][::-1]
 stamp = pl.read_parquet_metadata(master_uri, storage_options=S3)["store_runs"]
-assert json.loads(stamp) == sorted(recorded), "the registry has not caught up with the store's latest run"
+assert json.loads(stamp) == writes, "the registry has not caught up with the store's latest commit"
 
 # 2. The run that holds the pixel: newest first, a holes update where its mask marks the pixel,
 #    else a fill or a shards update. Each run's group in pixel_sources states its mode.

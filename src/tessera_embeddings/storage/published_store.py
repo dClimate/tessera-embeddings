@@ -361,7 +361,9 @@ def source_runs(
     non-empty commit's tiles cannot be read (a run from before tags, or an expired commit), since
     the order is then unknown. The diffs are read once, on the first call.
     """
-    entries = _year_entries(attrs, year)
+    # One record, or one per column half (ADR 038), each with the fills it replaced.
+    fills = [entry for head in year_runs(attrs.get("runs"), year) for entry in (head, *head.get("previous", []))]
+    entries = [*fills, *(attrs.get("updates") or {}).get(str(year), [])]
     carried = {
         e["run_id"]
         for e in entries
@@ -391,23 +393,17 @@ def source_runs(
     return of
 
 
-def _year_entries(attrs: Mapping[str, Any], year: int) -> list[dict]:
-    """Every run record of ``year``: its fills (one per column half, ADR 038), those they replaced, its updates."""
-    fills = [entry for head in year_runs(attrs.get("runs"), year) for entry in (head, *head.get("previous", []))]
-    return [*fills, *(attrs.get("updates") or {}).get(str(year), [])]
+def lineage_stamp(commits: Sequence[Commit]) -> str:
+    """The commits that wrote a zone-year, as the string a master is stamped with when it derives ``source_runs``.
 
-
-def store_runs_stamp(attrs: Mapping[str, Any], year: int) -> str:
-    """The runs that wrote shards in ``year``, from a zone group's attributes, as the string a master is stamped with.
-
-    A merge stamps the master with it when it derives ``source_runs``; a reader compares the stamp
-    with the store's attributes now, so a master merged before a later run landed reads as stale
-    rather than naming the wrong run. Only runs that wrote shards count, the same runs
-    ``source_runs`` is derived from: a record with a null ``commit`` (an update that had nothing to
-    write, a year marked empty) changes no tile, and no merge need follow it. A record from before
-    tags has no ``commit`` field and counts.
+    ``commits`` is :func:`committed_runs`' list, the exact input ``source_runs`` is derived from, so a
+    reader computing the same from the store now finds the stamp different exactly when a commit has
+    landed since the merge: a run whose shards committed before its run record did, a retry under
+    the same run id, a record-only run changes nothing. Each commit is its run and its time, which
+    a run record keeps as ``committed_at``, so the stamp is the same whether a commit is still in the
+    store's history or has expired out of it.
     """
-    return json.dumps(sorted({e["run_id"] for e in _year_entries(attrs, year) if e.get("commit", True)}))
+    return json.dumps([[commit.run_id, commit.at] for commit in commits])
 
 
 def _no_source_runs(_tile: str) -> list[str] | None:
@@ -424,7 +420,7 @@ class StoreYear(NamedTuple):
     commits: list[Commit]
     tiles_of: Callable[[str], frozenset[str]]
     source_runs: Callable[[str], list[str] | None] = _no_source_runs
-    #: :func:`store_runs_stamp` of the attributes ``source_runs`` was derived from.
+    #: :func:`lineage_stamp` of ``commits``, the input ``source_runs`` was derived from.
     runs_stamp: str = "[]"
 
 
@@ -442,8 +438,7 @@ def store_year(
     time_index = calendar_years(group).index(year)
     runs = committed_runs(group.attrs, year, writes.get((zone, year), ()))
     tiles_of = cache(lambda snapshot: commit_tiles(repo, zone, time_index, snapshot))
-    attrs = dict(group.attrs)
-    return StoreYear(runs, tiles_of, source_runs(attrs, year, runs, tiles_of), store_runs_stamp(attrs, year))
+    return StoreYear(runs, tiles_of, source_runs(dict(group.attrs), year, runs, tiles_of), lineage_stamp(runs))
 
 
 def shard_pixel_window(

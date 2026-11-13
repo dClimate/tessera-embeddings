@@ -40,7 +40,7 @@ from tessera_embeddings.storage.provenance import (
     table_dir,
     update_pixels_uri,
 )
-from tessera_embeddings.storage.published_store import store_runs_stamp
+from tessera_embeddings.storage.published_store import committed_runs, lineage_stamp, shard_writes
 from tessera_embeddings.storage.registry_master import STORE_RUNS_KEY
 from tessera_embeddings.storage.zarr_store import plain_zarr_storage_options
 
@@ -218,7 +218,7 @@ class ProvenanceRecord:
         if "source_runs" not in schema:  # or a master written before the column
             raise LookupError(f"{where.zone}/{year} {where.tile}: the registry holds no complete provenance record")
         stamp = pl.read_parquet_metadata(uri, storage_options=self._storage_options()).get(STORE_RUNS_KEY)
-        if stamp != store_runs_stamp(self._zone_attrs(where.zone), year):
+        if stamp != self._lineage_stamp(where.zone, year):
             raise LookupError(
                 f"{where.zone}/{year}: the registry's master was merged before the store's latest run for the "
                 "year, so its source_runs may be stale; merge it again before reading pixels"
@@ -246,12 +246,13 @@ class ProvenanceRecord:
                 return run
         raise LookupError(f"{where}: none of {runs} wrote this pixel")
 
-    def _zone_attrs(self, zone: str) -> dict[str, Any]:
-        """The store's zone group attributes, where each run of each year is recorded."""
+    def _lineage_stamp(self, zone: str, year: int) -> str:
+        """The store's commits into ``zone``'s ``year`` now, stamped as a merge stamps the master."""
         repo = open_global_repo(
             self.store, get_credentials=self.get_credentials, region=self.region, anonymous=self.anonymous
         )
-        return dict(cast(zarr.Group, zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[zone]).attrs)
+        group = cast(zarr.Group, zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[zone])
+        return lineage_stamp(committed_runs(group.attrs, year, shard_writes(repo).get((zone, year), ())))
 
     def _run_group(self, zone: str, year: int, run_id: str) -> zarr.Group:
         """``run_id``'s group in the ``pixel_sources`` store: its planes, one per sensor."""

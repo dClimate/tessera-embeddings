@@ -151,11 +151,16 @@ def publish_provenance(
         return None
     axes = {sensor: days_of(read_array(root, "time")) for sensor, root in mosaics.items()}
     counts = {sensor: _granule_counts(sensor, root) for sensor, root in mosaics.items()}
-    fs = _fs_for(
-        registry_root, plain_zarr_storage_options(registry_root, access.registry_credentials, access.s3_region)
-    )
+
+    def _fs() -> AbstractFileSystem:
+        # Built per write, with credentials asked for then: the shard copy can outlast a token (the
+        # published store's writer role is capped at an hour), and every file here is written after it.
+        return _fs_for(
+            registry_root, plain_zarr_storage_options(registry_root, access.registry_credentials, access.s3_region)
+        )
 
     def _open_output(uri: str) -> Any:  # noqa: ANN401 — an fsspec file
+        fs = _fs()
         fs.makedirs(uri.rsplit("/", 1)[0], exist_ok=True)
         return fs.open(uri, "wb")
 
@@ -181,7 +186,7 @@ def publish_provenance(
         _publish_granules(
             granules_uri(registry_root, zone, year, sensor, pins[sensor]),
             granule_rows(pins[sensor], sensor, *_day_lists(root, axes[sensor])),
-            fs,
+            _fs(),
             _open_output,
             {
                 "zone": zone,

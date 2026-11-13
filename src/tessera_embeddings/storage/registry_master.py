@@ -95,7 +95,7 @@ if TYPE_CHECKING:
 MEASURED_BY_FILL = "fill"
 
 #: A master file's key-value entry naming the runs the store recorded for its year when it was
-#: merged (:func:`~.published_store.store_runs_stamp`), for a reader to check against the store.
+#: merged (:func:`~.published_store.lineage_stamp`), for a reader to check against the store.
 STORE_RUNS_KEY = "store_runs"
 
 #: Value of ``measured_by`` for a row whose numbers were re-derived from the store afterwards.

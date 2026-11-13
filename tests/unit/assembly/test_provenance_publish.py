@@ -28,6 +28,7 @@ from odc.geo.geobox import GeoBox
 
 from tessera_embeddings.config.inference import ZoneLayout
 from tessera_embeddings.config.ingest import PROVENANCE_VERSION, SOURCE_INDEX_VAR
+from tessera_embeddings.inference import provenance_publish
 from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.inference.provenance import PROVENANCE_ATTR, SNAPSHOTS_ATTR, SourcePlanes, read_source_pieces
@@ -41,8 +42,9 @@ from tessera_embeddings.storage.provenance import (
     update_pixels_uri,
 )
 from tessera_embeddings.storage.provenance_reader import PixelLocation, ProvenanceRecord, locate
-from tessera_embeddings.storage.published_store import store_runs_stamp
+from tessera_embeddings.storage.published_store import committed_runs, lineage_stamp
 from tessera_embeddings.storage.registry_master import STORE_RUNS_KEY
+from tessera_embeddings.storage.shard_writer import SHARD_WRITE
 from tessera_embeddings.storage.zarr_store import (
     open_repo,
     open_store_as_zarr_group,
@@ -293,6 +295,21 @@ def test_shard_dates_and_planes_name_the_same_granules(tmp_path: Path, valid: np
     assert {str(r["solar_day"]) for r in rows} == set(DATES), "a fully rejected date keeps its rows"
 
 
+def test_every_file_written_after_the_shard_copy_asks_for_credentials_again(tmp_path: Path, monkeypatch) -> None:
+    """The copy can outlast a token, so the writes after it must not reuse one resolved before it."""
+    events: list[str] = []
+    real_options, real_copy = provenance_publish.plain_zarr_storage_options, provenance_publish._copy_shard
+    monkeypatch.setattr(
+        provenance_publish,
+        "plain_zarr_storage_options",
+        lambda *a, **k: events.append("credentials") or real_options(*a, **k),
+    )
+    monkeypatch.setattr(provenance_publish, "_copy_shard", lambda *a: events.append("copy") or real_copy(*a))
+    pins = _mosaics(tmp_path / "mosaics")
+    _publish(tmp_path, pins, *_stage(tmp_path / "staging", pins))
+    assert "credentials" in events[len(events) - events[::-1].index("copy") :], "shard_dates reused an old token"
+
+
 def test_publishing_again_rewrites_the_same_record(published) -> None:
     tmp_path, pins, _ = published
     before = _shard_dates(tmp_path)
@@ -385,17 +402,23 @@ def updated(published):
 
 
 def _store_attrs(run_ids: list[str]) -> dict:
-    """A zone group's run records for YEAR: the first run as the fill, the rest as updates."""
-    fill, *updates = run_ids
-    return {"runs": {str(YEAR): {"run_id": fill}}, "updates": {str(YEAR): [{"run_id": u} for u in updates]}}
+    """A zone group's run records for YEAR, a day apart: the first run as the fill, the rest as updates."""
+    fill, *updates = [
+        {"run_id": run, "assembled_at": f"2025-01-0{i + 1}T00:00:00+00:00"} for i, run in enumerate(run_ids)
+    ]
+    return {"runs": {str(YEAR): fill}, "updates": {str(YEAR): updates}}
 
 
-def _record_attrs(registry: Path, attrs: dict) -> None:
-    """Make the store beside ``registry`` hold ``attrs`` on its zone group, as each run's commit leaves them."""
+def _record_attrs(registry: Path, attrs: dict, shard_write: str | None = None) -> None:
+    """Make the store beside ``registry`` hold ``attrs`` on its zone group, in one commit.
+
+    ``shard_write`` tags the commit as that run's shard commit, as the shard writer tags its own.
+    """
     repo = icechunk.Repository.open_or_create(icechunk.local_filesystem_storage(f"{registry}.icechunk"))
     session = repo.writable_session("main")
     zarr.open_group(session.store, path=ZONE, mode="a").attrs.update(attrs)
-    session.commit("record runs")
+    tag = {SHARD_WRITE: {"run_id": shard_write, "zone": ZONE, "year": YEAR}} if shard_write else None
+    session.commit("record runs", metadata=tag)
 
 
 def _master(registry: Path, tiles: list[str], source_runs: list) -> None:
@@ -404,7 +427,7 @@ def _master(registry: Path, tiles: list[str], source_runs: list) -> None:
     master.mkdir(parents=True)
     run_ids = list(dict.fromkeys(run for runs in source_runs if runs for run in runs))
     _record_attrs(registry, _store_attrs(run_ids))
-    stamp = {STORE_RUNS_KEY: store_runs_stamp(_store_attrs(run_ids), YEAR)}
+    stamp = {STORE_RUNS_KEY: lineage_stamp(committed_runs(_store_attrs(run_ids), YEAR, []))}
     table = pa.table({"tile": tiles, "source_runs": pa.array(source_runs, pa.list_(pa.string()))}, metadata=stamp)
     pq.write_table(table, master / "part-0.parquet")
 
@@ -483,19 +506,29 @@ def test_a_refused_shard_that_staged_no_record_has_no_pixel_answer(tmp_path: Pat
         ProvenanceRecord(str(tmp_path / "registry")).pixel_granules_at(PixelLocation(ZONE, refused[0], 0, 0), YEAR)
 
 
-@pytest.mark.parametrize("wrote", [True, False], ids=["update-wrote-shards", "update-wrote-nothing"])
-def test_a_master_merged_before_the_latest_shard_writing_run_has_no_pixel_answer(published, wrote: bool) -> None:
-    """A run that wrote shards after the merge may own the pixel, so the lineage is refused until the
-    next merge; one that recorded itself without writing (a null commit) changes no tile, and is not.
+@pytest.mark.parametrize(
+    ("since", "stale"),
+    [("recorded", True), ("shards-before-record", True), ("recorded-nothing", False)],
+)
+def test_a_master_merged_before_the_latest_shard_writing_commit_has_no_pixel_answer(
+    published, since: str, stale: bool
+) -> None:
+    """A commit that wrote shards after the merge may own the pixel, so the lineage is refused until the
+    next merge, whether or not its run has recorded itself yet; a run that recorded itself without
+    writing (a null commit) changes no tile, and is not.
     """
     tmp_path, _pins, _ = published
     registry = tmp_path / "registry"
     _master(registry, ["chunk_0_0", "chunk_0_1", "chunk_1_0", "chunk_1_1"], [[RUN]] * 4)
     where, record = PixelLocation(ZONE, "chunk_0_0", 0, 0), ProvenanceRecord(str(registry))
     assert not record.pixel_granules_at(where, YEAR).is_empty()
-    update = {"run_id": UPDATE, "commit": {"snapshot": "s"} if wrote else None}
-    _record_attrs(registry, _store_attrs([RUN]) | {"updates": {str(YEAR): [update]}})
-    if wrote:
+    if since == "shards-before-record":
+        _record_attrs(registry, {"touched": True}, shard_write=UPDATE)
+    else:
+        commit = {"snapshot": "s", "committed_at": "2025-02-01T00:00:00+00:00"} if since == "recorded" else None
+        update = {"run_id": UPDATE, "assembled_at": "2025-02-01T00:00:00+00:00", "commit": commit}
+        _record_attrs(registry, {"updates": {str(YEAR): [update]}})
+    if stale:
         with pytest.raises(LookupError, match="merged before the store's latest run"):
             record.pixel_granules_at(where, YEAR)
     else:

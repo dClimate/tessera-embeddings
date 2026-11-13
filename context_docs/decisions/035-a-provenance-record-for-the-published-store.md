@@ -79,8 +79,10 @@ provenance beyond its registry, and none can be reconstructed.
     Walking `source_runs` from the newest, a holes update claims the pixels its `update_pixels`
     marks and a fill or a shards update claims every pixel. `source_runs` lives on the master, whose
     merge follows each run's commit and may lag or fail, so every merge stamps the master with the
-    runs the store recorded as writing shards that year, and the pixel helpers refuse (`LookupError`) a master whose
-    stamp differs from the store's run records now, rather than answer from an older run.
+    list of commits `source_runs` was derived from, and the pixel helpers derive that list from the
+    store again and refuse (`LookupError`) a master whose stamp differs, rather than answer from an
+    older run. The list comes from the shard commits themselves, so a run whose shards landed
+    before its run record is caught too.
 
 ## Left out
 
