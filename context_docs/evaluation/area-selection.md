@@ -180,9 +180,9 @@ with the v2 Large model, and the store was scored against itself.
   and moving every point 1 km east gives 0.358. Both fail, with the 975th smallest difference
   at −0.51 and −0.49.
 
-**Ontario in one year is a weak test.** Of its 316 points in 2018, the AlphaEarth split puts 49
-in training and 240 in testing, and only 3 of its 7 classes have the 10 training points needed to
-be kept. It can catch a large drop in quality but not a small one.
+**Ontario in one year is a weak test.** Of its 316 points in 2018, the AlphaEarth split puts 69
+in training and 247 in testing. Only 3 of its 7 classes have the 10 training points needed to be
+kept, which leaves 49 training points and 240 test points. It can catch a large drop in quality but not a small one.
 
 ## Not yet settled
 
