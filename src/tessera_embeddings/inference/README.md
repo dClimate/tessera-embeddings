@@ -573,8 +573,8 @@ dominated by large matrix multiplications, and GPUs run those on dedicated hardw
 (tensor cores) that is only efficient when the matrices are big — a larger batch makes each
 multiplication bigger, so less of that hardware sits unused. 7,168 was measured as the
 point where the matrices are large enough to saturate it without running out of VRAM;
-smaller and larger were both tried. v2 then runs each sub-batch in chunks of 64 pixels
-(below), so for v2 the sub-batch size sets how many pixels move per copy and per output write,
+smaller and larger were both tried. On an L40S or an L4, v2 then runs each sub-batch in small
+chunks (below), so there the sub-batch size sets how many pixels move per copy and per output write,
 not the size of the matrices the card multiplies.
 
 **Two batches are in flight at once.** A batch has to be copied from host memory into the
@@ -677,8 +677,10 @@ things worse:
   CPU and training run the modules as written. v2 only: v1.1's arithmetic is unchanged.
   Measurements: [`v2-on-blackwell.md`](../../../context_docs/inference/v2-on-blackwell.md) §3.
 
-**v2 runs each sub-batch in chunks of 64 pixels, each replaying a captured CUDA graph.**
-`MultimodalBTInferenceModel.forward` cuts the sub-batch into chunks of `GRAPH_CHUNK_PIXELS`,
+**On an L40S or an L4, v2 runs each sub-batch in small chunks, each replaying a captured CUDA
+graph.** The chunk size is per card, in `GRAPH_CHUNK_PIXELS`: 64 pixels on an L40S, 32 on an L4.
+A card not listed there runs the whole batch; the A10G is left out because no chunk size beat its
+whole-batch forward. `MultimodalBTInferenceModel.forward` cuts the sub-batch into chunks,
 copies each chunk into fixed input buffers, replays the graph and copies the chunk's rows out.
 Small chunks keep the intermediate activations in the GPU's cache instead of streaming them
 through memory; replaying a graph launches the whole forward at once, which removes the

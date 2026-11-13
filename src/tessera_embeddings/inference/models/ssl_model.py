@@ -26,16 +26,17 @@ parameter names, and fusion math are the same, only the backbone pooling head
 and the reducer's trailing LayerNorm differ (see ``student_v2.py``).
 ``build_dim_reducer`` below stays v1.1-specific.
 
-On a CUDA device in eval mode with gradients off, a v2 model runs each sub-batch in chunks of
-``GRAPH_CHUNK_PIXELS`` pixels, each chunk replaying a CUDA graph captured once per bucket shape::
+On a card listed in ``GRAPH_CHUNK_PIXELS``, in eval mode with gradients off, a v2 model runs each
+sub-batch in chunks of that card's size, each chunk replaying a CUDA graph captured once per bucket
+shape (64 pixels on an L40S)::
 
     sub-batch (B pixels) ─► chunk 1 ─► copy into static inputs ─► replay graph ─► copy rows out ─┐
                             chunk 2 ─► …                                                        ├─► (B, 128)
                             last chunk (m ≤ 64 rows) ─► same, keeping only m rows ──────────────┘
 
 Small chunks keep the intermediates in the GPU's cache; the graph removes the per-operation
-launch cost that would otherwise make small chunks slower. v1.1, the CPU, and any forward with
-gradients on or in training mode run the whole batch at once. Measurements:
+launch cost that would otherwise make small chunks slower. v1.1, the CPU, a card not listed, and
+any forward with gradients on or in training mode run the whole batch at once. Measurements:
 ``context_docs/inference/inference-on-gpus.md``.
 """
 
@@ -50,8 +51,9 @@ import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
-# Pixels per replayed chunk for v2: 64 was the fastest size measured on an L40S, and 128 was slower.
-GRAPH_CHUNK_PIXELS = 64
+# Pixels per replayed chunk for v2, by card (``torch.cuda.get_device_name``), for the cards where chunked
+# replay measured faster than the whole batch. A card not listed runs the whole batch: an A10G gains at no size.
+GRAPH_CHUNK_PIXELS: dict[str, int] = {"NVIDIA L40S": 64, "NVIDIA L4": 32}
 
 _Graph = tuple[torch.cuda.CUDAGraph, torch.Tensor, torch.Tensor, torch.Tensor]
 """A captured forward: (graph, static S2 input, static S1 input, static output)."""

@@ -16,7 +16,6 @@ from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.dataset import MosaicChunkInferenceDataset
 from tessera_embeddings.inference.inference import run_inference
 from tessera_embeddings.inference.models.builder import (
-    _build_inference_model,
     _build_v2_inference_model,
     _verify_v2_args,
 )
@@ -254,21 +253,22 @@ def test_v2_runs_the_unmodified_inference_loop(v2_model, sample_chunk_data, t_s1
     assert not any(np.isnan(result.scales.ravel()))
 
 
-def test_chunked_forward_matches_the_whole_batch(v2_model, inference_config) -> None:
-    """v2 runs in chunks (v1.1 does not), and chunking, short last chunk included, changes no output.
+def test_chunked_forward_matches_the_whole_batch(v2_model) -> None:
+    """Chunking, short last chunk included, changes no output; the chunk size comes from the card.
 
     On CUDA each chunk replays a captured graph; here the same loop runs the model eagerly on the
     static buffers, which is all a CPU can check.
     """
-    assert v2_model.chunk_pixels == GRAPH_CHUNK_PIXELS
-    assert _build_inference_model(inference_config, torch.device("cpu")).chunk_pixels is None
+    chunk = GRAPH_CHUNK_PIXELS["NVIDIA L40S"]
+    assert "NVIDIA A10G" not in GRAPH_CHUNK_PIXELS  # measured: no chunk size beats its whole batch
+    assert v2_model.chunk_pixels is None  # a CPU model runs the whole batch
 
-    n = 2 * GRAPH_CHUNK_PIXELS + 5
+    n = 2 * chunk + 5
     s2_x, s1_x = torch.randn(n, 16, 11), torch.randn(n, 8, 3)
-    s2_static, s1_static = s2_x[:GRAPH_CHUNK_PIXELS].clone(), s1_x[:GRAPH_CHUNK_PIXELS].clone()
+    s2_static, s1_static = s2_x[:chunk].clone(), s1_x[:chunk].clone()
     with torch.no_grad():
         whole = v2_model(s2_x, s1_x)
-        z_static = torch.empty(GRAPH_CHUNK_PIXELS, whole.shape[1])
+        z_static = torch.empty(chunk, whole.shape[1])
 
         def run_chunk() -> None:
             z_static.copy_(v2_model(s2_static, s1_static))

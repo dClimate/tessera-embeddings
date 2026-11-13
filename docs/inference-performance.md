@@ -260,9 +260,10 @@ different order, so v2 outputs move slightly, within the cross-config envelope
 pays on every card measured, most on the fastest
 ([`v2-on-blackwell.md`](../context_docs/inference/v2-on-blackwell.md) §3).
 
-**v2 runs each sub-batch in chunks of 64 pixels, each replaying a captured CUDA graph.** A
-7,168-pixel forward streams its intermediate activations through GPU memory; a 64-pixel chunk
-keeps them in the card's cache. Small chunks alone would be slower, because each launches the
+**On an L40S or an L4, v2 runs each sub-batch in small chunks, each replaying a captured CUDA
+graph.** A 7,168-pixel forward streams its intermediate activations through GPU memory; a chunk
+of 64 pixels (32 on an L4) keeps them in the card's cache. The size is per card because the
+gain is: an A10G is no faster at any chunk size, so it and any unmeasured card run the whole batch. Small chunks alone would be slower, because each launches the
 forward's many small kernels one by one, so each chunk replays a CUDA graph captured once per
 bucket shape, which launches them all at once. Outputs move slightly, the way a different batch
 shape moves them, so the change ships at a v2 store boundary under ADR 030. v1.1 runs whole

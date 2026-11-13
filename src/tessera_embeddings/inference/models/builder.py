@@ -93,8 +93,8 @@ def _build_v2_inference_model(config: InferenceConfig, device: torch.device) -> 
     v2 pooling head and the reducer's trailing non-affine LayerNorm (see
     ``student_v2``). Both backbones consume ``band_num + 1`` input features (the
     ``+1`` is DOY appended by the sampler): S2 is 10 bands, the merged S1 stream
-    (asc + desc concatenated) is 2. On CUDA the model runs in chunks of
-    ``GRAPH_CHUNK_PIXELS`` pixels replaying a captured CUDA graph (see ``ssl_model``); v1.1 does
+    (asc + desc concatenated) is 2. On a card listed in ``GRAPH_CHUNK_PIXELS`` the model runs in
+    chunks of that card's size replaying a captured CUDA graph (see ``ssl_model``); v1.1 does
     not, so its arithmetic is unchanged.
     """
     max_seq_len = max(config.num_obs_checkpoints)
@@ -134,7 +134,7 @@ def _build_v2_inference_model(config: InferenceConfig, device: torch.device) -> 
             repr_dim=config.representation_dim,
         ),
         fusion_method=config.fusion_method,
-        chunk_pixels=GRAPH_CHUNK_PIXELS,
+        chunk_pixels=GRAPH_CHUNK_PIXELS.get(torch.cuda.get_device_name(device)) if device.type == "cuda" else None,
     ).to(device)
 
 
