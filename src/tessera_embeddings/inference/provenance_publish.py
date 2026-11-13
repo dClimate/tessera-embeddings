@@ -1,6 +1,6 @@
-"""Publish a run's provenance record beside the registry, after its shards commit and before its tag.
+"""Publish a run's provenance record beside the registry, before its shards commit.
 
-Assembly's last data step (``context_docs/storage/registry-provenance-plan.md`` §4, Appendix C). From the
+Assembly's step before the commit (``context_docs/storage/registry-provenance-plan.md`` §4, Appendix C). From the
 mosaics, read at the snapshots the actors read, it exports each slot's granule list as that
 snapshot's ``granules`` file, unless an earlier run already did, in which case it checks the file
 holds the same lists. From the staged shards it writes the run's group in the ``pixel_sources``
@@ -9,11 +9,12 @@ snapshot, so a plane value and its date are a ``granules`` key; the run's ``shar
 per-shard summary; and, for a holes update, ``update_pixels``, the pixels it embedded. It checks
 that they agree with each other and with the mosaics as it goes. The layout is drawn in ``storage/provenance.py``.
 
-**A failure fails the zone-year.** :func:`publish_provenance` raises rather than logging: the caller
-runs it before the tag and the staging cleanup, so a failed publication leaves the zone-year
-untagged with everything its retry needs, and the retry republishes. Every per-run write replaces the
-run's previous attempt and a snapshot's granule file is written once, so publishing twice yields the
-same record. There is no separate marker.
+**A failure fails the run before anything is committed.** :func:`publish_provenance` raises rather
+than logging, and the caller runs it before the shard commit, so a committed run always has its
+record and a failed publication leaves the run uncommitted with its staging kept for the retry.
+Every per-run write replaces the run's previous attempt and a snapshot's granule file is written
+once, so publishing twice yields the same record. A record whose run never commits is never read:
+a reader reaches a run only through the registry's ``source_runs``, derived from the store's commits.
 
 **The record follows the mosaics.** It is published when the zone-year's mosaics were ingested with
 the ``provenance`` switch on, and nothing is published when none of them was. A mix can only be
@@ -109,6 +110,7 @@ class ProvenanceRun:
     mosaic_snapshots: Mapping[str, str]
     grid_shape: tuple[int, int]
     shard_px: int
+    mode: str = "fill"
 
 
 @dataclass(frozen=True)
@@ -205,6 +207,9 @@ def publish_provenance(
             "run_id": run_id,
             "grid_shape": list(run.grid_shape),
             "shard_px": run.shard_px,
+            # What the run claims: a fill or a shards update every pixel of the shards it wrote, a
+            # holes update only those its ``update_pixels`` mask marks. Stated, never inferred.
+            "mode": run.mode,
             **{f"snapshot_{s}": p for s, p in pins.items()},
         }
     )
@@ -351,21 +356,6 @@ def _day_lists(root: zarr.Group, axis: Sequence[datetime.date]) -> tuple[list[da
 def _json_list(raw: str) -> list[Any]:
     value = json.loads(raw) if raw else []
     return value if isinstance(value, list) else []
-
-
-def staged_snapshots(
-    staging_base: str, run_id: str, embedded: Sequence[str], refused: Sequence[str]
-) -> dict[str, str] | None:
-    """The mosaic snapshots a run's staged shards were read from; ``None`` when none staged a record.
-
-    What a retry publishes from: the versions the model read, never the mosaics' tips, which may have
-    moved since. :func:`publish_provenance` checks every shard names the same ones.
-    """
-    staged = _staged_shards(staging_base, run_id, embedded, refused).values()
-    return next(
-        (cast("dict[str, str]", pins) for s in staged if s is not None and (pins := s[0].attrs.get(SNAPSHOTS_ATTR))),
-        None,
-    )
 
 
 def _staged_shards(

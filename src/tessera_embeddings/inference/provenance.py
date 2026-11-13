@@ -69,7 +69,7 @@ STAGED_TIMES = "pixel_sources_{sensor}_time"
 PROVENANCE_ATTR = "provenance"
 
 #: The staged shard's attribute naming the mosaic snapshots its planes were read from, by store
-#: path: what publication describes, and what a retry republishes from.
+#: path: publication refuses a shard read from snapshots other than the run's.
 SNAPSHOTS_ATTR = "mosaic_snapshots"
 
 #: A holes update's staged pixel mask: the pixels the run embedded, which the planes are cut to and

@@ -203,11 +203,11 @@ The pipeline already has three stages; each gains one job.
 ```text
   INGEST, per zone-year                 MODEL, per shard                 ASSEMBLY, per zone-year
   ─────────────────────                 ────────────────                 ───────────────────────
-  for each day and sensor:              read the mosaics, run the       commit the shards to the store
-   fuse the granules into the mosaic     model, stage the shard          publish the registry rows
-   + NEW: write the day's granule list   + NEW: stage, per date, the   + NEW: publish the record,
-   + NEW: write a source_index band        index, negated where the        check it, and fail the
-     (which granule supplied each          observation was not valid       zone-year if it is wrong
+  for each day and sensor:              read the mosaics, run the       + NEW: publish the record,
+   fuse the granules into the mosaic     model, stage the shard            check it, and fail the
+   + NEW: write the day's granule list   + NEW: stage, per date, the       run if it is wrong
+   + NEW: write a source_index band        index, negated where the      commit the shards to the store
+     (which granule supplied each          observation was not valid     publish the registry rows
      pixel), in the same commit            for the model, with counts    then tag, delete staging and mosaics
 ```
 
@@ -258,9 +258,12 @@ the zone are not recorded: none of it covered a pixel the store embeds.
    commit has neither, so the list can never describe a day the mosaic lacks.
 2. *The model and the record read the same version of the mosaics.* The fill notes each mosaic's
    snapshot when it plans and every later read uses it, so a change to a mosaic during a fill
-   changes neither the embeddings nor the record, which names those snapshots.
-3. *If publishing the record fails, the zone-year fails, before anything is deleted.* The staging
-   and mosaics a retry needs are still there, and the retry publishes the same record.
+   changes neither the embeddings nor the record, which names those snapshots. Each staged shard
+   names the snapshots it was read from, and publication refuses one that names others.
+3. *The record is published before the run's shards commit.* A committed run therefore always has
+   its record, and a failed publication fails the run with nothing committed, its staging kept
+   for the retry, which publishes again. A record whose run never commits is never read: a reader
+   reaches a run only through `source_runs`, which the store's own commits derive.
 
 **The switch.** One setting, `provenance`, off by default, is set in the ingest. Each mosaic
 records whether it was built with the record, and a run that disagrees with an existing mosaic is
@@ -294,8 +297,8 @@ embedded 15,668 pixels and refused the rest; an update with a minimum of one emb
 for the update, whose `update_pixels` marks it and whose record names its dates and granules.
 
 **The reader's rule, for any number of runs.** Walk the shard's `source_runs` from the newest: a
-holes update claims a pixel only where its `update_pixels` marks it, and a fill or a shards update
-claims every pixel. The first run that claims the pixel holds its record; the helpers apply this.
+holes update, as its run group's `mode` attribute states, claims a pixel only where its
+`update_pixels` marks it, and a fill or a shards update claims every pixel. The first run that claims the pixel holds its record; the helpers apply this.
 
 ## 6. What it costs
 
@@ -479,11 +482,10 @@ holds.
 `ingest/provenance.py`, the per-source reader hook in `stac.py`, and the marks on dropped copies in
 `s2_roi.py`. The actor's planes:
 `inference/provenance.py`. Publication and its checks: `inference/provenance_publish.py`, called
-from `runners/zone_fill.py` on the fill and update paths and on retry of a landed but untagged
-cell. Tables and layout: `storage/provenance.py`. `source_runs`: `published_store.source_runs`,
+from `runners/zone_fill.py` on the fill and update paths, before each shard commit. Tables and layout: `storage/provenance.py`. `source_runs`: `published_store.source_runs`,
 applied to the master by every registry merge and rebuild. The reader helpers: `storage/provenance_reader.py`.
 
-**Checks at publication**, each failing the zone-year: every mosaic slot has a granule list; the
+**Checks at publication**, each failing the run before it commits: every mosaic slot has a granule list; the
 three mosaics agree on the switch; every embedded shard staged a record; every staged shard was
 read from the snapshots the run publishes; each plane's positive count equals its row's `valid_px`
 and its distinct absolute values, less one, are its `sources`;

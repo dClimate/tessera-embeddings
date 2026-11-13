@@ -250,7 +250,7 @@ way. The sensors are `s2` (optical), `s1_asc` and `s1_desc` (radar by orbit dire
 - **`pixel_sources`**: one Icechunk repository with a group `<ZONE>/<YEAR>/<run_id>`, holding a
   `(date, northing, easting)` `int16` array per sensor on the zone group's grid, and its dates as
   `<sensor>_date`. The group's attributes name the mosaic each sensor's array describes, as
-  `snapshot_<sensor>`. A value `k` names the image at `fusion_order = |k| - 1` in that mosaic's
+  `snapshot_<sensor>`, and the run's `mode`: `fill`, `shards` or `holes`. A value `k` names the image at `fusion_order = |k| - 1` in that mosaic's
   `granules` list for the date. Positive means the model used that observation; negative means the
   image had data there and the model rejected it, a cloud for instance; `0` means no image had
   data. One caveat on "used": the model takes at most 256 observations per sensor, so at a pixel
@@ -296,9 +296,9 @@ halves, `utm33n` and `utm33s`, each its own run, but both halves' records sit un
 
 A tile's pixels can come from more than one run: a holes update fills only the pixels the run
 before it left empty. The master row's `source_runs` lists the runs whose pixels the tile holds,
-oldest first. Walk it from the newest: a holes update holds the pixels its `update_pixels` mask
-marks, the pixels it embedded, and a fill or a shards update holds every pixel; the first run that
-holds the pixel has its record. Every merge derives `source_runs` afresh from the store's shard
+oldest first. Walk it from the newest: a run whose group's `mode` is `holes` holds the pixels its
+`update_pixels` mask marks, the pixels it embedded, and a fill or a shards update holds every
+pixel; the first run that holds the pixel has its record. Every merge derives `source_runs` afresh from the store's shard
 commits, in the order they landed: a fill or a shards update starts the list again, and a holes
 update adds itself.
 
@@ -324,23 +324,26 @@ master = pl.read_parquet(f"{REGISTRY}/master/zone={ZONE}/year={YEAR}/part-0.parq
 runs = master.filter(pl.col("tile") == TILE)["source_runs"].item()
 
 # 2. The run that holds the pixel: newest first, a holes update where its mask marks the pixel,
-#    else a fill or a shards update, which has no mask.
+#    else a fill or a shards update. Each run's group in pixel_sources states its mode.
+bucket, key = prov.removeprefix("s3://").split("/", 1)
+repo = icechunk.Repository.open(icechunk.s3_storage(
+    bucket=bucket, prefix=f"{key}/pixel_sources.icechunk", region="us-west-2", anonymous=True))
+store = repo.readonly_session("main").store
 for run_id in reversed(runs):
+    run = zarr.open_group(store, path=f"{ZONE}/{YEAR}/{run_id}", mode="r")
+    if run.attrs["mode"] != "holes":
+        break
     try:
         mask = zarr.open_group(f"{prov}/update_pixels/zone={ZONE}/year={YEAR}/{run_id}.zarr",
                                mode="r", storage_options={"anon": True})
     except FileNotFoundError:
-        break
+        continue                                   # a holes update that embedded nothing
     if TILE in mask and mask[TILE][ROW, COL]:
         break
 meta = pl.read_parquet_metadata(f"{prov}/shard_dates/zone={ZONE}/year={YEAR}/{run_id}.parquet", storage_options=S3)
 assert TILE not in meta.get("unrecorded_tiles", "").split(","), "a refused tile its run recorded nothing for"
 
 # 3. The pixel's value on each date, per sensor, from that run's group.
-bucket, key = prov.removeprefix("s3://").split("/", 1)
-repo = icechunk.Repository.open(icechunk.s3_storage(
-    bucket=bucket, prefix=f"{key}/pixel_sources.icechunk", region="us-west-2", anonymous=True))
-run = zarr.open_group(repo.readonly_session("main").store, path=f"{ZONE}/{YEAR}/{run_id}", mode="r")
 r, c = (int(n) for n in TILE.removeprefix("chunk_").split("_"))
 y, x = r * run.attrs["shard_px"] + ROW, c * run.attrs["shard_px"] + COL   # on the zone's grid
 seen = []

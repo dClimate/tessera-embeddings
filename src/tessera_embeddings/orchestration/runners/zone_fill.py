@@ -83,7 +83,6 @@ from tessera_embeddings.inference.provenance_publish import (
     ProvenanceRun,
     mosaics_carry_provenance,
     publish_provenance,
-    staged_snapshots,
 )
 from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.ingest.land_mask import narrow_tile_live
@@ -493,14 +492,18 @@ def _publish_provenance(
     refused: Collection[str],
     mosaic_snapshots: Mapping[str, str] | None,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+    mode: str = "fill",
 ) -> None:
-    """Publish the run's provenance record beside the registry. Raises, so the cell is not tagged.
+    """Publish the run's provenance record beside the registry, BEFORE its shard commit. Raises.
 
-    Between the shard commit and the tag, on every path that lands shards, and again on the retry of
-    a cell that landed but was not tagged: a failure here leaves the staging and mosaics the retry
-    needs (``context_docs/storage/registry-provenance-plan.md`` §4 rule 3). Transient storage errors
-    are retried as store writes are; a failed check is not, since it would fail the same way.
-    Nothing is published without a registry, or when the mosaics carry no record.
+    On every path that commits shards, ahead of the commit, so a committed run always has its record
+    and a failure costs nothing irreversible: the run is not committed, its staging is kept, and its
+    retry publishes again, every write keyed by run id (``context_docs/storage/
+    registry-provenance-plan.md`` §4 rule 3). A record whose run never commits is never read, since a
+    reader reaches a run only through the store's ``source_runs``. ``mode`` is the run's, ``fill``,
+    ``shards`` or ``holes``. Transient storage errors are retried as store writes are; a failed check
+    is not, since it would fail the same way. Nothing is published without a registry, or when the
+    mosaics carry no record.
     """
     if not cell.registry_root or not cell.staging_base or not mosaic_snapshots:
         return
@@ -522,6 +525,7 @@ def _publish_provenance(
         mosaic_snapshots=mosaic_snapshots,
         grid_shape=(int(scales.shape[1]), int(scales.shape[2])),
         shard_px=shard_pitch(scales),
+        mode=mode,
     )
     access = ProvenanceAccess(cell.get_credentials, store_credentials, cell.s3_region)
     retrying = store_write_retrying(log).copy(
@@ -530,32 +534,6 @@ def _publish_provenance(
     for attempt in retrying:
         with attempt:
             publish_provenance(run, access, log)
-
-
-def _republish_provenance(
-    cell: _ProvenanceCell, mosaic_base: str, s1_orbit: str, log: logging.Logger | logging.LoggerAdapter[logging.Logger]
-) -> None:
-    """Publish again for a run that landed but whose cell was not finished, from its staging.
-
-    The run's staging is still there, since cleanup follows the tag. It lists which shards the run
-    embedded and which it refused, and names the mosaic snapshots they were read from, which the
-    record must describe even if a mosaic has moved on since. When no shard names them, the
-    mosaics' current snapshots stand in, so publication still runs and its checks fail a run whose
-    shards staged no record rather than tagging it without one. A run with nothing staged under this
-    id landed under other inputs and has nothing of its own to describe.
-    """
-    if not cell.registry_root or not cell.staging_base:
-        return
-    listing = ZarrWriter(cell.staging_base)._list_staged(cell.run_id)
-    if not listing.complete and not listing.skipped:
-        log.warning(
-            "Zone %s year %d: no staging for run %s, so no provenance to republish", cell.zone, cell.year, cell.run_id
-        )
-        return
-    snapshots = staged_snapshots(cell.staging_base, cell.run_id, listing.complete, listing.skipped) or mosaic_snapshots(
-        mosaic_base, s1_orbit, get_credentials=cell.get_credentials, s3_region=cell.s3_region
-    )
-    _publish_provenance(cell, listing.complete, listing.skipped, snapshots, log)
 
 
 # jscpd:ignore-start: Args shared with assemble_zone_year
@@ -864,18 +842,12 @@ def _ensure_tagged(
     year: int,
     tag: str,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
-    before_tag: Callable[[], None] | None = None,
 ) -> str:
-    """The snapshot of a landed cell's tag, creating the tag on ``main`` if a crash skipped it.
-
-    ``before_tag`` runs first when the tag is missing, for the work a crash may have skipped with it.
-    """
+    """The snapshot of a landed cell's tag, creating the tag on ``main`` if a crash skipped it."""
     if tag in repo.list_tags():
         snapshot = repo.lookup_tag(tag)
         log.info("Zone %s year %d already complete and tagged (%s) — nothing to do", zone, year, tag)
     else:
-        if before_tag is not None:
-            before_tag()
         snapshot = repo.lookup_branch("main")
         tag_zone_year(repo, zone, year, snapshot_id=snapshot)
         log.info("Zone %s year %d landed but was untagged (crash before tag) — tagged %s", zone, year, tag)
@@ -896,7 +868,6 @@ def plan_zone_inference(
     s3_region: str | None = None,
     update: UpdateTarget | None = None,
     registry_root: str | None = None,
-    staging_base: str | None = None,
 ) -> ZonePlan:
     """Validate a (zone, year) cell and enumerate its live tiles — no GPU work.
 
@@ -915,10 +886,6 @@ def plan_zone_inference(
     live tiles are the mask's narrowed to the update's shards; the store is pinned under the
     update's base tag before anything is written; and in ``holes`` mode each tile is given its
     hole mask, a tile with no holes dropping out as kept. Nothing is ever marked or tagged.
-
-    Those same two retries publish the run's provenance record again from ``staging_base`` before
-    anything else, because a failed publication is the one step that leaves a cell landed but not
-    finished (:func:`_publish_provenance`).
     """
     t0 = time.monotonic()
     run_id = run_id or run_id_prefix(config.model_version) + uuid.uuid4().hex[:12]
@@ -973,7 +940,6 @@ def plan_zone_inference(
     # retention holds; see mark_zone_year_empty's attribution note) instead of re-inferring.
     # Zone-year tags are write-once forever — icechunk forbids tag-name reuse even after
     # deletion — so deliberate refills need a fresh tag name.
-    cell = _ProvenanceCell(store_path, staging_base, registry_root, zone, year, run_id, get_credentials, s3_region)
     if update is not None:
         check_radar_policy(update, allow_s2_only=config.allow_s2_only)
         state = update_state(node, year, update.name, half)
@@ -984,7 +950,6 @@ def plan_zone_inference(
             )
         if state == "done":
             log.info("Zone %s year %d: update %s already recorded — nothing to do", zone, year, update.name)
-            _republish_provenance(cell, mosaic_base, config.s1_orbit, log)
             _merge_registry_master(
                 registry_root,
                 store_path,
@@ -1003,15 +968,7 @@ def plan_zone_inference(
         check_no_tightening(repo, update.name, rule, [(zone, year)])
     tag = zone_year_tag(zone, year)
     if update is None and cell_complete(node, year, half):
-        snapshot = _ensure_tagged(
-            repo,
-            zone,
-            year,
-            tag,
-            log,
-            # Publication fails a cell before its tag, so an untagged landed cell may lack its record.
-            before_tag=lambda: _republish_provenance(cell, mosaic_base, config.s1_orbit, log),
-        )
+        snapshot = _ensure_tagged(repo, zone, year, tag, log)
         _merge_registry_master(
             registry_root, store_path, zone, year, None, get_credentials=get_credentials, s3_region=s3_region, log=log
         )
@@ -1219,7 +1176,6 @@ def infer_zone_year(
         s3_region=s3_region,
         update=update,
         registry_root=registry_root,
-        staging_base=staging_base,
     )
     return (
         complete_zone_inference(plan, results=None)
@@ -1416,6 +1372,8 @@ def assemble_zone_year(
         # Mark + tag FIRST, clean up after (matching the data path): a crash after cleanup but
         # before the tag would force full re-inference just to regenerate zero-byte markers.
         if live:
+            # Before the commit, so a committed run always has its record (_publish_provenance).
+            _publish_provenance(cell, [], [c.label for c in live], handoff.mosaic_snapshots, log)
             # The fill write and the completion mark land together in one call, so the year
             # can never be marked empty over shards this run did not clear.
             snapshot = writer.assemble_global(
@@ -1442,7 +1400,6 @@ def assemble_zone_year(
                 fault=fault,
                 input_coverage=input_coverage,
             )
-            _publish_provenance(cell, [], [c.label for c in live], handoff.mosaic_snapshots, log)
             # Before the tag, not after it: a deliberate refill FAILS at the tag step by design,
             # once its data and run file have landed, and the master must still learn of it.
             _merge_registry_master(
@@ -1524,6 +1481,7 @@ def assemble_zone_year(
             radar_coverage["s1_thin_below_obs"],
             radar_coverage["tiles_fully_s1_free"],
         )
+    _publish_provenance(cell, staged_labels, skipped_labels, handoff.mosaic_snapshots, log)
     snapshot = writer.assemble_global(
         store_path,
         zone,
@@ -1544,7 +1502,6 @@ def assemble_zone_year(
         fault=fault,
         input_coverage=input_coverage,
     )
-    _publish_provenance(cell, staged_labels, skipped_labels, handoff.mosaic_snapshots, log)
     # Before the tag, as on the all-refused branch: a deliberate refill fails at the tag step.
     _merge_registry_master(
         registry_root, store_path, zone, year, run_id, get_credentials=get_credentials, s3_region=s3_region, log=log
@@ -1623,6 +1580,8 @@ def _assemble_update(
         return commit_update_record(repo, zone, year_label, commit, record=record)
 
     if staged or cleared:
+        # The update's own record, cut to the pixels it wrote, before the commit as a fill's is.
+        _publish_provenance(cell, staged, skipped, handoff.mosaic_snapshots, log, mode=update.mode)
         snapshot = writer.assemble_global(
             store_path,
             zone,
@@ -1651,8 +1610,6 @@ def _assemble_update(
             fault=fault,
             input_coverage=input_coverage,
         )
-        # The update's own record: its shards' dates and planes, cut to the pixels it wrote.
-        _publish_provenance(cell, staged, skipped, handoff.mosaic_snapshots, log)
         if merged and registry_root:
             _publish_merged_rows(
                 writer,

@@ -28,7 +28,8 @@ provenance beyond its registry, and none can be reconstructed.
    positive when the model used the observation, negative when its validity test rejected it, a
    cloud for instance, and 0 when no granule had data. A reader can therefore tell "no image" from
    "image rejected", and see which granule was cloudy. The run's group names each sensor's mosaic
-   snapshot in its attributes, so a plane value and its date are a full `granules` key: a pixel
+   snapshot in its attributes, and the run's `mode` (`fill`, `shards` or `holes`), which tells a
+   reader whether the run claims every pixel of its shards or only its `update_pixels`, so a plane value and its date are a full `granules` key: a pixel
    query joins the plane to `granules` and nothing else, and the plane does not depend on a second,
    separately written table agreeing with it on ordering. The alternative, an `int8` rank into
    each shard-date's `sources`, is smaller: the fusion order measured 16–23% larger on optical and
@@ -52,14 +53,14 @@ provenance beyond its registry, and none can be reconstructed.
    listed too, off the time axis in two arrays of the mosaic committed when it is skipped, every
    copy under the day's reason: `low_coverage`, `producer_conflict`, `unreadable` or
    `missing_bands`.
-6. **Publication failure fails the zone-year, before the tag and the cleanup.** It is retried as
-   store writes are, and a retry of a landed but untagged cell republishes from its staging before
-   tagging. No marker, gate or held state.
+6. **The record is published before the run's shards commit.** A committed run always has its
+   record; a failed publication fails the run with nothing committed and its staging kept, and the
+   retry publishes again, every write keyed by run id. A record whose run never commits is never
+   read, since readers reach runs only through the store-derived `source_runs`. No marker, gate,
+   held state or republish path.
 7. **The actors and the export read the mosaics at the snapshots the plan sampled.** A commit to a
    mosaic mid-fill can change neither what the model read nor what the record says. Each staged
-   shard names the snapshots it was read from; publication refuses a shard that names others, and a
-   retry republishes from the staged names. Only when no shard names any does it read the mosaics'
-   current tips, so publication still runs and its checks fail a run that staged no record.
+   shard names the snapshots it was read from, and publication refuses a shard that names others.
 8. **The record is behind a `provenance` switch, off by default.** Only the public global store
    needs it; dev runs and internal stores run without it. The mosaic's ingest manifest records the
    setting as `provenance_version`, a term whose absence means off, so a resume under the other

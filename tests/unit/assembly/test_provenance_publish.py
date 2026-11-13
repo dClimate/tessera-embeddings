@@ -193,7 +193,7 @@ def _stage(
 
 
 def _publish(
-    tmp_path: Path, pins: dict[str, str], embedded: list[str], refused: list[str], run: str = RUN
+    tmp_path: Path, pins: dict[str, str], embedded: list[str], refused: list[str], run: str = RUN, mode: str = "fill"
 ) -> dict | None:
     return publish_provenance(
         ProvenanceRun(
@@ -207,6 +207,7 @@ def _publish(
             mosaic_snapshots=pins,
             grid_shape=(SIZE, SIZE),
             shard_px=SHARD,
+            mode=mode,
         )
     )
 
@@ -376,7 +377,7 @@ def updated(published):
     """
     tmp_path, pins, _ = published
     embedded, refused = _stage(tmp_path / "staging", pins, pixels=EMBEDDED_BY_UPDATE, run=UPDATE)
-    _publish(tmp_path, pins, embedded, refused, run=UPDATE)
+    _publish(tmp_path, pins, embedded, refused, run=UPDATE, mode="holes")
     _master(tmp_path / "registry", embedded + refused, [[RUN, UPDATE]] * 3 + [None])
     return str(tmp_path / "registry"), pins
 

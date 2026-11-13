@@ -217,15 +217,17 @@ class ProvenanceRecord:
     def _claiming_run(self, where: PixelLocation, year: int, runs: list[str]) -> str:
         """Newest first, the run whose pixel this is: a holes update where its mask marks it, else the run below.
 
-        A run with no ``update_pixels`` is a fill or a shards update, which wrote every pixel of the shard.
+        Each run's group states its ``mode``; a fill or a shards update wrote every pixel of its shards.
+        A holes update none of whose shards it embedded has no masks, and claims nothing.
         """
         for run in reversed(runs):
-            uri = update_pixels_uri(self.root, where.zone, year, run)
-            options = self._zarr_options(uri)
-            try:
-                masks = zarr.open_group(uri, mode="r", storage_options=options)
-            except FileNotFoundError:
+            if self._run_group(where.zone, year, run).attrs["mode"] != "holes":
                 return run
+            uri = update_pixels_uri(self.root, where.zone, year, run)
+            try:
+                masks = zarr.open_group(uri, mode="r", storage_options=self._zarr_options(uri))
+            except FileNotFoundError:
+                continue
             if where.tile in masks and bool(cast(zarr.Array, masks[where.tile])[where.row, where.col]):
                 return run
         raise LookupError(f"{where}: none of {runs} wrote this pixel")
