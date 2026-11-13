@@ -307,7 +307,9 @@ commit history and run records, by the same function; a difference raises `Looku
 than name an older run's images. So shards committed before their run record, a retry under the
 same run id, and a lagging or failed merge are all refused, and a run that wrote nothing (a null
 commit) changes neither list. A run's latest commit time is the one its run record keeps, and a
-retry's earlier attempt never enters the list, so expiring old snapshots leaves it unchanged. A failed
+retry's earlier attempt never enters the list, so expiring old snapshots leaves it unchanged, except
+for a retry that died between its shards and its record: that zone-year is refused until `repair`
+merges it again. A failed
 merge so shows as an error until a later merge, or `rebuild_registry_measurements.py repair`, lands.
 
 ## 6. What it costs

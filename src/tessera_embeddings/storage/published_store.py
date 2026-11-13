@@ -401,7 +401,9 @@ def lineage_stamp(commits: Sequence[Commit]) -> str:
     written since the merge: a new run, a run whose shards committed before its run record did, or a
     retry landing under the same run id. A record-only run changes nothing. Each run is stamped once,
     by its latest commit's time, which its run record keeps as ``committed_at``: a retry's earlier
-    attempt, which no record names, never enters the stamp, so expiring old snapshots cannot change it.
+    attempt, which no record names, never enters the stamp, so expiring old snapshots leaves it as it
+    was, unless a retry died after its shards and before its record; that zone-year's master is then
+    refused until ``rebuild_registry_measurements.py repair`` merges it again.
     """
     latest = {commit.run_id: commit.at for commit in commits}  # oldest first, so the last commit wins
     return json.dumps(sorted(([run, at] for run, at in latest.items()), key=lambda entry: entry[1]))
