@@ -29,9 +29,10 @@ from typing import Any
 from prefect import flow, get_run_logger, task
 from prefect.task_runners import ThreadPoolTaskRunner
 
+from tessera_embeddings.config.inference import ZoneLayout
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.ingest.land_mask import export_zone_roi, live_chunk_count, validate_zone_roi
-from tessera_embeddings.storage.zone_grid import ZONES, canonicalize_zone
+from tessera_embeddings.storage.zone_grid import fill_zones, fill_zones_of
 
 #: Zone-level fan-out width. The work is S3 request latency rather than CPU, so the useful
 #: ceiling is well above the runner's core count; 12 keeps peak memory modest (each in-flight
@@ -128,12 +129,13 @@ def export_zone_rois(
     *,
     paths: BucketPaths,
     zones: list[str] | None = None,
+    zone_layout: ZoneLayout = "hemispheres",
     mask_name: str = "global",
     max_parallel_zones: int = DEFAULT_MAX_PARALLEL_ZONES,
     validate_only: bool = False,
     s3_region: str | None = None,
 ) -> dict[str, Any]:
-    """Export and validate the ROI masks for ``zones`` (default: all 120).
+    """Export and validate the ROI masks for ``zones`` (default: every fill zone of ``zone_layout``).
 
     It is split into two flows because ``task_runner=`` binds at flow-definition time, so the
     fan-out width can only be a runtime parameter if the outer flow passes it to an inner one
@@ -142,10 +144,13 @@ def export_zone_rois(
     Args:
         paths: Deployment storage contract. Masks are written to
             ``paths.zone_roi_store(zone)`` — the same path the ingest reads.
-        zones: UTM zone common names (e.g. ``["33N", "35N"]``). Defaults to every zone in the
-            grid; the all-ocean ones cost one bitmap read and are reported as such rather
-            than excluded up front, so the land-zone count is an output of the run and not a
+        zones: Zone names (e.g. ``["33N", "35N"]`` or ``["utm33n", "utm33s"]``). Defaults to every
+            fill zone of ``zone_layout`` — each column's two halves in ``utm_zones`` (ADR 038).
+            The all-ocean ones cost one bitmap read and are reported as such rather than
+            excluded up front, so the land-zone count is an output of the run and not a
             hardcoded constant.
+        zone_layout: Which zone grid ``zones=None`` means (ADR 037): ``"hemispheres"`` for the
+            v1.1 stores, ``"utm_zones"`` for v2 onward.
         mask_name: Land-mask coverage repo basename.
         max_parallel_zones: Zones in flight at once.
         validate_only: Check the existing masks and write nothing — re-asserts the gate, and
@@ -160,7 +165,8 @@ def export_zone_rois(
             makes a green run usable as the campaign's entry gate.
     """
     log = get_run_logger()
-    todo = [canonicalize_zone(z) for z in (zones if zones is not None else list(ZONES))]
+    # A column named whole is its two halves, the only ROIs a fill reads (ADR 038).
+    todo = [h for z in zones for h in fill_zones_of(z)] if zones is not None else list(fill_zones(zone_layout))
     log.info(
         "%s ROI masks for %d zone(s), %d in flight",
         "Validating" if validate_only else "Exporting",

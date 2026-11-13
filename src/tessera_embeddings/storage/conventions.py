@@ -510,9 +510,10 @@ def build_convention_attrs(
       non-metre CRS (degrees, feet) or absent coords rather than given a false value.
     * ``geoemb:source_data`` — the source-dataset URLs.
 
-    ``geoemb:spatial_layout`` is never written. Its schema allows only ``"utm_zones"`` (60
-    groups named ``utm01`` to ``utm60``) and ``"global"`` (one array in a global CRS); our stores
-    are 120 hemisphere groups (``01N`` to ``60S``) or a single ROI, so either value would mislead.
+    ``geoemb:spatial_layout`` is not written here: it describes how a store divides into groups,
+    which this per-group builder cannot see. The global-store seed writes ``"utm_zones"`` on the
+    root of a store in that layout (ADR 037); a hemisphere-layout store and a single ROI match
+    neither value the schema allows, so they omit it.
 
     *include_geoemb* False emits only ``proj:``/``spatial:``: the multi-group campaign store
     carries geoemb: once at the root (:func:`build_geoemb_root_attrs`) and uses this builder

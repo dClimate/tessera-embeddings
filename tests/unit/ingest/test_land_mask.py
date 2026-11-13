@@ -10,6 +10,7 @@ import rasterio
 import zarr
 from rasterio.transform import from_bounds
 
+from tessera_embeddings.config.inference import ZoneLayout
 from tessera_embeddings.config.store_layout import INNER_PX, SHARD_PX
 from tessera_embeddings.ingest import land_mask
 from tessera_embeddings.ingest.live_windows import live_chunk_grid_from_keys
@@ -56,6 +57,11 @@ def test_zone_for_cell_matches_delivery_samples() -> None:
     assert land_mask.zone_for_cell(179.95, 0.05) == "60N"
     assert land_mask.zone_for_cell(0.05, 0.05) == "31N"
     assert land_mask.zone_for_cell(0.05, -0.05) == "31S"
+    # A utm_zones column is filled in halves, split at the equator (ADR 038).
+    assert (land_mask.zone_for_cell(0.05, 0.05, "utm_zones"), land_mask.zone_for_cell(0.05, -0.05, "utm_zones")) == (
+        "utm31n",
+        "utm31s",
+    )
 
 
 def test_project_cells_to_pixel_boxes_is_on_grid() -> None:
@@ -88,6 +94,21 @@ def test_build_zone_coverage_consistency_and_or() -> None:
     assert np.array_equal(cov.tile_live, land_mask._block_any(cov.chunk_live, ratio))
 
 
+def test_column_halves_split_the_column_coverage_exactly() -> None:
+    """ADR 038: the halves are the column's coverage cut at the equator — together all of it, sharing no shard.
+
+    Cells hug the equator from both sides, so a footprint crossing it is the case that matters.
+    """
+    lons, lats = np.array([2.35, 2.35, 2.45]), np.array([0.05, -0.05, 48.85])
+    column = land_mask.build_zone_coverage("utm31", lons, lats)
+    north, south = (land_mask.build_zone_coverage(z, lons, lats) for z in ("utm31n", "utm31s"))
+    for bitmap in ("tile_live", "chunk_live"):
+        n, s = getattr(north, bitmap), getattr(south, bitmap)
+        assert np.array_equal(n | s, getattr(column, bitmap)) and not (n & s).any()
+    assert (north.n_cells, south.n_cells) == (2, 1)
+    assert north.tile_live[: zone_grid.zone("utm31s").tile_rows[0]].any() and south.tile_live.any()
+
+
 def test_build_zone_coverage_empty_zone_is_all_false() -> None:
     cov = land_mask.build_zone_coverage("01N", np.empty(0), np.empty(0))
     assert cov.n_cells == 0
@@ -101,24 +122,26 @@ def _write_registry(tmp_path, names: list[str]) -> str:
     return str(reg)
 
 
-def _geo_zones() -> list[str]:
-    return sorted({land_mask.zone_for_cell(lon, lat) for lon, lat, *_ in land_mask._GEO_CHECKS})
+def _geo_zones(layout: ZoneLayout = "hemispheres") -> list[str]:
+    return sorted({land_mask.zone_for_cell(lon, lat, layout) for lon, lat, *_ in land_mask._GEO_CHECKS})
 
 
 def _land_cell_names() -> list[str]:
     return [f"grid_{lon}_{lat}.tiff" for lon, lat, live, _ in land_mask._GEO_CHECKS if live]
 
 
-def test_build_all_and_validate(tmp_path) -> None:
+@pytest.mark.parametrize("layout", ["hemispheres", "utm_zones"])
+def test_build_all_and_validate(tmp_path, layout: ZoneLayout) -> None:
     """Build the geo-check zones from a synthetic registry; validate end-to-end.
 
     Restricting to the geo-check zones means validation's known land points are
     live (their cells are in the registry) and the ocean point is dead (its zone
-    has no cells) — exercising the geographic self-check for real.
+    has no cells) — exercising the geographic self-check for real, in each layout's
+    grid (Brasília sits in a southern half, which a utm column holds at negative northings).
     """
     names = _land_cell_names()
     registry = _write_registry(tmp_path, names)
-    zones = _geo_zones()
+    zones = _geo_zones(layout)
     dest = str(tmp_path / "coverage.icechunk")
 
     result = land_mask.build_all(dest, registry_uri=registry, delivery_uri="s3://x/y/", zones=zones)

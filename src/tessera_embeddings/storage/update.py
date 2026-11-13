@@ -26,7 +26,8 @@ campaign's own, which it rewrites and sweeps (:meth:`BucketPaths.update_root`).
 
 **What the store records.** Each cell an update lands in gains one entry in its zone group's
 ``updates`` attr, per year an append-only list of records naming the update, its run, its code,
-the depth rule it applied (``optical_min_obs``) and the shards it ``written``/``kept``/``cleared``.
+the depth rule it applied (``optical_min_obs``) and the shards it ``written``/``kept``/``cleared``
+— and, for a column half of a ``utm_zones`` store (ADR 038), the ``half`` it covered.
 ``years_complete``, ``runs`` and the zone-year tags stay exactly as the original fill left them,
 so a cell's state is ``runs[year]`` with ``updates[year]`` applied on top, in order.
 ``update-<name>-base`` pins the store before an update's first write and ``update-<name>-complete``
@@ -44,7 +45,7 @@ from __future__ import annotations
 
 import json
 import zipfile
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -68,8 +69,9 @@ from tessera_embeddings.inference.chunk_spec import (
 )
 from tessera_embeddings.storage.campaign import pin_tag
 from tessera_embeddings.storage.registry_master import master_schema
-from tessera_embeddings.storage.shard_writer import commit_with_rebase, read_years_complete
-from tessera_embeddings.storage.zone_grid import canonicalize_zone
+from tessera_embeddings.storage.shard_writer import cell_complete, commit_with_rebase
+from tessera_embeddings.storage.zone_grid import Half, canonicalize_zone, fill_zones_of, group_and_half
+from tessera_embeddings.storage.zone_grid import zone as zone_spec
 
 UpdateMode = Literal["holes", "shards"]
 OnSkip = Literal["keep", "clear"]
@@ -302,7 +304,7 @@ def plan_from_registry(
     name: str,
     mode: UpdateMode,
     refused: Refused | None = None,
-    zones: Iterable[str] | None = None,
+    zones: Collection[str] | None = None,
     years: Iterable[int] | None = None,
     aoi: tuple[float, float, float, float] | None = None,
     storage_options: Mapping[str, Any] | None = None,
@@ -329,8 +331,8 @@ def plan_from_registry(
         extra_columns="ignore",
         storage_options=dict(storage_options) if storage_options else None,
     )
-    if zones is not None:
-        rows = rows.filter(pl.col("zone").is_in([canonicalize_zone(z) for z in zones]))
+    if zones is not None:  # the registry is partitioned by group; a half is cut out below
+        rows = rows.filter(pl.col("zone").is_in([zone_spec(canonicalize_zone(z)).group_name for z in zones]))
     if years is not None:
         rows = rows.filter(pl.col("year").is_in([int(y) for y in years]))
     if refused is not None:
@@ -348,8 +350,11 @@ def plan_from_registry(
         overlaps = ((tile_west <= east) & (tile_east >= west)) | ((tile_west - 360 <= east) & (tile_east - 360 >= west))
         rows = rows.filter(overlaps & (pl.col("bbox_south") <= north) & (pl.col("bbox_north") >= south))
     source = f"registry {registry_root} refused={refused} aoi={aoi} zones={zones} years={years}"
+    tiles = _by_fill_zone(rows.select("zone", "year", "tile").collect())
+    if zones is not None:
+        tiles = tiles.filter(pl.col("zone").is_in([h for z in zones for h in fill_zones_of(z)]))
     return plan_from_tiles(
-        rows.select("zone", "year", "tile").collect(),
+        tiles,
         name=name,
         mode=mode,
         **({"source": source} | plan_fields),
@@ -359,14 +364,15 @@ def plan_from_registry(
 def plan_from_tiles(tiles: pl.DataFrame, *, name: str, mode: UpdateMode, **plan_fields: Any) -> UpdatePlan:  # noqa: ANN401
     """Build a plan from ``zone, year, tile`` rows; a null tile asks for every live shard of its cell.
 
-    Zones are canonicalised before grouping, so ``7S`` and ``07S`` rows land in one cell.
+    Zones are canonicalised before grouping, so ``7S`` and ``07S`` rows land in one cell, and a whole
+    ``utm_zones`` column becomes the half each tile's row lies in (both, for a null tile).
 
     Raises:
         ValueError: If there are no rows.
     """
     if tiles.is_empty():
         raise ValueError(f"Update {name!r} selects no tiles")
-    zoned = tiles.with_columns(pl.col("zone").map_elements(canonicalize_zone, return_dtype=pl.String))
+    zoned = _by_fill_zone(tiles)
     cells: dict[str, tuple[str, ...] | None] = {
         cell_key(zone, year): None if any(t is None for t in group) else tuple(sorted(group))
         for zone, year, group in zoned.group_by("zone", "year").agg("tile").iter_rows()
@@ -374,10 +380,24 @@ def plan_from_tiles(tiles: pl.DataFrame, *, name: str, mode: UpdateMode, **plan_
     return UpdatePlan(name=name, mode=mode, cells=cells, **plan_fields)
 
 
-def read_updates(node: zarr.Group, year: int) -> list[dict[str, Any]]:
-    """The update records on ``year`` of a zone group, oldest first."""
+def _by_fill_zone(tiles: pl.DataFrame) -> pl.DataFrame:
+    """``zone, year, tile`` rows keyed by canonical fill zone: a column's tiles go to the half holding their row."""
+    rows = [
+        (half, year, tile)
+        for zone, year, tile in tiles.select("zone", "year", "tile").iter_rows()
+        for half in fill_zones_of(zone, None if tile is None else parse_chunk_label(tile)[0])
+    ]
+    return pl.DataFrame(rows, schema={"zone": pl.String, "year": pl.Int64, "tile": pl.String}, orient="row")
+
+
+def read_updates(node: zarr.Group, year: int, half: Half | None) -> list[dict[str, Any]]:
+    """The update records on ``year`` of one fill zone, oldest first: a group's, or one column half's.
+
+    A column's halves share the group's records (ADR 038) but not their pixels, so each reads only
+    its own; ``None`` is a group that is its own fill zone, whose records carry no half.
+    """
     raw = node.attrs.get(UPDATES_ATTR) or {}
-    return list(cast("dict[str, list[dict[str, Any]]]", raw).get(str(year), []))
+    return [r for r in cast("dict[str, list[dict[str, Any]]]", raw).get(str(year), []) if r.get("half") == half]
 
 
 def applied_optical_min_obs(store_rule: int | None, line: int | None) -> int | None:
@@ -404,7 +424,8 @@ def cell_optical_min_obs(root: zarr.Group, zone: str, year: int) -> int | None:
     rule = root.attrs.get("optical_min_obs")
     if rule is None:
         return None
-    records = read_updates(cast(zarr.Group, root[zone]), year)
+    group, half = group_and_half(zone)
+    records = read_updates(cast(zarr.Group, root[group]), year, half)
     return min([int(cast("int", rule)), *(int(r["optical_min_obs"]) for r in records if r.get("optical_min_obs"))])
 
 
@@ -428,15 +449,16 @@ def check_no_tightening(
             )
 
 
-def update_state(node: zarr.Group, year: int, name: str) -> UpdateState:
-    """Where update ``name`` stands on one cell.
+def update_state(node: zarr.Group, year: int, name: str, half: Half | None) -> UpdateState:
+    """Where update ``name`` stands on one cell: a group's year, or one column half of it (ADR 038).
 
     ``not_complete`` when the year was never filled: an update is an insert into existing data,
-    and an unfilled year is the campaign's to fill.
+    and an unfilled year is the campaign's to fill. A half's update records carry its ``half``,
+    so the other half of the column still has it to do.
     """
-    if any(record.get("update") == name for record in read_updates(node, year)):
+    if any(r.get("update") == name for r in read_updates(node, year, half)):
         return "done"
-    return "pending" if year in read_years_complete(node) else "not_complete"
+    return "pending" if cell_complete(node, year, half) else "not_complete"
 
 
 def update_states(
@@ -450,9 +472,10 @@ def update_states(
     root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
     states: dict[tuple[str, int], UpdateState] = {}
     for zone, year in cells:
-        if zone not in root:
+        group, half = group_and_half(zone)
+        if group not in root:
             raise ValueError(f"Update {name!r} names zone {zone}, which is not seeded in the store")
-        states[(zone, year)] = update_state(cast(zarr.Group, root[zone]), year, name)
+        states[(zone, year)] = update_state(cast(zarr.Group, root[group]), year, name, half)
     return states
 
 
@@ -505,7 +528,7 @@ def update_record(
 
 def commit_update_record(
     repo: icechunk.Repository,
-    group: str,
+    zone: str,
     year: int,
     commit: Mapping[str, str] | None = None,
     *,
@@ -519,18 +542,20 @@ def commit_update_record(
     :func:`~tessera_embeddings.storage.shard_writer.commit_year_attrs`, for the same reason: attrs
     cannot be merged by icechunk's conflict detector, and each writer only appends its own record,
     so re-reading and re-applying is exact. Idempotent per update: a record already present for this
-    update and year is left as it is.
+    update and year is left as it is. A column half's record (ADR 038) is stamped with its ``half``.
     """
+    group, half = group_and_half(zone)
+    record = {**record, "commit": dict(commit) if commit else None} | ({"half": half} if half else {})
     for attempt in range(1, tries + 1):
         session = repo.writable_session("main")
         node = cast(zarr.Group, zarr.open_group(session.store, mode="a")[group])
-        if update_state(node, year, str(record["update"])) == "done":
+        if update_state(node, year, str(record["update"]), half) == "done":
             return repo.lookup_branch("main")
         updates = dict(cast("dict[str, list[dict[str, Any]]]", node.attrs.get(UPDATES_ATTR) or {}))
-        updates[str(year)] = [*updates.get(str(year), []), {**record, "commit": dict(commit) if commit else None}]
+        updates[str(year)] = [*updates.get(str(year), []), record]
         node.attrs[UPDATES_ATTR] = updates
         try:
-            return commit_with_rebase(session, f"update {record['update']}: record {group} year {year}")
+            return commit_with_rebase(session, f"update {record['update']}: record {zone} year {year}")
         except icechunk.RebaseFailedError:
             if attempt == tries:
                 raise

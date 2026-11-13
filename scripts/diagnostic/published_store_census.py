@@ -151,7 +151,7 @@ def _zone_report(root: zarr.Group, zone: str, *, with_shards: bool, session: ice
     # The CRS is CHECKED, not just reported: another zone's EPSG code georeferences every array
     # wrongly while the shapes stay right and the attribute stays plausible. Expected value from
     # `zone_grid`, so this and the seeder cannot disagree.
-    spec = zone_grid.zone(zone) if zone in zone_grid.ZONES else None
+    spec = zone_grid.zone(zone) if zone in EXPECTED_ZONES else None
     if spec is None:
         departures.append(f"{zone}: not a known UTM zone, so neither its CRS nor its grid can be checked")
     else:

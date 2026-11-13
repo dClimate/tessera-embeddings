@@ -19,12 +19,12 @@ So the runtime artifact is **per-zone coverage bitmaps**, not a pixel mask:
   at inner-chunk granularity, kept for future coverage-edge shard leaning. By
   construction ``tile_live_2048 == 8x8-block-any(chunk_live_256)``.
 
-All 120 UTM zone groups live in one Icechunk repo (``BucketPaths.land_mask_store()``),
-mirroring the global store's layout so the consumer read is exactly
-``open_store_as_zarr_group(path, group=zone)`` — same helper, timeout/retry hardening and
-credential path as the rest of the campaign. The all-ocean zones (8 of 120) get empty
-bitmaps, so the runner always finds a coverage group and its ``mark_zone_year_empty`` path
-fires naturally.
+Every zone group of a layout (120 hemisphere zones, or 60 ``utm`` columns) lives in one
+Icechunk repo (``BucketPaths.land_mask_store()``), mirroring the global store's layout so the
+consumer read is exactly ``open_store_as_zarr_group(path, group=zone)`` — same helper,
+timeout/retry hardening and credential path as the rest of the campaign. All-ocean zones (8 of
+the 120 hemisphere zones) get empty bitmaps, so the runner always finds a coverage group and
+its ``mark_zone_year_empty`` path fires naturally.
 
 Building is pure geometry over the registry (sub-minute, no data-plane reads): stream
 ``registry.txt`` → assign each cell to its NOMINAL 6° UTM band by filename math → per zone,
@@ -53,6 +53,7 @@ import rasterio
 import zarr
 from pyproj import Transformer
 
+from tessera_embeddings.config.inference import ZoneLayout
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
 from tessera_embeddings.config.store_layout import INNER_PX, SHARD_PX
 from tessera_embeddings.inference.chunk_spec import parse_chunk_label
@@ -64,7 +65,7 @@ from tessera_embeddings.storage.zarr_store import (
     open_store_as_zarr_group,
     plain_zarr_storage_options,
 )
-from tessera_embeddings.storage.zone_grid import PIXEL_M, ZONE_SCHEME, ZONES, ZoneSpec
+from tessera_embeddings.storage.zone_grid import PIXEL_M, ZONE_SCHEME, ZoneSpec
 from tessera_embeddings.utils import utcnow_iso
 
 if TYPE_CHECKING:
@@ -160,21 +161,24 @@ def _validate_cell_center(name: str, lon: float, lat: float) -> None:
 
 @cache
 def _transformer(epsg: int) -> Transformer:
-    """WGS84 → zone-CRS transformer, cached per zone (there are only 120)."""
+    """WGS84 → zone-CRS transformer, cached per CRS (there are only 120)."""
     return Transformer.from_crs(4326, epsg, always_xy=True)
 
 
-def zone_for_cell(lon: float, lat: float) -> str:
-    """Cell centre → the UTM common name of its zone (e.g. ``"30N"``, ``"19S"``).
+def zone_for_cell(lon: float, lat: float, layout: ZoneLayout = "hemispheres") -> str:
+    """Cell centre → the zone *layout* fills it in (e.g. ``"30N"``, ``"19S"``, ``"utm30s"``).
 
     Uses the NOMINAL 6° UTM band (``utm_6deg_nominal``, ADR-008) — filename math only, never
     the MGRS exceptions in :func:`ingest.roi.determine_utm_zone`. Cells never straddle a 6°
     band edge (a band is exactly 60 0.1° cells and centres sit 0.05° off every boundary), so
-    the ``floor`` is exact. Hemisphere is the sign of the centre latitude (never exactly 0).
+    the ``floor`` is exact. Hemisphere, or a column's half, is the sign of the centre latitude
+    (never exactly 0).
     """
     band = math.floor((lon + 180.0) / 6.0) + 1
     band = min(max(band, 1), 60)
-    return f"{band:02d}{'N' if lat >= 0 else 'S'}"
+    return (
+        f"utm{band:02d}{'n' if lat >= 0 else 's'}" if layout == "utm_zones" else f"{band:02d}{'N' if lat >= 0 else 'S'}"
+    )
 
 
 def project_cells_to_pixel_boxes(
@@ -213,15 +217,21 @@ def build_zone_coverage(zone: str, lons: np.ndarray, lats: np.ndarray) -> ZoneCo
     :data:`INNER_PX`, so tile/chunk ranges never spill a partial edge. Both bitmaps come
     from the same clamped pixel box via ``ceil(ceil(x/256)/8) == ceil(x/2048)``, which is
     what makes ``tile_live == 8x8-block-any(chunk_live)`` hold globally.
+
+    **A column half (ADR 038) takes its whole column's cells**, so a footprint that crosses
+    the equator still sets its bits, then keeps only the bits on its own shard rows and counts
+    only the cells centred on its side. The two halves are therefore exactly the column's
+    coverage, split at a shard boundary, and never share a shard.
     """
     spec = zone_grid.zone(zone)
     tile_live = np.zeros((spec.height // SHARD_PX, spec.width // SHARD_PX), dtype=bool)
     chunk_live = np.zeros((spec.height // INNER_PX, spec.width // INNER_PX), dtype=bool)
-    n_cells = len(lons)
+    own = np.ones(len(lats), dtype=bool) if spec.half is None else (lats >= 0) == (spec.half == "n")
+    n_cells = int(own.sum())
     n_clipped = 0
-    if n_cells:
+    if len(lons):
         r0, r1, c0, c1 = project_cells_to_pixel_boxes(lons, lats, spec)
-        for i in range(n_cells):
+        for i in range(len(lons)):
             if r1[i] <= r0[i] or c1[i] <= c0[i]:
                 # Footprint fell WHOLLY outside the zone extent — e.g. a centre beyond
                 # UTM's usable range (>84°N / <80°S). It set no coverage bit; counted so
@@ -233,7 +243,7 @@ def build_zone_coverage(zone: str, lons: np.ndarray, lats: np.ndarray) -> ZoneCo
                 # place one. See ADR-017 — "global" means the registry's extent, 59.45S to
                 # 83.65N, published rather than implied. The counter stays because it is
                 # what would report a FUTURE registry reaching past what UTM can represent.
-                n_clipped += 1
+                n_clipped += int(own[i])
                 continue
             tile_live[
                 r0[i] // SHARD_PX : _ceil_div(r1[i], SHARD_PX),
@@ -243,6 +253,10 @@ def build_zone_coverage(zone: str, lons: np.ndarray, lats: np.ndarray) -> ZoneCo
                 r0[i] // INNER_PX : _ceil_div(r1[i], INNER_PX),
                 c0[i] // INNER_PX : _ceil_div(c1[i], INNER_PX),
             ] = True
+    r0_own, r1_own = spec.tile_rows
+    ratio = SHARD_PX // INNER_PX
+    tile_live[:r0_own] = tile_live[r1_own:] = False
+    chunk_live[: r0_own * ratio] = chunk_live[r1_own * ratio :] = False
     return ZoneCoverage(zone=zone, tile_live=tile_live, chunk_live=chunk_live, n_cells=n_cells, n_clipped=n_clipped)
 
 
@@ -271,13 +285,19 @@ def read_registry(registry_uri: str) -> tuple[list[str], str]:
     return names, sha
 
 
-def group_cells_by_zone(names: list[str]) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-    """Parse registry names and group cell centres by zone EPSG string."""
+def group_cells_by_zone(
+    names: list[str], layout: ZoneLayout = "hemispheres"
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Parse registry names and group cell centres by their zone GROUP in *layout*.
+
+    By group rather than by fill zone: a column half is built from its whole column's cells
+    (:func:`build_zone_coverage`).
+    """
     lon_by_zone: dict[str, list[float]] = defaultdict(list)
     lat_by_zone: dict[str, list[float]] = defaultdict(list)
     for name in names:
         lon, lat = parse_cell_name(name)
-        z = zone_for_cell(lon, lat)
+        z = zone_grid.zone(zone_for_cell(lon, lat, layout)).group_name
         lon_by_zone[z].append(lon)
         lat_by_zone[z].append(lat)
     return {
@@ -317,6 +337,7 @@ def build_all(
     registry_uri: str | None = None,
     delivery_uri: str = DEFAULT_DELIVERY_URI,
     zones: list[str] | None = None,
+    zone_layout: ZoneLayout = "hemispheres",
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
@@ -327,9 +348,11 @@ def build_all(
         dest: URI of the coverage Icechunk repo (``BucketPaths.land_mask_store()``).
         registry_uri: Registry file URI; defaults to ``{delivery_uri}/registry.txt``.
         delivery_uri: Partner delivery prefix (recorded in attrs as ``source``).
-        zones: Restrict to these zone COMMON NAMES — ``"33N"``, ``"07S"`` — the keys
-            ``zone_grid.zone`` is registered under, not EPSG codes (default: all 120). A
+        zones: Restrict to these zone NAMES — ``"33N"``, ``"07S"``, ``"utm33s"`` — the keys
+            ``zone_grid.zone`` is registered under, not EPSG codes (default: every fill zone
+            of ``zone_layout``, so a ``utm_zones`` mask holds each column's two halves). A
             restricted build still commits; unlisted zones simply aren't touched.
+        zone_layout: The layout to build when ``zones`` is not given; named zones carry their own.
         get_credentials: Optional Icechunk credential callback.
         s3_region: Region of the coverage repo, when not Icechunk's default. Without it a
             deployment whose bucket lives elsewhere could seed and fill the global store
@@ -343,10 +366,10 @@ def build_all(
     registry_uri = registry_uri or _join(delivery_uri, REGISTRY_NAME)
     log.info("Reading registry %s", registry_uri)
     names, sha = read_registry(registry_uri)
-    cells_by_zone = group_cells_by_zone(names)
-    log.info("Registry: %d cells across %d zones", len(names), len(cells_by_zone))
+    target_zones, zone_layout = _target_zones(zones, zone_layout)
+    cells_by_zone = group_cells_by_zone(names, zone_layout)
+    log.info("Registry: %d cells across %d zone groups", len(names), len(cells_by_zone))
 
-    target_zones = zones if zones is not None else list(ZONES)
     created_at = utcnow_iso()
 
     repo, _ = open_or_create_repo(dest, get_credentials=get_credentials, region=s3_region)
@@ -358,7 +381,7 @@ def build_all(
     zones_with_cells = 0
     for zone in target_zones:
         spec = zone_grid.zone(zone)
-        lons, lats = cells_by_zone.get(zone, (np.empty(0), np.empty(0)))
+        lons, lats = cells_by_zone.get(spec.group_name, (np.empty(0), np.empty(0)))
         cov = build_zone_coverage(zone, lons, lats)
         node = root.require_group(zone)
         _write_coverage_arrays(node, cov)
@@ -431,11 +454,23 @@ def _bitmap(node: zarr.Group, name: str) -> np.ndarray:
     return np.asarray(cast("zarr.Array", node[name]))
 
 
+def _target_zones(zones: list[str] | None, zone_layout: ZoneLayout) -> tuple[list[str], ZoneLayout]:
+    """The fill zones a build or validation covers, and their layout: named zones carry their own.
+
+    A column named whole is its two halves, the only masks a fill reads (ADR 038).
+    """
+    if zones is None:
+        return list(zone_grid.fill_zones(zone_layout)), zone_layout
+    halves = [h for z in zones for h in zone_grid.fill_zones_of(z)]
+    return halves, zone_grid.zone_layout_of(halves) or zone_layout
+
+
 # jscpd:ignore-start: explicit keyword signature and Args, mirroring build_coverage
 def validate_coverage(
     dest: str,
     *,
     zones: list[str] | None = None,
+    zone_layout: ZoneLayout = "hemispheres",
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
@@ -453,7 +488,7 @@ def validate_coverage(
     # jscpd:ignore-end
     log = log or logger
     ratio = SHARD_PX // INNER_PX
-    target_zones = zones if zones is not None else list(ZONES)
+    target_zones, zone_layout = _target_zones(zones, zone_layout)
     # One repo open; groups are indexed off the root.
     root = open_store_as_zarr_group(dest, get_credentials=get_credentials, region=s3_region)
     for zone in target_zones:
@@ -472,7 +507,7 @@ def validate_coverage(
         if n_cells > 0 and not tile_live.any():
             raise ValueError(f"Zone {zone}: {n_cells} cells but no live tiles")
 
-    _check_geo_points(root, set(target_zones), log)
+    _check_geo_points(root, set(target_zones), zone_layout, log)
 
 
 #: (lon, lat, expected_live, label) sanity points, all on exact 0.1° cell centres. Land
@@ -487,7 +522,10 @@ _GEO_CHECKS: tuple[tuple[float, float, bool, str], ...] = (
 
 
 def _check_geo_points(
-    root: zarr.Group, validated_zones: set[str], log: logging.Logger | logging.LoggerAdapter[logging.Logger]
+    root: zarr.Group,
+    validated_zones: set[str],
+    zone_layout: ZoneLayout,
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger],
 ) -> None:
     """Assert each in-scope :data:`_GEO_CHECKS` point's tile matches expectation.
 
@@ -495,7 +533,7 @@ def _check_geo_points(
     subset validation never touches an unbuilt group.
     """
     for lon, lat, expected, label in _GEO_CHECKS:
-        zone = zone_for_cell(lon, lat)
+        zone = zone_for_cell(lon, lat, zone_layout)
         if zone not in validated_zones:
             continue
         spec = zone_grid.zone(zone)
@@ -804,7 +842,7 @@ def export_zone_roi(
     all-fill chunks are elided.
 
     Args:
-        zone: UTM common name (e.g. ``"33N"``).
+        zone: Zone name (e.g. ``"utm33"`` or ``"33N"``).
         land_mask_path: Coverage Icechunk repo (``BucketPaths.land_mask_store``).
         dest_path: Output ROI zarr URI (e.g. ``{inputs}/rois/zarrs/zone_33N.zarr``).
         get_credentials: Icechunk credential callback. Used for the coverage-repo read AND,

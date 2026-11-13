@@ -31,17 +31,29 @@ def _capture_seed(monkeypatch) -> dict:
     def _fake_seed(repo, todo, *, years, model_version, optical_min_obs, commit_msg):
         captured["model_version"] = model_version
         captured["optical_min_obs"] = optical_min_obs
+        captured["groups"] = sorted(spec.group_name for spec in todo)
         return "snapshot"
 
     monkeypatch.setattr(mod, "seed_zone_groups", _fake_seed)
     return captured
 
 
-def test_seed_stamps_the_model(monkeypatch):
-    """The seed records the model every later fill follows."""
+@pytest.mark.parametrize(("model", "layout"), [("v1.1", "hemispheres"), ("v2-large", "utm_zones")])
+def test_seed_stamps_the_model_and_takes_its_zone_layout(monkeypatch, model, layout):
+    """The seed records the model every later fill follows, and a new store takes its layout."""
     captured = _capture_seed(monkeypatch)
+    mod.seed_global_store.fn(paths=_PATHS, model_version=model)
+    assert captured["model_version"] == model
+    assert captured["groups"] == sorted(mod.zones(layout))
+
+
+def test_an_existing_store_keeps_its_zone_layout_whatever_the_model(monkeypatch):
+    """A v2 seed into a hemisphere store finishes that store's 120 groups, not 60 utm columns."""
+    _seeded(monkeypatch, {"geoemb:model": "tessera-v1.1"}, cells_landed=0, seeded_zones=3)
+    seen: dict = {}
+    monkeypatch.setattr(mod, "seed_zone_groups", lambda repo, todo, **kw: seen.update(todo=todo) or "SNAP")
     mod.seed_global_store.fn(paths=_PATHS, model_version="v2-large")
-    assert captured["model_version"] == "v2-large"
+    assert {spec.hemisphere for spec in seen["todo"]} == {"N", "S"}
 
 
 def test_seed_creates_on_missing_repo_icechunk_error(monkeypatch):
@@ -106,7 +118,7 @@ def test_the_minimum_depth_rule_is_exactly_the_one_requested(monkeypatch, rule):
     assert captured["optical_min_obs"] == rule
 
 
-def _seeded(monkeypatch, root_attrs: dict, *, cells_landed: int, seeded_zones: int = len(mod.ZONES)):
+def _seeded(monkeypatch, root_attrs: dict, *, cells_landed: int, seeded_zones: int = len(mod.zones("hemispheres"))):
     """Wire a store with ``seeded_zones`` zone groups present (all by default), a given root and
     a given amount of landed data. Fewer than all takes the INCREMENTAL path.
     """
@@ -124,7 +136,7 @@ def _seeded(monkeypatch, root_attrs: dict, *, cells_landed: int, seeded_zones: i
         "open_global_repo",
         lambda *a, **k: type("R", (), {"readonly_session": lambda s, branch: type("S", (), {"store": object()})()})(),
     )
-    present = list(mod.ZONES)[:seeded_zones]
+    present = list(mod.zones("hemispheres"))[:seeded_zones]
     monkeypatch.setattr(
         mod,
         "campaign_status",
@@ -244,9 +256,9 @@ def test_a_partially_seeded_store_with_no_data_still_seeds_the_remainder(monkeyp
     seen: dict = {}
     monkeypatch.setattr(mod, "seed_zone_groups", lambda repo, todo, **kw: seen.update(kw, n=len(todo)) or "SNAP2")
     out = mod.seed_global_store.fn(paths=_PATHS, optical_min_obs=15)
-    assert seen["n"] == len(mod.ZONES) - 3, "the remainder is seeded"
+    assert seen["n"] == len(mod.zones("hemispheres")) - 3, "the remainder is seeded"
     assert seen["optical_min_obs"] == 15
-    assert out["seeded_now"] == len(mod.ZONES) - 3
+    assert out["seeded_now"] == len(mod.zones("hemispheres")) - 3
 
 
 def test_a_partially_seeded_store_that_is_already_stamped_seeds_the_remainder(monkeypatch):
@@ -257,8 +269,8 @@ def test_a_partially_seeded_store_that_is_already_stamped_seeds_the_remainder(mo
     seen: dict = {}
     monkeypatch.setattr(mod, "seed_zone_groups", lambda repo, todo, **kw: seen.update(n=len(todo)) or "SNAP3")
     out = mod.seed_global_store.fn(paths=_PATHS, optical_min_obs=15)
-    assert seen["n"] == len(mod.ZONES) - 3
-    assert out["seeded_now"] == len(mod.ZONES) - 3
+    assert seen["n"] == len(mod.zones("hemispheres")) - 3
+    assert out["seeded_now"] == len(mod.zones("hemispheres")) - 3
 
 
 def test_a_fully_seeded_store_still_validates_the_requested_identity(monkeypatch):

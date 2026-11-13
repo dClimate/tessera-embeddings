@@ -14,7 +14,7 @@ from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.orchestration.runners import zone_fill
 from tessera_embeddings.storage import global_store, shard_writer
 from tessera_embeddings.storage.update import UpdateTarget, commit_update_record, update_record
-from tessera_embeddings.storage.zone_grid import easting_coords, northing_coords
+from tessera_embeddings.storage.zone_grid import ZoneSpec, easting_coords, northing_coords
 from tests.unit.inference_stack import STACK
 from tests.unit.orchestration.runners.zone_fixtures import (
     BAND,
@@ -154,6 +154,37 @@ def test_fill_zone_year_end_to_end(tmp_path, monkeypatch, staged):
         np.testing.assert_array_equal(got, emb, err_msg=label)
     # Staging cleaned up after success.
     assert not (tmp_path / "staging" / "runZ").exists()
+
+
+def test_a_columns_two_halves_fill_one_group(tmp_path, staged):
+    """ADR 038: each half writes only its own tiles of the column's group; the year completes with the second."""
+    store = str(tmp_path / "global.icechunk")
+    column = ZoneSpec("32601", None, 1, SPEC.easting, SPEC.northing)
+    global_store.seed_zone_groups(global_store.create_global_repo(store), [column], years=YEARS, layout=SMALL)
+    mosaic_base = make_mosaic(tmp_path)
+    mask = make_mask(tmp_path, [(0, 0)], group="utm01n")
+    make_mask(tmp_path, [(1, 1)], group="utm01s")
+    repo = global_store.open_global_repo(store)
+
+    def _node():
+        return zarr.open_group(repo.readonly_session(branch="main").store, mode="r")["utm01"]
+
+    north = run_fill(tmp_path, store, zone="utm01n", land_mask_path=mask, mosaic_base=mosaic_base, run_id="runN")
+    assert (north["tag"], _node().attrs["years_complete"]) == ("zone-utm01n-2025", [])
+    assert zone_fill.zone_year_complete(store, "utm01n", 2025)
+    assert not zone_fill.zone_year_complete(store, "utm01s", 2025)
+
+    south = run_fill(tmp_path, store, zone="utm01s", land_mask_path=mask, mosaic_base=mosaic_base, run_id="runS")
+    node = _node()
+    assert (south["tag"], node.attrs["years_complete"]) == ("zone-utm01s-2025", [2025])
+    assert {h: r["run_id"] for h, r in node.attrs["runs"]["2025"].items()} == {"n": "runN", "s": "runS"}
+    with pytest.raises(ValueError, match="filled as its halves"):
+        run_fill(tmp_path, store, zone="utm01", land_mask_path=mask, mosaic_base=mosaic_base)
+    result = np.asarray(node["embeddings"][1])
+    for label, emb in staged.items():
+        row, col = (int(p) for p in label.split("_")[1:])
+        np.testing.assert_array_equal(result[row * TILE : (row + 1) * TILE, col * TILE : (col + 1) * TILE], emb)
+    assert sorted(staged) == ["chunk_0_0", "chunk_1_1"]
 
 
 def test_unseeded_zone_raises(tmp_path):
