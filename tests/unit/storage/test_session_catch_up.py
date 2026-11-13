@@ -12,9 +12,11 @@ import zarr
 
 from tessera_embeddings.config.store_layout import DIMS_3D, DIMS_4D, ArrayLayout, StoreLayout
 from tessera_embeddings.storage import global_store, session_catch_up
+from tessera_embeddings.storage.shard_writer import commit_year_attrs
 from tessera_embeddings.storage.zone_grid import ZoneSpec
 
 _CHUNK = 256
+_SHARD = 512
 # 512² shards of 256² inner chunks, 8 bands: a chunk write is a few hundred KB.
 _SMALL = StoreLayout(
     name="small",
@@ -53,7 +55,8 @@ class _FakeDiff:
     """
 
     def __init__(self, *, chunks=(), groups=(), arrays=(), moved=()):
-        self.updated_chunks = {p: [[0, 0, 0]] for p in chunks}
+        # A chunk is a path, written at coordinate (0, 0, 0), or a ``(path, coords)`` pair.
+        self.updated_chunks = dict(c if isinstance(c, tuple) else (c, [[0, 0, 0]]) for c in chunks)
         self.updated_groups = set(groups)
         self.new_groups = set()
         self.deleted_groups = set()
@@ -88,6 +91,21 @@ class _FakeDiff:
 )
 def test_which_changes_count_as_somebody_else_writing_our_cell(diff, touched):
     assert session_catch_up._diff_touches(diff, "01N") is touched
+
+
+@pytest.mark.parametrize(
+    ("diff", "touched"),
+    [
+        (_FakeDiff(chunks=["/01N/embeddings"], groups=["/01N"]), False),  # another shard + group attrs
+        (_FakeDiff(arrays=["/01N/extra"]), True),  # structure still counts
+        (_FakeDiff(chunks=[("/01N/time", [[0]])]), True),  # so does a coordinate array's chunk
+    ],
+)
+def test_given_its_shards_only_a_collision_is_ours(diff, touched):
+    # ADR 038: the other half of a column fills the same group at once, writing other shards
+    # and marking itself in the group's attrs. Neither can collide with a shard-only session.
+    assert session_catch_up._diff_touches(diff, "01N", {(0, 1, 0)}) is touched
+    assert session_catch_up._diff_touches(_FakeDiff(chunks=["/01N/embeddings"]), "01N", {(0, 0, 0)})
 
 
 def test_the_stub_carries_every_member_of_the_real_diff():
@@ -146,6 +164,24 @@ class TestCatchUpToBranch:
         node["01N"]["embeddings"][0, 0:_CHUNK, 0:_CHUNK, :] = 3
         with pytest.raises(icechunk.RebaseFailedError):
             session.commit("fill 01N", rebase_with=icechunk.ConflictDetector())
+
+    def test_given_its_shards_it_advances_past_the_other_half_of_its_group(self, tmp_path):
+        """ADR 038: two halves fill one group at once; each must keep catching up past the other.
+
+        The other half writes shard (0, 0) and marks itself complete; this session owns shard
+        (1, 0). The catch-up advances past both commits, and the commit that follows still
+        lands both writes, because icechunk's own check finds nothing in common.
+        """
+        repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        _commit_to(repo, "01N", 7)
+        commit_year_attrs(repo, "01N", 2025, run_id="other")
+        assert session_catch_up.catch_up_to_branch(repo, session, "01N", shards={(0, 0, 0)}) == "blocked"
+        assert session_catch_up.catch_up_to_branch(repo, session, "01N", shards={(0, 1, 0)}) == "advanced"
+        zarr.open_group(session.store, mode="a")["01N"]["embeddings"][0, _SHARD : _SHARD + _CHUNK, 0:_CHUNK, :] = 3
+        session.commit("fill 01N row 1", rebase_with=icechunk.ConflictDetector())
+        emb = zarr.open_group(repo.readonly_session("main").store, mode="r")["01N"]["embeddings"]
+        assert (emb[0, 0, 0, 0], emb[0, _SHARD, 0, 0]) == (7, 3)
 
     def test_repeated_catch_ups_keep_the_gap_at_zero(self, tmp_path):
         # The point of running it on a timer rather than once: after each unrelated commit

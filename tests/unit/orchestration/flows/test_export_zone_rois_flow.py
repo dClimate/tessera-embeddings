@@ -126,7 +126,7 @@ class TestOuterFlow:
 
     def test_defaults_to_every_zone(self, monkeypatch) -> None:
         impl, _ = self._run(monkeypatch, [])
-        assert impl.calls[0]["zones"] == list(zone_grid.ZONES)
+        assert impl.calls[0]["zones"] == list(zone_grid.zones("hemispheres"))
 
     def test_canonicalizes_requested_zones(self, monkeypatch) -> None:
         impl, _ = self._run(monkeypatch, [], zones=["31n"])

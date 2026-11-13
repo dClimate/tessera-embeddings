@@ -21,11 +21,12 @@ Contracts (all caller-owned):
   (:func:`tessera_embeddings.storage.global_store.seed_zone_groups`); the group's array shape
   and shard size are the grid authority. Nothing is created or resized here (D1).
 - **Ingest mosaics**: cover the zone grid exactly; a mismatch is a loud error.
-- **One fill per zone at a time**: concurrent fills of *different* zones commit to disjoint
-  groups and rebase cleanly, but two concurrent fills of the *same* zone (different years)
-  both rewrite that group's ``years_complete``/``runs`` attrs, and icechunk's
-  ``ConflictDetector`` cannot auto-merge attribute conflicts — the loser raises
-  ``RebaseFailedError``. Schedule zone-parallel, year-serial.
+- **Concurrent fills**: fills of different zones commit to disjoint groups. Fills that share
+  a group — two years of one zone, or the two halves of a ``utm_zones`` column (ADR 038),
+  which address their group through :func:`~tessera_embeddings.storage.zone_grid.group_and_half`
+  — write disjoint shards, and their year attrs commit separately and retry
+  (:func:`~tessera_embeddings.storage.shard_writer.commit_year_attrs`). Only the same cell
+  twice at once is unsafe.
 
 An all-ocean cell (the mask selects no tiles) — or one whose live tiles all skip (zero valid
 pixels) — is legitimate: it is marked complete with no data
@@ -81,7 +82,7 @@ from tessera_embeddings.storage.global_store import check_destination_types, ope
 from tessera_embeddings.storage.published_store import calendar_years, live_shards, shard_writes, store_year
 from tessera_embeddings.storage.registry_master import merge_cell
 from tessera_embeddings.storage.registry_rebuild import as_coverage_record, rebuild_tile
-from tessera_embeddings.storage.shard_writer import read_years_complete, shard_pitch
+from tessera_embeddings.storage.shard_writer import cell_complete, shard_pitch
 from tessera_embeddings.storage.time_axis import time_index_of, year_timestamp
 from tessera_embeddings.storage.update import (
     UpdateTarget,
@@ -95,7 +96,12 @@ from tessera_embeddings.storage.update import (
     update_state,
 )
 from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group, plain_zarr_storage_options
-from tessera_embeddings.storage.zone_grid import PIXEL_M, canonicalize_zone, tile_row_latitudes
+from tessera_embeddings.storage.zone_grid import (
+    PIXEL_M,
+    canonicalize_zone,
+    group_and_half,
+    tile_row_latitudes,
+)
 from tessera_embeddings.storage.zone_grid import zone as zone_spec
 
 
@@ -244,14 +250,14 @@ def zone_year_complete(
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
 ) -> bool:
-    """Whether ``(zone, year)`` is already recorded in the group's ``years_complete``.
+    """Whether ``(zone, year)`` is already recorded complete in its group (a column half: its own mark).
 
     A cheap metadata read so a caller can skip provisioning a GPU cluster for a
     crash-recovery retry of a landed-but-untagged cell (:func:`fill_zone_year` re-checks and,
     for such a cell, only re-creates the tag — no inference). False for an unseeded zone.
     """
     _, _, node = _open_zone(store_path, zone, get_credentials=get_credentials, s3_region=s3_region)
-    return node is not None and year in read_years_complete(node)
+    return node is not None and cell_complete(node, year, group_and_half(zone)[1])
 
 
 def zone_year_on_axis(
@@ -308,13 +314,15 @@ def _open_zone(
 ) -> tuple[icechunk.Repository, zarr.Group, zarr.Group | None]:
     """Open the global store read-only at ``main``: the repo, its root group and ``zone``'s group.
 
-    The zone group is ``None`` when the zone is not seeded; :func:`_require_zone` raises instead.
+    ``zone`` is a group or a fill zone, so a column half opens its column's group (ADR 038). The
+    group is ``None`` when it is not seeded; :func:`_require_zone` raises instead.
     """
     repo = open_global_repo(
         store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
     )
     root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
-    return repo, root, (cast(zarr.Group, root[zone]) if zone in root else None)
+    group = zone_spec(zone).group_name
+    return repo, root, (cast(zarr.Group, root[group]) if group in root else None)
 
 
 def _require_zone(
@@ -327,7 +335,8 @@ def _require_zone(
     """:func:`_open_zone` for a zone that must already be seeded."""
     repo, root, node = _open_zone(store_path, zone, get_credentials=get_credentials, s3_region=s3_region)
     if node is None:
-        raise ValueError(f"Zone group {zone!r} is not seeded in {store_path} — run seed_zone_groups first (D1).")
+        group = zone_spec(zone).group_name
+        raise ValueError(f"Zone group {group!r} is not seeded in {store_path} — run seed_zone_groups first (D1).")
     return repo, root, node
 
 
@@ -407,6 +416,8 @@ def _merge_registry_master(
     """
     if not registry_root:
         return
+    # The registry describes the store's groups, so a column half merges its whole column's cell.
+    zone = group_and_half(zone)[0]
     try:
         credentials = _store_credentials(store_path, get_credentials)
         repo = open_global_repo(store_path, get_credentials=credentials, region=s3_region)
@@ -476,7 +487,7 @@ def fill_zone_year(
 
     Args:
         store_path: URI of the global Icechunk repo (``BucketPaths.global_store()``).
-        zone: Zone group name — UTM common name, e.g. ``"01N"``/``"60S"``.
+        zone: Fill zone, e.g. ``"utm33s"`` (a column half) or ``"01N"`` (ADRs 037, 038).
         year: Campaign calendar year — must be on the group's pre-allocated axis.
         land_mask_path: Partner-supplied boolean zarr on the zone pixel grid.
         mosaic_base: Base path of the zone's ingest mosaic stores.
@@ -771,6 +782,7 @@ def plan_zone_inference(
 
     # The seeded zone group is the grid authority.
     repo, root, node = _require_zone(store_path, zone, get_credentials=get_credentials, s3_region=s3_region)
+    half = group_and_half(zone)[1]
 
     # The store's minimum-depth rule is part of its write-once root identity, so the store —
     # not this call's config — is the authority on what rule its zones are filled under. A fill
@@ -820,7 +832,7 @@ def plan_zone_inference(
     # deletion — so deliberate refills need a fresh tag name.
     if update is not None:
         check_radar_policy(update, allow_s2_only=config.allow_s2_only)
-        state = update_state(node, year, update.name)
+        state = update_state(node, year, update.name, half)
         if state == "not_complete":
             raise ValueError(
                 f"Update {update.name!r} targets {zone}-{year}, which has not been filled. An update "
@@ -845,7 +857,7 @@ def plan_zone_inference(
         # recorded branch, so rerunning an update that already landed still works.
         check_no_tightening(repo, update.name, rule, [(zone, year)])
     tag = zone_year_tag(zone, year)
-    if update is None and year in read_years_complete(node):
+    if update is None and cell_complete(node, year, half):
         snapshot = _ensure_tagged(repo, zone, year, tag, log)
         _merge_registry_master(
             registry_root, store_path, zone, year, None, get_credentials=get_credentials, s3_region=s3_region, log=log
@@ -1417,6 +1429,7 @@ def _assemble_update(
     """
     update = cast(UpdateTarget, handoff.update)
     zone, year, run_id, live, results = handoff.zone, handoff.year, handoff.run_id, handoff.live, handoff.results
+    group = group_and_half(zone)[0]
     staged = writer.verify_staged_completeness(run_id, live, log=log)
     skipped = sorted({c.label for c in live} - staged)
     cleared = skipped if update.on_skip == "clear" else []
@@ -1435,9 +1448,9 @@ def _assemble_update(
     merged = update.mode == "holes"
     committed: dict[str, str] = {}
 
-    def _record(repo: icechunk.Repository, group: str, year_label: int, commit: Mapping[str, str]) -> str:
+    def _record(repo: icechunk.Repository, zone: str, year_label: int, commit: Mapping[str, str]) -> str:
         committed.update(commit)  # the shard commit, which stamps the merged tiles' part
-        return commit_update_record(repo, group, year_label, commit, record=record)
+        return commit_update_record(repo, zone, year_label, commit, record=record)
 
     if staged or cleared:
         snapshot = writer.assemble_global(
@@ -1473,7 +1486,7 @@ def _assemble_update(
                 writer,
                 registry_root,
                 store_path,
-                zone,
+                group,
                 year,
                 run_id,
                 committed_at=committed["committed_at"],
@@ -1489,7 +1502,10 @@ def _assemble_update(
         )
     else:
         snapshot = commit_update_record(
-            open_global_repo(store_path, get_credentials=store_credentials, region=s3_region), zone, year, record=record
+            open_global_repo(store_path, get_credentials=store_credentials, region=s3_region),
+            zone,
+            year,
+            record=record,
         )
     cleanup()
     log.info(

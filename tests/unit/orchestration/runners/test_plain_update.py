@@ -107,7 +107,7 @@ def test_a_holes_update_fills_only_the_holes_and_records_itself(area):
     assert (emb[:_TILE, : _TILE // 2] == 2).all() and (emb[_TILE:, _TILE:] == 2).all()  # the holes
     assert (emb[:_TILE, _TILE // 2 : _TILE] == 1).all() and (emb[:, :_TILE][_TILE:] == 1).all()  # never touched
     assert not np.isnan(np.asarray(level0(root)["scales"][0])).any()
-    [record] = read_updates(root, 2025)
+    [record] = read_updates(root, 2025, None)
     assert (record["update"], record["mode"], record["written"]) == ("u1", "holes", ["chunk_0_0", "chunk_1_1"])
     assert record["kept"] == ["chunk_0_1", "chunk_1_0"]
     assert base_tag("u1") in open_global_repo(area["output"]).list_tags()

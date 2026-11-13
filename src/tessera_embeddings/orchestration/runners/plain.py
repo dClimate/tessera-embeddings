@@ -307,7 +307,7 @@ def _plan_update(
     if time_index is None:
         raise ValueError(f"{output_path} holds no {window} window to update; run without `update` first")
     year = year_of(read_time_values(level0(root))[time_index])
-    if any(record.get("update") == name for record in read_updates(root, year)):
+    if any(record.get("update") == name for record in read_updates(root, year, None)):
         log.info("Update %s is already recorded on %s for %d — nothing to do", name, output_path, year)
         return None
     if tiles is not None:

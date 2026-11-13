@@ -126,7 +126,7 @@ class OpticalPreflight:
     """One cell's preflight verdict, with the evidence a refusal must carry.
 
     Attributes:
-        zone: UTM common name the verdict is about.
+        zone: Zone name the verdict is about.
         finding: See :class:`SourceFinding`; only ``CONFIRMED_ABSENT`` may refuse.
         reason: Human-readable grounds — a refusal names what was probed and missed, so an
             operator can re-check it without re-deriving the geometry.
@@ -201,7 +201,7 @@ def preflight_optical_source(
     probe. The module docstring says why a miss is decisive and a hit is provisional.
 
     Args:
-        zone: UTM common name (e.g. ``"31S"``).
+        zone: Zone name (e.g. ``"utm31"`` or ``"31S"``).
         window: The cell's inference window; probed as its date range padded one UTC
             day per the solar-day convention.
         land_mask_path: Coverage repo holding the zone's ``tile_live_2048`` bitmap.

@@ -51,6 +51,8 @@ context_docs/
 │   ├── 032-v2-stores-name-their-axes-y-and-x.md
 │   ├── 033-radar-overlaps-go-to-the-most-acquired-burst.md
 │   ├── 034-an-acquisition-is-one-datastrip-of-one-pass.md
+│   ├── 037-v2-stores-use-the-utm-zones-layout.md
+│   ├── 038-the-campaign-fills-a-utm-column-in-two-halves.md
 │   ├── 039-architecture-rules-run-on-import-linter-and-ruff.md
 │   └── 040-new-code-is-gated-on-duplication-and-complexity.md
 │

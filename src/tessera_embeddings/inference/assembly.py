@@ -2568,7 +2568,8 @@ class ZarrWriter:
 
         Args:
             store_path: URI of the global Icechunk repo (``BucketPaths.global_store()``).
-            zone: Zone group name — UTM common name, e.g. ``"01N"``/``"60S"``.
+            zone: The fill zone, e.g. ``"utm33s"`` (a column half, of group ``utm33``) or ``"01N"``
+                (ADRs 037, 038). A half is marked complete on its own; its registry rows go to the group.
             year: Campaign calendar year to fill; must be on the group's pre-allocated time axis.
             run_id: Run identifier (locates staged files).
             registry_root: Root of the published registry dataset
@@ -2670,7 +2671,8 @@ class ZarrWriter:
         )
 
         # One readonly probe of the zone group: year index, shard pitch, variables.
-        node = level0(cast(zarr.Group, zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[zone]))
+        group = zone_grid.group_and_half(zone)[0]
+        node = level0(cast(zarr.Group, zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[group]))
         year_index = time_index if time_index is not None else time_index_of(node, year_timestamp(year))
         if year_index is None:
             raise ValueError(
@@ -2793,7 +2795,7 @@ class ZarrWriter:
         if registry_root:
             self.publish_registry_part(
                 registry_root,
-                zone,
+                group,
                 year,
                 run_id,
                 committed_at=telemetry["commit"]["committed_at"],

@@ -9,9 +9,15 @@ that dies part way leaves nothing half-written.
 
 ## Start here if you are contributing
 
-**`zone_grid.py`** defines the 120 groups the global dataset is divided into — 60 longitude
-bands, north and south — and each one's map projection, extent and name. Changing the world's
-coverage means changing this.
+**`zone_grid.py`** defines the groups a global store is divided into, and each one's map
+projection, extent and name. A v1.1 store has 120 groups, `01N` to `60S`: 60 longitude bands,
+split north and south. A v2 store has 60, `utm01` to `utm60`, one whole band each, which the
+campaign fills as two halves, `utm01n` and `utm01s` (ADRs 037, 038). Two functions translate
+between them: `group_and_half` gives the group and half a fill zone writes, and refuses a band
+named whole, which is never one cell; `fill_zones_of` gives the halves that make up a band named
+whole, as the registry and an operator may name it. The writers take the fill zone's name and
+work out the group and half themselves.
+Changing the world's coverage means changing this.
 
 **`conventions.py`** writes the labels that travel with the data, so someone opening it can
 tell what the numbers mean without asking us. A new metadata standard goes here.
@@ -36,7 +42,7 @@ writers on one dataset. `manifest.py` refuses a write whose settings do not matc
 dataset's.
 
 `empty_store.py` creates a dataset with the right shape but no values in it, and
-`global_store.py` does that for all 120 groups at once, so filling never resizes anything. It also
+`global_store.py` does that for every group at once, so filling never resizes anything. It also
 stamps the store's minimum optical depth rule on the root at seeding, where it never moves; a
 targeted update may apply a looser line to its own cells and records it there (`update.py`,
 [ADR 028](../../../context_docs/decisions/028-embed-every-pixel-with-an-optical-observation.md)).

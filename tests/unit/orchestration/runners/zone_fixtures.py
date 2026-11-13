@@ -142,26 +142,27 @@ def make_mask(
     tmp_path,
     live_tiles: list[tuple[int, int]],
     *,
+    group: str = ZONE,
     attrs: dict | None = None,
     tile_shape: tuple[int, int] | None = None,
 ) -> str:
     """A coverage-bitmap Icechunk repo (ADR-010) with the given tiles live.
 
     Mirrors :func:`ingest.land_mask.build_all` for one zone: a ``tile_live_2048``
-    bool array on the tile grid plus the zone/crs/grid_shape attrs the runner
-    guards. ``attrs`` overrides those attrs, so tests can construct wrong-zone / wrong-crs /
+    bool array on the tile grid of mask group ``group`` plus the zone/crs/grid_shape attrs the
+    runner guards. ``attrs`` overrides those attrs, so tests can construct wrong-zone / wrong-crs /
     wrong-shape masks that must be rejected.
     """
     nr, nc = tile_shape if tile_shape is not None else (NY // TILE, NX // TILE)
     path = str(tmp_path / "coverage.icechunk")
     repo, _ = open_or_create_repo(path)
     session = repo.writable_session("main")
-    node = zarr.open_group(session.store, mode="a").require_group(ZONE)
+    node = zarr.open_group(session.store, mode="a").require_group(group)
     tile_live = np.zeros((nr, nc), dtype=bool)
     for row, col in live_tiles:
         tile_live[row, col] = True
     node.create_array("tile_live_2048", data=tile_live, chunks=(nr, nc), dimension_names=("tile_row", "tile_col"))
-    node.attrs.update({"zone": ZONE, "crs": SPEC.crs, "grid_shape": [NY, NX]} | (attrs or {}))
+    node.attrs.update({"zone": group, "crs": SPEC.crs, "grid_shape": [NY, NX]} | (attrs or {}))
     session.commit("seed test coverage")
     return path
 
