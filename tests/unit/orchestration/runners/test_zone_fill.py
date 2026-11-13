@@ -9,6 +9,7 @@ import pytest
 import zarr
 
 from tessera_embeddings.config.inference import InferenceConfig
+from tessera_embeddings.config.store_geometry import band_axis, level0
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.orchestration.runners import zone_fill
@@ -22,6 +23,7 @@ from tests.unit.orchestration.runners.zone_fixtures import (
     NX,
     NY,
     SMALL,
+    SMALL_V2,
     SPEC,
     TILE,
     WINDOW,
@@ -168,11 +170,14 @@ def test_fill_zone_year_end_to_end(tmp_path, monkeypatch, layout):
     assert not (tmp_path / "staging" / "runZ").exists()
 
 
-def test_a_columns_two_halves_fill_one_group(tmp_path, staged):
-    """ADR 038: each half writes only its own tiles of the column's group; the year completes with the second."""
+def test_a_columns_two_halves_fill_one_group(tmp_path, staged, monkeypatch):
+    """ADR 038: each half writes only its own tiles of the column's group; the year completes with the second.
+
+    Each half's provenance record is published under the group, beside the other's, as its registry rows are.
+    """
     store = str(tmp_path / "global.icechunk")
     column = ZoneSpec("32601", None, 1, SPEC.easting, SPEC.northing)
-    global_store.seed_zone_groups(global_store.create_global_repo(store), [column], years=YEARS, layout=SMALL)
+    global_store.seed_zone_groups(global_store.create_global_repo(store), [column], years=YEARS, layout=SMALL_V2)
     mosaic_base = make_mosaic(tmp_path)
     mask = make_mask(tmp_path, [(0, 0)], group="utm01n")
     make_mask(tmp_path, [(1, 1)], group="utm01s")
@@ -181,18 +186,43 @@ def test_a_columns_two_halves_fill_one_group(tmp_path, staged):
     def _node():
         return zarr.open_group(repo.readonly_session(branch="main").store, mode="r")["utm01"]
 
-    north = run_fill(tmp_path, store, zone="utm01n", land_mask_path=mask, mosaic_base=mosaic_base, run_id="runN")
+    published: list = []
+    monkeypatch.setattr(
+        zone_fill, "publish_provenance", lambda run, *_a: published.append((run.zone, run.run_id, run.grid_shape))
+    )
+    registry = str(tmp_path / "registry")
+    north = run_fill(
+        tmp_path,
+        store,
+        zone="utm01n",
+        land_mask_path=mask,
+        mosaic_base=mosaic_base,
+        run_id="runN",
+        registry_root=registry,
+    )
     assert (north["tag"], _node().attrs["years_complete"]) == ("zone-utm01n-2025", [])
     assert zone_fill.zone_year_complete(store, "utm01n", 2025)
     assert not zone_fill.zone_year_complete(store, "utm01s", 2025)
 
-    south = run_fill(tmp_path, store, zone="utm01s", land_mask_path=mask, mosaic_base=mosaic_base, run_id="runS")
+    south = run_fill(
+        tmp_path,
+        store,
+        zone="utm01s",
+        land_mask_path=mask,
+        mosaic_base=mosaic_base,
+        run_id="runS",
+        registry_root=registry,
+    )
+    grid = tuple(level0(_node())["scales"].shape[1:])  # (y, x), whatever the band order
+    assert published == [("utm01", "runN", grid), ("utm01", "runS", grid)]
     node = _node()
     assert (south["tag"], node.attrs["years_complete"]) == ("zone-utm01s-2025", [2025])
     assert {h: r["run_id"] for h, r in node.attrs["runs"]["2025"].items()} == {"n": "runN", "s": "runS"}
     with pytest.raises(ValueError, match="filled as its halves"):
         run_fill(tmp_path, store, zone="utm01", land_mask_path=mask, mosaic_base=mosaic_base)
-    result = np.asarray(node["embeddings"][1])
+    embeddings = level0(node)["embeddings"]
+    result = np.asarray(embeddings[1])
+    result = result.transpose(1, 2, 0) if band_axis(embeddings) == 1 else result
     for label, emb in staged.items():
         row, col = (int(p) for p in label.split("_")[1:])
         np.testing.assert_array_equal(result[row * TILE : (row + 1) * TILE, col * TILE : (col + 1) * TILE], emb)
@@ -671,9 +701,9 @@ def _seed_global_with_rule(tmp_path, rule: int | None) -> str:
 
 
 def _published_part(registry_root: str) -> dict:
-    """The one part under ``registry_root``, read back as a column -> values dict."""
+    """The one run file under ``registry_root``, read back as a column -> values dict."""
     ds = pytest.importorskip("pyarrow.dataset")
-    table = ds.dataset(f"{registry_root}/parts", partitioning="hive").to_table()
+    table = ds.dataset(f"{registry_root}/runs", partitioning="hive").to_table()
     return table.to_pydict()
 
 
@@ -709,7 +739,7 @@ def test_the_registry_records_the_depth_rule_the_cell_was_filled_under(tmp_path,
     assert summary["empty"] is False
 
     cols = _published_part(registry_root)
-    assert cols["tile"], "a part was published"
+    assert cols["tile"], "a run file was published"
     assert set(cols["optical_min_obs"]) == {15}, "every row states the store's rule"
     assert set(cols["embedded"]) == {True}
     assert _master_tiles(registry_root) == sorted(cols["tile"]), "and the cell's master is current"
@@ -750,15 +780,17 @@ def _all_skip_inference(num_actors, config, chunks, mosaic_base, staging_base, r
 
 
 @pytest.mark.parametrize(
-    ("inference", "part_survives"),
+    ("inference", "run_file_survives"),
     [(staging_inference_stub({}), True), (_all_skip_inference, False)],
-    ids=["its-part-published", "an-all-refused-run-whose-part-never-published"],
+    ids=["its-run-file-published", "an-all-refused-run-whose-run-file-never-published"],
 )
-def test_a_retry_merges_the_master_a_fill_died_before_reaching(tmp_path, monkeypatch, caplog, inference, part_survives):
+def test_a_retry_merges_the_master_a_fill_died_before_reaching(
+    tmp_path, monkeypatch, caplog, inference, run_file_survives
+):
     """The retry finds the cell complete and skips the fill, so planning merges the master or nothing does.
 
     An all-refused run over a tile the store held nothing for still shows in its commit's diff, so
-    its retry refuses while its part is missing.
+    its retry refuses while its run file is missing.
     """
     monkeypatch.setattr(zone_fill, "run_inference", inference)
     store, registry_root = _seed_global_with_rule(tmp_path, 15), str(tmp_path / "registry")
@@ -776,21 +808,21 @@ def test_a_retry_merges_the_master_a_fill_died_before_reaching(tmp_path, monkeyp
     monkeypatch.setattr(zone_fill, "_merge_registry_master", died)
     with pytest.raises(KeyboardInterrupt):
         run_fill(tmp_path, store, **cell)
-    if not part_survives:
-        for part in (tmp_path / "registry" / "parts").rglob("*.parquet"):
-            part.unlink()
+    if not run_file_survives:
+        for run_file in (tmp_path / "registry" / "runs").rglob("*.parquet"):
+            run_file.unlink()
     monkeypatch.setattr(zone_fill, "_merge_registry_master", merge)
     with caplog.at_level(logging.ERROR):
         assert run_fill(tmp_path, store, **cell)["already_complete"] is True
-    if part_survives:
+    if run_file_survives:
         assert _master_tiles(registry_root) == ["chunk_0_0"]
     else:
-        assert "last wrote 1 tile(s) no part describes" in caplog.text
+        assert "last wrote 1 tile(s) no run file describes" in caplog.text
 
 
 def test_the_master_learns_of_a_refill_that_fails_at_the_tag_step(tmp_path, monkeypatch):
     """A deliberate refill fails at tagging by design — zone-year tags are write-once — after its data
-    and part have landed. Updating the master after the tag would never reach it.
+    and run file have landed. Updating the master after the tag would never reach it.
     """
     monkeypatch.setattr(zone_fill, "run_inference", staging_inference_stub({}))
 
@@ -1067,3 +1099,81 @@ def test_non_affine_mosaic_axis_raises(tmp_path, monkeypatch):
     monkeypatch.setattr(zone_fill, "run_inference", fail_if_called)
     with pytest.raises(ValueError, match=r"does not match zone .* seeded axis"):
         run_fill(tmp_path, store, land_mask_path=make_mask(tmp_path, [(0, 0)]), mosaic_base=mosaic_base)
+
+
+def _recording_publish(calls: list[dict], store: str, *, fail: bool = False):
+    """A stand-in for ``publish_provenance`` recording what it was given and the store's tip when it ran."""
+
+    def publish(run, *_args):
+        calls.append({**vars(run), "tip": global_store.open_global_repo(store).lookup_branch("main")})
+        if fail:
+            raise zone_fill.ProvenanceCheckError("a plane disagrees with its row")
+        return {}
+
+    return publish
+
+
+def test_provenance_is_published_before_the_shard_commit_from_the_runs_shards(tmp_path, monkeypatch):
+    store = seed_global(tmp_path)
+    before = global_store.open_global_repo(store).lookup_branch("main")
+    monkeypatch.setattr(zone_fill, "run_inference", staging_inference_stub({}))
+    calls: list[dict] = []
+    monkeypatch.setattr(zone_fill, "publish_provenance", _recording_publish(calls, store))
+    summary = run_fill(
+        tmp_path,
+        store,
+        land_mask_path=make_mask(tmp_path, [(0, 0), (1, 1)]),
+        mosaic_base=make_mosaic(tmp_path),
+        registry_root=str(tmp_path / "registry"),
+    )
+    assert summary["tag"]
+    [call] = calls
+    assert call["tip"] == before, "published before anything was committed"
+    assert (call["embedded"], call["refused"], call["mode"]) == (["chunk_0_0", "chunk_1_1"], [], "fill")
+    assert sorted(path.rsplit("/", 1)[-1] for path in call["mosaic_snapshots"]) == [
+        "reflectance.zarr",
+        "sar_ascending.zarr",
+        "sar_descending.zarr",
+    ]
+
+
+def test_a_failed_publication_commits_nothing_and_its_retry_publishes_then_commits(tmp_path, monkeypatch):
+    """A committed run always has its record: a publication that fails leaves the store untouched."""
+    store = seed_global(tmp_path)
+    repo = global_store.open_global_repo(store)
+    before = repo.lookup_branch("main")
+    mask, mosaic_base = make_mask(tmp_path, [(0, 0)]), make_mosaic(tmp_path)
+    monkeypatch.setattr(zone_fill, "run_inference", staging_inference_stub({}))
+    calls: list[dict] = []
+    monkeypatch.setattr(zone_fill, "publish_provenance", _recording_publish(calls, store, fail=True))
+    fill = {"land_mask_path": mask, "mosaic_base": mosaic_base, "registry_root": str(tmp_path / "registry")}
+    with pytest.raises(zone_fill.ProvenanceCheckError):
+        run_fill(tmp_path, store, run_id="r1", **fill)
+    assert len(calls) == 1, "a failed check is not retried"
+    assert repo.lookup_branch("main") == before, "nothing committed"
+
+    monkeypatch.setattr(zone_fill, "publish_provenance", _recording_publish(calls, store))
+    retry = run_fill(tmp_path, store, run_id="r1", **fill)
+    assert len(calls) == 2 and calls[-1]["tip"] == before and calls[-1]["embedded"] == ["chunk_0_0"]
+    assert "zone-01N-2025" in global_store.open_global_repo(store).list_tags() and retry["tag"]
+
+
+@pytest.mark.parametrize("carried", [True, False], ids=["mosaics-with-the-record", "mosaics-without"])
+def test_a_fill_names_its_run_in_source_runs_only_when_its_mosaics_carried_the_record(tmp_path, monkeypatch, carried):
+    store, registry_root = seed_global(tmp_path), str(tmp_path / "registry")
+    monkeypatch.setattr(zone_fill, "run_inference", staging_inference_stub({}))
+    monkeypatch.setattr(zone_fill, "mosaics_carry_provenance", lambda *_a, **_k: carried)
+    monkeypatch.setattr(zone_fill, "publish_provenance", lambda *_a, **_k: None)
+    run_fill(
+        tmp_path,
+        store,
+        land_mask_path=make_mask(tmp_path, [(0, 0)]),
+        mosaic_base=make_mosaic(tmp_path),
+        registry_root=registry_root,
+        run_id="runP",
+    )
+    expected = [["runP"]] if carried else [None]
+    master = pytest.importorskip("pyarrow.parquet").read_table(
+        f"{registry_root}/master/zone={ZONE}/year=2025/part-0.parquet"
+    )
+    assert master.column("source_runs").to_pylist() == expected

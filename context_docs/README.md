@@ -51,6 +51,8 @@ context_docs/
 │   ├── 032-v2-stores-name-their-axes-y-and-x.md
 │   ├── 033-radar-overlaps-go-to-the-most-acquired-burst.md
 │   ├── 034-an-acquisition-is-one-datastrip-of-one-pass.md
+│   ├── 035-a-provenance-record-for-the-published-store.md
+│   ├── 036-the-registry-folder-is-runs.md
 │   ├── 037-v2-stores-use-the-utm-zones-layout.md
 │   ├── 038-the-campaign-fills-a-utm-column-in-two-halves.md
 │   ├── 039-architecture-rules-run-on-import-linter-and-ruff.md
@@ -144,6 +146,10 @@ context_docs/
     │                                              unmeasured were re-derived from the store, why
     │                                              that is a re-derivation rather than an
     │                                              estimate, and the v1.1 run
+    ├── registry-provenance-plan.md             the provenance record: which granule supplied
+    │                                              every pixel on every date, for reviewers new to
+    │                                              the pipeline
+    ├── provenance-dev-verification.md          its end-to-end dev test, and what it costs
     └── icechunk-api-ledger.md                  signatures and gotchas the scale tests earned
 ```
 

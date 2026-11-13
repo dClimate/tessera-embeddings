@@ -28,7 +28,7 @@ holds the mechanism and the failure modes it is shaped by.
 | the coverage threshold and the S1 orbit | they change which tiles exist and what each one holds |
 | `allow_s2_only` | it changes which PIXELS are embedded, not just which tiles |
 | the inference source hash (`inference_code_identity`) | the code that turns input into output |
-| a targeted update's name, for an update's run only | registry parts are named by run id, so an update must never share one with another update or the campaign ([ADR 027](../decisions/027-targeted-updates.md)) |
+| a targeted update's name, for an update's run only | registry run files are named by run id, so an update must never share one with another update or the campaign ([ADR 027](../decisions/027-targeted-updates.md)) |
 
 **The code component is the inference source only.** An orchestration or ingest fix therefore reuses
 staged tiles rather than abandoning them. Two overrides exist for the judgement a hash cannot make
@@ -119,6 +119,15 @@ The `run_id` is minted from the **effective** S2-only mode — `InferenceConfig`
 `allow_s2_only` when the orbit resolves to none — rather than from the requested flag, and
 assembly-only mode reads the policy off the run_id prefix rather than trusting a parameter nobody had
 to set. A parameter describes an intention; the prefix describes what is on disk.
+
+The mosaic identity is sampled when the run id is minted, before the fill is dispatched, so it says
+whether the inputs changed since the last attempt, not whether they held still during this one. What
+holds them still is a second sample: the zone runner reads each active mosaic's snapshot once when it
+plans the cell (`zone_fill.mosaic_snapshots`), and every actor opens its mosaics at those snapshots
+(`ZoneContext.mosaic_snapshots`) while the provenance export reads the same ones. A commit to a
+mosaic mid-fill, which nothing in the pipeline makes, can then change neither what the model read nor
+what the record says it read. Opening a snapshot costs what opening a branch costs, since a branch
+open resolves to one.
 
 ## 5. A change inside the fingerprint closure has a landing window
 

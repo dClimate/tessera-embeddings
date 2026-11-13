@@ -62,6 +62,10 @@ class ZoneContext:
     #: What to call this cell in the progress line, e.g. ``"15N-2019"``. ``None`` for a
     #: single-area run, whose ``run_id`` is a content digest that would name nothing to a reader.
     cell: str | None = None
+    #: ``(store path, snapshot id)`` pairs pinning the cell's mosaics to the versions its fill sampled
+    #: when it planned the cell, so the model reads what the provenance export later describes. A
+    #: tuple so the context stays hashable; ``None`` reads each store's tip.
+    mosaic_snapshots: tuple[tuple[str, str], ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -471,6 +475,8 @@ class ActorPool:
             prefetch_hint=hint.chunk if hint is not None else None,
             time_window=item.ctx.time_window,
             s1_orbit=item.ctx.s1_orbit,
+            # Only when pinned, so an unpinned cell's call is exactly what it always was.
+            **({"mosaic_snapshots": dict(item.ctx.mosaic_snapshots)} if item.ctx.mosaic_snapshots else {}),
         )
         self.pending[ref] = (item, actor_idx)
         self.chunk_attempts[item.retry_key] = self.chunk_attempts.get(item.retry_key, 0) + 1
@@ -1135,6 +1141,7 @@ def _process_chunks_work_stealing(
     source_has_work: Callable[[], bool] | None = None,
     on_item_done: Callable[[WorkItem, dict], None] | None = None,
     cell: str | None = None,
+    mosaic_snapshots: Mapping[str, str] | None = None,
 ) -> list[dict]:
     """Process chunks with dynamic work-stealing across actors.
 
@@ -1206,11 +1213,18 @@ def _process_chunks_work_stealing(
             it runs on the scheduler thread, so it must not block.
         cell: What to call the cell built from this call's scalars (:attr:`ZoneContext.cell`).
             A chained session leaves it unset and names each cell on its own contexts.
+        mosaic_snapshots: The cell's mosaic pins (:attr:`ZoneContext.mosaic_snapshots`).
 
     Returns:
         List of result dicts (status, chunk label, timing, etc.).
     """
-    default_ctx = ZoneContext(mosaic_base, staging_base, run_id, cell=cell)
+    default_ctx = ZoneContext(
+        mosaic_base,
+        staging_base,
+        run_id,
+        cell=cell,
+        mosaic_snapshots=tuple(sorted(mosaic_snapshots.items())) if mosaic_snapshots else None,
+    )
     chunk_queue: deque[WorkItem | ChunkSpec] = deque(_as_item(c, default_ctx) for c in chunks)
     n_total = len(chunk_queue)
 

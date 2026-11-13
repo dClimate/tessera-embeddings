@@ -10,6 +10,7 @@ import mgrs
 import pytest
 import requests
 
+from tessera_embeddings.config.ingest import DROPPED, MISSING_BANDS
 from tessera_embeddings.errors import ConfigMismatchError
 from tessera_embeddings.ingest._http import NonJsonResponseError
 from tessera_embeddings.ingest.opera_query import (
@@ -25,6 +26,8 @@ from tessera_embeddings.ingest.opera_query import (
     mgrs_tile_to_bbox,
     normalize_opera_timestamps,
 )
+from tessera_embeddings.ingest.provenance import FUSION_POSITION, day_granules
+from tessera_embeddings.ingest.solar_days import normalize_to_solar_day, solar_day_of
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -146,18 +149,35 @@ class TestGranuleToItem:
         assert west < east and south < north
         assert west == pytest.approx(-11.05041)
 
-    def test_missing_band_links_returns_none(self):
-        """A granule lacking a VV or VH data link is skipped."""
-        assert _granule_to_item(_granule_entry("g1", bands=("VV",))) is None
+    @pytest.mark.parametrize(
+        "rewrite",
+        [
+            lambda href: href.replace("https://", "https://d123.cloudfront.net/") + "?Signature=secret",
+            lambda href: "s3://asf-bucket/" + href.rsplit("/", 1)[-1],
+        ],
+        ids=["signed", "s3-direct"],
+    )
+    def test_the_granule_list_records_the_catalogues_links_not_the_rewritten_ones(self, rewrite):
+        """Rewriting for reading changes what the loader opens, never what the record publishes."""
+        (item,) = normalize_to_solar_day([_granule_to_item(_granule_entry("g1"))], mid_longitude=15.0)
+        published = {key: asset.href for key, asset in item.assets.items()}
+        for asset in item.assets.values():
+            asset.href = rewrite(asset.href)
+        item.properties[FUSION_POSITION] = 0
+        source = {"provider": "p", "collection": "c", "catalog_url": "https://cat", "collection_id": "c"}
+        (listed,) = json.loads(day_granules([item], **source)[solar_day_of(item)])
+        assert listed["assets"] == published
 
-    def test_skip_reports_polarizations_found(self):
-        """The counter names WHAT was published, so an anomaly is quantifiable per query."""
+    def test_skip_reports_polarizations_found_and_marks_the_granule_dropped(self):
+        """The counter names WHAT was published, so an anomaly is quantifiable per query, and the
+        granule is kept, marked, so the provenance record can name it.
+        """
         skip_counts: Counter[str] = Counter()
-        assert _granule_to_item(_granule_entry("g-vv", bands=("VV",)), skip_counts) is None
-        assert _granule_to_item(_granule_entry("g-xpol", bands=("HH", "HV")), skip_counts) is None
-        assert _granule_to_item(_granule_entry("g-none", bands=()), skip_counts) is None
+        for title, bands in (("g-vv", ("VV",)), ("g-xpol", ("HH", "HV")), ("g-none", ())):
+            item = _granule_to_item(_granule_entry(title, bands=bands), skip_counts)
+            assert item.properties[DROPPED] == MISSING_BANDS
         # Dual-pol is accepted and never counted.
-        assert _granule_to_item(_granule_entry("g-ok"), skip_counts) is not None
+        assert DROPPED not in _granule_to_item(_granule_entry("g-ok"), skip_counts).properties
         assert skip_counts == {
             "VV-only": 1,
             "HH/HV (cross-pol, no VV+VH)": 1,
@@ -290,24 +310,28 @@ class TestMakeS1ItemProvider:
         with pytest.raises(ValueError, match=r"ascending.*descending"):
             make_s1_item_provider("invalid", (-122, 37, -121, 38), "2024-01-01", "2024-01-15", burst_census=_Census({}))
 
-    def test_builds_rewrites_and_normalizes_items(self):
-        """The provider queries CMR, rewrites assets to S3, and normalizes timestamps."""
-        items = [_granule_to_item(_granule_entry("g-1")), _granule_to_item(_granule_entry("g-2"))]
+    def test_builds_rewrites_and_normalizes_items_and_sets_the_incomplete_aside(self):
+        """The provider queries CMR, rewrites assets to S3, and normalizes timestamps. A granule
+        missing a polarisation goes to ``dropped`` rather than to the loader.
+        """
+        items = [_granule_to_item(_granule_entry(g)) for g in ("g-1", "g-2")]
+        incomplete = _granule_to_item(_granule_entry("g-vv", bands=("VV",)))
+        dropped: list = []
 
         with (
-            patch("tessera_embeddings.ingest.opera_query._query_cmr_granules", return_value=items),
+            patch("tessera_embeddings.ingest.opera_query._query_cmr_granules", return_value=[*items, incomplete]),
             patch("tessera_embeddings.ingest.opera_query.rewrite_assets_to_s3") as mock_rewrite,
         ):
             provide = make_s1_item_provider(
-                "ascending", (-122, 37, -121, 38), "2024-01-01", "2024-01-15", burst_census=_Census({})
+                "ascending", (-122, 37, -121, 38), "2024-01-01", "2024-01-15", burst_census=_Census({}), dropped=dropped
             )
             result = provide()
 
-        assert len(result) == 2
-        # Assets were rewritten once per item.
+        assert result == items and dropped == [incomplete]
+        # Assets were rewritten once per loadable item.
         assert mock_rewrite.call_count == 2
-        # Same-date bursts share the canonical noon-UTC timestamp.
-        assert all(item.datetime == datetime(2024, 6, 2, 12, 0, 0, tzinfo=UTC) for item in result)
+        # Same-date bursts share the canonical noon-UTC timestamp, the set-aside one included.
+        assert all(item.datetime == datetime(2024, 6, 2, 12, 0, 0, tzinfo=UTC) for item in [*result, *dropped])
 
 
 # ---------------------------------------------------------------------------

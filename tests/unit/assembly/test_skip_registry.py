@@ -45,7 +45,7 @@ from tessera_embeddings.inference.assembly import (
     summarise_optical_skips,
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
-from tessera_embeddings.storage.registry import part_uri
+from tessera_embeddings.storage.registry import RegistryRun, run_file_uri
 from tests.unit.inference_stack import STACK
 
 #: A shard commit's timestamp, as `write_year_shards` reports it.
@@ -496,7 +496,7 @@ class TestWhetherTheRadarRuleWasEvenOn:
 class TestThePartIsPublishedOnlyAfterTheCellCommits:
     """The registry is a sibling of the store, and nothing reconciles the two.
 
-    So a part written while the assembly was still running advertises embedded and refused tiles for
+    So a run file written while the assembly was still running advertises embedded and refused tiles for
     a zone-year that may never land — a failed worker, a failed merge, an injected fault — and the
     claim is permanent, to consumers who are explicitly told they need not open the store. The write
     therefore happens after the commit, and these tests pin that rather than the writing.
@@ -513,7 +513,7 @@ class TestThePartIsPublishedOnlyAfterTheCellCommits:
         summary = writer._skip_summary("run1", [], [chunk.label])
 
         assert summary["refused_px_by_reason"]["thin"] == 64, "the pooled summary is unchanged"
-        assert "registry_part" not in summary, "and it promises no part"
+        assert "registry_run_file" not in summary, "and it promises no run file"
         assert not list((tmp_path / "registry").glob("**/*.parquet")), "nothing was written"
 
     def test_publishing_writes_a_row_per_live_tile(self, tmp_path: Path) -> None:
@@ -525,17 +525,12 @@ class TestThePartIsPublishedOnlyAfterTheCellCommits:
             writer.write_skip_marker(chunk, "run1", _record(chunk.label, thin=64, obs_max=14))
         writer._skip_summary("run1", ["chunk_9_9"], ["chunk_0_0", "chunk_0_1"])
 
-        uri = writer.publish_registry_part(
+        uri = writer.publish_registry_run_file(
             root,
-            "32S",
-            2021,
-            "run1",
-            committed_at=COMMITTED,
-            embedded=["chunk_9_9"],
-            refused=["chunk_0_0", "chunk_0_1"],
+            RegistryRun("32S", 2021, "run1", COMMITTED, embedded=["chunk_9_9"], refused=["chunk_0_0", "chunk_0_1"]),
         )
 
-        assert uri == part_uri(root, "32S", 2021, "run1")
+        assert uri == run_file_uri(root, "32S", 2021, "run1")
         by_tile = {r["tile"]: r for r in pq.read_table(uri).to_pylist()}
         assert set(by_tile) == {"chunk_9_9", "chunk_0_0", "chunk_0_1"}, "every live tile"
         assert {r["assembled_at"] for r in by_tile.values()} == {COMMITTED}, "stamped with the commit, not the clock"
@@ -550,7 +545,7 @@ class TestThePartIsPublishedOnlyAfterTheCellCommits:
 
     def test_a_failed_publish_never_costs_a_committed_cell(self, tmp_path: Path, monkeypatch) -> None:
         """The cell has already landed by the time this runs. Raising here would fail a complete cell
-        over its index, and every column is derivable from the store, so a lost part is rebuildable.
+        over its index, and every column is derivable from the store, so a lost run file is rebuildable.
         """
         writer = ZarrWriter(str(tmp_path / "staging"))
         chunk = _chunk(0, 0)
@@ -562,8 +557,8 @@ class TestThePartIsPublishedOnlyAfterTheCellCommits:
 
         monkeypatch.setattr(_assembly_mod, "_fs_for", _boom)
         assert (
-            writer.publish_registry_part(
-                str(tmp_path / "reg"), "32S", 2021, "run1", committed_at=COMMITTED, embedded=[], refused=[chunk.label]
+            writer.publish_registry_run_file(
+                str(tmp_path / "reg"), RegistryRun("32S", 2021, "run1", COMMITTED, embedded=[], refused=[chunk.label])
             )
             is None
         ), "reported as not published rather than raised"

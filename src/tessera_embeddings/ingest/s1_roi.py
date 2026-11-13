@@ -41,12 +41,14 @@ import numpy as np
 import xarray as xr
 
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE, INGEST_CHUNKS
+from tessera_embeddings.config.providers import PROVIDERS
 from tessera_embeddings.errors import ProviderRefusedReadsError
 from tessera_embeddings.ingest._pipeline import pipelined
 from tessera_embeddings.ingest.duplicates import is_provider_refusal, is_unreadable_source
 from tessera_embeddings.ingest.live_windows import run_live_windows, windows_for_date
 from tessera_embeddings.ingest.loader_failures import install_capture_everywhere, refusal_wait_out
 from tessera_embeddings.ingest.opera_query import BURST_CENSUS_ATTR, BurstCensus, make_s1_item_provider
+from tessera_embeddings.ingest.provenance import SkippedDays, day_granules
 from tessera_embeddings.ingest.roi import (
     read_roi_mask,
     read_roi_metadata,
@@ -58,6 +60,7 @@ from tessera_embeddings.ingest.solar_days import (
     normalize_to_solar_day,
     owned_items,
     resume_window_start,
+    solar_day_of,
     solar_grouping_longitude,
     validated_batch_days,
     validated_window,
@@ -76,6 +79,17 @@ from tessera_embeddings.storage.zarr_store import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: The catalogue the radar leg reads: OPERA RTC-S1 bursts through CMR.
+_RADAR_PROVIDER, _RADAR_COLLECTION = "cmr-asf", "opera-rtc-s1"
+
+#: Where every radar granule list says its items came from.
+_RADAR_SOURCE = {
+    "provider": _RADAR_PROVIDER,
+    "collection": _RADAR_COLLECTION,
+    "catalog_url": PROVIDERS[_RADAR_PROVIDER].catalog_url,
+    "collection_id": PROVIDERS[_RADAR_PROVIDER].collections[_RADAR_COLLECTION].collection_id,
+}
 
 DEFAULT_CRED_REFRESH_INTERVAL_SEC = 30 * 60
 """Fallback refresh cadence, used only when the credential advertises no expiry."""
@@ -231,6 +245,13 @@ class _PreparedBatch:
     #: crosses UTC midnight. Empty window list = reaches nothing, so skip; missing key = unknown,
     #: so write everything; empty dict = the whole batch falls back.
     date_windows: dict[str, tuple[str, list[tuple[int, int, int, int]]]]
+    #: Solar day -> the provenance granule list for that day's slot. Empty with provenance off.
+    granules: dict[str, str] = field(default_factory=dict)
+    #: Every granule the query returned, the set-aside ones included, for a day given up whole.
+    items: list = field(default_factory=list)
+    #: Owned solar days whose every burst was set aside for a missing VV or VH: the loader never
+    #: sees them, so they get no slot and are recorded as skipped instead.
+    bandless_days: list[str] = field(default_factory=list)
 
 
 def _baselines_for(baselines: dict[str, int], dates: Iterable[str]) -> dict[str, int]:
@@ -266,6 +287,7 @@ def ingest_s1_roi_sar(
     narrow_windows_per_date: bool = True,
     allow_ingest_code_mismatch: bool = False,
     s3_region: str | None = None,
+    provenance: bool = False,
 ) -> SarIngestResult:
     """Ingest OPERA RTC-S1 SAR for an ROI using batched time windows.
 
@@ -324,6 +346,9 @@ def ingest_s1_roi_sar(
         s3_region: S3 region for the mosaic Icechunk store. ``None`` uses the
             storage layer's default; set it when the bucket lives elsewhere, or
             every write below signs against the wrong region.
+        provenance: Write the provenance record with every date: the day's burst list and a
+            per-pixel ``source_index`` band (:mod:`~tessera_embeddings.ingest.provenance`). Off by
+            default; the store records the setting and a resume must match it.
 
     Returns:
         :class:`SarIngestResult`. ``status="skipped"`` if zero dates
@@ -348,6 +373,7 @@ def ingest_s1_roi_sar(
         roi_zarr_path,
         storage_options=resolve_storage_options(storage_options),
         allow_ingest_code_mismatch=allow_ingest_code_mismatch,
+        provenance=provenance,
     )
 
     # Load blocks match the store's chunks: one read task per (chunk, band), and the
@@ -505,6 +531,7 @@ def ingest_s1_roi_sar(
     # for the same reason — every accepted cause is DETERMINISTIC — so re-offering costs one
     # re-evaluation and a record of the skip would only matter if the verdict could change.
     written_dates: set[str] = get_existing_dates(orbit_store, s3_region=s3_region)
+    skipped = SkippedDays(orbit_store, _RADAR_SOURCE, exists=bool(written_dates), s3_region=s3_region)
     #: The newest date this store holds. Everything at or below it is closed for good: a Zarr
     #: store's chunks sit at fixed positions, so a day cannot be slotted in behind one already
     #: written. Each of a cell's three child stores advances independently, so this is read per
@@ -695,7 +722,9 @@ def ingest_s1_roi_sar(
 
         # Wrap the provider to keep the items odc was given. Wrapping rather than querying twice
         # matters: these must be the SAME objects odc grouped, after any timestamp normalisation,
-        # or the footprints would describe a different set of acquisitions.
+        # or the footprints would describe a different set of acquisitions. The granules it sets
+        # aside, missing a polarisation, are kept apart for the granule list.
+        dropped_items: list = []
         base_provider = make_s1_item_provider(
             orbit,
             roi.bbox_wgs84,
@@ -704,6 +733,7 @@ def ingest_s1_roi_sar(
             use_s3_direct=use_s3_direct,
             burst_census=burst_census,
             mid_longitude=mid_longitude,
+            dropped=dropped_items,
         )
         seen_items: list = []
 
@@ -721,8 +751,8 @@ def ingest_s1_roi_sar(
 
         query_started = time.monotonic()
         data, baselines = ingest_tile(
-            provider="cmr-asf",
-            collection="opera-rtc-s1",
+            provider=_RADAR_PROVIDER,
+            collection=_RADAR_COLLECTION,
             tile_id=None,
             start_date=rng.query_start,
             end_date=rng.query_end,
@@ -741,6 +771,7 @@ def ingest_s1_roi_sar(
             # only saves loading a group that is already committed — but filtering on UTC
             # dates would let half of one through, which is the case that costs a write.
             mid_longitude=mid_longitude,
+            source_index=provenance,
         )
         query_s = time.monotonic() - query_started
         # THE most diagnostic line in this flow: without the item count there is no telling a
@@ -768,6 +799,16 @@ def ingest_s1_roi_sar(
             query_s,
             len(seen_items),
             _date_footprints(seen_items),
+            # The items the load stamped are the ones it fused, in each day's burst order.
+            day_granules([*seen_items, *dropped_items], **_RADAR_SOURCE) if provenance and data is not None else {},
+            [*seen_items, *dropped_items],
+            sorted(
+                {
+                    solar_day_of(it)
+                    for it in owned_items(normalize_to_solar_day(dropped_items, mid_longitude=mid_longitude), rng)
+                }
+                - {solar_day_of(it) for it in seen_items}
+            ),
         )
 
     # depth=1: one batch prepared ahead. A batch's write is one long consume, so a single
@@ -799,6 +840,7 @@ def ingest_s1_roi_sar(
         data, baselines, query_s = prepared.data, prepared.baselines, prepared.query_s
 
         refresh_credentials_if_stale()
+        skipped.record_days(prepared.bandless_days, prepared.items, "missing-bands")
 
         if data is not None:
             # The ROI mask was applied in _prepare_batch, on the same side of the phase
@@ -916,6 +958,9 @@ def ingest_s1_roi_sar(
                                     parallel_windows=overlap_window_writes,
                                     s3_region=s3_region,
                                     store_attrs={BURST_CENSUS_ATTR: burst_census.record()},
+                                    # KeyError for a written date the load did not list: with
+                                    # the record on, no slot may commit without its list.
+                                    granules=prepared.granules[date_str] if provenance else None,
                                 )
                 except Exception as exc:
                     # The retry is exhausted. Only a failure the source is answerable for is
@@ -935,7 +980,9 @@ def ingest_s1_roi_sar(
                         ) from exc
                     if not _give_up_date(date_str, exc):
                         raise
+                    skipped.record(date_str, prepared.items, "unreadable")
                     continue
+                skipped.written()
                 date_s = time.monotonic() - date_started
                 write_total_s += date_s
                 written_dates.add(date_str)

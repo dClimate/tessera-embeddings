@@ -21,7 +21,7 @@ from typing import Any, ClassVar, Self, cast
 
 import zarr
 
-from tessera_embeddings.config.ingest import ingest_code_identity
+from tessera_embeddings.config.ingest import PROVENANCE_VERSION, ingest_code_identity
 from tessera_embeddings.errors import ConfigMismatchError
 
 logger = logging.getLogger(__name__)
@@ -196,7 +196,7 @@ class StoreManifest:
                 mismatches[key] = ("<not recorded, i.e. off>", current_val)
         for key in existing:
             if key in known_fields and key not in current and existing[key] is not None:
-                mismatches[key] = (existing[key], None)
+                mismatches[key] = (existing[key], "<not set, i.e. off>" if key in self.ABSENT_MEANS_OFF else None)
 
         if mismatches:
             lines = [f"Cannot append to {store_path}: structural parameters changed."]
@@ -267,10 +267,19 @@ class IngestManifest(StoreManifest):
     #: at the cost of stranding multi-terabyte mosaics.
     REQUIRED_TO_APPEND: ClassVar[frozenset[str]] = frozenset({"ingest_code_identity"})
 
+    #: ``provenance_version`` is a policy whose absence is a value: a store seeded without the
+    #: record, before it existed or with it off, holds no granule list and no source index, and
+    #: is the same state either way. So a run with it on refuses such a store, and a run with it
+    #: off refuses one that has it, which is what keeps a granule list from ever falling short of
+    #: its time axis (``context_docs/storage/registry-provenance-plan.md`` §4).
+    ABSENT_MEANS_OFF: ClassVar[frozenset[str]] = frozenset({"provenance_version"})
+
     roi_manifest_hash: str | None = None
     coverage_sha256: str | None = None
     min_valid_coverage: float | None = None
     ingest_code_identity: str | None = None
+    #: The provenance record's version when the ingest writes it, ``None`` when it does not.
+    provenance_version: int | None = None
     #: Opt-in: resume a store whose recorded ``ingest_code_identity`` is not this run's.
     #: Relaxes only that term; the append is recorded under :data:`MIXED_CODE_IDENTITIES_ATTR`.
     allow_ingest_code_mismatch: bool = False
@@ -307,6 +316,7 @@ class IngestManifest(StoreManifest):
         min_valid_coverage: float | None = None,
         storage_options: dict | None = None,
         allow_ingest_code_mismatch: bool = False,
+        provenance: bool = False,
     ) -> IngestManifest:
         """Build from an ROI store, chaining the upstream ROI manifest hash.
 
@@ -321,6 +331,8 @@ class IngestManifest(StoreManifest):
                 ``to_dict``, so it neither appears in the store nor moves the hash — which
                 keeps this field from invalidating manifests written before it existed.
             allow_ingest_code_mismatch: See the field of the same name.
+            provenance: Whether this ingest writes the provenance record; see
+                ``provenance_version``.
         """
         coverage_sha: str | None = None
         try:
@@ -342,6 +354,7 @@ class IngestManifest(StoreManifest):
             # cannot disagree about what code they are — a value each computed for itself
             # is how they would drift.
             ingest_code_identity=ingest_code_identity(),
+            provenance_version=PROVENANCE_VERSION if provenance else None,
             allow_ingest_code_mismatch=allow_ingest_code_mismatch,
         )
 

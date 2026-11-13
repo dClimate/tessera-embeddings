@@ -28,12 +28,13 @@ Sentinel-2 reflectance and cloud masks. Four write paths, all committing atomica
 import itertools
 import logging
 import time
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
 from typing import Any, Literal, cast
 
+import dask
 import fsspec
 import fsspec.utils
 import icechunk
@@ -51,7 +52,13 @@ from tenacity import (
     wait_random,
 )
 
-from tessera_embeddings.config.ingest import INGEST_COMPRESSORS, mosaic_chunk_layout
+from tessera_embeddings.config.ingest import (
+    GRANULES_ARRAY,
+    INGEST_COMPRESSORS,
+    SKIPPED_DAYS_ARRAY,
+    SKIPPED_GRANULES_ARRAY,
+    mosaic_chunk_layout,
+)
 from tessera_embeddings.config.store_geometry import level0, spatial_dims_of
 from tessera_embeddings.errors import CorruptedStoreError, NonMonotonicDateError
 from tessera_embeddings.storage.manifest import MIXED_CODE_IDENTITIES_ATTR, IngestManifest, extract_manifest
@@ -985,6 +992,7 @@ def open_store_as_zarr_group(
     *,
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     region: str | None = None,
+    snapshot_id: str | None = None,
 ) -> zarr.Group:
     """Open an Icechunk store for reading as a raw zarr Group.
 
@@ -996,13 +1004,15 @@ def open_store_as_zarr_group(
     ``group`` selects one Zarr group (the global store's per-zone layout); ``None``
     returns the root. ``get_credentials``/``region`` are forwarded so a store outside the
     default S3 region, or reachable only via an explicit credential callback, can be read
-    with the same options as the writer used.
+    with the same options as the writer used. ``snapshot_id`` opens that version instead of the
+    branch tip.
     """
     return open_store_group_and_tip(
         store_path,
         group=group,
         get_credentials=get_credentials,
         region=region,
+        snapshot_id=snapshot_id,
     )[0]
 
 
@@ -1013,8 +1023,9 @@ def open_store_group_and_tip(
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     region: str | None = None,
     branch: str = "main",
+    snapshot_id: str | None = None,
 ) -> tuple[zarr.Group, str]:
-    """Open a store for reading and also return ``branch``'s tip snapshot ID.
+    """Open a store for reading and also return ``branch``'s tip snapshot ID, or ``snapshot_id``'s view.
 
     Same as :func:`open_store_as_zarr_group`, plus the commit the returned group is a view
     of. The snapshot ID is the store's canonical CONTENT identity — it moves on every commit
@@ -1028,7 +1039,7 @@ def open_store_group_and_tip(
     confusion the snapshot is here to prevent.
     """
     repo = open_repo(store_path, get_credentials=get_credentials, region=region)
-    tip = repo.lookup_branch(branch)
+    tip = snapshot_id or repo.lookup_branch(branch)
     session = repo.readonly_session(snapshot_id=tip)
     root = zarr.open_group(session.store, mode="r")
     if group is None:
@@ -1050,6 +1061,43 @@ indistinguishable. The coverage gate must fail on the second and not on the firs
 Written by the ingest paths themselves rather than by the completion marker, because the
 gate runs BEFORE the marker on a first ingest, and again later from the fill.
 """
+
+
+def record_skipped_days(store_path: str, lists: Mapping[str, str], *, s3_region: str | None = None) -> None:
+    """Commit the granule lists of days the ingest skipped whole, keyed by solar day, in one commit.
+
+    A day already recorded is overwritten, so a retried ingest leaves the list its latest attempt
+    built. The two arrays are created on first use and sit off the time axis, which they never
+    touch (``context_docs/storage/registry-provenance-plan.md`` §3).
+    """
+    repo = open_repo(store_path, region=s3_region)
+    for attempt in store_write_retrying(logger):
+        with attempt:
+            session = repo.writable_session("main")
+            root = zarr.open_group(session.store, mode="a")
+            days, granules = (_skipped_array(root, name) for name in (SKIPPED_DAYS_ARRAY, SKIPPED_GRANULES_ARRAY))
+            held = [str(day) for day in np.asarray(days[:])]
+            for day, listed in sorted(lists.items()):
+                if day not in held:
+                    held.append(day)
+                    days.resize((len(held),))
+                    granules.resize((len(held),))
+                days[held.index(day)], granules[held.index(day)] = day, listed
+            session.commit(f"skipped day(s) {', '.join(sorted(lists))}")
+
+
+def _skipped_array(root: zarr.Group, name: str) -> zarr.Array:
+    """``root[name]``, a one-dimensional string array along ``skipped_day``, created empty if absent."""
+    if name not in root:
+        root.create_array(
+            name,
+            shape=(0,),
+            chunks=(1,),
+            dtype=np.dtypes.StringDType(),
+            fill_value="",
+            dimension_names=("skipped_day",),
+        )
+    return cast(zarr.Array, root[name])
 
 
 def record_assessed_window(
@@ -1439,20 +1487,23 @@ def _write_windows_overlapped(
             writer.writer.targets = [
                 zarr.open_array(fork.store, path=target.path, mode="a") for target in writer.writer.targets
             ]
-            stored.extend(
-                writer.writer.sync(
-                    compute=False,
-                    chunkmanager_store_kwargs={"load_stored": False, "return_stored": True},
-                )
+            lazy = writer.writer.sync(
+                compute=False,
+                chunkmanager_store_kwargs={"load_stored": False, "return_stored": True},
             )
+            # One source comes back as one array, not a list of one; iterating it would slice it.
+            stored.extend(lazy if isinstance(lazy, list | tuple) else [lazy])
     except (AttributeError, TypeError) as exc:
         logger.warning("Overlapped window write failed to assemble (%s); writing sequentially", exc)
         return False
 
     if stored:
         # The single compute: every window's loads, masks and chunk writes in one graph,
-        # reduced to one mergeable changeset.
-        session.merge(session_merge_reduction(stored, split_every=_MERGE_SPLIT_EVERY))
+        # reduced to one mergeable changeset. Fused here first, because the distributed client
+        # submits a graph without dask's blockwise fusion: a block two writes share, such as the
+        # source index's cast, then reaches the scheduler as a task of its own (measured on a
+        # recorded radar week: 7% fewer tasks; a plain mosaic's graph is unchanged).
+        session.merge(session_merge_reduction(list(dask.optimize(*stored)), split_every=_MERGE_SPLIT_EVERY))
     # DEBUG, not INFO: the chattiest line this path produces, once per write, and Prefect
     # ships task logs to the orchestrator API from whichever Dask worker ran the task, so it
     # scales with total worker count. The timing is already in the caller's per-batch line.
@@ -1483,6 +1534,7 @@ def write_day_windows(
     s3_region: str | None = None,
     parallel_windows: bool = False,
     store_attrs: dict[str, Any] | None = None,
+    granules: str | None = None,
 ) -> None:
     """Write ONE date's live windows into a mosaic store, one commit for the date.
 
@@ -1508,6 +1560,7 @@ def write_day_windows(
         s3_region=s3_region,
         parallel_windows=parallel_windows,
         store_attrs=store_attrs,
+        granules=None if granules is None else [granules],
     )
 
 
@@ -1558,6 +1611,7 @@ def write_days_windows(
     s3_region: str | None = None,
     parallel_windows: bool = False,
     store_attrs: dict[str, Any] | None = None,
+    granules: Sequence[str] | None = None,
 ) -> None:
     """Write one or more dates' live windows into a mosaic store, ONE commit for the batch.
 
@@ -1592,12 +1646,20 @@ def write_days_windows(
 
     ``store_attrs`` merge into the root attrs in the dates' own commit, for a record that must
     exist whenever any date does, such as the radar burst census.
+
+    ``granules`` is the provenance granule list, one JSON string per date in ``days``, written
+    into the store's ``granules`` array at the date's own slot in the same commit, so a committed
+    slot always has its list and an uncommitted one has neither. A store seeded with it has the
+    array; whether a resume may write to that store either way is the manifest's
+    ``provenance_version`` term, validated before anything is written.
     """
     # jscpd:ignore-end
     from tessera_embeddings.storage.empty_store import create_empty_store  # local: storage-internal, avoids cycle
 
     if not days:
         return  # nothing to write; a commit recording nothing would be noise
+    if granules is not None and len(granules) != len(days):
+        raise ValueError(f"one granule list per date: {len(granules)} for {len(days)} date(s)")
 
     whens = _batch_times(days, chunks, roi.height, roi.width)
     day_ds = days[0][0]  # schema donor for seeding; every date shares the store's schema
@@ -1638,6 +1700,7 @@ def write_days_windows(
             chunks=chunks,
             baselines={},  # merged per date below, exactly like the append path
             manifest=manifest,
+            granule_list=granules is not None,
             # Seed through a repo opened with THIS call's credentials/region. Letting
             # create_empty_store open its own would use the default storage config, so the
             # probe above and every write below would honour a callback or a non-default
@@ -1672,8 +1735,10 @@ def write_days_windows(
         # in the ONE commit together, preserving the no-date-before-its-pixels invariant at
         # batch granularity.
         writes: list[tuple[xr.Dataset, list[tuple[int, int, int, int]], int, list[str]]] = []
-        for (one_ds, one_windows), when in zip(days, whens, strict=True):
+        for i, ((one_ds, one_windows), when) in enumerate(zip(days, whens, strict=True)):
             t = batch.append_time_slot(when)
+            if granules is not None:
+                cast("zarr.Array", batch.group[GRANULES_ARRAY])[t] = granules[i]
             drop = [c for c in ("time", "northing", "easting") if c in one_ds.coords]
             writes.append((one_ds, one_windows, t, drop))
         attrs = batch.group.attrs

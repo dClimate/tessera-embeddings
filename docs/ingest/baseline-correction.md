@@ -35,7 +35,7 @@ that asset lives (`boa_offset.source_decision`). Three properties of that decisi
   into one time slice, so a correction applied to its OUTPUT hits every tile at once, and a day
   whose tiles disagree has no correct answer — 347 days of one region-year were refused that way.
   The decision is stamped per reflectance asset at parse time (`stac.BoaOffsetParser`) and applied
-  inside the read (`stac._BoaCorrectingReader`) before anything is resampled together, so no pixel
+  inside the read (`stac._SourceReader`) before anything is resampled together, so no pixel
   is both corrected and uncorrected. It is purely additive, the amount being a constant: days the
   pipeline loaded before are bit-identical and only previously-refused days change. See
   [ADR 021](../../context_docs/decisions/021-correct-the-boa-offset-per-image.md) §3.

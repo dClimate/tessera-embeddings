@@ -37,8 +37,8 @@ even a deleted tag name — so a deliberate refill keeps the old tag on the old 
 must pin its new snapshot under a fresh, manually chosen name; campaign history is never
 silently rewritten.
 
-Once a cell with live tiles has committed and published its registry part, and before it is
-tagged, its parts are merged into the registry's ``master/`` file for the cell
+Once a cell with live tiles has committed and published its registry run file, and before it is
+tagged, its run files are merged into the registry's ``master/`` file for the cell
 (:func:`_merge_registry_master`), best-effort, so the registry consumers read is current as each
 cell lands — including a deliberate refill, which fails at the tag step by design.
 """
@@ -58,10 +58,12 @@ import fsspec
 import icechunk
 import numpy as np
 import zarr
+from tenacity import retry_if_not_exception_type
 
 from tessera_embeddings.config.assembly import AssemblyConfig
 from tessera_embeddings.config.fault_injection import ArmedFault
 from tessera_embeddings.config.inference import InferenceConfig, run_id_prefix
+from tessera_embeddings.config.ingest import PROVENANCE_VERSION
 from tessera_embeddings.config.paths import store_key
 from tessera_embeddings.config.store_geometry import level0, spatial_dims_of
 from tessera_embeddings.config.store_layout import GLOBAL, REQUIRED_VARS
@@ -75,11 +77,19 @@ from tessera_embeddings.inference.assembly import (
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, enumerate_chunks
 from tessera_embeddings.inference.data_loading import _active_orbits
+from tessera_embeddings.inference.provenance_publish import (
+    ProvenanceAccess,
+    ProvenanceCheckError,
+    ProvenanceRun,
+    mosaics_carry_provenance,
+    publish_provenance,
+)
 from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.ingest.land_mask import narrow_tile_live
 from tessera_embeddings.storage.campaign import mark_zone_year_empty, pin_tag, tag_zone_year, zone_year_tag
 from tessera_embeddings.storage.global_store import check_destination_types, open_global_repo
 from tessera_embeddings.storage.published_store import calendar_years, live_shards, shard_writes, store_year
+from tessera_embeddings.storage.registry import RegistryRun
 from tessera_embeddings.storage.registry_master import merge_cell
 from tessera_embeddings.storage.registry_rebuild import as_coverage_record, rebuild_tile
 from tessera_embeddings.storage.shard_writer import cell_complete, shard_pitch
@@ -95,7 +105,14 @@ from tessera_embeddings.storage.update import (
     update_record,
     update_state,
 )
-from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group, plain_zarr_storage_options
+from tessera_embeddings.storage.zarr_store import (
+    CONCURRENT_WRITER_ERRORS,
+    is_missing_repo,
+    open_repo,
+    open_store_as_zarr_group,
+    plain_zarr_storage_options,
+    store_write_retrying,
+)
 from tessera_embeddings.storage.zone_grid import (
     PIXEL_M,
     canonicalize_zone,
@@ -303,6 +320,9 @@ class ZoneFillHandoff:
     done: dict[str, Any] | None = None
     # The targeted update this cell runs for, or None for a campaign fill (see `_assemble_update`).
     update: UpdateTarget | None = None
+    # Each mosaic store's snapshot as the plan sampled it: what the actors read, and what the
+    # provenance export describes (`mosaic_snapshots`).
+    mosaic_snapshots: dict[str, str] | None = None
 
 
 def _open_zone(
@@ -391,18 +411,18 @@ def _merge_registry_master(
     s3_region: str | None,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
 ) -> None:
-    """Merge the part assembly just published into the cell's ``master/`` file. Never raises.
+    """Merge the run file assembly just published into the cell's ``master/`` file. Never raises.
 
-    This is what keeps the master current: every fill merges its cell's parts into the cell's
+    This is what keeps the master current: every fill merges its cell's run files into the cell's
     existing master file, tile by tile
     (:func:`~tessera_embeddings.storage.registry_master.merge_cell`), so a refill, a new year or
     an update of some tiles reaches consumers as it lands. Called before the tag, because a deliberate refill
-    fails at the tag step once its data and part have landed. Best-effort for the reason
-    ``publish_registry_part`` is: the cell has committed, and a registry failure must not fail it
+    fails at the tag step once its data and run file have landed. Best-effort for the reason
+    ``publish_registry_run_file`` is: the cell has committed, and a registry failure must not fail it
     or keep it from being tagged. A failure —
-    including ``run_id``'s own part never having published, which would otherwise rewrite the master
+    including ``run_id``'s own run file never having published, which would otherwise rewrite the master
     from the older runs and report success — is logged loudly and leaves the cell stale.
-    ``rebuild_registry_measurements.py repair --zones`` rebuilds it once the part exists.
+    ``rebuild_registry_measurements.py repair --zones`` rebuilds it once the run file exists.
 
     A retry of a cell that already landed, or of an update already recorded, runs it again with no
     ``run_id`` (:func:`plan_zone_inference`): a process that died between the commit and this merge
@@ -411,8 +431,8 @@ def _merge_registry_master(
     The store's live shards for the year are compared with the master's embedded tiles on the way,
     from the manifests alone, and a disagreement is logged at ERROR: no run removes a tile it did
     not write, so a shard cleared by hand would otherwise leave the master describing it. The
-    store's run record is checked against the cell's parts too (``store_disagreements``), which
-    refuses the update when a run that wrote the year has no part to describe its tiles.
+    store's run record is checked against the cell's run files too (``store_disagreements``), which
+    refuses the update when a run that wrote the year has no run file to describe its tiles.
     """
     if not registry_root:
         return
@@ -452,6 +472,72 @@ def _merge_registry_master(
     log.info("Zone %s year %d: registry master merged", zone, year)
 
 
+@dataclass(frozen=True)
+class _ProvenanceCell:
+    """Where one cell's provenance record goes, and how its stores are reached.
+
+    ``zone`` is the fill zone; ``mode`` the run's, ``fill``, ``shards`` or ``holes``.
+    """
+
+    store_path: str
+    staging_base: str | None
+    registry_root: str | None
+    zone: str
+    year: int
+    run_id: str
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None
+    s3_region: str | None
+    mode: str = "fill"
+
+
+def _publish_provenance(
+    cell: _ProvenanceCell,
+    embedded: Collection[str],
+    refused: Collection[str],
+    mosaic_snapshots: Mapping[str, str] | None,
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+) -> None:
+    """Publish the run's provenance record beside the registry, BEFORE its shard commit. Raises.
+
+    On every path that commits shards, ahead of the commit, so a committed run always has its record
+    and a failure costs nothing irreversible: the run is not committed, its staging is kept, and its
+    retry publishes again, every write keyed by run id (``context_docs/storage/
+    registry-provenance-plan.md`` §4 rule 3). A record whose run never commits is never read, since a
+    reader reaches a run only through the store's ``source_runs``. Transient storage errors are
+    retried as store writes are; a failed check is not, since it would fail the same way. Nothing is
+    published without a registry, or when the mosaics carry no record.
+    """
+    if not cell.registry_root or not cell.staging_base or not mosaic_snapshots:
+        return
+    store_credentials = _store_credentials(cell.store_path, cell.get_credentials)
+    repo = open_global_repo(cell.store_path, get_credentials=store_credentials, region=cell.s3_region)
+    # Published under the store group, as the registry is: a column half's record sits beside the other half's.
+    group_name = group_and_half(cell.zone)[0]
+    group = cast(zarr.Group, zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[group_name])
+    # Scales are (time, y, x) in either band order; embeddings are band-first in v2 (ADR 031).
+    scales = cast(zarr.Array, level0(group)["scales"])
+    run = ProvenanceRun(
+        staging_base=cell.staging_base,
+        registry_root=cell.registry_root,
+        zone=group_name,
+        year=cell.year,
+        run_id=cell.run_id,
+        embedded=sorted(embedded),
+        refused=sorted(refused),
+        mosaic_snapshots=mosaic_snapshots,
+        grid_shape=(int(scales.shape[1]), int(scales.shape[2])),
+        shard_px=shard_pitch(scales),
+        mode=cell.mode,
+    )
+    access = ProvenanceAccess(cell.get_credentials, store_credentials, cell.s3_region)
+    retrying = store_write_retrying(log).copy(
+        retry=retry_if_not_exception_type((*CONCURRENT_WRITER_ERRORS, ProvenanceCheckError))
+    )
+    for attempt in retrying:
+        with attempt:
+            publish_provenance(run, access, log)
+
+
 # jscpd:ignore-start: Args shared with assemble_zone_year
 def fill_zone_year(
     *,
@@ -462,7 +548,7 @@ def fill_zone_year(
     mosaic_base: str,
     staging_base: str,
     # Root of the published registry dataset; from `BucketPaths.optical_registry`. None writes
-    # no part. Mirrors `staging_base`: a location the CALLER resolves.
+    # no run file. Mirrors `staging_base`: a location the CALLER resolves.
     registry_root: str | None = None,
     config: InferenceConfig,
     num_actors: int,
@@ -493,9 +579,9 @@ def fill_zone_year(
         mosaic_base: Base path of the zone's ingest mosaic stores.
         staging_base: Base path for staged inference output.
         registry_root: Root of the published registry dataset
-            (:meth:`BucketPaths.optical_registry`). One Parquet part per cell lands under it,
+            (:meth:`BucketPaths.optical_registry`). One Parquet run file per cell lands under it,
             a row per live tile, because the year's summary in the store is pooled and cannot
-            say which refused tile came closest to the depth cutoff. ``None`` writes no part.
+            say which refused tile came closest to the depth cutoff. ``None`` writes no run file.
         config: Inference configuration; ``config.chunk_size`` must equal the group's shard
             size (1 tile == 1 shard, D3).
         num_actors: Ray inference actor count.
@@ -582,6 +668,32 @@ class ZonePlan:
     done: dict[str, Any] | None = None
     # The targeted update this cell runs for, carried to assembly through the handoff.
     update: UpdateTarget | None = None
+    # Each active mosaic store's snapshot, sampled once here (`mosaic_snapshots`).
+    mosaic_snapshots: dict[str, str] | None = None
+
+
+def mosaic_snapshots(
+    mosaic_base: str,
+    s1_orbit: str,
+    *,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+    s3_region: str | None = None,
+) -> dict[str, str]:
+    """Each active mosaic store's current snapshot, by store path. Sampled once per cell.
+
+    Every actor opens its mosaics at these snapshots and the provenance export reads them, so the
+    model and the record describe one version even if something commits to a mosaic mid-fill. Free
+    at read time: opening a branch resolves to a snapshot anyway. An orbit with no store is absent.
+    """
+    pins: dict[str, str] = {}
+    for store in ["reflectance", *(f"sar_{orbit}" for orbit in _active_orbits(s1_orbit))]:
+        path = f"{mosaic_base}/{store}.zarr"
+        try:
+            pins[path] = open_repo(path, get_credentials=get_credentials, region=s3_region).lookup_branch("main")
+        except icechunk.IcechunkError as exc:
+            if not is_missing_repo(exc):
+                raise
+    return pins
 
 
 def preflight_destination(
@@ -1011,6 +1123,9 @@ def plan_zone_inference(
         summary=summary,
         live=live,
         update=update,
+        mosaic_snapshots=mosaic_snapshots(
+            mosaic_base, config.s1_orbit, get_credentials=get_credentials, s3_region=s3_region
+        ),
     )
 
 
@@ -1113,6 +1228,7 @@ def _infer_planned(
         s3_region=s3_region,
         retire_idle_actors=retire_idle_actors,
         cell=f"{plan.zone}-{plan.year}",
+        mosaic_snapshots=plan.mosaic_snapshots,
     )
     return complete_zone_inference(plan, results=results)
 
@@ -1152,6 +1268,7 @@ def complete_zone_inference(plan: ZonePlan, *, results: list[dict] | None) -> Zo
         live=plan.live,
         results=results,
         update=plan.update,
+        mosaic_snapshots=plan.mosaic_snapshots,
     )
 
 
@@ -1161,7 +1278,7 @@ def assemble_zone_year(
     store_path: str,
     staging_base: str,
     # Root of the published registry dataset; from `BucketPaths.optical_registry`. None writes
-    # no part. Mirrors `staging_base`: a location the CALLER resolves.
+    # no run file. Mirrors `staging_base`: a location the CALLER resolves.
     registry_root: str | None = None,
     # The depth rule this cell was filled under, stamped on every registry row. Passed rather
     # than re-read: `preflight_destination` already asserted the config matches the store's
@@ -1199,6 +1316,12 @@ def assemble_zone_year(
     if handoff.done is not None:
         return handoff.done
     zone, year, run_id, t0 = handoff.zone, handoff.year, handoff.run_id, handoff.t0
+    cell = _ProvenanceCell(store_path, staging_base, registry_root, zone, year, run_id, get_credentials, s3_region)
+    # Recorded with the run, so the registry can tell which runs' pixels have a provenance record.
+    if handoff.mosaic_snapshots and mosaics_carry_provenance(
+        handoff.mosaic_snapshots, get_credentials=get_credentials, s3_region=s3_region
+    ):
+        input_coverage = {**(input_coverage or {}), "provenance_version": PROVENANCE_VERSION}
     summary, live, results = handoff.summary, handoff.live, handoff.results
     writer = ZarrWriter(staging_base)
 
@@ -1251,6 +1374,8 @@ def assemble_zone_year(
         # Mark + tag FIRST, clean up after (matching the data path): a crash after cleanup but
         # before the tag would force full re-inference just to regenerate zero-byte markers.
         if live:
+            # Before the commit, so a committed run always has its record (_publish_provenance).
+            _publish_provenance(cell, [], [c.label for c in live], handoff.mosaic_snapshots, log)
             # The fill write and the completion mark land together in one call, so the year
             # can never be marked empty over shards this run did not clear.
             snapshot = writer.assemble_global(
@@ -1263,14 +1388,14 @@ def assemble_zone_year(
                 skipped_labels=sorted(c.label for c in live),
                 # THE CELL WITH THE MOST TO SAY. Every live tile refused, so this branch holds
                 # the richest refusal record a cell can produce; omitting the registry root
-                # here wrote no part, `empty=True` also drops the pooled summary from the
+                # here wrote no run file, `empty=True` also drops the pooled summary from the
                 # year's provenance, and staging cleanup then destroyed the only surviving
                 # account of which tiles were thin, unimaged or radar-free.
                 registry_root=registry_root,
                 optical_min_obs=optical_min_obs,
                 empty=True,
                 # The STORE's credential: assemble_global uses it only to open the global store and
-                # to write the registry part beside it — both live in the store's own bucket.
+                # to write the registry run file beside it — both live in the store's own bucket.
                 get_credentials=_store_credentials(store_path, get_credentials),
                 s3_region=s3_region,
                 log=log,
@@ -1278,7 +1403,7 @@ def assemble_zone_year(
                 input_coverage=input_coverage,
             )
             # Before the tag, not after it: a deliberate refill FAILS at the tag step by design,
-            # once its data and part have landed, and the master must still learn of it.
+            # once its data and run file have landed, and the master must still learn of it.
             _merge_registry_master(
                 registry_root,
                 store_path,
@@ -1358,6 +1483,7 @@ def assemble_zone_year(
             radar_coverage["s1_thin_below_obs"],
             radar_coverage["tiles_fully_s1_free"],
         )
+    _publish_provenance(cell, staged_labels, skipped_labels, handoff.mosaic_snapshots, log)
     snapshot = writer.assemble_global(
         store_path,
         zone,
@@ -1371,7 +1497,7 @@ def assemble_zone_year(
         skipped_labels=skipped_labels,
         radar_coverage=radar_coverage,
         # The STORE's credential: assemble_global uses it only to open the global store and to
-        # write the registry part beside it — both live in the store's own bucket.
+        # write the registry run file beside it — both live in the store's own bucket.
         get_credentials=_store_credentials(store_path, get_credentials),
         s3_region=s3_region,
         log=log,
@@ -1429,6 +1555,9 @@ def _assemble_update(
     """
     update = cast(UpdateTarget, handoff.update)
     zone, year, run_id, live, results = handoff.zone, handoff.year, handoff.run_id, handoff.live, handoff.results
+    cell = _ProvenanceCell(
+        store_path, writer.staging_base, registry_root, zone, year, run_id, get_credentials, s3_region, update.mode
+    )
     group = group_and_half(zone)[0]
     staged = writer.verify_staged_completeness(run_id, live, log=log)
     skipped = sorted({c.label for c in live} - staged)
@@ -1449,10 +1578,12 @@ def _assemble_update(
     committed: dict[str, str] = {}
 
     def _record(repo: icechunk.Repository, zone: str, year_label: int, commit: Mapping[str, str]) -> str:
-        committed.update(commit)  # the shard commit, which stamps the merged tiles' part
+        committed.update(commit)  # the shard commit, which stamps the merged tiles' run file
         return commit_update_record(repo, zone, year_label, commit, record=record)
 
     if staged or cleared:
+        # The update's own record, cut to the pixels it wrote, before the commit as a fill's is.
+        _publish_provenance(cell, staged, skipped, handoff.mosaic_snapshots, log)
         snapshot = writer.assemble_global(
             store_path,
             zone,
@@ -1550,7 +1681,7 @@ def _publish_merged_rows(
     A merged shard holds two runs' pixels, so neither run's coverage record describes it, and the
     master keeps only each tile's newest row. Re-deriving from the store is exact — the registry
     repair proved it on every published row — and costs one read of each tile's observation counts.
-    The part is stamped with the update's shard commit, as every part is. Best-effort, like every
+    The run file is stamped with the update's shard commit, as every run file is. Best-effort, like every
     registry write after a commit: the cell has landed.
     """
     records: dict[str, dict] = {}
@@ -1578,17 +1709,15 @@ def _publish_merged_rows(
             year,
             zone,
         )
-    writer.publish_registry_part(
-        registry_root,
+    run = RegistryRun(
         zone,
         year,
         run_id,
-        committed_at=committed_at,
+        committed_at,
         embedded=labels,
         refused=[],
         optical_min_obs=optical_min_obs,
         embedded_records=records,
         update_name=update_name,
-        get_credentials=get_credentials,
-        s3_region=s3_region,
     )
+    writer.publish_registry_run_file(registry_root, run, get_credentials=get_credentials, s3_region=s3_region)

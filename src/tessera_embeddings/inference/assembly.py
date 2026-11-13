@@ -92,6 +92,7 @@ from tessera_embeddings.inference.chunk_spec import (
     parse_chunk_label,
     read_pixel_mask,
 )
+from tessera_embeddings.inference.provenance import SourcePlanes, stage_planes
 from tessera_embeddings.storage import zone_grid
 from tessera_embeddings.storage.conventions import (
     STACK_ATTR,
@@ -107,7 +108,7 @@ from tessera_embeddings.storage.global_store import create_layout_arrays, open_g
 from tessera_embeddings.storage.icechunk_logging import traced_commit
 from tessera_embeddings.storage.manifest import EmbeddingManifest, extract_manifest
 from tessera_embeddings.storage.object_store import delete_prefix
-from tessera_embeddings.storage.registry import part_uri, registry_rows, write_registry_part
+from tessera_embeddings.storage.registry import RegistryRun, registry_rows, run_file_uri, write_run_file
 from tessera_embeddings.storage.shard_writer import (
     PhaseTimer,
     claim_root_stack,
@@ -183,7 +184,7 @@ class IncompleteStageError(RuntimeError):
     """Raised when assembly is attempted before all chunks have been staged."""
 
 
-def _open_staged_tile(path: str) -> zarr.Group:
+def _open_staged_tile(path: str, *, use_consolidated: bool | None = None) -> zarr.Group:
     """Open a staged tile, refusing one whose write never finished.
 
     The single in-store completeness check. ``write_chunk`` sets ``staged_complete`` only after
@@ -204,8 +205,13 @@ def _open_staged_tile(path: str) -> zarr.Group:
         FileNotFoundError: If there is no tile at *path* (zarr's ``GroupNotFoundError`` is a
             subclass). Any other open error — auth, throttling, transient network — propagates
             untouched, so a bad moment on S3 never makes a valid tile look partial.
+
+    ``use_consolidated=False`` lists the tile's arrays from storage rather than from the listing
+    consolidated when its embeddings were written, which a reader of arrays added later needs.
     """
-    group = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
+    group = zarr.open_group(
+        path, mode="r", storage_options=_staged_storage_options(path), use_consolidated=use_consolidated
+    )
     if not group.attrs.get("staged_complete"):
         raise IncompleteStageError(
             f"Staged tile {path} lacks the staged_complete marker — a crashed write_chunk left partial "
@@ -958,7 +964,7 @@ class ZarrWriter:
         self.embedding_dim = embedding_dim
         self.band_first = band_first
         # This assembly's skip records, read from the markers by `_skip_summary` and consumed by
-        # `publish_registry_part` afterwards. Always present rather than appearing only once a
+        # `publish_registry_run_file` afterwards. Always present rather than appearing only once a
         # summary has run, so a reader can tell "no skips" from "a previous cell's skips";
         # `assemble_global` clears it at the start of every assembly.
         self._last_skip_records: dict[str, dict] = {}
@@ -1033,13 +1039,13 @@ class ZarrWriter:
         not WHICH tile, and ranking candidates by how close they came is the whole of that planning
         problem.
 
-        Does NOT publish them — it keeps them on the writer for :meth:`publish_registry_part`,
+        Does NOT publish them — it keeps them on the writer for :meth:`publish_registry_run_file`,
         which the caller runs only after the cell has committed. Registry consumers are told they
-        need not open the store, so a part written before the commit advertises a cell that may
+        need not open the store, so a run file written before the commit advertises a cell that may
         never land.
         """
         records, unreadable = read_skip_records(self.staging_base, run_id, skipped)
-        # KEPT for the caller to publish AFTER the commit — see `publish_registry_part`. Reading
+        # KEPT for the caller to publish AFTER the commit — see `publish_registry_run_file`. Reading
         # here is not optional: this is the last moment the markers exist.
         self._last_skip_records = dict(records)
         summary = summarise_optical_skips(staged=staged, skipped=skipped, records=records)
@@ -1104,6 +1110,9 @@ class ZarrWriter:
         run_id: str,
         obs_counts: Mapping[str, np.ndarray | None],
         month_covered: Mapping[str, np.ndarray | None] | None,
+        *,
+        planes: SourcePlanes | None = None,
+        pixels: np.ndarray | None = None,
     ) -> str:
         """Stage the coverage arrays of a chunk that embedded nothing. Call BEFORE the marker.
 
@@ -1115,6 +1124,10 @@ class ZarrWriter:
         No embeddings and no scales, which is the point: those are what the chunk failed to
         produce, and this avoids staging a 128-band fill array per refused tile. Assembly fills
         them and copies these — see :meth:`StagedShardSource._fill_block`.
+
+        ``planes`` are the shard's provenance planes (``inference/provenance.py``), staged here,
+        with their ``shard_dates`` summary as the ``provenance`` attribute, because a refused
+        shard's imagery was still seen.
         """
         path = self._coverage_path(run_id, chunk)
         staged_chunks_2d = (min(INNER_PX, chunk.height), min(INNER_PX, chunk.width))
@@ -1145,6 +1158,8 @@ class ZarrWriter:
         # leaves a tile that reads back as FILL rather than as an error, which here would publish
         # zeroed counts looking like measured ones.
         marker = zarr.open_group(path, mode="a", storage_options=_staged_storage_options(path))
+        if planes:
+            stage_planes(marker, planes, pixels)
         marker.attrs["staged_complete"] = True
         logger.info("Staged coverage-only tile for refused chunk %s to %s", chunk.label, path)
         return path
@@ -1189,47 +1204,39 @@ class ZarrWriter:
             )
         return present | recovered
 
-    def publish_registry_part(
+    def publish_registry_run_file(
         self,
         registry_root: str,
-        zone: str,
-        year: int,
-        run_id: str,
-        *,
-        committed_at: str,
-        embedded: list[str],
-        refused: list[str],
-        optical_min_obs: int | None = None,
-        embedded_records: Mapping[str, dict] | None = None,
-        update_name: str | None = None,
+        run: RegistryRun,
         get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
         s3_region: str | None = None,
     ) -> str | None:
-        """Publish this cell's registry part. Call ONLY after the cell has committed.
+        """Publish this cell's registry run file. Call ONLY after the cell has committed.
 
         The ordering is the point. The registry is a sibling of the store, not part of it, and
-        nothing reconciles the two — so a part written while assembly was still running advertises
+        nothing reconciles the two — so a run file written while assembly was still running advertises
         embedded and refused tiles for a zone-year that may never land, permanently. Publishing
-        after the commit makes the part's existence mean the cell exists.
+        after the commit makes the run file's existence mean the cell exists.
 
-        ``committed_at`` is the shard commit's own timestamp, stamped on every row as
+        ``run.committed_at`` is the shard commit's own timestamp, stamped on every row as
         ``assembled_at``. The master keeps each tile's newest row, so the stamp must order runs as
         the store wrote their pixels; the clock at publication would not, when one run commits
         first and publishes last.
 
         Returns the URI on success, ``None`` on failure. Best-effort in this direction only: losing
-        a part costs a future infill campaign some precision, while raising would fail a cell that
-        has already landed. A lost part is recoverable anyway, since every column is derivable from
+        a run file costs a future infill campaign some precision, while raising would fail a cell
+        that has already landed. A lost run file is recoverable anyway, since every column is derivable from
         the store the cell just wrote.
         """
         # Refused shards' records come from their markers, embedded shards' from the actors'
         # results. Merged because a row's measurements mean the same thing either way (see
         # `_coverage_record`); the marker side wins on a label in both, since a marker is written
         # at the end of a shard that refused everything.
-        records = {**(embedded_records or {}), **self._last_skip_records}
-        uri = part_uri(registry_root, zone, year, run_id)
-        boxes = _tile_bboxes_wgs84(zone, [*embedded, *refused])
-        # The build publishing this part IS the build that produced the cell — same process.
+        records = {**(run.embedded_records or {}), **self._last_skip_records}
+        zone, year, run_id = run.zone, run.year, run.run_id
+        uri = run_file_uri(registry_root, zone, year, run_id)
+        boxes = _tile_bboxes_wgs84(zone, [*run.embedded, *run.refused])
+        # The build publishing this run file IS the build that produced the cell — same process.
         # Returns None rather than raising, so a wheel install with no VCS information just leaves
         # the columns null.
         build = code_identity() or {}
@@ -1242,33 +1249,33 @@ class ZarrWriter:
             # Resolved per call, so a fill outliving its credential picks up a fresh one.
             fs = _fs_for(uri, plain_zarr_storage_options(uri, get_credentials, s3_region))
             fs.makedirs(uri.rsplit("/", 1)[0], exist_ok=True)
-            written = write_registry_part(
+            written = write_run_file(
                 uri,
                 registry_rows(
                     run_id,
-                    committed_at,
-                    embedded=embedded,
-                    refused=refused,
+                    run.committed_at,
+                    embedded=run.embedded,
+                    refused=run.refused,
                     records=records,
-                    optical_min_obs=optical_min_obs,
+                    optical_min_obs=run.optical_min_obs,
                     bboxes=boxes,
                     code=build,
-                    update_name=update_name,
+                    update_name=run.update_name,
                 ),
                 open_output=lambda target: fs.open(target, "wb"),
-                zone=zone,
-                year=year,
-                # Also in the key-value block, so a part read on its own, without the dataset's
-                # partitioning, still states the rule its rows were judged against.
-                extra_metadata={
-                    "optical_min_obs": "" if optical_min_obs is None else str(optical_min_obs),
+                # The rule is in the key-value block too, so a run file read on its own, without the
+                # dataset's partitioning, still states the rule its rows were judged against.
+                metadata={
+                    "zone": zone,
+                    "year": str(year),
+                    "optical_min_obs": "" if run.optical_min_obs is None else str(run.optical_min_obs),
                     "code_commit": str(build.get("commit") or ""),
                     "code_version": str(build.get("version") or ""),
                 },
             )
         except Exception:
             logger.exception(
-                "Run %s: registry part for %s year %d could not be published to %s. The cell itself "
+                "Run %s: registry run file for %s year %d could not be published to %s. The cell itself "
                 "is committed and unaffected, and every column is derivable from it, so this is a "
                 "rebuildable index rather than lost data. READ THIS AS A CONFIGURATION FAULT IF IT "
                 "REPEATS: a permission or credential failure here is identical on every cell, so the "
@@ -1280,7 +1287,7 @@ class ZarrWriter:
                 uri,
             )
             return None
-        logger.info("Published registry part with %d tile row(s) to %s", written, uri)
+        logger.info("Published registry run file with %d tile row(s) to %s", written, uri)
         return uri
 
     def discard_coverage(self, chunk: ChunkSpec, run_id: str) -> None:
@@ -1369,6 +1376,8 @@ class ZarrWriter:
         coverage: Mapping[str, Any] | None = None,
         *,
         stack: Mapping[str, str | None],
+        planes: SourcePlanes | None = None,
+        pixels: np.ndarray | None = None,
     ) -> str:
         """Write one chunk's embeddings to a staged intermediate (non-Icechunk) Zarr store.
 
@@ -1402,6 +1411,11 @@ class ZarrWriter:
             stack: What computed *embeddings* (:data:`~tessera_embeddings.storage.conventions.STACK_ATTR`),
                 from the process that ran the model. A run's first write records it as the run's
                 (:meth:`_join_run`); a tile carries no record of its own.
+            planes: The shard's provenance planes (``inference/provenance.py``), ranked and staged
+                beside the embeddings, with their ``shard_dates`` summary as the ``provenance``
+                attribute, written before ``staged_complete`` like ``coverage``.
+            pixels: For a holes update, the pixels this run embedded: the planes are cut to them and
+                they are staged as the update's ``update_pixels`` mask.
 
         Returns:
             Path to the staged Zarr store.
@@ -1508,6 +1522,8 @@ class ZarrWriter:
         # implies `attribute set` implies `to_zarr returned`. A crash anywhere earlier leaves a tile
         # the listing reports as interrupted, which the resume scan re-infers (mode="w" overwrites).
         marker = zarr.open_group(path, mode="a", storage_options=_staged_storage_options(path))
+        if planes:
+            stage_planes(marker, planes, pixels)
         if coverage is not None:
             # BEFORE `staged_complete`, so the completeness flag keeps meaning "everything this
             # tile carries is written". A reader gated on it can then take the record's absence as
@@ -2573,7 +2589,7 @@ class ZarrWriter:
             year: Campaign calendar year to fill; must be on the group's pre-allocated time axis.
             run_id: Run identifier (locates staged files).
             registry_root: Root of the published registry dataset
-                (:meth:`BucketPaths.optical_registry`). One Parquet part per cell lands under it,
+                (:meth:`BucketPaths.optical_registry`). One Parquet run file per cell lands under it,
                 a row per live tile, because the year's summary in the store is pooled and cannot
                 say WHICH tile came closest to the depth cutoff — the question a cleanup campaign
                 asks. ``None`` writes nothing and changes nothing the store commits.
@@ -2636,7 +2652,7 @@ class ZarrWriter:
         t0 = time.monotonic()
         workers_requested = n_workers
         # THIS ASSEMBLY'S records only. `_skip_summary` populates them during the shard write and
-        # `publish_registry_part` reads them afterwards, but `skipped_labels=None` is a supported
+        # `publish_registry_run_file` reads them afterwards, but `skipped_labels=None` is a supported
         # default that skips the summary entirely — so a reused writer would carry the PREVIOUS
         # cell's refusal measurements into these registry rows. Chunk labels are grid-local
         # (`chunk_<row>_<col>`) and repeat across every zone and year, so stale entries match by
@@ -2750,14 +2766,14 @@ class ZarrWriter:
             extent=extent,
         )
         telemetry: dict[str, Any] = {}
-        # Captured before the write, so the registry part reports what THIS call published rather
+        # Captured before the write, so the registry run file reports what THIS call published rather
         # than whatever a later listing happens to see.
         registry_embedded, registry_refused = list(labels), list(skipped)
         # TOP UP FROM THE STAGED TILES, before the staging prefix goes anywhere. A resumed leg's
         # `results` report earlier legs' tiles as synthetic successes with no coverage record, so
         # without this their registry rows publish null — the asymmetry that left half the
         # published registry saying nothing. Reading here rather than in the runner means every
-        # caller gets it, and a run that staged everything itself, or publishes no part, reads nothing at all.
+        # caller gets it, and a run that staged everything itself, or publishes no run file, reads nothing at all.
         if registry_root:
             embedded_records = self._top_up_embedded_records(run_id, registry_embedded, embedded_records)
         # The run's one stack against the store root's, stamping it on the store's first write. Every
@@ -2790,20 +2806,22 @@ class ZarrWriter:
             commit_attrs=commit_attrs,
         )
         # THE CELL IS COMMITTED. Only now may the registry say so: nothing reconciles it against
-        # the store, and consumers are told they need not open the store, so a part written any
+        # the store, and consumers are told they need not open the store, so a run file written any
         # earlier could advertise a cell that never landed.
         if registry_root:
-            self.publish_registry_part(
+            self.publish_registry_run_file(
                 registry_root,
-                group,
-                year,
-                run_id,
-                committed_at=telemetry["commit"]["committed_at"],
-                embedded=registry_embedded,
-                refused=registry_refused,
-                optical_min_obs=optical_min_obs,
-                embedded_records=embedded_records,
-                update_name=update_name,
+                RegistryRun(
+                    group,
+                    year,
+                    run_id,
+                    telemetry["commit"]["committed_at"],
+                    embedded=registry_embedded,
+                    refused=registry_refused,
+                    optical_min_obs=optical_min_obs,
+                    embedded_records=embedded_records,
+                    update_name=update_name,
+                ),
                 # The store's own callback: the registry is its sibling in the same bucket, so the
                 # credential that opened the store is the one that can write beside it.
                 get_credentials=get_credentials,
