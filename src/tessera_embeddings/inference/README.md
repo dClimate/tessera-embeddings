@@ -783,10 +783,11 @@ layout's own array set. Assembly keeps whichever of them are present in *both* t
 tile and the destination, so a store predating an array, or a run that stages nothing for
 one, needs no special case. Adding an array to the layout is therefore enough to have it
 carried — which was not true while the copy set was a hand-written tuple, and cost one
-published zone-year of empty `s2_month_covered` planes. A four-dimensional variable's
-trailing extent comes from `store_layout.trailing_extent` per variable, because there are
-now two different trailing axes (`band` is as wide as the embedding; `month` is twelve) and
-no "four dimensions means bands" rule would be safe.
+published zone-year of empty `s2_month_covered` planes. Every axis is read by name, through
+`store_geometry.axis_roles`: `band` is as wide as the embedding and `month` is twelve, and a
+v2 store puts `band` before the spatial axes (ADR 031), so no "four dimensions means bands
+last" rule would be safe. A staged tile is reordered into its destination's axis order as it
+is read (`store_geometry.reorder`).
 
 #### Completion markers: how a resume tells finished from interrupted
 
@@ -1037,7 +1038,11 @@ writer emits in one go is much larger than what a reader has to fetch.
 
 **The two layouts now share one geometry**, so what differs is the writer and the manifest
 split, not the objects. Both use `(1, 256, 256, 128)` inner chunks — full band depth, so the
-band axis is never split — inside `(1, 2048, 2048, 128)` shards.
+band axis is never split — inside `(1, 2048, 2048, 128)` shards. That is v1.1's geometry. A v2
+store (`SINGLE_V2`, `GLOBAL_V2`) holds `embeddings` band-first, `(1, 16, 2048, 2048)` shards of
+`(1, 4, 512, 512)` chunks, with every other array in 512² chunks, all in level group `0`; inference stages its tiles band-first to match, and
+assembly reads every axis by name, so neither path reorders a tile
+([ADR 031](../../../context_docs/decisions/031-the-v2-store-chunks-the-band-axis-at-16.md)).
 
 ```text
                   SINGLE (one area)               GLOBAL (zone group)

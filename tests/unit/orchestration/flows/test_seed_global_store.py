@@ -148,6 +148,7 @@ def _seeded(monkeypatch, root_attrs: dict, *, cells_landed: int, seeded_zones: i
     monkeypatch.setattr(mod, "_check_layout_matches", lambda *a, **k: None)
     monkeypatch.setattr(mod, "missing_seeded_arrays", lambda *a, **k: set())
     monkeypatch.setattr(mod, "spatial_dims_of", lambda grp: ("northing", "easting"))
+    monkeypatch.setattr(mod, "level0", lambda grp: grp)
     monkeypatch.setattr(mod, "read_time_values", lambda grp: list(mod.CAMPAIGN_YEARS))
     monkeypatch.setattr(mod, "year_of", lambda t: t)
     monkeypatch.setattr(mod, "check_root_identity", lambda *a, **k: None)

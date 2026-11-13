@@ -43,6 +43,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from tessera_embeddings.config.store_geometry import level0
 from tessera_embeddings.config.store_layout import SHARD_PX
 from tessera_embeddings.storage.registry import REASONS
 
@@ -285,9 +286,9 @@ def read_tile(group: zarr.Group, var: str, time_index: int, tile: str) -> np.nda
     """One tile of one observation-count array, as a 2-D array.
 
     A tile is exactly one shard, so this is one object read and no partial-shard decompression —
-    the geometry the rebuild's cost estimate assumes.
+    the geometry the rebuild's cost estimate assumes. *group* is the zone group.
     """
-    array = cast("zarr.Array", group[var])
+    array = cast("zarr.Array", level0(group)[var])
     y0, y1, x0, x1 = tile_window(tile, array.shape)
     return np.asarray(array[time_index, y0:y1, x0:x1])
 

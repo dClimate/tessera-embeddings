@@ -16,20 +16,21 @@ from functools import cache
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import numpy as np
+import zarr
 
-from tessera_embeddings.config.store_layout import (
-    GLOBAL,
-    SHARD_PX,
-    StoreLayout,
+from tessera_embeddings.config.store_geometry import (
+    axis_roles,
     clamp_chunks_and_shards,
+    dims_of,
+    level0,
     spatial_dims_of,
 )
+from tessera_embeddings.config.store_layout import GLOBAL, GLOBAL_V2, SHARD_PX, StoreLayout
 from tessera_embeddings.storage.global_store import _codec_id, missing_seeded_arrays
 from tessera_embeddings.storage.shard_writer import SHARD_WRITE, year_runs
 
 if TYPE_CHECKING:
     import icechunk
-    import zarr
 
     from tessera_embeddings.storage.zone_grid import ZoneSpec
 
@@ -39,18 +40,23 @@ if TYPE_CHECKING:
 COVERAGE_VAR = "scales"
 
 
-def layout_departures(group: zarr.Group, layout: StoreLayout = GLOBAL) -> list[str]:
+def layout_departures(group: zarr.Group, layout: StoreLayout | None = None) -> list[str]:
     """Every way ``group`` departs from ``layout``, as one sentence each; empty means it conforms.
+
+    *group* is a zone group. Its arrays are read from its level group ``0`` when it has one, and
+    the layout defaults to the global preset the group's shape says it was seeded with: v2's when
+    it has a level group (ADR 031), v1.1's otherwise.
 
     An array the layout declares and the group lacks is a departure; the reverse is not, because
     the coordinate arrays live beside the data arrays and no layout describes them. Expectations
     are clamped to each array's own shape by the writer's own
-    :func:`~tessera_embeddings.config.store_layout.clamp_chunks_and_shards`, or every zone narrower
+    :func:`~tessera_embeddings.config.store_geometry.clamp_chunks_and_shards`, or every zone narrower
     than one nominal shard reports a false departure.
     """
     # Against the Y/X names the group declares: v1.1 stores use northing/easting, later models y/x.
-    layout = layout.with_spatial_dims(spatial_dims_of(group))
-    present = dict(group.arrays())
+    arrays = level0(group)
+    layout = (layout or (GLOBAL if arrays is group else GLOBAL_V2)).with_spatial_dims(spatial_dims_of(group))
+    present = dict(arrays.arrays())
     out: list[str] = []
     # The COORDINATE arrays too: losing a spatial axis, `month` or `time_bnds` would otherwise only
     # skip that dimension's extent check, so the audit reports nothing while a labelled read of the
@@ -155,7 +161,7 @@ def coordinate_departures(group: zarr.Group, spec: ZoneSpec) -> list[str]:
     from tessera_embeddings.storage.zone_grid import easting_coords, northing_coords
 
     out: list[str] = []
-    present = dict(group.arrays())
+    present = dict(level0(group).arrays())
     # `month` by VALUE: 0..11, a reordering or a duplicate has the right rank and extent while
     # `sel(month=7)` selects the wrong plane. Small enough to read whole, unlike the spatial axes.
     month = present.get("month")
@@ -191,12 +197,14 @@ def coordinate_departures(group: zarr.Group, spec: ZoneSpec) -> list[str]:
 def calendar_years(group: zarr.Group) -> list[int]:
     """The calendar year of each time slot, from the group's own ``time`` coordinate.
 
+    *group* is a zone group; the coordinate is read from its level group ``0`` when it has one.
+
     The coordinate is int64 nanoseconds, so it must be VIEWED as ``datetime64[ns]`` before being
     truncated to years; casting the raw integers straight to ``datetime64[Y]`` reads each
     nanosecond count as a year offset. The range check makes a future change of units a loud
     failure rather than a silently wrong time-index-to-year mapping.
     """
-    time_coord = cast("zarr.Array", group["time"])
+    time_coord = cast("zarr.Array", level0(group)["time"])
     stamps = np.asarray(time_coord[:]).astype("datetime64[ns]")
     years = [int(y) for y in stamps.astype("datetime64[Y]").astype(int) + 1970]
     if not all(1970 <= y <= 2200 for y in years):
@@ -221,11 +229,13 @@ async def live_shards_async(
 ) -> dict[int, frozenset[tuple[int, int]]]:
     """:func:`live_shards`, for a caller that already has an event loop."""
     by_year: dict[int, set[tuple[int, int]]] = {}
-    async for coord in session.chunk_coordinates(f"/{zone}/{var}"):
-        # A 4-D array appends a band/month index that is always 0, one shard spanning the whole
-        # non-spatial axis, so take the spatial pair by position rather than a fixed arity.
-        time_index, shard_y, shard_x = int(coord[0]), int(coord[1]), int(coord[2])
-        by_year.setdefault(time_index, set()).add((shard_y, shard_x))
+    holder = level0(cast("zarr.Group", zarr.open_group(session.store, mode="r")[zone]))
+    # Axes by name: a band-first v2 `embeddings` holds eight band shards per processing shard, at positions
+    # (time, band, y, x); the set folds them into one (shard_y, shard_x) entry.
+    roles = axis_roles(dims_of(holder[var]))
+    t, y, x = (roles.index(role) for role in ("time", "Y", "X"))
+    async for coord in session.chunk_coordinates(f"/{holder.path}/{var}"):
+        by_year.setdefault(int(coord[t]), set()).add((int(coord[y]), int(coord[x])))
     return {year: frozenset(shards) for year, shards in sorted(by_year.items())}
 
 
@@ -309,16 +319,24 @@ def commit_tiles(repo: icechunk.Repository, zone: str, time_index: int, snapshot
     wholly with fill counts too, even where nothing was stored: Zarr deletes the chunk rather than
     storing fill, and the transaction log records the delete. Every such array
     shares the tile grid, one shard per tile in its first three coordinates; the coordinate arrays
-    have fewer.
+    have fewer. Each array's spatial axes are found by name, since a band-first array puts its band
+    axis between time and the spatial pair.
     """
     parent = repo.lookup_snapshot(snapshot).parent_id
     diff = repo.diff(from_snapshot_id=parent, to_snapshot_id=snapshot)
+    group = cast("zarr.Group", zarr.open_group(repo.readonly_session(snapshot_id=snapshot).store, mode="r")[zone])
+    y, x = spatial_dims_of(group)
+    axes = {
+        f"/{array.path}": (names.index(y), names.index(x))
+        for _, array in level0(group).arrays()
+        if {y, x} <= set(names := dims_of(array)) and names[0] == "time"
+    }
     return frozenset(
-        f"chunk_{c[1]}_{c[2]}"
+        f"chunk_{c[axes[path][0]]}_{c[axes[path][1]]}"
         for path, coords in diff.updated_chunks.items()
-        if path.startswith(f"/{zone}/")
+        if path in axes
         for c in coords
-        if len(c) >= 3 and c[0] == time_index
+        if c[0] == time_index
     )
 
 
@@ -443,7 +461,7 @@ def sample_live_pixels(
     if not shards or count <= 0:
         return []
     rng = np.random.default_rng(seed)
-    array = cast("zarr.Array", group[coverage_var])
+    array = cast("zarr.Array", level0(group)[coverage_var])
     candidates: list[tuple[int, int]] = []
     for index in rng.integers(len(shards), size=count * oversample):
         y0, y1, x0, x1 = shard_pixel_window(shards[int(index)], array.shape)

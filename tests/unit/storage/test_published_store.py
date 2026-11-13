@@ -169,6 +169,19 @@ class TestLiveShards:
         assert published_store.live_shards(session, "01N") == {0: frozenset({(1, 0)})}
         assert published_store.live_shards(session, "01N", "s2_obs_count") == {0: frozenset({(2, 1)})}
 
+    def test_band_first_embeddings_report_processing_shards_not_band_shards(self, seeded_store):
+        """A v2 `embeddings` is `(time, band, y, x)` in eight band shards per processing shard: the band
+        index is not a row, and two band shards of one processing shard are one entry.
+        """
+        store = seeded_store([_ZONE], years=_YEARS, model_version="v2-large")
+        session = global_store.open_global_repo(store).writable_session("main")
+        embeddings = zarr.open_group(session.store, mode="r+")["01N/0/embeddings"]
+        y, x = 2 * SHARD_PX, SHARD_PX  # the first pixel of processing shard (2, 1)
+        embeddings[0, 0, y, x] = embeddings[0, 20, y, x] = 7  # in band shards 0 and 1
+        session.commit("two band shards of one processing shard")
+        session = global_store.open_global_repo(store).readonly_session(branch="main")
+        assert published_store.live_shards(session, "01N", "embeddings") == {0: frozenset({(2, 1)})}
+
 
 class TestShardPixelWindow:
     """Converting a shard coordinate back to a pixel window."""

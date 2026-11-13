@@ -56,6 +56,7 @@ import zarr
 
 from tessera_embeddings.config.environment import code_identity, configure_logging
 from tessera_embeddings.config.fault_injection import ArmedFault
+from tessera_embeddings.config.store_geometry import axis_roles, dims_of, level0, window
 from tessera_embeddings.config.store_layout import SHARD_PX
 from tessera_embeddings.storage.conventions import STACK_ATTR, assert_stack_matches, library_stack
 from tessera_embeddings.storage.icechunk_logging import traced_commit
@@ -173,7 +174,8 @@ class ShardSource(Protocol):
     def load(self, shard: tuple[int, int]) -> dict[str, np.ndarray]:
         """Return ``{var_name: block}`` for a shard - each block covers the whole
         (edge-clamped) shard region with ocean inner chunks at the array fill
-        value. Return ``{}`` to skip a shard entirely.
+        value, with a one-slot time axis and in the destination array's axis order.
+        Return ``{}`` to skip a shard entirely.
         """
         ...
 
@@ -221,8 +223,13 @@ def commit_with_rebase(
 
 
 def shard_pitch(arr: zarr.Array) -> int:
-    """An array's northing write granularity: shard height if sharded, else chunk height."""
-    return (arr.shards or arr.chunks)[1]
+    """An array's northing write granularity: shard height if sharded, else chunk height.
+
+    Read on the first axis that is neither time nor band, by name, so a band-first array (ADR 031)
+    and a staged tile with no time axis answer the same as a band-last zone array.
+    """
+    names = dims_of(arr) or ("time", "y")
+    return (arr.shards or arr.chunks)[next(i for i, d in enumerate(names) if d not in ("time", "band"))]
 
 
 #: Live shard counts, ``[done_0, total_0, ...]`` by worker index. Shared memory reaches a spawned
@@ -838,12 +845,12 @@ def claim_root_stack(
 
 
 def _year_label(node: zarr.Group, year_index: int) -> int:
-    """Read the calendar year at ``year_index`` from a group's time coordinate.
+    """Read the calendar year at ``year_index`` from a zone group's time coordinate.
 
     Decodes via :func:`read_time_values` so a foreign store with non-TIME_ENCODING
     units errors loudly instead of yielding an epoch-adjacent bogus year.
     """
-    return year_of(read_time_values(node)[year_index])
+    return year_of(read_time_values(level0(node))[year_index])
 
 
 def partition_round_robin(items: list, n: int) -> list[list]:
@@ -887,7 +894,7 @@ def _write_shards_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 - retu
     progress_interval_s = float(payload.get("progress_interval_s", PROGRESS_INTERVAL_S))
     total = len(payload["shards"])
 
-    node = _group_node(fork.store, group)
+    node = level0(_group_node(fork.store, group))
     arrays: dict[str, zarr.Array] = {}
     timer = PhaseTimer()
     tiles = writes = nbytes = 0
@@ -910,15 +917,21 @@ def _write_shards_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 - retu
             if arr is None:
                 arr = arrays[var] = cast(zarr.Array, node[var])
             y0, x0 = sy * shard_px, sx * shard_px
-            h, w = block.shape[1], block.shape[2]
-            # Trailing dims (band) not indexed are written in full, so one
-            # assignment covers both the 3-D and 4-D arrays.
-            region = (slice(year, year + 1), slice(y0, y0 + h), slice(x0, x0 + w))
+            # The block is in the array's own axis order (ShardSource's contract). Band and month
+            # axes are written whole, so one assignment covers the 3-D and 4-D arrays in either
+            # band order.
+            roles = axis_roles(dims_of(arr))
+            h, w = block.shape[roles.index("Y")], block.shape[roles.index("X")]
+            region = window(dims_of(arr), year, slice(y0, y0 + h), slice(x0, x0 + w))
             if owned is not None:
                 # One variable at a time, so the extra memory is one shard of the widest array.
+                # The (h, w) pixel mask is broadcast over every other axis by role.
                 with timer.phase("pixel_merge"):
+                    mask = owned.reshape(
+                        [n if role in ("Y", "X") else 1 for role, n in zip(roles, block.shape, strict=True)]
+                    )
                     merged = np.asarray(arr[region])
-                    merged[:, owned] = block[:, owned]
+                    np.copyto(merged, block, where=mask)
                     block = merged
             with timer.phase("write"):
                 arr[region] = block
