@@ -26,6 +26,7 @@ import xarray as xr
 import zarr
 from dask.distributed import Client
 
+from tessera_embeddings.config.ingest import SKIPPED_DAYS_ARRAY, SKIPPED_GRANULES_ARRAY
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
 from tessera_embeddings.ingest import s2_roi
 from tessera_embeddings.storage.zarr_store import get_existing_dates, open_repo, open_store
@@ -161,7 +162,8 @@ def test_a_write_mode_produces_the_per_date_store(
     # passes; these are what stop either from being mistaken for parity.
     written = open_store(str(mode_store / "reflectance.zarr"))
     try:
-        assert sorted(written.data_vars) == sorted([*BANDS, "scl"])
+        # The gated date is recorded off the time axis, with its granules (ingest/provenance.py).
+        assert sorted(written.data_vars) == sorted([*BANDS, "scl", SKIPPED_DAYS_ARRAY, SKIPPED_GRANULES_ARRAY])
         assert written.sizes["time"] == len(DATES) - 1
     finally:
         written.close()
