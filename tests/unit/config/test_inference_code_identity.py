@@ -167,6 +167,16 @@ def test_the_real_ingest_fingerprint_covers_the_collection_settings() -> None:
     assert "config/providers.py" in _ingest_covered()
 
 
+def test_store_presets_and_model_settings_stay_out_of_the_ingest_fingerprint() -> None:
+    """The mosaic writer reads its geometry from ``store_geometry``, never the presets or the model record.
+
+    A new preset or model must not move the ingest identity and so block every mosaic resume (ADR 031 §5).
+    """
+    ingest = _ingest_covered()
+    assert "config/store_geometry.py" in ingest
+    assert not {"config/store_layout.py", "config/inference.py"} & ingest
+
+
 @pytest.mark.parametrize("module", ["storage/update.py", "ingest/land_mask.py", "config/paths.py"])
 def test_targeted_updates_move_neither_fingerprint(module: str) -> None:
     """An update's plan, paths and shard narrowing decide WHERE work runs, never what a pixel holds.

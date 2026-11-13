@@ -29,6 +29,7 @@ from typing import cast
 import icechunk
 import zarr
 
+from tessera_embeddings.config.store_geometry import level0
 from tessera_embeddings.storage.shard_writer import HALVES, commit_year_attrs, read_halves_complete
 from tessera_embeddings.storage.time_axis import CAMPAIGN_YEARS, time_index_of, year_timestamp
 from tessera_embeddings.storage.zone_grid import fill_zones, group_and_half, zone_layout_of, zones
@@ -195,7 +196,7 @@ def mark_zone_year_empty(
     # year cannot leave a writable session dangling.
     group = group_and_half(zone)[0]
     node = cast(zarr.Group, zarr.open_group(repo.readonly_session("main").store, mode="r")[group])
-    if time_index_of(node, year_timestamp(year)) is None:
+    if time_index_of(level0(node), year_timestamp(year)) is None:
         raise ValueError(
             f"Year {year} is not on {zone}'s pre-allocated time axis — refusing to mark an "
             "off-axis year complete (ADR-008 D1: the axis is fixed at seeding)."

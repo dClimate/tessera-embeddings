@@ -11,6 +11,7 @@ import zarr
 
 from tessera_embeddings.config.inference import InferenceConfig
 from tessera_embeddings.config.paths import store_key
+from tessera_embeddings.config.store_geometry import band_axis, dims_of, level0, window
 from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.orchestration.runners import zone_fill
 from tessera_embeddings.storage import global_store
@@ -19,6 +20,8 @@ from tessera_embeddings.storage.update import UpdateTarget, base_tag
 from tests.unit.inference_stack import STACK
 from tests.unit.orchestration.runners.zone_fixtures import (
     BAND,
+    SMALL,
+    SMALL_V2,
     TILE,
     ZONE,
     make_mask,
@@ -62,20 +65,28 @@ def _stub(seed: int, *, skip: tuple[str, ...] = ()):
 
 
 def _year(store: str) -> tuple[zarr.Group, dict[str, np.ndarray]]:
-    """The zone group on ``main`` and its 2025 slice of every array."""
+    """The zone group on ``main`` and its 2025 slice of every array, embeddings as ``(y, x, band)``."""
     repo = global_store.open_global_repo(store)
     node = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[ZONE]
-    return node, {v: np.asarray(node[v][_YEAR_INDEX]) for v in ("embeddings", "scales")}
+    embeddings, scales = level0(node)["embeddings"], level0(node)["scales"]
+    values = np.asarray(embeddings[_YEAR_INDEX])
+    return node, {
+        "embeddings": values.transpose(1, 2, 0) if band_axis(embeddings) == 1 else values,
+        "scales": np.asarray(scales[_YEAR_INDEX]),
+    }
 
 
 def _tile(values: np.ndarray, row: int, col: int) -> np.ndarray:
     return values[row * TILE : (row + 1) * TILE, col * TILE : (col + 1) * TILE]
 
 
-@pytest.fixture
-def filled(tmp_path, monkeypatch):
-    """A 2025 cell the campaign has filled and tagged, with a hole punched into tile (0, 0)."""
-    store = seed_global(tmp_path)
+@pytest.fixture(params=[SMALL, SMALL_V2], ids=["v1", "v2"])
+def filled(tmp_path, monkeypatch, request):
+    """A 2025 cell the campaign has filled and tagged, with a hole punched into tile (0, 0).
+
+    In both layouts, so every update is checked against a band-first v2 zone too.
+    """
+    store = seed_global(tmp_path, request.param)
     mosaic = make_mosaic(tmp_path)
     mask = make_mask(tmp_path, _LIVE)
     monkeypatch.setattr(zone_fill, "run_inference", staging_inference_stub({}))
@@ -83,9 +94,10 @@ def filled(tmp_path, monkeypatch):
     run_fill(tmp_path, store, land_mask_path=mask, mosaic_base=mosaic, registry_root=registry, run_id="fill1")
     repo = global_store.open_global_repo(store)
     session = repo.writable_session("main")
-    node = zarr.open_group(session.store, mode="a")[ZONE]
+    node = level0(zarr.open_group(session.store, mode="a")[ZONE])
     node["scales"][_YEAR_INDEX, :8, :8] = np.nan
-    node["embeddings"][_YEAR_INDEX, :8, :8] = 0
+    embeddings = node["embeddings"]
+    embeddings[window(dims_of(embeddings), _YEAR_INDEX, slice(0, 8), slice(0, 8))] = 0
     session.commit("punch a hole")
     return {"store": store, "mosaic": mosaic, "mask": mask, "registry": registry, "tmp": tmp_path}
 

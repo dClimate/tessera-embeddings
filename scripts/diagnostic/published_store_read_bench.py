@@ -38,6 +38,7 @@ from typing import Any, cast
 import numpy as np
 import zarr
 
+from tessera_embeddings.config.store_geometry import axis_roles, dims_of, level0
 from tessera_embeddings.config.store_layout import INNER_PX, SHARD_PX
 from tessera_embeddings.storage import published_store
 from tessera_embeddings.storage.global_store import open_global_repo
@@ -128,7 +129,7 @@ def _open_zone(payload: dict[str, Any]) -> tuple[zarr.Group, dict[str, float]]:
     root = zarr.open_group(session.store, mode="r")
     timings["root_group_open_s"] = round(time.monotonic() - started, 3)
     started = time.monotonic()
-    group = root[payload["zone"]]
+    group = level0(cast("zarr.Group", root[payload["zone"]]))
     _ = group["embeddings"].shape  # force the array metadata, which is what a reader needs
     timings["zone_group_open_s"] = round(time.monotonic() - started, 3)
     return group, timings
@@ -162,6 +163,12 @@ def run_phase(payload: dict[str, Any], repeats: int = 1) -> list[dict[str, Any]]
     return [{**base, "pass": n + 1, **_measure(group, payload)} for n in range(max(1, repeats))]
 
 
+def _index(array: zarr.Array, time_index: int, y: int | slice, x: int | slice, bands: int | None = None) -> tuple:
+    """An index into *array* in its own axis order, so v1.1's band-last and v2's band-first read alike."""
+    by_role = {"time": time_index, "Y": y, "X": x, "band": slice(0, bands)}
+    return tuple(by_role[role] for role in axis_roles(dims_of(array)))
+
+
 def _measure(group: zarr.Group, payload: dict[str, Any]) -> dict[str, Any]:
     """One pass of a read workload on an already-open group."""
     result: dict[str, Any] = {}
@@ -173,7 +180,7 @@ def _measure(group: zarr.Group, payload: dict[str, Any]) -> dict[str, Any]:
         latencies: list[float] = []
         for y, x in payload["points"]:
             started = time.monotonic()
-            _ = embeddings[time_index, y, x, :]
+            _ = embeddings[_index(embeddings, time_index, y, x)]
             latencies.append(time.monotonic() - started)
         after = _net_bytes_received()
         result.update(_percentiles(latencies))
@@ -185,7 +192,7 @@ def _measure(group: zarr.Group, payload: dict[str, Any]) -> dict[str, Any]:
     y0, x0 = payload["region_origin"]
     before = _net_bytes_received()
     started = time.monotonic()
-    block = embeddings[time_index, y0 : y0 + dy, x0 : x0 + dx, 0:bands]
+    block = embeddings[_index(embeddings, time_index, slice(y0, y0 + dy), slice(x0, x0 + dx), bands)]
     wall = time.monotonic() - started
     after = _net_bytes_received()
     if before is not None and after is not None:
@@ -231,7 +238,7 @@ def _contiguous_live_block(
     block of that size.
     """
     needed = span // SHARD_PX + (1 if span % SHARD_PX else 0)
-    scales = cast("zarr.Array", group["scales"])
+    scales = cast("zarr.Array", level0(group)["scales"])
     best: tuple[tuple[int, int], float] | None = None
     for shard_y, shard_x in sorted(shards):
         if not all((shard_y + dy, shard_x + dx) in shards for dy in range(needed) for dx in range(needed)):

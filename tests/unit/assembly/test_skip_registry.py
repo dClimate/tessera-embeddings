@@ -32,6 +32,7 @@ import zarr
 
 import tessera_embeddings.inference.assembly as _assembly_mod
 from tessera_embeddings.config.store_layout import (
+    GLOBAL,
     MONTH_COVERED_VARS,
     MONTHS_IN_YEAR,
     OBS_COUNT_VARS,
@@ -49,6 +50,11 @@ from tests.unit.inference_stack import STACK
 
 #: A shard commit's timestamp, as `write_year_shards` reports it.
 COMMITTED = "2026-08-01T00:00:00.123456+00:00"
+
+
+def _dest_dims(variables: tuple[str, ...]) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Each variable's axes as the global store holds them."""
+    return tuple((var, GLOBAL.for_var(var).dims) for var in variables)
 
 
 def _chunk(row: int, col: int) -> ChunkSpec:
@@ -362,6 +368,7 @@ class TestCoverageOnlyStaging:
             run_id="run1",
             shards=(),
             variables=("embeddings", "s2_obs_count", "s1_asc_obs_count", *MONTH_COVERED_VARS),
+            dest_dims=_dest_dims(("embeddings", "s2_obs_count", "s1_asc_obs_count", *MONTH_COVERED_VARS)),
             shard_px=8,
             dtypes=(
                 ("embeddings", "int8"),
@@ -399,6 +406,7 @@ class TestCoverageOnlyStaging:
             run_id="run1",
             shards=(),
             variables=("s2_obs_count",),
+            dest_dims=_dest_dims(("s2_obs_count",)),
             shard_px=8,
             dtypes=(("s2_obs_count", "uint16"),),
             cleared=((0, 0),),
@@ -608,6 +616,7 @@ class TestAPartialCoverageTileCannotWedgeACell:
             run_id="run1",
             shards=(),
             variables=("s2_obs_count",),
+            dest_dims=_dest_dims(("s2_obs_count",)),
             shard_px=8,
             dtypes=(("s2_obs_count", "uint16"),),
             cleared=((0, 0),),

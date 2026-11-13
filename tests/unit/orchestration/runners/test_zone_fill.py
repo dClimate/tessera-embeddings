@@ -18,6 +18,7 @@ from tessera_embeddings.storage.zone_grid import ZoneSpec, easting_coords, north
 from tests.unit.inference_stack import STACK
 from tests.unit.orchestration.runners.zone_fixtures import (
     BAND,
+    LAYOUTS,
     NX,
     NY,
     SMALL,
@@ -119,11 +120,19 @@ def test_a_resumed_fill_records_skips_an_earlier_leg_wrote(tmp_path, monkeypatch
     assert np.all(np.asarray(node["embeddings"][1])[TILE:, TILE:] == 0)
 
 
-def test_fill_zone_year_end_to_end(tmp_path, monkeypatch, staged):
-    """Live tiles land as shards at the year index; the cell is tagged and cleaned up."""
-    store = seed_global(tmp_path)
+@LAYOUTS
+def test_fill_zone_year_end_to_end(tmp_path, monkeypatch, layout):
+    """Live tiles land as shards at the year index; the cell is tagged and cleaned up.
+
+    In either layout: a v2 zone holds its arrays in level group 0, band-first, staged band-first
+    as a v2 actor stages them. (A tile staged in the other order lands too: the update tests
+    stage band-last into a v2 zone.)
+    """
+    store = seed_global(tmp_path, layout)
     mosaic_base = make_mosaic(tmp_path)
     mask = make_mask(tmp_path, [(0, 0), (0, 1), (1, 1)])
+    staged: dict[str, np.ndarray] = {}
+    monkeypatch.setattr(zone_fill, "run_inference", staging_inference_stub(staged, band_first=layout.band_first))
 
     summary = run_fill(tmp_path, store, land_mask_path=mask, mosaic_base=mosaic_base, run_id="runZ")
 
@@ -135,9 +144,10 @@ def test_fill_zone_year_end_to_end(tmp_path, monkeypatch, staged):
 
     repo = global_store.open_global_repo(store)
     assert repo.lookup_tag("zone-01N-2025") == summary["snapshot_id"]
-    node = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[ZONE]
-    assert node.attrs["years_complete"] == [2025]
-    assert node.attrs["runs"]["2025"]["run_id"] == "runZ"
+    zone = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[ZONE]
+    assert zone.attrs["years_complete"] == [2025]
+    assert zone.attrs["runs"]["2025"]["run_id"] == "runZ"
+    node = zone[layout.level] if layout.level else zone
     # Label accuracy under the calendar-year GUARANTEE: the slot's `time` point is
     # Jan 1 (the window start) and the seeded time_bnds state the slot's true
     # interval, half-open [Jan 1 2025, Jan 1 2026) — the window the strict gate required.
@@ -147,6 +157,8 @@ def test_fill_zone_year_end_to_end(tmp_path, monkeypatch, staged):
     assert np.asarray(node["time"][1]).astype("datetime64[ns]").astype("datetime64[D]").astype(str) == "2025-01-01"
     # 2025 is index 1 on the (2024, 2025) axis; staged tiles match, ocean tile is fill.
     result = np.asarray(node["embeddings"][1])
+    if layout.level:
+        result = result.transpose(1, 2, 0)  # band-first back to the stub's (y, x, band)
     assert np.all(result[TILE:, :TILE] == 0), "unmasked tile must stay at fill"
     for label, emb in staged.items():
         row, col = (int(p) for p in label.split("_")[1:])
@@ -484,11 +496,17 @@ def test_zone_year_complete_reflects_years_complete(tmp_path):
     assert zone_fill.zone_year_complete(store, "60N", 2025) is False  # not seeded in this store
 
 
-def test_zone_year_on_axis(tmp_path):
+@LAYOUTS
+def test_a_seeded_zone_passes_the_fill_preflight(tmp_path, layout):
+    zone_fill.preflight_destination(store_path=seed_global(tmp_path, layout), zone=ZONE, year=2025)
+
+
+@LAYOUTS
+def test_zone_year_on_axis(tmp_path, layout):
     """The preflight reports True for a seeded year, False off-axis / unseeded —
     so the flow can decline Ray for a year the runner would reject anyway.
     """
-    store = seed_global(tmp_path)
+    store = seed_global(tmp_path, layout)
     assert zone_fill.zone_year_on_axis(store, ZONE, 2025) is True
     assert zone_fill.zone_year_on_axis(store, ZONE, 2024) is True
     assert zone_fill.zone_year_on_axis(store, ZONE, 2026) is False  # off the seeded axis

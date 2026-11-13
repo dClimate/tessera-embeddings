@@ -25,18 +25,47 @@ def seeded(seeded_store):
     return seeded_store([_ZA, _ZB], years=(2023, 2024, 2025))
 
 
-@pytest.mark.parametrize(("model", "names"), [("v1.1", ("northing", "easting")), ("v2-large", ("y", "x"))])
-def test_each_model_seeds_its_own_spatial_names(tmp_path, model, names):
-    """v1.1 keeps northing/easting, v2 takes y/x, and the published-store audit accepts both."""
+@pytest.mark.parametrize(
+    ("model", "level", "embedding_dims", "zstd_level"),
+    [
+        ("v1.1", "", ("time", "northing", "easting", "band"), 0),
+        ("v2-large", "/0", ("time", "band", "y", "x"), 1),
+    ],
+)
+def test_each_model_seeds_its_own_layout(tmp_path, model, level, embedding_dims, zstd_level):
+    """v1.1 keeps northing/easting in the zone group; v2 seeds y/x, band-first, zstd at level 1, in level group 0.
+
+    The zone's attrs stay on the zone group either way, and the published-store audit accepts both.
+    """
     repo = global_store.create_global_repo(str(tmp_path / "global.icechunk"))
     global_store.seed_zone_groups(repo, [_ZA], years=(2025,), model_version=model)
-    g = zarr_store.open_store_as_zarr_group(str(tmp_path / "global.icechunk"), group="01N")
-    y, x = names
+    zone = zarr_store.open_store_as_zarr_group(str(tmp_path / "global.icechunk"), group="01N")
+    g = zarr_store.open_store_as_zarr_group(str(tmp_path / "global.icechunk"), group=f"01N{level}")
+    y, x = (d for d in embedding_dims if d not in ("time", "band"))
     assert (g[y].shape, g[x].shape) == ((4096,), (2048,))
-    assert g["embeddings"].metadata.dimension_names == ("time", y, x, "band")
-    assert g.attrs["spatial:dimensions"] == [y, x] and g[y].attrs["axis"] == "Y"
-    assert published_store.layout_departures(g) == []
-    assert published_store.coordinate_departures(g, _ZA) == []
+    assert g["embeddings"].metadata.dimension_names == embedding_dims
+    assert g["embeddings"].compressors[0].level == zstd_level  # ADR 031 accepted level 1, as measured
+    assert g["embeddings"].attrs["spatial:dimensions"] == [y, x]
+    assert zone.attrs["spatial:dimensions"] == [y, x] and g[y].attrs["axis"] == "Y"
+    assert published_store.layout_departures(zone) == []
+    assert published_store.coordinate_departures(zone, _ZA) == []
+
+
+def test_a_v2_zone_is_a_multiscales_pyramid_of_one_level(tmp_path):
+    """ADR 031: level 0 the pyramid's only entry, under the convention's own registration; the
+    root names v2's usable prefixes.
+    """
+    repo = global_store.create_global_repo(str(tmp_path / "global.icechunk"))
+    global_store.seed_zone_groups(repo, [_ZA], years=(2025,), model_version="v2-large")
+    zone = zarr_store.open_store_as_zarr_group(str(tmp_path / "global.icechunk"), group="01N")
+    registered = {c["uuid"]: c for c in zone.attrs["zarr_conventions"]}
+    assert registered["d35379db-88df-4056-af3a-620245f8e347"]["name"] == "multiscales"
+    assert zone.attrs["multiscales"] == {
+        "layout": [{"asset": "0", "transform": {"scale": [1.0, 1.0], "translation": [0.0, 0.0]}}]
+    }
+    assert set(zone.array_keys()) == set() and set(zone.group_keys()) == {"0"}
+    root = zarr_store.open_store_as_zarr_group(str(tmp_path / "global.icechunk"))
+    assert root.attrs["embedding_prefixes"] == [16, 32, 64, 128]  # the lengths a reader may truncate to
 
 
 def test_extending_a_store_keeps_its_names(tmp_path, monkeypatch):
@@ -48,7 +77,7 @@ def test_extending_a_store_keeps_its_names(tmp_path, monkeypatch):
     global_store.seed_zone_groups(repo, [_ZA], years=(2025,), model_version="v2-large")
     MODEL_FAMILIES["v2-large"] = v2
     global_store.seed_zone_groups(repo, [_ZB], years=(2025,), model_version="v2-large")
-    g = zarr_store.open_store_as_zarr_group(store, group="01S")
+    g = zarr_store.open_store_as_zarr_group(store, group="01S/0")
     assert g["scales"].metadata.dimension_names == ("time", "northing", "easting")
     assert "y" not in g
 
@@ -270,6 +299,13 @@ def test_reseed_with_a_different_layout_rejected(seeded_store, embeddings, match
     layout = dataclasses.replace(GLOBAL, arrays={**GLOBAL.arrays, "embeddings": embeddings})
     with pytest.raises(ValueError, match=match):
         global_store.seed_zone_groups(repo, [_ZB], years=(2025,), layout=layout)
+
+
+@pytest.mark.parametrize("bands", [EMBEDDING_DIM + 8, 8])
+def test_band_shards_that_do_not_tile_the_band_axis_are_refused(tmp_path, bands):
+    repo = global_store.create_global_repo(str(tmp_path / "g.icechunk"))
+    with pytest.raises(ValueError, match="do not tile"):
+        global_store.seed_zone_groups(repo, [_ZA], years=(2025,), layout=dataclasses.replace(GLOBAL, bands=bands))
 
 
 def test_seeding_rejects_duplicate_or_unordered_years(tmp_path):

@@ -25,12 +25,16 @@ Measurements and the full incident record are in
 
 from __future__ import annotations
 
+import functools
 import logging
 import threading
 from collections.abc import Callable, Collection, Generator
 from contextlib import contextmanager
 
 import icechunk
+import zarr
+
+from tessera_embeddings.config.store_geometry import axis_roles, dims_of
 
 _log = logging.getLogger(__name__)
 
@@ -87,7 +91,34 @@ class CaughtUpPastAConflictError(RuntimeError):
     """
 
 
-def _diff_touches(diff: icechunk.Diff, group: str, shards: Collection[tuple[int, int, int]] | None = None) -> bool:
+def _shard_of(coords: list[int], names: tuple[str, ...]) -> tuple[int, ...] | None:
+    """A chunk's ``(time, row, col)`` shard, read by axis name; ``None`` for an array without all three."""
+    picked = tuple(c for c, role in zip(coords, axis_roles(names), strict=True) if role in ("time", "Y", "X"))
+    return picked if len(picked) == 3 else None
+
+
+def _dims_at(repo: icechunk.Repository, snapshot: str) -> Callable[[str], tuple[str, ...]]:
+    """Each array's dimension names at *snapshot*, by path: the snapshot is opened on the first
+    lookup and each array read once, so a catch-up over many commits stays a handful of reads.
+    """
+
+    @functools.cache
+    def store() -> icechunk.IcechunkStore:
+        return repo.readonly_session(snapshot_id=snapshot).store
+
+    @functools.cache
+    def dims(path: str) -> tuple[str, ...]:
+        return dims_of(zarr.open_array(store(), path=path, mode="r"))
+
+    return dims
+
+
+def _diff_touches(
+    diff: icechunk.Diff,
+    group: str,
+    shards: Collection[tuple[int, int, int]] | None = None,
+    dims: Callable[[str], tuple[str, ...]] | None = None,
+) -> bool:
     """Did anything in ``diff`` change inside ``group`` that our commit could collide with?
 
     The safety half of :func:`catch_up_to_branch`. Moving a session's base past a commit is also
@@ -100,10 +131,10 @@ def _diff_touches(diff: icechunk.Diff, group: str, shards: Collection[tuple[int,
     group but its attributes: exactly the commits icechunk's own conflict check accepts. The
     shard writer passes them because the two halves of a column fill one group at once
     (ADR 038), and a sibling's commit — its shards, or its attrs-only completion mark — would
-    otherwise block the other half's catch-up for the rest of its write. Every per-tile array
-    holds one shard per tile in its first three coordinates (the reading
-    ``published_store.commit_tiles`` relies on too); a chunk with fewer, a coordinate array's,
-    always counts.
+    otherwise block the other half's catch-up for the rest of its write. A chunk's shard is read
+    from its array's time, Y and X axes by name (*dims*, required with ``shards``), so v2's
+    band-first ``embeddings`` reads like v1.1's band-last one; a chunk of an array without all
+    three, a coordinate array's, always counts.
     """
     own = f"/{group.strip('/')}"
     prefix = f"{own}/"
@@ -116,10 +147,12 @@ def _diff_touches(diff: icechunk.Diff, group: str, shards: Collection[tuple[int,
         if shards is not None and attr == "updated_groups":
             found.discard(own)  # our group's attributes: a shard-only session never sets them
         paths |= found
+    colliding = {*(shards or ()), None}  # None: a chunk with no shard, which always counts
     paths |= {
         str(path)
         for path, coords in diff.updated_chunks.items()
-        if shards is None or any(len(c) < 3 or tuple(c[:3]) in shards for c in coords)
+        if str(path).startswith(prefix)  # another group's chunks never count, so their axes are never read
+        and (shards is None or dims is None or any(_shard_of(c, dims(str(path))) in colliding for c in coords))
     }
     # A rename populates `moved_nodes` and NOTHING else — no chunks, no arrays, no groups — so
     # omitting it made a commit that renamed our own array read as untouched. Both ends count:
@@ -166,7 +199,7 @@ def catch_up_to_branch(
     base = session.snapshot_id
     if tip == base:
         return "current"
-    if _diff_touches(repo.diff(from_snapshot_id=base, to_snapshot_id=tip), group, shards):
+    if _diff_touches(repo.diff(from_snapshot_id=base, to_snapshot_id=tip), group, shards, _dims_at(repo, tip)):
         _logger.info(
             "Not catching up %s: another writer has touched this group since %s, so the "
             "commit must still compare against it.",
@@ -176,7 +209,9 @@ def catch_up_to_branch(
         return "blocked"
     session.rebase(icechunk.ConflictDetector())
     landed = session.snapshot_id
-    if landed != tip and _diff_touches(repo.diff(from_snapshot_id=tip, to_snapshot_id=landed), group, shards):
+    if landed != tip and _diff_touches(
+        repo.diff(from_snapshot_id=tip, to_snapshot_id=landed), group, shards, _dims_at(repo, landed)
+    ):
         # THE RACE, CLOSED AS FAR AS IT CAN BE. `rebase` takes no target snapshot — it goes to
         # whatever the tip is when it runs — so a commit landing between the check above and this
         # call is skipped without ever being vetted. That cannot be undone, but it must not pass

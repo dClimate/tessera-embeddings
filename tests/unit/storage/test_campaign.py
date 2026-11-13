@@ -21,7 +21,7 @@ _CHUNK = 256
 
 _EMB = ArrayLayout(DIMS_4D, (1, _CHUNK, _CHUNK, _BAND), "int8", 0, "zstd", shards=(1, _SHARD, _SHARD, _BAND))
 _SCL = ArrayLayout(DIMS_3D, (1, _CHUNK, _CHUNK), "float32", float("nan"), "pcodec", shards=(1, _SHARD, _SHARD))
-SMALL = StoreLayout(name="small", arrays={"embeddings": _EMB, "scales": _SCL})
+SMALL = StoreLayout(name="small", arrays={"embeddings": _EMB, "scales": _SCL}, bands=_BAND)
 
 _ZONE_A = ZoneSpec("32601", "N", 1, (0.0, 5_120.0), (0.0, 10_240.0))
 _ZONE_B = ZoneSpec("32602", "N", 2, (0.0, 5_120.0), (0.0, 10_240.0))

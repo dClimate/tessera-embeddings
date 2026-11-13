@@ -60,6 +60,7 @@ import zarr
 
 from tessera_embeddings.config.environment import code_identity
 from tessera_embeddings.config.paths import BucketPaths, check_update_name
+from tessera_embeddings.config.store_geometry import level0
 from tessera_embeddings.inference.chunk_spec import (
     ChunkSpec,
     chunk_label,
@@ -571,9 +572,9 @@ def stage_hole_masks(
     so it is neither inferred nor written. A mask already present is reused rather than recomputed,
     so a retry after the shards landed — when the store has no holes left — still infers and merges
     exactly the pixels the first attempt did. One an interrupted write cut short is recomputed:
-    nothing was inferred from it.
+    nothing was inferred from it. *node* is the zone group, or a single-area store's root.
     """
-    scales = cast(zarr.Array, node["scales"])
+    scales = cast(zarr.Array, level0(node)["scales"])
 
     def _stage(chunk: ChunkSpec) -> tuple[str, str | None]:
         uri = f"{prefix.rstrip('/')}/{chunk.label}.npz"
