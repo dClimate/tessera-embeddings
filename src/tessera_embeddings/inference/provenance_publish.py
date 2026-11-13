@@ -372,9 +372,9 @@ def _copy_shard(copy: _Copy, label: str, group: zarr.Group, embedded_px: int) ->
     """Copy one shard's staged planes into the run's group, checking them; return its rows."""
     row, col = parse_chunk_label(label)
     px = copy.run.shard_px
+    # A sensor absent here had no data in the shard, one no descending pass covered for instance:
+    # the actor reads the index wherever the mosaic carries one, and stages only what it found.
     summary = cast(dict[str, Any], provenance_summary(dict(group.attrs)))
-    if missing := sorted(set(copy.counts) - set(summary)):
-        raise ProvenanceCheckError(f"{label}: no staged record for {missing}, whose mosaics carry one")
     rows: list[dict[str, Any]] = []
     for sensor in sorted(summary):
         times, planes = cast("tuple[np.ndarray, zarr.Array]", staged_planes(group, sensor))

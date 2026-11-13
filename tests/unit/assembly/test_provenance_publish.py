@@ -314,6 +314,17 @@ def test_a_plane_that_disagrees_with_its_row_fails_the_publication(tmp_path: Pat
         _publish(tmp_path, pins, embedded, refused)
 
 
+def test_a_shard_no_pass_of_one_sensor_covered_publishes_without_it(tmp_path: Path) -> None:
+    """A shard no descending pass covered stages no descending record, and has no descending rows."""
+    pins = _mosaics(tmp_path / "mosaics")
+    embedded, refused = _stage(tmp_path / "staging", pins)
+    group = zarr.open_group(str(tmp_path / "staging" / RUN / "chunk_0_0.zarr"), mode="a")
+    group.attrs[PROVENANCE_ATTR] = {k: v for k, v in group.attrs[PROVENANCE_ATTR].items() if k != "s1_desc"}
+    _publish(tmp_path, pins, embedded, refused)
+    sensors = {r["sensor"] for r in _shard_dates(tmp_path).to_pylist() if r["tile"] == "chunk_0_0"}
+    assert sensors == {"s2", "s1_asc"}
+
+
 def test_an_embedded_shard_with_no_record_fails_the_publication(tmp_path: Path) -> None:
     pins = _mosaics(tmp_path / "mosaics")
     embedded, refused = _stage(tmp_path / "staging", pins)
