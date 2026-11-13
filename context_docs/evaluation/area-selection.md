@@ -158,8 +158,32 @@ across the world: Ontario has only ascending passes, and most of the Ethiopian b
 descending ones in its tested year, 2020. None of the areas tests embeddings made from Sentinel-2
 alone.
 
+## First run: Ontario, 2018
+
+On 2026-11-13 the steps were run on dev for Ontario alone in 2018, the 42 tiles of zone `utm17n`,
+with the v2 Large model, and the store was scored against itself.
+
+- **The steps worked as written.** The mask came out at 150 cells and 42 tiles, the store was
+  created at the location given by `global_store_uri`, and the fill wrote there and nowhere else.
+  The fill took 31 minutes, 25 of them for the cell itself.
+- **The first attempt found a bug in the fill.** `fill-zones-sequential` refused every v2 store,
+  because the run ID it gives its shared inference session lacked the v2 prefix. It failed after
+  42 minutes of downloading imagery. The fix is PR #271.
+- **Scoring the store against itself** gave every difference as exactly zero and a pass, and 100%
+  coverage. Reading the 316 labels from both stores took under two minutes from a laptop.
+- **The labels land on the right pixels.** With the `canada_crops_coarse` labels, v2 scores a
+  balanced accuracy of 0.924 against 0.333 for chance. The published v1.1 dataset, read at the
+  same points, scores 0.903.
+- **The pass rule fails a worse version.** Scrambling the embeddings across points gives 0.353,
+  and moving every point 1 km east gives 0.358. Both fail, with the 975th smallest difference
+  at −0.51 and −0.49.
+
+**Ontario in one year is a weak test.** Of its 316 points in 2018, the AlphaEarth split puts 49
+in training and 240 in testing, and only 3 of its 7 classes have the 10 training points needed to
+be kept. It can catch a large drop in quality but not a small one.
+
 ## Not yet settled
 
 - **No public code computes the scores.** The steps describe what to compute; the TESSERA team's
-  implementation lives with its private deployment code and has not yet been run on a store.
+  implementation lives with its private deployment code.
 - **159 Ethiopian points are labelled for 2021**, not 2020, so only the nine-year run scores them.
