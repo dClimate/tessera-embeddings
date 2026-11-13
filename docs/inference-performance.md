@@ -260,13 +260,22 @@ different order, so v2 outputs move slightly, within the cross-config envelope
 pays on every card measured, most on the fastest
 ([`v2-on-blackwell.md`](../context_docs/inference/v2-on-blackwell.md) §3).
 
+**v2 runs each sub-batch in chunks of 64 pixels, each replaying a captured CUDA graph.** A
+7,168-pixel forward streams its intermediate activations through GPU memory; a 64-pixel chunk
+keeps them in the card's cache. Small chunks alone would be slower, because each launches the
+forward's many small kernels one by one, so each chunk replays a CUDA graph captured once per
+bucket shape, which launches them all at once. Outputs move slightly, the way a different batch
+shape moves them, so the change ships at a v2 store boundary under ADR 030. v1.1 runs whole
+sub-batches as before (§7 of the [inference README](../src/tessera_embeddings/inference/README.md#7-the-forward-pass-on-the-gpu-inferencepy);
+measurements in [`inference-on-gpus.md`](../context_docs/inference/inference-on-gpus.md)).
+
 **Training-only parameters never reach the graph.** The checkpoint carries a BarlowTwins
 `projector` and a `segmented_matryoshka_projector` that served the variable-width training
 objective. Both are stripped by prefix before the model is built, so neither occupies VRAM nor
 appears in a forward pass.
 
 Two further options were tried and are off, both measured worse rather than merely unhelpful.
-`torch.compile` of the whole model captured it as a CUDA graph, consumed 11.6 GB of VRAM and
+`torch.compile` of the whole model, which also captured it as a CUDA graph, consumed 11.6 GB of VRAM and
 roughly doubled the forward pass, because the recurrent layer recompiled for every distinct sequence
 length it saw; only the pooling head's single timestep is compiled now. cuDNN's autotuner searches for the fastest kernel per input shape, and bucketing changes the
 shape constantly, so it searched constantly and inflated host memory doing it.

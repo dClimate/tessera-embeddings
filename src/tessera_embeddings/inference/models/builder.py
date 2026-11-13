@@ -29,7 +29,7 @@ import torch
 from tessera_embeddings.config.inference import model_family
 
 from .modules import V11TransformerEncoder
-from .ssl_model import MultimodalBTInferenceModel, build_dim_reducer
+from .ssl_model import GRAPH_CHUNK_PIXELS, MultimodalBTInferenceModel, build_dim_reducer
 from .student_v2 import StudentTransformerEncoder, build_v2_dim_reducer
 
 if TYPE_CHECKING:
@@ -93,7 +93,9 @@ def _build_v2_inference_model(config: InferenceConfig, device: torch.device) -> 
     v2 pooling head and the reducer's trailing non-affine LayerNorm (see
     ``student_v2``). Both backbones consume ``band_num + 1`` input features (the
     ``+1`` is DOY appended by the sampler): S2 is 10 bands, the merged S1 stream
-    (asc + desc concatenated) is 2.
+    (asc + desc concatenated) is 2. On CUDA the model runs in chunks of
+    ``GRAPH_CHUNK_PIXELS`` pixels replaying a captured CUDA graph (see ``ssl_model``); v1.1 does
+    not, so its arithmetic is unchanged.
     """
     max_seq_len = max(config.num_obs_checkpoints)
     family = model_family(config.model_version)
@@ -132,6 +134,7 @@ def _build_v2_inference_model(config: InferenceConfig, device: torch.device) -> 
             repr_dim=config.representation_dim,
         ),
         fusion_method=config.fusion_method,
+        chunk_pixels=GRAPH_CHUNK_PIXELS,
     ).to(device)
 
 

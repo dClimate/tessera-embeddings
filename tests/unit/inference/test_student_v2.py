@@ -15,7 +15,12 @@ from tessera_embeddings.config.inference import InferenceConfig, band_stats
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.dataset import MosaicChunkInferenceDataset
 from tessera_embeddings.inference.inference import run_inference
-from tessera_embeddings.inference.models.builder import _build_v2_inference_model, _verify_v2_args
+from tessera_embeddings.inference.models.builder import (
+    _build_inference_model,
+    _build_v2_inference_model,
+    _verify_v2_args,
+)
+from tessera_embeddings.inference.models.ssl_model import GRAPH_CHUNK_PIXELS, run_in_chunks
 from tessera_embeddings.inference.models.student_v2 import (
     AttentionPooling,
     QKNormEncoderLayer,
@@ -247,3 +252,26 @@ def test_v2_runs_the_unmodified_inference_loop(v2_model, sample_chunk_data, t_s1
     assert result.embeddings.dtype.name == "int8"
     assert result.scales.shape == (4, 4)
     assert not any(np.isnan(result.scales.ravel()))
+
+
+def test_chunked_forward_matches_the_whole_batch(v2_model, inference_config) -> None:
+    """v2 runs in chunks (v1.1 does not), and chunking, short last chunk included, changes no output.
+
+    On CUDA each chunk replays a captured graph; here the same loop runs the model eagerly on the
+    static buffers, which is all a CPU can check.
+    """
+    assert v2_model.chunk_pixels == GRAPH_CHUNK_PIXELS
+    assert _build_inference_model(inference_config, torch.device("cpu")).chunk_pixels is None
+
+    n = 2 * GRAPH_CHUNK_PIXELS + 5
+    s2_x, s1_x = torch.randn(n, 16, 11), torch.randn(n, 8, 3)
+    s2_static, s1_static = s2_x[:GRAPH_CHUNK_PIXELS].clone(), s1_x[:GRAPH_CHUNK_PIXELS].clone()
+    with torch.no_grad():
+        whole = v2_model(s2_x, s1_x)
+        z_static = torch.empty(GRAPH_CHUNK_PIXELS, whole.shape[1])
+
+        def run_chunk() -> None:
+            z_static.copy_(v2_model(s2_static, s1_static))
+
+        chunked = run_in_chunks(s2_x, s1_x, s2_static, s1_static, z_static, run_chunk)
+    torch.testing.assert_close(chunked, whole, atol=1e-5, rtol=1e-5)

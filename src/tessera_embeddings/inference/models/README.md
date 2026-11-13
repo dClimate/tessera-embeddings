@@ -16,7 +16,7 @@ has to treat sampling as model-specific
 | File | Ported from | Changes from original |
 |---|---|---|
 | `modules.py` | `tessera_infer/src/models/modules.py` | Type hints, ruff formatting. Upstream's `TransformerEncoder` renamed `V11TransformerEncoder` (upstream v2 has a same-named class; see `student_v2.py`). `TemporalPositionalEncoder` caches `div_term` per device in FP32 (computed on the CPU for v1.1 and on the device for v2, as each upstream does) and takes an explicit output dtype, and the encoder casts bands (not DOY) to the weights' dtype — see "The input stays FP32" in `../README.md` §7. `TemporalAwarePooling` runs its GRU, LayerNorm and attention score as one compiled step per timestep. Layer shapes and forward-pass math are unchanged. |
-| `ssl_model.py` | `tessera_infer/src/models/ssl_model.py` | Type hints, ruff formatting. Backbone annotations widened to `nn.Module` so the wrapper hosts either version's backbones. |
+| `ssl_model.py` | `tessera_infer/src/models/ssl_model.py` | Type hints, ruff formatting. Backbone annotations widened to `nn.Module` so the wrapper hosts either version's backbones. For v2 on CUDA, `forward` runs the batch in chunks of 64 pixels replaying a captured CUDA graph, which moves outputs slightly (ADR 030; `../README.md` §7); v1.1, CPU and training run the upstream forward whole. |
 | `student_v2.py` | `geotessera/TESSERA-V-2.0-2B-L` (Hugging Face) `model.py`, = `ucam-eo/tessera` `tessera_infer_v2/student/model.py` | Type hints, ruff formatting; upstream's `TransformerEncoder` renamed `StudentTransformerEncoder`; upstream's inline positional encoder replaced by the shared `modules.TemporalPositionalEncoder` (bit-identical at fp32, plus an explicit output-dtype cast and a per-device FP32 `div_term` cache); in inference on CUDA the encoder layers run through `_encoder_layer_forward` with each residual add + LayerNorm as one compiled kernel, which moves outputs slightly (ADR 030; `../README.md` §7); the top-level `PixelStudent` assembly is not duplicated — see below. |
 | `builder.py` | `tessera_infer/src/models/builder.py` | Type hints, ruff formatting. Added FSDP prefix stripping in `load_v11_checkpoint()`, plus the v2 build/load path (`_build_v2_inference_model`, `load_v2_checkpoint`, `_verify_v2_args`). |
 
@@ -122,7 +122,9 @@ meaning each:
 
 - **`ssl_model.py`**: `MultimodalBTInferenceModel` (the shared inference wrapper)
   and `build_dim_reducer` (v1.1 reducer). The fusion method (`concat` vs `sum`) and
-  `dim_reducer` structure must match the checkpoint.
+  `dim_reducer` structure must match the checkpoint. `run_in_chunks` is the chunk loop the v2
+  graph replay uses; `test_chunked_forward_matches_the_whole_batch` holds it to the
+  whole-batch forward on the CPU (no CI runner has a GPU, so the graph itself is untested there).
 
 - **`student_v2.py`**: `StudentTransformerEncoder`, `AttentionPooling`,
   `QKNormEncoderLayer`, `build_v2_dim_reducer` — the v2 Large checkpoint's exact

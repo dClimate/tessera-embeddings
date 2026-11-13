@@ -25,17 +25,62 @@ Ported from ``ucam-eo/tessera`` tag ``v1.1``
 parameter names, and fusion math are the same, only the backbone pooling head
 and the reducer's trailing LayerNorm differ (see ``student_v2.py``).
 ``build_dim_reducer`` below stays v1.1-specific.
+
+On a CUDA device in eval mode with gradients off, a v2 model runs each sub-batch in chunks of
+``GRAPH_CHUNK_PIXELS`` pixels, each chunk replaying a CUDA graph captured once per bucket shape::
+
+    sub-batch (B pixels) ─► chunk 1 ─► copy into static inputs ─► replay graph ─► copy rows out ─┐
+                            chunk 2 ─► …                                                        ├─► (B, 128)
+                            last chunk (m ≤ 64 rows) ─► same, keeping only m rows ──────────────┘
+
+Small chunks keep the intermediates in the GPU's cache; the graph removes the per-operation
+launch cost that would otherwise make small chunks slower. v1.1, the CPU, and any forward with
+gradients on or in training mode run the whole batch at once. Measurements:
+``context_docs/inference/inference-on-gpus.md``.
 """
 
 from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 
 import torch
 import torch.nn as nn
 
 logger = logging.getLogger(__name__)
+
+# Pixels per replayed chunk for v2: 64 was the fastest size measured on an L40S, and 128 was slower.
+GRAPH_CHUNK_PIXELS = 64
+
+_Graph = tuple[torch.cuda.CUDAGraph, torch.Tensor, torch.Tensor, torch.Tensor]
+"""A captured forward: (graph, static S2 input, static S1 input, static output)."""
+
+
+def run_in_chunks(
+    s2_x: torch.Tensor,
+    s1_x: torch.Tensor,
+    s2_static: torch.Tensor,
+    s1_static: torch.Tensor,
+    z_static: torch.Tensor,
+    run_chunk: Callable[[], None],
+) -> torch.Tensor:
+    """Run a batch through fixed-size static buffers, one chunk at a time.
+
+    Each chunk's rows are copied into ``s2_static``/``s1_static``, ``run_chunk`` fills ``z_static``
+    from them (on CUDA it is a captured graph's ``replay``), and the chunk's rows are copied out.
+    The chunk size is the static buffers' first dimension.
+    """
+    n, c = s2_x.shape[0], s2_static.shape[0]
+    out = z_static.new_empty((n, z_static.shape[1]))
+    for i in range(0, n, c):
+        # A short last chunk leaves stale rows past m; pixels are embedded independently, so they never reach kept rows.
+        m = min(c, n - i)
+        s2_static[:m].copy_(s2_x[i : i + m])
+        s1_static[:m].copy_(s1_x[i : i + m])
+        run_chunk()
+        out[i : i + m] = z_static[:m]
+    return out
 
 
 class MultimodalBTInferenceModel(nn.Module):
@@ -50,6 +95,12 @@ class MultimodalBTInferenceModel(nn.Module):
     the fusion math are identical in both versions, so this wrapper hosts either
     version's backbones and reducer; the version-specific blocks live in
     ``modules.py`` (v1.1) and ``student_v2.py`` (v2). ``builder.py`` picks.
+
+    ``chunk_pixels`` turns on chunks of that many pixels replaying a captured CUDA graph (see
+    the module docstring); ``None`` runs every batch whole. A graph is captured the first time a
+    ``(T_s2, T_s1)`` bucket shape is seen and kept for the life of the model, with no eviction:
+    there is at most one per bucket shape, which the default ladder of 32 sequence lengths per
+    stream bounds at about a thousand, and each holds only one chunk's worth of activations.
     """
 
     def __init__(
@@ -58,12 +109,16 @@ class MultimodalBTInferenceModel(nn.Module):
         s1_backbone: nn.Module,
         dim_reducer: nn.Module,
         fusion_method: str = "concat",
+        chunk_pixels: int | None = None,
     ) -> None:
         super().__init__()
         self.s2_backbone = s2_backbone
         self.s1_backbone = s1_backbone
         self.dim_reducer = dim_reducer
         self.fusion_method = fusion_method
+        self.chunk_pixels = chunk_pixels
+        # Per (T_s2, T_s1); a plain dict, so graphs never enter state_dict.
+        self._graphs: dict[tuple[int, int], _Graph] = {}
 
         # Pre-create CUDA streams for parallel backbone execution.
         self._s2_stream: torch.cuda.Stream | None = None
@@ -74,16 +129,43 @@ class MultimodalBTInferenceModel(nn.Module):
             self._s2_stream = torch.cuda.Stream(device=device)
             self._s1_stream = torch.cuda.Stream(device=device)
 
+    def replays_graphs(self, s2_x: torch.Tensor) -> bool:
+        """Whether ``forward`` on this input runs chunks replaying captured CUDA graphs."""
+        return self.chunk_pixels is not None and s2_x.is_cuda and not torch.is_grad_enabled() and not self.training
+
     def forward(self, s2_x: torch.Tensor, s1_x: torch.Tensor) -> torch.Tensor:
-        """Forward pass producing 192-dim representations.
+        """Forward pass producing the model's native representation.
 
         Args:
             s2_x: S2 input, shape ``(B, T_s2, 11)`` — 10 bands + DOY.
             s1_x: Merged S1 input, shape ``(B, T_s1, 3)`` — 2 bands + DOY.
 
         Returns:
-            Representation tensor of shape ``(B, 192)``.
+            Representation tensor of shape ``(B, 192)`` under v1.1, ``(B, 128)`` under v2 Large.
         """
+        if not self.replays_graphs(s2_x):
+            return self._forward_whole_batch(s2_x, s1_x)
+        key = (s2_x.shape[1], s1_x.shape[1])
+        if key not in self._graphs:
+            self._graphs[key] = self._capture(s2_x, s1_x)
+        graph, s2_static, s1_static, z_static = self._graphs[key]
+        return run_in_chunks(s2_x, s1_x, s2_static, s1_static, z_static, graph.replay)
+
+    def _capture(self, s2_x: torch.Tensor, s1_x: torch.Tensor) -> _Graph:
+        """Capture one chunk's forward for this bucket shape, on static zero inputs."""
+        assert self.chunk_pixels is not None
+        s2_static = s2_x.new_zeros((self.chunk_pixels, *s2_x.shape[1:]))
+        s1_static = s1_x.new_zeros((self.chunk_pixels, *s1_x.shape[1:]))
+        # Warm-up runs any lazy first-call work (compilation, per-device caches) outside the capture.
+        for _ in range(3):
+            self._forward_whole_batch(s2_static, s1_static)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            z_static = self._forward_whole_batch(s2_static, s1_static)
+        return graph, s2_static, s1_static, z_static
+
+    def _forward_whole_batch(self, s2_x: torch.Tensor, s1_x: torch.Tensor) -> torch.Tensor:
+        """The forward over the whole batch at once; also the body a captured graph records."""
         self._ensure_streams(s2_x.device)
         profile = getattr(self, "_profile", False)
 
