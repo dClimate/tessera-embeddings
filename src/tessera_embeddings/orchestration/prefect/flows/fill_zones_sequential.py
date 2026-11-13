@@ -1441,7 +1441,9 @@ def fill_zones_sequential_flow(
             [],
             "chained-session",
             "chained-session",
-            "chained-session",
+            # Each cell's work carries its own run id; this placeholder only meets the runner's
+            # encoder check, which reads an unprefixed id as v1.1 staging and refuses a v2 store.
+            run_id_prefix(model_version) + "chained-session",
             t0_flow,
             log,
             on_actor_retire=terminator,

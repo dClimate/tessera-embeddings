@@ -23,6 +23,7 @@ from prefect.exceptions import TerminationSignal
 from prefect.states import StateType
 
 import tessera_embeddings.orchestration.prefect.flows.fill_zones_sequential as mod
+from tessera_embeddings.config.inference import assert_run_id_matches_model
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.storage.update import UpdatePlan
 from tests.unit.deadline import run_under_deadline
@@ -594,6 +595,24 @@ def test_session_sized_to_largest_cell_not_fleet_ceiling(wired, monkeypatch):
     _run(zones=["01N", "02N"], num_actors=20)
     wired["seq_kwargs"]["session"](lambda: None, lambda item, result: None)
     assert captured["n"] == 5  # max cell request, not 20
+
+
+@pytest.mark.parametrize("model", ["v1.1", "v2-large"])
+def test_the_shared_session_passes_the_runners_encoder_check(wired, monkeypatch, model):
+    """The session's placeholder run id must name the store's encoder, or a v2 fill is refused."""
+    monkeypatch.setattr(mod, "store_model_version", lambda *a, **k: model)
+    captured: dict = {}
+    monkeypatch.setattr(
+        mod,
+        "run_inference",
+        lambda n, config, chunks, mosaics, staging, run_id, *a, **k: (
+            captured.update(run_id=run_id, model=config.model_version) or []
+        ),
+    )
+    _run(ami_ssm_name_by_model={"v1.1": "ami-v11", "v2-large": "ami-v2"})
+    wired["seq_kwargs"]["session"](lambda: None, lambda item, result: None)
+    assert captured["model"] == model
+    assert_run_id_matches_model(captured["run_id"], model)
 
 
 def test_a_nonpositive_failure_cap_is_rejected_before_any_side_effect(wired):
