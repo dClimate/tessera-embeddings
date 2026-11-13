@@ -52,6 +52,8 @@ context_docs/
 │   ├── 034-an-acquisition-is-one-datastrip-of-one-pass.md
 │   ├── 035-a-provenance-record-for-the-published-store.md
 │   ├── 036-the-registry-folder-is-runs.md
+│   ├── 037-v2-stores-use-the-utm-zones-layout.md
+│   ├── 038-the-campaign-fills-a-utm-column-in-two-halves.md
 │   ├── 039-architecture-rules-run-on-import-linter-and-ruff.md
 │   └── 040-new-code-is-gated-on-duplication-and-complexity.md
 │

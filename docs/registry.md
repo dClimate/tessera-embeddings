@@ -267,13 +267,13 @@ record = ProvenanceRecord(REGISTRY, region="us-west-2", anonymous=True)
 
 # A pixel: one row per sensor and date an image had data there, from the run that holds the pixel.
 record.pixel_granules(45.5071, 14.3761, 2024)
-locate(45.5071, 14.3761)   # PixelLocation(zone='33N', tile='chunk_209_14', row=1908, col=70)
+locate(45.5071, 14.3761)   # PixelLocation(zone='utm33', tile='chunk_209_14', row=1908, col=70)
 
 # A tile: per sensor and date one run recorded, its valid pixels and every image with data there.
-record.shard_granules("33N", 2024, "chunk_209_14", run_id)
+record.shard_granules("utm33", 2024, "chunk_209_14", run_id)
 
 # A day: every image in the optical mosaic of 9 May, in fusion order, then the copies set aside.
-record.day_granules("33N", 2024, "s2", dt.date(2024, 5, 9))
+record.day_granules("utm33", 2024, "s2", dt.date(2024, 5, 9))
 ```
 
 | call | one row per | columns |
@@ -283,7 +283,11 @@ record.day_granules("33N", 2024, "s2", dt.date(2024, 5, 9))
 | `day_granules(zone, year, sensor, day, run_id=None)` | image in the day's mosaic, then each copy set aside | the `granules` row; `run_id` keeps the mosaic that run read |
 
 The pixel calls raise `LookupError` where the tile has no complete record (below), and
-`ValueError` for a point outside its zone's grid.
+`ValueError` for a point outside its zone's grid. Points are placed on the v2 stores' grid, whose
+zones are whole UTM columns (`utm33`); pass `layout="hemispheres"` to the record or to `locate` for
+a store on v1.1's grid (`33N`, `33S`), which differs south of the equator. A column is filled as two
+halves, `utm33n` and `utm33s`, each its own run, but both halves' records sit under the column's
+`zone=utm33`, as its registry rows do.
 
 ### Which run holds a pixel
 
@@ -308,7 +312,7 @@ returns; the store's [reading guide][store] converts a point to a pixel without 
 import icechunk, numpy as np, polars as pl, zarr
 
 REGISTRY = "s3://<bucket>/<store>.registry"
-ZONE, YEAR, TILE, ROW, COL = "33N", 2024, "chunk_209_14", 1908, 70
+ZONE, YEAR, TILE, ROW, COL = "utm33", 2024, "chunk_209_14", 1908, 70
 S3 = {"aws_region": "us-west-2", "skip_signature": "true"}   # anonymous reads
 prov = f"{REGISTRY}/provenance"
 

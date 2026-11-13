@@ -98,8 +98,9 @@ the same day, which do not:
 `opera_query.burst_fusion_sort_key` orders each day's items by the burst's acquisitions over the
 whole ingest window, most first, with ties broken by burst id so a rerun builds the same pixels; a
 title naming no burst sorts last. The counts come from one census per orbit leg
-(`opera_query.BurstCensus`), read from granule titles in CMR's light reference format over the
-same solar days the batches own. It is recorded on the orbit's store as the root attribute
+(`opera_query.BurstCensus`), read from granule titles and download links in CMR's light CSV
+format over the same solar days the batches own. It counts only granules the batches can load, so
+one whose metadata claims VV and VH but whose links lack one is left out of both. It is recorded on the orbit's store as the root attribute
 `burst_census`, with the window and longitude it covers, in every date's commit. A resumed leg
 ranks by that record instead of counting again, and a leg asking for a different window is
 refused; a different window goes into its own store.

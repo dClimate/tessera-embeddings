@@ -7,9 +7,10 @@ The bookkeeping around the shard-writer fills (ADR-008 D7). Three concerns:
   every later ``expire_and_gc``.
 - **Snapshot hygiene** (`expire_and_gc`) expires old snapshots and garbage-collects the
   now-unreferenced objects, keeping the repo's manifest/object count bounded over a nine-year,
-  120-zone campaign.
-- **Progress** (`campaign_status`) reads each zone group's ``years_complete`` attr into a
-  resume-oriented view: what is done, what is still pending.
+  multi-zone campaign.
+- **Progress** (`campaign_status`) reads each zone group's ``years_complete`` attr — and a
+  column's ``halves_complete``, since the campaign fills a ``utm_zones`` column as two halves
+  (ADR 038) — into a resume-oriented view: what is done, what is still pending.
 
 That attr is advanced by :func:`tessera_embeddings.storage.shard_writer.write_year_shards` in the
 same commit as the data (D1), so status is always consistent with what has actually landed. The
@@ -20,17 +21,17 @@ zone-fill *runner* (inference -> assemble -> tag) lives in
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
-from dataclasses import dataclass
+from collections.abc import Collection, Iterable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import cast
 
 import icechunk
 import zarr
 
-from tessera_embeddings.storage.shard_writer import commit_year_attrs
+from tessera_embeddings.storage.shard_writer import HALVES, commit_year_attrs, read_halves_complete
 from tessera_embeddings.storage.time_axis import CAMPAIGN_YEARS, time_index_of, year_timestamp
-from tessera_embeddings.storage.zone_grid import ZONES
+from tessera_embeddings.storage.zone_grid import fill_zones, group_and_half, zone_layout_of, zones
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +107,7 @@ def missing_zones_for_year(
     repo: icechunk.Repository,
     year: int,
     *,
-    expected_zones: Iterable[str] | None = None,
+    expected_zones: Collection[str] | None = None,
     snapshot_id: str | None = None,
     branch: str = "main",
 ) -> tuple[str, ...]:
@@ -114,14 +115,14 @@ def missing_zones_for_year(
 
     The verification half of :func:`tag_year_complete`, split out so a caller can ask about an
     arbitrary scope (a road test, one hemisphere, a re-drive's remainder) without being able to
-    mint a campaign-wide completion tag from it. ``None`` means the full campaign (:data:`ZONES`).
+    mint a campaign-wide completion tag from it. ``None`` means the full campaign
+    (:meth:`CampaignStatus.campaign_zones`).
 
     Reads ``years_complete`` at the same snapshot a tag would pin — ``snapshot_id`` when given,
     else ``branch``'s tip — so the answer describes that snapshot rather than a branch that may
     have advanced since.
     """
-    expected = tuple(expected_zones) if expected_zones is not None else tuple(ZONES)
-    if not expected:
+    if expected_zones is not None and not expected_zones:
         # An empty scope makes the check vacuous: every zone in scope has landed, having verified
         # nothing. `None` means "the whole campaign"; an empty list means the caller computed a
         # scope and got nothing, which is a bug in the caller, not a completed year.
@@ -134,6 +135,7 @@ def missing_zones_for_year(
         if snapshot_id is not None
         else campaign_status(repo, branch=branch)
     )
+    expected = expected_zones if expected_zones is not None else status.campaign_zones()
     return tuple(z for z in expected if not status.has(z, year))
 
 
@@ -146,7 +148,8 @@ def tag_year_complete(
 ) -> str:
     """Tag ``year`` complete once **every** campaign zone has landed it; return the tag.
 
-    The scope is always the full campaign (:data:`ZONES`) and is deliberately *not* a parameter.
+    The scope is always the full campaign — every zone of the store's layout — and is
+    deliberately *not* a parameter.
     ``year-<year>-complete`` is a campaign-wide claim; icechunk tags are write-once forever and
     :func:`_ensure_tag` treats an existing tag as an idempotent success — so a tag minted after
     only a subset landed could never be corrected under its own name, and would permanently mark
@@ -159,8 +162,7 @@ def tag_year_complete(
     missing = missing_zones_for_year(repo, year, snapshot_id=snapshot_id, branch=branch)
     if missing:
         raise ValueError(
-            f"cannot tag year {year} complete: {len(missing)}/{len(ZONES)} zone(s) "
-            f"have not landed it (e.g. {missing[:5]})"
+            f"cannot tag year {year} complete: {len(missing)} zone(s) have not landed it (e.g. {missing[:5]})"
         )
     return _ensure_tag(
         repo, _year_complete_tag(year), snapshot_id or repo.lookup_branch(branch), explicit=snapshot_id is not None
@@ -176,7 +178,9 @@ def mark_zone_year_empty(
 ) -> str:
     """Mark a ``(zone, year)`` complete with **no data** — an all-ocean cell.
 
-    Some of the 120 zones (and some zone-years under the partner land mask) contain no land at
+    ``zone`` is a fill zone: a group, or a column half (ADR 038), which marks only its half.
+
+    Some zones (and some zone-years under the partner land mask) contain no land at
     all, so there is nothing to stage or shard-write — but the campaign work list
     (:func:`campaign_work_list`) must still see them land. This advances ``years_complete``
     (and ``runs`` provenance when ``run_id`` is given) in one commit, exactly as
@@ -189,7 +193,8 @@ def mark_zone_year_empty(
     """
     # Axis check on a read-only view: it must fail before any session is opened, so a rejected
     # year cannot leave a writable session dangling.
-    node = cast(zarr.Group, zarr.open_group(repo.readonly_session("main").store, mode="r")[zone])
+    group = group_and_half(zone)[0]
+    node = cast(zarr.Group, zarr.open_group(repo.readonly_session("main").store, mode="r")[group])
     if time_index_of(node, year_timestamp(year)) is None:
         raise ValueError(
             f"Year {year} is not on {zone}'s pre-allocated time axis — refusing to mark an "
@@ -256,6 +261,7 @@ class CampaignStatus:
 
     years: tuple[int, ...]  # the campaign year axis (e.g. 2017..2025)
     zones: dict[str, tuple[int, ...]]  # seeded group name -> years landed (sorted)
+    halves: dict[str, tuple[int, ...]] = field(default_factory=dict)  # column half -> years landed
 
     @property
     def zones_seeded(self) -> int:
@@ -264,12 +270,19 @@ class CampaignStatus:
 
     @property
     def zone_years_done(self) -> int:
-        """Total ``(zone, year)`` cells landed across all seeded zones."""
-        return sum(len(v) for v in self.zones.values())
+        """Total fill-zone cells landed: a column's halves count as they land, before the year completes."""
+        return sum(len(v) for v in (self.halves or self.zones).values())
+
+    def campaign_zones(self) -> tuple[str, ...]:
+        """The full campaign: every fill zone of the layout this store's groups use (ADR 037, 038)."""
+        layout = zone_layout_of(self.zones)
+        if layout is None:
+            raise ValueError("the store has no zone groups, so it has no layout yet — seed it first.")
+        return tuple(fill_zones(layout))
 
     def has(self, zone: str, year: int) -> bool:
-        """Whether ``zone`` has landed ``year``."""
-        return year in self.zones.get(zone, ())
+        """Whether ``zone`` — a group, or a column half — has landed ``year``."""
+        return year in self.zones.get(zone, ()) or year in self.halves.get(zone, ())
 
 
 def campaign_status(
@@ -289,13 +302,17 @@ def campaign_status(
     """
     session = repo.readonly_session(snapshot_id=snapshot_id) if snapshot_id else repo.readonly_session(branch)
     root = zarr.open_group(session.store, mode="r")
-    zones: dict[str, tuple[int, ...]] = {}
+    landed_by_group: dict[str, tuple[int, ...]] = {}
+    halves: dict[str, tuple[int, ...]] = {}
     for name in sorted(root.group_keys()):
         node = cast(zarr.Group, root[name])
         raw = node.attrs.get("years_complete", [])
         landed = tuple(sorted(int(y) for y in raw)) if isinstance(raw, list) else ()
-        zones[name] = landed
-    return CampaignStatus(years=tuple(years), zones=zones)
+        landed_by_group[name] = landed
+        if name in zones("utm_zones"):
+            for h in HALVES:
+                halves[name + h] = tuple(y for y in years if y in landed or h in read_halves_complete(node, y))
+    return CampaignStatus(years=tuple(years), zones=landed_by_group, halves=halves)
 
 
 def campaign_work_list(
@@ -311,19 +328,19 @@ def campaign_work_list(
     concurrently never queues two years of the SAME zone back to back. A cell counts DONE only
     when it is BOTH in ``years_complete`` AND has its zone-year tag. Two consequences:
 
-    - **Skip finished zones on a default re-run.** With ``expected_zones=None`` (all 120), a year
+    - **Skip finished zones on a default re-run.** With ``expected_zones=None`` (every zone), a year
       that partially completed and is re-driven only dispatches the zones still missing — a
       landed-and-tagged zone is filtered out.
     - **Recover a complete-but-untagged cell.** A crash between the fill commit and the tag leaves
       a cell in ``years_complete`` but untagged; it is INCLUDED so the fill runner's idempotent
       retag path runs (filtering on ``years_complete`` alone would skip it forever, and the year's
-      all-120 milestone tag would never land).
+      all-zone milestone tag would never land).
 
-    ``expected_zones`` is the zone filter for a subset / repair run (default: all 120).
+    ``expected_zones`` is the zone filter for a subset / repair run (default: every zone of the store's layout).
     """
     # Dedupe (order-preserving): duplicate zones/years from a caller would emit the same
     # (zone, year) twice, and the driver would dispatch two concurrent fills of one cell — their
     # years_complete/runs attr commits conflict (RebaseFailedError).
-    zone_names = tuple(dict.fromkeys(expected_zones)) if expected_zones is not None else tuple(ZONES)
+    zone_names = tuple(dict.fromkeys(expected_zones)) if expected_zones is not None else status.campaign_zones()
     yrs = tuple(dict.fromkeys(years)) if years is not None else status.years
     return [(z, y) for y in yrs for z in zone_names if not status.has(z, y) or zone_year_tag(z, y) not in existing_tags]

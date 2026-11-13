@@ -25,6 +25,7 @@ import zarr
 from affine import Affine
 from odc.geo.geobox import GeoBox
 
+from tessera_embeddings.config.inference import ZoneLayout
 from tessera_embeddings.config.ingest import PROVENANCE_VERSION, SOURCE_INDEX_VAR
 from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
@@ -367,15 +368,20 @@ def _master(registry: Path, tiles: list[str], source_runs: list) -> None:
 
 
 @pytest.mark.parametrize(
-    ("lat", "lon", "where"),
+    ("lat", "lon", "layout", "where"),
     [
-        (45.5071, 14.3761, PixelLocation("33N", "chunk_209_14", 1908, 70)),
-        (45.5149, 14.3794, PixelLocation("33N", "chunk_209_14", 1822, 96)),
+        (45.5071, 14.3761, "hemispheres", PixelLocation("33N", "chunk_209_14", 1908, 70)),
+        (45.5149, 14.3794, "hemispheres", PixelLocation("33N", "chunk_209_14", 1822, 96)),
+        (45.5071, 14.3761, "utm_zones", PixelLocation("utm33", "chunk_209_14", 1908, 70)),
+        (-33.9, 18.4, "hemispheres", PixelLocation("34S", "chunk_184_4", 51, 1382)),
+        (-33.9, 18.4, "utm_zones", PixelLocation("utm34", "chunk_639_4", 627, 1382)),
     ],
 )
-def test_a_point_is_located_on_the_stores_grid(lat: float, lon: float, where: PixelLocation) -> None:
-    """The two pixels the dev test traced, at the shard, row and column it found them."""
-    assert locate(lat, lon) == where
+def test_a_point_is_located_on_the_stores_grid(
+    lat: float, lon: float, layout: ZoneLayout, where: PixelLocation
+) -> None:
+    """The dev test's pixels where it found them; south of the equator the two layouts' grids differ."""
+    assert locate(lat, lon, layout) == where
 
 
 @pytest.mark.parametrize(("row", "col", "run"), [(0, 0, UPDATE), (3, 3, RUN)], ids=["update-marked", "fill"])

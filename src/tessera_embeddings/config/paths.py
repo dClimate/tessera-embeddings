@@ -108,7 +108,7 @@ class BucketPaths(BaseModel):
     def global_store(self, name: str = _DEFAULT_GLOBAL_STORE_NAME) -> str:
         """Return the URI of the single global-embeddings Icechunk repo.
 
-        The global campaign writes all 120 UTM-zone groups into one repo (ADR-008 D5),
+        The global campaign writes every UTM-zone group into one repo (ADR-008 D5),
         addressed by zone group name — unlike :meth:`store_for`, one ``.zarr`` per
         (roi, kind).
 
@@ -204,7 +204,7 @@ class BucketPaths(BaseModel):
     def land_mask_store(self, name: str = "global") -> str:
         """Return the URI of the campaign land-mask coverage Icechunk repo.
 
-        One repo of 120 UTM-zone groups (ADR-010), each holding registry-derived coverage
+        One repo of UTM-zone groups (ADR-010), each holding registry-derived coverage
         bitmaps (``tile_live_2048`` / ``chunk_live_256``) addressed by zone group name —
         mirroring :meth:`global_store` so the zone-fill runner reads it with the same
         ``open_store_as_zarr_group(path, group=zone)`` helper. Lives under ``inputs``, being

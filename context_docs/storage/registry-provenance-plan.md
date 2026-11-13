@@ -37,7 +37,7 @@ questions in §10. The appendices are reference material and can be skipped.
 
 | word | meaning |
 |---|---|
-| zone | one UTM zone and hemisphere, such as `33N`. The store is filled one zone-year at a time |
+| zone | a group of the store: on v1.1's layout a UTM zone and hemisphere, such as `33N`, which the dev runs below used; on v2's (ADR 037) a whole UTM column, `utm33`, filled as two halves, `utm33n` and `utm33s` (ADR 038). The record, like the registry, is keyed by the group, so both halves' runs publish under `zone=utm33` |
 | shard | a 2048 × 2048 pixel block of a zone, about 20 km on a side. The model works a shard at a time, and the registry has one row per shard per year. For historical reasons a shard is named `chunk_<row>_<col>` and the registry's column for it is `tile`; both mean shard |
 | sensor | `s2` (Sentinel-2, optical), `s1_asc` and `s1_desc` (Sentinel-1 radar, ascending and descending orbits) |
 | granule | one catalogue entry for one image: a Sentinel-2 scene (optical) or a Sentinel-1 burst (radar) |

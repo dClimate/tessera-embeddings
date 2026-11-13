@@ -13,7 +13,7 @@ import tessera_embeddings.storage.shard_writer as shard_writer
 from tessera_embeddings.config.store_layout import DIMS_3D, DIMS_4D, ArrayLayout, StoreLayout
 from tessera_embeddings.storage import campaign, global_store
 from tessera_embeddings.storage.shard_writer import commit_with_rebase, write_year_shards
-from tessera_embeddings.storage.zone_grid import ZONES, ZoneSpec
+from tessera_embeddings.storage.zone_grid import ZoneSpec, fill_zones
 
 _BAND = 8
 _SHARD = 512
@@ -126,13 +126,33 @@ def test_work_list_includes_complete_but_untagged(seed):
     assert ("01N", 2023) in work  # complete but untagged -> still dispatched (retag)
 
 
-def test_work_list_defaults_to_all_120_zones(seed):
-    """`expected_zones=None` drives the whole globe (an unseeded zone needs every year)."""
-    _, repo = seed()  # only 2 zones seeded, but the default list spans all 120
+@pytest.mark.parametrize(
+    ("hemisphere", "layout", "unseeded"), [("N", "hemispheres", ("60N", 2023)), (None, "utm_zones", ("utm60s", 2023))]
+)
+def test_work_list_defaults_to_every_zone_of_the_store_layout(seed, hemisphere, layout, unseeded):
+    """`expected_zones=None` drives the whole globe in the store's own layout (ADR 037), by halves (ADR 038)."""
+    specs = [ZoneSpec(f"3260{n}", hemisphere, n, (0.0, 5_120.0), (0.0, 10_240.0)) for n in (1, 2)]
+    _, repo = seed(zones=specs)  # only 2 zones seeded, but the default spans the layout
     status = campaign.campaign_status(repo, years=_YEARS)
     work = campaign.campaign_work_list(status, set(), years=_YEARS)  # expected_zones=None
-    assert len(work) == len(ZONES) * len(_YEARS)
-    assert ("60N", 2023) in work  # an unseeded zone still needs every year
+    assert len(work) == len(fill_zones(layout)) * len(_YEARS)
+    assert unseeded in work  # an unseeded zone still needs every year
+
+
+def test_a_column_year_completes_with_its_second_half(seed):
+    """ADR 038: each half marks only itself; the year enters ``years_complete`` with the second."""
+    _, repo = seed(zones=(ZoneSpec("32601", None, 1, (0.0, 5_120.0), (-10_240.0, 10_240.0)),))
+    write_year_shards(repo, "utm01n", 0, _OneInnerChunkSource(), n_workers=1, shard_px=_SHARD, run_id="north")
+    status = campaign.campaign_status(repo, years=_YEARS)
+    assert (status.has("utm01n", 2023), status.has("utm01s", 2023), status.zones["utm01"]) == (True, False, ())
+    assert status.zone_years_done == 1, "a landed half is data the seed must not stamp over"
+    assert campaign.campaign_work_list(status, set(), years=(2023,))[:2] == [("utm01n", 2023), ("utm01s", 2023)]
+
+    campaign.mark_zone_year_empty(repo, "utm01s", 2023, run_id="south")
+    status = campaign.campaign_status(repo, years=_YEARS)
+    assert (status.has("utm01s", 2023), status.zones["utm01"]) == (True, (2023,))
+    runs = zarr.open_group(repo.readonly_session("main").store, mode="r")["utm01"].attrs["runs"]
+    assert [r["run_id"] for r in shard_writer.year_runs(runs, 2023)] == ["north", "south"]
 
 
 # --- tags ------------------------------------------------------------------
@@ -169,7 +189,7 @@ def test_tag_zone_year_default_is_idempotent_after_head_moves(seed):
 
 
 def test_tag_year_complete_requires_all_zones(seed, monkeypatch):
-    monkeypatch.setattr(campaign, "ZONES", ("01N", "02N"))
+    monkeypatch.setattr(campaign, "fill_zones", lambda layout: dict.fromkeys(("01N", "02N")))
     _, repo = seed()
     _fill(repo, "01N", year_index=0)  # only one of two zones has 2023
     with pytest.raises(ValueError, match="have not landed it"):
@@ -177,7 +197,7 @@ def test_tag_year_complete_requires_all_zones(seed, monkeypatch):
 
 
 def test_tag_year_complete_when_all_land(seed, monkeypatch):
-    monkeypatch.setattr(campaign, "ZONES", ("01N", "02N"))
+    monkeypatch.setattr(campaign, "fill_zones", lambda layout: dict.fromkeys(("01N", "02N")))
     _, repo = seed()
     _fill(repo, "01N", year_index=0)
     _fill(repo, "02N", year_index=0)

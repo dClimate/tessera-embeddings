@@ -121,7 +121,7 @@ def _names_a_real_cell(run_file: dict[str, Any]) -> bool:
     return (
         run_file["zone"] is not None
         and run_file["year"] is not None
-        and run_file["zone"] in zone_grid.ZONES
+        and run_file["zone"] in zone_grid.zones("hemispheres")  # the published store is v1.1
         and run_file["year"] in CAMPAIGN_YEARS
     )
 

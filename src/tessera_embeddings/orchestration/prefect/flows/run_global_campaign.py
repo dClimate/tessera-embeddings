@@ -29,13 +29,13 @@ every zone-year infers in minutes, can hold the request for a backlog with
 ``inference_start_delay_minutes``.
 
 **Scheduling (ADR-008 D6 + the runner contract).** Inference is parallel across zones; only
-commits contend, and only *same-zone* fills conflict (shared ``years_complete``/``runs``
-attrs → ``RebaseFailedError``). By default (``overlap_years``) every requested year is ONE
-batch partitioned by ZONE, so a zone's years all land in one cluster and serialize on its
-single trailing assembly thread — which keeps same-zone fills apart without a year barrier.
-``overlap_years=False`` restores the year-by-year outer loop, dispatching each year's zones
-concurrently, where distinct zones make same-zone overlap impossible by construction. Either
-way ``max_parallel_clusters`` bounds concurrency. Commits are UNGATED: at 10 clusters the
+commits contend. Fills that share a group write disjoint shards and retry their attrs commit,
+so they are safe together — the two halves of a ``utm_zones`` column (ADR 038) are separate
+zones here and routinely land on different clusters. By default (``overlap_years``) every
+requested year is ONE batch partitioned by ZONE, so a zone's years all land in one cluster and
+serialize on its single trailing assembly thread. ``overlap_years=False`` restores the
+year-by-year outer loop, dispatching each year's zones concurrently. Either way
+``max_parallel_clusters`` bounds concurrency. Commits are UNGATED: at 10 clusters the
 committer ceiling is ~2N=20 on a single branch tip, measured at ~2.2 s commits
 (``context_docs/storage/writing-to-the-global-store.md``). ``campaign_work_list`` is year-major, the
 drain pattern the barrier path relies on.
@@ -101,7 +101,7 @@ from tessera_embeddings.storage.update import (
     update_states,
 )
 from tessera_embeddings.storage.zarr_store import is_missing_repo, open_store_group_and_tip
-from tessera_embeddings.storage.zone_grid import canonicalize_zone
+from tessera_embeddings.storage.zone_grid import fill_zones_of, group_and_half
 
 # S1/S2 grandchild ingest refs derive from this single source rather than duplicated string
 # literals, so a rename of the ingest deployments stays in ingest_zone_year.IngestDeployments.
@@ -633,10 +633,12 @@ async def run_global_campaign(
             rather than deployment names.
         store_name: Global-store repo basename.
         years: Campaign years to drive (default: all campaign years).
-        zones: Restrict the fill chain (inference + assembly) to these UTM zones in the
-            ergonomic ``"<1-60><N|S>"`` form, e.g. ``["33N", "15S"]``; ``None`` (default)
-            drives all 120. Either way only cells still needing work are dispatched, so a
-            re-run of a partially-complete year fills only the unfinished zones (see
+        zones: Restrict the fill chain (inference + assembly) to these UTM zones: a column half
+            (``"utm33s"``), a whole column (``"utm33"``, filled as both halves), or ``"33N"`` in
+            a hemisphere store; any case, leading zero optional. ``None`` (default) drives every
+            zone of the store's layout.
+            Either way only cells still needing work are dispatched, so a re-run of a
+            partially-complete year fills only the unfinished zones (see
             :func:`campaign_work_list`).
         max_parallel_clusters: The number of Ray clusters — ``fill-zones-sequential`` runs —
             dispatched per batch (a cost knob). **Defaults to 10**, the campaign's planned
@@ -773,7 +775,7 @@ async def run_global_campaign(
             cluster. What makes it safe is not the flag but two things underneath it: each
             cell carries its own inference window to the actors, and the zone-group attribute
             commit is separate and retried, so two years of one zone no longer collide. The
-            partition is over ZONES, so a zone's every year lands in one cluster and its
+            partition is over fill zones, so a fill zone's every year lands in one cluster and its
             assemblies serialize on that cluster's single trailing thread. ``False`` restores
             the barrier, which a repair pass over one year still wants.
         max_dispatch_rounds: How many ROUNDS of re-dispatch the campaign runs — not a
@@ -1053,19 +1055,19 @@ async def run_global_campaign(
                 f"(fixed at seeding, ADR-008 D1) — reseed the store or drop them from `years`."
             )
 
-    # Canonical common names ("33N", "07S"), so a bad id fails loudly here and the rest match
-    # the store's group names exactly.
-    expected_zones = [canonicalize_zone(z) for z in zones] if zones is not None else None
+    # Canonical fill-zone names ("utm33s", "07S"), so a bad id fails loudly here; a whole column
+    # ("utm33") is its two halves, the only units a v2 mask, ROI and mosaic exist for (ADR 038).
+    expected_zones = [h for z in zones for h in fill_zones_of(z)] if zones is not None else None
     # An explicit zones subset must be seeded: a typo that canonicalizes to a valid but
     # unseeded zone would otherwise count as pending and be ingested + filled only for the
-    # fill to reject an unseeded group. (The default None spans all 120; a not-fully-seeded
+    # fill to reject an unseeded group. (The default None spans every zone; a not-fully-seeded
     # store surfaces at the fill.)
     if expected_zones is not None:
-        unseeded = [z for z in expected_zones if z not in status.zones]
+        unseeded = [z for z in expected_zones if group_and_half(z)[0] not in status.zones]
         if unseeded:
             raise ValueError(f"Requested zone(s) {unseeded} are not seeded in {store_path} — run the seed flow first.")
 
-    # Cells still needing a fill, restricted to `zones` (default: all 120).
+    # Cells still needing a fill, restricted to `zones` (default: every zone of the store's layout).
     # campaign_work_list is tag-aware: it skips landed-and-tagged cells and INCLUDES
     # complete-but-untagged ones (crash between fill and tag → the runner's idempotent retag
     # path runs). See its docstring for the two use cases.
@@ -1098,10 +1100,10 @@ async def run_global_campaign(
             )
 
     # Every work cell must be seeded before we dispatch. The guard above covers a requested
-    # subset, but the default `zones=None` expands to all 120 in campaign_work_list, so a
+    # subset, but the default `zones=None` expands to every zone in campaign_work_list, so a
     # partially-seeded store would ingest each unseeded cell (expensive) only for the fill to
     # reject the missing group.
-    unseeded_work = sorted({z for z, _ in work if z not in status.zones})
+    unseeded_work = sorted({z for z, _ in work if group_and_half(z)[0] not in status.zones})
     if unseeded_work:
         raise ValueError(
             f"Zone(s) {unseeded_work} in the work list are not seeded in {store_path} — run the seed flow "
@@ -1141,7 +1143,7 @@ async def run_global_campaign(
         else:
             mosaic_root = paths.inputs
             work_set = set(work)
-            sweep_zones = expected_zones if expected_zones is not None else sorted(status.zones)
+            sweep_zones = expected_zones if expected_zones is not None else status.campaign_zones()
             finished = [
                 (z, y)
                 for y in set(campaign_years)
@@ -1888,7 +1890,7 @@ async def run_global_campaign(
 
         # Backfill the year-complete milestone/retention tag even when NO fills ran this pass
         # — a prior run may have completed every zone for the year but crashed before
-        # tagging. The milestone is defined over ALL 120 zones and `tag_year_complete` takes
+        # tagging. The milestone is defined over EVERY zone of the store's layout and `tag_year_complete` takes
         # no scope argument, so this run's `zones` subset cannot narrow it and a repair run
         # cannot stamp the global tag prematurely, which matters because tags are write-once
         # forever. Attempted for EVERY year in the batch: an unfinished year raises
@@ -1898,9 +1900,9 @@ async def run_global_campaign(
         for y in batch_years if plan is None else ():
             try:
                 year_tag = tag_year_complete(repo, y)
-                log.info("Year %d tagged complete (all 120 zones): %s", y, year_tag)
+                log.info("Year %d tagged complete (every zone): %s", y, year_tag)
             except ValueError as exc:
-                log.debug("Year %d not yet complete across all 120 zones (%s) — milestone tag deferred", y, exc)
+                log.debug("Year %d not yet complete across every zone (%s) — milestone tag deferred", y, exc)
 
     dispatched = sum(len(v) for v in runs_by_year.values())
     log.info("Campaign dispatch complete: %d fill run(s) across %d year(s)", dispatched, len(runs_by_year))

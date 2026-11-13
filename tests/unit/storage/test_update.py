@@ -120,6 +120,20 @@ def test_a_plan_can_come_from_the_registry(tmp_path, refused, aoi, cells):
 
 
 @pytest.mark.parametrize(
+    ("zones", "cells"),
+    [
+        (None, {"utm33n/2019": ("chunk_455_3",), "utm33s/2019": ("chunk_456_3",)}),
+        (["utm33s"], {"utm33s/2019": ("chunk_456_3",)}),
+    ],
+)
+def test_a_registry_column_is_planned_as_the_halves_its_tiles_lie_in(tmp_path, zones, cells):
+    """ADR 038: the registry keys a v2 column whole; each tile goes to the half holding its row."""
+    box = (0.0, 0.0, 1.0, 1.0)
+    root = _master(tmp_path, {("utm33", 2019): [_row("chunk_455_3", 1, box), _row("chunk_456_3", 1, box)]})
+    assert upd.plan_from_registry(root, name="halves", mode="shards", zones=zones).cells == cells
+
+
+@pytest.mark.parametrize(
     ("query", "match"),
     [({"refused": "thin"}, "selects no tiles"), ({"aoi": (179.0, 0.0, -179.0, 1.0)}, "crosses the antimeridian")],
 )
@@ -160,7 +174,7 @@ def test_an_update_record_appends_and_leaves_the_fill_alone(zone_repo):
 
     node = _node(zone_repo)
     assert zone_repo.lookup_branch("main") == tip
-    assert [(r["update"], r["commit"], r["optical_min_obs"]) for r in upd.read_updates(node, 2024)] == [
+    assert [(r["update"], r["commit"], r["optical_min_obs"]) for r in upd.read_updates(node, 2024, None)] == [
         ("fix-1", commit, 1)
     ]
     assert node.attrs["years_complete"] == [2024] and node.attrs["runs"]["2024"]["run_id"] == "fill"
@@ -197,6 +211,13 @@ def test_a_cells_line_is_the_loosest_any_write_to_it_applied(zone_repo):
     assert [upd.cell_optical_min_obs(root(), "01N", year) for year in (2024, 2025)] == [1, 15]
 
 
+def test_a_halfs_line_ignores_the_other_halfs_updates():
+    """ADR 038: the halves share the group's records, not their pixels."""
+    root = zarr.group(store=zarr.storage.MemoryStore(), attributes={"optical_min_obs": 15})
+    root.create_group("utm33").attrs[upd.UPDATES_ATTR] = {"2024": [{"update": "a", "half": "n", "optical_min_obs": 1}]}
+    assert [upd.cell_optical_min_obs(root, z, 2024) for z in ("utm33n", "utm33s")] == [1, 15]
+
+
 def test_an_update_whose_shard_commit_expired_is_still_known_to_the_store_check(zone_repo):
     """An update records itself in ``updates[year]``, not ``runs``, so after snapshot expiry that record is
     the store's only account of the write; without it the update's registry run file names a run the store lacks.
@@ -227,7 +248,7 @@ def test_an_update_record_retries_a_concurrent_attr_commit(zone_repo, monkeypatc
     upd.commit_update_record(
         zone_repo, "01N", 2024, record=upd.update_record(_target(), run_id="r", written=[], kept=[], optical_min_obs=1)
     )
-    assert calls["n"] == 2 and len(upd.read_updates(_node(zone_repo), 2024)) == 1
+    assert calls["n"] == 2 and len(upd.read_updates(_node(zone_repo), 2024, None)) == 1
 
 
 def test_the_complete_tag_waits_for_every_planned_cell(zone_repo):

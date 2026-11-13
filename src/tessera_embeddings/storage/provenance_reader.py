@@ -24,6 +24,7 @@ import numpy as np
 import polars as pl
 import zarr
 
+from tessera_embeddings.config.inference import ZoneLayout
 from tessera_embeddings.config.store_layout import SENSORS, SHARD_PX
 from tessera_embeddings.inference.chunk_spec import chunk_label, parse_chunk_label
 from tessera_embeddings.ingest.land_mask import zone_for_cell
@@ -71,13 +72,16 @@ class PixelLocation(NamedTuple):
     col: int
 
 
-def locate(lat: float, lon: float) -> PixelLocation:
-    """The store pixel holding a WGS84 point, on the store's own zone grid (``zone_grid``).
+def locate(lat: float, lon: float, layout: ZoneLayout = "utm_zones") -> PixelLocation:
+    """The store pixel holding a WGS84 point, on the zone grid of a store in ``layout`` (``zone_grid``).
+
+    ``"utm_zones"``, the v2 stores' layout, places a point in its UTM column (``utm33``);
+    ``"hemispheres"``, v1.1's, in its hemisphere zone (``33N``), whose southern grid differs.
 
     Raises:
         ValueError: the point is outside its zone's grid, beyond UTM's reach near the poles.
     """
-    spec = zone_grid.zone(zone_for_cell(lon, lat))
+    spec = zone_grid.zone(zone_for_cell(lon, lat, layout))
     east, north = zone_grid.to_wgs84(int(spec.epsg)).transform(lon, lat, direction="INVERSE")
     row = math.floor((spec.northing[1] - north) / zone_grid.PIXEL_M)
     col = math.floor((east - spec.easting[0]) / zone_grid.PIXEL_M)
@@ -91,17 +95,23 @@ class ProvenanceRecord:
 
     ``registry_root`` is a local path or an ``s3://`` URI; ``get_credentials`` and ``region`` are the
     credential callback and region the rest of the store's readers take. ``anonymous`` reads unsigned,
-    as a consumer without an AWS account reads the published registry.
+    as a consumer without an AWS account reads the published registry. ``layout`` is the store's
+    zone layout, which :meth:`pixel_granules` locates a point on.
     """
 
     def __init__(
-        self, registry_root: str, get_credentials: _Creds = None, region: str | None = None, anonymous: bool = False
+        self,
+        registry_root: str,
+        get_credentials: _Creds = None,
+        region: str | None = None,
+        anonymous: bool = False,
+        layout: ZoneLayout = "utm_zones",
     ) -> None:
         """A reader of the record beside ``registry_root``."""
         if anonymous and get_credentials is not None:
             raise ValueError("anonymous and get_credentials are mutually exclusive")
         self.root, self.get_credentials, self.region = registry_root.rstrip("/"), get_credentials, region
-        self.anonymous = anonymous
+        self.anonymous, self.layout = anonymous, layout
 
     def day_granules(
         self, zone: str, year: int, sensor: str, day: datetime.date, run_id: str | None = None
@@ -135,7 +145,7 @@ class ProvenanceRecord:
 
     def pixel_granules(self, lat: float, lon: float, year: int) -> pl.DataFrame:
         """Per sensor and date in ``year``, the granule that covered the store pixel at a WGS84 point."""
-        return self.pixel_granules_at(locate(lat, lon), year)
+        return self.pixel_granules_at(locate(lat, lon, self.layout), year)
 
     def pixel_granules_at(self, where: PixelLocation, year: int) -> pl.DataFrame:
         """Per sensor and date in ``year``, the granule that covered the pixel ``where``, as :data:`PIXEL_COLUMNS`.

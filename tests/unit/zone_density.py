@@ -14,10 +14,10 @@ registry sha256 ``5ea80dd9…c794e``. To refresh after a mask rebuild::
 
     from concurrent.futures import ThreadPoolExecutor
     from tessera_embeddings.orchestration.runners.zone_fill import zone_live_tile_count
-    from tessera_embeddings.storage.zone_grid import ZONES
+    from tessera_embeddings.storage.zone_grid import zones
     mask = "s3://<inputs-bucket>/masks/global.icechunk"
     with ThreadPoolExecutor(max_workers=16) as ex:
-        counts = dict(ex.map(lambda z: (z, zone_live_tile_count(mask, z)), sorted(ZONES)))
+        counts = dict(ex.map(lambda z: (z, zone_live_tile_count(mask, z)), sorted(zones("hemispheres"))))
 
 :func:`plan` runs the REAL campaign mechanics over these counts — the same
 ``_partition_by_live_tiles`` the driver calls, then the same densest-first sort
