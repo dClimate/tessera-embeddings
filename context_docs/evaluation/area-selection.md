@@ -143,9 +143,11 @@ a few of them will fall in the neighbouring field.
 
 Every area has Sentinel-1 radar in every year from 2017 to 2025, but only France has it from both
 orbit directions. Checked on 2026-11-12 by asking NASA's catalogue (CMR) for OPERA RTC-S1
-granules the way the ingest does: the same collection, orbit filter and VV polarisation
-requirement. Each area was split into 1° squares, and an orbit was counted only with at least 12
-granules in the year, about one a month.
+granules with the filters the ingest sends the catalogue: the same collection, orbit direction and
+VV polarisation. The ingest also needs VH, which it checks itself and this count does not. Each
+area was split into 1° squares, and an orbit was counted only with at least 12 granules in the
+year. A granule covers one strip of one pass, so this shows radar in each square, not at every
+pixel.
 
 | area | 2017–2025 |
 |---|---|
@@ -155,8 +157,8 @@ granules in the year, about one a month.
 
 So the six areas also test how a version handles radar from one orbit direction, which is common
 across the world: Ontario has only ascending passes, and most of the Ethiopian box has only
-descending ones in its tested year, 2020. None of the areas tests embeddings made from Sentinel-2
-alone.
+descending ones in its tested year, 2020. No area is without radar, so none tests a place made
+from Sentinel-2 alone, though single pixels without radar may still occur within them.
 
 ## First run: Ontario, 2018
 
