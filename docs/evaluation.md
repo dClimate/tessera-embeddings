@@ -154,7 +154,8 @@ aws s3 cp s3://global-tessera-inputs-dev/models/v2_student_large.pt \
 
 ## Test a version
 
-**1. Create its store.** The model is chosen here and cannot be changed afterwards.
+**1. Create its store**, from the Prefect deployment of the version's code branch, as in step 2.
+The model is chosen here and cannot be changed afterwards.
 `optical_min_obs=1` embeds every pixel with at least one clear Sentinel-2 observation in the year,
 as the global dataset does:
 
@@ -190,7 +191,10 @@ every year from 2017 to 2025, for both versions.
 **Test one version at a time.** Versions share the downloaded imagery, and each run deletes a zone's
 imagery for a year once that zone and year are finished (the `cleanup_mosaics` setting, on by
 default). Downloading it again for every run costs less than keeping it, unless you test more than
-two or three versions a month; the figures are in the context document.
+two or three versions a month; the figures are in the context document. A run that fails before
+a zone and year are finished leaves their imagery behind, and the next run reuses it whichever
+branch made it, so delete `<inputs>/mosaics/<zone>/<year>` for those cells before testing another
+version.
 
 ## Scoring
 
