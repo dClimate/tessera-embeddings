@@ -27,7 +27,7 @@ from pystac.utils import str_to_datetime
 from requests.adapters import HTTPAdapter
 
 from tessera_embeddings.config import S1_OPERA_BANDS
-from tessera_embeddings.config.ingest import DROPPED, MISSING_BANDS
+from tessera_embeddings.config.ingest import CATALOG_ASSETS, DROPPED, MISSING_BANDS
 from tessera_embeddings.errors import ConfigMismatchError
 from tessera_embeddings.ingest._http import (
     NonJsonResponseError,
@@ -230,7 +230,7 @@ def _granule_to_item(entry: dict[str, Any], skip_counts: Counter[str] | None = N
     geometry = _polygon_to_geojson(polygons[0][0]) if polygons else None
     bbox = _geometry_bbox(geometry) if geometry else None
 
-    properties: dict[str, Any] = {"datetime": entry["time_start"]}
+    properties: dict[str, Any] = {"datetime": entry["time_start"], CATALOG_ASSETS: dict(asset_hrefs)}
     if len(asset_hrefs) < len(S1_OPERA_BANDS):
         # Built all the same, so the provenance record can name the granule it set aside.
         properties[DROPPED] = MISSING_BANDS

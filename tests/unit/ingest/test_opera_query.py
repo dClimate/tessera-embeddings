@@ -26,6 +26,8 @@ from tessera_embeddings.ingest.opera_query import (
     mgrs_tile_to_bbox,
     normalize_opera_timestamps,
 )
+from tessera_embeddings.ingest.provenance import FUSION_POSITION, day_granules
+from tessera_embeddings.ingest.solar_days import normalize_to_solar_day, solar_day_of
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -146,6 +148,25 @@ class TestGranuleToItem:
         west, south, east, north = item.bbox
         assert west < east and south < north
         assert west == pytest.approx(-11.05041)
+
+    @pytest.mark.parametrize(
+        "rewrite",
+        [
+            lambda href: href.replace("https://", "https://d123.cloudfront.net/") + "?Signature=secret",
+            lambda href: "s3://asf-bucket/" + href.rsplit("/", 1)[-1],
+        ],
+        ids=["signed", "s3-direct"],
+    )
+    def test_the_granule_list_records_the_catalogues_links_not_the_rewritten_ones(self, rewrite):
+        """Rewriting for reading changes what the loader opens, never what the record publishes."""
+        (item,) = normalize_to_solar_day([_granule_to_item(_granule_entry("g1"))], mid_longitude=15.0)
+        published = {key: asset.href for key, asset in item.assets.items()}
+        for asset in item.assets.values():
+            asset.href = rewrite(asset.href)
+        item.properties[FUSION_POSITION] = 0
+        source = {"provider": "p", "collection": "c", "catalog_url": "https://cat", "collection_id": "c"}
+        (listed,) = json.loads(day_granules([item], **source)[solar_day_of(item)])
+        assert listed["assets"] == published
 
     def test_skip_reports_polarizations_found_and_marks_the_granule_dropped(self):
         """The counter names WHAT was published, so an anomaly is quantifiable per query, and the

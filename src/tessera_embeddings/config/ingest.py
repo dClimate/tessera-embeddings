@@ -44,6 +44,11 @@ SKIPPED_DAYS_ARRAY, SKIPPED_GRANULES_ARRAY = "skipped_days", "skipped_granules"
 #: Item property: why the ingest dropped this copy before the fuse, its granule list entry's ``status``.
 DROPPED = "tessera:dropped"
 
+#: Item property: the asset links as the catalogue published them, stamped where an item is built,
+#: before anything rewrites them for reading (S3 URIs, or signed CloudFront URLs whose query string
+#: is a credential). The granule list records these, never the rewritten ones.
+CATALOG_ASSETS = "tessera:catalog_assets"
+
 #: A provenance mosaic's per-pixel source index: the fusion position plus one of the granule that
 #: supplied the pixel, 0 where none had data. ``uint16`` because a day's fusion order is zone-wide.
 SOURCE_INDEX_VAR = "source_index"

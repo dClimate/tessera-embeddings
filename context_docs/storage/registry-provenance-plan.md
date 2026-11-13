@@ -22,7 +22,7 @@ questions in §10. The appendices are reference material and can be skipped.
 - **The record.** For every pixel, and every date on which a satellite image had data there, the
   record names that image (the *granule*) and says whether the model used the observation or
   rejected it, a cloud for instance, with the granule's id, acquisition time, cloud cover,
-  footprint and the exact file URLs that were read. It also lists the copies the ingest dropped
+  footprint and the catalogue's URLs of the files that were read. It also lists the copies the ingest dropped
   before building each day's mosaic, and why. It sits beside the store's existing registry.
 - **Three questions it answers,** each with a reader helper: what went into this day's mosaic,
   into this 20 km shard, and which granule supplied this pixel on each date?
@@ -430,7 +430,7 @@ sensor, snapshot and the run that first published it.
 | `acquired_at` | timestamp, UTC | the acquisition instant |
 | `cloud_cover`, `processing_baseline`, `product_uri` | float64, string, string | Sentinel-2 only |
 | `provider`, `collection`, `stac_item_url` | string | where the entry came from, and its catalogue link |
-| `assets` | map<string, string> | band to the exact URL read |
+| `assets` | map<string, string> | band to the URL of the file read, as the catalogue published it: radar is read through S3 URIs or signed CloudFront links, and the signed ones carry a credential, so the record keeps the catalogue's (`CATALOG_ASSETS`) |
 | `stepped_down` | bool | this copy replaced one that would not read |
 | `geometry`, `bbox_west` … `bbox_north` | WKB (GeoParquet 1.1), float64 | the footprint as published, WGS84 |
 

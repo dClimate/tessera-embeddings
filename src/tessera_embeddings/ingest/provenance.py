@@ -32,6 +32,7 @@ import numpy as np
 import xarray as xr
 
 from tessera_embeddings.config.ingest import (
+    CATALOG_ASSETS,
     DROPPED,
     DUPLICATE,
     FUSED,
@@ -184,7 +185,11 @@ def _record(item: Any, status: str, **source: str) -> dict[str, Any]:  # noqa: A
         "collection": source["collection"],
         # Rebuilt rather than kept: the query prunes links to bound the driver's memory.
         "stac_item_url": f"{source['catalog_url'].rstrip('/')}/collections/{source['collection_id']}/items/{item.id}",
-        "assets": {key: _href(asset) for key, asset in sorted(item.assets.items())},
+        # The catalogue's own links where the item was stamped with them: radar's are rewritten for
+        # reading, to S3 URIs or signed URLs that carry a credential and expire.
+        "assets": dict(
+            sorted((properties.get(CATALOG_ASSETS) or {k: _href(a) for k, a in item.assets.items()}).items())
+        ),
         "stepped_down": bool(properties.get(STEPPED_DOWN, False)),
         "geometry": item.geometry,
         "bbox": list(item.bbox) if item.bbox is not None else None,

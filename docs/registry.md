@@ -232,7 +232,8 @@ way. The sensors are `s2` (optical), `s1_asc` and `s1_desc` (radar by orbit dire
   (`fusion_order`, 0 first; the first image with data at a pixel supplies it). A file holds one
   mosaic snapshot's lists, named on every row as `snapshot_id`, and is written once, by the first
   run that read that snapshot. Each row carries the image's catalogue ID and link, acquisition
-  time, cloud cover, footprint (GeoParquet) and the exact object URLs that were read. A URL that no
+  time, cloud cover, footprint (GeoParquet) and the URLs of the files that were read, as the
+  catalogue published them (radar is read through rewritten links, which are not recorded). A URL that no
   longer resolves is itself information: the catalogue entry has moved since. After a day's fused
   images come the copies the ingest set aside before building the mosaic, with no `fusion_order`
   and a `status` saying why: `duplicate`, another copy of an image it used; `unreadable`, a copy
@@ -280,7 +281,7 @@ record.day_granules("utm33", 2024, "s2", dt.date(2024, 5, 9))
 
 | call | one row per | columns |
 |---|---|---|
-| `pixel_granules(lat, lon, year)`, or `pixel_granules_at(locate(...), year)` | sensor and date with data at the pixel | `run_id`, `sensor`, `solar_day`, `valid` (did the model use it), `fusion_order`, `granule_id`, `platform`, `acquired_at`, `cloud_cover`, `assets` (the URLs read) |
+| `pixel_granules(lat, lon, year)`, or `pixel_granules_at(locate(...), year)` | sensor and date with data at the pixel | `run_id`, `sensor`, `solar_day`, `valid` (did the model use it), `fusion_order`, `granule_id`, `platform`, `acquired_at`, `cloud_cover`, `assets` (the catalogue's URLs of the files read) |
 | `shard_granules(zone, year, tile, run_id)` | sensor, date and image with data in the tile | `shard_dates`' columns and the image's `granules` row |
 | `day_granules(zone, year, sensor, day, run_id=None)` | image in the day's mosaic, then each copy set aside | the `granules` row; `run_id` keeps the mosaic that run read |
 
