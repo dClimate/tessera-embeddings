@@ -92,7 +92,7 @@ from tessera_embeddings.inference.chunk_spec import (
     parse_chunk_label,
     read_pixel_mask,
 )
-from tessera_embeddings.inference.provenance import PROVENANCE_ATTR, SourcePlanes, stage_planes
+from tessera_embeddings.inference.provenance import SourcePlanes, stage_planes
 from tessera_embeddings.storage import zone_grid
 from tessera_embeddings.storage.conventions import (
     STACK_ATTR,
@@ -1159,7 +1159,7 @@ class ZarrWriter:
         # zeroed counts looking like measured ones.
         marker = zarr.open_group(path, mode="a", storage_options=_staged_storage_options(path))
         if planes:
-            marker.attrs[PROVENANCE_ATTR] = stage_planes(marker, planes, pixels)
+            stage_planes(marker, planes, pixels)
         marker.attrs["staged_complete"] = True
         logger.info("Staged coverage-only tile for refused chunk %s to %s", chunk.label, path)
         return path
@@ -1523,7 +1523,7 @@ class ZarrWriter:
         # the listing reports as interrupted, which the resume scan re-infers (mode="w" overwrites).
         marker = zarr.open_group(path, mode="a", storage_options=_staged_storage_options(path))
         if planes:
-            marker.attrs[PROVENANCE_ATTR] = stage_planes(marker, planes, pixels)
+            stage_planes(marker, planes, pixels)
         if coverage is not None:
             # BEFORE `staged_complete`, so the completeness flag keeps meaning "everything this
             # tile carries is written". A reader gated on it can then take the record's absence as

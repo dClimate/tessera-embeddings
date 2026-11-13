@@ -43,6 +43,7 @@ from tessera_embeddings.inference.chunk_spec import parse_chunk_label
 from tessera_embeddings.inference.provenance import (
     PLANE_CHUNK_PX,
     PLANE_COMPRESSORS,
+    SNAPSHOTS_ATTR,
     STAGED_UPDATE_PIXELS,
     provenance_summary,
     read_array,
@@ -156,6 +157,21 @@ def publish_provenance(
         fs.makedirs(uri.rsplit("/", 1)[0], exist_ok=True)
         return fs.open(uri, "wb")
 
+    shards = _staged_shards(run.staging_base, run_id, run.embedded, run.refused)
+    unrecorded = sorted(label for label, staged in shards.items() if staged is None)
+    if missing := sorted(set(unrecorded) & set(run.embedded)):
+        raise ProvenanceCheckError(f"{zone}/{year} run {run_id}: embedded shard(s) staged no provenance: {missing}")
+    if misread := sorted(
+        label
+        for label, staged in shards.items()
+        if staged is not None
+        and cast("dict[str, str]", staged[0].attrs.get(SNAPSHOTS_ATTR) or {}) != dict(run.mosaic_snapshots)
+    ):
+        raise ProvenanceCheckError(
+            f"{zone}/{year} run {run_id}: shard(s) {misread[:5]} were read from mosaic snapshots other than "
+            f"{dict(run.mosaic_snapshots)}, so the record would describe other granules than the model read"
+        )
+
     pins = _pins(run.mosaic_snapshots)
     metadata = {"zone": zone, "year": str(year), "run_id": run_id, **{f"snapshot_{s}": p for s, p in pins.items()}}
 
@@ -175,11 +191,6 @@ def publish_provenance(
         )
         for sensor, root in mosaics.items()
     )
-
-    shards = _staged_shards(run.staging_base, run_id, run.embedded, run.refused)
-    unrecorded = sorted(label for label, staged in shards.items() if staged is None)
-    if missing := sorted(set(unrecorded) & set(run.embedded)):
-        raise ProvenanceCheckError(f"{zone}/{year} run {run_id}: embedded shard(s) staged no provenance: {missing}")
 
     repo, _ = open_or_create_repo(
         pixel_sources_uri(registry_root), get_credentials=access.registry_credentials, region=access.s3_region
@@ -340,6 +351,21 @@ def _day_lists(root: zarr.Group, axis: Sequence[datetime.date]) -> tuple[list[da
 def _json_list(raw: str) -> list[Any]:
     value = json.loads(raw) if raw else []
     return value if isinstance(value, list) else []
+
+
+def staged_snapshots(
+    staging_base: str, run_id: str, embedded: Sequence[str], refused: Sequence[str]
+) -> dict[str, str] | None:
+    """The mosaic snapshots a run's staged shards were read from; ``None`` when none staged a record.
+
+    What a retry publishes from: the versions the model read, never the mosaics' tips, which may have
+    moved since. :func:`publish_provenance` checks every shard names the same ones.
+    """
+    staged = _staged_shards(staging_base, run_id, embedded, refused).values()
+    return next(
+        (cast("dict[str, str]", pins) for s in staged if s is not None and (pins := s[0].attrs.get(SNAPSHOTS_ATTR))),
+        None,
+    )
 
 
 def _staged_shards(

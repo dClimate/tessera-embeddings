@@ -50,12 +50,15 @@ provenance beyond its registry, and none can be reconstructed.
    fused, `unreadable` for a copy that would not read and was replaced, `missing_bands` for a
    radar granule whose catalogue entry lacks its VV or VH file. A day the ingest skipped whole is
    listed too, off the time axis in two arrays of the mosaic committed when it is skipped, every
-   copy under the day's reason: `low_coverage`, `producer_conflict` or `unreadable`.
+   copy under the day's reason: `low_coverage`, `producer_conflict`, `unreadable` or
+   `missing_bands`.
 6. **Publication failure fails the zone-year, before the tag and the cleanup.** It is retried as
    store writes are, and a retry of a landed but untagged cell republishes from its staging before
    tagging. No marker, gate or held state.
 7. **The actors and the export read the mosaics at the snapshots the plan sampled.** A commit to a
-   mosaic mid-fill can change neither what the model read nor what the record says.
+   mosaic mid-fill can change neither what the model read nor what the record says. Each staged
+   shard names the snapshots it was read from; publication refuses a shard that names others, and a
+   retry republishes from the staged names, never the mosaics' current tips.
 8. **The record is behind a `provenance` switch, off by default.** Only the public global store
    needs it; dev runs and internal stores run without it. The mosaic's ingest manifest records the
    setting as `provenance_version`, a term whose absence means off, so a resume under the other

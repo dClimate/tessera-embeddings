@@ -943,7 +943,7 @@ class InferenceActor:
             # Which granule supplied each pixel the input carried, per sensor and date: optical from
             # the whole-shard mask bundle now, radar from each strip as it loads. Empty unless the
             # mosaics carry a source index (``inference/provenance.py``).
-            planes = SourcePlanes(chunk.height, chunk.width)
+            planes = SourcePlanes(chunk.height, chunk.width, mosaic_snapshots)
             planes.add("s2", mask_bundle.source_pieces)
             logger.info("Chunk %s: T_kept=%d -> strip_h=%d -> %d strip(s)", chunk.label, t_kept, strip_h, len(strips))
             del prologue

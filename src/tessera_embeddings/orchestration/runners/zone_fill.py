@@ -83,6 +83,7 @@ from tessera_embeddings.inference.provenance_publish import (
     ProvenanceRun,
     mosaics_carry_provenance,
     publish_provenance,
+    staged_snapshots,
 )
 from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.ingest.land_mask import narrow_tile_live
@@ -531,14 +532,13 @@ def _publish_provenance(
             publish_provenance(run, access, log)
 
 
-def _republish_provenance(
-    cell: _ProvenanceCell, mosaic_base: str, s1_orbit: str, log: logging.Logger | logging.LoggerAdapter[logging.Logger]
-) -> None:
+def _republish_provenance(cell: _ProvenanceCell, log: logging.Logger | logging.LoggerAdapter[logging.Logger]) -> None:
     """Publish again for a run that landed but whose cell was not finished, from its staging.
 
-    The run's staging is still there, since cleanup follows the tag, and lists which shards it
-    embedded and which it refused. A run with nothing staged under this id landed under other inputs
-    and has nothing of its own to describe.
+    The run's staging is still there, since cleanup follows the tag. It lists which shards the run
+    embedded and which it refused, and names the mosaic snapshots they were read from, which the
+    record must describe even if a mosaic has moved on since. A run with nothing staged under this
+    id landed under other inputs and has nothing of its own to describe.
     """
     if not cell.registry_root or not cell.staging_base:
         return
@@ -548,7 +548,7 @@ def _republish_provenance(
             "Zone %s year %d: no staging for run %s, so no provenance to republish", cell.zone, cell.year, cell.run_id
         )
         return
-    snapshots = mosaic_snapshots(mosaic_base, s1_orbit, get_credentials=cell.get_credentials, s3_region=cell.s3_region)
+    snapshots = staged_snapshots(cell.staging_base, cell.run_id, listing.complete, listing.skipped)
     _publish_provenance(cell, listing.complete, listing.skipped, snapshots, log)
 
 
@@ -978,7 +978,7 @@ def plan_zone_inference(
             )
         if state == "done":
             log.info("Zone %s year %d: update %s already recorded — nothing to do", zone, year, update.name)
-            _republish_provenance(cell, mosaic_base, config.s1_orbit, log)
+            _republish_provenance(cell, log)
             _merge_registry_master(
                 registry_root,
                 store_path,
@@ -1004,7 +1004,7 @@ def plan_zone_inference(
             tag,
             log,
             # Publication fails a cell before its tag, so an untagged landed cell may lack its record.
-            before_tag=lambda: _republish_provenance(cell, mosaic_base, config.s1_orbit, log),
+            before_tag=lambda: _republish_provenance(cell, log),
         )
         _merge_registry_master(
             registry_root, store_path, zone, year, None, get_credentials=get_credentials, s3_region=s3_region, log=log

@@ -12,6 +12,7 @@ from tessera_embeddings.config.inference import InferenceConfig
 from tessera_embeddings.config.store_geometry import band_axis, level0
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import ZarrWriter
+from tessera_embeddings.inference.provenance import PROVENANCE_ATTR, SNAPSHOTS_ATTR
 from tessera_embeddings.orchestration.runners import zone_fill
 from tessera_embeddings.storage import global_store, shard_writer
 from tessera_embeddings.storage.update import UpdateTarget, commit_update_record, update_record
@@ -1155,6 +1156,10 @@ def test_a_failed_publication_leaves_the_cell_untagged_and_its_retry_republishes
         )
     assert len(calls) == 1, "a failed check is not retried"
     assert "zone-01N-2025" not in global_store.open_global_repo(store).list_tags()
+    # The actor stages the snapshots it read; the mosaics' tips may have moved on since.
+    staged = zarr.open_group(f"{calls[0]['staging_base']}/r1/chunk_0_0.zarr", mode="a")
+    read = dict.fromkeys(calls[0]["mosaic_snapshots"], "snapshot-the-model-read")
+    staged.attrs.update({PROVENANCE_ATTR: {}, SNAPSHOTS_ATTR: read})
 
     monkeypatch.setattr(zone_fill, "publish_provenance", _recording_publish(calls, store))
     retry = run_fill(
@@ -1166,7 +1171,9 @@ def test_a_failed_publication_leaves_the_cell_untagged_and_its_retry_republishes
         run_id="r1",
     )
     assert retry["already_complete"] is True
+    assert len(calls) == 2
     assert calls[-1]["tagged"] is False and calls[-1]["embedded"] == ["chunk_0_0"]
+    assert calls[-1]["mosaic_snapshots"] == read, "republished from what the model read, not the tips"
     assert "zone-01N-2025" in global_store.open_global_repo(store).list_tags()
 
 

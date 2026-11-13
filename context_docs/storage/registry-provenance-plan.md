@@ -151,7 +151,8 @@ granule whose catalogue entry lacks its VV or VH file. A day the ingest skipped 
 and no fused granules, only its copies, each dropped for the day's reason unless already dropped for
 its own: `low_coverage`, too little
 clear ground for the coverage gate; `producer_conflict`, no single offset correction fitting the
-day's images; or `unreadable`, every copy of some image failed to read.
+day's images; `unreadable`, every copy of some image failed to read; or `missing_bands`, every radar
+granule of the day lacked VV or VH, so the loader had nothing to fuse.
 
 **`shard_dates`: what went into each shard.** Per run, one row per shard, sensor and date on which
 a granule had data at at least one of the shard's pixels:
@@ -168,7 +169,10 @@ touch the shard are not in it. `snapshot_id` names the mosaic the run read, and 
 **`pixel_sources`: which granule supplied each pixel.** Per run and sensor, an array of one signed
 16-bit integer per pixel per date. A value k is the granule's fusion order plus one, `|k| - 1`:
 positive when the model used the observation, negative when it rejected it, a cloud for instance,
-and 0 when no granule had data. The run's group names each sensor's mosaic snapshot, so the value
+and 0 when no granule had data. At a pixel with more valid observations than the model's deepest
+bucket (256 per sensor) the model reads an evenly spaced subset of the positive values
+(`build_resample_indices_v2`), which is deterministic from the count, so the plane keeps every
+valid one rather than repeating that selection. The run's group names each sensor's mosaic snapshot, so the value
 and its date find the granule in `granules` without going through `shard_dates`. A fully cloudy
 date keeps its plane. The planes compress to about one to one and a half megabytes per optical
 shard-year (§6). They live in an Icechunk store of their own because each run has its own dates, while the
@@ -420,7 +424,7 @@ sensor, snapshot and the run that first published it.
 | `solar_day` | date | the mosaic slot |
 | `fusion_order` | int16 | position in the day's fusion order, 0 first; null for a dropped copy |
 | `granule_id` | string | the catalogue id of the copy |
-| `status` | string | `fused`; for a copy dropped before the fuse, `duplicate`, `unreadable` or `missing_bands`; for every copy of a day skipped whole, `low_coverage`, `producer_conflict` or `unreadable` |
+| `status` | string | `fused`; for a copy dropped before the fuse, `duplicate`, `unreadable` or `missing_bands`; for every copy of a day skipped whole, `low_coverage`, `producer_conflict`, `unreadable` or `missing_bands` |
 | `image_key` | string | which image it is a copy of: Sentinel-2 datatake and datastrip (#240), Sentinel-1 burst id (#250) |
 | `platform` | string | `S2A`, `S1C` and so on |
 | `acquired_at` | timestamp, UTC | the acquisition instant |
@@ -480,8 +484,9 @@ cell. Tables and layout: `storage/provenance.py`. `source_runs`: `published_stor
 applied to the master by every registry merge and rebuild. The reader helpers: `storage/provenance_reader.py`.
 
 **Checks at publication**, each failing the zone-year: every mosaic slot has a granule list; the
-three mosaics agree on the switch; every embedded shard staged a record; each plane's positive
-count equals its row's `valid_px` and its absolute values are exactly 1 to the length of `sources`;
+three mosaics agree on the switch; every embedded shard staged a record; every staged shard was
+read from the snapshots the run publishes; each plane's positive count equals its row's `valid_px`
+and its distinct absolute values, less one, are its `sources`;
 every `sources` entry is a fused granule of that day in the snapshot the row names; a snapshot's `granules`
 file, if an earlier run published it, holds the lists read now; a holes update's mask counts
 exactly its `embedded_px` and its planes are zero outside it. Re-running these checks from the

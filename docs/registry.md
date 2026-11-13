@@ -239,7 +239,8 @@ way. The sensors are `s2` (optical), `s1_asc` and `s1_desc` (radar by orbit dire
   that would not read and was replaced; or `missing_bands`, a radar image whose catalogue entry
   lacks its VV or VH file. Fused rows have `status` `fused`. A day the ingest skipped whole has
   no fused rows, only its images, each marked with the day's reason: `low_coverage`,
-  `producer_conflict` or `unreadable`.
+  `producer_conflict`, `unreadable`, or `missing_bands` when every radar image of the day lacked a
+  polarisation.
 - **`shard_dates`**: one row per tile, sensor and date on which an image had data at the tile, with
   `valid_px`, the tile's pixels whose observation the model used that day; `sources`, the
   `fusion_order` of every image with data at at least one of its pixels, used or not; and
@@ -251,7 +252,8 @@ way. The sensors are `s2` (optical), `s1_asc` and `s1_desc` (radar by orbit dire
   `snapshot_<sensor>`. A value `k` names the image at `fusion_order = |k| - 1` in that mosaic's
   `granules` list for the date. Positive means the model used that observation; negative means the
   image had data there and the model rejected it, a cloud for instance; `0` means no image had
-  data.
+  data. One caveat on "used": the model takes at most 256 observations per sensor, so at a pixel
+  with more valid ones than that it read a fixed, evenly spaced subset of the positive values.
 
 ### Reading the record with the helpers
 

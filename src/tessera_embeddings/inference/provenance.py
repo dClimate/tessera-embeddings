@@ -68,6 +68,10 @@ STAGED_TIMES = "pixel_sources_{sensor}_time"
 #: The staged shard's attribute holding its ``shard_dates`` summary, beside the planes it describes.
 PROVENANCE_ATTR = "provenance"
 
+#: The staged shard's attribute naming the mosaic snapshots its planes were read from, by store
+#: path: what publication describes, and what a retry republishes from.
+SNAPSHOTS_ATTR = "mosaic_snapshots"
+
 #: A holes update's staged pixel mask: the pixels the run embedded, which the planes are cut to and
 #: which publication copies to ``update_pixels``.
 STAGED_UPDATE_PIXELS = "update_pixels"
@@ -144,9 +148,9 @@ class SourcePlanes:
     though a shard's strips load one at a time.
     """
 
-    def __init__(self, height: int, width: int) -> None:
-        """An empty record for a ``height`` by ``width`` shard."""
-        self.height, self.width = height, width
+    def __init__(self, height: int, width: int, snapshots: Mapping[str, str] | None = None) -> None:
+        """An empty record for a ``height`` by ``width`` shard read from the mosaic ``snapshots``."""
+        self.height, self.width, self.snapshots = height, width, dict(snapshots or {})
         self._pieces: dict[str, dict[int, list[SourcePiece]]] = {sensor: {} for sensor in SENSORS}
         self._lock = threading.Lock()
 
@@ -202,12 +206,13 @@ def staging_kwargs(planes: SourcePlanes, scales: np.ndarray, *, holes: bool) -> 
     return {"planes": planes, "pixels": ~np.isnan(scales) if holes else None}
 
 
-def stage_planes(group: zarr.Group, planes: SourcePlanes, pixels: np.ndarray | None) -> dict[str, Any]:
-    """Write each sensor's planes into a staged shard; return its ``shard_dates`` summary.
+def stage_planes(group: zarr.Group, planes: SourcePlanes, pixels: np.ndarray | None) -> None:
+    """Write each sensor's planes into a staged shard, with its ``shard_dates`` summary and snapshots.
 
     The planes go in as ``(time, northing, easting)`` arrays chunked one date by the shard, with
     their mosaic time indices beside them. The summary is ``{sensor: {"time", "sources",
-    "valid_px"}}``; the caller stores it as the shard's ``provenance`` attribute. A sensor whose
+    "valid_px"}}``, stored as the shard's ``provenance`` attribute, and the mosaic snapshots the
+    planes were read from as its ``mosaic_snapshots`` attribute. A sensor whose
     mosaic had no index is absent from both, so the record follows the mosaics sensor by sensor.
     ``pixels``, given only for a holes update, is the pixels the run embedded; the planes are cut to
     it and it is staged too, as the update's ``update_pixels`` mask.
@@ -244,7 +249,7 @@ def stage_planes(group: zarr.Group, planes: SourcePlanes, pixels: np.ndarray | N
             "sources": [d.sources for d in dates],
             "valid_px": [d.valid_px for d in dates],
         }
-    return summary
+    group.attrs.update({PROVENANCE_ATTR: summary, SNAPSHOTS_ATTR: planes.snapshots})
 
 
 def staged_planes(group: zarr.Group, sensor: str) -> tuple[np.ndarray, zarr.Array] | None:

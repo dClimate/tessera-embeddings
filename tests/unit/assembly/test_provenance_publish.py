@@ -29,7 +29,7 @@ from tessera_embeddings.config.inference import ZoneLayout
 from tessera_embeddings.config.ingest import PROVENANCE_VERSION, SOURCE_INDEX_VAR
 from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
-from tessera_embeddings.inference.provenance import PROVENANCE_ATTR, SourcePlanes, read_source_pieces
+from tessera_embeddings.inference.provenance import PROVENANCE_ATTR, SNAPSHOTS_ATTR, SourcePlanes, read_source_pieces
 from tessera_embeddings.inference.provenance_publish import ProvenanceCheckError, ProvenanceRun, publish_provenance
 from tessera_embeddings.storage.manifest import IngestManifest
 from tessera_embeddings.storage.provenance import (
@@ -141,7 +141,7 @@ SOME_REJECTED[1] = False
 
 def _planes(pins: dict[str, str], chunk: ChunkSpec, valid: np.ndarray = ALL_VALID) -> SourcePlanes:
     """The actor's record of ``chunk``, read off the pinned mosaics; ``valid`` is the model's test."""
-    planes = SourcePlanes(SHARD, SHARD)
+    planes = SourcePlanes(SHARD, SHARD, pins)
     for path, pin in pins.items():
         root = open_store_as_zarr_group(path, snapshot_id=pin)
         times = np.arange(len(DATES))
@@ -323,6 +323,17 @@ def test_a_shard_no_pass_of_one_sensor_covered_publishes_without_it(tmp_path: Pa
     _publish(tmp_path, pins, embedded, refused)
     sensors = {r["sensor"] for r in _shard_dates(tmp_path).to_pylist() if r["tile"] == "chunk_0_0"}
     assert sensors == {"s2", "s1_asc"}
+
+
+def test_a_shard_read_from_other_mosaic_snapshots_fails_the_publication(tmp_path: Path) -> None:
+    """Its planes number another version's granules, so describing it from the run's would mislead."""
+    pins = _mosaics(tmp_path / "mosaics")
+    embedded, refused = _stage(tmp_path / "staging", pins)
+    group = zarr.open_group(str(tmp_path / "staging" / RUN / "chunk_0_1.zarr"), mode="a")
+    group.attrs[SNAPSHOTS_ATTR] = dict.fromkeys(pins, "another-version")
+    with pytest.raises(ProvenanceCheckError, match=r"\['chunk_0_1'\] were read from mosaic snapshots other"):
+        _publish(tmp_path, pins, embedded, refused)
+    assert not (tmp_path / "registry").exists(), "refused before anything is written"
 
 
 def test_an_embedded_shard_with_no_record_fails_the_publication(tmp_path: Path) -> None:
