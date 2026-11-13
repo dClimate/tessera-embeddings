@@ -180,13 +180,16 @@ finds no arrays and returns an empty dataset.
 ## Stores built with v2
 
 Everything above describes the published v1.1 store. A store built with the v2 model differs in
-three ways ([ADR 031](../context_docs/decisions/031-the-v2-store-chunks-the-band-axis-at-16.md)):
+four ways ([ADR 031](../context_docs/decisions/031-the-v2-store-chunks-the-band-axis-at-16.md)):
 
-- **The arrays sit one group deeper**, in each zone's level group `0`: open `group="33N/0"`. The
-  zone group `33N` keeps the attributes (`crs`, `proj:`, `spatial:`, `years_complete`, `runs`,
-  `updates`) and declares itself a `multiscales` pyramid whose only level so far is `0`.
-  The library's own `open_store(path, group="33N")` descends into `0` for you and carries the zone's
-  attributes onto the dataset.
+- **Zones are full UTM columns**, `utm01` to `utm60`, each spanning both hemispheres
+  ([ADR 037](../context_docs/decisions/037-v2-stores-use-the-utm-zones-layout.md)), so there is no
+  `33N`; the campaign fills each column as two halves, `utm33n` and `utm33s`.
+- **The arrays sit one group deeper**, in each zone's level group `0`: open `group="utm33/0"`. The
+  column group `utm33` keeps the attributes (`crs`, `proj:`, `spatial:`, `years_complete`,
+  `halves_complete`, `runs`, `updates`) and declares itself a `multiscales` pyramid whose only
+  level so far is `0`. The library's own `open_store(path, group="utm33")` descends into `0` for
+  you and carries the column's attributes onto the dataset.
 - **`embeddings` is `(time, band, y, x)`**, in shards of 16 dimensions cut into 512 × 512-pixel
   chunks of 4. v2's first 16, 32 and 64 dimensions each work as a shorter embedding, listed in the
   root's `embedding_prefixes`, and a read of the first 16 fetches an eighth of what all 128 cost.
@@ -199,7 +202,7 @@ With Dask, give it one task per shard rather than one per chunk, which halves th
 full vectors:
 
 ```python
-ds = xr.open_zarr(session.store, group="33N/0", consolidated=False,
+ds = xr.open_zarr(session.store, group="utm33/0", consolidated=False,
                   chunks={"time": 1, "band": 16, "y": 2048, "x": 2048})
 first16 = ds.embeddings.isel(band=slice(0, 16)) * ds.scales
 ```

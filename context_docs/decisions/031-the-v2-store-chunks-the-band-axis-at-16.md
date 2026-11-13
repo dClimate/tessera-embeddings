@@ -390,7 +390,7 @@ the same code unchanged.
   - Every reader and writer reaches the arrays through one helper, `store_geometry.level0`, which
     returns a v1.1 group unchanged: zone fill, targeted updates, the shard writer, the
     published-store audit, the registry rebuild and marking a zone-year empty.
-  - `zarr_store.open_store(path, group="33N")` descends into `0` and carries the zone's attributes
+  - `zarr_store.open_store(path, group="utm33")` descends into `0` and carries the zone's attributes
     onto the dataset.
 - **Every axis is found by name.** `store_geometry.axis_roles`, `window` and `reorder` build each
   index and each layout change from an array's dimension names, matching axes by role (time, band,
@@ -410,7 +410,7 @@ the same code unchanged.
   `geoemb:dimensions=128`.
 - **Reader-facing metadata.** The store root lists the model's usable prefixes in
   `embedding_prefixes` (16, 32, 64, 128, from `ModelFamily.prefixes`). The reader guide
-  ([`docs/global-store.md`](../../docs/global-store.md#stores-built-with-v2)) gives the `33N/0` path,
+  ([`docs/global-store.md`](../../docs/global-store.md#stores-built-with-v2)) gives the `utm33/0` path,
   zarr ≥ 3.3, and Dask chunks matched to shards (`chunks={"band": 16, "y": 2048, "x": 2048}`).
 - **Eight shards per processing shard mean 8× the embeddings shards, index entries and writes.** The
   busiest v1.1 zone-year wrote 9,132 processing shards, so a v2 zone-year holds at most about 140,000 index

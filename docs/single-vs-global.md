@@ -508,8 +508,8 @@ a cheaper point read than the figures above.
 **v2 stores split the band axis.** `embeddings` is `(time, band, y, x)`, each processing shard stored as
 eight shards of 16 bands, each cut into 512 × 512-pixel chunks of 4 bands (1.05 MB raw), so a
 reader of the first 16 dimensions fetches an eighth of a full vector and a phone reading 4 fetches
-a thirty-second. Every array, coordinates included, sits in the zone's level group `0` (`33N/0`, or
-`0/` in a single-area store); the zone's attributes stay on `33N`. The other arrays keep the
+a thirty-second. Every array, coordinates included, sits in the zone's level group `0` (`utm33/0`, or
+`0/` in a single-area store); the zone's attributes stay on `utm33`. The other arrays keep the
 shards above, in 512 × 512-pixel chunks. Why, and what each choice was measured against:
 [ADR 031](../context_docs/decisions/031-the-v2-store-chunks-the-band-axis-at-16.md).
 
