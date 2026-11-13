@@ -196,17 +196,22 @@ two or three versions a month; the figures are in the context document.
 
 ## Scoring
 
-This repository does not include code for these steps. They are written down so that every
-implementation computes the same thing.
+This repository does not include code for these steps. The pass decision compares two stores
+scored by the same code, so it needs one implementation used for both versions, not agreement
+between implementations. For scores that can be compared across teams, use the settings at the
+end of this section, which are the ones the TESSERA team's implementation uses.
 
 **Read each label's embedding** from the pixel that contains its point, in the year the label
 applies to, from both stores. [`global-store.md`](global-store.md) shows how to open a store and turn
 its stored integers back into embedding values. Zone `utm31n` is in the store's group `utm31`, with
 `x` and `y` in the map projection EPSG:32631. If a label's pixel has no embedding in one store or
-the other, leave that label out for both versions, and report how many were left out.
+the other, leave that label out for both versions, and report how many were left out. Also report
+how many labels the baseline embeds and the new version does not: if that is more than 1% of the
+baseline's, find out why before adopting the version, since a version that loses the hardest
+labels would otherwise score higher.
 
 - **PASTIS:** use pixels from each patch's `TARGET` file, leaving out class 0 (background) and
-  class 19 (unlabelled). Take at most 50 pixels per patch, chosen at random with a fixed seed.
+  class 19 (unlabelled). Take at most 50 pixels per patch, chosen at random.
   PASTIS splits its patches into five groups (`Fold`): train on groups 1–3 and test on group 5.
   Each patch's outline in `metadata.geojson` is in the Lambert-93 projection (EPSG:2154).
   The patches were cut from Sentinel-2 images, so each is a square on its UTM zone's 10 m grid.
@@ -229,6 +234,12 @@ the baseline's. To decide "clearly", repeat the comparison 1,000 times, each tim
 drawn at random with replacement, scoring both versions on the same draw. Sort the 1,000
 differences (new version minus baseline). If even the 975th smallest is below zero, the version is
 worse on nearly every draw and fails; otherwise it passes.
+
+**Settings.** The classifier is scikit-learn's `LogisticRegression` with its default settings
+and `max_iter=1000`, on the embedding values without scaling. Random choices use NumPy's
+`default_rng`: each PASTIS patch's pixels are drawn with the patch's `ID_PATCH` as the seed, and the
+1,000 resamples with seed 0, the same draws for both versions. Each draw's balanced accuracy
+averages over the classes present among its test points.
 
 **Check how many pixels have embeddings.** For each area and year, report the share of pixels
 inside the mask that hold an embedding, in both stores. If a version embeds more than one
