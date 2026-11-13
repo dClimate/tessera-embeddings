@@ -139,8 +139,8 @@ prefect deployment run --watch 'build-land-mask-coverage/<deployment>' -p paths=
 
 `run_validation=false` skips all the mask's self-checks, because some of them expect the whole
 world's land: one requires the tile over Paris to be land whenever zone `utm31n` is built, and these
-areas leave it out. The mask is checked instead by the land-cell count above and by the coverage
-check after each fill.
+areas leave it out. The list of cells is checked by the count in step 1; the built mask itself is
+not checked, so build it once and reuse it.
 
 If the areas ever change, build the new mask under a new name. The same applies to a change to the
 land-mask builder itself: build one mask for each version, so that the coverage check below can
