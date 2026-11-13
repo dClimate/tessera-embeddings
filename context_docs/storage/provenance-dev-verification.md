@@ -161,7 +161,7 @@ concurrent refills, the two orders review found, have unit tests only.
 ### Signed planes, set-aside copies and skipped days
 
 `fill-zones-sequential` filled 33N/2024 on twelve shards with the switch on (run
-`33N-2024-4d08ceff`, 47 min: 22 of ingest, 11 waiting for GPUs, 38 of inference on up to two
+`33N-2024-4d08ceff`, 47 min of wall clock, the phases overlapping across shards: 22 of ingest, 11 waiting for GPUs, 38 of inference on up to two
 GPUs, then 70 s of assembly).
 Publication wrote 1,579 `granules` rows and 2,148 `shard_dates` rows. The cell validation passed
 18 checks; its two findings, seams in the optical observation count at shard boundaries, are
@@ -226,8 +226,8 @@ its code is gone.
 
 | piece | measured | per zone-year |
 |---|---|---|
-| `pixel_sources`, optical | 1.14 and 1.22 MB a shard-year | as the plan's Appendix A (1.17) |
-| `pixel_sources`, radar | 0.07–0.20 MB a shard-year per orbit | a sixth of optical or less |
+| `pixel_sources`, optical, first day's two shards, unsigned ranks | 1.14 and 1.22 MB a shard-year | as the plan's Appendix A (1.17); the published planes' sizes are in the tables below |
+| `pixel_sources`, radar, the same | 0.07–0.20 MB a shard-year per orbit | a sixth of optical or less |
 | `granules`, zone 35N, one week | about 970 optical granules a day (151 B a row), 900–2,600 ascending and 1,000–2,500 descending bursts a day (93–110 B a row) | about 160 MB for a land-dense zone; the plan said under 100 MB |
 | the `granules` lists inside the mosaic | 0.10–0.17 MB a day per sensor, compressed | about 150 MB, deleted with the mosaic |
 
