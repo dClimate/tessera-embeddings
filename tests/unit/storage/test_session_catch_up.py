@@ -46,6 +46,14 @@ def _commit_to(repo, group, value):
     return session.commit(f"fill {group}")
 
 
+#: Dimension names by path for the pure cases, which have no repository to read them from.
+_DIMS = {
+    "/01N/embeddings": ("time", "northing", "easting", "band"),
+    "/01N/0/embeddings": ("time", "band", "y", "x"),
+    "/01N/time": ("time",),
+}
+
+
 class _FakeDiff:
     """A duck-typed :class:`icechunk.Diff` for the pure-function cases.
 
@@ -55,8 +63,8 @@ class _FakeDiff:
     """
 
     def __init__(self, *, chunks=(), groups=(), arrays=(), moved=()):
-        # A chunk is a path, written at coordinate (0, 0, 0), or a ``(path, coords)`` pair.
-        self.updated_chunks = dict(c if isinstance(c, tuple) else (c, [[0, 0, 0]]) for c in chunks)
+        # A chunk is a path, written at coordinate (0, 0, 0, 0), or a ``(path, coords)`` pair.
+        self.updated_chunks = dict(c if isinstance(c, tuple) else (c, [[0, 0, 0, 0]]) for c in chunks)
         self.updated_groups = set(groups)
         self.new_groups = set()
         self.deleted_groups = set()
@@ -104,8 +112,16 @@ def test_which_changes_count_as_somebody_else_writing_our_cell(diff, touched):
 def test_given_its_shards_only_a_collision_is_ours(diff, touched):
     # ADR 038: the other half of a column fills the same group at once, writing other shards
     # and marking itself in the group's attrs. Neither can collide with a shard-only session.
-    assert session_catch_up._diff_touches(diff, "01N", {(0, 1, 0)}) is touched
-    assert session_catch_up._diff_touches(_FakeDiff(chunks=["/01N/embeddings"]), "01N", {(0, 0, 0)})
+    assert session_catch_up._diff_touches(diff, "01N", {(0, 1, 0)}, _DIMS.get) is touched
+    assert session_catch_up._diff_touches(_FakeDiff(chunks=["/01N/embeddings"]), "01N", {(0, 0, 0)}, _DIMS.get)
+
+
+@pytest.mark.parametrize(("coords", "touched"), [([0, 1, 1, 0], True), ([0, 1, 0, 1], False)], ids=["ours", "other"])
+def test_a_band_first_chunk_is_placed_by_its_axis_names(coords, touched):
+    # (time, band, y, x): [0, 1, 1, 0] is band shard 1 of our shard; [0, 1, 0, 1] is shard (0, 1) though its
+    # first three coordinates read as ours.
+    diff = _FakeDiff(chunks=[("/01N/0/embeddings", [coords])])
+    assert session_catch_up._diff_touches(diff, "01N", {(0, 1, 0)}, _DIMS.get) is touched
 
 
 def test_the_stub_carries_every_member_of_the_real_diff():
