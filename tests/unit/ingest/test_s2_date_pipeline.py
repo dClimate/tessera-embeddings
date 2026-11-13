@@ -887,6 +887,41 @@ def test_a_day_the_gate_drops_is_listed_once_the_mosaic_exists(run_ingest, monke
     assert all([g["status"] for g in listed] == ["low_coverage"] for listed in committed.values())
 
 
+@pytest.mark.parametrize("way", ["producer-conflict", "unreadable", "fallback-fails-coverage"])
+def test_every_way_of_giving_up_a_day_lists_it(run_ingest, monkeypatch, way):
+    """Each path that gives a day up commits its copies once, each under the reason it had.
+
+    Over a store that already holds a date, so each list commits as the day is given up.
+    """
+    committed: list[dict] = []
+    monkeypatch.setattr(
+        provenance,
+        "record_skipped_days",
+        lambda _store, lists, **_k: committed.append({d: json.loads(g) for d, g in lists.items()}),
+    )
+    newer, older = _copies("2024-01-01")
+    kwargs: dict = {"catalogue": [newer, older]}
+    if way == "producer-conflict":
+        kwargs["load_raises"] = HeterogeneousProducerError("2024-01-01: no single offset decision fits")
+    else:
+        # The newer copy will not read; the older, if offered, reads and fails the gate.
+        def gate(*_a, **_k):
+            return (
+                _missing_object_gate() if way == "unreadable" or FUSION_POSITION in newer.properties else (False, None)
+            )
+
+        monkeypatch.setattr(s2_roi, "_coverage_from_scl", gate)
+    run_ingest({"2024-01-01": True}, pipeline_dates=False, provenance=True, existing_dates={"2023-12-31"}, **kwargs)
+    listed = [[(g["granule_id"], g["status"]) for g in day] for commit in committed for day in commit.values()]
+    assert listed == [
+        {
+            "producer-conflict": [(newer.id, "producer_conflict"), (older.id, "duplicate")],
+            "unreadable": [(newer.id, "unreadable"), (older.id, "unreadable")],
+            "fallback-fails-coverage": [(newer.id, "unreadable"), (older.id, "low_coverage")],
+        }[way]
+    ]
+
+
 def test_with_the_record_off_no_write_carries_a_list(run_ingest):
     run = run_ingest(SKIP_CHAIN, pipeline_dates=False)
     assert run.granules == {"2024-01-01": None, "2024-01-05": None}
