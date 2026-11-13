@@ -25,6 +25,7 @@ Measurements and the full incident record are in
 
 from __future__ import annotations
 
+import functools
 import logging
 import threading
 from collections.abc import Callable, Collection, Generator
@@ -97,9 +98,19 @@ def _shard_of(coords: list[int], names: tuple[str, ...]) -> tuple[int, ...] | No
 
 
 def _dims_at(repo: icechunk.Repository, snapshot: str) -> Callable[[str], tuple[str, ...]]:
-    """Each array's dimension names at *snapshot*, by path."""
-    store = repo.readonly_session(snapshot_id=snapshot).store
-    return lambda path: dims_of(zarr.open_array(store, path=path, mode="r"))
+    """Each array's dimension names at *snapshot*, by path: the snapshot is opened on the first
+    lookup and each array read once, so a catch-up over many commits stays a handful of reads.
+    """
+
+    @functools.cache
+    def store() -> icechunk.IcechunkStore:
+        return repo.readonly_session(snapshot_id=snapshot).store
+
+    @functools.cache
+    def dims(path: str) -> tuple[str, ...]:
+        return dims_of(zarr.open_array(store(), path=path, mode="r"))
+
+    return dims
 
 
 def _diff_touches(
@@ -140,7 +151,8 @@ def _diff_touches(
     paths |= {
         str(path)
         for path, coords in diff.updated_chunks.items()
-        if shards is None or dims is None or any(_shard_of(c, dims(path)) in colliding for c in coords)
+        if str(path).startswith(prefix)  # another group's chunks never count, so their axes are never read
+        and (shards is None or dims is None or any(_shard_of(c, dims(str(path))) in colliding for c in coords))
     }
     # A rename populates `moved_nodes` and NOTHING else — no chunks, no arrays, no groups — so
     # omitting it made a commit that renamed our own array read as untouched. Both ends count:
