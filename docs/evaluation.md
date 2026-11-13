@@ -274,6 +274,10 @@ running these areas; the context document shows the working.
 - **The normal test covers one year per area**, so a change that harms only some years, such as
   2017's thinner imagery, can pass unnoticed.
 - **It does not test the single-area runner**, which these steps do not use.
+- **It does not test a change to the campaign driver** (`run-global-campaign`): how it builds the
+  list of work, splits cells, routes them to deployments, passes settings on or retries. The steps
+  launch `fill-zones-sequential` directly, so the driver never runs. Only what the fill itself runs,
+  from downloading to the finished store, is tested.
 - **It does not test a change to the land mask**, or to how land cells become the areas each run
   downloads. Every version shares one mask and the files derived from it, and the coverage check
   measures each store against that mask, so a change there goes unseen.
