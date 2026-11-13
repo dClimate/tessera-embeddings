@@ -204,8 +204,8 @@ applies to, from both stores. [`global-store.md`](global-store.md) shows how to 
 its stored integers back into embedding values. Zone `utm31n` is in the store's group `utm31`, with
 `x` and `y` in the map projection EPSG:32631. If a label's pixel has no embedding in one store or
 the other, leave that label out for both versions, and report how many were left out. Also report
-how many labels the baseline embeds and the new version does not: if that is more than 1% of the
-baseline's, find out why before adopting the version, since a version that loses the hardest
+how many labels the baseline embeds and the new version does not: if, for any class, that is more
+than 1% of the baseline's, find out why before adopting the version, since a version that loses the hardest
 labels would otherwise score higher.
 
 - **PASTIS:** use pixels from each patch's `TARGET` file, leaving out class 0 (background) and
