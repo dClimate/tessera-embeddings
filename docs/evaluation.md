@@ -211,7 +211,8 @@ baseline's, find out why before adopting the version, since a version that loses
 labels would otherwise score higher.
 
 - **PASTIS:** use pixels from each patch's `TARGET` file, leaving out class 0 (background) and
-  class 19 (unlabelled). Take at most 50 pixels per patch, chosen at random.
+  class 19 (unlabelled). Take at most 50 pixels per patch, chosen at random from all its labelled pixels, before
+  leaving out those without an embedding.
   PASTIS splits its patches into five groups (`Fold`): train on groups 1–3 and test on group 5.
   Each patch's outline in `metadata.geojson` is in the Lambert-93 projection (EPSG:2154).
   The patches were cut from Sentinel-2 images, so each is a square on its UTM zone's 10 m grid.
@@ -235,8 +236,8 @@ drawn at random with replacement, scoring both versions on the same draw. Sort t
 differences (new version minus baseline). If even the 975th smallest is below zero, the version is
 worse on nearly every draw and fails; otherwise it passes.
 
-**Settings.** The classifier is scikit-learn's `LogisticRegression` with its default settings
-and `max_iter=1000`, on the embedding values without scaling. Random choices use NumPy's
+**Settings.** The classifier is scikit-learn's `LogisticRegression` with `solver="lbfgs"`,
+`C=1.0` and `max_iter=1000`, on the embedding values without scaling. Random choices use NumPy's
 `default_rng`: each PASTIS patch's pixels are drawn with the patch's `ID_PATCH` as the seed, and the
 1,000 resamples with seed 0, the same draws for both versions. Each draw's balanced accuracy
 averages over the classes present among its test points.
