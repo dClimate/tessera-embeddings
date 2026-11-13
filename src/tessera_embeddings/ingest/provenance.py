@@ -257,12 +257,18 @@ class SkippedDays:
 
     def record(self, day: str, items: Iterable[Any], reason: str | None) -> None:
         """List ``day``'s copies among ``items`` under the status for ``reason``, and commit them."""
-        status = _SKIP_STATUS.get(reason or "")
-        day_items = [item for item in items if solar_day_of(item) == day]
-        if status is None or not day_items:
+        self.record_days([day], items, reason)
+
+    def record_days(self, days: Iterable[str], items: Iterable[Any], reason: str | None) -> None:
+        """:meth:`record` for each of ``days``, in one commit."""
+        status, items = _SKIP_STATUS.get(reason or ""), list(items)
+        if status is None:
             return
-        mark_dropped((item for item in day_items if DROPPED not in item.properties), status)
-        self._pending[day] = day_granules(day_items, **self.source)[day]
+        for day in days:
+            day_items = [item for item in items if solar_day_of(item) == day]
+            if day_items:
+                mark_dropped((item for item in day_items if DROPPED not in item.properties), status)
+                self._pending[day] = day_granules(day_items, **self.source)[day]
         self._commit()
 
     def written(self) -> None:

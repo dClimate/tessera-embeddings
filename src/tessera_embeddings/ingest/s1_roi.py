@@ -840,8 +840,7 @@ def ingest_s1_roi_sar(
         data, baselines, query_s = prepared.data, prepared.baselines, prepared.query_s
 
         refresh_credentials_if_stale()
-        for day in prepared.bandless_days:
-            skipped.record(day, prepared.items, "missing-bands")
+        skipped.record_days(prepared.bandless_days, prepared.items, "missing-bands")
 
         if data is not None:
             # The ROI mask was applied in _prepare_batch, on the same side of the phase
