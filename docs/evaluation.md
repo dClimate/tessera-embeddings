@@ -191,10 +191,10 @@ every year from 2017 to 2025, for both versions.
 **Test one version at a time.** Versions share the downloaded imagery, and each run deletes a zone's
 imagery for a year once that zone and year are finished (the `cleanup_mosaics` setting, on by
 default). Downloading it again for every run costs less than keeping it, unless you test more than
-two or three versions a month; the figures are in the context document. A run that fails before
-a zone and year are finished leaves their imagery behind, and the next run reuses it whichever
-branch made it, so delete `<inputs>/mosaics/<zone>/<year>` for those cells before testing another
-version.
+two or three versions a month; the figures are in the context document. Before testing another
+version, check that `<inputs>/mosaics/` holds nothing for the zones and years run, and delete what
+remains. A run that fails, or whose cleanup fails after its cells have landed, leaves imagery
+behind, and the next run reuses it whichever branch made it.
 
 ## Scoring
 
