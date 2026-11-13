@@ -1115,7 +1115,7 @@ def ingest_s2_roi_reflectance(
                     # failed coverage, or reaches no live window). That is a legitimate
                     # skip, not a read failure, and must not be recorded as data loss.
                     # A fallback that ALSO failed to read keeps its place in the ladder.
-                    total_filtered += 1
+                    _record_skip(attempt)
                     return
 
         def _write_batch_or_isolate(batch: list[_PreparedDate], stall_s: float) -> None:

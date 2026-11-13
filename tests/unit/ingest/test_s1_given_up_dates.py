@@ -22,6 +22,7 @@ import numpy as np
 import pytest
 import xarray as xr
 
+from tessera_embeddings.config.ingest import DROPPED, MISSING_BANDS
 from tessera_embeddings.errors import ProviderRefusedReadsError
 from tessera_embeddings.ingest import provenance, s1_roi
 from tessera_embeddings.storage.zarr_store import STORE_WRITE_ATTEMPTS, store_write_retrying
@@ -162,6 +163,24 @@ def test_a_given_up_date_lists_its_bursts_as_unreadable(monkeypatch) -> None:
     _run(monkeypatch, failures={"2024-01-02": _raise("WarpOperationError: Chunk and warp failed", "ZIPDecode: error")})
     assert {day: [(g["granule_id"], g["status"]) for g in json.loads(listed)] for day, listed in committed.items()} == {
         "2024-01-02": [("burst-2024-01-02", "unreadable")]
+    }
+
+
+def test_a_day_whose_every_burst_lacks_a_polarisation_lists_them_as_missing_bands(monkeypatch) -> None:
+    """The loader never sees such a day, so it has no slot; its bursts are recorded off the time axis."""
+    committed: dict[str, list] = {}
+    monkeypatch.setattr(provenance, "record_skipped_days", lambda _s, lists, **_k: committed.update(lists))
+
+    def provider(*_a, dropped: list, **_k):
+        bandless = fake_stac_item("2024-01-03", item_id="burst-hh")
+        bandless.properties[DROPPED] = MISSING_BANDS
+        dropped.append(bandless)
+        return lambda: [fake_stac_item(day, item_id=f"burst-{day}") for day in _CATALOGUE if day != "2024-01-03"]
+
+    monkeypatch.setattr(s1_roi, "make_s1_item_provider", provider)
+    _run(monkeypatch, failures={}, catalogue=[d for d in _CATALOGUE if d != "2024-01-03"])
+    assert {day: [(g["granule_id"], g["status"]) for g in json.loads(listed)] for day, listed in committed.items()} == {
+        "2024-01-03": [("burst-hh", "missing_bands")]
     }
 
 

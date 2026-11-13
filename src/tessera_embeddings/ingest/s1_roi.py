@@ -60,6 +60,7 @@ from tessera_embeddings.ingest.solar_days import (
     normalize_to_solar_day,
     owned_items,
     resume_window_start,
+    solar_day_of,
     solar_grouping_longitude,
     validated_batch_days,
     validated_window,
@@ -248,6 +249,9 @@ class _PreparedBatch:
     granules: dict[str, str] = field(default_factory=dict)
     #: Every granule the query returned, the set-aside ones included, for a day given up whole.
     items: list = field(default_factory=list)
+    #: Owned solar days whose every burst was set aside for a missing VV or VH: the loader never
+    #: sees them, so they get no slot and are recorded as skipped instead.
+    bandless_days: list[str] = field(default_factory=list)
 
 
 def _baselines_for(baselines: dict[str, int], dates: Iterable[str]) -> dict[str, int]:
@@ -798,6 +802,13 @@ def ingest_s1_roi_sar(
             # The items the load stamped are the ones it fused, in each day's burst order.
             day_granules([*seen_items, *dropped_items], **_RADAR_SOURCE) if provenance and data is not None else {},
             [*seen_items, *dropped_items],
+            sorted(
+                {
+                    solar_day_of(it)
+                    for it in owned_items(normalize_to_solar_day(dropped_items, mid_longitude=mid_longitude), rng)
+                }
+                - {solar_day_of(it) for it in seen_items}
+            ),
         )
 
     # depth=1: one batch prepared ahead. A batch's write is one long consume, so a single
@@ -829,6 +840,8 @@ def ingest_s1_roi_sar(
         data, baselines, query_s = prepared.data, prepared.baselines, prepared.query_s
 
         refresh_credentials_if_stale()
+        for day in prepared.bandless_days:
+            skipped.record(day, prepared.items, "missing-bands")
 
         if data is not None:
             # The ROI mask was applied in _prepare_batch, on the same side of the phase

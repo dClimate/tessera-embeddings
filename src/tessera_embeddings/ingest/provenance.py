@@ -36,6 +36,7 @@ from tessera_embeddings.config.ingest import (
     DUPLICATE,
     FUSED,
     LOW_COVERAGE,
+    MISSING_BANDS,
     PRODUCER_CONFLICT,
     UNREADABLE,
 )
@@ -232,7 +233,12 @@ def day_granules(
 
 #: The ingest's reasons for skipping a whole day, as the status its copies are listed under. A day
 #: whose imagery reached no live window is absent: none of it covered a pixel the store embeds.
-_SKIP_STATUS = {"coverage": LOW_COVERAGE, "producer-conflict": PRODUCER_CONFLICT, "unreadable": UNREADABLE}
+_SKIP_STATUS = {
+    "coverage": LOW_COVERAGE,
+    "producer-conflict": PRODUCER_CONFLICT,
+    "unreadable": UNREADABLE,
+    "missing-bands": MISSING_BANDS,
+}
 
 
 class SkippedDays:
