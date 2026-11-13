@@ -131,13 +131,18 @@ each cell against the original image files, which is safe because the lines were
 from a list that was checked when it was published:
 
 ```bash
-prefect deployment run 'build-land-mask-coverage/<deployment>' -p paths='<paths>' \
+prefect deployment run --watch 'build-land-mask-coverage/<deployment>' -p paths='<paths>' \
     -p name=evaluation -p zone_layout=utm_zones -p verify=false \
     -p registry_uri=s3://global-tessera-inputs-dev/evaluation/masks/evaluation-registry.txt \
-    -p zones='["utm17n", "utm30n", "utm31n", "utm32n", "utm37n"]'
+    -p zones='["utm17n", "utm30n", "utm31n", "utm32n", "utm37n"]' -p run_validation=false
 ```
 
-If the areas ever change, build the new mask under a new name. A store records only the name of the
+`run_validation=false` skips the mask's self-checks, which expect the whole world's land: one
+requires the tile over Paris to be land whenever zone `utm31n` is built, and these areas leave it out.
+
+If the areas ever change, build the new mask under a new name. The same applies to a change to the
+land-mask builder itself: build one mask for each version, so that the coverage check below can
+see the difference. A store records only the name of the
 mask it was made with, so two different masks under one name cannot be told apart afterwards.
 
 **3. Copy each model's weights** into `<inputs>/models/`, where the flows look for them:
@@ -154,7 +159,7 @@ aws s3 cp s3://global-tessera-inputs-dev/models/v2_student_large.pt \
 as the global dataset does:
 
 ```bash
-prefect deployment run 'seed-global-store/<deployment>' -p paths='<paths>' \
+prefect deployment run --watch 'seed-global-store/<deployment>' -p paths='<paths>' \
     -p model_version=v2-large -p optical_min_obs=1
 ```
 
@@ -162,12 +167,16 @@ A version that changes the code but keeps the model's weights still uses `model_
 New weights first need their own `model_version` in this library, as any new model does before a
 global run.
 
-**2. Run it** from the Prefect deployment of the version's code branch.
+**2. Run it** from the Prefect deployment of the version's code branch. The fill hands each cell's
+download to an `ingest-zone-year` deployment, named by its `ingest_deployment` setting, and that
+deployment hands the Sentinel-1 and Sentinel-2 downloads to deployments chosen by `branch`. Both
+must point at the same branch, or a change to the download code is tested with the baseline's.
+Deployments registered for a branch may already set them; check with the deployment's parameters.
 `allow_s2_only=true` embeds pixels that have Sentinel-2 observations but no Sentinel-1 radar, as
 the global dataset does:
 
 ```bash
-prefect deployment run 'fill-zones-sequential/<deployment>' -p paths='<paths>' \
+prefect deployment run --watch 'fill-zones-sequential/<deployment>' -p paths='<paths>' \
     -p mask_name=evaluation -p allow_s2_only=true \
     -p cells='[["utm30n", 2019], ["utm31n", 2019], ["utm32n", 2019], ["utm37n", 2020], ["utm17n", 2018]]'
 ```
@@ -205,7 +214,7 @@ the other, leave that label out for both versions, and report how many were left
   first holds the crop types: `TARGET[0, i, j]` is the pixel whose centre is `(i + 0.5) × 10` m
   below the top edge and `(j + 0.5) × 10` m right of the left edge.
 - **The AlphaEarth files:** use every point inside the areas, with the `split` it comes with. A
-  point counts in the year its `valid_time_start` falls in, so the French LUCAS points, all from
+  point counts in the year its `valid_time_start_ms` falls in (Unix time in milliseconds), so the French LUCAS points, all from
   2017 and 2018, are scored only when those years are run.
 
 **Score each set of labels** by training a logistic-regression classifier on the training points'
@@ -213,7 +222,7 @@ embeddings and measuring it on the test points. Report the balanced accuracy, wh
 over classes of the share of each class's test points predicted correctly. Leave out any class with
 fewer than 10 training points inside the areas.
 
-**A version passes** if, for every set of labels, its balanced accuracy is not clearly lower than
+**A version passes** if, for every set of labels with points in the years run, its balanced accuracy is not clearly lower than
 the baseline's. To decide "clearly", repeat the comparison 1,000 times, each time on test points
 drawn at random with replacement, scoring both versions on the same draw. Sort the 1,000
 differences (new version minus baseline). If even the 975th smallest is below zero, the version is
@@ -226,7 +235,8 @@ accuracy passes.
 
 **If you ran all nine years**, score every set of labels in every year it has labels. And for each
 area, report how similar each pixel's embedding is from one year to the next (the median
-cosine similarity between consecutive years), for both versions. A large difference from the
+cosine similarity between consecutive years), for both versions. Use the same pixels for both
+versions: those holding an embedding in both years in both stores. A large difference from the
 baseline is worth explaining, but it is not by itself a failure.
 
 **The published v1.1 dataset is a useful extra comparison**, though not a pass mark, since a
