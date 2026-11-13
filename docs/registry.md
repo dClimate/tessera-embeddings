@@ -260,7 +260,8 @@ way. The sensors are `s2` (optical), `s1_asc` and `s1_desc` (radar by orbit dire
 
 `tessera_embeddings.storage.provenance_reader` answers the three usual questions as polars tables.
 `REGISTRY` is the registry's root, beside the store it describes; `anonymous=True` reads a public
-registry without an AWS account.
+registry without an AWS account. The pixel calls also read the store's own record of its runs, from
+the store the registry sits beside (`<name>.registry` beside `<name>.icechunk`), or from `store=`.
 
 ```python
 import datetime as dt
@@ -285,8 +286,9 @@ record.day_granules("utm33", 2024, "s2", dt.date(2024, 5, 9))
 | `shard_granules(zone, year, tile, run_id)` | sensor, date and image with data in the tile | `shard_dates`' columns and the image's `granules` row |
 | `day_granules(zone, year, sensor, day, run_id=None)` | image in the day's mosaic, then each copy set aside | the `granules` row; `run_id` keeps the mosaic that run read |
 
-The pixel calls raise `LookupError` where the tile has no complete record (below), and
-`ValueError` for a point outside its zone's grid. Points are placed on the v2 stores' grid, whose
+The pixel calls raise `LookupError` where the tile has no complete record, or where the registry
+has not yet caught up with the store's latest run for the year (both below), and `ValueError` for a
+point outside its zone's grid. Points are placed on the v2 stores' grid, whose
 zones are whole UTM columns (`utm33`); pass `layout="hemispheres"` to the record or to `locate` for
 a store on v1.1's grid (`33N`, `33S`), which differs south of the equator. A column is filled as two
 halves, `utm33n` and `utm33s`, each its own run, but both halves' records sit under the column's
@@ -302,6 +304,12 @@ pixel; the first run that holds the pixel has its record. Every merge derives `s
 commits, in the order they landed: a fill or a shards update starts the list again, and a holes
 update adds itself.
 
+A merge follows each run's commit, but it can lag or fail, and until it lands a run that has just
+written the tile is missing from `source_runs`. So each merge stamps the master file with the runs
+the store had recorded for the year, as `store_runs` in its key-value metadata, and the pixel calls
+compare it with the store's run records now: a mismatch raises `LookupError` rather than naming an
+older run's images. A by-hand reader makes the same check, step 1 below.
+
 `source_runs` is null where the tile has no complete record, such as a run from before the record
 existed. One more case has none: a refused tile whose run staged no record for it, which that
 run's `shard_dates` file lists in its `unrecorded_tiles` metadata.
@@ -312,7 +320,7 @@ Without the package, with polars, zarr and icechunk. `TILE`, `ROW` and `COL` are
 returns; the store's [reading guide][store] converts a point to a pixel without it.
 
 ```python
-import icechunk, numpy as np, polars as pl, zarr
+import icechunk, json, numpy as np, polars as pl, zarr
 
 REGISTRY = "s3://<bucket>/<store>.registry"
 ZONE, YEAR, TILE, ROW, COL = "utm33", 2024, "chunk_209_14", 1908, 70
@@ -320,8 +328,20 @@ S3 = {"aws_region": "us-west-2", "skip_signature": "true"}   # anonymous reads
 prov = f"{REGISTRY}/provenance"
 
 # 1. The runs whose pixels the tile holds, oldest first. None: the tile has no complete record.
-master = pl.read_parquet(f"{REGISTRY}/master/zone={ZONE}/year={YEAR}/part-0.parquet", storage_options=S3)
-runs = master.filter(pl.col("tile") == TILE)["source_runs"].item()
+master_uri = f"{REGISTRY}/master/zone={ZONE}/year={YEAR}/part-0.parquet"
+runs = pl.read_parquet(master_uri, storage_options=S3).filter(pl.col("tile") == TILE)["source_runs"].item()
+#    Trust it only if the master was merged after the store's latest run for the year: compare its
+#    stamp with the runs the store's zone group records (fills, one per column half, the fills
+#    they replaced, and updates).
+s_bucket, s_key = (REGISTRY.removesuffix(".registry") + ".icechunk").removeprefix("s3://").split("/", 1)
+s_repo = icechunk.Repository.open(icechunk.s3_storage(bucket=s_bucket, prefix=s_key, region="us-west-2", anonymous=True))
+attrs = zarr.open_group(s_repo.readonly_session("main").store, path=ZONE, mode="r").attrs
+fills = attrs["runs"][str(YEAR)]
+fills = [fills] if "run_id" in fills else list(fills.values())
+recorded = {e["run_id"] for f in fills for e in [f, *f.get("previous", [])]}
+recorded |= {u["run_id"] for u in attrs.get("updates", {}).get(str(YEAR), [])}
+stamp = pl.read_parquet_metadata(master_uri, storage_options=S3)["store_runs"]
+assert json.loads(stamp) == sorted(recorded), "the registry has not caught up with the store's latest run"
 
 # 2. The run that holds the pixel: newest first, a holes update where its mask marks the pixel,
 #    else a fill or a shards update. Each run's group in pixel_sources states its mode.

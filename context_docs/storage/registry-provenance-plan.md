@@ -300,6 +300,12 @@ for the update, whose `update_pixels` marks it and whose record names its dates 
 holes update, as its run group's `mode` attribute states, claims a pixel only where its
 `update_pixels` marks it, and a fill or a shards update claims every pixel. The first run that claims the pixel holds its record; the helpers apply this.
 
+**A master that has not caught up is refused.** `source_runs` is derived by the master merge that
+follows each run's commit, and a merge can lag or fail. Each merge stamps the master with the runs
+the store recorded for the year (`store_runs`), and the pixel helpers compare it with the store's
+run records now; a mismatch raises `LookupError` rather than name an older run's images. A failed
+merge so shows as an error until a later merge, or `rebuild_registry_measurements.py repair`, lands.
+
 ## 6. What it costs
 
 **Storage,** measured on the dev test's shards and on one week of a whole zone:

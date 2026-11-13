@@ -40,6 +40,8 @@ from tessera_embeddings.storage.provenance import (
     table_dir,
     update_pixels_uri,
 )
+from tessera_embeddings.storage.published_store import store_runs_stamp
+from tessera_embeddings.storage.registry_master import STORE_RUNS_KEY
 from tessera_embeddings.storage.zarr_store import plain_zarr_storage_options
 
 _Creds = Callable[[], icechunk.S3StaticCredentials] | None
@@ -96,7 +98,9 @@ class ProvenanceRecord:
     ``registry_root`` is a local path or an ``s3://`` URI; ``get_credentials`` and ``region`` are the
     credential callback and region the rest of the store's readers take. ``anonymous`` reads unsigned,
     as a consumer without an AWS account reads the published registry. ``layout`` is the store's
-    zone layout, which :meth:`pixel_granules` locates a point on.
+    zone layout, which :meth:`pixel_granules` locates a point on. ``store`` is the embedding store
+    the registry describes, by default the one it sits beside (``<name>.registry`` beside
+    ``<name>.icechunk``); a pixel's lookup reads its run records to check the registry is current.
     """
 
     def __init__(
@@ -106,12 +110,14 @@ class ProvenanceRecord:
         region: str | None = None,
         anonymous: bool = False,
         layout: ZoneLayout = "utm_zones",
+        store: str | None = None,
     ) -> None:
         """A reader of the record beside ``registry_root``."""
         if anonymous and get_credentials is not None:
             raise ValueError("anonymous and get_credentials are mutually exclusive")
         self.root, self.get_credentials, self.region = registry_root.rstrip("/"), get_credentials, region
         self.anonymous, self.layout = anonymous, layout
+        self.store = store or f"{self.root.removesuffix('.registry')}.icechunk"
 
     def day_granules(
         self, zone: str, year: int, sensor: str, day: datetime.date, run_id: str | None = None
@@ -200,15 +206,24 @@ class ProvenanceRecord:
         """The runs whose pixels the shard holds, oldest first, from the registry's ``master/``.
 
         Raises:
-            LookupError: the registry has no complete record for the shard, or no row for it.
+            LookupError: the registry has no complete record for the shard, or no row for it, or its
+                master was merged before the store's latest run for the year landed, so its
+                ``source_runs`` may not name it.
         """
-        master = self._scan(f"{self.root}/master/zone={where.zone}/year={year}/part-0.parquet")
+        uri = f"{self.root}/master/zone={where.zone}/year={year}/part-0.parquet"
+        master = self._scan(uri)
         try:
             schema = master.collect_schema()
         except FileNotFoundError:  # a zone-year with no master: never filled
             schema = pl.Schema()
         if "source_runs" not in schema:  # or a master written before the column
             raise LookupError(f"{where.zone}/{year} {where.tile}: the registry holds no complete provenance record")
+        stamp = pl.read_parquet_metadata(uri, storage_options=self._storage_options()).get(STORE_RUNS_KEY)
+        if stamp != store_runs_stamp(self._zone_attrs(where.zone), year):
+            raise LookupError(
+                f"{where.zone}/{year}: the registry's master was merged before the store's latest run for the "
+                "year, so its source_runs may be stale; merge it again before reading pixels"
+            )
         rows = master.filter(pl.col("tile") == where.tile).select("source_runs").collect()
         if rows.height != 1 or rows.item() is None:
             raise LookupError(f"{where.zone}/{year} {where.tile}: the registry holds no complete provenance record")
@@ -231,6 +246,13 @@ class ProvenanceRecord:
             if where.tile in masks and bool(cast(zarr.Array, masks[where.tile])[where.row, where.col]):
                 return run
         raise LookupError(f"{where}: none of {runs} wrote this pixel")
+
+    def _zone_attrs(self, zone: str) -> dict[str, Any]:
+        """The store's zone group attributes, where each run of each year is recorded."""
+        repo = open_global_repo(
+            self.store, get_credentials=self.get_credentials, region=self.region, anonymous=self.anonymous
+        )
+        return dict(cast(zarr.Group, zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[zone]).attrs)
 
     def _run_group(self, zone: str, year: int, run_id: str) -> zarr.Group:
         """``run_id``'s group in the ``pixel_sources`` store: its planes, one per sensor."""

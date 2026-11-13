@@ -94,6 +94,10 @@ if TYPE_CHECKING:
 #: Value of ``measured_by`` for a row whose numbers the fill itself recorded.
 MEASURED_BY_FILL = "fill"
 
+#: A master file's key-value entry naming the runs the store recorded for its year when it was
+#: merged (:func:`~.published_store.store_runs_stamp`), for a reader to check against the store.
+STORE_RUNS_KEY = "store_runs"
+
 #: Value of ``measured_by`` for a row whose numbers were re-derived from the store afterwards.
 MEASURED_BY_REBUILD = "rebuild"
 
@@ -599,7 +603,7 @@ def merge_cell(
         held = held.filter(pc.invert(pc.fill_null(pc.equal(held.column("measured_by"), MEASURED_BY_FILL), False)))
         master = merge(fills, held, *extra)
         if record is not None:
-            master = with_source_runs(master, record.source_runs)
+            master = with_source_runs(master, record)
         if failures := invariant_failures(master, expected_rows=tile_years(run_rows)):
             raise ValueError(f"{zone}/{year} master breaks its invariants: {'; '.join(failures)}")
         if not write or (version is None and not master.num_rows):
@@ -609,15 +613,20 @@ def merge_cell(
     raise ValueError(f"{zone}/{year} master changed under each of {tries} attempts to merge it")
 
 
-def with_source_runs(master: pa.Table, source_runs: Callable[[str], list[str] | None]) -> pa.Table:
-    """``master`` with every row's ``source_runs`` derived afresh from the store's record.
+def with_source_runs(master: pa.Table, store: StoreYear) -> pa.Table:
+    """``master`` with every row's ``source_runs`` derived afresh from the store's record, and stamped.
 
     Never kept from a row: the newest-run-wins merge picks a row by its measurements, and a re-derived
-    row carries a ``rebuild-…`` run id, so neither says which runs' pixels a tile holds now.
+    row carries a ``rebuild-…`` run id, so neither says which runs' pixels a tile holds now. The file
+    is stamped with the runs the store recorded (:data:`STORE_RUNS_KEY`), so a reader can tell a
+    master merged before a later run landed from a current one.
     """
     index = master.schema.get_field_index("source_runs")
-    values = [source_runs(tile) for tile in master.column("tile").to_pylist()]
-    return master.set_column(index, master.schema.field(index), pa.array(values, type=master.schema.field(index).type))
+    values = [store.source_runs(tile) for tile in master.column("tile").to_pylist()]
+    master = master.set_column(
+        index, master.schema.field(index), pa.array(values, type=master.schema.field(index).type)
+    )
+    return master.replace_schema_metadata({**(master.schema.metadata or {}), STORE_RUNS_KEY.encode(): store.runs_stamp})
 
 
 def stale_source_runs(master: pa.Table, source_runs: Callable[[str], list[str] | None]) -> list[str]:

@@ -10,6 +10,7 @@ existing store must take that store's granularity. An audit wants geometry under
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime
 from functools import cache
@@ -360,9 +361,7 @@ def source_runs(
     non-empty commit's tiles cannot be read (a run from before tags, or an expired commit), since
     the order is then unknown. The diffs are read once, on the first call.
     """
-    # One record, or one per column half (ADR 038), each with the fills it replaced.
-    fills = [entry for head in year_runs(attrs.get("runs"), year) for entry in (head, *head.get("previous", []))]
-    entries = [*fills, *(attrs.get("updates") or {}).get(str(year), [])]
+    entries = _year_entries(attrs, year)
     carried = {
         e["run_id"]
         for e in entries
@@ -392,6 +391,22 @@ def source_runs(
     return of
 
 
+def _year_entries(attrs: Mapping[str, Any], year: int) -> list[dict]:
+    """Every run record of ``year``: its fills (one per column half, ADR 038), those they replaced, its updates."""
+    fills = [entry for head in year_runs(attrs.get("runs"), year) for entry in (head, *head.get("previous", []))]
+    return [*fills, *(attrs.get("updates") or {}).get(str(year), [])]
+
+
+def store_runs_stamp(attrs: Mapping[str, Any], year: int) -> str:
+    """The run ids a zone group's attributes record for ``year``, as the string a master is stamped with.
+
+    A merge stamps the master with it when it derives ``source_runs``; a reader compares the stamp
+    with the store's attributes now, so a master merged before a later run landed reads as stale
+    rather than naming the wrong run.
+    """
+    return json.dumps(sorted({entry["run_id"] for entry in _year_entries(attrs, year)}))
+
+
 def _no_source_runs(_tile: str) -> list[str] | None:
     return None
 
@@ -406,6 +421,8 @@ class StoreYear(NamedTuple):
     commits: list[Commit]
     tiles_of: Callable[[str], frozenset[str]]
     source_runs: Callable[[str], list[str] | None] = _no_source_runs
+    #: :func:`store_runs_stamp` of the attributes ``source_runs`` was derived from.
+    runs_stamp: str = "[]"
 
 
 def store_year(
@@ -422,7 +439,8 @@ def store_year(
     time_index = calendar_years(group).index(year)
     runs = committed_runs(group.attrs, year, writes.get((zone, year), ()))
     tiles_of = cache(lambda snapshot: commit_tiles(repo, zone, time_index, snapshot))
-    return StoreYear(runs, tiles_of, source_runs(dict(group.attrs), year, runs, tiles_of))
+    attrs = dict(group.attrs)
+    return StoreYear(runs, tiles_of, source_runs(attrs, year, runs, tiles_of), store_runs_stamp(attrs, year))
 
 
 def shard_pixel_window(

@@ -21,6 +21,7 @@ from tessera_embeddings.storage.registry import dataset_schema, registry_schema
 from tessera_embeddings.storage.registry_master import (
     MEASURED_BY_FILL,
     MEASURED_BY_REBUILD,
+    STORE_RUNS_KEY,
     as_master_rows,
     audit,
     cell_version,
@@ -437,13 +438,14 @@ class TestSourceRunsComeFromTheStore:
 
     def test_the_master_takes_the_store_s_lineage_for_every_tile(self, registry: Path) -> None:
         lineage = {"chunk_0_0": ["run-a", "update"], "chunk_0_1": ["run-a"]}
-        store = StoreYear([_A], lambda snapshot: frozenset(_WROTE[snapshot]), lineage.get)
+        store = StoreYear([_A], lambda snapshot: frozenset(_WROTE[snapshot]), lineage.get, '["run-a", "update"]')
         merge_cell(LOCAL, str(registry), "33N", 2017, store=lambda: store)
         master = pq.read_table(registry / TestUpdateCell.MASTER)
         assert (
             dict(zip(master.column("tile").to_pylist(), master.column("source_runs").to_pylist(), strict=True))
             == lineage
         )
+        assert master.schema.metadata[STORE_RUNS_KEY.encode()] == b'["run-a", "update"]', "stamped for readers"
 
 
 class TestTheStoreStandsBehindTheParts:
