@@ -357,7 +357,7 @@ class TestWhoWroteAYear:
         ]
 
     def test_a_refill_keeps_that_the_run_it_replaced_marked_the_year_empty(self):
-        """A v1.1 year marked empty published no part, and the store check must not mistake it for a write."""
+        """A v1.1 year marked empty published no run file, and the store check must not mistake it for a write."""
         marked = {"2024": {"run_id": "v11", "assembled_at": "2026-07-01T00:00:00+00:00", "empty": True}}
         runs = shard_writer.run_provenance(marked, 2024, "refill", code={})
         assert published_store.committed_runs({"runs": runs}, 2024, []) == [
@@ -384,7 +384,7 @@ class TestWhoWroteAYear:
 
     def test_a_replaced_run_whose_shard_commit_expired_holds_nothing(self):
         """The refill rewrote every tile of the run it replaced, which the store check confirms before expiry;
-        the replaced run is still known, so its part is not mistaken for a stranger's.
+        the replaced run is still known, so its run file is not mistaken for a stranger's.
         """
         first, refill = (
             {"snapshot": s, "committed_at": f"2026-0{m}-01T00:00:00+00:00"} for s, m in (("s1", 7), ("s2", 8))
@@ -399,3 +399,77 @@ class TestWhoWroteAYear:
     def test_a_year_marked_without_shards_contributes_no_run(self):
         marked = shard_writer.run_provenance(None, 2024, "ocean", empty=True, code={})
         assert published_store.committed_runs({"runs": marked}, 2024, []) == []
+
+
+def _lineage(*writes: tuple[str, str | None, list[str]], head: str = "fill", unrecorded: tuple[str, ...] = ()):
+    """``source_runs`` over shard commits ``(run, mode, tiles)`` in the order they landed.
+
+    A ``None`` mode is a fill; the zone group's ``runs`` record names ``head``, and every run's
+    mosaics carried provenance unless it is in ``unrecorded``.
+    """
+
+    def entry(run: str, **fields: object) -> dict:
+        return {"run_id": run, "input_coverage": {} if run in unrecorded else {"provenance_version": 1}, **fields}
+
+    attrs = {"runs": {"2025": entry(head)}, "updates": {"2025": [entry(r, mode=m) for r, m, _ in writes if m]}}
+    commits = [Commit(run, f"2025-01-{i + 1:02d}", f"snap{i}") for i, (run, _, _) in enumerate(writes)]
+    tiles = {f"snap{i}": frozenset(t) for i, (_, _, t) in enumerate(writes)}
+    return published_store.source_runs(attrs, 2025, commits, tiles.__getitem__)("chunk_0_0")
+
+
+_FILL = ("fill", None, ["chunk_0_0"])
+
+
+class TestSourceRuns:
+    """Which runs' pixels a tile holds, from the year's shard commits in order (plan §5)."""
+
+    @pytest.mark.parametrize(
+        ("writes", "expected"),
+        [
+            ([_FILL], ["fill"]),
+            ([_FILL, ("h", "holes", ["chunk_0_0"])], ["fill", "h"]),
+            ([_FILL, ("h", "holes", ["chunk_9_9"])], ["fill"]),
+            ([_FILL, ("s", "shards", ["chunk_0_0"])], ["s"]),
+            ([_FILL, ("s", "shards", ["chunk_0_0"]), ("h", "holes", ["chunk_0_0"])], ["s", "h"]),
+            ([_FILL, ("h", "holes", ["chunk_0_0"]), ("h", "holes", ["chunk_0_0"])], ["fill", "h"]),
+        ],
+        ids=["fill", "holes-appends", "holes-elsewhere", "shards-restarts", "holes-after-shards", "holes-retry"],
+    )
+    def test_the_lineage_of_a_tile(self, writes: list, expected: list[str]) -> None:
+        assert _lineage(*writes) == expected
+
+    def test_a_refill_drops_the_updates_before_it(self) -> None:
+        writes = [("old", None, ["chunk_0_0"]), ("h", "holes", ["chunk_0_0"]), ("s", "shards", ["chunk_0_0"])]
+        assert _lineage(*writes, ("fill", None, ["chunk_0_0"])) == ["fill"]
+
+    def test_a_tile_a_refill_left_untouched_keeps_the_earlier_fill(self) -> None:
+        """The replaced fill's provenance marker survives in ``previous``, so its tiles keep their record."""
+        runs = shard_writer.run_provenance(None, 2025, "old", input_coverage={"provenance_version": 1}, code={})
+        runs = shard_writer.run_provenance(runs, 2025, "fill", input_coverage={"provenance_version": 1}, code={})
+        commits = [Commit("old", "2025-01-01", "snap0"), Commit("fill", "2025-01-02", "snap1")]
+        tiles = {"snap0": frozenset({"chunk_0_0", "chunk_9_9"}), "snap1": frozenset({"chunk_9_9"})}
+        of = published_store.source_runs({"runs": runs}, 2025, commits, tiles.__getitem__)
+        assert (of("chunk_0_0"), of("chunk_9_9")) == (["old"], ["fill"])
+
+    def test_of_two_concurrent_refills_the_head_record_is_not_credited_with_the_later_shards(self) -> None:
+        """``late``'s shards landed last but ``fill``'s record did, so ``late`` is known only from ``previous``."""
+        assert _lineage(_FILL, ("late", None, ["chunk_0_0"]), head="fill") is None
+
+    @pytest.mark.parametrize(
+        ("writes", "unrecorded"),
+        [([_FILL], ("fill",)), ([_FILL, ("h", "holes", ["chunk_0_0"])], ("fill",)), ([], ())],
+        ids=["switched-off", "a-recorded-update-over-an-unrecorded-fill", "never-filled"],
+    )
+    def test_a_tile_without_a_complete_record_is_null(self, writes: list, unrecorded: tuple[str, ...]) -> None:
+        assert _lineage(*writes, unrecorded=unrecorded) is None
+
+    def test_a_shards_update_with_a_record_completes_a_tile_an_unrecorded_fill_left(self) -> None:
+        assert _lineage(_FILL, ("s", "shards", ["chunk_0_0"]), unrecorded=("fill",)) == ["s"]
+
+    @pytest.mark.parametrize(("empty", "expected"), [(True, ["fill"]), (False, None)], ids=["empty", "unreadable"])
+    def test_a_commit_without_a_snapshot(self, empty: bool, expected: list[str] | None) -> None:
+        """An empty one wrote nothing; any other leaves the order unknown, so no tile is answered."""
+        attrs = {"runs": {"2025": {"run_id": "fill", "input_coverage": {"provenance_version": 1}}}}
+        commits = [Commit("old", "2025-01-01", None, empty), Commit("fill", "2025-01-02", "snap")]
+        found = published_store.source_runs(attrs, 2025, commits, lambda _: frozenset({"chunk_0_0"}))
+        assert found("chunk_0_0") == expected

@@ -18,14 +18,14 @@ tell what the numbers mean without asking us. A new metadata standard goes here.
 
 **`registry.py`** builds the summary table published beside the data: one row per tile per
 year saying whether it was filled and how good the coverage was. New columns that help
-someone judge whether an area is usable belong here. Each fill writes one raw part per zone-year
-to `parts/`; `registry_master.py` merges it into the zone-year's file in `master/`, the one
-registry consumers read, tile by tile, so `master/` always describes what the store holds now. It
-writes each file conditionally, so concurrent writers cannot lose each other's rows, and only when
-the store's record of the year's runs (`published_store.committed_runs`) accounts for every part.
-`registry_rebuild.py` re-derives a row's measurements from the store when a fill left them null.
-Both sit outside the inference code identity, so changing them never invalidates staged work. The
-design is in
+someone judge whether an area is usable belong here. Each run, a fill or an update, writes one
+raw file per zone-year to `runs/`, named by its run ID; `registry_master.py` merges it into the
+zone-year's file in `master/`, the one registry consumers read, tile by tile, so `master/` always
+describes what the store holds now. It writes each file conditionally, so concurrent writers
+cannot lose each other's rows, and only when the store's record of the year's runs
+(`published_store.committed_runs`) accounts for every run file. `registry_rebuild.py` re-derives
+a row's measurements from the store when a fill left them null. Both sit outside the inference
+code identity, so changing them never invalidates staged work. The design is in
 [`context_docs/storage/registry-master.md`](../../../context_docs/storage/registry-master.md).
 
 ## The rest
@@ -49,6 +49,13 @@ rewriting tiles whole. It records each update beside the original fill in the gr
 attr, never over it, and `shard_writer.py` merges a holes update into the tiles it touches
 ([ADR 027](../../../context_docs/decisions/027-targeted-updates.md)). It sits outside both code
 identities, like `campaign.py`.
+
+**`provenance.py`** lays out the provenance record published beside the registry for the public
+store: which satellite images went into each day's mosaic, and which one supplied every pixel on
+every date. **`provenance_reader.py`** reads it back as polars tables: a day's images, a tile's,
+and a pixel's from a latitude and longitude, following the registry's `source_runs`. The design is
+in
+[`context_docs/storage/registry-provenance-plan.md`](../../../context_docs/storage/registry-provenance-plan.md).
 
 `campaign.py` tracks what is finished and clears out old versions, `published_store.py`
 checks a finished dataset from outside, and `object_store.py` deletes what we no longer need.

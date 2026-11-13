@@ -622,9 +622,9 @@ def _seed_global_with_rule(tmp_path, rule: int | None) -> str:
 
 
 def _published_part(registry_root: str) -> dict:
-    """The one part under ``registry_root``, read back as a column -> values dict."""
+    """The one run file under ``registry_root``, read back as a column -> values dict."""
     ds = pytest.importorskip("pyarrow.dataset")
-    table = ds.dataset(f"{registry_root}/parts", partitioning="hive").to_table()
+    table = ds.dataset(f"{registry_root}/runs", partitioning="hive").to_table()
     return table.to_pydict()
 
 
@@ -660,7 +660,7 @@ def test_the_registry_records_the_depth_rule_the_cell_was_filled_under(tmp_path,
     assert summary["empty"] is False
 
     cols = _published_part(registry_root)
-    assert cols["tile"], "a part was published"
+    assert cols["tile"], "a run file was published"
     assert set(cols["optical_min_obs"]) == {15}, "every row states the store's rule"
     assert set(cols["embedded"]) == {True}
     assert _master_tiles(registry_root) == sorted(cols["tile"]), "and the cell's master is current"
@@ -701,15 +701,17 @@ def _all_skip_inference(num_actors, config, chunks, mosaic_base, staging_base, r
 
 
 @pytest.mark.parametrize(
-    ("inference", "part_survives"),
+    ("inference", "run_file_survives"),
     [(staging_inference_stub({}), True), (_all_skip_inference, False)],
-    ids=["its-part-published", "an-all-refused-run-whose-part-never-published"],
+    ids=["its-run-file-published", "an-all-refused-run-whose-run-file-never-published"],
 )
-def test_a_retry_merges_the_master_a_fill_died_before_reaching(tmp_path, monkeypatch, caplog, inference, part_survives):
+def test_a_retry_merges_the_master_a_fill_died_before_reaching(
+    tmp_path, monkeypatch, caplog, inference, run_file_survives
+):
     """The retry finds the cell complete and skips the fill, so planning merges the master or nothing does.
 
     An all-refused run over a tile the store held nothing for still shows in its commit's diff, so
-    its retry refuses while its part is missing.
+    its retry refuses while its run file is missing.
     """
     monkeypatch.setattr(zone_fill, "run_inference", inference)
     store, registry_root = _seed_global_with_rule(tmp_path, 15), str(tmp_path / "registry")
@@ -727,21 +729,21 @@ def test_a_retry_merges_the_master_a_fill_died_before_reaching(tmp_path, monkeyp
     monkeypatch.setattr(zone_fill, "_merge_registry_master", died)
     with pytest.raises(KeyboardInterrupt):
         run_fill(tmp_path, store, **cell)
-    if not part_survives:
-        for part in (tmp_path / "registry" / "parts").rglob("*.parquet"):
-            part.unlink()
+    if not run_file_survives:
+        for run_file in (tmp_path / "registry" / "runs").rglob("*.parquet"):
+            run_file.unlink()
     monkeypatch.setattr(zone_fill, "_merge_registry_master", merge)
     with caplog.at_level(logging.ERROR):
         assert run_fill(tmp_path, store, **cell)["already_complete"] is True
-    if part_survives:
+    if run_file_survives:
         assert _master_tiles(registry_root) == ["chunk_0_0"]
     else:
-        assert "last wrote 1 tile(s) no part describes" in caplog.text
+        assert "last wrote 1 tile(s) no run file describes" in caplog.text
 
 
 def test_the_master_learns_of_a_refill_that_fails_at_the_tag_step(tmp_path, monkeypatch):
     """A deliberate refill fails at tagging by design — zone-year tags are write-once — after its data
-    and part have landed. Updating the master after the tag would never reach it.
+    and run file have landed. Updating the master after the tag would never reach it.
     """
     monkeypatch.setattr(zone_fill, "run_inference", staging_inference_stub({}))
 
@@ -1087,3 +1089,24 @@ def test_a_failed_publication_leaves_the_cell_untagged_and_its_retry_republishes
     assert retry["already_complete"] is True
     assert calls[-1]["tagged"] is False and calls[-1]["embedded"] == ["chunk_0_0"]
     assert "zone-01N-2025" in global_store.open_global_repo(store).list_tags()
+
+
+@pytest.mark.parametrize("carried", [True, False], ids=["mosaics-with-the-record", "mosaics-without"])
+def test_a_fill_names_its_run_in_source_runs_only_when_its_mosaics_carried_the_record(tmp_path, monkeypatch, carried):
+    store, registry_root = seed_global(tmp_path), str(tmp_path / "registry")
+    monkeypatch.setattr(zone_fill, "run_inference", staging_inference_stub({}))
+    monkeypatch.setattr(zone_fill, "mosaics_carry_provenance", lambda *_a, **_k: carried)
+    monkeypatch.setattr(zone_fill, "publish_provenance", lambda *_a, **_k: None)
+    run_fill(
+        tmp_path,
+        store,
+        land_mask_path=make_mask(tmp_path, [(0, 0)]),
+        mosaic_base=make_mosaic(tmp_path),
+        registry_root=registry_root,
+        run_id="runP",
+    )
+    expected = [["runP"]] if carried else [None]
+    master = pytest.importorskip("pyarrow.parquet").read_table(
+        f"{registry_root}/master/zone={ZONE}/year=2025/part-0.parquet"
+    )
+    assert master.column("source_runs").to_pylist() == expected

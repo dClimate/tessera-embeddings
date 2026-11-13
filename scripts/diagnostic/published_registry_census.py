@@ -3,9 +3,9 @@
 The registry is the Parquet dataset beside the store that answers "is my area covered, and how
 well" without opening a petabyte. Three ways that promise can fail:
 
-**Shape.** Parts land at ``parts/zone=<ZONE>/year=<YEAR>/<run>.parquet``, keyed by run so a refill
-adds a part instead of overwriting one — two parts for a cell is expected and reported, none is a
-real disagreement with the store.
+**Shape.** Each run's file lands at ``runs/zone=<ZONE>/year=<YEAR>/<run>.parquet``, keyed by run so a
+refill adds a file instead of overwriting one — two run files for a cell is expected and reported, none
+is a real disagreement with the store.
 
 **Whole-dataset reads.** ``pyarrow`` infers a dataset's schema from the first file in sorted path
 order, so a column added mid-campaign is silently dropped if zone 01N was written before the
@@ -50,7 +50,7 @@ DEFAULT_REGISTRY = "s3://tessera-embeddings/v1.1/dclimate.registry"
 DEFAULT_REGION = "us-west-2"
 
 #: The campaign's preallocated time axis. A partition key outside it names a cell the store has no
-#: slot for, however well-formed the part under it is.
+#: slot for, however well-formed the run file under it is.
 CAMPAIGN_YEARS = tuple(range(2017, 2026))
 
 #: The three refusal reasons `refused_px` is the sum of. Mirrored from the registry module so this
@@ -59,10 +59,10 @@ _REFUSAL_REASONS = ("refused_no_optical_px", "refused_thin_px", "refused_no_rada
 
 #: Printed per category and, together, the schema half of the exit status.
 _SCHEMA_FINDINGS = (
-    "parts_missing_declared_columns",
-    "parts_with_undeclared_columns",
-    "parts_with_wrong_column_types",
-    "parts_whose_metadata_disagrees_with_its_path",
+    "run_files_missing_declared_columns",
+    "run_files_with_undeclared_columns",
+    "run_files_with_wrong_column_types",
+    "run_files_whose_metadata_disagrees_with_its_path",
 )
 #: The area-of-interest half of the exit status.
 _AOI_FINDINGS = (
@@ -83,15 +83,15 @@ def _filesystem(region: str, *, anonymous: bool = False) -> pyarrow.fs.FileSyste
     return S3FileSystem(region=region, anonymous=anonymous)
 
 
-def _parts(fs: pyarrow.fs.FileSystem, root: str) -> list[dict[str, Any]]:
-    """Every Parquet part with its parsed partition keys, from one listing of the dataset.
+def _run_files(fs: pyarrow.fs.FileSystem, root: str) -> list[dict[str, Any]]:
+    """Every run file with its parsed partition keys, from one listing of the dataset.
 
     From the PATH, which is the authority: ``zone`` and ``year`` are hive partition keys and
-    deliberately not columns, so a part opened alone learns what it describes from where it sits.
+    deliberately not columns, so a run file opened alone learns what it describes from where it sits.
     """
     from pyarrow.fs import FileSelector
 
-    prefix = root.removeprefix("s3://").rstrip("/") + "/parts"
+    prefix = root.removeprefix("s3://").rstrip("/") + "/runs"
     out: list[dict[str, Any]] = []
     for info in fs.get_file_info(FileSelector(prefix, recursive=True)):
         if not info.path.endswith(".parquet"):
@@ -111,18 +111,18 @@ def _parts(fs: pyarrow.fs.FileSystem, root: str) -> list[dict[str, Any]]:
     return out
 
 
-def _names_a_real_cell(part: dict[str, Any]) -> bool:
-    """Whether a part's path names a zone the store can hold and a year the campaign preallocated.
+def _names_a_real_cell(run_file: dict[str, Any]) -> bool:
+    """Whether a run file's path names a zone the store can hold and a year the campaign preallocated.
 
     ``zone=61N`` is syntactically fine and passes the schema audit while advertising coverage the
     store cannot hold, so a key that parses but names no real cell is as much a defect as one that
     does not. Checked against the zone grid, the authority the store's group names come from.
     """
     return (
-        part["zone"] is not None
-        and part["year"] is not None
-        and part["zone"] in zone_grid.ZONES
-        and part["year"] in CAMPAIGN_YEARS
+        run_file["zone"] is not None
+        and run_file["year"] is not None
+        and run_file["zone"] in zone_grid.ZONES
+        and run_file["year"] in CAMPAIGN_YEARS
     )
 
 
@@ -153,51 +153,51 @@ def _rows_with_null_bbox(fs: pyarrow.fs.FileSystem, prefix: str, year: int) -> l
 
 
 def _siblings(fs: pyarrow.fs.FileSystem, root: str) -> list[str]:
-    """Names of everything sitting directly under the registry root, ``parts`` included."""
+    """Names of everything sitting directly under the registry root, ``runs`` included."""
     from pyarrow.fs import FileSelector
 
     selector = FileSelector(root.removeprefix("s3://").rstrip("/"), recursive=False, allow_not_found=True)
     return sorted(Path(info.path).name for info in fs.get_file_info(selector))
 
 
-def _schema_audit(fs: pyarrow.fs.FileSystem, parts: list[dict[str, Any]]) -> dict[str, Any]:
-    """Whether every part carries the declared columns, and what its own metadata says.
+def _schema_audit(fs: pyarrow.fs.FileSystem, run_files: list[dict[str, Any]]) -> dict[str, Any]:
+    """Whether every run file carries the declared columns, and what its own metadata says.
 
-    Footers only, so the cost is one small range request per part.
+    Footers only, so the cost is one small range request per run file.
     """
     import pyarrow.parquet as pq
 
-    # Type AND nullability: the type alone accepts a part declaring `tile`, `run_id`,
+    # Type AND nullability: the type alone accepts a run file declaring `tile`, `run_id`,
     # `assembled_at` or `embedded` as nullable, and a null identity there breaks latest-wins.
     declared = {field.name: (str(field.type), field.nullable) for field in registry_schema()}
     missing: dict[str, list[str]] = {}
     extra: dict[str, list[str]] = {}
     retyped: dict[str, list[str]] = {}
     without_identity: list[str] = []
-    for part in parts:
-        schema = pq.read_schema(part["path"], filesystem=fs)
+    for run_file in run_files:
+        schema = pq.read_schema(run_file["path"], filesystem=fs)
         present = {field.name: (str(field.type), field.nullable) for field in schema}
         if absent := sorted(set(declared) - set(present)):
-            missing[part["path"]] = absent
+            missing[run_file["path"]] = absent
         if surplus := sorted(set(present) - set(declared)):
-            extra[part["path"]] = surplus
+            extra[run_file["path"]] = surplus
         if wrong := sorted(n for n in set(declared) & set(present) if declared[n] != present[n]):
-            retyped[part["path"]] = wrong
+            retyped[run_file["path"]] = wrong
         metadata = {k.decode(): v.decode() for k, v in (schema.metadata or {}).items() if k != b"pandas"}
-        # Run id as well as zone and year. Parts are keyed BY RUN, so a footer whose run id
+        # Run id as well as zone and year. Run files are keyed BY RUN, so a footer whose run id
         # contradicts its own filename carries two provenances and latest-wins cannot tell which
         # is the row's.
         if (
-            metadata.get("zone") != part["zone"]
-            or metadata.get("year") != str(part["year"])
-            or metadata.get("run_id") != part["run_id"]
+            metadata.get("zone") != run_file["zone"]
+            or metadata.get("year") != str(run_file["year"])
+            or metadata.get("run_id") != run_file["run_id"]
         ):
-            without_identity.append(part["path"])
+            without_identity.append(run_file["path"])
     return {
-        "parts_missing_declared_columns": missing,
-        "parts_with_undeclared_columns": extra,
-        "parts_with_wrong_column_types": retyped,
-        "parts_whose_metadata_disagrees_with_its_path": without_identity,
+        "run_files_missing_declared_columns": missing,
+        "run_files_with_undeclared_columns": extra,
+        "run_files_with_wrong_column_types": retyped,
+        "run_files_whose_metadata_disagrees_with_its_path": without_identity,
     }
 
 
@@ -205,7 +205,7 @@ def _read_dataset(fs: pyarrow.fs.FileSystem, root: str, *, with_schema: bool) ->
     """Read the whole dataset, with the declared schema or with an inferred one, and time it."""
     import pyarrow.dataset as ds
 
-    prefix = root.removeprefix("s3://").rstrip("/") + "/parts"
+    prefix = root.removeprefix("s3://").rstrip("/") + "/runs"
     started = time.monotonic()
     kwargs: dict[str, Any] = {"filesystem": fs, "partitioning": "hive", "format": "parquet"}
     if with_schema:
@@ -247,8 +247,8 @@ def _completeness(fs: pyarrow.fs.FileSystem, root: str) -> dict[str, Any]:
     which a resume loses, while a refused tile's was in its skip marker on object storage. Both are
     persisted now, so unmeasured rows concentrated on the embedded side mean that path regressed.
 
-    Counted over ``master/``, since that is what consumers read and ``parts/`` keeps its null rows
-    forever by design. The master is also audited against the parts, cell by cell
+    Counted over ``master/``, since that is what consumers read and ``runs/`` keeps its null rows
+    forever by design. The master is also audited against the run files, cell by cell
     (:func:`~tessera_embeddings.storage.registry_master.audit`): a fill whose master update failed
     leaves its cell short or stale with no null rows to count, so every cell that fails is named,
     for ``repair --zones``.
@@ -259,10 +259,10 @@ def _completeness(fs: pyarrow.fs.FileSystem, root: str) -> dict[str, Any]:
     prefix = _master(fs, root)
     started = time.monotonic()
     table = ds.dataset(prefix, filesystem=fs, partitioning="hive", schema=master_schema()).to_table()
-    parts_prefix = prefix.rsplit("/", 1)[0] + "/parts"
-    parts = ds.dataset(parts_prefix, filesystem=fs, partitioning="hive", schema=dataset_schema()).to_table()
-    problems = audit(table, parts)
-    invariants = invariant_failures(table, expected_rows=tile_years(parts))
+    runs_prefix = prefix.rsplit("/", 1)[0] + "/runs"
+    run_rows = ds.dataset(runs_prefix, filesystem=fs, partitioning="hive", schema=dataset_schema()).to_table()
+    problems = audit(table, run_rows)
+    invariants = invariant_failures(table, expected_rows=tile_years(run_rows))
     unmeasured = pc.is_null(table.column("chunk_px")).to_pylist()
     embedded = table.column("embedded").to_pylist()
     zones, years = table.column("zone").to_pylist(), table.column("year").to_pylist()
@@ -419,8 +419,8 @@ def _verify_against_store(
 ) -> list[dict[str, Any]]:
     """Per cell, compare the master's embedded tiles with the store's live shards.
 
-    The master and not ``parts/``, because it is what consumers read: a shard cleared by hand, which
-    no run's part records, leaves the master naming a tile the store no longer holds.
+    The master and not ``runs/``, because it is what consumers read: a shard cleared by hand, which
+    no run's file records, leaves the master naming a tile the store no longer holds.
     """
     import pyarrow.compute as pc
     import pyarrow.dataset as ds
@@ -452,7 +452,7 @@ def _verify_against_store(
             ],
         )
         rows = table.to_pylist()
-        # The UNION of the store's calendar and the registry's own years, or a part for a year the
+        # The UNION of the store's calendar and the registry's own years, or a run file for a year the
         # store has no slot for — `year=2026`, say — would never be looked at.
         registry_years = {int(r["year"]) for r in rows if r["year"] is not None}
         for year in sorted(set(calendar) | registry_years):
@@ -511,7 +511,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--verify-zones", default="", help="comma-separated zones to cross-check against the store")
     parser.add_argument("--aoi", default="", help="west,south,east,north in WGS84 degrees, to time a coverage query")
     parser.add_argument("--aoi-year", type=int, default=2025)
-    parser.add_argument("--skip-schema-audit", action="store_true", help="skip the per-part footer read")
+    parser.add_argument("--skip-schema-audit", action="store_true", help="skip the per-file footer read")
     parser.add_argument(
         "--max-unmeasured",
         type=float,
@@ -532,49 +532,49 @@ def main(argv: list[str] | None = None) -> int:
 
     fs = _filesystem(args.region, anonymous=args.anonymous)
     started = time.monotonic()
-    parts = _parts(fs, args.registry)
+    run_files = _run_files(fs, args.registry)
     listing_s = round(time.monotonic() - started, 2)
 
     # Separated BEFORE the cell map is built: a key of `(None, None)` sorted alongside
     # `("01N", 2017)` raises TypeError, so the diagnostic would crash on exactly the malformed paths
     # it exists to report.
-    unparsed = [part["path"] for part in parts if not _names_a_real_cell(part)]
+    unparsed = [run_file["path"] for run_file in run_files if not _names_a_real_cell(run_file)]
     cells: dict[tuple[str, int], list[dict[str, Any]]] = {}
-    for part in parts:
-        if _names_a_real_cell(part):
-            cells.setdefault((part["zone"], part["year"]), []).append(part)
+    for run_file in run_files:
+        if _names_a_real_cell(run_file):
+            cells.setdefault((run_file["zone"], run_file["year"]), []).append(run_file)
     refilled = {f"{z}/{y}": len(v) for (z, y), v in sorted(cells.items()) if len(v) > 1}
 
     print(f"registry:      {args.registry} ({args.region})")
-    print(f"parts:         {len(parts)} in {listing_s}s, {sum(p['size'] for p in parts) / 1e6:.1f} MB")
+    print(f"run files:     {len(run_files)} in {listing_s}s, {sum(p['size'] for p in run_files) / 1e6:.1f} MB")
     print(f"cells covered: {len(cells)}")
-    print(f"cells with more than one part (a refill): {len(refilled)} {list(refilled)[:8]}")
-    print(f"parts whose path does not parse or names no real zone: {len(unparsed)} {unparsed[:4]}")
+    print(f"cells with more than one run file (a refill): {len(refilled)} {list(refilled)[:8]}")
+    print(f"run files whose path does not parse or names no real zone: {len(unparsed)} {unparsed[:4]}")
 
     # A master and a dataset-level `_common_metadata` are what a consumer WITHOUT this
     # package needs, so one schema covers the whole read and comes from the dataset rather than
-    # from a part they must know is current. Absence is a finding about who can read this.
+    # from a file they must know is current. Absence is a finding about who can read this.
     siblings = _siblings(fs, args.registry)
-    print(f"siblings beside parts/: {[s for s in siblings if s != 'parts'] or 'none'}")
+    print(f"siblings beside runs/: {[s for s in siblings if s != 'runs'] or 'none'}")
 
     report: dict[str, Any] = {
         "registry": args.registry,
         "region": args.region,
-        "parts": len(parts),
-        "bytes": sum(p["size"] for p in parts),
+        "run_files": len(run_files),
+        "bytes": sum(p["size"] for p in run_files),
         "listing_s": listing_s,
         "cells": len(cells),
-        "cells_with_multiple_parts": refilled,
-        "parts_with_unparsable_path": unparsed,
+        "cells_with_multiple_run_files": refilled,
+        "run_files_with_unparsable_path": unparsed,
         "siblings": siblings,
     }
 
     if not args.skip_schema_audit:
         started = time.monotonic()
-        report["schema_audit"] = _schema_audit(fs, parts)
+        report["schema_audit"] = _schema_audit(fs, run_files)
         report["schema_audit"]["wall_s"] = round(time.monotonic() - started, 2)
         audit = report["schema_audit"]
-        print(f"\nschema audit ({audit['wall_s']}s over {len(parts)} footers):")
+        print(f"\nschema audit ({audit['wall_s']}s over {len(run_files)} footers):")
         for key in _SCHEMA_FINDINGS:
             print(f"  {key}: {len(audit[key])}")
 
@@ -659,9 +659,9 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             # Data present and NOT marked complete is the half-published state: a fill that wrote
-            # its shards and its part, then died before adding the year to `years_complete`. Its
+            # its shards and its run file, then died before adding the year to `years_complete`. Its
             # counts agree, so counting alone calls it healthy. ANY row counts as populated — a
-            # part holding only refused tiles has zero embedded rows and zero shards.
+            # run file holding only refused tiles has zero embedded rows and zero shards.
             populated = bool(finding["registry_rows"] or finding["store_live_shards"])
             unmarked = populated and not finding["marked_complete"]
             verdict = "agrees"
@@ -684,7 +684,7 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.json_out).write_text(json.dumps(report, indent=2, default=str))
         print(f"\nwrote {args.json_out}")
 
-    # EVERY category, not the two that look most serious: a part whose metadata contradicts its
+    # EVERY category, not the two that look most serious: a run file whose metadata contradicts its
     # path carries two identities, and an undeclared column means the writer and this checker
     # disagree about the schema. Automation exiting 0 on either has accepted a bad registry.
     aoi = report.get("aoi_query", {})

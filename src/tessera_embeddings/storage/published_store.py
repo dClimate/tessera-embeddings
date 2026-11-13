@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime
+from functools import cache
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import numpy as np
@@ -233,7 +234,7 @@ class Commit(NamedTuple):
 
     ``at`` orders runs: the commit's own timestamp, or for an untagged run the time it was marked.
     ``snapshot`` is the shard commit, ``None`` for an untagged run, and is what :func:`commit_tiles`
-    reads the tiles it wrote from. ``empty`` is a run that holds no tile now, so it needs no part: an
+    reads the tiles it wrote from. ``empty`` is a run that holds no tile now, so it needs no run file: an
     untagged run that marked the year as holding no data, or a run a refill replaced whose commit has
     expired, every tile of which the refill rewrote.
     """
@@ -273,7 +274,7 @@ def committed_runs(attrs: Mapping[str, Any], year: int, writes: Sequence[Commit]
     zone-year tag points at the attrs commit, not the shard commit before it. Either way the record
     says when the run wrote and not what, so the entry has no snapshot to diff. A ``commit`` of null
     is a year marked without shards, which wrote nothing. A run a refill replaced whose commit has
-    expired is marked ``empty``: its part, if it has one, is still the store's, but the refill rewrote
+    expired is marked ``empty``: its run file, if it has one, is still the store's, but the refill rewrote
     every tile it wrote, which the store check confirms while the commit is still there to diff, and
     nothing can afterwards. A targeted update records itself in the same shape beside the fill, in
     ``updates[year]`` (``storage.update``), so its expired commits are found the same way.
@@ -321,11 +322,72 @@ def commit_tiles(repo: icechunk.Repository, zone: str, time_index: int, snapshot
     )
 
 
+def source_runs(
+    attrs: Mapping[str, Any], year: int, commits: Sequence[Commit], tiles_of: Callable[[str], frozenset[str]]
+) -> Callable[[str], list[str] | None]:
+    """Each tile's runs in ``year``, oldest first, from the year's shard commits in the order they landed.
+
+    ``commits`` and ``tiles_of`` are :class:`StoreYear`'s: the store's own account of who wrote the year
+    and what each commit wrote, never an older registry row or the order run records landed in. For each
+    commit that wrote or cleared a tile: a ``holes`` update adds itself, since the tile keeps the
+    earlier runs' other pixels; a fill or a ``shards`` update replaces the whole tile and restarts the
+    list at itself. So a refill drops every update before it, and of two concurrent refills the one
+    whose shards landed last owns the tile.
+
+    ``None`` unless every run in a tile's list carries a provenance record, which a run notes as
+    ``input_coverage.provenance_version`` in its ``runs`` or ``updates`` entry, and a fill a refill
+    replaced keeps as ``provenance_version`` in ``previous``, so a reader can tell a
+    tile with no complete record (all of v1.1, anything filled with the switch off) from one that has
+    it (``context_docs/storage/registry-provenance-plan.md`` §5). ``None`` for every tile when a
+    non-empty commit's tiles cannot be read (a run from before tags, or an expired commit), since
+    the order is then unknown. The diffs are read once, on the first call.
+    """
+    head = (attrs.get("runs") or {}).get(str(year))
+    fills = [head, *head.get("previous", [])] if isinstance(head, Mapping) else []
+    entries = [*fills, *(attrs.get("updates") or {}).get(str(year), [])]
+    carried = {
+        e["run_id"]
+        for e in entries
+        if e.get("provenance_version") or (e.get("input_coverage") or {}).get("provenance_version")
+    }
+    holes = {e["run_id"] for e in entries if e.get("mode") == "holes"}
+
+    @cache
+    def lineage() -> dict[str, list[str]] | None:
+        runs: dict[str, list[str]] = {}
+        for commit in commits:
+            if commit.snapshot is None:
+                if commit.empty:
+                    continue
+                return None
+            for tile in tiles_of(commit.snapshot):
+                kept = runs.get(tile, []) if commit.run_id in holes else []
+                runs[tile] = [*kept, commit.run_id] if kept[-1:] != [commit.run_id] else kept
+        return runs
+
+    def of(tile: str) -> list[str] | None:
+        if not carried:  # no run recorded provenance, as for all of v1.1: no diffs to read
+            return None
+        found = (lineage() or {}).get(tile)
+        return found if found and carried.issuperset(found) else None
+
+    return of
+
+
+def _no_source_runs(_tile: str) -> list[str] | None:
+    return None
+
+
 class StoreYear(NamedTuple):
-    """What the store says about one zone-year's writers: who committed, and what a commit wrote."""
+    """What the store says about one zone-year's writers.
+
+    Who committed, what a commit wrote, and which runs each tile's pixels came from
+    (:func:`source_runs`).
+    """
 
     commits: list[Commit]
     tiles_of: Callable[[str], frozenset[str]]
+    source_runs: Callable[[str], list[str] | None] = _no_source_runs
 
 
 def store_year(
@@ -341,7 +403,8 @@ def store_year(
     """
     time_index = calendar_years(group).index(year)
     runs = committed_runs(group.attrs, year, writes.get((zone, year), ()))
-    return StoreYear(runs, lambda snapshot: commit_tiles(repo, zone, time_index, snapshot))
+    tiles_of = cache(lambda snapshot: commit_tiles(repo, zone, time_index, snapshot))
+    return StoreYear(runs, tiles_of, source_runs(dict(group.attrs), year, runs, tiles_of))
 
 
 def shard_pixel_window(
