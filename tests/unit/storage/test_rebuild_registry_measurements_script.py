@@ -23,11 +23,12 @@ import pytest
 import zarr
 
 from tessera_embeddings.storage import published_store
-from tessera_embeddings.storage.published_store import Commit
+from tessera_embeddings.storage.published_store import Commit, store_runs_stamp
 from tessera_embeddings.storage.registry import registry_schema
 from tessera_embeddings.storage.registry_master import (
     MEASURED_BY_FILL,
     MEASURED_BY_REBUILD,
+    STORE_RUNS_KEY,
     as_master_rows,
     master_schema,
     merge,
@@ -96,7 +97,10 @@ def _seed_master(root: Path, *, radar: int | None) -> None:
     ]
     table = pa.Table.from_pylist(rebuilt, schema=master_schema())
     fill = as_master_rows(pa.Table.from_pylist(FILL_ROWS, schema=master_schema()), MEASURED_BY_FILL)
-    write_cell(LOCAL, str(root), "33N", 2017, merge(fill, as_master_rows(table, MEASURED_BY_REBUILD)), version=None)
+    # Stamped with the store's runs for the year, as every merge stamps it.
+    master = merge(fill, as_master_rows(table, MEASURED_BY_REBUILD))
+    master = master.replace_schema_metadata({STORE_RUNS_KEY: store_runs_stamp({"runs": V11_RUNS}, 2017)})
+    write_cell(LOCAL, str(root), "33N", 2017, master, version=None)
 
 
 @pytest.fixture
@@ -215,6 +219,17 @@ class TestVerify:
         pq.write_table(table.set_column(i, table.schema.field(i), stale), path)
         assert script.main(["verify", "--registry", str(tmp_path)]) == 1
         assert "1 tile(s) whose source_runs is not the store's" in capsys.readouterr().out
+
+    def test_a_master_not_stamped_with_the_store_s_runs_fails(
+        self, script: Any, store: zarr.Group, tmp_path: Path, capsys: Any
+    ) -> None:
+        """Readers refuse such a master, so verify must send it to repair."""
+        _seed(tmp_path)
+        _seed_master(tmp_path, radar=None)
+        path = tmp_path / "master" / "zone=33N" / "year=2017" / "part-0.parquet"
+        pq.write_table(pq.read_table(path).replace_schema_metadata({}), path)
+        assert script.main(["verify", "--registry", str(tmp_path)]) == 1
+        assert "its master is not stamped with the store's runs" in capsys.readouterr().out
 
     def test_zones_narrow_what_is_checked(self, script: Any, store: zarr.Group, tmp_path: Path) -> None:
         """A zone-split verification must pass or fail on its own zones, and a mistyped one must not pass."""

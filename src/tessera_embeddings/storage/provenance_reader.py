@@ -98,9 +98,9 @@ class ProvenanceRecord:
     ``registry_root`` is a local path or an ``s3://`` URI; ``get_credentials`` and ``region`` are the
     credential callback and region the rest of the store's readers take. ``anonymous`` reads unsigned,
     as a consumer without an AWS account reads the published registry. ``layout`` is the store's
-    zone layout, which :meth:`pixel_granules` locates a point on. ``store`` is the embedding store
-    the registry describes, by default the one it sits beside (``<name>.registry`` beside
-    ``<name>.icechunk``); a pixel's lookup reads its run records to check the registry is current.
+    zone layout, which :meth:`pixel_granules` locates a point on. A pixel's lookup also reads the run
+    records of the store the registry sits beside, ``<name>.icechunk`` beside ``<name>.registry``
+    (``BucketPaths.optical_registry``), to check the registry has caught up with it.
     """
 
     def __init__(
@@ -110,14 +110,13 @@ class ProvenanceRecord:
         region: str | None = None,
         anonymous: bool = False,
         layout: ZoneLayout = "utm_zones",
-        store: str | None = None,
     ) -> None:
         """A reader of the record beside ``registry_root``."""
         if anonymous and get_credentials is not None:
             raise ValueError("anonymous and get_credentials are mutually exclusive")
         self.root, self.get_credentials, self.region = registry_root.rstrip("/"), get_credentials, region
         self.anonymous, self.layout = anonymous, layout
-        self.store = store or f"{self.root.removesuffix('.registry')}.icechunk"
+        self.store = f"{self.root.removesuffix('.registry')}.icechunk"
 
     def day_granules(
         self, zone: str, year: int, sensor: str, day: datetime.date, run_id: str | None = None

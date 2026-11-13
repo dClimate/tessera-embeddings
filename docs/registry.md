@@ -261,7 +261,7 @@ way. The sensors are `s2` (optical), `s1_asc` and `s1_desc` (radar by orbit dire
 `tessera_embeddings.storage.provenance_reader` answers the three usual questions as polars tables.
 `REGISTRY` is the registry's root, beside the store it describes; `anonymous=True` reads a public
 registry without an AWS account. The pixel calls also read the store's own record of its runs, from
-the store the registry sits beside (`<name>.registry` beside `<name>.icechunk`), or from `store=`.
+the store the registry sits beside (`<name>.registry` beside `<name>.icechunk`).
 
 ```python
 import datetime as dt
@@ -360,6 +360,8 @@ for run_id in reversed(runs):
         continue                                   # a holes update that embedded nothing
     if TILE in mask and mask[TILE][ROW, COL]:
         break
+else:
+    raise LookupError(f"none of {runs} wrote this pixel")
 meta = pl.read_parquet_metadata(f"{prov}/shard_dates/zone={ZONE}/year={YEAR}/{run_id}.parquet", storage_options=S3)
 assert TILE not in meta.get("unrecorded_tiles", "").split(","), "a refused tile its run recorded nothing for"
 

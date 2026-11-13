@@ -474,7 +474,10 @@ def _merge_registry_master(
 
 @dataclass(frozen=True)
 class _ProvenanceCell:
-    """Where one cell's provenance record goes, and how its stores are reached. ``zone`` is the fill zone."""
+    """Where one cell's provenance record goes, and how its stores are reached.
+
+    ``zone`` is the fill zone; ``mode`` the run's, ``fill``, ``shards`` or ``holes``.
+    """
 
     store_path: str
     staging_base: str | None
@@ -484,6 +487,7 @@ class _ProvenanceCell:
     run_id: str
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None
     s3_region: str | None
+    mode: str = "fill"
 
 
 def _publish_provenance(
@@ -492,7 +496,6 @@ def _publish_provenance(
     refused: Collection[str],
     mosaic_snapshots: Mapping[str, str] | None,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
-    mode: str = "fill",
 ) -> None:
     """Publish the run's provenance record beside the registry, BEFORE its shard commit. Raises.
 
@@ -500,10 +503,9 @@ def _publish_provenance(
     and a failure costs nothing irreversible: the run is not committed, its staging is kept, and its
     retry publishes again, every write keyed by run id (``context_docs/storage/
     registry-provenance-plan.md`` §4 rule 3). A record whose run never commits is never read, since a
-    reader reaches a run only through the store's ``source_runs``. ``mode`` is the run's, ``fill``,
-    ``shards`` or ``holes``. Transient storage errors are retried as store writes are; a failed check
-    is not, since it would fail the same way. Nothing is published without a registry, or when the
-    mosaics carry no record.
+    reader reaches a run only through the store's ``source_runs``. Transient storage errors are
+    retried as store writes are; a failed check is not, since it would fail the same way. Nothing is
+    published without a registry, or when the mosaics carry no record.
     """
     if not cell.registry_root or not cell.staging_base or not mosaic_snapshots:
         return
@@ -525,7 +527,7 @@ def _publish_provenance(
         mosaic_snapshots=mosaic_snapshots,
         grid_shape=(int(scales.shape[1]), int(scales.shape[2])),
         shard_px=shard_pitch(scales),
-        mode=mode,
+        mode=cell.mode,
     )
     access = ProvenanceAccess(cell.get_credentials, store_credentials, cell.s3_region)
     retrying = store_write_retrying(log).copy(
@@ -1554,7 +1556,7 @@ def _assemble_update(
     update = cast(UpdateTarget, handoff.update)
     zone, year, run_id, live, results = handoff.zone, handoff.year, handoff.run_id, handoff.live, handoff.results
     cell = _ProvenanceCell(
-        store_path, writer.staging_base, registry_root, zone, year, run_id, get_credentials, s3_region
+        store_path, writer.staging_base, registry_root, zone, year, run_id, get_credentials, s3_region, update.mode
     )
     group = group_and_half(zone)[0]
     staged = writer.verify_staged_completeness(run_id, live, log=log)
@@ -1581,7 +1583,7 @@ def _assemble_update(
 
     if staged or cleared:
         # The update's own record, cut to the pixels it wrote, before the commit as a fill's is.
-        _publish_provenance(cell, staged, skipped, handoff.mosaic_snapshots, log, mode=update.mode)
+        _publish_provenance(cell, staged, skipped, handoff.mosaic_snapshots, log)
         snapshot = writer.assemble_global(
             store_path,
             zone,

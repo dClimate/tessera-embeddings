@@ -629,6 +629,13 @@ def with_source_runs(master: pa.Table, store: StoreYear) -> pa.Table:
     return master.replace_schema_metadata({**(master.schema.metadata or {}), STORE_RUNS_KEY.encode(): store.runs_stamp})
 
 
+def master_stamp(fs: AbstractFileSystem, registry_root: str, zone: str, year: int) -> str | None:
+    """The :data:`STORE_RUNS_KEY` stamp of one cell's master file, ``None`` if it has none."""
+    with fs.open(_master_path(registry_root, zone, year), "rb") as f:
+        stamp = (pq.read_schema(f).metadata or {}).get(STORE_RUNS_KEY.encode())
+    return None if stamp is None else stamp.decode()
+
+
 def stale_source_runs(master: pa.Table, source_runs: Callable[[str], list[str] | None]) -> list[str]:
     """The tiles of one cell's ``master`` rows whose ``source_runs`` is not the store's, sorted.
 

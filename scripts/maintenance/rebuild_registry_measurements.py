@@ -84,6 +84,7 @@ from tessera_embeddings.storage.registry_master import (
     cell_tables,
     invariant_failures,
     master_schema,
+    master_stamp,
     merge,
     merge_cell,
     stale_source_runs,
@@ -484,13 +485,13 @@ def cmd_verify(args: argparse.Namespace) -> int:
         for (zone, year), cell in _every_cell(fs, args.registry, store, _cells(run_rows, []), args.zones).items():
             if isinstance(slot := _store_slot(store, zone, year, cell), str):
                 problems.setdefault(f"{zone}/{year}", []).append(f"the store cannot stand behind its run files: {slot}")
-            elif (rows := held.get((zone, year))) is not None and (
-                stale := stale_source_runs(rows, slot[1]().source_runs)
-            ):
-                problems.setdefault(f"{zone}/{year}", []).append(
-                    f"{len(stale)} tile(s) whose source_runs is not the store's: {stale[:5]}"
-                )
-        problems = dict(sorted(problems.items()))
+            elif (rows := held.get((zone, year))) is not None:
+                record, found = slot[1](), problems.setdefault(f"{zone}/{year}", [])
+                if stale := stale_source_runs(rows, record.source_runs):
+                    found.append(f"{len(stale)} tile(s) whose source_runs is not the store's: {stale[:5]}")
+                if master_stamp(fs, args.registry, zone, year) != record.runs_stamp:
+                    found.append("its master is not stamped with the store's runs, so readers refuse it")
+        problems = {cell: found for cell, found in sorted(problems.items()) if found}
     origins = master.column("measured_by").to_pylist()
     print(f"master {master.num_rows} rows against {expected} distinct tile-years in runs/")
     print(f"  measured by fill {origins.count(MEASURED_BY_FILL)}, by rebuild {origins.count(MEASURED_BY_REBUILD)}")

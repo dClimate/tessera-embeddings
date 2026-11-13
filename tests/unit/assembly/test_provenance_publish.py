@@ -195,22 +195,21 @@ def _stage(
     return embedded, [refused.label]
 
 
-def _publish(
-    tmp_path: Path, pins: dict[str, str], embedded: list[str], refused: list[str], run: str = RUN, mode: str = "fill"
-) -> dict | None:
+def _publish(tmp_path: Path, pins: dict[str, str], embedded: list[str], refused: list[str], **run) -> dict | None:
+    """Publish one run's record; ``run`` overrides the fill's ``run_id`` or ``mode``."""
+    run = {"run_id": RUN, "mode": "fill"} | run
     return publish_provenance(
         ProvenanceRun(
             staging_base=str(tmp_path / "staging"),
             registry_root=str(tmp_path / "registry"),
             zone=ZONE,
             year=YEAR,
-            run_id=run,
             embedded=embedded,
             refused=refused,
             mosaic_snapshots=pins,
             grid_shape=(SIZE, SIZE),
             shard_px=SHARD,
-            mode=mode,
+            **run,
         )
     )
 
@@ -251,13 +250,13 @@ def test_a_snapshots_granules_are_written_once_and_checked_by_every_later_run(pu
     tmp_path, pins, _ = published
     uri = _granules_uri(tmp_path, pins, "s2")
     embedded, refused = _stage(tmp_path / "staging", pins, run=UPDATE)
-    _publish(tmp_path, pins, embedded, refused, run=UPDATE)
+    _publish(tmp_path, pins, embedded, refused, run_id=UPDATE)
     table = pq.read_table(uri)
     assert table.schema.metadata[b"first_published_by"] == RUN.encode()
     assert set(_shard_dates(tmp_path, UPDATE).column("snapshot_id").to_pylist()) == set(pins.values())
     pq.write_table(table.slice(1), uri)
     with pytest.raises(ProvenanceCheckError, match="already published"):
-        _publish(tmp_path, pins, embedded, refused, run=UPDATE)
+        _publish(tmp_path, pins, embedded, refused, run_id=UPDATE)
 
 
 @pytest.mark.parametrize("valid", [ALL_VALID, SOME_REJECTED], ids=["all-valid", "some-rejected"])
@@ -380,7 +379,7 @@ def updated(published):
     """
     tmp_path, pins, _ = published
     embedded, refused = _stage(tmp_path / "staging", pins, pixels=EMBEDDED_BY_UPDATE, run=UPDATE)
-    _publish(tmp_path, pins, embedded, refused, run=UPDATE, mode="holes")
+    _publish(tmp_path, pins, embedded, refused, run_id=UPDATE, mode="holes")
     _master(tmp_path / "registry", embedded + refused, [[RUN, UPDATE]] * 3 + [None])
     return str(tmp_path / "registry"), pins
 
