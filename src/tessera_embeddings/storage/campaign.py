@@ -131,11 +131,7 @@ def missing_zones_for_year(
             f"cannot assess year {year}: expected_zones is empty. Pass None for all "
             "zones, or a non-empty scope; an empty scope verifies nothing."
         )
-    status = (
-        campaign_status(repo, snapshot_id=snapshot_id)
-        if snapshot_id is not None
-        else campaign_status(repo, branch=branch)
-    )
+    status = campaign_status(repo, years=(year,), branch=branch, snapshot_id=snapshot_id)
     expected = expected_zones if expected_zones is not None else status.campaign_zones()
     return tuple(z for z in expected if not status.has(z, year))
 

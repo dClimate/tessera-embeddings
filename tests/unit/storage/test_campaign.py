@@ -206,6 +206,16 @@ def test_tag_year_complete_when_all_land(seed, monkeypatch):
     assert tag in repo.list_tags()
 
 
+def test_tag_year_complete_off_the_default_years_by_halves(seeded_store, monkeypatch):
+    """A year outside the default campaign years completes once both halves of its column land."""
+    monkeypatch.setattr(campaign, "fill_zones", lambda layout: dict.fromkeys(("utm01n", "utm01s")))
+    column = ZoneSpec("32601", None, 1, (0.0, 5_120.0), (-10_240.0, 10_240.0))
+    repo = global_store.open_global_repo(seeded_store((column,), name="g.icechunk", years=(2026,), layout=SMALL))
+    for half in ("utm01n", "utm01s"):
+        campaign.mark_zone_year_empty(repo, half, 2026)
+    assert campaign.tag_year_complete(repo, 2026) == "year-2026-complete"
+
+
 def test_missing_zones_for_year_reports_in_scope_order(seed):
     """The report is the scope minus what landed, so a caller can name what is left."""
     _, repo = seed()
