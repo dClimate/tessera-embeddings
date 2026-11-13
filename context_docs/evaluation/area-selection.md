@@ -170,7 +170,7 @@ with the v2 Large model, and the store was scored against itself.
   The fill took 31 minutes, 25 of them for the cell itself.
 - **The first attempt found a bug in the fill.** `fill-zones-sequential` refused every v2 store,
   because the run ID it gives its shared inference session lacked the v2 prefix. It failed after
-  42 minutes of downloading imagery. The fix is PR #271.
+  42 minutes of downloading imagery. PR #271 fixed it.
 - **Scoring the store against itself** gave every difference as exactly zero and a pass, and 100%
   coverage. Reading the 316 labels from both stores took under two minutes from a laptop.
 - **The labels land on the right pixels.** With the `canada_crops_coarse` labels, v2 scores a
