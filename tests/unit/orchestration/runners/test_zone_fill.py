@@ -1138,8 +1138,13 @@ def test_provenance_is_published_before_the_tag_from_the_runs_shards(tmp_path, m
     ]
 
 
-def test_a_failed_publication_leaves_the_cell_untagged_and_its_retry_republishes(tmp_path, monkeypatch):
-    """The cell has landed, so the retry takes the landed branch; that branch must publish before it tags."""
+@pytest.mark.parametrize("named", [True, False], ids=["staging-names-snapshots", "staging-names-none"])
+def test_a_failed_publication_leaves_the_cell_untagged_and_its_retry_republishes(tmp_path, monkeypatch, named):
+    """The cell has landed, so the retry takes the landed branch; that branch must publish before it tags.
+
+    From the snapshots the staged shards name, which the mosaics' tips may have moved past; where
+    they name none, from the tips, so publication still runs its checks rather than being skipped.
+    """
     store = seed_global(tmp_path)
     mask, mosaic_base = make_mask(tmp_path, [(0, 0)]), make_mosaic(tmp_path)
     monkeypatch.setattr(zone_fill, "run_inference", staging_inference_stub({}))
@@ -1159,7 +1164,8 @@ def test_a_failed_publication_leaves_the_cell_untagged_and_its_retry_republishes
     # The actor stages the snapshots it read; the mosaics' tips may have moved on since.
     staged = zarr.open_group(f"{calls[0]['staging_base']}/r1/chunk_0_0.zarr", mode="a")
     read = dict.fromkeys(calls[0]["mosaic_snapshots"], "snapshot-the-model-read")
-    staged.attrs.update({PROVENANCE_ATTR: {}, SNAPSHOTS_ATTR: read})
+    if named:
+        staged.attrs.update({PROVENANCE_ATTR: {}, SNAPSHOTS_ATTR: read})
 
     monkeypatch.setattr(zone_fill, "publish_provenance", _recording_publish(calls, store))
     retry = run_fill(
@@ -1173,7 +1179,7 @@ def test_a_failed_publication_leaves_the_cell_untagged_and_its_retry_republishes
     assert retry["already_complete"] is True
     assert len(calls) == 2
     assert calls[-1]["tagged"] is False and calls[-1]["embedded"] == ["chunk_0_0"]
-    assert calls[-1]["mosaic_snapshots"] == read, "republished from what the model read, not the tips"
+    assert calls[-1]["mosaic_snapshots"] == (read if named else calls[0]["mosaic_snapshots"])
     assert "zone-01N-2025" in global_store.open_global_repo(store).list_tags()
 
 

@@ -58,7 +58,8 @@ provenance beyond its registry, and none can be reconstructed.
 7. **The actors and the export read the mosaics at the snapshots the plan sampled.** A commit to a
    mosaic mid-fill can change neither what the model read nor what the record says. Each staged
    shard names the snapshots it was read from; publication refuses a shard that names others, and a
-   retry republishes from the staged names, never the mosaics' current tips.
+   retry republishes from the staged names. Only when no shard names any does it read the mosaics'
+   current tips, so publication still runs and its checks fail a run that staged no record.
 8. **The record is behind a `provenance` switch, off by default.** Only the public global store
    needs it; dev runs and internal stores run without it. The mosaic's ingest manifest records the
    setting as `provenance_version`, a term whose absence means off, so a resume under the other
