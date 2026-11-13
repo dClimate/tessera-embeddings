@@ -513,3 +513,21 @@ class TestSourceRuns:
         commits = [Commit("old", "2025-01-01", None, empty), Commit("fill", "2025-01-02", "snap")]
         found = published_store.source_runs(attrs, 2025, commits, lambda _: frozenset({"chunk_0_0"}))
         assert found("chunk_0_0") == expected
+
+
+@pytest.mark.parametrize(
+    ("later", "changes"),
+    [
+        ([Commit("fill", "2025-01-02", None)], False),  # the retry's first attempt expired out of history
+        (
+            [Commit("fill", "2025-01-01", "s1"), Commit("fill", "2025-01-02", "s2"), Commit("upd", "2025-02-01", "s3")],
+            True,
+        ),
+        ([Commit("fill", "2025-01-01", "s1"), Commit("fill", "2025-01-03", "s4")], True),  # a further retry
+    ],
+    ids=["first-attempt-expired", "a-new-run", "a-retry-after-the-merge"],
+)
+def test_the_lineage_stamp_moves_only_when_a_run_writes(later, changes) -> None:
+    """A retried run is stamped by its latest commit, so expiring its first attempt leaves the master current."""
+    merged = published_store.lineage_stamp([Commit("fill", "2025-01-01", "s1"), Commit("fill", "2025-01-02", "s2")])
+    assert (published_store.lineage_stamp(later) != merged) is changes

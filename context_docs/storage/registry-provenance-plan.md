@@ -301,14 +301,13 @@ holes update, as its run group's `mode` attribute states, claims a pixel only wh
 `update_pixels` marks it, and a fill or a shards update claims every pixel. The first run that claims the pixel holds its record; the helpers apply this.
 
 **A master that has not caught up is refused.** `source_runs` is derived by the master merge that
-follows each run's commit, and a merge can lag or fail. Each merge stamps the master with the very
-list `source_runs` was derived from, every commit that wrote shards into the year as its run and
-its time (`store_runs`), and the pixel helpers build that list from the store again, from its
+follows each run's commit, and a merge can lag or fail. Each merge stamps the master with the runs
+`source_runs` was derived from, each by the time of its latest commit (`store_runs`), and the pixel helpers build that list from the store again, from its
 commit history and run records, by the same function; a difference raises `LookupError` rather
 than name an older run's images. So shards committed before their run record, a retry under the
 same run id, and a lagging or failed merge are all refused, and a run that wrote nothing (a null
-commit) changes neither list. A commit's time is the one its run record keeps, so expiring old
-snapshots leaves the list unchanged. A failed
+commit) changes neither list. A run's latest commit time is the one its run record keeps, and a
+retry's earlier attempt never enters the list, so expiring old snapshots leaves it unchanged. A failed
 merge so shows as an error until a later merge, or `rebuild_registry_measurements.py repair`, lands.
 
 ## 6. What it costs

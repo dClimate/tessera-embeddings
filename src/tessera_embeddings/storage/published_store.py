@@ -394,16 +394,17 @@ def source_runs(
 
 
 def lineage_stamp(commits: Sequence[Commit]) -> str:
-    """The commits that wrote a zone-year, as the string a master is stamped with when it derives ``source_runs``.
+    """The runs that wrote a zone-year, each by its latest commit, as the string a master is stamped with.
 
-    ``commits`` is :func:`committed_runs`' list, the exact input ``source_runs`` is derived from, so a
-    reader computing the same from the store now finds the stamp different exactly when a commit has
-    landed since the merge: a run whose shards committed before its run record did, a retry under
-    the same run id, a record-only run changes nothing. Each commit is its run and its time, which
-    a run record keeps as ``committed_at``, so the stamp is the same whether a commit is still in the
-    store's history or has expired out of it.
+    ``commits`` is :func:`committed_runs`' list, the input ``source_runs`` is derived from, so a
+    reader computing the same from the store now finds the stamp different exactly when a run has
+    written since the merge: a new run, a run whose shards committed before its run record did, or a
+    retry landing under the same run id. A record-only run changes nothing. Each run is stamped once,
+    by its latest commit's time, which its run record keeps as ``committed_at``: a retry's earlier
+    attempt, which no record names, never enters the stamp, so expiring old snapshots cannot change it.
     """
-    return json.dumps([[commit.run_id, commit.at] for commit in commits])
+    latest = {commit.run_id: commit.at for commit in commits}  # oldest first, so the last commit wins
+    return json.dumps(sorted(([run, at] for run, at in latest.items()), key=lambda entry: entry[1]))
 
 
 def _no_source_runs(_tile: str) -> list[str] | None:
