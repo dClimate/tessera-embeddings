@@ -190,7 +190,7 @@ def _transfer_and_forward(
     if profile and device.type == "cuda":
         # Only the profile batch pays a sync, to time the forward accurately.
         torch.cuda.synchronize()
-    tb3 = time.monotonic()
+    tb3 = time.monotonic()  # includes a CUDA graph capture if this batch is the first of its bucket shape
 
     if profile:
         disable_model_profiling(model)

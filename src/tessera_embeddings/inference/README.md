@@ -684,7 +684,10 @@ Small chunks keep the intermediate activations in the GPU's cache instead of str
 through memory; replaying a graph launches the whole forward at once, which removes the
 per-operation launch cost that would otherwise make small chunks slower. The graph for a
 `(T_s2, T_s1)` bucket shape is captured the first time that shape is seen — three warm-up
-forwards on zero inputs, then the capture — and kept for the life of the actor. A short last
+forwards on zero inputs, then the capture — and kept for the life of the actor. All of a
+model's graphs share one memory pool, which is safe because they never replay at the same time
+and each chunk's output is copied out before the next replay, so graph memory stays near one
+capture's peak however many bucket shapes the actor sees. A short last
 chunk replays with stale rows past its end; each pixel is embedded independently, so they never
 reach the rows kept. The chunked forward moves outputs slightly, the way a different batch shape
 does, so it ships at a v2 store boundary

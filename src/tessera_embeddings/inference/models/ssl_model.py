@@ -100,7 +100,10 @@ class MultimodalBTInferenceModel(nn.Module):
     the module docstring); ``None`` runs every batch whole. A graph is captured the first time a
     ``(T_s2, T_s1)`` bucket shape is seen and kept for the life of the model, with no eviction:
     there is at most one per bucket shape, which the default ladder of 32 sequence lengths per
-    stream bounds at about a thousand, and each holds only one chunk's worth of activations.
+    stream bounds at about a thousand. All of a model's graphs share one memory pool, which is
+    safe because they never replay at the same time and each chunk's output is copied out before
+    the next replay; it keeps graph memory near one capture's peak however many bucket shapes a
+    worker sees.
     """
 
     def __init__(
@@ -119,6 +122,7 @@ class MultimodalBTInferenceModel(nn.Module):
         self.chunk_pixels = chunk_pixels
         # Per (T_s2, T_s1); a plain dict, so graphs never enter state_dict.
         self._graphs: dict[tuple[int, int], _Graph] = {}
+        self._graph_pool: torch.cuda._POOL_HANDLE | None = None
 
         # Pre-create CUDA streams for parallel backbone execution.
         self._s2_stream: torch.cuda.Stream | None = None
@@ -159,8 +163,10 @@ class MultimodalBTInferenceModel(nn.Module):
         # Warm-up runs any lazy first-call work (compilation, per-device caches) outside the capture.
         for _ in range(3):
             self._forward_whole_batch(s2_static, s1_static)
+        if self._graph_pool is None:
+            self._graph_pool = torch.cuda.graph_pool_handle()
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        with torch.cuda.graph(graph, pool=self._graph_pool):
             z_static = self._forward_whole_batch(s2_static, s1_static)
         return graph, s2_static, s1_static, z_static
 
