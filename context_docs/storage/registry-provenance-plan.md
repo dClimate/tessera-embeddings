@@ -302,7 +302,8 @@ holes update, as its run group's `mode` attribute states, claims a pixel only wh
 
 **A master that has not caught up is refused.** `source_runs` is derived by the master merge that
 follows each run's commit, and a merge can lag or fail. Each merge stamps the master with the runs
-the store recorded for the year (`store_runs`), and the pixel helpers compare it with the store's
+the store recorded as writing shards that year (`store_runs`; a run with nothing to write, such as
+an update that found no holes, records a null commit and is left out), and the pixel helpers compare it with the store's
 run records now; a mismatch raises `LookupError` rather than name an older run's images. A failed
 merge so shows as an error until a later merge, or `rebuild_registry_measurements.py repair`, lands.
 

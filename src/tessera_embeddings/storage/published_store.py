@@ -398,13 +398,16 @@ def _year_entries(attrs: Mapping[str, Any], year: int) -> list[dict]:
 
 
 def store_runs_stamp(attrs: Mapping[str, Any], year: int) -> str:
-    """The run ids a zone group's attributes record for ``year``, as the string a master is stamped with.
+    """The runs that wrote shards in ``year``, from a zone group's attributes, as the string a master is stamped with.
 
     A merge stamps the master with it when it derives ``source_runs``; a reader compares the stamp
     with the store's attributes now, so a master merged before a later run landed reads as stale
-    rather than naming the wrong run.
+    rather than naming the wrong run. Only runs that wrote shards count, the same runs
+    ``source_runs`` is derived from: a record with a null ``commit`` (an update that had nothing to
+    write, a year marked empty) changes no tile, and no merge need follow it. A record from before
+    tags has no ``commit`` field and counts.
     """
-    return json.dumps(sorted({entry["run_id"] for entry in _year_entries(attrs, year)}))
+    return json.dumps(sorted({e["run_id"] for e in _year_entries(attrs, year) if e.get("commit", True)}))
 
 
 def _no_source_runs(_tile: str) -> list[str] | None:

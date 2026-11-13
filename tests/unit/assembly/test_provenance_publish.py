@@ -390,12 +390,12 @@ def _store_attrs(run_ids: list[str]) -> dict:
     return {"runs": {str(YEAR): {"run_id": fill}}, "updates": {str(YEAR): [{"run_id": u} for u in updates]}}
 
 
-def _record_runs(registry: Path, run_ids: list[str]) -> None:
-    """Make the store beside ``registry`` record ``run_ids`` for YEAR, as each run's commit does."""
+def _record_attrs(registry: Path, attrs: dict) -> None:
+    """Make the store beside ``registry`` hold ``attrs`` on its zone group, as each run's commit leaves them."""
     repo = icechunk.Repository.open_or_create(icechunk.local_filesystem_storage(f"{registry}.icechunk"))
     session = repo.writable_session("main")
-    zarr.open_group(session.store, path=ZONE, mode="a").attrs.update(_store_attrs(run_ids))
-    session.commit(f"record {run_ids}")
+    zarr.open_group(session.store, path=ZONE, mode="a").attrs.update(attrs)
+    session.commit("record runs")
 
 
 def _master(registry: Path, tiles: list[str], source_runs: list) -> None:
@@ -403,7 +403,7 @@ def _master(registry: Path, tiles: list[str], source_runs: list) -> None:
     master = registry / "master" / f"zone={ZONE}" / f"year={YEAR}"
     master.mkdir(parents=True)
     run_ids = list(dict.fromkeys(run for runs in source_runs if runs for run in runs))
-    _record_runs(registry, run_ids)
+    _record_attrs(registry, _store_attrs(run_ids))
     stamp = {STORE_RUNS_KEY: store_runs_stamp(_store_attrs(run_ids), YEAR)}
     table = pa.table({"tile": tiles, "source_runs": pa.array(source_runs, pa.list_(pa.string()))}, metadata=stamp)
     pq.write_table(table, master / "part-0.parquet")
@@ -483,16 +483,23 @@ def test_a_refused_shard_that_staged_no_record_has_no_pixel_answer(tmp_path: Pat
         ProvenanceRecord(str(tmp_path / "registry")).pixel_granules_at(PixelLocation(ZONE, refused[0], 0, 0), YEAR)
 
 
-def test_a_master_merged_before_the_latest_run_has_no_pixel_answer(published) -> None:
-    """A run that landed after the merge may own the pixel, so the master's lineage is not trusted."""
+@pytest.mark.parametrize("wrote", [True, False], ids=["update-wrote-shards", "update-wrote-nothing"])
+def test_a_master_merged_before_the_latest_shard_writing_run_has_no_pixel_answer(published, wrote: bool) -> None:
+    """A run that wrote shards after the merge may own the pixel, so the lineage is refused until the
+    next merge; one that recorded itself without writing (a null commit) changes no tile, and is not.
+    """
     tmp_path, _pins, _ = published
     registry = tmp_path / "registry"
     _master(registry, ["chunk_0_0", "chunk_0_1", "chunk_1_0", "chunk_1_1"], [[RUN]] * 4)
     where, record = PixelLocation(ZONE, "chunk_0_0", 0, 0), ProvenanceRecord(str(registry))
     assert not record.pixel_granules_at(where, YEAR).is_empty()
-    _record_runs(registry, [RUN, UPDATE])
-    with pytest.raises(LookupError, match="merged before the store's latest run"):
-        record.pixel_granules_at(where, YEAR)
+    update = {"run_id": UPDATE, "commit": {"snapshot": "s"} if wrote else None}
+    _record_attrs(registry, _store_attrs([RUN]) | {"updates": {str(YEAR): [update]}})
+    if wrote:
+        with pytest.raises(LookupError, match="merged before the store's latest run"):
+            record.pixel_granules_at(where, YEAR)
+    else:
+        assert not record.pixel_granules_at(where, YEAR).is_empty()
 
 
 @pytest.mark.parametrize("written", [True, False], ids=["before-source-runs", "never-filled"])

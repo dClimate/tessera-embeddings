@@ -306,7 +306,7 @@ update adds itself.
 
 A merge follows each run's commit, but it can lag or fail, and until it lands a run that has just
 written the tile is missing from `source_runs`. So each merge stamps the master file with the runs
-the store had recorded for the year, as `store_runs` in its key-value metadata, and the pixel calls
+the store had recorded as writing shards that year, as `store_runs` in its key-value metadata, and the pixel calls
 compare it with the store's run records now: a mismatch raises `LookupError` rather than naming an
 older run's images. A by-hand reader makes the same check, step 1 below.
 
@@ -331,15 +331,15 @@ prov = f"{REGISTRY}/provenance"
 master_uri = f"{REGISTRY}/master/zone={ZONE}/year={YEAR}/part-0.parquet"
 runs = pl.read_parquet(master_uri, storage_options=S3).filter(pl.col("tile") == TILE)["source_runs"].item()
 #    Trust it only if the master was merged after the store's latest run for the year: compare its
-#    stamp with the runs the store's zone group records (fills, one per column half, the fills
-#    they replaced, and updates).
+#    stamp with the runs the store's zone group records as writing shards (fills, one per column
+#    half, the fills they replaced, and updates).
 s_bucket, s_key = (REGISTRY.removesuffix(".registry") + ".icechunk").removeprefix("s3://").split("/", 1)
 s_repo = icechunk.Repository.open(icechunk.s3_storage(bucket=s_bucket, prefix=s_key, region="us-west-2", anonymous=True))
 attrs = zarr.open_group(s_repo.readonly_session("main").store, path=ZONE, mode="r").attrs
 fills = attrs["runs"][str(YEAR)]
 fills = [fills] if "run_id" in fills else list(fills.values())
-recorded = {e["run_id"] for f in fills for e in [f, *f.get("previous", [])]}
-recorded |= {u["run_id"] for u in attrs.get("updates", {}).get(str(YEAR), [])}
+recorded = [e for f in fills for e in [f, *f.get("previous", [])]] + attrs.get("updates", {}).get(str(YEAR), [])
+recorded = {e["run_id"] for e in recorded if e.get("commit", True)}   # a null commit wrote no shards
 stamp = pl.read_parquet_metadata(master_uri, storage_options=S3)["store_runs"]
 assert json.loads(stamp) == sorted(recorded), "the registry has not caught up with the store's latest run"
 
