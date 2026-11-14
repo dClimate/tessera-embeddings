@@ -182,14 +182,15 @@ def _transfer_and_forward(
     s1_input = torch.from_numpy(batch["s1"]).to(device, non_blocking=True)
     tb2 = time.monotonic()
 
-    if profile:
+    # Not for CUDA graph replay: a replay runs no Python, and per-layer syncs must never run inside a capture.
+    if profile and not model.replays_graphs(s2_input):
         enable_model_profiling(model)
 
     z = model(s2_input, s1_input)  # (B, representation_dim) — 192 for v1.1, 128 for v2 Large
     if profile and device.type == "cuda":
         # Only the profile batch pays a sync, to time the forward accurately.
         torch.cuda.synchronize()
-    tb3 = time.monotonic()
+    tb3 = time.monotonic()  # includes a CUDA graph capture if this batch is the first of its bucket shape
 
     if profile:
         disable_model_profiling(model)

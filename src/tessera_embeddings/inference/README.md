@@ -573,7 +573,9 @@ dominated by large matrix multiplications, and GPUs run those on dedicated hardw
 (tensor cores) that is only efficient when the matrices are big — a larger batch makes each
 multiplication bigger, so less of that hardware sits unused. 7,168 was measured as the
 point where the matrices are large enough to saturate it without running out of VRAM;
-smaller and larger were both tried.
+smaller and larger were both tried. On an L40S or an L4, v2 then runs each sub-batch in small
+chunks (below), so there the sub-batch size sets how many pixels move per copy and per output write,
+not the size of the matrices the card multiplies.
 
 **Two batches are in flight at once.** A batch has to be copied from host memory into the
 GPU before the GPU can compute it, and a card cannot compute during a copy it is waiting
@@ -639,9 +641,10 @@ to 0.0027. The copy to the GPU was already FP32, so this costs no bandwidth.
 **Five things are deliberately off or replaced**, each because it was measured and made
 things worse:
 
-- **`torch.compile` is off for the model.** Capturing the model as a CUDA graph consumed
-  11.6 GB of VRAM and roughly doubled the forward pass, because v1.1's recurrent layer
-  recompiled for every distinct sequence length it saw. Two small pieces are compiled instead
+- **`torch.compile` is off for the whole model.** Compiling it, which also captured it as a
+  CUDA graph, consumed 11.6 GB of VRAM and roughly doubled the forward pass, because v1.1's
+  recurrent layer recompiled for every distinct sequence length it saw. (v2's graphs, below,
+  are captured directly from the eager forward, without the compiler.) Two small pieces are compiled instead
   (both below): v1.1's pooling-head timestep, whose shapes do not depend on the sequence
   length, and v2's residual add + LayerNorm, compiled for dynamic shapes. Each compiles once
   per process.
@@ -673,6 +676,29 @@ things worse:
   ([ADR 030](../../../context_docs/decisions/030-forward-pass-reorderings-ship-at-a-store-boundary.md));
   CPU and training run the modules as written. v2 only: v1.1's arithmetic is unchanged.
   Measurements: [`v2-on-blackwell.md`](../../../context_docs/inference/v2-on-blackwell.md) §3.
+
+**On an L40S or an L4, v2 runs each sub-batch in small chunks, each replaying a captured CUDA
+graph.** The chunk size is per card, in `GRAPH_CHUNK_PIXELS`: 64 pixels on an L40S, 32 on an L4.
+A card not listed there runs the whole batch; the A10G is left out because no chunk size beat its
+whole-batch forward. `MultimodalBTInferenceModel.forward` cuts the sub-batch into chunks,
+copies each chunk into fixed input buffers, replays the graph and copies the chunk's rows out.
+Small chunks keep the intermediate activations in the GPU's cache instead of streaming them
+through memory; replaying a graph launches the whole forward at once, which removes the
+per-operation launch cost that would otherwise make small chunks slower. The graph for a
+`(T_s2, T_s1)` bucket shape is captured the first time that shape is seen — three warm-up
+forwards on zero inputs, then the capture — and kept for the life of the actor. All of a
+model's graphs share one memory pool, which is safe because they never replay at the same time
+and each chunk's output is copied out before the next replay, so graph memory stays near one
+capture's peak however many bucket shapes the actor sees. A short last
+chunk replays with stale rows past its end; each pixel is embedded independently, so they never
+reach the rows kept. The chunked forward moves outputs slightly, the way a different batch shape
+does, so it ships at a v2 store boundary
+([ADR 030](../../../context_docs/decisions/030-forward-pass-reorderings-ship-at-a-store-boundary.md),
+[ADR 042](../../../context_docs/decisions/042-chunked-graph-replay-ships-above-the-two-card-yardstick.md)).
+The one-per-strip profiled batch replays the same graphs, so it skips the per-layer timing logs
+(a replay runs no Python) but keeps its forward time and TFLOPS lines. v1.1, the CPU, and any
+forward with gradients on run the whole sub-batch at once, so v1.1's arithmetic is unchanged.
+Measurements: [`v2-chunked-graph-replay.md`](../../../context_docs/inference/v2-chunked-graph-replay.md).
 
 **What the logs report, and why it is not pixels per second.** A pixel with few
 observations costs about a tenth of a densely observed one, so a pixels-per-second figure
