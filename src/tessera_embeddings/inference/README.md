@@ -693,11 +693,12 @@ capture's peak however many bucket shapes the actor sees. A short last
 chunk replays with stale rows past its end; each pixel is embedded independently, so they never
 reach the rows kept. The chunked forward moves outputs slightly, the way a different batch shape
 does, so it ships at a v2 store boundary
-([ADR 030](../../../context_docs/decisions/030-forward-pass-reorderings-ship-at-a-store-boundary.md)).
+([ADR 030](../../../context_docs/decisions/030-forward-pass-reorderings-ship-at-a-store-boundary.md),
+[ADR 042](../../../context_docs/decisions/042-chunked-graph-replay-ships-above-the-two-card-yardstick.md)).
 The one-per-strip profiled batch replays the same graphs, so it skips the per-layer timing logs
 (a replay runs no Python) but keeps its forward time and TFLOPS lines. v1.1, the CPU, and any
 forward with gradients on run the whole sub-batch at once, so v1.1's arithmetic is unchanged.
-Measurements: [`inference-on-gpus.md`](../../../context_docs/inference/inference-on-gpus.md).
+Measurements: [`v2-chunked-graph-replay.md`](../../../context_docs/inference/v2-chunked-graph-replay.md).
 
 **What the logs report, and why it is not pixels per second.** A pixel with few
 observations costs about a tenth of a densely observed one, so a pixels-per-second figure

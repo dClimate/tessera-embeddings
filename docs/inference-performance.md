@@ -266,9 +266,9 @@ of 64 pixels (32 on an L4) keeps them in the card's cache. The size is per card 
 gain is: an A10G is no faster at any chunk size, so it and any unmeasured card run the whole batch. Small chunks alone would be slower, because each launches the
 forward's many small kernels one by one, so each chunk replays a CUDA graph captured once per
 bucket shape, which launches them all at once. Outputs move slightly, the way a different batch
-shape moves them, so the change ships at a v2 store boundary under ADR 030. v1.1 runs whole
+shape moves them, so the change ships at a v2 store boundary under ADRs 030 and 042. v1.1 runs whole
 sub-batches as before (§7 of the [inference README](../src/tessera_embeddings/inference/README.md#7-the-forward-pass-on-the-gpu-inferencepy);
-measurements in [`inference-on-gpus.md`](../context_docs/inference/inference-on-gpus.md)).
+measurements in [`v2-chunked-graph-replay.md`](../context_docs/inference/v2-chunked-graph-replay.md)).
 
 **Training-only parameters never reach the graph.** The checkpoint carries a BarlowTwins
 `projector` and a `segmented_matryoshka_projector` that served the variable-width training
