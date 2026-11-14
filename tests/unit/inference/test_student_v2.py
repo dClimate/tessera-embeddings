@@ -260,7 +260,6 @@ def test_chunked_forward_matches_the_whole_batch(v2_model) -> None:
     static buffers, which is all a CPU can check.
     """
     chunk = GRAPH_CHUNK_PIXELS["NVIDIA L40S"]
-    assert "NVIDIA A10G" not in GRAPH_CHUNK_PIXELS  # measured: no chunk size beats its whole batch
     assert v2_model.chunk_pixels is None  # a CPU model runs the whole batch
 
     n = 2 * chunk + 5

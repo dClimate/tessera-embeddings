@@ -134,7 +134,6 @@ def _build_v2_inference_model(config: InferenceConfig, device: torch.device) -> 
             repr_dim=config.representation_dim,
         ),
         fusion_method=config.fusion_method,
-        chunk_pixels=GRAPH_CHUNK_PIXELS.get(torch.cuda.get_device_name(device)) if device.type == "cuda" else None,
     ).to(device)
 
 
@@ -337,8 +336,11 @@ def build_inference_model(
     model = model.to(device)
     model.eval()
     del state_dict
+    # Set after the move: the chunk size belongs to the card the model runs on, not the CPU it is built on.
+    if is_v2 and device.type == "cuda":
+        model.chunk_pixels = GRAPH_CHUNK_PIXELS.get(torch.cuda.get_device_name(device))
 
-    logger.info("Built %s inference model on %s", config.model_version, device)
+    logger.info("Built %s inference model on %s (chunk_pixels=%s)", config.model_version, device, model.chunk_pixels)
     return model
 
 
