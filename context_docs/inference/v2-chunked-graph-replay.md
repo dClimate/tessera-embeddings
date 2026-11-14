@@ -116,7 +116,39 @@ On one tile, 48-pixel chunks match 64 on every usability measure; 80-pixel chunk
 The chunked forward is bit-identical to itself: across passes of one actor, and across two fresh
 processes running PR #273's code on two tiles.
 
-## 7. Measured and not adopted
+## 7. A year of Iowa, both arms side by side
+
+PR #273's code against `main` (`db60e3e8`) through the dev pipeline: `iowa_epsg5070`, calendar 2024,
+ascending radar, inference only, eight L40S per arm, both arms started in the same minute. 392 tiles
+finished in both arms and are compared as pairs, from each tile's `CHUNK_SUMMARY`:
+
+| | `main`, whole batch | PR #273, 64-pixel chunks | change |
+|---|---:|---:|---:|
+| inference time, summed over tiles | 50,644 s | 45,281 s | −10.6% |
+| tile time, summed over tiles | 58,220 s | 53,988 s | −7.3% |
+| time before a tile's first strip | 7,027 s | 7,624 s | +8.5% |
+| GPU instance-hours billed | 16.58 h | 15.38 h | −7.2% |
+| median per-tile ratio, inference | | 0.893 | |
+| median per-tile ratio, tile time | | 0.918 | |
+
+The chunked arm's cards averaged 1,578 MHz while inferring and the control's 1,646 MHz. A chunked
+forward draws more power per unit of time, so a card at its 350 W limit settles at a lower clock; the
+single-box counters in §4 show the same 5%. The gain above is net of it. No card in either arm was
+thermally throttled. The time before a tile's first strip is reads from S3, which the change does not
+touch; the two arms read the same mosaics at the same time, and the 8.5% is unexplained.
+
+**Outputs.** Twelve tiles spread across the state, each arm on whichever card ran it, compared with
+`te-compare-outputs --cross-config`: all twelve pass, with 93.8–94.8% of int8 values equal, at least
+99.956% within one level, a largest difference of 3 levels, a lowest per-pixel cosine of 0.99986 and a
+largest scale drift of 1.54%. The remaining tiles were not compared.
+
+**What it is worth.** The v2 campaign estimate
+([`../campaign/campaign-cost-model.md`](../campaign/campaign-cost-model.md) §13) has about $363,000 and
+244,000 hours of graphics cards. 7.3% of that is about $26,000 and 18,000 card-hours over the nine
+years, taking the campaign from about $560,000 to about $534,000. That assumes every hour is an L40S; an A10G
+gains nothing (§5), so the saving shrinks by the share of hours that fall back to A10Gs.
+
+## 8. Measured and not adopted
 
 | idea | result |
 |---|---|
