@@ -15,7 +15,8 @@ than a 7,168-pixel one, so the sums are ordered differently. On an L40S the chan
 inference time and 7% off tile time.
 
 It passes the cross-config envelope on every tile measured. It does not meet ADR 030's usability bar.
-Same script, same sampling, Iowa tiles, one L40S:
+Same script and sampling. The chunked figures are from Iowa tiles on one L40S; the two-card figures
+are ADR 030's, an RTX PRO 6000 against an L40S:
 
 | | 64-pixel chunks vs whole batch | two cards, same code (ADR 030's bar) |
 |---|---:|---:|
