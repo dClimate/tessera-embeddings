@@ -10,10 +10,11 @@ import inspect
 import logging
 
 import numpy as np
+import pytest
 import zarr
 
 from tessera_embeddings.config.inference import InferenceConfig
-from tessera_embeddings.config.store_layout import DIMS_3D, DIMS_4D, ArrayLayout, StoreLayout
+from tessera_embeddings.config.store_layout import DIMS_3D, DIMS_4D, DIMS_4D_BAND_FIRST, ArrayLayout, StoreLayout
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.inference.runner import run_inference
@@ -35,7 +36,11 @@ YEARS = (2024, 2025)
 
 _EMB = ArrayLayout(DIMS_4D, (1, INNER, INNER, BAND), "int8", 0, "zstd", shards=(1, TILE, TILE, BAND))
 _SCL = ArrayLayout(DIMS_3D, (1, INNER, INNER), "float32", float("nan"), "pcodec", shards=(1, TILE, TILE))
-SMALL = StoreLayout(name="small", arrays={"embeddings": _EMB, "scales": _SCL})
+SMALL = StoreLayout(name="small", arrays={"embeddings": _EMB, "scales": _SCL}, bands=BAND)
+# v2's shape in miniature: band-first, two band shards of two-band chunks, in level group 0 (ADR 031).
+_EMB_V2 = ArrayLayout(DIMS_4D_BAND_FIRST, (1, 2, INNER, INNER), "int8", 0, "zstd", shards=(1, BAND // 2, TILE, TILE))
+SMALL_V2 = StoreLayout(name="small-v2", arrays={"embeddings": _EMB_V2, "scales": _SCL}, bands=BAND, level="0")
+LAYOUTS = pytest.mark.parametrize("layout", [SMALL, SMALL_V2], ids=["v1", "v2"])
 
 # 10 m pixels -> metre extents for a NY x NX pixel zone.
 SPEC = ZoneSpec("32601", "N", 1, (0.0, NX * 10.0), (0.0, NY * 10.0))
@@ -91,10 +96,10 @@ def run_infer(tmp_path, store, **overrides):
     return zone_fill.infer_zone_year(**runner_kwargs(tmp_path, store, **overrides))
 
 
-def seed_global(tmp_path) -> str:
+def seed_global(tmp_path, layout: StoreLayout = SMALL) -> str:
     store = str(tmp_path / "global.icechunk")
     repo = global_store.create_global_repo(store)
-    global_store.seed_zone_groups(repo, [SPEC], years=YEARS, layout=SMALL)
+    global_store.seed_zone_groups(repo, [SPEC], years=YEARS, layout=layout)
     return store
 
 
@@ -162,11 +167,11 @@ def make_mask(
     return path
 
 
-def staging_inference_stub(staged: dict[str, np.ndarray]):
+def staging_inference_stub(staged: dict[str, np.ndarray], *, band_first: bool = False):
     """A run_inference stand-in that stages every tile and reports success.
 
-    Records what it staged into ``staged`` (label -> embeddings) so tests can
-    compare the assembled store against it.
+    Records what it staged into ``staged`` (label -> embeddings, as ``(y, x, band)``) so tests
+    can compare the assembled store against it. *band_first* stages as a v2 actor does.
     """
 
     def stub(*args, **kwargs):
@@ -174,7 +179,7 @@ def staging_inference_stub(staged: dict[str, np.ndarray]):
         call = inspect.signature(run_inference).bind(*args, **kwargs).arguments
         chunks, staging_base, run_id = call["chunks"], call["staging_base"], call["run_id"]
         rng = np.random.default_rng(5)
-        writer = ZarrWriter(staging_base, embedding_dim=BAND)
+        writer = ZarrWriter(staging_base, embedding_dim=BAND, band_first=band_first)
         results = []
         for chunk in chunks:
             emb = rng.integers(-100, 100, size=(chunk.height, chunk.width, BAND)).astype(np.int8)

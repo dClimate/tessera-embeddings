@@ -28,12 +28,13 @@ Sentinel-2 reflectance and cloud masks. Four write paths, all committing atomica
 import itertools
 import logging
 import time
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
+import dask
 import fsspec
 import fsspec.utils
 import icechunk
@@ -51,8 +52,14 @@ from tenacity import (
     wait_random,
 )
 
-from tessera_embeddings.config.ingest import INGEST_COMPRESSORS, mosaic_chunk_layout
-from tessera_embeddings.config.store_layout import spatial_dims_of
+from tessera_embeddings.config.ingest import (
+    GRANULES_ARRAY,
+    INGEST_COMPRESSORS,
+    SKIPPED_DAYS_ARRAY,
+    SKIPPED_GRANULES_ARRAY,
+    mosaic_chunk_layout,
+)
+from tessera_embeddings.config.store_geometry import level0, spatial_dims_of
 from tessera_embeddings.errors import CorruptedStoreError, NonMonotonicDateError
 from tessera_embeddings.storage.manifest import MIXED_CODE_IDENTITIES_ATTR, IngestManifest, extract_manifest
 from tessera_embeddings.storage.time_axis import TIME_ENCODING, compute_doy, read_time_values
@@ -507,6 +514,12 @@ _DEFAULT_STORAGE_MAX_TRIES = 10
 _DEFAULT_STORAGE_INITIAL_BACKOFF_MS = 200
 _DEFAULT_STORAGE_MAX_BACKOFF_MS = 30_000
 
+# Manifests a commit fetches and rewrites at once. Icechunk's default of 1 fetches every manifest
+# a commit touches one after another, so a mosaic commit, one or more manifests for each of its
+# arrays, waits on that many serial round trips. Empirical: see
+# context_docs/ingest/campaign-ingest-measurements.md.
+_MANIFEST_FETCHES_DURING_COMMIT = 16
+
 
 @contextmanager
 def manifest_split(split_sizes: "dict[str, int] | None" = DEFAULT_MANIFEST_SPLIT_SIZES) -> "Generator[None]":
@@ -569,6 +582,10 @@ def _default_repo_config() -> icechunk.RepositoryConfig:
     default). When active it bounds a commit's manifest rewrite to the shards it touched, the
     dominant region-write cost on large continental stores.
 
+    **Manifest fetches during a commit run concurrently** (``_MANIFEST_FETCHES_DURING_COMMIT``)
+    rather than one at a time. The global store replaces this manifest config with its own
+    (:func:`global_store_config`), which is saved inside that store.
+
     **Request concurrency is icechunk's default (256) and is never overridden**, because at 1 —
     what assembly's old per-fork budget produced — icechunk deadlocks ``commit`` and
     ``rebase``/``diff``. ``context_docs/assembly/icechunk-max-concurrent-requests-1-deadlock.md``.
@@ -583,8 +600,10 @@ def _default_repo_config() -> icechunk.RepositoryConfig:
     immediately.
     """
     config = icechunk.RepositoryConfig.default()
-    if _manifest_split_sizes:
-        config.manifest = icechunk.ManifestConfig(splitting=_manifest_splitting_config(_manifest_split_sizes))
+    config.manifest = icechunk.ManifestConfig(
+        splitting=_manifest_splitting_config(_manifest_split_sizes) if _manifest_split_sizes else None,
+        max_concurrent_manifest_fetches_during_commit=_MANIFEST_FETCHES_DURING_COMMIT,
+    )
     # Mutate the existing StorageSettings in place (RepositoryConfig.default() may leave
     # storage=None) so any fields icechunk seeded survive.
     storage = config.storage or icechunk.StorageSettings()
@@ -774,7 +793,7 @@ _CHUNKS_UNSET = _ChunksUnset()
 
 # Accepted ``chunks`` values, mirroring ``xr.open_zarr``: a per-dimension mapping,
 # a uniform block size, ``"auto"``, or ``None`` (no dask graph).
-type ChunksArg = dict | int | str | None | _ChunksUnset
+type ChunksArg = dict | int | Literal["auto"] | None | _ChunksUnset
 
 
 def _open_readonly(
@@ -796,13 +815,22 @@ def _open_readonly(
 
     ``group`` selects a Zarr group within the store (the global store's per-zone layout);
     ``None`` reads the root. Readers should target a single group and never open the whole
-    120-group repo as a datatree (~200x slower — ADR-008 D5).
+    120-group repo as a datatree (~200x slower — ADR-008 D5). A group that keeps its arrays in a
+    level group ``0`` (a v2 store, ADR 031 §1) is read from there, with the group's own attrs —
+    CRS, ``spatial:``, ``geoemb:`` — carried onto the dataset beneath the level's.
     """
     repo = open_repo(store_path, get_credentials=get_credentials, region=region)
     session = repo.readonly_session(branch="main")
+    node = zarr.open_group(session.store, mode="r", path=group or "")
+    level = level0(node)
+    path = level.path or None
     if isinstance(chunks, _ChunksUnset):
-        return xr.open_zarr(session.store, consolidated=False, group=group)
-    return xr.open_zarr(session.store, consolidated=False, chunks=chunks, group=group)
+        ds = xr.open_zarr(session.store, consolidated=False, group=path)
+    else:
+        ds = xr.open_zarr(session.store, consolidated=False, chunks=chunks, group=path)
+    if level is not node:
+        ds.attrs = {**dict(node.attrs), **ds.attrs}
+    return ds
 
 
 def _assert_no_committed_dates(repo: "icechunk.Repository", store_path: str) -> None:
@@ -964,6 +992,7 @@ def open_store_as_zarr_group(
     *,
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     region: str | None = None,
+    snapshot_id: str | None = None,
 ) -> zarr.Group:
     """Open an Icechunk store for reading as a raw zarr Group.
 
@@ -975,13 +1004,15 @@ def open_store_as_zarr_group(
     ``group`` selects one Zarr group (the global store's per-zone layout); ``None``
     returns the root. ``get_credentials``/``region`` are forwarded so a store outside the
     default S3 region, or reachable only via an explicit credential callback, can be read
-    with the same options as the writer used.
+    with the same options as the writer used. ``snapshot_id`` opens that version instead of the
+    branch tip.
     """
     return open_store_group_and_tip(
         store_path,
         group=group,
         get_credentials=get_credentials,
         region=region,
+        snapshot_id=snapshot_id,
     )[0]
 
 
@@ -992,8 +1023,9 @@ def open_store_group_and_tip(
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     region: str | None = None,
     branch: str = "main",
+    snapshot_id: str | None = None,
 ) -> tuple[zarr.Group, str]:
-    """Open a store for reading and also return ``branch``'s tip snapshot ID.
+    """Open a store for reading and also return ``branch``'s tip snapshot ID, or ``snapshot_id``'s view.
 
     Same as :func:`open_store_as_zarr_group`, plus the commit the returned group is a view
     of. The snapshot ID is the store's canonical CONTENT identity — it moves on every commit
@@ -1007,7 +1039,7 @@ def open_store_group_and_tip(
     confusion the snapshot is here to prevent.
     """
     repo = open_repo(store_path, get_credentials=get_credentials, region=region)
-    tip = repo.lookup_branch(branch)
+    tip = snapshot_id or repo.lookup_branch(branch)
     session = repo.readonly_session(snapshot_id=tip)
     root = zarr.open_group(session.store, mode="r")
     if group is None:
@@ -1029,6 +1061,43 @@ indistinguishable. The coverage gate must fail on the second and not on the firs
 Written by the ingest paths themselves rather than by the completion marker, because the
 gate runs BEFORE the marker on a first ingest, and again later from the fill.
 """
+
+
+def record_skipped_days(store_path: str, lists: Mapping[str, str], *, s3_region: str | None = None) -> None:
+    """Commit the granule lists of days the ingest skipped whole, keyed by solar day, in one commit.
+
+    A day already recorded is overwritten, so a retried ingest leaves the list its latest attempt
+    built. The two arrays are created on first use and sit off the time axis, which they never
+    touch (``context_docs/storage/registry-provenance-plan.md`` §3).
+    """
+    repo = open_repo(store_path, region=s3_region)
+    for attempt in store_write_retrying(logger):
+        with attempt:
+            session = repo.writable_session("main")
+            root = zarr.open_group(session.store, mode="a")
+            days, granules = (_skipped_array(root, name) for name in (SKIPPED_DAYS_ARRAY, SKIPPED_GRANULES_ARRAY))
+            held = [str(day) for day in np.asarray(days[:])]
+            for day, listed in sorted(lists.items()):
+                if day not in held:
+                    held.append(day)
+                    days.resize((len(held),))
+                    granules.resize((len(held),))
+                days[held.index(day)], granules[held.index(day)] = day, listed
+            session.commit(f"skipped day(s) {', '.join(sorted(lists))}")
+
+
+def _skipped_array(root: zarr.Group, name: str) -> zarr.Array:
+    """``root[name]``, a one-dimensional string array along ``skipped_day``, created empty if absent."""
+    if name not in root:
+        root.create_array(
+            name,
+            shape=(0,),
+            chunks=(1,),
+            dtype=np.dtypes.StringDType(),
+            fill_value="",
+            dimension_names=("skipped_day",),
+        )
+    return cast(zarr.Array, root[name])
 
 
 def record_assessed_window(
@@ -1117,6 +1186,28 @@ def get_existing_dates(
             logger.debug(f"Repo absent ({time.monotonic() - t0:.1f}s): {store_path}")
             return set()
         raise
+
+
+def get_root_attr(
+    store_path: str,
+    key: str,
+    *,
+    get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
+    s3_region: str | None = None,
+) -> Any:  # noqa: ANN401 — whatever JSON the attr holds
+    """One root attribute of a store, or None if the store or attribute is absent; other errors raise."""
+    try:
+        ds = _open_readonly(store_path, get_credentials=get_credentials, region=s3_region)
+    except FileNotFoundError:
+        return None
+    except icechunk.IcechunkError as exc:
+        if is_missing_repo(exc):
+            return None
+        raise
+    try:
+        return ds.attrs.get(key)
+    finally:
+        ds.close()
 
 
 def resolve_region(
@@ -1396,20 +1487,23 @@ def _write_windows_overlapped(
             writer.writer.targets = [
                 zarr.open_array(fork.store, path=target.path, mode="a") for target in writer.writer.targets
             ]
-            stored.extend(
-                writer.writer.sync(
-                    compute=False,
-                    chunkmanager_store_kwargs={"load_stored": False, "return_stored": True},
-                )
+            lazy = writer.writer.sync(
+                compute=False,
+                chunkmanager_store_kwargs={"load_stored": False, "return_stored": True},
             )
+            # One source comes back as one array, not a list of one; iterating it would slice it.
+            stored.extend(lazy if isinstance(lazy, list | tuple) else [lazy])
     except (AttributeError, TypeError) as exc:
         logger.warning("Overlapped window write failed to assemble (%s); writing sequentially", exc)
         return False
 
     if stored:
         # The single compute: every window's loads, masks and chunk writes in one graph,
-        # reduced to one mergeable changeset.
-        session.merge(session_merge_reduction(stored, split_every=_MERGE_SPLIT_EVERY))
+        # reduced to one mergeable changeset. Fused here first, because the distributed client
+        # submits a graph without dask's blockwise fusion: a block two writes share, such as the
+        # source index's cast, then reaches the scheduler as a task of its own (measured on a
+        # recorded radar week: 7% fewer tasks; a plain mosaic's graph is unchanged).
+        session.merge(session_merge_reduction(list(dask.optimize(*stored)), split_every=_MERGE_SPLIT_EVERY))
     # DEBUG, not INFO: the chattiest line this path produces, once per write, and Prefect
     # ships task logs to the orchestrator API from whichever Dask worker ran the task, so it
     # scales with total worker count. The timing is already in the caller's per-batch line.
@@ -1439,6 +1533,8 @@ def write_day_windows(
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     s3_region: str | None = None,
     parallel_windows: bool = False,
+    store_attrs: dict[str, Any] | None = None,
+    granules: str | None = None,
 ) -> None:
     """Write ONE date's live windows into a mosaic store, one commit for the date.
 
@@ -1463,6 +1559,8 @@ def write_day_windows(
         get_credentials=get_credentials,
         s3_region=s3_region,
         parallel_windows=parallel_windows,
+        store_attrs=store_attrs,
+        granules=None if granules is None else [granules],
     )
 
 
@@ -1512,6 +1610,8 @@ def write_days_windows(
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     s3_region: str | None = None,
     parallel_windows: bool = False,
+    store_attrs: dict[str, Any] | None = None,
+    granules: Sequence[str] | None = None,
 ) -> None:
     """Write one or more dates' live windows into a mosaic store, ONE commit for the batch.
 
@@ -1543,12 +1643,23 @@ def write_days_windows(
     as the append path does (baselines union, doy concat, ``last_appended`` bump). The
     manifest is validated BEFORE anything is written — the per-append structural gate must
     not be lost to batching.
+
+    ``store_attrs`` merge into the root attrs in the dates' own commit, for a record that must
+    exist whenever any date does, such as the radar burst census.
+
+    ``granules`` is the provenance granule list, one JSON string per date in ``days``, written
+    into the store's ``granules`` array at the date's own slot in the same commit, so a committed
+    slot always has its list and an uncommitted one has neither. A store seeded with it has the
+    array; whether a resume may write to that store either way is the manifest's
+    ``provenance_version`` term, validated before anything is written.
     """
     # jscpd:ignore-end
     from tessera_embeddings.storage.empty_store import create_empty_store  # local: storage-internal, avoids cycle
 
     if not days:
         return  # nothing to write; a commit recording nothing would be noise
+    if granules is not None and len(granules) != len(days):
+        raise ValueError(f"one granule list per date: {len(granules)} for {len(days)} date(s)")
 
     whens = _batch_times(days, chunks, roi.height, roi.width)
     day_ds = days[0][0]  # schema donor for seeding; every date shares the store's schema
@@ -1589,6 +1700,7 @@ def write_days_windows(
             chunks=chunks,
             baselines={},  # merged per date below, exactly like the append path
             manifest=manifest,
+            granule_list=granules is not None,
             # Seed through a repo opened with THIS call's credentials/region. Letting
             # create_empty_store open its own would use the default storage config, so the
             # probe above and every write below would honour a callback or a non-default
@@ -1623,8 +1735,10 @@ def write_days_windows(
         # in the ONE commit together, preserving the no-date-before-its-pixels invariant at
         # batch granularity.
         writes: list[tuple[xr.Dataset, list[tuple[int, int, int, int]], int, list[str]]] = []
-        for (one_ds, one_windows), when in zip(days, whens, strict=True):
+        for i, ((one_ds, one_windows), when) in enumerate(zip(days, whens, strict=True)):
             t = batch.append_time_slot(when)
+            if granules is not None:
+                cast("zarr.Array", batch.group[GRANULES_ARRAY])[t] = granules[i]
             drop = [c for c in ("time", "northing", "easting") if c in one_ds.coords]
             writes.append((one_ds, one_windows, t, drop))
         attrs = batch.group.attrs
@@ -1633,6 +1747,8 @@ def write_days_windows(
         attrs["baselines_applied"] = merged
         attrs["doy"] = list(cast("list", attrs.get("doy", []))) + compute_doy(np.array(whens)).tolist()
         attrs["last_appended"] = utcnow_iso()
+        if store_attrs:
+            attrs.update(store_attrs)
         if mixed:
             # Same commit as the dates it describes; a union, since one resume writes many.
             prior = cast("list", attrs.get(MIXED_CODE_IDENTITIES_ATTR, []))

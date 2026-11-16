@@ -233,9 +233,10 @@ This is not ceremony. An actor lives for hours, and the default Rust credential 
 resolves the instance-profile credential once and may fail to refresh it. When it lapses,
 the tile in flight **and every tile that actor takes afterwards** fail with `no providers
 in chain provided credentials`. A botocore-backed, self-refreshing callback fixes that. One
-caveat carries over from `ingest/README.md`: `_resolve_iam_credentials` must stay
-`lru_cache`d, or the callback's re-invocation every fifteen minutes triggers a cold
-instance-metadata lookup each time and runs into throttling.
+caveat carries over from
+[ingest authentication](../../../docs/ingest/authentication.md#imds-throttling-why-_resolve_iam_credentials-is-cached):
+`_resolve_iam_credentials` must stay `lru_cache`d, or the callback's re-invocation every
+fifteen minutes triggers a cold instance-metadata lookup each time and runs into throttling.
 
 ### 4. Loading a tile's imagery
 
@@ -572,7 +573,9 @@ dominated by large matrix multiplications, and GPUs run those on dedicated hardw
 (tensor cores) that is only efficient when the matrices are big — a larger batch makes each
 multiplication bigger, so less of that hardware sits unused. 7,168 was measured as the
 point where the matrices are large enough to saturate it without running out of VRAM;
-smaller and larger were both tried.
+smaller and larger were both tried. On an L40S or an L4, v2 then runs each sub-batch in small
+chunks (below), so there the sub-batch size sets how many pixels move per copy and per output write,
+not the size of the matrices the card multiplies.
 
 **Two batches are in flight at once.** A batch has to be copied from host memory into the
 GPU before the GPU can compute it, and a card cannot compute during a copy it is waiting
@@ -638,9 +641,10 @@ to 0.0027. The copy to the GPU was already FP32, so this costs no bandwidth.
 **Five things are deliberately off or replaced**, each because it was measured and made
 things worse:
 
-- **`torch.compile` is off for the model.** Capturing the model as a CUDA graph consumed
-  11.6 GB of VRAM and roughly doubled the forward pass, because v1.1's recurrent layer
-  recompiled for every distinct sequence length it saw. Two small pieces are compiled instead
+- **`torch.compile` is off for the whole model.** Compiling it, which also captured it as a
+  CUDA graph, consumed 11.6 GB of VRAM and roughly doubled the forward pass, because v1.1's
+  recurrent layer recompiled for every distinct sequence length it saw. (v2's graphs, below,
+  are captured directly from the eager forward, without the compiler.) Two small pieces are compiled instead
   (both below): v1.1's pooling-head timestep, whose shapes do not depend on the sequence
   length, and v2's residual add + LayerNorm, compiled for dynamic shapes. Each compiles once
   per process.
@@ -672,6 +676,29 @@ things worse:
   ([ADR 030](../../../context_docs/decisions/030-forward-pass-reorderings-ship-at-a-store-boundary.md));
   CPU and training run the modules as written. v2 only: v1.1's arithmetic is unchanged.
   Measurements: [`v2-on-blackwell.md`](../../../context_docs/inference/v2-on-blackwell.md) §3.
+
+**On an L40S or an L4, v2 runs each sub-batch in small chunks, each replaying a captured CUDA
+graph.** The chunk size is per card, in `GRAPH_CHUNK_PIXELS`: 64 pixels on an L40S, 32 on an L4.
+A card not listed there runs the whole batch; the A10G is left out because no chunk size beat its
+whole-batch forward. `MultimodalBTInferenceModel.forward` cuts the sub-batch into chunks,
+copies each chunk into fixed input buffers, replays the graph and copies the chunk's rows out.
+Small chunks keep the intermediate activations in the GPU's cache instead of streaming them
+through memory; replaying a graph launches the whole forward at once, which removes the
+per-operation launch cost that would otherwise make small chunks slower. The graph for a
+`(T_s2, T_s1)` bucket shape is captured the first time that shape is seen — three warm-up
+forwards on zero inputs, then the capture — and kept for the life of the actor. All of a
+model's graphs share one memory pool, which is safe because they never replay at the same time
+and each chunk's output is copied out before the next replay, so graph memory stays near one
+capture's peak however many bucket shapes the actor sees. A short last
+chunk replays with stale rows past its end; each pixel is embedded independently, so they never
+reach the rows kept. The chunked forward moves outputs slightly, the way a different batch shape
+does, so it ships at a v2 store boundary
+([ADR 030](../../../context_docs/decisions/030-forward-pass-reorderings-ship-at-a-store-boundary.md),
+[ADR 042](../../../context_docs/decisions/042-chunked-graph-replay-ships-above-the-two-card-yardstick.md)).
+The one-per-strip profiled batch replays the same graphs, so it skips the per-layer timing logs
+(a replay runs no Python) but keeps its forward time and TFLOPS lines. v1.1, the CPU, and any
+forward with gradients on run the whole sub-batch at once, so v1.1's arithmetic is unchanged.
+Measurements: [`v2-chunked-graph-replay.md`](../../../context_docs/inference/v2-chunked-graph-replay.md).
 
 **What the logs report, and why it is not pixels per second.** A pixel with few
 observations costs about a tenth of a densely observed one, so a pixels-per-second figure
@@ -782,10 +809,11 @@ layout's own array set. Assembly keeps whichever of them are present in *both* t
 tile and the destination, so a store predating an array, or a run that stages nothing for
 one, needs no special case. Adding an array to the layout is therefore enough to have it
 carried — which was not true while the copy set was a hand-written tuple, and cost one
-published zone-year of empty `s2_month_covered` planes. A four-dimensional variable's
-trailing extent comes from `store_layout.trailing_extent` per variable, because there are
-now two different trailing axes (`band` is as wide as the embedding; `month` is twelve) and
-no "four dimensions means bands" rule would be safe.
+published zone-year of empty `s2_month_covered` planes. Every axis is read by name, through
+`store_geometry.axis_roles`: `band` is as wide as the embedding and `month` is twelve, and a
+v2 store puts `band` before the spatial axes (ADR 031), so no "four dimensions means bands
+last" rule would be safe. A staged tile is reordered into its destination's axis order as it
+is read (`store_geometry.reorder`).
 
 #### Completion markers: how a resume tells finished from interrupted
 
@@ -873,6 +901,23 @@ count. Every column is derivable from the store, so such rows are repairable:
 `scripts/maintenance/rebuild_registry_measurements.py`. That script also repaired the 1,519,045
 null rows of the v1.1 campaign, which ran before the embedded path persisted its record
 ([`registry-backfill.md`](../../../context_docs/storage/registry-backfill.md)).
+
+#### The provenance planes ride on the tile too
+
+When the mosaics were ingested with the `provenance` switch on, they carry a per-pixel
+`source_index`, and the actor turns it into the shard's share of the provenance record. Wherever the
+loader reads a sensor's validity (the whole-shard SCL mask for optical, each strip's VV and VH for
+radar) it reads the index over the same window, negates it where the model's test fails, and keeps
+it compressed per date. Optical reads it on every date, a fully cloudy one included, although the
+model skips those. At the staging write, on the background writer, each date becomes one `int16`
+plane of the granule's signed fusion order plus one: positive where the model used the
+observation, negative where it rejected it, zero where no granule had data. It is staged as
+`pixel_sources_<sensor>`, with the summary (each date's `sources` and valid-pixel count) as the
+tile's `provenance` attribute. A holes update cuts its planes to the pixels it embedded and stages
+that mask beside them, which becomes its `update_pixels`. Assembly then
+publishes the record before tagging the cell (`provenance_publish.py`,
+[`docs/registry.md`](../../../docs/registry.md)). Every mosaic read is pinned to the snapshot the
+plan sampled, so the record describes what the model read.
 
 ### 2. Assembling the staged tiles into the store
 
@@ -1019,7 +1064,11 @@ writer emits in one go is much larger than what a reader has to fetch.
 
 **The two layouts now share one geometry**, so what differs is the writer and the manifest
 split, not the objects. Both use `(1, 256, 256, 128)` inner chunks — full band depth, so the
-band axis is never split — inside `(1, 2048, 2048, 128)` shards.
+band axis is never split — inside `(1, 2048, 2048, 128)` shards. That is v1.1's geometry. A v2
+store (`SINGLE_V2`, `GLOBAL_V2`) holds `embeddings` band-first, `(1, 16, 2048, 2048)` shards of
+`(1, 4, 512, 512)` chunks, with every other array in 512² chunks, all in level group `0`; inference stages its tiles band-first to match, and
+assembly reads every axis by name, so neither path reorders a tile
+([ADR 031](../../../context_docs/decisions/031-the-v2-store-chunks-the-band-axis-at-16.md)).
 
 ```text
                   SINGLE (one area)               GLOBAL (zone group)
@@ -1227,6 +1276,8 @@ New code (not ported):
 | `dataset.py` | Valid-pixel filtering and lazy per-batch indexing |
 | `quantization.py` | Int8 quantization with per-pixel scale factors and dequantization |
 | `assembly.py` | Staged Zarr writes + raw-zarr fork/merge assembly into Icechunk (single-ROI + global modes) |
+| `provenance.py` | The actor's half of the provenance record: source-index pieces read beside the masks, stitched per shard-date and staged |
+| `provenance_publish.py` | Publishing a run's provenance record beside the registry, and its checks, before the cell is tagged |
 | `actors.py` | Ray actor wrapping the full per-chunk pipeline |
 | `scheduling.py` | Work-stealing scheduler (`_process_chunks_work_stealing`) and `ActorPool` — manages dispatch, actor replacement, idle retirement, and tracker polling |
 | `progress.py` | Lightweight Ray actor (`num_cpus=0`) polled by the flow runner every 60s for batch-level progress and 5-minute stall detection |

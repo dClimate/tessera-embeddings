@@ -14,6 +14,7 @@ both modes the same way still fails.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -27,9 +28,11 @@ import pytest
 import xarray as xr
 from tenacity import Retrying, stop_after_attempt
 
+from tessera_embeddings.config.ingest import SOURCE_INDEX_VAR
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
 from tessera_embeddings.ingest import live_windows as live_windows_mod
-from tessera_embeddings.ingest import roi_processing, s2_roi
+from tessera_embeddings.ingest import provenance, roi_processing, s2_roi
+from tessera_embeddings.ingest.provenance import FUSION_POSITION, stamp_fusion_positions
 from tessera_embeddings.ingest.stac import HeterogeneousProducerError
 from tessera_embeddings.storage.zarr_store import store_write_retrying
 from tests.stac_items import fake_stac_item
@@ -134,6 +137,8 @@ class _Run:
         self.load_started: dict[str, float] = {}
         self.write_ended: dict[str, float] = {}
         self.attempts: list[str] = []
+        #: Date -> the provenance granule list its write carried.
+        self.granules: dict[str, str | None] = {}
 
 
 @pytest.fixture
@@ -156,6 +161,8 @@ def run_ingest(monkeypatch):
         return retrying
 
     monkeypatch.setattr(s2_roi, "store_write_retrying", _no_sleep)
+    # The store is faked, so the record of skipped days is too; a test asserting on it patches it.
+    monkeypatch.setattr(provenance, "record_skipped_days", lambda *_a, **_k: None)
 
     # Cropping is unconditional, so window derivation runs on every path and needs a mask
     # these tests do not have. One window covering the whole ROI keeps the date pipeline —
@@ -181,18 +188,24 @@ def run_ingest(monkeypatch):
         write_s: float = 0.0,
         log: logging.Logger | None = None,
         existing_dates: set[str] | None = None,
+        catalogue: list | None = None,
         **ingest_kwargs,
     ) -> _Run:
         run = _Run()
         runs.append(run)  # so a test can inspect a run whose write raised
 
-        def load_stac_items(day_items, **_kwargs):
+        def load_stac_items(day_items, **kwargs):
             if load_raises is not None:
                 raise load_raises
             date = day_items[0].datetime.strftime("%Y-%m-%d")
             run.load_started[date] = time.monotonic()
             run.loaded.append(date)
-            return _day_ds(date, valid=dates[date])
+            ds = _day_ds(date, valid=dates[date])
+            if kwargs.get("source_index"):
+                # What the real loader does with the record on: stamp what it fused, add the band.
+                stamp_fusion_positions(day_items, day_items)
+                ds[SOURCE_INDEX_VAR] = xr.ones_like(ds["blue"])
+            return ds
 
         def _record_write(day_ds) -> None:
             """The write stub's whole behaviour, shared by every writer it stands in for.
@@ -209,16 +222,21 @@ def run_ingest(monkeypatch):
             run.written.append(date)
             run.write_ended[date] = time.monotonic()
 
-        def write_day_windows(_store, day_ds, _windows, **_kwargs):
+        def write_day_windows(_store, day_ds, _windows, **kwargs):
             _record_write(day_ds)
+            run.granules[str(day_ds.time.dt.date.values[0])] = kwargs.get("granules")
 
-        def write_days_windows(_store, days, **_kwargs):
+        def write_days_windows(_store, days, **kwargs):
             # The batched writer takes (day_ds, windows) pairs; each still counts as its
             # own write, which is what the one-commit-per-date accounting assumes.
-            for day_ds, _windows in days:
+            lists = kwargs.get("granules") or [None] * len(days)
+            for (day_ds, _windows), granules in zip(days, lists, strict=True):
                 _record_write(day_ds)
+                run.granules[str(day_ds.time.dt.date.values[0])] = granules
 
-        monkeypatch.setattr(s2_roi, "query_stac_items", lambda **_kwargs: ([fake_stac_item(d) for d in dates], {}))
+        monkeypatch.setattr(
+            s2_roi, "query_stac_items", lambda **_kwargs: (catalogue or [fake_stac_item(d) for d in dates], {})
+        )
         monkeypatch.setattr(s2_roi, "load_stac_items", load_stac_items)
         # What the store already holds. Default empty — a fresh ingest — but a test can
         # populate it to stand a run up over an existing store, which is what a resume is.
@@ -809,6 +827,104 @@ def test_a_bound_that_is_not_a_date_is_refused(run_ingest, pipeline_dates, bad_e
             start_date="2018-01-01",
             end_date=bad_end,
         )
+
+
+@BOTH_MODES
+@pytest.mark.parametrize("batch_dates", [1, 4], ids=["per-date", "batched"])
+def test_each_written_date_carries_its_own_granule_list(run_ingest, pipeline_dates, batch_dates):
+    """With the record on, every write carries the list of the granules its load fused, and only its own."""
+    run = run_ingest(SKIP_CHAIN, pipeline_dates=pipeline_dates, batch_dates=batch_dates, provenance=True)
+    assert sorted(run.granules) == ["2024-01-01", "2024-01-05"]
+    for date, granules in run.granules.items():
+        assert granules is not None
+        assert [g["granule_id"] for g in json.loads(granules)] == [f"S2A_T13TDE_{date.replace('-', '')}_0_L2A"]
+
+
+def _copies(date: str) -> list:
+    """Two copies of one image, the newer processing baseline first."""
+    copies = [fake_stac_item(date, item_id=f"S2A_T13TDE_{date.replace('-', '')}_{n}_L2A") for n in (0, 1)]
+    day = date.replace("-", "")
+    for copy, baseline in zip(copies, ("05.11", "05.10"), strict=True):
+        copy.properties |= {
+            "grid:code": "MGRS-13TDE",
+            "s2:processing_baseline": baseline,
+            "s2:datatake_id": f"GS2A_{day}T100000_000001_N{baseline}",
+            "s2:datastrip_id": f"S2A_OPER_MSI_L2A_DS_TEST_{day}T120000_S{day}T100001_N{baseline}",
+        }
+    return copies
+
+
+@pytest.mark.parametrize("newer_unreadable", [False, True], ids=["duplicate", "unreadable"])
+def test_a_dropped_copy_is_listed_with_its_reason(run_ingest, monkeypatch, newer_unreadable):
+    """The losing duplicate, or the copy that would not read and was replaced, follows the fused one."""
+    newer, older = _copies("2024-01-01")
+    if newer_unreadable:
+        real = s2_roi._coverage_from_scl
+
+        def newer_will_not_read(*args, **kwargs):
+            return _missing_object_gate() if FUSION_POSITION in newer.properties else real(*args, **kwargs)
+
+        monkeypatch.setattr(s2_roi, "_coverage_from_scl", newer_will_not_read)
+    run = run_ingest({"2024-01-01": True}, pipeline_dates=False, provenance=True, catalogue=[newer, older])
+    listed = [(g["granule_id"], g["status"], g["stepped_down"]) for g in json.loads(run.granules["2024-01-01"])]
+    if newer_unreadable:
+        assert listed == [(older.id, "fused", True), (newer.id, "unreadable", False)]
+    else:
+        assert listed == [(newer.id, "fused", False), (older.id, "duplicate", False)]
+
+
+@BOTH_MODES
+def test_a_day_the_gate_drops_is_listed_once_the_mosaic_exists(run_ingest, monkeypatch, pipeline_dates):
+    """Each gate-failed day is committed with its granules marked low coverage; none waits past the first write."""
+    committed: dict[str, list] = {}
+    monkeypatch.setattr(
+        provenance,
+        "record_skipped_days",
+        lambda _store, lists, **_k: committed.update({d: json.loads(g) for d, g in lists.items()}),
+    )
+    run_ingest(SKIP_CHAIN, pipeline_dates=pipeline_dates, provenance=True)
+    assert sorted(committed) == ["2024-01-02", "2024-01-03", "2024-01-04"]
+    assert all([g["status"] for g in listed] == ["low_coverage"] for listed in committed.values())
+
+
+@pytest.mark.parametrize("way", ["producer-conflict", "unreadable", "fallback-fails-coverage"])
+def test_every_way_of_giving_up_a_day_lists_it(run_ingest, monkeypatch, way):
+    """Each path that gives a day up commits its copies once, each under the reason it had.
+
+    Over a store that already holds a date, so each list commits as the day is given up.
+    """
+    committed: list[dict] = []
+    monkeypatch.setattr(
+        provenance,
+        "record_skipped_days",
+        lambda _store, lists, **_k: committed.append({d: json.loads(g) for d, g in lists.items()}),
+    )
+    newer, older = _copies("2024-01-01")
+    kwargs: dict = {"catalogue": [newer, older]}
+    if way == "producer-conflict":
+        kwargs["load_raises"] = HeterogeneousProducerError("2024-01-01: no single offset decision fits")
+    else:
+        # The newer copy will not read; the older, if offered, reads and fails the gate.
+        def gate(*_a, **_k):
+            return (
+                _missing_object_gate() if way == "unreadable" or FUSION_POSITION in newer.properties else (False, None)
+            )
+
+        monkeypatch.setattr(s2_roi, "_coverage_from_scl", gate)
+    run_ingest({"2024-01-01": True}, pipeline_dates=False, provenance=True, existing_dates={"2023-12-31"}, **kwargs)
+    listed = [[(g["granule_id"], g["status"]) for g in day] for commit in committed for day in commit.values()]
+    assert listed == [
+        {
+            "producer-conflict": [(newer.id, "producer_conflict"), (older.id, "duplicate")],
+            "unreadable": [(newer.id, "unreadable"), (older.id, "unreadable")],
+            "fallback-fails-coverage": [(newer.id, "unreadable"), (older.id, "low_coverage")],
+        }[way]
+    ]
+
+
+def test_with_the_record_off_no_write_carries_a_list(run_ingest):
+    run = run_ingest(SKIP_CHAIN, pipeline_dates=False)
+    assert run.granules == {"2024-01-01": None, "2024-01-05": None}
 
 
 def test_batch_dates_validation_rejects_bad_combinations(tmp_path) -> None:

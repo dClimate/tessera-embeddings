@@ -184,6 +184,16 @@ def _acquisition_instant(item: Any) -> datetime.datetime | None:  # noqa: ANN401
         return None
 
 
+def solar_day_of_instant(instant: datetime.datetime, *, mid_longitude: float | None) -> datetime.date:
+    """The solar day an acquisition instant belongs to at ``mid_longitude``; its UTC date for None.
+
+    The one place the offset is applied to a time, shared by :func:`normalize_to_solar_day` and
+    the radar burst census, so an acquisition counts on the day it is loaded on.
+    """
+    offset = datetime.timedelta(seconds=solar_day_offset_seconds(mid_longitude) if mid_longitude is not None else 0)
+    return (instant + offset).date()
+
+
 def normalize_to_solar_day(items: list[Any], *, mid_longitude: float | None) -> list[Any]:
     """Stamp every item with **noon UTC of the solar day it belongs to**. In place.
 
@@ -212,7 +222,6 @@ def normalize_to_solar_day(items: list[Any], *, mid_longitude: float | None) -> 
     ``mid_longitude`` of ``None`` groups by UTC date instead, for callers that genuinely
     are not working in solar days.
     """
-    offset = datetime.timedelta(seconds=solar_day_offset_seconds(mid_longitude) if mid_longitude is not None else 0)
     groups: dict[datetime.date, list[Any]] = {}
     for item in items:
         # THE SOLAR DAY IS COMPUTED FROM THE ACQUISITION INSTANT, which survives normalisation in
@@ -228,13 +237,13 @@ def normalize_to_solar_day(items: list[Any], *, mid_longitude: float | None) -> 
         # because it has nothing else to read.
         acquired = _acquisition_instant(item)
         if acquired is not None:
-            day = (acquired + offset).date()
+            day = solar_day_of_instant(acquired, mid_longitude=mid_longitude)
         else:
             # No usable property: an object that never came from a catalogue. Fall back to the
             # canonical-stamp reading, which is still right for anything this package produced.
             when = item.datetime
             is_canonical = (when.hour, when.minute, when.second, when.microsecond) == (12, 0, 0, 0)
-            day = when.date() if is_canonical else (when + offset).date()
+            day = when.date() if is_canonical else solar_day_of_instant(when, mid_longitude=mid_longitude)
         groups.setdefault(day, []).append(item)
     for day, group in groups.items():
         canonical = datetime.datetime(day.year, day.month, day.day, 12, 0, 0, tzinfo=datetime.UTC)

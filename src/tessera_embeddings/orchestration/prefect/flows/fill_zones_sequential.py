@@ -732,7 +732,7 @@ def fill_zones_sequential_flow(
 
     Args:
         cells: ``(zone, year)`` pairs for this cluster — zone as its group name, e.g.
-            ``[("utm33", 2025), ("utm15", 2025)]``. **May span campaign years**, which is what
+            ``[("utm33n", 2025), ("utm15s", 2025)]``. **May span campaign years**, which is what
             lets the driver drop the year barrier: each cell carries its OWN inference window
             to the actors (``ZoneContext.time_window``, so a cell is never inferred over
             another year's months), and assemblies serialize on the runner's single trailing
@@ -1441,7 +1441,9 @@ def fill_zones_sequential_flow(
             [],
             "chained-session",
             "chained-session",
-            "chained-session",
+            # Each cell's work carries its own run id; this placeholder only meets the runner's
+            # encoder check, which reads an unprefixed id as v1.1 staging and refuses a v2 store.
+            run_id_prefix(model_version) + "chained-session",
             t0_flow,
             log,
             on_actor_retire=terminator,
@@ -1479,9 +1481,9 @@ def fill_zones_sequential_flow(
                 store_path=store_path,
                 staging_base=prep.staging_base,
                 # The published registry's ROOT, derived from the STORE THIS RUN WRITES. Deriving
-                # it from the default repo name instead put this flow's parts beside
+                # it from the default repo name instead put this flow's run files beside
                 # `tessera.icechunk` while it filled `tessera-radar` (2026-08-19). Bucket
-                # conventions belong to BucketPaths (§0.3); the part's name is composed
+                # conventions belong to BucketPaths (§0.3); the run file's name is composed
                 # downstream, where the run id is.
                 registry_root=paths.optical_registry(store_path),
                 # The depth rule every registry row is judged against, from the store root — the

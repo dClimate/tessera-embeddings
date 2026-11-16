@@ -158,7 +158,7 @@ def _compare_zarr_path(
 def _compare_arrays(arr_a: np.ndarray, arr_b: np.ndarray, *, name: str, rtol: float, atol: float) -> None:
     assert arr_a.shape == arr_b.shape, f"{name}: shape {arr_a.shape} vs {arr_b.shape}"
     assert arr_a.dtype == arr_b.dtype, f"{name}: dtype {arr_a.dtype} vs {arr_b.dtype}"
-    if rtol == 0.0 and atol == 0.0:
+    if (rtol == 0.0 and atol == 0.0) or not np.issubdtype(arr_a.dtype, np.number):  # strings have no tolerance
         np.testing.assert_array_equal(arr_a, arr_b, err_msg=f"data differs for {name}")
     else:
         np.testing.assert_allclose(arr_a, arr_b, rtol=rtol, atol=atol, err_msg=f"data differs for {name}")

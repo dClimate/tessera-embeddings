@@ -172,7 +172,7 @@ python scripts/update/plan_update.py from-registry \
 |---|---|
 | `--inputs` | the deployment's `paths.inputs`. The plan is written under it, where the flows look for it |
 | `--refused` | keep tiles that left pixels empty for this reason: `thin` (too few optical observations), `no_optical` (none at all), `no_radar` (no radar observation), or `any`. Without it, every tile is kept |
-| `--zones`, `--years` | keep only these zones and years, comma-separated |
+| `--zones`, `--years` | keep only these zones and years, comma-separated. In a v2 store, name a half (`utm19s`) or a whole band (`utm19`); the registry lists a band whole, and the plan splits its tiles into the half each lies in, since an update fills halves |
 | `--aoi=W,S,E,N` | keep tiles that overlap this box of longitudes and latitudes. Write it with `=`, or a negative first number is read as an option. It may not cross the 180° meridian; plan each side separately |
 | `--registry` | the registry's location: the folder that holds `master/` |
 | `--region` | the S3 region of the registry and the land mask (default `us-west-2`) |
@@ -367,7 +367,7 @@ to the store after it.
 | `needs allow_s2_only=True` | a `holes` update ran with radar required | add `-p allow_s2_only=true` |
 | the run stopped part way | some zone-years are not done | run the same command again |
 | `could not be re-derived` or `registry master NOT merged` in the log, or `verify` names a zone-year | the store is correct, but the registry is behind for that zone-year | `python scripts/maintenance/rebuild_registry_measurements.py repair --registry ... --store ... --zones <zone> --write` |
-| `registry part ... could not be published` in the log | the store is correct, but the update's registry rows were never written, and `repair` cannot rebuild them | fix the cause (usually permissions), then run a `shards` update of the same tiles under a new name |
+| `registry run file ... could not be published` in the log | the store is correct, but the update's registry rows were never written, and `repair` cannot rebuild them | fix the cause (usually permissions), then run a `shards` update of the same tiles under a new name |
 
 ## How long it takes
 

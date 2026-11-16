@@ -21,7 +21,7 @@ zone-fill *runner* (inference -> assemble -> tag) lives in
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import cast
@@ -29,6 +29,7 @@ from typing import cast
 import icechunk
 import zarr
 
+from tessera_embeddings.config.store_geometry import level0
 from tessera_embeddings.storage.shard_writer import HALVES, commit_year_attrs, read_halves_complete
 from tessera_embeddings.storage.time_axis import CAMPAIGN_YEARS, time_index_of, year_timestamp
 from tessera_embeddings.storage.zone_grid import fill_zones, group_and_half, zone_layout_of, zones
@@ -107,7 +108,7 @@ def missing_zones_for_year(
     repo: icechunk.Repository,
     year: int,
     *,
-    expected_zones: Iterable[str] | None = None,
+    expected_zones: Collection[str] | None = None,
     snapshot_id: str | None = None,
     branch: str = "main",
 ) -> tuple[str, ...]:
@@ -122,8 +123,7 @@ def missing_zones_for_year(
     else ``branch``'s tip — so the answer describes that snapshot rather than a branch that may
     have advanced since.
     """
-    scope = tuple(expected_zones) if expected_zones is not None else None  # a generator is read once
-    if scope == ():
+    if expected_zones is not None and not expected_zones:
         # An empty scope makes the check vacuous: every zone in scope has landed, having verified
         # nothing. `None` means "the whole campaign"; an empty list means the caller computed a
         # scope and got nothing, which is a bug in the caller, not a completed year.
@@ -131,12 +131,8 @@ def missing_zones_for_year(
             f"cannot assess year {year}: expected_zones is empty. Pass None for all "
             "zones, or a non-empty scope; an empty scope verifies nothing."
         )
-    status = (
-        campaign_status(repo, snapshot_id=snapshot_id)
-        if snapshot_id is not None
-        else campaign_status(repo, branch=branch)
-    )
-    expected = scope if scope is not None else status.campaign_zones()
+    status = campaign_status(repo, years=(year,), branch=branch, snapshot_id=snapshot_id)
+    expected = expected_zones if expected_zones is not None else status.campaign_zones()
     return tuple(z for z in expected if not status.has(z, year))
 
 
@@ -194,16 +190,16 @@ def mark_zone_year_empty(
     """
     # Axis check on a read-only view: it must fail before any session is opened, so a rejected
     # year cannot leave a writable session dangling.
-    group, half = group_and_half(zone)
+    group = group_and_half(zone)[0]
     node = cast(zarr.Group, zarr.open_group(repo.readonly_session("main").store, mode="r")[group])
-    if time_index_of(node, year_timestamp(year)) is None:
+    if time_index_of(level0(node), year_timestamp(year)) is None:
         raise ValueError(
             f"Year {year} is not on {zone}'s pre-allocated time axis — refusing to mark an "
             "off-axis year complete (ADR-008 D1: the axis is fixed at seeding)."
         )
     # Delegated so there is exactly ONE writer of years_complete/runs, with one retry-on-conflict
     # policy — what makes a no-land mark safe to run concurrently with another year of the zone.
-    return commit_year_attrs(repo, group, year, run_id=run_id, empty=True, skip_if_marked=True, half=half)
+    return commit_year_attrs(repo, zone, year, run_id=run_id, empty=True, skip_if_marked=True)
 
 
 @dataclass(frozen=True)
@@ -271,8 +267,8 @@ class CampaignStatus:
 
     @property
     def zone_years_done(self) -> int:
-        """Total ``(zone, year)`` cells landed across all seeded zones."""
-        return sum(len(v) for v in self.zones.values())
+        """Total fill-zone cells landed: a column's halves count as they land, before the year completes."""
+        return sum(len(v) for v in (self.halves or self.zones).values())
 
     def campaign_zones(self) -> tuple[str, ...]:
         """The full campaign: every fill zone of the layout this store's groups use (ADR 037, 038)."""

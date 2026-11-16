@@ -12,7 +12,8 @@ measurements on every row and `measured_by` saying whether the fill or the re-de
 them. The re-derived rows live in `master/` alone; they are not published as a prefix of their own.
 This is why the rows were empty, why re-deriving them is exact, the run, and what stops it
 recurring. How `master/` stays current after that is
-[`registry-master.md`](registry-master.md).
+[`registry-master.md`](registry-master.md). The folder this record calls `parts/`, and a file in it
+a part, is now `runs/` and a run file ([ADR 036](../decisions/036-the-registry-folder-is-runs.md)).
 
 ## Why the rows were empty
 

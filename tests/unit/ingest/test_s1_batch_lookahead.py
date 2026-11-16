@@ -19,7 +19,8 @@ because the rule they pin lives in that loop rather than in the pipeline.
 from __future__ import annotations
 
 import datetime as dt
-from datetime import date, timedelta
+import json
+from datetime import date, datetime, timedelta
 from itertools import pairwise
 from types import SimpleNamespace
 
@@ -27,9 +28,13 @@ import numpy as np
 import pytest
 import xarray as xr
 
+from tessera_embeddings.config.ingest import DROPPED, MISSING_BANDS
 from tessera_embeddings.ingest import live_windows as live_windows_mod
 from tessera_embeddings.ingest import s1_roi
 from tessera_embeddings.ingest.live_windows import WINDOW_COST_IN_CHUNKS, WINDOW_COST_IN_CHUNKS_OVERLAPPED
+from tessera_embeddings.ingest.opera_query import BURST_CENSUS_ATTR, BURST_ID
+from tessera_embeddings.ingest.provenance import stamp_fusion_positions
+from tessera_embeddings.ingest.solar_days import normalize_to_solar_day
 
 # Every S1 leg these tests run is kept off disk and network the same way.
 pytestmark = pytest.mark.usefixtures("s1_leg_offline")
@@ -53,12 +58,39 @@ def _fake_client():
     )()
 
 
-def _run_ingest(monkeypatch, catalogue: list[str], existing: set[str], **kwargs) -> list[str]:
+def _burst(day: str, *, missing_bands: bool = False) -> SimpleNamespace:
+    """One radar granule acquired mid-morning UTC on ``day``, as the provider would hand it over.
+
+    ``missing_bands`` makes it one the provider sets aside, as the catalogue query marks it.
+    """
+    burst = "T001-000002-IW1" if missing_bands else "T001-000001-IW1"
+    return SimpleNamespace(
+        id=f"OPERA_L2_RTC-S1_{burst}_{day.replace('-', '')}T100000Z_X_S1A_30_v1.0",
+        datetime=datetime.fromisoformat(f"{day}T10:00:00+00:00"),
+        properties={"datetime": f"{day}T10:00:00Z", BURST_ID: burst}
+        | ({DROPPED: MISSING_BANDS} if missing_bands else {}),
+        assets={},
+        geometry=None,
+        bbox=None,
+    )
+
+
+def _run_ingest(
+    monkeypatch,
+    catalogue: list[str],
+    existing: set[str],
+    providers: list | None = None,
+    writes: list | None = None,
+    recorded_census: dict | None = None,
+    **kwargs,
+) -> list[str]:
     """Drive ``ingest_s1_roi_sar`` against a faked catalogue and store.
 
     ``catalogue`` is every solar date the catalogue holds; the fake returns the ones
     inside whatever range each batch asks for, which is what a real catalogue does.
-    Returns the dates actually written, in order.
+    Returns the dates actually written, in order. ``providers``, when given, collects the
+    keyword arguments each batch built its item provider with; ``writes`` the keyword
+    arguments of each date's write. ``recorded_census`` is what the store's root attr holds.
 
     That range is deliberately WIDER than the batch owns — ``fixed_day_ranges`` pads it a
     day either side so a solar day straddling a boundary is complete for whichever batch
@@ -74,7 +106,13 @@ def _run_ingest(monkeypatch, catalogue: list[str], existing: set[str], **kwargs)
     """
     written: list[str] = []
 
-    def fake_ingest_tile(*, start_date: str, end_date: str, existing_dates=None, **_):
+    def fake_ingest_tile(
+        *, start_date: str, end_date: str, existing_dates=None, item_provider_fn=None, source_index=False, **_
+    ):
+        if source_index:
+            # What the real loader does with the record on: fuse the provider's items, stamped.
+            fused = item_provider_fn()
+            stamp_fusion_positions(fused, fused)
         dates = [d for d in catalogue if start_date <= d <= end_date]
         if not dates:
             return None, {}
@@ -84,12 +122,31 @@ def _run_ingest(monkeypatch, catalogue: list[str], existing: set[str], **kwargs)
         )
         return ds, {}
 
-    def fake_write_day_windows(_store, data, *_args, **_kwargs):
+    def fake_write_day_windows(_store, data, *_args, **kwargs):
         written.append(str(data["time"].values[0])[:10])
+        if writes is not None:
+            writes.append(kwargs)
 
     monkeypatch.setattr(s1_roi, "ingest_tile", fake_ingest_tile)
     monkeypatch.setattr(s1_roi, "write_day_windows", fake_write_day_windows)
     monkeypatch.setattr(s1_roi, "get_existing_dates", lambda _store, **_kw: set(existing))
+    monkeypatch.setattr(s1_roi, "get_root_attr", lambda _store, _key, **_kw: recorded_census)
+
+    def fake_provider(_orbit, _bbox, query_start, query_end, **kwargs):
+        if providers is not None:
+            providers.append(kwargs)
+        days = [d for d in catalogue if query_start <= d <= query_end]
+
+        def provide() -> list:
+            # Each day also has a granule missing a polarisation, which the provider sets aside,
+            # stamped with its solar day as the real one does.
+            set_aside = [_burst(d, missing_bands=True) for d in days]
+            kwargs["dropped"].extend(normalize_to_solar_day(set_aside, mid_longitude=kwargs["mid_longitude"]))
+            return [_burst(d) for d in days]
+
+        return provide
+
+    monkeypatch.setattr(s1_roi, "make_s1_item_provider", fake_provider)
 
     s1_roi.ingest_s1_roi_sar(
         roi_zarr_path="s3://bucket/roi.zarr",
@@ -524,6 +581,75 @@ def test_a_bound_that_is_not_a_date_is_refused(monkeypatch) -> None:
         )
 
 
+@pytest.mark.parametrize("pipe", _WRITE_PATHS)
+def test_one_burst_census_ranks_every_batch_over_the_requested_window(monkeypatch, pipe: bool) -> None:
+    """The radar fusion order ranks a burst by its acquisitions over the WHOLE window (ADR 033).
+
+    Built per batch, it would rank a burst by a month. Built over the resumed window — this store
+    already holds the first two days, so the search starts on the third — a resumed leg would rank
+    bursts differently from the run it resumes, and write different pixels for the same days.
+    """
+    built: list[tuple] = []
+
+    class _Census:
+        def __init__(self, *args, **kwargs) -> None:
+            built.append((args, kwargs))
+
+        def record(self) -> dict:
+            return {}
+
+    monkeypatch.setattr(s1_roi, "BurstCensus", _Census)
+    providers: list[dict] = []
+    _run_ingest(
+        monkeypatch,
+        catalogue=["2024-01-03", "2024-01-05"],
+        existing={"2024-01-01", "2024-01-02"},
+        providers=providers,
+        start_date="2024-01-01",
+        end_date="2024-01-06",
+        pipeline_batches=pipe,
+    )
+
+    assert built == [
+        (((0, 0, 1, 1), ("2024-01-01", "2024-01-06"), "ascending"), {"mid_longitude": 0.5, "recorded": None})
+    ]
+    assert len(providers) > 1, "needs several batches to show they share one census"
+    assert all(k["burst_census"] is providers[0]["burst_census"] for k in providers)
+
+
+@pytest.mark.parametrize(
+    ("existing", "recorded", "expected"),
+    [
+        pytest.param(set(), None, {"T001-000001-IW1": 2}, id="first-leg-counts-and-records"),
+        pytest.param(
+            {"2024-01-01"},
+            {"window": ["2024-01-01", "2024-01-04"], "mid_longitude": 0.5, "counts": {"T001-000001-IW1": 9}},
+            {"T001-000001-IW1": 9},
+            id="resume-reuses-the-record",
+        ),
+    ],
+)
+def test_a_store_holds_the_census_that_ranked_its_dates(monkeypatch, existing, recorded, expected) -> None:
+    """Every date's write carries the census as a root attr, and a resumed leg ranks by the one
+    its store already holds rather than counting the catalogue again (ADR 033): a backfilled
+    acquisition could otherwise flip a tie and fuse later days by a different burst.
+    """
+    writes: list[dict] = []
+    _run_ingest(
+        monkeypatch,
+        catalogue=["2024-01-01", "2024-01-03"],
+        existing=existing,
+        writes=writes,
+        recorded_census=recorded,
+        start_date="2024-01-01",
+        end_date="2024-01-04",
+    )
+
+    assert writes, "the open date is written"
+    record = {"window": ["2024-01-01", "2024-01-04"], "mid_longitude": 0.5, "counts": expected}
+    assert all(w["store_attrs"] == {BURST_CENSUS_ATTR: record} for w in writes)
+
+
 def test_s1_batch_windows_tile_inclusive_range_without_overlap(monkeypatch) -> None:
     """Batches OWN a tiling of the inclusive [start, end] range and QUERY a day past it.
 
@@ -573,3 +699,29 @@ def test_s1_batch_windows_tile_inclusive_range_without_overlap(monkeypatch) -> N
     for (_, prev_end), (next_start, _) in pairwise(queried):
         assert next_start < prev_end, f"the query pad was lost at {prev_end}/{next_start}"
     assert provided == queried
+
+
+@pytest.mark.parametrize("pipe", _WRITE_PATHS)
+def test_each_written_date_carries_its_own_burst_list(monkeypatch, pipe: bool) -> None:
+    """With the record on, a date's write lists the bursts its load fused, then those set aside."""
+    writes: list = []
+    written = _run_ingest(
+        monkeypatch,
+        catalogue=["2024-01-01", "2024-01-02", "2024-01-04"],
+        existing=set(),
+        writes=writes,
+        pipeline_batches=pipe,
+        provenance=True,
+    )
+    assert written == ["2024-01-01", "2024-01-02", "2024-01-04"]
+    for day, kwargs in zip(written, writes, strict=True):
+        fused, set_aside = json.loads(kwargs["granules"])
+        assert (fused["granule_id"], fused["status"]) == (_burst(day).id, "fused")
+        assert (fused["image_key"], fused["platform"]) == ("T001-000001-IW1", "S1A")
+        assert (set_aside["granule_id"], set_aside["status"]) == (_burst(day, missing_bands=True).id, "missing_bands")
+
+
+def test_with_the_record_off_no_radar_write_carries_a_list(monkeypatch) -> None:
+    writes: list = []
+    _run_ingest(monkeypatch, catalogue=["2024-01-01"], existing=set(), writes=writes)
+    assert [kwargs["granules"] for kwargs in writes] == [None]

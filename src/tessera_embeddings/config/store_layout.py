@@ -30,26 +30,25 @@ from __future__ import annotations
 
 import dataclasses
 import warnings
-from typing import TYPE_CHECKING, cast
 
 import numpy as np
+from zarr.codecs import ZstdCodec
 from zarr.codecs.numcodecs import PCodec as _PCodecZarr3
 
-from tessera_embeddings.config.inference import EMBEDDING_DIM
-
-if TYPE_CHECKING:
-    import xarray as xr
-    import zarr
+from tessera_embeddings.config.inference import EMBEDDING_DIM, model_family
+from tessera_embeddings.config.store_geometry import LEVEL0, PRESET_SPATIAL_DIMS, axis_roles, clamp_chunks_and_shards
 
 # PCodec is intentionally a Zarr v3 *serializer* (array->bytes), not a bytes->bytes compressor; silence the "not in
 # the Zarr v3 spec" warning it emits on construction. This module is the codec's canonical home (inference.assembly
 # and the scale-test harness import it from here).
 warnings.filterwarnings("ignore", message="Numcodecs codecs are not in the Zarr version 3")
 
-DIMS_4D: tuple[str, str, str, str] = ("time", "northing", "easting", "band")
-DIMS_3D: tuple[str, str, str] = ("time", "northing", "easting")
+DIMS_4D: tuple[str, str, str, str] = ("time", *PRESET_SPATIAL_DIMS, "band")
+DIMS_3D: tuple[str, str, str] = ("time", *PRESET_SPATIAL_DIMS)
 #: Trailing axis of :data:`MONTH_COVERED_VARS` — twelve calendar months, not bands.
-DIMS_4D_MONTH: tuple[str, str, str, str] = ("time", "northing", "easting", "month")
+DIMS_4D_MONTH: tuple[str, str, str, str] = ("time", *PRESET_SPATIAL_DIMS, "month")
+#: v2's ``embeddings`` order: each chunk holds whole image planes, one per band (ADR 031 §3).
+DIMS_4D_BAND_FIRST: tuple[str, str, str, str] = ("time", "band", *PRESET_SPATIAL_DIMS)
 
 #: The three observation sources a pixel can be seen by, as the prefix their per-sensor arrays are named from. ONE
 #: list, because every per-sensor array is a pair — a count and a month mask — derived from a single validity mask per
@@ -89,8 +88,8 @@ MONTH_COORD = tuple(range(1, MONTHS_IN_YEAR + 1))
 #: for an unwritten pixel, exactly as a count of 0.
 #:
 #: Stored as ``int8`` carrying the attribute ``dtype="bool"``, xarray's own representation of a boolean array, so a
-#: reader gets booleans back while the on-disk type is the one the staging writer can produce (``Dataset.to_zarr``
-#: stores bool as int8 whatever the encoding says, and assembly reads staged tiles with raw zarr).
+#: reader gets booleans back while the on-disk type is the one the staging writer produces (it stages the masks as
+#: int8 explicitly, ``ZarrWriter._stage_month_masks``, and assembly reads staged tiles with raw zarr).
 MONTH_COVERED_VARS: tuple[str, ...] = tuple(f"{sensor}_month_covered" for sensor in SENSORS)
 
 #: The month mask paired with each obs-count array, so a caller holding one can name the other without slicing a name
@@ -99,6 +98,7 @@ MONTH_COVERED_FOR_OBS: dict[str, str] = dict(zip(OBS_COUNT_VARS, MONTH_COVERED_V
 
 # codec keys
 _ZSTD = "zstd"  # default bytes codec + default (zstd) compressor
+_ZSTD1 = "zstd1"  # default bytes codec + zstd at level 1 (v2 embeddings, ADR 031 §1)
 _PCODEC = "pcodec"  # PCodec serializer, no bytes-compressor
 _RAW = "raw"  # default bytes codec, no compressor
 
@@ -108,35 +108,13 @@ def pcodec_serializer() -> _PCodecZarr3:
     return _PCodecZarr3()
 
 
-def clamp_chunks_and_shards(
-    shape: tuple[int, ...],
-    chunks: tuple[int, ...],
-    shards: tuple[int, ...] | None,
-) -> tuple[tuple[int, ...], tuple[int, ...] | None]:
-    """Clamp nominal chunk/shard sizes to an array's ``shape``.
-
-    Chunks are clamped to the shape; shards are clamped to the shape and then floored to a whole
-    multiple of the clamped chunks (Zarr v3 requires shards to be exact chunk multiples), never
-    below one chunk, so a store smaller than one nominal chunk/shard still creates cleanly. The
-    single implementation of this geometry math: both :meth:`ArrayLayout.create_kwargs` and the
-    empty-store seeder call it.
-    """
-    # max(..., 1): a zero-extent axis is legal (a mosaic seeded with an EMPTY time axis, appended per date), but a
-    # zero chunk edge is not — keep the nominal chunk so the axis grows into it.
-    clamped = tuple(max(min(c, s), 1) for c, s in zip(chunks, shape, strict=True))
-    if shards is None:
-        return clamped, None
-    clamped_shards = tuple(max(c, (min(sh, s) // c) * c) for sh, s, c in zip(shards, shape, clamped, strict=True))
-    return clamped, clamped_shards
-
-
 @dataclasses.dataclass(frozen=True)
 class ArrayLayout:
     """On-disk geometry for one data variable.
 
     ``chunks``/``shards`` are element counts over ``dims``. ``codec`` is one of ``"zstd"``
-    (default serializer + zstd), ``"pcodec"`` (PCodec serializer, no compressor — floats only),
-    or ``"raw"`` (default serializer, no compressor).
+    (default serializer + zstd at its default level), ``"zstd1"`` (the same at level 1), ``"pcodec"``
+    (PCodec serializer, no compressor — floats only), or ``"raw"`` (default serializer, no compressor).
 
     ``attrs`` are array attributes written at creation, as pairs so the layout stays hashable and
     two presets cannot share a mutable dict. Needed because a dtype is not always the whole story:
@@ -155,8 +133,9 @@ class ArrayLayout:
     def create_kwargs(self, shape: tuple[int, ...]) -> dict:
         """Build ``zarr.Group.create_array`` kwargs for an array of ``shape``.
 
-        Chunks (and shards, kept a whole multiple of the clamped chunks) are clamped to ``shape``
-        so a store smaller than one nominal chunk/shard still creates cleanly.
+        Chunks and shards are clamped to ``shape`` by
+        :func:`~tessera_embeddings.config.store_geometry.clamp_chunks_and_shards`, so a store smaller
+        than one nominal chunk/shard still creates cleanly.
         """
         if len(shape) != len(self.dims):
             raise ValueError(f"shape {shape} has {len(shape)} dims, layout expects {len(self.dims)} ({self.dims})")
@@ -176,18 +155,26 @@ class ArrayLayout:
         elif self.codec == _RAW:
             kwargs["serializer"] = "auto"
             kwargs["compressors"] = None
-        else:  # _ZSTD
+        else:  # _ZSTD, _ZSTD1
             kwargs["serializer"] = "auto"
-            kwargs["compressors"] = "auto"
+            kwargs["compressors"] = ZstdCodec(level=1) if self.codec == _ZSTD1 else "auto"
         return kwargs
 
 
 @dataclasses.dataclass(frozen=True)
 class StoreLayout:
-    """The geometry of every data variable in a store, keyed by variable name."""
+    """The geometry of every data variable in a store, keyed by variable name.
+
+    ``bands`` is the extent of the band axis, which the band shards must tile exactly. Required, with
+    no default, because the band shards no longer state it: a v2 shard holds 16 of 128. ``level``
+    names the child group the arrays sit in, ``"0"`` for a v2 store (ADR 031 §1), or ``None`` for
+    one that keeps them in the zone group or store root, as v1.1 does.
+    """
 
     name: str
     arrays: dict[str, ArrayLayout]
+    bands: int
+    level: str | None = None
 
     def for_var(self, var: str) -> ArrayLayout:
         """Return the layout for a data variable, or raise if unknown."""
@@ -195,6 +182,11 @@ class StoreLayout:
             return self.arrays[var]
         except KeyError as exc:
             raise KeyError(f"{self.name} has no layout for variable {var!r} (known: {sorted(self.arrays)})") from exc
+
+    @property
+    def band_first(self) -> bool:
+        """Whether ``embeddings`` puts its band axis before the spatial pair, as v2 does (ADR 031 §3)."""
+        return self.for_var("embeddings").dims[1] == "band"
 
     @property
     def spatial_dims(self) -> tuple[str, str]:
@@ -206,7 +198,8 @@ class StoreLayout:
         """This layout with its Y and X dimensions named *spatial_dims*; geometry unchanged.
 
         The presets spell them ``northing``/``easting``. A new store takes its model's names
-        (``ModelFamily.spatial_dims``) and an existing one keeps its own (:func:`spatial_dims_of`).
+        (``ModelFamily.spatial_dims``) and an existing one keeps its own
+        (:func:`~tessera_embeddings.config.store_geometry.spatial_dims_of`).
         """
         rename = dict(zip(self.spatial_dims, spatial_dims, strict=True))
         arrays = {
@@ -214,23 +207,6 @@ class StoreLayout:
             for var, array in self.arrays.items()
         }
         return dataclasses.replace(self, arrays=arrays)
-
-
-def spatial_dims_of(group: zarr.Group | xr.Dataset) -> tuple[str, str]:
-    """The Y and X dimension names an existing output store uses.
-
-    Its ``spatial:dimensions`` when it declares them, as every georeferenced store does; otherwise
-    its required ``scales`` array, ``(time, Y, X)``, which a store with pixel-index coordinates
-    still has; the presets' names for anything else (a mosaic, a malformed group), so an audit
-    reports it rather than raises. Takes a zarr group or the xarray dataset opened from one.
-    """
-    declared = cast("list[str] | None", group.attrs.get("spatial:dimensions"))
-    if declared and len(declared) == 2:
-        return declared[0], declared[1]
-    scales = group.get("scales")
-    # xarray names a variable's dims on the variable; zarr in the array's metadata.
-    dims = getattr(scales, "dims", None) or getattr(getattr(scales, "metadata", None), "dimension_names", None)
-    return (dims[1], dims[2]) if dims and len(dims) == 3 else (DIMS_3D[1], DIMS_3D[2])
 
 
 def _obs(chunks: tuple[int, ...], shards: tuple[int, ...] | None, codec: str) -> dict[str, ArrayLayout]:
@@ -280,12 +256,12 @@ def _sharded_arrays(*, include_std: bool) -> dict[str, ArrayLayout]:
         # coverage is spatially smooth and a plane compresses ~400x while packed bits look like noise to the
         # compressor. The 6x uncompressed never reaches disk, and a plane per month needs no helper library to read.
         #
-        # int8 + attrs dtype="bool" is xarray's OWN representation of a boolean array, forced here by the write path:
-        # staged tiles are written with `Dataset.to_zarr`, which stores bool as int8 whatever the encoding asks, while
-        # assembly reads those tiles with RAW zarr and sees int8 — so a bool destination refused every staged month
-        # tile on the dtype guard. Matching the destination to what the writer can express keeps the guard intact, and
-        # the attribute is what makes an xarray reader see booleans rather than 0/1, so `cov.sel(month=7)` is still a
-        # boolean mask. Size is unchanged: numpy bool is 1 byte.
+        # int8 + attrs dtype="bool" is xarray's OWN representation of a boolean array, and what the staging writer
+        # stages (explicitly: from xarray 2026.9, `to_zarr` would store bool natively). Assembly reads staged tiles
+        # with RAW zarr and compares dtypes, so destination and staged tile must agree — a bool destination refused
+        # every staged month tile on the dtype guard. Matching the destination to what the writer stages keeps the
+        # guard intact, and the attribute is what makes an xarray reader see booleans rather than 0/1, so
+        # `cov.sel(month=7)` is still a boolean mask. Size is unchanged: numpy bool is 1 byte.
         **{
             var: ArrayLayout(
                 DIMS_4D_MONTH,
@@ -306,7 +282,7 @@ def _sharded_arrays(*, include_std: bool) -> dict[str, ArrayLayout]:
 
 #: Single-ROI output. Its own name because callers pass a preset explicitly and the name lands in the store's creating
 #: commit message.
-SINGLE = StoreLayout(name="single", arrays=_sharded_arrays(include_std=True))
+SINGLE = StoreLayout(name="single", arrays=_sharded_arrays(include_std=True), bands=EMBEDDING_DIM)
 
 #: The arrays every staged tile must carry and every destination must hold.
 REQUIRED_VARS: tuple[str, str] = ("embeddings", "scales")
@@ -322,19 +298,61 @@ REQUIRED_VARS: tuple[str, str] = ("embeddings", "scales")
 CARRIED_VARS: tuple[str, ...] = tuple(v for v in SINGLE.arrays if v not in REQUIRED_VARS)
 
 
-def trailing_extent(var: str, embedding_dim: int) -> int | None:
-    """The trailing-axis extent a 4-D *var* must have, or ``None`` if it is 2-D per timestep.
-
-    Read off the layout's own dims rather than a list of variable names, because the two 4-D
-    trailing axes differ in width: ``band`` is as wide as the embedding, ``month`` is twelve. A
-    single "4-D means band" rule rejects a correct month tile and shapes a cleared one wrongly.
-    ``None`` for an unknown var, or for a band axis when *embedding_dim* is 0 (check disabled).
-    """
-    dims = SINGLE.arrays[var].dims if var in SINGLE.arrays else ()
-    if len(dims) != 4:
-        return None
-    return MONTHS_IN_YEAR if dims[3] == "month" else (embedding_dim or None)
-
-
 #: The global campaign (ADR-008 D3). No ``embedding_std``, ever — see :func:`_sharded_arrays`.
-GLOBAL = StoreLayout(name="global", arrays=_sharded_arrays(include_std=False))
+GLOBAL = StoreLayout(name="global", arrays=_sharded_arrays(include_std=False), bands=EMBEDDING_DIM)
+
+
+#: v2's shards and chunks along the band axis: 16 dimensions to a shard, the shortest prefix v2 was trained on, cut
+#: into chunks of 4, so a phone or browser fetches only the dimensions it reads (ADR 031 §4).
+V2_BANDS_PER_SHARD = 16
+V2_BANDS_PER_CHUNK = 4
+#: v2's chunk edge in pixels. 256² builds four times the Dask tasks at default chunks; 1,024² makes a full vector
+#: cost 134 MB.
+V2_CHUNK_PX = 512
+
+
+def _v2(array: ArrayLayout) -> ArrayLayout:
+    """*array* in v2's geometry: band-first in 16-band shards of 4-band chunks, zstd at level 1, if it has a
+    band axis, and 512² chunks spatially either way.
+
+    One spatial chunk edge for every array is what lets a store smaller than one shard clamp every array
+    to the same shard height, which assembly requires (ADR 031 §5).
+    """
+    if array.dims == DIMS_4D:
+        return dataclasses.replace(
+            array,
+            dims=DIMS_4D_BAND_FIRST,
+            codec=_ZSTD1 if array.codec == _ZSTD else array.codec,
+            chunks=(1, V2_BANDS_PER_CHUNK, V2_CHUNK_PX, V2_CHUNK_PX),
+            shards=(1, V2_BANDS_PER_SHARD, SHARD_PX, SHARD_PX),
+        )
+    chunks = tuple(
+        V2_CHUNK_PX if role in ("Y", "X") else c for role, c in zip(axis_roles(array.dims), array.chunks, strict=True)
+    )
+    return dataclasses.replace(array, chunks=chunks)
+
+
+def _band_first(arrays: dict[str, ArrayLayout]) -> dict[str, ArrayLayout]:
+    """*arrays* in v2's geometry (:func:`_v2`)."""
+    return {var: _v2(array) for var, array in arrays.items()}
+
+
+#: The v2 stores: ``embeddings`` (and the single-area ``embedding_std``) band-first, in 16-band shards of 4-band
+#: chunks, every array at 512² chunks and in level group ``0`` (ADR 031).
+SINGLE_V2 = StoreLayout(
+    name="single-v2", arrays=_band_first(_sharded_arrays(include_std=True)), bands=EMBEDDING_DIM, level=LEVEL0
+)
+GLOBAL_V2 = StoreLayout(
+    name="global-v2", arrays=_band_first(_sharded_arrays(include_std=False)), bands=EMBEDDING_DIM, level=LEVEL0
+)
+
+
+def layout_for(model_version: str, *, single: bool) -> StoreLayout:
+    """The preset a NEW store takes from its model: v1.1's geometry, or v2's (ADR 031 §5).
+
+    An existing store keeps the geometry it was created with whatever the model, which the write
+    path reads from the store itself.
+    """
+    if model_family(model_version).generation == "v2":
+        return SINGLE_V2 if single else GLOBAL_V2
+    return SINGLE if single else GLOBAL

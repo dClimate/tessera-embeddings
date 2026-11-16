@@ -56,6 +56,7 @@ import zarr
 
 from tessera_embeddings.config.environment import code_identity, configure_logging
 from tessera_embeddings.config.fault_injection import ArmedFault
+from tessera_embeddings.config.store_geometry import axis_roles, dims_of, level0, window
 from tessera_embeddings.config.store_layout import SHARD_PX
 from tessera_embeddings.storage.conventions import STACK_ATTR, assert_stack_matches, library_stack
 from tessera_embeddings.storage.icechunk_logging import traced_commit
@@ -66,7 +67,7 @@ from tessera_embeddings.storage.session_catch_up import (
     ticking,
 )
 from tessera_embeddings.storage.time_axis import read_time_values, year_of
-from tessera_embeddings.storage.zone_grid import Half
+from tessera_embeddings.storage.zone_grid import Half, group_and_half
 
 _log = logging.getLogger(__name__)
 
@@ -173,7 +174,8 @@ class ShardSource(Protocol):
     def load(self, shard: tuple[int, int]) -> dict[str, np.ndarray]:
         """Return ``{var_name: block}`` for a shard - each block covers the whole
         (edge-clamped) shard region with ocean inner chunks at the array fill
-        value. Return ``{}`` to skip a shard entirely.
+        value, with a one-slot time axis and in the destination array's axis order.
+        Return ``{}`` to skip a shard entirely.
         """
         ...
 
@@ -221,8 +223,13 @@ def commit_with_rebase(
 
 
 def shard_pitch(arr: zarr.Array) -> int:
-    """An array's northing write granularity: shard height if sharded, else chunk height."""
-    return (arr.shards or arr.chunks)[1]
+    """An array's northing write granularity: shard height if sharded, else chunk height.
+
+    Read on the first axis that is neither time nor band, by name, so a band-first array (ADR 031)
+    and a staged tile with no time axis answer the same as a band-last zone array.
+    """
+    names = dims_of(arr) or ("time", "y")
+    return (arr.shards or arr.chunks)[next(i for i, d in enumerate(names) if d not in ("time", "band"))]
 
 
 #: Live shard counts, ``[done_0, total_0, ...]`` by worker index. Shared memory reaches a spawned
@@ -587,7 +594,7 @@ def read_halves_complete(node: zarr.Group, year: int) -> set[str]:
     return set(raw.get(str(year), [])) if isinstance(raw, dict) else set()
 
 
-def cell_complete(node: zarr.Group, year: int, half: Half | None = None) -> bool:
+def cell_complete(node: zarr.Group, year: int, half: Half | None) -> bool:
     """Whether a fill zone has landed ``year``: its group's ``years_complete``, or the half's own mark."""
     return year in read_years_complete(node) or (half is not None and half in read_halves_complete(node, year))
 
@@ -627,7 +634,8 @@ def run_provenance(
     store's authority on who wrote a year: this record lands in a second commit, which a dying
     process can miss. **A refill keeps the runs before it** in ``previous``, as ``run_id``,
     ``assembled_at``, ``commit`` and ``empty`` alone, which is all that is known of a run from
-    before tags.
+    before tags, plus ``provenance_version`` when the run carried the provenance record: a tile the
+    refill leaves untouched is still that run's, and its ``source_runs`` needs the marker.
 
     ``input_coverage`` answers the question the calendar-year guarantee below does NOT: not
     what window was *requested*, but **how much of it the input actually held** — per source
@@ -695,7 +703,10 @@ def run_provenance(
     prior = slots.get(key)
     if isinstance(prior, dict):
         # A re-run under the same id replaces its own entry; any other run joins the history.
-        replaced = [] if prior.get("run_id") == run_id else [{k: prior[k] for k in _HISTORY if k in prior}]
+        kept = {k: prior[k] for k in _HISTORY if k in prior}
+        if version := (prior.get("input_coverage") or {}).get("provenance_version"):
+            kept["provenance_version"] = version
+        replaced = [] if prior.get("run_id") == run_id else [kept]
         previous = [p for p in [*prior.get("previous", []), *replaced] if p.get("run_id") != run_id]
         if previous:
             record["previous"] = previous
@@ -714,7 +725,7 @@ def _or_none(value: Mapping[str, Any] | None) -> dict | None:
 
 def commit_year_attrs(
     repo: icechunk.Repository,
-    group: str,
+    zone: str,
     year_label: int,
     *,
     run_id: str | None = None,
@@ -725,9 +736,8 @@ def commit_year_attrs(
     commit: Mapping[str, str] | None = None,
     tries: int = 8,
     skip_if_marked: bool = False,
-    half: Half | None = None,
 ) -> str:
-    """Advance one year's ``years_complete``/``runs`` in its own small commit, retrying.
+    """Advance one fill zone's year in ``years_complete``/``runs``, in its own small commit, retrying.
 
     The single writer of those attrs, and the reason concurrent fills of the SAME
     zone group are safe.
@@ -764,6 +774,7 @@ def commit_year_attrs(
     the new run, which is what a genuine refill through :func:`write_year_shards` means:
     shards were rewritten, so the provenance should say by which run.
     """
+    group, half = group_and_half(zone)
     for attempt in range(1, tries + 1):
         session = repo.writable_session("main")
         node = _group_node(session.store, group)
@@ -790,7 +801,7 @@ def commit_year_attrs(
                 half=half,
             )
         try:
-            return commit_with_rebase(session, f"mark {group}{half or ''} year {year_label} complete")
+            return commit_with_rebase(session, f"mark {zone} year {year_label} complete")
         except icechunk.RebaseFailedError:
             if attempt == tries:
                 raise
@@ -834,12 +845,12 @@ def claim_root_stack(
 
 
 def _year_label(node: zarr.Group, year_index: int) -> int:
-    """Read the calendar year at ``year_index`` from a group's time coordinate.
+    """Read the calendar year at ``year_index`` from a zone group's time coordinate.
 
     Decodes via :func:`read_time_values` so a foreign store with non-TIME_ENCODING
     units errors loudly instead of yielding an epoch-adjacent bogus year.
     """
-    return year_of(read_time_values(node)[year_index])
+    return year_of(read_time_values(level0(node))[year_index])
 
 
 def partition_round_robin(items: list, n: int) -> list[list]:
@@ -883,7 +894,7 @@ def _write_shards_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 - retu
     progress_interval_s = float(payload.get("progress_interval_s", PROGRESS_INTERVAL_S))
     total = len(payload["shards"])
 
-    node = _group_node(fork.store, group)
+    node = level0(_group_node(fork.store, group))
     arrays: dict[str, zarr.Array] = {}
     timer = PhaseTimer()
     tiles = writes = nbytes = 0
@@ -906,15 +917,21 @@ def _write_shards_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 - retu
             if arr is None:
                 arr = arrays[var] = cast(zarr.Array, node[var])
             y0, x0 = sy * shard_px, sx * shard_px
-            h, w = block.shape[1], block.shape[2]
-            # Trailing dims (band) not indexed are written in full, so one
-            # assignment covers both the 3-D and 4-D arrays.
-            region = (slice(year, year + 1), slice(y0, y0 + h), slice(x0, x0 + w))
+            # The block is in the array's own axis order (ShardSource's contract). Band and month
+            # axes are written whole, so one assignment covers the 3-D and 4-D arrays in either
+            # band order.
+            roles = axis_roles(dims_of(arr))
+            h, w = block.shape[roles.index("Y")], block.shape[roles.index("X")]
+            region = window(dims_of(arr), year, slice(y0, y0 + h), slice(x0, x0 + w))
             if owned is not None:
                 # One variable at a time, so the extra memory is one shard of the widest array.
+                # The (h, w) pixel mask is broadcast over every other axis by role.
                 with timer.phase("pixel_merge"):
+                    mask = owned.reshape(
+                        [n if role in ("Y", "X") else 1 for role, n in zip(roles, block.shape, strict=True)]
+                    )
                     merged = np.asarray(arr[region])
-                    merged[:, owned] = block[:, owned]
+                    np.copyto(merged, block, where=mask)
                     block = merged
             with timer.phase("write"):
                 arr[region] = block
@@ -929,7 +946,7 @@ def _write_shards_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 - retu
 
 def write_year_shards(
     repo: icechunk.Repository,
-    group: str,
+    zone: str,
     year_index: int,
     source: ShardSource,
     *,
@@ -945,7 +962,6 @@ def write_year_shards(
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     fault: ArmedFault | None = None,
     commit_attrs: Callable[[icechunk.Repository, str, int, Mapping[str, str]], str] | None = None,
-    half: Half | None = None,
 ) -> str:
     """Fill one (zone, year) with whole shards from ``source``, then mark it complete in a second commit.
 
@@ -984,7 +1000,7 @@ def write_year_shards(
     facts — the per-worker stats and ``wall_s``/``merge_s`` from
     :func:`run_forked`, its ``catch_ups`` tally, plus ``commit_s`` and
     ``attrs_commit_s`` (each measured around its commit) — and ``commit``, the shard
-    commit's ``snapshot`` and ``committed_at``, which the registry part is stamped with.
+    commit's ``snapshot`` and ``committed_at``, which the registry run file is stamped with.
     An out-parameter rather than a changed return, so the snapshot id the callers and
     tags key on stays a plain string; the caller that wants a summary record owns emitting it.
 
@@ -1002,10 +1018,10 @@ def write_year_shards(
     one function, there is nothing outside the process to aim a kill at, and a state
     documented as benign but never observed is an assumption.
 
-    ``half`` is the column half being filled (ADR 038): ``source`` holds only its shards, and the
-    attrs commit marks only that half.
+    ``zone`` is the fill zone: a group, or a column half (ADR 038), whose ``source`` holds only its
+    own shards of the shared group and whose attrs commit marks only that half.
 
-    ``commit_attrs(repo, group, year, commit)`` replaces the second commit, given the shard commit
+    ``commit_attrs(repo, zone, year, commit)`` replaces the second commit, given the shard commit
     as ``commit_year_attrs`` is. A targeted update passes its own record writer here, so writing
     shards into a year that is already complete records the update and leaves ``years_complete``
     and ``runs`` exactly as the original fill left them.
@@ -1013,6 +1029,7 @@ def write_year_shards(
     Returns the ATTR commit's snapshot id — a tag must point at a state where the
     year is both written and marked.
     """
+    group, half = group_and_half(zone)
     session = repo.writable_session("main")
     shards = list(source.live_shards())
     if not shards:
@@ -1062,18 +1079,18 @@ def write_year_shards(
     if fault is not None:
         # The drill's death lands HERE, between the two commits, and nowhere else can
         # produce this state on purpose. Inert for any other fault or any other cell.
-        fault.die_between_commits(group, year_label, log=log or _log)
+        fault.die_between_commits(zone, year_label, log=log or _log)
     t_attrs = time.monotonic()
     # The per-year attrs go in their OWN commit (see `commit_year_attrs`), so a same-zone
     # collision costs a sub-second retry instead of this whole assembly. Return that
     # snapshot rather than the shard one: a tag must point at a state where the year is
     # both written AND marked.
     snapshot = (
-        commit_attrs(repo, group, year_label, commit)
+        commit_attrs(repo, zone, year_label, commit)
         if commit_attrs is not None
         else commit_year_attrs(
             repo,
-            group,
+            zone,
             year_label,
             run_id=run_id,
             radar_coverage=radar_coverage,
@@ -1081,7 +1098,6 @@ def write_year_shards(
             input_coverage=input_coverage,
             empty=empty,
             commit=commit,
-            half=half,
         )
     )
     if telemetry is not None:

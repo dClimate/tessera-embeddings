@@ -148,9 +148,9 @@ class BucketPaths(BaseModel):
 
         **Takes the store URI, and the argument is required.** Anything derived instead (the
         default repo basename, or ``outputs``) can name a store the run is not writing, and
-        the failure is silent: every tool works, the Parquet part is valid, and it describes
+        the failure is silent: every tool works, the Parquet run file is valid, and it describes
         a zone-year that store does not contain. Worse than an overwrite, because two
-        stores' parts then merge into one dataset under the same partition keys with nothing
+        stores' run files then merge into one dataset under the same partition keys with nothing
         able to tell them apart. Deriving from ``outputs`` fails the same way in the other
         direction — production publishes through :attr:`global_store_uri` to a bucket that
         is not ours, so the registry would sit in our bucket and the store in the public

@@ -10,7 +10,7 @@ Three layers, tested separately because they fail separately:
 
 * :func:`source_decision` — the whole decision, as a pure function of a bucket and a baseline.
 * :class:`BoaOffsetParser` — stamps that decision onto each source at parse time, and refuses.
-* :class:`_BoaCorrectingReader` — applies it to pixels, inside a real ``odc.stac.load``.
+* :class:`_SourceReader` — applies it to pixels, inside a real ``odc.stac.load``.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from odc.loader import RioDriver
 from pyproj import Transformer
 from rasterio.transform import from_origin
 
+from tessera_embeddings.config.ingest import SOURCE_INDEX_VAR
 from tessera_embeddings.config.providers import PROVIDERS, CollectionConfig
 from tessera_embeddings.config.satellites import S2_BASELINE_OFFSET, S2_BASELINE_THRESHOLD, S2_L2A_BANDS
 from tessera_embeddings.ingest.asset_locations import Harmonisation
@@ -35,8 +36,8 @@ from tessera_embeddings.ingest.boa_offset import OffsetDecision, source_decision
 from tessera_embeddings.ingest.stac import (
     BoaOffsetParser,
     HeterogeneousProducerError,
-    _BoaCorrectingDriver,
     _reflectance_asset_keys,
+    _SourceDriver,
     collection_harmonisation,
     load_stac_items,
 )
@@ -227,7 +228,7 @@ class TestTheParserStampsEachSource:
         3,081-entry table cost 14.6 MB of graph across 64 chunk tasks.
         """
         parser = BoaOffsetParser({}, frozenset(S2_L2A_BANDS), _T, S2_BASELINE_OFFSET, None)
-        assert len(pickle.dumps(_BoaCorrectingDriver(parser))) < 2048
+        assert len(pickle.dumps(_SourceDriver(parser))) < 2048
 
 
 class TestReflectanceAssetKeysComeFromOdc:
@@ -332,7 +333,9 @@ class TestTheOffsetIsRemovedPerImage:
     driver, reader, fuser — over real GeoTIFFs.
     """
 
-    def _load(self, items: list[pystac.Item], monkeypatch: pytest.MonkeyPatch, tiles: int) -> Any:
+    def _load(
+        self, items: list[pystac.Item], monkeypatch: pytest.MonkeyPatch, tiles: int, *, source_index: bool = False
+    ) -> Any:
         # Only the href-to-bucket step is stubbed, because a local file addresses no bucket. That
         # step is unit-tested on its own in `test_asset_locations`; everything downstream is real.
         buckets = {item.assets["blue"].href: item.properties["_bucket"] for item in items}
@@ -349,6 +352,7 @@ class TestTheOffsetIsRemovedPerImage:
             extra_bands=["scl"],
             geobox=geobox,
             chunks={"time": 1, "northing": 320, "easting": 320},
+            source_index=source_index,
         ).compute()
 
     def test_the_day_that_used_to_be_refused_now_loads_correctly(
@@ -394,6 +398,30 @@ class TestTheOffsetIsRemovedPerImage:
         assert set(np.unique(data.scl.isel(time=0).values)) == {0, 1500}
         assert set(np.unique(data.blue.isel(time=0).values)) == {0, 500}, "nodata 0 survives the correction"
         assert data.blue.dtype == np.uint16, "a signed result would make the store dtype depend on load order"
+
+    def test_the_source_index_rides_on_the_correcting_load(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The offset and the index are stamped by one parser, and neither disturbs the other.
+
+        Two tiles side by side: each supplies its own ground, so the index names each, the
+        reflectance is corrected per tile, and SCL comes back as it would unpacked.
+        """
+        width = _RES * _SIZE
+        raw = _tile_item("raw", tmp_path, value=1500, x0=_ORIGIN_E, baseline="05.00", tile="MGRS-33TWM")
+        cog = _tile_item("cog", tmp_path, value=400, x0=_ORIGIN_E + width, baseline="05.00", tile="MGRS-33TWN")
+        raw.properties["_bucket"] = _RAW_BUCKET
+        cog.properties["_bucket"] = _HARMONISED_BUCKET
+
+        indexed = self._load([raw, cog], monkeypatch, tiles=2, source_index=True)
+        plain = self._load([raw, cog], monkeypatch, tiles=2)
+
+        np.testing.assert_array_equal(indexed.scl.values, plain.scl.values)
+        np.testing.assert_array_equal(indexed.blue.values, plain.blue.values)
+        index = indexed[SOURCE_INDEX_VAR].isel(time=0).values
+        stride = width // 10
+        assert set(np.unique(index[:, :stride])) == {0, 1}, "the first tile, less its nodata corner"
+        assert set(np.unique(index[:, stride:])) == {0, 2}, "the second tile, less its nodata corner"
 
     def test_a_refusal_escapes_before_any_pixel_is_read(self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
         """Items are parsed synchronously, so an undecidable source fails the call rather than a task.
@@ -481,4 +509,4 @@ class TestTheDriverDoesNotDisturbTheRead:
         Overriding either environment method would silently take workers off credential refresh.
         """
         for method in ("restore_env", "capture_env", "new_load", "finalise_load"):
-            assert getattr(_BoaCorrectingDriver, method, None) is getattr(RioDriver, method, None), method
+            assert getattr(_SourceDriver, method, None) is getattr(RioDriver, method, None), method

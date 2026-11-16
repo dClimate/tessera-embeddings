@@ -18,6 +18,41 @@ from tessera_embeddings.config.code_identity import source_identity
 #: including it would make a mask rebuild look like an ingest code change.
 _MOSAIC_CONTENT_SOURCES: tuple[str, ...] = ("ingest/s1_roi.py", "ingest/s2_roi.py")
 
+#: The provenance record's version, stamped on a mosaic's ingest manifest when the ingest runs with
+#: ``provenance`` on. Its absence means the mosaic was built without the record; the manifest
+#: refuses to resume a store under the other setting (``IngestManifest.provenance_version``).
+PROVENANCE_VERSION = 1
+
+#: A provenance mosaic's per-slot granule list: one JSON array per time slot naming the day's
+#: granules in fusion order, then the copies dropped before the fuse, written in the same commit as
+#: the slot's pixels.
+GRANULES_ARRAY = "granules"
+
+#: A granule list entry's ``status``: fused into the slot, or dropped before the fuse as a losing
+#: duplicate, as a copy that would not read and was replaced by another, or as a radar granule whose
+#: catalogue entry lacks its VV or VH file.
+FUSED, DUPLICATE, UNREADABLE, MISSING_BANDS = "fused", "duplicate", "unreadable", "missing_bands"
+
+#: The status of every copy of a day the ingest skipped whole, beyond ``UNREADABLE``: too little clear
+#: ground for the coverage gate, or no single offset correction fitting the day's images.
+LOW_COVERAGE, PRODUCER_CONFLICT = "low_coverage", "producer_conflict"
+
+#: A mosaic's record of the days its ingest skipped whole: the solar days, and each one's granule
+#: list in the shape ``GRANULES_ARRAY`` holds for a written day. Neither is on the time axis.
+SKIPPED_DAYS_ARRAY, SKIPPED_GRANULES_ARRAY = "skipped_days", "skipped_granules"
+
+#: Item property: why the ingest dropped this copy before the fuse, its granule list entry's ``status``.
+DROPPED = "tessera:dropped"
+
+#: Item property: the asset links as the catalogue published them, stamped where an item is built,
+#: before anything rewrites them for reading (S3 URIs, or signed CloudFront URLs whose query string
+#: is a credential). The granule list records these, never the rewritten ones.
+CATALOG_ASSETS = "tessera:catalog_assets"
+
+#: A provenance mosaic's per-pixel source index: the fusion position plus one of the granule that
+#: supplied the pixel, 0 where none had data. ``uint16`` because a day's fusion order is zone-wide.
+SOURCE_INDEX_VAR = "source_index"
+
 
 # jscpd:ignore-start: same shape as inference_code_identity; each fingerprints its own sources
 def ingest_code_identity() -> str:
@@ -255,6 +290,12 @@ class IngestSettings(BaseModel):
     # set it only on a probe rung. ingest-zone-year composes a unique per-child filename
     # (``s2.html``, ``s1-<orbit>.html``) under it.
     perf_report_uri: str | None = None
+    # Write the provenance record into every mosaic: each date's granule list and a per-pixel
+    # source index, from which assembly publishes `provenance/` beside the registry. Off by
+    # default, because only the public global store needs it; that campaign's deployment turns it
+    # on. A mosaic records the setting and refuses a resume under the other one:
+    # context_docs/storage/registry-provenance-plan.md §4.
+    provenance: bool = False
 
     @model_validator(mode="after")
     def _worker_bounds_ordered(self) -> IngestSettings:

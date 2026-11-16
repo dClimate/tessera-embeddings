@@ -1,6 +1,7 @@
 """Dataclasses and the provider registry for querying satellite data from STAC catalogs."""
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 from .satellites import (
     LANDSAT_C2_BANDS,
@@ -28,10 +29,14 @@ class CollectionConfig:
         tile_id_property: STAC property containing tile/grid ID
         tile_id_prefix: Prefix for tile ID in queries (e.g., "MGRS-")
         has_scl: whether this collection provides an SCL layer to use for cloudmask
+        fusion_order: the sort a solar day's items get before the loader, which keeps the first
+            valid source (``stac._FUSION_SORT_KEYS``); ``None`` leaves odc's ``(time, id)``
         harmonisation_varies_by_item: whether items here can disagree about whether the BOA
             offset was already subtracted, forcing a per-item decision from asset locations
         band_names_are_asset_keys: whether the names in ``bands`` are the item's asset keys
             rather than common names the loader resolves through an alias table
+        source_index_band: the asset key of the band whose per-granule pixels decide the
+            provenance source index, or ``None`` where this collection records none
     """
 
     collection_id: str
@@ -42,6 +47,7 @@ class CollectionConfig:
     tile_id_property: str | None = "grid:code"
     tile_id_prefix: str = ""
     has_scl: bool = False
+    fusion_order: Literal["clearest_scene", "most_acquired_burst"] | None = None
     #: Off by default: a collection served by one producer has one answer. On, the producer
     #: decision reads each item's asset LOCATIONS, which requires `band_names_are_asset_keys`.
     harmonisation_varies_by_item: bool = False
@@ -50,6 +56,9 @@ class CollectionConfig:
     #: producer classification, read-set completeness, locality — is uninformative where this is
     #: False, and reports every copy as incomplete and remote.
     band_names_are_asset_keys: bool = False
+    #: The band the source index is read from: the one each sensor's validity is judged on, so the
+    #: index and the mask share one definition (``ingest/provenance.py``). Needs ``fusion_order``.
+    source_index_band: str | None = None
 
     @property
     def requires_baseline_correction(self) -> bool:
@@ -139,8 +148,10 @@ PROVIDERS: dict[str, STACProvider] = {
                 tile_id_property="grid:code",
                 tile_id_prefix="MGRS-",
                 has_scl=True,
+                fusion_order="clearest_scene",
                 harmonisation_varies_by_item=True,
                 band_names_are_asset_keys=True,
+                source_index_band="scl",
             ),
             "sentinel-2-l1c": CollectionConfig(
                 collection_id="sentinel-2-l1c",
@@ -184,6 +195,9 @@ PROVIDERS: dict[str, STACProvider] = {
                 resolution=30,
                 tile_id_property=None,
                 tile_id_prefix="",
+                # ADR 033: where bursts of one solar day overlap, the most-acquired one wins.
+                fusion_order="most_acquired_burst",
+                source_index_band="0_VV",
             ),
         },
     ),

@@ -521,6 +521,10 @@ class ModelFamily:
     #: hemisphere groups its published store already has; later models take the geoembeddings
     #: ``utm_zones`` layout. An existing store keeps its own layout whatever the model.
     zone_layout: ZoneLayout
+    #: The leading lengths of its embedding a reader may use on their own, in Matryoshka order: v2
+    #: was trained so its first 16, 32 and 64 dimensions each stand as a shorter embedding. Empty for
+    #: a model trained without them. Published as the store root's ``embedding_prefixes``.
+    prefixes: tuple[int, ...] = ()
 
     @property
     def takes_norm_source(self) -> bool:
@@ -573,6 +577,7 @@ MODEL_FAMILIES: dict[str, ModelFamily] = {
         radar_free_s1_bin=1,
         own_worker_image=False,
         spatial_dims=("y", "x"),
+        prefixes=(16, 32, 64, 128),
         zone_layout="utm_zones",
     ),
 }

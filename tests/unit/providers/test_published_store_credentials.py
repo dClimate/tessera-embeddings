@@ -26,7 +26,7 @@ from tessera_embeddings.providers.aws import credentials as cred
 
 _OURS = "s3://global-tessera-embeddings/global-tessera/global/tessera.icechunk"
 _THEIRS = "s3://tessera-embeddings/v1.1/dclimate.icechunk"
-_THEIR_REGISTRY = "s3://tessera-embeddings/v1.1/dclimate.registry/parts/zone=16S/year=2021/r.parquet"
+_THEIR_REGISTRY = "s3://tessera-embeddings/v1.1/dclimate.registry/runs/zone=16S/year=2021/r.parquet"
 _ROLE = "arn:aws:iam::601791338954:role/TesseraDClimateWriterRole"
 
 

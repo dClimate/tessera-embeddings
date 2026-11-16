@@ -10,25 +10,28 @@ existing store must take that store's granularity. An audit wants geometry under
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime
+from functools import cache
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import numpy as np
+import zarr
 
-from tessera_embeddings.config.store_layout import (
-    GLOBAL,
-    SHARD_PX,
-    StoreLayout,
+from tessera_embeddings.config.store_geometry import (
+    axis_roles,
     clamp_chunks_and_shards,
+    dims_of,
+    level0,
     spatial_dims_of,
 )
+from tessera_embeddings.config.store_layout import GLOBAL, GLOBAL_V2, SHARD_PX, StoreLayout
 from tessera_embeddings.storage.global_store import _codec_id, missing_seeded_arrays
 from tessera_embeddings.storage.shard_writer import SHARD_WRITE, year_runs
 
 if TYPE_CHECKING:
     import icechunk
-    import zarr
 
     from tessera_embeddings.storage.zone_grid import ZoneSpec
 
@@ -38,18 +41,23 @@ if TYPE_CHECKING:
 COVERAGE_VAR = "scales"
 
 
-def layout_departures(group: zarr.Group, layout: StoreLayout = GLOBAL) -> list[str]:
+def layout_departures(group: zarr.Group, layout: StoreLayout | None = None) -> list[str]:
     """Every way ``group`` departs from ``layout``, as one sentence each; empty means it conforms.
+
+    *group* is a zone group. Its arrays are read from its level group ``0`` when it has one, and
+    the layout defaults to the global preset the group's shape says it was seeded with: v2's when
+    it has a level group (ADR 031), v1.1's otherwise.
 
     An array the layout declares and the group lacks is a departure; the reverse is not, because
     the coordinate arrays live beside the data arrays and no layout describes them. Expectations
     are clamped to each array's own shape by the writer's own
-    :func:`~tessera_embeddings.config.store_layout.clamp_chunks_and_shards`, or every zone narrower
+    :func:`~tessera_embeddings.config.store_geometry.clamp_chunks_and_shards`, or every zone narrower
     than one nominal shard reports a false departure.
     """
     # Against the Y/X names the group declares: v1.1 stores use northing/easting, later models y/x.
-    layout = layout.with_spatial_dims(spatial_dims_of(group))
-    present = dict(group.arrays())
+    arrays = level0(group)
+    layout = (layout or (GLOBAL if arrays is group else GLOBAL_V2)).with_spatial_dims(spatial_dims_of(group))
+    present = dict(arrays.arrays())
     out: list[str] = []
     # The COORDINATE arrays too: losing a spatial axis, `month` or `time_bnds` would otherwise only
     # skip that dimension's extent check, so the audit reports nothing while a labelled read of the
@@ -154,7 +162,7 @@ def coordinate_departures(group: zarr.Group, spec: ZoneSpec) -> list[str]:
     from tessera_embeddings.storage.zone_grid import easting_coords, northing_coords
 
     out: list[str] = []
-    present = dict(group.arrays())
+    present = dict(level0(group).arrays())
     # `month` by VALUE: 0..11, a reordering or a duplicate has the right rank and extent while
     # `sel(month=7)` selects the wrong plane. Small enough to read whole, unlike the spatial axes.
     month = present.get("month")
@@ -190,12 +198,14 @@ def coordinate_departures(group: zarr.Group, spec: ZoneSpec) -> list[str]:
 def calendar_years(group: zarr.Group) -> list[int]:
     """The calendar year of each time slot, from the group's own ``time`` coordinate.
 
+    *group* is a zone group; the coordinate is read from its level group ``0`` when it has one.
+
     The coordinate is int64 nanoseconds, so it must be VIEWED as ``datetime64[ns]`` before being
     truncated to years; casting the raw integers straight to ``datetime64[Y]`` reads each
     nanosecond count as a year offset. The range check makes a future change of units a loud
     failure rather than a silently wrong time-index-to-year mapping.
     """
-    time_coord = cast("zarr.Array", group["time"])
+    time_coord = cast("zarr.Array", level0(group)["time"])
     stamps = np.asarray(time_coord[:]).astype("datetime64[ns]")
     years = [int(y) for y in stamps.astype("datetime64[Y]").astype(int) + 1970]
     if not all(1970 <= y <= 2200 for y in years):
@@ -220,11 +230,13 @@ async def live_shards_async(
 ) -> dict[int, frozenset[tuple[int, int]]]:
     """:func:`live_shards`, for a caller that already has an event loop."""
     by_year: dict[int, set[tuple[int, int]]] = {}
-    async for coord in session.chunk_coordinates(f"/{zone}/{var}"):
-        # A 4-D array appends a band/month index that is always 0, one shard spanning the whole
-        # non-spatial axis, so take the spatial pair by position rather than a fixed arity.
-        time_index, shard_y, shard_x = int(coord[0]), int(coord[1]), int(coord[2])
-        by_year.setdefault(time_index, set()).add((shard_y, shard_x))
+    holder = level0(cast("zarr.Group", zarr.open_group(session.store, mode="r")[zone]))
+    # Axes by name: a band-first v2 `embeddings` holds eight band shards per processing shard, at positions
+    # (time, band, y, x); the set folds them into one (shard_y, shard_x) entry.
+    roles = axis_roles(dims_of(holder[var]))
+    t, y, x = (roles.index(role) for role in ("time", "Y", "X"))
+    async for coord in session.chunk_coordinates(f"/{holder.path}/{var}"):
+        by_year.setdefault(int(coord[t]), set()).add((int(coord[y]), int(coord[x])))
     return {year: frozenset(shards) for year, shards in sorted(by_year.items())}
 
 
@@ -233,7 +245,7 @@ class Commit(NamedTuple):
 
     ``at`` orders runs: the commit's own timestamp, or for an untagged run the time it was marked.
     ``snapshot`` is the shard commit, ``None`` for an untagged run, and is what :func:`commit_tiles`
-    reads the tiles it wrote from. ``empty`` is a run that holds no tile now, so it needs no part: an
+    reads the tiles it wrote from. ``empty`` is a run that holds no tile now, so it needs no run file: an
     untagged run that marked the year as holding no data, or a run a refill replaced whose commit has
     expired, every tile of which the refill rewrote.
     """
@@ -273,7 +285,7 @@ def committed_runs(attrs: Mapping[str, Any], year: int, writes: Sequence[Commit]
     zone-year tag points at the attrs commit, not the shard commit before it. Either way the record
     says when the run wrote and not what, so the entry has no snapshot to diff. A ``commit`` of null
     is a year marked without shards, which wrote nothing. A run a refill replaced whose commit has
-    expired is marked ``empty``: its part, if it has one, is still the store's, but the refill rewrote
+    expired is marked ``empty``: its run file, if it has one, is still the store's, but the refill rewrote
     every tile it wrote, which the store check confirms while the commit is still there to diff, and
     nothing can afterwards. A targeted update records itself in the same shape beside the fill, in
     ``updates[year]`` (``storage.update``), so its expired commits are found the same way.
@@ -308,24 +320,111 @@ def commit_tiles(repo: icechunk.Repository, zone: str, time_index: int, snapshot
     wholly with fill counts too, even where nothing was stored: Zarr deletes the chunk rather than
     storing fill, and the transaction log records the delete. Every such array
     shares the tile grid, one shard per tile in its first three coordinates; the coordinate arrays
-    have fewer.
+    have fewer. Each array's spatial axes are found by name, since a band-first array puts its band
+    axis between time and the spatial pair.
     """
     parent = repo.lookup_snapshot(snapshot).parent_id
     diff = repo.diff(from_snapshot_id=parent, to_snapshot_id=snapshot)
+    group = cast("zarr.Group", zarr.open_group(repo.readonly_session(snapshot_id=snapshot).store, mode="r")[zone])
+    y, x = spatial_dims_of(group)
+    axes = {
+        f"/{array.path}": (names.index(y), names.index(x))
+        for _, array in level0(group).arrays()
+        if {y, x} <= set(names := dims_of(array)) and names[0] == "time"
+    }
     return frozenset(
-        f"chunk_{c[1]}_{c[2]}"
+        f"chunk_{c[axes[path][0]]}_{c[axes[path][1]]}"
         for path, coords in diff.updated_chunks.items()
-        if path.startswith(f"/{zone}/")
+        if path in axes
         for c in coords
-        if len(c) >= 3 and c[0] == time_index
+        if c[0] == time_index
     )
 
 
+def source_runs(
+    attrs: Mapping[str, Any], year: int, commits: Sequence[Commit], tiles_of: Callable[[str], frozenset[str]]
+) -> Callable[[str], list[str] | None]:
+    """Each tile's runs in ``year``, oldest first, from the year's shard commits in the order they landed.
+
+    ``commits`` and ``tiles_of`` are :class:`StoreYear`'s: the store's own account of who wrote the year
+    and what each commit wrote, never an older registry row or the order run records landed in. For each
+    commit that wrote or cleared a tile: a ``holes`` update adds itself, since the tile keeps the
+    earlier runs' other pixels; a fill or a ``shards`` update replaces the whole tile and restarts the
+    list at itself. So a refill drops every update before it, and of two concurrent refills the one
+    whose shards landed last owns the tile.
+
+    ``None`` unless every run in a tile's list carries a provenance record, which a run notes as
+    ``input_coverage.provenance_version`` in its ``runs`` or ``updates`` entry, and a fill a refill
+    replaced keeps as ``provenance_version`` in ``previous``, so a reader can tell a
+    tile with no complete record (all of v1.1, anything filled with the switch off) from one that has
+    it (``context_docs/storage/registry-provenance-plan.md`` §5). ``None`` for every tile when a
+    non-empty commit's tiles cannot be read (a run from before tags, or an expired commit), since
+    the order is then unknown. The diffs are read once, on the first call.
+    """
+    # One record, or one per column half (ADR 038), each with the fills it replaced.
+    fills = [entry for head in year_runs(attrs.get("runs"), year) for entry in (head, *head.get("previous", []))]
+    entries = [*fills, *(attrs.get("updates") or {}).get(str(year), [])]
+    carried = {
+        e["run_id"]
+        for e in entries
+        if e.get("provenance_version") or (e.get("input_coverage") or {}).get("provenance_version")
+    }
+    holes = {e["run_id"] for e in entries if e.get("mode") == "holes"}
+
+    @cache
+    def lineage() -> dict[str, list[str]] | None:
+        runs: dict[str, list[str]] = {}
+        for commit in commits:
+            if commit.snapshot is None:
+                if commit.empty:
+                    continue
+                return None
+            for tile in tiles_of(commit.snapshot):
+                kept = runs.get(tile, []) if commit.run_id in holes else []
+                runs[tile] = [*kept, commit.run_id] if kept[-1:] != [commit.run_id] else kept
+        return runs
+
+    def of(tile: str) -> list[str] | None:
+        if not carried:  # no run recorded provenance, as for all of v1.1: no diffs to read
+            return None
+        found = (lineage() or {}).get(tile)
+        return found if found and carried.issuperset(found) else None
+
+    return of
+
+
+def lineage_stamp(commits: Sequence[Commit]) -> str:
+    """The runs that wrote a zone-year, each by its latest commit, as the string a master is stamped with.
+
+    ``commits`` is :func:`committed_runs`' list, the input ``source_runs`` is derived from, so a
+    reader computing the same from the store now finds the stamp different exactly when a run has
+    written since the merge: a new run, a run whose shards committed before its run record did, or a
+    retry landing under the same run id. A record-only run changes nothing. Each run is stamped once,
+    by its latest commit's time, which its run record keeps as ``committed_at``: a retry's earlier
+    attempt, which no record names, never enters the stamp, so expiring old snapshots leaves it as it
+    was, unless a retry died after its shards and before its record; that zone-year's master is then
+    refused until ``rebuild_registry_measurements.py repair`` merges it again.
+    """
+    latest = {commit.run_id: commit.at for commit in commits}  # oldest first, so the last commit wins
+    return json.dumps(sorted(([run, at] for run, at in latest.items()), key=lambda entry: entry[1]))
+
+
+def _no_source_runs(_tile: str) -> list[str] | None:
+    return None
+
+
 class StoreYear(NamedTuple):
-    """What the store says about one zone-year's writers: who committed, and what a commit wrote."""
+    """What the store says about one zone-year's writers.
+
+    Who committed, what a commit wrote, and which runs each tile's pixels came from
+    (:func:`source_runs`).
+    """
 
     commits: list[Commit]
     tiles_of: Callable[[str], frozenset[str]]
+    source_runs: Callable[[str], list[str] | None] = _no_source_runs
+    #: :func:`lineage_stamp` of ``commits``, the input ``source_runs`` was derived from.
+    runs_stamp: str = "[]"
 
 
 def store_year(
@@ -341,7 +440,8 @@ def store_year(
     """
     time_index = calendar_years(group).index(year)
     runs = committed_runs(group.attrs, year, writes.get((zone, year), ()))
-    return StoreYear(runs, lambda snapshot: commit_tiles(repo, zone, time_index, snapshot))
+    tiles_of = cache(lambda snapshot: commit_tiles(repo, zone, time_index, snapshot))
+    return StoreYear(runs, tiles_of, source_runs(dict(group.attrs), year, runs, tiles_of), lineage_stamp(runs))
 
 
 def shard_pixel_window(
@@ -380,7 +480,7 @@ def sample_live_pixels(
     if not shards or count <= 0:
         return []
     rng = np.random.default_rng(seed)
-    array = cast("zarr.Array", group[coverage_var])
+    array = cast("zarr.Array", level0(group)[coverage_var])
     candidates: list[tuple[int, int]] = []
     for index in rng.integers(len(shards), size=count * oversample):
         y0, y1, x0, x1 = shard_pixel_window(shards[int(index)], array.shape)

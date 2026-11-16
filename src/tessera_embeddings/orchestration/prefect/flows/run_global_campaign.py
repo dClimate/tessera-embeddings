@@ -101,7 +101,7 @@ from tessera_embeddings.storage.update import (
     update_states,
 )
 from tessera_embeddings.storage.zarr_store import is_missing_repo, open_store_group_and_tip
-from tessera_embeddings.storage.zone_grid import canonicalize_zone, group_and_half
+from tessera_embeddings.storage.zone_grid import fill_zones_of, group_and_half
 
 # S1/S2 grandchild ingest refs derive from this single source rather than duplicated string
 # literals, so a rename of the ingest deployments stays in ingest_zone_year.IngestDeployments.
@@ -240,13 +240,10 @@ def _mosaic_identity(
     can change after an early read — either would let stale staged tiles resume against a
     rebuilt mosaic. Genuinely-absent stores (missing repo / not found) are skipped.
 
-    SCOPE: this pins the inputs at RESUME time, not at read time. The tip is sampled once
-    here while the fill's actors later open each mosaic from the moving ``main``, so it
-    answers "have the inputs changed since the last attempt?" and NOT "did they hold still
-    while this attempt ran?". Nothing in the pipeline writes a mosaic during its own fill (a
-    cell's ingest completes before it dispatches, mosaics are per-(zone,year), cleanup runs
-    after), so the remaining window needs an out-of-band writer committing mid-fill. Closing
-    it would mean threading these snapshot IDs into every actor store open.
+    SCOPE: this pins the inputs at RESUME time: it answers "have the inputs changed since the
+    last attempt?". What holds them still DURING the attempt is the runner's own sample of the
+    same tips when it plans the cell, which every actor store open and the provenance export use
+    (``zone_fill.mosaic_snapshots``).
 
     Only the ACTIVE orbit set is fingerprinted (reflectance + ``_active_orbits(s1_orbit)``),
     because the fill reads only those. An inactive opposite-orbit store that happens to be
@@ -322,7 +319,7 @@ def _staging_run_id(
     ``context_docs/storage/staging-identity-and-resume.md``.
 
     ``update`` names a targeted update, whose run must never share an id with another update's or
-    the campaign's: registry parts are named by run id, and the mosaic identity is content, so two
+    the campaign's: registry run files are named by run id, and the mosaic identity is content, so two
     runs on identical mosaics would otherwise publish over each other. ``None`` adds nothing, so
     campaign ids are unchanged.
     """
@@ -636,9 +633,10 @@ async def run_global_campaign(
             rather than deployment names.
         store_name: Global-store repo basename.
         years: Campaign years to drive (default: all campaign years).
-        zones: Restrict the fill chain (inference + assembly) to these UTM zones, named as
-            the store's groups are (``"utm33"``, or ``"33N"`` in a hemisphere store; any case,
-            leading zero optional); ``None`` (default) drives every zone of the store's layout.
+        zones: Restrict the fill chain (inference + assembly) to these UTM zones: a column half
+            (``"utm33s"``), a whole column (``"utm33"``, filled as both halves), or ``"33N"`` in
+            a hemisphere store; any case, leading zero optional. ``None`` (default) drives every
+            zone of the store's layout.
             Either way only cells still needing work are dispatched, so a re-run of a
             partially-complete year fills only the unfinished zones (see
             :func:`campaign_work_list`).
@@ -1057,9 +1055,9 @@ async def run_global_campaign(
                 f"(fixed at seeding, ADR-008 D1) — reseed the store or drop them from `years`."
             )
 
-    # Canonical zone names ("utm33", "07S"), so a bad id fails loudly here and the rest match
-    # the store's group names exactly.
-    expected_zones = [canonicalize_zone(z) for z in zones] if zones is not None else None
+    # Canonical fill-zone names ("utm33s", "07S"), so a bad id fails loudly here; a whole column
+    # ("utm33") is its two halves, the only units a v2 mask, ROI and mosaic exist for (ADR 038).
+    expected_zones = [h for z in zones for h in fill_zones_of(z)] if zones is not None else None
     # An explicit zones subset must be seeded: a typo that canonicalizes to a valid but
     # unseeded zone would otherwise count as pending and be ingested + filled only for the
     # fill to reject an unseeded group. (The default None spans every zone; a not-fully-seeded
@@ -1145,7 +1143,7 @@ async def run_global_campaign(
         else:
             mosaic_root = paths.inputs
             work_set = set(work)
-            sweep_zones = expected_zones if expected_zones is not None else sorted(status.zones)
+            sweep_zones = expected_zones if expected_zones is not None else status.campaign_zones()
             finished = [
                 (z, y)
                 for y in set(campaign_years)

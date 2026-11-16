@@ -21,7 +21,7 @@ _CHUNK = 256
 
 _EMB = ArrayLayout(DIMS_4D, (1, _CHUNK, _CHUNK, _BAND), "int8", 0, "zstd", shards=(1, _SHARD, _SHARD, _BAND))
 _SCL = ArrayLayout(DIMS_3D, (1, _CHUNK, _CHUNK), "float32", float("nan"), "pcodec", shards=(1, _SHARD, _SHARD))
-SMALL = StoreLayout(name="small", arrays={"embeddings": _EMB, "scales": _SCL})
+SMALL = StoreLayout(name="small", arrays={"embeddings": _EMB, "scales": _SCL}, bands=_BAND)
 
 _ZONE_A = ZoneSpec("32601", "N", 1, (0.0, 5_120.0), (0.0, 10_240.0))
 _ZONE_B = ZoneSpec("32602", "N", 2, (0.0, 5_120.0), (0.0, 10_240.0))
@@ -142,9 +142,10 @@ def test_work_list_defaults_to_every_zone_of_the_store_layout(seed, hemisphere, 
 def test_a_column_year_completes_with_its_second_half(seed):
     """ADR 038: each half marks only itself; the year enters ``years_complete`` with the second."""
     _, repo = seed(zones=(ZoneSpec("32601", None, 1, (0.0, 5_120.0), (-10_240.0, 10_240.0)),))
-    write_year_shards(repo, "utm01", 0, _OneInnerChunkSource(), n_workers=1, shard_px=_SHARD, run_id="north", half="n")
+    write_year_shards(repo, "utm01n", 0, _OneInnerChunkSource(), n_workers=1, shard_px=_SHARD, run_id="north")
     status = campaign.campaign_status(repo, years=_YEARS)
     assert (status.has("utm01n", 2023), status.has("utm01s", 2023), status.zones["utm01"]) == (True, False, ())
+    assert status.zone_years_done == 1, "a landed half is data the seed must not stamp over"
     assert campaign.campaign_work_list(status, set(), years=(2023,))[:2] == [("utm01n", 2023), ("utm01s", 2023)]
 
     campaign.mark_zone_year_empty(repo, "utm01s", 2023, run_id="south")
@@ -203,6 +204,16 @@ def test_tag_year_complete_when_all_land(seed, monkeypatch):
     tag = campaign.tag_year_complete(repo, 2023)
     assert tag == "year-2023-complete"
     assert tag in repo.list_tags()
+
+
+def test_tag_year_complete_off_the_default_years_by_halves(seeded_store, monkeypatch):
+    """A year outside the default campaign years completes once both halves of its column land."""
+    monkeypatch.setattr(campaign, "fill_zones", lambda layout: dict.fromkeys(("utm01n", "utm01s")))
+    column = ZoneSpec("32601", None, 1, (0.0, 5_120.0), (-10_240.0, 10_240.0))
+    repo = global_store.open_global_repo(seeded_store((column,), name="g.icechunk", years=(2026,), layout=SMALL))
+    for half in ("utm01n", "utm01s"):
+        campaign.mark_zone_year_empty(repo, half, 2026)
+    assert campaign.tag_year_complete(repo, 2026) == "year-2026-complete"
 
 
 def test_missing_zones_for_year_reports_in_scope_order(seed):

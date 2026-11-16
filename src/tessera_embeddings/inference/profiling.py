@@ -105,7 +105,9 @@ def enable_model_profiling(model: MultimodalBTInferenceModel) -> None:
     """Set ``_profile`` flag on model and all sub-modules.
 
     When ``_profile=True``, the forward methods in ``modules.py`` and
-    ``ssl_model.py`` log per-layer timing and intermediate dtypes.
+    ``ssl_model.py`` log per-layer timing and intermediate dtypes. Not used on a model that
+    replays CUDA graphs (``MultimodalBTInferenceModel.replays_graphs``): a replay runs no Python,
+    and the per-layer ``synchronize`` calls must never run inside a graph capture.
     """
     _set_model_profiling(model, True)
 

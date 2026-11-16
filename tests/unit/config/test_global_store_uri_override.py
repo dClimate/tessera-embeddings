@@ -17,7 +17,7 @@ from __future__ import annotations
 import pytest
 
 from tessera_embeddings.config.paths import BucketPaths
-from tessera_embeddings.storage.registry import part_uri
+from tessera_embeddings.storage.registry import run_file_uri
 
 #: The real target, so the test says what this exists for.
 OPEN_DATA = "s3://tessera-embeddings/v1.1/dclimate.icechunk"
@@ -121,10 +121,10 @@ class TestTheRegistrySitsBesideWhicheverStoreIsInUse:
 
         `optical_registry` used to call `global_store()` with no arguments, so it derived from the
         DEFAULT repo basename whatever store the run was writing. A campaign against
-        `store_name="tessera-radar"` published its registry beside `tessera.icechunk`: the part was
+        `store_name="tessera-radar"` published its registry beside `tessera.icechunk`: the run file was
         valid, every tool worked, and it described a zone-year that store does not contain.
 
-        Worse than an overwrite. Two stores' parts then merge into one dataset under the same
+        Worse than an overwrite. Two stores' run files then merge into one dataset under the same
         `zone=`/`year=` keys, and nothing IN the dataset can tell them apart — so the wrongness is
         unfalsifiable from the artifact a consumer was told to trust instead of the store.
         """
@@ -134,8 +134,8 @@ class TestTheRegistrySitsBesideWhicheverStoreIsInUse:
         assert paths.optical_registry(radar) == "s3://out/global/tessera-radar.registry"
         assert paths.optical_registry(radar) != paths.optical_registry(paths.global_store())
 
-        # And the part lands beside the store it describes, not beside the default one.
-        detail = part_uri(paths.optical_registry(radar), "16S", 2022, "16S-2022-792816d6")
+        # And the run file lands beside the store it describes, not beside the default one.
+        detail = run_file_uri(paths.optical_registry(radar), "16S", 2022, "16S-2022-792816d6")
         assert detail.startswith("s3://out/global/tessera-radar.registry/")
         assert "tessera.registry" not in detail
 

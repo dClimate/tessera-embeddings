@@ -48,12 +48,18 @@ context_docs/
 │   ├── 028-embed-every-pixel-with-an-optical-observation.md
 │   ├── 029-one-flow-per-ingest.md
 │   ├── 030-forward-pass-reorderings-ship-at-a-store-boundary.md
+│   ├── 031-the-v2-store-chunks-the-band-axis-at-16.md
 │   ├── 032-v2-stores-name-their-axes-y-and-x.md
+│   ├── 033-radar-overlaps-go-to-the-most-acquired-burst.md
 │   ├── 034-an-acquisition-is-one-datastrip-of-one-pass.md
+│   ├── 035-a-provenance-record-for-the-published-store.md
+│   ├── 036-the-registry-folder-is-runs.md
 │   ├── 037-v2-stores-use-the-utm-zones-layout.md
 │   ├── 038-the-campaign-fills-a-utm-column-in-two-halves.md
 │   ├── 039-architecture-rules-run-on-import-linter-and-ruff.md
-│   └── 040-new-code-is-gated-on-duplication-and-complexity.md
+│   ├── 040-new-code-is-gated-on-duplication-and-complexity.md
+│   ├── 041-unit-tests-run-the-forked-writer-in-threads.md
+│   └── 042-chunked-graph-replay-ships-above-the-two-card-yardstick.md
 │
 ├── campaign/                      THE GLOBAL CAMPAIGN — start here
 │   ├── campaign-plan.md                        <- START HERE. What runs, with what settings, in
@@ -79,8 +85,9 @@ context_docs/
 │   │                                              budget, live-tile cropping, region writes
 │   ├── source-read-failures.md                 twelve ways a source read fails, the guard each
 │   │                                              earned, and the retry budget they share
-│   ├── solar-day-fusion-order.md               which scene wins a contested pixel, and why the
-│   │                                              answer was inverted for the life of the code
+│   ├── solar-day-fusion-order.md               which scene or burst wins a contested pixel, and
+│   │                                              why the optical answer was inverted for the
+│   │                                              life of the code
 │   └── split-datastrips.md                     why a pass split across datastrips keeps every
 │                                                  granule, and what dropping one cost
 │
@@ -105,6 +112,9 @@ context_docs/
 │   ├── v2-on-blackwell.md                      the g7e (RTX PRO 6000) against the fleet's cards,
 │   │                                              v2's fused add + LayerNorm, prep workers by host
 │   │                                              size, outputs across cards, g7e capacity
+│   ├── v2-chunked-graph-replay.md              v2 in small chunks replaying a CUDA graph: the
+│   │                                              gain per card, chunk sizes, outputs, and the C++
+│   │                                              encoder it came from
 │   ├── fresh-worker-start.md                   a new worker's first minutes are its EBS volume
 │   │                                              loading the AMI, and the mounted venv image that
 │   │                                              removes them
@@ -142,6 +152,10 @@ context_docs/
     │                                              unmeasured were re-derived from the store, why
     │                                              that is a re-derivation rather than an
     │                                              estimate, and the v1.1 run
+    ├── registry-provenance-plan.md             the provenance record: which granule supplied
+    │                                              every pixel on every date, for reviewers new to
+    │                                              the pipeline
+    ├── provenance-dev-verification.md          its end-to-end dev test, and what it costs
     └── icechunk-api-ledger.md                  signatures and gotchas the scale tests earned
 ```
 

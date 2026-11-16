@@ -1,7 +1,9 @@
 # 027 — Targeted updates re-run chosen shards of filled cells, beside the original fill
 
 **Status:** Accepted 2026-10-12 (repo owner). Built on `feat/targeted-updates`, stacked on the
-registry PR that makes `master/` the one always-current registry (#219).
+registry PR that makes `master/` the one always-current registry (#219). The registry folder
+this record calls `parts/`, and a file in it a part, is now `runs/` and a run file
+([ADR 036](036-the-registry-folder-is-runs.md)).
 
 The global store is filled one UTM zone-year at a time, and a filled cell was built never to be
 touched again. That is right for a campaign and wrong for what comes after it: the published v1.1

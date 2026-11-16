@@ -44,7 +44,12 @@ import dask.distributed
 import numpy as np
 import xarray as xr
 
-from tessera_embeddings.config.ingest import AUTO_BATCH_DATES, INGEST_CHUNK_SIZE, INGEST_CHUNKS
+from tessera_embeddings.config.ingest import (
+    AUTO_BATCH_DATES,
+    INGEST_CHUNK_SIZE,
+    INGEST_CHUNKS,
+    SOURCE_INDEX_VAR,
+)
 from tessera_embeddings.config.providers import PROVIDERS
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
 from tessera_embeddings.ingest._pipeline import pipelined
@@ -65,6 +70,7 @@ from tessera_embeddings.ingest.loader_failures import (
     install_capture_everywhere,
     label_objects,
 )
+from tessera_embeddings.ingest.provenance import SkippedDays, day_granules, mark_duplicates, mark_stepped_down
 from tessera_embeddings.ingest.roi import (
     read_roi_mask,
     read_roi_metadata,
@@ -309,6 +315,8 @@ class _PreparedDate:
     straddle the threshold is corrected image by image while this map still names one baseline
     for the date.
     """
+    granules: str | None = None
+    """The provenance granule list for the slot, as written to the store; ``None`` with it off."""
     read_error: BaseException | None = None
     """Set when PREPARATION hit a source that would not read, instead of raising.
 
@@ -340,6 +348,7 @@ def ingest_s2_roi_reflectance(
     batch_chunk_budget: int | None = None,
     allow_ingest_code_mismatch: bool = False,
     s3_region: str | None = None,
+    provenance: bool = False,
 ) -> IngestResult:
     """Ingest S2 L2A reflectance for an ROI defined by a Zarr mask.
 
@@ -398,6 +407,9 @@ def ingest_s2_roi_reflectance(
         s3_region: S3 region for the mosaic Icechunk store. ``None`` uses the storage layer's
             default; set it when the bucket lives elsewhere, or every write below signs against
             the wrong region.
+        provenance: Write the provenance record with every date: the day's granule list and a
+            per-pixel ``source_index`` band (:mod:`~tessera_embeddings.ingest.provenance`). Off by
+            default; the store records the setting and a resume must match it.
 
     Returns:
         :class:`IngestResult`. ``status="skipped"`` if zero STAC items were returned or zero
@@ -428,7 +440,16 @@ def ingest_s2_roi_reflectance(
         min_valid_coverage=min_valid_coverage,
         storage_options=resolve_storage_options(storage_options),
         allow_ingest_code_mismatch=allow_ingest_code_mismatch,
+        provenance=provenance,
     )
+    catalogue = PROVIDERS[provider]
+    #: Where every granule list says its items came from.
+    source = {
+        "provider": provider,
+        "collection": collection,
+        "catalog_url": catalogue.catalog_url,
+        "collection_id": catalogue.collections[collection].collection_id,
+    }
 
     mid_longitude = solar_grouping_longitude(roi)
 
@@ -500,6 +521,7 @@ def ingest_s2_roi_reflectance(
     #: move the line under decisions already made against it.
     _committed_at_start = get_existing_dates(reflectance_store, s3_region=s3_region)
     last_written_date: str | None = max(_committed_at_start, default=None)
+    skipped = SkippedDays(reflectance_store, source, exists=bool(_committed_at_start), s3_region=s3_region)
 
     # Where the CATALOGUE is searched from. Everything at or below the newest held date is closed
     # for good, so searching back there cannot write anything — and searching is most of what a
@@ -544,6 +566,9 @@ def ingest_s2_roi_reflectance(
     # the coverage counter, whose contract is the SCL gate: a run that lost most of a year to
     # catalogue metadata was reporting it as coverage filtering.
     producer_conflict_dates: list[dict[str, str]] = []
+    #: Per solar day of the current supply, the copies dropped before the fuse: losing duplicates,
+    #: and copies that would not read and were replaced. Their granule list names them too.
+    dropped_by_day: dict[str, list] = {}
 
     def _narrow(day_items: list) -> list:
         """The live windows a date's imagery reaches: pure geometry, no read."""
@@ -596,6 +621,7 @@ def ingest_s2_roi_reflectance(
                 resampling="bilinear",
                 groupby="solar_day",
                 geobox=roi.geobox,
+                source_index=provenance,
             )
         except HeterogeneousProducerError as exc:
             # The day has no correct offset decision, so it is SKIPPED — loudly, and alone.
@@ -694,7 +720,7 @@ def ingest_s2_roi_reflectance(
             )
         build_s, gate_s = built_at - stage_started, time.monotonic() - built_at
         if not passes:
-            return _PreparedDate(date, None, [], build_s, gate_s, "coverage")
+            return _PreparedDate(date, None, [], build_s, gate_s, "coverage", items=day_items)
 
         # Stamp the slice with its SOLAR DAY. The axis is day-granular either way; taking the
         # value from the grouping rather than from odc's label is what makes it identify the day
@@ -737,14 +763,21 @@ def ingest_s2_roi_reflectance(
         # ROI both fill with 0, so `x.where(A, 0).where(B, 0)` is `x.where(A & B, 0)`
         # — and each `where` is a graph task per (chunk, band), which is the budget
         # that limits ingest. SCL keeps only the ROI mask: it is categorical, and
-        # zeroing it by its own validity would rewrite the class codes it carries.
+        # zeroing it by its own validity would rewrite the class codes it carries. The source
+        # index keeps it too: it names the granule behind every pixel, cloudy or not, and the
+        # model's own validity test decides later which of them it saw.
         roi_2d = date_mask
         keep = roi_2d if any_valid is None else (any_valid & roi_2d)
         for var in day_ds.data_vars:
-            mask_for_var = roi_2d if str(var) == "scl" else keep
+            mask_for_var = roi_2d if str(var) in ("scl", SOURCE_INDEX_VAR) else keep
             day_ds[str(var)] = day_ds[str(var)].where(mask_for_var, other=0)
 
-        return _PreparedDate(date, day_ds, date_windows, build_s, gate_s, items=day_items, baselines=baselines)
+        # Listed now, from the positions THIS load stamped: a fallback copy re-prepares the date
+        # and re-stamps, and its list must describe its own fuse.
+        granules = day_granules([*day_items, *dropped_by_day.get(date, ())], **source)[date] if provenance else None
+        return _PreparedDate(
+            date, day_ds, date_windows, build_s, gate_s, items=day_items, baselines=baselines, granules=granules
+        )
 
     def _write_date(prepared: _PreparedDate, stall_s: float) -> None:
         """Write one prepared date's pixels: the store's only writer.
@@ -781,7 +814,9 @@ def ingest_s2_roi_reflectance(
                         chunks=INGEST_CHUNKS,
                         parallel_windows=overlap_window_writes,
                         s3_region=s3_region,
+                        granules=prepared.granules,
                     )
+        skipped.written()
         # One line per kept date, partitioning its wall clock into the graph build in the driver,
         # the coverage-gate compute and the write (windows + commit). Stable format: CloudWatch
         # queries and the pipeline analysis key off it. `total` is build+gate+write, the date's
@@ -851,7 +886,9 @@ def ingest_s2_roi_reflectance(
                         chunks=INGEST_CHUNKS,
                         parallel_windows=overlap_window_writes,
                         s3_region=s3_region,
+                        granules=[p.granules for p in batch if p.granules is not None] if provenance else None,
                     )
+        skipped.written()
         # The batch's write is ONE compute, so a per-date write time does not exist as a
         # measurement: this line is the batched counterpart of `Stage timings` and analysis
         # divides by n. build/gate are sums of the real per-date values.
@@ -908,6 +945,9 @@ def ingest_s2_roi_reflectance(
         items, alternates = select_preferred_duplicates(items, read_keys, known_kind)
         log_duplicate_selection(log, roi_label, alternates, kept=items, read_keys=read_keys, items=supplied)
         date_alternates.update(alternates)
+        # Scoped to this supply like the ladder, whose preparations all finish inside it.
+        dropped_by_day.clear()
+        dropped_by_day.update(mark_duplicates(supplied, items))
 
         def _record_skip(prepared: _PreparedDate) -> None:
             """Account for a date that produced nothing, under the reason it actually had.
@@ -918,6 +958,9 @@ def ingest_s2_roi_reflectance(
             end-of-run summary, which names the remedy the coverage counter cannot.
             """
             nonlocal total_filtered, total_refused
+            skipped.record(
+                prepared.date, [*prepared.items, *dropped_by_day.get(prepared.date, ())], prepared.skip_reason
+            )
             if prepared.skip_reason != "producer-conflict":
                 total_filtered += 1
                 # A COVERAGE rejection, counted and not otherwise recorded, which is enough: the
@@ -956,6 +999,7 @@ def ingest_s2_roi_reflectance(
             the tiles listed are every tile in the date, of which an unknown few lost pixels. The
             second cannot be acted on the way the first can.
             """
+            skipped.record(prepared.date, [*prepared.items, *dropped_by_day.get(prepared.date, ())], "unreadable")
             all_tiles = sorted({t for it in prepared.items if (t := item_tile(it)) is not None})
             attributed = bool(blamed)
             tiles = sorted({tile for tile, _ in blamed}) if blamed else all_tiles
@@ -1045,6 +1089,8 @@ def ingest_s2_roi_reflectance(
                     total_filtered += 1
                     return
                 stepped_items, swapped = stepped
+                # Marked for the granule list: the copy that would not read, and the one standing in.
+                dropped_by_day.setdefault(attempt.date, []).extend(mark_stepped_down(attempt.items, stepped_items))
                 before = copies_label(attempt.items, only=swapped)
                 after = copies_label(stepped_items, only=swapped)
                 if not tried:
@@ -1069,7 +1115,7 @@ def ingest_s2_roi_reflectance(
                     # failed coverage, or reaches no live window). That is a legitimate
                     # skip, not a read failure, and must not be recorded as data loss.
                     # A fallback that ALSO failed to read keeps its place in the ladder.
-                    total_filtered += 1
+                    _record_skip(attempt)
                     return
 
         def _write_batch_or_isolate(batch: list[_PreparedDate], stall_s: float) -> None:

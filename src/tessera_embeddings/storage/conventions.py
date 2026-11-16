@@ -27,6 +27,7 @@ import numpy as np
 from pyproj import CRS
 
 from tessera_embeddings.config.inference import ModelVersion, encoder_url, model_family, model_version_for_encoder
+from tessera_embeddings.config.store_geometry import level0
 
 if TYPE_CHECKING:
     import zarr
@@ -100,6 +101,17 @@ _GEOEMB_CONVENTION = {
     "uuid": "61c12cc5-0e28-4056-999a-480cf3fb7e4c",
     "name": "geoemb:",
     "description": "Geoembeddings convention for geospatial embedding arrays with model provenance",
+}
+
+# A zone group, or a single-area store's root, is one multiscales pyramid in one coordinate system, its levels child
+# groups: `0` holds the 10 m arrays, and coarser levels go beside it once built (ADR 031 §1). Every field is the
+# schema's `const`, as for proj and spatial.
+_MULTISCALES_CONVENTION = {
+    "schema_url": "https://raw.githubusercontent.com/zarr-conventions/multiscales/refs/tags/v0.1/schema.json",
+    "spec_url": "https://github.com/zarr-conventions/multiscales/blob/v0.1/README.md",
+    "uuid": "d35379db-88df-4056-af3a-620245f8e347",
+    "name": "multiscales",
+    "description": "Multiscale layout of zarr datasets",
 }
 
 # --- geoemb: field defaults (this pipeline's fixed provenance) --------------
@@ -280,7 +292,8 @@ _CF_COORD_ATTRS: tuple[dict[str, str], dict[str, str]] = (
 def stamp_array_conventions(node: zarr.Group) -> None:
     """Label *node*'s arrays for readers that open one array at a time, from the group's own attrs.
 
-    Call after the group attrs are written. Both labels derive from what the group declares, so
+    The arrays are those in *node*'s level group ``0`` when it has one (ADR 031 §1), while the
+    attrs stay on *node*. Call after the group attrs are written. Both labels derive from what the group declares, so
     they cannot disagree with it however its CRS was found (a mosaic attr or the MGRS tile).
 
     * Every array spanning both of the group's ``spatial:dimensions`` registers ``spatial`` and
@@ -300,14 +313,15 @@ def stamp_array_conventions(node: zarr.Group) -> None:
     wanted: dict[str, dict[str, Any]] = (
         dict(zip(dims, _CF_COORD_ATTRS, strict=True)) if dims and _is_metre_crs(epsg) else {}
     )
-    for name, arr in node.arrays() if dims else ():
+    arrays = level0(node)
+    for name, arr in arrays.arrays() if dims else ():
         if set(dims) <= set(getattr(arr.metadata, "dimension_names", None) or ()):
             registered = cast("list[dict[str, Any]]", arr.attrs.get("zarr_conventions") or [])
             others = [c for c in registered if c.get("uuid") != _SPATIAL_CONVENTION["uuid"]]
             wanted[name] = {"zarr_conventions": [*others, _SPATIAL_CONVENTION], "spatial:dimensions": dims}
     for name, attrs in wanted.items():
-        if any(node[name].attrs.get(k) != v for k, v in attrs.items()):
-            node[name].attrs.update(attrs)
+        if any(arrays[name].attrs.get(k) != v for k, v in attrs.items()):
+            arrays[name].attrs.update(attrs)
 
 
 def _compute_affine_transform(y_coords: np.ndarray, x_coords: np.ndarray) -> list[float]:
@@ -436,6 +450,10 @@ def _geoemb_fields(
         attrs["checkpoint_id"] = checkpoint_id
     if gsd is not None:
         attrs["geoemb:gsd"] = gsd
+    # The prefixes a reader may truncate to, so a reader wanting 16 dimensions knows it may read
+    # only the first band shard (ADR 031 §5).
+    if model_version is not None and (prefixes := model_family(model_version).prefixes):
+        attrs["embedding_prefixes"] = list(prefixes)
     return attrs
 
 
@@ -487,6 +505,7 @@ def build_convention_attrs(
     gsd: float | None = None,
     source_data: tuple[str, ...] = DEFAULT_SOURCE_DATA,
     include_geoemb: bool = True,
+    level: str | None = None,
 ) -> dict:
     """Build GeoZarr convention attributes for the root group.
 
@@ -518,6 +537,11 @@ def build_convention_attrs(
     *include_geoemb* False emits only ``proj:``/``spatial:``: the multi-group campaign store
     carries geoemb: once at the root (:func:`build_geoemb_root_attrs`) and uses this builder
     only for each zone's CRS/grid.
+
+    *level* names the child group holding the arrays, when they sit in one: the group is then
+    declared a ``multiscales`` pyramid whose only level is that group, at the group's own scale.
+    Nothing builds a coarser level yet; each one, once built, adds an entry naming the level it
+    was derived from (ADR 031 §1).
     """
     conventions: list[dict] = []
     attrs: dict = {}
@@ -564,6 +588,12 @@ def build_convention_attrs(
                 source_data=source_data,
             )
         )
+
+    if level is not None:
+        conventions.append(_MULTISCALES_CONVENTION)
+        attrs["multiscales"] = {
+            "layout": [{"asset": level, "transform": {"scale": [1.0, 1.0], "translation": [0.0, 0.0]}}]
+        }
 
     if conventions:
         attrs["zarr_conventions"] = conventions

@@ -72,9 +72,8 @@ renaming them would mean reading every existing mosaic under either name.
   say whatever they were created with. The boundary is seeding and assembly.
 - **v2 stores created before this change keep `northing`/`easting`**, under the "named once" rule.
   These are the dev stores used for v2 testing.
-- **[ADR 031](https://github.com/dClimate/tessera-embeddings/pull/243) describes the v2 layout as
-  `(time, band, northing, easting)`.** Under this decision it is `(time, band, y, x)`; the two
-  documents need reconciling where their branches meet.
+- **The band-first v2 layout of [ADR 031](031-the-v2-store-chunks-the-band-axis-at-16.md) is
+  `(time, band, y, x)`.** v1.1's band-last order keeps its names, `(time, northing, easting, band)`.
 - **Readers find both.** rioxarray finds a v2 store's axes by name and a v1.1 store's through the CF
   `axis` attributes. Both pass the strict schema audit in
   [conforming to the Zarr conventions](../storage/conforming-to-the-zarr-conventions.md).

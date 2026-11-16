@@ -10,7 +10,15 @@ import zarr
 
 from tessera_embeddings.config.inference import EMBEDDING_DIM, INFERENCE_CHUNK_SIZE
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
-from tessera_embeddings.config.store_layout import GLOBAL, SHARD_PX, SINGLE, spatial_dims_of
+from tessera_embeddings.config.store_geometry import spatial_dims_of
+from tessera_embeddings.config.store_layout import (
+    GLOBAL,
+    GLOBAL_V2,
+    SHARD_PX,
+    SINGLE,
+    SINGLE_V2,
+    layout_for,
+)
 
 
 def test_global_embeddings_geometry():
@@ -32,6 +40,39 @@ def test_single_matches_global_geometry():
         single, global_ = SINGLE.for_var(var), GLOBAL.for_var(var)
         assert (single.dims, single.chunks, single.shards) == (global_.dims, global_.chunks, global_.shards), var
         assert (single.dtype, single.codec) == (global_.dtype, global_.codec), var
+
+
+@pytest.mark.parametrize(
+    ("model", "single", "expected"),
+    [("v1.1", False, GLOBAL), ("v1.1", True, SINGLE), ("v2-large", False, GLOBAL_V2), ("v2-large", True, SINGLE_V2)],
+)
+def test_a_new_store_takes_its_models_layout(model, single, expected):
+    assert layout_for(model, single=single) is expected
+
+
+@pytest.mark.parametrize("v2", [GLOBAL_V2, SINGLE_V2])
+def test_v2_stores_embeddings_band_first_in_16_band_shards_of_4_band_chunks(v2):
+    """ADR 031: every other array keeps v1.1's geometry but for 512² chunks, and every array sits in level group 0.
+
+    One spatial chunk edge is what clamps every array of an area under one shard (768 px here) to the
+    same shard height, which assembly requires: one shard per axis, the size of its one inference tile.
+    """
+    v1 = SINGLE if "embedding_std" in v2.arrays else GLOBAL
+    band_arrays = {"embeddings", "embedding_std"} & v2.arrays.keys()
+    for var in band_arrays:
+        k = v2.for_var(var).create_kwargs((9, EMBEDDING_DIM, 4096, 4096))
+        assert k["dimension_names"] == ("time", "band", "northing", "easting")
+        assert (k["chunks"], k["shards"]) == ((1, 4, 512, 512), (1, 16, 2048, 2048))
+    geometry = lambda a: (a.dims, a.shards, a.dtype, a.codec, a.attrs)  # noqa: E731 - NaN fills never compare
+    assert v2.arrays.keys() == v1.arrays.keys()
+    assert all(geometry(v2.arrays[var]) == geometry(v1.arrays[var]) for var in v1.arrays.keys() - band_arrays)
+    assert {v2.arrays[var].chunks[1:3] for var in v2.arrays.keys() - band_arrays} == {(512, 512)}
+    shape = {"time": 1, "band": EMBEDDING_DIM, "month": 12, "northing": 768, "easting": 768}
+    pitches = {
+        v2.for_var(var).create_kwargs(tuple(shape[d] for d in a.dims))["shards"][-2] for var, a in v2.arrays.items()
+    }
+    assert pitches == {1024}
+    assert (v2.level, v1.level, v2.bands) == ("0", None, EMBEDDING_DIM)
 
 
 def test_the_global_store_never_declares_embedding_std():
@@ -61,12 +102,12 @@ def test_the_inference_tile_is_one_shard():
 
 
 def test_chunks_and_shards_clamp_to_small_shape():
-    # A store smaller than one nominal shard must still create cleanly.
+    """An area smaller than one nominal shard is one shard, rounded up to whole chunks, as its one inference tile is."""
     k = GLOBAL.for_var("embeddings").create_kwargs((1, 300, 300, EMBEDDING_DIM))
-    assert k["chunks"] == (1, 256, 256, EMBEDDING_DIM)
-    # shard clamped to a whole multiple of the (clamped) chunk within shape
-    assert k["shards"][1] % k["chunks"][1] == 0
-    assert k["shards"][1] <= 300
+    assert (k["chunks"], k["shards"]) == ((1, 256, 256, EMBEDDING_DIM), (1, 512, 512, EMBEDDING_DIM))
+    arr = zarr.create_array(zarr.storage.MemoryStore(), **k)
+    arr[:] = np.ones(arr.shape, dtype=arr.dtype)
+    assert arr[:].all()
 
 
 def test_sharded_roundtrip_and_fill(tmp_path):
@@ -93,20 +134,22 @@ def test_sharded_roundtrip_and_fill(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("declared", "scales_dims", "expected"),
+    ("declared", "scales_dims", "level", "expected"),
     [
-        (["y", "x"], ("time", "y", "x"), ("y", "x")),
-        (None, ("time", "y", "x"), ("y", "x")),  # pixel-index coordinates declare nothing
-        (None, ("y", "x"), ("northing", "easting")),  # malformed: the audit reports, not raises
+        (["y", "x"], ("time", "y", "x"), "", ("y", "x")),
+        (None, ("time", "y", "x"), "", ("y", "x")),  # pixel-index coordinates declare nothing
+        (None, ("y", "x"), "", ("northing", "easting")),  # malformed: the audit reports, not raises
+        (None, ("time", "y", "x"), "0", ("y", "x")),  # a v2 group: `scales` sits in its level group
     ],
 )
-def test_spatial_dims_of_reads_the_declaration_then_the_scales_array(declared, scales_dims, expected):
+def test_spatial_dims_of_reads_the_declaration_then_the_scales_array(declared, scales_dims, level, expected):
     group = zarr.group(store=zarr.storage.MemoryStore())
-    group.create_array("scales", shape=(1,) * len(scales_dims), dtype="f4", dimension_names=scales_dims)
+    holder = group.require_group(level) if level else group
+    holder.create_array("scales", shape=(1,) * len(scales_dims), dtype="f4", dimension_names=scales_dims)
     if declared:
         group.attrs["spatial:dimensions"] = declared
     assert spatial_dims_of(group) == expected
-    assert spatial_dims_of(xr.open_zarr(group.store, consolidated=False)) == expected
+    assert spatial_dims_of(xr.open_zarr(group.store, consolidated=False, group=level or None)) == expected
 
 
 def test_with_spatial_dims_renames_every_array_and_keeps_the_geometry():
