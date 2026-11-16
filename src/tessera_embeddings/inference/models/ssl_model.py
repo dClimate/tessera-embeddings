@@ -62,17 +62,17 @@ _Graph = tuple[torch.cuda.CUDAGraph, torch.Tensor, torch.Tensor, torch.Tensor]
 def run_in_chunks(
     s2_x: torch.Tensor,
     s1_x: torch.Tensor,
-    s2_static: torch.Tensor,
-    s1_static: torch.Tensor,
-    z_static: torch.Tensor,
+    static: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     run_chunk: Callable[[], None],
 ) -> torch.Tensor:
     """Run a batch through fixed-size static buffers, one chunk at a time.
 
-    Each chunk's rows are copied into ``s2_static``/``s1_static``, ``run_chunk`` fills ``z_static``
-    from them (on CUDA it is a captured graph's ``replay``), and the chunk's rows are copied out.
+    ``static`` is the fixed ``(s2, s1, z)`` buffers. Each chunk's rows are copied into the two inputs,
+    ``run_chunk`` fills ``z`` from them (on CUDA it is a captured graph's ``replay``), and the chunk's rows are
+    copied out.
     The chunk size is the static buffers' first dimension.
     """
+    s2_static, s1_static, z_static = static
     n, c = s2_x.shape[0], s2_static.shape[0]
     out = z_static.new_empty((n, z_static.shape[1]))
     for i in range(0, n, c):
@@ -154,8 +154,8 @@ class MultimodalBTInferenceModel(nn.Module):
         key = (s2_x.shape[1], s1_x.shape[1])
         if key not in self._graphs:
             self._graphs[key] = self._capture(s2_x, s1_x)
-        graph, s2_static, s1_static, z_static = self._graphs[key]
-        return run_in_chunks(s2_x, s1_x, s2_static, s1_static, z_static, graph.replay)
+        captured = self._graphs[key]
+        return run_in_chunks(s2_x, s1_x, captured[1:], captured[0].replay)
 
     def _capture(self, s2_x: torch.Tensor, s1_x: torch.Tensor) -> _Graph:
         """Capture one chunk's forward for this bucket shape, on static zero inputs."""

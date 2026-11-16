@@ -272,5 +272,5 @@ def test_chunked_forward_matches_the_whole_batch(v2_model) -> None:
         def run_chunk() -> None:
             z_static.copy_(v2_model(s2_static, s1_static))
 
-        chunked = run_in_chunks(s2_x, s1_x, s2_static, s1_static, z_static, run_chunk)
+        chunked = run_in_chunks(s2_x, s1_x, (s2_static, s1_static, z_static), run_chunk)
     torch.testing.assert_close(chunked, whole, atol=1e-5, rtol=1e-5)
