@@ -20,6 +20,7 @@ what was tried and abandoned — you want [`context_docs/`](../context_docs/) in
 | know which names are stable to import | [`public-api.md`](public-api.md) |
 | read the published global dataset | [`global-store.md`](global-store.md) |
 | redo or fill part of a store you have already filled | [`updates.md`](updates.md) |
+| check a model or pipeline change on small labelled areas before a global run | [`evaluation.md`](evaluation.md) |
 | find out what the global dataset covers, and how well, without opening it | [`registry.md`](registry.md) |
 | see what other people have built with TESSERA embeddings | [`example-uses-of-tessera.md`](example-uses-of-tessera.md) |
 | choose between one area and the whole globe | [`single-vs-global.md`](single-vs-global.md) |
