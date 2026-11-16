@@ -112,9 +112,9 @@ context_docs/
 │   ├── fresh-worker-start.md                   a new worker's first minutes are its EBS volume
 │   │                                              loading the AMI, and the mounted venv image that
 │   │                                              removes them
-│   ├── fp8-on-l40s.md                          FP8 linears on the g6e: pass the per-value envelope,
-│   │                                              fail the neighbour gate on near-tie churn; ~1.2-1.3x
-│   │                                              only with fused quantisation
+│   ├── reduced-precision-inference.md          FP8 on the g6e and int8 on Intel AMX: both pass the
+│   │                                              per-value envelope and fail the neighbour gate on
+│   │                                              near-tie churn; int8 makes CPU spot ~g5 parity
 │   └── the-fleet-and-the-work-source.md        a fleet lives for one `run_inference` call, so a
 │                                                  retry through a second call rebuilt one; the
 │                                                  wind-down, and why the fleet is not held
