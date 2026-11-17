@@ -14,7 +14,7 @@
 - **Which bar applies.** The CPU path was to be pursued only within 1.3× of GPU cost. Against the g6e that bar is **$0.039/Mpx**, which projected int8 on c8i spot ($0.039–0.048) reaches only at its best case; FP8 on the g6e would lower it to about $0.031–0.033. g6e capacity was effectively unavailable while these measurements were taken, and wherever that recurs the fallback GPU is the g5.2xlarge, with a bar of **$0.054/Mpx** that int8 clears.
 - **The neighbour gate over-penalises, and has been re-examined.** ADR 012's top-20 gate (0.9940) is failed even by bf16 on a different kernel stack: the CPU library scores 0.989–0.990, and bf16 under `torch.compile` scores 0.988. The churn is swaps among near-tied neighbours: counted tie-tolerantly, every evaluated change keeps 0.999 or more. See [Calibrating the gate](#calibrating-the-gate).
 - **Downstream accuracy is unaffected within a store, and at risk only across a change.** On labelled pixels, FP8 and int8 move kNN and linear-probe accuracy by no more than matched random noise does (within about ±0.2 points). The one consumer that loses accuracy is a classifier trained on embeddings from one side of a change and applied to the other.
-- **g5 fallback inside an FP8 store is accepted, on bf16** ([ADR 042](../decisions/042-fp8-linears-ship-on-cross-change-accuracy-and-the-a10g-stays-bf16.md)). Across six tiles on real kernels, a linear classifier fitted on one card's pixels and applied to the other's moves within the metric's own noise on four tiles, and loses at most 0.2 points on the other two (Ecuador, Kansas), where FP8's shared shift has a small real cost. kNN is unaffected everywhere. See [The mixed-pool test](#the-mixed-pool-test).
+- **g5 fallback inside an FP8 store is accepted, on bf16** ([ADR 042](../decisions/042-fp8-linears-ship-on-cross-change-accuracy-and-the-a10g-stays-bf16.md)). Across six tiles on real kernels, a linear classifier fitted on one card's pixels and applied to the other's moves within the metric's own noise on three tiles, and loses at most 0.2 points where FP8's shared shift has a small real cost (Ecuador, Kansas, marginally Punjab). kNN is unaffected everywhere. See [The mixed-pool test](#the-mixed-pool-test).
 
 ## Baselines: production engine, bf16, four dense UK chunks of ~4.0M px
 
@@ -219,8 +219,8 @@ Measured 2026-11-17 on the full lattice (230,400 px per tile), with real kernels
 |---|---|---|---|---|---|
 | two cards, bf16 (L40S, A10G, L4) | ≥ 99.998% | 0.999–1.000 | 1.0000 / ≥ 0.9987 | 0.02–0.10 | ±0.01 / ±0.01 |
 | two cards, native FP8 (L40S, L4) | ≥ 99.99% | 0.994–1.000 | ≥ 0.9999 / ≥ 0.9986 | 0.01–0.07 | ±0.01 / ±0.01 |
-| FP8 change on the L40S, all four linears | 99.58–99.97% | 0.954–0.977 | 0.995–1.000 / 0.972–0.994 | 0.25–0.29 | −0.15 to +0.11 / −0.03 to +0.05 |
-| FP8 change on the L40S, Stage 1 | 99.78–99.99% | 0.958–0.979 | 0.997–1.000 / 0.975–0.995 | 0.22–0.27 | −0.10 to +0.20 / −0.05 to +0.01 |
+| FP8 change on the L40S, all four linears | 99.58–99.97% | 0.954–0.977 | 0.995–1.000 / 0.972–0.994 | 0.25–0.29 | −0.15 to +0.15 / −0.03 to +0.05 |
+| FP8 change on the L40S, Stage 1 | 99.78–99.99% | 0.958–0.979 | 0.997–1.000 / 0.975–0.995 | 0.22–0.27 | −0.20 to +0.20 / −0.05 to +0.01 |
 | A10G bf16 vs L40S FP8 (a mixed store) | as the FP8 rows | | | | −0.20 to +0.26 / −0.05 to +0.05 |
 | A10G emulated FP8 vs L40S native FP8 | 99.90–99.998% | 0.966–0.987 | 0.998–1.000 / 0.987–0.999 | 0.006–0.009 | ±0.02 / −0.05 to +0.02 |
 
@@ -236,15 +236,15 @@ Measured 2026-11-17 on the full lattice (230,400 px per tile), with real kernels
 | Kansas | **−0.15 / +0.15** | −0.10 / +0.12 | 0.07–0.08 (0.05) |
 
 - **The fleet's cards are nearly identical on bf16**, and the L4 matches the L40S on FP8. ADR 030's yardstick, "no further apart than two cards on identical code", therefore rejects any precision change, and a bf16 g5 in an FP8 store is exactly the FP8 change.
-- **The cross-change metric has its own noise floor**, 0.03–0.13 points depending on the tile, with no change of dtype at all. On four tiles, and on Ecuador with all four linears, FP8 sits inside it.
-- **FP8's shared shift has a small real cost on a linear probe on two tiles.** On Ecuador Stage 1 and Kansas all four, the probe moves 2–3 noise standard deviations, past every draw, by equal and opposite amounts in the two directions. The largest loss in a mixed store is 0.20 points. kNN-20 stays within noise everywhere.
+- **The cross-change metric has its own noise floor**, 0.03–0.13 points depending on the tile, with no change of dtype at all. A move counts as structural when it passes the largest of the five draws. On UK, Iowa and Finland, and on Ecuador and Punjab for the other size, FP8 sits inside the noise.
+- **FP8's shared shift has a small real cost on a linear probe on three tiles.** On Ecuador Stage 1 and Kansas at both sizes, the probe moves 2–3 noise standard deviations, past every draw, by equal and opposite amounts in the two directions; Punjab all four passes its largest draw marginally (0.04 against 0.03). The largest loss in a mixed store is 0.20 points. kNN-20 stays within noise everywhere.
 - **Emulated FP8 on the A10G removes the shared shift** (coherence at the noise floor) and holds a mixed store to ±0.02 points. ADR 042 rejects it: it adds card-specific rounding to remove at most 0.2 points on a linear probe.
 - **Top-25 per stratum is stricter than overall.** Inside one class or window FP8 scores as low as 0.972 (Finland's water), under the 0.995 calibrated over whole tiles.
 
 ### What this supports
 
 1. **Keep the per-value envelope as the magnitude gate.** It trips where the first measurable harm appears.
-2. **Replace the strict top-20 gate with a tie-tolerant measure, reported rather than gated.** Top-25 at 0.995 over a whole tile passes every benign change evaluated and trips with the envelope. Scored inside one window it is stricter (FP8 gives 0.992–0.994), so a per-stratum threshold needs its own calibration.
+2. **Replace the strict top-20 gate with a tie-tolerant measure, reported rather than gated.** Top-25 at 0.995 over a whole tile passes every benign change evaluated and trips with the envelope. Scored inside one class or window it is stricter (FP8 scores as low as 0.972), so a per-stratum threshold needs its own calibration.
 3. **Report a shared-shift (coherence) check per cluster** for structured error, since no neighbour metric sees it. FP8's 0.25–0.29 costs at most 0.2 points across a change on real kernels, so it is reported, not gated.
 4. **Harm appears only across a change, and is small.** The store boundary stays (ADR 042). Cross-change accuracy is the gate, on loss, scored against matched noise so that the metric's own noise floor is not mistaken for harm.
 

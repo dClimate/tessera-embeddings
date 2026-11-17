@@ -24,8 +24,8 @@ four linears and on QKV and FFN up only (Stage 1). Ranges cover the six tiles:
 |---|---:|---:|---:|---:|---:|
 | two cards, bf16, identical code (L40S, A10G, L4) | ≥ 99.998% | 0.999–1.000 | 1.0000 | 0.02–0.10 | ±0.01 |
 | two cards, native FP8 (L40S, L4) | ≥ 99.99% | 0.994–1.000 | ≥ 0.9999 | 0.01–0.07 | ±0.01 |
-| FP8 on the L40S, all four linears | 99.58–99.97% | 0.954–0.977 | 0.995–1.000 | 0.25–0.29 | −0.15 to +0.11 |
-| FP8 on the L40S, Stage 1 | 99.78–99.99% | 0.958–0.979 | 0.997–1.000 | 0.22–0.27 | −0.10 to +0.20 |
+| FP8 on the L40S, all four linears | 99.58–99.97% | 0.954–0.977 | 0.995–1.000 | 0.25–0.29 | −0.15 to +0.15 |
+| FP8 on the L40S, Stage 1 | 99.78–99.99% | 0.958–0.979 | 0.997–1.000 | 0.22–0.27 | −0.20 to +0.20 |
 | A10G bf16 vs L40S FP8 (a mixed store) | as the FP8 rows | | | | −0.20 to +0.26 |
 | A10G emulated FP8 vs L40S native FP8 | 99.90–99.998% | 0.966–0.987 | 0.998–1.000 | 0.006–0.009 | ±0.02 |
 
@@ -47,13 +47,15 @@ Four findings decide this:
   agree on ≥ 99.998% of values within ±1 and keep 0.999 of top-20 neighbours, far closer than the RTX
   PRO 6000 that set ADR 030's 0.981. Any change of precision, FP8 or int8, fails it.
 - **A bf16 g5 in an FP8 store is exactly the FP8 change**, because the A10G's bf16 matches the L40S's.
-- **Most of that change is indistinguishable from noise.** On four of six tiles, and on Ecuador with
-  all four linears, FP8 moves the probe no further than matched noise does, and kNN-20 never does.
-- **FP8's shared shift (coherence 0.25) has a small real cost on a linear probe on two tiles.** On
-  Ecuador (Stage 1, ±0.20) and Kansas (all four, ±0.15) the probe moves 2–3 noise standard deviations,
-  past every noise draw, and by equal and opposite amounts in the two directions, which noise never
-  does. The largest loss in a mixed store is 0.20 points, about one labelled pixel in 500 changing
-  class. kNN-20 sees nothing beyond noise.
+- **Most of that change is indistinguishable from noise.** A move counts as structural when it goes
+  past the largest of the five noise draws. On UK, Iowa and Finland, and on Ecuador and Punjab for the
+  other size, FP8 moves the probe no further than matched noise does, and kNN-20 never does.
+- **FP8's shared shift (coherence 0.25) has a small real cost on a linear probe on three tiles.** On
+  Ecuador (Stage 1, ±0.20) and Kansas (all four ±0.15, Stage 1 ±0.12) the probe moves 2–3 noise
+  standard deviations, past every noise draw, by equal and opposite amounts in the two directions,
+  which noise never does; Punjab (all four) passes its largest draw marginally, 0.04 against 0.03. The
+  largest loss in a mixed store is 0.20 points, about one labelled pixel in 500 changing class. kNN-20
+  sees nothing beyond noise.
 
 ## Decision
 
