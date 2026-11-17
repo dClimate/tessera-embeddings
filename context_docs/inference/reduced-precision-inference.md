@@ -7,14 +7,14 @@
 
 | path | numerics (ADR 012) | speed | cost per Mpx (UK) | verdict |
 |---|---|---|---|---|
-| **FP8 on g6e (L40S)** | per-value ✓, neighbours ✗ (0.97) | ~1.2–1.3× forward pass, only with hand-written fused quantisation; naive and `torch.compile` versions are slower than bf16 | ~$0.024–0.025 vs $0.030 | planned: g6e stays the workhorse, so this is the next speed work (see Next steps) |
+| **FP8 on g6e (L40S)** | per-value ✓, strict neighbours ✗ (0.97), cross-change accuracy ✓ ([ADR 042](../decisions/042-fp8-linears-ship-on-cross-change-accuracy-and-the-a10g-stays-bf16.md)) | ~1.2–1.3× forward pass, only with hand-written fused quantisation; naive and `torch.compile` versions are slower than bf16 | ~$0.024–0.025 vs $0.030 | planned: g6e stays the workhorse, so this is the next speed work (see Next steps) |
 | **int8 on Intel (c8i, AMX)** | per-value ✓, neighbours ✗ (0.98) | ~1.45–1.6× projected over CPU bf16 | spot ~$0.039–0.048, against a bar of $0.039 (g6e) or $0.054 (g5) | at best reaches the g6e bar; viable as spot overflow only where we fall back to g5 |
 
 - **Fleet plan.** As of 2026-11-16 the g6e (L40S) remains the workhorse until further notice: we expect to get a substantial number of them. That makes FP8 on the g6e the path to build.
 - **Which bar applies.** The CPU path was to be pursued only within 1.3× of GPU cost. Against the g6e that bar is **$0.039/Mpx**, which projected int8 on c8i spot ($0.039–0.048) reaches only at its best case; FP8 on the g6e would lower it to about $0.031–0.033. g6e capacity was effectively unavailable while these measurements were taken, and wherever that recurs the fallback GPU is the g5.2xlarge, with a bar of **$0.054/Mpx** that int8 clears.
 - **The neighbour gate over-penalises, and has been re-examined.** ADR 012's top-20 gate (0.9940) is failed even by bf16 on a different kernel stack: the CPU library scores 0.989–0.990, and bf16 under `torch.compile` scores 0.988. The churn is swaps among near-tied neighbours: counted tie-tolerantly, every evaluated change keeps 0.999 or more. See [Calibrating the gate](#calibrating-the-gate).
 - **Downstream accuracy is unaffected within a store, and at risk only across a change.** On labelled pixels, FP8 and int8 move kNN and linear-probe accuracy by no more than matched random noise does (within about ±0.2 points). The one consumer that loses accuracy is a classifier trained on embeddings from one side of a change and applied to the other.
-- **Open question: is g5 fallback consistent enough?** If g6e capacity falls short and a g5 fills part of an FP8 store, that store mixes FP8 and bf16 pixels, which is the across-a-change case. At FP8's size the measured loss is small, but FP8's error has a shared component that the neighbour metrics do not see, and it is untested on real kernels and on more than two tiles.
+- **g5 fallback inside an FP8 store is fine, on bf16** ([ADR 042](../decisions/042-fp8-linears-ship-on-cross-change-accuracy-and-the-a10g-stays-bf16.md)). On real kernels, a classifier fitted on FP8 pixels and applied to the g5's bf16 pixels moves by no more than ±0.07 points. FP8's shared shift is real (coherence 0.27) but costs nothing measurable. See [The mixed-pool test](#the-mixed-pool-test).
 
 ## Baselines: production engine, bf16, four dense UK chunks of ~4.0M px
 
@@ -211,12 +211,29 @@ Synthetic errors applied to the production embeddings, to see what each measure 
 - **Low-rank noise is over-penalised**: it fails top-25 at 0.995 with no accuracy change.
 - **The class-directed shift passes every gate we have.** Only coherence separates it from noise: 0.69–0.73 over all pixels, against 0.01–0.02.
 
+### The mixed-pool test
+
+Measured 2026-11-17 on the full lattice (230,400 px per tile), with real kernels, to settle g5 fallback in an FP8 store. No g6e had capacity, so native FP8 ran on an L4 (same Ada FP8 hardware); bf16 ran on the L40S (the production store), the A10G and the L4. Stage 1 is FP8 on QKV and FFN up only, quantised from the fp32 LayerNorm output as the fused kernel will emit it. "Emulated" is FP8 on the A10G: E4M3 operands through an fp32 GEMM, then the scales.
+
+| pair (UK and Iowa) | within ±1 | strict top-20 | inside top-25, overall / worst stratum | coherence | cross-change probe / kNN-20, pts |
+|---|---|---|---|---|---|
+| two cards, bf16 (any of L40S, A10G, L4) | ≥ 99.999% | 0.9992–0.9996 | 1.0000 / 1.0000 | 0.05–0.10 | 0.00 / 0.00 |
+| FP8 change, all four linears (L4) | 99.84% | 0.971–0.973 | 0.9992–0.9995 / 0.992 | 0.27–0.28 | −0.02 to +0.07 / 0.00 |
+| FP8 change, Stage 1 (L4) | 99.90–99.92% | 0.973–0.974 | 0.9993–0.9996 / 0.994 | 0.25–0.27 | −0.02 to +0.03 / −0.01 |
+| A10G bf16 vs L4 FP8 (a mixed store) | as the FP8 rows | | | | −0.04 to +0.02 / −0.02 to +0.01 |
+| A10G emulated FP8 vs L4 native FP8 | 99.97–99.98% | 0.978–0.984 | 0.9997–1.0000 / 0.996–0.999 | 0.006–0.007 | −0.02 to +0.01 / −0.01 to 0.00 |
+
+- **The fleet's two cards are nearly identical on bf16**: 99.86–99.91% of int8 values equal. ADR 030's yardstick, "no further apart than two cards on identical code", therefore rejects any precision change.
+- **A bf16 g5 in an FP8 store is exactly the FP8 change, shared shift included, and it costs nothing measurable across the change.** The simulation's −0.04 to −0.21 points did not reproduce on real kernels.
+- **Emulated FP8 on the A10G removes the shared shift** and leaves unstructured noise about half FP8's size. It is not needed, and ADR 042 rejects it to keep the forward pass card-agnostic outside one capability check.
+- **Top-25 per stratum is stricter than overall.** Inside one window, FP8 scores 0.992–0.994, under the 0.995 that was calibrated over whole tiles.
+
 ### What this supports
 
 1. **Keep the per-value envelope as the magnitude gate.** It trips where the first measurable harm appears.
-2. **Replace the strict top-20 gate with top-25 at 0.995, scored on the worst stratum.** It passes every benign change evaluated and trips with the envelope.
-3. **Add a shared-shift check per cluster** for structured error, since no neighbour metric sees it. Its threshold is not set, and FP8's 0.27 needs a ruling.
-4. **Harm appeared only across a change.** That supports ADR 030's store boundary, and it is why g5 fallback inside an FP8 store is an open question.
+2. **Replace the strict top-20 gate with a tie-tolerant measure, reported rather than gated.** Top-25 at 0.995 over a whole tile passes every benign change evaluated and trips with the envelope. Scored inside one window it is stricter (FP8 gives 0.992–0.994), so a per-stratum threshold needs its own calibration.
+3. **Report a shared-shift (coherence) check per cluster** for structured error, since no neighbour metric sees it. FP8's 0.27 cost nothing across a change on real kernels, so it is reported, not gated.
+4. **Harm appeared only across a change, and only in simulation and synthetic controls.** The store boundary stays (ADR 042), and cross-change accuracy is the gate.
 
 ## Next steps
 
@@ -224,11 +241,10 @@ The g6e stays the workhorse, so the plan is FP8 on the L40S, built by extending 
 
 **Starting point.** v2's CUDA forward (`_encoder_layer_forward` in `student_v2.py`) already runs each residual add and LayerNorm as one compiled bf16 kernel, and the FFN-up bias and ReLU in the matmul's epilogue ([ADR 030](../decisions/030-forward-pass-reorderings-ship-at-a-store-boundary.md), 5–7% on the L40S and A10G). The baselines above include it, so the bf16 fusion step is done and the remaining gain is FP8's.
 
-1. **Settle the gate.** The first downstream pass is above: on two tiles, simulated FP8 costs nothing within a store. Still needed before FP8 ships:
-   - the same tests on real `_scaled_mm` output and on more than two tiles;
-   - the two-card comparison scored with top-25 and coherence on one sampling. ADR 030's 0.981 uses a different sampling from the lattice, so FP8 has not been scored against it;
-   - a threshold for the shared-shift check;
-   - a decision record, because FP8 changes precision rather than order and ADR 030 does not cover it.
+1. **Gate: settled** by [ADR 042](../decisions/042-fp8-linears-ship-on-cross-change-accuracy-and-the-a10g-stays-bf16.md), on [the mixed-pool test](#the-mixed-pool-test). A precision change meets ADR 012's envelope plus cross-change accuracy within 0.2 points; neighbour overlaps and coherence are reported. Still needed before an FP8 store begins:
+   - native FP8 on an L40S (the test ran on an L4 because g6e had no capacity);
+   - more than two tiles;
+   - Stage 2's static scales, if Stage 2 ships, through the same test.
 2. **Stage 1: FP8 out of the fused add + LayerNorm (Tier A, target ~1.15×).**
    - Replace the compiled add + LayerNorm with a hand-written kernel that also emits its result as E4M3. The encoder is post-norm, so each LayerNorm output feeds both the residual stream and the next GEMM: the kernel writes bf16 for the first and FP8 for the second.
    - QKV and FFN up take the FP8 output through `torch._scaled_mm`, with weights quantised once at load.
@@ -240,12 +256,7 @@ The g6e stays the workhorse, so the plan is FP8 on the L40S, built by extending 
    - Otherwise a Triton FP8 GEMM with a ReLU and FP8-output epilogue, which has to match cuBLASLt's FFN speed to be worth having.
    - Static scales need a calibration pass. Out-proj (1.10× per layer) is decided on measurement and may stay bf16.
 5. **Ship at a store boundary**, as ADR 030 requires of the bf16 fusion.
-6. **Open question: is g5 fallback consistent enough?** The A10G has no FP8, so a g5 filling part of an FP8 store writes bf16 pixels beside FP8 ones. What is known:
-   - a probe across a change of FP8's size lost 0.04–0.21 points here, the same as matched noise;
-   - FP8's shared shift (coherence 0.27) is the kind of error that hurt most across a change in the controls, and it is measured only in simulation;
-   - mixed fleets already mix cards: ADR 030 accepts the L40S against RTX PRO 6000 difference inside one store.
-
-   To decide: score real FP8 on a g6e against bf16 on a g5 for the same tiles with the per-stratum top-25 and the shared-shift check, and compare with the two-card baseline. If it is no further apart than two cards on identical code, fallback is fine; otherwise an FP8 store is g6e-only.
+6. **g5 fallback: settled.** A g5 fills FP8 stores on today's bf16 forward. The FP8 layers are picked by one capability check at model build, and nothing else knows the card (ADR 042).
 
 Parked while the g6e is the workhorse:
 
@@ -266,6 +277,7 @@ Parked while the g6e is the workhorse:
   | `int8_sim.py` | int8 simulation and library profile |
   | `bench_int8.sh` | `benchdnn` |
 
+- **Mixed-pool test** is in `s3://arbol-tessera-inputs-dev/perf/fp8-mixed/`: `scripts/mixed_pool_gpu.py` (embeds the lattice per card: bf16, FP8 all four, FP8 Stage 1; native on Ada, emulated on the A10G), `scripts/mixed_pool_score.py` (envelope, neighbours, coherence, cross-change classifiers), the outputs `mixed_<card>_<tile>.npz`, the labels and `score_{uk,iowa}.txt`.
 - **Gate calibration scripts** are not yet uploaded to that prefix: `tie_tolerant.py` (variants and neighbour metrics), `labels.py` (labels and observation counts), `ladder.py` (noise ladder and controls), `coherence.py` (cross-change probe and coherence).
 - **Labels:** CDL 2024 from CropScape's coverage endpoint, sampled at pixel centres; WorldCover 2021 v200 from `s3://esa-worldcover`.
 - **Lattice inputs** are in `s3://arbol-tessera-inputs-dev/perf/fp8-lattice/`.

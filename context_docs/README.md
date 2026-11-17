@@ -56,7 +56,9 @@ context_docs/
 │   ├── 037-v2-stores-use-the-utm-zones-layout.md
 │   ├── 038-the-campaign-fills-a-utm-column-in-two-halves.md
 │   ├── 039-architecture-rules-run-on-import-linter-and-ruff.md
-│   └── 040-new-code-is-gated-on-duplication-and-complexity.md
+│   ├── 040-new-code-is-gated-on-duplication-and-complexity.md
+│   ├── 041-unit-tests-run-the-forked-writer-in-threads.md
+│   └── 042-fp8-linears-ship-on-cross-change-accuracy-and-the-a10g-stays-bf16.md
 │
 ├── campaign/                      THE GLOBAL CAMPAIGN — start here
 │   ├── campaign-plan.md                        <- START HERE. What runs, with what settings, in
