@@ -87,7 +87,8 @@ Four findings decide this:
 
 ## Consequences
 
-- g5 fallback keeps working for FP8 stores at today's g5 cost, and needs no new code.
+- g5 fallback keeps working for FP8 stores at today's g5 cost. The g5 runs today's bf16 forward; the
+  only new code is recording the store's precision and passing it to model construction.
 - **What a mixed FP8 store carries:** between its g5 and g6e pixels, FP8's shared shift. A linear
   classifier fitted on one card's pixels and applied to the other's can lose up to 0.2 points on some
   tiles (measured: cloudy tropics and Kansas wheat); kNN is unaffected. This is the first thing to
