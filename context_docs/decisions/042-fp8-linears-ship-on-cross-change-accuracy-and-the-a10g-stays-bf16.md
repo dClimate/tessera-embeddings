@@ -50,10 +50,11 @@ Four findings decide this:
 - **Most of that change is indistinguishable from noise.** A move counts as structural when it goes
   past the largest of the five noise draws. On UK, Iowa and Finland, and on Ecuador and Punjab for the
   other size, FP8 moves the probe no further than matched noise does, and kNN-20 never does.
-- **FP8's shared shift (coherence 0.25) has a small real cost on a linear probe on three tiles.** On
-  Ecuador (Stage 1, ±0.20) and Kansas (all four ±0.15, Stage 1 ±0.12) the probe moves 2–3 noise
-  standard deviations, past every noise draw, by equal and opposite amounts in the two directions,
-  which noise never does; Punjab (all four) passes its largest draw marginally, 0.04 against 0.03. The
+- **FP8's shared shift (coherence 0.25) has a small real cost on a linear probe on two tiles.** On
+  Ecuador (Stage 1, ±0.20) and Kansas (all four ±0.15, Stage 1 −0.10/+0.12) the probe moves about 2–4
+  noise standard deviations, past every noise draw, by roughly equal and opposite amounts in the two
+  directions, which noise never does. Punjab (all four) passes its largest draw marginally, but as a
+  gain (+0.04 against 0.03), not a loss. The
   largest loss in a mixed store is 0.20 points, about one labelled pixel in 500 changing class. kNN-20
   sees nothing beyond noise.
 
