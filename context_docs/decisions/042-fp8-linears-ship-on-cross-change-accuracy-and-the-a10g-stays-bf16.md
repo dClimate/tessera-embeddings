@@ -12,7 +12,9 @@ changes precision, not the order of floating-point work, so
 had to be settled before building the fused kernels: which gate a precision change meets, and whether
 a g5 (A10G, which has no FP8) can still fill part of an FP8 store when g6e capacity runs short.
 
-Fusion changes speed, not the values written, so the unfused `torch._scaled_mm` path answers both.
+Both were measured on the unfused `torch._scaled_mm` path, which quantises with the same scale rule as
+the planned fused kernels. Fusion reorders the LayerNorm's reduction, a bf16-sized difference (ADR 030)
+far smaller than FP8's, but not zero, so the shipped kernels are measured again (decision 2).
 Measured 2026-11-17 with production code and the production checkpoint, on ADR 012's lattice (3×3
 windows of 160×160, 230,400 px per tile) over six tiles of calendar 2024: dense UK and Iowa, plus
 Ecuador lowlands (cloudy tropics), Punjab (irrigated, arid), Kansas (winter wheat; ascending radar
@@ -66,8 +68,9 @@ Four findings decide this:
    a gain is not harm. Each tile is also scored against five draws of matched isotropic noise, and a
    move outside that spread is reported as structural. Top-20 overlap, top-25 overlap and coherence
    are reported, not gated.
-2. **FP8 means E4M3, with per-channel weight and per-row activation scales.** Static activation scales
-   (Stage 2) change the values and must pass the same gate before they ship.
+2. **FP8 means E4M3, with per-channel weight and per-row activation scales.** The fused kernels that
+   ship must pass the same gate on the lattice themselves, against bf16 on the A10G as well as the
+   L40S. Static activation scales (Stage 2) change the values further and are held to it too.
 3. **It lands at a store boundary** (ADR 025 §2). A store begun in bf16 is finished in bf16, and FP8
    stores are those started after the change.
 4. **Inside an FP8 store, an A10G runs today's bf16 forward unchanged.** One capability check, made
