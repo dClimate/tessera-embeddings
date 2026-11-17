@@ -114,7 +114,10 @@ context_docs/
 │   │                                              removes them
 │   ├── reduced-precision-inference.md          FP8 on the g6e and int8 on Intel AMX: both pass the
 │   │                                              per-value envelope and fail the neighbour gate on
-│   │                                              near-tie churn; int8 makes CPU spot ~g5 parity
+│   │                                              near-tie churn; int8 makes CPU spot ~g5 parity;
+│   │                                              the plan for fused FP8 on the g6e workhorse;
+│   │                                              a tie-tolerant neighbour gate, calibrated on
+│   │                                              labelled pixels
 │   └── the-fleet-and-the-work-source.md        a fleet lives for one `run_inference` call, so a
 │                                                  retry through a second call rebuilt one; the
 │                                                  wind-down, and why the fleet is not held
