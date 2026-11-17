@@ -8,10 +8,10 @@
 | path | numerics (ADR 012) | speed | cost per Mpx (UK) | verdict |
 |---|---|---|---|---|
 | **FP8 on g6e (L40S)** | per-value ✓, neighbours ✗ (0.97) | ~1.2–1.3× forward pass, only with hand-written fused quantisation; naive and `torch.compile` versions are slower than bf16 | ~$0.024–0.025 vs $0.030 | planned: g6e stays the workhorse, so this is the next speed work (see Next steps) |
-| **int8 on Intel (c8i, AMX)** | per-value ✓, neighbours ✗ (0.98) | ~1.45–1.6× projected over CPU bf16 | spot ~$0.041–0.046, against a bar of $0.039 (g6e) or $0.054 (g5) | just misses the g6e bar; viable as spot overflow only where we fall back to g5 |
+| **int8 on Intel (c8i, AMX)** | per-value ✓, neighbours ✗ (0.98) | ~1.45–1.6× projected over CPU bf16 | spot ~$0.039–0.048, against a bar of $0.039 (g6e) or $0.054 (g5) | at best reaches the g6e bar; viable as spot overflow only where we fall back to g5 |
 
 - **Fleet plan.** As of 2026-11-16 the g6e (L40S) remains the workhorse until further notice: we expect to get a substantial number of them. That makes FP8 on the g6e the path to build.
-- **Which bar applies.** The CPU path was to be pursued only within 1.3× of GPU cost. Against the g6e that bar is **$0.039/Mpx**, which projected int8 on c8i spot ($0.041–0.046) just misses; FP8 on the g6e would lower it to about $0.031–0.033. g6e capacity was effectively unavailable while these measurements were taken, and wherever that recurs the fallback GPU is the g5.2xlarge, with a bar of **$0.054/Mpx** that int8 clears.
+- **Which bar applies.** The CPU path was to be pursued only within 1.3× of GPU cost. Against the g6e that bar is **$0.039/Mpx**, which projected int8 on c8i spot ($0.039–0.048) reaches only at its best case; FP8 on the g6e would lower it to about $0.031–0.033. g6e capacity was effectively unavailable while these measurements were taken, and wherever that recurs the fallback GPU is the g5.2xlarge, with a bar of **$0.054/Mpx** that int8 clears.
 - **The neighbour gate over-penalises, and has been re-examined.** ADR 012's top-20 gate (0.9940) is failed even by bf16 on a different kernel stack: the CPU library scores 0.989–0.990, and bf16 under `torch.compile` scores 0.988. The churn is swaps among near-tied neighbours: counted tie-tolerantly, every evaluated change keeps 0.999 or more. See [Calibrating the gate](#calibrating-the-gate).
 - **Downstream accuracy is unaffected within a store, and at risk only across a change.** On labelled pixels, FP8 and int8 move kNN and linear-probe accuracy by no more than matched random noise does (within about ±0.2 points). The one consumer that loses accuracy is a classifier trained on embeddings from one side of a change and applied to the other.
 - **Open question: is g5 fallback consistent enough?** If g6e capacity falls short and a g5 fills part of an FP8 store, that store mixes FP8 and bf16 pixels, which is the across-a-change case. At FP8's size the measured loss is small, but FP8's error has a shared component that the neighbour metrics do not see, and it is untested on real kernels and on more than two tiles.
@@ -114,7 +114,7 @@ The four transformer GEMMs are **74%** of the time.
 
 **Projection:**
 - **Speed:** Amdahl gives about 1.6× with free quantisation. Allowing for per-token quantise and dequantise, which is cheap because each thread's block of 4–8 pixels is already in cache, it comes to **about 1.45–1.6× end-to-end**.
-- **On spot:** that projects c8i.8xlarge spot at **$0.041–0.046/Mpx**. It clears the 1.3× g5 bar of $0.054 and is roughly at parity with g5 on-demand, but sits just above the 1.3× g6e bar of $0.039.
+- **On spot:** applying the 1.45–1.6× range to the measured bf16 spot cost projects c8i.8xlarge spot at **$0.039–0.048/Mpx**. It clears the 1.3× g5 bar of $0.054 and is roughly at parity with g5 on-demand, but only its best case reaches the 1.3× g6e bar of $0.039.
 - **On-demand:** c8i on-demand stays about 2.1–2.3× the g5.
 
 ### Graviton
