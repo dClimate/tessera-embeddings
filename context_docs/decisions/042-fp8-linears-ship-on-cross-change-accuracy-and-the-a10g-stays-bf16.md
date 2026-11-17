@@ -13,41 +13,56 @@ had to be settled before building the fused kernels: which gate a precision chan
 a g5 (A10G, which has no FP8) can still fill part of an FP8 store when g6e capacity runs short.
 
 Fusion changes speed, not the values written, so the unfused `torch._scaled_mm` path answers both.
-Measured 2026-11-17 on ADR 012's lattice (3×3 windows of 160×160 on a dense UK tile and an Iowa tile,
-230,400 px each), with production code and the production checkpoint. No g6e had capacity, so native
-FP8 ran on an L4 (the same Ada FP8 hardware). bf16 ran on the L40S (the production store), the A10G
-and the L4. FP8 used row-wise activation and per-channel weight scales, on all four linears and on
-QKV and FFN up only (Stage 1). Ranges cover both tiles:
+Measured 2026-11-17 with production code and the production checkpoint, on ADR 012's lattice (3×3
+windows of 160×160, 230,400 px per tile) over six tiles of calendar 2024: dense UK and Iowa, plus
+Ecuador lowlands (cloudy tropics), Punjab (irrigated, arid), Kansas (winter wheat; ascending radar
+only) and Finland (boreal). Native FP8 ran on the L40S and on an L4; bf16 ran on all three cards;
+FP8 was also emulated on the A10G. FP8 used row-wise activation and per-channel weight scales, on all
+four linears and on QKV and FFN up only (Stage 1). Ranges cover the six tiles:
 
-| | int8 within ±1 | top-20 kept | inside top-25 | coherence | cross-change accuracy (pts) |
+| | int8 within ±1 | top-20 kept | inside top-25 | coherence | cross-change probe (pts) |
 |---|---:|---:|---:|---:|---:|
-| two cards, bf16, identical code | ≥ 99.999% | 0.9992–0.9996 | 1.0000 | 0.05–0.10 | 0.00 |
-| FP8, all four linears | 99.84% | 0.971–0.973 | 0.9992–0.9995 | 0.27–0.28 | −0.02 to +0.07 |
-| FP8, Stage 1 | 99.90–99.92% | 0.973–0.974 | 0.9993–0.9996 | 0.25–0.27 | −0.02 to +0.03 |
-| A10G bf16 vs FP8 (a mixed store) | as the FP8 rows | | | | −0.04 to +0.02 |
+| two cards, bf16, identical code (L40S, A10G, L4) | ≥ 99.998% | 0.999–1.000 | 1.0000 | 0.02–0.10 | ±0.01 |
+| two cards, native FP8 (L40S, L4) | ≥ 99.99% | 0.994–1.000 | ≥ 0.9999 | 0.01–0.07 | ±0.01 |
+| FP8 on the L40S, all four linears | 99.58–99.97% | 0.954–0.977 | 0.995–1.000 | 0.25–0.29 | −0.15 to +0.11 |
+| FP8 on the L40S, Stage 1 | 99.78–99.99% | 0.958–0.979 | 0.997–1.000 | 0.22–0.27 | −0.10 to +0.20 |
+| A10G bf16 vs L40S FP8 (a mixed store) | as the FP8 rows | | | | −0.20 to +0.26 |
+| A10G emulated FP8 vs L40S native FP8 | 99.90–99.998% | 0.966–0.987 | 0.998–1.000 | 0.006–0.009 | ±0.02 |
 
 *Coherence* is the length of the mean error vector over the mean error length: about 0.02 for
-unstructured noise, 1 for a shift every pixel shares. *Cross-change accuracy* is the change when a
-linear probe or a kNN-20 classifier, fitted on labelled pixels (USDA CDL in Iowa, ESA WorldCover in
-the UK) from one side, is applied to the other side's pixels from held-out windows, against applying
-it to its own side: about 230,000 labelled pixels per tile, in three held-out folds.
+unstructured noise, 1 for a shift every pixel shares. *Cross-change probe* is the change when a linear
+probe, fitted on labelled pixels from one side (ESA WorldCover 2021; USDA CDL 2024 in Iowa and
+Kansas), is applied to the other side's pixels from held-out windows, against applying it to its own
+side: about 230,000 labelled pixels per tile in three held-out folds, both directions. A kNN-20
+classifier scored the same way moves by at most ±0.05 points on every pair.
 
-Three findings decide this:
+To tell a real effect from the metric's own noise, the same test was run on isotropic per-pixel noise
+matched to FP8's mean cosine after int8 quantisation, five draws per tile and size. Noise alone moves
+the probe by up to 0.03–0.13 points depending on the tile (standard deviation 0.015–0.063), and kNN-20
+by up to 0.05.
 
-- **ADR 030's yardstick cannot admit a precision change.** On identical bf16 code the A10G and the
-  L40S agree on 99.86–99.91% of int8 values and keep 0.9995 of top-20 neighbours, far closer than the
-  RTX PRO 6000 that set ADR 030's 0.981. Any change of precision, FP8 or int8, fails it.
-- **FP8's error is partly a shared shift** (coherence 0.27), the kind of error that neighbour metrics
-  miss and that hurt a classifier crossing a change in the synthetic controls.
-- **On real kernels that shift costs nothing measurable across the change.** Every pairing, including
-  bf16 pixels from an A10G read by a classifier fitted on FP8 pixels, stays within ±0.07 points.
+Four findings decide this:
+
+- **ADR 030's yardstick cannot admit a precision change.** On identical bf16 code the fleet's cards
+  agree on ≥ 99.998% of values within ±1 and keep 0.999 of top-20 neighbours, far closer than the RTX
+  PRO 6000 that set ADR 030's 0.981. Any change of precision, FP8 or int8, fails it.
+- **A bf16 g5 in an FP8 store is exactly the FP8 change**, because the A10G's bf16 matches the L40S's.
+- **Most of that change is indistinguishable from noise.** On four of six tiles, and on Ecuador with
+  all four linears, FP8 moves the probe no further than matched noise does, and kNN-20 never does.
+- **FP8's shared shift (coherence 0.25) has a small real cost on a linear probe on two tiles.** On
+  Ecuador (Stage 1, ±0.20) and Kansas (all four, ±0.15) the probe moves 2–3 noise standard deviations,
+  past every noise draw, and by equal and opposite amounts in the two directions, which noise never
+  does. The largest loss in a mixed store is 0.20 points, about one labelled pixel in 500 changing
+  class. kNN-20 sees nothing beyond noise.
 
 ## Decision
 
 1. **A precision change to the forward pass is gated by ADR 012's cross-config envelope plus
-   cross-change accuracy.** On every labelled tile measured, a probe and a kNN-20 classifier fitted on
-   one side and applied to the other must move by no more than 0.2 points, the refit jitter of the
-   gate calibration. Top-20 overlap, top-25 overlap and coherence are reported, not gated.
+   cross-change accuracy.** On every labelled tile measured, a linear probe and a kNN-20 classifier
+   fitted on one side and applied to the other must lose no more than 0.2 points. The gate is on loss:
+   a gain is not harm. Each tile is also scored against five draws of matched isotropic noise, and a
+   move outside that spread is reported as structural. Top-20 overlap, top-25 overlap and coherence
+   are reported, not gated.
 2. **FP8 means E4M3, with per-channel weight and per-row activation scales.** Static activation scales
    (Stage 2) change the values and must pass the same gate before they ship.
 3. **It lands at a store boundary** (ADR 025 §2). A store begun in bf16 is finished in bf16, and FP8
@@ -59,22 +74,32 @@ Three findings decide this:
 ## Consequences
 
 - g5 fallback keeps working for FP8 stores at today's g5 cost, and needs no new code.
-- An FP8 store filled partly on a g5 carries FP8's shared shift between its g5 and g6e pixels. That
-  is measured harmless on two tiles. It is the first thing to recheck if a downstream user reports a
-  seam between regions.
-- **Before an FP8 store begins**, this measurement is repeated with native FP8 on an L40S and on more
-  than two tiles, scored with `mixed_pool_score.py`.
+- **What a mixed FP8 store carries:** between its g5 and g6e pixels, FP8's shared shift. A linear
+  classifier fitted on one card's pixels and applied to the other's can lose up to 0.2 points on some
+  tiles (measured: cloudy tropics and Kansas wheat); kNN is unaffected. This is the first thing to
+  recheck if a downstream user reports a seam between regions, and the case for emulated FP8 on the g5
+  if one does.
+- The gate passes Stage 1 and all four linears on six tiles, with the mixed store's largest loss at
+  the 0.2-point limit (Ecuador, Stage 1). A change that moves further, such as Stage 2's static
+  scales, needs a decision rather than a pass.
 - The tie-tolerant neighbour gate proposed in the reduced-precision record (top-25 at 0.995 on the
-  worst stratum) is not adopted. Inside one window FP8 scores 0.992–0.994, and that threshold was
-  calibrated over whole tiles. A per-stratum threshold needs its own noise ladder.
+  worst stratum) is not adopted. Inside one class or window FP8 scores as low as 0.972 (Finland's
+  water), and that threshold was calibrated over whole tiles. A per-stratum threshold needs its own
+  noise ladder.
+- The measurement scripts and every output are in `s3://arbol-tessera-inputs-dev/perf/fp8-mixed/`;
+  the four new tiles' mosaics stay under `mosaics/fp8-*` for reruns.
 
 ## Rejected alternatives
 
-- **ADR 030's two-card comparison as the bar.** The fleet's two cards agree too closely for it to
-  measure anything but bit-level reordering.
+- **A fixed 0.2-point bound on any move, in either direction.** The metric's own noise reaches 0.13
+  points on these tiles, and the largest move (+0.26) is a gain, the mirror of the 0.20 loss.
+- **ADR 030's two-card comparison as the bar.** The fleet's cards agree too closely for it to measure
+  anything but bit-level reordering.
 - **ADR 012's 0.9940 top-20 gate.** bf16 on a different kernel stack fails it, and FP8's churn is
   swaps among near-tied neighbours that cost no accuracy.
 - **FP8 emulated on the A10G** (FP8 rounding on bf16 tensor cores). It removes the shared shift,
-  bringing the A10G to coherence 0.006–0.007 against native FP8, but adds a third forward path and
-  card-specific rounding for no measured gain.
-- **g6e-only FP8 stores.** They give up the g5 fallback to avoid a difference that measures as zero.
+  holding a mixed store to ±0.02 points with coherence at the noise floor, but adds card-specific
+  rounding to every forward path that a g5 runs, to remove a loss of at most 0.2 points on a linear
+  probe.
+- **g6e-only FP8 stores.** They give up g5 fallback, which g6e capacity has needed repeatedly, for the
+  same 0.2 points.
