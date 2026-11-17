@@ -22,7 +22,7 @@ QKV and FFN up only (Stage 1). Ranges cover both tiles:
 | | int8 within ±1 | top-20 kept | inside top-25 | coherence | cross-change accuracy (pts) |
 |---|---:|---:|---:|---:|---:|
 | two cards, bf16, identical code | ≥ 99.999% | 0.9992–0.9996 | 1.0000 | 0.05–0.10 | 0.00 |
-| FP8, all four linears | 99.84% | 0.971–0.973 | 0.9992–0.9995 | 0.27–0.28 | −0.04 to +0.07 |
+| FP8, all four linears | 99.84% | 0.971–0.973 | 0.9992–0.9995 | 0.27–0.28 | −0.02 to +0.07 |
 | FP8, Stage 1 | 99.90–99.92% | 0.973–0.974 | 0.9993–0.9996 | 0.25–0.27 | −0.02 to +0.03 |
 | A10G bf16 vs FP8 (a mixed store) | as the FP8 rows | | | | −0.04 to +0.02 |
 
