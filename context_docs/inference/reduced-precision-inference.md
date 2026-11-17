@@ -224,6 +224,8 @@ Measured 2026-11-17 on the full lattice (230,400 px per tile), with real kernels
 | A10G bf16 vs L40S FP8 (a mixed store) | as the FP8 rows | | | | −0.20 to +0.26 / −0.05 to +0.05 |
 | A10G emulated FP8 vs L40S native FP8 | 99.90–99.998% | 0.966–0.987 | 0.998–1.000 / 0.987–0.999 | 0.006–0.009 | ±0.02 / −0.05 to +0.02 |
 
+ADR 012's full cross-config envelope holds on every tile and variant, mixed stores included: at least 99.58% of values within ±1 (floor 99.5%), worst-pixel cosine at least 0.99940 (floor 0.999), per-pixel scale drift at most 2.6% (limit 3%). Ecuador with all four linears is the closest to all three limits.
+
 **Noise control.** Isotropic per-pixel noise matched to FP8's mean cosine after int8 quantisation, five draws per tile and size, scored with the same folds:
 
 | tile | FP8 all four, probe (both directions) | FP8 Stage 1, probe | matched noise, largest probe move (sd) |
@@ -259,7 +261,7 @@ The g6e stays the workhorse, so the plan is FP8 on the L40S, built by extending 
    - Replace the compiled add + LayerNorm with a hand-written kernel that also emits its result as E4M3. The encoder is post-norm, so each LayerNorm output feeds both the residual stream and the next GEMM: the kernel writes bf16 for the first and FP8 for the second.
    - QKV and FFN up take the FP8 output through `torch._scaled_mm`, with weights quantised once at load.
    - Hand-written rather than `torch.compile`, which was slower and crashed on varied batch shapes with FP8.
-   - The g5 keeps today's bf16 path: the A10G has no FP8.
+   - The store records its precision at creation and model construction reads it, so a bf16 store stays bf16 on an L40S. Inside an FP8 store the g5 builds today's bf16 path, since the A10G has no FP8 (ADR 042).
 3. **Measure Stage 1 on g6e.xlarge**: production chunks for speed, the lattice for parity through ADR 042's gate, scored against bf16 on the A10G as well as the L40S, since the fused kernel's numerics are not exactly the unfused path's. The measured figure shows how much of the ~1.35× ceiling is left for Stage 2.
 4. **Stage 2: FFN down (Tier B, target ~1.25–1.3×), if Stage 1's number justifies it.**
    - First check whether `_scaled_mm` can emit FP8 output with a static result scale. If so, FFN up feeds FFN down with no bf16 round trip and both stay on cuBLASLt.

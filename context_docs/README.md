@@ -118,8 +118,8 @@ context_docs/
 │   │                                              per-value envelope and fail the neighbour gate on
 │   │                                              near-tie churn; int8 makes CPU spot ~g5 parity;
 │   │                                              the plan for fused FP8 on the g6e workhorse;
-│   │                                              a tie-tolerant neighbour gate, calibrated on
-│   │                                              labelled pixels
+│   │                                              the gate: cross-change accuracy against matched
+│   │                                              noise (ADR 042); neighbour overlaps are reported
 │   └── the-fleet-and-the-work-source.md        a fleet lives for one `run_inference` call, so a
 │                                                  retry through a second call rebuilt one; the
 │                                                  wind-down, and why the fleet is not held

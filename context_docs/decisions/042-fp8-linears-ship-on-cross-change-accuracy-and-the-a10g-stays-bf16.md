@@ -31,6 +31,11 @@ four linears and on QKV and FFN up only (Stage 1). Ranges cover the six tiles:
 | A10G bf16 vs L40S FP8 (a mixed store) | as the FP8 rows | | | | −0.20 to +0.26 |
 | A10G emulated FP8 vs L40S native FP8 | 99.90–99.998% | 0.966–0.987 | 0.998–1.000 | 0.006–0.009 | ±0.02 |
 
+ADR 012's full cross-config envelope holds on every tile and variant, mixed stores included: at least
+99.58% of values within ±1 (floor 99.5%), worst-pixel cosine at least 0.99940 (floor 0.999) and
+per-pixel scale drift at most 2.6% (limit 3%). Ecuador with all four linears is the closest to all
+three limits.
+
 *Coherence* is the length of the mean error vector over the mean error length: about 0.02 for
 unstructured noise, 1 for a shift every pixel shares. *Cross-change probe* is the change when a linear
 probe, fitted on labelled pixels from one side (ESA WorldCover 2021; USDA CDL 2024 in Iowa and
@@ -73,9 +78,12 @@ Four findings decide this:
    L40S. Static activation scales (Stage 2) change the values further and are held to it too.
 3. **It lands at a store boundary** (ADR 025 §2). A store begun in bf16 is finished in bf16, and FP8
    stores are those started after the change.
-4. **Inside an FP8 store, an A10G runs today's bf16 forward unchanged.** One capability check, made
-   when the model is built, picks the FP8 encoder layers on Ada and newer. No other code knows which
-   card it runs on.
+4. **Precision is a property of the store, and inside an FP8 store an A10G runs today's bf16 forward
+   unchanged.** A store's precision is recorded when the store is created and handed to model
+   construction for every run that writes to it, so a bf16 store is finished in bf16 on any card. The
+   card only decides whether the store's precision can run: on Ada and newer an FP8 store builds the
+   FP8 encoder layers, and on an A10G it builds the bf16 ones. No other code knows which card it runs
+   on.
 
 ## Consequences
 
