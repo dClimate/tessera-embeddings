@@ -187,15 +187,15 @@ What the controls show, on the six tiles:
 2. **FP8 fails this gate and ships as a named exception.** It fails on Kansas winter wheat (probe
    recall, both sizes, up to 1.0 point including a mixed store), Iowa forest (probe precision, all four
    linears, 0.65) and Ecuador trees (probe recall, all four linears, 0.55); Ecuador's Stage 1 mixed
-   store loses 0.2005 points at the tile level; it leaves the six cells in the context table
-   unresolved; and it trips the tripwire.
+   store loses 0.2005 points at the tile level; it leaves the six cells in the context's
+   unresolved-cells table unresolved; and it trips the tripwire.
    These losses are accepted for FP8 E4M3 as defined in decision 3, the unresolved cells included:
    this is their decision. The exception does not change the
    gate: any other precision change, int8 included, meets it unchanged. The fused kernels and Stage 2
    go through the gate themselves, and pass under this exception only if they fail or are unresolved
    in these cells and Ecuador's tile bound alone, by no more than the recorded loss plus one SE
    (a cell's jackknife SE; for Ecuador's tile bound, 0.2005 + 0.047, its jackknife SE over blocks),
-   and trip the tripwire only in the classes of the context table, by no more than 1.1 times the
+   and trip the tripwire only in the classes of the context's gap-closure table, by no more than 1.1 times the
    gap closure recorded there. Each is held to the record for its own size, all four linears or
    Stage 1. Gap closure has no SE of its own, so the tenth is an allowance set by hand: two cards on
    identical code move it by at most 0.05, under a twentieth of the smallest recorded trip. A cell
@@ -206,7 +206,7 @@ What the controls show, on the six tiles:
    The exception in decision 2 is defined on these scales. Stage 2's static activation scales are a
    different quantisation: Stage 2 goes through the gate, and stays inside the exception only on
    decision 2's terms. Past them it is a new decision.
-4. **It lands at a store boundary** (ADR 025 §2). A store begun in bf16 is finished in bf16, and FP8
+4. **It lands at a store boundary** (ADR 025 §2). A store begun in bf16 is finished on today's forward, and FP8
    stores are those started after the change.
 5. **Precision is a property of the store, and inside an FP8 store an A10G runs today's bf16 forward
    unchanged.** A store's precision is recorded when the store is created and handed to model
