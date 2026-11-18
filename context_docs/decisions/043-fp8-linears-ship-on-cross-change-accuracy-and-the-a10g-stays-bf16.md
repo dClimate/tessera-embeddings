@@ -116,13 +116,36 @@ What the controls show, on the six tiles:
   to gate, under z_fam: Finland grass loses 1.09 ± 0.30 of probe recall (all four), and Kansas
   soybeans up to 1.30 ± 0.45 of probe precision (both sizes).
 - **The gap-closure tripwire fires for FP8 on every tile** except UK and Finland at Stage 1, and for
-  no noise draw on any tile.
+  no noise draw on any tile. Gap closure in thousandths of the centroid gap, a mixed store's being
+  the same:
+
+  | tile | class | tripwire | all four | Stage 1 |
+  |---|---|---:|---:|---:|
+  | UK | trees | 0.82 | 1.16 | under (0.53) |
+  | Iowa | pasture | 1.00 | 2.73 | 1.84 |
+  | Ecuador | trees | 1.72 | 3.92 | 1.85 |
+  | Ecuador | grass | 0.35 | 1.97 | 2.61 |
+  | Punjab | trees | 0.73 | 1.86 | 2.07 |
+  | Kansas | pasture | 0.80 | 5.24 | 4.40 |
+  | Kansas | winter wheat | 2.53 | 4.34 | 2.60 |
+  | Kansas | sorghum | 2.77 | 7.03 | 4.08 |
+  | Finland | grass | 2.79 | 3.28 | under (1.51) |
+
+  Two cards on identical bf16 reach 0.05 at most, and the noise draws 0.25.
 - **Coherence does not track harm:** 0.75 at the weakest control dose against 0.72 at about nine times
   the probe damage, and two cards on identical bf16 reach 0.60 inside one class.
 
 ## Decision
 
-1. **A precision change to the forward pass passes when, on every labelled tile:**
+1. **A precision change to the forward pass passes when, on every tile of the suite:**
+
+   The suite is the six tiles measured here (UK, Iowa, Ecuador, Punjab, Kansas, Finland; calendar
+   2024; ADR 012's lattice; ESA WorldCover 2021 labels, USDA CDL 2024 in Iowa and Kansas), with the
+   labels, scripts and per-card embeddings stored under
+   `s3://arbol-tessera-inputs-dev/perf/fp8-mixed/`; the reduced-precision record lists every input.
+   A candidate is scored on all six. A tile may be added; dropping or replacing one is a new
+   decision.
+
    1. **Envelope:** ADR 012's cross-config envelope holds.
    2. **Tile loss:** a linear probe and a kNN-20 classifier, fitted on one side and applied to the
       other, lose no more than 0.2 points, in both directions.
@@ -155,6 +178,10 @@ What the controls show, on the six tiles:
    5. **Tripwire:** a class's gap closure is its mean error projected on the direction to another
       class's centroid, as a share of the centroid gap. Past half its own control's gap closure at the
       dose that costs δ, the change needs a decision even if accuracy passes.
+      - A control's dose is its worst loss in any gated cell on the tile. The gap closure at δ is
+        interpolated linearly between the three doses, and scaled in proportion from the nearest
+        dose where δ lies outside them, as it does when no dose costs δ.
+      - A class with no control has no tripwire. If it is gated it is already listed as unvalidated.
 
    Neighbour overlaps and coherence are reported, not gated.
 2. **FP8 fails this gate and ships as a named exception.** It fails on Kansas winter wheat (probe
@@ -167,7 +194,13 @@ What the controls show, on the six tiles:
    gate: any other precision change, int8 included, meets it unchanged. The fused kernels and Stage 2
    go through the gate themselves, and pass under this exception only if they fail or are unresolved
    in these cells and Ecuador's tile bound alone, by no more than the recorded loss plus one SE
-   (a cell's jackknife SE; for Ecuador's tile bound, 0.2005 + 0.047, its jackknife SE over blocks). Anything else is a new decision.
+   (a cell's jackknife SE; for Ecuador's tile bound, 0.2005 + 0.047, its jackknife SE over blocks),
+   and trip the tripwire only in the classes of the context table, by no more than 1.1 times the
+   gap closure recorded there. Each is held to the record for its own size, all four linears or
+   Stage 1. Gap closure has no SE of its own, so the tenth is an allowance set by hand: two cards on
+   identical code move it by at most 0.05, under a twentieth of the smallest recorded trip. A cell
+   or class that worsens past its bound is outside the exception even if nothing new fails.
+   Anything else is a new decision.
 3. **FP8 means E4M3, with per-channel weight and per-row activation scales.** The fused kernels that
    ship must be measured on the lattice themselves, against bf16 on the A10G as well as the L40S.
    The exception in decision 2 is defined on these scales. Stage 2's static activation scales are a
@@ -253,7 +286,7 @@ What the controls show, on the six tiles:
   anything but bit-level reordering.
 - **ADR 012's 0.9940 top-20 gate.** bf16 on a different kernel stack fails it, and FP8's churn is
   swaps among near-tied neighbours that cost no accuracy.
-- **FP8 emulated on the A10G** (FP8 rounding on bf16 tensor cores). It removes the shared shift inside
+- **FP8 emulated on the A10G** (E4M3-rounded operands through an fp32 GEMM, then the scales). It removes the shared shift inside
   a mixed store, holding it to ±0.02 points with coherence at the noise floor, but adds card-specific
   rounding to every forward path that a g5 runs, and does nothing for a classifier applied across a
   bf16 and an FP8 store, where the same losses appear.
