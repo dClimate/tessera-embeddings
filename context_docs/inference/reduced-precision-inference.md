@@ -301,7 +301,7 @@ The g6e stays the workhorse, so the plan is FP8 on the L40S, built by extending 
    - Otherwise a Triton FP8 GEMM with a ReLU and FP8-output epilogue, which has to match cuBLASLt's FFN speed to be worth having.
    - Static scales need a calibration pass. Out-proj (1.10× per layer) is decided on measurement and may stay bf16.
 5. **Ship at a store boundary**, as ADR 030 requires of the bf16 fusion.
-6. **g5 fallback: settled.** A g5 fills FP8 stores on today's bf16 forward. Model construction reads the store's recorded precision; inside an FP8 store, the L40S and the L4 build FP8 layers, the g5's A10G builds the bf16 ones, and any other card refuses to write until it has been measured on the lattice (ADR 043). A mixed store carries FP8's shared shift between its g5 and g6e pixels: about 0.2 points on a linear probe at the tile level (0.2005 on Ecuador, Stage 1) and up to 1.0 point on a single class (Kansas winter wheat), nothing on kNN.
+6. **g5 fallback: settled.** A g5 fills FP8 stores on today's bf16 forward. Model construction reads the store's recorded precision; inside an FP8 store, the L40S builds FP8 layers, the g5's A10G builds the bf16 ones, and any other card, the L4 included since it is not in the fleet, refuses to write until it has been measured on the lattice (ADR 043). A mixed store carries FP8's shared shift between its g5 and g6e pixels: about 0.2 points on a linear probe at the tile level (0.2005 on Ecuador, Stage 1) and up to 1.0 point on a single class (Kansas winter wheat), nothing on kNN.
 
 Parked while the g6e is the workhorse:
 

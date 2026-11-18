@@ -211,12 +211,13 @@ What the controls show, on the six tiles:
 5. **Precision is a property of the store, and inside an FP8 store an A10G runs today's bf16 forward
    unchanged.** A store's precision is recorded when the store is created and handed to model
    construction for every run that writes to it, so a bf16 store is finished on today's forward on any card. The
-   card only decides whether the store's precision can run, and only the three cards measured here
-   may write to an FP8 store: the L40S and the L4 build the FP8 encoder layers, and the A10G builds
-   the bf16 ones. Any other card refuses to write to an FP8 store. That covers a newer architecture
-   with FP8, such as Blackwell's RTX PRO 6000, which may select different kernels, and a card
-   without bf16, such as the T4, which today's forward moves to FP16. A card joins either list by
-   being measured on the lattice against the L40S. No other code knows which card it runs on.
+   card only decides whether the store's precision can run, and only the fleet's two cards may write
+   to an FP8 store: the L40S builds the FP8 encoder layers, and the A10G builds the bf16 ones. Any
+   other card refuses to write to an FP8 store. That covers the L4, which is not in the fleet and
+   whose FP8 was measured only on the unfused path; a newer architecture with FP8, such as
+   Blackwell's RTX PRO 6000, which may select different kernels; and a card without bf16, such as
+   the T4, which today's forward moves to FP16. A card joins either list by being measured on the
+   lattice against the L40S, on the kernels that ship. No other code knows which card it runs on.
 
 ## How the thresholds were set
 
