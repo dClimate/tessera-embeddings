@@ -7,14 +7,14 @@
 
 | path | numerics (ADR 012) | speed | cost per Mpx (UK) | verdict |
 |---|---|---|---|---|
-| **FP8 on g6e (L40S)** | per-value ✓, strict neighbours ✗ (0.97), cross-change accuracy ✓ ([ADR 042](../decisions/042-fp8-linears-ship-on-cross-change-accuracy-and-the-a10g-stays-bf16.md)) | ~1.2–1.3× forward pass, only with hand-written fused quantisation; naive and `torch.compile` versions are slower than bf16 | ~$0.024–0.025 vs $0.030 | planned: g6e stays the workhorse, so this is the next speed work (see Next steps) |
+| **FP8 on g6e (L40S)** | per-value ✓, strict neighbours ✗ (0.97), cross-change accuracy ✓ per tile, ✗ per class on three tiles, shipped as a named exception ([ADR 042](../decisions/042-fp8-linears-ship-on-cross-change-accuracy-and-the-a10g-stays-bf16.md)) | ~1.2–1.3× forward pass, only with hand-written fused quantisation; naive and `torch.compile` versions are slower than bf16 | ~$0.024–0.025 vs $0.030 | planned: g6e stays the workhorse, so this is the next speed work (see Next steps) |
 | **int8 on Intel (c8i, AMX)** | per-value ✓, neighbours ✗ (0.98) | ~1.45–1.6× projected over CPU bf16 | spot ~$0.039–0.048, against a bar of $0.039 (g6e) or $0.054 (g5) | at best reaches the g6e bar; viable as spot overflow only where we fall back to g5 |
 
 - **Fleet plan.** As of 2026-11-16 the g6e (L40S) remains the workhorse until further notice: we expect to get a substantial number of them. That makes FP8 on the g6e the path to build.
 - **Which bar applies.** The CPU path was to be pursued only within 1.3× of GPU cost. Against the g6e that bar is **$0.039/Mpx**, which projected int8 on c8i spot ($0.039–0.048) reaches only at its best case; FP8 on the g6e would lower it to about $0.031–0.033. g6e capacity was effectively unavailable while these measurements were taken, and wherever that recurs the fallback GPU is the g5.2xlarge, with a bar of **$0.054/Mpx** that int8 clears.
 - **The neighbour gate over-penalises, and has been re-examined.** ADR 012's top-20 gate (0.9940) is failed even by bf16 on a different kernel stack: the CPU library scores 0.989–0.990, and bf16 under `torch.compile` scores 0.988. The churn is swaps among near-tied neighbours: counted tie-tolerantly, every evaluated change keeps 0.999 or more. See [Calibrating the gate](#calibrating-the-gate).
-- **Downstream accuracy is unaffected within a single-precision store, and at risk only across a change.** On labelled pixels, FP8 and int8 move kNN and linear-probe accuracy by no more than matched random noise does (within about ±0.2 points). The one consumer that loses accuracy is a classifier trained on embeddings from one side of a change and applied to the other. A store mixing g5 bf16 and g6e FP8 pixels contains such a change: a linear classifier crossing it loses up to 0.2 points on some tiles (next bullet).
-- **g5 fallback inside an FP8 store is accepted, on bf16** ([ADR 042](../decisions/042-fp8-linears-ship-on-cross-change-accuracy-and-the-a10g-stays-bf16.md)). Across six tiles on real kernels, a linear classifier fitted on one card's pixels and applied to the other's loses nothing beyond the metric's own noise on four tiles, and at most 0.2 points where FP8's shared shift has a small real cost (Ecuador, Kansas). kNN is unaffected everywhere. See [The mixed-pool test](#the-mixed-pool-test).
+- **Downstream accuracy is unaffected within a single-precision store, and at risk only across a change.** On labelled pixels, FP8 and int8 move kNN and linear-probe accuracy by no more than matched random noise does (within about ±0.2 points). The one consumer that loses accuracy is a classifier trained on embeddings from one side of a change and applied to the other. A store mixing g5 bf16 and g6e FP8 pixels contains such a change: a linear classifier crossing it loses up to 0.2 points on some tiles, and up to 1.0 point on a single class (next bullet).
+- **g5 fallback inside an FP8 store is accepted, on bf16** ([ADR 042](../decisions/042-fp8-linears-ship-on-cross-change-accuracy-and-the-a10g-stays-bf16.md)). Across six tiles on real kernels, a linear classifier fitted on one card's pixels and applied to the other's loses nothing beyond the metric's own noise on four tiles, and at most 0.2 points where FP8's shared shift has a small real cost (Ecuador, Kansas). Per class the cost is larger: up to 1.0 point of Kansas winter wheat recall, and 0.55–0.65 on one class each in Iowa and Ecuador with all four linears, which ADR 042 accepts as a named exception. kNN is unaffected everywhere. See [The mixed-pool test](#the-mixed-pool-test) and [Per-class losses across the change](#per-class-losses-across-the-change).
 
 ## Baselines: production engine, bf16, four dense UK chunks of ~4.0M px
 
@@ -243,12 +243,40 @@ ADR 012's full cross-config envelope holds on every tile and variant, mixed stor
 - **Emulated FP8 on the A10G removes the shared shift** (coherence at the noise floor) and holds a mixed store to ±0.02 points. ADR 042 rejects it: it adds card-specific rounding to remove at most 0.2 points on a linear probe.
 - **Top-25 per stratum is stricter than overall.** Inside one class or window FP8 scores as low as 0.972 (Finland's water), under the 0.995 calibrated over whole tiles.
 
+### Per-class losses across the change
+
+The tile-level bound misses harm to one class: the class-directed control above passes it while costing UK cropland 2 points of kNN recall, because cropland is 3% of the labels. So the same lattice was scored per class, with every threshold calibrated per tile from controls only (2026-11-17, one m7i.16xlarge, about an hour for six tiles). The resulting gate is ADR 042's decision 1.
+
+- **Cells:** each class × consumer (probe, kNN-20) × direction (fitted on the reference and applied to the change, and the reverse) × measure (recall, precision). Loss in points, with a delete-one-block jackknife SE over 144 blocks of 40×40 px. Naive SEs are too small by a large factor because errors cluster in fields.
+- **Known good:** two cards on identical bf16, and 20 matched-noise draws per FP8 size. A cell is gated when its median noise SE is at most δ/4 = 0.125. z_fam is the 95th percentile over the 40 draws of the largest loss/SE among gated cells: 2.79–4.45 over 16–40 gated cells per tile.
+- **Known bad:** each class with at least 2,000 px shifted towards its most-confused class at cosine 0.9999, 0.99995 and 0.99998 inside the class; and the largest class towards the smallest such class.
+- **A cell fails** when it loses more than δ = 0.5 points with loss/SE above z_fam.
+
+| tile | gated classes (cells) | z_fam | FP8 all four, worst gated cell | FP8 Stage 1, worst gated cell |
+|---|---|---:|---|---|
+| UK | 4 (28) | 2.79 | cropland kNN precision 0.25 ± 0.18 | cropland kNN precision 0.31 ± 0.16 |
+| Iowa | 5 (39) | 2.83 | **forest probe precision 0.64 ± 0.15** | forest probe precision 0.27 ± 0.10 |
+| Ecuador | 5 (35) | 4.45 | **trees probe recall 0.55 ± 0.09** | cropland probe precision 0.35 ± 0.08 |
+| Punjab | 4 (26) | 3.58 | trees probe recall 0.39 ± 0.12 | trees probe recall 0.34 ± 0.14 |
+| Kansas | 6 (40) | 3.16 | **winter wheat probe recall 0.96 ± 0.21** | **winter wheat probe recall 0.66 ± 0.16** |
+| Finland | 2 (16) | 4.21 | trees probe precision 0.12 ± 0.03 | trees probe precision 0.08 ± 0.03 |
+
+Bold cells fail. A mixed store (A10G bf16 against L40S FP8) fails in the same cells by the same amounts, to within 0.04.
+
+- **Every known-good variant passes:** 240 noise draws and 12 two-card pairs, with no tripwire either.
+- **The controls are rejected where they do harm.** At cosine 0.9999 the gate rejects the control in 21 of the 25 gated classes that have one. The four it passes cost no gated cell a resolvable 0.5 points: Finland water, Kansas soybeans and developed, Punjab grass. UK cropland is rejected at 0.9999 (kNN recall −2.00 ± 0.68, z 3.0) and 0.99995 (−1.07 ± 0.37), but not at 0.99998 (−0.79 ± 0.31, z 2.5): the gate's detection limit on a weak class. The large-to-small shift fails on every tile at 0.9999, mostly through the large class's recall when fitted on the changed side, not the small class's precision as expected.
+- **FP8's failures are all on the linear probe;** kNN-20 passes every cell. Cells too noisy to gate still show losses past 0.5: Finland grass 1.09 ± 0.30 (all four), Ecuador cropland 0.79 ± 0.18 (z 4.4 against 4.45).
+- **The training sample matters more than FP8 for minority classes.** Ten redraws of the 48,000-px training sample on bf16 move per-class recall by a standard deviation of 0.1–0.6 points for large classes and 1–5.6 for minority ones (UK cropland 5.6 on the probe, 3.0 on kNN). Letting δ widen to 3 × that spread would set it at 2–17 points for minority classes and stop the gate rejecting the UK cropland control, so the spread is reported, not used.
+- **Gap closure** (a class's mean error projected on the direction to another class's centroid, as a share of the gap) trips for FP8 on every tile except UK and Finland at Stage 1, and for no noise draw. It is reported: a trip asks for a decision, and FP8's exception already is one.
+
+ADR 042 records the outcome: FP8 fails the gate on Kansas (both sizes), Iowa and Ecuador (all four linears), and ships as a named exception that accepts those measured losses.
+
 ### What this supports
 
 1. **Keep the per-value envelope as the magnitude gate.** It trips where the first measurable harm appears.
 2. **Replace the strict top-20 gate with a tie-tolerant measure, reported rather than gated.** Top-25 at 0.995 over a whole tile passes every benign change evaluated and trips with the envelope. Scored inside one class or window it is stricter (FP8 scores as low as 0.972), so a per-stratum threshold needs its own calibration.
 3. **Report a shared-shift (coherence) check per cluster** for structured error, since no neighbour metric sees it. FP8's 0.25–0.29 costs at most 0.2 points across a change on real kernels, so it is reported, not gated.
-4. **Harm appears only across a change, and is small.** The store boundary stays (ADR 042). Cross-change accuracy is the gate, on loss, scored against matched noise so that the metric's own noise floor is not mistaken for harm.
+4. **Harm appears only across a change, and is concentrated in single classes.** The store boundary stays (ADR 042). Cross-change accuracy is the gate, on loss, per tile and per class, with thresholds calibrated against matched noise and synthetic controls so that the metric's own noise floor is not mistaken for harm.
 
 ## Next steps
 
@@ -256,7 +284,7 @@ The g6e stays the workhorse, so the plan is FP8 on the L40S, built by extending 
 
 **Starting point.** v2's CUDA forward (`_encoder_layer_forward` in `student_v2.py`) already runs each residual add and LayerNorm as one compiled bf16 kernel, and the FFN-up bias and ReLU in the matmul's epilogue ([ADR 030](../decisions/030-forward-pass-reorderings-ship-at-a-store-boundary.md), 5–7% on the L40S and A10G). The baselines above include it, so the bf16 fusion step is done and the remaining gain is FP8's.
 
-1. **Gate: settled** by [ADR 042](../decisions/042-fp8-linears-ship-on-cross-change-accuracy-and-the-a10g-stays-bf16.md), on [the mixed-pool test](#the-mixed-pool-test). A precision change meets ADR 012's envelope, and a classifier fitted across the change loses no more than 0.2 points on any labelled tile; moves outside matched noise are reported. Native L40S FP8 and six tiles are measured. Still needed: Stage 2's static scales, if Stage 2 ships, through the same test.
+1. **Gate: settled** by [ADR 042](../decisions/042-fp8-linears-ship-on-cross-change-accuracy-and-the-a10g-stays-bf16.md), on [the mixed-pool test](#the-mixed-pool-test) and [the per-class scoring](#per-class-losses-across-the-change). A precision change meets ADR 012's envelope; a classifier fitted across the change loses no more than 0.2 points on any labelled tile; and no gated class loses more than 0.5 points beyond the noise. FP8 fails the per-class part on Kansas winter wheat (both sizes), Iowa forest and Ecuador trees (all four linears), and ships as a named exception for those losses. Still needed: the fused kernels and Stage 2's static scales, if Stage 2 ships, through the same test; they stay inside the exception only if they fail in the same cells by no more than the recorded loss plus one SE.
 2. **Stage 1: FP8 out of the fused add + LayerNorm (Tier A, target ~1.15×).**
    - Replace the compiled add + LayerNorm with a hand-written kernel that also emits its result as E4M3. The encoder is post-norm, so each LayerNorm output feeds both the residual stream and the next GEMM: the kernel writes bf16 for the first and FP8 for the second.
    - QKV and FFN up take the FP8 output through `torch._scaled_mm`, with weights quantised once at load.
@@ -268,7 +296,7 @@ The g6e stays the workhorse, so the plan is FP8 on the L40S, built by extending 
    - Otherwise a Triton FP8 GEMM with a ReLU and FP8-output epilogue, which has to match cuBLASLt's FFN speed to be worth having.
    - Static scales need a calibration pass. Out-proj (1.10× per layer) is decided on measurement and may stay bf16.
 5. **Ship at a store boundary**, as ADR 030 requires of the bf16 fusion.
-6. **g5 fallback: settled.** A g5 fills FP8 stores on today's bf16 forward. Model construction reads the store's recorded precision; inside an FP8 store, a capability check builds FP8 layers on Ada and newer and the bf16 ones on the g5 (ADR 042). A mixed store carries FP8's shared shift between its g5 and g6e pixels: up to 0.2 points on a linear probe on some tiles, nothing on kNN.
+6. **g5 fallback: settled.** A g5 fills FP8 stores on today's bf16 forward. Model construction reads the store's recorded precision; inside an FP8 store, a capability check builds FP8 layers on Ada and newer and the bf16 ones on the g5 (ADR 042). A mixed store carries FP8's shared shift between its g5 and g6e pixels: up to 0.2 points on a linear probe at the tile level and up to 1.0 point on a single class (Kansas winter wheat), nothing on kNN.
 
 Parked while the g6e is the workhorse:
 
@@ -289,7 +317,7 @@ Parked while the g6e is the workhorse:
   | `int8_sim.py` | int8 simulation and library profile |
   | `bench_int8.sh` | `benchdnn` |
 
-- **Mixed-pool test** is in `s3://arbol-tessera-inputs-dev/perf/fp8-mixed/`: `scripts/mixed_pool_gpu.py` (embeds the lattice per card: bf16, FP8 all four, FP8 Stage 1; native on Ada, emulated on the A10G), `scripts/mixed_pool_score.py` (envelope, neighbours, coherence, cross-change classifiers), `scripts/noise_control.py` (the matched-noise control), `scripts/lattice_prep2.py` and `scripts/labels2.py` (lattice and labels without a reference store), the outputs `mixed_<card>_<tile>.npz`, the labels, `score6_<tile>.txt` and `nc_<tile>.txt`. The four new tiles' mosaics are in `s3://arbol-tessera-inputs-dev/mosaics/fp8-{ecuador,punjab,kansas,finland}`.
+- **Mixed-pool test** is in `s3://arbol-tessera-inputs-dev/perf/fp8-mixed/`: `scripts/mixed_pool_gpu.py` (embeds the lattice per card: bf16, FP8 all four, FP8 Stage 1; native on Ada, emulated on the A10G), `scripts/mixed_pool_score.py` (envelope, neighbours, coherence, cross-change classifiers), `scripts/noise_control.py` (the matched-noise control), `scripts/lattice_prep2.py` and `scripts/labels2.py` (lattice and labels without a reference store), the outputs `mixed_<card>_<tile>.npz`, the labels, `score6_<tile>.txt` and `nc_<tile>.txt`. The per-class scoring is `scripts/perclass_cal.py` (per-pixel predictions for every variant, one npz each under `perclass/<tile>/`), then `scripts/perclass_rule.py` (applies the gate locally from those predictions) with `bootstrap-perclass.sh` and `watch_perclass.sh`. Its reports are `perclass/rule_delta05/` (the gate as decided) and `perclass/rule_delta_refit/` (δ widened by the refit spread, rejected). The four new tiles' mosaics are in `s3://arbol-tessera-inputs-dev/mosaics/fp8-{ecuador,punjab,kansas,finland}`.
 - **Gate calibration scripts** are not yet uploaded to that prefix: `tie_tolerant.py` (variants and neighbour metrics), `labels.py` (labels and observation counts), `ladder.py` (noise ladder and controls), `coherence.py` (cross-change probe and coherence).
 - **Labels:** CDL 2024 from CropScape's coverage endpoint, sampled at pixel centres; WorldCover 2021 v200 from `s3://esa-worldcover`.
 - **Lattice inputs** are in `s3://arbol-tessera-inputs-dev/perf/fp8-lattice/`.
