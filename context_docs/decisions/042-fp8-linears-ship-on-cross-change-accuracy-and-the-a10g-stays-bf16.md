@@ -111,9 +111,10 @@ What the controls show, on the six tiles:
       - z_fam is the 95th percentile, over the noise draws, of the largest loss / SE among the tile's
         gated cells.
       - Gains are not harm.
-   4. **Validity:** the gate counts on a tile only if it rejects each gated class's class-directed
-      control at cosine 0.9999. A class whose control passes is listed with that control's worst
-      loss, so a shift that does no harm is told apart from a blind spot.
+   4. **Validity:** the gate counts on a tile only if each gated class's class-directed control at
+      cosine 0.9999 is either rejected or costs no gated cell more than δ at loss / SE above z_fam.
+      A class whose control passes is listed with that control's worst loss, so a shift that does no
+      harm is told apart from a blind spot.
    5. **Tripwire:** a class's gap closure is its mean error projected on the direction to another
       class's centroid, as a share of the centroid gap. Past half its own control's gap closure at the
       dose that costs δ, the change needs a decision even if accuracy passes.
