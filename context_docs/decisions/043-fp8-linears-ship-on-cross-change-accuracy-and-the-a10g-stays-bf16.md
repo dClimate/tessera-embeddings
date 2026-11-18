@@ -177,7 +177,7 @@ What the controls show, on the six tiles:
    stores are those started after the change.
 5. **Precision is a property of the store, and inside an FP8 store an A10G runs today's bf16 forward
    unchanged.** A store's precision is recorded when the store is created and handed to model
-   construction for every run that writes to it, so a bf16 store is finished in bf16 on any card. The
+   construction for every run that writes to it, so a bf16 store is finished on today's forward on any card. The
    card only decides whether the store's precision can run, and only the three cards measured here
    may write to an FP8 store: the L40S and the L4 build the FP8 encoder layers, and the A10G builds
    the bf16 ones. Any other card refuses to write to an FP8 store. That covers a newer architecture
