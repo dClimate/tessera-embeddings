@@ -58,6 +58,7 @@ NDRAWS = 2 if SMOKE else 20
 DOSES = (0.9999, 0.99995, 0.99998)
 NREFIT = 2 if SMOKE else 10
 MIN_CTRL = 2000  # px; classes smaller than this cannot reach the gating SE, so get no control
+PROBE_C = 0.003  # chosen by select_probe_c.py: spatial CV on the bf16 reference, one-SE rule
 PROBE_TOL = 1e-6
 PROBE_MAX_ITER = 5000
 SIZES = ("all4", "stage1")
@@ -94,7 +95,7 @@ def environment() -> dict:
         "scipy": scipy.__version__,
         "sklearn": sklearn.__version__,
         "blas": blas,
-        "probe": {"tol": PROBE_TOL, "max_iter": PROBE_MAX_ITER},
+        "probe": {"C": PROBE_C, "tol": PROBE_TOL, "max_iter": PROBE_MAX_ITER},
     }
 
 
@@ -141,17 +142,18 @@ FOLDS = folds_for(1)  # the scorer's own folds
 
 
 def fit(a: np.ndarray, folds: list = FOLDS) -> list:
-    """A standardised logistic-regression probe per fold, fitted on ``a`` to convergence.
+    """A standardised, L2-regularised logistic-regression probe per fold, fitted on ``a`` to convergence.
 
-    The embeddings are badly conditioned once standardised (v2's Matryoshka dimensions carry very unequal
-    signal; condition number ~1e5), so L-BFGS needs ~900-1,500 iterations. A fit stopped short of that is not a
-    function of its data alone: where it stops depends on the floating-point path, which moves verdicts between
-    environments. At ``PROBE_TOL`` predictions agree with a fit to 1e-8 on all but ~0.01% of pixels.
+    ``PROBE_C`` is the regularization a user tuning a classifier on these embeddings would pick: it maximises
+    held-out balanced accuracy on the reference (within one SE). The fit runs to convergence because a fit
+    stopped short is not a function of its data alone: where it stops depends on the floating-point path, which
+    moves verdicts between environments.
     """
     out = []
     for _, train in folds:
         mu, sd = a[train].mean(0), a[train].std(0) + 1e-9
-        clf = LogisticRegression(max_iter=PROBE_MAX_ITER, tol=PROBE_TOL).fit((a[train] - mu) / sd, lab[train])
+        clf = LogisticRegression(C=PROBE_C, max_iter=PROBE_MAX_ITER, tol=PROBE_TOL)
+        clf.fit((a[train] - mu) / sd, lab[train])
         if int(np.max(clf.n_iter_)) >= PROBE_MAX_ITER:
             raise RuntimeError(f"probe did not converge in {PROBE_MAX_ITER} iterations")
         out.append((clf, mu, sd))
