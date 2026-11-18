@@ -1,5 +1,5 @@
 #!/bin/bash
-# User data for one precision-gate box. launch.sh fills the __PLACEHOLDERS__.
+# User data for one precision-gate box. launch.sh fills in the double-underscored placeholders.
 #
 # Roles:
 #   gpu-<card>     embed the lattice on this card (l40s, a10g, l4) with __VARIANTS__, one npz per tile
