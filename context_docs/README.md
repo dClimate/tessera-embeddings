@@ -58,6 +58,7 @@ context_docs/
 │   ├── 039-architecture-rules-run-on-import-linter-and-ruff.md
 │   ├── 040-new-code-is-gated-on-duplication-and-complexity.md
 │   ├── 041-unit-tests-run-the-forked-writer-in-threads.md
+│   ├── 042-chunked-graph-replay-ships-above-the-two-card-yardstick.md
 │   └── 043-fp8-linears-ship-on-cross-change-accuracy-and-the-a10g-stays-bf16.md
 │
 ├── campaign/                      THE GLOBAL CAMPAIGN — start here
@@ -111,6 +112,9 @@ context_docs/
 │   ├── v2-on-blackwell.md                      the g7e (RTX PRO 6000) against the fleet's cards,
 │   │                                              v2's fused add + LayerNorm, prep workers by host
 │   │                                              size, outputs across cards, g7e capacity
+│   ├── v2-chunked-graph-replay.md              v2 in small chunks replaying a CUDA graph: the
+│   │                                              gain per card, chunk sizes, outputs, and the C++
+│   │                                              encoder it came from
 │   ├── fresh-worker-start.md                   a new worker's first minutes are its EBS volume
 │   │                                              loading the AMI, and the mounted venv image that
 │   │                                              removes them

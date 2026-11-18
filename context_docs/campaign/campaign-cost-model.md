@@ -1680,6 +1680,12 @@ a third less than §12's $828,364, and take about 10.5 days on §12's average fl
 Measured 2026-10-05 on the Iowa year on g6e.xlarge (L40S) cards; the factors are applied to the
 whole card line, A10G hours included.
 
+**Chunked graph replay (PR #273) takes a further 7% off L40S time,** measured on the same Iowa year
+on 2026-11-13: about $26,000 and 18,000 card-hours if every hour were an L40S, for a campaign of about
+$534,000. An A10G gains nothing from it, so the saving shrinks by the share of hours that fall back to
+A10Gs ([`../inference/v2-chunked-graph-replay.md`](../inference/v2-chunked-graph-replay.md) §7). The
+table below predates it.
+
 **A v2 campaign fills its own store.** A global store is seeded for one model and every zone fill
 follows it, so v2 seeds a fresh store with `model_version="v2-large"`; this section costs that
 campaign.

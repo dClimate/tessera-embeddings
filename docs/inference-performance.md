@@ -260,13 +260,23 @@ different order, so v2 outputs move slightly, within the cross-config envelope
 pays on every card measured, most on the fastest
 ([`v2-on-blackwell.md`](../context_docs/inference/v2-on-blackwell.md) §3).
 
+**On an L40S or an L4, v2 runs each sub-batch in small chunks, each replaying a captured CUDA
+graph.** A 7,168-pixel forward streams its intermediate activations through GPU memory; a chunk
+of 64 pixels (32 on an L4) keeps them in the card's cache. The size is per card because the
+gain is: an A10G is no faster at any chunk size, so it and any unmeasured card run the whole batch. Small chunks alone would be slower, because each launches the
+forward's many small kernels one by one, so each chunk replays a CUDA graph captured once per
+bucket shape, which launches them all at once. Outputs move slightly, the way a different batch
+shape moves them, so the change ships at a v2 store boundary under ADRs 030 and 042. v1.1 runs whole
+sub-batches as before (§7 of the [inference README](../src/tessera_embeddings/inference/README.md#7-the-forward-pass-on-the-gpu-inferencepy);
+measurements in [`v2-chunked-graph-replay.md`](../context_docs/inference/v2-chunked-graph-replay.md)).
+
 **Training-only parameters never reach the graph.** The checkpoint carries a BarlowTwins
 `projector` and a `segmented_matryoshka_projector` that served the variable-width training
 objective. Both are stripped by prefix before the model is built, so neither occupies VRAM nor
 appears in a forward pass.
 
 Two further options were tried and are off, both measured worse rather than merely unhelpful.
-`torch.compile` of the whole model captured it as a CUDA graph, consumed 11.6 GB of VRAM and
+`torch.compile` of the whole model, which also captured it as a CUDA graph, consumed 11.6 GB of VRAM and
 roughly doubled the forward pass, because the recurrent layer recompiled for every distinct sequence
 length it saw; only the pooling head's single timestep is compiled now. cuDNN's autotuner searches for the fastest kernel per input shape, and bucketing changes the
 shape constantly, so it searched constantly and inflated host memory doing it.
