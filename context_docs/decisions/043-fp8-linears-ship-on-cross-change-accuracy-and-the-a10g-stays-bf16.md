@@ -59,7 +59,8 @@ threshold in it is calibrated per tile from controls, never from the candidate:
 
 What the controls show, on the six tiles:
 
-- **Every known-good variant passes,** all 240 noise draws and all 12 two-card pairs.
+- **No known-good variant fails.** All 12 two-card pairs and 239 of the 240 noise draws pass; one
+  draw is unresolved.
 - **The gate rejects the class-directed control at cosine 0.9999 in 21 of the 25 gated classes that
   have one** (Ecuador water, at 1,709 px, is too small for a control),
   including both shifts that motivated it: UK cropland towards grass (kNN recall −2.00 ± 0.68, z 3.0
@@ -149,7 +150,7 @@ What the controls show, on the six tiles:
       fail it, and the class is listed as flag-only on that tile. Where it passes while losing more
       than δ in a reported cell, the gate cannot see that kind of change at all, and the class is
       listed as uncovered. A gated class too small for a
-      control (under 2,000 labelled pixels) is listed as unvalidated. Both lists go beside the
+      control (under 2,000 labelled pixels) is listed as unvalidated. All three lists go beside the
       verdict; the classes' cells still count.
    5. **Tripwire:** a class's gap closure is its mean error projected on the direction to another
       class's centroid, as a share of the centroid gap. Past half its own control's gap closure at the
@@ -177,12 +178,12 @@ What the controls show, on the six tiles:
 5. **Precision is a property of the store, and inside an FP8 store an A10G runs today's bf16 forward
    unchanged.** A store's precision is recorded when the store is created and handed to model
    construction for every run that writes to it, so a bf16 store is finished in bf16 on any card. The
-   card only decides whether the store's precision can run: on a card whose native FP8 has been
-   measured against the L40S's (today the L40S and the L4) an FP8 store builds the FP8 encoder
-   layers, and on every other card, the A10G included, it builds the bf16 ones. A newer architecture
-   that supports FP8, such as Blackwell's RTX PRO 6000, may select different kernels, so it runs bf16
-   until its FP8 output has been measured on the lattice and it is added to the list. No other code
-   knows which card it runs on.
+   card only decides whether the store's precision can run, and only the three cards measured here
+   may write to an FP8 store: the L40S and the L4 build the FP8 encoder layers, and the A10G builds
+   the bf16 ones. Any other card refuses to write to an FP8 store. That covers a newer architecture
+   with FP8, such as Blackwell's RTX PRO 6000, which may select different kernels, and a card
+   without bf16, such as the T4, which today's forward moves to FP16. A card joins either list by
+   being measured on the lattice against the L40S. No other code knows which card it runs on.
 
 ## How the thresholds were set
 
@@ -210,7 +211,8 @@ What the controls show, on the six tiles:
 ## Consequences
 
 - g5 fallback keeps working for FP8 stores at today's g5 cost. The g5 runs today's bf16 forward; the
-  only new code is recording the store's precision and passing it to model construction.
+  new code is recording the store's precision, passing it to model construction, and refusing an
+  FP8 store on a card outside the measured three.
 - **What FP8 costs a downstream user:** a linear classifier fitted on one precision and applied to the
   other, across stores or inside a mixed store, loses up to 1.0 point of winter wheat recall on Kansas
   (0.7 at Stage 1), and up to 0.65 on single minority classes elsewhere with all four linears. Those
