@@ -63,10 +63,12 @@ What the controls show, on the six tiles:
 - **The gate rejects the class-directed control at cosine 0.9999 in 21 of the 25 gated classes that
   have one** (Ecuador water, at 1,709 px, is too small for a control),
   including both shifts that motivated it: UK cropland towards grass (kNN recall −2.00 ± 0.68, z 3.0
-  against z_fam 2.79) and Iowa soybeans towards corn (probe recall −0.68 ± 0.10). The four it passes
-  cost no gated cell a resolvable 0.5 points: Finland water (worst 0.02), Kansas soybeans (0.57 ±
-  0.24, z 2.4) and developed (0.17), Punjab grass (0.48 ± 0.15, z 3.2). Its detection limit shows at
-  the weakest dose: UK cropland's −0.79 ± 0.31 at cosine 0.99998 passes.
+  against z_fam 2.79) and Iowa soybeans towards corn (probe recall −0.68 ± 0.10). Of the four it
+  passes, Finland water's control does no harm (worst 0.22), and Kansas soybeans' and Punjab grass's
+  cost about a point that the data cannot resolve (1.30 ± 0.66, 0.94 ± 0.85). **Kansas developed is a
+  blind spot:** its control costs 3.23 ± 0.44 points of probe recall, but developed's probe cells
+  (7,396 px) are too noisy to gate there. FP8 loses at most 0.47 ± 0.20 in those cells. The detection
+  limit also shows at the weakest dose: UK cropland's −0.79 ± 0.31 at cosine 0.99998 passes.
 - **The large-to-small shift fails on all six tiles at 0.9999,** mostly through the large class's own
   recall when the classifier is fitted on the changed side, not through the small class's precision
   as expected.
@@ -111,10 +113,11 @@ What the controls show, on the six tiles:
       - z_fam is the 95th percentile, over the noise draws, of the largest loss / SE among the tile's
         gated cells.
       - Gains are not harm.
-   4. **Validity:** the gate counts on a tile only if each gated class's class-directed control at
-      cosine 0.9999 is either rejected or costs no gated cell more than δ at loss / SE above z_fam.
-      A class whose control passes is listed with that control's worst loss, so a shift that does no
-      harm is told apart from a blind spot.
+   4. **Validity:** each gated class's class-directed control at cosine 0.9999 should be rejected.
+      Where it passes, the control's worst loss in any of that class's cells, gated or not, is
+      listed. If that loss exceeds δ with loss / SE above z_fam, the class is a blind spot on that
+      tile: the gate does not cover it there, and the candidate's losses in its cells are reported
+      beside the verdict.
    5. **Tripwire:** a class's gap closure is its mean error projected on the direction to another
       class's centroid, as a share of the centroid gap. Past half its own control's gap closure at the
       dose that costs δ, the change needs a decision even if accuracy passes.
