@@ -6,7 +6,8 @@ writes the full report as JSON.
 
 With ``--bounds``, each variant named in ``--hold`` is also checked against the exception's bounds for
 this tile: ``--hold fp8_stage1=stage1:fp8`` holds variant ``fp8_stage1`` to the Stage 1 record's
-``fp8`` comparison. The exit code is 1 if any held variant is outside the exception.
+``fp8`` comparison. The exit code is 3 if any held variant is outside the exception, so a caller can
+tell that result from a crash.
 
 usage: apply_gate.py <labels.npz> <label_key> <variant_dir> <tile> <report.json>
                      [--bounds fp8_exception_bounds.json --hold VARIANT=SIZE:COMPARISON ...]
@@ -22,6 +23,8 @@ from pathlib import Path
 import numpy as np
 
 from tessera_embeddings.profiling.inference import precision_gate as pg
+
+OUTSIDE_EXIT = 3
 
 
 def load_scores(tile: pg.Tile, vdir: str) -> dict[str, pg.Score]:
@@ -105,7 +108,7 @@ def main(argv: list[str] | None = None) -> int:
     print_report(a.tile, report)
     ok = hold(report, a.tile, a.bounds, a.hold) if a.bounds else True
     Path(a.report).write_text(json.dumps(report, indent=1))
-    return 0 if ok else 1
+    return 0 if ok else OUTSIDE_EXIT
 
 
 if __name__ == "__main__":
