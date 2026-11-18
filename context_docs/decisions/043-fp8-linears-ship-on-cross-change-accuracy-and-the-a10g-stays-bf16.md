@@ -66,7 +66,7 @@ What the controls show, on the six tiles:
   against z_fam 2.79) and Iowa soybeans towards corn (probe recall −0.68 ± 0.10). Of the four it
   does not reject, Finland water's control does no harm (worst 0.22) and passes. The other three are
   unresolved, so the gate flags them without failing them: Kansas soybeans' and Punjab grass's cost
-  about a point in gated cells (1.30 ± 0.66, 0.58 ± 0.36), and **Kansas developed's** costs
+  1.30 ± 0.66 and 0.58 ± 0.36 points in gated cells, and **Kansas developed's** costs
   3.23 ± 0.44 points of probe recall in cells too noisy to gate (7,396 px), where FP8 loses at most
   0.47 ± 0.20. The detection limit also shows at the weakest dose: UK cropland's −0.79 ± 0.31 at
   cosine 0.99998 is unresolved, not rejected.
@@ -146,7 +146,9 @@ What the controls show, on the six tiles:
       - Gains are not harm.
    4. **Validity:** each gated class's class-directed control at cosine 0.9999 should be rejected.
       Where it is only unresolved, the gate can flag a change of that kind in that class but cannot
-      fail it, and the class is listed as flag-only on that tile. A gated class too small for a
+      fail it, and the class is listed as flag-only on that tile. Where it passes while losing more
+      than δ in a reported cell, the gate cannot see that kind of change at all, and the class is
+      listed as uncovered. A gated class too small for a
       control (under 2,000 labelled pixels) is listed as unvalidated. Both lists go beside the
       verdict; the classes' cells still count.
    5. **Tripwire:** a class's gap closure is its mean error projected on the direction to another
