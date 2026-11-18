@@ -58,6 +58,8 @@ NDRAWS = 2 if SMOKE else 20
 DOSES = (0.9999, 0.99995, 0.99998)
 NREFIT = 2 if SMOKE else 10
 MIN_CTRL = 2000  # px; classes smaller than this cannot reach the gating SE, so get no control
+PROBE_TOL = 1e-6
+PROBE_MAX_ITER = 5000
 SIZES = ("all4", "stage1")
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
@@ -72,6 +74,28 @@ def deq(card: str, variant: str) -> np.ndarray:
     """A card's variant, dequantised to float32."""
     f = F[card]
     return f[f"{variant}_q"].astype(np.float32) * f[f"{variant}_s"][:, None]
+
+
+def environment() -> dict:
+    """What the predictions depend on beyond the data: library versions, BLAS, the probe's stopping rule."""
+    import platform
+
+    import scipy
+    import sklearn
+    from threadpoolctl import threadpool_info
+
+    blas = [
+        {k: i.get(k) for k in ("internal_api", "version", "architecture", "num_threads")} for i in threadpool_info()
+    ]
+    return {
+        "python": platform.python_version(),
+        "machine": platform.machine(),
+        "numpy": np.__version__,
+        "scipy": scipy.__version__,
+        "sklearn": sklearn.__version__,
+        "blas": blas,
+        "probe": {"tol": PROBE_TOL, "max_iter": PROBE_MAX_ITER},
+    }
 
 
 def unit(x: np.ndarray) -> np.ndarray:
@@ -117,11 +141,20 @@ FOLDS = folds_for(1)  # the scorer's own folds
 
 
 def fit(a: np.ndarray, folds: list = FOLDS) -> list:
-    """A standardised logistic-regression probe per fold, fitted on ``a``."""
+    """A standardised logistic-regression probe per fold, fitted on ``a`` to convergence.
+
+    The embeddings are badly conditioned once standardised (v2's Matryoshka dimensions carry very unequal
+    signal; condition number ~1e5), so L-BFGS needs ~900-1,500 iterations. A fit stopped short of that is not a
+    function of its data alone: where it stops depends on the floating-point path, which moves verdicts between
+    environments. At ``PROBE_TOL`` predictions agree with a fit to 1e-8 on all but ~0.01% of pixels.
+    """
     out = []
     for _, train in folds:
         mu, sd = a[train].mean(0), a[train].std(0) + 1e-9
-        out.append((LogisticRegression(max_iter=200, tol=1e-3).fit((a[train] - mu) / sd, lab[train]), mu, sd))
+        clf = LogisticRegression(max_iter=PROBE_MAX_ITER, tol=PROBE_TOL).fit((a[train] - mu) / sd, lab[train])
+        if int(np.max(clf.n_iter_)) >= PROBE_MAX_ITER:
+            raise RuntimeError(f"probe did not converge in {PROBE_MAX_ITER} iterations")
+        out.append((clf, mu, sd))
     return out
 
 
@@ -244,10 +277,10 @@ if SHARD == 0:
         env[name]["coherence"] = pg.coherence(deq(*r), deq(*t))
         env[name]["noise_cosine_target"] = cn.get(name.split("_", 1)[-1])
     (OUTDIR / "envelope.json").write_text(json.dumps(env, indent=1))
+    (OUTDIR / "environment.json").write_text(json.dumps(environment(), indent=1))
     if UPLOAD:
-        subprocess.run(
-            ["aws", "s3", "cp", "--quiet", str(OUTDIR / "envelope.json"), f"{UPLOAD}/envelope.json"], check=False
-        )
+        for name in ("envelope.json", "environment.json"):
+            subprocess.run(["aws", "s3", "cp", "--quiet", str(OUTDIR / name), f"{UPLOAD}/{name}"], check=False)
 
 
 def test_side(name: str) -> tuple[np.ndarray, np.ndarray]:

@@ -119,6 +119,7 @@ cpu() {
     [ $rc -eq 0 ] || [ $rc -eq 3 ] || { echo "ERROR: apply_gate crashed on $t (rc $rc)"; cat "reports/$t.txt"; return $rc; }
     [ $rc -eq 3 ] && echo "gate: $t has a variant outside the exception"
     cp "out/$t/envelope.json" "reports/${t}_envelope.json"
+    cp "out/$t/environment.json" "reports/${t}_environment.json"
   done
   aws s3 sync --quiet reports/ "$OUT/$set/reports/"
 }
