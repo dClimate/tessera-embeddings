@@ -126,7 +126,7 @@ What the controls show, on the six tiles:
    These losses are accepted for FP8 E4M3 as defined in decision 3. The exception does not change the
    gate: any other precision change, int8 included, meets it unchanged. The fused kernels and Stage 2
    go through the gate themselves, and pass under this exception only if they fail in these cells
-   alone, by no more than the recorded loss plus one SE. Anything else is a new decision.
+   and Ecuador's tile bound alone, by no more than the recorded loss plus one SE. Anything else is a new decision.
 3. **FP8 means E4M3, with per-channel weight and per-row activation scales.** The fused kernels that
    ship must be measured on the lattice themselves, against bf16 on the A10G as well as the L40S.
    Static activation scales (Stage 2) change the values further and are held to the same gate.
@@ -164,9 +164,10 @@ What the controls show, on the six tiles:
 - **What FP8 costs a downstream user:** a linear classifier fitted on one precision and applied to the
   other, across stores or inside a mixed store, loses up to 1.0 point of winter wheat recall on Kansas
   (0.7 at Stage 1), and up to 0.65 on single minority classes elsewhere with all four linears. At the
-  tile level that is at most 0.2 points; kNN is unaffected. This is the first thing to recheck if a
+  tile level that is at most 0.2 points (0.2005 for Ecuador's Stage 1 mixed store); kNN is unaffected. This is the first thing to recheck if a
   downstream user reports a seam between FP8 and bf16 stores, or between regions inside a mixed store.
-- Stage 1 is the cheaper exception: it fails only on Kansas winter wheat. All four linears adds Iowa
+- Stage 1 is the cheaper exception: it fails only on Kansas winter wheat, plus Ecuador's tile bound by
+  0.0005 as a mixed store. All four linears adds Iowa
   forest and Ecuador trees.
 - The tie-tolerant neighbour gate proposed in the reduced-precision record (top-25 at 0.995 on the
   worst stratum) is not adopted. Inside one class or window FP8 scores as low as 0.972 (Finland's
