@@ -130,7 +130,8 @@ What the controls show, on the six tiles:
    These losses are accepted for FP8 E4M3 as defined in decision 3. The exception does not change the
    gate: any other precision change, int8 included, meets it unchanged. The fused kernels and Stage 2
    go through the gate themselves, and pass under this exception only if they fail in these cells
-   and Ecuador's tile bound alone, by no more than the recorded loss plus one SE. Anything else is a new decision.
+   and Ecuador's tile bound alone, by no more than the recorded loss plus one SE
+   (a cell's jackknife SE; for Ecuador's tile bound, 0.2005 + 0.047, its jackknife SE over blocks). Anything else is a new decision.
 3. **FP8 means E4M3, with per-channel weight and per-row activation scales.** The fused kernels that
    ship must be measured on the lattice themselves, against bf16 on the A10G as well as the L40S.
    Static activation scales (Stage 2) change the values further and are held to the same gate.
