@@ -1,0 +1,176 @@
+{
+ "decision": "context_docs/decisions/043-fp8-linears-ship-on-cross-change-accuracy-and-the-a10g-stays-bf16.md",
+ "rule": "a cell or tile bound: recorded loss + its jackknife SE, in points; a tripwire class: 1.1 x recorded gap closure. A comparison with no record of its own uses the largest recorded.",
+ "sizes": {
+  "all4": {
+   "cpu-ab-iowa": {
+    "cells": {
+     "forest|probe|x->ref|precision": {
+      "fp8": 0.7902101875816053,
+      "mixed": 0.7963207318584204
+     }
+    },
+    "trip": {
+     "pasture": {
+      "fp8": 0.002998416405171156,
+      "mixed": 0.002998416405171156
+     }
+    }
+   },
+   "cpu-ab-uk": {
+    "trip": {
+     "trees": {
+      "fp8": 0.0012783769750967624,
+      "mixed": 0.0012783769750967624
+     }
+    }
+   },
+   "fp8-ecuador": {
+    "cells": {
+     "cropland|probe|x->ref|recall": {
+      "fp8": 0.9701905877930018,
+      "mixed": 0.9732973390019388
+     },
+     "trees|probe|x->ref|recall": {
+      "fp8": 0.6399814998286456,
+      "mixed": 0.6376121963212977
+     }
+    },
+    "trip": {
+     "grass": {
+      "fp8": 0.00216186682227999,
+      "mixed": 0.00216186682227999
+     },
+     "trees": {
+      "fp8": 0.0043095828499645,
+      "mixed": 0.0043095828499645
+     }
+    }
+   },
+   "fp8-finland": {
+    "trip": {
+     "grass": {
+      "fp8": 0.0036075216485187416,
+      "mixed": 0.0036075216485187416
+     }
+    }
+   },
+   "fp8-kansas": {
+    "cells": {
+     "corn|probe|x->ref|recall": {
+      "fp8": 0.8388769560567665,
+      "mixed": 0.9971151485153669
+     },
+     "sorghum|probe|ref->x|recall": {
+      "mixed": 0.8160269720303711
+     },
+     "sorghum|probe|x->ref|precision": {
+      "fp8": 0.9327092146029456,
+      "mixed": 1.0826200766580611
+     },
+     "winter wheat|probe|ref->x|recall": {
+      "fp8": 1.1632468160452116,
+      "mixed": 1.2060974569966172
+     }
+    },
+    "trip": {
+     "pasture": {
+      "fp8": 0.005766377598047257,
+      "mixed": 0.005766377598047257
+     },
+     "sorghum": {
+      "fp8": 0.007736916467547417,
+      "mixed": 0.007736916467547417
+     },
+     "winter wheat": {
+      "fp8": 0.004771661153063178,
+      "mixed": 0.004771661153063178
+     }
+    }
+   },
+   "fp8-punjab": {
+    "cells": {
+     "trees|probe|ref->x|precision": {
+      "fp8": 0.6337015457052901
+     }
+    },
+    "trip": {
+     "trees": {
+      "fp8": 0.002048856776673347,
+      "mixed": 0.002048856776673347
+     }
+    }
+   }
+  },
+  "stage1": {
+   "cpu-ab-iowa": {
+    "trip": {
+     "pasture": {
+      "fp8": 0.0020256869378499688,
+      "mixed": 0.0020256869378499688
+     }
+    }
+   },
+   "fp8-ecuador": {
+    "cells": {
+     "wetland|probe|x->ref|recall": {
+      "fp8": 0.964044413674578
+     }
+    },
+    "tile": {
+     "probe x->ref": {
+      "mixed": 0.24776190076271815
+     }
+    },
+    "trip": {
+     "grass": {
+      "fp8": 0.0028694759588688613,
+      "mixed": 0.0028694759588688613
+     },
+     "trees": {
+      "fp8": 0.0020345000666566193,
+      "mixed": 0.0020345000666566193
+     }
+    }
+   },
+   "fp8-kansas": {
+    "cells": {
+     "winter wheat|probe|ref->x|recall": {
+      "fp8": 0.816210406598014,
+      "mixed": 0.8468765328333091
+     }
+    },
+    "trip": {
+     "pasture": {
+      "fp8": 0.004836335498839617,
+      "mixed": 0.004836335498839617
+     },
+     "sorghum": {
+      "fp8": 0.004486684454604983,
+      "mixed": 0.004486684454604983
+     },
+     "winter wheat": {
+      "fp8": 0.002857737499289215,
+      "mixed": 0.002857737499289215
+     }
+    }
+   },
+   "fp8-punjab": {
+    "trip": {
+     "trees": {
+      "fp8": 0.002277098526246846,
+      "mixed": 0.002277098526246846
+     }
+    }
+   }
+  }
+ },
+ "tiles": [
+  "cpu-ab-iowa",
+  "cpu-ab-uk",
+  "fp8-ecuador",
+  "fp8-finland",
+  "fp8-kansas",
+  "fp8-punjab"
+ ]
+}

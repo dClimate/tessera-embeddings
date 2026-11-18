@@ -59,6 +59,17 @@ Answers "why is this environment behaving that way?" and is expected to work on 
 | `published_store_read_bench.py` | Read performance of the published store — open latency, point-vector percentiles, region throughput, bytes on the wire — using the same workloads and concurrency sweep as `scoping/scale_tests/t1_read_bench.py`, so the built store can be compared against the scoped one. |
 | `published_registry_census.py` | Whether the published Parquet registry is shaped as designed, whether a whole-dataset read loses columns, how fast an area-of-interest coverage query answers, whether the embedded tiles `master/` names agree with the store's live shards (`--verify-zones`), how many rows of `master/` carry no measurements (fails above `--max-unmeasured`, zero by default, and fails outright if `master/` is absent), and whether every cell of `master/` matches its run files — every tile present, each from its latest run, its fill fields and measurements unaltered — naming each cell that does not. |
 
+## `precision_gate/` — supported tooling for precision changes
+
+The gate every precision change to the forward pass meets
+([ADR 043](../context_docs/decisions/043-fp8-linears-ship-on-cross-change-accuracy-and-the-a10g-stays-bf16.md)).
+The rule itself is the library's `profiling.inference.precision_gate`; these scripts feed it and apply it.
+
+| script | what it does |
+|---|---|
+| `apply_gate.py` | Applies the gate to one tile's per-variant predictions: calibrates from the noise draws and controls, gives every variant a verdict, writes the report JSON. With `--bounds` and `--hold VARIANT=SIZE:COMPARISON` it also holds variants to a named exception, and exits 1 if any is outside it. Re-applied to the record's predictions it reproduces ADR 043's reports exactly. |
+| `make_fp8_bounds.py` | Writes `fp8_exception_bounds.json`, FP8's exception (ADR 043 decision 2) as bounds, from the record's reports: each listed cell or tile bound at recorded loss + one SE, each tripwire class at 1.1 x its recorded gap closure. Run once; the JSON is committed and a unit test pins it to the ADR's figures. |
+
 ## `scoping/` — kept-for-reference instruments
 
 Each answered one sizing question whose answer is published in `context_docs/`. Kept so a
