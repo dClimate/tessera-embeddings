@@ -126,6 +126,9 @@ context_docs/
 │   │                                              class against matched noise and controls (ADR 043);
 │   │                                              FP8 fails per class on three tiles and ships as a
 │   │                                              named exception; neighbour overlaps are reported
+│   ├── fp8-fused-kernels-gate-plan.md          PLAN (deleted when done): the test that gates the
+│   │                                              fused FP8 kernels against ADR 043's exception,
+│   │                                              re-based on chunked graph replay
 │   └── the-fleet-and-the-work-source.md        a fleet lives for one `run_inference` call, so a
 │                                                  retry through a second call rebuilt one; the
 │                                                  wind-down, and why the fleet is not held
