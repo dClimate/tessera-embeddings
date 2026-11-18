@@ -167,15 +167,20 @@ What the controls show, on the six tiles:
    (a cell's jackknife SE; for Ecuador's tile bound, 0.2005 + 0.047, its jackknife SE over blocks). Anything else is a new decision.
 3. **FP8 means E4M3, with per-channel weight and per-row activation scales.** The fused kernels that
    ship must be measured on the lattice themselves, against bf16 on the A10G as well as the L40S.
-   Static activation scales (Stage 2) change the values further and are held to the same gate.
+   The exception in decision 2 is defined on these scales. Stage 2's static activation scales are a
+   different quantisation: Stage 2 goes through the gate, and stays inside the exception only on
+   decision 2's terms. Past them it is a new decision.
 4. **It lands at a store boundary** (ADR 025 §2). A store begun in bf16 is finished in bf16, and FP8
    stores are those started after the change.
 5. **Precision is a property of the store, and inside an FP8 store an A10G runs today's bf16 forward
    unchanged.** A store's precision is recorded when the store is created and handed to model
    construction for every run that writes to it, so a bf16 store is finished in bf16 on any card. The
-   card only decides whether the store's precision can run: on Ada and newer an FP8 store builds the
-   FP8 encoder layers, and on an A10G it builds the bf16 ones. No other code knows which card it runs
-   on.
+   card only decides whether the store's precision can run: on a card whose native FP8 has been
+   measured against the L40S's (today the L40S and the L4) an FP8 store builds the FP8 encoder
+   layers, and on every other card, the A10G included, it builds the bf16 ones. A newer architecture
+   that supports FP8, such as Blackwell's RTX PRO 6000, may select different kernels, so it runs bf16
+   until its FP8 output has been measured on the lattice and it is added to the list. No other code
+   knows which card it runs on.
 
 ## How the thresholds were set
 

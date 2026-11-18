@@ -140,7 +140,7 @@ The four transformer GEMMs are **74%** of the time.
 
 ## Calibrating the gate
 
-Run on the same lattice pixels, against the production store. FP8 and int8 are the simulated variants, regenerated on 10,000 pixels per tile; the strict overlaps reproduce the tables above.
+Run on the same lattice pixels, against the production store. FP8 and int8 are the simulated variants, regenerated on a 10,000-pixel subset per tile; the strict overlaps reproduce the tables above. The noise ladder uses a larger labelled sample than the variants do, so the variants are scored on their own subset, with a noise row recomputed there for comparison.
 
 ### Tie-tolerant neighbours
 
@@ -183,6 +183,8 @@ Change in accuracy, in points, when isotropic noise is added to every pixel:
 - **ADR 012's ±1 envelope (≥ 99.5%) trips at that same point**, and so does top-25 at 0.995. For unstructured error the per-value envelope is well placed and a neighbour gate adds nothing to it.
 
 ### The evaluated changes on the same test
+
+The variants exist only for the 10,000-pixel subset, so the queries are its labelled pixels (9,789 in Iowa, 9,999 in the UK), not the ladder's 36,000. kNN-20 is leave-one-window-out inside the subset. The probe is fitted on 48,000 reference pixels outside the subset, from the other window rows, and applied to the subset. The noise row is drawn on the same subset and scored the same way, so the table compares like with like. Its values are not the ladder's first row, which has its own larger sample and training set.
 
 | variant (10,000 px per tile) | kNN-20, Iowa / UK | probe across the change, Iowa / UK | error coherence, all pixels |
 |---|---|---|---|
@@ -290,6 +292,7 @@ The g6e stays the workhorse, so the plan is FP8 on the L40S, built by extending 
 2. **Stage 1: FP8 out of the fused add + LayerNorm (Tier A, target ~1.15×).**
    - Replace the compiled add + LayerNorm with a hand-written kernel that also emits its result as E4M3. The encoder is post-norm, so each LayerNorm output feeds both the residual stream and the next GEMM: the kernel writes bf16 for the first and FP8 for the second.
    - QKV and FFN up take the FP8 output through `torch._scaled_mm`, with weights quantised once at load.
+   - The first layer's QKV is the exception: its input is the embedding plus the temporal encoding (`student_v2.py`, before any add + LayerNorm), so no fused kernel emits it as FP8. That is one of the four QKVs in each backbone. The measured Stage 1 variant quantised that input from bf16 in a separate pass. The shipped path either does the same, paying the separate quantisation the profile showed to be slower than the GEMM, or leaves that one QKV in bf16; Stage 1's measurement decides, and either goes through the gate.
    - Hand-written rather than `torch.compile`, which was slower and crashed on varied batch shapes with FP8.
    - The store records its precision at creation and model construction reads it, so a bf16 store stays bf16 on an L40S. Inside an FP8 store the g5 builds today's bf16 path, since the A10G has no FP8 (ADR 043).
 3. **Measure Stage 1 on g6e.xlarge**: production chunks for speed, the lattice for parity through ADR 043's gate, scored against bf16 on the A10G as well as the L40S, since the fused kernel's numerics are not exactly the unfused path's. The measured figure shows how much of the ~1.35× ceiling is left for Stage 2.
@@ -298,7 +301,7 @@ The g6e stays the workhorse, so the plan is FP8 on the L40S, built by extending 
    - Otherwise a Triton FP8 GEMM with a ReLU and FP8-output epilogue, which has to match cuBLASLt's FFN speed to be worth having.
    - Static scales need a calibration pass. Out-proj (1.10× per layer) is decided on measurement and may stay bf16.
 5. **Ship at a store boundary**, as ADR 030 requires of the bf16 fusion.
-6. **g5 fallback: settled.** A g5 fills FP8 stores on today's bf16 forward. Model construction reads the store's recorded precision; inside an FP8 store, a capability check builds FP8 layers on Ada and newer and the bf16 ones on the g5 (ADR 043). A mixed store carries FP8's shared shift between its g5 and g6e pixels: about 0.2 points on a linear probe at the tile level (0.2005 on Ecuador, Stage 1) and up to 1.0 point on a single class (Kansas winter wheat), nothing on kNN.
+6. **g5 fallback: settled.** A g5 fills FP8 stores on today's bf16 forward. Model construction reads the store's recorded precision; inside an FP8 store, FP8 layers are built on the cards whose FP8 has been measured (the L40S and the L4) and the bf16 ones on every other card, the g5 included (ADR 043). A mixed store carries FP8's shared shift between its g5 and g6e pixels: about 0.2 points on a linear probe at the tile level (0.2005 on Ecuador, Stage 1) and up to 1.0 point on a single class (Kansas winter wheat), nothing on kNN.
 
 Parked while the g6e is the workhorse:
 
@@ -320,7 +323,7 @@ Parked while the g6e is the workhorse:
   | `bench_int8.sh` | `benchdnn` |
 
 - **Mixed-pool test** is in `s3://arbol-tessera-inputs-dev/perf/fp8-mixed/`: `scripts/mixed_pool_gpu.py` (embeds the lattice per card: bf16, FP8 all four, FP8 Stage 1; native on Ada, emulated on the A10G), `scripts/mixed_pool_score.py` (envelope, neighbours, coherence, cross-change classifiers), `scripts/noise_control.py` (the matched-noise control), `scripts/lattice_prep2.py` and `scripts/labels2.py` (lattice and labels without a reference store), the outputs `mixed_<card>_<tile>.npz`, the labels, `score6_<tile>.txt` and `nc_<tile>.txt`. The per-class scoring is `scripts/perclass_cal.py` (per-pixel predictions for every variant, one npz each under `perclass/<tile>/`), then `scripts/perclass_rule.py` (applies the gate locally from those predictions) with `bootstrap-perclass.sh` and `watch_perclass.sh`. Its reports are `perclass/rule_unres/` (the gate as decided), `perclass/rule_delta05/` (the same gate without the unresolved outcome, from `scripts/perclass_rule_delta05.py`) and `perclass/rule_delta_refit/` (δ widened by the refit spread, rejected). The four new tiles' mosaics are in `s3://arbol-tessera-inputs-dev/mosaics/fp8-{ecuador,punjab,kansas,finland}`.
-- **Gate calibration scripts** are not yet uploaded to that prefix: `tie_tolerant.py` (variants and neighbour metrics), `labels.py` (labels and observation counts), `ladder.py` (noise ladder and controls), `coherence.py` (cross-change probe and coherence).
+- **Gate calibration scripts** are in `s3://arbol-tessera-inputs-dev/perf/cpu-ab/scripts/`: `tie_tolerant.py` (variants and neighbour metrics), `labels.py` (labels and observation counts), `ladder.py` (noise ladder and controls), `coherence.py` (cross-change probe and coherence). The variants and the ladder's reports are in `perf/cpu-ab/gate-calibration/` (`variants_<tile>.npz`, `ladder_<tile>.txt`); the neighbour and coherence tables were printed, not saved, and rerun from the variants.
 - **Labels:** CDL 2024 from CropScape's coverage endpoint, sampled at pixel centres; WorldCover 2021 v200 from `s3://esa-worldcover`.
 - **Lattice inputs** are in `s3://arbol-tessera-inputs-dev/perf/fp8-lattice/`.
 - **Mosaics** (calendar 2024) are at `s3://arbol-tessera-inputs-dev/mosaics/cpu-ab-{uk,iowa}`. The production stores are at `s3://arbol-tessera-embeddings-dev/cpu-ab/embeddings/`.
