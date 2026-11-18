@@ -64,11 +64,16 @@ What the controls show, on the six tiles:
   have one** (Ecuador water, at 1,709 px, is too small for a control),
   including both shifts that motivated it: UK cropland towards grass (kNN recall −2.00 ± 0.68, z 3.0
   against z_fam 2.79) and Iowa soybeans towards corn (probe recall −0.68 ± 0.10). Of the four it
-  passes, Finland water's control does no harm (worst 0.22), and Kansas soybeans' and Punjab grass's
-  cost about a point that the data cannot resolve (1.30 ± 0.66, 0.94 ± 0.85). **Kansas developed is a
-  blind spot:** its control costs 3.23 ± 0.44 points of probe recall, but developed's probe cells
-  (7,396 px) are too noisy to gate there. FP8 loses at most 0.47 ± 0.20 in those cells. The detection
-  limit also shows at the weakest dose: UK cropland's −0.79 ± 0.31 at cosine 0.99998 passes.
+  does not reject, Finland water's control does no harm (worst 0.22) and passes. The other three are
+  unresolved, so the gate flags them without failing them: Kansas soybeans' and Punjab grass's cost
+  about a point in gated cells (1.30 ± 0.66, 0.58 ± 0.36), and **Kansas developed's** costs
+  3.23 ± 0.44 points of probe recall in cells too noisy to gate (7,396 px), where FP8 loses at most
+  0.47 ± 0.20. The detection limit also shows at the weakest dose: UK cropland's −0.79 ± 0.31 at
+  cosine 0.99998 is unresolved, not rejected.
+- **Structured error carries a far larger SE than noise in the same cell.** Kansas sorghum's control
+  loses 3.20 ± 1.12 points of probe recall where the noise draws' SE is 0.07, so its loss / SE is 2.9
+  against z_fam 3.16. A cell gated on the noise SE therefore does not resolve every 2δ loss, and a
+  loss past δ that the candidate's own SE leaves under z_fam is unresolved (decision 1.3).
 - **The large-to-small shift fails on all six tiles at 0.9999,** mostly through the large class's own
   recall when the classifier is fitted on the changed side, not through the small class's precision
   as expected.
@@ -91,8 +96,24 @@ What the controls show, on the six tiles:
 - **A mixed store fails in the same cells,** since A10G bf16 is the L40S's bf16: Kansas winter wheat
   1.00 (all four) and 0.70 (Stage 1), Iowa forest 0.65, Ecuador trees 0.55. Ecuador's Stage 1 mixed
   store also sits on the tile bound, losing 0.2005 points.
-- **Losses past 0.5 in cells too noisy to gate are reported:** Finland grass loses 1.09 ± 0.30 of probe
-  recall (all four), and Ecuador cropland 0.79 ± 0.18 passes at z 4.4 against 4.45.
+- **FP8 leaves six cells unresolved,** five with all four linears and one at Stage 1. Loss in points
+  of the probe, mixed-store figure where it is larger:
+
+  | tile | cell | loss | loss / SE against z_fam | why unresolved |
+  |---|---|---|---|---|
+  | Ecuador, all four | cropland recall | 0.79 ± 0.18 | 4.3 against 4.45 | gated; own SE 0.18 against noise 0.12 |
+  | Kansas, all four | sorghum precision | 0.78 ± 0.30 | 2.6 against 3.16 | gated; own SE 0.30 against noise 0.06 |
+  | Kansas, all four | corn recall | 0.68 ± 0.32 | 2.1 against 3.16 | gated; own SE 0.32 against noise 0.05 |
+  | Kansas, all four (mixed store only) | sorghum recall | 0.51 ± 0.30 | 1.7 against 3.16 | gated; own SE 0.30 against noise 0.06 |
+  | Punjab, all four | trees precision | 0.53 ± 0.10 | 5.2 against 3.58 | not gated: noise SE 0.126 against 0.125 |
+  | Ecuador, Stage 1 | wetland recall | 0.79 ± 0.17 | 4.5 against 4.45 | not gated: noise SE 0.139 |
+
+  Punjab with all four linears and Ecuador at Stage 1 fail nothing, so these cells move them from
+  pass to unresolved. Known-good variants almost never land there: none of the 12 two-card pairs and
+  1 of the 240 noise draws (Finland, an ungated grass cell at z 4.25 against 4.21).
+- **Losses past 0.5 that are neither failed nor unresolved are reported.** They sit in cells too noisy
+  to gate, under z_fam: Finland grass loses 1.09 ± 0.30 of probe recall (all four), and Kansas
+  soybeans up to 1.30 ± 0.45 of probe precision (both sizes).
 - **The gap-closure tripwire fires for FP8 on every tile** except UK and Finland at Stage 1, and for
   no noise draw on any tile.
 - **Coherence does not track harm:** 0.75 at the weakest control dose against 0.72 at about nine times
@@ -104,20 +125,30 @@ What the controls show, on the six tiles:
    1. **Envelope:** ADR 012's cross-config envelope holds.
    2. **Tile loss:** a linear probe and a kNN-20 classifier, fitted on one side and applied to the
       other, lose no more than 0.2 points, in both directions.
-   3. **Class loss:** no gated cell loses more than δ = 0.5 points with loss / SE above z_fam.
+   3. **Class loss:** every cell that loses more than δ = 0.5 points is sorted by whether it is gated
+      and whether its loss / SE is above z_fam:
+
+      | | loss / SE above z_fam | loss / SE at or under z_fam |
+      |---|---|---|
+      | **gated cell** | the change **fails** | **unresolved** |
+      | **other cell** | **unresolved** | reported |
+
+      A change passes when no cell fails and none is unresolved. An unresolved cell needs a decision,
+      as a tripwire does: the loss is past δ and the gate cannot call it noise.
       - A *cell* is one class × consumer (probe, kNN-20) × direction (fitted on the reference and
         applied to the change, and the reverse) × measure (recall, precision).
-      - SE is a delete-one-block jackknife over 40×40-pixel blocks.
-      - A cell is *gated* when its median SE over the matched-noise draws is at most δ/4, so a 2δ loss
-        is always resolvable. Other cells are reported.
+      - SE is the candidate's own delete-one-block jackknife over 40×40-pixel blocks.
+      - A cell is *gated* when its median SE over the matched-noise draws is at most δ/4. That
+        resolves a 2δ loss whose SE is the noise's. Structured error clusters in fields and can carry
+        several times that SE, which is what the gated-and-under case catches.
       - z_fam is the 95th percentile, over the noise draws, of the largest loss / SE among the tile's
         gated cells.
       - Gains are not harm.
    4. **Validity:** each gated class's class-directed control at cosine 0.9999 should be rejected.
-      Where it passes, the control's worst loss in any of that class's cells, gated or not, is
-      listed. If that loss exceeds δ with loss / SE above z_fam, the class is a blind spot on that
-      tile: the gate does not cover it there, and the candidate's losses in its cells are reported
-      beside the verdict.
+      Where it is only unresolved, the gate can flag a change of that kind in that class but cannot
+      fail it, and the class is listed as flag-only on that tile. A gated class too small for a
+      control (under 2,000 labelled pixels) is listed as unvalidated. Both lists go beside the
+      verdict; the classes' cells still count.
    5. **Tripwire:** a class's gap closure is its mean error projected on the direction to another
       class's centroid, as a share of the centroid gap. Past half its own control's gap closure at the
       dose that costs δ, the change needs a decision even if accuracy passes.
@@ -126,11 +157,13 @@ What the controls show, on the six tiles:
 2. **FP8 fails this gate and ships as a named exception.** It fails on Kansas winter wheat (probe
    recall, both sizes, up to 1.0 point including a mixed store), Iowa forest (probe precision, all four
    linears, 0.65) and Ecuador trees (probe recall, all four linears, 0.55); Ecuador's Stage 1 mixed
-   store loses 0.2005 points at the tile level; and it trips the tripwire.
-   These losses are accepted for FP8 E4M3 as defined in decision 3. The exception does not change the
+   store loses 0.2005 points at the tile level; it leaves the six cells in the context table
+   unresolved; and it trips the tripwire.
+   These losses are accepted for FP8 E4M3 as defined in decision 3, the unresolved cells included:
+   this is their decision. The exception does not change the
    gate: any other precision change, int8 included, meets it unchanged. The fused kernels and Stage 2
-   go through the gate themselves, and pass under this exception only if they fail in these cells
-   and Ecuador's tile bound alone, by no more than the recorded loss plus one SE
+   go through the gate themselves, and pass under this exception only if they fail or are unresolved
+   in these cells and Ecuador's tile bound alone, by no more than the recorded loss plus one SE
    (a cell's jackknife SE; for Ecuador's tile bound, 0.2005 + 0.047, its jackknife SE over blocks). Anything else is a new decision.
 3. **FP8 means E4M3, with per-channel weight and per-row activation scales.** The fused kernels that
    ship must be measured on the lattice themselves, against bf16 on the A10G as well as the L40S.
@@ -149,8 +182,13 @@ What the controls show, on the six tiles:
 - δ = 0.5 was fixed before the six-tile per-class run, from the controls alone: a 1.0 allowance was
   dropped because Iowa's soybean control costs 0.70 at worst, so 1.0 would admit it. At that point
   per-class FP8 results existed only for UK and Iowa (worst cells 0.27 and 0.17).
-- Two choices were made after seeing data that included FP8. Both make the gate stricter on FP8, not
+- Three choices were made after seeing data that included FP8. All make the gate stricter on FP8, not
   more lenient:
+  - **The unresolved outcome** (added 2026-11-18, in review). Before it, a gated cell passed whenever
+    the candidate's own SE kept loss / SE under z_fam, however large the loss. It moves FP8's Punjab
+    (all four) and Ecuador (Stage 1) results from pass to unresolved and changes no failure. An
+    ungated cell is unresolved only above z_fam because a loss past δ alone is routine there: it
+    occurs in 71 of the 240 noise draws, all 40 on Finland.
   - **Gating per cell rather than per class.** UK cropland's kNN cells resolve a 2δ loss but its probe
     cells do not (noise SE 0.08–0.11 against 0.13–0.17). Gating per class would drop the class that
     motivated the gate.
@@ -168,12 +206,15 @@ What the controls show, on the six tiles:
   only new code is recording the store's precision and passing it to model construction.
 - **What FP8 costs a downstream user:** a linear classifier fitted on one precision and applied to the
   other, across stores or inside a mixed store, loses up to 1.0 point of winter wheat recall on Kansas
-  (0.7 at Stage 1), and up to 0.65 on single minority classes elsewhere with all four linears. At the
+  (0.7 at Stage 1), and up to 0.65 on single minority classes elsewhere with all four linears. Those
+  are the losses the gate confirms. Unresolved cells add up to 0.79 (Ecuador cropland and wetland
+  recall), and cells too noisy to gate show point estimates of 1.09 ± 0.30 (Finland grass recall) and
+  1.30 ± 0.45 (Kansas soybean precision). At the
   tile level that is at most 0.2 points (0.2005 for Ecuador's Stage 1 mixed store); kNN is unaffected. This is the first thing to recheck if a
   downstream user reports a seam between FP8 and bf16 stores, or between regions inside a mixed store.
 - Stage 1 is the cheaper exception: it fails only on Kansas winter wheat, plus Ecuador's tile bound by
-  0.0005 as a mixed store. All four linears adds Iowa
-  forest and Ecuador trees.
+  0.0005 as a mixed store, with one unresolved cell (Ecuador wetland). All four linears adds Iowa
+  forest and Ecuador trees, and five unresolved cells.
 - The tie-tolerant neighbour gate proposed in the reduced-precision record (top-25 at 0.995 on the
   worst stratum) is not adopted. Inside one class or window FP8 scores as low as 0.972 (Finland's
   water), and that threshold was calibrated over whole tiles. A per-stratum threshold needs its own
@@ -181,7 +222,8 @@ What the controls show, on the six tiles:
 - Each tile's gate costs about 70–80 scored variants (40 noise draws, controls for each class, refit
   redraws): about an hour for all six tiles on one m7i.16xlarge with 60 single-threaded shards.
 - The measurement scripts and every output are in `s3://arbol-tessera-inputs-dev/perf/fp8-mixed/`,
-  the per-class run under `perclass/`; the four new tiles' mosaics stay under `mosaics/fp8-*` for
+  the per-class run under `perclass/`. The gate as decided is `scripts/perclass_rule.py`, and its
+  reports are `perclass/rule_unres/`. The four new tiles' mosaics stay under `mosaics/fp8-*` for
   reruns.
 
 ## Rejected alternatives
