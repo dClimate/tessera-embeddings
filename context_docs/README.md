@@ -58,7 +58,7 @@ context_docs/
 │   ├── 039-architecture-rules-run-on-import-linter-and-ruff.md
 │   ├── 040-new-code-is-gated-on-duplication-and-complexity.md
 │   ├── 041-unit-tests-run-the-forked-writer-in-threads.md
-│   └── 042-fp8-linears-ship-on-cross-change-accuracy-and-the-a10g-stays-bf16.md
+│   └── 043-fp8-linears-ship-on-cross-change-accuracy-and-the-a10g-stays-bf16.md
 │
 ├── campaign/                      THE GLOBAL CAMPAIGN — start here
 │   ├── campaign-plan.md                        <- START HERE. What runs, with what settings, in
@@ -119,7 +119,7 @@ context_docs/
 │   │                                              near-tie churn; int8 makes CPU spot ~g5 parity;
 │   │                                              the plan for fused FP8 on the g6e workhorse;
 │   │                                              the gate: cross-change accuracy per tile and per
-│   │                                              class against matched noise and controls (ADR 042);
+│   │                                              class against matched noise and controls (ADR 043);
 │   │                                              FP8 fails per class on three tiles and ships as a
 │   │                                              named exception; neighbour overlaps are reported
 │   └── the-fleet-and-the-work-source.md        a fleet lives for one `run_inference` call, so a

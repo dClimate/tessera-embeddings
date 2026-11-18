@@ -1,4 +1,4 @@
-# 042 — A per-class gate for precision changes; FP8 linears fail it and ship as a named exception, at a store boundary, and the A10G stays bf16
+# 043 — A per-class gate for precision changes; FP8 linears fail it and ship as a named exception, at a store boundary, and the A10G stays bf16
 
 **Status:** Proposed (2026-11-17)
 
