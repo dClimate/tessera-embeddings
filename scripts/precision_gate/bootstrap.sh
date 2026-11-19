@@ -109,6 +109,7 @@ cpu() {
   aws s3 sync --quiet logs/ "$OUT/$set/logs/" || true
   STEP=upload
   aws s3 sync --quiet out/ "$OUT/$set/pred/"  # checked: the gate's result is re-applied from these
+  STEP=calibrate
   [ $failed -eq 0 ] || { echo "ERROR: $failed calibrate shards failed"; return 1; }
   STEP=gate
   mkdir -p reports
