@@ -975,7 +975,7 @@ def fill_zones_sequential_flow(
     store_credentials = icechunk_credentials_for(store_path, iam_icechunk_credentials)
     model_version = store_model_version(store_path, get_credentials=store_credentials, region=s3_region)
     # And the precision it was begun at (ADR 043), so a bf16 store is finished in bf16.
-    precision = store_precision(store_path, model_version, get_credentials=store_credentials, region=s3_region)
+    precision = store_precision(store_path, get_credentials=store_credentials, region=s3_region)
     ami_ssm_name = ami_ssm_name_for_model(ami_ssm_name, ami_ssm_name_by_model, model_version)
     # Where this run's mosaics and staging live: the campaign's, or the update's own.
     update_root = paths.update_root(update) if update is not None else None

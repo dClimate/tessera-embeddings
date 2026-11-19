@@ -119,7 +119,7 @@ def assert_output_store_accepts(
     # legacy store, which is the case that needs catching most.
     assert_model_matches(root.attrs, config.model_version, checkpoint_to_version(config.checkpoint_path), where=path)
     # So is its precision (ADR 043): an existing store keeps the one it was begun at.
-    if (stored := precision_of_root(root.attrs, config.model_version)) != config.precision:
+    if (stored := precision_of_root(root.attrs)) != config.precision:
         raise ConfigMismatchError(
             f"{path} was computed at {stored} precision and this run is configured for {config.precision}. "
             f"A store keeps one precision (ADR 043): run with precision={stored!r}, or write a new store."

@@ -209,8 +209,8 @@ def main(argv: list[str] | None = None) -> int:
     unknown = set(variants) - set(VARIANTS)
     if unknown:
         p.error(f"unknown variants {sorted(unknown)}")
-    if any(v.startswith("fp8") for v in variants) and torch.cuda.get_device_capability() < (8, 9):
-        p.error("FP8 variants need compute capability 8.9 or later")
+    if any(v.startswith("fp8_") for v in variants) and torch.cuda.get_device_capability() < (8, 9):
+        p.error("the FP8 stand-ins need compute capability 8.9 or later")
 
     torch.backends.cuda.matmul.allow_tf32 = False
     cfg = InferenceConfig(

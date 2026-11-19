@@ -224,6 +224,17 @@ def test_the_store_names_the_model_that_fills_it(seeded_store, model):
     """Every fill takes its model from the store's root, and runs that model's checkpoint."""
     store = seeded_store([_ZA], years=(2025,), model_version=model)
     assert global_store.store_model_version(store) == model
+    # ...and the precision it was seeded at (ADR 043): v2's FP8, v1.1's bf16, written once at the seed.
+    assert global_store.store_precision(store) == ("fp8" if model == "v2-large" else "bf16")
+
+
+def test_a_store_seeded_before_adr_043_is_filled_in_bf16(seeded_store):
+    """A v2 root stamped without a precision is a bf16 store, so its fills stay bf16 on every card."""
+    store = seeded_store([_ZA], years=(2025,), model_version="v2-large")
+    session = global_store.open_global_repo(store).writable_session("main")
+    del zarr.open_group(session.store, mode="a").attrs["inference_precision"]
+    session.commit("a root stamped before ADR 043")
+    assert global_store.store_precision(store) == "bf16"
 
 
 @pytest.mark.parametrize(

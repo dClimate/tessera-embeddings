@@ -263,7 +263,7 @@ def fill_zone_year_flow(
     # fill or update of a v1.1 store runs v1.1 whatever any default says.
     model_version = store_model_version(store_path, get_credentials=store_credentials, region=s3_region)
     # And the precision it was begun at (ADR 043), so a bf16 store is finished in bf16.
-    precision = store_precision(store_path, model_version, get_credentials=store_credentials, region=s3_region)
+    precision = store_precision(store_path, get_credentials=store_credentials, region=s3_region)
     ami_ssm_name = ami_ssm_name_for_model(ami_ssm_name, ami_ssm_name_by_model, model_version)
     checkpoint = checkpoint_filename(model_version=model_version)
     land_mask_path = paths.land_mask_store(mask_name)

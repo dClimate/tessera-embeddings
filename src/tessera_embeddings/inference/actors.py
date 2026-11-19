@@ -50,7 +50,7 @@ from tessera_embeddings.inference.progress import chunk_uid
 from tessera_embeddings.inference.provenance import SourcePlanes, staging_kwargs
 from tessera_embeddings.inference.read_plan import _chunk_read_plan
 from tessera_embeddings.inference.resource_monitor import ResourceMonitor
-from tessera_embeddings.storage.conventions import checkpoint_stem, run_precision_entry
+from tessera_embeddings.storage.conventions import checkpoint_stem, precision_attrs
 from tessera_embeddings.storage.zarr_store import credentials_provider
 
 if TYPE_CHECKING:
@@ -632,7 +632,7 @@ class InferenceActor:
             "torch": torch.__version__,
             "cuda": torch.version.cuda if self.device.type == "cuda" else None,
             # The precision the run DECLARES, not what this card built: an A10G in an FP8 store runs bf16 (ADR 043).
-            **run_precision_entry(cast("Precision", self.config.precision)),
+            **precision_attrs(cast("Precision", self.config.precision)),
         }
 
     # ------------------------------------------------------------------

@@ -187,30 +187,24 @@ def checkpoint_stem(checkpoint: str) -> str:
 
 
 def library_stack(stack: Mapping[str, str | None]) -> dict[str, str | None]:
-    """The part of a run's stack a store root records under :data:`STACK_ATTR`.
-
-    ``precision`` is carried only when the run declares one, which it does only when it is not bf16
-    (ADR 043): a record without it is bf16, so every stack written before FP8 existed still compares equal.
-    """
-    keep = ("torch", "cuda", "precision") if "precision" in stack else ("torch", "cuda")
-    return {k: stack.get(k) for k in keep}
+    """The part of a run's stack a store root records under :data:`STACK_ATTR`."""
+    return {k: stack.get(k) for k in ("torch", "cuda")}
 
 
-def run_precision_entry(precision: Precision) -> dict[str, str]:
-    """The ``precision`` entry of a run's stack: none for bf16, so a bf16 record is unchanged by ADR 043."""
-    return {} if precision == "bf16" else {"precision": precision}
+#: Store-root attr: the precision of the encoder's large multiplies (ADR 043), written when the store is
+#: created and never changed. A run's stack carries the same key. Written only when it is not bf16, so
+#: absence means bf16: every store and run made before ADR 043 reads correctly with no migration.
+PRECISION_ATTR = "inference_precision"
 
 
-def precision_of_root(root_attrs: Mapping[str, object], model_version: ModelVersion) -> Precision:
-    """The precision every write into a store runs at: what its first write recorded, else a new store's default.
+def precision_attrs(precision: Precision) -> dict[str, str]:
+    """What a store created at *precision* records on its root, and a run at it in its stack."""
+    return {} if precision == "bf16" else {PRECISION_ATTR: precision}
 
-    A root whose :data:`STACK_ATTR` names no precision was written in bf16, as every store before ADR 043
-    was. A root nothing has written to yet takes *model_version*'s default.
-    """
-    stack = root_attrs.get(STACK_ATTR)
-    if isinstance(stack, Mapping):
-        return cast("Precision", stack.get("precision", "bf16"))
-    return model_family(model_version).precisions[0]
+
+def precision_of_root(root_attrs: Mapping[str, object]) -> Precision:
+    """The precision every write into a store runs at: what it recorded when it was created, else bf16."""
+    return cast("Precision", root_attrs.get(PRECISION_ATTR, "bf16"))
 
 
 def assert_model_matches(
@@ -243,16 +237,20 @@ def assert_stack_matches(root_attrs: Mapping[str, object], stack: Mapping[str, s
     Changing a store's stack is a deliberate restamp after measuring equivalence (ADR 025), never a flag.
     """
     assert_model_matches(root_attrs, str(stack["model_version"]), str(stack["checkpoint_id"]), where=where)
+    if (stored_precision := precision_of_root(root_attrs)) != (run_precision := stack.get(PRECISION_ATTR, "bf16")):
+        raise ValueError(
+            f"Refusing to write into {where}: it holds {stored_precision} embeddings and this run computes "
+            f"{run_precision}. A store keeps the precision it was created at (ADR 043): fills read it with "
+            "store_precision, and a single-area run sets InferenceConfig.precision to it."
+        )
     # Present means compared, whatever its type: a malformed stamp is refused, never read as absent.
     if STACK_ATTR in root_attrs and (stored := root_attrs[STACK_ATTR]) != library_stack(stack):
         cuda = stack.get("cuda")
         raise ValueError(
             f"Refusing to write into {where}: it was computed on {stored!r}, and this run on PyTorch "
-            f"{stack.get('torch')} with {f'CUDA {cuda}' if cuda else 'CPU'} at "
-            f"{stack.get('precision', 'bf16')} precision. One store never mixes two stacks or two precisions "
-            "(ADR 025, ADR 043). Run on the store's stack: the global flows pick its worker image through "
-            "ami_ssm_name_by_model and its precision through store_precision, and a local run needs that "
-            "PyTorch installed (docs/environment-setup.md) and the store's precision in its config. "
+            f"{stack.get('torch')} with {f'CUDA {cuda}' if cuda else 'CPU'}. One store never mixes two "
+            "stacks (ADR 025). Run on the store's stack: the global flows pick its worker image through "
+            "ami_ssm_name_by_model, and a local run needs that PyTorch installed (docs/environment-setup.md). "
             "Moving a store to another stack is a restamp after an equivalence check (ADR 025)."
         )
 

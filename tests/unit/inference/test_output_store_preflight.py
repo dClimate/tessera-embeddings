@@ -21,6 +21,7 @@ from tessera_embeddings.inference.orchestration_helpers import (
     build_inference_config,
     embedding_store_path,
 )
+from tessera_embeddings.storage.conventions import precision_attrs
 from tessera_embeddings.storage.manifest import ConfigMismatchError
 from tessera_embeddings.storage.zarr_store import open_or_create_repo
 
@@ -199,12 +200,10 @@ def test_a_store_keeps_its_precision_before_any_compute(tmp_path, stamped, run, 
     path = _store_published_by(tmp_path, config, encoder_url("v2-large"))
     repo, _ = open_or_create_repo(path)
     session = repo.writable_session("main")
-    zarr.open_group(session.store, mode="a").attrs["inference_stack"] = {
-        "torch": "2.14.1+cu130",
-        "cuda": "13.0",
-        **({"precision": stamped} if stamped else {}),
-    }
-    session.commit("first write's stack")
+    # A store with embeddings and no stack record (written before ADR 025) is bf16 like any other unmarked store.
+    zarr.open_group(session.store, mode="a").attrs.update(precision_attrs(stamped) if stamped else {})
+    if stamped:
+        session.commit("created at fp8")
     check = functools.partial(
         assert_output_store_accepts,
         output_bucket=str(tmp_path / "outputs"),

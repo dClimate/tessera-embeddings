@@ -54,7 +54,7 @@ from tessera_embeddings.inference.assembly import (
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, enumerate_chunks, filter_chunks_by_roi_mask
 from tessera_embeddings.inference.quantization import quantize_rows
 from tessera_embeddings.storage import shard_writer
-from tessera_embeddings.storage.conventions import STACK_ATTR, library_stack
+from tessera_embeddings.storage.conventions import STACK_ATTR, library_stack, precision_attrs
 from tessera_embeddings.storage.global_store import create_global_repo, create_layout_arrays, open_global_repo
 from tessera_embeddings.storage.time_axis import TIME_ENCODING
 from tessera_embeddings.storage.zarr_store import (
@@ -370,6 +370,13 @@ class TestAssembly:
         assert self._assemble_on(tmp_path, STACK, "first")[STACK_ATTR] == library_stack(STACK)
         with pytest.raises(ValueError, match="Refusing to write"):
             self._assemble_on(tmp_path, OTHER_STACK, "second")
+
+    def test_a_new_store_takes_its_first_runs_precision_and_keeps_it(self, tmp_path):
+        """ADR 043: the store a run creates records the run's precision, and a run at another one is refused."""
+        v2 = {**STACK, "model_version": "v2-large", "checkpoint_id": "v2_student_large"}
+        assert self._assemble_on(tmp_path, {**v2, **precision_attrs("fp8")}, "v2-first")["inference_precision"] == "fp8"
+        with pytest.raises(ValueError, match="precision it was created at"):
+            self._assemble_on(tmp_path, v2, "v2-second")
 
     def test_a_run_is_assembled_only_under_the_identity_it_was_staged_with(self, tmp_path, writer, output):
         """The run id varies with the checkpoint, so only a reused one can disagree; it is refused, never relabelled."""
