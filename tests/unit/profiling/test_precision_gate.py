@@ -106,3 +106,29 @@ def test_a_tile_loss_past_the_bound_fails() -> None:
     cal = pg.calibrate(_noise())
     s = pg.Score(cells={GATED: (0.0, 0.05)}, tile={("probe", "x->ref"): (0.21, 0.05)}, gap_closure={0: 0.0})
     assert pg.verdict(s, cal) == "fail"
+
+
+def test_a_named_exception_holds_a_later_run_to_its_recorded_losses() -> None:
+    ww = "winter wheat|probe|ref->x|recall"
+    recorded = {
+        "fail_cells": [ww],
+        "unresolved": [],
+        "fail_tile": [],
+        "trip": {"pasture": 4e-3},
+        "gc": {"pasture": 4e-3},
+        "cells": {ww: [0.66, 0.16]},
+        "tile": {},
+        "envelope": {"passed": True},
+    }
+    bounds = pg.exception_bounds(recorded)
+    assert bounds == pytest.approx({ww: 0.82, "trip:pasture": 4.4e-3})
+    assert pg.outside_exception(recorded, bounds) == []
+
+    worse = recorded | {"cells": {ww: [0.9, 0.1]}}
+    assert "past its bound" in pg.outside_exception(worse, bounds)[0]
+    new_cell = recorded | {
+        "unresolved": ["corn|probe|x->ref|recall"],
+        "cells": {ww: [0.5, 0.1], "corn|probe|x->ref|recall": [0.6, 0.3]},
+    }
+    assert "not in the exception" in pg.outside_exception(new_cell, bounds)[0]
+    assert pg.outside_exception(recorded | {"envelope": {"passed": False}}, bounds)

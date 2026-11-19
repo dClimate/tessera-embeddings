@@ -18,6 +18,8 @@ Terms (``context_docs/decisions/043-...md``, decision 1):
 - The tripwire: a class's gap closure past half its own control's gap closure at the dose
   costing δ. A trip needs a decision, so it leaves the variant unresolved.
 - A comparison whose ADR 012 envelope fails, fails.
+- A named exception (decision 2) accepts a failing change's recorded losses: :func:`exception_bounds` sets
+  its bounds, :func:`outside_exception` holds a later run to them.
 
 Variant names follow ``calibrate.py``: ``noise_*`` are the matched-noise draws, ``ctrl_<i>_<j>_<cos>``
 the class-directed controls, ``ctrl2_*`` the large-to-small control, ``refit_*`` training-sample
@@ -42,6 +44,8 @@ DELTA = 0.5
 """Points a cell may lose before it can fail or be unresolved (decision 1.3)."""
 TILE_BOUND = 0.2
 """Points a whole tile may lose, per consumer and direction (decision 1.2)."""
+TRIP_ALLOWANCE = 1.1
+"""A named exception's bound on a tripped class, as a multiple of its recorded gap closure (decision 2)."""
 CONTROL_COSINE = 0.9999
 """The control dose each gated class's control should be rejected at (decision 1.4)."""
 MIN_REPORTED_PX = 200
@@ -417,3 +421,29 @@ def coherence(ref: np.ndarray, test: np.ndarray) -> float:
     """Length of the mean unit-vector error over the mean error length: ~0.02 for noise, 1 for a shared shift."""
     e = test / np.linalg.norm(test, axis=1, keepdims=True) - ref / np.linalg.norm(ref, axis=1, keepdims=True)
     return float(np.linalg.norm(e.mean(0)) / (np.linalg.norm(e, axis=1).mean() + 1e-12))
+
+
+def exception_bounds(variant: Mapping) -> dict[str, float]:
+    """The bounds a named exception sets from one variant's report.
+
+    Each failed or unresolved cell and failed tile pair at its loss plus one SE; each tripped class
+    (``trip:<class>``) at ``TRIP_ALLOWANCE`` x its gap closure.
+    """
+    out = {k: sum(variant["cells"][k]) for k in [*variant["fail_cells"], *variant["unresolved"]]}
+    out |= {k: sum(variant["tile"][k]) for k in variant["fail_tile"]}
+    return out | {f"trip:{k}": TRIP_ALLOWANCE * g for k, g in variant["trip"].items()}
+
+
+def outside_exception(variant: Mapping, bounds: Mapping[str, float]) -> list[str]:
+    """Why a variant is outside an exception's bounds for its tile; empty means inside.
+
+    A failed envelope, a flagged item the exception does not list, or a listed item past its bound.
+    """
+    values = {k: v[0] for k, v in variant["cells"].items()} | {k: v[0] for k, v in variant["tile"].items()}
+    values |= {f"trip:{k}": g for k, g in variant["gc"].items()}
+    envelope_fails = variant["envelope"] is not None and not variant["envelope"]["passed"]
+    reasons = ["ADR 012's envelope fails, which no exception covers"] if envelope_fails else []
+    reasons += [f"{k} {values[k]:.3f} not in the exception" for k in exception_bounds(variant) if k not in bounds]
+    return reasons + [
+        f"{k} {values[k]:.3f} past its bound {b:.3f}" for k, b in bounds.items() if values.get(k, 0.0) > b
+    ]

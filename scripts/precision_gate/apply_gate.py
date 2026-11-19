@@ -5,10 +5,14 @@ missing file is an error, a stray one is ignored), one ``.npz`` per variant and 
 the gate (``tessera_embeddings.profiling.inference.precision_gate``), prints one line per variant and the
 refit spread, and writes the full report as JSON.
 
-Every embedded comparison (each key of ``envelope.json``, known-good ones included) must pass. The exit
-code is 3 if any does not, so a caller can tell that result from a crash.
+Every embedded comparison (each key of ``envelope.json``, known-good ones included) must pass, or, with
+``--exception``, stay inside that named exception's bounds for this tile. The exit code is 3 if any does
+not, so a caller can tell that result from a crash. Each comparison that does not pass carries the
+``exception_bounds`` an exception for it would set; an exception file is
+``{"decision": <ADR>, "tiles": {<tile>: {<item>: <bound>}}}``, taking the larger of ``candidate``'s and
+``mixed``'s bound per item.
 
-usage: apply_gate.py <labels.npz> <label_key> <variant_dir> <tile> <report.json>
+usage: apply_gate.py <labels.npz> <label_key> <variant_dir> <tile> <report.json> [--exception <file.json>]
 """
 
 from __future__ import annotations
@@ -82,12 +86,24 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("variant_dir")
     p.add_argument("tile")
     p.add_argument("report")
+    p.add_argument("--exception")
     a = p.parse_args(argv)
     labels = np.load(a.labels)
     tile = pg.make_tile(labels[a.label_key], a.label_key, labels["Y"], labels["X"])
     report = load_report(tile, a.variant_dir)
     print_report(a.tile, report)
-    report["not_passed"] = [n for n, v in report["variants"].items() if v["envelope"] and v["verdict"] != "pass"]
+    exception = json.loads(Path(a.exception).read_text())["tiles"].get(a.tile, {}) if a.exception else None
+    report["not_passed"] = []
+    for name, v in report["variants"].items():
+        if not v["envelope"] or v["verdict"] == "pass":
+            continue
+        v["exception_bounds"] = pg.exception_bounds(v)
+        if exception is not None:
+            v["outside_exception"] = pg.outside_exception(v, exception)
+            print(f"exception {name}: " + ("; ".join(v["outside_exception"]) or "inside"))
+            if not v["outside_exception"]:
+                continue
+        report["not_passed"].append(name)
     print(f"GATE {a.tile}: " + (f"NOT PASSED: {', '.join(report['not_passed'])}" if report["not_passed"] else "PASS"))
     Path(a.report).write_text(json.dumps(report, indent=1))
     return NOT_PASSED_EXIT if report["not_passed"] else 0

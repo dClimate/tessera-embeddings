@@ -68,7 +68,14 @@ the candidate. It was measured on six tiles with FP8 on the L40S as its first ca
 
    An unresolved result needs a decision; only a pass ships without one. Neighbour overlaps, coherence and the
    refit spread are reported, not gated.
-2. **A change that passes still lands at a store boundary**, as ADR 030 requires of any change to outputs: a
+2. **A change that fails may ship as a named exception**, which is a decision of its own, recorded in an ADR that
+   accepts its measured losses. The exception's bounds are each failed or unresolved cell and failed tile loss
+   at its recorded loss plus one SE, and each tripped class at 1.1 × its recorded gap closure. Gap closure has
+   no SE, so the tenth is set by hand: two cards on identical code move it by at most 0.05. Later runs of the
+   change, such as its final kernels, are held to those bounds (`apply_gate.py --exception`). Anything the
+   exception does not list, an item past its bound, or a failed envelope is a new decision. The exception
+   leaves the gate unchanged for every other change.
+3. **A change that passes, or ships as an exception, still lands at a store boundary**, as ADR 030 requires of any change to outputs: a
    store is finished on the forward it began with.
 
 ## How the thresholds were set

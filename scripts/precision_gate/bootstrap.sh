@@ -17,6 +17,7 @@ CODE=__CODE__
 OUT=__OUT__/$RUN
 INPUTS=__INPUTS__
 CHECKPOINT=__CHECKPOINT__
+EXCEPTION=__EXCEPTION__  # a named exception's file in the repository, or empty
 TILES="cpu-ab-uk cpu-ab-iowa fp8-ecuador fp8-punjab fp8-finland fp8-kansas"
 LOG=/var/log/gate-$ROLE.log
 exec > >(tee -a "$LOG") 2>&1
@@ -111,7 +112,7 @@ cpu() {
     rc=0
     # shellcheck disable=SC2046
     $PY /opt/te/scripts/precision_gate/apply_gate.py $(label_args "$t" | sed 's|^|labels/|') "out/$t" "$t" \
-      "reports/$t.json" > "reports/$t.txt" || rc=$?
+      "reports/$t.json" ${EXCEPTION:+--exception "/opt/te/$EXCEPTION"} > "reports/$t.txt" || rc=$?
     [ $rc -eq 0 ] || [ $rc -eq 3 ] || { echo "ERROR: apply_gate crashed on $t (rc $rc)"; cat "reports/$t.txt"; return $rc; }
     grep '^GATE' "reports/$t.txt"
     [ $rc -eq 3 ] && not_passed="$not_passed $t"

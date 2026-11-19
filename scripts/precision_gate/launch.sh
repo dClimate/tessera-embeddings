@@ -10,6 +10,7 @@
 #   GATE_AMI, GATE_SUBNETS (space-separated), GATE_SG, GATE_INSTANCE_PROFILE_ARN,
 #   GATE_OUT (s3 root for runs), GATE_INPUTS (s3 root holding fp8-lattice/ and fp8-mixed/),
 #   GATE_CHECKPOINT (s3 URI of the v2 checkpoint), GATE_CODE (code tarball name under $GATE_OUT/<run>/code/),
+#   GATE_EXCEPTION (optional: a named exception's file, relative to the repository root),
 #   AWS_PROFILE, AWS_REGION
 # Prints "<role> <instance-id> <type> <az>" on success; exits 1 if no type had capacity.
 set -euo pipefail
@@ -22,7 +23,7 @@ ud=$(mktemp)
 trap 'rm -f "$ud"' EXIT
 sed -e "s|__RUN__|$RUN|" -e "s|__ROLE__|$ROLE|" -e "s|__CODE__|$GATE_CODE|" -e "s|__OUT__|$GATE_OUT|" \
   -e "s|__INPUTS__|$GATE_INPUTS|" -e "s|__CHECKPOINT__|$GATE_CHECKPOINT|" \
-  -e "s|__CAP_MIN__|$CAP|" "$here/bootstrap.sh" > "$ud"
+  -e "s|__EXCEPTION__|${GATE_EXCEPTION:-}|" -e "s|__CAP_MIN__|$CAP|" "$here/bootstrap.sh" > "$ud"
 if grep -q '__[A-Z_]*__' "$ud"; then
   echo "unfilled placeholder: $(grep -o '__[A-Z_]*__' "$ud" | head -1)" >&2
   exit 2

@@ -77,7 +77,8 @@ te-observe-cluster \
 - **`precision_gate.py`** — ADR 043's gate for a precision change: per-tile and
   per-class cross-change losses with block-jackknife SEs, thresholds calibrated
   from matched noise and class-directed controls, verdicts (pass, fail,
-  unresolved), the validity lists and the tripwire. Pure numpy over saved
+  unresolved), the validity lists and the tripwire, and a named exception's
+  bounds and the check against them. Pure numpy over saved
   predictions; `scripts/precision_gate/` produces and applies them.
 - **`compare_outputs.py`** — ADR-012 equivalence gate. Compares staged
   embeddings (int8 + scales) between a reference and a test run; exits nonzero
