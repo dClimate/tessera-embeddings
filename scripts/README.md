@@ -62,17 +62,16 @@ Answers "why is this environment behaving that way?" and is expected to work on 
 ## `precision_gate/` — supported tooling for precision changes
 
 The gate every precision change to the forward pass meets
-([ADR 043](../context_docs/decisions/043-fp8-linears-ship-on-cross-change-accuracy-and-the-a10g-stays-bf16.md)).
-The rule itself is the library's `profiling.inference.precision_gate`; these scripts feed it and apply it.
+([ADR 043](../context_docs/decisions/043-a-per-class-gate-for-precision-changes.md)). The rule itself is the
+library's `profiling.inference.precision_gate`; these scripts feed it and apply it. A run embeds the lattice
+four times, today's code on an L40S, A10G and L4 and the candidate branch on an L40S, then scores on CPU.
 
 | script | what it does |
 |---|---|
-| `apply_gate.py` | Applies the gate to one tile's per-variant predictions: calibrates from the noise draws and controls, gives every variant one verdict over the envelope, losses and tripwire (a trip is unresolved), reports the refit spread, writes the report JSON. Scores exactly the variants `base.npz` lists. Exits 3 if any embedded comparison does not pass (1 is a crash). Re-applied to the record's predictions it reproduces ADR 043's reports exactly. |
-| `embed_lattice.py` | Embeds ADR 012's lattice on one card, building a fresh production model per variant (bf16 chunked as production runs it, bf16 whole-batch, and the record's unfused FP8 sizes), so each runs the card's real forward, CUDA graph replay included. Refuses a box whose GPU is not the named card. One npz per tile. |
-| `calibrate.py` | Per-pixel probe and kNN-20 predictions for every variant the gate scores on one tile (the comparisons, 40 matched-noise draws, class-directed controls, refit redraws), sharded, one npz per variant; shard 0 also writes the ADR 012 envelope and coherence for each comparison. The record's method, folds and seeds. |
-| `select_probe_c.py` | Chooses the probe's L2 regularization `C` the way a user tuning a classifier would: spatial cross-validation on the bf16 reference over the gate's own folds, balanced accuracy, smallest `C` within one SE of the best. Reports each `C`'s iterations and the weights' share on the trailing 64 dimensions. `calibrate.py`'s `PROBE_C` is its result. |
-| `stage_record_embeddings.py` | Lays ADR 043's recorded embeddings out as `embed_lattice.py` writes them, so `calibrate.py` can re-score the record in a new environment and separate the environment's effect from a forward-pass change's. |
-| `bootstrap.sh`, `launch.sh`, `watch.sh` | Run the above on EC2: one box per card (`gpu-l40s`, `gpu-a10g`, `gpu-l4`) and one per scoring set (`cpu-record`, `cpu-rebase`). Every exit uploads the log and a status file (`ok`, `not-passed` when a gate ran to the end without passing, or `failed:<step>`) and shuts the box down; predictions upload in one checked sync. `watch.sh` exits 3 when every box finished and a gate did not pass, and fails fast on a failed status, a box gone without one, a traceback, CUDA error or OOM in the log, or 20 minutes without progress. Account infrastructure comes from `GATE_*` environment variables, never the repository. |
+| `embed_lattice.py` | Embeds ADR 012's lattice with the production forward of the code it runs from, for one side (`l40s`, `a10g`, `l4` or `cand`). Refuses a box whose GPU is not the side's card. |
+| `calibrate.py` | Per-pixel probe and kNN-20 predictions for every variant the gate scores on one tile (two card pairs, the candidate, a mixed store, 40 matched-noise draws, class-directed controls, refit redraws), sharded, one npz per variant; shard 0 also writes each comparison's ADR 012 envelope. |
+| `apply_gate.py` | Applies the gate to one tile's predictions: one verdict per variant over envelope, losses and tripwire, the validity lists and the refit spread, as JSON. Exits 3 if any comparison does not pass (1 is a crash). |
+| `bootstrap.sh`, `launch.sh`, `watch.sh` | Run the above on EC2: `gpu-l40s`, `gpu-a10g`, `gpu-l4`, `gpu-cand`, then `cpu-score`. Every exit uploads the log and a status (`ok`, `not-passed`, or `failed:<step>`) and shuts the box down. `watch.sh` exits 3 when every box finished and a gate did not pass, and fails fast on a failure, a box gone without a status, an error in the log, or 20 minutes without progress. Account infrastructure comes from `GATE_*` environment variables. |
 
 ## `scoping/` — kept-for-reference instruments
 

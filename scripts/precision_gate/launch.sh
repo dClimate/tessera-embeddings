@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Launch one precision-gate box: one pass over the subnets for each instance type given, no retry loop.
 #
-# usage: launch.sh <run> <role> <variants|-> <cap_minutes> <instance-type> [<fallback-type> ...]
-#   role: gpu-l40s, gpu-a10g, gpu-l4, cpu-record or cpu-rebase (see bootstrap.sh)
+# usage: launch.sh <run> <role> <cap_minutes> <instance-type> [<fallback-type> ...]
+#   role: gpu-l40s, gpu-a10g, gpu-l4, gpu-cand or cpu-score (see bootstrap.sh); for gpu-cand, GATE_CODE names
+#   the candidate's tarball, for every other role today's code
 #
 # The account's infrastructure comes from the environment, so no account identifiers live in this
 # repository:
@@ -12,15 +13,15 @@
 #   AWS_PROFILE, AWS_REGION
 # Prints "<role> <instance-id> <type> <az>" on success; exits 1 if no type had capacity.
 set -euo pipefail
-RUN=$1 ROLE=$2 VARIANTS=$3 CAP=$4
-shift 4
+RUN=$1 ROLE=$2 CAP=$3
+shift 3
 : "${GATE_AMI:?}" "${GATE_SUBNETS:?}" "${GATE_SG:?}" "${GATE_INSTANCE_PROFILE_ARN:?}" "${GATE_OUT:?}" \
   "${GATE_INPUTS:?}" "${GATE_CHECKPOINT:?}" "${GATE_CODE:?}" "${AWS_REGION:?}"
 here=$(cd "$(dirname "$0")" && pwd)
 ud=$(mktemp)
 trap 'rm -f "$ud"' EXIT
 sed -e "s|__RUN__|$RUN|" -e "s|__ROLE__|$ROLE|" -e "s|__CODE__|$GATE_CODE|" -e "s|__OUT__|$GATE_OUT|" \
-  -e "s|__INPUTS__|$GATE_INPUTS|" -e "s|__CHECKPOINT__|$GATE_CHECKPOINT|" -e "s|__VARIANTS__|$VARIANTS|" \
+  -e "s|__INPUTS__|$GATE_INPUTS|" -e "s|__CHECKPOINT__|$GATE_CHECKPOINT|" \
   -e "s|__CAP_MIN__|$CAP|" "$here/bootstrap.sh" > "$ud"
 if grep -q '__[A-Z_]*__' "$ud"; then
   echo "unfilled placeholder: $(grep -o '__[A-Z_]*__' "$ud" | head -1)" >&2

@@ -6,20 +6,17 @@ matrices. ``apply_gate.py`` applies the gate from these files, so its rule can c
 recomputing predictions. Shard 0 also writes ``envelope.json``: ADR 012's envelope and coherence for
 every embedded comparison.
 
-Embeddings come from ``embed_lattice.py``: ``lattice_<card>_<tile>.npz`` for cards ``l40s``, ``a10g`` and
-``l4``. The reference is L40S ``bf16``, today's chunked forward. Variants:
+Embeddings come from ``embed_lattice.py``: ``lattice_<side>_<tile>.npz`` for sides ``l40s``, ``a10g``,
+``l4`` (today's code) and ``cand`` (the candidate, on an L40S). The reference is ``l40s``. Variants:
 
-  cards_A10G, cards_L4          two cards on today's bf16 forward (known good)
-  chunking                      L40S whole-batch bf16: what chunked graph replay itself does
-  fp8_all4, fp8_stage1          FP8 on the L40S against the reference
-  mixed_all4, mixed_stage1      reference A10G bf16, test L40S FP8 (a mixed store)
-  noise_<size>_<d>              isotropic noise matched to that FP8 size's mean cosine after int8, 20 draws each
-  ctrl_<i>_<j>_<cos>            class i shifted towards class j's centroid, cosine <cos> inside class i
-                                (j = i's most-confused class under the reference probe)
-  ctrl2_<i>_<j>_<cos>           the largest class shifted towards the smallest control-eligible class
-  refit_<r>                     bf16 only, 48k training sample redrawn (seed r): the refit spread, reported
-
-The method, folds and seeds are the record's (``perclass_cal.py`` in ``s3://.../perf/fp8-mixed/scripts/``).
+  cards_A10G, cards_L4    two cards on today's code (known good)
+  candidate               the candidate against the reference
+  mixed                   reference A10G, test the candidate (a store both cards write to)
+  noise_<d>               isotropic noise matched to the candidate's mean cosine after int8, 40 draws
+  ctrl_<i>_<j>_<cos>      class i shifted towards class j's centroid, cosine <cos> inside class i
+                          (j = i's most-confused class under the reference probe)
+  ctrl2_<i>_<j>_<cos>     the largest class shifted towards the smallest control-eligible class
+  refit_<r>               the reference only, 48k training sample redrawn (seed r): the refit spread, reported
 
 Per variant (int8 arrays over the lattice; -1 = unlabelled):
   p_rx, k_rx   fitted on the reference, applied to the test side  (baseline: p_rr, k_rr in base.npz)
@@ -52,27 +49,25 @@ labels_path, label_key, embed_dir, TILE = sys.argv[1:5]
 SHARD, NSHARDS, OUTDIR = int(sys.argv[5]), int(sys.argv[6]), Path(sys.argv[7])
 SMOKE = os.environ.get("SMOKE") == "1"
 NTRAIN = 4800 if SMOKE else 48000
-NDRAWS = 2 if SMOKE else 20
+NDRAWS = 4 if SMOKE else 40
 DOSES = (0.9999, 0.99995, 0.99998)
 NREFIT = 2 if SMOKE else 10
 MIN_CTRL = 2000  # px; classes smaller than this cannot reach the gating SE, so get no control
-PROBE_C = 0.003  # chosen by select_probe_c.py: spatial CV on the bf16 reference, one-SE rule
+PROBE_C = 0.003  # spatial CV on the reference, one-SE rule (select_probe_c.py, removed in this file's history)
 PROBE_TOL = 1e-6
 PROBE_MAX_ITER = 5000
-SIZES = ("all4", "stage1")
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
 L = np.load(labels_path)
-F = {card: np.load(Path(embed_dir) / f"lattice_{card}_{TILE}.npz") for card in ("l40s", "a10g", "l4")}
+F = {side: np.load(Path(embed_dir) / f"lattice_{side}_{TILE}.npz") for side in ("l40s", "a10g", "l4", "cand")}
 for f in F.values():
     assert (f["Y"] == L["Y"]).all() and (f["X"] == L["X"]).all()
 N = L["Y"].size
 
 
-def deq(card: str, variant: str) -> np.ndarray:
-    """A card's variant, dequantised to float32."""
-    f = F[card]
-    return f[f"{variant}_q"].astype(np.float32) * f[f"{variant}_s"][:, None]
+def deq(side: str) -> np.ndarray:
+    """A side's embedding, dequantised to float32."""
+    return F[side]["q"].astype(np.float32) * F[side]["s"][:, None]
 
 
 def environment() -> dict:
@@ -118,7 +113,7 @@ win = 3 * (yi // 160) + xi // 160
 ok = lab >= 0
 cnt = np.bincount(lab[ok], minlength=K)
 
-ref = deq("l40s", "bf16")
+ref = deq("l40s")
 u_ref = unit(ref)
 cent = np.stack([u_ref[lab == i].mean(0) if cnt[i] else np.zeros(128, np.float32) for i in range(K)])
 km_rng = np.random.default_rng(0)
@@ -232,11 +227,10 @@ def save(name: str, **arrs: np.ndarray) -> None:
 
 # (reference side, test side) per embedded comparison; the envelope is scored for each
 PAIRS = {
-    "cards_A10G": (("l40s", "bf16"), ("a10g", "bf16")),
-    "cards_L4": (("l40s", "bf16"), ("l4", "bf16")),
-    "chunking": (("l40s", "bf16"), ("l40s", "bf16_whole")),
-    **{f"fp8_{s}": (("l40s", "bf16"), ("l40s", f"fp8_{s}")) for s in SIZES},
-    **{f"mixed_{s}": (("a10g", "bf16"), ("l40s", f"fp8_{s}")) for s in SIZES},
+    "cards_A10G": ("l40s", "a10g"),
+    "cards_L4": ("l40s", "l4"),
+    "candidate": ("l40s", "cand"),
+    "mixed": ("a10g", "cand"),
 }
 
 log("classes: " + ", ".join(f"{n} {c}" for n, c in zip(names, cnt, strict=True)))
@@ -255,30 +249,26 @@ log(
     + f"; ctrl2 {names[big]}->{names[small]}"
 )
 
-fp8 = {s: deq("l40s", f"fp8_{s}") for s in SIZES}
-cn = {}
-for s, x in fp8.items():
-    c = float((u_ref * unit(x)).sum(1).mean())
-    c_try = float((u_ref * unit(noisy(999, c))).sum(1).mean())
-    cn[s] = 1 - (2 * (1 - c) - (1 - c_try))  # squared angles add: aim the noise at what is left after re-quantising
+c = float((u_ref * unit(deq("cand"))).sum(1).mean())
+c_try = float((u_ref * unit(noisy(999, c))).sum(1).mean())
+cn = 1 - (2 * (1 - c) - (1 - c_try))  # squared angles add: aim the noise at what is left after re-quantising
 
 V = list(PAIRS)
-V += [f"noise_{s}_{d}" for d in range(NDRAWS) for s in SIZES]
+V += [f"noise_{d}" for d in range(NDRAWS)]
 V += [f"ctrl_{i}_{j}_{c:g}" for i, j in confused.items() for c in DOSES]
 V += [f"ctrl2_{big}_{small}_{c:g}" for c in DOSES]
 V += [f"refit_{r}" for r in range(NREFIT)]
 if SMOKE:
-    V = [V[k] for k in (0, 2, 3, 5, len(PAIRS), len(PAIRS) + 2 * NDRAWS, len(V) - 1)]
+    V = [V[k] for k in (0, 2, 3, *range(len(PAIRS), len(PAIRS) + NDRAWS), len(PAIRS) + NDRAWS, len(V) - 2, len(V) - 1)]
 mine = [name for k, name in enumerate(V) if k % NSHARDS == SHARD]
 log(f"{len(V)} variants, {len(mine)} on this shard")
 if SHARD == 0:
     save("base", p_rr=p_rr, k_rr=knn(ref, ref), clus=clus.astype(np.int8), variants=np.array(V))
     env = {}
     for name, (r, t) in PAIRS.items():
-        fr, ft = F[r[0]], F[t[0]]
-        env[name] = pg.envelope(fr[f"{r[1]}_q"], fr[f"{r[1]}_s"], ft[f"{t[1]}_q"], ft[f"{t[1]}_s"])
-        env[name]["coherence"] = pg.coherence(deq(*r), deq(*t))
-        env[name]["noise_cosine_target"] = cn.get(name.split("_", 1)[-1])
+        env[name] = pg.envelope(F[r]["q"], F[r]["s"], F[t]["q"], F[t]["s"])
+        env[name]["coherence"] = pg.coherence(deq(r), deq(t))
+    env["candidate"]["noise_cosine_target"] = cn
     (OUTDIR / "envelope.json").write_text(json.dumps(env, indent=1))
     (OUTDIR / "environment.json").write_text(json.dumps(environment(), indent=1))
 
@@ -288,9 +278,9 @@ def test_side(name: str) -> tuple[np.ndarray, np.ndarray]:
     kind, *a = name.split("_")
     if name in PAIRS:
         r, t = PAIRS[name]
-        return (ref if r == ("l40s", "bf16") else deq(*r)), deq(*t)
+        return (ref if r == "l40s" else deq(r)), deq(t)
     if kind == "noise":
-        return ref, noisy(100 + int(a[1]) + (0 if a[0] == "all4" else 1000), cn[a[0]])
+        return ref, noisy(100 + int(a[0]), cn)
     if kind in ("ctrl", "ctrl2"):
         return ref, directed(int(a[0]), int(a[1]), float(a[2]))
     raise ValueError(name)

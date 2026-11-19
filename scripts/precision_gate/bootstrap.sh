@@ -2,9 +2,9 @@
 # User data for one precision-gate box. launch.sh fills in the double-underscored placeholders.
 #
 # Roles:
-#   gpu-<card>     embed the lattice on this card (l40s, a10g, l4) with __VARIANTS__, one npz per tile
-#   cpu-record     re-score ADR 043's recorded embeddings in this environment (the environment-only control)
-#   cpu-rebase     score this run's embeddings, which the gpu-* boxes must already have written
+#   gpu-<side>     embed the lattice for one side (l40s, a10g, l4: today's code; cand: the candidate's code,
+#                  on an L40S), one npz per tile. __CODE__ is the code tarball this box runs.
+#   cpu-score      score the run's embeddings, which the four gpu-* boxes must already have written
 #
 # Every exit uploads the log and a status file and shuts the box down. The status is ok; not-passed when
 # a cpu-* box's gate ran to the end and some comparison did not pass (a result, not a crash); or
@@ -17,7 +17,6 @@ CODE=__CODE__
 OUT=__OUT__/$RUN
 INPUTS=__INPUTS__
 CHECKPOINT=__CHECKPOINT__
-VARIANTS=__VARIANTS__
 TILES="cpu-ab-uk cpu-ab-iowa fp8-ecuador fp8-punjab fp8-finland fp8-kansas"
 LOG=/var/log/gate-$ROLE.log
 exec > >(tee -a "$LOG") 2>&1
@@ -57,7 +56,7 @@ label_args() {  # tile -> "<labels file> <label key>"
 }
 
 gpu() {
-  local card=${ROLE#gpu-}
+  local side=${ROLE#gpu-}
   STEP=torch
   uv pip install -q --python $PY --reinstall-package torch "torch==2.14.1+cu130" \
     --index-url https://download.pytorch.org/whl/cu130 --index-strategy unsafe-best-match
@@ -69,26 +68,19 @@ gpu() {
   for t in $TILES; do
     STEP=embed:$t
     aws s3 cp --quiet "$INPUTS/fp8-lattice/lattice_$t.pt" /opt/lat/
-    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True $PY scripts/precision_gate/embed_lattice.py \
-      "$card" /opt/lat /opt/emb "$t" --variants "$VARIANTS"
-    aws s3 cp --quiet "/opt/emb/lattice_${card}_$t.npz" "$OUT/embed/"
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True $PY scripts/precision_gate/embed_lattice.py "$side" /opt/lat /opt/emb "$t"
+    aws s3 cp --quiet "/opt/emb/lattice_${side}_$t.npz" "$OUT/embed/"
     rm -f "/opt/lat/lattice_$t.pt"
   done
 }
 
 cpu() {
-  local set=${ROLE#cpu-} ns=10 pids=() t s
+  local ns=10 pids=() t s
   export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
   STEP=inputs
-  mkdir -p /opt/s/labels /opt/s/emb /opt/s/rec /opt/s/logs && cd /opt/s
+  mkdir -p /opt/s/labels /opt/s/emb /opt/s/logs && cd /opt/s
   aws s3 sync --quiet "$INPUTS/fp8-mixed/labels/" labels/
-  if [ "$set" = record ]; then
-    aws s3 sync --quiet "$INPUTS/fp8-mixed/" rec/ --exclude '*' --include 'mixed_g6e_*.npz' --include 'mixed_g6_*.npz' \
-      --include 'mixed_g5_*.npz' --include 'mixed_g5emu_*.npz'
-    $PY /opt/te/scripts/precision_gate/stage_record_embeddings.py rec emb $TILES
-  else
-    aws s3 sync --quiet "$OUT/embed/" emb/
-  fi
+  aws s3 sync --quiet "$OUT/embed/" emb/
   STEP=calibrate
   for t in $TILES; do
     for s in $(seq 0 $((ns - 1))); do
@@ -106,9 +98,9 @@ cpu() {
   local progress=$! failed=0
   for p in "${pids[@]}"; do wait "$p" || failed=$((failed + 1)); done
   kill $progress || true
-  aws s3 sync --quiet logs/ "$OUT/$set/logs/" || true
+  aws s3 sync --quiet logs/ "$OUT/score/logs/" || true
   STEP=upload
-  aws s3 sync --quiet out/ "$OUT/$set/pred/"  # checked: the gate's result is re-applied from these
+  aws s3 sync --quiet out/ "$OUT/score/pred/"  # checked: the gate's result is re-applied from these
   STEP=calibrate
   [ $failed -eq 0 ] || { echo "ERROR: $failed calibrate shards failed"; return 1; }
   STEP=gate
@@ -125,7 +117,7 @@ cpu() {
     [ $rc -eq 3 ] && not_passed="$not_passed $t"
     cp "out/$t/environment.json" "reports/${t}_environment.json"
   done
-  aws s3 sync --quiet reports/ "$OUT/$set/reports/"
+  aws s3 sync --quiet reports/ "$OUT/score/reports/"
   STEP=verdict
   [ -z "$not_passed" ] || { echo "GATE NOT PASSED on:$not_passed"; exit 3; }
 }
