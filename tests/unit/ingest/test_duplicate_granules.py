@@ -449,6 +449,8 @@ class TestASpareThatWillRefuseIsKeptOffTheLadderWithoutVisibleAssets:
         # Where the producer varies by item the assets ARE the evidence, so there is no
         # collection-wide answer to give.
         assert _known_harmonisation("earth-search", "sentinel-2-l2a") is None
+        # Collection 1 has one producer, which leaves the offset in.
+        assert _known_harmonisation("earth-search", "sentinel-2-c1-l2a") is Harmonisation.RAW
         # And a collection owed no offset at all has no producer worth naming.
         assert _known_harmonisation("earth-search", "sentinel-2-l1c") is None
 

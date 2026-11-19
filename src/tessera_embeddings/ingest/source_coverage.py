@@ -58,11 +58,11 @@ import numpy as np
 from pystac_client import Client
 from pystac_client.stac_api_io import StacApiIO
 
-from tessera_embeddings.config import PROVIDERS
+from tessera_embeddings.config import DEFAULT_S2_COLLECTION, PROVIDERS
 from tessera_embeddings.ingest._http import make_logging_retry, spawn_abandonable
 from tessera_embeddings.ingest.land_mask import live_tile_block_bboxes_wgs84
 from tessera_embeddings.ingest.solar_days import whole_window_range
-from tessera_embeddings.ingest.stac import split_antimeridian_bbox
+from tessera_embeddings.ingest.stac import collection_for_window, split_antimeridian_bbox
 from tessera_embeddings.storage import zone_grid
 from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group
 
@@ -184,7 +184,7 @@ def preflight_optical_source(
     *,
     land_mask_path: str,
     provider: str = "earth-search",
-    collection: str = "sentinel-2-l2a",
+    collection: str = DEFAULT_S2_COLLECTION,
     block_tiles: int = BLOCK_TILES,
     budget_s: float = PROBE_BUDGET_S,
     probe: ExistenceProbe | None = None,
@@ -231,7 +231,7 @@ def preflight_optical_source(
         # land, so the common case settles in one probe.
         blocks.sort(key=lambda entry: entry[1], reverse=True)
         if probe is None:
-            probe = _make_default_probe(provider, collection)
+            probe = _make_default_probe(provider, collection_for_window(provider, collection, *window.to_date_range()))
     except Exception as exc:
         log.warning("Optical preflight for %s could not be set up — passing the cell through", zone, exc_info=True)
         return OpticalPreflight(zone, SourceFinding.INCONCLUSIVE, f"preflight setup failed: {exc!r}", 0)

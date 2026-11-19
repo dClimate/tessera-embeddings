@@ -1,6 +1,7 @@
 """Dataclasses and the provider registry for querying satellite data from STAC catalogs."""
 
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Literal
 
 from .satellites import (
@@ -59,6 +60,11 @@ class CollectionConfig:
     #: The band the source index is read from: the one each sensor's validity is judged on, so the
     #: index and the mask share one definition (``ingest/provenance.py``). Needs ``fusion_order``.
     source_index_band: str | None = None
+    #: Inclusive ``(first, last)`` ISO-date ranges the catalogue is known to hold only part of, and
+    #: the alias of the collection a window touching any of them reads instead. A run reads one
+    #: collection end to end, so the store it writes never mixes producers within a run.
+    incomplete: tuple[tuple[str, str], ...] = ()
+    fallback: str | None = None
 
     @property
     def requires_baseline_correction(self) -> bool:
@@ -103,6 +109,23 @@ class STACProvider:
 # Pre-configured Providers
 # =============================================================================
 
+#: The Sentinel-2 collection every pipeline reads unless told otherwise.
+DEFAULT_S2_COLLECTION = "sentinel-2-c1-l2a"
+
+#: Earth Search's two Sentinel-2 L2A collections share everything but what is set per collection.
+_earth_search_s2_l2a = partial(
+    CollectionConfig,
+    bands=S2_L2A_BANDS,
+    resolution=10,
+    baseline_threshold=S2_BASELINE_THRESHOLD,
+    baseline_offset=S2_BASELINE_OFFSET,
+    tile_id_prefix="MGRS-",
+    has_scl=True,
+    fusion_order="clearest_scene",
+    band_names_are_asset_keys=True,
+    source_index_band="scl",
+)
+
 # Served identically by Earth Search and Planetary Computer, which differ only in what they call
 # the Sentinel-1 collection.
 _LANDSAT_C2_L2 = CollectionConfig(
@@ -132,27 +155,31 @@ PROVIDERS: dict[str, STACProvider] = {
         name="Earth Search (Element 84)",
         catalog_url="https://earth-search.aws.element84.com/v1",
         collections={
-            # Earth Search harmonises the BOA offset (subtracts 1000 post-baseline 04.00) in its
-            # OWN COGs, but this collection also indexes items pointing at ESA originals, which
-            # still carry it — hence the threshold plus `harmonisation_varies_by_item`, which
-            # decides per ASSET from where that asset lives. Unsetting the threshold exempts the
-            # whole collection and is correct only if every item is a harmonised COG. The
-            # raster:bands offset=-0.1 and earthsearch:boa_offset_applied metadata are unreliable
-            # (sertit/eoreader#120), so asset location is the signal. ADR 021.
-            "sentinel-2-l2a": CollectionConfig(
-                collection_id="sentinel-2-l2a",
-                bands=S2_L2A_BANDS,
-                resolution=10,
-                baseline_threshold=S2_BASELINE_THRESHOLD,
-                baseline_offset=S2_BASELINE_OFFSET,
-                tile_id_property="grid:code",
-                tile_id_prefix="MGRS-",
-                has_scl=True,
-                fusion_order="clearest_scene",
-                harmonisation_varies_by_item=True,
-                band_names_are_asset_keys=True,
-                source_index_band="scl",
+            # Collection 1: ESA's reprocessing of the whole archive at baseline 05.00 or later,
+            # served by one producer (Element 84's COGs) that leaves the BOA offset IN the pixels.
+            # So every item is RAW and the offset is always owed. Settled for the collection
+            # (`harmonisation_varies_by_item` off) and never read from the bucket, because these
+            # COGs live in `e84-earth-search-sentinel-data`, which `asset_locations` lists as
+            # harmonised for the legacy collection's objects there. Its `raster:bands` offset of
+            # -0.1 is correct here, unlike the legacy collection's.
+            #
+            # `incomplete`: measured against the legacy collection on eight tiles across six
+            # continents, Collection 1 holds every legacy date in 2020, 2021 and 2023 onward but
+            # about a third of 2019's (none before late March), half of 2018's, almost none
+            # before, and under a tenth of 2022's. Windows touching those years read the legacy
+            # collection. ADR 044.
+            "sentinel-2-c1-l2a": _earth_search_s2_l2a(
+                collection_id="sentinel-2-c1-l2a",
+                incomplete=(("2015-01-01", "2019-12-31"), ("2022-01-01", "2022-12-31")),
+                fallback="sentinel-2-l2a",
             ),
+            # The legacy collection, read where Collection 1 is incomplete. Earth Search harmonises
+            # the BOA offset (subtracts 1000 post-baseline 04.00) in its OWN COGs, but this
+            # collection also indexes items pointing at ESA originals, which still carry it —
+            # hence `harmonisation_varies_by_item`, which decides per ASSET from where that asset
+            # lives. The raster:bands offset=-0.1 and earthsearch:boa_offset_applied metadata are
+            # unreliable here (sertit/eoreader#120), so asset location is the signal. ADR 021.
+            "sentinel-2-l2a": _earth_search_s2_l2a(collection_id="sentinel-2-l2a", harmonisation_varies_by_item=True),
             "sentinel-2-l1c": CollectionConfig(
                 collection_id="sentinel-2-l1c",
                 bands=S2_L1C_BANDS,

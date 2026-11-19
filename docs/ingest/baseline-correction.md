@@ -58,6 +58,14 @@ read keyed on the configured band names finds nothing under — be decided here 
 rather than refused on every modern item. One decision serves both shapes of collection, so they
 cannot disagree about a producer.
 
+**Collection 1 (`sentinel-2-c1-l2a`, the default) is one of these collections.** Its single
+producer leaves the offset in, so every item is corrected. Its COGs live in
+`e84-earth-search-sentinel-data`, which `asset_locations` lists as harmonised because the legacy
+collection's COGs there are, so consulting the bucket would leave Collection 1 pixels 1000 too high.
+The per-asset decision described above applies only to the legacy `sentinel-2-l2a`, which is read
+for the years Collection 1 is incomplete
+([ADR 044](../../context_docs/decisions/044-sentinel-2-reads-collection-1-where-it-is-complete.md)).
+
 Which assets carry the reflectance bands is resolved through **odc's own alias table**
 (`stac._reflectance_asset_keys`), not from the configured band names, for the same reason. `scl`
 is excluded structurally — it is simply not among the resolved keys — rather than by a list the

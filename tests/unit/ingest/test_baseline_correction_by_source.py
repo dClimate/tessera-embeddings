@@ -40,6 +40,7 @@ from tessera_embeddings.ingest.duplicates import select_preferred_duplicates
 from tessera_embeddings.ingest.stac import (
     _declared_baseline,
     _extract_baseline,
+    collection_harmonisation,
     extract_baselines,
 )
 
@@ -250,6 +251,19 @@ class TestThePerItemCheckIsScopedToTheCollectionThatNeedsIt:
         item = self._pc_item()
         bucket = asset_bucket(item.assets["B02"]["href"])
         assert source_decision(bucket, _declared_baseline(item), 400, None) is OffsetDecision.UNDECIDABLE
+
+
+def test_collection_1_is_corrected_though_its_bucket_is_listed_harmonised() -> None:
+    """Collection 1 keeps the offset in COGs served from the bucket the legacy collection's
+    harmonised COGs also live in. Its config settles RAW, which overrides the bucket; the control
+    shows the bucket alone would exempt it and leave every pixel 1000 too high.
+    """
+    bucket = asset_bucket(
+        "https://e84-earth-search-sentinel-data.s3.us-west-2.amazonaws.com/sentinel-2-c1-l2a/15/T/VF/2023/7/x/B04.tif"
+    )
+    settled = collection_harmonisation(PROVIDERS["earth-search"].collections["sentinel-2-c1-l2a"])
+    assert source_decision(bucket, 509, 400, settled) is OffsetDecision.OWED
+    assert source_decision(bucket, 509, 400, None) is OffsetDecision.EXEMPT
 
 
 class TestTheTwoBucketSetsAreIndependent:
