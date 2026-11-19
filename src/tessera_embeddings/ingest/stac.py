@@ -56,6 +56,7 @@ from tessera_embeddings.ingest.solar_days import (
     normalize_to_solar_day,
     owned_items,
     resolve_grouping_longitude,
+    validated_window,
 )
 
 # =============================================================================
@@ -273,7 +274,8 @@ def collection_for_window(provider_name: str, collection_alias: str, start_date:
     here, so the optical preflight probes the collection the ingest will read.
     """
     config = _get_collection_config(provider_name, collection_alias)
-    start, end = start_date[:10], end_date[:10]
+    # Canonical spellings, since a compact `20220101` sorts above `2022-12-31` (`validated_window`).
+    start, end = (day.isoformat() for day in validated_window(start_date, end_date))
     if config.fallback is None or not any(start <= last and end >= first for first, last in config.incomplete):
         return collection_alias
     logger.info("%s is incomplete within %s..%s; reading %s instead", collection_alias, start, end, config.fallback)
