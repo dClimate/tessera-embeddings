@@ -62,7 +62,7 @@ Graph capture, replay-equals-eager and NaN isolation all held. Mean cosine to bf
   1.9%. Per-tensor scales are similar. E5M2 fails the envelope (95.7–97.4% within ±1).
 - **Six tiles, real kernels.** ADR 012's envelope held on every tile, mixed stores included: at least 99.58%
   within ±1, worst cosine 0.99940, drift at most 2.6%. Ecuador with all four linears came closest. Across the
-  change, a linear probe moved at most 0.2 points per tile, past the metric's own noise only on Ecuador and Kansas.
+  change, a linear probe moved at most 0.17 points per tile, past the metric's own noise only on Ecuador and Kansas.
   kNN-20 stayed within noise.
 - **Per class it fails ADR 043's gate.** At Stage 1 it fails Ecuador wetland recall (0.84 ± 0.18). It leaves
   Kansas developed kNN precision (0.51 ± 0.17) and Finland grass recall (0.52 ± 0.09) unresolved. With all four
@@ -124,7 +124,9 @@ These findings bear on ADR 012's gates, not only on FP8:
   `scripts/te-fp8-code.tgz` (the code measured), and `out/`. The code is also in this repository's history,
   reverted in `614ce448`.
 - **Six-tile accuracy and the gate's calibration:** `s3://arbol-tessera-inputs-dev/perf/fp8-mixed/` (per-card
-  embeddings, labels, scripts, per-class scoring under `perclass/`). Re-scored with the converged probe in
+  embeddings, labels, scripts, per-class scoring under `perclass/`; `scripts/perclass_cal.py` and
+  `perclass_rule.py` became `scripts/precision_gate/calibrate.py` and `apply_gate.py`, whose reports carry
+  each tile's z_fam and gated cells). Re-scored with the converged probe in
   `perf/fp8-rebase/rebase-20261118/record/`. The tiles' mosaics are in `mosaics/fp8-*` and `mosaics/cpu-ab-*`.
 - **Early FP8 and int8 measurements, neighbour calibration:** `s3://arbol-tessera-inputs-dev/perf/cpu-ab/`
   (`scripts/`, `gate-calibration/`). CPU library integration is on branch `feature/cpu-tc-encoder`.
