@@ -108,9 +108,10 @@ the activations already quantised, the best any fused kernel could do:
   own gain: 1.42× (QKV) and 1.85× (FFN up) at 896,000 rows, at most 1.17× and none at 7,400. FP8 doubles the
   tensor cores' arithmetic rate, which pays only when a multiply is long enough for arithmetic to dominate.
 - **Dropping chunks for FP8 does not help.** Chunked replay makes the bf16 forward 1.04–1.19× faster than the whole
-  batch ([`v2-chunked-graph-replay.md`](v2-chunked-graph-replay.md) §3), so whole-batch FP8 would need about
-  1.17–1.28× over whole-batch bf16 to clear the 1.08× bar against today's forward: past the fused-LayerNorm
-  estimate (~1.15×), and reached only by the Tier B estimate (~1.25–1.3×).
+  batch ([`v2-chunked-graph-replay.md`](v2-chunked-graph-replay.md) §3), so whole-batch FP8 would need
+  1.12–1.29× over whole-batch bf16 to clear the 1.08× bar against today's forward. The fused-LayerNorm estimate
+  (~1.15×) clears that only on the shapes chunking helps least; the Tier B estimate (~1.25–1.3×) on most. Both
+  are estimates, never built.
 - **The first FFN projection gains nothing from FP8 even when quantisation is free.** bf16 already runs its bias
   and ReLU inside the multiply; FP8 adds the ReLU as its own pass.
 - **Ceilings, with every quantisation free.** Summing the free savings over the eight encoder layers and dividing
