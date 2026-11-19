@@ -8,8 +8,6 @@ moves the same check to flow entry, where it costs one metadata read.
 
 from __future__ import annotations
 
-import functools
-
 import pytest
 import zarr
 
@@ -21,7 +19,6 @@ from tessera_embeddings.inference.orchestration_helpers import (
     build_inference_config,
     embedding_store_path,
 )
-from tessera_embeddings.storage.conventions import precision_attrs
 from tessera_embeddings.storage.manifest import ConfigMismatchError
 from tessera_embeddings.storage.zarr_store import open_or_create_repo
 
@@ -180,40 +177,3 @@ def test_a_checkpoint_change_is_refused_before_compute_even_without_a_manifest(t
             config=_config(tmp_path, checkpoint="tessera_v1_mpc.pt"),
             mosaic_base=None,
         )
-
-
-@pytest.mark.parametrize(
-    ("stamped", "run", "refused"),
-    [(None, "fp8", True), ("fp8", "bf16", True), ("fp8", "fp8", False), (None, "bf16", False)],
-)
-def test_a_store_keeps_its_precision_before_any_compute(tmp_path, stamped, run, refused) -> None:
-    """ADR 043: an existing v2 store begun in bf16 (no precision recorded) refuses an FP8 run, and the reverse."""
-    config = build_inference_config(
-        s1_orbit="both",
-        time_window=parse_time_window("June 2025"),
-        checkpoint_path=f"{tmp_path}/models/v2_student_large.pt",
-        inputs_bucket=str(tmp_path / "inputs"),
-        output_bucket=str(tmp_path / "outputs"),
-        model_version="v2-large",
-        precision=run,
-    )
-    path = _store_published_by(tmp_path, config, encoder_url("v2-large"))
-    repo, _ = open_or_create_repo(path)
-    session = repo.writable_session("main")
-    # A store with embeddings and no stack record (written before ADR 025) is bf16 like any other unmarked store.
-    zarr.open_group(session.store, mode="a").attrs.update(precision_attrs(stamped) if stamped else {})
-    if stamped:
-        session.commit("created at fp8")
-    check = functools.partial(
-        assert_output_store_accepts,
-        output_bucket=str(tmp_path / "outputs"),
-        roi_name=_ROI,
-        output_name_suffix="",
-        config=config,
-        mosaic_base=None,
-    )
-    if refused:
-        with pytest.raises(ConfigMismatchError, match="precision"):
-            check()
-    else:
-        check()

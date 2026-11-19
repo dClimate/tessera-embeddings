@@ -43,7 +43,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Callable
-from typing import NamedTuple, cast
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -151,86 +151,8 @@ def _compiled_add_layer_norm() -> Callable[..., torch.Tensor]:
     return cast(Callable[..., torch.Tensor], compiled)
 
 
-E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448
-_SCALE_FLOOR = 1e-12  # an all-zero row or channel scales to this rather than dividing by zero
-_ROW_MULTIPLE = 16  # cuBLASLt's FP8 multiply needs rows in multiples of 16
-
-
-class FP8Weight(NamedTuple):
-    """A linear layer's weight in E4M3, laid out for :func:`torch.nn.functional.scaled_mm`."""
-
-    #: ``(in, out)``, column-major: the transpose of the E4M3 ``(out, in)`` weight.
-    weight: torch.Tensor
-    #: ``(1, out)`` fp32: the value of output channel ``j`` is ``weight[:, j] * scale[0, j]``.
-    scale: torch.Tensor
-
-
-class FP8Layer(NamedTuple):
-    """The two FP8 linears of one encoder layer. ``qkv`` is ``None`` where that projection stays bf16."""
-
-    qkv: FP8Weight | None
-    ffn_up: FP8Weight
-
-
-def _scale_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """E4M3 codes of the fp32 rows of *x*, each scaled so its largest magnitude is 448, and the ``(rows, 1)`` scales.
-
-    A row holding a NaN or an infinity gets a NaN or infinite scale, so it stays non-finite through the
-    multiply and the int8 quantiser refuses it, and no other row is touched. The clamp keeps a quotient one
-    rounding step past 448 a finite code.
-    """
-    scale = x.abs().amax(dim=1, keepdim=True).div_(E4M3_MAX).clamp_(min=_SCALE_FLOOR)
-    return (x / scale).clamp_(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn), scale
-
-
-def fp8_weight(weight: torch.Tensor) -> FP8Weight:
-    """Quantise an fp32 ``(out, in)`` weight to E4M3 with one scale per output channel."""
-    codes, scale = _scale_rows(weight.float())
-    return FP8Weight(codes.t(), scale.t().contiguous())
-
-
-def build_fp8_layers(encoder: StudentTransformerEncoder) -> list[FP8Layer]:
-    """FP8 weights for QKV and the first FFN projection of every layer of *encoder*, from its current weights.
-
-    Call it while the weights are still fp32, so each is rounded once. The first layer's QKV stays bf16:
-    its input is the band embedding plus the day-of-year encoding, which no LayerNorm has produced.
-    """
-    layers = cast("nn.TransformerEncoder", encoder.transformer_encoder).layers
-    return [
-        FP8Layer(
-            qkv=None if i == 0 else fp8_weight(cast("nn.TransformerEncoderLayer", layer).self_attn.in_proj_weight),
-            ffn_up=fp8_weight(cast("nn.TransformerEncoderLayer", layer).linear1.weight),
-        )
-        for i, layer in enumerate(layers)
-    ]
-
-
-def _fp8_linear(x: torch.Tensor, weight: FP8Weight, bias: torch.Tensor) -> torch.Tensor:
-    """``x @ W.T + bias`` with *x* quantised per token row and *W* per output channel, output in *x*'s dtype."""
-    x2 = x.reshape(-1, x.shape[-1])
-    m = x2.shape[0]
-    if pad := -m % _ROW_MULTIPLE:  # never on a replayed chunk; a whole batch may need it
-        x2 = F.pad(x2, (0, 0, 0, pad))
-    codes, scale = _scale_rows(x2.float())
-    y = F.scaled_mm(
-        codes,
-        weight.weight,
-        scale,
-        F.ScalingType.RowWise,
-        weight.scale,
-        F.ScalingType.RowWise,
-        bias=bias,
-        output_dtype=x.dtype,
-        use_fast_accum=True,
-    )
-    return y[:m].view(*x.shape[:-1], -1)
-
-
 def _encoder_layer_forward(
-    layer: nn.TransformerEncoderLayer,
-    x: torch.Tensor,
-    add_layer_norm: Callable[..., torch.Tensor],
-    fp8: FP8Layer | None = None,
+    layer: nn.TransformerEncoderLayer, x: torch.Tensor, add_layer_norm: Callable[..., torch.Tensor]
 ) -> torch.Tensor:
     """Inference forward of a post-norm ReLU ``layer`` from its own weights, ending each sub-layer in *add_layer_norm*.
 
@@ -239,26 +161,16 @@ def _encoder_layer_forward(
     the first FFN projection with its bias and ReLU in the matmul's epilogue, the second, add + LayerNorm.
     Given the plain :func:`_add_layer_norm` it computes ``layer(x)``; the fast path is one opaque operator,
     so this is the only way to fuse its add and LayerNorm. No dropout: inference only.
-
-    With *fp8*, QKV (where ``fp8.qkv`` is set) and the first FFN projection run as E4M3 multiplies
-    (:func:`_fp8_linear`), the ReLU applied after; every other step is the same kernel on the same values.
     """
     b, t, e = x.shape
     attn = layer.self_attn
-    if fp8 is not None and fp8.qkv is not None:
-        qkv = _fp8_linear(x, fp8.qkv, attn.in_proj_bias)
-    else:
-        qkv = F.linear(x, attn.in_proj_weight, attn.in_proj_bias)
-    qkv = qkv.view(b, t, 3, attn.num_heads, e // attn.num_heads)
+    qkv = F.linear(x, attn.in_proj_weight, attn.in_proj_bias).view(b, t, 3, attn.num_heads, e // attn.num_heads)
     q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)  # each (B, heads, T, head_dim), head_dim contiguous
     o = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(b, t, e)
     x = add_layer_norm(
         x, F.linear(o, attn.out_proj.weight, attn.out_proj.bias), layer.norm1.weight, layer.norm1.bias, layer.norm1.eps
     )
-    if fp8 is not None:
-        h = torch.relu(_fp8_linear(x, fp8.ffn_up, layer.linear1.bias))
-    else:
-        h = torch._addmm_activation(layer.linear1.bias, x.reshape(-1, e), layer.linear1.weight.t()).view(b, t, -1)
+    h = torch._addmm_activation(layer.linear1.bias, x.reshape(-1, e), layer.linear1.weight.t()).view(b, t, -1)
     return add_layer_norm(
         x, F.linear(h, layer.linear2.weight, layer.linear2.bias), layer.norm2.weight, layer.norm2.bias, layer.norm2.eps
     )
@@ -276,10 +188,6 @@ class StudentTransformerEncoder(nn.Module):
     :class:`QKNormEncoderLayer`. In inference on CUDA, with autograd off, the standard stack runs through
     :func:`_encoder_layer_forward` with each residual add and LayerNorm fused into one kernel; on
     CPU, in training, and wherever gradients are recorded, it runs the modules as written.
-
-    ``fp8_layers`` (:func:`build_fp8_layers`, set by the model builder on a card in ``FP8_CARDS``)
-    makes that inference path run QKV and the first FFN projection in E4M3. It is a plain attribute,
-    not a buffer, so ``model.bfloat16()`` cannot cast the E4M3 weights, and it is not in the state dict.
     """
 
     def __init__(
@@ -321,7 +229,6 @@ class StudentTransformerEncoder(nn.Module):
             self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
             # jscpd:ignore-end
         self.attn_pool = AttentionPooling(latent_dim * 4)
-        self.fp8_layers: list[FP8Layer] | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Encode ``(B, T, band_num + 1)`` — last channel is raw integer DOY.
@@ -343,10 +250,8 @@ class StudentTransformerEncoder(nn.Module):
                 x = layer(x)
         elif x.is_cuda and not self.training and not torch.is_grad_enabled() and x.shape[1] > 0:
             add_layer_norm = _compiled_add_layer_norm()
-            layers = cast("nn.TransformerEncoder", self.transformer_encoder).layers
-            fp8 = self.fp8_layers or [None] * len(layers)
-            for layer, fp8_layer in zip(layers, fp8, strict=True):
-                x = _encoder_layer_forward(cast("nn.TransformerEncoderLayer", layer), x, add_layer_norm, fp8_layer)
+            for layer in cast("nn.TransformerEncoder", self.transformer_encoder).layers:
+                x = _encoder_layer_forward(cast("nn.TransformerEncoderLayer", layer), x, add_layer_norm)
         else:
             x = self.transformer_encoder(x)
         return self.attn_pool(x)

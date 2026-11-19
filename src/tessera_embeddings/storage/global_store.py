@@ -33,7 +33,6 @@ import zarr
 from tessera_embeddings.config.inference import (
     DEFAULT_MODEL_VERSION,
     ModelVersion,
-    Precision,
     checkpoint_filename,
     model_family,
     model_version_for_encoder,
@@ -52,8 +51,6 @@ from tessera_embeddings.storage.conventions import (
     assert_model_matches,
     build_convention_attrs,
     build_geoemb_root_attrs,
-    precision_attrs,
-    precision_of_root,
     stamp_array_conventions,
 )
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
@@ -147,22 +144,6 @@ def store_model_version(
         attrs, model_version, checkpoint_filename(model_version=model_version), where=f"global store {store_path}"
     )
     return model_version
-
-
-def store_precision(
-    store_path: str,
-    *,
-    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
-    region: str | None = None,
-) -> Precision:
-    """The precision a fill of this global store runs at: what the store recorded when it was seeded (ADR 043).
-
-    Read beside :func:`store_model_version`, before anything is provisioned, and passed into the fill's
-    inference config, so a store keeps one precision for life: a store seeded before ADR 043 records none
-    and is finished in bf16, on any card.
-    """
-    repo = open_global_repo(store_path, get_credentials=get_credentials, region=region)
-    return precision_of_root(zarr.open_group(repo.readonly_session(branch="main").store, mode="r").attrs)
 
 
 def set_saved_manifest_preload(
@@ -575,9 +556,6 @@ def _stamp_identity(
     hemisphere groups are not the 60 it names (ADR 037).
     """
     root.attrs.update(_root_attrs(layout, model_version=model_version, optical_min_obs=optical_min_obs))
-    # Write-once like the rest: a new store takes its model's precision (ADR 043); a store stamped before
-    # this existed records none and stays bf16.
-    root.attrs.update(precision_attrs(model_family(model_version).precisions[0]))
     if zone_layout == "utm_zones":
         root.attrs["geoemb:spatial_layout"] = "utm_zones"
 

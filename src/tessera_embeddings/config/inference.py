@@ -28,10 +28,6 @@ logger = logging.getLogger(__name__)
 # strings. ``model_version`` always names a member of this literal; a checkpoint's
 # filename stem, recorded on stores, is ``checkpoint_id``.
 ModelVersion = Literal["v1.1", "v2-large"]
-#: The arithmetic of the encoder's large matrix multiplies. ``"bf16"`` is the forward every card ran
-#: before ADR 043; ``"fp8"`` runs QKV and the first FFN projection in E4M3 on a card in
-#: ``models.ssl_model.FP8_CARDS``, and today's bf16 forward on any other. A property of the store.
-Precision = Literal["bf16", "fp8"]
 
 DEFAULT_MODEL_VERSION: ModelVersion = "v1.1"
 
@@ -525,9 +521,6 @@ class ModelFamily:
     #: hemisphere groups its published store already has; later models take the geoembeddings
     #: ``utm_zones`` layout. An existing store keeps its own layout whatever the model.
     zone_layout: ZoneLayout
-    #: The precisions it may run at, the first being what a new store takes (ADR 043). An existing
-    #: store keeps the precision it recorded when it was created.
-    precisions: tuple[Precision, ...]
     #: The leading lengths of its embedding a reader may use on their own, in Matryoshka order: v2
     #: was trained so its first 16, 32 and 64 dimensions each stand as a shorter embedding. Empty for
     #: a model trained without them. Published as the store root's ``embedding_prefixes``.
@@ -571,7 +564,6 @@ MODEL_FAMILIES: dict[str, ModelFamily] = {
         own_worker_image=True,
         spatial_dims=("northing", "easting"),
         zone_layout="hemispheres",
-        precisions=("bf16",),
     ),
     "v2-large": ModelFamily(
         arch=_V2_LARGE_ARCH,
@@ -587,7 +579,6 @@ MODEL_FAMILIES: dict[str, ModelFamily] = {
         spatial_dims=("y", "x"),
         prefixes=(16, 32, 64, 128),
         zone_layout="utm_zones",
-        precisions=("fp8", "bf16"),
     ),
 }
 
@@ -892,9 +883,6 @@ class InferenceConfig:
 
     # Which upstream model family to run (see ModelVersion).
     model_version: ModelVersion = DEFAULT_MODEL_VERSION
-    # The store's precision (see Precision). None takes the model's default for a new store; a run
-    # writing to an existing store passes the precision that store recorded.
-    precision: Precision | None = None
 
     def initial_actor_request(self, num_actors: int) -> int:
         """How many actors to create before the scheduling loop takes over.
@@ -965,13 +953,6 @@ class InferenceConfig:
             raise ValueError(
                 f"norm_source={self.norm_source!r} does not apply to model_version={self.model_version!r}: "
                 "v2 students hard-code a single set of band statistics. Leave norm_source unset."
-            )
-        if self.precision is None:
-            self.precision = family.precisions[0]
-        elif self.precision not in family.precisions:
-            raise ValueError(
-                f"precision={self.precision!r} does not apply to model_version={self.model_version!r}; "
-                f"it runs at {list(family.precisions)}."
             )
 
         # HERE, not at model construction. Both of these are decided by this object alone — no

@@ -14,8 +14,6 @@ from tessera_embeddings.storage.conventions import (
     assert_stack_matches,
     build_convention_attrs,
     build_geoemb_root_attrs,
-    precision_attrs,
-    precision_of_root,
     stamp_array_conventions,
     tile_id_to_epsg,
 )
@@ -433,11 +431,7 @@ def test_one_comparison_serves_every_reader_of_the_encoder_identity() -> None:
             assert_encoder_matches(published, model_version=wanted, where="s")
 
 
-_FP8_ROOT = {"inference_stack": {"torch": "2.5.1+cu121", "cuda": "12.1"}, "inference_precision": "fp8"}
 _V11 = {"model_version": "v1.1", "checkpoint_id": "tessera_v1_1_aws_encoder", "torch": "2.5.1+cu121", "cuda": "12.1"}
-
-
-_V11_FP8 = {**_V11, **precision_attrs("fp8")}
 
 
 @pytest.mark.parametrize(
@@ -453,15 +447,6 @@ _V11_FP8 = {**_V11, **precision_attrs("fp8")}
         ),
         ({"inference_stack": {"torch": "2.14.1+cu130", "cuda": "12.1"}}, _V11, "never mixes two stacks"),
         ({"inference_stack": None}, _V11, "never mixes two stacks"),  # malformed is refused, not "unstamped"
-        # ADR 043: a root without a precision is bf16, stamped or not, so an FP8 run is refused there, and the reverse.
-        (
-            {"inference_stack": {"torch": "2.5.1+cu121", "cuda": "12.1"}},
-            _V11_FP8,
-            "created at",
-        ),
-        ({}, _V11_FP8, "created at"),
-        (_FP8_ROOT, _V11_FP8, None),
-        (_FP8_ROOT, _V11, "created at"),
         ({"geoemb:model": ["not", "a", "url"]}, _V11, "Refusing to append"),  # malformed is refused, not v1.1
     ],
 )
@@ -514,12 +499,3 @@ def test_spatial_arrays_repeat_the_group_spatial_dimensions() -> None:
     assert node["scales"].attrs["spatial:dimensions"] == ["northing", "easting"]
     assert [c["uuid"] for c in node["scales"].attrs["zarr_conventions"]] == ["other", _SPATIAL_CONVENTION["uuid"]]
     assert dict(node["time"].attrs) == {}
-
-
-def test_a_store_keeps_the_precision_it_was_created_at() -> None:
-    """Absence is bf16 for every store, including one written before stacks were recorded (ADR 043)."""
-    assert precision_of_root({}) == "bf16"
-    assert precision_of_root({"inference_stack": {"torch": "2.14.1+cu130", "cuda": "13.0"}}) == "bf16"
-    assert precision_of_root(_FP8_ROOT) == "fp8"
-    assert precision_attrs("bf16") == {}
-    assert precision_attrs("fp8") == {"inference_precision": "fp8"}

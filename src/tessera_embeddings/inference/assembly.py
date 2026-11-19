@@ -61,7 +61,6 @@ from tessera_embeddings.config.inference import (
     OPTICAL_MIN_OBS,
     RADAR_THIN_MAX_OBS,
     ModelVersion,
-    Precision,
     TimeWindow,
     model_family,
 )
@@ -96,14 +95,12 @@ from tessera_embeddings.inference.chunk_spec import (
 from tessera_embeddings.inference.provenance import SourcePlanes, stage_planes
 from tessera_embeddings.storage import zone_grid
 from tessera_embeddings.storage.conventions import (
-    PRECISION_ATTR,
     STACK_ATTR,
     assert_model_matches,
     assert_stack_matches,
     build_convention_attrs,
     checkpoint_stem,
     library_stack,
-    precision_attrs,
     stamp_array_conventions,
 )
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
@@ -2425,12 +2422,9 @@ class ZarrWriter:
         if manifest:
             attrs["_manifest"] = manifest.to_dict()
             _log.info("Wrote _manifest to %s", output_path)
-        # Write-once: a store's first write records its stack, and no later one replaces it. A store first written
-        # here was created by this run, so it also takes the run's precision (ADR 043); an existing store without
-        # a stack predates FP8, and the check above held this run to its bf16.
+        # Write-once: a store's first write records its stack, and no later one replaces it.
         if stack is not None and STACK_ATTR not in node.attrs:
             attrs[STACK_ATTR] = library_stack(stack)
-            attrs.update(precision_attrs(cast("Precision", stack.get(PRECISION_ATTR, "bf16"))))
         if time_window:
             # Raw writes never clobber attrs, so prior windows are read straight off the store
             # and merged.

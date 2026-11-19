@@ -21,7 +21,7 @@ import logging
 import tempfile
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import fsspec
 import torch
@@ -29,8 +29,8 @@ import torch
 from tessera_embeddings.config.inference import model_family
 
 from .modules import V11TransformerEncoder
-from .ssl_model import FP8_CARDS, GRAPH_CHUNK_PIXELS, MultimodalBTInferenceModel, build_dim_reducer
-from .student_v2 import StudentTransformerEncoder, build_fp8_layers, build_v2_dim_reducer
+from .ssl_model import GRAPH_CHUNK_PIXELS, MultimodalBTInferenceModel, build_dim_reducer
+from .student_v2 import StudentTransformerEncoder, build_v2_dim_reducer
 
 if TYPE_CHECKING:
     from tessera_embeddings.config.inference import InferenceConfig
@@ -336,33 +336,12 @@ def build_inference_model(
     model = model.to(device)
     model.eval()
     del state_dict
-    # Set after the move: the chunk size and the FP8 layers belong to the card the model runs on, not the CPU it is
-    # built on.
-    fp8 = is_v2 and device.type == "cuda" and _fit_v2_to_card(model, config, torch.cuda.get_device_name(device))
+    # Set after the move: the chunk size belongs to the card the model runs on, not the CPU it is built on.
+    if is_v2 and device.type == "cuda":
+        model.chunk_pixels = GRAPH_CHUNK_PIXELS.get(torch.cuda.get_device_name(device))
 
-    logger.info(
-        "Built %s inference model on %s (store precision %s, FP8 layers %s, chunk_pixels=%s)",
-        config.model_version,
-        device,
-        config.precision,
-        "built" if fp8 else "not built",
-        model.chunk_pixels,
-    )
+    logger.info("Built %s inference model on %s (chunk_pixels=%s)", config.model_version, device, model.chunk_pixels)
     return model
-
-
-def _fit_v2_to_card(model: MultimodalBTInferenceModel, config: InferenceConfig, card: str) -> bool:
-    """Give a v2 *model* on *card* its replay chunk size and, in an FP8 store on an FP8 card, its FP8 layers.
-
-    Returns whether FP8 layers were built. Call it while the weights are still fp32, so each FP8 weight is
-    rounded once; inference casts the rest of the model to bf16 afterwards.
-    """
-    model.chunk_pixels = GRAPH_CHUNK_PIXELS.get(card)
-    if config.precision != "fp8" or card not in FP8_CARDS:
-        return False
-    for encoder in cast("tuple[StudentTransformerEncoder, ...]", (model.s2_backbone, model.s1_backbone)):
-        encoder.fp8_layers = build_fp8_layers(encoder)
-    return True
 
 
 # Schemes that mean "fetch this from somewhere else first". A local filesystem path (or an explicit file:// URI) is

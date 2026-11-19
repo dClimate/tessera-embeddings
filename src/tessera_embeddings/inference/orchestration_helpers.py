@@ -14,10 +14,9 @@ from typing import Any
 import icechunk
 
 from tessera_embeddings.config.inference import InferenceConfig, TimeWindow
-from tessera_embeddings.errors import ConfigMismatchError
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, enumerate_chunks_from_dataset
 from tessera_embeddings.inference.data_loading import _active_orbits
-from tessera_embeddings.storage.conventions import assert_model_matches, precision_of_root
+from tessera_embeddings.storage.conventions import assert_model_matches
 from tessera_embeddings.storage.manifest import EmbeddingManifest, extract_manifest
 from tessera_embeddings.storage.zarr_store import is_missing_repo, open_store, open_store_as_zarr_group
 
@@ -100,7 +99,7 @@ def assert_output_store_accepts(
     (legacy) stores pass; ``validate_against`` warns on the latter.
 
     Raises:
-        ConfigMismatchError: If the existing store's manifest or precision disagrees.
+        ConfigMismatchError: If the existing store's manifest disagrees.
     """
     _log = log or logger
     path = embedding_store_path(output_bucket, roi_name, output_name_suffix)
@@ -118,12 +117,6 @@ def assert_output_store_accepts(
     # never be published. The manifest cannot stand in for it: it is skipped outright for a
     # legacy store, which is the case that needs catching most.
     assert_model_matches(root.attrs, config.model_version, checkpoint_to_version(config.checkpoint_path), where=path)
-    # So is its precision (ADR 043): an existing store keeps the one it was begun at.
-    if (stored := precision_of_root(root.attrs)) != config.precision:
-        raise ConfigMismatchError(
-            f"{path} was computed at {stored} precision and this run is configured for {config.precision}. "
-            f"A store keeps one precision (ADR 043): run with precision={stored!r}, or write a new store."
-        )
     build_embedding_manifest(
         config=config, mosaic_base=mosaic_base, get_credentials=get_credentials, s3_region=s3_region
     ).validate_against(extract_manifest(dict(root.attrs)), path)

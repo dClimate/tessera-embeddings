@@ -55,10 +55,6 @@ logger = logging.getLogger(__name__)
 # replay measured faster than the whole batch. A card not listed runs the whole batch: an A10G gains at no size.
 GRAPH_CHUNK_PIXELS: dict[str, int] = {"NVIDIA L40S": 64, "NVIDIA L4": 32}
 
-# The cards that build v2's FP8 encoder layers in a store whose precision is "fp8": those its FP8 forward was
-# measured on (ADR 043). Any other card, the A10G included, builds today's bf16 forward in such a store.
-FP8_CARDS: frozenset[str] = frozenset({"NVIDIA L40S"})
-
 _Graph = tuple[torch.cuda.CUDAGraph, torch.Tensor, torch.Tensor, torch.Tensor]
 """A captured forward: (graph, static S2 input, static S1 input, static output)."""
 

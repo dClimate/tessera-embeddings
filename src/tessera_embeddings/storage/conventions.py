@@ -26,13 +26,7 @@ from typing import TYPE_CHECKING, Any, cast
 import numpy as np
 from pyproj import CRS
 
-from tessera_embeddings.config.inference import (
-    ModelVersion,
-    Precision,
-    encoder_url,
-    model_family,
-    model_version_for_encoder,
-)
+from tessera_embeddings.config.inference import ModelVersion, encoder_url, model_family, model_version_for_encoder
 from tessera_embeddings.config.store_geometry import level0
 
 if TYPE_CHECKING:
@@ -191,22 +185,6 @@ def library_stack(stack: Mapping[str, str | None]) -> dict[str, str | None]:
     return {k: stack.get(k) for k in ("torch", "cuda")}
 
 
-#: Store-root attr: the precision of the encoder's large multiplies (ADR 043), written when the store is
-#: created and never changed. A run's stack carries the same key. Written only when it is not bf16, so
-#: absence means bf16: every store and run made before ADR 043 reads correctly with no migration.
-PRECISION_ATTR = "inference_precision"
-
-
-def precision_attrs(precision: Precision) -> dict[str, str]:
-    """What a store created at *precision* records on its root, and a run at it in its stack."""
-    return {} if precision == "bf16" else {PRECISION_ATTR: precision}
-
-
-def precision_of_root(root_attrs: Mapping[str, object]) -> Precision:
-    """The precision every write into a store runs at: what it recorded when it was created, else bf16."""
-    return cast("Precision", root_attrs.get(PRECISION_ATTR, "bf16"))
-
-
 def assert_model_matches(
     root_attrs: Mapping[str, object], model_version: str, checkpoint_id: str, *, where: str
 ) -> None:
@@ -237,12 +215,6 @@ def assert_stack_matches(root_attrs: Mapping[str, object], stack: Mapping[str, s
     Changing a store's stack is a deliberate restamp after measuring equivalence (ADR 025), never a flag.
     """
     assert_model_matches(root_attrs, str(stack["model_version"]), str(stack["checkpoint_id"]), where=where)
-    if (stored_precision := precision_of_root(root_attrs)) != (run_precision := stack.get(PRECISION_ATTR, "bf16")):
-        raise ValueError(
-            f"Refusing to write into {where}: it holds {stored_precision} embeddings and this run computes "
-            f"{run_precision}. A store keeps the precision it was created at (ADR 043): fills read it with "
-            "store_precision, and a single-area run sets InferenceConfig.precision to it."
-        )
     # Present means compared, whatever its type: a malformed stamp is refused, never read as absent.
     if STACK_ATTR in root_attrs and (stored := root_attrs[STACK_ATTR]) != library_stack(stack):
         cuda = stack.get("cuda")

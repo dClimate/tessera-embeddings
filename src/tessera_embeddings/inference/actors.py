@@ -18,7 +18,7 @@ import time
 from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import ray
@@ -32,7 +32,6 @@ from tessera_embeddings.config.inference import (
     TUNED_GPU_GIB,
     TUNED_TOKENS_PER_PIXEL,
     InferenceConfig,
-    Precision,
     S1Orbit,
     batch_size_for_gpu,
 )
@@ -50,7 +49,7 @@ from tessera_embeddings.inference.progress import chunk_uid
 from tessera_embeddings.inference.provenance import SourcePlanes, staging_kwargs
 from tessera_embeddings.inference.read_plan import _chunk_read_plan
 from tessera_embeddings.inference.resource_monitor import ResourceMonitor
-from tessera_embeddings.storage.conventions import checkpoint_stem, precision_attrs
+from tessera_embeddings.storage.conventions import checkpoint_stem
 from tessera_embeddings.storage.zarr_store import credentials_provider
 
 if TYPE_CHECKING:
@@ -617,7 +616,7 @@ class InferenceActor:
     # Cross-chunk prefetch
     @functools.cached_property
     def _inference_stack(self) -> dict[str, str | None]:
-        """What this actor computes with: model, checkpoint stem, PyTorch and CUDA (ADR 025), and precision (ADR 043).
+        """What this actor computes with: model, checkpoint stem, PyTorch and CUDA (ADR 025).
 
         Read here, where the model runs: the driver runs the lockfile's CPU build whatever the workers
         run, so only this process knows. A staging run records it once (``ZarrWriter._join_run``) and
@@ -631,8 +630,6 @@ class InferenceActor:
             "checkpoint_id": checkpoint_stem(self.config.checkpoint_path),
             "torch": torch.__version__,
             "cuda": torch.version.cuda if self.device.type == "cuda" else None,
-            # The precision the run DECLARES, not what this card built: an A10G in an FP8 store runs bf16 (ADR 043).
-            **precision_attrs(cast("Precision", self.config.precision)),
         }
 
     # ------------------------------------------------------------------
