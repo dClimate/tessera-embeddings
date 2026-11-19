@@ -24,8 +24,9 @@ the candidate. It was measured on six tiles with FP8 on the L40S as its first ca
 - **Structured error carries a far larger SE than noise in the same cell.** Kansas sorghum's control loses
   3.20 ± 1.12 points where the noise SE is 0.07. A gated cell can therefore hide a large loss behind the
   candidate's own SE, which is why the gate has an unresolved outcome.
-- **FP8 failed the gate.** At Stage 1 it failed Ecuador wetland recall (0.84 ± 0.18) and left two cells
-  unresolved. With all four linears it also failed in Iowa and Ecuador. It tripped the tripwire on most tiles.
+- **FP8 failed the gate on Ecuador at both sizes** (Stage 1 wetland recall 0.84 ± 0.18, all four linears
+  cropland recall 0.65 ± 0.15). It left cells unresolved on Kansas and Finland, and on Punjab with all four,
+  and tripped the tripwire on Kansas sorghum. UK and Iowa passed.
 
 ## Decision
 
