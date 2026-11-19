@@ -26,7 +26,13 @@ from typing import TYPE_CHECKING, Any, cast
 import numpy as np
 from pyproj import CRS
 
-from tessera_embeddings.config.inference import ModelVersion, encoder_url, model_family, model_version_for_encoder
+from tessera_embeddings.config.inference import (
+    ModelVersion,
+    Precision,
+    encoder_url,
+    model_family,
+    model_version_for_encoder,
+)
 from tessera_embeddings.config.store_geometry import level0
 
 if TYPE_CHECKING:
@@ -181,8 +187,30 @@ def checkpoint_stem(checkpoint: str) -> str:
 
 
 def library_stack(stack: Mapping[str, str | None]) -> dict[str, str | None]:
-    """The part of a run's stack a store root records under :data:`STACK_ATTR`."""
-    return {k: stack.get(k) for k in ("torch", "cuda")}
+    """The part of a run's stack a store root records under :data:`STACK_ATTR`.
+
+    ``precision`` is carried only when the run declares one, which it does only when it is not bf16
+    (ADR 043): a record without it is bf16, so every stack written before FP8 existed still compares equal.
+    """
+    keep = ("torch", "cuda", "precision") if "precision" in stack else ("torch", "cuda")
+    return {k: stack.get(k) for k in keep}
+
+
+def run_precision_entry(precision: Precision) -> dict[str, str]:
+    """The ``precision`` entry of a run's stack: none for bf16, so a bf16 record is unchanged by ADR 043."""
+    return {} if precision == "bf16" else {"precision": precision}
+
+
+def precision_of_root(root_attrs: Mapping[str, object], model_version: ModelVersion) -> Precision:
+    """The precision every write into a store runs at: what its first write recorded, else a new store's default.
+
+    A root whose :data:`STACK_ATTR` names no precision was written in bf16, as every store before ADR 043
+    was. A root nothing has written to yet takes *model_version*'s default.
+    """
+    stack = root_attrs.get(STACK_ATTR)
+    if isinstance(stack, Mapping):
+        return cast("Precision", stack.get("precision", "bf16"))
+    return model_family(model_version).precisions[0]
 
 
 def assert_model_matches(
@@ -220,9 +248,11 @@ def assert_stack_matches(root_attrs: Mapping[str, object], stack: Mapping[str, s
         cuda = stack.get("cuda")
         raise ValueError(
             f"Refusing to write into {where}: it was computed on {stored!r}, and this run on PyTorch "
-            f"{stack.get('torch')} with {f'CUDA {cuda}' if cuda else 'CPU'}. One store never mixes two "
-            "stacks (ADR 025). Run on the store's stack: the global flows pick its worker image through "
-            "ami_ssm_name_by_model, and a local run needs that PyTorch installed (docs/environment-setup.md). "
+            f"{stack.get('torch')} with {f'CUDA {cuda}' if cuda else 'CPU'} at "
+            f"{stack.get('precision', 'bf16')} precision. One store never mixes two stacks or two precisions "
+            "(ADR 025, ADR 043). Run on the store's stack: the global flows pick its worker image through "
+            "ami_ssm_name_by_model and its precision through store_precision, and a local run needs that "
+            "PyTorch installed (docs/environment-setup.md) and the store's precision in its config. "
             "Moving a store to another stack is a restamp after an equivalence check (ADR 025)."
         )
 

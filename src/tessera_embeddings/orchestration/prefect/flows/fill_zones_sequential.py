@@ -102,7 +102,7 @@ from tessera_embeddings.orchestration.runners.zone_fill import (
     zone_year_complete,
     zone_year_on_axis,
 )
-from tessera_embeddings.storage.global_store import open_global_repo, store_model_version
+from tessera_embeddings.storage.global_store import open_global_repo, store_model_version, store_precision
 from tessera_embeddings.storage.object_store import delete_prefix
 from tessera_embeddings.storage.update import (
     applied_optical_min_obs,
@@ -970,11 +970,12 @@ def fill_zones_sequential_flow(
     store_path = paths.global_store(store_name)
     # The store decides the model, and with it the checkpoint, worker image and staging prefix: an
     # update of the v1.1 store runs v1.1 whatever any default says.
-    model_version = store_model_version(
-        store_path,
-        get_credentials=icechunk_credentials_for(store_path, iam_icechunk_credentials),
-        region=s3_region,
-    )
+    # The STORE's credential: in production the store is the partner's published bucket, which the
+    # task role cannot read.
+    store_credentials = icechunk_credentials_for(store_path, iam_icechunk_credentials)
+    model_version = store_model_version(store_path, get_credentials=store_credentials, region=s3_region)
+    # And the precision it was begun at (ADR 043), so a bf16 store is finished in bf16.
+    precision = store_precision(store_path, model_version, get_credentials=store_credentials, region=s3_region)
     ami_ssm_name = ami_ssm_name_for_model(ami_ssm_name, ami_ssm_name_by_model, model_version)
     # Where this run's mosaics and staging live: the campaign's, or the update's own.
     update_root = paths.update_root(update) if update is not None else None
@@ -1041,6 +1042,7 @@ def fill_zones_sequential_flow(
             time_window=_window_for(cell_year),
             checkpoint_path=checkpoint_path,
             model_version=model_version,
+            precision=precision,
             inputs_bucket=paths.inputs,
             output_bucket=paths.outputs,
             chunk_size=SHARD_PX,  # 1 inference tile == 1 shard (D3)
@@ -1066,9 +1068,6 @@ def fill_zones_sequential_flow(
     # would refuse them, but here before any ingest or cluster).
     update_done: list[tuple[str, int]] = []
     not_filled: list[tuple[str, int]] = []
-    # The STORE's credential: in production the store is the partner's published bucket, which the
-    # task role cannot read.
-    store_credentials = icechunk_credentials_for(store_path, iam_icechunk_credentials)
     states = (
         update_states(
             open_global_repo(store_path, get_credentials=store_credentials, region=s3_region), plan.name, cells

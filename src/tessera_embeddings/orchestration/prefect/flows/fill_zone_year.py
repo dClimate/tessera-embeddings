@@ -50,7 +50,7 @@ from tessera_embeddings.orchestration.runners.zone_fill import (
     zone_year_complete,
     zone_year_on_axis,
 )
-from tessera_embeddings.storage.global_store import store_model_version
+from tessera_embeddings.storage.global_store import store_model_version, store_precision
 from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group
 from tessera_embeddings.storage.zone_grid import canonicalize_zone
 
@@ -262,6 +262,8 @@ def fill_zone_year_flow(
     # The store decides the model, and with it the checkpoint, worker image and staging prefix: a
     # fill or update of a v1.1 store runs v1.1 whatever any default says.
     model_version = store_model_version(store_path, get_credentials=store_credentials, region=s3_region)
+    # And the precision it was begun at (ADR 043), so a bf16 store is finished in bf16.
+    precision = store_precision(store_path, model_version, get_credentials=store_credentials, region=s3_region)
     ami_ssm_name = ami_ssm_name_for_model(ami_ssm_name, ami_ssm_name_by_model, model_version)
     checkpoint = checkpoint_filename(model_version=model_version)
     land_mask_path = paths.land_mask_store(mask_name)
@@ -335,6 +337,7 @@ def fill_zone_year_flow(
         time_window=window,
         checkpoint_path=f"{paths.inputs.rstrip('/')}/models/{checkpoint}",
         model_version=model_version,
+        precision=precision,
         inputs_bucket=paths.inputs,
         output_bucket=paths.outputs,
         # 1 inference tile == 1 output shard == 2x2 tiles per 4096-px ingest chunk (D3), so

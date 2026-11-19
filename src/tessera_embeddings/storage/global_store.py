@@ -33,6 +33,7 @@ import zarr
 from tessera_embeddings.config.inference import (
     DEFAULT_MODEL_VERSION,
     ModelVersion,
+    Precision,
     checkpoint_filename,
     model_family,
     model_version_for_encoder,
@@ -51,6 +52,7 @@ from tessera_embeddings.storage.conventions import (
     assert_model_matches,
     build_convention_attrs,
     build_geoemb_root_attrs,
+    precision_of_root,
     stamp_array_conventions,
 )
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
@@ -144,6 +146,24 @@ def store_model_version(
         attrs, model_version, checkpoint_filename(model_version=model_version), where=f"global store {store_path}"
     )
     return model_version
+
+
+def store_precision(
+    store_path: str,
+    model_version: ModelVersion,
+    *,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+    region: str | None = None,
+) -> Precision:
+    """The precision a fill of this global store runs at (ADR 043): what its first write recorded.
+
+    Read beside :func:`store_model_version`, before anything is provisioned, and passed into the fill's
+    inference config, so a store keeps one precision for life: a bf16 store is finished in bf16 on any card.
+    A store nothing has written to takes *model_version*'s default (``conventions.precision_of_root``).
+    """
+    repo = open_global_repo(store_path, get_credentials=get_credentials, region=region)
+    attrs = zarr.open_group(repo.readonly_session(branch="main").store, mode="r").attrs
+    return precision_of_root(attrs, model_version)
 
 
 def set_saved_manifest_preload(

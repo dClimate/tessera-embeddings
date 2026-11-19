@@ -14,6 +14,9 @@ from tessera_embeddings.storage.conventions import (
     assert_stack_matches,
     build_convention_attrs,
     build_geoemb_root_attrs,
+    library_stack,
+    precision_of_root,
+    run_precision_entry,
     stamp_array_conventions,
     tile_id_to_epsg,
 )
@@ -431,6 +434,7 @@ def test_one_comparison_serves_every_reader_of_the_encoder_identity() -> None:
             assert_encoder_matches(published, model_version=wanted, where="s")
 
 
+_FP8_ROOT = {"inference_stack": {"torch": "2.5.1+cu121", "cuda": "12.1", "precision": "fp8"}}
 _V11 = {"model_version": "v1.1", "checkpoint_id": "tessera_v1_1_aws_encoder", "torch": "2.5.1+cu121", "cuda": "12.1"}
 
 
@@ -447,6 +451,14 @@ _V11 = {"model_version": "v1.1", "checkpoint_id": "tessera_v1_1_aws_encoder", "t
         ),
         ({"inference_stack": {"torch": "2.14.1+cu130", "cuda": "12.1"}}, _V11, "never mixes two stacks"),
         ({"inference_stack": None}, _V11, "never mixes two stacks"),  # malformed is refused, not "unstamped"
+        # ADR 043: a record without a precision is bf16, so an FP8 run is refused by a bf16 store and the reverse.
+        ({"inference_stack": {"torch": "2.5.1+cu121", "cuda": "12.1"}}, {**_V11, "precision": "fp8"}, "two precisions"),
+        (
+            {"inference_stack": {"torch": "2.5.1+cu121", "cuda": "12.1", "precision": "fp8"}},
+            {**_V11, "precision": "fp8"},
+            None,
+        ),
+        ({"inference_stack": {"torch": "2.5.1+cu121", "cuda": "12.1", "precision": "fp8"}}, _V11, "two precisions"),
         ({"geoemb:model": ["not", "a", "url"]}, _V11, "Refusing to append"),  # malformed is refused, not v1.1
     ],
 )
@@ -499,3 +511,23 @@ def test_spatial_arrays_repeat_the_group_spatial_dimensions() -> None:
     assert node["scales"].attrs["spatial:dimensions"] == ["northing", "easting"]
     assert [c["uuid"] for c in node["scales"].attrs["zarr_conventions"]] == ["other", _SPATIAL_CONVENTION["uuid"]]
     assert dict(node["time"].attrs) == {}
+
+
+@pytest.mark.parametrize(
+    ("root", "model", "precision"),
+    [
+        ({}, "v2-large", "fp8"),  # nothing written yet: the model's default for a new store
+        ({}, "v1.1", "bf16"),
+        ({"inference_stack": {"torch": "2.14.1+cu130", "cuda": "13.0"}}, "v2-large", "bf16"),  # begun before ADR 043
+        ({"inference_stack": {"torch": "2.14.1+cu130", "cuda": "13.0", "precision": "fp8"}}, "v2-large", "fp8"),
+    ],
+)
+def test_a_store_keeps_the_precision_its_first_write_recorded(root, model, precision) -> None:
+    assert precision_of_root(root, model) == precision
+
+
+def test_only_a_non_bf16_run_records_a_precision() -> None:
+    """A bf16 run's stack and root stamp are exactly what they were before ADR 043."""
+    assert run_precision_entry("bf16") == {}
+    assert library_stack({**_V11, **run_precision_entry("bf16")}) == {"torch": "2.5.1+cu121", "cuda": "12.1"}
+    assert library_stack({**_V11, **run_precision_entry("fp8")})["precision"] == "fp8"
