@@ -5,12 +5,12 @@ missing file is an error, a stray one is ignored), one ``.npz`` per variant and 
 the gate (``tessera_embeddings.profiling.inference.precision_gate``), prints one line per variant and the
 refit spread, and writes the full report as JSON.
 
-Every embedded comparison (each key of ``envelope.json``, known-good ones included) must pass, or, with
-``--exception``, stay inside that named exception's bounds for this tile. The exit code is 3 if any does
-not, so a caller can tell that result from a crash. Each comparison that does not pass carries the
-``exception_bounds`` an exception for it would set; an exception file is
-``{"decision": <ADR>, "tiles": {<tile>: {<item>: <bound>}}}``, taking the larger of ``candidate``'s and
-``mixed``'s bound per item.
+Every embedded comparison (each key of ``envelope.json``, known-good ones included) must pass. With
+``--exception``, the candidate and mixed comparisons may instead stay inside that named exception's bounds
+for this tile. The exit code is 3 if any comparison does neither, so a caller can tell that result from a
+crash. Each comparison that does not pass carries the ``exception_bounds`` an exception for it would set;
+an exception file is ``{"decision": <ADR>, "tiles": {<tile>: {<item>: <bound>}}}``, taking the larger of
+``candidate``'s and ``mixed``'s bound per item.
 
 usage: apply_gate.py <labels.npz> <label_key> <variant_dir> <tile> <report.json> [--exception <file.json>]
 """
@@ -98,7 +98,7 @@ def main(argv: list[str] | None = None) -> int:
         if not v["envelope"] or v["verdict"] == "pass":
             continue
         v["exception_bounds"] = pg.exception_bounds(v)
-        if exception is not None:
+        if exception is not None and name in ("candidate", "mixed"):  # never the known-good card pairs
             v["outside_exception"] = pg.outside_exception(v, exception)
             print(f"exception {name}: " + ("; ".join(v["outside_exception"]) or "inside"))
             if not v["outside_exception"]:
