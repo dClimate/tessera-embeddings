@@ -17,15 +17,20 @@ from tessera_embeddings.inference.dataset import MosaicChunkInferenceDataset
 from tessera_embeddings.inference.inference import run_inference
 from tessera_embeddings.inference.models.builder import (
     _build_v2_inference_model,
+    _fit_v2_to_card,
     _verify_v2_args,
 )
 from tessera_embeddings.inference.models.ssl_model import GRAPH_CHUNK_PIXELS, run_in_chunks
 from tessera_embeddings.inference.models.student_v2 import (
+    E4M3_MAX,
     AttentionPooling,
     QKNormEncoderLayer,
     StudentTransformerEncoder,
     _add_layer_norm,
     _encoder_layer_forward,
+    _scale_rows,
+    build_fp8_layers,
+    fp8_weight,
 )
 
 # The v2 Large checkpoint's stored ``args``.
@@ -274,3 +279,109 @@ def test_chunked_forward_matches_the_whole_batch(v2_model) -> None:
 
         chunked = run_in_chunks(s2_x, s1_x, (s2_static, s1_static, z_static), run_chunk)
     torch.testing.assert_close(chunked, whole, atol=1e-5, rtol=1e-5)
+
+
+# ── FP8 (ADR 043) ──
+# F.scaled_mm runs row-wise E4M3 on the CPU, so the layer's arithmetic is checked here; capture, replay and the
+# card's handling of non-finite rows are checked on an L40S (context_docs/inference/fp8-completion-plan.md §3.1).
+
+
+@pytest.fixture(scope="module")
+def fp8_encoder() -> tuple[StudentTransformerEncoder, list]:
+    """A small random encoder at v2's width, and its FP8 layers."""
+    torch.manual_seed(0)
+    enc = StudentTransformerEncoder(band_num=10, latent_dim=160, nhead=4, num_encoder_layers=3, dim_feedforward=256)
+    return enc.eval(), build_fp8_layers(enc)
+
+
+def test_fp8_layers_quantise_two_linears_and_leave_the_first_qkv(fp8_encoder) -> None:
+    """QKV of every layer after the first and every first FFN projection; each scale maps its channel's max to 448."""
+    enc, layers = fp8_encoder
+    assert [layer.qkv is None for layer in layers] == [True, False, False]
+    w = enc.transformer_encoder.layers[1].linear1.weight
+    q = layers[1].ffn_up
+    assert q.weight.dtype == torch.float8_e4m3fn and q.weight.shape == w.t().shape
+    torch.testing.assert_close(q.scale[0], w.abs().amax(dim=1) / E4M3_MAX)
+    # E4M3 keeps 3 mantissa bits (half a step is 1/16 relative); its subnormals step by 2**-9 of the scale.
+    assert ((q.weight.float() * q.scale - w.t()).abs() <= w.t().abs() / 16 + q.scale * 2**-10).all()
+
+
+def test_fp8_weights_survive_the_bf16_cast_and_stay_out_of_the_state_dict(fp8_encoder) -> None:
+    enc, layers = fp8_encoder
+    copy = StudentTransformerEncoder(band_num=10, latent_dim=160, nhead=4, num_encoder_layers=3, dim_feedforward=256)
+    keys = set(copy.state_dict())
+    copy.fp8_layers = layers
+    copy.bfloat16()
+    assert copy.fp8_layers[1].qkv.weight.dtype == torch.float8_e4m3fn
+    assert copy.fp8_layers[1].qkv.scale.dtype == torch.float32
+    assert set(copy.state_dict()) == keys
+
+
+@pytest.mark.parametrize("t", [1, 9])
+def test_fp8_layer_tracks_bf16_and_quantises_each_row_alone(fp8_encoder, t: int) -> None:
+    """Close to today's layer (a transposed weight or a scale on the wrong axis is far off), and per row.
+
+    A pixel's codes must not depend on its batch, so every scale is per token row. (The CPU's matrix
+    multiplies themselves may round by batch size; the card's are checked for that on an L40S.)
+    """
+    enc, layers = fp8_encoder
+    layer, fp8 = enc.transformer_encoder.layers[1], layers[1]
+    x = torch.randn(5, t, 640)
+    with torch.no_grad():
+        ref = _encoder_layer_forward(layer, x, _add_layer_norm)
+        out = _encoder_layer_forward(layer, x, _add_layer_norm, fp8)
+    assert torch.nn.functional.cosine_similarity(out.flatten(1), ref.flatten(1)).min() > 0.999
+    rows = x.reshape(-1, 640)
+    codes, scales = _scale_rows(rows)
+    alone_codes, alone_scales = _scale_rows(rows[3:4])
+    assert torch.equal(alone_codes.view(torch.uint8), codes[3:4].view(torch.uint8))
+    assert torch.equal(alone_scales, scales[3:4])
+
+
+def test_fp8_layer_keeps_a_zero_pixel_finite_and_a_nan_pixel_to_itself(fp8_encoder) -> None:
+    """An all-zero token row scales to the floor, not to a NaN; a NaN stays in its own pixel."""
+    enc, layers = fp8_encoder
+    layer, fp8 = enc.transformer_encoder.layers[1], layers[1]
+    x = torch.randn(4, 6, 640)
+    x[0] = 0.0
+    x[2, 3, 7] = float("nan")
+    with torch.no_grad():
+        out = _encoder_layer_forward(layer, x, _add_layer_norm, fp8)
+        clean = _encoder_layer_forward(layer, x[[0, 1, 3]], _add_layer_norm, fp8)
+    assert torch.isfinite(out[[0, 1, 3]]).all()
+    assert not torch.isfinite(out[2]).all()
+    torch.testing.assert_close(out[[0, 1, 3]], clean, atol=1e-6, rtol=1e-6)
+
+
+def test_fp8_weight_clamps_rather_than_overflowing() -> None:
+    """A channel's own max lands on 448 exactly; nothing becomes a NaN code."""
+    w = torch.tensor([[1.0, -3.0, 0.5], [0.0, 0.0, 0.0]])
+    q = fp8_weight(w)
+    assert torch.isfinite(q.weight.float()).all()
+    assert q.weight.float()[1, 0] == -E4M3_MAX
+
+
+@pytest.mark.parametrize(
+    ("card", "precision", "chunk", "fp8"),
+    [
+        ("NVIDIA L40S", "fp8", 64, True),
+        ("NVIDIA L40S", "bf16", 64, False),
+        ("NVIDIA A10G", "fp8", None, False),
+        ("NVIDIA L4", "fp8", 32, False),
+        ("NVIDIA RTX PRO 6000 Blackwell Server Edition", "fp8", None, False),
+    ],
+)
+def test_only_an_fp8_card_in_an_fp8_store_builds_fp8_layers(card: str, precision: str, chunk, fp8: bool) -> None:
+    model = _build_v2_inference_model(v2_config(precision=precision), torch.device("cpu"))
+    assert _fit_v2_to_card(model, model_config := v2_config(precision=precision), card) is fp8
+    assert model.chunk_pixels == chunk
+    for encoder in (model.s2_backbone, model.s1_backbone):
+        assert (encoder.fp8_layers is not None) is fp8
+    assert model_config.precision == precision
+
+
+def test_precision_defaults_per_model_and_v11_refuses_fp8() -> None:
+    assert v2_config().precision == "fp8"
+    assert InferenceConfig(time_window=parse_time_window("June 2025"), checkpoint_path="x").precision == "bf16"
+    with pytest.raises(ValueError, match="precision"):
+        InferenceConfig(time_window=parse_time_window("June 2025"), checkpoint_path="x", precision="fp8")
