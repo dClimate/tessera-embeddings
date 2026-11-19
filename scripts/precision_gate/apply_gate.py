@@ -5,16 +5,17 @@ missing file is an error, a stray one is ignored), one ``.npz`` per variant and 
 the gate (``tessera_embeddings.profiling.inference.precision_gate``), prints one line per variant and the
 refit spread, and writes the full report as JSON.
 
-With ``--bounds``, each variant named in ``--hold`` is also checked against the exception's bounds for
-this tile: ``--hold fp8_stage1=stage1:fp8`` holds variant ``fp8_stage1`` to the Stage 1 record's
-``fp8`` comparison.
+With ``--bounds``, each variant named in ``--hold`` is also checked against a named exception's bounds
+for this tile (decision 2; the file maps size -> tile -> ``cells``/``tile``/``trip`` -> item -> comparison
+-> bound): ``--hold fp8_stage1=stage1:fp8`` holds variant ``fp8_stage1`` to the ``stage1`` record's ``fp8``
+comparison. No exception is in force today.
 
 Every embedded comparison (each key of ``envelope.json``, known-good ones included) must pass: outright,
 or held and inside its exception. The exit code is 3 if any does not, so a caller can tell that result
 from a crash.
 
 usage: apply_gate.py <labels.npz> <label_key> <variant_dir> <tile> <report.json>
-                     [--bounds fp8_exception_bounds.json --hold VARIANT=SIZE:COMPARISON ...]
+                     [--bounds <exception.json> --hold VARIANT=SIZE:COMPARISON ...]
 """
 
 from __future__ import annotations

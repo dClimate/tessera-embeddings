@@ -370,8 +370,8 @@ for work already planned:
    on the lattice, and the FP8 multiply's position dependence would have to be solved or accepted first. The
    recommendation is not to.
 2. **The gate.** [ADR 043](../decisions/043-fp8-linears-ship-on-cross-change-accuracy-and-the-a10g-stays-bf16.md)
-   decision 1 is the bar for any precision change and does not depend on FP8 shipping. Its tables, and the bounds
-   in `scripts/precision_gate/fp8_exception_bounds.json`, come from a linear probe that stopped fitting early
+   decision 1 is the bar for any precision change and does not depend on FP8 shipping. Its tables, and the FP8
+   exception's bounds file generated from them (deleted with FP8), come from a linear probe that stopped fitting early
    (fixed in the gate code, commit `af33d0a3`). Re-scored with the probe fitted to convergence
    (`s3://arbol-tessera-inputs-dev/perf/fp8-rebase/rebase-20261118/record/`), the same embeddings give, at Stage 1:
    no failure on Kansas (winter wheat recall was 0.66), a failure on Ecuador wetland recall (0.84 ± 0.18, was

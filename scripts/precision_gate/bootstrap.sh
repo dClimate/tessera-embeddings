@@ -119,9 +119,7 @@ cpu() {
     rc=0
     # shellcheck disable=SC2046
     $PY /opt/te/scripts/precision_gate/apply_gate.py $(label_args "$t" | sed 's|^|labels/|') "out/$t" "$t" \
-      "reports/$t.json" --bounds /opt/te/scripts/precision_gate/fp8_exception_bounds.json \
-      --hold fp8_stage1=stage1:fp8 --hold mixed_stage1=stage1:mixed --hold fp8_all4=all4:fp8 \
-      --hold mixed_all4=all4:mixed > "reports/$t.txt" || rc=$?
+      "reports/$t.json" > "reports/$t.txt" || rc=$?
     [ $rc -eq 0 ] || [ $rc -eq 3 ] || { echo "ERROR: apply_gate crashed on $t (rc $rc)"; cat "reports/$t.txt"; return $rc; }
     grep '^GATE' "reports/$t.txt"
     [ $rc -eq 3 ] && not_passed="$not_passed $t"
