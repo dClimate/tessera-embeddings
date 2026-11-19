@@ -118,13 +118,10 @@ context_docs/
 │   ├── fresh-worker-start.md                   a new worker's first minutes are its EBS volume
 │   │                                              loading the AMI, and the mounted venv image that
 │   │                                              removes them
-│   ├── reduced-precision-inference.md          FP8 on the g6e and int8 on Intel AMX: both pass the
-│   │                                              per-value envelope and fail the neighbour gate on
-│   │                                              near-tie churn; int8 makes CPU spot ~g5 parity;
-│   │                                              the gate: cross-change accuracy per tile and per
-│   │                                              class against matched noise and controls (ADR 043);
-│   │                                              FP8 built and timed at production chunk sizes:
-│   │                                              0.89x bf16, ceiling 1.02x, so not adopted
+│   ├── reduced-precision-inference.md          FP8 on the g6e: slower than bf16 at production
+│   │                                              chunk sizes (0.89x, ceiling 1.02x), not adopted;
+│   │                                              int8 on Intel AMX: ~g5 parity on spot, parked;
+│   │                                              why the neighbour gate over-penalises
 │   └── the-fleet-and-the-work-source.md        a fleet lives for one `run_inference` call, so a
 │                                                  retry through a second call rebuilt one; the
 │                                                  wind-down, and why the fleet is not held
