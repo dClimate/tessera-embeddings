@@ -59,7 +59,7 @@ context_docs/
 │   ├── 040-new-code-is-gated-on-duplication-and-complexity.md
 │   ├── 041-unit-tests-run-the-forked-writer-in-threads.md
 │   ├── 042-chunked-graph-replay-ships-above-the-two-card-yardstick.md
-│   └── 043-fp8-linears-ship-on-cross-change-accuracy-and-the-a10g-stays-bf16.md
+│   └── 043-a-per-class-gate-for-precision-changes.md
 │
 ├── campaign/                      THE GLOBAL CAMPAIGN — start here
 │   ├── campaign-plan.md                        <- START HERE. What runs, with what settings, in
