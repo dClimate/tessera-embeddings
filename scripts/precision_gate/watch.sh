@@ -3,16 +3,19 @@
 #
 # usage: watch.sh <s3 run prefix> <role>=<instance-id> [...]
 #
-# Each pass, for each box still running: its status file (ok ends it; failed:* is a failure), its EC2
+# Each pass, for each box still running: its status file (ok ends it; not-passed ends it with a gate
+# result that is not a pass; failed:* is a failure), its EC2
 # state (stopped or terminated without a status is a crash), its uploaded log (a traceback, CUDA error
 # or OOM kill is a failure), and its progress (log lines must keep growing: 20 minutes without a new
 # line is a stall). Polls every 30 s for the first 10 minutes, when most failures happen, then every 2 min.
-# Exits 0 when every box reports ok, 1 on the first failure.
+# Exits 0 when every box reports ok, 3 when every box has finished and some gate did not pass, 1 on the
+# first failure.
 set -uo pipefail
 PREFIX=$1
 shift
 : "${AWS_REGION:?}"
 declare -A ID LINES SEEN
+not_passed=""
 for pair in "$@"; do
   ID[${pair%%=*}]=${pair#*=}
   LINES[${pair%%=*}]=0
@@ -27,6 +30,9 @@ while true; do
     status=$(aws s3 cp --quiet "$PREFIX/status/$role" - 2>/dev/null || true)
     case $status in
       ok) continue ;;
+      not-passed)
+        [[ " $not_passed " == *" $role "* ]] || { not_passed="$not_passed $role"; echo "GATE NOT PASSED $role"; }
+        continue ;;
       failed*) echo "FAIL $role: $status"; aws s3 cp --quiet "$PREFIX/logs/$role.log" - 2>/dev/null | tail -30; exit 1 ;;
     esac
     running=$((running + 1))
@@ -56,6 +62,7 @@ while true; do
     fi
   done
   if [ $running -eq 0 ]; then
+    [ -n "$not_passed" ] && { echo "ALL FINISHED; GATE NOT PASSED on:$not_passed"; exit 3; }
     echo "ALL OK"
     exit 0
   fi

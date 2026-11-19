@@ -16,7 +16,8 @@ Terms (``context_docs/decisions/043-...md``, decision 1):
 - A gated cell past δ with loss / SE above ``z_fam`` fails; past δ with loss / SE at or under it,
   or ungated with loss / SE above it, it is unresolved. A tile loss past 0.2 fails.
 - The tripwire: a class's gap closure past half its own control's gap closure at the dose
-  costing δ.
+  costing δ. A trip needs a decision, so it leaves the variant unresolved.
+- A comparison whose ADR 012 envelope fails, fails.
 
 Variant names follow ``calibrate.py``: ``noise_*`` are the matched-noise draws, ``ctrl_<i>_<j>_<cos>``
 the class-directed controls, ``ctrl2_*`` the large-to-small control, ``refit_*`` training-sample
@@ -24,7 +25,8 @@ redraws.
 
 :func:`check_exception` then holds a variant to a named exception (decision 2): every cell, tile
 bound and tripwire class it fails, leaves unresolved or trips must be listed in the exception, and
-no listed one may exceed its bound.
+no listed one may exceed its bound; no exception covers a failed envelope. :func:`passes` is the
+gate's outcome for a comparison: it passes outright, or it is held to an exception and inside it.
 """
 
 from __future__ import annotations
@@ -331,16 +333,20 @@ def validity(scores: Mapping[str, Score], cal: Calibration) -> Validity:
     return Validity(flag_only=flag_only, uncovered=uncovered, control_passes=passes, unvalidated=unvalidated)
 
 
-def verdict(score: Score, cal: Calibration) -> str:
-    """``fail``, ``unresolved`` or ``pass``. A trip asks for a decision but does not change the verdict."""
-    if failed_cells(score, cal) or failed_tile(score):
+def verdict(score: Score, cal: Calibration, envelope_passed: bool = True) -> str:
+    """``fail``, ``unresolved`` or ``pass``: decision 1's envelope, tile and class losses, and tripwire together.
+
+    A trip asks for a decision, as an unresolved cell does, so it leaves the variant unresolved.
+    """
+    if not envelope_passed or failed_cells(score, cal) or failed_tile(score):
         return "fail"
-    return "unresolved" if unresolved_cells(score, cal) else "pass"
+    return "unresolved" if unresolved_cells(score, cal) or tripped(score, cal) else "pass"
 
 
-def _variant_report(tile: Tile, score: Score, cal: Calibration) -> dict:
+def _variant_report(tile: Tile, score: Score, cal: Calibration, env: dict | None) -> dict:
     return {
-        "verdict": verdict(score, cal),
+        "verdict": verdict(score, cal, env is None or env["passed"]),
+        "envelope": env,
         "fail_cells": [tile.key_name(k) for k in failed_cells(score, cal)],
         "fail_tile": [f"{c} {d}" for c, d in failed_tile(score)],
         "unresolved": [tile.key_name(k) for k in unresolved_cells(score, cal)],
@@ -351,8 +357,25 @@ def _variant_report(tile: Tile, score: Score, cal: Calibration) -> dict:
     }
 
 
-def evaluate(tile: Tile, scores: Mapping[str, Score]) -> dict:
-    """The tile's calibration, validity lists and every variant's verdict, as a JSON-ready dict."""
+def refit_spread(tile: Tile, base: Mapping[str, np.ndarray], refits: Sequence[Mapping[str, np.ndarray]]) -> dict:
+    """Per class, consumer and measure: the SD in points, over training-sample redraws, of the move from the base fit.
+
+    Reported beside the verdicts, not gated: it is how far a loss can move with the training sample alone.
+    """
+    moves: dict[str, list[float]] = {}
+    for consumer, key in (("probe", "p_rr"), ("knn", "k_rr")):
+        for r in refits:
+            for i, (rl, _, pl, _) in class_cells(tile, base[key], r[key]).items():
+                moves.setdefault(f"{tile.names[i]}|{consumer}|recall", []).append(rl)
+                moves.setdefault(f"{tile.names[i]}|{consumer}|precision", []).append(pl)
+    return {k: float(np.std(v, ddof=1)) for k, v in moves.items() if len(v) > 1}
+
+
+def evaluate(tile: Tile, scores: Mapping[str, Score], envelopes: Mapping[str, dict]) -> dict:
+    """The tile's calibration, validity lists and every variant's verdict, as a JSON-ready dict.
+
+    ``envelopes`` holds :func:`envelope` for each embedded comparison; controls and noise draws have none.
+    """
     cal = calibrate(scores)
     val = validity(scores, cal)
 
@@ -370,7 +393,7 @@ def evaluate(tile: Tile, scores: Mapping[str, Score]) -> dict:
         "uncovered": names(val.uncovered),
         "control_passes": names(val.control_passes),
         "unvalidated": names(val.unvalidated),
-        "variants": {v: _variant_report(tile, s, cal) for v, s in scores.items() if not v.startswith("refit")},
+        "variants": {v: _variant_report(tile, s, cal, envelopes.get(v)) for v, s in scores.items()},
     }
 
 
@@ -435,11 +458,13 @@ def check_exception(variant: Mapping, bounds: Mapping | None, comparison: str) -
     tile with no listed items passes ``None``.
     """
     bounds = bounds or {}
+    envelope_failed = variant["envelope"] is not None and not variant["envelope"]["passed"]
     cells = {k: v[0] for k, v in variant["cells"].items()}
     tiles = {k: v[0] for k, v in variant["tile"].items()}
     flagged_cells = {k: cells[k] for k in [*variant["fail_cells"], *variant["unresolved"]]}
     flagged_tile = {k: tiles[k] for k in variant["fail_tile"]}
     reasons = [
+        *(["ADR 012's envelope fails, which no exception covers"] if envelope_failed else []),
         *_held_to(flagged_cells, cells, bounds.get("cells", {}), comparison),
         *_held_to(flagged_tile, tiles, bounds.get("tile", {}), comparison),
         *_held_to(variant["trip"], variant["gc"], bounds.get("trip", {}), comparison),
@@ -448,3 +473,8 @@ def check_exception(variant: Mapping, bounds: Mapping | None, comparison: str) -
         return ExceptionResult("outside", reasons)
     flagged = flagged_cells or flagged_tile or variant["trip"]
     return ExceptionResult("inside" if flagged else "clean", [])
+
+
+def passes(variant: Mapping) -> bool:
+    """The gate's outcome for one variant's report: it passes outright, or it is held to an exception and inside it."""
+    return variant["verdict"] == "pass" or variant.get("exception", {}).get("status") in ("clean", "inside")

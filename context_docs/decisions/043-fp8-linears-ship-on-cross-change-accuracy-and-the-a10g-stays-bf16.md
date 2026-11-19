@@ -5,7 +5,9 @@ since [ADR 042](042-chunked-graph-replay-ships-above-the-two-card-yardstick.md),
 0.83–0.91× bf16 and cannot exceed 1.02× even with quantisation free
 ([reduced-precision record](../inference/reduced-precision-inference.md#fp8-at-production-chunk-sizes)). Decision 1,
 the gate, stands for any precision change; decisions 2–5 describe an FP8 that is not built. The tables below come
-from a probe that stopped fitting early; the record's Next steps give the converged figures.
+from a probe that stopped fitting early; the record's Next steps give the converged figures. A mixed store's gap
+closure in them was measured against the L40S bf16 reference rather than its own A10G one, which is why it matches
+FP8's; the gate's tooling now measures each comparison from its own reference side.
 
 ## Context
 

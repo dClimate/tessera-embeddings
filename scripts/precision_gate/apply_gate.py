@@ -1,13 +1,17 @@
 """Apply ADR 043's precision gate to one tile's per-variant predictions, and optionally hold variants to an exception.
 
-Reads the ``.npz`` files ``calibrate.py`` wrote for one tile (``base.npz`` plus one per variant), applies
-the gate (``tessera_embeddings.profiling.inference.precision_gate``), prints one line per variant and
-writes the full report as JSON.
+Reads what ``calibrate.py`` wrote for one tile: ``base.npz``, whose ``variants`` list is the manifest (a
+missing file is an error, a stray one is ignored), one ``.npz`` per variant and ``envelope.json``. Applies
+the gate (``tessera_embeddings.profiling.inference.precision_gate``), prints one line per variant and the
+refit spread, and writes the full report as JSON.
 
 With ``--bounds``, each variant named in ``--hold`` is also checked against the exception's bounds for
 this tile: ``--hold fp8_stage1=stage1:fp8`` holds variant ``fp8_stage1`` to the Stage 1 record's
-``fp8`` comparison. The exit code is 3 if any held variant is outside the exception, so a caller can
-tell that result from a crash.
+``fp8`` comparison.
+
+Every embedded comparison (each key of ``envelope.json``, known-good ones included) must pass: outright,
+or held and inside its exception. The exit code is 3 if any does not, so a caller can tell that result
+from a crash.
 
 usage: apply_gate.py <labels.npz> <label_key> <variant_dir> <tile> <report.json>
                      [--bounds fp8_exception_bounds.json --hold VARIANT=SIZE:COMPARISON ...]
@@ -24,19 +28,22 @@ import numpy as np
 
 from tessera_embeddings.profiling.inference import precision_gate as pg
 
-OUTSIDE_EXIT = 3
+NOT_PASSED_EXIT = 3
 
 
-def load_scores(tile: pg.Tile, vdir: str) -> dict[str, pg.Score]:
-    """Score every variant file in ``vdir`` against ``base.npz``; refit redraws carry no change to score."""
+def load_report(tile: pg.Tile, vdir: str) -> dict:
+    """Score every variant ``base.npz`` lists, and evaluate the tile with its envelopes and refit spread."""
     base = dict(np.load(Path(vdir) / "base.npz"))
-    scores = {}
-    for path in sorted(Path(vdir).glob("*.npz")):
-        name = path.stem
-        if name == "base" or name.startswith("refit"):
-            continue
-        scores[name] = pg.score_variant(tile, dict(np.load(path)), base)
-    return scores
+    scores, refits = {}, []
+    for name in base["variants"].tolist():
+        preds = dict(np.load(Path(vdir) / f"{name}.npz"))
+        if name.startswith("refit"):
+            refits.append(preds)  # a redraw of the training sample: no change to score
+        else:
+            scores[name] = pg.score_variant(tile, preds, base)
+    report = pg.evaluate(tile, scores, json.loads((Path(vdir) / "envelope.json").read_text()))
+    report["refit_spread"] = pg.refit_spread(tile, base, refits)
+    return report
 
 
 def print_report(tile_name: str, report: dict) -> None:
@@ -50,6 +57,8 @@ def print_report(tile_name: str, report: dict) -> None:
         f"control passes {report['control_passes']}; unvalidated {report['unvalidated']}"
     )
     print("tripwire x1e3: " + ", ".join(f"{k} {1e3 * v:.2f}" for k, v in report["tripwire"].items()))
+    worst = sorted(report["refit_spread"].items(), key=lambda kv: -kv[1])[:5]
+    print("refit spread SD (points), largest: " + ", ".join(f"{k} {v:.2f}" for k, v in worst))
     for name, v in report["variants"].items():
         t = v["tile"]
         line = (
@@ -61,6 +70,8 @@ def print_report(tile_name: str, report: dict) -> None:
                 line += f"; {label}: " + " | ".join(f"{k} {_fmt(v, k)}" for k in items)
         if v["trip"]:
             line += "; TRIP: " + ", ".join(f"{k} {1e3 * g:.2f}" for k, g in v["trip"].items())
+        if v["envelope"] and not v["envelope"]["passed"]:
+            line += "; ENVELOPE FAILS"
         print(line)
 
 
@@ -69,10 +80,9 @@ def _fmt(variant: dict, key: str) -> str:
     return f"{loss:.2f}({se:.2f})"
 
 
-def hold(report: dict, tile_name: str, bounds_path: str, holds: list[str]) -> bool:
-    """Check each held variant against the exception; True if all are clean or inside."""
+def hold(report: dict, tile_name: str, bounds_path: str, holds: list[str]) -> None:
+    """Check each held variant against the exception, recording the result in its report."""
     bounds = json.loads(Path(bounds_path).read_text())
-    ok = True
     for spec in holds:
         variant, size_cmp = spec.split("=")
         size, comparison = size_cmp.split(":")
@@ -87,8 +97,6 @@ def hold(report: dict, tile_name: str, bounds_path: str, holds: list[str]) -> bo
             f"exception {variant} ({size}, {comparison}): {res.status.upper()}"
             + ("".join(f"\n    {r}" for r in res.reasons))
         )
-        ok &= res.status != "outside"
-    return ok
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -104,11 +112,14 @@ def main(argv: list[str] | None = None) -> int:
     a = p.parse_args(argv)
     labels = np.load(a.labels)
     tile = pg.make_tile(labels[a.label_key], a.label_key, labels["Y"], labels["X"])
-    report = pg.evaluate(tile, load_scores(tile, a.variant_dir))
+    report = load_report(tile, a.variant_dir)
     print_report(a.tile, report)
-    ok = hold(report, a.tile, a.bounds, a.hold) if a.bounds else True
+    if a.bounds:
+        hold(report, a.tile, a.bounds, a.hold)
+    report["not_passed"] = [n for n, v in report["variants"].items() if v["envelope"] and not pg.passes(v)]
+    print(f"GATE {a.tile}: " + (f"NOT PASSED: {', '.join(report['not_passed'])}" if report["not_passed"] else "PASS"))
     Path(a.report).write_text(json.dumps(report, indent=1))
-    return 0 if ok else OUTSIDE_EXIT
+    return NOT_PASSED_EXIT if report["not_passed"] else 0
 
 
 if __name__ == "__main__":

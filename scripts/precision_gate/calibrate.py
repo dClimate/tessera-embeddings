@@ -25,20 +25,19 @@ Per variant (int8 arrays over the lattice; -1 = unlabelled):
   p_rx, k_rx   fitted on the reference, applied to the test side  (baseline: p_rr, k_rr in base.npz)
   p_xx, k_xx   fitted on the test side, applied to itself
   p_xr, k_xr   fitted on the test side, applied to the reference
-  gc_cls[i,j]  class i's mean unit-vector error projected on (centroid j - centroid i), over |gap|^2
-  gc_clu[a,b]  the same over 64 k-means clusters of the reference
+  gc_cls[i,j]  class i's mean unit-vector error projected on (centroid j - centroid i), over |gap|^2, with
+               the error and the centroids taken from the comparison's own reference side
+  gc_clu[a,b]  the same over 64 k-means clusters (fitted on L40S bf16, assigned on the reference side)
   (mixed variants also carry p_rr, k_rr for their own reference; refit variants carry only p_rr, k_rr)
 
 usage: calibrate.py <labels.npz> <label_key> <embed_dir> <tile> <shard> <nshards> <out_dir>
-env:   SMOKE=1 for a fast local check (small training sample, a few variants); UPLOAD=s3://... to copy
-       each variant's file as it finishes
+env:   SMOKE=1 for a fast local check (small training sample, a few variants)
 """
 
 from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -51,7 +50,6 @@ from tessera_embeddings.profiling.inference import precision_gate as pg
 
 labels_path, label_key, embed_dir, TILE = sys.argv[1:5]
 SHARD, NSHARDS, OUTDIR = int(sys.argv[5]), int(sys.argv[6]), Path(sys.argv[7])
-UPLOAD = os.environ.get("UPLOAD", "")
 SMOKE = os.environ.get("SMOKE") == "1"
 NTRAIN = 4800 if SMOKE else 48000
 NDRAWS = 2 if SMOKE else 20
@@ -126,7 +124,6 @@ cent = np.stack([u_ref[lab == i].mean(0) if cnt[i] else np.zeros(128, np.float32
 km_rng = np.random.default_rng(0)
 km = KMeans(n_clusters=64, n_init=1, random_state=0).fit(u_ref[km_rng.choice(N, 30000, replace=False)])
 clus = km.predict(u_ref)
-ccent = np.stack([u_ref[clus == c].mean(0) if (clus == c).any() else np.zeros(128, np.float32) for c in range(64)])
 
 
 def folds_for(seed: int) -> list[tuple[np.ndarray, np.ndarray]]:
@@ -179,12 +176,19 @@ def knn(a: np.ndarray, x: np.ndarray, folds: list = FOLDS) -> np.ndarray:
     return p
 
 
-def gap_closure(x: np.ndarray, groups_of: np.ndarray, cents: np.ndarray, n: int) -> np.ndarray:
-    """[i, j]: group i's mean unit-vector error projected on the gap to centroid j, as a share of that gap."""
-    e = unit(x) - u_ref
-    me = np.stack(
-        [e[groups_of == g].mean(0) if (groups_of == g).any() else np.zeros(128, np.float32) for g in range(n)]
-    )
+def gap_closure(x: np.ndarray, r: np.ndarray, groups_of: np.ndarray, n: int) -> np.ndarray:
+    """[i, j]: group i's mean unit-vector error from ``r`` to ``x``, on the gap between ``r``'s centroids i and j.
+
+    As a share of that gap: the reference side sets both the error and the centroids.
+    """
+    u_r = unit(r)
+
+    def means(v: np.ndarray) -> np.ndarray:
+        return np.stack(
+            [v[groups_of == g].mean(0) if (groups_of == g).any() else np.zeros(128, np.float32) for g in range(n)]
+        )
+
+    me, cents = means(unit(x) - u_r), means(u_r)
     gap = cents[None, :, :] - cents[:, None, :]  # [i, j] = cent_j - cent_i
     return ((me[:, None, :] * gap).sum(-1) / np.maximum((gap * gap).sum(-1), 1e-12)).astype(np.float32)
 
@@ -221,11 +225,8 @@ def log(m: str) -> None:
 
 
 def save(name: str, **arrs: np.ndarray) -> None:
-    """Write one variant's predictions, and upload them if ``UPLOAD`` is set."""
-    path = OUTDIR / f"{name}.npz"
-    np.savez_compressed(path, names=np.array(names), cnt=cnt, **arrs)
-    if UPLOAD:
-        subprocess.run(["aws", "s3", "cp", "--quiet", str(path), f"{UPLOAD}/{path.name}"], check=False)
+    """Write one variant's predictions."""
+    np.savez_compressed(OUTDIR / f"{name}.npz", names=np.array(names), cnt=cnt, **arrs)
     log(f"done {name}")
 
 
@@ -280,9 +281,6 @@ if SHARD == 0:
         env[name]["noise_cosine_target"] = cn.get(name.split("_", 1)[-1])
     (OUTDIR / "envelope.json").write_text(json.dumps(env, indent=1))
     (OUTDIR / "environment.json").write_text(json.dumps(environment(), indent=1))
-    if UPLOAD:
-        for name in ("envelope.json", "environment.json"):
-            subprocess.run(["aws", "s3", "cp", "--quiet", str(OUTDIR / name), f"{UPLOAD}/{name}"], check=False)
 
 
 def test_side(name: str) -> tuple[np.ndarray, np.ndarray]:
@@ -319,8 +317,8 @@ for name in mine:
         p_xr=probe(fx, r),
         k_xx=knn(x, x),
         k_xr=knn(x, r),
-        gc_cls=gap_closure(x, lab, cent, K),
-        gc_clu=gap_closure(x, clus, ccent, 64),
+        gc_cls=gap_closure(x, r, lab, K),
+        gc_clu=gap_closure(x, r, clus if r is ref else km.predict(unit(r)), 64),
         cos=np.float32((unit(r) * unit(x)).sum(1).mean()),
         **extra,
     )

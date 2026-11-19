@@ -49,6 +49,8 @@ E4M3 = torch.float8_e4m3fn
 E4M3_MAX = 448.0
 PRODUCTION_LAYER = student_v2._encoder_layer_forward
 ROW_BLOCK = 65536
+CARDS = {"l40s": "NVIDIA L40S", "a10g": "NVIDIA A10G", "l4": "NVIDIA L4"}
+"""The cards calibrate.py reads, by the device name each must report."""
 
 
 def quant_rows_e4m3(x2: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -187,7 +189,7 @@ def _git_sha() -> str:
 def main(argv: list[str] | None = None) -> int:
     """Entry point."""
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("card")
+    p.add_argument("card", choices=sorted(CARDS))
     p.add_argument("lattice_dir")
     p.add_argument("out_dir")
     p.add_argument("tiles", nargs="+")
@@ -214,6 +216,8 @@ def main(argv: list[str] | None = None) -> int:
     total_gib = torch.cuda.get_device_properties(0).total_memory / 2**30
     batch = a.batch or batch_size_for_gpu(cfg.batch_size, total_gib)
     name = torch.cuda.get_device_name(0)
+    if name != CARDS[a.card]:  # the card names the output file calibrate.py reads, so it must be the real one
+        p.error(f"card {a.card} expects {CARDS[a.card]}, but this box has {name}")
     print(f"{a.card}: {name}, torch {torch.__version__}, batch {batch}, code {_git_sha()}", flush=True)
     out_dir = Path(a.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

@@ -6,8 +6,9 @@
 #   cpu-record     re-score ADR 043's recorded embeddings in this environment (the environment-only control)
 #   cpu-rebase     score this run's embeddings, which the gpu-* boxes must already have written
 #
-# Every exit, success or failure, uploads the log and a status file (ok, or failed:<step>:rc=<n>) and
-# shuts the box down; the log is also uploaded every minute, so a watcher sees progress and tracebacks.
+# Every exit uploads the log and a status file and shuts the box down. The status is ok; not-passed when
+# a cpu-* box's gate ran to the end and some comparison did not pass (a result, not a crash); or
+# failed:<step>:rc=<n>. the log is also uploaded every minute, so a watcher sees progress and tracebacks.
 # A hard shutdown is scheduled first, in case the trap itself never runs.
 set -euo pipefail
 RUN=__RUN__
@@ -29,6 +30,7 @@ finish() {
   rc=$?
   status=ok
   [ $rc -ne 0 ] && status="failed:$STEP:rc=$rc"
+  [ $rc -eq 3 ] && [ "$STEP" = verdict ] && status=not-passed
   echo "FINISH $status"
   aws s3 cp --quiet "$LOG" "$OUT/logs/$ROLE.log" || true
   echo "$status" | aws s3 cp - "$OUT/status/$ROLE" || true
@@ -91,7 +93,7 @@ cpu() {
   for t in $TILES; do
     for s in $(seq 0 $((ns - 1))); do
       # shellcheck disable=SC2046
-      UPLOAD=$OUT/$set/pred/$t $PY -u -W ignore /opt/te/scripts/precision_gate/calibrate.py \
+      $PY -u -W ignore /opt/te/scripts/precision_gate/calibrate.py \
         $(label_args "$t" | sed 's|^|labels/|') emb "$t" "$s" $ns "out/$t" > "logs/${t}_$s.txt" 2>&1 &
       pids+=($!)
     done
@@ -105,11 +107,14 @@ cpu() {
   for p in "${pids[@]}"; do wait "$p" || failed=$((failed + 1)); done
   kill $progress || true
   aws s3 sync --quiet logs/ "$OUT/$set/logs/" || true
+  STEP=upload
+  aws s3 sync --quiet out/ "$OUT/$set/pred/"  # checked: the gate's result is re-applied from these
   [ $failed -eq 0 ] || { echo "ERROR: $failed calibrate shards failed"; return 1; }
   STEP=gate
   mkdir -p reports
+  local not_passed=""
   for t in $TILES; do
-    # Exit 3 is a variant outside the exception: a result, not a box failure. Anything else non-zero is a crash.
+    # Exit 3 is a comparison that did not pass: a result, kept until every tile is reported. Anything else is a crash.
     rc=0
     # shellcheck disable=SC2046
     $PY /opt/te/scripts/precision_gate/apply_gate.py $(label_args "$t" | sed 's|^|labels/|') "out/$t" "$t" \
@@ -117,11 +122,13 @@ cpu() {
       --hold fp8_stage1=stage1:fp8 --hold mixed_stage1=stage1:mixed --hold fp8_all4=all4:fp8 \
       --hold mixed_all4=all4:mixed > "reports/$t.txt" || rc=$?
     [ $rc -eq 0 ] || [ $rc -eq 3 ] || { echo "ERROR: apply_gate crashed on $t (rc $rc)"; cat "reports/$t.txt"; return $rc; }
-    [ $rc -eq 3 ] && echo "gate: $t has a variant outside the exception"
-    cp "out/$t/envelope.json" "reports/${t}_envelope.json"
+    grep '^GATE' "reports/$t.txt"
+    [ $rc -eq 3 ] && not_passed="$not_passed $t"
     cp "out/$t/environment.json" "reports/${t}_environment.json"
   done
   aws s3 sync --quiet reports/ "$OUT/$set/reports/"
+  STEP=verdict
+  [ -z "$not_passed" ] || { echo "GATE NOT PASSED on:$not_passed"; exit 3; }
 }
 
 case $ROLE in
