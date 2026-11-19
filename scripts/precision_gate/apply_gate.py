@@ -1,21 +1,14 @@
-"""Apply ADR 043's precision gate to one tile's per-variant predictions, and optionally hold variants to an exception.
+"""Apply ADR 043's precision gate to one tile's per-variant predictions.
 
 Reads what ``calibrate.py`` wrote for one tile: ``base.npz``, whose ``variants`` list is the manifest (a
 missing file is an error, a stray one is ignored), one ``.npz`` per variant and ``envelope.json``. Applies
 the gate (``tessera_embeddings.profiling.inference.precision_gate``), prints one line per variant and the
 refit spread, and writes the full report as JSON.
 
-With ``--bounds``, each variant named in ``--hold`` is also checked against a named exception's bounds
-for this tile (decision 2; the file maps size -> tile -> ``cells``/``tile``/``trip`` -> item -> comparison
--> bound): ``--hold fp8_stage1=stage1:fp8`` holds variant ``fp8_stage1`` to the ``stage1`` record's ``fp8``
-comparison. No exception is in force today.
-
-Every embedded comparison (each key of ``envelope.json``, known-good ones included) must pass: outright,
-or held and inside its exception. The exit code is 3 if any does not, so a caller can tell that result
-from a crash.
+Every embedded comparison (each key of ``envelope.json``, known-good ones included) must pass. The exit
+code is 3 if any does not, so a caller can tell that result from a crash.
 
 usage: apply_gate.py <labels.npz> <label_key> <variant_dir> <tile> <report.json>
-                     [--bounds <exception.json> --hold VARIANT=SIZE:COMPARISON ...]
 """
 
 from __future__ import annotations
@@ -81,25 +74,6 @@ def _fmt(variant: dict, key: str) -> str:
     return f"{loss:.2f}({se:.2f})"
 
 
-def hold(report: dict, tile_name: str, bounds_path: str, holds: list[str]) -> None:
-    """Check each held variant against the exception, recording the result in its report."""
-    bounds = json.loads(Path(bounds_path).read_text())
-    for spec in holds:
-        variant, size_cmp = spec.split("=")
-        size, comparison = size_cmp.split(":")
-        res = pg.check_exception(report["variants"][variant], bounds["sizes"][size].get(tile_name), comparison)
-        report["variants"][variant]["exception"] = {
-            "size": size,
-            "comparison": comparison,
-            "status": res.status,
-            "reasons": res.reasons,
-        }
-        print(
-            f"exception {variant} ({size}, {comparison}): {res.status.upper()}"
-            + ("".join(f"\n    {r}" for r in res.reasons))
-        )
-
-
 def main(argv: list[str] | None = None) -> int:
     """Entry point."""
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -108,16 +82,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("variant_dir")
     p.add_argument("tile")
     p.add_argument("report")
-    p.add_argument("--bounds")
-    p.add_argument("--hold", action="append", default=[])
     a = p.parse_args(argv)
     labels = np.load(a.labels)
     tile = pg.make_tile(labels[a.label_key], a.label_key, labels["Y"], labels["X"])
     report = load_report(tile, a.variant_dir)
     print_report(a.tile, report)
-    if a.bounds:
-        hold(report, a.tile, a.bounds, a.hold)
-    report["not_passed"] = [n for n, v in report["variants"].items() if v["envelope"] and not pg.passes(v)]
+    report["not_passed"] = [n for n, v in report["variants"].items() if v["envelope"] and v["verdict"] != "pass"]
     print(f"GATE {a.tile}: " + (f"NOT PASSED: {', '.join(report['not_passed'])}" if report["not_passed"] else "PASS"))
     Path(a.report).write_text(json.dumps(report, indent=1))
     return NOT_PASSED_EXIT if report["not_passed"] else 0

@@ -1,4 +1,4 @@
-"""ADR 043's precision gate: the cell arithmetic, the rule, and the FP8 exception check.
+"""ADR 043's precision gate: the cell arithmetic and the rule.
 
 The rule's full behaviour was checked once against the record: re-applied to the recorded per-variant
 predictions it reproduces every verdict, z_fam, gated cell and tripwire on all six tiles. These tests pin
@@ -106,75 +106,3 @@ def test_a_tile_loss_past_the_bound_fails() -> None:
     cal = pg.calibrate(_noise())
     s = pg.Score(cells={GATED: (0.0, 0.05)}, tile={("probe", "x->ref"): (0.21, 0.05)}, gap_closure={0: 0.0})
     assert pg.verdict(s, cal) == "fail"
-
-
-def _variant(fail=(), unresolved=(), fail_tile=(), trip=None, cells=None, tile=None, gc=None, env=True) -> dict:
-    return {
-        "verdict": "pass" if not (fail or unresolved or fail_tile or trip) and env else "fail",
-        "envelope": {"passed": env},
-        "fail_cells": list(fail),
-        "unresolved": list(unresolved),
-        "fail_tile": list(fail_tile),
-        "trip": trip or {},
-        "cells": cells or {},
-        "tile": tile or {},
-        "gc": gc or {},
-    }
-
-
-WW = "winter wheat|probe|ref->x|recall"
-BOUNDS_KANSAS = {"cells": {WW: {"fp8": 0.82, "mixed": 0.85}}, "trip": {"pasture": {"fp8": 4.8e-3, "mixed": 4.8e-3}}}
-
-
-def test_exception_clean_inside_and_outside() -> None:
-    clean = _variant(cells={WW: [0.3, 0.1]}, gc={"pasture": 1e-3})
-    assert pg.check_exception(clean, BOUNDS_KANSAS, "fp8").status == "clean"
-
-    inside = _variant(fail=[WW], cells={WW: [0.8, 0.1]}, trip={"pasture": 4e-3}, gc={"pasture": 4e-3})
-    assert pg.check_exception(inside, BOUNDS_KANSAS, "fp8").status == "inside"
-
-    past = _variant(fail=[WW], cells={WW: [0.83, 0.1]}, gc={"pasture": 1e-3})
-    assert pg.check_exception(past, BOUNDS_KANSAS, "fp8").status == "outside"
-    assert pg.check_exception(past, BOUNDS_KANSAS, "mixed").status == "inside"  # each comparison its own bound
-
-    new_cell = "corn|probe|x->ref|recall"
-    unlisted = _variant(unresolved=[new_cell], cells={WW: [0.1, 0.1], new_cell: [0.6, 0.3]}, gc={"pasture": 1e-3})
-    res = pg.check_exception(unlisted, BOUNDS_KANSAS, "fp8")
-    assert res.status == "outside"
-    assert "not in the exception" in res.reasons[0]
-
-    new_trip = _variant(cells={WW: [0.1, 0.1]}, trip={"sorghum": 3e-3}, gc={"pasture": 1e-3, "sorghum": 3e-3})
-    assert pg.check_exception(new_trip, BOUNDS_KANSAS, "fp8").status == "outside"
-
-
-def test_a_listed_cell_that_worsens_past_its_bound_is_outside_even_unflagged() -> None:
-    # Past its bound but not flagged, e.g. because a recalibration left it ungated under z_fam.
-    v = _variant(cells={WW: [0.9, 0.5]}, gc={"pasture": 1e-3})
-    assert pg.check_exception(v, BOUNDS_KANSAS, "fp8").status == "outside"
-
-
-def test_a_comparison_with_no_record_uses_the_largest_recorded_bound() -> None:
-    cell = "sorghum|probe|ref->x|recall"
-    bounds = {"cells": {cell: {"mixed": 0.81}}}
-    v = _variant(unresolved=[cell], cells={cell: [0.7, 0.3]})
-    assert pg.check_exception(v, bounds, "fp8").status == "inside"
-
-
-def test_tile_with_nothing_listed_holds_every_flag_outside() -> None:
-    v = _variant(fail_tile=["probe x->ref"], tile={"probe x->ref": [0.21, 0.05]})
-    assert pg.check_exception(v, None, "fp8").status == "outside"
-
-
-def test_a_failed_envelope_is_outside_any_exception_and_does_not_pass() -> None:
-    v = _variant(cells={WW: [0.3, 0.1]}, gc={"pasture": 1e-3}, env=False)
-    v["exception"] = {"status": pg.check_exception(v, BOUNDS_KANSAS, "fp8").status}
-    assert v["exception"]["status"] == "outside"
-    assert not pg.passes(v)
-
-
-def test_passes_outright_or_inside_an_exception() -> None:
-    assert pg.passes(_variant())
-    held = _variant(fail=[WW], cells={WW: [0.8, 0.1]}, gc={"pasture": 1e-3})
-    assert not pg.passes(held)  # not held to anything
-    held["exception"] = {"status": pg.check_exception(held, BOUNDS_KANSAS, "fp8").status}
-    assert pg.passes(held)

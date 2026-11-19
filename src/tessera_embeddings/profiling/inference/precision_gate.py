@@ -23,10 +23,6 @@ Variant names follow ``calibrate.py``: ``noise_*`` are the matched-noise draws, 
 the class-directed controls, ``ctrl2_*`` the large-to-small control, ``refit_*`` training-sample
 redraws.
 
-:func:`check_exception` then holds a variant to a named exception (decision 2): every cell, tile
-bound and tripwire class it fails, leaves unresolved or trips must be listed in the exception, and
-no listed one may exceed its bound; no exception covers a failed envelope. :func:`passes` is the
-gate's outcome for a comparison: it passes outright, or it is held to an exception and inside it.
 """
 
 from __future__ import annotations
@@ -421,60 +417,3 @@ def coherence(ref: np.ndarray, test: np.ndarray) -> float:
     """Length of the mean unit-vector error over the mean error length: ~0.02 for noise, 1 for a shared shift."""
     e = test / np.linalg.norm(test, axis=1, keepdims=True) - ref / np.linalg.norm(ref, axis=1, keepdims=True)
     return float(np.linalg.norm(e.mean(0)) / (np.linalg.norm(e, axis=1).mean() + 1e-12))
-
-
-def _bound_for(by_comparison: Mapping[str, float], comparison: str) -> float:
-    """A comparison's own recorded bound, or the largest recorded where it has none (one cell, two comparisons)."""
-    return by_comparison.get(comparison, max(by_comparison.values()))
-
-
-def _held_to(
-    flagged: Mapping[str, float],
-    values: Mapping[str, float],
-    bounds: Mapping[str, Mapping[str, float]],
-    comparison: str,
-) -> list[str]:
-    """Items outside the exception: flagged and not listed, or listed and past their bound."""
-    out = [f"{k} {v:.3f} not in the exception" for k, v in flagged.items() if k not in bounds]
-    for k, by in bounds.items():
-        b = _bound_for(by, comparison)
-        if k in values and values[k] > b:
-            out.append(f"{k} {values[k]:.3f} past its bound {b:.3f}")
-    return out
-
-
-@dataclass(frozen=True)
-class ExceptionResult:
-    """``clean`` (passes outright), ``inside`` (only listed items, within bound) or ``outside``."""
-
-    status: str
-    reasons: list[str]
-
-
-def check_exception(variant: Mapping, bounds: Mapping | None, comparison: str) -> ExceptionResult:
-    """Hold one variant's report (from :func:`evaluate`) to an exception's bounds for one tile.
-
-    ``bounds`` has ``cells``, ``tile`` and ``trip``, each mapping an item to {comparison: bound}; a
-    tile with no listed items passes ``None``.
-    """
-    bounds = bounds or {}
-    envelope_failed = variant["envelope"] is not None and not variant["envelope"]["passed"]
-    cells = {k: v[0] for k, v in variant["cells"].items()}
-    tiles = {k: v[0] for k, v in variant["tile"].items()}
-    flagged_cells = {k: cells[k] for k in [*variant["fail_cells"], *variant["unresolved"]]}
-    flagged_tile = {k: tiles[k] for k in variant["fail_tile"]}
-    reasons = [
-        *(["ADR 012's envelope fails, which no exception covers"] if envelope_failed else []),
-        *_held_to(flagged_cells, cells, bounds.get("cells", {}), comparison),
-        *_held_to(flagged_tile, tiles, bounds.get("tile", {}), comparison),
-        *_held_to(variant["trip"], variant["gc"], bounds.get("trip", {}), comparison),
-    ]
-    if reasons:
-        return ExceptionResult("outside", reasons)
-    flagged = flagged_cells or flagged_tile or variant["trip"]
-    return ExceptionResult("inside" if flagged else "clean", [])
-
-
-def passes(variant: Mapping) -> bool:
-    """The gate's outcome for one variant's report: it passes outright, or it is held to an exception and inside it."""
-    return variant["verdict"] == "pass" or variant.get("exception", {}).get("status") in ("clean", "inside")
