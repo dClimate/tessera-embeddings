@@ -7,14 +7,14 @@
 
 | path | numerics (ADR 012) | speed | cost per Mpx (UK) | verdict |
 |---|---|---|---|---|
-| **FP8 on g6e (L40S)** | per-value ✓, strict neighbours ✗ (0.97), cross-change accuracy ✓ per tile except Ecuador's Stage 1 mixed store (0.2005), ✗ per class on three tiles, shipped as a named exception ([ADR 043](../decisions/043-fp8-linears-ship-on-cross-change-accuracy-and-the-a10g-stays-bf16.md)) | ~1.2–1.3× forward pass, only with hand-written fused quantisation; naive and `torch.compile` versions are slower than bf16 | ~$0.024–0.025 vs $0.030 | planned: g6e stays the workhorse, so this is the next speed work (see Next steps) |
+| **FP8 on g6e (L40S)** | per-value ✓, strict neighbours ✗ (0.97), cross-change accuracy ✓ per tile except Ecuador's Stage 1 mixed store (0.2005), ✗ per class on three tiles, shipped as a named exception ([ADR 043](../decisions/043-fp8-linears-ship-on-cross-change-accuracy-and-the-a10g-stays-bf16.md)) | **0.83–0.91× the bf16 forward** at production chunk sizes; even with quantisation free, at most 1.02× (Stage 1) or 1.13× (all four linears) | none | **not adopted** (2026-11-19): see [FP8 at production chunk sizes](#fp8-at-production-chunk-sizes) |
 | **int8 on Intel (c8i, AMX)** | per-value ✓, neighbours ✗ (0.98) | ~1.45–1.6× projected over CPU bf16 | spot ~$0.039–0.048, against a bar of $0.039 (g6e) or $0.054 (g5) | at best reaches the g6e bar; viable as spot overflow only where we fall back to g5 |
 
-- **Fleet plan.** As of 2026-11-16 the g6e (L40S) remains the workhorse until further notice: we expect to get a substantial number of them. That makes FP8 on the g6e the path to build.
+- **Fleet plan.** As of 2026-11-16 the g6e (L40S) remains the workhorse until further notice: we expect to get a substantial number of them. That made FP8 on the g6e the path to build, and it was built and measured: since chunked graph replay ([ADR 042](../decisions/042-chunked-graph-replay-ships-above-the-two-card-yardstick.md)) the L40S multiplies 7,400-row chunks, not 896,000-row batches, and at that size FP8 is slower than bf16.
 - **Which bar applies.** The CPU path was to be pursued only within 1.3× of GPU cost. Against the g6e that bar is **$0.039/Mpx**, which projected int8 on c8i spot ($0.039–0.048) reaches only at its best case; FP8 on the g6e would lower it to about $0.031–0.033. g6e capacity was effectively unavailable while these measurements were taken, and wherever that recurs the fallback GPU is the g5.2xlarge, with a bar of **$0.054/Mpx** that int8 clears.
 - **The neighbour gate over-penalises, and has been re-examined.** ADR 012's top-20 gate (0.9940) is failed even by bf16 on a different kernel stack: the CPU library scores 0.989–0.990, and bf16 under `torch.compile` scores 0.988. The churn is swaps among near-tied neighbours: counted tie-tolerantly, every evaluated change keeps 0.999 or more on the two-tile calibration, and 0.995 or more over whole tiles on the six-tile lattice. See [Calibrating the gate](#calibrating-the-gate).
 - **Downstream accuracy is unaffected within a single-precision store, and at risk only across a change.** On labelled pixels, FP8 and int8 move kNN and linear-probe accuracy by no more than matched random noise does (within about ±0.2 points). The one consumer that loses accuracy is a classifier trained on embeddings from one side of a change and applied to the other. A store mixing g5 bf16 and g6e FP8 pixels contains such a change: a linear classifier crossing it loses up to 0.2 points on some tiles, and up to 1.0 point on a single class (next bullet).
-- **g5 fallback inside an FP8 store is accepted, on bf16** ([ADR 043](../decisions/043-fp8-linears-ship-on-cross-change-accuracy-and-the-a10g-stays-bf16.md)). Across six tiles on real kernels, a linear classifier fitted on one card's pixels and applied to the other's loses nothing beyond the metric's own noise on four tiles, and at most 0.2 points where FP8's shared shift has a small real cost (Ecuador, Kansas). Per class the cost is larger: up to 1.0 point of Kansas winter wheat recall, and 0.55–0.65 on one class each in Iowa and Ecuador with all four linears, which ADR 043 accepts as a named exception. kNN is unaffected everywhere. See [The mixed-pool test](#the-mixed-pool-test) and [Per-class losses across the change](#per-class-losses-across-the-change).
+- **g5 fallback inside an FP8 store would have been accepted, on bf16** ([ADR 043](../decisions/043-fp8-linears-ship-on-cross-change-accuracy-and-the-a10g-stays-bf16.md)). Across six tiles on real kernels, a linear classifier fitted on one card's pixels and applied to the other's loses nothing beyond the metric's own noise on four tiles, and at most 0.2 points where FP8's shared shift has a small real cost (Ecuador, Kansas). Per class the cost is larger: up to 1.0 point of Kansas winter wheat recall, and 0.55–0.65 on one class each in Iowa and Ecuador with all four linears, which ADR 043 accepts as a named exception. kNN is unaffected everywhere. See [The mixed-pool test](#the-mixed-pool-test) and [Per-class losses across the change](#per-class-losses-across-the-change).
 
 ## Baselines: production engine, bf16, four dense UK chunks of ~4.0M px
 
@@ -60,6 +60,76 @@
 | hand-written fused quantisation, estimated | Tier A (QKV and FFN up fed from a fused LayerNorm, ~200 LoC, 2–3 days): **~1.15×**. Tier B (plus a Triton FP8 GEMM with a ReLU and FP8 output epilogue for FFN down, plus static-scale calibration, a further ~350–400 LoC, 4–6 days): **~1.25–1.3×** |
 
 FP8 applies only to Ada and newer, so the g5's A10G gets nothing from it.
+
+### FP8 at production chunk sizes
+
+*Measured 2026-11-19 on one g6e.4xlarge (L40S, PyTorch 2.14.1+cu130, the production worker environment and its
+`CUBLAS_WORKSPACE_CONFIG`), with the production checkpoint.*
+
+The figures above were taken on batches of 896,000 token rows. Since chunked graph replay, an L40S runs each
+sub-batch in 64-pixel chunks, which at these bucket depths is 64 to 7,200 rows per multiply. The Stage 1 forward
+was built as it would ship and timed there:
+
+- **Code.** `F.scaled_mm` with row-wise E4M3 scales on QKV (layers 2–4) and the first FFN projection; weights
+  quantised once from fp32 at model build; each activation row quantised in a separate pass (amax, divide, clamp,
+  cast); bias inside the multiply; the ReLU after it. Captured in the CUDA graph without change. Commits
+  `ea5d2d9e`, `1a068a3f` (the store's precision record), `3664ae55`, reverted in `614ce448`; also
+  `s3://global-tessera-inputs-dev/perf/fp8/scripts/te-fp8-code.tgz`.
+- **Method.** As [`v2-chunked-graph-replay.md`](v2-chunked-graph-replay.md) §2: card pre-heated 90 s, seven Iowa
+  bucket shapes of 7,168 pixels, four rounds, every round timing every arm in rotating order, fastest round per
+  shape. Each arm is its own model built through `build_inference_model`. The card's clock moved between 1,335 and
+  2,040 MHz across rounds at its 350 W limit; the rotation spreads that over every arm.
+
+**The whole forward:**
+
+| bucket (S2 × S1 steps) | bf16, ms per 64-pixel chunk | FP8 Stage 1 | FP8, first layer's QKV too |
+|---|---:|---:|---:|
+| 48 × 56 | 1.90 | 0.900× | 0.891× |
+| 80 × 56 | 2.57 | 0.897× | 0.877× |
+| 88 × 56 | 2.76 | 0.901× | 0.884× |
+| 40 × 32 | 1.33 | 0.848× | 0.831× |
+| 80 × 32 | 2.14 | 0.895× | 0.881× |
+| 80 × 1 | 1.62 | 0.827× | 0.820× |
+| 112 × 48 | 3.09 | 0.914× | 0.890× |
+| all seven | | **0.889×** | 0.873× |
+
+**Each multiply, at chunk sizes** (64 pixels × T steps; one multiply, inside a CUDA graph, ms). "Free" is FP8 with
+the activations already quantised, the best any fused kernel could do:
+
+| T | QKV bf16 | QKV FP8 free | QKV FP8 shipped | FFN up bf16 | FFN up FP8 free | out-proj bf16 / FP8 free | FFN down bf16 / FP8 free | quantising one row set |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 32 | 0.030 | 0.029 | 0.055 | 0.044 | 0.043 | 0.016 / 0.014 | 0.047 / 0.028 | 0.026 |
+| 48 | 0.049 | 0.041 | 0.074 | 0.060 | 0.059 | 0.017 / 0.016 | 0.047 / 0.031 | 0.032 |
+| 80 | 0.074 | 0.060 | 0.107 | 0.089 | 0.096 | 0.029 / 0.027 | 0.088 / 0.052 | 0.045 |
+| 112 | 0.096 | 0.082 | 0.143 | 0.122 | 0.140 | 0.030 / 0.030 | 0.094 / 0.062 | 0.059 |
+
+- **Quantising a row set costs about as much as the multiply it feeds.** At 896,000 rows the multiply dominated;
+  at 7,400 it does not.
+- **The first FFN projection gains nothing from FP8 even when quantisation is free.** bf16 already runs its bias
+  and ReLU inside the multiply; FP8 adds the ReLU as its own pass.
+- **Ceilings, with every quantisation free.** Summing the free savings over the eight encoder layers and dividing
+  by the measured bf16 forward: **1.02× for Stage 1** and **1.13× for all four linears**, where FFN down carries
+  most of it. Both are upper bounds, since the two backbones run on parallel streams and overlap. Reaching the
+  all-four figure needs FFN down's input to arrive already in FP8, which means FFN up emitting FP8 with fixed
+  activation scales (the old plan's Tier B, about 350–400 lines of Triton plus a calibration pass), and all four
+  linears is also the size that lost more on the lattice.
+- **Against the bar.** The plan's bar was 1.08× on the forward, about 5% of tile time or $18,000 over the nine-year
+  v2 campaign. Stage 1 cannot reach it at any amount of kernel work. All four linears could only in the best case,
+  at the cost above.
+
+**Two numerical findings, both relevant to any later FP8 work:**
+
+- **The FP8 multiply is not position-independent.** The same rows moved 7 pixels within a batch give different
+  bf16 outputs from `F.scaled_mm` at some sizes (64 × 32, 64 × 48 and 64 × 88 rows; up to 0.031), in both
+  accumulation modes. The quantiser's codes and scales are identical, and bf16's multiply is position-independent
+  at every size tested. A pixel's FP8 embedding would therefore depend on which chunk row it lands in, which every
+  determinism check in this project assumes it does not.
+- **Accuracy at chunk sizes matches the record.** FP8 Stage 1 against bf16 on random inputs at the seven shapes:
+  mean per-pixel cosine 0.99991–0.99992, worst 0.99976. Replaying a captured graph equals the eager forward bit for
+  bit, and a NaN or infinite input reaches the output as non-finite without changing any other pixel.
+
+Outputs: `s3://global-tessera-inputs-dev/perf/fp8/out/` (`b2` the forward, `g1`/`g2` the multiplies), scripts
+beside them in `scripts/`.
 
 ## int8 on Intel (c8i, Granite Rapids AMX)
 
@@ -284,24 +354,23 @@ ADR 043 records the outcome: FP8 fails the gate on Kansas (both sizes), Iowa and
 
 ## Next steps
 
-The g6e stays the workhorse, so the plan is FP8 on the L40S, built by extending the fusion production already has.
+**FP8 on the L40S is closed for Stage 1** ([FP8 at production chunk sizes](#fp8-at-production-chunk-sizes)): since
+chunked graph replay its ceiling is 1.02× on the forward. Two things remain open, each for a decision rather than
+for work already planned:
 
-**Starting point.** v2's CUDA forward (`_encoder_layer_forward` in `student_v2.py`) already runs each residual add and LayerNorm as one compiled bf16 kernel, and the FFN-up bias and ReLU in the matmul's epilogue ([ADR 030](../decisions/030-forward-pass-reorderings-ship-at-a-store-boundary.md), 5–7% on the L40S and A10G). The baselines above include it, so the bf16 fusion step is done and the remaining gain is FP8's.
-
-1. **Gate: settled** by [ADR 043](../decisions/043-fp8-linears-ship-on-cross-change-accuracy-and-the-a10g-stays-bf16.md), on [the mixed-pool test](#the-mixed-pool-test) and [the per-class scoring](#per-class-losses-across-the-change). A precision change meets ADR 012's envelope; a classifier fitted across the change loses no more than 0.2 points on any labelled tile; and no gated class loses more than 0.5 points beyond the noise. FP8 fails the per-class part on Kansas winter wheat (both sizes), Iowa forest and Ecuador trees (all four linears), and ships as a named exception for those losses. Still needed: the fused kernels and Stage 2's static scales, if Stage 2 ships, through the same test; they stay inside the exception only if they fail or are unresolved in the same cells by no more than the recorded loss plus one SE, and trip the tripwire only in the same classes by no more than 1.1 times the recorded gap closure.
-2. **Stage 1: FP8 out of the fused add + LayerNorm (Tier A, target ~1.15×).**
-   - Replace the compiled add + LayerNorm with a hand-written kernel that also emits its result as E4M3. The encoder is post-norm, so each LayerNorm output feeds both the residual stream and the next GEMM: the kernel writes bf16 for the first and FP8 for the second.
-   - QKV and FFN up take the FP8 output through `torch._scaled_mm`, with weights quantised once at load.
-   - The first layer's QKV is the exception: its input is the embedding plus the temporal encoding (`student_v2.py`, before any add + LayerNorm), so no fused kernel emits it as FP8. That is one of the four QKVs in each backbone. The measured Stage 1 variant quantised that input from bf16 in a separate pass. The shipped path either does the same, paying the separate quantisation the profile showed to be slower than the GEMM, or leaves that one QKV in bf16; Stage 1's measurement decides, and either goes through the gate.
-   - Hand-written rather than `torch.compile`, which was slower and crashed on varied batch shapes with FP8.
-   - The store records its precision at creation and model construction reads it, so a bf16 store stays bf16 on an L40S. Inside an FP8 store the g5 builds today's bf16 path, since the A10G has no FP8 (ADR 043).
-3. **Measure Stage 1 on g6e.xlarge**: production chunks for speed, the lattice for parity through ADR 043's gate, scored against bf16 on the A10G as well as the L40S, since the fused kernel's numerics are not exactly the unfused path's. The measured figure shows how much of the ~1.35× ceiling is left for Stage 2.
-4. **Stage 2: FFN down (Tier B, target ~1.25–1.3×), if Stage 1's number justifies it.**
-   - First check whether `_scaled_mm` can emit FP8 output with a static result scale. If so, FFN up feeds FFN down with no bf16 round trip and both stay on cuBLASLt.
-   - Otherwise a Triton FP8 GEMM with a ReLU and FP8-output epilogue, which has to match cuBLASLt's FFN speed to be worth having.
-   - Static scales need a calibration pass. Out-proj (1.10× per layer) is decided on measurement and may stay bf16.
-5. **Ship at a store boundary**, as ADR 030 requires of the bf16 fusion.
-6. **g5 fallback: settled.** A g5 fills FP8 stores on today's bf16 forward. Model construction reads the store's recorded precision; inside an FP8 store, the L40S builds FP8 layers, the g5's A10G builds the bf16 ones, and any other card, the L4 included since it is not in the fleet, refuses to write until it has been measured on the lattice (ADR 043). A mixed store carries FP8's shared shift between its g5 and g6e pixels: about 0.2 points on a linear probe at the tile level (0.2005 on Ecuador, Stage 1) and up to 1.0 point on a single class (Kansas winter wheat), nothing on kNN.
+1. **Whether to try all four linears.** Its ceiling is 1.13× with every quantisation free and needs FFN up to emit
+   FP8 with fixed activation scales, a hand-written kernel and a calibration pass; all four linears also lost more
+   on the lattice, and the FP8 multiply's position dependence would have to be solved or accepted first. The
+   recommendation is not to.
+2. **The gate.** [ADR 043](../decisions/043-fp8-linears-ship-on-cross-change-accuracy-and-the-a10g-stays-bf16.md)
+   decision 1 is the bar for any precision change and does not depend on FP8 shipping. Its tables, and the bounds
+   in `scripts/precision_gate/fp8_exception_bounds.json`, come from a linear probe that stopped fitting early
+   (fixed in the gate code, commit `af33d0a3`). Re-scored with the probe fitted to convergence
+   (`s3://arbol-tessera-inputs-dev/perf/fp8-rebase/rebase-20261118/record/`), the same embeddings give, at Stage 1:
+   no failure on Kansas (winter wheat recall was 0.66), a failure on Ecuador wetland recall (0.84 ± 0.18, was
+   unresolved at 0.79), and two unresolved cells (Kansas developed kNN precision 0.51 ± 0.17, Finland grass recall
+   0.52 ± 0.09). All 12 two-card pairs and 239 of the 240 noise draws still pass. Any later candidate is scored
+   with the converged probe.
 
 Parked while the g6e is the workhorse:
 
@@ -327,6 +396,9 @@ Parked while the g6e is the workhorse:
 - **Labels:** CDL 2024 from CropScape's coverage endpoint, sampled at pixel centres; WorldCover 2021 v200 from `s3://esa-worldcover`.
 - **Lattice inputs** are in `s3://arbol-tessera-inputs-dev/perf/fp8-lattice/`.
 - **Mosaics** (calendar 2024) are at `s3://arbol-tessera-inputs-dev/mosaics/cpu-ab-{uk,iowa}`. The production stores are at `s3://arbol-tessera-embeddings-dev/cpu-ab/embeddings/`.
+- **FP8 at production chunk sizes** is in `s3://global-tessera-inputs-dev/perf/fp8/` (account `global-tessera-dev`):
+  `scripts/bench_fp8.py` (the whole forward, per arm, with the GPU checks), `scripts/bench_gemm.py` (each multiply
+  and the position probe), `scripts/te-fp8-code.tgz` (the code measured), outputs under `out/`.
 - **CPU library integration** is on branch `feature/cpu-tc-encoder`: `TcEncoder`, thread and affinity fixes, and the plain runner's `--skip-ingest`.
 - **Caveats:**
   - The int8 numbers are a simulation plus a projection. The library has not been changed.

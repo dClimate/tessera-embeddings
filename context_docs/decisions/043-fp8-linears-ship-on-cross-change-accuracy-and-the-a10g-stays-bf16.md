@@ -1,6 +1,11 @@
 # 043 — A per-class gate for precision changes; FP8 linears fail it and ship as a named exception, at a store boundary, and the A10G stays bf16
 
-**Status:** Proposed (2026-11-17)
+**Status:** Proposed (2026-11-17). **FP8 is not adopted** (2026-11-19): at the 64-pixel chunks the L40S has run
+since [ADR 042](042-chunked-graph-replay-ships-above-the-two-card-yardstick.md), the Stage 1 forward measures
+0.83–0.91× bf16 and cannot exceed 1.02× even with quantisation free
+([reduced-precision record](../inference/reduced-precision-inference.md#fp8-at-production-chunk-sizes)). Decision 1,
+the gate, stands for any precision change; decisions 2–5 describe an FP8 that is not built. The tables below come
+from a probe that stopped fitting early; the record's Next steps give the converged figures.
 
 ## Context
 

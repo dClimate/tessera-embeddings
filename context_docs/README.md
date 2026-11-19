@@ -121,11 +121,10 @@ context_docs/
 │   ├── reduced-precision-inference.md          FP8 on the g6e and int8 on Intel AMX: both pass the
 │   │                                              per-value envelope and fail the neighbour gate on
 │   │                                              near-tie churn; int8 makes CPU spot ~g5 parity;
-│   │                                              the plan for fused FP8 on the g6e workhorse;
 │   │                                              the gate: cross-change accuracy per tile and per
 │   │                                              class against matched noise and controls (ADR 043);
-│   │                                              FP8 fails per class on three tiles and ships as a
-│   │                                              named exception; neighbour overlaps are reported
+│   │                                              FP8 built and timed at production chunk sizes:
+│   │                                              0.89x bf16, ceiling 1.02x, so not adopted
 │   └── the-fleet-and-the-work-source.md        a fleet lives for one `run_inference` call, so a
 │                                                  retry through a second call rebuilt one; the
 │                                                  wind-down, and why the fleet is not held
