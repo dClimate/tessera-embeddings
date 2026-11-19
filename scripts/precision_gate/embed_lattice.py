@@ -7,16 +7,19 @@ because graphs are cached on the model per bucket shape, and a reused model woul
 variant's graphs for every later one.
 
 Variants:
-  bf16               today's forward on this card
-  bf16_whole         today's forward with chunking off (the whole batch), as before PR #273
+  bf16               the bf16 forward on this card (a model built for a bf16 store)
+  bf16_whole         the bf16 forward with chunking off (the whole batch), as before PR #273
+  fp8                the shipped FP8 forward: a model built for an FP8 store, which on an L40S runs QKV (after the
+                     first layer) and the first FFN projection in E4M3 (``student_v2.build_fp8_layers``), and on any
+                     other card the bf16 forward
   fp8_all4           all four transformer linears in E4M3 through ``torch._scaled_mm``, row-wise activation
                      and per-channel weight scales, quantised from the bf16 activations (ADR 043's record)
   fp8_stage1         QKV and FFN up only, quantised from the fp32 LayerNorm output as the planned fused kernel
                      emits it; out-proj and FFN down stay bf16 (the record's Stage 1)
   fp8_stage1_whole   fp8_stage1 with chunking off, to reproduce the record bit for bit
 
-The FP8 variants are the record's unfused code, swapped in for ``student_v2._encoder_layer_forward``
-before the fresh model's first forward; they need FP8 tensor cores (compute capability 8.9 or later).
+``fp8_all4`` and ``fp8_stage1`` are the record's stand-ins, swapped in for ``student_v2._encoder_layer_forward``
+on a bf16 model before its first forward; they need FP8 tensor cores (compute capability 8.9 or later).
 Embeddings are quantised with ``quantize_rows``, as the record's were.
 
 usage: embed_lattice.py <card> <lattice_dir> <out_dir> <tile> [<tile> ...] --variants bf16,fp8_stage1,...
@@ -26,6 +29,7 @@ usage: embed_lattice.py <card> <lattice_dir> <out_dir> <tile> [<tile> ...] --var
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import os
 import subprocess
 import sys
@@ -38,7 +42,7 @@ import torch
 import torch.nn.functional as F  # noqa: N812 - the conventional alias, as in student_v2
 from torch import Tensor, nn
 
-from tessera_embeddings.config.inference import InferenceConfig, batch_size_for_gpu
+from tessera_embeddings.config.inference import InferenceConfig, Precision, batch_size_for_gpu
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.inference import _prepare_gpu
 from tessera_embeddings.inference.models import student_v2
@@ -102,7 +106,9 @@ def fp8_all4_layer() -> Callable:
     """The record's all-four-linears layer forward."""
     lin = FP8Linear()
 
-    def layer_fwd(layer: nn.TransformerEncoderLayer, x: Tensor, add_layer_norm: Callable[..., Tensor]) -> Tensor:
+    def layer_fwd(
+        layer: nn.TransformerEncoderLayer, x: Tensor, add_layer_norm: Callable[..., Tensor], _fp8: object = None
+    ) -> Tensor:
         attn = layer.self_attn
         o = _attention(layer, x, lin(x, attn.in_proj_weight, attn.in_proj_bias))
         n1, n2 = layer.norm1, layer.norm2
@@ -130,7 +136,9 @@ def fp8_stage1_layer() -> Callable:
         return hit[1] if hit is not None and hit[0] is x else None
 
     # Ignores the production add + LayerNorm it is passed: it needs the fp32 output, so it runs its own.
-    def layer_fwd(layer: nn.TransformerEncoderLayer, x: Tensor, _add_layer_norm: Callable[..., Tensor]) -> Tensor:
+    def layer_fwd(
+        layer: nn.TransformerEncoderLayer, x: Tensor, _add_layer_norm: Callable[..., Tensor], _fp8: object = None
+    ) -> Tensor:
         attn = layer.self_attn
         o = _attention(layer, x, lin(x, attn.in_proj_weight, attn.in_proj_bias, src32(x)))
         n1, n2 = layer.norm1, layer.norm2
@@ -141,23 +149,24 @@ def fp8_stage1_layer() -> Callable:
     return layer_fwd
 
 
-# variant -> (layer forward factory, chunking on)
-VARIANTS: dict[str, tuple[Callable[[], Callable], bool]] = {
-    "bf16": (lambda: PRODUCTION_LAYER, True),
-    "bf16_whole": (lambda: PRODUCTION_LAYER, False),
-    "fp8_all4": (fp8_all4_layer, True),
-    "fp8_stage1": (fp8_stage1_layer, True),
-    "fp8_stage1_whole": (fp8_stage1_layer, False),
+# variant -> (layer forward factory, chunking on, the store precision the model is built for)
+VARIANTS: dict[str, tuple[Callable[[], Callable], bool, Precision]] = {
+    "bf16": (lambda: PRODUCTION_LAYER, True, "bf16"),
+    "bf16_whole": (lambda: PRODUCTION_LAYER, False, "bf16"),
+    "fp8": (lambda: PRODUCTION_LAYER, True, "fp8"),
+    "fp8_all4": (fp8_all4_layer, True, "bf16"),
+    "fp8_stage1": (fp8_stage1_layer, True, "bf16"),
+    "fp8_stage1_whole": (fp8_stage1_layer, False, "bf16"),
 }
 
 
 def embed(cfg: InferenceConfig, ckpt: str, lattice: dict, variant: str, batch: int) -> tuple[np.ndarray, dict]:
     """One variant over one tile's lattice, on a freshly built production model."""
     dev = torch.device("cuda")
-    make_layer, chunked = VARIANTS[variant]
+    make_layer, chunked, precision = VARIANTS[variant]
     student_v2._encoder_layer_forward = make_layer()
     try:
-        model = build_inference_model(cfg, dev, checkpoint_path=ckpt)
+        model = build_inference_model(dataclasses.replace(cfg, precision=precision), dev, checkpoint_path=ckpt)
         _prepare_gpu(model, dev)
         if not chunked:
             model.chunk_pixels = None
@@ -166,7 +175,8 @@ def embed(cfg: InferenceConfig, ckpt: str, lattice: dict, variant: str, batch: i
             for b in lattice["batches"]:
                 for s in range(0, b["s2"].shape[0], batch):
                     zs.append(model(b["s2"][s : s + batch].to(dev), b["s1"][s : s + batch].to(dev)).float().cpu())
-        meta = {"chunk_pixels": model.chunk_pixels, "graphs": len(model._graphs)}
+        fp8_built = any(e.fp8_layers is not None for e in (model.s2_backbone, model.s1_backbone))
+        meta = {"chunk_pixels": model.chunk_pixels, "graphs": len(model._graphs), "fp8_layers": fp8_built}
     finally:
         student_v2._encoder_layer_forward = PRODUCTION_LAYER
     del model
@@ -232,11 +242,17 @@ def main(argv: list[str] | None = None) -> int:
             z, meta = embed(cfg, a.checkpoint, lattice, v, batch)
             out[f"{v}_q"], out[f"{v}_s"] = quantize_rows(z)
             out[f"{v}_chunk_pixels"] = -1 if meta["chunk_pixels"] is None else meta["chunk_pixels"]
+            out[f"{v}_fp8_layers"] = meta["fp8_layers"]
             print(
                 f"{tile} {v}: {time.monotonic() - t0:.0f}s, chunk_pixels {meta['chunk_pixels']}, "
-                f"{meta['graphs']} graphs, {z.shape[0]:,} px",
+                f"{meta['graphs']} graphs, FP8 layers {meta['fp8_layers']}, {z.shape[0]:,} px",
                 flush=True,
             )
+        # The gate scores against "bf16": it must be a bf16 forward, and on an FP8 card the shipped forward must differ.
+        if out.get("bf16_fp8_layers"):
+            raise RuntimeError("the bf16 reference was built with FP8 layers")
+        if out.get("fp8_fp8_layers") and "bf16_q" in out and np.array_equal(out["fp8_q"], out["bf16_q"]):
+            raise RuntimeError("the fp8 variant embedded exactly as bf16: its FP8 layers did not run")
         np.savez(out_dir / f"lattice_{a.card}_{tile}.npz", **out)
         print(f"PROGRESS tile {tile} done", flush=True)
         del lattice
