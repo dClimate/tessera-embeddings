@@ -67,6 +67,35 @@ On 15TVF it holds all of 2019 and 2022, at the baselines originally produced: 14
    the collection the ingest will read.
 4. **The store records both collections** in `geoemb:source_data`.
 
+## Dev test
+
+Run on 2026-11-19 in global-tessera-dev, through YE branch `dev/global-tessera-s2-c1` pinned to this
+PR, with the `ingest-s2-roi-reflectance` flow. The area was `rois/zarrs/tiny_epsg5070.zarr`, about
+4.5 × 6 km in western Minnesota spanning MGRS tiles 15TUM and 14TQS. Each run used 4 workers with
+provenance on. Three runs went in parallel, each taking about 2.5–3 minutes:
+
+| Run | Window | `collection` | Collection recorded in provenance | Dates |
+|---|---|---|---|---|
+| A | July 2023 | default | `sentinel-2-c1-l2a` | 12 |
+| B | July 2023 | `sentinel-2-l2a` (control) | `sentinel-2-l2a` | 12 |
+| C | July 2022 | default | `sentinel-2-l2a` (fallback) | 7 |
+
+- **The offset is removed correctly.** A and B hold the same 12 dates, and every pixel came from the
+  same source scene (`source_index` agrees everywhere). On every band, the median and mean difference
+  is 0. At least 99.9% of pixels agree to within ±10 and at least 99.8% exactly; none differ by
+  500 or more.
+- **The remaining 0.15% of pixels** (5,007 of 3.4 million) are dark: a median of 32 in A against 51
+  in B on `nir08`, where the band's median is 3,778. Reading one scene's files directly, Collection 1
+  minus 1,000 equals the legacy COG on every pixel except a handful whose raw value is below 1,000,
+  that is, negative reflectance. The two producers floor those differently
+  ([ADR 020](020-boa-offset-applies-to-every-valid-dn.md)), and bilinear resampling of the 20 m
+  bands spreads each difference to its neighbours.
+- **The fallback works end to end.** Collection 1 has no July 2022 imagery over this area, and run C
+  read the legacy collection and found 7 dates passing the coverage filter.
+
+Provenance was on in every run, but no run had it off, so this test does not measure the cost of
+provenance.
+
 ## Consequences
 
 - From 2020 onward, except 2022, mosaics come from one baseline and one producer. Duplicate
