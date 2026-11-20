@@ -113,6 +113,7 @@ class TestBuildConventionAttrs:
         assert attrs["geoemb:model"] == _V11_URL  # public encoder ref
         assert attrs["checkpoint_id"] == "1.1"  # a checkpoint id is provenance, not the public URL
         assert attrs["geoemb:source_data"] == [
+            "https://earth-search.aws.element84.com/v1/collections/sentinel-2-c1-l2a",
             "https://earth-search.aws.element84.com/v1/collections/sentinel-2-l2a",
             "https://doi.org/10.5067/SNWG/OPERA_L2_RTC-S1_V1",
         ]

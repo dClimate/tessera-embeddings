@@ -25,6 +25,7 @@ from tessera_embeddings.ingest.stac import (
     _loadable_assets,
     _prune_item_dict,
     _query_stac_items,
+    collection_for_window,
     correct_boa_dn,
     extract_baselines,
     ingest_tile,
@@ -142,6 +143,21 @@ class TestProviderConfiguration:
         config = _get_collection_config(provider_name, collection_alias)
 
         assert config.requires_baseline_correction == expected_correction
+
+    @pytest.mark.parametrize(
+        "collection,start,end,expected",
+        [
+            ("sentinel-2-c1-l2a", "2023-01-01", "2023-12-31", "sentinel-2-c1-l2a"),
+            ("sentinel-2-c1-l2a", "2020-01-01", "2021-12-31", "sentinel-2-c1-l2a"),
+            ("sentinel-2-c1-l2a", "2022-06-01", "2022-06-30", "sentinel-2-l2a"),
+            ("sentinel-2-c1-l2a", "2019-12-01", "2020-03-31", "sentinel-2-l2a"),  # one day in a gap is enough
+            ("sentinel-2-c1-l2a", "2021-06-01", "2023-06-30", "sentinel-2-l2a"),  # spans the 2022 gap
+            ("sentinel-2-c1-l2a", "20220101", "2022-12-31", "sentinel-2-l2a"),  # compact ISO spelling
+            ("sentinel-2-l2a", "2022-06-01", "2022-06-30", "sentinel-2-l2a"),  # no fallback configured
+        ],
+    )
+    def test_collection_for_window_reads_one_collection_per_window(self, collection, start, end, expected):
+        assert collection_for_window("earth-search", collection, start, end) == expected
 
     def test_get_collection_config_raises_on_unknown_collection(self):
         """Unknown collection should raise ValueError with available options."""

@@ -50,7 +50,7 @@ from tessera_embeddings.config.ingest import (
     INGEST_CHUNKS,
     SOURCE_INDEX_VAR,
 )
-from tessera_embeddings.config.providers import PROVIDERS
+from tessera_embeddings.config.providers import DEFAULT_S2_COLLECTION, PROVIDERS
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
 from tessera_embeddings.ingest._pipeline import pipelined
 from tessera_embeddings.ingest.asset_locations import Harmonisation
@@ -90,6 +90,7 @@ from tessera_embeddings.ingest.solar_days import (
 )
 from tessera_embeddings.ingest.stac import (
     HeterogeneousProducerError,
+    collection_for_window,
     collection_harmonisation,
     extract_baselines,
     group_items_by_date,
@@ -338,7 +339,7 @@ def ingest_s2_roi_reflectance(
     client: dask.distributed.Client,
     min_valid_coverage: float = DEFAULT_MIN_VALID_COVERAGE,
     provider: str = "earth-search",
-    collection: str = "sentinel-2-l2a",
+    collection: str = DEFAULT_S2_COLLECTION,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     storage_options: StorageOptions = None,
     stream_stac_monthly: bool = True,
@@ -362,7 +363,9 @@ def ingest_s2_roi_reflectance(
         min_valid_coverage: Minimum percentage of valid ROI pixels (from SCL) to keep a date.
         provider: STAC provider key from
             :data:`tessera_embeddings.config.providers.PROVIDERS`.
-        collection: Collection alias within the provider.
+        collection: Collection alias within the provider. Read through
+            :func:`~tessera_embeddings.ingest.stac.collection_for_window`, so a window this
+            collection holds only part of reads its configured fallback instead.
         log: Optional logger; defaults to ``logging.getLogger(__name__)``.
         storage_options: fsspec storage options for reading the ROI mask. ``None`` lets fsspec
             auto-detect from the URI.
@@ -442,6 +445,7 @@ def ingest_s2_roi_reflectance(
         allow_ingest_code_mismatch=allow_ingest_code_mismatch,
         provenance=provenance,
     )
+    collection = collection_for_window(provider, collection, start_date, end_date)
     catalogue = PROVIDERS[provider]
     #: Where every granule list says its items came from.
     source = {

@@ -50,6 +50,10 @@ UNHARMONISED_ASSET_BUCKETS: frozenset[str] = frozenset({"sentinel-s2-l2a"})
 #: ``context_docs/decisions/020-boa-offset-applies-to-every-valid-dn.md`` for the measurement, the
 #: metadata that cannot substitute for it, and the residual risk this accepts.
 #:
+#: True of the LEGACY collection's objects only: Collection 1 keeps the offset in COGs served from
+#: ``e84-earth-search-sentinel-data`` too, which is why its config settles RAW and this list is
+#: never consulted for it (ADR 044).
+#:
 #: An unrecognised bucket is neither harmonised nor known-raw, so it is UNKNOWN and the caller
 #: refuses the date: over-correcting harmonised data and under-correcting raw data are both wrong
 #: and both silent, so neither is safe to default to.

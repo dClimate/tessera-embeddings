@@ -14,6 +14,7 @@ from typing import Any
 from prefect import flow, get_run_logger
 from prefect.runtime import flow_run as flow_run_ctx
 
+from tessera_embeddings.config.providers import DEFAULT_S2_COLLECTION
 from tessera_embeddings.ingest.roi_processing import DEFAULT_MIN_VALID_COVERAGE
 from tessera_embeddings.ingest.s2_roi import BATCH_CHUNKS_PER_WORKER
 from tessera_embeddings.orchestration.prefect.flows._dask_lifecycle import (
@@ -91,7 +92,7 @@ def ingest_s2_roi_reflectance(
     max_workers: int = 50,
     min_valid_coverage: float = DEFAULT_MIN_VALID_COVERAGE,
     provider: str = "earth-search",
-    collection: str = "sentinel-2-l2a",
+    collection: str = DEFAULT_S2_COLLECTION,
     ec2_scheduler: bool = False,
     use_local: bool = False,
     storage_options: dict | None = None,

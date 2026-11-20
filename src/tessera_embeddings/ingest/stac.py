@@ -56,6 +56,7 @@ from tessera_embeddings.ingest.solar_days import (
     normalize_to_solar_day,
     owned_items,
     resolve_grouping_longitude,
+    validated_window,
 )
 
 # =============================================================================
@@ -262,6 +263,23 @@ def _get_collection_config(
             f"Unknown collection '{collection_alias}' for provider '{provider_name}'. Available: {available}"
         )
     return provider.collections[collection_alias]
+
+
+def collection_for_window(provider_name: str, collection_alias: str, start_date: str, end_date: str) -> str:
+    """The collection to read ``start_date``..``end_date`` from: the one asked for, or its fallback.
+
+    A window touching any range the collection's config marks ``incomplete`` reads the fallback
+    for the WHOLE window, never a mix: one run keeps one producer, so its offset rule and its
+    duplicate handling hold end to end. Every entry point that queries for a window resolves it
+    here, so the optical preflight probes the collection the ingest will read.
+    """
+    config = _get_collection_config(provider_name, collection_alias)
+    # Canonical spellings, since a compact `20220101` sorts above `2022-12-31` (`validated_window`).
+    start, end = (day.isoformat() for day in validated_window(start_date, end_date))
+    if config.fallback is None or not any(start <= last and end >= first for first, last in config.incomplete):
+        return collection_alias
+    logger.info("%s is incomplete within %s..%s; reading %s instead", collection_alias, start, end, config.fallback)
+    return config.fallback
 
 
 def split_antimeridian_bbox(
