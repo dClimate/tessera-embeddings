@@ -82,10 +82,23 @@ On 15TVF it holds all of 2019 and 2022, at the baselines originally produced: 14
    ingest and the preflight both resolve through it, so the preflight probes the collection the
    ingest will read.
    - The test starts a day before the window, because the catalogue query does: an image dated
-     that UTC day can belong to the window's first solar day. It ends on the window's last day.
-     Sentinel-2 passes at about 10:30 local solar time, so an image's UTC date is its solar day or
-     the day before, and the query's padding day after the window never holds one of its images.
-     Testing that day too would send every window ending on 2021-12-31 to the legacy collection.
+     that UTC day can belong to the window's first solar day. It ends on the window's last day,
+     because the query's padding day after the window holds none of the window's images at the
+     one place it could matter, the day before 2022-01-01. Testing that day too would send every
+     window ending on 2021-12-31 to the legacy collection.
+   - Measured on 2026-11-23 with the ingest's own solar-day rule (`solar_days.solar_day_of_instant`).
+     In 2023, 6,141 Collection 1 images between 180° and 60°W were dated the UTC day after their
+     solar day, all of them in the first hour after midnight UTC:
+     - zones 01–02 above 67.5°N (Chukotka and the Chukchi Sea);
+     - zones 07–11 above 79°N (the Canadian Arctic islands).
+
+     All were taken between late February and October, when those latitudes have daylight. The
+     same region of the legacy collection from 2021-11-01 to 2022-02-28 held 47 such images, all
+     on 2022-02-28, and none between 2021-12-20 and 2022-01-10. South of 55°S, between 180° and
+     120°W, there were none in 2023. Sentinel-2's 10:30 local overpass time holds at mid-latitudes
+     only; this far north the overpass is near local noon or later.
+   - This makes the rule depend on the ranges. A future `incomplete` range starting between March
+     and October would need the trailing day tested too, for ROIs in those zones.
    - Isolated missing dates are accepted rather than routed. Falling back for one date would send
      the whole year to the legacy collection to recover under 1% of its images.
 4. **The store records both collections** in `geoemb:source_data`.

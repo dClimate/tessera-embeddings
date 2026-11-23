@@ -275,8 +275,11 @@ def collection_for_window(provider_name: str, collection_alias: str, start_date:
 
     The test runs from the query's first UTC date, the day before the window, because an image
     dated then can belong to the window's first solar day (``solar_days``). It ends on the
-    window's last day, not the query's: Sentinel-2 passes at about 10:30 local solar time, so an
-    image's UTC date is its solar day or the day before, never the day after.
+    window's last day, not the query's. An image dated the UTC day AFTER its solar day exists only
+    in the far-western high Arctic, and only between late February and October. No incomplete
+    range starts in those months, so the trailing day never holds an image the window needs, and
+    testing it would send every window ending the day before a range to the fallback. A range
+    starting between March and October would break this; see ADR 044 before adding one.
     """
     config = _get_collection_config(provider_name, collection_alias)
     window = whole_window_range(start_date, end_date)
