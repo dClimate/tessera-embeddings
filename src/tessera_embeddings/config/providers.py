@@ -119,6 +119,7 @@ _earth_search_s2_l2a = partial(
     resolution=10,
     baseline_threshold=S2_BASELINE_THRESHOLD,
     baseline_offset=S2_BASELINE_OFFSET,
+    tile_id_property="grid:code",
     tile_id_prefix="MGRS-",
     has_scl=True,
     fusion_order="clearest_scene",
