@@ -163,14 +163,12 @@ PROVIDERS: dict[str, STACProvider] = {
             # harmonised for the legacy collection's objects there. Its `raster:bands` offset of
             # -0.1 is correct here, unlike the legacy collection's.
             #
-            # `incomplete`: measured against the legacy collection on eight tiles across six
-            # continents, Collection 1 holds every legacy date in 2020, 2021 and 2023 onward but
-            # about a third of 2019's (none before late March), half of 2018's, almost none
-            # before, and under a tenth of 2022's. Windows touching those years read the legacy
-            # collection. ADR 044.
+            # `incomplete`: the two periods Collection 1 has not yet reprocessed, measured against
+            # the legacy collection, each end with about a week's margin. Windows touching either
+            # read the legacy collection. Isolated dates it lacks elsewhere are accepted. ADR 044.
             "sentinel-2-c1-l2a": _earth_search_s2_l2a(
                 collection_id="sentinel-2-c1-l2a",
-                incomplete=(("2015-01-01", "2019-12-31"), ("2022-01-01", "2022-12-31")),
+                incomplete=(("2015-01-01", "2019-03-31"), ("2022-01-01", "2022-12-15")),
                 fallback="sentinel-2-l2a",
             ),
             # The legacy collection, read where Collection 1 is incomplete. Earth Search harmonises

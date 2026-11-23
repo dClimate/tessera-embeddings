@@ -148,9 +148,11 @@ class TestProviderConfiguration:
         "collection,start,end,expected",
         [
             ("sentinel-2-c1-l2a", "2023-01-01", "2023-12-31", "sentinel-2-c1-l2a"),
-            ("sentinel-2-c1-l2a", "2020-01-01", "2021-12-31", "sentinel-2-c1-l2a"),
+            ("sentinel-2-c1-l2a", "2019-06-01", "2021-12-31", "sentinel-2-c1-l2a"),
             ("sentinel-2-c1-l2a", "2022-06-01", "2022-06-30", "sentinel-2-l2a"),
-            ("sentinel-2-c1-l2a", "2019-12-01", "2020-03-31", "sentinel-2-l2a"),  # one day in a gap is enough
+            ("sentinel-2-c1-l2a", "2019-01-01", "2019-12-31", "sentinel-2-l2a"),  # one day in a gap is enough
+            ("sentinel-2-c1-l2a", "2022-12-16", "2022-12-31", "sentinel-2-l2a"),  # its padding day is in the gap
+            ("sentinel-2-c1-l2a", "2022-12-17", "2022-12-31", "sentinel-2-c1-l2a"),
             ("sentinel-2-c1-l2a", "2021-06-01", "2023-06-30", "sentinel-2-l2a"),  # spans the 2022 gap
             ("sentinel-2-c1-l2a", "20220101", "2022-12-31", "sentinel-2-l2a"),  # compact ISO spelling
             ("sentinel-2-l2a", "2022-06-01", "2022-06-30", "sentinel-2-l2a"),  # no fallback configured

@@ -56,7 +56,7 @@ from tessera_embeddings.ingest.solar_days import (
     normalize_to_solar_day,
     owned_items,
     resolve_grouping_longitude,
-    validated_window,
+    whole_window_range,
 )
 
 # =============================================================================
@@ -272,10 +272,15 @@ def collection_for_window(provider_name: str, collection_alias: str, start_date:
     for the WHOLE window, never a mix: one run keeps one producer, so its offset rule and its
     duplicate handling hold end to end. Every entry point that queries for a window resolves it
     here, so the optical preflight probes the collection the ingest will read.
+
+    The test runs from the query's first UTC date, the day before the window, because an image
+    dated then can belong to the window's first solar day (``solar_days``). It ends on the
+    window's last day, not the query's: Sentinel-2 passes at about 10:30 local solar time, so an
+    image's UTC date is its solar day or the day before, never the day after.
     """
     config = _get_collection_config(provider_name, collection_alias)
-    # Canonical spellings, since a compact `20220101` sorts above `2022-12-31` (`validated_window`).
-    start, end = (day.isoformat() for day in validated_window(start_date, end_date))
+    window = whole_window_range(start_date, end_date)
+    start, end = window.query_start, window.own_end
     if config.fallback is None or not any(start <= last and end >= first for first, last in config.incomplete):
         return collection_alias
     logger.info("%s is incomplete within %s..%s; reading %s instead", collection_alias, start, end, config.fallback)

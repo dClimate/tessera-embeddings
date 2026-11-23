@@ -216,9 +216,10 @@ Earth Search's `sentinel-1-grd`, `sentinel-2-l1c` and `landsat-c2-l2` entries ar
 directly rather than taking it as a parameter.
 
 **Collection 1 is the default** (`DEFAULT_S2_COLLECTION`): one producer at one baseline, so its
-offset rule is settled for the whole collection. Earth Search holds only part of it for 2015–2019
-and 2022, so a window touching those years reads the legacy collection instead, for the whole
-window (`stac.collection_for_window`, configured by `CollectionConfig.incomplete` and `fallback`).
+offset rule is settled for the whole collection. Earth Search has not yet reprocessed two periods
+into it: everything before about April 2019, and 2022 until about mid-December. A window touching
+either period reads the legacy collection instead, for the whole window
+(`stac.collection_for_window`, configured by `CollectionConfig.incomplete` and `fallback`).
 The coverage measurements and the reasoning are in
 [ADR 044](../../../context_docs/decisions/044-sentinel-2-reads-collection-1-where-it-is-complete.md).
 

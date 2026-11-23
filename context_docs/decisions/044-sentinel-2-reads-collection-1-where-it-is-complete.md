@@ -41,8 +41,23 @@ date the legacy collection lacks.
 | 44QKE (India) | 4/65 | 56/132 | 113/145 | 145/145 | — | 12/146 | — | 146/146 | 159/159 |
 
 Each cell is Collection 1 dates over legacy dates. A dash means not measured; 33UUP's 2019 query
-failed with a 502. In 2019 Collection 1 starts in late March everywhere. In 2022 it holds a few
-dates, mostly from December. 2026 to mid-November matched on three tiles.
+failed with a 502. 2026 to mid-November matched on three tiles.
+
+The gaps are two periods Element 84 has not yet reprocessed, not scattered losses. Measured on
+2026-11-23 across five of the tiles:
+
+- **2019:** Collection 1's first date is 2019-03-23 or 2019-03-24 on every tile; before it there
+  is nothing in 2019 and about half of 2018.
+- **2022:** its first date in late 2022 is between 2022-12-06 and 2022-12-08; from there it holds
+  every legacy date into 2023.
+- **Isolated dates** are missing outside those periods: 2024-01-11 on 33UUP and 36MZE (but not on
+  15TVF, 55HBU, 23KLP or 44QKE), 2019-06-25 on 33UUP and 2019-04-04 on 44QKE. This accounts for the
+  215/216 and 144/145 in the 2024 column, under 1% of a year.
+- **Near the antimeridian** Collection 1 is no worse than the legacy collection. Element 84
+  [documents](https://github.com/Element84/earth-search/blob/main/docs/collections/sentinel-2-l2a.md#known-issues)
+  that it excludes most scenes crossing 180°. In 2023 it held every legacy date on 60KYF and 60KXF
+  (Fiji), and 51 of 53 on 60VXQ (Kamchatka, June to August). On 01KAB, 01KBB and 01VCC the legacy
+  collection returns nothing for the tile while Collection 1 returns 25 to 28 dates.
 
 Collection 1 can also hold several items for one tile and day: two datastrips of one pass, or two
 satellites. They carry the same `s2:datatake_id` and `s2:datastrip_id` fields as the legacy items, so
@@ -60,11 +75,19 @@ On 15TVF it holds all of 2019 and 2022, at the baselines originally produced: 14
 2. **Its offset rule is settled for the whole collection.** `harmonisation_varies_by_item` is off, so
    `collection_harmonisation` answers RAW and `boa_offset.source_decision` never consults the
    bucket. The threshold stays at 04.00, so every Collection 1 item is corrected.
-3. **Years where it is incomplete read the legacy collection.** Its config sets `incomplete` to 2015
-   through 2019 and to 2022, with `fallback="sentinel-2-l2a"`. `stac.collection_for_window` routes a
-   window that touches any of those days to the fallback **for the whole window**, so one run never
-   mixes producers. The ingest and the preflight both resolve through it, so the preflight probes
-   the collection the ingest will read.
+3. **The periods it lacks read the legacy collection.** Its config sets `incomplete` to 2015-01-01
+   through 2019-03-31 and 2022-01-01 through 2022-12-15, each about a week past the measured edge,
+   with `fallback="sentinel-2-l2a"`. `stac.collection_for_window` routes a window that touches any
+   of those days to the fallback **for the whole window**, so one run never mixes producers. The
+   ingest and the preflight both resolve through it, so the preflight probes the collection the
+   ingest will read.
+   - The test starts a day before the window, because the catalogue query does: an image dated
+     that UTC day can belong to the window's first solar day. It ends on the window's last day.
+     Sentinel-2 passes at about 10:30 local solar time, so an image's UTC date is its solar day or
+     the day before, and the query's padding day after the window never holds one of its images.
+     Testing that day too would send every window ending on 2021-12-31 to the legacy collection.
+   - Isolated missing dates are accepted rather than routed. Falling back for one date would send
+     the whole year to the legacy collection to recover under 1% of its images.
 4. **The store records both collections** in `geoemb:source_data`.
 
 ## Dev test
@@ -98,7 +121,8 @@ provenance.
 
 ## Consequences
 
-- From 2020 onward, except 2022, mosaics come from one baseline and one producer. Duplicate
+- From April 2019 onward, except 2022 before mid-December, mosaics come from one baseline and one
+  producer. Annual windows for 2019 and 2022 still read the legacy collection. Duplicate
   selection still runs, but in Collection 1 it only separates images; there are no competing copies.
 - Mosaics change for 2020, 2021 and 2023 onward. Where the legacy collection supplied pre-04.00
   originals, pixels differ slightly (686 against 690 on 15TVF on 2020-07-10). Scene classification
@@ -107,5 +131,7 @@ provenance.
   not resume under it without `allow_ingest_code_mismatch`.
 - The `incomplete` ranges are a measured snapshot. When Element 84 backfills 2022 or the early
   years, rerun the date comparison and shrink the ranges.
+- A Collection 1 window can lack an isolated date the legacy collection holds, such as 2024-01-11
+  on some tiles.
 - `provider="planetary-computer"` has no Collection 1 entry. It must be given
   `collection="sentinel-2-l2a"` explicitly, as with every unvalidated use of that provider.
