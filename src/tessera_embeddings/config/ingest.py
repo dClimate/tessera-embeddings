@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field, model_validator
 from zarr.codecs import BloscCodec
 
 from tessera_embeddings.config.code_identity import source_identity
+from tessera_embeddings.config.providers import PROVIDERS
 
 #: Source whose change alters which dates and pixels a MOSAIC holds.
 #:
@@ -296,6 +297,11 @@ class IngestSettings(BaseModel):
     # on. A mosaic records the setting and refuses a resume under the other one:
     # context_docs/storage/registry-provenance-plan.md §4.
     provenance: bool = False
+    # Which Sentinel-2 source each named calendar year reads, as {year: [provider, collection]}
+    # (e.g. {2017: ["planetary-computer", "sentinel-2-l2a"]}). Years not named read the default
+    # table, `config.providers.S2_SOURCE_BY_PERIOD`. A mosaic records the source it was built from
+    # and a resume keeps it; naming a different one for a year already begun is refused (ADR 045).
+    s2_sources: dict[int, tuple[str, str]] | None = None
 
     @model_validator(mode="after")
     def _worker_bounds_ordered(self) -> IngestSettings:
@@ -311,6 +317,14 @@ class IngestSettings(BaseModel):
                 f"max_workers ({self.max_workers}) is below min_workers ({self.min_workers}); "
                 "the worker bounds must be orderable."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _s2_sources_known(self) -> IngestSettings:
+        """Refuse an unknown Sentinel-2 source at run start, before any fleet is launched for it."""
+        for year, (provider, collection) in (self.s2_sources or {}).items():
+            if collection not in getattr(PROVIDERS.get(provider), "collections", {}):
+                raise ValueError(f"s2_sources[{year}]: no collection {collection!r} for provider {provider!r}")
         return self
 
     def floor_for(self, derived_max: int) -> int:

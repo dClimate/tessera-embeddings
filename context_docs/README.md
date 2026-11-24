@@ -60,7 +60,8 @@ context_docs/
 │   ├── 041-unit-tests-run-the-forked-writer-in-threads.md
 │   ├── 042-chunked-graph-replay-ships-above-the-two-card-yardstick.md
 │   ├── 043-a-per-class-gate-for-precision-changes.md
-│   └── 044-sentinel-2-reads-collection-1-where-it-is-complete.md
+│   ├── 044-sentinel-2-reads-collection-1-where-it-is-complete.md
+│   └── 045-sentinel-2-sources-are-chosen-per-calendar-year.md
 │
 ├── campaign/                      THE GLOBAL CAMPAIGN — start here
 │   ├── campaign-plan.md                        <- START HERE. What runs, with what settings, in

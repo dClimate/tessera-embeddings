@@ -49,7 +49,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, cast, final
@@ -58,11 +58,12 @@ import numpy as np
 from pystac_client import Client
 from pystac_client.stac_api_io import StacApiIO
 
-from tessera_embeddings.config import DEFAULT_S2_COLLECTION, PROVIDERS
+from tessera_embeddings.config import PROVIDERS
+from tessera_embeddings.config.providers import S2Source
 from tessera_embeddings.ingest._http import make_logging_retry, spawn_abandonable
 from tessera_embeddings.ingest.land_mask import live_tile_block_bboxes_wgs84
 from tessera_embeddings.ingest.solar_days import whole_window_range
-from tessera_embeddings.ingest.stac import collection_for_window, split_antimeridian_bbox
+from tessera_embeddings.ingest.stac import s2_source_for_window, split_antimeridian_bbox
 from tessera_embeddings.storage import zone_grid
 from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group
 
@@ -183,8 +184,9 @@ def preflight_optical_source(
     window: TimeWindow,
     *,
     land_mask_path: str,
-    provider: str = "earth-search",
-    collection: str = DEFAULT_S2_COLLECTION,
+    provider: str | None = None,
+    collection: str | None = None,
+    s2_sources: Mapping[int, S2Source] | None = None,
     block_tiles: int = BLOCK_TILES,
     budget_s: float = PROBE_BUDGET_S,
     probe: ExistenceProbe | None = None,
@@ -206,8 +208,10 @@ def preflight_optical_source(
             day per the solar-day convention.
         land_mask_path: Coverage repo holding the zone's ``tile_live_2048`` bitmap.
         provider: STAC provider key — must be the one the S2 ingest reads, since the
-            decisiveness of a miss rests on probing the ingest's own catalogue.
+            decisiveness of a miss rests on probing the ingest's own catalogue. Given together
+            with ``collection`` or not at all, exactly as the ingest takes them.
         collection: Collection alias within the provider, same constraint.
+        s2_sources: The run's per-year Sentinel-2 sources, as the ingest takes them.
         block_tiles: Block edge for the per-block sweep (see :data:`BLOCK_TILES`).
         budget_s: Wall-clock probe budget (see :data:`PROBE_BUDGET_S`).
         probe: Injectable catalogue probe; ``None`` builds the default from
@@ -231,7 +235,9 @@ def preflight_optical_source(
         # land, so the common case settles in one probe.
         blocks.sort(key=lambda entry: entry[1], reverse=True)
         if probe is None:
-            probe = _make_default_probe(provider, collection_for_window(provider, collection, *window.to_date_range()))
+            probe = _make_default_probe(
+                *s2_source_for_window(*window.to_date_range(), provider, collection, s2_sources)
+            )
     except Exception as exc:
         log.warning("Optical preflight for %s could not be set up — passing the cell through", zone, exc_info=True)
         return OpticalPreflight(zone, SourceFinding.INCONCLUSIVE, f"preflight setup failed: {exc!r}", 0)

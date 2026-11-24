@@ -60,11 +60,6 @@ class CollectionConfig:
     #: The band the source index is read from: the one each sensor's validity is judged on, so the
     #: index and the mask share one definition (``ingest/provenance.py``). Needs ``fusion_order``.
     source_index_band: str | None = None
-    #: Inclusive ``(first, last)`` ISO-date ranges the catalogue is known to hold only part of, and
-    #: the alias of the collection a window touching any of them reads instead. A run reads one
-    #: collection end to end, so the store it writes never mixes producers within a run.
-    incomplete: tuple[tuple[str, str], ...] = ()
-    fallback: str | None = None
 
     @property
     def requires_baseline_correction(self) -> bool:
@@ -109,8 +104,23 @@ class STACProvider:
 # Pre-configured Providers
 # =============================================================================
 
-#: The Sentinel-2 collection every pipeline reads unless told otherwise.
-DEFAULT_S2_COLLECTION = "sentinel-2-c1-l2a"
+#: A Sentinel-2 source: a key of :data:`PROVIDERS` and a collection alias within it.
+S2Source = tuple[str, str]
+
+#: The Sentinel-2 source a window reads when no row of :data:`S2_SOURCE_BY_PERIOD` claims it.
+DEFAULT_S2_SOURCE: S2Source = ("earth-search", "sentinel-2-c1-l2a")
+
+#: Where each period of Sentinel-2 is read from by default: inclusive ``(first day, last day,
+#: source)``, first matching row wins. A run overrides it per calendar year with
+#: ``IngestSettings.s2_sources``. Every row is whole calendar years, so every window inside one
+#: calendar year reads the same source. A window spanning two years reads one source for both, so
+#: cutting a year's processing across year boundaries can still mix sources within it. Applied by
+#: ``stac.s2_source_for_window``; the measurements behind each row are in ADR 044 and ADR 045.
+S2_SOURCE_BY_PERIOD: tuple[tuple[str, str, S2Source], ...] = (
+    # Collection 1 holds nothing before late March 2019 except about half of 2018, and little of 2022.
+    ("2015-01-01", "2019-12-31", ("earth-search", "sentinel-2-l2a")),
+    ("2022-01-01", "2022-12-31", ("earth-search", "sentinel-2-l2a")),
+)
 
 #: Earth Search's two Sentinel-2 L2A collections share everything but what is set per collection.
 _earth_search_s2_l2a = partial(
@@ -156,23 +166,16 @@ PROVIDERS: dict[str, STACProvider] = {
         name="Earth Search (Element 84)",
         catalog_url="https://earth-search.aws.element84.com/v1",
         collections={
-            # Collection 1: ESA's reprocessing of the whole archive at baseline 05.00 or later,
+            # Collection 1: ESA's reprocessing of the archive at baseline 05.00 or later,
             # served by one producer (Element 84's COGs) that leaves the BOA offset IN the pixels.
             # So every item is RAW and the offset is always owed. Settled for the collection
             # (`harmonisation_varies_by_item` off) and never read from the bucket, because these
             # COGs live in `e84-earth-search-sentinel-data`, which `asset_locations` lists as
             # harmonised for the legacy collection's objects there. Its `raster:bands` offset of
-            # -0.1 is correct here, unlike the legacy collection's.
-            #
-            # `incomplete`: the two periods Collection 1 has not yet reprocessed, measured against
-            # the legacy collection, each end with about a week's margin. Windows touching either
-            # read the legacy collection. Isolated dates it lacks elsewhere are accepted. ADR 044.
-            "sentinel-2-c1-l2a": _earth_search_s2_l2a(
-                collection_id="sentinel-2-c1-l2a",
-                incomplete=(("2015-01-01", "2019-03-31"), ("2022-01-01", "2022-12-15")),
-                fallback="sentinel-2-l2a",
-            ),
-            # The legacy collection, read where Collection 1 is incomplete. Earth Search harmonises
+            # -0.1 is correct here, unlike the legacy collection's. The years it holds only part
+            # of read the legacy collection instead (`S2_SOURCE_BY_PERIOD`).
+            "sentinel-2-c1-l2a": _earth_search_s2_l2a(collection_id="sentinel-2-c1-l2a"),
+            # The legacy collection, read for the years Collection 1 holds only part of. Earth Search harmonises
             # the BOA offset (subtracts 1000 post-baseline 04.00) in its OWN COGs, but this
             # collection also indexes items pointing at ESA originals, which still carry it —
             # hence `harmonisation_varies_by_item`, which decides per ASSET from where that asset

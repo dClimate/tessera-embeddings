@@ -10,7 +10,7 @@ import logging
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
 from itertools import count
@@ -31,6 +31,7 @@ from tessera_embeddings.config import (
 )
 from tessera_embeddings.config.environment import configure_gdal_environment
 from tessera_embeddings.config.ingest import INGEST_CHUNKS, SOURCE_INDEX_VAR
+from tessera_embeddings.config.providers import DEFAULT_S2_SOURCE, S2_SOURCE_BY_PERIOD, S2Source
 from tessera_embeddings.ingest._http import make_logging_retry, spawn_abandonable
 from tessera_embeddings.ingest.asset_locations import (
     Harmonisation,
@@ -56,7 +57,7 @@ from tessera_embeddings.ingest.solar_days import (
     normalize_to_solar_day,
     owned_items,
     resolve_grouping_longitude,
-    whole_window_range,
+    validated_window,
 )
 
 # =============================================================================
@@ -265,29 +266,47 @@ def _get_collection_config(
     return provider.collections[collection_alias]
 
 
-def collection_for_window(provider_name: str, collection_alias: str, start_date: str, end_date: str) -> str:
-    """The collection to read ``start_date``..``end_date`` from: the one asked for, or its fallback.
+def s2_source_for_window(
+    start_date: str,
+    end_date: str,
+    provider: str | None = None,
+    collection: str | None = None,
+    s2_sources: Mapping[int, S2Source] | None = None,
+    recorded: S2Source | None = None,
+) -> S2Source:
+    """The Sentinel-2 source to read ``start_date``..``end_date`` from, as ``(provider, collection)``.
 
-    A window touching any range the collection's config marks ``incomplete`` reads the fallback
-    for the WHOLE window, never a mix: one run keeps one producer, so its offset rule and its
-    duplicate handling hold end to end. Every entry point that queries for a window resolves it
-    here, so the optical preflight probes the collection the ingest will read.
+    The first of these that applies decides, for the WHOLE window, so one run keeps one producer
+    and its offset rule and duplicate handling hold end to end:
 
-    The test runs from the query's first UTC date, the day before the window, because an image
-    dated then can belong to the window's first solar day (``solar_days``). It ends on the
-    window's last day, not the query's. An image dated the UTC day AFTER its solar day exists only
-    in the far-western high Arctic, and only between late February and October. No incomplete
-    range starts in those months, so the trailing day never holds an image the window needs, and
-    testing it would send every window ending the day before a range to the fallback. A range
-    starting between March and October would break this; see ADR 044 before adding one.
+    1. a ``provider`` and ``collection`` given together, read as given (a control arm);
+    2. ``s2_sources``, the run's ``{year: source}`` choice, for a window touching one of its years;
+    3. ``recorded``, the source a mosaic store being resumed was built from, so a resume keeps its
+       producer even after the default table changes;
+    4. the first row of :data:`~tessera_embeddings.config.providers.S2_SOURCE_BY_PERIOD` holding
+       any of the window's days, else :data:`~tessera_embeddings.config.providers.DEFAULT_S2_SOURCE`.
+
+    Every entry point that queries for a window resolves it here, so the optical preflight probes
+    the source a fresh ingest will read (it passes no ``recorded``: a resumed cell may differ).
+
+    The window's own days are tested, not the padding day the catalogue query adds either side
+    (``solar_days``). The leading one is the last day of the previous year when the window starts
+    a year, and every source in the default table holds the last day of the year before its row.
+    The trailing one can hold an image of the window's last solar day only in the far-western high
+    Arctic between late February and October, so never on 1 January. Both are measured in ADR 044.
     """
-    config = _get_collection_config(provider_name, collection_alias)
-    window = whole_window_range(start_date, end_date)
-    start, end = window.query_start, window.own_end
-    if config.fallback is None or not any(start <= last and end >= first for first, last in config.incomplete):
-        return collection_alias
-    logger.info("%s is incomplete within %s..%s; reading %s instead", collection_alias, start, end, config.fallback)
-    return config.fallback
+    if (provider is None) != (collection is None):
+        raise ValueError(f"Name both a provider and a collection, or neither: got {provider!r} and {collection!r}")
+    start, end = (day.isoformat() for day in validated_window(start_date, end_date))
+    rows = [(f"{year}-01-01", f"{year}-12-31", tuple(src)) for year, src in sorted((s2_sources or {}).items())]
+    if recorded is not None:
+        rows.append((start, end, tuple(recorded)))
+    rows += S2_SOURCE_BY_PERIOD
+    source = (provider, collection) if provider is not None and collection is not None else None
+    source = source or next((src for first, last, src in rows if start <= last and end >= first), DEFAULT_S2_SOURCE)
+    _get_collection_config(*source)
+    logger.info("Sentinel-2 for %s..%s reads %s/%s", start, end, *source)
+    return source
 
 
 def split_antimeridian_bbox(

@@ -26,7 +26,7 @@ from pathlib import Path
 
 import vcr  # vcrpy
 
-from tessera_embeddings.config import DEFAULT_S2_COLLECTION
+from tessera_embeddings.config import DEFAULT_S2_SOURCE
 
 # AOI matches examples/quickstart/roi.geojson — Denver, CO.
 BBOX = (-105.020, 39.740, -105.010, 39.750)
@@ -70,7 +70,7 @@ def _record_s2_search() -> Path:
     with vcr.VCR(record_mode="once", **VCR_CONFIG).use_cassette(str(cassette_path)):
         client = Client.open("https://earth-search.aws.element84.com/v1")
         search = client.search(
-            collections=[DEFAULT_S2_COLLECTION],
+            collections=[DEFAULT_S2_SOURCE[1]],
             bbox=BBOX,
             datetime=DATETIME,
             max_items=200,

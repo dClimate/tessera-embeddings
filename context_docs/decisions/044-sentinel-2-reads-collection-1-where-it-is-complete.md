@@ -1,6 +1,8 @@
 # 044 — Sentinel-2 is read from Collection 1 wherever Earth Search holds all of it
 
-**Status:** Proposed (PR open, 2026-11-19)
+**Status:** Accepted (2026-11-19). Decision 3's mechanism is replaced by
+[ADR 045](045-sentinel-2-sources-are-chosen-per-calendar-year.md): one table of whole calendar years,
+tested on the window's own days.
 
 ## Context
 

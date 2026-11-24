@@ -800,6 +800,7 @@ async def ingest_zone_year(
             {
                 **common,
                 "min_valid_coverage": ingest_settings.min_valid_coverage,
+                "s2_sources": ingest_settings.s2_sources,
                 "perf_report_uri": f"{perf_base}/s2.html" if perf_base else None,
             },
             _leg_store(mosaic_base, None),

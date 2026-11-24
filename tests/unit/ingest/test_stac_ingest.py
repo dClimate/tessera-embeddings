@@ -25,14 +25,18 @@ from tessera_embeddings.ingest.stac import (
     _loadable_assets,
     _prune_item_dict,
     _query_stac_items,
-    collection_for_window,
     correct_boa_dn,
     extract_baselines,
     ingest_tile,
+    s2_source_for_window,
     solar_day_sort_key,
     split_antimeridian_bbox,
     split_query_window,
 )
+
+C1 = ("earth-search", "sentinel-2-c1-l2a")
+LEGACY = ("earth-search", "sentinel-2-l2a")
+PC = ("planetary-computer", "sentinel-2-l2a")
 
 
 class TestBaselineCorrection:
@@ -145,21 +149,40 @@ class TestProviderConfiguration:
         assert config.requires_baseline_correction == expected_correction
 
     @pytest.mark.parametrize(
-        "collection,start,end,expected",
+        "start,end,expected",
         [
-            ("sentinel-2-c1-l2a", "2023-01-01", "2023-12-31", "sentinel-2-c1-l2a"),
-            ("sentinel-2-c1-l2a", "2019-06-01", "2021-12-31", "sentinel-2-c1-l2a"),
-            ("sentinel-2-c1-l2a", "2022-06-01", "2022-06-30", "sentinel-2-l2a"),
-            ("sentinel-2-c1-l2a", "2019-01-01", "2019-12-31", "sentinel-2-l2a"),  # one day in a gap is enough
-            ("sentinel-2-c1-l2a", "2022-12-16", "2022-12-31", "sentinel-2-l2a"),  # its padding day is in the gap
-            ("sentinel-2-c1-l2a", "2022-12-17", "2022-12-31", "sentinel-2-c1-l2a"),
-            ("sentinel-2-c1-l2a", "2021-06-01", "2023-06-30", "sentinel-2-l2a"),  # spans the 2022 gap
-            ("sentinel-2-c1-l2a", "20220101", "2022-12-31", "sentinel-2-l2a"),  # compact ISO spelling
-            ("sentinel-2-l2a", "2022-06-01", "2022-06-30", "sentinel-2-l2a"),  # no fallback configured
+            ("2023-01-01", "2023-12-31", C1),  # its padding day, 2022-12-31, is not tested
+            ("2020-01-01", "2020-12-31", C1),
+            ("2019-01-01", "2019-12-31", LEGACY),
+            ("2019-06-01", "2019-06-30", LEGACY),  # whole years: a month reads what its year read
+            ("2022-12-16", "2022-12-31", LEGACY),
+            ("2021-06-01", "2023-06-30", LEGACY),  # spans the 2022 row
+            ("20220101", "2022-12-31", LEGACY),  # compact ISO spelling
         ],
     )
-    def test_collection_for_window_reads_one_collection_per_window(self, collection, start, end, expected):
-        assert collection_for_window("earth-search", collection, start, end) == expected
+    def test_s2_source_for_window_reads_one_source_per_window(self, start, end, expected):
+        assert s2_source_for_window(start, end) == expected
+
+    def test_s2_source_for_window_reads_an_explicit_source_as_given(self):
+        assert s2_source_for_window("2022-06-01", "2022-06-30", *C1) == C1
+
+    @pytest.mark.parametrize(
+        "start,end,provider,run_years,recorded,expected",
+        [
+            ("2017-03-01", "2017-03-31", None, {2017: PC}, None, PC),  # the run's year beats the table
+            ("2018-01-01", "2018-12-31", None, {2017: PC}, None, LEGACY),  # a year it does not name
+            ("2017-01-01", "2017-12-31", None, None, C1, C1),  # a resume keeps what its store records
+            ("2017-01-01", "2017-12-31", None, {2017: PC}, LEGACY, PC),  # ...unless the run names the year
+            ("2017-01-01", "2017-12-31", C1, {2017: PC}, LEGACY, C1),  # an explicit source beats all
+        ],
+    )
+    def test_s2_source_for_window_precedence(self, start, end, provider, run_years, recorded, expected):
+        assert s2_source_for_window(start, end, *(provider or (None, None)), run_years, recorded) == expected
+
+    @pytest.mark.parametrize("provider,collection", [("earth-search", None), (None, "sentinel-2-l2a")])
+    def test_s2_source_for_window_refuses_half_a_source(self, provider, collection):
+        with pytest.raises(ValueError, match="both a provider and a collection"):
+            s2_source_for_window("2023-01-01", "2023-12-31", provider, collection)
 
     def test_get_collection_config_raises_on_unknown_collection(self):
         """Unknown collection should raise ValueError with available options."""

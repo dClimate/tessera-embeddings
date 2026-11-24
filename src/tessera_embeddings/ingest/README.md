@@ -215,13 +215,27 @@ Earth Search's `sentinel-1-grd`, `sentinel-2-l1c` and `landsat-c2-l2` entries ar
 **have no caller**: radar comes from OPERA, and `ingest_s1_roi_sar` names the `cmr-asf` provider
 directly rather than taking it as a parameter.
 
-**Collection 1 is the default** (`DEFAULT_S2_COLLECTION`): one producer at one baseline, so its
-offset rule is settled for the whole collection. Earth Search has not yet reprocessed two periods
-into it: everything before about April 2019, and 2022 until about mid-December. A window touching
-either period reads the legacy collection instead, for the whole window
-(`stac.collection_for_window`, configured by `CollectionConfig.incomplete` and `fallback`).
-The coverage measurements and the reasoning are in
-[ADR 044](../../../context_docs/decisions/044-sentinel-2-reads-collection-1-where-it-is-complete.md).
+**Which catalogue and collection a window reads is chosen per calendar year**, by
+`stac.s2_source_for_window`, which takes the first of these that applies, for the whole window:
+
+1. a `provider` and `collection` named together, read as given (how a control arm reads a source of
+   its choosing);
+2. the run's own `{year: [provider, collection]}` choice, `IngestSettings.s2_sources` (or the S2
+   flow's `s2_sources` parameter), for a window touching one of its years;
+3. the source the mosaic store being resumed records, so a resume keeps its producer;
+4. the default table, `S2_SOURCE_BY_PERIOD` in `config/providers.py`, of whole calendar years, and
+   for a window touching none of its rows `DEFAULT_S2_SOURCE`, Earth Search's Collection 1, which
+   has one producer at one baseline, so its offset rule is settled for the whole collection.
+
+The default table sends 2015 to 2019, and 2022, to the legacy collection, because Earth Search has
+reprocessed only part of those years into Collection 1. Every window inside one calendar year reads
+the same source (a window spanning two years reads one source for both). Each Sentinel-2 mosaic
+records its source in its `_manifest` (`s2_source`), so a resume that names a different source for
+a year already begun is refused rather than mixing two producers in one store. The coverage
+measurements are in
+[ADR 044](../../../context_docs/decisions/044-sentinel-2-reads-collection-1-where-it-is-complete.md)
+and the rules in
+[ADR 045](../../../context_docs/decisions/045-sentinel-2-sources-are-chosen-per-calendar-year.md).
 
 **In the legacy collection, ESA's own products reach us through Earth Search, not through a
 separate catalogue.** The `sentinel-2-l2a` collection there indexes both Element 84's reprocessed COGs and items whose

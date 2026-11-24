@@ -280,6 +280,10 @@ class IngestManifest(StoreManifest):
     ingest_code_identity: str | None = None
     #: The provenance record's version when the ingest writes it, ``None`` when it does not.
     provenance_version: int | None = None
+    #: Sentinel-2 only: the ``(provider, collection)`` the mosaic is read from. A resume reads it
+    #: back (``stac.s2_source_for_window``), so one store keeps one producer, and a run naming
+    #: another source for it is refused here. Absent from stores written before it existed.
+    s2_source: tuple[str, str] | None = None
     #: Opt-in: resume a store whose recorded ``ingest_code_identity`` is not this run's.
     #: Relaxes only that term; the append is recorded under :data:`MIXED_CODE_IDENTITIES_ATTR`.
     allow_ingest_code_mismatch: bool = False
@@ -317,6 +321,7 @@ class IngestManifest(StoreManifest):
         storage_options: dict | None = None,
         allow_ingest_code_mismatch: bool = False,
         provenance: bool = False,
+        s2_source: tuple[str, str] | None = None,
     ) -> IngestManifest:
         """Build from an ROI store, chaining the upstream ROI manifest hash.
 
@@ -333,6 +338,7 @@ class IngestManifest(StoreManifest):
             allow_ingest_code_mismatch: See the field of the same name.
             provenance: Whether this ingest writes the provenance record; see
                 ``provenance_version``.
+            s2_source: See the field of the same name.
         """
         coverage_sha: str | None = None
         try:
@@ -356,6 +362,7 @@ class IngestManifest(StoreManifest):
             ingest_code_identity=ingest_code_identity(),
             provenance_version=PROVENANCE_VERSION if provenance else None,
             allow_ingest_code_mismatch=allow_ingest_code_mismatch,
+            s2_source=s2_source,
         )
 
 
