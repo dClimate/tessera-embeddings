@@ -146,7 +146,7 @@ legacy ingest reads. It compared SCL, red and nir over a 20 km square centred on
 162 pairs in all.
 
 - **The legacy ingest already reads Element 84's 05.00 reprocessing.** Between 2023 and 2024
-  Element 84 added a baseline 05.00 copy of each 2019–2021 scene to the legacy collection, beside
+  Element 84 added a baseline 05.00 copy of every 2019–2021 scene surveyed to the legacy collection, beside
   the original (02.12, 02.14 or 03.01). Duplicate selection prefers the newer baseline, and it chose
   a 05.00 copy in all 162 pairs. Those copies match Collection 1 except on near-black pixels and in
   the one case below. The originals differ (400 DN mean absolute red on 15TVF on 2021-01-21, and a
@@ -176,8 +176,8 @@ provenance on), with Collection 1 and legacy arms for January and July 2021:
 SCL is identical in both months. July's residue is the near-black floor difference described
 above, spread by resampling, as in the 2023 test. Both arms record baseline 500 for every date.
 
-Taken together, the switch leaves the years surveyed (April 2019 onward, outside 2022) effectively
-unchanged, apart from scenes like the 15TVF shift above. It does the same in any other
+Taken together, the switch leaves the months surveyed effectively unchanged, apart from scenes like
+the 15TVF shift above. 2024 onward was not surveyed. It does the same in any other
 year where the legacy collection already holds Element 84's 05.xx copies. No embedding comparison was run, so the effect on
 embeddings is unmeasured. It was judged unnecessary because at most 0.006% of the dev test area's
 mosaic pixels differ by 100 DN or more.
@@ -187,10 +187,11 @@ mosaic pixels differ by 100 DN or more.
 - From April 2019 onward, except 2022 before mid-December, mosaics come from one baseline and one
   producer. Annual windows for 2019 and 2022 still read the legacy collection. Duplicate
   selection still runs, but in Collection 1 it only separates images; there are no competing copies.
-- Mosaics barely change from April 2019 onward, outside 2022. The legacy collection holds
+- Mosaics barely change in the months surveyed, from 2019 to 2023. The legacy collection held
   Element 84's 05.00 reprocessing of every scene surveyed, and duplicate selection already reads it
-  (see Consistency checks). Where a scene has only its original, pixels and scene classification
-  differ slightly (686 against 690 on 15TVF on 2020-07-10, original against Collection 1). The change therefore lands at a store boundary, like
+  (see Consistency checks). No surveyed scene had only its original. Where one does, pixels and scene
+  classification differ slightly: the original of 15TVF on 2020-07-10 reads 686 against
+  Collection 1's 690. 2024 onward was not surveyed. The change therefore lands at a store boundary, like
   other input changes. The ingest code identity changes with this code, so an existing store will
   not resume under it without `allow_ingest_code_mismatch`.
 - The `incomplete` ranges are a measured snapshot. When Element 84 backfills 2022 or the early
