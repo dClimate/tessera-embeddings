@@ -14,7 +14,6 @@ from typing import Any
 from prefect import flow, get_run_logger
 from prefect.runtime import flow_run as flow_run_ctx
 
-from tessera_embeddings.config.providers import DEFAULT_S2_COLLECTION
 from tessera_embeddings.ingest.roi_processing import DEFAULT_MIN_VALID_COVERAGE
 from tessera_embeddings.ingest.s2_roi import BATCH_CHUNKS_PER_WORKER
 from tessera_embeddings.orchestration.prefect.flows._dask_lifecycle import (
@@ -91,8 +90,8 @@ def ingest_s2_roi_reflectance(
     min_workers: int = 1,
     max_workers: int = 50,
     min_valid_coverage: float = DEFAULT_MIN_VALID_COVERAGE,
-    provider: str = "earth-search",
-    collection: str = DEFAULT_S2_COLLECTION,
+    provider: str | None = None,
+    collection: str | None = None,
     ec2_scheduler: bool = False,
     use_local: bool = False,
     storage_options: dict | None = None,
@@ -125,7 +124,8 @@ def ingest_s2_roi_reflectance(
         min_workers: Minimum Dask workers for adaptive scaling.
         max_workers: Maximum Dask workers for adaptive scaling.
         min_valid_coverage: Minimum percentage of valid ROI pixels (from SCL) to keep a date.
-        provider: STAC provider key.
+        provider: STAC provider key, given together with ``collection`` or not at all. Neither
+            reads the source the ingest's period table chooses for the window.
         collection: Collection alias within the provider.
         ec2_scheduler: Run the Dask scheduler on EC2 instead of Fargate (better
             single-thread CPU for large graphs). Ignored when ``use_local=True``.

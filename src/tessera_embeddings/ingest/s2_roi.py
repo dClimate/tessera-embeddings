@@ -50,7 +50,7 @@ from tessera_embeddings.config.ingest import (
     INGEST_CHUNKS,
     SOURCE_INDEX_VAR,
 )
-from tessera_embeddings.config.providers import DEFAULT_S2_COLLECTION, PROVIDERS
+from tessera_embeddings.config.providers import PROVIDERS
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
 from tessera_embeddings.ingest._pipeline import pipelined
 from tessera_embeddings.ingest.asset_locations import Harmonisation
@@ -90,12 +90,12 @@ from tessera_embeddings.ingest.solar_days import (
 )
 from tessera_embeddings.ingest.stac import (
     HeterogeneousProducerError,
-    collection_for_window,
     collection_harmonisation,
     extract_baselines,
     group_items_by_date,
     load_stac_items,
     query_stac_items,
+    s2_source_for_window,
     selection_read_keys,
     solar_day_sort_key,
     stream_stac_months,
@@ -338,8 +338,8 @@ def ingest_s2_roi_reflectance(
     store_path: str,
     client: dask.distributed.Client,
     min_valid_coverage: float = DEFAULT_MIN_VALID_COVERAGE,
-    provider: str = "earth-search",
-    collection: str = DEFAULT_S2_COLLECTION,
+    provider: str | None = None,
+    collection: str | None = None,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     storage_options: StorageOptions = None,
     stream_stac_monthly: bool = True,
@@ -361,11 +361,10 @@ def ingest_s2_roi_reflectance(
         client: Connected :class:`dask.distributed.Client`, supplied by the flow shell or plain
             runner. We do NOT call :func:`dask.distributed.get_client` inside.
         min_valid_coverage: Minimum percentage of valid ROI pixels (from SCL) to keep a date.
-        provider: STAC provider key from
-            :data:`tessera_embeddings.config.providers.PROVIDERS`.
-        collection: Collection alias within the provider. Read through
-            :func:`~tessera_embeddings.ingest.stac.collection_for_window`, so a window this
-            collection holds only part of reads its configured fallback instead.
+        provider: STAC provider key from :data:`tessera_embeddings.config.providers.PROVIDERS`,
+            given together with ``collection`` or not at all. Neither reads the source
+            :func:`~tessera_embeddings.ingest.stac.s2_source_for_window` chooses for the window.
+        collection: Collection alias within ``provider``.
         log: Optional logger; defaults to ``logging.getLogger(__name__)``.
         storage_options: fsspec storage options for reading the ROI mask. ``None`` lets fsspec
             auto-detect from the URI.
@@ -445,7 +444,7 @@ def ingest_s2_roi_reflectance(
         allow_ingest_code_mismatch=allow_ingest_code_mismatch,
         provenance=provenance,
     )
-    collection = collection_for_window(provider, collection, start_date, end_date)
+    provider, collection = s2_source_for_window(start_date, end_date, provider, collection)
     catalogue = PROVIDERS[provider]
     #: Where every granule list says its items came from.
     source = {

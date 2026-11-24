@@ -8,7 +8,7 @@ works::
 """
 
 from .providers import (
-    DEFAULT_S2_COLLECTION,
+    DEFAULT_S2_SOURCE,
     PROVIDERS,
     CollectionConfig,
     STACProvider,
@@ -34,7 +34,7 @@ from .satellites import (
 )
 
 __all__ = [
-    "DEFAULT_S2_COLLECTION",
+    "DEFAULT_S2_SOURCE",
     "LANDSAT_BASELINE_OFFSET",
     "LANDSAT_BASELINE_THRESHOLD",
     "LANDSAT_C2_BANDS",

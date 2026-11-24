@@ -18,7 +18,6 @@ from dask.distributed import get_client  # noqa: TID251 — task shells fetch th
 from prefect import get_run_logger, task
 
 from tessera_embeddings.config.ingest import INGEST_MANIFEST_SPLIT
-from tessera_embeddings.config.providers import DEFAULT_S2_COLLECTION
 from tessera_embeddings.ingest.roi_processing import DEFAULT_MIN_VALID_COVERAGE
 from tessera_embeddings.ingest.s1_roi import S1Orbit, ingest_s1_roi_sar
 from tessera_embeddings.ingest.s2_roi import ingest_s2_roi_reflectance
@@ -33,8 +32,8 @@ def process_roi_reflectance(
     end_date: str,
     store_path: str,
     min_valid_coverage: float = DEFAULT_MIN_VALID_COVERAGE,
-    provider: str = "earth-search",
-    collection: str = DEFAULT_S2_COLLECTION,
+    provider: str | None = None,
+    collection: str | None = None,
     storage_options: StorageOptions = None,
     stream_stac_monthly: bool = True,
     overlap_window_writes: bool = True,

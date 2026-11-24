@@ -31,6 +31,7 @@ from tessera_embeddings.config import (
 )
 from tessera_embeddings.config.environment import configure_gdal_environment
 from tessera_embeddings.config.ingest import INGEST_CHUNKS, SOURCE_INDEX_VAR
+from tessera_embeddings.config.providers import DEFAULT_S2_SOURCE, S2_SOURCE_BY_PERIOD, S2Source
 from tessera_embeddings.ingest._http import make_logging_retry, spawn_abandonable
 from tessera_embeddings.ingest.asset_locations import (
     Harmonisation,
@@ -56,7 +57,7 @@ from tessera_embeddings.ingest.solar_days import (
     normalize_to_solar_day,
     owned_items,
     resolve_grouping_longitude,
-    whole_window_range,
+    validated_window,
 )
 
 # =============================================================================
@@ -265,29 +266,35 @@ def _get_collection_config(
     return provider.collections[collection_alias]
 
 
-def collection_for_window(provider_name: str, collection_alias: str, start_date: str, end_date: str) -> str:
-    """The collection to read ``start_date``..``end_date`` from: the one asked for, or its fallback.
+def s2_source_for_window(
+    start_date: str, end_date: str, provider: str | None = None, collection: str | None = None
+) -> S2Source:
+    """The Sentinel-2 source to read ``start_date``..``end_date`` from, as ``(provider, collection)``.
 
-    A window touching any range the collection's config marks ``incomplete`` reads the fallback
-    for the WHOLE window, never a mix: one run keeps one producer, so its offset rule and its
+    A ``provider`` and ``collection`` given together are read as given, which is how a control arm
+    reads a source the table would not choose. Given neither, the first row of
+    :data:`~tessera_embeddings.config.providers.S2_SOURCE_BY_PERIOD` holding any of the window's
+    days decides, for the WHOLE window: one run keeps one producer, so its offset rule and its
     duplicate handling hold end to end. Every entry point that queries for a window resolves it
-    here, so the optical preflight probes the collection the ingest will read.
+    here, so the optical preflight probes the source the ingest will read.
 
-    The test runs from the query's first UTC date, the day before the window, because an image
-    dated then can belong to the window's first solar day (``solar_days``). It ends on the
-    window's last day, not the query's. An image dated the UTC day AFTER its solar day exists only
-    in the far-western high Arctic, and only between late February and October. No incomplete
-    range starts in those months, so the trailing day never holds an image the window needs, and
-    testing it would send every window ending the day before a range to the fallback. A range
-    starting between March and October would break this; see ADR 044 before adding one.
+    The window's own days are tested, not the padding day the catalogue query adds either side
+    (``solar_days``). The leading one is the last day of the previous year when the window starts
+    a year, and every source in the table holds the last day of the year before its row. The
+    trailing one can hold an image of the window's last solar day only in the far-western high
+    Arctic between late February and October, so never on 1 January. Both are measured in ADR 044.
     """
-    config = _get_collection_config(provider_name, collection_alias)
-    window = whole_window_range(start_date, end_date)
-    start, end = window.query_start, window.own_end
-    if config.fallback is None or not any(start <= last and end >= first for first, last in config.incomplete):
-        return collection_alias
-    logger.info("%s is incomplete within %s..%s; reading %s instead", collection_alias, start, end, config.fallback)
-    return config.fallback
+    if (provider is None) != (collection is None):
+        raise ValueError(f"Name both a provider and a collection, or neither: got {provider!r} and {collection!r}")
+    if provider is not None and collection is not None:
+        _get_collection_config(provider, collection)
+        return provider, collection
+    start, end = (day.isoformat() for day in validated_window(start_date, end_date))
+    source = next(
+        (src for first, last, src in S2_SOURCE_BY_PERIOD if start <= last and end >= first), DEFAULT_S2_SOURCE
+    )
+    logger.info("Sentinel-2 for %s..%s reads %s/%s", start, end, *source)
+    return source
 
 
 def split_antimeridian_bbox(

@@ -215,13 +215,18 @@ Earth Search's `sentinel-1-grd`, `sentinel-2-l1c` and `landsat-c2-l2` entries ar
 **have no caller**: radar comes from OPERA, and `ingest_s1_roi_sar` names the `cmr-asf` provider
 directly rather than taking it as a parameter.
 
-**Collection 1 is the default** (`DEFAULT_S2_COLLECTION`): one producer at one baseline, so its
-offset rule is settled for the whole collection. Earth Search has not yet reprocessed two periods
-into it: everything before about April 2019, and 2022 until about mid-December. A window touching
-either period reads the legacy collection instead, for the whole window
-(`stac.collection_for_window`, configured by `CollectionConfig.incomplete` and `fallback`).
-The coverage measurements and the reasoning are in
-[ADR 044](../../../context_docs/decisions/044-sentinel-2-reads-collection-1-where-it-is-complete.md).
+**Which catalogue and collection a window reads is decided by one table**, `S2_SOURCE_BY_PERIOD`
+in `config/providers.py`, of whole calendar years. A window touching a row reads that row's source
+for the whole window, so a year is never read from two sources; a window touching none reads
+`DEFAULT_S2_SOURCE`, Earth Search's Collection 1, which has one producer at one baseline, so its
+offset rule is settled for the whole collection. Today the table sends 2015 to 2019, and 2022, to
+the legacy collection, because Earth Search has reprocessed only part of those years into
+Collection 1. `stac.s2_source_for_window` applies the table; a caller naming both `provider` and
+`collection` bypasses it, which is how a control arm reads a source of its choosing. The coverage
+measurements are in
+[ADR 044](../../../context_docs/decisions/044-sentinel-2-reads-collection-1-where-it-is-complete.md)
+and the table's rules in
+[ADR 045](../../../context_docs/decisions/045-sentinel-2-sources-are-chosen-per-calendar-year.md).
 
 **In the legacy collection, ESA's own products reach us through Earth Search, not through a
 separate catalogue.** The `sentinel-2-l2a` collection there indexes both Element 84's reprocessed COGs and items whose
