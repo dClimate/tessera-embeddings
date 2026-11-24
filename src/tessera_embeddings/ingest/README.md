@@ -251,10 +251,25 @@ Each `CollectionConfig` records: collection ID, band list, native resolution, ti
 (for S2/Landsat property-based queries), and correction parameters. For OPERA RTC-S1 on
 CMR-STAC there is no tile ID property, so the query falls back to a WGS84 bbox.
 
-`PROVIDERS` also carries a `planetary-computer` entry. **Nothing has ever run against it** — it
-is a sketch of a future path rather than a supported one, and the Cambridge TESSERA team's report
-that Microsoft throttles heavy outbound traffic from Planetary Computer is why the OPERA RTC route
-was built instead. Treat it as unvalidated configuration.
+**Microsoft Planetary Computer's `sentinel-2-l2a` is readable but not yet in the table.** It is
+read only when a caller names `provider="planetary-computer"` and `collection="sentinel-2-l2a"`,
+while its coverage and its speed at scale are tested. It differs from Earth Search in three ways,
+each handled at one place so that nothing else has to know which catalogue answered:
+
+- **It names assets natively** (`B02`, `SCL`) and declares no pixel type. The query layer re-keys
+  each item to this repository's band names as it arrives (`stac._rekey_assets`, driven by
+  `CollectionConfig.asset_keys`) and declares the bands `uint16`, and `scl` `uint8`, with nodata 0.
+  Without that the loader would read floats with no nodata, and a granule's empty area outside its
+  swath would overwrite its neighbour's pixels.
+- **Its files need a read token.** `stac._SourceReader` signs each Azure URL just before reading it
+  ([docs/ingest/authentication.md](../../../docs/ingest/authentication.md#planetary-computer-read-tokens)).
+- **Its copies of one image share their file names**, so a failed read is matched to its item by
+  the whole object key (`loader_failures.href_key`), not the last two path segments.
+
+Its pixels keep the reflectance offset from baseline 04.00, so the collection settles as
+unharmonised and the offset is removed per item by baseline. For 2023 it serves the same images as
+Collection 1, but from different ESA processing runs (and ESA's 2024 reprocessing for some dates),
+so the two agree to about half a percent rather than exactly.
 
 ---
 ## Detailed Ingestion Process

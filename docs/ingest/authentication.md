@@ -1,4 +1,4 @@
-# Ingest authentication: Earthdata Login and the OPERA credentials
+# Ingest authentication: Earthdata Login, the OPERA credentials, and Planetary Computer tokens
 
 OPERA RTC-S1 radar hosted by ASF requires NASA Earthdata Login (EDL) credentials, because ASF
 uses NASA's OAuth2/URS system for access control. Unlike Sentinel-2, OPERA data is not publicly
@@ -10,7 +10,8 @@ It is for anyone setting up a radar ingest, or diagnosing an `AccessDenied`, `Ex
 instance-metadata (IMDS) error during one. It covers setup, the S3 direct access path the pipeline
 uses and the credential-lifetime rules around it, the identity used for the project's own bucket,
 how asset URLs are rewritten to S3, and the legacy signed-URL fallback. The rest of the radar
-path is in [radar.md](radar.md).
+path is in [radar.md](radar.md). Sentinel-2 read from Microsoft Planetary Computer needs a read
+token of its own, covered in the last section.
 
 ## Setup
 
@@ -166,3 +167,22 @@ re-injects credentials whenever the redirect target URL contains `urs.earthdata.
 `resolve_item_assets` follows the full redirect chain per asset and mutates the STAC item's
 asset HREFs to CloudFront signed URLs before `odc.stac.load` reads them. This path is kept
 for out-of-region access where S3 direct is not available, but is significantly slower.
+
+## Planetary Computer read tokens
+
+Planetary Computer refuses an unsigned read of its Sentinel-2 files (HTTP 409). A read needs a
+shared-access token appended to the URL as a query string. The token is free and needs no account:
+`https://planetarycomputer.microsoft.com/api/sas/v1/token/{account}/{container}` hands one out,
+it signs every file in that storage container, and it lasts about 45 minutes. Longer-lived tokens
+need a subscription key, which Microsoft no longer issues.
+
+Because an ingest outlives many tokens, nothing is signed when the catalogue is queried. Each
+worker process signs a URL immediately before reading it (`auth.sign_azure_href`, called from
+`stac._SourceReader.read`), from a token it caches and replaces once less than ten minutes of life
+remain. Every other part of the ingest, including provenance and duplicate selection, sees the
+catalogue's own unsigned URLs.
+
+- A failed refresh keeps the cached token while it is still valid and retries on the next read.
+- With no valid token, the read fails as any other read failure does.
+- The token service is retried on 429 and 5xx, as reads are.
+
