@@ -287,7 +287,7 @@ def s2_source_for_window(
        any of the window's days, else :data:`~tessera_embeddings.config.providers.DEFAULT_S2_SOURCE`.
 
     Every entry point that queries for a window resolves it here, so the optical preflight probes
-    the source the ingest will read.
+    the source a fresh ingest will read (it passes no ``recorded``: a resumed cell may differ).
 
     The window's own days are tested, not the padding day the catalogue query adds either side
     (``solar_days``). The leading one is the last day of the previous year when the window starts
