@@ -111,11 +111,12 @@ S2Source = tuple[str, str]
 DEFAULT_S2_SOURCE: S2Source = ("earth-search", "sentinel-2-c1-l2a")
 
 #: Where each period of Sentinel-2 is read from: inclusive ``(first day, last day, source)``, first
-#: matching row wins. Every row is whole calendar years, so a year is read from one source whatever
-#: windows its processing is cut into, and a store never mixes producers within a year. Applied by
+#: matching row wins. Every row is whole calendar years, so every window inside one calendar year
+#: reads the same source. A window spanning two years reads one source for both, so cutting a year's
+#: processing across year boundaries can still mix sources within it. Applied by
 #: ``stac.s2_source_for_window``; the measurements behind each row are in ADR 044 and ADR 045.
 S2_SOURCE_BY_PERIOD: tuple[tuple[str, str, S2Source], ...] = (
-    # Collection 1 lacks nothing before late March 2019 and about half of 2018, and most of 2022.
+    # Collection 1 holds nothing before late March 2019 except about half of 2018, and little of 2022.
     ("2015-01-01", "2019-12-31", ("earth-search", "sentinel-2-l2a")),
     ("2022-01-01", "2022-12-31", ("earth-search", "sentinel-2-l2a")),
 )

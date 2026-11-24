@@ -31,7 +31,9 @@ Three things now need more than that mechanism gives:
    `CollectionConfig.incomplete` and `fallback` are removed.
 2. **Every row is whole calendar years.** The legacy collection's rows become 2015 through 2019,
    and 2022. A window touching a row reads that row's source for the whole window, as before, so
-   no window inside one year can read a different source from that year's own run.
+   no window inside one year can read a different source from that year's own run. A window
+   spanning two years still reads one source for both, so runs cut across year boundaries can
+   mix sources within a year; the campaign's windows are calendar years.
 3. **The window's own days are tested**, not the padding day the catalogue query adds either side.
    Testing the padding day would send a run starting on 1 January to the previous year's row,
    which matters once adjacent years have different sources. It is safe because:

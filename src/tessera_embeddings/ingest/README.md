@@ -217,7 +217,8 @@ directly rather than taking it as a parameter.
 
 **Which catalogue and collection a window reads is decided by one table**, `S2_SOURCE_BY_PERIOD`
 in `config/providers.py`, of whole calendar years. A window touching a row reads that row's source
-for the whole window, so a year is never read from two sources; a window touching none reads
+for the whole window, so every window inside one calendar year reads the same source (a window
+spanning two years reads one source for both); a window touching none reads
 `DEFAULT_S2_SOURCE`, Earth Search's Collection 1, which has one producer at one baseline, so its
 offset rule is settled for the whole collection. Today the table sends 2015 to 2019, and 2022, to
 the legacy collection, because Earth Search has reprocessed only part of those years into
