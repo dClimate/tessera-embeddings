@@ -132,14 +132,59 @@ provenance on. Three runs went in parallel, each taking about 2.5–3 minutes:
 Provenance was on in every run, but no run had it off, so this test does not measure the cost of
 provenance.
 
+## Consistency checks
+
+These ran on 2026-11-24, to test whether the switch changes what the ingest produces, beyond the
+single month of the dev test above.
+
+**Scene survey: what the ingest would read.** The survey covered six tiles (15TVF, 33UUP, 36MZE,
+55HBU, 23KLP and 44QKE) in January and July of 2021 and 2023. In each tile-month it took up to four
+datatakes: the two clearest, and two with 20–70% cloud. Each Collection 1 scene was paired with the
+legacy copy `duplicates.select_preferred_duplicates` keeps, which is the copy the legacy ingest
+reads. It compared SCL, red and nir over a 20 km square centred on the scene's data, 81 pairs in all.
+
+- **In 2021 the legacy collection already serves Collection 1's pixels.** Element 84 added a
+  baseline 05.00 copy of each 2021 scene to the legacy collection in 2023, beside the original
+  (02.14 or 03.01). Duplicate selection prefers the newer baseline, so the legacy ingest reads the
+  05.00 copy, which is pixel-identical to Collection 1. The original copies differ by 400 DN in
+  mean absolute red, but are never chosen.
+- **79 of 81 pairs agree on SCL exactly**, and no pair changes a date's verdict at the 5%
+  valid-coverage gate. Their red and nir match except on near-black pixels, where Collection 1
+  minus 1,000 goes negative and the legacy COG is floored. `correct_boa_dn` floors both alike
+  ([ADR 020](020-boa-offset-applies-to-every-valid-dn.md)).
+- **One genuine difference favours Collection 1.** On 15TVF on 2021-01-21 the legacy collection
+  holds two 05.00 reprocessings of one image, sequence `_1` and sequence `_2`. Duplicate selection
+  keeps `_2`, which sits one pixel west of Collection 1: a mean absolute red difference of 568 DN,
+  falling to 176 after a one-column shift. `_1` is identical to Collection 1. Collection 1 holds a
+  single copy, so the ambiguity disappears.
+- **The other mismatch was a pairing artefact.** 55HBU on 2023-07-19 has two datastrips, and both
+  collections hold both.
+
+**Dev ingest, 2021.** Same set-up as the dev test above (`tiny_epsg5070.zarr`, 4 workers,
+provenance on), with Collection 1 and legacy arms for January and July 2021:
+
+| Month | Dates (each arm) | `source_index` equal | Pixels exactly equal, per band | Pixels differing by ≥ 100 |
+|---|---|---|---|---|
+| January 2021 | 6 | 100% | ≥ 99.998% | 0 |
+| July 2021 | 11 | 100% | ≥ 99.7% | ≤ 0.006% |
+
+SCL is identical in both months. July's residue is the near-black floor difference described
+above, spread by resampling, as in the 2023 test. Both arms record baseline 500 for every date.
+
+Taken together, the switch leaves 2021 and 2023 effectively unchanged. It does the same in any other
+year where the legacy collection already holds Element 84's 05.xx copies. An embedding comparison was not run: with
+inputs this close, it could not show a difference the mosaics do not.
+
 ## Consequences
 
 - From April 2019 onward, except 2022 before mid-December, mosaics come from one baseline and one
   producer. Annual windows for 2019 and 2022 still read the legacy collection. Duplicate
   selection still runs, but in Collection 1 it only separates images; there are no competing copies.
-- Mosaics change for 2020, 2021 and 2023 onward. Where the legacy collection supplied pre-04.00
-  originals, pixels differ slightly (686 against 690 on 15TVF on 2020-07-10). Scene classification
-  can also differ under the newer Sen2Cor. The change therefore lands at a store boundary, like
+- Mosaics barely change where the legacy collection already holds Element 84's 05.xx copies, as it
+  did in every 2021 and 2023 scene checked, because duplicate selection already reads them (see
+  Consistency checks). Other years were not checked.
+  Where it held only a pre-04.00 original, pixels and scene classification differ slightly (686
+  against 690 on 15TVF on 2020-07-10). The change therefore lands at a store boundary, like
   other input changes. The ingest code identity changes with this code, so an existing store will
   not resume under it without `allow_ingest_code_mismatch`.
 - The `incomplete` ranges are a measured snapshot. When Element 84 backfills 2022 or the early
