@@ -146,7 +146,7 @@ reads. It compared SCL, red and nir over a 20 km square centred on the scene's d
 - **In 2021 the legacy collection already serves Collection 1's pixels.** Element 84 added a
   baseline 05.00 copy of each 2021 scene to the legacy collection in 2023, beside the original
   (02.14 or 03.01). Duplicate selection prefers the newer baseline, so the legacy ingest reads the
-  05.00 copy, which is pixel-identical to Collection 1. The original copies differ by 400 DN in
+  05.00 copy. That copy matches Collection 1 except on near-black pixels and in the one case below. The original copies differ by 400 DN in
   mean absolute red, but are never chosen.
 - **79 of 81 pairs agree on SCL exactly**, and no pair changes a date's verdict at the 5%
   valid-coverage gate. Their red and nir match except on near-black pixels, where Collection 1
@@ -172,8 +172,9 @@ SCL is identical in both months. July's residue is the near-black floor differen
 above, spread by resampling, as in the 2023 test. Both arms record baseline 500 for every date.
 
 Taken together, the switch leaves 2021 and 2023 effectively unchanged. It does the same in any other
-year where the legacy collection already holds Element 84's 05.xx copies. An embedding comparison was not run: with
-inputs this close, it could not show a difference the mosaics do not.
+year where the legacy collection already holds Element 84's 05.xx copies. No embedding comparison was run, so the effect on
+embeddings is unmeasured. It was judged unnecessary because at most 0.006% of mosaic pixels differ
+by 100 DN or more.
 
 ## Consequences
 
