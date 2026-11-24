@@ -15,7 +15,6 @@ Embeddings come from ``embed_lattice.py``: ``lattice_<side>_<tile>.npz`` for sid
   noise_<d>               isotropic noise matched to the candidate's mean cosine after int8, 40 draws
   ctrl_<i>_<j>_<cos>      class i shifted towards class j's centroid, cosine <cos> inside class i
                           (j = i's most-confused class under the reference probe)
-  ctrl2_<i>_<j>_<cos>     the largest class shifted towards the smallest control-eligible class
   refit_<r>               the reference only, 48k training sample redrawn (seed r): the refit spread, reported
 
 Per variant (int8 arrays over the lattice; -1 = unlabelled):
@@ -24,7 +23,6 @@ Per variant (int8 arrays over the lattice; -1 = unlabelled):
   p_xr, k_xr   fitted on the test side, applied to the reference
   gc_cls[i,j]  class i's mean unit-vector error projected on (centroid j - centroid i), over |gap|^2, with
                the error and the centroids taken from the comparison's own reference side
-  gc_clu[a,b]  the same over 64 k-means clusters (fitted on L40S bf16, assigned on the reference side)
   (mixed variants also carry p_rr, k_rr for their own reference; refit variants carry only p_rr, k_rr)
 
 usage: calibrate.py <labels.npz> <label_key> <embed_dir> <tile> <shard> <nshards> <out_dir>
@@ -41,7 +39,6 @@ import warnings
 from pathlib import Path
 
 import numpy as np
-from sklearn.cluster import KMeans
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import LogisticRegression
 
@@ -72,28 +69,6 @@ def deq(side: str) -> np.ndarray:
     return F[side]["q"].astype(np.float32) * F[side]["s"][:, None]
 
 
-def environment() -> dict:
-    """What the predictions depend on beyond the data: library versions, BLAS, the probe's stopping rule."""
-    import platform
-
-    import scipy
-    import sklearn
-    from threadpoolctl import threadpool_info
-
-    blas = [
-        {k: i.get(k) for k in ("internal_api", "version", "architecture", "num_threads")} for i in threadpool_info()
-    ]
-    return {
-        "python": platform.python_version(),
-        "machine": platform.machine(),
-        "numpy": np.__version__,
-        "scipy": scipy.__version__,
-        "sklearn": sklearn.__version__,
-        "blas": blas,
-        "probe": {"C": PROBE_C, "tol": PROBE_TOL, "max_iter": PROBE_MAX_ITER},
-    }
-
-
 def unit(x: np.ndarray) -> np.ndarray:
     """Rows scaled to unit length."""
     return x / (np.linalg.norm(x, axis=1, keepdims=True) + 1e-12)
@@ -118,9 +93,6 @@ cnt = np.bincount(lab[ok], minlength=K)
 ref = deq("l40s")
 u_ref = unit(ref)
 cent = np.stack([u_ref[lab == i].mean(0) if cnt[i] else np.zeros(128, np.float32) for i in range(K)])
-km_rng = np.random.default_rng(0)
-km = KMeans(n_clusters=64, n_init=1, random_state=0).fit(u_ref[km_rng.choice(N, 30000, replace=False)])
-clus = km.predict(u_ref)
 
 
 def folds_for(seed: int) -> list[tuple[np.ndarray, np.ndarray]]:
@@ -243,12 +215,9 @@ conf = np.zeros((K, K), int)
 np.add.at(conf, (lab[ok], p_rr[ok]), 1)
 np.fill_diagonal(conf, -1)
 confused = {i: int(np.argmax(np.where(np.arange(K) != i, conf[i], -1))) for i in eligible}
-big = int(np.argmax(cnt))
-small = min((i for i in eligible if i != big), key=lambda i: cnt[i])
 log(
     f"base probe acc {100 * (p_rr[ok] == lab[ok]).mean():.2f}; most confused: "
     + ", ".join(f"{names[i]}->{names[j]}" for i, j in confused.items())
-    + f"; ctrl2 {names[big]}->{names[small]}"
 )
 
 c = float((u_ref * unit(deq("cand"))).sum(1).mean())
@@ -258,21 +227,19 @@ cn = 1 - (2 * (1 - c) - (1 - c_try))  # squared angles add: aim the noise at wha
 V = list(PAIRS)
 V += [f"noise_{d}" for d in range(NDRAWS)]
 V += [f"ctrl_{i}_{j}_{c:g}" for i, j in confused.items() for c in DOSES]
-V += [f"ctrl2_{big}_{small}_{c:g}" for c in DOSES]
 V += [f"refit_{r}" for r in range(NREFIT)]
 if SMOKE:
     V = [V[k] for k in (0, 2, 3, *range(len(PAIRS), len(PAIRS) + NDRAWS), len(PAIRS) + NDRAWS, len(V) - 2, len(V) - 1)]
 mine = [name for k, name in enumerate(V) if k % NSHARDS == SHARD]
 log(f"{len(V)} variants, {len(mine)} on this shard")
 if SHARD == 0:
-    save("base", p_rr=p_rr, k_rr=knn(ref, ref), clus=clus.astype(np.int8), variants=np.array(V))
+    save("base", p_rr=p_rr, k_rr=knn(ref, ref), variants=np.array(V))
     env = {}
     for name, (r, t) in PAIRS.items():
         env[name] = pg.envelope(F[r]["q"], F[r]["s"], F[t]["q"], F[t]["s"])
         env[name]["coherence"] = pg.coherence(deq(r), deq(t))
     env["candidate"]["noise_cosine_target"] = cn
     (OUTDIR / "envelope.json").write_text(json.dumps(env, indent=1))
-    (OUTDIR / "environment.json").write_text(json.dumps(environment(), indent=1))
 
 
 def test_side(name: str) -> tuple[np.ndarray, np.ndarray]:
@@ -283,7 +250,7 @@ def test_side(name: str) -> tuple[np.ndarray, np.ndarray]:
         return (ref if r == "l40s" else deq(r)), deq(t)
     if kind == "noise":
         return ref, noisy(100 + int(a[0]), cn)
-    if kind in ("ctrl", "ctrl2"):
+    if kind == "ctrl":
         return ref, directed(int(a[0]), int(a[1]), float(a[2]))
     raise ValueError(name)
 
@@ -310,7 +277,6 @@ for name in mine:
         k_xx=knn(x, x),
         k_xr=knn(x, r),
         gc_cls=gap_closure(x, r, lab, K),
-        gc_clu=gap_closure(x, r, clus if r is ref else km.predict(unit(r)), 64),
         cos=np.float32((unit(r) * unit(x)).sum(1).mean()),
         **extra,
     )

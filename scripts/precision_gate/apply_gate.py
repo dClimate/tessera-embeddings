@@ -50,10 +50,7 @@ def print_report(tile_name: str, report: dict) -> None:
         f"=== {tile_name}: z_fam {report['z_fam']:.2f} over {len(report['gated_cells'])} gated cells; classes "
         + ", ".join(f"{k} {v}" for k, v in report["classes"].items())
     )
-    print(
-        f"flag-only {report['flag_only']}; uncovered {report['uncovered']}; "
-        f"control passes {report['control_passes']}; unvalidated {report['unvalidated']}"
-    )
+    print(f"flag-only {report['flag_only']}; uncovered {report['uncovered']}; unvalidated {report['unvalidated']}")
     print("tripwire x1e3: " + ", ".join(f"{k} {1e3 * v:.2f}" for k, v in report["tripwire"].items()))
     worst = sorted(report["refit_spread"].items(), key=lambda kv: -kv[1])[:5]
     print("refit spread SD (points), largest: " + ", ".join(f"{k} {v:.2f}" for k, v in worst))

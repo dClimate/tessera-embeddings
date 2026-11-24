@@ -116,7 +116,6 @@ cpu() {
     [ $rc -eq 0 ] || [ $rc -eq 3 ] || { echo "ERROR: apply_gate crashed on $t (rc $rc)"; cat "reports/$t.txt"; return $rc; }
     grep '^GATE' "reports/$t.txt"
     [ $rc -eq 3 ] && not_passed="$not_passed $t"
-    cp "out/$t/environment.json" "reports/${t}_environment.json"
   done
   aws s3 sync --quiet reports/ "$OUT/score/reports/"
   STEP=verdict

@@ -5,26 +5,10 @@ accuracy, per tile and per class, beyond what matched noise does. The prediction
 ``scripts/precision_gate/calibrate.py``, one ``.npz`` per variant. This module turns them into
 cells, calibrates the thresholds from the known-good and known-bad variants, and gives each
 variant a verdict. It is pure numpy so that the rule can be tested without a GPU or scikit-learn.
-
-Terms (``context_docs/decisions/043-...md``, decision 1):
-
-- A *cell* is one class x consumer (probe, kNN-20) x direction x measure (recall, precision).
-  ``ref->x`` is fitted on the reference and applied to the changed side; ``x->ref`` the reverse.
-- Loss is in points, positive = worse. SE is a delete-one-block jackknife over 40 x 40 px blocks.
-- A cell is *gated* when its median SE over the matched-noise draws is at most δ/4.
-- ``z_fam`` is the 95th percentile over the noise draws of the largest loss / SE among gated cells.
-- A gated cell past δ with loss / SE above ``z_fam`` fails; past δ with loss / SE at or under it,
-  or ungated with loss / SE above it, it is unresolved. A tile loss past 0.2 fails.
-- The tripwire: a class's gap closure past half its own control's gap closure at the dose
-  costing δ. A trip needs a decision, so it leaves the variant unresolved.
-- A comparison whose ADR 012 envelope fails, fails.
-- A named exception (decision 2) accepts a failing change's recorded losses: :func:`exception_bounds` sets
-  its bounds, :func:`outside_exception` holds a later run to them.
-
-Variant names follow ``calibrate.py``: ``noise_*`` are the matched-noise draws, ``ctrl_<i>_<j>_<cos>``
-the class-directed controls, ``ctrl2_*`` the large-to-small control, ``refit_*`` training-sample
-redraws.
-
+The rule and its terms (cell, gated, z_fam, tripwire, named exception) are defined in
+``context_docs/decisions/043-a-per-class-gate-for-precision-changes.md``. Loss is in points, positive =
+worse; ``ref->x`` is fitted on the reference and applied to the changed side, ``x->ref`` the reverse.
+Variant names follow ``calibrate.py``.
 """
 
 from __future__ import annotations
@@ -312,14 +296,13 @@ class Validity:
 
     flag_only: list[int]
     uncovered: list[int]
-    control_passes: list[int]
     unvalidated: list[int]
 
 
 def validity(scores: Mapping[str, Score], cal: Calibration) -> Validity:
     """Classify each gated class by how the gate treats its own control at :data:`CONTROL_COSINE`."""
     ctrl = controls(scores)
-    flag_only, uncovered, passes, unvalidated = [], [], [], []
+    flag_only, uncovered, unvalidated = [], [], []
     for i in cal.gated_classes:
         name = ctrl.get(i, {}).get(CONTROL_COSINE)
         if name is None:
@@ -333,9 +316,7 @@ def validity(scores: Mapping[str, Score], cal: Calibration) -> Validity:
             flag_only.append(i)
         elif max(loss for loss, _ in s.cells.values()) > DELTA:
             uncovered.append(i)
-        else:
-            passes.append(i)
-    return Validity(flag_only=flag_only, uncovered=uncovered, control_passes=passes, unvalidated=unvalidated)
+    return Validity(flag_only=flag_only, uncovered=uncovered, unvalidated=unvalidated)
 
 
 def verdict(score: Score, cal: Calibration, envelope_passed: bool = True) -> str:
@@ -401,7 +382,6 @@ def evaluate(tile: Tile, scores: Mapping[str, Score], envelopes: Mapping[str, di
         "tripwire": {tile.names[i]: t for i, t in cal.tripwire.items()},
         "flag_only": names(val.flag_only),
         "uncovered": names(val.uncovered),
-        "control_passes": names(val.control_passes),
         "unvalidated": names(val.unvalidated),
         "variants": {
             v: _variant_report(tile, s, cal, envelopes[v] if is_comparison(v) else None) for v, s in scores.items()
