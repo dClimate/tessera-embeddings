@@ -171,10 +171,11 @@ provenance on), with Collection 1 and legacy arms for January and July 2021:
 SCL is identical in both months. July's residue is the near-black floor difference described
 above, spread by resampling, as in the 2023 test. Both arms record baseline 500 for every date.
 
-Taken together, the switch leaves 2021 and 2023 effectively unchanged. It does the same in any other
+Taken together, the switch leaves 2021 and 2023 effectively unchanged, apart from scenes like the
+15TVF shift above. It does the same in any other
 year where the legacy collection already holds Element 84's 05.xx copies. No embedding comparison was run, so the effect on
-embeddings is unmeasured. It was judged unnecessary because at most 0.006% of mosaic pixels differ
-by 100 DN or more.
+embeddings is unmeasured. It was judged unnecessary because at most 0.006% of the dev test area's
+mosaic pixels differ by 100 DN or more.
 
 ## Consequences
 
