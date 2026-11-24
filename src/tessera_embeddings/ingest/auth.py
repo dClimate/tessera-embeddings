@@ -103,9 +103,21 @@ def sign_azure_href(href: str) -> str:
 
 
 def _sas_session() -> requests.Session:
-    """A session that waits out the token service's throttling and outages, as reads do."""
+    """A session that waits out the token service's throttling and outages, as reads do.
+
+    The service refuses with 429 when a starting fleet's workers all ask at once from one NAT
+    address, so the waits are jittered: without it the refused workers retry in step and collide
+    again. Ten attempts capped at two minutes each ride out a burst of several fleets.
+    """
     session = requests.Session()
-    retry = Retry(total=5, backoff_factor=2, status_forcelist=(429, 500, 502, 503, 504), allowed_methods=("GET",))
+    retry = Retry(
+        total=10,
+        backoff_factor=2,
+        backoff_max=120,
+        backoff_jitter=30,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET",),
+    )
     session.mount("https://", HTTPAdapter(max_retries=retry))
     return session
 
