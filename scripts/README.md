@@ -59,6 +59,20 @@ Answers "why is this environment behaving that way?" and is expected to work on 
 | `published_store_read_bench.py` | Read performance of the published store — open latency, point-vector percentiles, region throughput, bytes on the wire — using the same workloads and concurrency sweep as `scoping/scale_tests/t1_read_bench.py`, so the built store can be compared against the scoped one. |
 | `published_registry_census.py` | Whether the published Parquet registry is shaped as designed, whether a whole-dataset read loses columns, how fast an area-of-interest coverage query answers, whether the embedded tiles `master/` names agree with the store's live shards (`--verify-zones`), how many rows of `master/` carry no measurements (fails above `--max-unmeasured`, zero by default, and fails outright if `master/` is absent), and whether every cell of `master/` matches its run files — every tile present, each from its latest run, its fill fields and measurements unaltered — naming each cell that does not. |
 
+## `precision_gate/` — supported tooling for precision changes
+
+The gate every precision change to the forward pass meets
+([ADR 043](../context_docs/decisions/043-a-per-class-gate-for-precision-changes.md)). The rule itself is the
+library's `profiling.inference.precision_gate`; these scripts feed it and apply it. A run embeds the lattice
+four times, today's code on an L40S, A10G and L4 and the candidate branch on an L40S, then scores on CPU.
+
+| script | what it does |
+|---|---|
+| `embed_lattice.py` | Embeds ADR 012's lattice with the production forward of the code it runs from, for one side (`l40s`, `a10g`, `l4` or `cand`). Refuses a box whose GPU is not the side's card. |
+| `calibrate.py` | Per-pixel probe and kNN-20 predictions for every variant the gate scores on one tile (two card pairs, the candidate, a mixed store, 40 matched-noise draws, class-directed controls, refit redraws), sharded, one npz per variant; shard 0 also writes each comparison's ADR 012 envelope. |
+| `apply_gate.py` | Applies the gate to one tile's predictions: one verdict per variant over envelope, losses and tripwire, the validity lists and the refit spread, as JSON. With `--exception`, holds failing comparisons to a named exception's bounds (ADR 043 decision 2); each failing comparison's report carries the bounds an exception for it would set. Exits 3 if any comparison neither passes nor stays inside the exception (1 is a crash). |
+| `bootstrap.sh`, `launch.sh`, `watch.sh` | Run the above on EC2: `gpu-l40s`, `gpu-a10g`, `gpu-l4`, `gpu-cand`, then `cpu-score`. Every exit uploads the log and a status (`ok`, `not-passed`, or `failed:<step>`) and shuts the box down. `watch.sh` exits 3 when every box finished and a gate did not pass, and fails fast on a failure, a box gone without a status, an error in the log, or 20 minutes without progress. Account infrastructure comes from `GATE_*` environment variables. |
+
 ## `scoping/` — kept-for-reference instruments
 
 Each answered one sizing question whose answer is published in `context_docs/`. Kept so a

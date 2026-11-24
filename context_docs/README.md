@@ -59,6 +59,7 @@ context_docs/
 │   ├── 040-new-code-is-gated-on-duplication-and-complexity.md
 │   ├── 041-unit-tests-run-the-forked-writer-in-threads.md
 │   ├── 042-chunked-graph-replay-ships-above-the-two-card-yardstick.md
+│   ├── 043-a-per-class-gate-for-precision-changes.md
 │   └── 044-sentinel-2-reads-collection-1-where-it-is-complete.md
 │
 ├── campaign/                      THE GLOBAL CAMPAIGN — start here
@@ -118,6 +119,10 @@ context_docs/
 │   ├── fresh-worker-start.md                   a new worker's first minutes are its EBS volume
 │   │                                              loading the AMI, and the mounted venv image that
 │   │                                              removes them
+│   ├── reduced-precision-inference.md          FP8 on the g6e: slower than bf16 at production
+│   │                                              chunk sizes (0.89x, ceiling 1.02x), not adopted;
+│   │                                              int8 on Intel AMX: ~g5 parity on spot, parked;
+│   │                                              why the neighbour gate over-penalises
 │   └── the-fleet-and-the-work-source.md        a fleet lives for one `run_inference` call, so a
 │                                                  retry through a second call rebuilt one; the
 │                                                  wind-down, and why the fleet is not held
