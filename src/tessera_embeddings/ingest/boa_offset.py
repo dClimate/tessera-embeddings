@@ -71,8 +71,8 @@ def source_decision(
         threshold: baselines at or above this carry the offset (``400``, i.e. ESA's ``04.00``).
         known_harmonisation: the producer for EVERY source, where the collection's configuration
             settles it and the assets have nothing to add. Planetary Computer serves the whole
-            archive unharmonised and keys its assets natively, so ``bucket`` there describes a
-            location nobody has classified and must not be consulted — see
+            archive unharmonised from Azure, so ``bucket`` there describes a location nobody has
+            classified and must not be consulted — see
             :func:`~tessera_embeddings.ingest.stac.collection_harmonisation`. Typed
             :data:`~tessera_embeddings.ingest.asset_locations.SettledProducer`, so ``MIXED`` and
             ``UNKNOWN`` cannot be passed: an answer naming no producer cannot decide a correction,

@@ -444,7 +444,10 @@ class TestASpareThatWillRefuseIsKeptOffTheLadderWithoutVisibleAssets:
         """The wiring, so the fix cannot be correct in the library and absent at the call site."""
         from tessera_embeddings.ingest.s2_roi import _known_harmonisation, _read_asset_keys
 
-        assert _read_asset_keys("planetary-computer", "sentinel-2-l2a") == ()
+        # Re-keyed as it arrives, so its read set is judged by name like Earth Search's.
+        assert _read_asset_keys("planetary-computer", "sentinel-2-l2a") == _read_asset_keys(
+            "earth-search", "sentinel-2-l2a"
+        )
         assert _known_harmonisation("planetary-computer", "sentinel-2-l2a") is Harmonisation.RAW
         # Where the producer varies by item the assets ARE the evidence, so there is no
         # collection-wide answer to give.

@@ -119,9 +119,9 @@ logger = logging.getLogger(__name__)
 #: Named in ONE place because it reaches two very different calls: the loader, which reads SCL to
 #: build the cloud mask, and the STAC query, which prunes assets off each item before the loader
 #: runs (``stac._loadable_assets``). The query keeps ``scl`` on its own only for collections
-#: configured ``has_scl=True``; a provider without that flag — Planetary Computer's
-#: ``sentinel-2-l2a`` — drops the asset at query time and the load then fails on a band that was
-#: there in the catalogue. Passing the same tuple to both is what makes the two agree.
+#: configured ``has_scl=True``; a collection without that flag drops the asset at query time and
+#: the load then fails on a band that was there in the catalogue. Passing the same tuple to both
+#: is what makes the two agree.
 _LOADED_EXTRA_BANDS = ["scl"]
 
 

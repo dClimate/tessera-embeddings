@@ -240,7 +240,7 @@ class TestReflectanceAssetKeysComeFromOdc:
         assert _reflectance_asset_keys([item], config) == frozenset(S2_L2A_BANDS)
 
     def test_a_native_keyed_item_resolves_through_the_alias_table(self) -> None:
-        """Planetary Computer serves ``blue`` as an asset called ``B02``.
+        """A collection served under native keys names ``blue`` as an asset called ``B02``.
 
         Deciding the offset against the CONFIGURED names would match none of its assets and correct
         nothing, silently — so the resolution has to be odc's own rather than a mapping kept here.

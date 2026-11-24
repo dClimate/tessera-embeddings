@@ -459,9 +459,9 @@ def extract_baselines(items: list[Any]) -> dict[str, int]:
 def selection_read_keys(config: CollectionConfig, extra_bands: "list[str] | None" = None) -> tuple[str, ...]:
     """The asset set duplicate selection may judge readability and locality over.
 
-    Empty where the collection's configured names are not its asset keys: Planetary Computer serves
-    the same bands as ``B02`` and ``SCL`` and relies on the loader's alias table, so looking those
-    names up directly reports every copy incomplete and remote — worse than not asking, because an
+    Empty where the collection's configured names are not its asset keys (a collection served
+    under native keys such as ``B02`` and ``SCL`` and not re-keyed by ``asset_keys``), because
+    looking those names up directly reports every copy incomplete and remote — worse than not asking, because an
     actually asset-incomplete copy could then win on the terms that remain. An empty set ties both
     terms, so they decide nothing.
     """
@@ -643,8 +643,6 @@ def _load_from_stac(
         # Kept exactly where the collection names a fusion order (`_FUSION_SORT_KEYS`), since the
         # fuser keeps the first valid source; elsewhere odc's `(time, id)` order makes the result a
         # function of the items, not of the provider's order.
-        # TODO: Planetary Computer's `sentinel-2-l2a` names none, so `id` rather than cloud cover
-        # decides its overlaps. Naming `"clearest_scene"` there fixes it; unexercised, so not made.
         "preserve_original_order": collection_config.fusion_order is not None,
     }
 
@@ -716,11 +714,11 @@ def _reflectance_asset_keys(items: list[Any], collection_config: CollectionConfi
     """The ASSET KEYS serving this collection's reflectance bands, through odc's alias table.
 
     Not the configured band names, and the difference decides whether the correction fires at all.
-    Earth Search names its assets after the bands (``blue``), so the two coincide; Planetary
-    Computer serves ``blue`` as an asset called ``B02`` and relies on odc resolving the
-    ``eo:bands`` common name. Deciding the offset against configured names would match none of
-    that provider's assets and correct nothing, silently — hence odc's own resolution rather than
-    a mapping maintained here.
+    Earth Search names its assets after the bands (``blue``), as does any collection re-keyed by
+    ``asset_keys``, so the two coincide; a collection serving ``blue`` as an asset called ``B02``
+    relies on odc resolving the ``eo:bands`` common name. Deciding the offset against configured
+    names would match none of that collection's assets and correct nothing, silently — hence odc's
+    own resolution rather than a mapping maintained here.
 
     Resolved from ONE item rather than all of them: the assumption that assets of one name share a
     structure across a collection is odc's own, the same one the load relies on, and a per-item
@@ -862,9 +860,8 @@ class BoaOffsetParser(SourceParser):
         Args:
             cfg: odc's conversion config, passed through to :class:`StacMDParser`.
             reflectance_assets: the ASSET KEYS of the reflectance bands, already resolved through
-                odc's alias table — not the configured band names, since Planetary Computer serves
-                ``blue`` as an asset called ``B02`` and a set of configured names would match none
-                of its assets.
+                odc's alias table — not the configured band names, since a collection serving
+                ``blue`` as an asset called ``B02`` would match none of its assets by name.
             threshold: baselines at or above this carry the offset.
             offset: the value to add, negative for a correction.
             known_harmonisation: the producer for every source, where the collection settles it.
@@ -1029,6 +1026,28 @@ def _requested_assets(collection_config: CollectionConfig, extra_bands: "list[st
     duplicate copy on that broader set penalises it for lacking an asset the load never reads.
     """
     return (*collection_config.bands, *(b for b in (extra_bands or ()) if b not in collection_config.bands))
+
+
+def _rekey_assets(item: dict[str, Any], config: CollectionConfig) -> dict[str, Any]:
+    """The item with its assets keyed by this repository's band names, as Earth Search keys them.
+
+    For a catalogue serving the bands under its own keys (``config.asset_keys``), so that pruning,
+    duplicate selection, the offset decision, provenance and the loader all see one item shape
+    whichever catalogue answered. Assets outside the mapping are dropped here, as pruning would
+    drop them. Each kept asset also gets the ``raster:bands`` entry Earth Search's carry: Planetary
+    Computer's carry none, and without it the loader reads every band as ``float32`` with no
+    nodata, so the zero fill outside a granule's swath would count as data and overwrite a
+    neighbouring granule's pixels.
+    """
+    if not config.asset_keys:
+        return item
+    assets = item.get("assets") or {}
+    renamed = {
+        ours: {**assets[theirs], "raster:bands": [{"data_type": "uint8" if ours == "scl" else "uint16", "nodata": 0}]}
+        for ours, theirs in config.asset_keys.items()
+        if theirs in assets
+    }
+    return {**item, "assets": renamed}
 
 
 def _prune_item_dict(item: dict[str, Any], keep_assets: frozenset[str]) -> dict[str, Any]:
@@ -1372,7 +1391,7 @@ def _walk_query_window(
             # assembly step, and defaulting it would collapse EVERY such item into one entry.
             if raw.get("id") is None:
                 raise ValueError(f"STAC item without an 'id' from {provider.catalog_url} — cannot dedupe it")
-            node.items.append(Item.from_dict(_prune_item_dict(raw, keep_assets)))
+            node.items.append(Item.from_dict(_prune_item_dict(_rekey_assets(raw, collection_config), keep_assets)))
         # Sized off the first page's match count, so a window too deep to walk is
         # re-cut before any deep cursor is requested rather than after one is refused.
         if page_no == 1 and (shorter := split_query_window(win_start, win_end, _parts_for_depth(page))):
