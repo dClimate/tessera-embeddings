@@ -68,6 +68,7 @@ def test_gap_closure_at_delta_interpolates_and_extrapolates_in_proportion() -> N
     assert pg._gap_closure_at_delta([(0.2, 1.0), (1.0, 3.0)]) == pytest.approx(1.75)
     assert pg._gap_closure_at_delta([(1.0, 2.0), (2.0, 4.0)]) == pytest.approx(1.0)  # δ below every dose
     assert pg._gap_closure_at_delta([(0.1, 1.0), (0.25, 2.0)]) == pytest.approx(4.0)  # δ above every dose
+    assert pg._gap_closure_at_delta([(-0.2, 1.0), (0.0, 2.0)]) is None  # no dose costs anything: no tripwire
 
 
 def _score(cells: dict[pg.CellKey, tuple[float, float]], gc: float = 0.0) -> pg.Score:
@@ -99,7 +100,9 @@ def test_calibration_gates_on_noise_se_and_sorts_candidates() -> None:
     assert pg.verdict(harmless, cal) == "pass"
     assert pg.verdict(harmless, cal, envelope_passed=False) == "fail"
     tripping = _score({GATED: (0.4, 0.05), UNGATED: (0.0, 0.3)}, gc=0.02)
-    assert pg.verdict(tripping, dataclasses.replace(cal, tripwire={0: 0.01})) == "unresolved"  # a trip needs a decision
+    tripwired = dataclasses.replace(cal, tripwire={0: 0.01})
+    assert pg.verdict(tripping, tripwired) == "unresolved"  # a trip needs a decision
+    assert pg.validity({"ctrl_0_1_0.9999": tripping}, tripwired).flag_only == [0]  # and the lists agree
 
 
 def test_a_tile_loss_past_the_bound_fails() -> None:
@@ -126,6 +129,8 @@ def test_a_named_exception_holds_a_later_run_to_its_recorded_losses() -> None:
 
     worse = recorded | {"cells": {ww: [0.9, 0.1]}}
     assert "past its bound" in pg.outside_exception(worse, bounds)[0]
+    unflagged = recorded | {"fail_cells": [], "trip": {}, "cells": {ww: [0.9, 0.5]}}  # passes, yet past its bound
+    assert "past its bound" in pg.outside_exception(unflagged, bounds)[0]
     new_cell = recorded | {
         "unresolved": ["corn|probe|x->ref|recall"],
         "cells": {ww: [0.5, 0.1], "corn|probe|x->ref|recall": [0.6, 0.3]},

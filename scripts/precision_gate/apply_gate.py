@@ -95,15 +95,19 @@ def main(argv: list[str] | None = None) -> int:
     exception = json.loads(Path(a.exception).read_text())["tiles"].get(a.tile, {}) if a.exception else None
     report["not_passed"] = []
     for name, v in report["variants"].items():
-        if not v["envelope"] or v["verdict"] == "pass":
+        if not pg.is_comparison(name):
             continue
-        v["exception_bounds"] = pg.exception_bounds(v)
+        if v["verdict"] != "pass":
+            v["exception_bounds"] = pg.exception_bounds(v)
         if exception is not None and name in ("candidate", "mixed"):  # never the known-good card pairs
+            # held on every run: a listed item past its bound is outside even when the verdict passes
             v["outside_exception"] = pg.outside_exception(v, exception)
             print(f"exception {name}: " + ("; ".join(v["outside_exception"]) or "inside"))
-            if not v["outside_exception"]:
-                continue
-        report["not_passed"].append(name)
+            passed = not v["outside_exception"]
+        else:
+            passed = v["verdict"] == "pass"
+        if not passed:
+            report["not_passed"].append(name)
     print(f"GATE {a.tile}: " + (f"NOT PASSED: {', '.join(report['not_passed'])}" if report["not_passed"] else "PASS"))
     Path(a.report).write_text(json.dumps(report, indent=1))
     return NOT_PASSED_EXIT if report["not_passed"] else 0

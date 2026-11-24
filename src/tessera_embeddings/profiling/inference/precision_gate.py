@@ -246,13 +246,16 @@ def controls(scores: Mapping[str, Score]) -> dict[int, dict[float, str]]:
     return out
 
 
-def _gap_closure_at_delta(points: Sequence[tuple[float, float]]) -> float:
-    """Gap closure at the dose that costs δ, from (worst gated loss, gap closure) per dose.
+def _gap_closure_at_delta(points: Sequence[tuple[float, float]]) -> float | None:
+    """Gap closure at the dose that costs δ, from (worst gated loss, gap closure) per dose, sorted by loss.
 
-    Linear between the doses; scaled in proportion from the nearest dose where δ lies outside them.
+    Linear between the doses; scaled in proportion from the nearest dose where δ lies outside them. None when
+    no dose costs anything, since no dose then establishes what costs δ.
     """
     losses = np.array([p[0] for p in points])
     gaps = np.array([p[1] for p in points])
+    if losses[-1] <= 0:
+        return None
     if losses[0] <= DELTA <= losses[-1]:
         return float(np.interp(DELTA, losses, gaps))
     nearest = -1 if losses[-1] < DELTA else 0
@@ -271,7 +274,8 @@ def calibrate(scores: Mapping[str, Score]) -> Calibration:
     trip = {}
     for i, doses in controls(scores).items():
         points = sorted((_worst_gated_loss(scores[v], gated), scores[v].gap_closure[i]) for v in doses.values())
-        trip[i] = _gap_closure_at_delta(points) / 2
+        if (at_delta := _gap_closure_at_delta(points)) is not None:
+            trip[i] = at_delta / 2
     return Calibration(
         cell_se=cell_se, gated=gated, z_fam=float(np.percentile(z_draws, 95)), z_draws=z_draws, tripwire=trip
     )
@@ -322,9 +326,10 @@ def validity(scores: Mapping[str, Score], cal: Calibration) -> Validity:
             unvalidated.append(i)
             continue
         s = scores[name]
-        if failed_cells(s, cal) or failed_tile(s):
+        outcome = verdict(s, cal)  # the lists restate the gate's own verdict on the control
+        if outcome == "fail":
             continue
-        if unresolved_cells(s, cal):
+        if outcome == "unresolved":
             flag_only.append(i)
         elif max(loss for loss, _ in s.cells.values()) > DELTA:
             uncovered.append(i)
@@ -341,6 +346,11 @@ def verdict(score: Score, cal: Calibration, envelope_passed: bool = True) -> str
     if not envelope_passed or failed_cells(score, cal) or failed_tile(score):
         return "fail"
     return "unresolved" if unresolved_cells(score, cal) or tripped(score, cal) else "pass"
+
+
+def is_comparison(name: str) -> bool:
+    """An embedded comparison (two cards, the candidate, a mixed store), as opposed to a noise draw or control."""
+    return not name.startswith(("noise", "ctrl", "refit"))
 
 
 def _variant_report(tile: Tile, score: Score, cal: Calibration, env: dict | None) -> dict:
@@ -374,7 +384,7 @@ def refit_spread(tile: Tile, base: Mapping[str, np.ndarray], refits: Sequence[Ma
 def evaluate(tile: Tile, scores: Mapping[str, Score], envelopes: Mapping[str, dict]) -> dict:
     """The tile's calibration, validity lists and every variant's verdict, as a JSON-ready dict.
 
-    ``envelopes`` holds :func:`envelope` for each embedded comparison; controls and noise draws have none.
+    ``envelopes`` must hold :func:`envelope` for every embedded comparison; noise draws and controls have none.
     """
     cal = calibrate(scores)
     val = validity(scores, cal)
@@ -393,7 +403,9 @@ def evaluate(tile: Tile, scores: Mapping[str, Score], envelopes: Mapping[str, di
         "uncovered": names(val.uncovered),
         "control_passes": names(val.control_passes),
         "unvalidated": names(val.unvalidated),
-        "variants": {v: _variant_report(tile, s, cal, envelopes.get(v)) for v, s in scores.items()},
+        "variants": {
+            v: _variant_report(tile, s, cal, envelopes[v] if is_comparison(v) else None) for v, s in scores.items()
+        },
     }
 
 
