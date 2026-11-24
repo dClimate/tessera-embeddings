@@ -51,7 +51,7 @@ The gaps are two periods Element 84 has not yet reprocessed, not scattered losse
 - **2022:** its first date in late 2022 is between 2022-12-06 and 2022-12-08; from there it holds
   every legacy date into 2023.
 - **Isolated dates** are missing outside those periods: 2024-01-11 on 33UUP and 36MZE (but not on
-  15TVF, 55HBU, 23KLP or 44QKE), 2019-06-25 on 33UUP and 2019-04-04 on 44QKE. This accounts for the
+  15TVF, 55HBU, 23KLP or 44QKE), 2023-05-23 on 44QKE, 2019-06-25 on 33UUP and 2019-04-04 on 44QKE. This accounts for the
   215/216 and 144/145 in the 2024 column, under 1% of a year.
 - **Near the antimeridian** Collection 1 is no worse than the legacy collection. Element 84
   [documents](https://github.com/Element84/earth-search/blob/main/docs/collections/sentinel-2-l2a.md#known-issues)
@@ -138,32 +138,42 @@ These ran on 2026-11-24, to test whether the switch changes what the ingest prod
 single month of the dev test above.
 
 **Scene survey: what the ingest would read.** The survey covered six tiles (15TVF, 33UUP, 36MZE,
-55HBU, 23KLP and 44QKE) over eight months: July and October 2019, January and July of 2020, 2021
-and 2023. It spans every year Collection 1 is read for except 2024 onward. In each tile-month it
-took up to four datatakes: the two clearest, and two with 20–70% cloud. Each Collection 1 scene was
-paired with the legacy copy `duplicates.select_preferred_duplicates` keeps, which is the copy the
-legacy ingest reads. It compared SCL, red and nir over a 20 km square centred on the scene's data:
-162 pairs in all.
+55HBU, 23KLP and 44QKE) over twelve months: July and October 2019, and January and July of 2020,
+2021, 2023, 2024 and 2025. That is every year Collection 1 is read for. In each tile-month it took
+up to four images: the two clearest, and two with 20–70% cloud. Each Collection 1 image was paired
+with the legacy copy of the same pass and datastrip that `duplicates.select_preferred_duplicates`
+keeps, which is the copy the legacy ingest reads. It compared SCL, red and nir over a 20 km square
+centred on the image's data: 250 pairs in all, 248 of them correctly matched.
 
-- **The legacy ingest already reads Element 84's 05.00 reprocessing.** Between 2023 and 2024
-  Element 84 added a baseline 05.00 copy of every 2019–2021 scene surveyed to the legacy collection, beside
-  the original (02.12, 02.14 or 03.01). Duplicate selection prefers the newer baseline, and it chose
-  a 05.00 copy in all 162 pairs. Those copies match Collection 1 except on near-black pixels and in
-  the one case below. The originals differ (400 DN mean absolute red on 15TVF on 2021-01-21, and a
-  different SCL cloud fraction on 15TVF on 2019-07-01), but were never chosen.
-- **All 160 correctly paired scenes agree on SCL exactly**, and none changes a date's verdict at
-  the 5% valid-coverage gate. Their red and nir match except on near-black pixels, where Collection
-  1 minus 1,000 goes negative and the legacy COG is floored. `correct_boa_dn` floors both alike
-  ([ADR 020](020-boa-offset-applies-to-every-valid-dn.md)).
+- **The legacy ingest already reads the same product.** For 2019–2021, Element 84 added a baseline
+  05.00 copy of every scene surveyed to the legacy collection in 2023–2024, beside the original
+  (02.12, 02.14 or 03.01). Duplicate selection prefers the newer baseline, and chose the 05.00 copy
+  in every pair. From 2023 both collections hold Element 84 COGs of the same ESA product (baselines
+  05.09 to 05.11), and the legacy copy chosen was always one. The originals differ (400 DN mean
+  absolute red on 15TVF on 2021-01-21, and a different SCL cloud fraction on 15TVF on 2019-07-01),
+  but were never chosen.
+- **SCL is identical in every pair compared**, and no pair changes a date's verdict at the 5%
+  valid-coverage gate. Red and nir are identical except on near-black pixels, where Collection 1
+  minus 1,000 goes negative and the legacy COG is floored; `correct_boa_dn` floors both alike
+  ([ADR 020](020-boa-offset-applies-to-every-valid-dn.md)). The one exception is below.
 - **One genuine difference favours Collection 1.** On 15TVF on 2021-01-21 the legacy collection
   holds two 05.00 reprocessings of one image, sequence `_1` and sequence `_2`. Duplicate selection
   keeps `_2`, which sits one pixel west of Collection 1: a mean absolute red difference of 568 DN,
   falling to 176 after a one-column shift. `_1` is identical to Collection 1. Collection 1 holds a
   single copy, so the ambiguity disappears.
-- **Two mismatches were pairing artefacts.** On 55HBU on 2023-07-19 and 15TVF on 2019-07-01 the
-  pass reached the tile in two datastrips. The survey matched by datatake, and so paired one strip
-  with the other strip's copy. Both collections hold both strips, and the correctly matched copies
-  agree.
+- **One pair could not be read.** On 55HBU on 2024-01-12 the legacy copy chosen points at ESA's
+  original JPEG 2000 files in the requester-pays `sentinel-s2-l2a` bucket, which the survey reads
+  without credentials. Collection 1 serves the same image as a COG.
+- The 2019–2023 months were first paired by pass alone, so on days with two datastrips one strip
+  met the other strip's copy (55HBU on 2023-07-19, 15TVF on 2019-07-01). Those two pairs are
+  artefacts and are left out of the figures above. The 2024–2025 months were paired by pass and
+  datastrip, which removes them.
+
+**Strip-level coverage.** The coverage table above counts dates, which hides a date where
+Collection 1 holds one datastrip of two. Counting images (pass and datastrip) on the six tiles in
+2020, 2021, 2023, 2024 and 2025 (30 tile-years, about 5,000 legacy images), Collection 1 lacks four:
+2024-01-11 on 33UUP and 36MZE, 2023-05-23 on 44QKE, and one of the two datastrips on 55HBU on
+2024-01-12. In 2025 it holds a few images the legacy collection lacks.
 
 **Dev ingest, 2021.** Same set-up as the dev test above (`tiny_epsg5070.zarr`, 4 workers,
 provenance on), with Collection 1 and legacy arms for January and July 2021:
@@ -176,9 +186,8 @@ provenance on), with Collection 1 and legacy arms for January and July 2021:
 SCL is identical in both months. July's residue is the near-black floor difference described
 above, spread by resampling, as in the 2023 test. Both arms record baseline 500 for every date.
 
-Taken together, the switch leaves the months surveyed effectively unchanged, apart from scenes like
-the 15TVF shift above. 2024 onward was not surveyed. It does the same in any other
-year where the legacy collection already holds Element 84's 05.xx copies. No embedding comparison was run, so the effect on
+Taken together, the switch leaves every surveyed month from 2019 to 2025 effectively unchanged,
+apart from scenes like the 15TVF shift above. No embedding comparison was run, so the effect on
 embeddings is unmeasured. It was judged unnecessary because at most 0.006% of the dev test area's
 mosaic pixels differ by 100 DN or more.
 
@@ -187,16 +196,16 @@ mosaic pixels differ by 100 DN or more.
 - From April 2019 onward, except 2022 before mid-December, mosaics come from one baseline and one
   producer. Annual windows for 2019 and 2022 still read the legacy collection. Duplicate
   selection still runs, but in Collection 1 it only separates images; there are no competing copies.
-- Mosaics barely change in the months surveyed, from 2019 to 2023. The legacy collection held
-  Element 84's 05.00 reprocessing of every scene surveyed, and duplicate selection already reads it
-  (see Consistency checks). No surveyed scene had only its original. Where one does, pixels and scene
+- Mosaics barely change in the months surveyed, from 2019 to 2025 (2022 is not read from
+  Collection 1). The legacy ingest already read the same product in every scene surveyed (see
+  Consistency checks). No surveyed scene had only its original. Where one does, pixels and scene
   classification differ slightly: the original of 15TVF on 2020-07-10 reads 686 against
-  Collection 1's 690. 2024 onward was not surveyed. The change therefore lands at a store boundary, like
+  Collection 1's 690. The change therefore lands at a store boundary, like
   other input changes. The ingest code identity changes with this code, so an existing store will
   not resume under it without `allow_ingest_code_mismatch`.
 - The `incomplete` ranges are a measured snapshot. When Element 84 backfills 2022 or the early
   years, rerun the date comparison and shrink the ranges.
-- A Collection 1 window can lack an isolated date the legacy collection holds, such as 2024-01-11
-  on some tiles.
+- A Collection 1 window can lack an isolated image the legacy collection holds: four of about
+  5,000 in the strip-level count, such as 2024-01-11 on some tiles.
 - `provider="planetary-computer"` has no Collection 1 entry. It must be given
   `collection="sentinel-2-l2a"` explicitly, as with every unvalidated use of that provider.
