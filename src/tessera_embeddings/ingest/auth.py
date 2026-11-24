@@ -96,7 +96,7 @@ def sign_azure_href(href: str) -> str:
                 token, expiry = body["token"], datetime.datetime.fromisoformat(body["msft:expiry"])
                 _sas_tokens[key] = (token, expiry)
             except (requests.RequestException, NonJsonResponseError, ValueError, KeyError):
-                if expiry <= now:
+                if expiry <= datetime.datetime.now(datetime.UTC):  # the refresh itself may outlast the token
                     raise
                 logger.warning("Planetary Computer token refresh failed; reading on the current one", exc_info=True)
     return f"{parts._replace(query='').geturl()}?{token}"

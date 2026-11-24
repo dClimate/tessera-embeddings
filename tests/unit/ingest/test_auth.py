@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import threading
+import time
 from collections.abc import Callable
 
 import pytest
@@ -305,10 +306,11 @@ class _TokenService:
     """Stands in for the token endpoint: hands out numbered tokens, or fails when told to."""
 
     def __init__(self, life: datetime.timedelta, fail: bool = False) -> None:
-        self.life, self.fail, self.calls = life, fail, 0
+        self.life, self.fail, self.calls, self.delay = life, fail, 0, 0.0
 
     def get(self, url: str, timeout: float) -> requests.Response:
         self.calls += 1
+        time.sleep(self.delay)
         if self.fail:
             raise requests.ConnectionError("token service down")
         resp = requests.Response()
@@ -349,6 +351,16 @@ def test_a_failed_refresh_keeps_a_valid_token_and_raises_without_one(
     token_service(5, fail=True)
     assert auth.sign_azure_href(_BLOB) == f"{_BLOB}?sig=1"
     auth._sas_tokens.clear()
+    with pytest.raises(requests.ConnectionError):
+        auth.sign_azure_href(_BLOB)
+
+
+def test_a_token_that_expires_during_a_failed_refresh_is_not_used(
+    token_service: Callable[..., _TokenService],
+) -> None:
+    token_service(5, fail=True).delay = 0.3
+    expiry = datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=0.1)
+    auth._sas_tokens[("sentinel2l2a01", "sentinel2-l2")] = ("sig=old", expiry)
     with pytest.raises(requests.ConnectionError):
         auth.sign_azure_href(_BLOB)
 
