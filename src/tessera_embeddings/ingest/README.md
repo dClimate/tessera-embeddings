@@ -207,15 +207,24 @@ catalogues are queried in production:
 
 | Catalogue | Collection in production | Whose pixels arrive |
 |---|---|---|
-| Earth Search (Element 84) | Sentinel-2 L2A | Element 84's harmonised COGs (`sentinel-cogs`, `e84-earth-search-sentinel-data`) **and** ESA's originals (`sentinel-s2-l2a`) |
+| Earth Search (Element 84) | Sentinel-2 L2A Collection 1 (`sentinel-2-c1-l2a`) | Element 84's COGs of ESA's 05.00+ reprocessing, offset still in (`e84-earth-search-sentinel-data`) |
+| Earth Search (Element 84) | Sentinel-2 L2A legacy (`sentinel-2-l2a`), for the years Collection 1 is incomplete | Element 84's harmonised COGs (`sentinel-cogs`, `e84-earth-search-sentinel-data`) **and** ESA's originals (`sentinel-s2-l2a`) |
 | CMR-STAC (NASA/ASF) | OPERA RTC-S1 | ASF (`asf-cumulus-prod-opera-products`) |
 
 Earth Search's `sentinel-1-grd`, `sentinel-2-l1c` and `landsat-c2-l2` entries are configured and
 **have no caller**: radar comes from OPERA, and `ingest_s1_roi_sar` names the `cmr-asf` provider
 directly rather than taking it as a parameter.
 
-**ESA's own products reach us through Earth Search, not through a separate catalogue.** The
-`sentinel-2-l2a` collection there indexes both Element 84's reprocessed COGs and items whose
+**Collection 1 is the default** (`DEFAULT_S2_COLLECTION`): one producer at one baseline, so its
+offset rule is settled for the whole collection. Earth Search has not yet reprocessed two periods
+into it: everything before about April 2019, and 2022 until about mid-December. A window touching
+either period reads the legacy collection instead, for the whole window
+(`stac.collection_for_window`, configured by `CollectionConfig.incomplete` and `fallback`).
+The coverage measurements and the reasoning are in
+[ADR 044](../../../context_docs/decisions/044-sentinel-2-reads-collection-1-where-it-is-complete.md).
+
+**In the legacy collection, ESA's own products reach us through Earth Search, not through a
+separate catalogue.** The `sentinel-2-l2a` collection there indexes both Element 84's reprocessed COGs and items whose
 assets point straight at ESA's archive, and a query returns them mixed. The two producers differ
 on one thing that matters — Element 84 has already subtracted the post-baseline-04.00 reflectance
 offset and ESA has not — so which producer served an asset is decided per asset from where that

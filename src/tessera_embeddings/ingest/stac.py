@@ -56,6 +56,7 @@ from tessera_embeddings.ingest.solar_days import (
     normalize_to_solar_day,
     owned_items,
     resolve_grouping_longitude,
+    whole_window_range,
 )
 
 # =============================================================================
@@ -262,6 +263,31 @@ def _get_collection_config(
             f"Unknown collection '{collection_alias}' for provider '{provider_name}'. Available: {available}"
         )
     return provider.collections[collection_alias]
+
+
+def collection_for_window(provider_name: str, collection_alias: str, start_date: str, end_date: str) -> str:
+    """The collection to read ``start_date``..``end_date`` from: the one asked for, or its fallback.
+
+    A window touching any range the collection's config marks ``incomplete`` reads the fallback
+    for the WHOLE window, never a mix: one run keeps one producer, so its offset rule and its
+    duplicate handling hold end to end. Every entry point that queries for a window resolves it
+    here, so the optical preflight probes the collection the ingest will read.
+
+    The test runs from the query's first UTC date, the day before the window, because an image
+    dated then can belong to the window's first solar day (``solar_days``). It ends on the
+    window's last day, not the query's. An image dated the UTC day AFTER its solar day exists only
+    in the far-western high Arctic, and only between late February and October. No incomplete
+    range starts in those months, so the trailing day never holds an image the window needs, and
+    testing it would send every window ending the day before a range to the fallback. A range
+    starting between March and October would break this; see ADR 044 before adding one.
+    """
+    config = _get_collection_config(provider_name, collection_alias)
+    window = whole_window_range(start_date, end_date)
+    start, end = window.query_start, window.own_end
+    if config.fallback is None or not any(start <= last and end >= first for first, last in config.incomplete):
+        return collection_alias
+    logger.info("%s is incomplete within %s..%s; reading %s instead", collection_alias, start, end, config.fallback)
+    return config.fallback
 
 
 def split_antimeridian_bbox(

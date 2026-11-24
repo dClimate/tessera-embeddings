@@ -59,7 +59,8 @@ context_docs/
 │   ├── 040-new-code-is-gated-on-duplication-and-complexity.md
 │   ├── 041-unit-tests-run-the-forked-writer-in-threads.md
 │   ├── 042-chunked-graph-replay-ships-above-the-two-card-yardstick.md
-│   └── 043-a-per-class-gate-for-precision-changes.md
+│   ├── 043-a-per-class-gate-for-precision-changes.md
+│   └── 044-sentinel-2-reads-collection-1-where-it-is-complete.md
 │
 ├── campaign/                      THE GLOBAL CAMPAIGN — start here
 │   ├── campaign-plan.md                        <- START HERE. What runs, with what settings, in

@@ -26,6 +26,8 @@ from pathlib import Path
 
 import vcr  # vcrpy
 
+from tessera_embeddings.config import DEFAULT_S2_COLLECTION
+
 # AOI matches examples/quickstart/roi.geojson — Denver, CO.
 BBOX = (-105.020, 39.740, -105.010, 39.750)
 DATETIME = "2024-07-01/2024-07-31"
@@ -59,7 +61,7 @@ VCR_CONFIG = {
 
 
 def _record_s2_search() -> Path:
-    """Record an S2 L2A search against Earth Search."""
+    """Record a search of the default S2 collection against Earth Search."""
     from pystac_client import Client
 
     cassette_path = CASSETTE_DIR / "test_s2_roi_parity.yaml"
@@ -68,7 +70,7 @@ def _record_s2_search() -> Path:
     with vcr.VCR(record_mode="once", **VCR_CONFIG).use_cassette(str(cassette_path)):
         client = Client.open("https://earth-search.aws.element84.com/v1")
         search = client.search(
-            collections=["sentinel-2-l2a"],
+            collections=[DEFAULT_S2_COLLECTION],
             bbox=BBOX,
             datetime=DATETIME,
             max_items=200,

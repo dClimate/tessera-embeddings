@@ -115,10 +115,11 @@ _MULTISCALES_CONVENTION = {
 }
 
 # --- geoemb: field defaults (this pipeline's fixed provenance) --------------
-#: The source datasets, as resolvable dataset references: the Earth Search Sentinel-2 L2A
-#: collection we query (it indexes both the `sentinel-cogs` and `sentinel-s2-l2a` buckets,
-#: ADR 021) and the OPERA RTC-S1 collection's DOI.
+#: The source datasets, as resolvable dataset references: both Earth Search Sentinel-2 L2A
+#: collections — Collection 1 by default, the legacy one for the years Collection 1 holds only
+#: part of (ADR 044) — and the OPERA RTC-S1 collection's DOI.
 DEFAULT_SOURCE_DATA: tuple[str, ...] = (
+    "https://earth-search.aws.element84.com/v1/collections/sentinel-2-c1-l2a",
     "https://earth-search.aws.element84.com/v1/collections/sentinel-2-l2a",
     "https://doi.org/10.5067/SNWG/OPERA_L2_RTC-S1_V1",
 )
