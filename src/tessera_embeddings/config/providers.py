@@ -110,10 +110,11 @@ S2Source = tuple[str, str]
 #: The Sentinel-2 source a window reads when no row of :data:`S2_SOURCE_BY_PERIOD` claims it.
 DEFAULT_S2_SOURCE: S2Source = ("earth-search", "sentinel-2-c1-l2a")
 
-#: Where each period of Sentinel-2 is read from: inclusive ``(first day, last day, source)``, first
-#: matching row wins. Every row is whole calendar years, so every window inside one calendar year
-#: reads the same source. A window spanning two years reads one source for both, so cutting a year's
-#: processing across year boundaries can still mix sources within it. Applied by
+#: Where each period of Sentinel-2 is read from by default: inclusive ``(first day, last day,
+#: source)``, first matching row wins. A run overrides it per calendar year with
+#: ``IngestSettings.s2_sources``. Every row is whole calendar years, so every window inside one
+#: calendar year reads the same source. A window spanning two years reads one source for both, so
+#: cutting a year's processing across year boundaries can still mix sources within it. Applied by
 #: ``stac.s2_source_for_window``; the measurements behind each row are in ADR 044 and ADR 045.
 S2_SOURCE_BY_PERIOD: tuple[tuple[str, str, S2Source], ...] = (
     # Collection 1 holds nothing before late March 2019 except about half of 2018, and little of 2022.

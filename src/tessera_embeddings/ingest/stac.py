@@ -10,7 +10,7 @@ import logging
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
 from itertools import count
@@ -267,32 +267,44 @@ def _get_collection_config(
 
 
 def s2_source_for_window(
-    start_date: str, end_date: str, provider: str | None = None, collection: str | None = None
+    start_date: str,
+    end_date: str,
+    provider: str | None = None,
+    collection: str | None = None,
+    s2_sources: Mapping[int, S2Source] | None = None,
+    recorded: S2Source | None = None,
 ) -> S2Source:
     """The Sentinel-2 source to read ``start_date``..``end_date`` from, as ``(provider, collection)``.
 
-    A ``provider`` and ``collection`` given together are read as given, which is how a control arm
-    reads a source the table would not choose. Given neither, the first row of
-    :data:`~tessera_embeddings.config.providers.S2_SOURCE_BY_PERIOD` holding any of the window's
-    days decides, for the WHOLE window: one run keeps one producer, so its offset rule and its
-    duplicate handling hold end to end. Every entry point that queries for a window resolves it
-    here, so the optical preflight probes the source the ingest will read.
+    The first of these that applies decides, for the WHOLE window, so one run keeps one producer
+    and its offset rule and duplicate handling hold end to end:
+
+    1. a ``provider`` and ``collection`` given together, read as given (a control arm);
+    2. ``s2_sources``, the run's ``{year: source}`` choice, for a window touching one of its years;
+    3. ``recorded``, the source a mosaic store being resumed was built from, so a resume keeps its
+       producer even after the default table changes;
+    4. the first row of :data:`~tessera_embeddings.config.providers.S2_SOURCE_BY_PERIOD` holding
+       any of the window's days, else :data:`~tessera_embeddings.config.providers.DEFAULT_S2_SOURCE`.
+
+    Every entry point that queries for a window resolves it here, so the optical preflight probes
+    the source the ingest will read.
 
     The window's own days are tested, not the padding day the catalogue query adds either side
     (``solar_days``). The leading one is the last day of the previous year when the window starts
-    a year, and every source in the table holds the last day of the year before its row. The
-    trailing one can hold an image of the window's last solar day only in the far-western high
+    a year, and every source in the default table holds the last day of the year before its row.
+    The trailing one can hold an image of the window's last solar day only in the far-western high
     Arctic between late February and October, so never on 1 January. Both are measured in ADR 044.
     """
     if (provider is None) != (collection is None):
         raise ValueError(f"Name both a provider and a collection, or neither: got {provider!r} and {collection!r}")
-    if provider is not None and collection is not None:
-        _get_collection_config(provider, collection)
-        return provider, collection
     start, end = (day.isoformat() for day in validated_window(start_date, end_date))
-    source = next(
-        (src for first, last, src in S2_SOURCE_BY_PERIOD if start <= last and end >= first), DEFAULT_S2_SOURCE
-    )
+    rows = [(f"{year}-01-01", f"{year}-12-31", tuple(src)) for year, src in sorted((s2_sources or {}).items())]
+    if recorded is not None:
+        rows.append((start, end, tuple(recorded)))
+    rows += S2_SOURCE_BY_PERIOD
+    source = (provider, collection) if provider is not None and collection is not None else None
+    source = source or next((src for first, last, src in rows if start <= last and end >= first), DEFAULT_S2_SOURCE)
+    _get_collection_config(*source)
     logger.info("Sentinel-2 for %s..%s reads %s/%s", start, end, *source)
     return source
 

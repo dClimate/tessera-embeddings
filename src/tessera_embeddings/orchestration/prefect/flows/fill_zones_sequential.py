@@ -1223,6 +1223,7 @@ def fill_zones_sequential_flow(
                 zone,
                 _window_for(year),
                 land_mask_path=land_mask_path,
+                s2_sources=ingest_settings.s2_sources,
                 get_credentials=iam_icechunk_credentials,
                 s3_region=s3_region,
                 log=log,

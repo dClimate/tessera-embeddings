@@ -34,7 +34,7 @@ import logging
 import math
 import operator
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import reduce
 from typing import final
@@ -50,7 +50,7 @@ from tessera_embeddings.config.ingest import (
     INGEST_CHUNKS,
     SOURCE_INDEX_VAR,
 )
-from tessera_embeddings.config.providers import PROVIDERS
+from tessera_embeddings.config.providers import PROVIDERS, S2Source
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
 from tessera_embeddings.ingest._pipeline import pipelined
 from tessera_embeddings.ingest.asset_locations import Harmonisation
@@ -104,6 +104,7 @@ from tessera_embeddings.storage.manifest import IngestManifest
 from tessera_embeddings.storage.zarr_store import (
     StorageOptions,
     get_existing_dates,
+    get_root_attr,
     record_assessed_window,
     resolve_storage_options,
     store_write_retrying,
@@ -340,6 +341,7 @@ def ingest_s2_roi_reflectance(
     min_valid_coverage: float = DEFAULT_MIN_VALID_COVERAGE,
     provider: str | None = None,
     collection: str | None = None,
+    s2_sources: Mapping[int, S2Source] | None = None,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     storage_options: StorageOptions = None,
     stream_stac_monthly: bool = True,
@@ -365,6 +367,9 @@ def ingest_s2_roi_reflectance(
             given together with ``collection`` or not at all. Neither reads the source
             :func:`~tessera_embeddings.ingest.stac.s2_source_for_window` chooses for the window.
         collection: Collection alias within ``provider``.
+        s2_sources: The run's ``{year: (provider, collection)}`` choice; years it does not name
+            read the default table. A store being resumed keeps the source it records unless
+            this names another for its year, which its manifest then refuses.
         log: Optional logger; defaults to ``logging.getLogger(__name__)``.
         storage_options: fsspec storage options for reading the ROI mask. ``None`` lets fsspec
             auto-detect from the URI.
@@ -437,14 +442,16 @@ def ingest_s2_roi_reflectance(
     # holds, and an interrupted store records it nowhere else — so a resume at a different
     # threshold would skip the dates the old one admitted and append new ones under the new rule.
     # Validated on every write, so the refusal lands before the resumed run commits a date.
+    recorded = (get_root_attr(reflectance_store, "_manifest", s3_region=s3_region) or {}).get("s2_source")
+    provider, collection = s2_source_for_window(start_date, end_date, provider, collection, s2_sources, recorded)
     ingest_manifest = IngestManifest.from_roi_store(
         roi_zarr_path,
         min_valid_coverage=min_valid_coverage,
         storage_options=resolve_storage_options(storage_options),
         allow_ingest_code_mismatch=allow_ingest_code_mismatch,
         provenance=provenance,
+        s2_source=(provider, collection),
     )
-    provider, collection = s2_source_for_window(start_date, end_date, provider, collection)
     catalogue = PROVIDERS[provider]
     #: Where every granule list says its items came from.
     source = {

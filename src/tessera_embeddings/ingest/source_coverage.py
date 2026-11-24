@@ -49,7 +49,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, cast, final
@@ -59,6 +59,7 @@ from pystac_client import Client
 from pystac_client.stac_api_io import StacApiIO
 
 from tessera_embeddings.config import PROVIDERS
+from tessera_embeddings.config.providers import S2Source
 from tessera_embeddings.ingest._http import make_logging_retry, spawn_abandonable
 from tessera_embeddings.ingest.land_mask import live_tile_block_bboxes_wgs84
 from tessera_embeddings.ingest.solar_days import whole_window_range
@@ -185,6 +186,7 @@ def preflight_optical_source(
     land_mask_path: str,
     provider: str | None = None,
     collection: str | None = None,
+    s2_sources: Mapping[int, S2Source] | None = None,
     block_tiles: int = BLOCK_TILES,
     budget_s: float = PROBE_BUDGET_S,
     probe: ExistenceProbe | None = None,
@@ -209,6 +211,7 @@ def preflight_optical_source(
             decisiveness of a miss rests on probing the ingest's own catalogue. Given together
             with ``collection`` or not at all, exactly as the ingest takes them.
         collection: Collection alias within the provider, same constraint.
+        s2_sources: The run's per-year Sentinel-2 sources, as the ingest takes them.
         block_tiles: Block edge for the per-block sweep (see :data:`BLOCK_TILES`).
         budget_s: Wall-clock probe budget (see :data:`PROBE_BUDGET_S`).
         probe: Injectable catalogue probe; ``None`` builds the default from
@@ -232,7 +235,9 @@ def preflight_optical_source(
         # land, so the common case settles in one probe.
         blocks.sort(key=lambda entry: entry[1], reverse=True)
         if probe is None:
-            probe = _make_default_probe(*s2_source_for_window(*window.to_date_range(), provider, collection))
+            probe = _make_default_probe(
+                *s2_source_for_window(*window.to_date_range(), provider, collection, s2_sources)
+            )
     except Exception as exc:
         log.warning("Optical preflight for %s could not be set up — passing the cell through", zone, exc_info=True)
         return OpticalPreflight(zone, SourceFinding.INCONCLUSIVE, f"preflight setup failed: {exc!r}", 0)

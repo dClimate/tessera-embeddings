@@ -36,6 +36,7 @@ from tessera_embeddings.ingest.stac import (
 
 C1 = ("earth-search", "sentinel-2-c1-l2a")
 LEGACY = ("earth-search", "sentinel-2-l2a")
+PC = ("planetary-computer", "sentinel-2-l2a")
 
 
 class TestBaselineCorrection:
@@ -164,6 +165,19 @@ class TestProviderConfiguration:
 
     def test_s2_source_for_window_reads_an_explicit_source_as_given(self):
         assert s2_source_for_window("2022-06-01", "2022-06-30", *C1) == C1
+
+    @pytest.mark.parametrize(
+        "start,end,provider,run_years,recorded,expected",
+        [
+            ("2017-03-01", "2017-03-31", None, {2017: PC}, None, PC),  # the run's year beats the table
+            ("2018-01-01", "2018-12-31", None, {2017: PC}, None, LEGACY),  # a year it does not name
+            ("2017-01-01", "2017-12-31", None, None, C1, C1),  # a resume keeps what its store records
+            ("2017-01-01", "2017-12-31", None, {2017: PC}, LEGACY, PC),  # ...unless the run names the year
+            ("2017-01-01", "2017-12-31", C1, {2017: PC}, LEGACY, C1),  # an explicit source beats all
+        ],
+    )
+    def test_s2_source_for_window_precedence(self, start, end, provider, run_years, recorded, expected):
+        assert s2_source_for_window(start, end, *(provider or (None, None)), run_years, recorded) == expected
 
     @pytest.mark.parametrize("provider,collection", [("earth-search", None), (None, "sentinel-2-l2a")])
     def test_s2_source_for_window_refuses_half_a_source(self, provider, collection):

@@ -92,6 +92,7 @@ def ingest_s2_roi_reflectance(
     min_valid_coverage: float = DEFAULT_MIN_VALID_COVERAGE,
     provider: str | None = None,
     collection: str | None = None,
+    s2_sources: dict[int, tuple[str, str]] | None = None,
     ec2_scheduler: bool = False,
     use_local: bool = False,
     storage_options: dict | None = None,
@@ -127,6 +128,8 @@ def ingest_s2_roi_reflectance(
         provider: STAC provider key, given together with ``collection`` or not at all. Neither
             reads the source the ingest's period table chooses for the window.
         collection: Collection alias within the provider.
+        s2_sources: Which Sentinel-2 source each named calendar year reads, overriding the default
+            table; see ``IngestSettings.s2_sources``.
         ec2_scheduler: Run the Dask scheduler on EC2 instead of Fargate (better
             single-thread CPU for large graphs). Ignored when ``use_local=True``.
         use_local: Use the local-machine Dask provider instead of AWS, for tests and dev.
@@ -184,6 +187,7 @@ def ingest_s2_roi_reflectance(
         "min_valid_coverage": min_valid_coverage,
         "provider": provider,
         "collection": collection,
+        "s2_sources": s2_sources,
         "storage_options": storage_options,
         "stream_stac_monthly": stream_stac_monthly,
         "overlap_window_writes": overlap_window_writes,
