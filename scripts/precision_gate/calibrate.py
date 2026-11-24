@@ -62,6 +62,8 @@ L = np.load(labels_path)
 F = {side: np.load(Path(embed_dir) / f"lattice_{side}_{TILE}.npz") for side in ("l40s", "a10g", "l4", "cand")}
 for f in F.values():
     assert (f["Y"] == L["Y"]).all() and (f["X"] == L["X"]).all()
+code = {side: str(f["code"]) for side, f in F.items()}  # same tarball on both sides would certify nothing
+assert code["l40s"] == code["a10g"] == code["l4"] != code["cand"], code
 N = L["Y"].size
 
 

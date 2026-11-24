@@ -66,8 +66,8 @@ the candidate. It was measured on six tiles with FP8 on the L40S as its first ca
       centroid, as a share of that gap. The tripwire is half its own control's gap closure at the dose that
       costs δ, interpolated between the three doses. A trip leaves the change unresolved.
 
-   An unresolved result needs a decision; only a pass ships without one. Neighbour overlaps, coherence and the
-   refit spread are reported, not gated.
+   An unresolved result needs a decision; only a pass ships without one. Coherence and the refit spread are
+   reported, not gated.
 2. **A change that fails may ship as a named exception**, which is a decision of its own, recorded in an ADR that
    accepts its measured losses. The exception's bounds are each failed or unresolved cell and failed tile loss
    at its recorded loss plus one SE, and each tripped class at 1.1 × its recorded gap closure. Gap closure has
