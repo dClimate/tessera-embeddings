@@ -162,16 +162,18 @@ def _strip_band_suffix(href: str) -> str:
 
 
 def href_key(href: str) -> str:
-    """A comparable identity for one source object, across URL spellings.
+    """A comparable identity for one source object, across URL spellings: its object key.
 
     A catalogue asset says ``s3://bucket/key`` while the loader logs
-    ``https://bucket.s3.<region>.amazonaws.com/key``, and a path-style URL puts the bucket in the
-    path. The last two path segments — granule directory and file — are the same in all three and
-    unique within a collection, so they are the key.
+    ``https://bucket.s3.<region>.amazonaws.com/key``, and a path-style URL (host ``s3.<region>...``)
+    puts the bucket in the path, so that one segment is dropped. The whole key, not its last few
+    segments, because Planetary Computer's last segments (``R10m/T15TVF_..._B02_10m.tif``) are the
+    same for every copy of an image; only the product directory above them tells copies apart. A
+    query string, such as a read token, is never part of the path.
     """
-    path = urlsplit(_strip_band_suffix(href)).path
-    parts = [p for p in path.split("/") if p]
-    return "/".join(parts[-2:])
+    parts = urlsplit(_strip_band_suffix(href))
+    segments = [p for p in parts.path.split("/") if p]
+    return "/".join(segments[1:] if parts.netloc.startswith("s3.") else segments)
 
 
 class _AbortedReadHandler(logging.Handler):
@@ -710,7 +712,7 @@ def label_objects(hrefs: Iterable[str]) -> str:
     Granule directory and file only: the bucket and collection prefix are the same for every
     object in a run, so including them makes each entry four times longer for no distinction.
     """
-    keys = sorted({href_key(h) for h in hrefs})
+    keys = sorted({"/".join(href_key(h).split("/")[-2:]) for h in hrefs})
     if not keys:
         return "unattributed"
     if len(keys) > _OBJECT_LABEL_CAP:
