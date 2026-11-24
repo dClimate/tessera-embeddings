@@ -37,10 +37,12 @@ import json
 import os
 import sys
 import time
+import warnings
 from pathlib import Path
 
 import numpy as np
 from sklearn.cluster import KMeans
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import LogisticRegression
 
 from tessera_embeddings.profiling.inference import precision_gate as pg
@@ -145,9 +147,9 @@ def fit(a: np.ndarray, folds: list = FOLDS) -> list:
     for _, train in folds:
         mu, sd = a[train].mean(0), a[train].std(0) + 1e-9
         clf = LogisticRegression(C=PROBE_C, max_iter=PROBE_MAX_ITER, tol=PROBE_TOL)
-        clf.fit((a[train] - mu) / sd, lab[train])
-        if int(np.max(clf.n_iter_)) >= PROBE_MAX_ITER:
-            raise RuntimeError(f"probe did not converge in {PROBE_MAX_ITER} iterations")
+        with warnings.catch_warnings():  # bootstrap runs with -W ignore; a probe that stops short must still fail
+            warnings.simplefilter("error", ConvergenceWarning)
+            clf.fit((a[train] - mu) / sd, lab[train])
         out.append((clf, mu, sd))
     return out
 
