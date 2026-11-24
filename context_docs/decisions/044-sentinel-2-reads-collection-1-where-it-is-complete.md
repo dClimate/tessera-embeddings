@@ -38,7 +38,7 @@ date the legacy collection lacks.
 | 36MZE (Tanzania) | 0/102 | 63/144 | 112/145 | 144/144 | — | 12/144 | — | 144/145 | 173/173 |
 | 55HBU (Australia) | 4/33 | 37/109 | 106/137 | 128/128 | 140/140 | 9/139 | 141/141 | 141/141 | 154/153 |
 | 23KLP (Brazil) | 3/54 | 46/132 | 113/145 | 145/145 | 146/146 | 12/144 | 146/146 | 146/146 | 158/155 |
-| 44QKE (India) | 4/65 | 56/132 | 113/145 | 145/145 | — | 12/146 | — | 146/146 | 159/159 |
+| 44QKE (India) | 4/65 | 56/132 | 113/145 | 145/145 | — | 12/146 | 144/145 | 146/146 | 159/159 |
 
 Each cell is Collection 1 dates over legacy dates. A dash means not measured; 33UUP's 2019 query
 failed with a 502. 2026 to mid-November matched on three tiles.
@@ -51,8 +51,9 @@ The gaps are two periods Element 84 has not yet reprocessed, not scattered losse
 - **2022:** its first date in late 2022 is between 2022-12-06 and 2022-12-08; from there it holds
   every legacy date into 2023.
 - **Isolated dates** are missing outside those periods: 2024-01-11 on 33UUP and 36MZE (but not on
-  15TVF, 55HBU, 23KLP or 44QKE), 2023-05-23 on 44QKE, 2019-06-25 on 33UUP and 2019-04-04 on 44QKE. This accounts for the
-  215/216 and 144/145 in the 2024 column, under 1% of a year.
+  15TVF, 55HBU, 23KLP or 44QKE), 2023-05-23 on 44QKE, 2019-06-25 on 33UUP and 2019-04-04 on 44QKE.
+  Each is one date, under 1% of its year; 2024-01-11 accounts for the 215/216 and 144/145 in the
+  2024 column, and 2023-05-23 for 44QKE's 144/145 in 2023 (measured 2026-11-24).
 - **Near the antimeridian** Collection 1 is no worse than the legacy collection. Element 84
   [documents](https://github.com/Element84/earth-search/blob/main/docs/collections/sentinel-2-l2a.md#known-issues)
   that it excludes most scenes crossing 180°. In 2023 it held every legacy date on 60KYF and 60KXF
