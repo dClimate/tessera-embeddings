@@ -80,6 +80,7 @@ from odc.loader._reader import nodata_mask, resolve_dst_fill_value  # noqa: E402
 from odc.stac._mdtools import StacMDParser  # noqa: E402
 
 # Below the GDAL configuration because it reaches rasterio, through `auth`'s odc reader session.
+from tessera_embeddings.ingest.auth import sign_azure_href  # noqa: E402
 from tessera_embeddings.ingest.opera_query import burst_fusion_sort_key  # noqa: E402
 
 #: The dtype odc loads a band in when its metadata names none (``odc.loader.resolve_load_cfg``).
@@ -937,7 +938,13 @@ class _SourceReader(RioReader):
         dst: np.ndarray | None = None,
         selection: Any = None,  # noqa: ANN401 — odc's ReaderSubsetSelection
     ) -> tuple[tuple[slice, slice], np.ndarray]:
-        """Read this source, then correct or pack it, before anything fuses it with another."""
+        """Read this source, then correct or pack it, before anything fuses it with another.
+
+        Signed here, at the read, not when the source is opened: the loader opens every source of
+        a layer and then reads them one after another, so a URL signed at open could outlive its
+        token before its turn. Nothing but this read ever sees the signed URL.
+        """
+        self._src = replace(self._src, uri=sign_azure_href(self._src.uri))
         driver_data = self._src.driver_data if isinstance(self._src.driver_data, dict) else {}
         if (position := driver_data.get(_POSITION_KEY)) is not None:
             return self._read_packed(cfg, dst_geobox, selection, position, driver_data[_NATIVE_KEY])

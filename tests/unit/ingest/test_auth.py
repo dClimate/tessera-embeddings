@@ -6,6 +6,8 @@ credential-drift patch. No HTTP call is made; no network access is required.
 
 from __future__ import annotations
 
+import datetime
+import json
 import logging
 import os
 import threading
@@ -16,6 +18,7 @@ import rasterio.env
 import requests
 from odc.loader._rio import _local, rio_env
 
+from tessera_embeddings.ingest import auth
 from tessera_embeddings.ingest._http import NonJsonResponseError, json_or_raise
 from tessera_embeddings.ingest.auth import _datapool_url_to_s3, _EDLSession, get_edl_session
 
@@ -293,3 +296,65 @@ def test_a_credential_body_is_never_logged_or_raised(caplog: pytest.LogCaptureFi
     assert "SUPERSECRET" not in caplog.text
     # Suppressing the body must not cost the fields that identify the failure.
     assert "cumulus.asf.alaska.edu" in str(exc_info.value)
+
+
+_BLOB = "https://sentinel2l2a01.blob.core.windows.net/sentinel2-l2/15/T/VF/B02.tif"
+
+
+class _TokenService:
+    """Stands in for the token endpoint: hands out numbered tokens, or fails when told to."""
+
+    def __init__(self, life: datetime.timedelta, fail: bool = False) -> None:
+        self.life, self.fail, self.calls = life, fail, 0
+
+    def get(self, url: str, timeout: float) -> requests.Response:
+        self.calls += 1
+        if self.fail:
+            raise requests.ConnectionError("token service down")
+        resp = requests.Response()
+        resp.status_code, resp.url = 200, url
+        expiry = (datetime.datetime.now(datetime.UTC) + self.life).isoformat()
+        resp._content = json.dumps({"token": f"sig={self.calls}", "msft:expiry": expiry}).encode()
+        return resp
+
+
+@pytest.fixture
+def token_service(monkeypatch: pytest.MonkeyPatch) -> Callable[..., _TokenService]:
+    def install(life_minutes: float, fail: bool = False) -> _TokenService:
+        service = _TokenService(datetime.timedelta(minutes=life_minutes), fail)
+        monkeypatch.setattr(auth, "_sas_session", lambda: service)
+        return service
+
+    monkeypatch.setattr(auth, "_sas_tokens", {})
+    return install
+
+
+def test_a_token_is_reused_until_it_nears_expiry(token_service: Callable[..., _TokenService]) -> None:
+    service = token_service(45)
+    assert auth.sign_azure_href(_BLOB) == auth.sign_azure_href(_BLOB) == f"{_BLOB}?sig=1"
+    assert service.calls == 1
+
+
+def test_a_token_near_expiry_is_replaced_and_an_old_one_stripped(token_service: Callable[..., _TokenService]) -> None:
+    token_service(5)
+    first = auth.sign_azure_href(_BLOB)
+    assert auth.sign_azure_href(first) == f"{_BLOB}?sig=2"
+
+
+def test_a_failed_refresh_keeps_a_valid_token_and_raises_without_one(
+    token_service: Callable[..., _TokenService],
+) -> None:
+    token_service(5)
+    auth.sign_azure_href(_BLOB)
+    token_service(5, fail=True)
+    assert auth.sign_azure_href(_BLOB) == f"{_BLOB}?sig=1"
+    auth._sas_tokens.clear()
+    with pytest.raises(requests.ConnectionError):
+        auth.sign_azure_href(_BLOB)
+
+
+def test_only_azure_hrefs_are_signed(token_service: Callable[..., _TokenService]) -> None:
+    service = token_service(45)
+    href = "s3://sentinel-cogs/sentinel-s2-l2a-cogs/B02.tif"
+    assert auth.sign_azure_href(href) == href
+    assert service.calls == 0

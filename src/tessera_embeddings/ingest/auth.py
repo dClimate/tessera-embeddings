@@ -1,6 +1,11 @@
-"""NASA Earthdata Login (EDL) authentication for ASF-hosted OPERA data.
+"""Credentials for imagery that needs them: NASA Earthdata Login for OPERA, and Planetary Computer
+read tokens for Sentinel-2 on Azure.
 
-Two access modes for OPERA RTC-S1 data on ASF:
+Planetary Computer refuses an unsigned read. Its token is free, anonymous and short-lived (about 45
+minutes), so it is appended to each URL at the moment of reading (:func:`sign_azure_href`), never
+when the item is queried: an ingest outlives many tokens.
+
+NASA Earthdata Login (EDL) authentication for ASF-hosted OPERA data has two access modes for OPERA RTC-S1 data on ASF:
 
 1. **S3 direct access** (preferred): temporary STS credentials from ASF's cumulus endpoint enable
    in-region S3 reads from us-west-2. One HTTP call per task (~0.5 s) replaces hundreds of
@@ -14,11 +19,13 @@ Cumulus app approved under Authorized Apps at urs.earthdata.nasa.gov.
 
 from __future__ import annotations
 
+import datetime
 import logging
 import os
 import re
+import threading
 from typing import TYPE_CHECKING
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 import requests
 from dask.distributed import WorkerPlugin, get_client  # noqa: TID251 — registers a worker plugin cluster-wide
@@ -27,7 +34,7 @@ from odc.loader._rio import _local as _odc_thread_session
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from tessera_embeddings.ingest._http import json_or_raise
+from tessera_embeddings.ingest._http import NonJsonResponseError, json_or_raise
 
 if TYPE_CHECKING:
     import pystac
@@ -55,6 +62,52 @@ _TRUSTED_AUTH_SUFFIXES = (
 _DATAPOOL_RE = re.compile(r"https://datapool\.asf\.alaska\.edu/RTC/OPERA-S1/(.+)")
 _EARTHDATACLOUD_RE = re.compile(r"https://cumulus\.asf\.earthdatacloud\.nasa\.gov/OPERA/(OPERA_L2_RTC-S1/.+)")
 _BAND_SUFFIX_RE = re.compile(r"_(VV|VH|mask)\.tif$")
+
+
+_AZURE_BLOB_HOST = ".blob.core.windows.net"
+_SAS_TOKEN_URL = "https://planetarycomputer.microsoft.com/api/sas/v1/token/{account}/{container}"
+#: A token is replaced once less than this is left, so a read started on it finishes inside it.
+_SAS_REFRESH_MARGIN = datetime.timedelta(minutes=10)
+_sas_tokens: dict[tuple[str, str], tuple[str, datetime.datetime]] = {}
+#: One fetch per process at a time: every reader thread would otherwise refresh at once.
+_sas_lock = threading.Lock()
+
+
+def sign_azure_href(href: str) -> str:
+    """``href`` with a current Planetary Computer read token appended, if it is on Azure Blob Storage.
+
+    Anything else is returned unchanged. A token already on the href is replaced, so signing again
+    never reads on a stale one. One token signs a whole storage container and is cached per
+    process until it nears expiry. A failed refresh keeps the cached token while it is still
+    valid; with none valid, the error is raised and the read fails as any other read failure does.
+    """
+    parts = urlsplit(href)
+    if not parts.netloc.endswith(_AZURE_BLOB_HOST):
+        return href
+    key = (parts.netloc.removesuffix(_AZURE_BLOB_HOST), parts.path.split("/")[1])
+    with _sas_lock:
+        token, expiry = _sas_tokens.get(key, ("", datetime.datetime.min.replace(tzinfo=datetime.UTC)))
+        now = datetime.datetime.now(datetime.UTC)
+        if expiry - now < _SAS_REFRESH_MARGIN:
+            try:
+                response = _sas_session().get(_SAS_TOKEN_URL.format(account=key[0], container=key[1]), timeout=30)
+                response.raise_for_status()
+                body = json_or_raise(response, log_body=False)
+                token, expiry = body["token"], datetime.datetime.fromisoformat(body["msft:expiry"])
+                _sas_tokens[key] = (token, expiry)
+            except (requests.RequestException, NonJsonResponseError, ValueError, KeyError):
+                if expiry <= now:
+                    raise
+                logger.warning("Planetary Computer token refresh failed; reading on the current one", exc_info=True)
+    return f"{parts._replace(query='').geturl()}?{token}"
+
+
+def _sas_session() -> requests.Session:
+    """A session that waits out the token service's throttling and outages, as reads do."""
+    session = requests.Session()
+    retry = Retry(total=5, backoff_factor=2, status_forcelist=(429, 500, 502, 503, 504), allowed_methods=("GET",))
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    return session
 
 
 class _EDLSession(requests.Session):
