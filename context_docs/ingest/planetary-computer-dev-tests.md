@@ -15,10 +15,12 @@ where one applies. All test data has been deleted.
   slower, because their connection-tracking table fills (§3).
 - **The read token survives a long run**: a two-hour ingest renewed it several times with no
   failure and no slowdown (§4).
-- **Several ingests behind one NAT address are refused by the token service** (§5). Each worker
-  fetches its own token, and more than about 60 to 120 workers starting behind one address are
-  throttled with HTTP 429 for longer than any retry waits. This blocks campaign scale until a
-  fleet shares one token.
+- **Several ingests behind one NAT address were refused by the token service** while each worker
+  fetched its own token (§5). Sharing one token per Dask fleet removed that: six 60-worker
+  ingests behind one address all started and read (§6).
+- **At that load, some reads fail with no response at all**, and two of the six ingests failed
+  on a file that could not be opened (§6). Our NAT dropped nothing. This blocks campaign scale
+  until the ingest survives such a read.
 
 ## 1. Pixel agreement
 
@@ -77,8 +79,43 @@ one public address.
 - Three 60-worker ingests behind each of two addresses, with ten retries jittered over about
   ten minutes: all six refused.
 
-A worker asks for a token when it first reads and every ~35 minutes after, so a fleet's start is
-a burst of one request per worker. The service tolerates one 60-worker fleet per address and not
-120 or 180 workers, and its refusals outlast any wait an ingest can afford. A campaign puts about
-400 workers behind each address. The read path therefore needs one token per fleet, fetched once
-and shared with its workers, before Planetary Computer can serve more than one ingest per address.
+At the time each worker asked for its own token when it first read and every ~35 minutes after,
+so a fleet's start was a burst of one request per worker. The service tolerated one 60-worker
+fleet per address and not 120 or 180 workers, and its refusals outlasted any wait an ingest could
+afford. A campaign puts about 400 workers behind each address, so a fleet now shares one token
+(`auth.sign_azure_href`; [authentication](../../docs/ingest/authentication.md)).
+
+## 6. Six ingests behind one address, sharing a token per fleet
+
+25 November 2026, 16:43 UTC. Six 60-worker ingests (360 workers), each one month of Iowa in 2023,
+every Dask cluster pinned to the us-west-2b subnet by overriding `PRIVATE_SUBNETS` per run, so
+all traffic left through one `c7gn.8xlarge` NAT instance and one address. The other two zones'
+NAT instances stayed `t4g.micro`. The control is §5: two or three fleets per address, each worker
+with its own token, were all refused.
+
+| Month | Outcome | Duration | Dates kept |
+|---|---|---|---|
+| February | completed | 22.1 min | 13 / 21 |
+| March | **failed**, 16 min in | 15.8 min | — |
+| April | completed | 25.6 min | 19 / 23 |
+| May | completed (one batch retried date by date) | 29.9 min | 19 / 25 |
+| November | **failed**, 21 min in | 21.0 min | — |
+| December | completed | 21.8 min | 14 / 23 |
+
+- **No token was refused.** Every ingest started and read, with no token-service error logged.
+- **Each ingest ran 1.2–1.7 times as long as one alone.** The single Iowa run of §2 took 18.1
+  minutes end to end. The NAT instance carried 1.0–1.5 GB/s in five-minute averages, about
+  170–240 MB/s per ingest against 330–430 alone. It tracked at most about 40,000 connections, its
+  CPU stayed idle, and its connection table recorded no failed inserts or drops.
+- **Some reads got no response at all.** In the first 15 minutes, 11 range reads across the six
+  ingests failed with `response_code=0` (the connection closed with no HTTP status); the ingest's
+  retries covered them. The single ingests of §2–§4, about three hours in all, retried nothing.
+- **Two ingests failed on a file GDAL could not open.** The March and November runs each hit a
+  file reported as "not recognized as being in a supported file format" on every retry within a
+  minute, with a token valid for another half hour. Read again afterwards, the March file is a
+  sound 244 MB TIFF. A failed open is not tolerated the way a failed read inside a file is, so the
+  flow failed. That the retries repeated the error exactly suggests GDAL kept a bad first response
+  for that URL, but this has not been confirmed.
+
+Open before campaign scale: why reads lose their connection under this load (Azure's side is the
+remaining suspect), and making an ingest survive one unopenable file as it survives a failed read.
