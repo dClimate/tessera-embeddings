@@ -182,7 +182,11 @@ worker process signs a URL immediately before reading it (`auth.sign_azure_href`
 remain. Every other part of the ingest, including provenance and duplicate selection, sees the
 catalogue's own unsigned URLs.
 
-- A failed refresh keeps the cached token while it is still valid and retries on the next read.
-- With no valid token, the read fails as any other read failure does.
-- The token service is retried on 429 and 5xx, as reads are.
+- **Refreshing a valid token never holds up a read.** One thread makes a single attempt while the
+  others keep reading on the cached token; a failed attempt is tried again by a later read.
+- **With no valid token**, which is every worker as a fleet starts, reads wait on one fetch that
+  retries 429 and 5xx up to ten times, with randomised waits of up to two minutes. The service
+  refuses with 429 when many workers ask at once from one address: two 60-worker ingests behind
+  one NAT instance were refused outright with plain exponential retries, because the refused
+  workers retried in step. If that fetch fails too, the read fails as any other read failure does.
 

@@ -69,8 +69,9 @@ _SAS_TOKEN_URL = "https://planetarycomputer.microsoft.com/api/sas/v1/token/{acco
 #: A token is replaced once less than this is left, so a read started on it finishes inside it.
 _SAS_REFRESH_MARGIN = datetime.timedelta(minutes=10)
 _sas_tokens: dict[tuple[str, str], tuple[str, datetime.datetime]] = {}
-#: One fetch per process at a time: every reader thread would otherwise refresh at once.
+#: Held by the one thread fetching a token, so a process asks the service once at a time.
 _sas_lock = threading.Lock()
+_NO_TOKEN = ("", datetime.datetime.min.replace(tzinfo=datetime.UTC))
 
 
 def sign_azure_href(href: str) -> str:
@@ -78,43 +79,62 @@ def sign_azure_href(href: str) -> str:
 
     Anything else is returned unchanged. A token already on the href is replaced, so signing again
     never reads on a stale one. One token signs a whole storage container and is cached per
-    process until it nears expiry. A failed refresh keeps the cached token while it is still
-    valid; with none valid, the error is raised and the read fails as any other read failure does.
+    process. Two cases, so that waiting on the token service never stalls reads that need not wait:
+
+    - **A valid token nearing expiry** is refreshed by one thread with a single attempt, while
+      every other read carries on with the cached token; a failed attempt is retried by a later
+      read. Nothing waits for it.
+    - **No valid token** (a starting worker, or one whose refreshes all failed): reads wait on
+      one patient, jittered fetch (:func:`_sas_session`), and its error fails the read.
     """
     parts = urlsplit(href)
     if not parts.netloc.endswith(_AZURE_BLOB_HOST):
         return href
     key = (parts.netloc.removesuffix(_AZURE_BLOB_HOST), parts.path.split("/")[1])
-    with _sas_lock:
-        token, expiry = _sas_tokens.get(key, ("", datetime.datetime.min.replace(tzinfo=datetime.UTC)))
-        now = datetime.datetime.now(datetime.UTC)
-        if expiry - now < _SAS_REFRESH_MARGIN:
-            try:
-                response = _sas_session().get(_SAS_TOKEN_URL.format(account=key[0], container=key[1]), timeout=30)
-                response.raise_for_status()
-                body = json_or_raise(response, log_body=False)
-                token, expiry = body["token"], datetime.datetime.fromisoformat(body["msft:expiry"])
-                _sas_tokens[key] = (token, expiry)
-            except (requests.RequestException, NonJsonResponseError, ValueError, KeyError):
-                if expiry <= datetime.datetime.now(datetime.UTC):  # the refresh itself may outlast the token
-                    raise
-                logger.warning("Planetary Computer token refresh failed; reading on the current one", exc_info=True)
+    token, expiry = _sas_tokens.get(key, _NO_TOKEN)
+    now = datetime.datetime.now(datetime.UTC)
+    if now < expiry < now + _SAS_REFRESH_MARGIN and _sas_lock.acquire(blocking=False):
+        try:
+            token, expiry = _fetch_sas_token(key, patient=False)
+        except _SAS_ERRORS:
+            logger.warning("Planetary Computer token refresh failed; reading on the current one", exc_info=True)
+        finally:
+            _sas_lock.release()
+    if expiry <= datetime.datetime.now(datetime.UTC):
+        with _sas_lock:
+            token, expiry = _sas_tokens.get(key, _NO_TOKEN)  # another thread may have fetched it
+            if expiry <= datetime.datetime.now(datetime.UTC):
+                token, expiry = _fetch_sas_token(key, patient=True)
     return f"{parts._replace(query='').geturl()}?{token}"
 
 
-def _sas_session() -> requests.Session:
-    """A session that waits out the token service's throttling and outages, as reads do.
+_SAS_ERRORS = (requests.RequestException, NonJsonResponseError, ValueError, KeyError)
+
+
+def _fetch_sas_token(key: tuple[str, str], *, patient: bool) -> tuple[str, datetime.datetime]:
+    """Fetch and cache a token for ``(account, container)``."""
+    response = _sas_session(patient).get(_SAS_TOKEN_URL.format(account=key[0], container=key[1]), timeout=30)
+    response.raise_for_status()
+    body = json_or_raise(response, log_body=False)
+    _sas_tokens[key] = (body["token"], datetime.datetime.fromisoformat(body["msft:expiry"]))
+    return _sas_tokens[key]
+
+
+def _sas_session(patient: bool) -> requests.Session:
+    """A token-service session: one attempt, or a patient one that waits out throttling.
 
     The service refuses with 429 when a starting fleet's workers all ask at once from one NAT
-    address, so the waits are jittered: without it the refused workers retry in step and collide
-    again. Ten attempts capped at two minutes each ride out a burst of several fleets.
+    address, so the patient waits are jittered, and ``Retry-After`` is ignored because obeying
+    it would put the refused workers back in step. Ten attempts capped at two minutes each ride
+    out a burst of several fleets.
     """
     session = requests.Session()
     retry = Retry(
-        total=10,
+        total=10 if patient else 0,
         backoff_factor=2,
         backoff_max=120,
         backoff_jitter=30,
+        respect_retry_after_header=False,
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=("GET",),
     )

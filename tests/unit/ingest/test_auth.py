@@ -324,7 +324,7 @@ class _TokenService:
 def token_service(monkeypatch: pytest.MonkeyPatch) -> Callable[..., _TokenService]:
     def install(life_minutes: float, fail: bool = False) -> _TokenService:
         service = _TokenService(datetime.timedelta(minutes=life_minutes), fail)
-        monkeypatch.setattr(auth, "_sas_session", lambda: service)
+        monkeypatch.setattr(auth, "_sas_session", lambda patient: service)
         return service
 
     monkeypatch.setattr(auth, "_sas_tokens", {})
@@ -363,6 +363,16 @@ def test_a_token_that_expires_during_a_failed_refresh_is_not_used(
     auth._sas_tokens[("sentinel2l2a01", "sentinel2-l2")] = ("sig=old", expiry)
     with pytest.raises(requests.ConnectionError):
         auth.sign_azure_href(_BLOB)
+
+
+def test_reads_carry_on_with_a_valid_token_while_another_thread_refreshes(
+    token_service: Callable[..., _TokenService],
+) -> None:
+    service = token_service(5)
+    auth.sign_azure_href(_BLOB)
+    with auth._sas_lock:  # another thread is mid-refresh
+        assert auth.sign_azure_href(_BLOB) == f"{_BLOB}?sig=1"
+    assert service.calls == 1
 
 
 def test_only_azure_hrefs_are_signed(token_service: Callable[..., _TokenService]) -> None:
