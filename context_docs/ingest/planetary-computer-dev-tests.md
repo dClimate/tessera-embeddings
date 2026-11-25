@@ -103,13 +103,14 @@ with its own token, were all refused.
 | December | completed | 21.8 min | 14 / 23 |
 
 - **No token was refused.** Every ingest started and read, with no token-service error logged.
-- **Each ingest ran roughly 1.2–1.7 times as long as one alone.** Durations here are end to end,
-  cluster start included; on that basis the single Iowa run of §2 (15.7 minutes of ingest) took
-  18.1. The months differ from its July, and kept different numbers of dates. The NAT instance carried 1.0–1.5 GB/s in five-minute averages, about
-  170–240 MB/s per ingest against 330–430 alone. It tracked at most about 40,000 connections, its
-  CPU stayed idle, and its connection table recorded no failed inserts or drops.
-- **Some reads got no response at all.** In the first 15 minutes, 11 range reads across the six
-  ingests failed with `response_code=0` (the connection closed with no HTTP status); the ingest's
+- **Each ingest took about 1.3–1.65 times as long per date found as one alone, or 1.6–2.0 times
+  per date kept.** Durations are end to end, cluster start included; on that basis the single Iowa
+  run of §2 (15.7 minutes of ingest) took 18.1 minutes for 25 dates found and 21 kept. The NAT
+  instance carried 1.0–1.5 GB/s in five-minute averages, about 170–240 MB/s per ingest against
+  330–430 alone. It tracked at most about 40,000 connections, its CPU stayed idle, and its
+  connection table recorded no failed inserts or drops.
+- **Some reads got no response at all.** Over the 35 minutes GDAL logged 8,214 retries of a range
+  read that got no HTTP status, and 83 of one answered HTTP 503, almost all at 17:01–17:02. Its own
   retries covered them. The single ingests of §2–§4, about three hours in all, retried nothing.
 - **Two ingests failed on a file GDAL could not open.** The March and November runs each hit a
   file reported as "not recognized as being in a supported file format" on every retry within a
