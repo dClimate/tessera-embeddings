@@ -10,9 +10,13 @@ where one applies. All test data has been deleted.
 - **Pixels are right.** Planetary Computer's mosaics keep the same dates as Earth Search where
   both hold the same images, with no pixel empty in one mosaic and filled in the other. Values
   differ slightly because the two catalogues hold different ESA processing runs (§1).
-- **A single ingest is 3.7–4.6 times slower than Collection 1**, with no failures, once the NAT
-  instances are large enough (§2). On the standing `t4g.micro` NAT instances it is 40–50 times
-  slower, because their connection-tracking table fills (§3).
+- **With the NAT out of the way, one ingest is 2.7–3.6 times slower than Collection 1** (§8).
+  Every request crosses a 160 ms round trip to Azure West Europe, against 1 ms to S3 in Oregon.
+  The 3.7–4.6 of §2 was measured before NAT packet drops could be seen. On the standing
+  `t4g.micro` NAT instances it is 40–50 times slower, because their connection table fills (§3).
+- **Several ingests behind one address slow each other, at Microsoft's end.** With no packet
+  dropped, three per address ran 3.9–4.6 times Collection 1 and six per address 5.2–6.8 times;
+  a second address raised the total from 1.25 to 1.8 GB/s (§8).
 - **The read token survives a long run**: a two-hour ingest renewed it several times with no
   failure and no slowdown (§4).
 - **Several ingests behind one NAT address were refused by the token service** while each worker
@@ -21,7 +25,7 @@ where one applies. All test data has been deleted.
 - **At that load, some reads fail with no response at all**, and two of the six ingests failed
   when such a failure hit a file's header, which GDAL reports as an unrecognised format (§6). The
   failures are packets the NAT instance drops for exceeding EC2's packets-per-second allowance.
-  With each source read retried, all six completed (§7).
+  With each source read retried, all six completed (§7); on a `c7gn.16xlarge` the drops stop (§8).
 
 ## 1. Pixel agreement
 
@@ -39,7 +43,8 @@ files that declare no nodata of their own. The re-keying in `stac._rekey_assets`
 
 ## 2. Speed of one ingest, on `c7gn.8xlarge` NAT instances
 
-Paired runs at 60 workers each, started together.
+Paired runs at 60 workers each, started together. **Superseded by §8**: these ran before the NAT
+instance's packet drops were counted, and §7 shows that size dropping packets at higher load.
 
 | Area and window | Collection 1 | Planetary Computer | Ratio |
 |---|---|---|---|
@@ -147,5 +152,40 @@ place and EC2's per-instance allowance counters sampled on the NAT instance ever
   had stopped. All six read threads on one worker waited on a lock inside GDAL's `reproject` with
   no traffic, then the write finished. Its cause is not known.
 
-Open before campaign scale: sizing NAT egress for packet rate (a larger instance, more NAT
-instances and addresses, or a managed NAT gateway), and the April stall.
+## 8. Speed with the NAT out of the way, on `c7gn.16xlarge`
+
+25 November 2026, 19:20–21:00 UTC. The us-west-2b NAT instance, and for the last round also
+us-west-2c's, raised to `c7gn.16xlarge`, with EC2's allowance counters sampled every minute. **No
+round dropped a packet** (`pps_allowance_exceeded` stayed 0; peak 47,782 tracked connections). Times
+are ingest only, from the first batch to the coverage summary; cluster start is excluded.
+
+**One ingest each, paired** (Iowa and 35N ran at the same time, two Planetary Computer fleets on
+one NAT):
+
+| Area and window | Collection 1 | Planetary Computer | Ratio | Dates kept, both |
+|---|---|---|---|---|
+| Iowa, July 2023 | 3.6 min | 13.0 min | 3.6× | 21 / 25 |
+| Zone 35N, 2024-01-01..07 | 14.1 min | 38.3 min | 2.7× | 6 / 7 |
+
+The coverage gate and the write slow by the same factor (Iowa 3.7× and 3.9×), so the cost is in
+each read. From the NAT instance, a request to Azure West Europe takes a 160 ms round trip and a
+new connection 0.65 s to its first byte, against 1 ms and 0.15 s to S3 in us-west-2; 8 MB arrives
+in 2.9 s against 0.1 s. Planetary Computer's 512-pixel blocks, against Earth Search's 1,024, also
+mean more requests per read.
+
+**Six at once**, each one month of Iowa in 2023, with six Collection 1 controls for the same months
+alongside (Earth Search reads do not cross the NAT):
+
+| Planetary Computer ingests per address | Ratio to Collection 1, per month | Through the NAT instances |
+|---|---|---|
+| six, behind one address | 5.2–6.8× | 1.25 GB/s |
+| three, behind each of two addresses | 3.9–4.6× | 1.8 GB/s in total |
+
+All 18 runs completed with the same dates kept as their controls (within one date, where the
+catalogues differ) and no write retried; 26 source reads in the one-address round succeeded on a
+second try. With no packet dropped and no NAT allowance near its limit, the extra slowdown is
+beyond our NAT: something on Microsoft's side, or the path to it, caps each client address.
+Spreading fleets over more addresses recovers most of it.
+
+Open before campaign scale: how many fleets each NAT address should carry, and which NAT to run
+(instance size for packet rate, or a managed gateway); the April stall of §7.
