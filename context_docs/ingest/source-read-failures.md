@@ -1773,11 +1773,22 @@ abort line (`loader_failures.retried_read`), so an object that reads on a retry 
 another object's failure in the same date. Radar reads go through odc's own reader and are not
 covered.
 
+### Why the connections drop: the NAT instance's packet allowance
+
+EC2 drops packets an instance sends or receives beyond its packets-per-second allowance, below
+anything Linux on the instance can see, and counts them in the ENA driver's
+`pps_allowance_exceeded` (`ethtool -S`). On a rerun at the same load with the guard in place,
+the `c7gn.8xlarge` NAT instance dropped **15.2 million packets in 19 minutes**, up to 2.2 million a
+minute, while its bandwidth and connection-tracking allowances were never exceeded and its Linux
+connection table dropped nothing. The drops stopped when the reading did. A NAT instance forwards
+every packet twice, in and out, so a fleet's packet rate, not its bandwidth, is what sizes it.
+
 ### Still open
 
-Why connections drop at this load. Our NAT's Linux connection table dropped nothing, and the 503s
-in the same minutes say Azure was under strain. Not yet measured: EC2's own per-instance allowances
-for connections, packets and bandwidth on the NAT instance, which Linux does not see.
+A 13-minute stall in one write on the rerun, after the drops had stopped: every read thread on one
+worker waited on a lock inside GDAL's `reproject`, with no network traffic and no GDAL warning,
+then the write finished on its own. Native stacks would say what they waited for; they were not
+taken.
 
 ## What patience the imagery read path actually has — and the three options odc shadows
 

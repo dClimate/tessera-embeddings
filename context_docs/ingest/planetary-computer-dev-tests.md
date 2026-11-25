@@ -20,7 +20,8 @@ where one applies. All test data has been deleted.
   ingests behind one address all started and read (§6).
 - **At that load, some reads fail with no response at all**, and two of the six ingests failed
   when such a failure hit a file's header, which GDAL reports as an unrecognised format (§6). The
-  reader now retries each source; whether that is enough is not yet tested.
+  failures are packets the NAT instance drops for exceeding EC2's packets-per-second allowance.
+  With each source read retried, all six completed (§7).
 
 ## 1. Pixel agreement
 
@@ -120,6 +121,30 @@ with its own token, were all refused.
   reported as an unrecognised format ([source-read failures, Cause 13](source-read-failures.md)).
   The reader now retries each source in place.
 
-Open before campaign scale: whether the per-source retry carries six ingests through, and why
-connections drop at this load. Our NAT's connection table dropped nothing; EC2's own limits on the
-NAT instance were not measured.
+## 7. The same six ingests, with the per-source retry
+
+25 November 2026, 18:12 UTC, the same months and pinning as §6, with each source read retried in
+place and EC2's per-instance allowance counters sampled on the NAT instance every minute.
+
+| Month | Outcome | Duration | Dates kept |
+|---|---|---|---|
+| February | completed | 19.8 min | 13 / 21 |
+| March | completed | 23.0 min | 16 / 24 |
+| April | completed | 46.3 min, one write stalled 13 min | 19 / 23 |
+| May | completed | 22.7 min | 19 / 25 |
+| November | completed | 24.2 min | 19 / 24 |
+| December | completed | 19.4 min | 14 / 23 |
+
+- **All six completed, and no write was retried.** 32 source reads failed and each succeeded on its
+  second try; none was given up.
+- **The NAT instance dropped 15.2 million packets** for exceeding its packets-per-second
+  allowance (`pps_allowance_exceeded`), up to 2.2 million a minute from 18:16 to 18:34, and none
+  after the heavy reading ended. Its bandwidth and connection allowances were never exceeded, and
+  its Linux connection table, which peaked at 43,844, dropped nothing. These drops are the lost
+  connections of §6 ([source-read failures, Cause 13](source-read-failures.md)).
+- **One April write took 13 minutes** (788 s against 220–500 s for its others), after the drops
+  had stopped. All six read threads on one worker waited on a lock inside GDAL's `reproject` with
+  no traffic, then the write finished. Its cause is not known.
+
+Open before campaign scale: sizing NAT egress for packet rate (a larger instance, more NAT
+instances and addresses, or a managed NAT gateway), and the April stall.
