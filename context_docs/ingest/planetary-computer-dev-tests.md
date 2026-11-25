@@ -103,8 +103,9 @@ with its own token, were all refused.
 | December | completed | 21.8 min | 14 / 23 |
 
 - **No token was refused.** Every ingest started and read, with no token-service error logged.
-- **Each ingest ran 1.2–1.7 times as long as one alone.** The single Iowa run of §2 took 18.1
-  minutes end to end. The NAT instance carried 1.0–1.5 GB/s in five-minute averages, about
+- **Each ingest ran roughly 1.2–1.7 times as long as one alone.** Durations here are end to end,
+  cluster start included; on that basis the single Iowa run of §2 (15.7 minutes of ingest) took
+  18.1. The months differ from its July, and kept different numbers of dates. The NAT instance carried 1.0–1.5 GB/s in five-minute averages, about
   170–240 MB/s per ingest against 330–430 alone. It tracked at most about 40,000 connections, its
   CPU stayed idle, and its connection table recorded no failed inserts or drops.
 - **Some reads got no response at all.** In the first 15 minutes, 11 range reads across the six
