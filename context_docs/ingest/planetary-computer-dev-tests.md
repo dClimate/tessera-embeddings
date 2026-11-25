@@ -19,8 +19,8 @@ where one applies. All test data has been deleted.
   fetched its own token (§5). Sharing one token per Dask fleet removed that: six 60-worker
   ingests behind one address all started and read (§6).
 - **At that load, some reads fail with no response at all**, and two of the six ingests failed
-  on a file that could not be opened (§6). Our NAT dropped nothing. This blocks campaign scale
-  until the ingest survives such a read.
+  when such a failure hit a file's header, which GDAL reports as an unrecognised format (§6). The
+  reader now retries each source; whether that is enough is not yet tested.
 
 ## 1. Pixel agreement
 
@@ -114,9 +114,11 @@ with its own token, were all refused.
 - **Two ingests failed on a file GDAL could not open.** The March and November runs each hit a
   file reported as "not recognized as being in a supported file format" on every retry within a
   minute, with a token valid for another half hour. Read again afterwards, the March file is a
-  sound 244 MB TIFF. A failed open is not tolerated the way a failed read inside a file is, so the
-  flow failed. That the retries repeated the error exactly suggests GDAL kept a bad first response
-  for that URL, but this has not been confirmed.
+  sound 244 MB TIFF. Each of the write's three attempts failed on a different file. The cause is
+  GDAL's: a connection lost while it reads a file's header is retried once, logged nowhere and
+  reported as an unrecognised format ([source-read failures, Cause 13](source-read-failures.md)).
+  The reader now retries each source in place.
 
-Open before campaign scale: why reads lose their connection under this load (Azure's side is the
-remaining suspect), and making an ingest survive one unopenable file as it survives a failed read.
+Open before campaign scale: whether the per-source retry carries six ingests through, and why
+connections drop at this load. Our NAT's connection table dropped nothing; EC2's own limits on the
+NAT instance were not measured.
