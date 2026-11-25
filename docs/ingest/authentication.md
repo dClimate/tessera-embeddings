@@ -192,7 +192,8 @@ per fleet, about every 35 minutes. A process outside a Dask cluster keeps its to
 
 - **Refreshing a valid token holds up only the read that makes the attempt.** One thread in the
   worker makes a single attempt while the others keep reading on its copy. After a failure, no
-  worker in the fleet tries again for a random 30–60 seconds.
+  worker in the fleet tries again for a random 30–60 seconds. A worker that cannot reach the
+  scheduler keeps reading on its copy while that is valid, and tries again after the same pause.
 - **With no valid token**, as when a fleet starts, reads wait on one fetch that retries 429 and
   5xx up to ten times, with randomised waits of up to two minutes, and ignores `Retry-After` so
   refused requesters do not retry in step. If that fetch fails too, the read fails as any other
