@@ -10,7 +10,8 @@ where one applies. All test data has been deleted.
 - **Pixels are right.** Planetary Computer's mosaics keep the same dates as Earth Search where
   both hold the same images, with no pixel empty in one mosaic and filled in the other. Values
   differ slightly because the two catalogues hold different ESA processing runs (§1).
-- **With the NAT out of the way, one ingest is 2.7–3.6 times slower than Collection 1** (§8).
+- **With the NAT out of the way, one ingest is at most 2.7–3.6 times slower than Collection 1**
+  (§8; two fleets shared the address, so a lone ingest may be slightly faster).
   Every request crosses a 160 ms round trip to Azure West Europe, against 1 ms to S3 in Oregon.
   The 3.7–4.6 of §2 was measured before NAT packet drops could be seen. On the standing
   `t4g.micro` NAT instances it is 40–50 times slower, because their connection table fills (§3).
@@ -116,9 +117,8 @@ with its own token, were all refused.
   330–430 alone. It tracked at most about 40,000 connections, its CPU stayed idle, and its
   connection table recorded no failed inserts or drops.
 - **Some reads got no response at all.** In the 35 minutes from 16:40, GDAL logged 8,214 retries
-  of range reads that got no HTTP status and 83 of reads answered HTTP 503, almost all at
-  17:01–17:02. Its own
-  retries covered them. The single ingests of §2–§4, about three hours in all, retried nothing.
+  of range reads that got no HTTP status and 83 of range reads answered HTTP 503, almost all at
+  17:01–17:02. Its own retries covered them. The single ingests of §2–§4, about three hours in all, retried nothing.
 - **Two ingests failed on a file GDAL could not open.** The March and November runs each hit a
   file reported as "not recognized as being in a supported file format" on every retry within a
   minute, with a token valid for another half hour. Read again afterwards, the March file is a
@@ -160,7 +160,7 @@ round dropped a packet** (`pps_allowance_exceeded` stayed 0; peak 47,782 tracked
 are ingest only, from the first batch to the coverage summary; cluster start is excluded.
 
 **One ingest each, paired** (Iowa and 35N ran at the same time, two Planetary Computer fleets on
-one NAT):
+one NAT, so a lone ingest may be slightly faster):
 
 | Area and window | Collection 1 | Planetary Computer | Ratio | Dates kept, both |
 |---|---|---|---|---|
