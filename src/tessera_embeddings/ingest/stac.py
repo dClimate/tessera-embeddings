@@ -5,13 +5,16 @@ corrections, and filters by existing dates. Supports multiple providers (Earth S
 Computer) and collections (Sentinel-2 L2A, Sentinel-1 GRD, Landsat).
 """
 
+import ctypes
 import datetime
 import logging
+import random
 import threading
 import time
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from itertools import count
 from typing import Any, final
@@ -69,6 +72,7 @@ from tessera_embeddings.ingest.solar_days import (
 configure_gdal_environment()
 
 import odc.stac  # noqa: E402
+import rasterio._base  # noqa: E402
 from odc.loader import RasterBandMetadata, RasterLoadParams, RioDriver, RioReader, resolve_src_nodata  # noqa: E402
 
 # Private, and the only private odc imports here. `_resolve_driver` uses a driver's own `md_parser`
@@ -78,9 +82,11 @@ from odc.loader import RasterBandMetadata, RasterLoadParams, RioDriver, RioReade
 # test, which the source index must reproduce exactly (see `_SourceReader`).
 from odc.loader._reader import nodata_mask, resolve_dst_fill_value  # noqa: E402
 from odc.stac._mdtools import StacMDParser  # noqa: E402
+from rasterio.errors import RasterioError  # noqa: E402
 
 # Below the GDAL configuration because it reaches rasterio, through `auth`'s odc reader session.
 from tessera_embeddings.ingest.auth import sign_azure_href  # noqa: E402
+from tessera_embeddings.ingest.loader_failures import retried_read  # noqa: E402
 from tessera_embeddings.ingest.opera_query import burst_fusion_sort_key  # noqa: E402
 
 #: The dtype odc loads a band in when its metadata names none (``odc.loader.resolve_load_cfg``).
@@ -920,6 +926,21 @@ class BoaOffsetParser(SourceParser):
         return {_OFFSET_KEY: self._offset if decision is OffsetDecision.OWED else 0}
 
 
+#: Tries per source read, with jittered waits of about 1, 2 and 4 s between them.
+_SOURCE_READ_TRIES = 4
+
+
+def _forget_cached_object(uri: str) -> None:
+    """Drop what GDAL cached about the remote object ``uri``, so the next open asks the server again.
+
+    A failed open can leave the object's size cached as zero, and every later open of it in this
+    process then reports an unrecognised format without a request. Called through the GDAL that
+    rasterio links, as :mod:`tessera_embeddings.ingest.loader_failures` does.
+    """
+    if uri.startswith(("http://", "https://")):
+        ctypes.CDLL(rasterio._base.__file__).VSICurlPartialClearCache(f"/vsicurl/{uri}".encode())
+
+
 class _SourceReader(RioReader):
     """One source's reader, doing to its pixels what the parser stamped on the source.
 
@@ -943,8 +964,45 @@ class _SourceReader(RioReader):
         Signed here, at the read, not when the source is opened: the loader opens every source of
         a layer and then reads them one after another, so a URL signed at open could outlive its
         token before its turn. Nothing but this read ever sees the signed URL.
+
+        Tried up to :data:`_SOURCE_READ_TRIES` times, because under load a read fails in transit
+        far more often than its object is bad, and GDAL does not retry every such failure itself:
+        a connection lost while it reads a file's header is reported as the file being in no
+        supported format, and logged nowhere. Retried here, one failure costs this source a few
+        seconds; raised, it costs a retry of the whole write, every source of every date in it.
+        Each retry re-signs the URL and clears what GDAL cached about the object. The last failure
+        is raised unchanged, so every verdict on it is the one it had before. See
+        ``context_docs/ingest/source-read-failures.md``, Cause 13.
         """
-        self._src = replace(self._src, uri=sign_azure_href(self._src.uri))
+        for attempt in range(1, _SOURCE_READ_TRIES + 1):
+            self._src = replace(self._src, uri=sign_azure_href(self._src.uri))
+            last = attempt == _SOURCE_READ_TRIES
+            try:
+                with nullcontext() if last else retried_read():
+                    return self._read_once(cfg, dst_geobox, dst=dst, selection=selection)
+            except RasterioError:
+                if last:
+                    raise
+                _forget_cached_object(self._src.uri)
+                logger.warning(
+                    "Source read failed (try %d of %d), retrying: %s",
+                    attempt,
+                    _SOURCE_READ_TRIES,
+                    self._src.uri.split("?")[0],
+                    exc_info=True,
+                )
+                time.sleep(random.uniform(0.5, 1.5) * 2 ** (attempt - 1))
+        raise AssertionError("unreachable: the last try returns or raises")
+
+    def _read_once(
+        self,
+        cfg: Any,  # noqa: ANN401 — odc's RasterLoadParams
+        dst_geobox: Any,  # noqa: ANN401 — odc.geo GeoBox
+        *,
+        dst: np.ndarray | None,
+        selection: Any,  # noqa: ANN401 — odc's ReaderSubsetSelection
+    ) -> tuple[tuple[slice, slice], np.ndarray]:
+        """One read of this source, corrected or packed."""
         driver_data = self._src.driver_data if isinstance(self._src.driver_data, dict) else {}
         if (position := driver_data.get(_POSITION_KEY)) is not None:
             return self._read_packed(cfg, dst_geobox, selection, position, driver_data[_NATIVE_KEY])

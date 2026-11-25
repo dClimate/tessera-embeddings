@@ -81,7 +81,8 @@ import re
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Generator, Iterable
+from contextlib import contextmanager
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -151,6 +152,25 @@ _install_lock = threading.Lock()
 
 _handlers: list[logging.Handler] = []
 
+#: Set on a thread while it runs a read that will be tried again if it fails. See :func:`retried_read`.
+_attempt = threading.local()
+
+
+@contextmanager
+def retried_read() -> Generator[None]:
+    """Run a read whose failure will be retried, so the loader's abort message for it is not recorded.
+
+    The capture names the objects a date gave up on. An attempt with another to follow is not
+    that, and recorded it would blame an object that then read fine for a different object's
+    failure in the same date. The handler runs on the thread that logs, which is the reading
+    thread, so a thread-local flag is exact.
+    """
+    _attempt.retried = True
+    try:
+        yield
+    finally:
+        _attempt.retried = False
+
 
 def _strip_band_suffix(href: str) -> str:
     """Drop the ``:<band>`` the loader appends to the href it names.
@@ -188,7 +208,7 @@ class _AbortedReadHandler(logging.Handler):
             message = record.getMessage()
         except Exception:  # pragma: no cover — a broken record must not break a read
             return
-        if _ABORT_MARKER not in message:
+        if _ABORT_MARKER not in message or getattr(_attempt, "retried", False):
             return
         match = _ABORT_RE.search(message)
         if match is None:

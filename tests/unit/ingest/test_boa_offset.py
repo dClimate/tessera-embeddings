@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import datetime as dt
 import pickle
+import time
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -31,11 +33,13 @@ from rasterio.transform import from_origin
 from tessera_embeddings.config.ingest import SOURCE_INDEX_VAR
 from tessera_embeddings.config.providers import PROVIDERS, CollectionConfig
 from tessera_embeddings.config.satellites import S2_BASELINE_OFFSET, S2_BASELINE_THRESHOLD, S2_L2A_BANDS
+from tessera_embeddings.ingest import loader_failures
 from tessera_embeddings.ingest.asset_locations import Harmonisation
 from tessera_embeddings.ingest.boa_offset import OffsetDecision, source_decision
 from tessera_embeddings.ingest.stac import (
     BoaOffsetParser,
     HeterogeneousProducerError,
+    _forget_cached_object,
     _reflectance_asset_keys,
     _SourceDriver,
     collection_harmonisation,
@@ -510,3 +514,40 @@ class TestTheDriverDoesNotDisturbTheRead:
         """
         for method in ("restore_env", "capture_env", "new_load", "finalise_load"):
             assert getattr(_SourceDriver, method, None) is getattr(RioDriver, method, None), method
+
+
+class TestASourceReadIsRetried:
+    """A source that fails to read is tried again in place, through a real ``odc.stac.load``."""
+
+    _load = TestTheOffsetIsRemovedPerImage._load
+
+    def _missing_tile(self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch, *, returns: bool) -> pystac.Item:
+        """A tile whose file is gone when first read and, if ``returns``, back after the first wait."""
+        item = _tile_item("raw", tmp_path, value=1500, x0=_ORIGIN_E, baseline="05.00", tile="MGRS-33TWM")
+        item.properties["_bucket"] = _RAW_BUCKET
+        path = Path(item.assets["blue"].href)
+        hidden = path.rename(path.with_suffix(".gone"))
+        monkeypatch.setattr(time, "sleep", lambda _s: returns and hidden.exists() and hidden.rename(path))
+        loader_failures.install_capture()
+        loader_failures.drain_local()
+        return item
+
+    def test_a_read_that_fails_and_then_succeeds_loads_and_blames_nothing(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        item = self._missing_tile(tmp_path, monkeypatch, returns=True)
+        data = self._load([item], monkeypatch, tiles=1)
+        assert set(np.unique(data.blue.isel(time=0).values)) == {0, 500}
+        assert loader_failures.drain_local() == [], "an object that read on a retry was recorded as aborted"
+
+    def test_a_read_that_never_succeeds_raises_and_names_its_object(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        item = self._missing_tile(tmp_path, monkeypatch, returns=False)
+        with pytest.raises(rasterio.errors.RasterioIOError):
+            self._load([item], monkeypatch, tiles=1)
+        assert {href.rsplit(":", 1)[0] for href in loader_failures.drain_local()} == {item.assets["blue"].href}
+
+    def test_forgetting_a_remote_object_reaches_gdal(self) -> None:
+        """The cache clear goes through ctypes, so a renamed GDAL symbol would fail only at a failed read."""
+        _forget_cached_object("https://example.invalid/T15_B02.tif?sig=1")
