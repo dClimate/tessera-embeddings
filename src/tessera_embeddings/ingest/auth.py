@@ -34,8 +34,7 @@ from urllib.parse import urlparse, urlsplit
 
 import requests
 from dask.distributed import Lock, Variable, WorkerPlugin, get_client  # noqa: TID251 — cluster-wide plugin and token
-from distributed.core import Status
-from distributed.worker import Worker
+from distributed.worker import WORKER_ANY_RUNNING, Worker
 from odc.loader._rio import ThreadSession as _OdcThreadSession
 from odc.loader._rio import _local as _odc_thread_session
 from requests.adapters import HTTPAdapter
@@ -75,14 +74,20 @@ _AZURE_BLOB_HOST = ".blob.core.windows.net"
 _SAS_TOKEN_URL = "https://planetarycomputer.microsoft.com/api/sas/v1/token/{account}/{container}"
 #: A token is replaced once less than this is left, so a read started on it finishes inside it.
 _SAS_REFRESH_MARGIN = datetime.timedelta(minutes=10)
-#: This process's copy of each container's token, read by every read without a lock.
-_sas_tokens: dict[tuple[str, str], tuple[str, datetime.datetime]] = {}
+#: This process's copy of each container's token: the token, its expiry, and when the copy is next
+#: due for renewal. Every read consults it without a lock.
+_sas_tokens: dict[tuple[str, str], tuple[str, datetime.datetime, datetime.datetime]] = {}
 #: Held by the one thread in this process renewing a token.
 _sas_lock = threading.Lock()
-_NO_TOKEN = ("", datetime.datetime.min.replace(tzinfo=datetime.UTC))
-_NEVER = _NO_TOKEN[1].isoformat()
+_NEVER_DT = datetime.datetime.min.replace(tzinfo=datetime.UTC)
+_NO_TOKEN = ("", _NEVER_DT, _NEVER_DT)
+_NEVER = _NEVER_DT.isoformat()
 #: The token records of a process outside a Dask cluster. A worker's live on the scheduler.
 _sas_records: dict[tuple[str, str], dict[str, str]] = {}
+
+
+def _utcnow() -> datetime.datetime:
+    return datetime.datetime.now(datetime.UTC)
 
 
 def sign_azure_href(href: str) -> str:
@@ -90,52 +95,74 @@ def sign_azure_href(href: str) -> str:
 
     Anything else is returned unchanged. A token already on the href is replaced, so signing again
     never reads on a stale one. One token signs a whole storage container. Each process keeps a
-    copy for its reads, and on a Dask worker the whole fleet shares one (:func:`_renew_sas_token`),
-    so the token service hears from one worker per fleet rather than from every worker. Renewal
-    begins ten minutes before expiry and is done by one thread, whose read waits for it while the
-    others carry on with the copy; only a process holding no valid token makes every read wait.
+    copy, which reads use without asking anyone until the copy is due for renewal; on a Dask worker
+    renewal goes through the token the whole fleet shares (:func:`_renew_sas_token`). One thread
+    renews, and its read waits for it while the others carry on with the copy; only a copy that
+    has expired makes every read wait.
     """
     parts = urlsplit(href)
     if not parts.netloc.endswith(_AZURE_BLOB_HOST):
         return href
     key = (parts.netloc.removesuffix(_AZURE_BLOB_HOST), parts.path.split("/")[1])
-    token, expiry = _sas_tokens.get(key, _NO_TOKEN)
-    now = datetime.datetime.now(datetime.UTC)
-    if expiry < now + _SAS_REFRESH_MARGIN and _sas_lock.acquire(blocking=expiry <= now):
+    token, expiry, due = _sas_tokens.get(key, _NO_TOKEN)
+    if _utcnow() >= due and (_sas_lock.acquire(blocking=False) or (expiry <= _utcnow() and _sas_lock.acquire())):
         try:
-            token, expiry = _sas_tokens[key] = _renew_sas_token(key)
+            token, expiry, due = _sas_tokens[key] = _renewed_copy(key)
         finally:
             _sas_lock.release()
     return f"{parts._replace(query='').geturl()}?{token}"
 
 
+def _renewed_copy(key: tuple[str, str]) -> tuple[str, datetime.datetime, datetime.datetime]:
+    """This process's copy of ``key``'s token after renewal, and when it is next due.
+
+    It is due ten minutes before expiry, or once the fleet's pause after a failed attempt ends.
+    Any failure to renew, including losing the scheduler, keeps a still-valid copy in use and
+    puts off this process's next attempt for a jittered 30-60 s; without a valid copy it is raised.
+    """
+    copy = _sas_tokens.get(key, _NO_TOKEN)
+    if _utcnow() < copy[2]:  # another thread renewed it while this one waited
+        return copy
+    try:
+        token, expiry, next_try = _renew_sas_token(key)
+    except Exception:  # the token service or the scheduler; a valid copy outlives either
+        if copy[1] <= _utcnow():
+            raise
+        logger.warning("Planetary Computer token renewal failed; reading on the current one", exc_info=True)
+        return copy[0], copy[1], _utcnow() + datetime.timedelta(seconds=random.uniform(30, 60))
+    return token, expiry, max(expiry - _SAS_REFRESH_MARGIN, next_try)
+
+
 _SAS_ERRORS = (requests.RequestException, NonJsonResponseError, ValueError, KeyError)
 
 
-def _renew_sas_token(key: tuple[str, str]) -> tuple[str, datetime.datetime]:
-    """The freshest token for ``key``, asking the service only when the shared record needs it.
+def _renew_sas_token(key: tuple[str, str]) -> tuple[str, datetime.datetime, datetime.datetime]:
+    """The freshest token for ``key``, its expiry, and when its holders may next ask the service.
 
     The record is the fleet's on a Dask worker (:func:`_token_record`), so a worker usually adopts
     a token another worker fetched. Once less than ten minutes is left on it, the holder fetches
     a new one: with a single attempt while the record's token is still valid, patiently
     (:func:`_sas_session`) once it is not. A failed single attempt keeps the valid token in use
     and stops every holder of the record from asking again for a jittered 30-60 s, so a throttled
-    fleet does not retry on every read. Without a valid token the error is raised, failing the read.
+    fleet does not retry in step. Without a valid token the error is raised.
     """
     with _token_record(key) as record:
         expiry = datetime.datetime.fromisoformat(record.get("expiry", _NEVER))
-        now = datetime.datetime.now(datetime.UTC)
+        now = _utcnow()
         paused = now < datetime.datetime.fromisoformat(record.get("next_try", _NEVER))
         if expiry < now + _SAS_REFRESH_MARGIN and (expiry <= now or not paused):
             try:
                 record.update(_fetch_sas_token(key, patient=expiry <= now))
             except _SAS_ERRORS:
-                now = datetime.datetime.now(datetime.UTC)
+                now = _utcnow()
                 if expiry <= now:
                     raise
                 record["next_try"] = (now + datetime.timedelta(seconds=random.uniform(30, 60))).isoformat()
-                logger.warning("Planetary Computer token refresh failed; reading on the current one", exc_info=True)
-        return record["token"], datetime.datetime.fromisoformat(record["expiry"])
+        return (
+            record["token"],
+            datetime.datetime.fromisoformat(record["expiry"]),
+            datetime.datetime.fromisoformat(record.get("next_try", _NEVER)),
+        )
 
 
 @contextlib.contextmanager
@@ -144,23 +171,26 @@ def _token_record(key: tuple[str, str]) -> Generator[dict[str, str]]:
 
     On a Dask worker it is the fleet's: a Dask ``Variable`` on the scheduler, under a cluster-wide
     ``Lock``. The worker is found through ``Worker._instances`` because ``get_worker()`` works only
-    on a task's own thread, and a read may run on another. Elsewhere the record is this process's,
+    on a task's own thread, and a read may run on another; a worker Dask has paused for memory
+    still finishes the reads it started, so it counts. Elsewhere the record is this process's,
     under ``_sas_lock``, which the caller holds.
     """
-    worker = next((w for w in Worker._instances if w.status == Status.running), None)
+    worker = next((w for w in Worker._instances if w.status in WORKER_ANY_RUNNING), None)
     if worker is None:
         yield _sas_records.setdefault(key, {})
         return
     variable, lock = _fleet_token_handles("planetary-computer-token/" + "/".join(key), worker)
     with lock:
         try:
-            record = dict(variable.get(timeout=0))
+            shared = dict(variable.get(timeout=0))
         except TimeoutError:  # no worker has fetched one yet
-            record = {}
+            shared = {}
+        record = dict(shared)
         try:
             yield record
         finally:
-            variable.set(record)
+            if record != shared:
+                variable.set(record)
 
 
 @functools.cache

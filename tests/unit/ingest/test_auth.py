@@ -367,7 +367,7 @@ def test_a_token_that_expires_during_a_failed_refresh_is_not_used(
     failing = token_service(5, fail=True)
     failing.delay = 0.3
     expiry = datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=0.1)
-    auth._sas_tokens[_KEY] = ("sig=old", expiry)
+    auth._sas_tokens[_KEY] = ("sig=old", expiry, expiry - auth._SAS_REFRESH_MARGIN)
     auth._sas_records[_KEY] = {"token": "sig=old", "expiry": expiry.isoformat()}
     with pytest.raises(requests.ConnectionError):
         auth.sign_azure_href(_BLOB)
@@ -400,3 +400,19 @@ def test_a_fleet_shares_one_token(token_service: Callable[..., _TokenService]) -
         assert auth.sign_azure_href(_BLOB) == f"{_BLOB}?sig=1"
     assert service.calls == 1
     assert auth._sas_records == {}  # the record lived on the scheduler, not in this process
+
+
+def test_a_lost_scheduler_keeps_a_valid_copy_and_puts_off_the_next_attempt(
+    token_service: Callable[..., _TokenService], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token_service(5)
+    auth.sign_azure_href(_BLOB)
+    attempts = []
+
+    def lose_the_scheduler(key: tuple[str, str]) -> None:
+        attempts.append(key)
+        raise OSError("scheduler unreachable")
+
+    monkeypatch.setattr(auth, "_renew_sas_token", lose_the_scheduler)
+    assert auth.sign_azure_href(_BLOB) == auth.sign_azure_href(_BLOB) == f"{_BLOB}?sig=1"
+    assert len(attempts) == 1
