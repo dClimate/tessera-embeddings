@@ -3,7 +3,8 @@ read tokens for Sentinel-2 on Azure.
 
 Planetary Computer refuses an unsigned read. Its token is free, anonymous and short-lived (about 45
 minutes), so it is appended to each URL at the moment of reading (:func:`sign_azure_href`), never
-when the item is queried: an ingest outlives many tokens.
+when the item is queried: an ingest outlives many tokens. The token service throttles each public
+address, and a fleet's workers all leave through one NAT address, so a fleet shares one token.
 
 NASA Earthdata Login (EDL) authentication for ASF-hosted OPERA data has two access modes for OPERA RTC-S1 data on ASF:
 
@@ -19,17 +20,22 @@ Cumulus app approved under Authorized Apps at urs.earthdata.nasa.gov.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
+import functools
 import logging
 import os
 import random
 import re
 import threading
+from collections.abc import Generator
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse, urlsplit
 
 import requests
-from dask.distributed import WorkerPlugin, get_client  # noqa: TID251 — registers a worker plugin cluster-wide
+from dask.distributed import Lock, Variable, WorkerPlugin, get_client  # noqa: TID251 — cluster-wide plugin and token
+from distributed.core import Status
+from distributed.worker import Worker
 from odc.loader._rio import ThreadSession as _OdcThreadSession
 from odc.loader._rio import _local as _odc_thread_session
 from requests.adapters import HTTPAdapter
@@ -69,28 +75,25 @@ _AZURE_BLOB_HOST = ".blob.core.windows.net"
 _SAS_TOKEN_URL = "https://planetarycomputer.microsoft.com/api/sas/v1/token/{account}/{container}"
 #: A token is replaced once less than this is left, so a read started on it finishes inside it.
 _SAS_REFRESH_MARGIN = datetime.timedelta(minutes=10)
+#: This process's copy of each container's token, read by every read without a lock.
 _sas_tokens: dict[tuple[str, str], tuple[str, datetime.datetime]] = {}
-#: Held by the one thread fetching a token, so a process asks the service once at a time.
+#: Held by the one thread in this process renewing a token.
 _sas_lock = threading.Lock()
 _NO_TOKEN = ("", datetime.datetime.min.replace(tzinfo=datetime.UTC))
-#: After a failed refresh, when this process may try again: a jittered pause, so a throttled
-#: fleet does not retry on every read, in step.
-_sas_next_try: dict[tuple[str, str], datetime.datetime] = {}
+_NEVER = _NO_TOKEN[1].isoformat()
+#: The token records of a process outside a Dask cluster. A worker's live on the scheduler.
+_sas_records: dict[tuple[str, str], dict[str, str]] = {}
 
 
 def sign_azure_href(href: str) -> str:
     """``href`` with a current Planetary Computer read token appended, if it is on Azure Blob Storage.
 
     Anything else is returned unchanged. A token already on the href is replaced, so signing again
-    never reads on a stale one. One token signs a whole storage container and is cached per
-    process. Two cases, so that waiting on the token service never stalls reads that need not wait:
-
-    - **A valid token nearing expiry** is refreshed by one thread with a single attempt, which
-      that thread's read waits for while every other read carries on with the cached token. After
-      a failed attempt none is made for a jittered 30-60 s, so a throttled fleet does not retry in
-      step on every read.
-    - **No valid token** (a starting worker, or one whose refreshes all failed): reads wait on
-      one patient, jittered fetch (:func:`_sas_session`), and its error fails the read.
+    never reads on a stale one. One token signs a whole storage container. Each process keeps a
+    copy for its reads, and on a Dask worker the whole fleet shares one (:func:`_renew_sas_token`),
+    so the token service hears from one worker per fleet rather than from every worker. Renewal
+    begins ten minutes before expiry and is done by one thread, whose read waits for it while the
+    others carry on with the copy; only a process holding no valid token makes every read wait.
     """
     parts = urlsplit(href)
     if not parts.netloc.endswith(_AZURE_BLOB_HOST):
@@ -98,45 +101,89 @@ def sign_azure_href(href: str) -> str:
     key = (parts.netloc.removesuffix(_AZURE_BLOB_HOST), parts.path.split("/")[1])
     token, expiry = _sas_tokens.get(key, _NO_TOKEN)
     now = datetime.datetime.now(datetime.UTC)
-    if now < expiry < now + _SAS_REFRESH_MARGIN and _sas_lock.acquire(blocking=False):
+    if expiry < now + _SAS_REFRESH_MARGIN and _sas_lock.acquire(blocking=expiry <= now):
         try:
-            token, expiry = _sas_tokens.get(key, _NO_TOKEN)  # another thread may have renewed it
-            now = datetime.datetime.now(datetime.UTC)
-            if expiry < now + _SAS_REFRESH_MARGIN and now >= _sas_next_try.get(key, _NO_TOKEN[1]):
-                token, expiry = _fetch_sas_token(key, patient=False)
-        except _SAS_ERRORS:
-            pause = datetime.timedelta(seconds=random.uniform(30, 60))
-            _sas_next_try[key] = datetime.datetime.now(datetime.UTC) + pause
-            logger.warning("Planetary Computer token refresh failed; reading on the current one", exc_info=True)
+            token, expiry = _sas_tokens[key] = _renew_sas_token(key)
         finally:
             _sas_lock.release()
-    if expiry <= datetime.datetime.now(datetime.UTC):
-        with _sas_lock:
-            token, expiry = _sas_tokens.get(key, _NO_TOKEN)  # another thread may have fetched it
-            if expiry <= datetime.datetime.now(datetime.UTC):
-                token, expiry = _fetch_sas_token(key, patient=True)
     return f"{parts._replace(query='').geturl()}?{token}"
 
 
 _SAS_ERRORS = (requests.RequestException, NonJsonResponseError, ValueError, KeyError)
 
 
-def _fetch_sas_token(key: tuple[str, str], *, patient: bool) -> tuple[str, datetime.datetime]:
-    """Fetch and cache a token for ``(account, container)``."""
+def _renew_sas_token(key: tuple[str, str]) -> tuple[str, datetime.datetime]:
+    """The freshest token for ``key``, asking the service only when the shared record needs it.
+
+    The record is the fleet's on a Dask worker (:func:`_token_record`), so a worker usually adopts
+    a token another worker fetched. Once less than ten minutes is left on it, the holder fetches
+    a new one: with a single attempt while the record's token is still valid, patiently
+    (:func:`_sas_session`) once it is not. A failed single attempt keeps the valid token in use
+    and stops every holder of the record from asking again for a jittered 30-60 s, so a throttled
+    fleet does not retry on every read. Without a valid token the error is raised, failing the read.
+    """
+    with _token_record(key) as record:
+        expiry = datetime.datetime.fromisoformat(record.get("expiry", _NEVER))
+        now = datetime.datetime.now(datetime.UTC)
+        paused = now < datetime.datetime.fromisoformat(record.get("next_try", _NEVER))
+        if expiry < now + _SAS_REFRESH_MARGIN and (expiry <= now or not paused):
+            try:
+                record.update(_fetch_sas_token(key, patient=expiry <= now))
+            except _SAS_ERRORS:
+                now = datetime.datetime.now(datetime.UTC)
+                if expiry <= now:
+                    raise
+                record["next_try"] = (now + datetime.timedelta(seconds=random.uniform(30, 60))).isoformat()
+                logger.warning("Planetary Computer token refresh failed; reading on the current one", exc_info=True)
+        return record["token"], datetime.datetime.fromisoformat(record["expiry"])
+
+
+@contextlib.contextmanager
+def _token_record(key: tuple[str, str]) -> Generator[dict[str, str]]:
+    """The token record for ``key`` that every reader of it shares, held exclusively while open.
+
+    On a Dask worker it is the fleet's: a Dask ``Variable`` on the scheduler, under a cluster-wide
+    ``Lock``. The worker is found through ``Worker._instances`` because ``get_worker()`` works only
+    on a task's own thread, and a read may run on another. Elsewhere the record is this process's,
+    under ``_sas_lock``, which the caller holds.
+    """
+    worker = next((w for w in Worker._instances if w.status == Status.running), None)
+    if worker is None:
+        yield _sas_records.setdefault(key, {})
+        return
+    variable, lock = _fleet_token_handles("planetary-computer-token/" + "/".join(key), worker)
+    with lock:
+        try:
+            record = dict(variable.get(timeout=0))
+        except TimeoutError:  # no worker has fetched one yet
+            record = {}
+        try:
+            yield record
+        finally:
+            variable.set(record)
+
+
+@functools.cache
+def _fleet_token_handles(name: str, worker: Worker) -> tuple[Variable, Lock]:
+    """The shared record and its lock, made once per worker: each ``Lock`` keeps its lease alive on a timer."""
+    return Variable(name, client=worker.client), Lock(name, scheduler_rpc=worker.scheduler, loop=worker.loop)
+
+
+def _fetch_sas_token(key: tuple[str, str], *, patient: bool) -> dict[str, str]:
+    """Ask the token service for ``(account, container)``'s token."""
     response = _sas_session(patient).get(_SAS_TOKEN_URL.format(account=key[0], container=key[1]), timeout=30)
     response.raise_for_status()
     body = json_or_raise(response, log_body=False)
-    _sas_tokens[key] = (body["token"], datetime.datetime.fromisoformat(body["msft:expiry"]))
-    return _sas_tokens[key]
+    return {"token": body["token"], "expiry": datetime.datetime.fromisoformat(body["msft:expiry"]).isoformat()}
 
 
 def _sas_session(patient: bool) -> requests.Session:
     """A token-service session: one attempt, or a patient one that waits out throttling.
 
-    The service refuses with 429 when a starting fleet's workers all ask at once from one NAT
-    address, so the patient waits are jittered, and ``Retry-After`` is ignored because obeying
-    it would put the refused workers back in step. Ten attempts capped at two minutes each ride
-    out a burst of several fleets.
+    The service refuses with 429 when too many requests come from one public address, which
+    several fleets can share, so the patient waits are jittered and ``Retry-After`` is ignored:
+    obeying it would put refused requesters back in step. Ten attempts capped at two minutes each
+    ride out a burst.
     """
     session = requests.Session()
     retry = Retry(

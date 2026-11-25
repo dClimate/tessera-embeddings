@@ -177,17 +177,23 @@ it signs every file in that storage container, and it lasts about 45 minutes. Lo
 need a subscription key, which Microsoft no longer issues.
 
 Because an ingest outlives many tokens, nothing is signed when the catalogue is queried. Each
-worker process signs a URL immediately before reading it (`auth.sign_azure_href`, called from
-`stac._SourceReader.read`), from a token it caches and replaces once less than ten minutes of life
-remain. Every other part of the ingest, including provenance and duplicate selection, sees the
-catalogue's own unsigned URLs.
+process signs a URL immediately before reading it (`auth.sign_azure_href`, called from
+`stac._SourceReader.read`), from its own copy of the token, which it replaces once less than ten
+minutes of life remain. Every other part of the ingest, including provenance and duplicate
+selection, sees the catalogue's own unsigned URLs.
 
-- **Refreshing a valid token holds up only the read that makes the attempt.** One thread makes a
-  single attempt while the others keep reading on the cached token. After a failure, the process
-  waits a random 30–60 seconds before trying again.
-- **With no valid token**, which is every worker as a fleet starts, reads wait on one fetch that
-  retries 429 and 5xx up to ten times, with randomised waits of up to two minutes. The service
-  refuses with 429 when many workers ask at once from one address: two 60-worker ingests behind
-  one NAT instance were refused outright with plain exponential retries, because the refused
-  workers retried in step. If that fetch fails too, the read fails as any other read failure does.
+**A Dask fleet shares one token.** The token service throttles each public address, and all of a
+fleet's workers leave through one NAT instance and one address. When one asked separately, two
+60-worker fleets behind one address were refused (HTTP 429) for longer than any retry could wait.
+So the token lives on the Dask scheduler, as a Dask `Variable` guarded by a cluster-wide `Lock`. A
+worker whose copy needs replacing takes the lock and adopts the scheduler's token if it is fresh,
+and only otherwise asks the service and stores the answer there. The service hears from one worker
+per fleet, about every 35 minutes. A process outside a Dask cluster keeps its token to itself.
 
+- **Refreshing a valid token holds up only the read that makes the attempt.** One thread in the
+  worker makes a single attempt while the others keep reading on its copy. After a failure, no
+  worker in the fleet tries again for a random 30–60 seconds.
+- **With no valid token**, as when a fleet starts, reads wait on one fetch that retries 429 and
+  5xx up to ten times, with randomised waits of up to two minutes, and ignores `Retry-After` so
+  refused requesters do not retry in step. If that fetch fails too, the read fails as any other
+  read failure does.

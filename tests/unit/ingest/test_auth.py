@@ -17,6 +17,7 @@ from collections.abc import Callable
 import pytest
 import rasterio.env
 import requests
+from distributed import Client, LocalCluster
 from odc.loader._rio import _local, rio_env
 
 from tessera_embeddings.ingest import auth
@@ -300,6 +301,7 @@ def test_a_credential_body_is_never_logged_or_raised(caplog: pytest.LogCaptureFi
 
 
 _BLOB = "https://sentinel2l2a01.blob.core.windows.net/sentinel2-l2/15/T/VF/B02.tif"
+_KEY = ("sentinel2l2a01", "sentinel2-l2")
 
 
 class _TokenService:
@@ -328,7 +330,7 @@ def token_service(monkeypatch: pytest.MonkeyPatch) -> Callable[..., _TokenServic
         return service
 
     monkeypatch.setattr(auth, "_sas_tokens", {})
-    monkeypatch.setattr(auth, "_sas_next_try", {})
+    monkeypatch.setattr(auth, "_sas_records", {})
     return install
 
 
@@ -354,6 +356,7 @@ def test_a_failed_refresh_keeps_a_valid_token_pauses_and_raises_without_one(
     assert auth.sign_azure_href(_BLOB) == auth.sign_azure_href(_BLOB) == f"{_BLOB}?sig=1"
     assert failing.patient == [False]  # the second read waits out the pause instead of asking again
     auth._sas_tokens.clear()
+    auth._sas_records.clear()
     with pytest.raises(requests.ConnectionError):
         auth.sign_azure_href(_BLOB)
 
@@ -361,11 +364,14 @@ def test_a_failed_refresh_keeps_a_valid_token_pauses_and_raises_without_one(
 def test_a_token_that_expires_during_a_failed_refresh_is_not_used(
     token_service: Callable[..., _TokenService],
 ) -> None:
-    token_service(5, fail=True).delay = 0.3
+    failing = token_service(5, fail=True)
+    failing.delay = 0.3
     expiry = datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=0.1)
-    auth._sas_tokens[("sentinel2l2a01", "sentinel2-l2")] = ("sig=old", expiry)
+    auth._sas_tokens[_KEY] = ("sig=old", expiry)
+    auth._sas_records[_KEY] = {"token": "sig=old", "expiry": expiry.isoformat()}
     with pytest.raises(requests.ConnectionError):
         auth.sign_azure_href(_BLOB)
+    assert failing.patient == [False]
 
 
 def test_reads_carry_on_with_a_valid_token_while_another_thread_refreshes(
@@ -383,3 +389,14 @@ def test_only_azure_hrefs_are_signed(token_service: Callable[..., _TokenService]
     href = "s3://sentinel-cogs/sentinel-s2-l2a-cogs/B02.tif"
     assert auth.sign_azure_href(href) == href
     assert service.calls == 0
+
+
+def test_a_fleet_shares_one_token(token_service: Callable[..., _TokenService]) -> None:
+    """A worker that starts with no token adopts the one another worker fetched."""
+    service = token_service(45)
+    with LocalCluster(n_workers=1, processes=False, dashboard_address=None) as cluster, Client(cluster):
+        auth.sign_azure_href(_BLOB)
+        auth._sas_tokens.clear()  # a second worker process starts with no copy of its own
+        assert auth.sign_azure_href(_BLOB) == f"{_BLOB}?sig=1"
+    assert service.calls == 1
+    assert auth._sas_records == {}  # the record lived on the scheduler, not in this process
