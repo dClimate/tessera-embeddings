@@ -22,6 +22,7 @@ from __future__ import annotations
 import datetime
 import logging
 import os
+import random
 import re
 import threading
 from typing import TYPE_CHECKING
@@ -72,6 +73,9 @@ _sas_tokens: dict[tuple[str, str], tuple[str, datetime.datetime]] = {}
 #: Held by the one thread fetching a token, so a process asks the service once at a time.
 _sas_lock = threading.Lock()
 _NO_TOKEN = ("", datetime.datetime.min.replace(tzinfo=datetime.UTC))
+#: After a failed refresh, when this process may try again: a jittered pause, so a throttled
+#: fleet does not retry on every read, in step.
+_sas_next_try: dict[tuple[str, str], datetime.datetime] = {}
 
 
 def sign_azure_href(href: str) -> str:
@@ -93,10 +97,12 @@ def sign_azure_href(href: str) -> str:
     key = (parts.netloc.removesuffix(_AZURE_BLOB_HOST), parts.path.split("/")[1])
     token, expiry = _sas_tokens.get(key, _NO_TOKEN)
     now = datetime.datetime.now(datetime.UTC)
-    if now < expiry < now + _SAS_REFRESH_MARGIN and _sas_lock.acquire(blocking=False):
+    due = now >= _sas_next_try.get(key, _NO_TOKEN[1])
+    if now < expiry < now + _SAS_REFRESH_MARGIN and due and _sas_lock.acquire(blocking=False):
         try:
             token, expiry = _fetch_sas_token(key, patient=False)
         except _SAS_ERRORS:
+            _sas_next_try[key] = now + datetime.timedelta(seconds=random.uniform(30, 60))
             logger.warning("Planetary Computer token refresh failed; reading on the current one", exc_info=True)
         finally:
             _sas_lock.release()

@@ -306,7 +306,7 @@ class _TokenService:
     """Stands in for the token endpoint: hands out numbered tokens, or fails when told to."""
 
     def __init__(self, life: datetime.timedelta, fail: bool = False) -> None:
-        self.life, self.fail, self.calls, self.delay = life, fail, 0, 0.0
+        self.life, self.fail, self.calls, self.delay, self.patient = life, fail, 0, 0.0, []
 
     def get(self, url: str, timeout: float) -> requests.Response:
         self.calls += 1
@@ -324,10 +324,11 @@ class _TokenService:
 def token_service(monkeypatch: pytest.MonkeyPatch) -> Callable[..., _TokenService]:
     def install(life_minutes: float, fail: bool = False) -> _TokenService:
         service = _TokenService(datetime.timedelta(minutes=life_minutes), fail)
-        monkeypatch.setattr(auth, "_sas_session", lambda patient: service)
+        monkeypatch.setattr(auth, "_sas_session", lambda patient: service.patient.append(patient) or service)
         return service
 
     monkeypatch.setattr(auth, "_sas_tokens", {})
+    monkeypatch.setattr(auth, "_sas_next_try", {})
     return install
 
 
@@ -338,18 +339,20 @@ def test_a_token_is_reused_until_it_nears_expiry(token_service: Callable[..., _T
 
 
 def test_a_token_near_expiry_is_replaced_and_an_old_one_stripped(token_service: Callable[..., _TokenService]) -> None:
-    token_service(5)
+    service = token_service(5)
     first = auth.sign_azure_href(_BLOB)
     assert auth.sign_azure_href(first) == f"{_BLOB}?sig=2"
+    assert service.patient == [True, False]  # a start waits patiently; a refresh makes one attempt
 
 
-def test_a_failed_refresh_keeps_a_valid_token_and_raises_without_one(
+def test_a_failed_refresh_keeps_a_valid_token_pauses_and_raises_without_one(
     token_service: Callable[..., _TokenService],
 ) -> None:
     token_service(5)
     auth.sign_azure_href(_BLOB)
-    token_service(5, fail=True)
-    assert auth.sign_azure_href(_BLOB) == f"{_BLOB}?sig=1"
+    failing = token_service(5, fail=True)
+    assert auth.sign_azure_href(_BLOB) == auth.sign_azure_href(_BLOB) == f"{_BLOB}?sig=1"
+    assert failing.patient == [False]  # the second read waits out the pause instead of asking again
     auth._sas_tokens.clear()
     with pytest.raises(requests.ConnectionError):
         auth.sign_azure_href(_BLOB)
