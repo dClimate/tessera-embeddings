@@ -116,7 +116,8 @@ def sign_azure_href(href: str) -> str:
 def _renewed_copy(key: tuple[str, str]) -> tuple[str, datetime.datetime, datetime.datetime]:
     """This process's copy of ``key``'s token after renewal, and when it is next due.
 
-    It is due ten minutes before expiry, or once the fleet's pause after a failed attempt ends.
+    It is due ten minutes before expiry, or once the fleet's pause after a failed attempt ends,
+    and never later than expiry.
     Any failure to renew, including losing the scheduler, keeps a still-valid copy in use and
     puts off this process's next attempt for a jittered 30-60 s; without a valid copy it is raised.
     """
@@ -129,8 +130,8 @@ def _renewed_copy(key: tuple[str, str]) -> tuple[str, datetime.datetime, datetim
         if copy[1] <= _utcnow():
             raise
         logger.warning("Planetary Computer token renewal failed; reading on the current one", exc_info=True)
-        return copy[0], copy[1], _utcnow() + datetime.timedelta(seconds=random.uniform(30, 60))
-    return token, expiry, max(expiry - _SAS_REFRESH_MARGIN, next_try)
+        return copy[0], copy[1], min(copy[1], _utcnow() + datetime.timedelta(seconds=random.uniform(30, 60)))
+    return token, expiry, min(expiry, max(expiry - _SAS_REFRESH_MARGIN, next_try))
 
 
 _SAS_ERRORS = (requests.RequestException, NonJsonResponseError, ValueError, KeyError)

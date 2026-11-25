@@ -402,10 +402,11 @@ def test_a_fleet_shares_one_token(token_service: Callable[..., _TokenService]) -
     assert auth._sas_records == {}  # the record lived on the scheduler, not in this process
 
 
-def test_a_lost_scheduler_keeps_a_valid_copy_and_puts_off_the_next_attempt(
-    token_service: Callable[..., _TokenService], monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("life_seconds", [300, 0.5])
+def test_a_lost_scheduler_keeps_a_valid_copy_and_puts_off_the_next_attempt_until_expiry(
+    token_service: Callable[..., _TokenService], monkeypatch: pytest.MonkeyPatch, life_seconds: float
 ) -> None:
-    token_service(5)
+    token_service(life_seconds / 60)
     auth.sign_azure_href(_BLOB)
     attempts = []
 
@@ -416,3 +417,7 @@ def test_a_lost_scheduler_keeps_a_valid_copy_and_puts_off_the_next_attempt(
     monkeypatch.setattr(auth, "_renew_sas_token", lose_the_scheduler)
     assert auth.sign_azure_href(_BLOB) == auth.sign_azure_href(_BLOB) == f"{_BLOB}?sig=1"
     assert len(attempts) == 1
+    if life_seconds < 1:  # the pause ends at expiry: an expired copy is renewed, never read on
+        time.sleep(life_seconds)
+        with pytest.raises(OSError, match="scheduler unreachable"):
+            auth.sign_azure_href(_BLOB)
