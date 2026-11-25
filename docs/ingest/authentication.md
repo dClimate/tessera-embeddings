@@ -182,8 +182,9 @@ worker process signs a URL immediately before reading it (`auth.sign_azure_href`
 remain. Every other part of the ingest, including provenance and duplicate selection, sees the
 catalogue's own unsigned URLs.
 
-- **Refreshing a valid token never holds up a read.** One thread makes a single attempt while the
-  others keep reading on the cached token; a failed attempt is tried again by a later read.
+- **Refreshing a valid token holds up only the read that makes the attempt.** One thread makes a
+  single attempt while the others keep reading on the cached token. After a failure, the process
+  waits a random 30–60 seconds before trying again.
 - **With no valid token**, which is every worker as a fleet starts, reads wait on one fetch that
   retries 429 and 5xx up to ten times, with randomised waits of up to two minutes. The service
   refuses with 429 when many workers ask at once from one address: two 60-worker ingests behind

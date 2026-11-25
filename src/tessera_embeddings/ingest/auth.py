@@ -85,9 +85,10 @@ def sign_azure_href(href: str) -> str:
     never reads on a stale one. One token signs a whole storage container and is cached per
     process. Two cases, so that waiting on the token service never stalls reads that need not wait:
 
-    - **A valid token nearing expiry** is refreshed by one thread with a single attempt, while
-      every other read carries on with the cached token; a failed attempt is retried by a later
-      read. Nothing waits for it.
+    - **A valid token nearing expiry** is refreshed by one thread with a single attempt, which
+      that thread's read waits for while every other read carries on with the cached token. After
+      a failed attempt none is made for a jittered 30-60 s, so a throttled fleet does not retry in
+      step on every read.
     - **No valid token** (a starting worker, or one whose refreshes all failed): reads wait on
       one patient, jittered fetch (:func:`_sas_session`), and its error fails the read.
     """
@@ -97,12 +98,13 @@ def sign_azure_href(href: str) -> str:
     key = (parts.netloc.removesuffix(_AZURE_BLOB_HOST), parts.path.split("/")[1])
     token, expiry = _sas_tokens.get(key, _NO_TOKEN)
     now = datetime.datetime.now(datetime.UTC)
-    due = now >= _sas_next_try.get(key, _NO_TOKEN[1])
-    if now < expiry < now + _SAS_REFRESH_MARGIN and due and _sas_lock.acquire(blocking=False):
+    if now < expiry < now + _SAS_REFRESH_MARGIN and _sas_lock.acquire(blocking=False):
         try:
-            token, expiry = _fetch_sas_token(key, patient=False)
+            if datetime.datetime.now(datetime.UTC) >= _sas_next_try.get(key, _NO_TOKEN[1]):
+                token, expiry = _fetch_sas_token(key, patient=False)
         except _SAS_ERRORS:
-            _sas_next_try[key] = now + datetime.timedelta(seconds=random.uniform(30, 60))
+            pause = datetime.timedelta(seconds=random.uniform(30, 60))
+            _sas_next_try[key] = datetime.datetime.now(datetime.UTC) + pause
             logger.warning("Planetary Computer token refresh failed; reading on the current one", exc_info=True)
         finally:
             _sas_lock.release()
