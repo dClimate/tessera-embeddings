@@ -100,7 +100,9 @@ def sign_azure_href(href: str) -> str:
     now = datetime.datetime.now(datetime.UTC)
     if now < expiry < now + _SAS_REFRESH_MARGIN and _sas_lock.acquire(blocking=False):
         try:
-            if datetime.datetime.now(datetime.UTC) >= _sas_next_try.get(key, _NO_TOKEN[1]):
+            token, expiry = _sas_tokens.get(key, _NO_TOKEN)  # another thread may have renewed it
+            now = datetime.datetime.now(datetime.UTC)
+            if expiry < now + _SAS_REFRESH_MARGIN and now >= _sas_next_try.get(key, _NO_TOKEN[1]):
                 token, expiry = _fetch_sas_token(key, patient=False)
         except _SAS_ERRORS:
             pause = datetime.timedelta(seconds=random.uniform(30, 60))
