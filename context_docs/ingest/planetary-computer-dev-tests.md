@@ -242,11 +242,11 @@ address. Prices are us-west-2 and eu-central-1 on-demand from the AWS pricing AP
 | Oregon, six per address | 10 | 5.9× | $53,000 | $3,000 | — | $56,000 |
 | Oregon, two per address | 30 | 4.0× | $36,000 | $1,600 | — | $37,600 |
 | **Oregon, one per address** | **60** | **3.5×** | **$31,500** | **$2,700** | — | **$34,200** |
-| Frankfurt, one per address, mosaics written to Oregon | 60 | ~1.2× (estimated) | $12,400 (Frankfurt Fargate is 15% dearer) | $900 | $25,600 (1,280 TB at $20/TB) | ~$39,000 |
+| Frankfurt, one per address, mosaics written to Oregon | 60 | ~1.2× (estimated) | $12,400 (Frankfurt Fargate is 15% dearer) | $1,100 | $25,600 (1,280 TB at $20/TB) | ~$39,000 |
 | Managed NAT gateway, Oregon | — | as above | as above | — | ~$45/TB processed | ruled out |
 
 - **Addresses, not region, decide the cost.** Going from three addresses to thirty or sixty saves
-  about $145,000 per global year for about $2,000 of NAT instances.
+  about $145,000 per global year, and the NAT bill falls slightly too, because each smaller instance runs for less time.
 - **Oregon at one or two per address is the cheapest design measured.** Frankfurt removes most of the
   Fargate time but pays it back in transfer, needs the same number of addresses, and needs an ingest
   deployment in another region. Its estimated slowdown and its cross-region mosaic writes are not
