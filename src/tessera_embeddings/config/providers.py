@@ -10,6 +10,7 @@ from .satellites import (
     S1_BASELINE_THRESHOLD,
     S1_GRD_BANDS,
     S1_OPERA_BANDS,
+    S2_BAND_MAPPING,
     S2_BASELINE_OFFSET,
     S2_BASELINE_THRESHOLD,
     S2_L1C_BANDS,
@@ -36,6 +37,8 @@ class CollectionConfig:
             offset was already subtracted, forcing a per-item decision from asset locations
         band_names_are_asset_keys: whether the names in ``bands`` are the item's asset keys
             rather than common names the loader resolves through an alias table
+        asset_keys: this repository's band names mapped to the catalogue's own asset keys, for a
+            catalogue serving the bands under other names; each item is re-keyed as it arrives
         source_index_band: the asset key of the band whose per-granule pixels decide the
             provenance source index, or ``None`` where this collection records none
     """
@@ -52,14 +55,18 @@ class CollectionConfig:
     #: Off by default: a collection served by one producer has one answer. On, the producer
     #: decision reads each item's asset LOCATIONS, which requires `band_names_are_asset_keys`.
     harmonisation_varies_by_item: bool = False
-    #: Earth Search keys its assets by the names in `bands`; Planetary Computer serves the same
-    #: imagery under native keys (`B02`, `SCL`). Any check that looks an asset up BY NAME —
-    #: producer classification, read-set completeness, locality — is uninformative where this is
-    #: False, and reports every copy as incomplete and remote.
+    #: Earth Search keys its assets by the names in `bands`, and so does any collection re-keyed
+    #: through `asset_keys`. Any check that looks an asset up BY NAME — producer classification,
+    #: read-set completeness, locality — is uninformative where this is False, and reports every
+    #: copy as incomplete and remote.
     band_names_are_asset_keys: bool = False
     #: The band the source index is read from: the one each sensor's validity is judged on, so the
     #: index and the mask share one definition (``ingest/provenance.py``). Needs ``fusion_order``.
     source_index_band: str | None = None
+    #: Planetary Computer serves `blue` as `B02` and `scl` as `SCL`. The query layer renames each
+    #: item's assets as it arrives (``stac._rekey_assets``), so nothing after it sees a
+    #: difference between catalogues. Empty where the catalogue already uses these names.
+    asset_keys: dict[str, str] = field(default_factory=dict)
 
     @property
     def requires_baseline_correction(self) -> bool:
@@ -122,8 +129,8 @@ S2_SOURCE_BY_PERIOD: tuple[tuple[str, str, S2Source], ...] = (
     ("2022-01-01", "2022-12-31", ("earth-search", "sentinel-2-l2a")),
 )
 
-#: Earth Search's two Sentinel-2 L2A collections share everything but what is set per collection.
-_earth_search_s2_l2a = partial(
+#: Every Sentinel-2 L2A collection read shares everything but what is set per collection.
+_s2_l2a = partial(
     CollectionConfig,
     bands=S2_L2A_BANDS,
     resolution=10,
@@ -174,14 +181,14 @@ PROVIDERS: dict[str, STACProvider] = {
             # harmonised for the legacy collection's objects there. Its `raster:bands` offset of
             # -0.1 is correct here, unlike the legacy collection's. The years it holds only part
             # of read the legacy collection instead (`S2_SOURCE_BY_PERIOD`).
-            "sentinel-2-c1-l2a": _earth_search_s2_l2a(collection_id="sentinel-2-c1-l2a"),
+            "sentinel-2-c1-l2a": _s2_l2a(collection_id="sentinel-2-c1-l2a"),
             # The legacy collection, read for the years Collection 1 holds only part of. Earth Search harmonises
             # the BOA offset (subtracts 1000 post-baseline 04.00) in its OWN COGs, but this
             # collection also indexes items pointing at ESA originals, which still carry it —
             # hence `harmonisation_varies_by_item`, which decides per ASSET from where that asset
             # lives. The raster:bands offset=-0.1 and earthsearch:boa_offset_applied metadata are
             # unreliable here (sertit/eoreader#120), so asset location is the signal. ADR 021.
-            "sentinel-2-l2a": _earth_search_s2_l2a(collection_id="sentinel-2-l2a", harmonisation_varies_by_item=True),
+            "sentinel-2-l2a": _s2_l2a(collection_id="sentinel-2-l2a", harmonisation_varies_by_item=True),
             "sentinel-2-l1c": CollectionConfig(
                 collection_id="sentinel-2-l1c",
                 bands=S2_L1C_BANDS,
@@ -234,18 +241,16 @@ PROVIDERS: dict[str, STACProvider] = {
         name="Microsoft Planetary Computer",
         catalog_url="https://planetarycomputer.microsoft.com/api/stac/v1",
         collections={
-            # Planetary Computer serves ESA's values unharmonised and serves them ALL that way,
-            # so the answer is the collection's and `harmonisation_varies_by_item` stays off. It
-            # also keys assets natively (`B02`, `SCL`), relying on the loader to resolve the
-            # common names in `bands`, so a per-item read of asset locations would find nothing.
-            "sentinel-2-l2a": CollectionConfig(
+            # Planetary Computer serves ESA's values with the offset left in, for every item, so
+            # the answer is the collection's: `harmonisation_varies_by_item` stays off and the
+            # offset is removed by baseline, item by item. 2017 and 2018 are Esri's 2021
+            # processing at baseline 02.12 and owe nothing. Its native asset keys are renamed as
+            # each item arrives, after which it is configured exactly as Earth Search's are.
+            "sentinel-2-l2a": _s2_l2a(
                 collection_id="sentinel-2-l2a",
-                bands=S2_L2A_BANDS,
-                resolution=10,
-                baseline_threshold=S2_BASELINE_THRESHOLD,
-                baseline_offset=S2_BASELINE_OFFSET,
                 tile_id_property="s2:mgrs_tile",
                 tile_id_prefix="",
+                asset_keys={**{band: native for native, band in S2_BAND_MAPPING.items()}, "scl": "SCL"},
             ),
             "sentinel-1-grd": _s1_grd("sentinel-1-rtc"),
             "landsat-c2-l2": _LANDSAT_C2_L2,

@@ -6,16 +6,21 @@ credential-drift patch. No HTTP call is made; no network access is required.
 
 from __future__ import annotations
 
+import datetime
+import json
 import logging
 import os
 import threading
+import time
 from collections.abc import Callable
 
 import pytest
 import rasterio.env
 import requests
+from distributed import Client, LocalCluster
 from odc.loader._rio import _local, rio_env
 
+from tessera_embeddings.ingest import auth
 from tessera_embeddings.ingest._http import NonJsonResponseError, json_or_raise
 from tessera_embeddings.ingest.auth import _datapool_url_to_s3, _EDLSession, get_edl_session
 
@@ -293,3 +298,126 @@ def test_a_credential_body_is_never_logged_or_raised(caplog: pytest.LogCaptureFi
     assert "SUPERSECRET" not in caplog.text
     # Suppressing the body must not cost the fields that identify the failure.
     assert "cumulus.asf.alaska.edu" in str(exc_info.value)
+
+
+_BLOB = "https://sentinel2l2a01.blob.core.windows.net/sentinel2-l2/15/T/VF/B02.tif"
+_KEY = ("sentinel2l2a01", "sentinel2-l2")
+
+
+class _TokenService:
+    """Stands in for the token endpoint: hands out numbered tokens, or fails when told to."""
+
+    def __init__(self, life: datetime.timedelta, fail: bool = False) -> None:
+        self.life, self.fail, self.calls, self.delay, self.patient = life, fail, 0, 0.0, []
+
+    def get(self, url: str, timeout: float) -> requests.Response:
+        self.calls += 1
+        time.sleep(self.delay)
+        if self.fail:
+            raise requests.ConnectionError("token service down")
+        resp = requests.Response()
+        resp.status_code, resp.url = 200, url
+        expiry = (datetime.datetime.now(datetime.UTC) + self.life).isoformat()
+        resp._content = json.dumps({"token": f"sig={self.calls}", "msft:expiry": expiry}).encode()
+        return resp
+
+
+@pytest.fixture
+def token_service(monkeypatch: pytest.MonkeyPatch) -> Callable[..., _TokenService]:
+    def install(life_minutes: float, fail: bool = False) -> _TokenService:
+        service = _TokenService(datetime.timedelta(minutes=life_minutes), fail)
+        monkeypatch.setattr(auth, "_sas_session", lambda patient: service.patient.append(patient) or service)
+        return service
+
+    monkeypatch.setattr(auth, "_sas_tokens", {})
+    monkeypatch.setattr(auth, "_sas_records", {})
+    return install
+
+
+def test_a_token_is_reused_until_it_nears_expiry(token_service: Callable[..., _TokenService]) -> None:
+    service = token_service(45)
+    assert auth.sign_azure_href(_BLOB) == auth.sign_azure_href(_BLOB) == f"{_BLOB}?sig=1"
+    assert service.calls == 1
+
+
+def test_a_token_near_expiry_is_replaced_and_an_old_one_stripped(token_service: Callable[..., _TokenService]) -> None:
+    service = token_service(5)
+    first = auth.sign_azure_href(_BLOB)
+    assert auth.sign_azure_href(first) == f"{_BLOB}?sig=2"
+    assert service.patient == [True, False]  # a start waits patiently; a refresh makes one attempt
+
+
+def test_a_failed_refresh_keeps_a_valid_token_pauses_and_raises_without_one(
+    token_service: Callable[..., _TokenService],
+) -> None:
+    token_service(5)
+    auth.sign_azure_href(_BLOB)
+    failing = token_service(5, fail=True)
+    assert auth.sign_azure_href(_BLOB) == auth.sign_azure_href(_BLOB) == f"{_BLOB}?sig=1"
+    assert failing.patient == [False]  # the second read waits out the pause instead of asking again
+    auth._sas_tokens.clear()
+    auth._sas_records.clear()
+    with pytest.raises(requests.ConnectionError):
+        auth.sign_azure_href(_BLOB)
+
+
+def test_a_token_that_expires_during_a_failed_refresh_is_not_used(
+    token_service: Callable[..., _TokenService],
+) -> None:
+    failing = token_service(5, fail=True)
+    failing.delay = 0.3
+    expiry = datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=0.1)
+    auth._sas_tokens[_KEY] = ("sig=old", expiry, expiry - auth._SAS_REFRESH_MARGIN)
+    auth._sas_records[_KEY] = {"token": "sig=old", "expiry": expiry.isoformat()}
+    with pytest.raises(requests.ConnectionError):
+        auth.sign_azure_href(_BLOB)
+    assert failing.patient == [False]
+
+
+def test_reads_carry_on_with_a_valid_token_while_another_thread_refreshes(
+    token_service: Callable[..., _TokenService],
+) -> None:
+    service = token_service(5)
+    auth.sign_azure_href(_BLOB)
+    with auth._sas_lock:  # another thread is mid-refresh
+        assert auth.sign_azure_href(_BLOB) == f"{_BLOB}?sig=1"
+    assert service.calls == 1
+
+
+def test_only_azure_hrefs_are_signed(token_service: Callable[..., _TokenService]) -> None:
+    service = token_service(45)
+    href = "s3://sentinel-cogs/sentinel-s2-l2a-cogs/B02.tif"
+    assert auth.sign_azure_href(href) == href
+    assert service.calls == 0
+
+
+def test_a_fleet_shares_one_token(token_service: Callable[..., _TokenService]) -> None:
+    """A worker that starts with no token adopts the one another worker fetched."""
+    service = token_service(45)
+    with LocalCluster(n_workers=1, processes=False, dashboard_address=None) as cluster, Client(cluster):
+        auth.sign_azure_href(_BLOB)
+        auth._sas_tokens.clear()  # a second worker process starts with no copy of its own
+        assert auth.sign_azure_href(_BLOB) == f"{_BLOB}?sig=1"
+    assert service.calls == 1
+    assert auth._sas_records == {}  # the record lived on the scheduler, not in this process
+
+
+@pytest.mark.parametrize("life_seconds", [300, 0.5])
+def test_a_lost_scheduler_keeps_a_valid_copy_and_puts_off_the_next_attempt_until_expiry(
+    token_service: Callable[..., _TokenService], monkeypatch: pytest.MonkeyPatch, life_seconds: float
+) -> None:
+    token_service(life_seconds / 60)
+    auth.sign_azure_href(_BLOB)
+    attempts = []
+
+    def lose_the_scheduler(key: tuple[str, str]) -> None:
+        attempts.append(key)
+        raise OSError("scheduler unreachable")
+
+    monkeypatch.setattr(auth, "_renew_sas_token", lose_the_scheduler)
+    assert auth.sign_azure_href(_BLOB) == auth.sign_azure_href(_BLOB) == f"{_BLOB}?sig=1"
+    assert len(attempts) == 1
+    if life_seconds < 1:  # the pause ends at expiry: an expired copy is renewed, never read on
+        time.sleep(life_seconds)
+        with pytest.raises(OSError, match="scheduler unreachable"):
+            auth.sign_azure_href(_BLOB)

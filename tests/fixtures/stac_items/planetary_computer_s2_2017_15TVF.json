@@ -1,0 +1,479 @@
+{
+ "id": "S2A_MSIL2A_20170726T165851_R069_T15TVF_20210210T144523",
+ "bbox": [
+  -94.1994491,
+  40.5567069,
+  -92.8829684,
+  41.5517851
+ ],
+ "type": "Feature",
+ "links": [],
+ "assets": {
+  "B02": {
+   "href": "https://sentinel2l2a01.blob.core.windows.net/sentinel2-l2/15/T/VF/2017/07/26/S2A_MSIL2A_20170726T165851_N0212_R069_T15TVF_20210210T144523.SAFE/GRANULE/L2A_T15TVF_A010934_20170726T170151/IMG_DATA/R10m/T15TVF_20170726T165851_B02_10m.tif",
+   "proj:bbox": [
+    399960.0,
+    4490220.0,
+    509760.0,
+    4600020.0
+   ],
+   "proj:shape": [
+    10980,
+    10980
+   ],
+   "proj:transform": [
+    10.0,
+    0.0,
+    399960.0,
+    0.0,
+    -10.0,
+    4600020.0
+   ],
+   "gsd": 10,
+   "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+   "roles": [
+    "data"
+   ],
+   "title": "Band 2 - Blue - 10m",
+   "eo:bands": [
+    {
+     "name": "B02",
+     "common_name": "blue",
+     "description": "Band 2 - Blue",
+     "center_wavelength": 0.49,
+     "full_width_half_max": 0.098
+    }
+   ]
+  },
+  "B03": {
+   "href": "https://sentinel2l2a01.blob.core.windows.net/sentinel2-l2/15/T/VF/2017/07/26/S2A_MSIL2A_20170726T165851_N0212_R069_T15TVF_20210210T144523.SAFE/GRANULE/L2A_T15TVF_A010934_20170726T170151/IMG_DATA/R10m/T15TVF_20170726T165851_B03_10m.tif",
+   "proj:bbox": [
+    399960.0,
+    4490220.0,
+    509760.0,
+    4600020.0
+   ],
+   "proj:shape": [
+    10980,
+    10980
+   ],
+   "proj:transform": [
+    10.0,
+    0.0,
+    399960.0,
+    0.0,
+    -10.0,
+    4600020.0
+   ],
+   "gsd": 10,
+   "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+   "roles": [
+    "data"
+   ],
+   "title": "Band 3 - Green - 10m",
+   "eo:bands": [
+    {
+     "name": "B03",
+     "common_name": "green",
+     "description": "Band 3 - Green",
+     "center_wavelength": 0.56,
+     "full_width_half_max": 0.045
+    }
+   ]
+  },
+  "B04": {
+   "href": "https://sentinel2l2a01.blob.core.windows.net/sentinel2-l2/15/T/VF/2017/07/26/S2A_MSIL2A_20170726T165851_N0212_R069_T15TVF_20210210T144523.SAFE/GRANULE/L2A_T15TVF_A010934_20170726T170151/IMG_DATA/R10m/T15TVF_20170726T165851_B04_10m.tif",
+   "proj:bbox": [
+    399960.0,
+    4490220.0,
+    509760.0,
+    4600020.0
+   ],
+   "proj:shape": [
+    10980,
+    10980
+   ],
+   "proj:transform": [
+    10.0,
+    0.0,
+    399960.0,
+    0.0,
+    -10.0,
+    4600020.0
+   ],
+   "gsd": 10,
+   "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+   "roles": [
+    "data"
+   ],
+   "title": "Band 4 - Red - 10m",
+   "eo:bands": [
+    {
+     "name": "B04",
+     "common_name": "red",
+     "description": "Band 4 - Red",
+     "center_wavelength": 0.665,
+     "full_width_half_max": 0.038
+    }
+   ]
+  },
+  "B05": {
+   "href": "https://sentinel2l2a01.blob.core.windows.net/sentinel2-l2/15/T/VF/2017/07/26/S2A_MSIL2A_20170726T165851_N0212_R069_T15TVF_20210210T144523.SAFE/GRANULE/L2A_T15TVF_A010934_20170726T170151/IMG_DATA/R20m/T15TVF_20170726T165851_B05_20m.tif",
+   "proj:bbox": [
+    399960.0,
+    4490220.0,
+    509760.0,
+    4600020.0
+   ],
+   "proj:shape": [
+    5490,
+    5490
+   ],
+   "proj:transform": [
+    20.0,
+    0.0,
+    399960.0,
+    0.0,
+    -20.0,
+    4600020.0
+   ],
+   "gsd": 20,
+   "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+   "roles": [
+    "data"
+   ],
+   "title": "Band 5 - Vegetation red edge 1 - 20m",
+   "eo:bands": [
+    {
+     "name": "B05",
+     "common_name": "rededge",
+     "description": "Band 5 - Vegetation red edge 1",
+     "center_wavelength": 0.704,
+     "full_width_half_max": 0.019
+    }
+   ]
+  },
+  "B06": {
+   "href": "https://sentinel2l2a01.blob.core.windows.net/sentinel2-l2/15/T/VF/2017/07/26/S2A_MSIL2A_20170726T165851_N0212_R069_T15TVF_20210210T144523.SAFE/GRANULE/L2A_T15TVF_A010934_20170726T170151/IMG_DATA/R20m/T15TVF_20170726T165851_B06_20m.tif",
+   "proj:bbox": [
+    399960.0,
+    4490220.0,
+    509760.0,
+    4600020.0
+   ],
+   "proj:shape": [
+    5490,
+    5490
+   ],
+   "proj:transform": [
+    20.0,
+    0.0,
+    399960.0,
+    0.0,
+    -20.0,
+    4600020.0
+   ],
+   "gsd": 20,
+   "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+   "roles": [
+    "data"
+   ],
+   "title": "Band 6 - Vegetation red edge 2 - 20m",
+   "eo:bands": [
+    {
+     "name": "B06",
+     "common_name": "rededge",
+     "description": "Band 6 - Vegetation red edge 2",
+     "center_wavelength": 0.74,
+     "full_width_half_max": 0.018
+    }
+   ]
+  },
+  "B07": {
+   "href": "https://sentinel2l2a01.blob.core.windows.net/sentinel2-l2/15/T/VF/2017/07/26/S2A_MSIL2A_20170726T165851_N0212_R069_T15TVF_20210210T144523.SAFE/GRANULE/L2A_T15TVF_A010934_20170726T170151/IMG_DATA/R20m/T15TVF_20170726T165851_B07_20m.tif",
+   "proj:bbox": [
+    399960.0,
+    4490220.0,
+    509760.0,
+    4600020.0
+   ],
+   "proj:shape": [
+    5490,
+    5490
+   ],
+   "proj:transform": [
+    20.0,
+    0.0,
+    399960.0,
+    0.0,
+    -20.0,
+    4600020.0
+   ],
+   "gsd": 20,
+   "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+   "roles": [
+    "data"
+   ],
+   "title": "Band 7 - Vegetation red edge 3 - 20m",
+   "eo:bands": [
+    {
+     "name": "B07",
+     "common_name": "rededge",
+     "description": "Band 7 - Vegetation red edge 3",
+     "center_wavelength": 0.783,
+     "full_width_half_max": 0.028
+    }
+   ]
+  },
+  "B08": {
+   "href": "https://sentinel2l2a01.blob.core.windows.net/sentinel2-l2/15/T/VF/2017/07/26/S2A_MSIL2A_20170726T165851_N0212_R069_T15TVF_20210210T144523.SAFE/GRANULE/L2A_T15TVF_A010934_20170726T170151/IMG_DATA/R10m/T15TVF_20170726T165851_B08_10m.tif",
+   "proj:bbox": [
+    399960.0,
+    4490220.0,
+    509760.0,
+    4600020.0
+   ],
+   "proj:shape": [
+    10980,
+    10980
+   ],
+   "proj:transform": [
+    10.0,
+    0.0,
+    399960.0,
+    0.0,
+    -10.0,
+    4600020.0
+   ],
+   "gsd": 10,
+   "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+   "roles": [
+    "data"
+   ],
+   "title": "Band 8 - NIR - 10m",
+   "eo:bands": [
+    {
+     "name": "B08",
+     "common_name": "nir",
+     "description": "Band 8 - NIR",
+     "center_wavelength": 0.842,
+     "full_width_half_max": 0.145
+    }
+   ]
+  },
+  "B11": {
+   "href": "https://sentinel2l2a01.blob.core.windows.net/sentinel2-l2/15/T/VF/2017/07/26/S2A_MSIL2A_20170726T165851_N0212_R069_T15TVF_20210210T144523.SAFE/GRANULE/L2A_T15TVF_A010934_20170726T170151/IMG_DATA/R20m/T15TVF_20170726T165851_B11_20m.tif",
+   "proj:bbox": [
+    399960.0,
+    4490220.0,
+    509760.0,
+    4600020.0
+   ],
+   "proj:shape": [
+    5490,
+    5490
+   ],
+   "proj:transform": [
+    20.0,
+    0.0,
+    399960.0,
+    0.0,
+    -20.0,
+    4600020.0
+   ],
+   "gsd": 20,
+   "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+   "roles": [
+    "data"
+   ],
+   "title": "Band 11 - SWIR (1.6) - 20m",
+   "eo:bands": [
+    {
+     "name": "B11",
+     "common_name": "swir16",
+     "description": "Band 11 - SWIR (1.6)",
+     "center_wavelength": 1.61,
+     "full_width_half_max": 0.143
+    }
+   ]
+  },
+  "B12": {
+   "href": "https://sentinel2l2a01.blob.core.windows.net/sentinel2-l2/15/T/VF/2017/07/26/S2A_MSIL2A_20170726T165851_N0212_R069_T15TVF_20210210T144523.SAFE/GRANULE/L2A_T15TVF_A010934_20170726T170151/IMG_DATA/R20m/T15TVF_20170726T165851_B12_20m.tif",
+   "proj:bbox": [
+    399960.0,
+    4490220.0,
+    509760.0,
+    4600020.0
+   ],
+   "proj:shape": [
+    5490,
+    5490
+   ],
+   "proj:transform": [
+    20.0,
+    0.0,
+    399960.0,
+    0.0,
+    -20.0,
+    4600020.0
+   ],
+   "gsd": 20,
+   "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+   "roles": [
+    "data"
+   ],
+   "title": "Band 12 - SWIR (2.2) - 20m",
+   "eo:bands": [
+    {
+     "name": "B12",
+     "common_name": "swir22",
+     "description": "Band 12 - SWIR (2.2)",
+     "center_wavelength": 2.19,
+     "full_width_half_max": 0.242
+    }
+   ]
+  },
+  "B8A": {
+   "href": "https://sentinel2l2a01.blob.core.windows.net/sentinel2-l2/15/T/VF/2017/07/26/S2A_MSIL2A_20170726T165851_N0212_R069_T15TVF_20210210T144523.SAFE/GRANULE/L2A_T15TVF_A010934_20170726T170151/IMG_DATA/R20m/T15TVF_20170726T165851_B8A_20m.tif",
+   "proj:bbox": [
+    399960.0,
+    4490220.0,
+    509760.0,
+    4600020.0
+   ],
+   "proj:shape": [
+    5490,
+    5490
+   ],
+   "proj:transform": [
+    20.0,
+    0.0,
+    399960.0,
+    0.0,
+    -20.0,
+    4600020.0
+   ],
+   "gsd": 20,
+   "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+   "roles": [
+    "data"
+   ],
+   "title": "Band 8A - Vegetation red edge 4 - 20m",
+   "eo:bands": [
+    {
+     "name": "B8A",
+     "common_name": "rededge",
+     "description": "Band 8A - Vegetation red edge 4",
+     "center_wavelength": 0.865,
+     "full_width_half_max": 0.033
+    }
+   ]
+  },
+  "SCL": {
+   "href": "https://sentinel2l2a01.blob.core.windows.net/sentinel2-l2/15/T/VF/2017/07/26/S2A_MSIL2A_20170726T165851_N0212_R069_T15TVF_20210210T144523.SAFE/GRANULE/L2A_T15TVF_A010934_20170726T170151/IMG_DATA/R20m/T15TVF_20170726T165851_SCL_20m.tif",
+   "proj:bbox": [
+    399960.0,
+    4490220.0,
+    509760.0,
+    4600020.0
+   ],
+   "proj:shape": [
+    5490,
+    5490
+   ],
+   "proj:transform": [
+    20.0,
+    0.0,
+    399960.0,
+    0.0,
+    -20.0,
+    4600020.0
+   ],
+   "gsd": 20,
+   "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+   "roles": [
+    "data"
+   ],
+   "title": "Scene classfication map (SCL)"
+  },
+  "preview": {
+   "href": "https://sentinel2l2a01.blob.core.windows.net/sentinel2-l2/15/T/VF/2017/07/26/S2A_MSIL2A_20170726T165851_N0212_R069_T15TVF_20210210T144523.SAFE/GRANULE/L2A_T15TVF_A010934_20170726T170151/QI_DATA/T15TVF_20170726T165851_PVI.tif",
+   "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+   "roles": [
+    "thumbnail"
+   ],
+   "title": "Thumbnail"
+  }
+ },
+ "geometry": {
+  "type": "Polygon",
+  "coordinates": [
+   [
+    [
+     -94.1994491,
+     41.5455888
+    ],
+    [
+     -92.8829684,
+     41.5517851
+    ],
+    [
+     -92.8847084,
+     40.5626924
+    ],
+    [
+     -94.1816203,
+     40.5567069
+    ],
+    [
+     -94.1994491,
+     41.5455888
+    ]
+   ]
+  ]
+ },
+ "collection": "sentinel-2-l2a",
+ "properties": {
+  "datetime": "2017-07-26T16:58:51.026000Z",
+  "platform": "Sentinel-2A",
+  "proj:epsg": 32615,
+  "instruments": [
+   "msi"
+  ],
+  "s2:mgrs_tile": "15TVF",
+  "constellation": "Sentinel 2",
+  "s2:granule_id": "S2A_OPER_MSI_L2A_TL_ESRI_20210210T144524_A010934_T15TVF_N02.12",
+  "eo:cloud_cover": 84.977969,
+  "s2:datatake_id": "GS2A_20170726T165851_010934_N02.12",
+  "s2:product_uri": "S2A_MSIL2A_20170726T165851_N0212_R069_T15TVF_20210210T144523.SAFE",
+  "s2:datastrip_id": "S2A_OPER_MSI_L2A_DS_ESRI_20210210T144524_S20170726T170151_N02.12",
+  "s2:product_type": "S2MSI2A",
+  "sat:orbit_state": "descending",
+  "s2:datatake_type": "INS-NOBS",
+  "s2:generation_time": "2021-02-10T14:45:23.311Z",
+  "sat:relative_orbit": 69,
+  "s2:water_percentage": 0.041463,
+  "s2:mean_solar_zenith": 26.2034772460223,
+  "s2:mean_solar_azimuth": 141.131080894238,
+  "s2:processing_baseline": "02.12",
+  "s2:snow_ice_percentage": 14.971474,
+  "s2:vegetation_percentage": 0.0,
+  "s2:thin_cirrus_percentage": 0.02419,
+  "s2:cloud_shadow_percentage": 0.0,
+  "s2:nodata_pixel_percentage": 3e-06,
+  "s2:unclassified_percentage": 0.006188,
+  "s2:dark_features_percentage": 0.0,
+  "s2:not_vegetated_percentage": 0.002903,
+  "s2:degraded_msi_data_percentage": 0.0,
+  "s2:high_proba_clouds_percentage": 21.308941,
+  "s2:reflectance_conversion_factor": 0.968937185499599,
+  "s2:medium_proba_clouds_percentage": 63.644838,
+  "s2:saturated_defective_pixel_percentage": 0.0
+ },
+ "stac_extensions": [
+  "https://stac-extensions.github.io/eo/v1.0.0/schema.json",
+  "https://stac-extensions.github.io/sat/v1.0.0/schema.json",
+  "https://stac-extensions.github.io/projection/v1.0.0/schema.json"
+ ],
+ "stac_version": "1.0.0"
+}

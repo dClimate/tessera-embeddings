@@ -1,16 +1,19 @@
 """Unit tests for ingest/stac.py - STAC ingestion with provider/collection config."""
 
+import json
 import threading
 import time
 from datetime import datetime
 from types import SimpleNamespace
 
 import numpy as np
+import odc.stac
 import pytest
 from pystac import Item
 from pystac_client.item_search import ItemSearch
 
 from tessera_embeddings.config import (
+    PROVIDERS,
     S2_L2A_BANDS,
     CollectionConfig,
 )
@@ -25,6 +28,7 @@ from tessera_embeddings.ingest.stac import (
     _loadable_assets,
     _prune_item_dict,
     _query_stac_items,
+    _rekey_assets,
     correct_boa_dn,
     extract_baselines,
     ingest_tile,
@@ -33,6 +37,7 @@ from tessera_embeddings.ingest.stac import (
     split_antimeridian_bbox,
     split_query_window,
 )
+from tests._paths import FIXTURES
 
 C1 = ("earth-search", "sentinel-2-c1-l2a")
 LEGACY = ("earth-search", "sentinel-2-l2a")
@@ -577,6 +582,29 @@ class TestAntimeridianBboxSplit:
         # walk produced, so the same request always yields the same item sequence. Straddling
         # item "S" is deduped to one copy and keeps the position its first sighting gave it.
         assert [i.id for i in items] == ["S", "E", "W"]
+
+
+class TestPlanetaryComputerItems:
+    """A Planetary Computer item, recorded from the live catalogue, as the query layer hands it on."""
+
+    @staticmethod
+    def _rekeyed() -> dict:
+        raw = json.loads((FIXTURES / "stac_items" / "planetary_computer_s2_2017_15TVF.json").read_text())
+        return _rekey_assets(raw, PROVIDERS["planetary-computer"].collections["sentinel-2-l2a"])
+
+    def test_it_is_keyed_by_band_name_and_survives_pruning(self):
+        config = PROVIDERS["planetary-computer"].collections["sentinel-2-l2a"]
+        item = self._rekeyed()
+        assert set(item["assets"]) == _loadable_assets(config)
+        assert _prune_item_dict(item, _loadable_assets(config)) == item
+
+    def test_the_loader_reads_integers_with_zero_as_nodata(self):
+        """Without the declared pixel type the loader reads float with no nodata, so a granule's
+        empty area outside its swath would overwrite its neighbour's pixels.
+        """
+        ds = odc.stac.load([Item.from_dict(self._rekeyed())], bands=["blue", "scl"], chunks={}, resolution=10)
+        assert (ds["blue"].dtype, ds["blue"].attrs["nodata"]) == (np.uint16, 0)
+        assert (ds["scl"].dtype, ds["scl"].attrs["nodata"]) == (np.uint8, 0)
 
 
 class TestItemPruning:

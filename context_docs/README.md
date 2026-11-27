@@ -85,7 +85,9 @@ context_docs/
 │   ├── campaign-ingest-measurements.md         what ingest costs, what made it faster, and what
 │   │                                              limits it now — the graph budget, the catalogue
 │   │                                              budget, live-tile cropping, region writes
-│   ├── source-read-failures.md                 twelve ways a source read fails, the guard each
+│   ├── planetary-computer-dev-tests.md         Sentinel-2 from Planetary Computer on dev: pixels
+│   │                                              agree, 3.7–4.6× slower, NAT and token limits
+│   ├── source-read-failures.md                 thirteen ways a source read fails, the guard each
 │   │                                              earned, and the retry budget they share
 │   ├── solar-day-fusion-order.md               which scene or burst wins a contested pixel, and
 │   │                                              why the optical answer was inverted for the

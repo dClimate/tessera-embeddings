@@ -81,7 +81,8 @@ import re
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Generator, Iterable
+from contextlib import contextmanager
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -151,6 +152,25 @@ _install_lock = threading.Lock()
 
 _handlers: list[logging.Handler] = []
 
+#: Set on a thread while it runs a read that will be tried again if it fails. See :func:`retried_read`.
+_attempt = threading.local()
+
+
+@contextmanager
+def retried_read() -> Generator[None]:
+    """Run a read whose failure will be retried, so the loader's abort message for it is not recorded.
+
+    The capture names the objects a date gave up on. An attempt with another to follow is not
+    that, and recorded it would blame an object that then read fine for a different object's
+    failure in the same date. The handler runs on the thread that logs, which is the reading
+    thread, so a thread-local flag is exact.
+    """
+    _attempt.retried = True
+    try:
+        yield
+    finally:
+        _attempt.retried = False
+
 
 def _strip_band_suffix(href: str) -> str:
     """Drop the ``:<band>`` the loader appends to the href it names.
@@ -162,16 +182,18 @@ def _strip_band_suffix(href: str) -> str:
 
 
 def href_key(href: str) -> str:
-    """A comparable identity for one source object, across URL spellings.
+    """A comparable identity for one source object, across URL spellings: its object key.
 
     A catalogue asset says ``s3://bucket/key`` while the loader logs
-    ``https://bucket.s3.<region>.amazonaws.com/key``, and a path-style URL puts the bucket in the
-    path. The last two path segments — granule directory and file — are the same in all three and
-    unique within a collection, so they are the key.
+    ``https://bucket.s3.<region>.amazonaws.com/key``, and a path-style URL (host ``s3.<region>...``)
+    puts the bucket in the path, so that one segment is dropped. The whole key, not its last few
+    segments, because Planetary Computer's last segments (``R10m/T15TVF_..._B02_10m.tif``) are the
+    same for every copy of an image; only the product directory above them tells copies apart. A
+    query string, such as a read token, is never part of the path.
     """
-    path = urlsplit(_strip_band_suffix(href)).path
-    parts = [p for p in path.split("/") if p]
-    return "/".join(parts[-2:])
+    parts = urlsplit(_strip_band_suffix(href))
+    segments = [p for p in parts.path.split("/") if p]
+    return "/".join(segments[1:] if parts.netloc.startswith("s3.") else segments)
 
 
 class _AbortedReadHandler(logging.Handler):
@@ -186,7 +208,7 @@ class _AbortedReadHandler(logging.Handler):
             message = record.getMessage()
         except Exception:  # pragma: no cover — a broken record must not break a read
             return
-        if _ABORT_MARKER not in message:
+        if _ABORT_MARKER not in message or getattr(_attempt, "retried", False):
             return
         match = _ABORT_RE.search(message)
         if match is None:
@@ -710,7 +732,7 @@ def label_objects(hrefs: Iterable[str]) -> str:
     Granule directory and file only: the bucket and collection prefix are the same for every
     object in a run, so including them makes each entry four times longer for no distinction.
     """
-    keys = sorted({href_key(h) for h in hrefs})
+    keys = sorted({"/".join(href_key(h).split("/")[-2:]) for h in hrefs})
     if not keys:
         return "unattributed"
     if len(keys) > _OBJECT_LABEL_CAP:

@@ -58,6 +58,7 @@ from tessera_embeddings.ingest.loader_failures import (
     collect_logged_refusals,
     drain_local,
     href_key,
+    implicated_items,
     implicated_tile_dates,
     install_capture,
     install_capture_everywhere,
@@ -124,7 +125,7 @@ class TestNamingTheObject:
 
     def test_the_href_survives_the_band_suffix(self) -> None:
         """The loader appends ``:1`` for the band; the object's identity does not include it."""
-        assert href_key(ABORT_MESSAGE.split(": ", 1)[1]) == "S2B_34WFA_20210908_1_L2A/B02.tif"
+        assert href_key(ABORT_MESSAGE.split(": ", 1)[1]).endswith("S2B_34WFA_20210908_1_L2A/B02.tif")
 
     def test_the_three_url_spellings_agree(self) -> None:
         """A catalogue asset, a virtual-hosted URL and a path-style URL name one object.
@@ -132,11 +133,10 @@ class TestNamingTheObject:
         If they did not agree, every comparison between what the loader opened and what the
         catalogue offered would silently find nothing.
         """
-        key = "S2B_34WFA_20210908_1_L2A/B02.tif"
-        prefix = "sentinel-s2-l2a-cogs/34/W/FA/2021/9"
-        assert href_key(f"s3://sentinel-cogs/{prefix}/{key}") == key
-        assert href_key(f"https://sentinel-cogs.s3.us-west-2.amazonaws.com/{prefix}/{key}") == key
-        assert href_key(f"https://s3.us-west-2.amazonaws.com/sentinel-cogs/{prefix}/{key}") == key
+        key = "sentinel-s2-l2a-cogs/34/W/FA/2021/9/S2B_34WFA_20210908_1_L2A/B02.tif"
+        assert href_key(f"s3://sentinel-cogs/{key}") == key
+        assert href_key(f"https://sentinel-cogs.s3.us-west-2.amazonaws.com/{key}") == key
+        assert href_key(f"https://s3.us-west-2.amazonaws.com/sentinel-cogs/{key}") == key
 
     def test_the_label_names_nothing_when_nothing_was_captured(self) -> None:
         """``unattributed`` is a distinct answer from a list of objects, and must read as one."""
@@ -150,7 +150,7 @@ class TestCapturingWhatTheLoaderReports:
         install_capture()
         drain_local()
         logging.getLogger("odc.loader._rio").error(ABORT_MESSAGE)
-        assert [href_key(h) for h in drain_local()] == ["S2B_34WFA_20210908_1_L2A/B02.tif"]
+        assert [href_key(h) for h in drain_local()] == [href_key(ABORT_MESSAGE.split(": ", 1)[1])]
 
     def test_installing_twice_does_not_double_the_record(self) -> None:
         """The worker plugin's setup runs again on reconnect, and a second handler would
@@ -698,6 +698,21 @@ class TestMappingObjectsBackToCopies:
         a tile for it would step down a copy that read perfectly well.
         """
         assert implicated_tile_dates([_copy("MGRS-34WFA", 1)], ["s3://b/p/S2B_33TAA_20210101_0_L2A/B02.tif"]) == set()
+
+    def test_copies_sharing_their_last_path_segments_are_told_apart(self) -> None:
+        """Planetary Computer ends every copy of an image in ``R10m/<file>``; only the product
+        directory differs, so one failed copy must not implicate the others.
+        """
+        tail = "GRANULE/L2A_T31UFU_A015626_20180616T103631/IMG_DATA/R10m/T31UFU_20180616T103631_B02_10m.tif"
+        products = [
+            "S2A_MSIL2A_20180616T103631_N0212_R008_T31UFU_20210101T000000.SAFE",
+            "S2A_MSIL2A_20180616T103631_N0212_R008_T31UFU_20210101T000002.SAFE",
+        ]
+        hrefs = [
+            f"https://sentinel2l2a01.blob.core.windows.net/sentinel2-l2/31/U/FU/2018/06/16/{p}/{tail}" for p in products
+        ]
+        copies = [_Item(f"copy-{i}", "MGRS-31UFU", 0, assets={"blue": h}) for i, h in enumerate(hrefs)]
+        assert implicated_items(copies, [f"{hrefs[1]}?st=token"]) == [copies[1]]
 
 
 class TestBlastRadius:

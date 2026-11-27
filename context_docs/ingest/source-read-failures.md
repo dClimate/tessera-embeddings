@@ -1,16 +1,18 @@
-# Ingest source-read failures: twelve causes, and the retry budget they share
+# Ingest source-read failures: thirteen causes, and the retry budget they share
 
-**Investigation record.** Twelve ways a source read fails during ingest, how each was identified,
-what guard each earned, and — in §13 — the patience budget the imagery read path actually has,
-which is what every one of those guards sits on top of.
+**Investigation record.** Thirteen ways a source read fails during ingest, how each was identified,
+what guard each earned, and — in "What patience the imagery read path actually has" — the budget
+GDAL itself spends, which is what every one of those guards sits on top of.
 
 Investigation record. Causes 1 and 2 traced 2026-08-04/05 on `global-tessera-dev`; cause 3 absorbed
 2026-08-18 from its own document, for the reason given at that section; cause 4 traced 2026-08-20,
 cause 5 on 2026-08-21, causes 6 and 7 on 2026-08-22/23, causes 8, 9 and 10 on 2026-08-24, and causes
-11 and 12 on 2026-08-25, all from live campaign legs. **Corrected in place: this document said
+11 and 12 on 2026-08-25, all from live campaign legs; cause 13 on 2026-11-25, from a Planetary
+Computer dev test. **Corrected in place: this document said
 "three causes" until cause 4 was added, "four causes" until cause 5 joined it, "five causes" until
 cause 6 did, "six causes" until cause 7 did, "eight causes" until cause 9 did, "nine causes" until
-cause 10 did, "ten causes" until cause 11 did, and "eleven causes" until cause 12 did.** Causes 9,
+cause 10 did, "ten causes" until cause 11 did, "eleven causes" until cause 12 did, and "twelve
+causes" until cause 13 did.** Causes 9,
 10, 11 and 12 are all later halves of cause 8 rather than new mechanisms: cause 9 is the same
 refusal classified correctly and then given a budget that could not act on the classification,
 cause 10 is the same refusal never classified at all because the evidence for it was never in the
@@ -1717,7 +1719,78 @@ about itself and wrong about the question. Before trusting a predicate, ask what
 evidence covers and whether that is the interval the decision is about — and if two readers of one
 failure can disagree, the narrower one is the one to widen, not the one to freeze.
 
-## 13. What patience the imagery read path actually has — and the three options odc shadows
+## Cause 13 — a lost connection read as an unrecognised file, 2026-11-25
+
+**The first cause found on Planetary Computer, and a GDAL behaviour rather than a provider's.** Six
+60-worker ingests reading Planetary Computer behind one NAT address
+([dev tests §6](planetary-computer-dev-tests.md)) lost two runs to `RasterioIOError: '<url>' not
+recognized as being in a supported file format.` Nothing is wrong with the files.
+
+### The failure
+
+The March run's write of 14–15 March 2023 used all three of its store-write attempts. The first
+failed with `Chunk and warp failed`; the second and third with "not recognized", on two DIFFERENT
+files (`T15TUG_..._B11_20m.tif`, then `T15TUH_..._B02_10m.tif`) on different workers. GDAL logged
+nothing about either file, and the B02 file read back afterwards as a sound 244 MB TIFF. The
+November run failed the same way on two scene-classification files.
+
+Around them, the fleet's workers logged 8,297 of GDAL's retry warnings in 35 minutes: 8,214 for a
+range read that got no HTTP status at all (`HTTP error code for <url> range a-b: 0. Retrying`), and
+83 for HTTP 503. Almost all came in two minutes, 17:01–17:02, after the March failure. The NAT
+instance's connection table recorded no failed inserts or drops.
+
+### How it was identified
+
+A local HTTP server served a tiled TIFF and misbehaved on chosen requests, read through rasterio
+1.5.0 and its GDAL 3.12.1, the versions the workers run:
+
+| What the server did | What GDAL reported | Logged at `WARNING` | Later opens in that process |
+|---|---|---|---|
+| dropped the size request (HEAD) | read on a second try, or `CURL error: Empty reply from server` | no | ask again |
+| answered the size request 200 with size 0 | not recognized | no | fail without asking: the size is cached |
+| dropped the header read (first 16 KB) twice | not recognized | no | ask again |
+| answered the header read 503 until retries ran out | not recognized | yes, `HTTP error code: 503 … Retrying` | ask again |
+| dropped a block read | retried up to `GDAL_HTTP_MAX_RETRY`, then `Chunk and warp failed` | yes | — |
+
+**GDAL tries a dropped header read twice, whatever `GDAL_HTTP_MAX_RETRY` says** (0, 2 and 10 all
+gave two attempts), logs nothing, and reports the file as in no supported format. The production
+failures had no 503 logged against them, so they were dropped header reads: the same lost
+connections as the 8,214 retried block reads, on the one path GDAL does not retry or report.
+
+The classifier reads "not recognized" as `UNDECIDABLE`, correctly: the words say nothing about the
+bytes. So the write was retried, and that is where the run was lost. A write's retry re-reads every
+source of every date in its batch, hundreds of file opens, so under this load each attempt met a
+fresh transient failure somewhere and three attempts were not enough.
+
+### The guard
+
+`stac._SourceReader.read` retries one source up to four times, with jittered waits of about 1, 2
+and 4 s. Before each retry it re-signs the URL and clears what GDAL cached about that object
+(`VSICurlPartialClearCache`), which also undoes a cached size of 0. The last failure is raised
+unchanged, so every verdict about it is the one it had before; a permanently bad object costs
+about 7 s more before that verdict. An attempt with another to follow does not record the loader's
+abort line (`loader_failures.retried_read`), so an object that reads on a retry is never blamed for
+another object's failure in the same date. Radar reads go through odc's own reader and are not
+covered.
+
+### Why the connections drop: the NAT instance's packet allowance
+
+EC2 drops packets an instance sends or receives beyond its packets-per-second allowance, below
+anything Linux on the instance can see, and counts them in the ENA driver's
+`pps_allowance_exceeded` (`ethtool -S`). On a rerun at the same load with the guard in place,
+the `c7gn.8xlarge` NAT instance dropped **15.2 million packets in 19 minutes**, up to 2.2 million a
+minute, while its bandwidth and connection-tracking allowances were never exceeded and its Linux
+connection table dropped nothing. The drops stopped when the reading did. A NAT instance forwards
+every packet twice, in and out, so a fleet's packet rate, not its bandwidth, is what sizes it.
+
+### Still open
+
+A 13-minute stall in one write on the rerun, after the drops had stopped: every read thread on one
+worker waited on a lock inside GDAL's `reproject`, with no network traffic and no GDAL warning,
+then the write finished on its own. Native stacks would say what they waited for; they were not
+taken.
+
+## What patience the imagery read path actually has — and the three options odc shadows
 
 Record, 2026-08-27, from a live S3 us-west-2 degradation. **This shipped no code.** The scope is far
 smaller than the investigation first claimed, and every closure of the remaining gap was worse than
