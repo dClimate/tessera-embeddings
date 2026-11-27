@@ -1,6 +1,6 @@
 # Reading Sentinel-2 from Planetary Computer: dev tests, November 2026
 
-Tests of the Planetary Computer read path (PR #279) on global-tessera-dev, 24–25 November 2026,
+Tests of the Planetary Computer read path (PR #279) on global-tessera-dev, 24–27 November 2026,
 before any year is routed to it. Every run used the S2 ROI ingest flow with `provider` and
 `collection` named, on ARM Fargate workers, against an Earth Search control run at the same time
 where one applies. All test data has been deleted.
@@ -15,9 +15,11 @@ where one applies. All test data has been deleted.
   Every request crosses a 160 ms round trip to Azure West Europe, against 1 ms to S3 in Oregon.
   The 3.7–4.6 of §2 was measured before NAT packet drops could be seen. On the standing
   `t4g.micro` NAT instances it is 40–50 times slower, because their connection table fills (§3).
-- **Several ingests behind one address slow each other, at Microsoft's end.** With no packet
-  dropped, three per address ran 3.9–4.6 times Collection 1 and six per address 5.2–6.8 times;
-  a second address raised the total from 1.25 to 1.8 GB/s (§8).
+- **Microsoft holds each client address to about 1.3 GB/s.** Past about three ingests per address
+  each slows in proportion: twelve behind one address ran 12 times slower than Collection 1 (§9).
+  At 60 ingests at once, the campaign needs 30–60 NAT addresses; the cheapest design measured is
+  Oregon at one or two ingests per address, about $34,000–38,000 per global year against $9,000 from
+  Earth Search (§10). Reading from Frankfurt costs about the same once transfer is counted.
 - **The read token survives a long run**: a two-hour ingest renewed it several times with no
   failure and no slowdown (§4).
 - **Several ingests behind one NAT address were refused by the token service** while each worker
@@ -187,5 +189,71 @@ second try. With no packet dropped and no NAT allowance near its limit, the extr
 beyond our NAT: something on Microsoft's side, or the path to it, caps each client address.
 Spreading fleets over more addresses recovers most of it.
 
-Open before campaign scale: how many fleets each NAT address should carry, and which NAT to run
-(instance size for packet rate, or a managed gateway); the April stall of §7.
+Open before campaign scale: the April stall of §7. §9 settles how many fleets each address should
+carry; a managed gateway is ruled out on price (§10).
+
+## 9. How many ingests per address, and reading from Frankfurt
+
+27 November 2026. All three NAT instances `c7gn.16xlarge`, no packet dropped in any round. One-month
+Iowa 2023 ingests, each Dask cluster pinned to a subnet, with a Collection 1 control for the same
+month in each round except the last, which uses the two-per-address round's controls. Ingest time is
+from the catalogue query to the coverage summary.
+
+| Ingests per address | Ratio to Collection 1 (February, April, November) | Mean over every month run |
+|---|---|---|
+| one, over three addresses | 3.2–4.0× | 3.5× |
+| two, over three addresses | 3.4–4.6× | 4.0× (six months) |
+| three, over two addresses (§8) | 4.1–4.2× | 4.3× |
+| six, behind one address (§8) | 5.3–5.6× | 5.9× |
+| twelve, behind one address | 11.1–13.3× | 12.4× (six months) |
+
+With twelve behind one address the NAT instance carried 1.2–1.4 GB/s throughout, the same total as
+with six. **Microsoft holds each client address to about 1.3 GB/s**, so past about three ingests
+each one gets an equal share of that and slows in proportion. Below that, the round trip sets the
+pace: one ingest alone is still 3.5 times slower than Collection 1.
+
+**Read benchmark.** One `c7g.4xlarge` in each region, with its own public address, reading random
+1,024-pixel windows of 10 m red-band files from Iowa, July 2023
+(`temp/pc-s2-dev/bench/bench.py`, not committed):
+
+| | Oregon | Frankfurt |
+|---|---|---|
+| Round trip to Planetary Computer (TCP connect) | 155 ms | 9 ms |
+| Planetary Computer, 1 thread | 2.4 windows/s | 10.1 windows/s |
+| Planetary Computer, 96 threads | 158 windows/s, 0.53 GB/s | 382 windows/s, 1.28 GB/s |
+| Collection 1 (S3 in Oregon), 1 thread | 11.3 windows/s | 3.6 windows/s |
+
+From Frankfurt one thread reads Planetary Computer about as fast as Oregon reads Collection 1, and
+96 threads reach the same 1.3 GB/s per-address ceiling. Multi-threaded Collection 1 reads hung on a
+read with no timeout and were not measured.
+
+## 10. What each design costs
+
+Per global year of imagery read from Planetary Computer, with 60 ingests running at once. The basis
+is the campaign cost model's Graviton Fargate line ([campaign cost model](../campaign/campaign-cost-model.md)
+§13): about $9,000 of Sentinel-2 ingest per global year at Earth Search speed, which is about 780
+fleet-hours. Fargate time scales with the slowdown; NAT instance hours are fleet-hours ÷ ingests per
+address. Prices are us-west-2 and eu-central-1 on-demand from the AWS pricing API.
+
+| Design | Addresses | Slowdown | Fargate | NAT instances | Transfer | Total |
+|---|---|---|---|---|---|---|
+| Earth Search (reference) | — | 1× | $9,000 | — | — | $9,000 |
+| Oregon, today's three addresses (20 per address) | 3 | ~20× (from the ceiling) | ~$180,000 | ~$3,000 | — | ~$183,000 |
+| Oregon, six per address | 10 | 5.9× | $53,000 | $3,000 | — | $56,000 |
+| Oregon, two per address | 30 | 4.0× | $36,000 | $1,600 | — | $37,600 |
+| **Oregon, one per address** | **60** | **3.5×** | **$31,500** | **$2,700** | — | **$34,200** |
+| Frankfurt, one per address, mosaics written to Oregon | 60 | ~1.2× (estimated) | $12,400 (Frankfurt Fargate is 15% dearer) | $900 | $25,600 (1,280 TB at $20/TB) | ~$39,000 |
+| Managed NAT gateway, Oregon | — | as above | as above | — | ~$45/TB processed | ruled out |
+
+- **Addresses, not region, decide the cost.** Going from three addresses to thirty or sixty saves
+  about $145,000 per global year for about $2,000 of NAT instances.
+- **Oregon at one or two per address is the cheapest design measured.** Frankfurt removes most of the
+  Fargate time but pays it back in transfer, needs the same number of addresses, and needs an ingest
+  deployment in another region. Its estimated slowdown and its cross-region mosaic writes are not
+  measured. Frankfurt finishes ingest about three times sooner, which matters only if ingest, not
+  the graphics-card fleet, sets the campaign's pace.
+- **NAT instance sizes are assumed**: `c7gn.4xlarge` ($1.00/h) for one or two ingests, `c7gn.8xlarge`
+  for three, `c7gn.16xlarge` for six or more. Six ingests dropped packets on a `c7gn.8xlarge` (§7),
+  so a smaller size needs its packet counters checked before a campaign relies on it.
+- **Giving each worker its own public address** instead of a NAT would remove the shared address for
+  about $0.005 per worker-hour, but takes workers out of the isolated network design.
